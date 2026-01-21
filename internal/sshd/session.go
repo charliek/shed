@@ -34,7 +34,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 	if user == reservedAPIUser {
 		log.Printf("Rejected reserved username: %s", user)
 		fmt.Fprintf(sess.Stderr(), "Error: username '%s' is reserved for API access\n", user)
-		sess.Exit(1)
+		_ = sess.Exit(1)
 		return
 	}
 
@@ -45,7 +45,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 	if shedName == "" {
 		log.Printf("Empty shed name from user")
 		fmt.Fprintf(sess.Stderr(), "Error: invalid username\n")
-		sess.Exit(1)
+		_ = sess.Exit(1)
 		return
 	}
 
@@ -56,7 +56,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 	if err != nil {
 		log.Printf("Failed to get shed %s: %v", shedName, err)
 		fmt.Fprintf(sess.Stderr(), "Error: shed '%s' not found\n", shedName)
-		sess.Exit(1)
+		_ = sess.Exit(1)
 		return
 	}
 
@@ -68,7 +68,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 		if err := s.docker.StartShed(ctx, shedName); err != nil {
 			log.Printf("Failed to start shed %s: %v", shedName, err)
 			fmt.Fprintf(sess.Stderr(), "Error: failed to start shed: %v\n", err)
-			sess.Exit(1)
+			_ = sess.Exit(1)
 			return
 		}
 
@@ -76,7 +76,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 		if err := s.waitForReady(ctx, shedName); err != nil {
 			log.Printf("Shed %s not ready: %v", shedName, err)
 			fmt.Fprintf(sess.Stderr(), "Error: shed not ready: %v\n", err)
-			sess.Exit(1)
+			_ = sess.Exit(1)
 			return
 		}
 
@@ -85,7 +85,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 		if err != nil {
 			log.Printf("Failed to get shed %s after start: %v", shedName, err)
 			fmt.Fprintf(sess.Stderr(), "Error: failed to get shed after start: %v\n", err)
-			sess.Exit(1)
+			_ = sess.Exit(1)
 			return
 		}
 	}
@@ -94,7 +94,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 	if shed.Status != config.StatusRunning {
 		log.Printf("Shed %s is not running (status: %s)", shedName, shed.Status)
 		fmt.Fprintf(sess.Stderr(), "Error: shed '%s' is not running (status: %s)\n", shedName, shed.Status)
-		sess.Exit(1)
+		_ = sess.Exit(1)
 		return
 	}
 
@@ -102,11 +102,11 @@ func (s *Server) handleSession(sess ssh.Session) {
 	if err := s.execInContainer(ctx, sess, shed); err != nil {
 		log.Printf("Exec failed for shed %s: %v", shedName, err)
 		// Don't write error to stderr here as it may have already been closed.
-		sess.Exit(1)
+		_ = sess.Exit(1)
 		return
 	}
 
-	sess.Exit(0)
+	_ = sess.Exit(0)
 }
 
 // waitForReady polls until the container is ready or timeout.

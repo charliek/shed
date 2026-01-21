@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
 
 	"github.com/charliek/shed/internal/config"
 )
@@ -222,7 +222,7 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 	ctr, err := c.docker.ContainerInspect(ctx, containerName)
 	if err != nil {
 		// Check if it's a not found error
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil, fmt.Errorf("shed %q not found", name)
 		}
 		return nil, fmt.Errorf("failed to inspect container: %w", err)
@@ -245,7 +245,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		Force:         true,
 		RemoveVolumes: false, // We handle volume separately
 	}); err != nil {
-		if !client.IsErrNotFound(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return fmt.Errorf("failed to remove container: %w", err)
 		}
 	}
@@ -351,7 +351,7 @@ func (c *Client) AttachToShed(ctx context.Context, name string, tty bool) (types
 }
 
 // containerToShed converts a container summary to a Shed.
-func containerToShed(ctr types.Container) config.Shed {
+func containerToShed(ctr container.Summary) config.Shed {
 	labels := ctr.Labels
 
 	name := labels[config.LabelShedName]
@@ -374,7 +374,7 @@ func containerToShed(ctr types.Container) config.Shed {
 }
 
 // inspectToShed converts a container inspect response to a Shed.
-func inspectToShed(ctr types.ContainerJSON) *config.Shed {
+func inspectToShed(ctr container.InspectResponse) *config.Shed {
 	labels := ctr.Config.Labels
 
 	name := labels[config.LabelShedName]
@@ -411,7 +411,7 @@ func containerStateToStatus(state string) string {
 }
 
 // inspectStateToStatus converts Docker container state from inspect to shed status.
-func inspectStateToStatus(state *types.ContainerState) string {
+func inspectStateToStatus(state *container.State) string {
 	if state == nil {
 		return config.StatusError
 	}

@@ -56,11 +56,11 @@ var stopCmd = &cobra.Command{
 }
 
 var (
-	createRepo   string
-	createImage  string
-	listAll      bool
-	deleteKeep   bool
-	deleteForce  bool
+	createRepo  string
+	createImage string
+	listAll     bool
+	deleteKeep  bool
+	deleteForce bool
 )
 
 func init() {

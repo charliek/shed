@@ -240,6 +240,40 @@ go test -tags=integration ./...
 - Keep functions focused and small
 - Prefer returning errors over panicking
 
+## Continuous Integration
+
+This project uses GitHub Actions for CI. The workflow runs on:
+- Push to `main` or `feature/*` branches
+- Pull requests to `main` or `feature/*` branches
+
+### CI Jobs
+
+1. **Test**: Runs all unit tests
+2. **Lint**: Runs golangci-lint with project configuration
+3. **Dockerfile Lint**: Runs hadolint on the shed-base Dockerfile
+
+### Running Checks Locally
+
+Before pushing, run the same checks that CI runs:
+
+```bash
+make check           # Run lint + test
+make lint            # Go linting only
+make lint-dockerfile # Dockerfile linting (requires hadolint)
+make coverage        # Tests with coverage report
+```
+
+### Installing Tools
+
+```bash
+# golangci-lint
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.5
+
+# hadolint (for Dockerfile linting)
+# macOS: brew install hadolint
+# Linux: see https://github.com/hadolint/hadolint#install
+```
+
 ## Submitting Changes
 
 1. Fork the repository
