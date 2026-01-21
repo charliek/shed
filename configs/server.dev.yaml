@@ -1,0 +1,30 @@
+# Shed Server Development Configuration
+#
+# Use this for local development and testing:
+#   shed-server serve --config ./configs/server.dev.yaml
+
+name: localhost-dev
+
+http_port: 8080
+ssh_port: 2222
+
+default_image: shed-base:latest
+
+# Minimal credentials for development
+# Add more as needed for your workflow
+credentials:
+  git_ssh:
+    source: ~/.ssh
+    target: /root/.ssh
+    readonly: true
+
+  git_config:
+    source: ~/.gitconfig
+    target: /root/.gitconfig
+    readonly: true
+
+# No env file for dev - set env vars directly if needed
+env_file: ""
+
+# Debug logging for development
+log_level: debug

@@ -1,0 +1,55 @@
+# Binaries
+bin/
+dist/
+shed
+shed-server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of go coverage
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Local configuration (keep examples)
+server.yaml
+!configs/server.example.yaml
+!configs/server.dev.yaml
+
+# Logs
+*.log
+/tmp/
+
+# Debug files
+__debug_bin*
+
+# OS generated files
+Thumbs.db
+ehthumbs.db

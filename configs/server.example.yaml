@@ -1,0 +1,64 @@
+# Shed Server Configuration
+#
+# Copy this file to one of the following locations:
+#   - ./server.yaml (current directory)
+#   - ~/.config/shed/server.yaml
+#   - /etc/shed/server.yaml
+
+# Server identity - used in API responses and logging
+name: my-server
+
+# Network configuration
+http_port: 8080
+ssh_port: 2222
+
+# Docker settings
+# Default image used when creating sheds without --image flag
+default_image: shed-base:latest
+
+# Credentials to mount into containers
+# Each entry creates a bind mount from host to container
+# Paths support ~ expansion
+credentials:
+  git_ssh:
+    source: ~/.ssh
+    target: /root/.ssh
+    readonly: true
+
+  git_config:
+    source: ~/.gitconfig
+    target: /root/.gitconfig
+    readonly: true
+
+  claude:
+    source: ~/.claude
+    target: /root/.claude
+    readonly: false  # Needs write access for token refresh
+
+  opencode:
+    source: ~/.config/opencode
+    target: /root/.config/opencode
+    readonly: true
+
+  gh:
+    source: ~/.config/gh
+    target: /root/.config/gh
+    readonly: true
+
+# Environment file path
+# Each line should be in format: KEY=value
+# These variables are injected into all containers
+env_file: ~/.shed/env
+
+# Terminal configuration (optional)
+# The shed-base image includes ncurses-term which handles most terminal types.
+# These settings are only needed for exotic terminals not in ncurses-term.
+# terminal:
+#   # Default TERM value when normalization is needed (usually not required)
+#   fallback_term: xterm-256color
+#   # Explicit TERM mappings for specific terminals
+#   term_mappings:
+#     some-exotic-term: xterm-256color
+
+# Logging level: debug, info, warn, error
+log_level: info
