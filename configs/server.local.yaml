@@ -1,0 +1,58 @@
+# Shed Server Development Configuration
+#
+# Use this for local development and testing:
+#   shed-server serve --config ./configs/server.dev.yaml
+
+name: localhost-dev
+
+http_port: 8080
+ssh_port: 2222
+
+default_image: shed-base:latest
+
+# Minimal credentials for development
+# Add more as needed for your workflow
+credentials:
+  git_ssh:
+    source: ~/.ssh
+    target: /mnt/ssh-host
+    readonly: true
+
+  git_config:
+    source: ~/.gitconfig
+    target: /root/.gitconfig
+    readonly: true
+
+  # Claude Code - container-specific credentials
+  claude:
+    source: ~/.shed/mounts/claude
+    target: /root/.claude
+    readonly: false
+
+  # OpenCode - 3 directories for data, state, and cache
+  opencode_data:
+    source: ~/.shed/mounts/opencode/share
+    target: /root/.local/share/opencode
+    readonly: false
+
+  opencode_state:
+    source: ~/.shed/mounts/opencode/state
+    target: /root/.local/state/opencode
+    readonly: false
+
+  opencode_cache:
+    source: ~/.shed/mounts/opencode/cache
+    target: /root/.cache/opencode
+    readonly: false
+
+  # GitHub CLI - credentials and config
+  gh:
+    source: ~/.shed/mounts/gh
+    target: /root/.config/gh
+    readonly: false
+
+# Environment file with GIT_SSH_COMMAND for SSH key access
+env_file: ~/.shed/env
+
+# Debug logging for development
+log_level: debug

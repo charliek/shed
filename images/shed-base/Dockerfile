@@ -6,15 +6,28 @@ RUN apt-get update && apt-get install -y \
     git \
     tmux \
     vim \
+    emacs-nox \
     wget \
     jq \
     openssh-client \
     build-essential \
     ca-certificates \
     ncurses-term \
+    tree \
+    ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js 22.x (for Claude Code)
+# mise
+RUN curl https://mise.run | sh
+
+# RUN mise install \
+#     java@temurin-21 \
+#     node@lts \
+#     uv \
+#     gh 
+
+
+# Node.js 22.x
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -32,6 +45,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
+
+# UV + Python
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN /root/.local/bin/uv python install 3.13
 
 # Shell customization - colored prompt showing shed name and path
 # Append to /root/.bashrc (runs last for login shells, after Ubuntu's default PS1)
