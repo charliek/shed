@@ -156,6 +156,30 @@ func (c *APIClient) StopShed(name string) (*config.Shed, error) {
 	return &shed, nil
 }
 
+// ListSessions retrieves all tmux sessions in a shed.
+func (c *APIClient) ListSessions(shedName string) ([]config.Session, error) {
+	var resp config.SessionsResponse
+	if err := c.doRequest(http.MethodGet, "/api/sheds/"+shedName+"/sessions", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Sessions, nil
+}
+
+// ListAllSessions retrieves all tmux sessions across all sheds.
+func (c *APIClient) ListAllSessions() ([]config.Session, error) {
+	var resp config.SessionsResponse
+	if err := c.doRequest(http.MethodGet, "/api/sessions", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Sessions, nil
+}
+
+// KillSession terminates a tmux session in a shed.
+func (c *APIClient) KillSession(shedName, sessionName string) error {
+	path := fmt.Sprintf("/api/sheds/%s/sessions/%s", shedName, sessionName)
+	return c.doRequest(http.MethodDelete, path, nil, nil, http.StatusNoContent, http.StatusOK)
+}
+
 // Ping checks if the server is reachable.
 func (c *APIClient) Ping() bool {
 	client := &http.Client{

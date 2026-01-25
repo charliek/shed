@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -12,13 +13,15 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
+var execSessionFlag string
+
 var consoleCmd = &cobra.Command{
 	Use:   "console <name>",
 	Short: "Open an interactive console to a shed",
 	Long: `Open an interactive SSH console to a shed.
 
 This command replaces the current process with an SSH connection
-to the specified shed.`,
+to the specified shed. For tmux session support, use "shed attach" instead.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runConsole,
 }
@@ -29,9 +32,19 @@ var execCmd = &cobra.Command{
 	Long: `Execute a command in a shed via SSH.
 
 This command replaces the current process with an SSH connection
-that runs the specified command.`,
+that runs the specified command.
+
+Use --session to run the command in the context of an existing tmux session.
+
+Examples:
+  shed exec myproj git status                     # Direct execution
+  shed exec myproj --session default git status   # Run in tmux session`,
 	Args: cobra.MinimumNArgs(2),
 	RunE: runExec,
+}
+
+func init() {
+	execCmd.Flags().StringVarP(&execSessionFlag, "session", "S", "", "Run command in tmux session context")
 }
 
 func runConsole(cmd *cobra.Command, args []string) error {
@@ -42,6 +55,19 @@ func runConsole(cmd *cobra.Command, args []string) error {
 func runExec(cmd *cobra.Command, args []string) error {
 	name := args[0]
 	command := args[1:]
+
+	// If --session flag is provided, wrap command in tmux send-keys
+	if execSessionFlag != "" {
+		if err := config.ValidateSessionName(execSessionFlag); err != nil {
+			return fmt.Errorf("invalid session name: %w", err)
+		}
+		// Use tmux send-keys to run the command in the session
+		// This sends the command to the session and presses Enter
+		escapedCmd := strings.Join(command, " ")
+		tmuxCmd := fmt.Sprintf("tmux send-keys -t %s '%s' Enter", execSessionFlag, escapedCmd)
+		command = []string{"sh", "-c", tmuxCmd}
+	}
+
 	return sshToShed(name, command)
 }
 

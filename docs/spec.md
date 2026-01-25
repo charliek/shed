@@ -304,6 +304,73 @@ Stops a running shed.
 - `404 Not Found` - Shed does not exist
 - `409 Conflict` - Shed is already stopped
 
+#### 3.2.9 GET /api/sheds/{name}/sessions
+
+Lists all tmux sessions in a shed container.
+
+**Response (200 OK):**
+```json
+{
+  "sessions": [
+    {
+      "name": "default",
+      "shed_name": "codelens",
+      "created_at": "2026-01-20T10:30:00Z",
+      "attached": true,
+      "window_count": 1
+    },
+    {
+      "name": "debug",
+      "shed_name": "codelens",
+      "created_at": "2026-01-20T11:00:00Z",
+      "attached": false,
+      "window_count": 2
+    }
+  ]
+}
+```
+
+**Errors:**
+- `404 Not Found` - Shed does not exist
+- `409 Conflict` - Shed is not running
+- `503 Service Unavailable` - tmux not available in container
+
+#### 3.2.10 DELETE /api/sheds/{name}/sessions/{session}
+
+Terminates a tmux session in a shed container.
+
+**Response (204 No Content)**
+
+**Errors:**
+- `404 Not Found` - Shed or session does not exist
+- `409 Conflict` - Shed is not running
+
+#### 3.2.11 GET /api/sessions
+
+Lists all tmux sessions across all running sheds.
+
+**Response (200 OK):**
+```json
+{
+  "sessions": [
+    {
+      "name": "default",
+      "shed_name": "codelens",
+      "created_at": "2026-01-20T10:30:00Z",
+      "attached": true,
+      "window_count": 1
+    },
+    {
+      "name": "default",
+      "shed_name": "stbot",
+      "created_at": "2026-01-19T14:00:00Z",
+      "attached": false,
+      "window_count": 1
+    }
+  ]
+}
+```
+
 ### 3.3 SSH Server
 
 #### 3.3.1 Connection Routing
@@ -638,20 +705,103 @@ Executes a command in a shed.
 
 ```bash
 shed exec <name> <command...>
+shed exec <name> --session <session> <command...>
 ```
+
+**Flags:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session`, `-S` | None | Run command in tmux session context |
 
 **Examples:**
 ```bash
 shed exec codelens git status
 shed exec codelens "cd /workspace/codelens && npm test"
+shed exec codelens --session default git status  # Run in tmux session
 ```
 
 **Output:**
 Command stdout/stderr streamed to terminal, exits with command's exit code.
 
-### 4.5 IDE Integration Commands
+#### 4.4.3 shed attach
 
-#### 4.5.1 shed ssh-config
+Attaches to a tmux session in a shed container. Creates the session if it doesn't exist.
+
+```bash
+shed attach <name> [flags]
+```
+
+**Flags:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session`, `-S` | "default" | Session name to attach to |
+| `--new` | false | Force create new session (error if exists) |
+
+**Examples:**
+```bash
+shed attach codelens                    # Attach to default session
+shed attach codelens --session debug    # Attach to "debug" session
+shed attach codelens --new --session exp  # Create new "exp" session
+```
+
+**Behavior:**
+1. Look up shed's server from cache
+2. Verify shed is running
+3. If `--new`, check session doesn't already exist
+4. SSH with tmux command: `tmux new-session -A -s <session> -c /workspace`
+
+**Detaching:**
+Use tmux's native detach command: `Ctrl-B D`
+
+### 4.5 Session Management Commands
+
+#### 4.5.1 shed sessions
+
+Lists tmux sessions across sheds.
+
+```bash
+shed sessions [shed-name] [flags]
+```
+
+**Flags:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--all`, `-a` | false | List from all servers |
+| `--json` | false | Output as JSON |
+
+**Examples:**
+```bash
+shed sessions                    # List all sessions on default server
+shed sessions myproj             # List sessions in specific shed
+shed sessions --all              # List across all servers
+shed sessions --json             # Output as JSON
+```
+
+**Output:**
+```
+SHED        SESSION      STATUS      CREATED      WINDOWS
+codelens    default      attached    2h ago       1
+codelens    debug        detached    30m ago      2
+stbot       default      detached    1d ago       1
+```
+
+#### 4.5.2 shed sessions kill
+
+Terminates a tmux session.
+
+```bash
+shed sessions kill <shed-name> <session-name>
+```
+
+**Example:**
+```bash
+shed sessions kill codelens debug
+✓ Killed session "debug" in shed "codelens"
+```
+
+### 4.6 IDE Integration Commands
+
+#### 4.6.1 shed ssh-config
 
 Generates or installs SSH config for IDE integration.
 
@@ -753,7 +903,7 @@ Host shed-stbot
 - If block doesn't exist, appends to end of file
 - Creates `~/.ssh/config` if it doesn't exist (with mode 0600)
 
-### 4.6 Shed Resolution
+### 4.7 Shed Resolution
 
 When a command references a shed by name:
 
