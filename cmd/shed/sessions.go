@@ -172,6 +172,11 @@ func formatTimeAgo(t time.Time) string {
 
 	duration := time.Since(t)
 
+	// Handle future times (e.g., clock skew between host and container)
+	if duration < 0 {
+		return "just now"
+	}
+
 	switch {
 	case duration < time.Minute:
 		return "just now"

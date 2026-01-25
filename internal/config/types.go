@@ -2,9 +2,22 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
+)
+
+// Sentinel errors for session operations.
+var (
+	// ErrSessionNotFoundSentinel is returned when a tmux session does not exist.
+	ErrSessionNotFoundSentinel = errors.New("session not found")
+
+	// ErrTmuxNotAvailableSentinel is returned when tmux is not installed in the container.
+	ErrTmuxNotAvailableSentinel = errors.New("tmux is not available in this container")
+
+	// ErrShedNotRunningSentinel is returned when an operation requires a running shed.
+	ErrShedNotRunningSentinel = errors.New("shed is not running")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -111,6 +124,7 @@ type ShedsResponse struct {
 // SessionsResponse is returned by GET /api/sheds/{name}/sessions and GET /api/sessions.
 type SessionsResponse struct {
 	Sessions []Session `json:"sessions"`
+	Warnings []string  `json:"warnings,omitempty"`
 }
 
 // CreateShedRequest is the request body for POST /api/sheds.

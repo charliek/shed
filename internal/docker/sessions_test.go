@@ -52,10 +52,7 @@ func TestParseTmuxSessions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sessions, err := parseTmuxSessions(tt.output, tt.shedName)
-			if err != nil {
-				t.Fatalf("parseTmuxSessions() error = %v", err)
-			}
+			sessions := parseTmuxSessions(tt.output, tt.shedName)
 
 			if len(sessions) != tt.wantCount {
 				t.Errorf("parseTmuxSessions() returned %d sessions, want %d", len(sessions), tt.wantCount)
@@ -78,10 +75,7 @@ func TestParseTmuxSessions(t *testing.T) {
 func TestParseTmuxSessionsFields(t *testing.T) {
 	// Test that all fields are correctly parsed
 	output := "mysession:1706200000:1:3\n"
-	sessions, err := parseTmuxSessions(output, "testproj")
-	if err != nil {
-		t.Fatalf("parseTmuxSessions() error = %v", err)
-	}
+	sessions := parseTmuxSessions(output, "testproj")
 
 	if len(sessions) != 1 {
 		t.Fatalf("expected 1 session, got %d", len(sessions))
@@ -123,7 +117,7 @@ func TestParseTmuxSessionsAttachedStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sessions, _ := parseTmuxSessions(tt.output, "proj")
+			sessions := parseTmuxSessions(tt.output, "proj")
 			if len(sessions) != 1 {
 				t.Fatalf("expected 1 session")
 			}

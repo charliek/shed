@@ -63,12 +63,20 @@ func runExec(cmd *cobra.Command, args []string) error {
 		}
 		// Use tmux send-keys to run the command in the session
 		// This sends the command to the session and presses Enter
-		escapedCmd := strings.Join(command, " ")
+		// Escape single quotes by replacing ' with '\'' (end quote, escaped quote, start quote)
+		escapedCmd := escapeForShellSingleQuote(strings.Join(command, " "))
 		tmuxCmd := fmt.Sprintf("tmux send-keys -t %s '%s' Enter", execSessionFlag, escapedCmd)
 		command = []string{"sh", "-c", tmuxCmd}
 	}
 
 	return sshToShed(name, command)
+}
+
+// escapeForShellSingleQuote escapes a string for safe inclusion in single quotes.
+// Single quotes cannot be escaped inside single-quoted strings, so we end the
+// single-quoted string, add an escaped single quote, and start a new single-quoted string.
+func escapeForShellSingleQuote(s string) string {
+	return strings.ReplaceAll(s, "'", `'\''`)
 }
 
 // sshToShed establishes an SSH connection to a shed.
@@ -83,15 +91,8 @@ func sshToShed(name string, command []string) error {
 
 	// Verify the shed is running
 	client := NewAPIClientFromEntry(entry)
-	shed, err := client.GetShed(name)
-	if err != nil {
-		return fmt.Errorf("failed to get shed status: %w", err)
-	}
-
-	if shed.Status != config.StatusRunning {
-		printError(fmt.Sprintf("shed %q is %s", name, shed.Status),
-			"shed start "+name+"  # Start the shed first")
-		return fmt.Errorf("shed %q is not running", name)
+	if _, err := requireRunningShed(client, name); err != nil {
+		return err
 	}
 
 	if verboseFlag {

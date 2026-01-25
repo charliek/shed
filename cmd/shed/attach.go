@@ -61,15 +61,8 @@ func runAttach(cmd *cobra.Command, args []string) error {
 
 	// Verify the shed is running
 	client := NewAPIClientFromEntry(entry)
-	shed, err := client.GetShed(name)
-	if err != nil {
-		return fmt.Errorf("failed to get shed status: %w", err)
-	}
-
-	if shed.Status != config.StatusRunning {
-		printError(fmt.Sprintf("shed %q is %s", name, shed.Status),
-			"shed start "+name+"  # Start the shed first")
-		return fmt.Errorf("shed %q is not running", name)
+	if _, err := requireRunningShed(client, name); err != nil {
+		return err
 	}
 
 	// If --new flag is set, check that session doesn't exist

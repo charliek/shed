@@ -14,11 +14,12 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// ErrTmuxNotAvailable is returned when tmux is not installed in the container.
-var ErrTmuxNotAvailable = fmt.Errorf("tmux is not available in this container")
-
-// ErrSessionNotFound is returned when a tmux session does not exist.
-var ErrSessionNotFound = fmt.Errorf("session not found")
+// Re-export sentinel errors from config for backward compatibility.
+var (
+	ErrTmuxNotAvailable = config.ErrTmuxNotAvailableSentinel
+	ErrSessionNotFound  = config.ErrSessionNotFoundSentinel
+	ErrShedNotRunning   = config.ErrShedNotRunningSentinel
+)
 
 // ListSessions returns all tmux sessions in a shed container.
 // Returns an empty list if the container has no sessions or tmux is not available.
@@ -31,7 +32,7 @@ func (c *Client) ListSessions(ctx context.Context, shedName string) ([]config.Se
 		return nil, err
 	}
 	if shed.Status != config.StatusRunning {
-		return nil, fmt.Errorf("shed %q is not running", shedName)
+		return nil, fmt.Errorf("shed %q: %w", shedName, ErrShedNotRunning)
 	}
 
 	// tmux list-sessions format: name:created:attached:windows
@@ -55,7 +56,7 @@ func (c *Client) ListSessions(ctx context.Context, shedName string) ([]config.Se
 		return nil, fmt.Errorf("tmux list-sessions failed: %s", output)
 	}
 
-	return parseTmuxSessions(output, shedName)
+	return parseTmuxSessions(output, shedName), nil
 }
 
 // SessionExists checks if a tmux session exists in a shed container.
@@ -68,7 +69,7 @@ func (c *Client) SessionExists(ctx context.Context, shedName, sessionName string
 		return false, err
 	}
 	if shed.Status != config.StatusRunning {
-		return false, fmt.Errorf("shed %q is not running", shedName)
+		return false, fmt.Errorf("shed %q: %w", shedName, ErrShedNotRunning)
 	}
 
 	cmd := []string{"tmux", "has-session", "-t", sessionName}
@@ -92,18 +93,10 @@ func (c *Client) KillSession(ctx context.Context, shedName, sessionName string) 
 		return err
 	}
 	if shed.Status != config.StatusRunning {
-		return fmt.Errorf("shed %q is not running", shedName)
+		return fmt.Errorf("shed %q: %w", shedName, ErrShedNotRunning)
 	}
 
-	// Check if session exists first
-	exists, err := c.SessionExists(ctx, shedName, sessionName)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return ErrSessionNotFound
-	}
-
+	// Kill the session directly and handle "not found" from tmux output
 	cmd := []string{"tmux", "kill-session", "-t", sessionName}
 
 	output, exitCode, err := c.execCommand(ctx, containerName, cmd)
@@ -112,6 +105,10 @@ func (c *Client) KillSession(ctx context.Context, shedName, sessionName string) 
 	}
 
 	if exitCode != 0 {
+		// Check if session doesn't exist
+		if strings.Contains(output, "can't find session") || strings.Contains(output, "no session") {
+			return fmt.Errorf("session %q: %w", sessionName, ErrSessionNotFound)
+		}
 		return fmt.Errorf("tmux kill-session failed: %s", output)
 	}
 
@@ -152,7 +149,8 @@ func (c *Client) execCommand(ctx context.Context, containerName string, cmd []st
 
 // parseTmuxSessions parses tmux list-sessions output into Session structs.
 // Format: name:created_timestamp:attached(0/1):windows
-func parseTmuxSessions(output string, shedName string) ([]config.Session, error) {
+// Malformed lines are silently skipped.
+func parseTmuxSessions(output string, shedName string) []config.Session {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	sessions := make([]config.Session, 0, len(lines))
 
@@ -193,5 +191,5 @@ func parseTmuxSessions(output string, shedName string) ([]config.Session, error)
 		})
 	}
 
-	return sessions, nil
+	return sessions
 }

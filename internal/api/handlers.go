@@ -188,13 +188,19 @@ func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var allSessions []config.Session
+	var warnings []string
 	for _, shed := range sheds {
 		if shed.Status != config.StatusRunning {
 			continue
 		}
 		sessions, err := s.docker.ListSessions(r.Context(), shed.Name)
 		if err != nil {
-			// Skip sheds where we can't list sessions (tmux not available, etc.)
+			// Record warning for sheds where we can't list sessions
+			if errors.Is(err, config.ErrTmuxNotAvailableSentinel) {
+				warnings = append(warnings, "shed "+shed.Name+": tmux not available")
+			} else {
+				warnings = append(warnings, "shed "+shed.Name+": "+err.Error())
+			}
 			continue
 		}
 		allSessions = append(allSessions, sessions...)
@@ -202,6 +208,7 @@ func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
 
 	resp := config.SessionsResponse{
 		Sessions: allSessions,
+		Warnings: warnings,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -294,18 +301,19 @@ func sanitizeErrorMessage(errMsg, context string) string {
 
 // mapSessionError maps a session-related error to an HTTP status code, error code, and message.
 func mapSessionError(err error) (int, string, string) {
-	errMsg := err.Error()
-
-	// Check for specific session errors
-	if strings.Contains(errMsg, "session not found") {
-		return http.StatusNotFound, config.ErrSessionNotFound, errMsg
+	// Check for specific sentinel errors using errors.Is
+	if errors.Is(err, config.ErrSessionNotFoundSentinel) {
+		return http.StatusNotFound, config.ErrSessionNotFound, err.Error()
 	}
-	if strings.Contains(errMsg, "tmux is not available") {
+	if errors.Is(err, config.ErrTmuxNotAvailableSentinel) {
 		return http.StatusServiceUnavailable, config.ErrTmuxNotAvailable, "tmux is not available in this container"
 	}
-	if strings.Contains(errMsg, "not running") {
-		return http.StatusConflict, config.ErrShedAlreadyStopped, errMsg
+	if errors.Is(err, config.ErrShedNotRunningSentinel) {
+		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
 	}
+
+	// Fall back to string matching for errors that don't use sentinel pattern
+	errMsg := err.Error()
 	if strings.Contains(errMsg, "not found") {
 		return http.StatusNotFound, config.ErrShedNotFound, errMsg
 	}
