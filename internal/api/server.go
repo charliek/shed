@@ -29,6 +29,12 @@ type DockerClient interface {
 
 	// StopShed stops a running shed container.
 	StopShed(ctx context.Context, name string) (*config.Shed, error)
+
+	// ListSessions returns all tmux sessions in a shed container.
+	ListSessions(ctx context.Context, shedName string) ([]config.Session, error)
+
+	// KillSession terminates a tmux session in a shed container.
+	KillSession(ctx context.Context, shedName, sessionName string) error
 }
 
 // Server is the HTTP API server for shed.
@@ -64,6 +70,9 @@ func (s *Server) Router() chi.Router {
 		r.Get("/info", s.handleGetInfo)
 		r.Get("/ssh-host-key", s.handleGetSSHHostKey)
 
+		// Sessions (aggregate across all sheds)
+		r.Get("/sessions", s.handleListAllSessions)
+
 		// Sheds
 		r.Route("/sheds", func(r chi.Router) {
 			r.Get("/", s.handleListSheds)
@@ -73,6 +82,10 @@ func (s *Server) Router() chi.Router {
 				r.Delete("/", s.handleDeleteShed)
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
+
+				// Sessions within a shed
+				r.Get("/sessions", s.handleListSessions)
+				r.Delete("/sessions/{session}", s.handleKillSession)
 			})
 		})
 	})

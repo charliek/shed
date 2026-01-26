@@ -144,6 +144,76 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, shed)
 }
 
+// handleListSessions returns all tmux sessions in a shed.
+// GET /api/sheds/{name}/sessions
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+
+	sessions, err := s.docker.ListSessions(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapSessionError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	resp := config.SessionsResponse{
+		Sessions: sessions,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleKillSession terminates a tmux session in a shed.
+// DELETE /api/sheds/{name}/sessions/{session}
+func (s *Server) handleKillSession(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	sessionName := chi.URLParam(r, "session")
+
+	if err := s.docker.KillSession(r.Context(), name, sessionName); err != nil {
+		code, errCode, msg := mapSessionError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListAllSessions returns all tmux sessions across all running sheds.
+// GET /api/sessions
+func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
+	sheds, err := s.docker.ListSheds(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, config.ErrDockerError, err.Error())
+		return
+	}
+
+	var allSessions []config.Session
+	var warnings []string
+	for _, shed := range sheds {
+		if shed.Status != config.StatusRunning {
+			continue
+		}
+		sessions, err := s.docker.ListSessions(r.Context(), shed.Name)
+		if err != nil {
+			// Record warning for sheds where we can't list sessions
+			if errors.Is(err, config.ErrTmuxNotAvailableSentinel) {
+				warnings = append(warnings, "shed "+shed.Name+": tmux not available")
+			} else {
+				warnings = append(warnings, "shed "+shed.Name+": "+err.Error())
+			}
+			continue
+		}
+		allSessions = append(allSessions, sessions...)
+	}
+
+	resp := config.SessionsResponse{
+		Sessions: allSessions,
+		Warnings: warnings,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // writeJSON writes a JSON response with the given status code.
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.WriteHeader(status)
@@ -227,4 +297,26 @@ func sanitizeErrorMessage(errMsg, context string) string {
 		}
 	}
 	return context
+}
+
+// mapSessionError maps a session-related error to an HTTP status code, error code, and message.
+func mapSessionError(err error) (int, string, string) {
+	// Check for specific sentinel errors using errors.Is
+	if errors.Is(err, config.ErrSessionNotFoundSentinel) {
+		return http.StatusNotFound, config.ErrSessionNotFound, err.Error()
+	}
+	if errors.Is(err, config.ErrTmuxNotAvailableSentinel) {
+		return http.StatusServiceUnavailable, config.ErrTmuxNotAvailable, "tmux is not available in this container"
+	}
+	if errors.Is(err, config.ErrShedNotRunningSentinel) {
+		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
+	}
+
+	// Fall back to string matching for errors that don't use sentinel pattern
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "not found") {
+		return http.StatusNotFound, config.ErrShedNotFound, errMsg
+	}
+
+	return http.StatusInternalServerError, config.ErrDockerError, "internal server error"
 }

@@ -82,19 +82,65 @@ Developer Machine                    Remote Server
 ## CLI Commands
 
 ```bash
+# Shed Management
 shed create <name> [--repo URL]  # Create a new shed
 shed list                        # List all sheds on the current server
-shed console <name>              # Open terminal session
-shed exec <name> <cmd>           # Run command in shed
 shed start <name>                # Start a stopped shed
 shed stop <name>                 # Stop a running shed
 shed delete <name> [--force]     # Delete a shed
-shed ssh-config                  # Generate SSH config for IDE integration
 
+# Connection & Execution
+shed console <name>              # Open direct terminal session
+shed attach <name>               # Attach to tmux session (persistent)
+shed attach <name> -S <session>  # Attach to named session
+shed exec <name> <cmd>           # Run command in shed
+
+# Session Management
+shed sessions                    # List all sessions on default server
+shed sessions <name>             # List sessions in a specific shed
+shed sessions --all              # List sessions across all servers
+shed sessions kill <shed> <session>  # Kill a session
+
+# Server & IDE
 shed server add <name>           # Add a server to client config
 shed server list                 # List configured servers
 shed server remove <name>        # Remove a server from client config
+shed ssh-config                  # Generate SSH config for IDE integration
 ```
+
+## Session Persistence
+
+Shed supports persistent sessions via tmux. This allows you to:
+
+1. Start a long-running agent (Claude Code, OpenCode)
+2. Detach from the session (Ctrl-B D)
+3. Reconnect later to check on progress
+4. Run multiple named sessions per shed
+
+### Quick Example
+
+```bash
+# Create a shed and attach to a persistent session
+shed create myproj --repo user/repo
+shed attach myproj
+
+# Inside the session, start an agent
+claude
+
+# Detach with Ctrl-B D (tmux default)
+# The agent keeps running!
+
+# Later, reattach to see progress
+shed attach myproj
+
+# List all active sessions
+shed sessions --all
+```
+
+### console vs attach
+
+- `shed console` - Direct shell, no persistence (exits when you disconnect)
+- `shed attach` - tmux session, persists after disconnect
 
 ## Server Setup
 

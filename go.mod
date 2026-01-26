@@ -1,6 +1,8 @@
 module github.com/charliek/shed
 
-go 1.24.12
+go 1.24.0
+
+toolchain go1.24.7
 
 require (
 	github.com/containerd/errdefs v1.0.0

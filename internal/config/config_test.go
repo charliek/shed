@@ -239,3 +239,60 @@ func TestClientConfigShedCache(t *testing.T) {
 		t.Error("GetShedServer() should fail for removed shed")
 	}
 }
+
+func TestValidateShedName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"valid simple", "myapp", false},
+		{"valid with hyphen", "my-app", false},
+		{"valid with numbers", "app123", false},
+		{"valid single char", "a", false},
+		{"empty", "", true},
+		{"starts with number", "123app", true},
+		{"starts with hyphen", "-myapp", true},
+		{"ends with hyphen", "myapp-", true},
+		{"uppercase", "MyApp", true},
+		{"underscores", "my_app", true},
+		{"too long", "a" + string(make([]byte, MaxShedNameLength)), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateShedName(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateShedName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateSessionName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"valid simple", "default", false},
+		{"valid with hyphen", "my-session", false},
+		{"valid with underscore", "my_session", false},
+		{"valid with numbers", "session123", false},
+		{"valid uppercase", "MySession", false},
+		{"valid mixed", "Claude_Session-1", false},
+		{"empty", "", true},
+		{"starts with hyphen", "-session", true},
+		{"starts with underscore", "_session", true},
+		{"too long", "a" + string(make([]byte, MaxSessionNameLength)), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSessionName(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateSessionName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
