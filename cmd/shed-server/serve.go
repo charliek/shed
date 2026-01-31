@@ -171,6 +171,16 @@ func (a *dockerAPIAdapter) StopShed(ctx context.Context, name string) (*config.S
 	return a.client.StopShed(ctx, name)
 }
 
+// ListSessions returns all tmux sessions in a shed container.
+func (a *dockerAPIAdapter) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
+	return a.client.ListSessions(ctx, shedName)
+}
+
+// KillSession terminates a tmux session in a shed container.
+func (a *dockerAPIAdapter) KillSession(ctx context.Context, shedName, sessionName string) error {
+	return a.client.KillSession(ctx, shedName, sessionName)
+}
+
 // dockerSSHAdapter adapts the docker.Client to the sshd.DockerClient interface.
 type dockerSSHAdapter struct {
 	client *docker.Client
