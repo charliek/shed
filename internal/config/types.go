@@ -2,13 +2,29 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
 )
 
+// Sentinel errors for session operations.
+var (
+	// ErrSessionNotFoundSentinel is returned when a tmux session does not exist.
+	ErrSessionNotFoundSentinel = errors.New("session not found")
+
+	// ErrTmuxNotAvailableSentinel is returned when tmux is not installed in the container.
+	ErrTmuxNotAvailableSentinel = errors.New("tmux is not available in this container")
+
+	// ErrShedNotRunningSentinel is returned when an operation requires a running shed.
+	ErrShedNotRunningSentinel = errors.New("shed is not running")
+)
+
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
 var shedNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
+
+// sessionNameRegex validates session names: alphanumeric, underscores, and hyphens.
+var sessionNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
 // MaxShedNameLength is the maximum allowed length for a shed name.
 const MaxShedNameLength = 63
@@ -49,6 +65,44 @@ const (
 	StatusError    = "error"
 )
 
+// Session represents a tmux session within a shed container.
+type Session struct {
+	Name        string    `json:"name"`
+	ShedName    string    `json:"shed_name"`
+	ServerName  string    `json:"server_name,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	Attached    bool      `json:"attached"`
+	WindowCount int       `json:"window_count,omitempty"`
+}
+
+// Session constants.
+const (
+	// DefaultSessionName is the name used when no session is specified.
+	DefaultSessionName = "default"
+
+	// MaxSessionNameLength is the maximum allowed length for a session name.
+	MaxSessionNameLength = 63
+)
+
+// ValidateSessionName validates that a session name is valid.
+// Names must be alphanumeric with underscores and hyphens allowed,
+// must start with an alphanumeric character, and must be at most 63 characters.
+func ValidateSessionName(name string) error {
+	if name == "" {
+		return fmt.Errorf("session name cannot be empty")
+	}
+
+	if len(name) > MaxSessionNameLength {
+		return fmt.Errorf("session name cannot exceed %d characters", MaxSessionNameLength)
+	}
+
+	if !sessionNameRegex.MatchString(name) {
+		return fmt.Errorf("session name must be alphanumeric with underscores and hyphens (not at start), starting with alphanumeric")
+	}
+
+	return nil
+}
+
 // ServerInfo is returned by GET /api/info.
 type ServerInfo struct {
 	Name     string `json:"name"`
@@ -65,6 +119,12 @@ type SSHHostKeyResponse struct {
 // ShedsResponse is returned by GET /api/sheds.
 type ShedsResponse struct {
 	Sheds []Shed `json:"sheds"`
+}
+
+// SessionsResponse is returned by GET /api/sheds/{name}/sessions and GET /api/sessions.
+type SessionsResponse struct {
+	Sessions []Session `json:"sessions"`
+	Warnings []string  `json:"warnings,omitempty"`
 }
 
 // CreateShedRequest is the request body for POST /api/sheds.
@@ -105,6 +165,9 @@ const (
 	ErrCloneFailed        = "CLONE_FAILED"
 	ErrDockerError        = "DOCKER_ERROR"
 	ErrInternalError      = "INTERNAL_ERROR"
+	ErrSessionNotFound    = "SESSION_NOT_FOUND"
+	ErrInvalidSessionName = "INVALID_SESSION_NAME"
+	ErrTmuxNotAvailable   = "TMUX_NOT_AVAILABLE"
 )
 
 // Docker label keys for shed containers.

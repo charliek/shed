@@ -1,8 +1,8 @@
 # Binaries
 bin/
 dist/
-shed
-shed-server
+/shed
+/shed-server
 *.exe
 *.exe~
 *.dll
