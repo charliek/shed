@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -64,6 +65,8 @@ var (
 	createNoProvision bool
 	createNoSync      bool
 	createSyncProfile string
+	createTimeout     time.Duration
+	startTimeout      time.Duration
 	listAll           bool
 	deleteKeep        bool
 	deleteForce       bool
@@ -75,6 +78,9 @@ func init() {
 	createCmd.Flags().BoolVar(&createNoProvision, "no-provision", false, "Skip running provisioning hooks")
 	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")
 	createCmd.Flags().StringVar(&createSyncProfile, "sync-profile", "", "Profile to sync after creation (default: 'default')")
+	createCmd.Flags().DurationVar(&createTimeout, "timeout", 0, "Timeout for create operation (default: from config or 10m)")
+
+	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
 	listCmd.Flags().BoolVarP(&listAll, "all", "a", false, "List sheds from all servers")
 
@@ -102,7 +108,14 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Creating shed %s on %s...\n", name, serverName)
 	}
 
-	client := NewAPIClientFromEntry(entry)
+	// Determine timeout: CLI flag > config > default
+	// Note: --timeout 0 is treated as "not set" and uses config/default value
+	timeout := createTimeout
+	if timeout == 0 {
+		timeout = clientConfig.GetCreateTimeout()
+	}
+
+	client := NewAPIClientFromEntry(entry, timeout)
 	req := &config.CreateShedRequest{
 		Name:        name,
 		Repo:        createRepo,
@@ -153,7 +166,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	if listAll {
 		// Query all servers
 		for name, e := range clientConfig.Servers {
-			client := NewAPIClientFromEntry(&e)
+			client := NewAPIClientFromEntry(&e, DefaultTimeout)
 			resp, err := client.ListSheds()
 			if err != nil {
 				if verboseFlag {
@@ -168,7 +181,7 @@ func runList(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		client := NewAPIClientFromEntry(entry)
+		client := NewAPIClientFromEntry(entry, DefaultTimeout)
 		resp, err := client.ListSheds()
 		if err != nil {
 			return fmt.Errorf("failed to list sheds: %w", err)
@@ -248,7 +261,7 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// Stop any associated tunnels first
 	stopTunnelsForShed(name)
 
-	client := NewAPIClientFromEntry(entry)
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
 	if err := client.DeleteShed(name, deleteKeep); err != nil {
 		return fmt.Errorf("failed to delete shed: %w", err)
 	}
@@ -277,7 +290,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Starting shed %s on %s...\n", name, serverName)
 	}
 
-	client := NewAPIClientFromEntry(entry)
+	// Determine timeout: CLI flag > config > default
+	// Note: --timeout 0 is treated as "not set" and uses config/default value
+	timeout := startTimeout
+	if timeout == 0 {
+		timeout = clientConfig.GetCreateTimeout()
+	}
+
+	client := NewAPIClientFromEntry(entry, timeout)
 	shed, err := client.StartShed(name)
 	if err != nil {
 		return fmt.Errorf("failed to start shed: %w", err)
@@ -310,7 +330,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	// Stop any associated tunnels first
 	stopTunnelsForShed(name)
 
-	client := NewAPIClientFromEntry(entry)
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
 	shed, err := client.StopShed(name)
 	if err != nil {
 		return fmt.Errorf("failed to stop shed: %w", err)
@@ -353,7 +373,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		entry, err := clientConfig.GetServer(cachedServer)
 		if err == nil {
 			// Verify the shed still exists
-			client := NewAPIClientFromEntry(entry)
+			client := NewAPIClientFromEntry(entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
 				return cachedServer, entry, nil
 			}
@@ -368,7 +388,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		if err != nil {
 			return "", nil, err
 		}
-		client := NewAPIClientFromEntry(entry)
+		client := NewAPIClientFromEntry(entry, DefaultTimeout)
 		if _, err := client.GetShed(name); err != nil {
 			printError(fmt.Sprintf("shed %q not found on %s", name, serverFlag),
 				"shed list --all       # Find which server has it",
@@ -382,7 +402,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 	if clientConfig.DefaultServer != "" {
 		entry, _ := clientConfig.GetServer(clientConfig.DefaultServer)
 		if entry != nil {
-			client := NewAPIClientFromEntry(entry)
+			client := NewAPIClientFromEntry(entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
 				clientConfig.CacheShed(name, clientConfig.DefaultServer, "")
 				return clientConfig.DefaultServer, entry, nil
@@ -395,7 +415,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		if serverName == clientConfig.DefaultServer {
 			continue // Already checked
 		}
-		client := NewAPIClientFromEntry(&entry)
+		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
 		if _, err := client.GetShed(name); err == nil {
 			// Update cache
 			clientConfig.CacheShed(name, serverName, "")

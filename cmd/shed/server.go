@@ -77,7 +77,7 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect and get server info
-	client := NewAPIClient(host, serverAddPort)
+	client := NewAPIClient(host, serverAddPort, DefaultTimeout)
 	info, err := client.GetInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get server info: %w", err)
@@ -150,7 +150,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 		entry := clientConfig.Servers[name]
 
 		// Check if server is online
-		client := NewAPIClientFromEntry(&entry)
+		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
 		status := "offline"
 		if client.Ping() {
 			status = "online"

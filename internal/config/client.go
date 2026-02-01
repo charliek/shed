@@ -14,9 +14,18 @@ type ClientConfig struct {
 	Servers       map[string]ServerEntry `yaml:"servers"`
 	DefaultServer string                 `yaml:"default_server"`
 	Sheds         map[string]ShedCache   `yaml:"sheds"`
+	CreateTimeout time.Duration          `yaml:"create_timeout,omitempty"`
 
 	// Path to config file (not serialized)
 	path string `yaml:"-"`
+}
+
+// GetCreateTimeout returns the configured create timeout or the default (10 minutes).
+func (c *ClientConfig) GetCreateTimeout() time.Duration {
+	if c.CreateTimeout > 0 {
+		return c.CreateTimeout
+	}
+	return 10 * time.Minute
 }
 
 // ServerEntry represents a configured server.
