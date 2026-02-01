@@ -129,9 +129,10 @@ type SessionsResponse struct {
 
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
-	Name  string `json:"name"`
-	Repo  string `json:"repo,omitempty"`
-	Image string `json:"image,omitempty"`
+	Name        string `json:"name"`
+	Repo        string `json:"repo,omitempty"`
+	Image       string `json:"image,omitempty"`
+	NoProvision bool   `json:"no_provision,omitempty"`
 }
 
 // APIError represents an error response from the API.

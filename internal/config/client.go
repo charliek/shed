@@ -36,7 +36,7 @@ type ShedCache struct {
 
 // GetClientConfigDir returns the path to the shed config directory.
 func GetClientConfigDir() string {
-	return expandPath("~/.shed")
+	return ExpandPath("~/.shed")
 }
 
 // GetClientConfigPath returns the path to the client config file.
@@ -57,6 +57,11 @@ func GetTunnelsConfigPath() string {
 // GetTunnelStatePath returns the path to the tunnel state file.
 func GetTunnelStatePath() string {
 	return filepath.Join(GetClientConfigDir(), "tunnel-state.json")
+}
+
+// GetSyncConfigPath returns the path to the sync config file.
+func GetSyncConfigPath() string {
+	return filepath.Join(GetClientConfigDir(), "sync.yaml")
 }
 
 // LoadClientConfig loads the client configuration from the default location.

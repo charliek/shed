@@ -60,12 +60,12 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 	var configPath string
 	if path != "" {
-		configPath = expandPath(path)
+		configPath = ExpandPath(path)
 	} else {
 		// Search standard locations
 		locations := []string{
 			"./server.yaml",
-			expandPath("~/.config/shed/server.yaml"),
+			ExpandPath("~/.config/shed/server.yaml"),
 			"/etc/shed/server.yaml",
 		}
 
@@ -109,7 +109,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 	// Expand and validate paths in credentials
 	for name, mount := range cfg.Credentials {
-		source := filepath.Clean(expandPath(mount.Source))
+		source := filepath.Clean(ExpandPath(mount.Source))
 		target := filepath.Clean(mount.Target)
 
 		// Source must be an absolute path
@@ -129,7 +129,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 	// Load environment file if specified
 	if cfg.EnvFile != "" {
-		envPath := expandPath(cfg.EnvFile)
+		envPath := ExpandPath(cfg.EnvFile)
 		envVars, err := loadEnvFile(envPath)
 		if err != nil {
 			// Log warning but don't fail if env file is missing
@@ -166,8 +166,8 @@ func (c *ServerConfig) Validate() error {
 	return nil
 }
 
-// expandPath expands ~ to the user's home directory.
-func expandPath(path string) string {
+// ExpandPath expands ~ to the user's home directory.
+func ExpandPath(path string) string {
 	if strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
