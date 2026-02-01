@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/api"
@@ -219,6 +221,11 @@ func (a *dockerSSHAdapter) ExecInContainer(ctx context.Context, containerID stri
 	cmd := opts.Cmd
 	if len(cmd) == 0 {
 		cmd = []string{"/bin/bash", "--login"}
+	} else {
+		// Wrap command in shell to support operators like &&, ||, |, etc.
+		// SSH sends the command as space-separated tokens, but Docker exec
+		// expects an argv. The shell parses operators correctly.
+		cmd = []string{"/bin/sh", "-c", strings.Join(cmd, " ")}
 	}
 
 	// Create exec configuration
@@ -289,10 +296,14 @@ func (a *dockerSSHAdapter) ExecInContainer(ctx context.Context, containerID stri
 				_, _ = io.Copy(opts.Stdout, attachResp.Reader)
 			}
 		} else {
-			// In non-TTY mode, we need to demux stdout/stderr
-			// For simplicity, we'll just copy everything to stdout
+			// In non-TTY mode, Docker multiplexes stdout/stderr with headers
+			// Use stdcopy to demux the stream
 			if opts.Stdout != nil {
-				_, _ = io.Copy(opts.Stdout, attachResp.Reader)
+				stderr := opts.Stderr
+				if stderr == nil {
+					stderr = opts.Stdout // fallback: send stderr to stdout
+				}
+				_, _ = stdcopy.StdCopy(opts.Stdout, stderr, attachResp.Reader)
 			}
 		}
 	}()

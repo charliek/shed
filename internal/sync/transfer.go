@@ -171,9 +171,17 @@ func (s *Syncer) syncPath(ctx context.Context, pm PathMapping, shedName string, 
 		return fmt.Errorf("failed to create tar: %w", err)
 	}
 
-	// Both files and directories: extract to parent, use basename
-	extractDir := filepath.Dir(target)
-	targetName := filepath.Base(target)
+	// For pattern-filtered directories, extract directly to target (files are at tar root)
+	// For regular directories/files, extract to parent directory
+	hasPattern := pm.Include != "" && info.IsDir()
+	var extractDir, targetName string
+	if hasPattern {
+		extractDir = target
+		targetName = ""
+	} else {
+		extractDir = filepath.Dir(target)
+		targetName = filepath.Base(target)
+	}
 
 	// Transfer and extract via SSH
 	return s.transferViaSsh(ctx, tarData, extractDir, source, targetName, info.IsDir(), shedName, serverEntry)
@@ -251,10 +259,11 @@ func (s *Syncer) createTarWithPattern(ctx context.Context, source string, patter
 		return stdout.Bytes(), nil
 	}
 
-	// Convert to relative paths
+	// Convert to relative paths from source directory (not parent)
+	// This ensures files are at the root of the tar, not nested in source dirname
 	relPaths := make([]string, 0, len(matches))
 	for _, match := range matches {
-		rel, err := filepath.Rel(filepath.Dir(source), match)
+		rel, err := filepath.Rel(source, match)
 		if err != nil {
 			fmt.Fprintf(s.output, "    Warning: skipping %s: %v\n", match, err)
 			continue
@@ -262,8 +271,8 @@ func (s *Syncer) createTarWithPattern(ctx context.Context, source string, patter
 		relPaths = append(relPaths, rel)
 	}
 
-	// Build tar command with file list
-	args := []string{"-cpzf", "-", "-C", filepath.Dir(source)}
+	// Build tar command with file list, using source as base directory
+	args := []string{"-cpzf", "-", "-C", source}
 	args = append(args, relPaths...)
 
 	cmd := exec.CommandContext(ctx, "tar", args...)

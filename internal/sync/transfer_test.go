@@ -1,8 +1,11 @@
 package sync
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,6 +127,72 @@ func TestCreateTar_WithInclude(t *testing.T) {
 	// Verify tar data is not empty
 	if len(tarData) < 10 {
 		t.Error("tar data too small")
+	}
+}
+
+func TestCreateTar_WithInclude_PathsAtRoot(t *testing.T) {
+	// This test verifies that pattern-filtered tars have files at root level,
+	// not nested in the source directory name. This is critical for correct
+	// extraction to target directories with different names.
+	dir := t.TempDir()
+	testDir := filepath.Join(dir, "certs")
+	if err := os.MkdirAll(testDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(testDir, "cert.pem"), []byte("cert data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(testDir, "key.pem"), []byte("key data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{}
+	syncer := NewSyncer(cfg)
+	var buf bytes.Buffer
+	syncer.SetOutput(&buf)
+	ctx := context.Background()
+
+	// Create tar with include pattern
+	tarData, err := syncer.createTar(ctx, testDir, "*.pem")
+	if err != nil {
+		t.Fatalf("createTar with include failed: %v", err)
+	}
+
+	// Extract and verify paths are at root level (not "certs/cert.pem")
+	gzr, err := gzip.NewReader(bytes.NewReader(tarData))
+	if err != nil {
+		t.Fatalf("failed to create gzip reader: %v", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	files := make(map[string]bool)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("failed to read tar: %v", err)
+		}
+		files[hdr.Name] = true
+
+		// Verify files are NOT nested in "certs/" directory
+		if filepath.Dir(hdr.Name) != "." {
+			t.Errorf("file %q should be at root level, not nested", hdr.Name)
+		}
+	}
+
+	// Verify we got both .pem files
+	if !files["cert.pem"] {
+		t.Error("cert.pem not found in tar")
+	}
+	if !files["key.pem"] {
+		t.Error("key.pem not found in tar")
+	}
+	// Verify other.txt was excluded
+	if files["other.txt"] {
+		t.Error("other.txt should not be in tar (not matching *.pem)")
 	}
 }
 
