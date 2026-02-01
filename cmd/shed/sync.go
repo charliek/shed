@@ -64,7 +64,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	// Ensure shed is running
-	client := NewAPIClientFromEntry(entry)
+	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
 	if _, err := ensureRunningShed(client, name); err != nil {
 		return err
 	}

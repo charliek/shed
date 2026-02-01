@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,25 +12,32 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
+const (
+	// DefaultTimeout for quick API operations (list, stop, delete, etc.)
+	DefaultTimeout = 30 * time.Second
+)
+
 // APIClient provides methods for interacting with the shed server API.
 type APIClient struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL       string
+	httpClient    *http.Client
+	createTimeout time.Duration
 }
 
 // NewAPIClient creates a new API client for the given host and port.
-func NewAPIClient(host string, port int) *APIClient {
+func NewAPIClient(host string, port int, createTimeout time.Duration) *APIClient {
 	return &APIClient{
 		baseURL: fmt.Sprintf("http://%s:%d", host, port),
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: DefaultTimeout,
 		},
+		createTimeout: createTimeout,
 	}
 }
 
 // NewAPIClientFromEntry creates a new API client from a server entry.
-func NewAPIClientFromEntry(entry *config.ServerEntry) *APIClient {
-	return NewAPIClient(entry.Host, entry.HTTPPort)
+func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
+	return NewAPIClient(entry.Host, entry.HTTPPort, createTimeout)
 }
 
 // doRequest performs an HTTP request with JSON body and response handling.
@@ -54,6 +62,70 @@ func (c *APIClient) doRequest(method, path string, body, result interface{}, exp
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check for expected status codes
+	validStatus := false
+	if len(expectedStatus) == 0 {
+		validStatus = resp.StatusCode == http.StatusOK
+	} else {
+		for _, s := range expectedStatus {
+			if resp.StatusCode == s {
+				validStatus = true
+				break
+			}
+		}
+	}
+	if !validStatus {
+		return c.parseError(resp)
+	}
+
+	// Decode result if provided
+	if result != nil {
+		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// doRequestWithTimeout performs an HTTP request with a custom timeout using context.
+// Used for long-running operations like create and start that may need more time.
+func (c *APIClient) doRequestWithTimeout(method, path string, body, result interface{}, timeout time.Duration, expectedStatus ...int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var bodyReader io.Reader
+	if body != nil {
+		bodyData, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("failed to encode request: %w", err)
+		}
+		bodyReader = bytes.NewReader(bodyData)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Create a client without a Timeout for long-running requests.
+	// Important: When both http.Client.Timeout and context deadline are set,
+	// the shorter one wins. Since c.httpClient has a 30s timeout, we must use
+	// a separate client here to allow the context timeout (potentially minutes)
+	// to control cancellation.
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("request timed out after %v (use --timeout to increase)", timeout)
+		}
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 	defer resp.Body.Close()
@@ -114,7 +186,7 @@ func (c *APIClient) ListSheds() (*config.ShedsResponse, error) {
 // CreateShed creates a new shed.
 func (c *APIClient) CreateShed(req *config.CreateShedRequest) (*config.Shed, error) {
 	var shed config.Shed
-	if err := c.doRequest(http.MethodPost, "/api/sheds", req, &shed, http.StatusCreated, http.StatusOK); err != nil {
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/sheds", req, &shed, c.createTimeout, http.StatusCreated, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return &shed, nil
@@ -141,7 +213,7 @@ func (c *APIClient) DeleteShed(name string, keepVolume bool) error {
 // StartShed starts a stopped shed.
 func (c *APIClient) StartShed(name string) (*config.Shed, error) {
 	var shed config.Shed
-	if err := c.doRequest(http.MethodPost, "/api/sheds/"+name+"/start", nil, &shed); err != nil {
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/sheds/"+name+"/start", nil, &shed, c.createTimeout); err != nil {
 		return nil, err
 	}
 	return &shed, nil

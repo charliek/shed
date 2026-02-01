@@ -83,6 +83,7 @@ shed create <name> [flags]
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
+| `--timeout` | | `10m` | Timeout for create operation (e.g., `30s`, `5m`, `2h`) |
 
 **Examples:**
 
@@ -92,6 +93,7 @@ shed create codelens --repo charliek/codelens
 shed create stbot --repo charliek/stbot --server cloud-vps
 shed create myproj --sync-profile full
 shed create myproj --no-sync
+shed create bigproj --repo org/large-repo --timeout 30m
 ```
 
 ### shed list
@@ -120,8 +122,12 @@ mini-desktop    mcp-test      stopped    3 days ago       -
 Starts a stopped shed.
 
 ```bash
-shed start <name>
+shed start <name> [flags]
 ```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--timeout` | | `10m` | Timeout for start operation (e.g., `30s`, `5m`, `2h`) |
 
 ### shed stop
 
