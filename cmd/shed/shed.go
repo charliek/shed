@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/sync"
 	"github.com/charliek/shed/internal/tunnels"
 )
 
@@ -57,16 +59,22 @@ var stopCmd = &cobra.Command{
 }
 
 var (
-	createRepo  string
-	createImage string
-	listAll     bool
-	deleteKeep  bool
-	deleteForce bool
+	createRepo        string
+	createImage       string
+	createNoProvision bool
+	createNoSync      bool
+	createSyncProfile string
+	listAll           bool
+	deleteKeep        bool
+	deleteForce       bool
 )
 
 func init() {
 	createCmd.Flags().StringVarP(&createRepo, "repo", "r", "", "Git repository URL to clone")
 	createCmd.Flags().StringVarP(&createImage, "image", "i", "", "Docker image to use")
+	createCmd.Flags().BoolVar(&createNoProvision, "no-provision", false, "Skip running provisioning hooks")
+	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")
+	createCmd.Flags().StringVar(&createSyncProfile, "sync-profile", "", "Profile to sync after creation (default: 'default')")
 
 	listCmd.Flags().BoolVarP(&listAll, "all", "a", false, "List sheds from all servers")
 
@@ -90,9 +98,10 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 	client := NewAPIClientFromEntry(entry)
 	req := &config.CreateShedRequest{
-		Name:  name,
-		Repo:  createRepo,
-		Image: createImage,
+		Name:        name,
+		Repo:        createRepo,
+		Image:       createImage,
+		NoProvision: createNoProvision,
 	}
 
 	shed, err := client.CreateShed(req)
@@ -104,6 +113,13 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	clientConfig.CacheShed(name, serverName, shed.Status)
 	if err := clientConfig.Save(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
+	}
+
+	// Auto-sync default profile unless --no-sync is set
+	if !createNoSync {
+		if err := autoSyncAfterCreate(cmd.Context(), name, entry); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: sync failed: %v\n", err)
+		}
 	}
 
 	printSuccess("Created shed %s on %s", name, serverName)
@@ -391,4 +407,37 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		"shed list --all       # Find which server has it",
 		"shed create "+name+"  # Create a new shed")
 	return "", nil, fmt.Errorf("shed %q not found", name)
+}
+
+// autoSyncAfterCreate syncs files after shed creation.
+func autoSyncAfterCreate(ctx context.Context, shedName string, entry *config.ServerEntry) error {
+	// Load sync config
+	cfg, err := sync.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load sync config: %w", err)
+	}
+
+	if cfg.IsEmpty() {
+		return nil
+	}
+
+	// Determine profile to sync
+	profile := createSyncProfile
+	if profile == "" {
+		profile = cfg.GetDefaultProfile()
+		if profile == "" {
+			// No default profile, skip silently
+			return nil
+		}
+	} else {
+		// Check if explicitly specified profile exists
+		if _, err := cfg.GetProfile(profile); err != nil {
+			return fmt.Errorf("profile %q not found", profile)
+		}
+	}
+
+	fmt.Printf("Syncing %s profile...\n", profile)
+
+	syncer := sync.NewSyncer(cfg)
+	return syncer.SyncProfile(ctx, profile, shedName, entry, false)
 }

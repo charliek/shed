@@ -77,6 +77,7 @@ func init() {
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(consoleCmd)
 	rootCmd.AddCommand(execCmd)
+	rootCmd.AddCommand(syncCmd)
 }
 
 func main() {
@@ -100,7 +101,7 @@ func getServerEntry() (*config.ServerEntry, string, error) {
 
 // printSuccess prints a success message with a checkmark.
 func printSuccess(format string, args ...interface{}) {
-	fmt.Printf("\u2713 "+format+"\n", args...)
+	fmt.Printf("✓ "+format+"\n", args...)
 }
 
 // printError prints an error message with suggestions.

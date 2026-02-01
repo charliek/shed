@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/provision"
 )
 
 // gitSSHRegex matches git@host:path format (e.g., git@github.com:user/repo.git)
@@ -146,6 +148,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
+	// Run provisioning hooks if not disabled
+	if !req.NoProvision {
+		if err := c.runProvisioning(ctx, resp.ID, req.Name, true, os.Stdout, os.Stderr); err != nil {
+			log.Printf("Warning: provisioning failed: %v", err)
+		}
+	}
+
 	return &config.Shed{
 		Name:        req.Name,
 		Status:      config.StatusRunning,
@@ -176,7 +185,9 @@ func (c *Client) cloneRepo(ctx context.Context, containerID, repo string) error 
 	defer attachResp.Close()
 
 	// Wait for command to complete by reading output
-	_, _ = io.Copy(io.Discard, attachResp.Reader)
+	if _, err := io.Copy(io.Discard, attachResp.Reader); err != nil {
+		log.Printf("Warning: error reading git clone output: %v", err)
+	}
 
 	// Check exit code
 	inspectResp, err := c.docker.ContainerExecInspect(ctx, execResp.ID)
@@ -278,6 +289,11 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	// Start the container
 	if err := c.docker.ContainerStart(ctx, containerName, container.StartOptions{}); err != nil {
 		return nil, fmt.Errorf("failed to start container: %w", err)
+	}
+
+	// Run startup hook only (install already ran on create)
+	if err := c.runProvisioning(ctx, shed.ContainerID, name, false, os.Stdout, os.Stderr); err != nil {
+		log.Printf("Warning: startup hook failed: %v", err)
 	}
 
 	// Return updated shed info
@@ -423,4 +439,62 @@ func inspectStateToStatus(state *container.State) string {
 		return config.StatusStarting
 	}
 	return config.StatusStopped
+}
+
+// runProvisioning loads and runs provisioning hooks for a container.
+// If runInstall is true, both install and startup hooks are run.
+// If runInstall is false, only the startup hook is run.
+// Output is written to stdout and stderr writers.
+func (c *Client) runProvisioning(ctx context.Context, containerID, shedName string, runInstall bool, stdout, stderr io.Writer) error {
+	// Load provisioning config from within the container
+	cfg, err := provision.LoadConfigFromContainer(ctx, c.docker, containerID, config.WorkspacePath)
+	if err != nil {
+		return fmt.Errorf("failed to load provisioning config: %w", err)
+	}
+
+	if !cfg.HasAnyHooks() {
+		return nil
+	}
+
+	// Create executor
+	executor := provision.NewExecutor(c.docker, shedName, cfg)
+	executor.SetOutput(stdout, stderr)
+
+	// Create state tracker
+	state := provision.NewState(c.docker)
+
+	// Run install hook if requested and not already run
+	if runInstall && cfg.HasInstallHook() {
+		installRan, _ := state.HasInstallRun(ctx, containerID)
+		if !installRan {
+			fmt.Fprintln(stdout, "Running install hook...")
+			if err := executor.RunInstall(ctx, containerID); err != nil {
+				if hookErr, ok := err.(*provision.HookError); ok {
+					fmt.Fprintf(stderr, "✗ Install hook failed (exit code %d)\n", hookErr.ExitCode)
+					fmt.Fprintf(stderr, "  Last output: %s\n", hookErr.LastOutput)
+					fmt.Fprintf(stderr, "  Full log: %s\n", hookErr.LogFile)
+					_ = state.MarkInstallFailed(ctx, containerID, err)
+				}
+				return err
+			}
+			fmt.Fprintln(stdout, "✓ Install hook complete")
+			_ = state.MarkInstallComplete(ctx, containerID)
+		}
+	}
+
+	// Run startup hook
+	if cfg.HasStartupHook() {
+		fmt.Fprintln(stdout, "Running startup hook...")
+		if err := executor.RunStartup(ctx, containerID); err != nil {
+			if hookErr, ok := err.(*provision.HookError); ok {
+				fmt.Fprintf(stderr, "✗ Startup hook failed (exit code %d)\n", hookErr.ExitCode)
+				fmt.Fprintf(stderr, "  Last output: %s\n", hookErr.LastOutput)
+				fmt.Fprintf(stderr, "  Full log: %s\n", hookErr.LogFile)
+			}
+			return err
+		}
+		fmt.Fprintln(stdout, "✓ Startup hook complete")
+	}
+
+	return nil
 }
