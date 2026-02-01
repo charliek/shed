@@ -45,6 +45,9 @@ Examples:
 
 func init() {
 	execCmd.Flags().StringVarP(&execSessionFlag, "session", "S", "", "Run command in tmux session context")
+
+	rootCmd.AddCommand(consoleCmd)
+	rootCmd.AddCommand(execCmd)
 }
 
 func runConsole(cmd *cobra.Command, args []string) error {

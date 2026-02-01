@@ -80,6 +80,12 @@ func init() {
 
 	deleteCmd.Flags().BoolVar(&deleteKeep, "keep-volume", false, "Keep the data volume")
 	deleteCmd.Flags().BoolVarP(&deleteForce, "force", "f", false, "Delete without confirmation")
+
+	rootCmd.AddCommand(createCmd)
+	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(deleteCmd)
+	rootCmd.AddCommand(startCmd)
+	rootCmd.AddCommand(stopCmd)
 }
 
 func runCreate(cmd *cobra.Command, args []string) error {

@@ -65,6 +65,8 @@ func init() {
 	serverCmd.AddCommand(serverListCmd)
 	serverCmd.AddCommand(serverRemoveCmd)
 	serverCmd.AddCommand(serverSetDefaultCmd)
+
+	rootCmd.AddCommand(serverCmd)
 }
 
 func runServerAdd(cmd *cobra.Command, args []string) error {

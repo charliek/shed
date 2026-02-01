@@ -41,6 +41,11 @@ func init() {
 }
 
 func runSSHConfig(cmd *cobra.Command, args []string) error {
+	// Validate mutually exclusive flags
+	if sshConfigInstall && sshConfigUninstall {
+		return fmt.Errorf("cannot specify both --install and --uninstall")
+	}
+
 	// Handle uninstall
 	if sshConfigUninstall {
 		return runSSHConfigUninstall()

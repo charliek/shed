@@ -35,6 +35,8 @@ func init() {
 	syncCmd.Flags().StringVarP(&syncProfile, "profile", "p", "", "Profile to sync (default: 'default')")
 	syncCmd.Flags().StringVarP(&syncFeature, "feature", "f", "", "Single feature to sync")
 	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "Show what would be synced without syncing")
+
+	rootCmd.AddCommand(syncCmd)
 }
 
 func runSync(cmd *cobra.Command, args []string) error {

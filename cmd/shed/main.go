@@ -67,17 +67,8 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().StringVarP(&configFlag, "config", "c", "", "Path to config file")
 
-	// Add subcommands
+	// Add subcommand defined in this file
 	rootCmd.AddCommand(versionCmd)
-	rootCmd.AddCommand(serverCmd)
-	rootCmd.AddCommand(createCmd)
-	rootCmd.AddCommand(listCmd)
-	rootCmd.AddCommand(deleteCmd)
-	rootCmd.AddCommand(startCmd)
-	rootCmd.AddCommand(stopCmd)
-	rootCmd.AddCommand(consoleCmd)
-	rootCmd.AddCommand(execCmd)
-	rootCmd.AddCommand(syncCmd)
 }
 
 func main() {
