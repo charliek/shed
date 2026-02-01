@@ -94,3 +94,24 @@ func (c *Client) buildEnvList() []string {
 	}
 	return envList
 }
+
+// GetContainerIP returns the IP address of a container.
+func (c *Client) GetContainerIP(ctx context.Context, containerID string) (string, error) {
+	info, err := c.docker.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	// Try bridge network first, fall back to first available
+	if network, ok := info.NetworkSettings.Networks["bridge"]; ok && network.IPAddress != "" {
+		return network.IPAddress, nil
+	}
+
+	for _, network := range info.NetworkSettings.Networks {
+		if network.IPAddress != "" {
+			return network.IPAddress, nil
+		}
+	}
+
+	return "", fmt.Errorf("no IP address found for container %s", containerID)
+}

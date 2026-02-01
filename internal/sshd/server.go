@@ -7,10 +7,13 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
@@ -29,6 +32,9 @@ type DockerClient interface {
 
 	// ExecInContainer executes a command in a container with the given options.
 	ExecInContainer(ctx context.Context, containerID string, opts ExecOptions) error
+
+	// GetContainerIP returns the IP address of a container.
+	GetContainerIP(ctx context.Context, containerID string) (string, error)
 }
 
 // ShedInfo contains information about a shed needed by the SSH server.
@@ -114,6 +120,10 @@ func NewServer(dockerClient DockerClient, hostKeyPath string, port int, termConf
 		},
 		Handler: func(sess ssh.Session) {
 			s.handleSession(sess)
+		},
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session":      ssh.DefaultSessionHandler,
+			"direct-tcpip": s.handleDirectTCPIP,
 		},
 	}
 
@@ -229,4 +239,80 @@ func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	// For MVP, accept all keys.
 	// TODO: Implement proper key verification against stored keys.
 	return true
+}
+
+// localForwardChannelData matches RFC4254 Section 7.2
+type localForwardChannelData struct {
+	DestAddr   string
+	DestPort   uint32
+	OriginAddr string
+	OriginPort uint32
+}
+
+// handleDirectTCPIP handles local port forwarding (-L) by proxying to the container.
+func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
+	newChan gossh.NewChannel, ctx ssh.Context) {
+
+	d := localForwardChannelData{}
+	if err := gossh.Unmarshal(newChan.ExtraData(), &d); err != nil {
+		_ = newChan.Reject(gossh.ConnectionFailed, "error parsing forward data")
+		return
+	}
+
+	user := ctx.User()
+	log.Printf("Port forward: user=%s dest=%s:%d", user, d.DestAddr, d.DestPort)
+
+	// Only allow localhost destinations (security: prevent using shed as proxy)
+	if d.DestAddr != "localhost" && d.DestAddr != "127.0.0.1" && d.DestAddr != "::1" {
+		log.Printf("Port forward denied: non-localhost destination %s for user %s", d.DestAddr, user)
+		_ = newChan.Reject(gossh.Prohibited, "only localhost forwarding allowed")
+		return
+	}
+
+	// Look up container for this shed
+	shed, err := s.docker.GetShed(ctx, user)
+	if err != nil {
+		log.Printf("Port forward: shed not found for user %s: %v", user, err)
+		_ = newChan.Reject(gossh.ConnectionFailed, "shed not found")
+		return
+	}
+
+	// Get container IP to forward to
+	containerIP, err := s.docker.GetContainerIP(ctx, shed.ContainerID)
+	if err != nil {
+		log.Printf("Port forward: cannot get container IP for %s: %v", user, err)
+		_ = newChan.Reject(gossh.ConnectionFailed, "cannot get container IP")
+		return
+	}
+
+	// Connect to container's port
+	dest := net.JoinHostPort(containerIP, strconv.FormatUint(uint64(d.DestPort), 10))
+	dconn, err := net.DialTimeout("tcp", dest, 30*time.Second)
+	if err != nil {
+		log.Printf("Port forward: failed to connect to %s: %v", dest, err)
+		_ = newChan.Reject(gossh.ConnectionFailed, err.Error())
+		return
+	}
+
+	// Accept the SSH channel
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		dconn.Close()
+		return
+	}
+	go gossh.DiscardRequests(reqs)
+
+	log.Printf("Port forward established: %s -> %s", user, dest)
+
+	// Bidirectional proxy
+	go func() {
+		defer ch.Close()
+		defer dconn.Close()
+		_, _ = io.Copy(ch, dconn)
+	}()
+	go func() {
+		defer ch.Close()
+		defer dconn.Close()
+		_, _ = io.Copy(dconn, ch)
+	}()
 }

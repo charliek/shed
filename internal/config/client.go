@@ -49,6 +49,16 @@ func GetKnownHostsPath() string {
 	return filepath.Join(GetClientConfigDir(), "known_hosts")
 }
 
+// GetTunnelsConfigPath returns the path to the tunnels config file.
+func GetTunnelsConfigPath() string {
+	return filepath.Join(GetClientConfigDir(), "tunnels.yaml")
+}
+
+// GetTunnelStatePath returns the path to the tunnel state file.
+func GetTunnelStatePath() string {
+	return filepath.Join(GetClientConfigDir(), "tunnel-state.json")
+}
+
 // LoadClientConfig loads the client configuration from the default location.
 func LoadClientConfig() (*ClientConfig, error) {
 	return LoadClientConfigFromPath(GetClientConfigPath())

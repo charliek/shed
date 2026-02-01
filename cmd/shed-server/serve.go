@@ -206,6 +206,11 @@ func (a *dockerSSHAdapter) StartShed(ctx context.Context, name string) error {
 	return err
 }
 
+// GetContainerIP returns the IP address of a container.
+func (a *dockerSSHAdapter) GetContainerIP(ctx context.Context, containerID string) (string, error) {
+	return a.client.GetContainerIP(ctx, containerID)
+}
+
 // ExecInContainer executes a command in a container with the given options.
 func (a *dockerSSHAdapter) ExecInContainer(ctx context.Context, containerID string, opts sshd.ExecOptions) error {
 	dockerClient := a.client.Docker()

@@ -59,9 +59,9 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Verify the shed is running
+	// Ensure the shed is running (auto-start if stopped)
 	client := NewAPIClientFromEntry(entry)
-	if _, err := requireRunningShed(client, name); err != nil {
+	if _, err := ensureRunningShed(client, name); err != nil {
 		return err
 	}
 

@@ -114,19 +114,24 @@ func printError(msg string, suggestions ...string) {
 	}
 }
 
-// requireRunningShed gets a shed and verifies it's running.
-// Returns the shed if running, or prints a helpful error and returns an error if not.
-func requireRunningShed(client *APIClient, name string) (*config.Shed, error) {
+// ensureRunningShed gets a shed and starts it if not running.
+// Returns the shed after ensuring it's running.
+func ensureRunningShed(client *APIClient, name string) (*config.Shed, error) {
 	shed, err := client.GetShed(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shed status: %w", err)
 	}
 
-	if shed.Status != config.StatusRunning {
-		printError(fmt.Sprintf("shed %q is %s", name, shed.Status),
-			"shed start "+name+"  # Start the shed first")
-		return nil, fmt.Errorf("shed %q is not running", name)
+	if shed.Status == config.StatusRunning {
+		return shed, nil
 	}
 
+	// Auto-start the shed
+	fmt.Printf("Starting shed %s...\n", name)
+	shed, err = client.StartShed(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start shed: %w", err)
+	}
+	printSuccess("Shed %s started", name)
 	return shed, nil
 }
