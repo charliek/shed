@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/tunnels"
 )
 
 var createCmd = &cobra.Command{
@@ -222,6 +223,9 @@ func runDelete(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Stop any associated tunnels first
+	stopTunnelsForShed(name)
+
 	client := NewAPIClientFromEntry(entry)
 	if err := client.DeleteShed(name, deleteKeep); err != nil {
 		return fmt.Errorf("failed to delete shed: %w", err)
@@ -281,6 +285,9 @@ func runStop(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Stopping shed %s on %s...\n", name, serverName)
 	}
 
+	// Stop any associated tunnels first
+	stopTunnelsForShed(name)
+
 	client := NewAPIClientFromEntry(entry)
 	shed, err := client.StopShed(name)
 	if err != nil {
@@ -297,6 +304,23 @@ func runStop(cmd *cobra.Command, args []string) error {
 
 	printSuccess("Stopped shed %s", name)
 	return nil
+}
+
+// stopTunnelsForShed stops any running tunnels for a shed.
+// Errors are logged but not returned since tunnel cleanup is best-effort.
+func stopTunnelsForShed(name string) {
+	mgr, err := tunnels.NewManager()
+	if err != nil {
+		if verboseFlag {
+			fmt.Fprintf(os.Stderr, "Warning: failed to initialize tunnel manager: %v\n", err)
+		}
+		return
+	}
+	if err := mgr.StopAllTunnelsForShed(name); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to stop tunnel for %s: %v\n", name, err)
+	} else if verboseFlag {
+		fmt.Printf("Stopped tunnel for %s\n", name)
+	}
 }
 
 // findShedServer finds which server hosts a shed.
