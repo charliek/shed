@@ -1,0 +1,12 @@
+[project]
+name = "shed-docs"
+version = "0.1.0"
+description = "Documentation for shed development environment manager"
+requires-python = ">=3.12"
+
+[dependency-groups]
+docs = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.6.14",
+    "pymdown-extensions>=10.15",
+]

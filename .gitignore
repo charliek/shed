@@ -53,3 +53,8 @@ __debug_bin*
 # OS generated files
 Thumbs.db
 ehthumbs.db
+
+# Documentation build
+site-build/
+.venv/
+uv.lock

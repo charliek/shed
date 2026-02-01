@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all
+.PHONY: build build-cli build-server test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all docs docs-serve
 
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -73,3 +73,13 @@ lint-dockerfile:
 
 # Run all linting (Go + Dockerfile)
 lint-all: lint lint-dockerfile
+
+# Build documentation
+docs:
+	uv sync --group docs
+	uv run mkdocs build
+
+# Serve documentation locally
+docs-serve:
+	uv sync --group docs
+	uv run mkdocs serve
