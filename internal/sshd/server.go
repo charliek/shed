@@ -18,77 +18,14 @@ import (
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/terminal"
 )
-
-// DockerClient defines the interface for docker operations needed by the SSH server.
-// This allows the sshd package to compile independently of the docker package.
-type DockerClient interface {
-	// GetShed returns a shed by name, or an error if not found.
-	GetShed(ctx context.Context, name string) (*ShedInfo, error)
-
-	// StartShed starts a stopped shed.
-	StartShed(ctx context.Context, name string) error
-
-	// ExecInContainer executes a command in a container with the given options.
-	ExecInContainer(ctx context.Context, containerID string, opts ExecOptions) error
-
-	// GetContainerIP returns the IP address of a container.
-	GetContainerIP(ctx context.Context, containerID string) (string, error)
-}
-
-// ShedInfo contains information about a shed needed by the SSH server.
-type ShedInfo struct {
-	Name        string
-	Status      string
-	ContainerID string
-}
-
-// ExecOptions contains options for executing a command in a container.
-type ExecOptions struct {
-	// Cmd is the command to execute. If empty, defaults to the container's shell.
-	Cmd []string
-
-	// Stdin, Stdout, Stderr are the I/O streams.
-	Stdin  ReadCloser
-	Stdout WriteCloser
-	Stderr WriteCloser
-
-	// TTY indicates whether to allocate a pseudo-TTY.
-	TTY bool
-
-	// Env contains additional environment variables.
-	Env []string
-
-	// InitialSize is the initial terminal size (if TTY is true).
-	InitialSize *TerminalSize
-
-	// ResizeChan receives terminal resize events.
-	ResizeChan <-chan TerminalSize
-}
-
-// TerminalSize represents terminal dimensions.
-type TerminalSize struct {
-	Width  uint
-	Height uint
-}
-
-// ReadCloser is an interface for reading with close capability.
-type ReadCloser interface {
-	Read(p []byte) (n int, err error)
-	Close() error
-}
-
-// WriteCloser is an interface for writing with close capability.
-type WriteCloser interface {
-	Write(p []byte) (n int, err error)
-	Close() error
-}
 
 // Server is an SSH server that connects users to shed containers.
 type Server struct {
 	sshServer   *ssh.Server
-	docker      DockerClient
+	backend     backend.Backend
 	hostKeyPath string
 	port        int
 	hostKey     gossh.Signer
@@ -97,9 +34,9 @@ type Server struct {
 }
 
 // NewServer creates a new SSH server.
-func NewServer(dockerClient DockerClient, hostKeyPath string, port int, termConfig *terminal.Config) (*Server, error) {
+func NewServer(b backend.Backend, hostKeyPath string, port int, termConfig *terminal.Config) (*Server, error) {
 	s := &Server{
-		docker:      dockerClient,
+		backend:     b,
 		hostKeyPath: hostKeyPath,
 		port:        port,
 		termConfig:  termConfig,
@@ -270,18 +207,18 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 	}
 
 	// Look up container for this shed
-	shed, err := s.docker.GetShed(ctx, user)
+	shed, err := s.backend.GetShed(ctx, user)
 	if err != nil {
 		log.Printf("Port forward: shed not found for user %s: %v", user, err)
 		_ = newChan.Reject(gossh.ConnectionFailed, "shed not found")
 		return
 	}
 
-	// Get container IP to forward to
-	containerIP, err := s.docker.GetContainerIP(ctx, shed.ContainerID)
+	// Get network endpoint to forward to
+	containerIP, err := s.backend.GetNetworkEndpoint(ctx, shed.Name)
 	if err != nil {
-		log.Printf("Port forward: cannot get container IP for %s: %v", user, err)
-		_ = newChan.Reject(gossh.ConnectionFailed, "cannot get container IP")
+		log.Printf("Port forward: cannot get network endpoint for %s: %v", user, err)
+		_ = newChan.Reject(gossh.ConnectionFailed, "cannot get network endpoint")
 		return
 	}
 

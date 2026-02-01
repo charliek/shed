@@ -59,7 +59,7 @@ func runSessions(cmd *cobra.Command, args []string) error {
 	if sessionsAllFlag {
 		// Query all servers
 		for serverName, entry := range clientConfig.Servers {
-			client := NewAPIClientFromEntry(&entry)
+			client := NewAPIClientFromEntry(&entry, DefaultTimeout)
 			resp, err := client.ListAllSessions()
 			if err != nil {
 				if verboseFlag {
@@ -83,7 +83,7 @@ func runSessions(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		client := NewAPIClientFromEntry(entry)
+		client := NewAPIClientFromEntry(entry, DefaultTimeout)
 
 		if len(args) == 1 {
 			// List sessions for a specific shed
@@ -129,7 +129,7 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	client := NewAPIClientFromEntry(entry)
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
 	if err := client.KillSession(shedName, sessionName); err != nil {
 		return fmt.Errorf("failed to kill session: %w", err)
 	}

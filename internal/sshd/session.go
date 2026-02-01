@@ -8,6 +8,7 @@ import (
 
 	"github.com/gliderlabs/ssh"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -52,7 +53,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 	ctx := sess.Context()
 
 	// Look up the shed.
-	shed, err := s.docker.GetShed(ctx, shedName)
+	shed, err := s.backend.GetShed(ctx, shedName)
 	if err != nil {
 		log.Printf("Failed to get shed %s: %v", shedName, err)
 		fmt.Fprintf(sess.Stderr(), "Error: shed '%s' not found\n", shedName)
@@ -65,7 +66,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 		log.Printf("Auto-starting stopped shed: %s", shedName)
 		fmt.Fprintf(sess.Stderr(), "Starting shed '%s'...\n", shedName)
 
-		if err := s.docker.StartShed(ctx, shedName); err != nil {
+		if _, err := s.backend.StartShed(ctx, shedName); err != nil {
 			log.Printf("Failed to start shed %s: %v", shedName, err)
 			fmt.Fprintf(sess.Stderr(), "Error: failed to start shed: %v\n", err)
 			_ = sess.Exit(1)
@@ -81,7 +82,7 @@ func (s *Server) handleSession(sess ssh.Session) {
 		}
 
 		// Refresh shed info after starting.
-		shed, err = s.docker.GetShed(ctx, shedName)
+		shed, err = s.backend.GetShed(ctx, shedName)
 		if err != nil {
 			log.Printf("Failed to get shed %s after start: %v", shedName, err)
 			fmt.Fprintf(sess.Stderr(), "Error: failed to get shed after start: %v\n", err)
@@ -124,7 +125,7 @@ func (s *Server) waitForReady(ctx context.Context, shedName string) error {
 				return fmt.Errorf("timeout waiting for shed to be ready")
 			}
 
-			shed, err := s.docker.GetShed(ctx, shedName)
+			shed, err := s.backend.GetShed(ctx, shedName)
 			if err != nil {
 				continue // Keep trying.
 			}
@@ -140,8 +141,8 @@ func (s *Server) waitForReady(ctx context.Context, shedName string) error {
 	}
 }
 
-// execInContainer executes a command or shell in the container.
-func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *ShedInfo) error {
+// execInContainer executes a command or shell in the shed.
+func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *config.Shed) error {
 	// Get the command to execute.
 	cmd := sess.Command()
 
@@ -160,7 +161,7 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *Sh
 	env = append(env, fmt.Sprintf("SHED_NAME=%s", shed.Name))
 
 	// Create resize channel for window changes.
-	resizeChan := make(chan TerminalSize, 10)
+	resizeChan := make(chan backend.TerminalSize, 10)
 	defer close(resizeChan)
 
 	// Handle window resize events in a goroutine.
@@ -169,16 +170,16 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *Sh
 	}
 
 	// Build initial terminal size.
-	var initialSize *TerminalSize
+	var initialSize *backend.TerminalSize
 	if isPTY {
-		initialSize = &TerminalSize{
+		initialSize = &backend.TerminalSize{
 			Width:  uint(ptyReq.Window.Width),
 			Height: uint(ptyReq.Window.Height),
 		}
 	}
 
 	// Create the exec options.
-	opts := ExecOptions{
+	opts := backend.ExecOptions{
 		Cmd:         cmd,
 		Stdin:       &sessionReadCloser{sess},
 		Stdout:      &sessionWriteCloser{sess},
@@ -189,13 +190,13 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *Sh
 		ResizeChan:  resizeChan,
 	}
 
-	log.Printf("Executing in container %s: tty=%v cmd=%v", shed.ContainerID, isPTY, cmd)
+	log.Printf("Executing in shed %s: tty=%v cmd=%v", shed.Name, isPTY, cmd)
 
-	return s.docker.ExecInContainer(ctx, shed.ContainerID, opts)
+	return s.backend.Exec(ctx, shed.Name, opts)
 }
 
 // handleWindowResize forwards window resize events from SSH to the resize channel.
-func (s *Server) handleWindowResize(ctx context.Context, winCh <-chan ssh.Window, resizeChan chan<- TerminalSize) {
+func (s *Server) handleWindowResize(ctx context.Context, winCh <-chan ssh.Window, resizeChan chan<- backend.TerminalSize) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -206,7 +207,7 @@ func (s *Server) handleWindowResize(ctx context.Context, winCh <-chan ssh.Window
 			}
 			// Non-blocking send to resize channel.
 			select {
-			case resizeChan <- TerminalSize{
+			case resizeChan <- backend.TerminalSize{
 				Width:  uint(win.Width),
 				Height: uint(win.Height),
 			}:

@@ -24,6 +24,9 @@ servers:
 
 default_server: mini-desktop
 
+# Timeout for shed create and start operations
+create_timeout: 30m
+
 sheds:
   codelens:
     server: mini-desktop
@@ -41,6 +44,7 @@ sheds:
 | `servers.<name>.ssh_port` | int | SSH server port |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
+| `create_timeout` | duration | Timeout for create/start operations (default: `10m`) |
 
 ## Server Configuration
 

@@ -1,5 +1,7 @@
 FROM ubuntu:24.04
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # System packages
 RUN apt-get update && apt-get install -y \
     curl \
@@ -15,10 +17,15 @@ RUN apt-get update && apt-get install -y \
     ncurses-term \
     tree \
     ripgrep \
+    unzip \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
+# unzip: for extracting archives in provisioning scripts
+# sudo: for provisioning scripts that need elevated privileges
 
 # mise
 RUN curl https://mise.run | sh
+ENV PATH="/root/.local/share/mise/shims:/root/.local/bin:${PATH}"
 
 # RUN mise install \
 #     java@temurin-21 \

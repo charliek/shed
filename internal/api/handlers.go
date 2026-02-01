@@ -37,9 +37,9 @@ func (s *Server) handleGetSSHHostKey(w http.ResponseWriter, r *http.Request) {
 // handleListSheds returns all sheds.
 // GET /api/sheds
 func (s *Server) handleListSheds(w http.ResponseWriter, r *http.Request) {
-	sheds, err := s.docker.ListSheds(r.Context())
+	sheds, err := s.backend.ListSheds(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, config.ErrDockerError, err.Error())
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, err.Error())
 		return
 	}
 
@@ -74,7 +74,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		req.Image = s.cfg.DefaultImage
 	}
 
-	shed, err := s.docker.CreateShed(r.Context(), req)
+	shed, err := s.backend.CreateShed(r.Context(), req)
 	if err != nil {
 		code, errCode, msg := mapDockerError(err)
 		writeError(w, code, errCode, msg)
@@ -89,7 +89,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	shed, err := s.docker.GetShed(r.Context(), name)
+	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
 		code, errCode, msg := mapDockerError(err)
 		writeError(w, code, errCode, msg)
@@ -105,7 +105,7 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	keepVolume := r.URL.Query().Get("keep_volume") == "true"
 
-	if err := s.docker.DeleteShed(r.Context(), name, keepVolume); err != nil {
+	if err := s.backend.DeleteShed(r.Context(), name, keepVolume); err != nil {
 		code, errCode, msg := mapDockerError(err)
 		writeError(w, code, errCode, msg)
 		return
@@ -119,7 +119,7 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	shed, err := s.docker.StartShed(r.Context(), name)
+	shed, err := s.backend.StartShed(r.Context(), name)
 	if err != nil {
 		code, errCode, msg := mapDockerError(err)
 		writeError(w, code, errCode, msg)
@@ -134,7 +134,7 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	shed, err := s.docker.StopShed(r.Context(), name)
+	shed, err := s.backend.StopShed(r.Context(), name)
 	if err != nil {
 		code, errCode, msg := mapDockerError(err)
 		writeError(w, code, errCode, msg)
@@ -149,7 +149,7 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	sessions, err := s.docker.ListSessions(r.Context(), name)
+	sessions, err := s.backend.ListSessions(r.Context(), name)
 	if err != nil {
 		code, errCode, msg := mapSessionError(err)
 		writeError(w, code, errCode, msg)
@@ -175,7 +175,7 @@ func (s *Server) handleKillSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.docker.KillSession(r.Context(), name, sessionName); err != nil {
+	if err := s.backend.KillSession(r.Context(), name, sessionName); err != nil {
 		code, errCode, msg := mapSessionError(err)
 		writeError(w, code, errCode, msg)
 		return
@@ -187,9 +187,9 @@ func (s *Server) handleKillSession(w http.ResponseWriter, r *http.Request) {
 // handleListAllSessions returns all tmux sessions across all running sheds.
 // GET /api/sessions
 func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
-	sheds, err := s.docker.ListSheds(r.Context())
+	sheds, err := s.backend.ListSheds(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, config.ErrDockerError, err.Error())
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, err.Error())
 		return
 	}
 
@@ -199,7 +199,7 @@ func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
 		if shed.Status != config.StatusRunning {
 			continue
 		}
-		sessions, err := s.docker.ListSessions(r.Context(), shed.Name)
+		sessions, err := s.backend.ListSessions(r.Context(), shed.Name)
 		if err != nil {
 			// Record warning for sheds where we can't list sessions
 			if errors.Is(err, config.ErrTmuxNotAvailableSentinel) {
@@ -284,7 +284,7 @@ func mapDockerError(err error) (int, string, string) {
 	}
 
 	// For unknown errors, return a generic message to avoid leaking Docker internals
-	return http.StatusInternalServerError, config.ErrDockerError, "internal server error"
+	return http.StatusInternalServerError, config.ErrBackendError, "internal server error"
 }
 
 // sanitizeErrorMessage extracts shed-related information while hiding Docker implementation details.
@@ -324,5 +324,5 @@ func mapSessionError(err error) (int, string, string) {
 		return http.StatusNotFound, config.ErrShedNotFound, errMsg
 	}
 
-	return http.StatusInternalServerError, config.ErrDockerError, "internal server error"
+	return http.StatusInternalServerError, config.ErrBackendError, "internal server error"
 }
