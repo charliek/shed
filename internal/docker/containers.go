@@ -99,6 +99,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		config.LabelShed:        "true",
 		config.LabelShedName:    req.Name,
 		config.LabelShedCreated: createdAt.Format(time.RFC3339),
+		config.LabelShedBackend: config.BackendDocker,
 	}
 	if req.Repo != "" {
 		labels[config.LabelShedRepo] = req.Repo
@@ -161,6 +162,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		CreatedAt:   createdAt,
 		Repo:        req.Repo,
 		ContainerID: resp.ID,
+		Backend:     config.BackendDocker,
 	}, nil
 }
 
@@ -372,6 +374,11 @@ func containerToShed(ctr container.Summary) config.Shed {
 
 	name := labels[config.LabelShedName]
 	repo := labels[config.LabelShedRepo]
+	// Default to docker for backwards compatibility with existing containers
+	backend := labels[config.LabelShedBackend]
+	if backend == "" {
+		backend = config.BackendDocker
+	}
 
 	var createdAt time.Time
 	if created := labels[config.LabelShedCreated]; created != "" {
@@ -386,6 +393,7 @@ func containerToShed(ctr container.Summary) config.Shed {
 		CreatedAt:   createdAt,
 		Repo:        repo,
 		ContainerID: ctr.ID,
+		Backend:     backend,
 	}
 }
 
@@ -395,6 +403,11 @@ func inspectToShed(ctr container.InspectResponse) *config.Shed {
 
 	name := labels[config.LabelShedName]
 	repo := labels[config.LabelShedRepo]
+	// Default to docker for backwards compatibility with existing containers
+	backend := labels[config.LabelShedBackend]
+	if backend == "" {
+		backend = config.BackendDocker
+	}
 
 	var createdAt time.Time
 	if created := labels[config.LabelShedCreated]; created != "" {
@@ -409,6 +422,7 @@ func inspectToShed(ctr container.InspectResponse) *config.Shed {
 		CreatedAt:   createdAt,
 		Repo:        repo,
 		ContainerID: ctr.ID,
+		Backend:     backend,
 	}
 }
 

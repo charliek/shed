@@ -55,6 +55,7 @@ type Shed struct {
 	CreatedAt   time.Time `json:"created_at" yaml:"created_at"`
 	Repo        string    `json:"repo,omitempty" yaml:"repo,omitempty"`
 	ContainerID string    `json:"container_id" yaml:"container_id"`
+	Backend     string    `json:"backend,omitempty" yaml:"backend,omitempty"`
 }
 
 // Shed status constants.
@@ -164,7 +165,7 @@ const (
 	ErrShedAlreadyStopped = "SHED_ALREADY_STOPPED"
 	ErrInvalidShedName    = "INVALID_SHED_NAME"
 	ErrCloneFailed        = "CLONE_FAILED"
-	ErrDockerError        = "DOCKER_ERROR"
+	ErrBackendError       = "BACKEND_ERROR"
 	ErrInternalError      = "INTERNAL_ERROR"
 	ErrSessionNotFound    = "SESSION_NOT_FOUND"
 	ErrInvalidSessionName = "INVALID_SESSION_NAME"
@@ -177,6 +178,13 @@ const (
 	LabelShedName    = "shed.name"
 	LabelShedCreated = "shed.created"
 	LabelShedRepo    = "shed.repo"
+	LabelShedBackend = "shed.backend"
+)
+
+// Backend type constants for Shed.Backend field.
+const (
+	BackendDocker      = "docker"
+	BackendFirecracker = "firecracker"
 )
 
 // ContainerPrefix is prepended to shed names for Docker containers.
