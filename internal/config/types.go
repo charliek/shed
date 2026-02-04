@@ -134,6 +134,16 @@ type CreateShedRequest struct {
 	Repo        string `json:"repo,omitempty"`
 	Image       string `json:"image,omitempty"`
 	NoProvision bool   `json:"no_provision,omitempty"`
+
+	// Backend specifies which backend to use ("docker" or "firecracker")
+	// If empty, uses the server's default backend
+	Backend string `json:"backend,omitempty"`
+
+	// CPUs specifies the number of vCPUs (firecracker only)
+	CPUs int `json:"cpus,omitempty"`
+
+	// MemoryMB specifies the memory in MB (firecracker only)
+	MemoryMB int `json:"memory_mb,omitempty"`
 }
 
 // APIError represents an error response from the API.

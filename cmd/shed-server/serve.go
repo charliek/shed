@@ -13,8 +13,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/api"
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/docker"
+	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/sshd"
 )
 
@@ -44,26 +46,52 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("HTTP port: %d", cfg.HTTPPort)
 	log.Printf("SSH port: %d", cfg.SSHPort)
 
-	// Initialize Docker client
-	dockerClient, err := docker.NewClient(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to create docker client: %w", err)
-	}
-	log.Printf("Connected to Docker")
+	// Initialize backend based on configuration
+	var be backend.Backend
 
-	// Create backend wrapper
-	backend := docker.NewBackend(dockerClient)
-	defer backend.Close()
+	backendType := cfg.Backend
+	if backendType == "" {
+		backendType = config.BackendDocker // Default to Docker
+	}
+
+	switch backendType {
+	case config.BackendDocker:
+		// Initialize Docker client
+		dockerClient, err := docker.NewClient(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to create docker client: %w", err)
+		}
+		log.Printf("Connected to Docker")
+		be = docker.NewBackend(dockerClient)
+
+	case config.BackendFirecracker:
+		// Initialize Firecracker client
+		fcCfg := cfg.Firecracker
+		if fcCfg == nil {
+			fcCfg = config.DefaultFirecrackerConfig()
+		}
+		fcClient, err := firecracker.NewClient(fcCfg)
+		if err != nil {
+			return fmt.Errorf("failed to create firecracker client: %w", err)
+		}
+		log.Printf("Initialized Firecracker backend")
+		be = firecracker.NewBackend(fcClient)
+
+	default:
+		return fmt.Errorf("unknown backend type: %s", backendType)
+	}
+
+	defer be.Close()
 
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(backend, DefaultHostKeyPath, cfg.SSHPort, cfg.Terminal)
+	sshServer, err := sshd.NewServer(be, DefaultHostKeyPath, cfg.SSHPort, cfg.Terminal)
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}
 	hostKey := sshServer.GetHostPublicKey()
 
 	// Initialize HTTP API server
-	apiServer := api.NewServer(backend, cfg, hostKey)
+	apiServer := api.NewServer(be, cfg, hostKey)
 	router := apiServer.Router()
 
 	// Create HTTP server

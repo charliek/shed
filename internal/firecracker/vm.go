@@ -1,0 +1,210 @@
+package firecracker
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
+	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
+	"github.com/sirupsen/logrus"
+
+	"github.com/charliek/shed/internal/config"
+)
+
+// VM represents a running Firecracker VM instance.
+type VM struct {
+	meta    *Metadata
+	cfg     *config.FirecrackerConfig
+	netMgr  *NetworkManager
+	machine *firecracker.Machine
+}
+
+// CreateVM creates a new VM instance (but does not start it).
+func CreateVM(ctx context.Context, meta *Metadata, cfg *config.FirecrackerConfig, netMgr *NetworkManager) (*VM, error) {
+	return &VM{
+		meta:   meta,
+		cfg:    cfg,
+		netMgr: netMgr,
+	}, nil
+}
+
+// Start starts the VM.
+func (vm *VM) Start(ctx context.Context) error {
+	// Ensure socket directory exists
+	socketDir := vm.cfg.SocketDir
+	if err := os.MkdirAll(socketDir, 0755); err != nil {
+		return fmt.Errorf("failed to create socket directory: %w", err)
+	}
+
+	// Socket path for this VM
+	socketPath := filepath.Join(socketDir, fmt.Sprintf("%s.sock", vm.meta.Name))
+
+	// Remove old socket if it exists
+	os.Remove(socketPath)
+
+	// Build firecracker configuration
+	fcCfg := firecracker.Config{
+		SocketPath:      socketPath,
+		KernelImagePath: vm.cfg.KernelPath,
+		KernelArgs:      "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init",
+		Drives: []models.Drive{
+			{
+				DriveID:      firecracker.String("rootfs"),
+				PathOnHost:   firecracker.String(vm.meta.RootfsPath),
+				IsRootDevice: firecracker.Bool(true),
+				IsReadOnly:   firecracker.Bool(false),
+			},
+		},
+		MachineCfg: models.MachineConfiguration{
+			VcpuCount:  firecracker.Int64(int64(vm.meta.CPUs)),
+			MemSizeMib: firecracker.Int64(int64(vm.meta.MemoryMB)),
+		},
+		VsockDevices: []firecracker.VsockDevice{
+			{
+				Path: "/dev/vsock",
+				CID:  uint32(vm.meta.CID),
+			},
+		},
+		NetworkInterfaces: []firecracker.NetworkInterface{
+			{
+				StaticConfiguration: &firecracker.StaticNetworkConfiguration{
+					MacAddress:  generateMACAddress(vm.meta.CID),
+					HostDevName: vm.meta.TAPDevice,
+				},
+			},
+		},
+	}
+
+	// Create the machine
+	logger := logrus.New()
+	logger.SetOutput(os.Stderr)
+	logger.SetLevel(logrus.InfoLevel)
+	machineOpts := []firecracker.Opt{
+		firecracker.WithLogger(logrus.NewEntry(logger)),
+	}
+
+	machine, err := firecracker.NewMachine(ctx, fcCfg, machineOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to create firecracker machine: %w", err)
+	}
+
+	vm.machine = machine
+
+	// Start the machine
+	if err := machine.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start firecracker machine: %w", err)
+	}
+
+	// Get the PID from the running machine
+	pid, err := machine.PID()
+	if err != nil {
+		log.Printf("Warning: failed to get Firecracker PID: %v", err)
+	} else {
+		vm.meta.PID = pid
+	}
+
+	// Wait for the agent to be healthy
+	vsockClient := NewVsockClient(vm.meta.CID, vm.cfg.ConsolePort, vm.cfg.HealthPort)
+	if err := vsockClient.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
+		// Try to stop the VM on failure
+		vm.Stop(context.Background())
+		return fmt.Errorf("agent health check failed: %w", err)
+	}
+
+	return nil
+}
+
+// Stop stops the VM gracefully.
+func (vm *VM) Stop(ctx context.Context) error {
+	if vm.machine == nil {
+		// Try to stop by PID if we have one
+		if vm.meta.PID > 0 {
+			return vm.stopByPID(ctx)
+		}
+		return nil
+	}
+
+	// Try graceful shutdown via API first
+	shutdownCtx, cancel := context.WithTimeout(ctx, vm.cfg.StopTimeout.Duration())
+	defer cancel()
+
+	if err := vm.machine.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful shutdown failed: %v, forcing stop", err)
+	}
+
+	// Wait for the machine to stop
+	if err := vm.machine.Wait(shutdownCtx); err != nil {
+		// Force kill if graceful shutdown fails
+		if vm.meta.PID > 0 {
+			syscall.Kill(vm.meta.PID, syscall.SIGKILL)
+		}
+	}
+
+	return nil
+}
+
+// stopByPID stops a VM by its PID when we don't have a machine handle.
+func (vm *VM) stopByPID(ctx context.Context) error {
+	if vm.meta.PID <= 0 {
+		return nil
+	}
+
+	// Check if process exists
+	process, err := os.FindProcess(vm.meta.PID)
+	if err != nil {
+		return nil // Process doesn't exist
+	}
+
+	// Try SIGTERM first
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		return nil // Process already dead
+	}
+
+	// Wait for process to exit
+	done := make(chan error, 1)
+	go func() {
+		_, err := process.Wait()
+		done <- err
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-time.After(vm.cfg.StopTimeout.Duration()):
+		// Force kill
+		process.Signal(syscall.SIGKILL)
+		return nil
+	case <-ctx.Done():
+		process.Signal(syscall.SIGKILL)
+		return ctx.Err()
+	}
+}
+
+// IsRunning checks if the VM is currently running.
+func (vm *VM) IsRunning() bool {
+	if vm.meta.PID <= 0 {
+		return false
+	}
+
+	// Check if process exists
+	process, err := os.FindProcess(vm.meta.PID)
+	if err != nil {
+		return false
+	}
+
+	// Send signal 0 to check if process exists
+	err = process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// generateMACAddress generates a MAC address based on the CID.
+func generateMACAddress(cid uint32) string {
+	// Use a locally administered MAC address (second hex digit is 2, 6, A, or E)
+	// Format: 02:FC:00:00:XX:XX where XX:XX is derived from CID
+	return fmt.Sprintf("02:FC:00:00:%02X:%02X", (cid>>8)&0xFF, cid&0xFF)
+}

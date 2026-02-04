@@ -66,6 +66,9 @@ var (
 	createNoSync      bool
 	createSyncProfile string
 	createTimeout     time.Duration
+	createBackend     string
+	createCPUs        int
+	createMemory      int
 	startTimeout      time.Duration
 	listAll           bool
 	deleteKeep        bool
@@ -79,6 +82,9 @@ func init() {
 	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")
 	createCmd.Flags().StringVar(&createSyncProfile, "sync-profile", "", "Profile to sync after creation (default: 'default')")
 	createCmd.Flags().DurationVar(&createTimeout, "timeout", 0, "Timeout for create operation (default: from config or 10m)")
+	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: docker or firecracker (default: server default)")
+	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker only)")
+	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker only)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
@@ -96,6 +102,26 @@ func init() {
 
 func runCreate(cmd *cobra.Command, args []string) error {
 	name := args[0]
+
+	// Validate backend flag
+	if createBackend != "" && createBackend != config.BackendDocker && createBackend != config.BackendFirecracker {
+		return fmt.Errorf("invalid backend %q: must be %q or %q", createBackend, config.BackendDocker, config.BackendFirecracker)
+	}
+
+	// Validate firecracker-specific flags
+	if createBackend == config.BackendFirecracker {
+		if createCPUs != 0 && createCPUs < 1 {
+			return fmt.Errorf("invalid cpus %d: must be at least 1", createCPUs)
+		}
+		if createMemory != 0 && createMemory < 128 {
+			return fmt.Errorf("invalid memory %d: must be at least 128 MB", createMemory)
+		}
+	} else if createBackend == config.BackendDocker || createBackend == "" {
+		// Warn if firecracker-specific flags are used with docker backend
+		if createCPUs != 0 || createMemory != 0 {
+			fmt.Fprintf(os.Stderr, "Warning: --cpus and --memory flags are ignored for docker backend\n")
+		}
+	}
 
 	entry, serverName, err := getServerEntry()
 	if err != nil {
@@ -121,6 +147,9 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		Repo:        createRepo,
 		Image:       createImage,
 		NoProvision: createNoProvision,
+		Backend:     createBackend,
+		CPUs:        createCPUs,
+		MemoryMB:    createMemory,
 	}
 
 	shed, err := client.CreateShed(req)

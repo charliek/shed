@@ -2,9 +2,11 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -22,8 +24,110 @@ type ServerConfig struct {
 	LogLevel     string                 `yaml:"log_level"`
 	Terminal     *terminal.Config       `yaml:"terminal"`
 
+	// Backend specifies the default backend type: "docker" or "firecracker"
+	Backend string `yaml:"backend"`
+
+	// Firecracker contains Firecracker-specific configuration
+	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
+}
+
+// FirecrackerConfig contains Firecracker-specific configuration.
+type FirecrackerConfig struct {
+	// KernelPath is the path to the Linux kernel image
+	KernelPath string `yaml:"kernel_path"`
+
+	// BaseRootfs is the path to the base rootfs image
+	BaseRootfs string `yaml:"base_rootfs"`
+
+	// InstanceDir is the directory for instance data
+	InstanceDir string `yaml:"instance_dir"`
+
+	// SocketDir is the directory for Firecracker API sockets
+	SocketDir string `yaml:"socket_dir"`
+
+	// DefaultCPUs is the default number of vCPUs for new VMs
+	DefaultCPUs int `yaml:"default_cpus"`
+
+	// DefaultMemoryMB is the default memory in MB for new VMs
+	DefaultMemoryMB int `yaml:"default_memory_mb"`
+
+	// DefaultDiskGB is the default disk size in GB for new VMs
+	DefaultDiskGB int `yaml:"default_disk_gb"`
+
+	// VsockBaseCID is the starting CID for vsock allocation
+	VsockBaseCID uint32 `yaml:"vsock_base_cid"`
+
+	// ConsolePort is the vsock port for console/exec connections
+	ConsolePort uint32 `yaml:"console_port"`
+
+	// HealthPort is the vsock port for health checks
+	HealthPort uint32 `yaml:"health_port"`
+
+	// StartTimeout is the timeout for VM startup
+	StartTimeout Duration `yaml:"start_timeout"`
+
+	// StopTimeout is the timeout for graceful VM shutdown
+	StopTimeout Duration `yaml:"stop_timeout"`
+
+	// BridgeName is the name of the Linux bridge for VM networking
+	BridgeName string `yaml:"bridge_name"`
+
+	// BridgeCIDR is the CIDR for the bridge network (e.g., "172.30.0.1/24")
+	BridgeCIDR string `yaml:"bridge_cidr"`
+
+	// TAPPrefix is the prefix for TAP device names
+	TAPPrefix string `yaml:"tap_prefix"`
+}
+
+// Duration is a wrapper around time.Duration for YAML marshaling
+type Duration time.Duration
+
+// UnmarshalYAML implements yaml.Unmarshaler for Duration
+func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	duration, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(duration)
+	return nil
+}
+
+// MarshalYAML implements yaml.Marshaler for Duration
+func (d Duration) MarshalYAML() (interface{}, error) {
+	return time.Duration(d).String(), nil
+}
+
+// Duration returns the time.Duration value
+func (d Duration) Duration() time.Duration {
+	return time.Duration(d)
+}
+
+// DefaultFirecrackerConfig returns a FirecrackerConfig with default values.
+func DefaultFirecrackerConfig() *FirecrackerConfig {
+	return &FirecrackerConfig{
+		KernelPath:      "/var/lib/shed/firecracker/vmlinux.bin",
+		BaseRootfs:      "/var/lib/shed/firecracker/base-rootfs.ext4",
+		InstanceDir:     "/var/lib/shed/firecracker/instances",
+		SocketDir:       "/var/run/shed/firecracker",
+		DefaultCPUs:     2,
+		DefaultMemoryMB: 4096,
+		DefaultDiskGB:   20,
+		VsockBaseCID:    100,
+		ConsolePort:     1024,
+		HealthPort:      1025,
+		StartTimeout:    Duration(30 * time.Second),
+		StopTimeout:     Duration(10 * time.Second),
+		BridgeName:      "shed-br0",
+		BridgeCIDR:      "172.30.0.1/24",
+		TAPPrefix:       "shed-tap",
+	}
 }
 
 // MountConfig represents a bind mount configuration.
@@ -161,6 +265,72 @@ func (c *ServerConfig) Validate() error {
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
 		return fmt.Errorf("invalid log_level: %s (must be debug, info, warn, or error)", c.LogLevel)
+	}
+
+	// Validate Firecracker config if backend is firecracker
+	if c.Backend == BackendFirecracker {
+		if c.Firecracker == nil {
+			return fmt.Errorf("firecracker configuration is required when backend is 'firecracker'")
+		}
+		if err := c.Firecracker.Validate(); err != nil {
+			return fmt.Errorf("firecracker config: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// Validate checks that the Firecracker configuration is valid.
+func (c *FirecrackerConfig) Validate() error {
+	// Validate paths exist
+	if c.KernelPath == "" {
+		return fmt.Errorf("kernel_path is required")
+	}
+	if c.BaseRootfs == "" {
+		return fmt.Errorf("base_rootfs is required")
+	}
+	if c.InstanceDir == "" {
+		return fmt.Errorf("instance_dir is required")
+	}
+	if c.SocketDir == "" {
+		return fmt.Errorf("socket_dir is required")
+	}
+
+	// Validate CPU and memory minimums
+	if c.DefaultCPUs < 1 {
+		return fmt.Errorf("default_cpus must be at least 1")
+	}
+	if c.DefaultMemoryMB < 128 {
+		return fmt.Errorf("default_memory_mb must be at least 128")
+	}
+
+	// Validate vsock ports
+	if c.ConsolePort == 0 {
+		return fmt.Errorf("console_port must be set")
+	}
+	if c.HealthPort == 0 {
+		return fmt.Errorf("health_port must be set")
+	}
+	if c.ConsolePort == c.HealthPort {
+		return fmt.Errorf("console_port and health_port must be different")
+	}
+
+	// Validate network configuration
+	if c.BridgeName == "" {
+		return fmt.Errorf("bridge_name is required")
+	}
+	if c.BridgeCIDR == "" {
+		return fmt.Errorf("bridge_cidr is required")
+	}
+
+	// Validate CIDR format
+	_, _, err := net.ParseCIDR(c.BridgeCIDR)
+	if err != nil {
+		return fmt.Errorf("invalid bridge_cidr %q: %w", c.BridgeCIDR, err)
+	}
+
+	if c.TAPPrefix == "" {
+		return fmt.Errorf("tap_prefix is required")
 	}
 
 	return nil

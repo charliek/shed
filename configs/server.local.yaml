@@ -56,3 +56,22 @@ env_file: ~/.shed/env
 
 # Debug logging for development
 log_level: debug
+
+backend: firecracker
+
+firecracker:
+  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
+  base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+  instance_dir: /var/lib/shed/firecracker/instances
+  socket_dir: /var/run/shed/firecracker
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  vsock_base_cid: 100
+  console_port: 1024
+  health_port: 1025
+  start_timeout: 30s
+  stop_timeout: 10s
+  bridge_name: shed-br0
+  bridge_cidr: 172.30.0.1/24
+  tap_prefix: shed-tap

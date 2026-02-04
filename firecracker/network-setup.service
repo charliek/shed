@@ -1,0 +1,13 @@
+[Unit]
+Description=Network Setup for Firecracker VM
+After=systemd-networkd-wait-online.service
+Before=network-online.target docker.service shed-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/network-setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
