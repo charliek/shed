@@ -64,12 +64,33 @@ rm -rf "$TMP_DIR"
 echo ""
 echo "=== Downloading kernel ==="
 
-# Use the Firecracker-provided kernel
+# Use the Ignite kernel which has BPF/cgroup support for Docker containers
+# This kernel is extracted from the weaveworks/ignite-kernel Docker image
+IGNITE_KERNEL_VERSION="5.10.51"
+IGNITE_IMAGE="weaveworks/ignite-kernel:${IGNITE_KERNEL_VERSION}"
+
+echo "Extracting kernel from Docker image: $IGNITE_IMAGE"
+echo "(This kernel has BPF and cgroup support for Docker containers)"
+
+# Pull the image
+docker pull "$IGNITE_IMAGE"
+
+# Create a temporary container and extract the kernel
+CONTAINER_ID=$(docker create "$IGNITE_IMAGE" /bin/true)
+docker cp "$CONTAINER_ID:/boot/vmlinux-${IGNITE_KERNEL_VERSION}" "$OUTPUT_DIR/vmlinux.bin"
+docker rm "$CONTAINER_ID"
+
+echo "Extracted kernel to $OUTPUT_DIR/vmlinux.bin"
+
+# Also download the minimal Firecracker kernel as a fallback
+echo ""
+echo "=== Downloading minimal kernel (fallback) ==="
 KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/ci-artifacts/kernels/${FC_ARCH}/vmlinux-5.10.217.bin"
 echo "URL: $KERNEL_URL"
 
-sudo curl -L -o "$OUTPUT_DIR/vmlinux.bin" "$KERNEL_URL"
-echo "Downloaded kernel to $OUTPUT_DIR/vmlinux.bin"
+sudo curl -L -o "$OUTPUT_DIR/vmlinux-minimal.bin" "$KERNEL_URL"
+echo "Downloaded minimal kernel to $OUTPUT_DIR/vmlinux-minimal.bin"
+echo "(Use this if you don't need Docker container support)"
 
 # Verify installation
 echo ""

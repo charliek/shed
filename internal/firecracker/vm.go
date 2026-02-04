@@ -49,10 +49,11 @@ func (vm *VM) Start(ctx context.Context) error {
 
 	// Build firecracker configuration
 	// Kernel args include:
-	// - IP and gateway for network setup (parsed by network-setup.sh)
+	// - IP configuration in kernel autoconf format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>
 	// - cgroup_enable=memory for Docker cgroup support
+	// The "off" at the end disables DHCP/BOOTP which can block boot on some kernels
 	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s gateway=%s cgroup_enable=memory cgroup_memory=1",
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:255.255.255.0::eth0:off cgroup_enable=memory cgroup_memory=1",
 		vm.meta.IPAddress, vm.netMgr.Gateway(),
 	)
 

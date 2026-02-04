@@ -271,11 +271,9 @@ shed exec myproject -- dockerd --debug
 
 The `vfs` storage driver is slower than overlay2 but always works in VM environments where overlay filesystems may not be supported.
 
-**Limitations:** The default Firecracker kernel has limited networking and cgroup features:
-- Docker bridge networking is disabled (no nftables support) - use `--network=host`
-- Container startup may fail with BPF errors (no cgroup BPF support)
+**Note:** Docker bridge networking is disabled (kernel lacks nftables support), so containers use `--network=host` by default. This means containers share the VM's network namespace. The default kernel (from Weave Ignite) has BPF cgroup support, so containers start correctly.
 
-To run Docker containers fully, you need a custom kernel with `CONFIG_CGROUP_BPF`, `CONFIG_BPF`, and nftables support. See `docs/firecracker_install.md` for details.
+If using the minimal kernel (`vmlinux-minimal.bin`), containers will fail with BPF errors. Switch to the default kernel for Docker support.
 
 ## Debugging
 

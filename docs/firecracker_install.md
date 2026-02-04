@@ -300,12 +300,16 @@ error setting cgroup config for procHooks process: bpf_prog_query(BPF_CGROUP_DEV
 failed: invalid argument
 ```
 
-This means the Firecracker kernel lacks BPF cgroup support (`CONFIG_CGROUP_BPF`). The default Firecracker kernel is minimal and doesn't include BPF. To run Docker containers, you need to build a custom kernel with:
+This means the kernel lacks BPF cgroup support. The default kernel downloaded by `download-firecracker.sh` (from Weave Ignite) has BPF support. If you're using the minimal kernel (`vmlinux-minimal.bin`), switch to the default kernel which has:
 - `CONFIG_BPF=y`
 - `CONFIG_BPF_SYSCALL=y`
 - `CONFIG_CGROUP_BPF=y`
 
-See the Firecracker documentation for building custom kernels.
+To switch kernels, update `kernel_path` in your server.yaml:
+```yaml
+firecracker:
+  kernel_path: /var/lib/shed/firecracker/vmlinux.bin  # Full kernel with Docker support
+  # kernel_path: /var/lib/shed/firecracker/vmlinux-minimal.bin  # Minimal kernel (no Docker)
 
 ## Network Architecture
 
