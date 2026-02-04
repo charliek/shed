@@ -7,7 +7,7 @@ This guide covers the installation and setup of the Firecracker backend for shed
 - Linux host with KVM support
 - Root access (for network setup)
 - Docker (for building rootfs and downloading kernel)
-- Go 1.21+ (for building shed-agent)
+- Go 1.24+ (for building shed-agent)
 
 ## 1. Check KVM Support
 
@@ -127,6 +127,21 @@ http_port: 8080
 ssh_port: 2222
 backend: firecracker
 
+# Credentials are copied into VMs at create/start time
+# (Firecracker doesn't support bind mounts like Docker)
+credentials:
+  ssh:
+    source: ~/.ssh
+    target: /root/.ssh
+    readonly: true
+  gitconfig:
+    source: ~/.gitconfig
+    target: /root/.gitconfig
+    readonly: true
+
+# Environment variables passed to git clone and provisioning hooks
+env_file: ~/.shed/env
+
 firecracker:
   kernel_path: /var/lib/shed/firecracker/vmlinux.bin
   base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
@@ -138,12 +153,25 @@ firecracker:
   vsock_base_cid: 100
   console_port: 1024
   health_port: 1025
-  start_timeout: 30s
+  start_timeout: 120s
   stop_timeout: 10s
   bridge_name: shed-br0
   bridge_cidr: 172.30.0.1/24
   tap_prefix: shed-tap
 ```
+
+### Configure SSH for Private Repos
+
+To clone private repositories via SSH, create an env file with the `GIT_SSH_COMMAND`:
+
+```bash
+mkdir -p ~/.shed
+cat > ~/.shed/env << 'EOF'
+GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519
+EOF
+```
+
+**Note:** Adjust the SSH key path if you use a different key type (e.g., `id_rsa`).
 
 ## 6. Create Required Directories
 

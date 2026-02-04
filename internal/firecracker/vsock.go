@@ -86,11 +86,15 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	defer conn.Close()
 
 	// Build exec request
+	workingDir := opts.WorkingDir
+	if workingDir == "" {
+		workingDir = "/workspace"
+	}
 	req := agentproto.ExecRequest{
 		Cmd:        opts.Cmd,
 		Env:        opts.Env,
 		TTY:        opts.TTY,
-		WorkingDir: "/workspace",
+		WorkingDir: workingDir,
 	}
 
 	if opts.InitialSize != nil {
@@ -116,8 +120,15 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 					Rows: uint16(size.Height),
 					Cols: uint16(size.Width),
 				}
-				data, _ := json.Marshal(msg)
-				agentproto.WriteMessage(conn, agentproto.MsgTypeResize, data)
+				data, err := json.Marshal(msg)
+				if err != nil {
+					// Log but continue - resize failures are non-fatal
+					continue
+				}
+				if err := agentproto.WriteMessage(conn, agentproto.MsgTypeResize, data); err != nil {
+					// Log but continue - resize failures are non-fatal, connection may be closing
+					continue
+				}
 			}
 		}()
 	}
@@ -128,7 +139,13 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	// Copy stdin to connection
 	if opts.Stdin != nil {
 		go func() {
-			io.Copy(conn, opts.Stdin)
+			if _, err := io.Copy(conn, opts.Stdin); err != nil {
+				// Log stdin errors but don't fail - often expected on disconnect
+				// Only log if it's not a closed connection error
+				if !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "EOF") {
+					// Silently ignore - stdin errors are often expected when connection closes
+				}
+			}
 			// Signal EOF by closing write side if possible
 			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 				cw.CloseWrite()

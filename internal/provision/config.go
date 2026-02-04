@@ -153,9 +153,9 @@ func readFileFromContainer(ctx context.Context, docker *client.Client, container
 		// File doesn't exist or other error
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg == "" {
-			errMsg = "file not found"
+			errMsg = fmt.Sprintf("command failed with exit code %d", inspectResp.ExitCode)
 		}
-		return nil, fmt.Errorf("%s", errMsg)
+		return nil, fmt.Errorf("%s (exit code %d)", errMsg, inspectResp.ExitCode)
 	}
 
 	return stdout.Bytes(), nil
@@ -171,4 +171,10 @@ func parseShedConfigContent(data []byte) (*Config, error) {
 		cfg.Env = make(map[string]string)
 	}
 	return &cfg, nil
+}
+
+// ParseConfigContent parses .shed/provision.yaml content from raw bytes.
+// This is exported for use by backends that read config via their own mechanism.
+func ParseConfigContent(data []byte) (*Config, error) {
+	return parseShedConfigContent(data)
 }
