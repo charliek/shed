@@ -272,7 +272,7 @@ Verify:
 
 ### Docker Fails to Start in VM
 
-Docker is configured with the `vfs` storage driver for maximum reliability in VM environments. If Docker fails to start:
+Docker is configured with the `vfs` storage driver and `cgroupfs` driver for compatibility with the Firecracker kernel. If Docker fails to start:
 
 ```bash
 # Check Docker daemon status
@@ -289,6 +289,23 @@ shed exec myproject -- cat /proc/cmdline | grep cgroup
 ```
 
 If you see cgroup errors, ensure the kernel args include `cgroup_enable=memory cgroup_memory=1`. This is set automatically by shed-server.
+
+### Docker Containers Fail to Start (BPF Error)
+
+If you see errors like `bpf_prog_query(BPF_CGROUP_DEVICE) failed`:
+
+```
+runc create failed: unable to start container process: error during container init:
+error setting cgroup config for procHooks process: bpf_prog_query(BPF_CGROUP_DEVICE)
+failed: invalid argument
+```
+
+This means the Firecracker kernel lacks BPF cgroup support (`CONFIG_CGROUP_BPF`). The default Firecracker kernel is minimal and doesn't include BPF. To run Docker containers, you need to build a custom kernel with:
+- `CONFIG_BPF=y`
+- `CONFIG_BPF_SYSCALL=y`
+- `CONFIG_CGROUP_BPF=y`
+
+See the Firecracker documentation for building custom kernels.
 
 ## Network Architecture
 

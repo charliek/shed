@@ -271,6 +271,12 @@ shed exec myproject -- dockerd --debug
 
 The `vfs` storage driver is slower than overlay2 but always works in VM environments where overlay filesystems may not be supported.
 
+**Limitations:** The default Firecracker kernel has limited networking and cgroup features:
+- Docker bridge networking is disabled (no nftables support) - use `--network=host`
+- Container startup may fail with BPF errors (no cgroup BPF support)
+
+To run Docker containers fully, you need a custom kernel with `CONFIG_CGROUP_BPF`, `CONFIG_BPF`, and nftables support. See `docs/firecracker_install.md` for details.
+
 ## Debugging
 
 ### View VM Console Output
