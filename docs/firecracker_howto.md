@@ -295,7 +295,7 @@ Kernel arguments control network configuration and cgroup settings. To verify th
 shed exec myproject -- cat /proc/cmdline
 
 # Expected output includes:
-# ip=172.30.0.X gateway=172.30.0.1 cgroup_enable=memory cgroup_memory=1
+# ip=172.30.0.X::172.30.0.1:255.255.255.0::eth0:off cgroup_enable=memory cgroup_memory=1
 ```
 
 ### Verify Network Setup

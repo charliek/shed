@@ -6,7 +6,7 @@ This guide covers the installation and setup of the Firecracker backend for shed
 
 - Linux host with KVM support
 - Root access (for network setup)
-- Docker (for building rootfs)
+- Docker (for building rootfs and downloading kernel)
 - Go 1.21+ (for building shed-agent)
 
 ## 1. Check KVM Support
@@ -32,7 +32,10 @@ Run the download script to get Firecracker and a compatible kernel:
 
 This installs:
 - `/usr/local/bin/firecracker` - Firecracker binary
-- `/var/lib/shed/firecracker/vmlinux.bin` - Linux kernel
+- `/var/lib/shed/firecracker/vmlinux.bin` - Linux kernel (from Weave Ignite, with Docker support)
+- `/var/lib/shed/firecracker/vmlinux-minimal.bin` - Minimal kernel (fallback, no Docker support)
+
+**Note:** The script requires Docker to extract the kernel from the `weaveworks/ignite-kernel` image.
 
 ## 3. Build the Rootfs Image
 
@@ -259,7 +262,7 @@ Possible causes:
 
 ### No Network Connectivity in VM
 
-**How network is configured:** The VM's IP address is passed via kernel command line arguments (`ip=X.X.X.X gateway=Y.Y.Y.Y`). The `network-setup.sh` script inside the VM parses these from `/proc/cmdline` and configures eth0.
+**How network is configured:** The VM's IP address is passed via kernel command line arguments using the kernel IP autoconfig format: `ip=<client>::<gateway>:<netmask>::<device>:off`. For example: `ip=172.30.0.2::172.30.0.1:255.255.255.0::eth0:off`. The kernel configures the network interface automatically during boot.
 
 Verify:
 1. Bridge is up: `ip link show shed-br0`
@@ -310,6 +313,7 @@ To switch kernels, update `kernel_path` in your server.yaml:
 firecracker:
   kernel_path: /var/lib/shed/firecracker/vmlinux.bin  # Full kernel with Docker support
   # kernel_path: /var/lib/shed/firecracker/vmlinux-minimal.bin  # Minimal kernel (no Docker)
+```
 
 ## Network Architecture
 
