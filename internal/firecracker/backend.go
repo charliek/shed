@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
@@ -76,7 +77,8 @@ func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) 
 	}
 
 	// Execute tmux list-sessions via vsock
-	vsockClient := NewVsockClient(meta.CID, b.client.cfg.ConsolePort, b.client.cfg.HealthPort)
+	vsockPath := filepath.Join(b.client.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
+	vsockClient := NewVsockClient(vsockPath, b.client.cfg.ConsolePort, b.client.cfg.HealthPort)
 
 	// Create a simple exec to run tmux list-sessions
 	// We'll capture output and parse it
@@ -129,7 +131,8 @@ func (b *FirecrackerBackend) KillSession(ctx context.Context, shedName, sessionN
 	}
 
 	// Execute tmux kill-session via vsock
-	vsockClient := NewVsockClient(meta.CID, b.client.cfg.ConsolePort, b.client.cfg.HealthPort)
+	vsockPath := filepath.Join(b.client.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
+	vsockClient := NewVsockClient(vsockPath, b.client.cfg.ConsolePort, b.client.cfg.HealthPort)
 
 	opts := backend.ExecOptions{
 		Cmd: []string{"tmux", "kill-session", "-t", sessionName},
@@ -171,7 +174,8 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 	opts.Cmd = cmd
 
 	// Execute via vsock
-	vsockClient := NewVsockClient(meta.CID, b.client.cfg.ConsolePort, b.client.cfg.HealthPort)
+	vsockPath := filepath.Join(b.client.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
+	vsockClient := NewVsockClient(vsockPath, b.client.cfg.ConsolePort, b.client.cfg.HealthPort)
 	return vsockClient.Exec(ctx, opts)
 }
 

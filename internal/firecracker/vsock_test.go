@@ -5,10 +5,10 @@ import (
 )
 
 func TestNewVsockClient(t *testing.T) {
-	client := NewVsockClient(100, 1024, 1025)
+	client := NewVsockClient("/tmp/test.vsock", 1024, 1025)
 
-	if client.cid != 100 {
-		t.Errorf("cid = %v, want 100", client.cid)
+	if client.socketPath != "/tmp/test.vsock" {
+		t.Errorf("socketPath = %v, want /tmp/test.vsock", client.socketPath)
 	}
 	if client.consolePort != 1024 {
 		t.Errorf("consolePort = %v, want 1024", client.consolePort)
@@ -21,22 +21,22 @@ func TestNewVsockClient(t *testing.T) {
 func TestNewVsockClient_DifferentValues(t *testing.T) {
 	tests := []struct {
 		name        string
-		cid         uint32
+		socketPath  string
 		consolePort uint32
 		healthPort  uint32
 	}{
-		{"default", 100, 1024, 1025},
-		{"high CID", 65535, 1024, 1025},
-		{"different ports", 200, 2000, 2001},
-		{"same ports", 100, 1000, 1000}, // technically valid
+		{"default", "/var/lib/shed/sockets/test.vsock", 1024, 1025},
+		{"custom path", "/tmp/firecracker/vm1.vsock", 1024, 1025},
+		{"different ports", "/run/firecracker.vsock", 2000, 2001},
+		{"same ports", "/tmp/test.vsock", 1000, 1000}, // technically valid
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := NewVsockClient(tt.cid, tt.consolePort, tt.healthPort)
+			client := NewVsockClient(tt.socketPath, tt.consolePort, tt.healthPort)
 
-			if client.cid != tt.cid {
-				t.Errorf("cid = %v, want %v", client.cid, tt.cid)
+			if client.socketPath != tt.socketPath {
+				t.Errorf("socketPath = %v, want %v", client.socketPath, tt.socketPath)
 			}
 			if client.consolePort != tt.consolePort {
 				t.Errorf("consolePort = %v, want %v", client.consolePort, tt.consolePort)

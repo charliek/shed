@@ -1,29 +1,31 @@
 package firecracker
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/backend"
-	"github.com/mdlayher/vsock"
 )
 
-// VsockClient handles vsock communication with the guest agent.
+// VsockClient handles vsock communication with the guest agent via Firecracker's UDS.
 type VsockClient struct {
-	cid         uint32
+	socketPath  string
 	consolePort uint32
 	healthPort  uint32
 }
 
 // NewVsockClient creates a new VsockClient.
-func NewVsockClient(cid, consolePort, healthPort uint32) *VsockClient {
+// socketPath is the path to Firecracker's vsock Unix domain socket.
+func NewVsockClient(socketPath string, consolePort, healthPort uint32) *VsockClient {
 	return &VsockClient{
-		cid:         cid,
+		socketPath:  socketPath,
 		consolePort: consolePort,
 		healthPort:  healthPort,
 	}
@@ -179,7 +181,12 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	}
 }
 
-// dialWithContext dials a vsock connection with context support.
+// dialWithContext connects to the guest via Firecracker's vsock UDS.
+// Firecracker's vsock protocol requires:
+// 1. Connect to the Unix domain socket
+// 2. Send "CONNECT <port>\n"
+// 3. Read response "OK <port>\n"
+// 4. Then the connection is bridged to the guest
 func (c *VsockClient) dialWithContext(ctx context.Context, port uint32) (net.Conn, error) {
 	// Create a channel to receive the connection result
 	type dialResult struct {
@@ -189,8 +196,39 @@ func (c *VsockClient) dialWithContext(ctx context.Context, port uint32) (net.Con
 	result := make(chan dialResult, 1)
 
 	go func() {
-		conn, err := vsock.Dial(c.cid, port, nil)
-		result <- dialResult{conn, err}
+		// Connect to Firecracker's vsock UDS
+		conn, err := net.Dial("unix", c.socketPath)
+		if err != nil {
+			result <- dialResult{nil, fmt.Errorf("failed to connect to vsock socket: %w", err)}
+			return
+		}
+
+		// Send CONNECT command
+		connectCmd := fmt.Sprintf("CONNECT %d\n", port)
+		if _, err := conn.Write([]byte(connectCmd)); err != nil {
+			conn.Close()
+			result <- dialResult{nil, fmt.Errorf("failed to send CONNECT command: %w", err)}
+			return
+		}
+
+		// Read response
+		reader := bufio.NewReader(conn)
+		response, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			result <- dialResult{nil, fmt.Errorf("failed to read CONNECT response: %w", err)}
+			return
+		}
+
+		response = strings.TrimSpace(response)
+		if !strings.HasPrefix(response, "OK ") {
+			conn.Close()
+			result <- dialResult{nil, fmt.Errorf("vsock CONNECT failed: %s", response)}
+			return
+		}
+
+		// Return a connection that wraps the buffered reader
+		result <- dialResult{&vsockConn{Conn: conn, reader: reader}, nil}
 	}()
 
 	select {
@@ -199,4 +237,14 @@ func (c *VsockClient) dialWithContext(ctx context.Context, port uint32) (net.Con
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// vsockConn wraps a net.Conn with a buffered reader for the initial handshake.
+type vsockConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *vsockConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
 }

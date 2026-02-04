@@ -151,13 +151,32 @@ sudo chown -R $USER:$USER /var/lib/shed/firecracker
 sudo chown -R $USER:$USER /var/run/shed/firecracker
 ```
 
-## 7. Start the Server
+## 7. Set Capabilities (Alternative to Running as Root)
+
+To run shed-server without sudo, grant capabilities to BOTH binaries:
 
 ```bash
-shed-server serve
+# Both binaries need CAP_NET_ADMIN for TAP device creation
+sudo setcap cap_net_admin+ep ./bin/shed-server
+sudo setcap cap_net_admin+ep /usr/local/bin/firecracker
+
+# Verify capabilities are set
+getcap ./bin/shed-server /usr/local/bin/firecracker
 ```
 
-## 8. Create a Firecracker Shed
+**Note:** Firecracker is spawned as a child process, and Linux capabilities don't inherit to child processes. That's why both binaries need the capability set directly.
+
+## 8. Start the Server
+
+```bash
+# With capabilities set (from step 7)
+shed-server serve
+
+# Or run as root
+sudo shed-server serve
+```
+
+## 9. Create a Firecracker Shed
 
 ```bash
 # Create a shed with the Firecracker backend
@@ -195,11 +214,35 @@ Solution: Create the bridge network (see step 4).
 failed to create TAP device: operation not permitted
 ```
 
-Solution: Run shed-server as root or with CAP_NET_ADMIN capability:
+or
+
+```
+Could not create the network device: Open tap device failed: ... Resource busy
+```
+
+Solution: Run shed-server as root or with CAP_NET_ADMIN capability on BOTH binaries:
 ```bash
 sudo shed-server serve
-# Or with capabilities
+
+# Or with capabilities (must set on BOTH binaries)
 sudo setcap cap_net_admin+ep $(which shed-server)
+sudo setcap cap_net_admin+ep $(which firecracker)
+```
+
+If you see "Resource busy", clean up stale TAP devices:
+```bash
+sudo ip link delete shed-tap-0  # or whichever TAP is stale
+```
+
+### Vsock Address In Use
+
+```
+Cannot create backend for vsock device: UnixBind(Os { code: 98, kind: AddrInUse, message: "Address in use" })
+```
+
+Solution: Remove stale vsock socket files:
+```bash
+sudo rm -f /var/run/shed/firecracker/*.vsock
 ```
 
 ### VM Timeout During Start
@@ -212,6 +255,7 @@ Possible causes:
 1. Rootfs image is corrupted - rebuild with `build-firecracker-rootfs.sh`
 2. Kernel is incompatible - try a different kernel version
 3. shed-agent is not starting - check VM console output
+4. Stale socket files - remove `/var/run/shed/firecracker/*.sock` and `*.vsock`
 
 ### No Network Connectivity in VM
 

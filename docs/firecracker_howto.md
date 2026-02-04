@@ -148,8 +148,11 @@ Each VM has a copy of the base rootfs:
 ```
 /var/lib/shed/firecracker/instances/myproject/
 ├── metadata.json    # VM configuration and state
-├── rootfs.ext4      # VM's root filesystem (copy of base)
-└── firecracker.sock # API socket (when running)
+└── rootfs.ext4      # VM's root filesystem (copy of base)
+
+/var/run/shed/firecracker/  # Runtime sockets (when VM is running)
+├── myproject.sock   # Firecracker API socket
+└── myproject.vsock  # vsock UDS for guest communication
 ```
 
 ### Expanding Disk Space
@@ -204,9 +207,12 @@ done
 ### Clean Up Stale Sockets
 
 ```bash
-# Remove old API sockets
-rm -f /var/run/shed/firecracker/*.sock
+# Remove old API and vsock sockets
+sudo rm -f /var/run/shed/firecracker/*.sock
+sudo rm -f /var/run/shed/firecracker/*.vsock
 ```
+
+**Note:** Stale vsock sockets cause "Address in use" errors on VM start. The shed-server cleans these up automatically on VM stop, but manual cleanup may be needed after crashes.
 
 ### Full Reset
 
@@ -266,16 +272,27 @@ shed exec myproject -- journalctl -u shed-agent
 
 ### Manually Test vsock Connection
 
-From the host, you can use `socat` to test vsock:
+Firecracker exposes vsock via Unix Domain Socket with a special protocol (not kernel vsock):
 
 ```bash
+# The vsock socket is at:
+ls -la /var/run/shed/firecracker/myproject.vsock
+
+# To test manually, connect and send CONNECT command:
 # Install socat if needed
 sudo apt install socat
 
-# Connect to agent health port (port 1025, CID from metadata)
-CID=$(cat /var/lib/shed/firecracker/instances/myproject/metadata.json | jq -r '.cid')
-socat - SOCKET-CONNECT:40:0:x0000x$(printf '%04x' 1025)x$(printf '%08x' $CID)x0000000000000000
+# Connect to the UDS and send CONNECT to a port (e.g., health port 1025)
+echo -e "CONNECT 1025\n" | socat - UNIX-CONNECT:/var/run/shed/firecracker/myproject.vsock
+
+# A successful connection returns "OK 1025"
 ```
+
+**Note:** The vsock protocol works as follows:
+1. Connect to Firecracker's Unix socket (`myproject.vsock`)
+2. Send `CONNECT <port>\n`
+3. Receive `OK <port>\n` on success
+4. The connection is then bridged to the guest at that port
 
 ### Enable Debug Logging
 
@@ -344,6 +361,8 @@ Most operations require root or specific capabilities:
 # Run server as root
 sudo shed-server serve
 
-# Or grant capabilities
+# Or grant capabilities to BOTH binaries
+# (Firecracker is spawned as a child process and needs its own capabilities)
 sudo setcap cap_net_admin+ep $(which shed-server)
+sudo setcap cap_net_admin+ep $(which firecracker)
 ```

@@ -66,7 +66,7 @@ func (vm *VM) Start(ctx context.Context) error {
 		},
 		VsockDevices: []firecracker.VsockDevice{
 			{
-				Path: "/dev/vsock",
+				Path: filepath.Join(socketDir, fmt.Sprintf("%s.vsock", vm.meta.Name)),
 				CID:  uint32(vm.meta.CID),
 			},
 		},
@@ -81,6 +81,10 @@ func (vm *VM) Start(ctx context.Context) error {
 	}
 
 	// Create the machine
+	// Use background context for VM lifecycle - the VM should persist
+	// beyond the HTTP request that created it
+	vmCtx := context.Background()
+
 	logger := logrus.New()
 	logger.SetOutput(os.Stderr)
 	logger.SetLevel(logrus.InfoLevel)
@@ -88,7 +92,7 @@ func (vm *VM) Start(ctx context.Context) error {
 		firecracker.WithLogger(logrus.NewEntry(logger)),
 	}
 
-	machine, err := firecracker.NewMachine(ctx, fcCfg, machineOpts...)
+	machine, err := firecracker.NewMachine(vmCtx, fcCfg, machineOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create firecracker machine: %w", err)
 	}
@@ -96,7 +100,7 @@ func (vm *VM) Start(ctx context.Context) error {
 	vm.machine = machine
 
 	// Start the machine
-	if err := machine.Start(ctx); err != nil {
+	if err := machine.Start(vmCtx); err != nil {
 		return fmt.Errorf("failed to start firecracker machine: %w", err)
 	}
 
@@ -109,7 +113,8 @@ func (vm *VM) Start(ctx context.Context) error {
 	}
 
 	// Wait for the agent to be healthy
-	vsockClient := NewVsockClient(vm.meta.CID, vm.cfg.ConsolePort, vm.cfg.HealthPort)
+	vsockPath := filepath.Join(socketDir, fmt.Sprintf("%s.vsock", vm.meta.Name))
+	vsockClient := NewVsockClient(vsockPath, vm.cfg.ConsolePort, vm.cfg.HealthPort)
 	if err := vsockClient.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
 		// Try to stop the VM on failure
 		vm.Stop(context.Background())
@@ -121,6 +126,9 @@ func (vm *VM) Start(ctx context.Context) error {
 
 // Stop stops the VM gracefully.
 func (vm *VM) Stop(ctx context.Context) error {
+	// Clean up socket files
+	defer vm.cleanupSockets()
+
 	if vm.machine == nil {
 		// Try to stop by PID if we have one
 		if vm.meta.PID > 0 {
@@ -146,6 +154,17 @@ func (vm *VM) Stop(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// cleanupSockets removes the API and vsock socket files for this VM.
+func (vm *VM) cleanupSockets() {
+	socketDir := vm.cfg.SocketDir
+	// Remove API socket
+	apiSocket := filepath.Join(socketDir, fmt.Sprintf("%s.sock", vm.meta.Name))
+	os.Remove(apiSocket)
+	// Remove vsock socket
+	vsockSocket := filepath.Join(socketDir, fmt.Sprintf("%s.vsock", vm.meta.Name))
+	os.Remove(vsockSocket)
 }
 
 // stopByPID stops a VM by its PID when we don't have a machine handle.
