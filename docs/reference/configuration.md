@@ -87,22 +87,29 @@ log_level: info
 | `name` | string | `shed-server` | Server identifier |
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
+| `backend` | string | `docker` | Backend type: `docker` or `firecracker` |
 | `default_image` | string | `shed-base:latest` | Default Docker image for sheds |
-| `credentials` | map | `{}` | Bind mounts for credentials |
+| `credentials` | map | `{}` | Credentials to mount/copy into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
+| `firecracker` | object | - | Firecracker-specific configuration (see below) |
 
-### Credential Mounts
+### Credentials
 
-Credentials are bind-mounted into all shed containers:
+Credentials are made available to sheds. The method depends on the backend:
+
+- **Docker**: Credentials are bind-mounted (live sync with host)
+- **Firecracker**: Credentials are copied at create/start time (no live sync)
 
 ```yaml
 credentials:
   name:
     source: /host/path      # Path on the host (~ supported)
-    target: /container/path  # Path inside container
+    target: /container/path  # Path inside shed
     readonly: true           # Optional, default false
 ```
+
+**Note:** For Firecracker, changes to credentials on the host after shed start won't be reflected in the VM until the next restart.
 
 **Common credential mounts:**
 
@@ -144,6 +151,49 @@ credentials:
     target: /root/.config/gcloud
     readonly: true
 ```
+
+## Firecracker Configuration
+
+When using `backend: firecracker`, configure the Firecracker-specific settings:
+
+```yaml
+backend: firecracker
+
+firecracker:
+  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
+  base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+  instance_dir: /var/lib/shed/firecracker/instances
+  socket_dir: /var/run/shed/firecracker
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  vsock_base_cid: 100
+  console_port: 1024
+  health_port: 1025
+  start_timeout: 120s
+  stop_timeout: 10s
+  bridge_name: shed-br0
+  bridge_cidr: 172.30.0.1/24
+  tap_prefix: shed-tap
+```
+
+### Firecracker Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `kernel_path` | string | - | Path to Linux kernel image |
+| `base_rootfs` | string | - | Path to base rootfs ext4 image |
+| `instance_dir` | string | - | Directory for VM instances |
+| `socket_dir` | string | - | Directory for API/vsock sockets |
+| `default_cpus` | int | `2` | Default vCPUs per VM |
+| `default_memory_mb` | int | `4096` | Default memory per VM (MB) |
+| `start_timeout` | duration | `30s` | VM startup timeout |
+| `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
+| `bridge_name` | string | `shed-br0` | Linux bridge name |
+| `bridge_cidr` | string | `172.30.0.1/24` | Bridge network CIDR |
+| `tap_prefix` | string | `shed-tap` | TAP device name prefix |
+
+See [Firecracker Installation](../firecracker_install.md) for setup details.
 
 ## Environment File
 

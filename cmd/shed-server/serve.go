@@ -70,7 +70,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if fcCfg == nil {
 			fcCfg = config.DefaultFirecrackerConfig()
 		}
-		fcClient, err := firecracker.NewClient(fcCfg)
+		fcClient, err := firecracker.NewClient(fcCfg, cfg)
 		if err != nil {
 			return fmt.Errorf("failed to create firecracker client: %w", err)
 		}

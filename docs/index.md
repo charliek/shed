@@ -9,6 +9,7 @@ Shed is a lightweight tool for managing persistent, containerized development en
 - **Multi-Server** - Manage sheds across home servers and cloud VPS instances
 - **IDE Integration** - Native Cursor/VS Code support via SSH Remote
 - **AI-Ready** - Pre-configured for Claude Code and OpenCode workflows
+- **Dual Backend** - Choose between Docker containers or Firecracker microVMs
 
 ## Architecture
 
@@ -16,6 +17,11 @@ Shed consists of two binaries:
 
 - **`shed`** - CLI for developer machines (macOS, Linux)
 - **`shed-server`** - Server daemon exposing HTTP API (port 8080) and SSH server (port 2222)
+
+The server supports two backends:
+
+- **Docker** (default) - Uses Docker containers with bind mounts
+- **Firecracker** - Uses microVMs with vsock communication
 
 ```mermaid
 flowchart LR
@@ -25,11 +31,15 @@ flowchart LR
 
     subgraph server["Remote Server"]
         SERVER["shed-server"]
-        subgraph docker["Docker"]
-            SHED1["shed-myproj"]
-            SHED2["shed-other"]
+        subgraph backends["Backends"]
+            subgraph docker["Docker"]
+                SHED1["container"]
+            end
+            subgraph fc["Firecracker"]
+                VM1["microVM"]
+            end
         end
-        SERVER --> docker
+        SERVER --> backends
     end
 
     CLI -->|"HTTP (8080)"| SERVER
@@ -41,7 +51,8 @@ flowchart LR
 | Component | Requirements |
 |-----------|--------------|
 | Client | macOS or Linux with Go 1.24+ |
-| Server | Linux with Docker installed |
+| Server (Docker) | Linux with Docker installed |
+| Server (Firecracker) | Linux with KVM support |
 | Network | Tailscale (or any private network) connecting all machines |
 
 ## Quick Links
@@ -50,6 +61,9 @@ flowchart LR
 - [CLI Reference](reference/cli.md) - All commands and options
 - [Configuration](reference/configuration.md) - Client and server config
 - [Server Setup](getting-started/server-setup.md) - Install shed-server
+- [Firecracker Installation](firecracker_install.md) - Set up Firecracker backend
+- [Firecracker Operations](firecracker_howto.md) - Using Firecracker sheds
+- [Roadmap](ROADMAP.md) - Future enhancements
 
 ## Security Model
 

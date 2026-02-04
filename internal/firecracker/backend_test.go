@@ -16,11 +16,12 @@ func TestNewBackend(t *testing.T) {
 	}
 
 	client := &Client{
-		cfg:      cfg,
-		netMgr:   netMgr,
-		vms:      make(map[string]*VM),
-		usedCIDs: make(map[uint32]string),
-		usedIPs:  make(map[string]string),
+		cfg:       cfg,
+		serverCfg: nil, // Not needed for this test
+		netMgr:    netMgr,
+		vms:       make(map[string]*VM),
+		usedCIDs:  make(map[uint32]string),
+		usedIPs:   make(map[string]string),
 	}
 
 	b := NewBackend(client)
@@ -43,11 +44,12 @@ func TestBackendType(t *testing.T) {
 	}
 
 	client := &Client{
-		cfg:      cfg,
-		netMgr:   netMgr,
-		vms:      make(map[string]*VM),
-		usedCIDs: make(map[uint32]string),
-		usedIPs:  make(map[string]string),
+		cfg:       cfg,
+		serverCfg: nil, // Not needed for this test
+		netMgr:    netMgr,
+		vms:       make(map[string]*VM),
+		usedCIDs:  make(map[uint32]string),
+		usedIPs:   make(map[string]string),
 	}
 
 	b := NewBackend(client)

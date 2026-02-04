@@ -50,6 +50,94 @@ shed delete myproject
 shed delete myproject --force
 ```
 
+## Credentials
+
+Firecracker VMs don't support bind mounts like Docker. Instead, credentials configured in `server.yaml` are **copied** into the VM at create and start time using tar over vsock.
+
+### How It Works
+
+1. On `shed create` and `shed start`, credentials are:
+   - Archived on the host using tar
+   - Transferred to the VM via vsock
+   - Extracted to the target location
+   - Ownership is set to root:root
+
+2. Changes to credentials on the host after VM starts won't be reflected in the VM until restart
+
+### Verifying Credentials
+
+```bash
+# Check SSH keys were transferred
+shed exec myproject -- ls -la /root/.ssh/
+
+# Check git config
+shed exec myproject -- cat /root/.gitconfig
+
+# Test SSH access to GitHub
+shed exec myproject -- ssh -T git@github.com
+```
+
+### Private Repository Access
+
+For private repos, ensure:
+1. SSH credentials are configured in `server.yaml`
+2. `GIT_SSH_COMMAND` is set in your env file (`~/.shed/env`)
+
+```bash
+# Example env file for SSH git access
+cat ~/.shed/env
+GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519
+```
+
+## Provisioning
+
+Shed supports automatic provisioning via `.shed/provision.yaml` in your repository. This works the same as Docker but uses vsock for execution.
+
+### Provisioning Flow
+
+1. **On Create** (with `--repo`):
+   - Credentials are transferred
+   - Repository is cloned
+   - Install hook runs (if configured)
+   - Startup hook runs (if configured)
+
+2. **On Start** (restart):
+   - Credentials are refreshed
+   - Startup hook runs (install hook is skipped)
+
+### Skip Provisioning
+
+```bash
+# Create without running hooks
+shed create myproject --backend=firecracker --repo=https://github.com/user/repo.git --no-provision
+```
+
+### Check Provisioning Logs
+
+```bash
+# View install hook output
+shed exec myproject -- cat /var/log/shed/install.log
+
+# View startup hook output
+shed exec myproject -- cat /var/log/shed/startup.log
+
+# Check provisioning state
+shed exec myproject -- cat /var/log/shed/.provision_state
+```
+
+### Example provision.yaml
+
+```yaml
+hooks:
+  install: .shed/scripts/install.sh    # Runs once on create
+  startup: .shed/scripts/startup.sh    # Runs on every start
+
+env:
+  MY_VAR: "value"
+
+timeout: 30m
+```
+
 ## Inspecting VMs
 
 ### List All Sheds

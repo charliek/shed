@@ -1,6 +1,11 @@
 # Provisioning
 
-Shed supports in-repo provisioning scripts that run automatically when containers start. These scripts are version-controlled with your code.
+Shed supports in-repo provisioning scripts that run automatically when sheds start. These scripts are version-controlled with your code.
+
+Provisioning works with both backends:
+
+- **Docker**: Hooks execute via `docker exec`
+- **Firecracker**: Hooks execute via vsock
 
 ## Quick Start
 
