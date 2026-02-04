@@ -45,6 +45,9 @@ RUN rm -f /lib/systemd/system/multi-user.target.wants/* \
     /lib/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup* \
     /lib/systemd/system/systemd-update-utmp*
 
+# Configure Docker with vfs storage driver (most reliable in VM environments)
+COPY daemon.json /etc/docker/daemon.json
+
 # Enable Docker service
 RUN systemctl enable docker
 

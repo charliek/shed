@@ -259,11 +259,36 @@ Possible causes:
 
 ### No Network Connectivity in VM
 
+**How network is configured:** The VM's IP address is passed via kernel command line arguments (`ip=X.X.X.X gateway=Y.Y.Y.Y`). The `network-setup.sh` script inside the VM parses these from `/proc/cmdline` and configures eth0.
+
 Verify:
 1. Bridge is up: `ip link show shed-br0`
 2. IP forwarding is enabled: `cat /proc/sys/net/ipv4/ip_forward`
 3. NAT rules are in place: `sudo iptables -t nat -L -n`
 4. TAP device is attached to bridge: `ip link show`
+5. Check kernel args inside VM: `shed exec myproject -- cat /proc/cmdline`
+6. Check network-setup ran: `shed exec myproject -- systemctl status network-setup`
+7. Check interface is up: `shed exec myproject -- ip addr show eth0`
+
+### Docker Fails to Start in VM
+
+Docker is configured with the `vfs` storage driver for maximum reliability in VM environments. If Docker fails to start:
+
+```bash
+# Check Docker daemon status
+shed exec myproject -- systemctl status docker
+
+# View Docker daemon logs
+shed exec myproject -- journalctl -u docker
+
+# Verify daemon.json exists
+shed exec myproject -- cat /etc/docker/daemon.json
+
+# Check cgroup support (kernel args should include cgroup_enable=memory)
+shed exec myproject -- cat /proc/cmdline | grep cgroup
+```
+
+If you see cgroup errors, ensure the kernel args include `cgroup_enable=memory cgroup_memory=1`. This is set automatically by shed-server.
 
 ## Network Architecture
 

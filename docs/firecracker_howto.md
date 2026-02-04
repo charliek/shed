@@ -236,7 +236,7 @@ rm -f /var/run/shed/firecracker/*.sock
 
 ## Docker Inside VMs
 
-Docker is pre-installed in the rootfs and works out of the box:
+Docker is pre-installed in the rootfs and configured with the `vfs` storage driver for maximum reliability in VM environments.
 
 ```bash
 # Run Docker commands inside the VM
@@ -249,6 +249,28 @@ shed exec myproject -- systemctl status docker
 shed exec myproject -- docker images
 ```
 
+### Docker Troubleshooting
+
+If Docker fails to start:
+
+```bash
+# Check daemon logs
+shed exec myproject -- journalctl -u docker
+
+# Verify daemon.json config
+shed exec myproject -- cat /etc/docker/daemon.json
+# Should show: "storage-driver": "vfs"
+
+# Check cgroup kernel args
+shed exec myproject -- cat /proc/cmdline | grep cgroup
+# Should include: cgroup_enable=memory cgroup_memory=1
+
+# Manually start Docker with debug
+shed exec myproject -- dockerd --debug
+```
+
+The `vfs` storage driver is slower than overlay2 but always works in VM environments where overlay filesystems may not be supported.
+
 ## Debugging
 
 ### View VM Console Output
@@ -258,6 +280,35 @@ The VM console output goes to the Firecracker process. To see it:
 ```bash
 # Run shed-server in foreground with debug logging
 shed-server serve
+```
+
+### Check Kernel Arguments
+
+Kernel arguments control network configuration and cgroup settings. To verify they were passed correctly:
+
+```bash
+# Check kernel args from inside VM
+shed exec myproject -- cat /proc/cmdline
+
+# Expected output includes:
+# ip=172.30.0.X gateway=172.30.0.1 cgroup_enable=memory cgroup_memory=1
+```
+
+### Verify Network Setup
+
+```bash
+# Check if network-setup service ran
+shed exec myproject -- systemctl status network-setup
+
+# View network-setup logs
+shed exec myproject -- journalctl -u network-setup
+
+# Check interface configuration
+shed exec myproject -- ip addr show eth0
+
+# Test connectivity
+shed exec myproject -- ping -c 1 172.30.0.1  # gateway
+shed exec myproject -- ping -c 1 8.8.8.8      # internet
 ```
 
 ### Check Agent Status

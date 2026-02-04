@@ -48,10 +48,18 @@ func (vm *VM) Start(ctx context.Context) error {
 	os.Remove(socketPath)
 
 	// Build firecracker configuration
+	// Kernel args include:
+	// - IP and gateway for network setup (parsed by network-setup.sh)
+	// - cgroup_enable=memory for Docker cgroup support
+	kernelArgs := fmt.Sprintf(
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s gateway=%s cgroup_enable=memory cgroup_memory=1",
+		vm.meta.IPAddress, vm.netMgr.Gateway(),
+	)
+
 	fcCfg := firecracker.Config{
 		SocketPath:      socketPath,
 		KernelImagePath: vm.cfg.KernelPath,
-		KernelArgs:      "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init",
+		KernelArgs:      kernelArgs,
 		Drives: []models.Drive{
 			{
 				DriveID:      firecracker.String("rootfs"),
@@ -101,6 +109,7 @@ func (vm *VM) Start(ctx context.Context) error {
 
 	// Start the machine
 	if err := machine.Start(vmCtx); err != nil {
+		vm.cleanupSockets() // Clean up .sock and .vsock files on failure
 		return fmt.Errorf("failed to start firecracker machine: %w", err)
 	}
 
