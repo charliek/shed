@@ -1,6 +1,6 @@
 # Firecracker Backend Operations
 
-This guide covers common operations and troubleshooting for the Firecracker backend.
+This guide covers common operations and troubleshooting for the Firecracker backend. Ensure your server has Firecracker enabled in `enabled_backends` and is running on Linux.
 
 ## Basic Operations
 

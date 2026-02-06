@@ -1,6 +1,6 @@
 # Firecracker Backend Installation
 
-This guide covers the installation and setup of the Firecracker backend for shed.
+This guide covers the installation and setup of the Firecracker backend for shed. Firecracker is Linux-only and requires KVM.
 
 ## Prerequisites
 

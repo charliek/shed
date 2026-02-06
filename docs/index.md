@@ -18,10 +18,12 @@ Shed consists of two binaries:
 - **`shed`** - CLI for developer machines (macOS, Linux)
 - **`shed-server`** - Server daemon exposing HTTP API (port 8080) and SSH server (port 2222)
 
-The server supports two backends:
+The server supports two backends (enabled per server configuration):
 
 - **Docker** (default) - Uses Docker containers with bind mounts
-- **Firecracker** - Uses microVMs with vsock communication
+- **Firecracker** - Uses microVMs with vsock communication (Linux-only)
+
+You can set a server default backend and optionally override it per shed with `shed create --backend=...` when that backend is enabled on the server.
 
 ```mermaid
 flowchart LR
