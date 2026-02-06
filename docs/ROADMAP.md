@@ -2,6 +2,14 @@
 
 This document outlines planned future enhancements for Shed.
 
+## Backend UX and Parity Followups
+
+1. CLI backend awareness and validation. `shed create` should call `/api/info` to learn `enabled_backends` and `default_backend`, then warn about `--cpus/--memory` only when the resolved backend is Docker, fail fast with a clear error if the requested backend is not enabled on the server, and display the resolved backend in the create output to reduce ambiguity.
+
+2. Working directory parity across backends. `ExecOptions.WorkingDir` should be honored for Docker exec the same way it is for Firecracker. Default should remain `/workspace` when unset.
+
+3. Test coverage for backend routing and parity. Add tests for backend selection logic (explicit backend, default backend, unsupported backend), `WorkingDir` behavior for Docker exec, and CLI warnings based on `/api/info` responses.
+
 ## Firecracker Live Mounts (SSHFS over vsock)
 
 ### Use Case

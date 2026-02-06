@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -24,8 +25,14 @@ type ServerConfig struct {
 	LogLevel     string                 `yaml:"log_level"`
 	Terminal     *terminal.Config       `yaml:"terminal"`
 
-	// Backend specifies the default backend type: "docker" or "firecracker"
-	Backend string `yaml:"backend"`
+	// EnabledBackends specifies the backend types this server supports.
+	EnabledBackends []string `yaml:"enabled_backends,omitempty"`
+
+	// DefaultBackend specifies the default backend type: "docker" or "firecracker"
+	DefaultBackend string `yaml:"default_backend,omitempty"`
+
+	// Backend is deprecated (use default_backend instead).
+	Backend string `yaml:"backend,omitempty"`
 
 	// Firecracker contains Firecracker-specific configuration
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
@@ -140,14 +147,16 @@ type MountConfig struct {
 // DefaultServerConfig returns a ServerConfig with default values.
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Name:         "shed-server",
-		HTTPPort:     8080,
-		SSHPort:      2222,
-		DefaultImage: "shed-base:latest",
-		Credentials:  make(map[string]MountConfig),
-		LogLevel:     "info",
-		Terminal:     terminal.DefaultConfig(),
-		EnvVars:      make(map[string]string),
+		Name:            "shed-server",
+		HTTPPort:        8080,
+		SSHPort:         2222,
+		DefaultImage:    "shed-base:latest",
+		Credentials:     make(map[string]MountConfig),
+		LogLevel:        "info",
+		Terminal:        terminal.DefaultConfig(),
+		EnvVars:         make(map[string]string),
+		DefaultBackend:  BackendDocker,
+		EnabledBackends: []string{BackendDocker},
 	}
 }
 
@@ -211,6 +220,8 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		cfg.Terminal = terminal.DefaultConfig()
 	}
 
+	cfg.normalizeBackends()
+
 	// Expand and validate paths in credentials
 	for name, mount := range cfg.Credentials {
 		source := filepath.Clean(ExpandPath(mount.Source))
@@ -267,10 +278,38 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("invalid log_level: %s (must be debug, info, warn, or error)", c.LogLevel)
 	}
 
-	// Validate Firecracker config if backend is firecracker
-	if c.Backend == BackendFirecracker {
+	if len(c.EnabledBackends) == 0 {
+		return fmt.Errorf("enabled_backends must include at least one backend")
+	}
+
+	if c.DefaultBackend == "" {
+		return fmt.Errorf("default_backend is required")
+	}
+
+	if !isValidBackend(c.DefaultBackend) {
+		return fmt.Errorf("invalid default_backend: %s (must be docker or firecracker)", c.DefaultBackend)
+	}
+
+	enabled := make(map[string]bool, len(c.EnabledBackends))
+	for _, backend := range c.EnabledBackends {
+		if !isValidBackend(backend) {
+			return fmt.Errorf("invalid enabled_backends entry: %s (must be docker or firecracker)", backend)
+		}
+		enabled[backend] = true
+	}
+
+	if !enabled[c.DefaultBackend] {
+		return fmt.Errorf("default_backend %q must be in enabled_backends", c.DefaultBackend)
+	}
+
+	if runtime.GOOS != "linux" && enabled[BackendFirecracker] {
+		return fmt.Errorf("firecracker backend is only supported on linux")
+	}
+
+	// Validate Firecracker config if enabled
+	if enabled[BackendFirecracker] {
 		if c.Firecracker == nil {
-			return fmt.Errorf("firecracker configuration is required when backend is 'firecracker'")
+			return fmt.Errorf("firecracker configuration is required when backend is enabled")
 		}
 		if err := c.Firecracker.Validate(); err != nil {
 			return fmt.Errorf("firecracker config: %w", err)
@@ -278,6 +317,26 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	return nil
+}
+
+func isValidBackend(backend string) bool {
+	return backend == BackendDocker || backend == BackendFirecracker
+}
+
+func (c *ServerConfig) normalizeBackends() {
+	if c.DefaultBackend == "" && c.Backend != "" {
+		c.DefaultBackend = c.Backend
+	}
+	if c.DefaultBackend == "" {
+		c.DefaultBackend = BackendDocker
+	}
+	if len(c.EnabledBackends) == 0 {
+		if c.Backend != "" {
+			c.EnabledBackends = []string{c.Backend}
+		} else {
+			c.EnabledBackends = []string{c.DefaultBackend}
+		}
+	}
 }
 
 // Validate checks that the Firecracker configuration is valid.

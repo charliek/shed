@@ -106,10 +106,12 @@ func ValidateSessionName(name string) error {
 
 // ServerInfo is returned by GET /api/info.
 type ServerInfo struct {
-	Name     string `json:"name"`
-	Version  string `json:"version"`
-	SSHPort  int    `json:"ssh_port"`
-	HTTPPort int    `json:"http_port"`
+	Name            string   `json:"name"`
+	Version         string   `json:"version"`
+	SSHPort         int      `json:"ssh_port"`
+	HTTPPort        int      `json:"http_port"`
+	DefaultBackend  string   `json:"default_backend"`
+	EnabledBackends []string `json:"enabled_backends"`
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.
@@ -175,6 +177,7 @@ const (
 	ErrShedAlreadyStopped = "SHED_ALREADY_STOPPED"
 	ErrInvalidShedName    = "INVALID_SHED_NAME"
 	ErrCloneFailed        = "CLONE_FAILED"
+	ErrBackendNotEnabled  = "BACKEND_NOT_ENABLED"
 	ErrBackendError       = "BACKEND_ERROR"
 	ErrInternalError      = "INTERNAL_ERROR"
 	ErrSessionNotFound    = "SESSION_NOT_FOUND"

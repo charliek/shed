@@ -46,41 +46,39 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("HTTP port: %d", cfg.HTTPPort)
 	log.Printf("SSH port: %d", cfg.SSHPort)
 
-	// Initialize backend based on configuration
-	var be backend.Backend
+	// Initialize enabled backends
+	backends := make(map[backend.Type]backend.Backend)
+	for _, backendType := range cfg.EnabledBackends {
+		switch backendType {
+		case config.BackendDocker:
+			dockerClient, err := docker.NewClient(cfg)
+			if err != nil {
+				return fmt.Errorf("failed to create docker client: %w", err)
+			}
+			log.Printf("Connected to Docker")
+			backends[backend.TypeDocker] = docker.NewBackend(dockerClient)
 
-	backendType := cfg.Backend
-	if backendType == "" {
-		backendType = config.BackendDocker // Default to Docker
+		case config.BackendFirecracker:
+			fcCfg := cfg.Firecracker
+			if fcCfg == nil {
+				fcCfg = config.DefaultFirecrackerConfig()
+			}
+			fcClient, err := firecracker.NewClient(fcCfg, cfg)
+			if err != nil {
+				return fmt.Errorf("failed to create firecracker client: %w", err)
+			}
+			log.Printf("Initialized Firecracker backend")
+			backends[backend.TypeFirecracker] = firecracker.NewBackend(fcClient)
+
+		default:
+			return fmt.Errorf("unknown backend type: %s", backendType)
+		}
 	}
 
-	switch backendType {
-	case config.BackendDocker:
-		// Initialize Docker client
-		dockerClient, err := docker.NewClient(cfg)
-		if err != nil {
-			return fmt.Errorf("failed to create docker client: %w", err)
-		}
-		log.Printf("Connected to Docker")
-		be = docker.NewBackend(dockerClient)
-
-	case config.BackendFirecracker:
-		// Initialize Firecracker client
-		fcCfg := cfg.Firecracker
-		if fcCfg == nil {
-			fcCfg = config.DefaultFirecrackerConfig()
-		}
-		fcClient, err := firecracker.NewClient(fcCfg, cfg)
-		if err != nil {
-			return fmt.Errorf("failed to create firecracker client: %w", err)
-		}
-		log.Printf("Initialized Firecracker backend")
-		be = firecracker.NewBackend(fcClient)
-
-	default:
-		return fmt.Errorf("unknown backend type: %s", backendType)
+	be, err := backend.NewRouter(backend.Type(cfg.DefaultBackend), backends)
+	if err != nil {
+		return fmt.Errorf("failed to initialize backend router: %w", err)
 	}
-
 	defer be.Close()
 
 	// Initialize SSH server

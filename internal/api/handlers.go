@@ -15,10 +15,12 @@ import (
 // GET /api/info
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	info := config.ServerInfo{
-		Name:     s.cfg.Name,
-		Version:  version.Info(),
-		SSHPort:  s.cfg.SSHPort,
-		HTTPPort: s.cfg.HTTPPort,
+		Name:            s.cfg.Name,
+		Version:         version.Info(),
+		SSHPort:         s.cfg.SSHPort,
+		HTTPPort:        s.cfg.HTTPPort,
+		DefaultBackend:  s.cfg.DefaultBackend,
+		EnabledBackends: s.cfg.EnabledBackends,
 	}
 
 	writeJSON(w, http.StatusOK, info)
@@ -281,6 +283,9 @@ func mapDockerError(err error) (int, string, string) {
 	}
 	if strings.Contains(errMsg, "already stopped") || strings.Contains(errMsg, "not running") {
 		return http.StatusConflict, config.ErrShedAlreadyStopped, sanitizeErrorMessage(errMsg, "not running")
+	}
+	if strings.Contains(errMsg, "backend") && strings.Contains(errMsg, "not enabled") {
+		return http.StatusBadRequest, config.ErrBackendNotEnabled, errMsg
 	}
 
 	// For unknown errors, return a generic message to avoid leaking Docker internals

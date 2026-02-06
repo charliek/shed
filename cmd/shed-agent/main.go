@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 // Package main implements the shed-agent, which runs inside Firecracker VMs
 // and handles command execution via vsock.
 package main

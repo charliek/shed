@@ -57,7 +57,9 @@ env_file: ~/.shed/env
 # Debug logging for development
 log_level: debug
 
-backend: firecracker
+enabled_backends:
+  - firecracker
+default_backend: firecracker
 
 firecracker:
   kernel_path: /var/lib/shed/firecracker/vmlinux.bin

@@ -119,13 +119,16 @@ sudo netfilter-persistent save
 
 ## 5. Configure shed-server
 
-Update your `server.yaml` to use the Firecracker backend:
+Update your `server.yaml` to enable the Firecracker backend:
 
 ```yaml
 name: shed-server
 http_port: 8080
 ssh_port: 2222
-backend: firecracker
+enabled_backends:
+  - docker
+  - firecracker
+default_backend: firecracker
 
 # Credentials are copied into VMs at create/start time
 # (Firecracker doesn't support bind mounts like Docker)

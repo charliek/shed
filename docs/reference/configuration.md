@@ -87,12 +87,15 @@ log_level: info
 | `name` | string | `shed-server` | Server identifier |
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
-| `backend` | string | `docker` | Backend type: `docker` or `firecracker` |
+| `enabled_backends` | list | `[docker]` | Backends this server supports (`docker`, `firecracker`) |
+| `default_backend` | string | `docker` | Default backend used when none is specified |
 | `default_image` | string | `shed-base:latest` | Default Docker image for sheds |
 | `credentials` | map | `{}` | Credentials to mount/copy into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
+
+**Note:** Firecracker is only supported on Linux. On macOS, only `docker` can be enabled.
 
 ### Credentials
 
@@ -154,10 +157,13 @@ credentials:
 
 ## Firecracker Configuration
 
-When using `backend: firecracker`, configure the Firecracker-specific settings:
+When enabling Firecracker, configure the Firecracker-specific settings:
 
 ```yaml
-backend: firecracker
+enabled_backends:
+  - docker
+  - firecracker
+default_backend: firecracker
 
 firecracker:
   kernel_path: /var/lib/shed/firecracker/vmlinux.bin
