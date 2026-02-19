@@ -5,6 +5,7 @@ package firecracker
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os/exec"
 	"strings"
@@ -167,24 +168,32 @@ func (nm *NetworkManager) EnsureBridgeExists() error {
 	// Assign IP address
 	addr, err := netlink.ParseAddr(nm.bridgeCIDR)
 	if err != nil {
-		netlink.LinkDel(bridge)
+		if delErr := netlink.LinkDel(bridge); delErr != nil {
+			log.Printf("Warning: failed to delete bridge %s: %v", nm.bridgeName, delErr)
+		}
 		return fmt.Errorf("failed to parse bridge address: %w", err)
 	}
 
 	bridgeLink, err := netlink.LinkByName(nm.bridgeName)
 	if err != nil {
-		netlink.LinkDel(bridge)
+		if delErr := netlink.LinkDel(bridge); delErr != nil {
+			log.Printf("Warning: failed to delete bridge %s: %v", nm.bridgeName, delErr)
+		}
 		return fmt.Errorf("failed to find created bridge: %w", err)
 	}
 
 	if err := netlink.AddrAdd(bridgeLink, addr); err != nil {
-		netlink.LinkDel(bridge)
+		if delErr := netlink.LinkDel(bridge); delErr != nil {
+			log.Printf("Warning: failed to delete bridge %s: %v", nm.bridgeName, delErr)
+		}
 		return fmt.Errorf("failed to assign address to bridge: %w", err)
 	}
 
 	// Bring up bridge
 	if err := netlink.LinkSetUp(bridgeLink); err != nil {
-		netlink.LinkDel(bridge)
+		if delErr := netlink.LinkDel(bridge); delErr != nil {
+			log.Printf("Warning: failed to delete bridge %s: %v", nm.bridgeName, delErr)
+		}
 		return fmt.Errorf("failed to bring up bridge: %w", err)
 	}
 
