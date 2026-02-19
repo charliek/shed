@@ -91,16 +91,19 @@ nav:
   - Getting Started:
       - Quick Start: getting-started/quick-start.md
       - Server Setup: getting-started/server-setup.md
+      - Firecracker Setup: firecracker_install.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
       - Tunnels: reference/tunnels.md
       - File Sync: reference/sync.md
       - Provisioning: reference/provisioning.md
+      - Firecracker Operations: firecracker_howto.md
       - HTTP API: reference/api.md
   - Development:
       - Setup: development/setup.md
       - Architecture: development/architecture.md
+  - Roadmap: ROADMAP.md
 
 extra:
   social:

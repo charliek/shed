@@ -302,6 +302,15 @@ func (c *VsockClient) dialWithContext(ctx context.Context, port uint32) (net.Con
 		return r.conn, r.err
 	case <-ctx.Done():
 		close(done)
+		// Drain the result channel in case the goroutine already sent a
+		// connection before seeing done. Without this the connection leaks.
+		select {
+		case r := <-result:
+			if r.conn != nil {
+				_ = r.conn.Close()
+			}
+		default:
+		}
 		return nil, ctx.Err()
 	}
 }

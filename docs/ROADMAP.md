@@ -2,6 +2,28 @@
 
 This document outlines planned future enhancements for Shed.
 
+## Firecracker Hardening (Deferred)
+
+Follow-up improvements to consider after the initial Firecracker backend merges.
+
+- Disable root SSH login by default in the Firecracker rootfs and switch to a non-root user workflow.
+- Improve `ipToUint32` handling in `internal/firecracker/network.go` (explicit errors for invalid IPv4).
+- Add deeper graceful shutdown handling for `shed-agent` connection goroutines (beyond basic timeout-driven exit).
+- Evaluate shell-operator behavior for Docker/Firecracker exec and document quoting expectations.
+- Consider stricter validation defaults for Firecracker configs (additional guardrails beyond `vsock_base_cid`).
+- Atomic metadata save: write metadata to a temp file then rename to prevent orphaned resources on partial failure.
+- Replace string-matching error detection with typed sentinel errors (e.g., `ErrShedNotFound`) across firecracker and router packages.
+- Add metadata JSON version field for forward/backward compatibility of the metadata format.
+- Add comprehensive test coverage for `shellEscape()` in `backend.go`.
+- Consider reducing `MaxMessageSize` (16MB) or adding streaming for large messages in agentproto.
+- Document integration test strategy (requires KVM, can't be automated in CI without nested virtualization).
+- Revisit Firecracker kernel source strategy:
+  - Compare Ignite (current), Firecracker-CI kernel, and custom build options for Docker compatibility (overlayfs, cgroups, iptables, etc.).
+  - Verify current Docker use cases against Firecracker-CI kernel and document any missing configs.
+  - Decide on default kernel source and provide an explicit fallback path (e.g., config/flag to select kernel).
+  - Define an update cadence and security review notes for kernel artifacts.
+  - If switching defaults, update docs and add a brief migration note.
+
 ## Firecracker Live Mounts (SSHFS over vsock)
 
 ### Use Case
@@ -78,3 +100,7 @@ Support for distributed development environments:
 - Shared networking
 - Service discovery
 - Orchestration integration
+
+## General Quality
+
+- Revisit docstring coverage thresholds and expand public API documentation if needed.

@@ -93,10 +93,19 @@ func (vm *VM) Start(ctx context.Context) error {
 		},
 	}
 
-	// Create the machine
-	// Use background context for VM lifecycle - the VM should persist
-	// beyond the HTTP request that created it
+	// Use background context for the VM lifecycle so it persists beyond
+	// the HTTP request that created it. NewMachine and machine.Start both
+	// store this context for ongoing Firecracker API communication, so a
+	// request-scoped context would incorrectly cancel the VM when the
+	// request completes. Caller-supplied cancellation is still respected
+	// via the health-check below which uses ctx with StartTimeout.
 	vmCtx := context.Background()
+
+	// Bail out early if the caller already cancelled before we do the
+	// (relatively expensive) machine creation.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	logger := logrus.New()
 	logger.SetOutput(os.Stderr)

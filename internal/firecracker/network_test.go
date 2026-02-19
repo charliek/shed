@@ -249,7 +249,10 @@ func TestFindAvailableTAPIndex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := nm.FindAvailableTAPIndex(tt.usedIndices)
+			got, err := nm.FindAvailableTAPIndex(tt.usedIndices)
+			if err != nil {
+				t.Fatalf("FindAvailableTAPIndex() unexpected error = %v", err)
+			}
 			if got != tt.want {
 				t.Errorf("FindAvailableTAPIndex() = %v, want %v", got, tt.want)
 			}

@@ -132,7 +132,10 @@ func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err 
 	}
 
 	// Find available index
-	index := c.netMgr.FindAvailableTAPIndex(usedIndices)
+	index, err := c.netMgr.FindAvailableTAPIndex(usedIndices)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to find available TAP index: %w", err)
+	}
 	tapDevice = c.netMgr.TAPDeviceName(index)
 	ipAddress, err = c.netMgr.AllocateIP(index)
 	if err != nil {

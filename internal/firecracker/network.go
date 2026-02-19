@@ -237,11 +237,16 @@ func (nm *NetworkManager) SetupNAT() error {
 	return nil
 }
 
+// maxTAPIndex is the upper bound on TAP device indices to prevent unbounded iteration.
+const maxTAPIndex = 1024
+
 // FindAvailableTAPIndex finds the next available TAP device index.
-func (nm *NetworkManager) FindAvailableTAPIndex(usedIndices map[int]bool) int {
-	for i := 0; ; i++ {
+// Returns an error if no index is available below maxTAPIndex.
+func (nm *NetworkManager) FindAvailableTAPIndex(usedIndices map[int]bool) (int, error) {
+	for i := 0; i < maxTAPIndex; i++ {
 		if !usedIndices[i] && !nm.TAPExists(nm.TAPDeviceName(i)) {
-			return i
+			return i, nil
 		}
 	}
+	return 0, fmt.Errorf("no available TAP index found (checked %d indices)", maxTAPIndex)
 }
