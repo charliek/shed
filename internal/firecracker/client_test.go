@@ -48,7 +48,7 @@ func TestAllocateCID(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client.usedCIDs = tt.usedCIDs
-			got, err := client.AllocateCID()
+			got, err := client.AllocateCID("test")
 			if err != nil {
 				t.Fatalf("AllocateCID() error = %v", err)
 			}
@@ -72,27 +72,25 @@ func TestAllocateCID_Exhaustion(t *testing.T) {
 	}
 
 	// Allocate the second-to-last CID
-	cid1, err := client.AllocateCID()
+	cid1, err := client.AllocateCID("first")
 	if err != nil {
 		t.Fatalf("First AllocateCID() error = %v", err)
 	}
 	if cid1 != MaxVsockCID-1 {
 		t.Errorf("First CID = %v, want %v", cid1, MaxVsockCID-1)
 	}
-	client.usedCIDs[cid1] = "vm-1"
 
 	// Allocate the last CID
-	cid2, err := client.AllocateCID()
+	cid2, err := client.AllocateCID("second")
 	if err != nil {
 		t.Fatalf("Second AllocateCID() error = %v", err)
 	}
 	if cid2 != MaxVsockCID {
 		t.Errorf("Second CID = %v, want %v", cid2, MaxVsockCID)
 	}
-	client.usedCIDs[cid2] = "vm-2"
 
 	// Try to allocate when all CIDs are exhausted
-	_, err = client.AllocateCID()
+	_, err = client.AllocateCID("third")
 	if err == nil {
 		t.Error("Expected error when CIDs exhausted, got nil")
 	}

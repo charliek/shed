@@ -9,11 +9,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 // ErrInstanceNotFound is returned when a requested instance does not exist.
 var ErrInstanceNotFound = errors.New("instance not found")
+
+// ErrInvalidInstanceName is returned when a requested instance name is unsafe.
+var ErrInvalidInstanceName = errors.New("invalid instance name")
 
 // Metadata represents the persistent state of a VM instance.
 type Metadata struct {
@@ -68,6 +72,10 @@ func InstanceDir(baseDir, name string) string {
 
 // LoadMetadata loads metadata from the instance directory.
 func LoadMetadata(instanceDir, name string) (*Metadata, error) {
+	if err := validateInstanceName(name); err != nil {
+		return nil, err
+	}
+
 	path := MetadataPath(instanceDir, name)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -87,6 +95,10 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 
 // Save writes the metadata to the instance directory.
 func (m *Metadata) Save(instanceDir string) error {
+	if err := validateInstanceName(m.Name); err != nil {
+		return err
+	}
+
 	dir := InstanceDir(instanceDir, m.Name)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create instance directory: %w", err)
@@ -107,9 +119,29 @@ func (m *Metadata) Save(instanceDir string) error {
 
 // Delete removes the instance directory and all its contents.
 func (m *Metadata) Delete(instanceDir string) error {
+	if err := validateInstanceName(m.Name); err != nil {
+		return err
+	}
+
 	dir := InstanceDir(instanceDir, m.Name)
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("failed to remove instance directory: %w", err)
+	}
+	return nil
+}
+
+func validateInstanceName(name string) error {
+	if name == "" {
+		return ErrInvalidInstanceName
+	}
+	if filepath.IsAbs(name) {
+		return ErrInvalidInstanceName
+	}
+	if strings.Contains(name, "..") {
+		return ErrInvalidInstanceName
+	}
+	if strings.ContainsRune(name, filepath.Separator) {
+		return ErrInvalidInstanceName
 	}
 	return nil
 }

@@ -51,20 +51,35 @@ type ExitCodeMessage struct {
 // WriteMessage writes a framed message.
 // Format: [type:1 byte][length:4 bytes big-endian][payload:length bytes]
 func WriteMessage(w io.Writer, msgType byte, payload []byte) error {
+	if len(payload) > MaxMessageSize {
+		return fmt.Errorf("WriteMessage: payload size %d exceeds maximum %d", len(payload), MaxMessageSize)
+	}
+
 	header := make([]byte, 5)
 	header[0] = msgType
 	binary.BigEndian.PutUint32(header[1:5], uint32(len(payload)))
 
-	if _, err := w.Write(header); err != nil {
+	if err := writeAll(w, header); err != nil {
 		return err
 	}
 
 	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
+		if err := writeAll(w, payload); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+	}
 	return nil
 }
 

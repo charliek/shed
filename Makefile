@@ -1,5 +1,7 @@
 .PHONY: build build-cli build-server build-agent test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all docs docs-serve firecracker-rootfs download-firecracker
 
+GOARCH ?= $(shell go env GOARCH)
+
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -18,7 +20,7 @@ build-server:
 
 # Build shed-agent only (for Firecracker VMs)
 build-agent:
-	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o bin/shed-agent ./cmd/shed-agent
+	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-agent ./cmd/shed-agent
 
 # Run all unit tests
 test:

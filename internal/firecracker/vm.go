@@ -199,23 +199,27 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 		return nil // Process already dead
 	}
 
-	// Wait for process to exit
-	done := make(chan error, 1)
-	go func() {
-		_, err := process.Wait()
-		done <- err
-	}()
+	timeout := vm.cfg.StopTimeout.Duration()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
 
-	select {
-	case <-done:
-		return nil
-	case <-time.After(vm.cfg.StopTimeout.Duration()):
-		// Force kill
-		_ = process.Signal(syscall.SIGKILL)
-		return nil
-	case <-ctx.Done():
-		_ = process.Signal(syscall.SIGKILL)
-		return ctx.Err()
+	for {
+		if err := process.Signal(syscall.Signal(0)); err != nil {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			_ = process.Signal(syscall.SIGKILL)
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			_ = process.Signal(syscall.SIGKILL)
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

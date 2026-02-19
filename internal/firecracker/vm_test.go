@@ -95,7 +95,7 @@ func TestIsRunning_InvalidPID(t *testing.T) {
 func TestIsRunning_NonexistentPID(t *testing.T) {
 	// Use a very high PID that's unlikely to exist
 	// Note: This test may be flaky on systems with very high PIDs
-	highPID := 4000000000 // Very high, unlikely to exist
+	highPID := 2000000000 // Very high, unlikely to exist (fits 32-bit int)
 
 	dir := mustTempDir(t, "vm-test")
 	cfg := testFirecrackerConfig(dir)

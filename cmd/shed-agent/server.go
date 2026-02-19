@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/mdlayher/vsock"
 )
@@ -74,7 +75,8 @@ func (s *Server) Start() error {
 					return
 				default:
 					log.Printf("Console accept error: %v", err)
-					return
+					time.Sleep(200 * time.Millisecond)
+					continue
 				}
 			}
 			s.wg.Add(1)
@@ -98,7 +100,8 @@ func (s *Server) Start() error {
 					return
 				default:
 					log.Printf("Health accept error: %v", err)
-					return
+					time.Sleep(200 * time.Millisecond)
+					continue
 				}
 			}
 			s.wg.Add(1)

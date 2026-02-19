@@ -217,12 +217,16 @@ func (c *VsockClient) dialWithContext(ctx context.Context, port uint32) (net.Con
 		err  error
 	}
 	result := make(chan dialResult, 1)
+	done := make(chan struct{})
 
 	go func() {
 		// Connect to Firecracker's vsock UDS
 		conn, err := net.Dial("unix", c.socketPath)
 		if err != nil {
-			result <- dialResult{nil, fmt.Errorf("failed to connect to vsock socket: %w", err)}
+			select {
+			case result <- dialResult{nil, fmt.Errorf("failed to connect to vsock socket: %w", err)}:
+			case <-done:
+			}
 			return
 		}
 
@@ -230,7 +234,10 @@ func (c *VsockClient) dialWithContext(ctx context.Context, port uint32) (net.Con
 		connectCmd := fmt.Sprintf("CONNECT %d\n", port)
 		if _, err := conn.Write([]byte(connectCmd)); err != nil {
 			conn.Close()
-			result <- dialResult{nil, fmt.Errorf("failed to send CONNECT command: %w", err)}
+			select {
+			case result <- dialResult{nil, fmt.Errorf("failed to send CONNECT command: %w", err)}:
+			case <-done:
+			}
 			return
 		}
 
@@ -239,25 +246,37 @@ func (c *VsockClient) dialWithContext(ctx context.Context, port uint32) (net.Con
 		response, err := reader.ReadString('\n')
 		if err != nil {
 			conn.Close()
-			result <- dialResult{nil, fmt.Errorf("failed to read CONNECT response: %w", err)}
+			select {
+			case result <- dialResult{nil, fmt.Errorf("failed to read CONNECT response: %w", err)}:
+			case <-done:
+			}
 			return
 		}
 
 		response = strings.TrimSpace(response)
 		if !strings.HasPrefix(response, "OK ") {
 			conn.Close()
-			result <- dialResult{nil, fmt.Errorf("vsock CONNECT failed: %s", response)}
+			select {
+			case result <- dialResult{nil, fmt.Errorf("vsock CONNECT failed: %s", response)}:
+			case <-done:
+			}
 			return
 		}
 
 		// Return a connection that wraps the buffered reader
-		result <- dialResult{&vsockConn{Conn: conn, reader: reader}, nil}
+		wrapped := &vsockConn{Conn: conn, reader: reader}
+		select {
+		case result <- dialResult{wrapped, nil}:
+		case <-done:
+			_ = conn.Close()
+		}
 	}()
 
 	select {
 	case r := <-result:
 		return r.conn, r.err
 	case <-ctx.Done():
+		close(done)
 		return nil, ctx.Err()
 	}
 }

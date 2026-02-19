@@ -199,6 +199,12 @@ func TestMaxMessageSizeEnforced(t *testing.T) {
 	if err != io.EOF && err != io.ErrUnexpectedEOF {
 		t.Errorf("expected EOF error, got: %v", err)
 	}
+
+	// Verify WriteMessage enforces size
+	tooLarge := make([]byte, MaxMessageSize+1)
+	if err := WriteMessage(&buf, MsgTypeData, tooLarge); err == nil {
+		t.Error("expected error for WriteMessage exceeding MaxMessageSize")
+	}
 }
 
 func TestMessageTypes(t *testing.T) {

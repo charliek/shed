@@ -18,8 +18,16 @@ if [ -z "$IP_ADDR" ]; then
     # CID 100 -> 172.30.0.2, CID 101 -> 172.30.0.3, etc.
     CID=$(cat /sys/class/vsock/cid 2>/dev/null || echo "")
     if [ -n "$CID" ]; then
-        LAST_OCTET=$((CID - 100 + 2))
-        IP_ADDR="172.30.0.${LAST_OCTET}"
+        if [[ "$CID" =~ ^[0-9]+$ ]]; then
+            LAST_OCTET=$((CID - 100 + 2))
+            if [ "$LAST_OCTET" -ge 2 ] && [ "$LAST_OCTET" -le 254 ]; then
+                IP_ADDR="172.30.0.${LAST_OCTET}"
+            else
+                echo "Derived IP octet out of range from CID ${CID}: ${LAST_OCTET}"
+            fi
+        else
+            echo "Invalid CID value: $CID"
+        fi
     fi
 fi
 

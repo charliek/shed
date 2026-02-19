@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -93,16 +94,26 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	}
 
 	// Channel to signal when command exits
-	done := make(chan error, 1)
+	exitCh := make(chan error, 1)
 
 	// WaitGroup to ensure output is flushed before sending exit code
 	var outputWg sync.WaitGroup
 
+	stopCh := make(chan struct{})
+
 	// Handle resize messages in background
 	go func() {
 		for {
-			msgType, data, err := readMessage(conn)
+			msgType, data, err := readMessageWithTimeout(conn, 500*time.Millisecond)
 			if err != nil {
+				if isTimeout(err) {
+					select {
+					case <-stopCh:
+						return
+					default:
+						continue
+					}
+				}
 				return
 			}
 
@@ -161,10 +172,10 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 
 	// Wait for command to exit
 	go func() {
-		done <- cmd.Wait()
+		exitCh <- cmd.Wait()
 	}()
 
-	err = <-done
+	err = <-exitCh
 	exitCode := 0
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
@@ -177,6 +188,7 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	// Wait for output to be flushed before sending exit code
 	outputWg.Wait()
 
+	close(stopCh)
 	_ = writeExitCode(conn, exitCode)
 	log.Printf("Command exited with code %d", exitCode)
 }
@@ -215,12 +227,22 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 	// WaitGroup to ensure output is flushed before sending exit code
 	var outputWg sync.WaitGroup
 
+	done := make(chan struct{})
+
 	// Copy stdin from connection messages
 	go func() {
 		defer stdin.Close()
 		for {
-			msgType, data, err := readMessage(conn)
+			msgType, data, err := readMessageWithTimeout(conn, 500*time.Millisecond)
 			if err != nil {
+				if isTimeout(err) {
+					select {
+					case <-done:
+						return
+					default:
+						continue
+					}
+				}
 				return
 			}
 			if msgType == MsgTypeSignal {
@@ -292,6 +314,24 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 	// Wait for output to be flushed before sending exit code
 	outputWg.Wait()
 
+	close(done)
 	_ = writeExitCode(conn, exitCode)
 	log.Printf("Command exited with code %d", exitCode)
+}
+
+func readMessageWithTimeout(conn net.Conn, timeout time.Duration) (byte, []byte, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return 0, nil, err
+	}
+	return readMessage(conn)
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	return false
 }

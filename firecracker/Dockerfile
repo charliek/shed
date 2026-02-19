@@ -49,10 +49,10 @@ RUN rm -f /lib/systemd/system/multi-user.target.wants/* \
 COPY daemon.json /etc/docker/daemon.json
 
 # Enable Docker service
-RUN systemctl enable docker
+RUN SYSTEMD_OFFLINE=1 systemctl enable docker
 
 # Enable SSH service
-RUN systemctl enable ssh
+RUN SYSTEMD_OFFLINE=1 systemctl enable ssh
 
 # Configure SSH
 RUN mkdir -p /run/sshd && \
@@ -72,7 +72,7 @@ RUN chmod +x /usr/local/bin/shed-agent
 
 # Copy shed-agent systemd service
 COPY shed-agent.service /etc/systemd/system/shed-agent.service
-RUN systemctl enable shed-agent
+RUN SYSTEMD_OFFLINE=1 systemctl enable shed-agent
 
 # Copy network setup script
 COPY network-setup.sh /usr/local/bin/network-setup.sh
@@ -80,7 +80,7 @@ RUN chmod +x /usr/local/bin/network-setup.sh
 
 # Copy network setup systemd service
 COPY network-setup.service /etc/systemd/system/network-setup.service
-RUN systemctl enable network-setup
+RUN SYSTEMD_OFFLINE=1 systemctl enable network-setup
 
 # Set default working directory
 WORKDIR /workspace

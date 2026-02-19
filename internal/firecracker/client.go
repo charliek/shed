@@ -91,15 +91,16 @@ func (c *Client) Config() *config.FirecrackerConfig {
 // reasonable upper bound to prevent resource exhaustion.
 const MaxVsockCID uint32 = 65535
 
-// AllocateCID allocates a new CID for a VM.
+// AllocateCID allocates and reserves a new CID for a VM.
 // Returns an error if all CIDs in the range [VsockBaseCID, MaxVsockCID] are exhausted.
-func (c *Client) AllocateCID() (uint32, error) {
+func (c *Client) AllocateCID(name string) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	cid := c.cfg.VsockBaseCID
 	for cid <= MaxVsockCID {
 		if _, used := c.usedCIDs[cid]; !used {
+			c.usedCIDs[cid] = name
 			return cid, nil
 		}
 		cid++
@@ -140,6 +141,22 @@ func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err 
 	return tapDevice, ipAddress, nil
 }
 
+// ReleaseCID releases a reserved CID.
+func (c *Client) ReleaseCID(cid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.usedCIDs, cid)
+}
+
+// ReleaseIP releases a reserved IP address.
+func (c *Client) ReleaseIP(ip string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.usedIPs, ip)
+}
+
 // RegisterInstance registers a CID and IP as used by an instance.
 // This is idempotent - safe to call if already registered (e.g., IP was pre-registered by AllocateNetwork).
 func (c *Client) RegisterInstance(name string, cid uint32, ip string) {
@@ -172,17 +189,20 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	// Allocate resources
-	cid, err := c.AllocateCID()
+	cid, err := c.AllocateCID(req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate CID: %w", err)
 	}
 	tapDevice, ipAddress, err := c.AllocateNetwork(req.Name)
 	if err != nil {
+		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to allocate network: %w", err)
 	}
 
 	// Create TAP device
 	if err := c.netMgr.CreateTAPDevice(tapDevice); err != nil {
+		c.ReleaseIP(ipAddress)
+		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to create TAP device: %w", err)
 	}
 
@@ -192,6 +212,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
 		}
+		c.ReleaseIP(ipAddress)
+		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
@@ -228,6 +250,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if rmErr := DeleteRootfs(c.cfg.InstanceDir, req.Name); rmErr != nil {
 			log.Printf("Warning: failed to delete rootfs for %s: %v", req.Name, rmErr)
 		}
+		c.ReleaseIP(ipAddress)
+		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 

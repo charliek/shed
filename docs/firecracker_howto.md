@@ -233,7 +233,7 @@ shed exec myproject -- curl -I https://google.com
 
 Each VM has a copy of the base rootfs:
 
-```
+```text
 /var/lib/shed/firecracker/instances/myproject/
 ├── metadata.json    # VM configuration and state
 └── rootfs.ext4      # VM's root filesystem (copy of base)

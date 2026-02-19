@@ -40,25 +40,49 @@ FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${F
 echo "URL: $FC_URL"
 
 TMP_DIR=$(mktemp -d)
-curl -L "$FC_URL" | tar -xz -C "$TMP_DIR"
+curl -fL "$FC_URL" | tar -xz -C "$TMP_DIR"
+
+# Download checksums
+CHECKSUM_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/checksums.txt"
+curl -fL -o "$TMP_DIR/checksums.txt" "$CHECKSUM_URL"
 
 # Find and copy binaries
 FC_BIN=$(find "$TMP_DIR" -name "firecracker-*" -type f | head -1)
 JAILER_BIN=$(find "$TMP_DIR" -name "jailer-*" -type f | head -1)
 
 if [ -n "$FC_BIN" ]; then
+    FC_BASENAME=$(basename "$FC_BIN")
+    EXPECTED_SUM=$(grep " ${FC_BASENAME}$" "$TMP_DIR/checksums.txt" | awk '{print $1}')
+    if [ -z "$EXPECTED_SUM" ]; then
+        echo "ERROR: missing checksum for $FC_BASENAME"
+        exit 1
+    fi
+    ACTUAL_SUM=$(sha256sum "$FC_BIN" | awk '{print $1}')
+    if [ "$EXPECTED_SUM" != "$ACTUAL_SUM" ]; then
+        echo "ERROR: checksum mismatch for $FC_BASENAME"
+        exit 1
+    fi
     sudo cp "$FC_BIN" /usr/local/bin/firecracker
     sudo chmod +x /usr/local/bin/firecracker
     echo "Installed firecracker to /usr/local/bin/firecracker"
 fi
 
 if [ -n "$JAILER_BIN" ]; then
+    JAILER_BASENAME=$(basename "$JAILER_BIN")
+    EXPECTED_SUM=$(grep " ${JAILER_BASENAME}$" "$TMP_DIR/checksums.txt" | awk '{print $1}')
+    if [ -z "$EXPECTED_SUM" ]; then
+        echo "ERROR: missing checksum for $JAILER_BASENAME"
+        exit 1
+    fi
+    ACTUAL_SUM=$(sha256sum "$JAILER_BIN" | awk '{print $1}')
+    if [ "$EXPECTED_SUM" != "$ACTUAL_SUM" ]; then
+        echo "ERROR: checksum mismatch for $JAILER_BASENAME"
+        exit 1
+    fi
     sudo cp "$JAILER_BIN" /usr/local/bin/jailer
     sudo chmod +x /usr/local/bin/jailer
     echo "Installed jailer to /usr/local/bin/jailer"
 fi
-
-rm -rf "$TMP_DIR"
 
 # Download kernel
 echo ""
@@ -88,9 +112,22 @@ echo "=== Downloading minimal kernel (fallback) ==="
 KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/ci-artifacts/kernels/${FC_ARCH}/vmlinux-5.10.217.bin"
 echo "URL: $KERNEL_URL"
 
-sudo curl -L -o "$OUTPUT_DIR/vmlinux-minimal.bin" "$KERNEL_URL"
+sudo curl -fL -o "$OUTPUT_DIR/vmlinux-minimal.bin" "$KERNEL_URL"
+KERNEL_SHA_URL="${KERNEL_URL}.sha256"
+if curl -fL -o "$TMP_DIR/vmlinux-minimal.bin.sha256" "$KERNEL_SHA_URL"; then
+    EXPECTED_KERNEL_SUM=$(awk '{print $1}' "$TMP_DIR/vmlinux-minimal.bin.sha256")
+    ACTUAL_KERNEL_SUM=$(sha256sum "$OUTPUT_DIR/vmlinux-minimal.bin" | awk '{print $1}')
+    if [ "$EXPECTED_KERNEL_SUM" != "$ACTUAL_KERNEL_SUM" ]; then
+        echo "ERROR: checksum mismatch for vmlinux-minimal.bin"
+        exit 1
+    fi
+else
+    echo "WARNING: no checksum available for vmlinux-minimal.bin"
+fi
 echo "Downloaded minimal kernel to $OUTPUT_DIR/vmlinux-minimal.bin"
 echo "(Use this if you don't need Docker container support)"
+
+rm -rf "$TMP_DIR"
 
 # Verify installation
 echo ""

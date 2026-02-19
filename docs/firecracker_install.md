@@ -224,7 +224,7 @@ shed create myproject --backend=firecracker --cpus=4 --memory=8192
 
 ### KVM Permission Denied
 
-```
+```text
 failed to create firecracker machine: permission denied
 ```
 
@@ -236,7 +236,7 @@ sudo usermod -aG kvm $USER
 
 ### Bridge Not Found
 
-```
+```text
 failed to find bridge shed-br0
 ```
 
@@ -244,13 +244,13 @@ Solution: Create the bridge network (see step 4).
 
 ### TAP Device Creation Failed
 
-```
+```text
 failed to create TAP device: operation not permitted
 ```
 
 or
 
-```
+```text
 Could not create the network device: Open tap device failed: ... Resource busy
 ```
 
@@ -270,7 +270,7 @@ sudo ip link delete shed-tap-0  # or whichever TAP is stale
 
 ### Vsock Address In Use
 
-```
+```text
 Cannot create backend for vsock device: UnixBind(Os { code: 98, kind: AddrInUse, message: "Address in use" })
 ```
 
@@ -281,7 +281,7 @@ sudo rm -f /var/run/shed/firecracker/*.vsock
 
 ### VM Timeout During Start
 
-```
+```text
 agent health check failed: context deadline exceeded
 ```
 
@@ -328,7 +328,7 @@ If you see cgroup errors, ensure the kernel args include `cgroup_enable=memory c
 
 If you see errors like `bpf_prog_query(BPF_CGROUP_DEVICE) failed`:
 
-```
+```text
 runc create failed: unable to start container process: error during container init:
 error setting cgroup config for procHooks process: bpf_prog_query(BPF_CGROUP_DEVICE)
 failed: invalid argument
@@ -348,7 +348,7 @@ firecracker:
 
 ## Network Architecture
 
-```
+```text
                     ┌─────────────┐
                     │   Host      │
                     │  eth0/wlan  │

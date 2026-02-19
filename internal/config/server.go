@@ -374,6 +374,10 @@ func (c *FirecrackerConfig) Validate() error {
 		return fmt.Errorf("console_port and health_port must be different")
 	}
 
+	if c.VsockBaseCID < 3 {
+		return fmt.Errorf("vsock_base_cid must be at least 3 (0-2 are reserved)")
+	}
+
 	// Validate network configuration
 	if c.BridgeName == "" {
 		return fmt.Errorf("bridge_name is required")
