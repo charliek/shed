@@ -9,6 +9,7 @@ This file tracks follow-up ideas and improvements to consider after the current 
 - Add deeper graceful shutdown handling for `shed-agent` connection goroutines (beyond basic timeout-driven exit).
 - Evaluate shell-operator behavior for Docker/Firecracker exec and document quoting expectations.
 - Consider stricter validation defaults for Firecracker configs (additional guardrails beyond `vsock_base_cid`).
+- Revisit Firecracker kernel source strategy (Ignite vs Firecracker-CI/custom build) to preserve Docker support while improving maintainability.
 
 ## General Quality
 

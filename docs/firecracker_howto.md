@@ -89,6 +89,8 @@ cat ~/.shed/env
 GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519
 ```
 
+Warning: The `GIT_SSH_COMMAND` above disables host key checking with `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null`, which is insecure and intended only for CI or ephemeral environments; prefer pre-populating `known_hosts` with `ssh-keyscan` or using a dedicated deploy key.
+
 ## Provisioning
 
 Shed supports automatic provisioning via `.shed/provision.yaml` in your repository. This works the same as Docker but uses vsock for execution.
@@ -319,7 +321,7 @@ for tap in $(ip link show | grep -o 'shed-tap-[0-9]*'); do
 done
 
 # Remove sockets
-rm -f /var/run/shed/firecracker/*.sock
+sudo rm -f /var/run/shed/firecracker/*.sock
 ```
 
 ## Docker Inside VMs
@@ -426,7 +428,7 @@ ls -la /var/run/shed/firecracker/myproject.vsock
 sudo apt install socat
 
 # Connect to the UDS and send CONNECT to a port (e.g., health port 1025)
-echo -e "CONNECT 1025\n" | socat - UNIX-CONNECT:/var/run/shed/firecracker/myproject.vsock
+printf "CONNECT 1025\n" | socat - UNIX-CONNECT:/var/run/shed/firecracker/myproject.vsock
 
 # A successful connection returns "OK 1025"
 ```

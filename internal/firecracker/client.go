@@ -133,7 +133,10 @@ func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err 
 	// Find available index
 	index := c.netMgr.FindAvailableTAPIndex(usedIndices)
 	tapDevice = c.netMgr.TAPDeviceName(index)
-	ipAddress = c.netMgr.AllocateIP(index)
+	ipAddress, err = c.netMgr.AllocateIP(index)
+	if err != nil {
+		return "", "", err
+	}
 
 	// Mark IP as used immediately to prevent race conditions with parallel allocations
 	c.usedIPs[ipAddress] = name

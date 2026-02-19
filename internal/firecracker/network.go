@@ -45,7 +45,7 @@ func (nm *NetworkManager) TAPDeviceName(index int) string {
 
 // AllocateIP returns the IP address for an instance index.
 // Index 0 is reserved for the gateway, so instances start at index 1.
-func (nm *NetworkManager) AllocateIP(index int) string {
+func (nm *NetworkManager) AllocateIP(index int) (string, error) {
 	// Start from gateway IP and add the index + 1
 	// e.g., gateway is 172.30.0.1, index 0 gets 172.30.0.2
 	ip := make(net.IP, len(nm.gateway))
@@ -54,8 +54,12 @@ func (nm *NetworkManager) AllocateIP(index int) string {
 	// Convert IP to uint32 for proper arithmetic across octets
 	ipInt := ipToUint32(ip)
 	ipInt += uint32(index + 1)
+	allocated := uint32ToIP(ipInt)
+	if nm.network != nil && !nm.network.Contains(allocated) {
+		return "", fmt.Errorf("allocated IP %s is outside of subnet %s", allocated.String(), nm.network.String())
+	}
 
-	return uint32ToIP(ipInt).String()
+	return allocated.String(), nil
 }
 
 // ipToUint32 converts an IPv4 address to a uint32.

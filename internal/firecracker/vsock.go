@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/agentproto"
@@ -23,6 +24,17 @@ type VsockClient struct {
 	socketPath  string
 	consolePort uint32
 	healthPort  uint32
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (lw *lockedWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.w.Write(p)
 }
 
 // NewVsockClient creates a new VsockClient.
@@ -112,7 +124,14 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 		return fmt.Errorf("failed to marshal exec request: %w", err)
 	}
 
-	if err := agentproto.WriteMessage(conn, agentproto.MsgTypeExecRequest, reqData); err != nil {
+	writeMu := &sync.Mutex{}
+	writeMessage := func(msgType byte, payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return agentproto.WriteMessage(conn, msgType, payload)
+	}
+
+	if err := writeMessage(agentproto.MsgTypeExecRequest, reqData); err != nil {
 		return fmt.Errorf("failed to send exec request: %w", err)
 	}
 
@@ -129,7 +148,7 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 					// Log but continue - resize failures are non-fatal
 					continue
 				}
-				if err := agentproto.WriteMessage(conn, agentproto.MsgTypeResize, data); err != nil {
+				if err := writeMessage(agentproto.MsgTypeResize, data); err != nil {
 					// Log but continue - resize failures are non-fatal, connection may be closing
 					continue
 				}
@@ -143,16 +162,22 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	// Copy stdin to connection
 	if opts.Stdin != nil {
 		go func() {
-			if _, err := io.Copy(conn, opts.Stdin); err != nil {
+			lockedWriter := &lockedWriter{
+				mu: writeMu,
+				w:  conn,
+			}
+			if _, err := io.Copy(lockedWriter, opts.Stdin); err != nil {
 				// Log stdin errors but don't fail - often expected on disconnect
 				if !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "EOF") {
 					log.Printf("Warning: stdin copy failed: %v", err)
 				}
 			}
 			// Signal EOF by closing write side if possible
+			writeMu.Lock()
 			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 				_ = cw.CloseWrite()
 			}
+			writeMu.Unlock()
 		}()
 	}
 

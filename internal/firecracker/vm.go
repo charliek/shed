@@ -5,6 +5,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -156,19 +157,30 @@ func (vm *VM) Stop(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, vm.cfg.StopTimeout.Duration())
 	defer cancel()
 
-	if err := vm.machine.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Graceful shutdown failed: %v, forcing stop", err)
+	shutdownErr := vm.machine.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		log.Printf("Graceful shutdown failed: %v, forcing stop", shutdownErr)
 	}
 
 	// Wait for the machine to stop
-	if err := vm.machine.Wait(shutdownCtx); err != nil {
+	waitErr := vm.machine.Wait(shutdownCtx)
+	if waitErr != nil {
 		// Force kill if graceful shutdown fails
 		if vm.meta.PID > 0 {
 			_ = syscall.Kill(vm.meta.PID, syscall.SIGKILL)
 		}
 	}
 
-	return nil
+	switch {
+	case shutdownErr != nil && waitErr != nil:
+		return fmt.Errorf("graceful shutdown failed: %w; wait failed: %v", shutdownErr, waitErr)
+	case shutdownErr != nil:
+		return shutdownErr
+	case waitErr != nil:
+		return waitErr
+	default:
+		return nil
+	}
 }
 
 // cleanupSockets removes the API and vsock socket files for this VM.
@@ -196,7 +208,10 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 
 	// Try SIGTERM first
 	if err := process.Signal(syscall.SIGTERM); err != nil {
-		return nil // Process already dead
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return fmt.Errorf("failed to signal VM: %w", err)
 	}
 
 	timeout := vm.cfg.StopTimeout.Duration()
@@ -206,17 +221,27 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 
 	for {
 		if err := process.Signal(syscall.Signal(0)); err != nil {
-			return nil
+			if errors.Is(err, syscall.ESRCH) {
+				return nil
+			}
+			if errors.Is(err, syscall.EPERM) {
+				continue
+			}
+			return fmt.Errorf("failed to check VM process: %w", err)
 		}
 
 		if time.Now().After(deadline) {
-			_ = process.Signal(syscall.SIGKILL)
+			if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("failed to kill VM after timeout: %w", err)
+			}
 			return nil
 		}
 
 		select {
 		case <-ctx.Done():
-			_ = process.Signal(syscall.SIGKILL)
+			if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("context canceled, failed to kill VM: %w", err)
+			}
 			return ctx.Err()
 		case <-ticker.C:
 		}

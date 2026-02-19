@@ -63,6 +63,7 @@ func TestAllocateIP(t *testing.T) {
 		name  string
 		index int
 		want  string
+		err   bool
 	}{
 		{
 			name:  "first IP",
@@ -92,13 +93,22 @@ func TestAllocateIP(t *testing.T) {
 		{
 			name:  "just past boundary",
 			index: 254,
-			want:  "172.30.1.0",
+			err:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := nm.AllocateIP(tt.index)
+			got, err := nm.AllocateIP(tt.index)
+			if tt.err {
+				if err == nil {
+					t.Fatalf("AllocateIP(%d) expected error, got nil", tt.index)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AllocateIP(%d) unexpected error: %v", tt.index, err)
+			}
 			if got != tt.want {
 				t.Errorf("AllocateIP(%d) = %v, want %v", tt.index, got, tt.want)
 			}

@@ -55,9 +55,11 @@ RUN SYSTEMD_OFFLINE=1 systemctl enable docker
 RUN SYSTEMD_OFFLINE=1 systemctl enable ssh
 
 # Configure SSH
-RUN mkdir -p /run/sshd && \
-    echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
-    echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
+RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d && \
+    printf "%s\n" \
+    "PermitRootLogin no" \
+    "PasswordAuthentication no" \
+    > /etc/ssh/sshd_config.d/10-shed.conf
 
 # Create workspace directory
 RUN mkdir -p /workspace && chmod 755 /workspace
@@ -86,4 +88,4 @@ RUN SYSTEMD_OFFLINE=1 systemctl enable network-setup
 WORKDIR /workspace
 
 # Set the init system as entrypoint
-CMD ["/sbin/init"]
+ENTRYPOINT ["/sbin/init"]
