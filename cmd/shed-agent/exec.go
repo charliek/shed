@@ -35,7 +35,7 @@ func handleExecConnection(conn net.Conn) {
 	var req ExecRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		log.Printf("Failed to unmarshal exec request: %v", err)
-		writeExitCode(conn, 1)
+		_ = writeExitCode(conn, 1)
 		return
 	}
 
@@ -77,7 +77,7 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		log.Printf("Failed to start command with PTY: %v", err)
-		writeExitCode(conn, 1)
+		_ = writeExitCode(conn, 1)
 		return
 	}
 	defer ptmx.Close()
@@ -177,7 +177,7 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	// Wait for output to be flushed before sending exit code
 	outputWg.Wait()
 
-	writeExitCode(conn, exitCode)
+	_ = writeExitCode(conn, exitCode)
 	log.Printf("Command exited with code %d", exitCode)
 }
 
@@ -187,28 +187,28 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("Failed to create stdout pipe: %v", err)
-		writeExitCode(conn, 1)
+		_ = writeExitCode(conn, 1)
 		return
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		log.Printf("Failed to create stderr pipe: %v", err)
-		writeExitCode(conn, 1)
+		_ = writeExitCode(conn, 1)
 		return
 	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		log.Printf("Failed to create stdin pipe: %v", err)
-		writeExitCode(conn, 1)
+		_ = writeExitCode(conn, 1)
 		return
 	}
 
 	// Start command
 	if err := cmd.Start(); err != nil {
 		log.Printf("Failed to start command: %v", err)
-		writeExitCode(conn, 1)
+		_ = writeExitCode(conn, 1)
 		return
 	}
 
@@ -292,6 +292,6 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 	// Wait for output to be flushed before sending exit code
 	outputWg.Wait()
 
-	writeExitCode(conn, exitCode)
+	_ = writeExitCode(conn, exitCode)
 	log.Printf("Command exited with code %d", exitCode)
 }

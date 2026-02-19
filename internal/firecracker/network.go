@@ -94,26 +94,26 @@ func (nm *NetworkManager) CreateTAPDevice(name string) error {
 	bridge, err := netlink.LinkByName(nm.bridgeName)
 	if err != nil {
 		// Clean up TAP device on failure
-		netlink.LinkDel(tap)
+		_ = netlink.LinkDel(tap)
 		return fmt.Errorf("failed to find bridge %s: %w", nm.bridgeName, err)
 	}
 
 	// Get the TAP link (need to re-fetch after creation)
 	tapLink, err := netlink.LinkByName(name)
 	if err != nil {
-		netlink.LinkDel(tap)
+		_ = netlink.LinkDel(tap)
 		return fmt.Errorf("failed to find created TAP device %s: %w", name, err)
 	}
 
 	// Attach TAP to bridge
 	if err := netlink.LinkSetMaster(tapLink, bridge); err != nil {
-		netlink.LinkDel(tap)
+		_ = netlink.LinkDel(tap)
 		return fmt.Errorf("failed to attach TAP %s to bridge %s: %w", name, nm.bridgeName, err)
 	}
 
 	// Bring up TAP device
 	if err := netlink.LinkSetUp(tapLink); err != nil {
-		netlink.LinkDel(tap)
+		_ = netlink.LinkDel(tap)
 		return fmt.Errorf("failed to bring up TAP device %s: %w", name, err)
 	}
 

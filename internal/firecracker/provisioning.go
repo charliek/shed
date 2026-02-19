@@ -180,7 +180,9 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 		// Try to extract exit code from error message
 		exitCode := 1
 		if strings.Contains(err.Error(), "exit code") {
-			fmt.Sscanf(err.Error(), "command exited with code %d", &exitCode)
+			if _, scanErr := fmt.Sscanf(err.Error(), "command exited with code %d", &exitCode); scanErr != nil {
+				exitCode = 1
+			}
 		}
 
 		// Get last few lines for error context
@@ -257,9 +259,9 @@ type ProvisionState struct {
 
 // State file path and keys (matching Docker implementation).
 const (
-	stateFilePath    = "/var/log/shed/.provision_state"
-	stateKeyInstall  = "install_ran"
-	stateKeyError    = "error"
+	stateFilePath   = "/var/log/shed/.provision_state"
+	stateKeyInstall = "install_ran"
+	stateKeyError   = "error"
 )
 
 // NewProvisionState creates a new provisioning state tracker.

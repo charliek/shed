@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -144,14 +145,13 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 		go func() {
 			if _, err := io.Copy(conn, opts.Stdin); err != nil {
 				// Log stdin errors but don't fail - often expected on disconnect
-				// Only log if it's not a closed connection error
 				if !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "EOF") {
-					// Silently ignore - stdin errors are often expected when connection closes
+					log.Printf("Warning: stdin copy failed: %v", err)
 				}
 			}
 			// Signal EOF by closing write side if possible
 			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-				cw.CloseWrite()
+				_ = cw.CloseWrite()
 			}
 		}()
 	}
@@ -186,7 +186,10 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 			default:
 				// Data frame - write to stdout
 				if opts.Stdout != nil {
-					opts.Stdout.Write(data)
+					if _, err := opts.Stdout.Write(data); err != nil {
+						done <- err
+						return
+					}
 				}
 			}
 		}

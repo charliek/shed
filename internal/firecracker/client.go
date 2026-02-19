@@ -231,14 +231,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// Create and start VM
 	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
 	if err != nil {
-		c.netMgr.DeleteTAPDevice(tapDevice)
+		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+		}
 		DeleteRootfs(c.cfg.InstanceDir, req.Name)
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
 	if err := vm.Start(ctx); err != nil {
-		c.netMgr.DeleteTAPDevice(tapDevice)
+		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+		}
 		DeleteRootfs(c.cfg.InstanceDir, req.Name)
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to start VM: %w", err)
@@ -247,8 +251,12 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// Update metadata to running
 	meta.Status = config.StatusRunning
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		vm.Stop(context.Background())
-		c.netMgr.DeleteTAPDevice(tapDevice)
+		if stopErr := vm.Stop(context.Background()); stopErr != nil {
+			log.Printf("Warning: failed to stop VM: %v", stopErr)
+		}
+		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+		}
 		DeleteRootfs(c.cfg.InstanceDir, req.Name)
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
@@ -424,7 +432,9 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	// Update metadata
 	meta.Status = config.StatusRunning
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		vm.Stop(context.Background())
+		if stopErr := vm.Stop(context.Background()); stopErr != nil {
+			log.Printf("Warning: failed to stop VM: %v", stopErr)
+		}
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 

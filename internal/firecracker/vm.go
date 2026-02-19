@@ -130,7 +130,9 @@ func (vm *VM) Start(ctx context.Context) error {
 	vsockClient := NewVsockClient(vsockPath, vm.cfg.ConsolePort, vm.cfg.HealthPort)
 	if err := vsockClient.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
 		// Try to stop the VM on failure
-		vm.Stop(context.Background())
+		if stopErr := vm.Stop(context.Background()); stopErr != nil {
+			log.Printf("Warning: failed to stop VM after health check failure: %v", stopErr)
+		}
 		return fmt.Errorf("agent health check failed: %w", err)
 	}
 
@@ -162,7 +164,7 @@ func (vm *VM) Stop(ctx context.Context) error {
 	if err := vm.machine.Wait(shutdownCtx); err != nil {
 		// Force kill if graceful shutdown fails
 		if vm.meta.PID > 0 {
-			syscall.Kill(vm.meta.PID, syscall.SIGKILL)
+			_ = syscall.Kill(vm.meta.PID, syscall.SIGKILL)
 		}
 	}
 
@@ -209,10 +211,10 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 		return nil
 	case <-time.After(vm.cfg.StopTimeout.Duration()):
 		// Force kill
-		process.Signal(syscall.SIGKILL)
+		_ = process.Signal(syscall.SIGKILL)
 		return nil
 	case <-ctx.Done():
-		process.Signal(syscall.SIGKILL)
+		_ = process.Signal(syscall.SIGKILL)
 		return ctx.Err()
 	}
 }
