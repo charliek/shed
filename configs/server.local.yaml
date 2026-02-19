@@ -58,6 +58,7 @@ env_file: ~/.shed/env
 log_level: debug
 
 enabled_backends:
+  - docker
   - firecracker
 default_backend: firecracker
 

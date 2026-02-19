@@ -315,3 +315,11 @@ type vsockConn struct {
 func (c *vsockConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
+
+// CloseWrite forwards CloseWrite if the underlying connection supports it.
+func (c *vsockConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}

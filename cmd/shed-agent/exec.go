@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,7 +37,9 @@ func handleExecConnection(conn net.Conn) {
 	var req ExecRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		log.Printf("Failed to unmarshal exec request: %v", err)
-		_ = writeExitCode(conn, 1)
+		if err := writeExitCode(conn, 1); err != nil {
+			log.Printf("Warning: failed to write exit code: %v", err)
+		}
 		return
 	}
 
@@ -63,7 +66,18 @@ func handleExecConnection(conn net.Conn) {
 
 	// Set environment
 	cmd.Env = append(os.Environ(), req.Env...)
-	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+
+	// Only set TERM if not already provided by the caller
+	hasTerm := false
+	for _, e := range cmd.Env {
+		if strings.HasPrefix(e, "TERM=") {
+			hasTerm = true
+			break
+		}
+	}
+	if !hasTerm {
+		cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+	}
 
 	if req.TTY {
 		runWithPTY(conn, cmd, req.Rows, req.Cols)
@@ -78,7 +92,9 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		log.Printf("Failed to start command with PTY: %v", err)
-		_ = writeExitCode(conn, 1)
+		if err := writeExitCode(conn, 1); err != nil {
+			log.Printf("Warning: failed to write exit code: %v", err)
+		}
 		return
 	}
 	defer ptmx.Close()
@@ -189,7 +205,9 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	outputWg.Wait()
 
 	close(stopCh)
-	_ = writeExitCode(conn, exitCode)
+	if err := writeExitCode(conn, exitCode); err != nil {
+		log.Printf("Warning: failed to write exit code: %v", err)
+	}
 	log.Printf("Command exited with code %d", exitCode)
 }
 
@@ -199,28 +217,36 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("Failed to create stdout pipe: %v", err)
-		_ = writeExitCode(conn, 1)
+		if err := writeExitCode(conn, 1); err != nil {
+			log.Printf("Warning: failed to write exit code: %v", err)
+		}
 		return
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		log.Printf("Failed to create stderr pipe: %v", err)
-		_ = writeExitCode(conn, 1)
+		if err := writeExitCode(conn, 1); err != nil {
+			log.Printf("Warning: failed to write exit code: %v", err)
+		}
 		return
 	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		log.Printf("Failed to create stdin pipe: %v", err)
-		_ = writeExitCode(conn, 1)
+		if err := writeExitCode(conn, 1); err != nil {
+			log.Printf("Warning: failed to write exit code: %v", err)
+		}
 		return
 	}
 
 	// Start command
 	if err := cmd.Start(); err != nil {
 		log.Printf("Failed to start command: %v", err)
-		_ = writeExitCode(conn, 1)
+		if err := writeExitCode(conn, 1); err != nil {
+			log.Printf("Warning: failed to write exit code: %v", err)
+		}
 		return
 	}
 
@@ -262,6 +288,9 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 		}
 	}()
 
+	// Mutex to protect concurrent writes to conn from stdout/stderr goroutines
+	var connMu sync.Mutex
+
 	// Copy stdout to connection
 	outputWg.Add(1)
 	go func() {
@@ -273,7 +302,10 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 				return
 			}
 			if n > 0 {
-				if err := writeData(conn, buf[:n]); err != nil {
+				connMu.Lock()
+				err := writeData(conn, buf[:n])
+				connMu.Unlock()
+				if err != nil {
 					log.Printf("Warning: failed to write stdout to connection: %v", err)
 					return
 				}
@@ -292,7 +324,10 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 				return
 			}
 			if n > 0 {
-				if err := writeData(conn, buf[:n]); err != nil {
+				connMu.Lock()
+				err := writeData(conn, buf[:n])
+				connMu.Unlock()
+				if err != nil {
 					log.Printf("Warning: failed to write stderr to connection: %v", err)
 					return
 				}
@@ -315,7 +350,12 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 	outputWg.Wait()
 
 	close(done)
-	_ = writeExitCode(conn, exitCode)
+	connMu.Lock()
+	err = writeExitCode(conn, exitCode)
+	connMu.Unlock()
+	if err != nil {
+		log.Printf("Warning: failed to write exit code: %v", err)
+	}
 	log.Printf("Command exited with code %d", exitCode)
 }
 

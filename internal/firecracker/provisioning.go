@@ -293,12 +293,42 @@ func (s *ProvisionState) MarkInstallFailed(ctx context.Context, err error) error
 	})
 }
 
+// escapeStateValue escapes a value for safe storage in the key=value state file.
+// Backslashes are escaped first, then newlines, ensuring round-trip safety.
+func escapeStateValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	return s
+}
+
+// unescapeStateValue reverses escapeStateValue.
+func unescapeStateValue(s string) string {
+	var result strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				result.WriteByte('\n')
+				i++
+			case '\\':
+				result.WriteByte('\\')
+				i++
+			default:
+				result.WriteByte(s[i])
+			}
+		} else {
+			result.WriteByte(s[i])
+		}
+	}
+	return result.String()
+}
+
 // writeStateFile writes provisioning state to a file in the VM.
 func (s *ProvisionState) writeStateFile(ctx context.Context, state map[string]string) error {
-	// Build content
+	// Build content with escaped values to handle newlines safely
 	var content strings.Builder
 	for key, value := range state {
-		content.WriteString(fmt.Sprintf("%s=%s\n", key, value))
+		content.WriteString(fmt.Sprintf("%s=%s\n", key, escapeStateValue(value)))
 	}
 
 	// Use heredoc to safely write content
@@ -330,7 +360,7 @@ func (s *ProvisionState) readStateFile(ctx context.Context) (map[string]string, 
 		return nil, err
 	}
 
-	// Parse key=value pairs
+	// Parse key=value pairs, unescaping values that may contain encoded newlines
 	state := make(map[string]string)
 	lines := strings.Split(stdout.String(), "\n")
 	for _, line := range lines {
@@ -340,7 +370,7 @@ func (s *ProvisionState) readStateFile(ctx context.Context) (map[string]string, 
 		}
 		if idx := strings.Index(line, "="); idx > 0 {
 			key := line[:idx]
-			value := line[idx+1:]
+			value := unescapeStateValue(line[idx+1:])
 			state[key] = value
 		}
 	}

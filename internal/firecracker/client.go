@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -114,19 +114,20 @@ func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Build map of used indices from TAP device names
+	// Build map of used indices by computing offset from the gateway IP.
+	// AllocateIP(index) returns gateway + index + 1, so the reverse is:
+	//   index = allocatedIP - gateway - 1
 	usedIndices := make(map[int]bool)
+	gatewayIP := net.ParseIP(c.netMgr.Gateway()).To4()
+	gatewayInt := ipToUint32(gatewayIP)
 	for ip := range c.usedIPs {
-		// Extract index from IP (last octet - 2 gives us the index)
-		// e.g., 172.30.0.2 -> index 0, 172.30.0.3 -> index 1
-		parts := strings.Split(ip, ".")
-		if len(parts) == 4 {
-			if lastOctet, err := strconv.Atoi(parts[3]); err == nil {
-				index := lastOctet - 2 // .2 -> index 0, .3 -> index 1, etc.
-				if index >= 0 {
-					usedIndices[index] = true
-				}
-			}
+		parsed := net.ParseIP(ip).To4()
+		if parsed == nil {
+			continue
+		}
+		index := int(ipToUint32(parsed) - gatewayInt - 1)
+		if index >= 0 {
+			usedIndices[index] = true
 		}
 	}
 
@@ -310,12 +311,6 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
 	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort)
 
-	// Wait for VM to be ready
-	if err := vsockClient.WaitForHealth(ctx, time.Duration(c.cfg.StartTimeout)); err != nil {
-		log.Printf("Warning: VM health check failed: %v", err)
-		// Continue anyway - VM may still be usable
-	}
-
 	// Transfer credentials
 	if c.serverCfg != nil {
 		credTransfer := NewCredentialTransfer(vsockClient, c.serverCfg)
@@ -485,12 +480,6 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	// Get vsock client for setup operations
 	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
 	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort)
-
-	// Wait for VM to be ready
-	if err := vsockClient.WaitForHealth(ctx, time.Duration(c.cfg.StartTimeout)); err != nil {
-		log.Printf("Warning: VM health check failed: %v", err)
-		// Continue anyway - VM may still be usable
-	}
 
 	// Refresh credentials on start
 	if c.serverCfg != nil {
