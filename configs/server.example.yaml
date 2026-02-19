@@ -16,6 +16,12 @@ ssh_port: 2222
 # Default image used when creating sheds without --image flag
 default_image: shed-base:latest
 
+# Backend configuration
+# Firecracker is Linux-only; enable it only on supported servers.
+enabled_backends:
+  - docker
+default_backend: docker
+
 # Credentials to mount into containers
 # Each entry creates a bind mount from host to container
 # Paths support ~ expansion

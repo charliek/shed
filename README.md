@@ -207,8 +207,10 @@ http_port: 8080
 ssh_port: 2222
 default_image: shed-base:latest
 
-# backend: docker       # Default - use Docker containers
-# backend: firecracker  # Use Firecracker microVMs
+# enabled_backends:
+#   - docker
+#   - firecracker
+# default_backend: docker  # Firecracker is Linux-only
 
 credentials:
   ssh:
@@ -221,7 +223,7 @@ credentials:
     readonly: true
 env_file: ~/.shed/env
 
-# Firecracker-specific config (only needed if backend: firecracker)
+# Firecracker-specific config (only needed if firecracker is enabled)
 # firecracker:
 #   kernel_path: /var/lib/shed/firecracker/vmlinux.bin
 #   base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4

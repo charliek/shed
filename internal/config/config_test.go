@@ -77,6 +77,15 @@ func TestServerConfigDefaults(t *testing.T) {
 }
 
 func TestServerConfigValidation(t *testing.T) {
+	validConfig := &ServerConfig{
+		Name:            "test",
+		HTTPPort:        8080,
+		SSHPort:         2222,
+		LogLevel:        "info",
+		DefaultBackend:  BackendDocker,
+		EnabledBackends: []string{BackendDocker},
+	}
+
 	tests := []struct {
 		name    string
 		cfg     *ServerConfig
@@ -84,22 +93,22 @@ func TestServerConfigValidation(t *testing.T) {
 	}{
 		{
 			name:    "valid",
-			cfg:     &ServerConfig{Name: "test", HTTPPort: 8080, SSHPort: 2222, LogLevel: "info"},
+			cfg:     validConfig,
 			wantErr: false,
 		},
 		{
 			name:    "missing name",
-			cfg:     &ServerConfig{HTTPPort: 8080, SSHPort: 2222, LogLevel: "info"},
+			cfg:     &ServerConfig{HTTPPort: 8080, SSHPort: 2222, LogLevel: "info", DefaultBackend: BackendDocker, EnabledBackends: []string{BackendDocker}},
 			wantErr: true,
 		},
 		{
 			name:    "invalid http port",
-			cfg:     &ServerConfig{Name: "test", HTTPPort: 0, SSHPort: 2222, LogLevel: "info"},
+			cfg:     &ServerConfig{Name: "test", HTTPPort: 0, SSHPort: 2222, LogLevel: "info", DefaultBackend: BackendDocker, EnabledBackends: []string{BackendDocker}},
 			wantErr: true,
 		},
 		{
 			name:    "invalid log level",
-			cfg:     &ServerConfig{Name: "test", HTTPPort: 8080, SSHPort: 2222, LogLevel: "invalid"},
+			cfg:     &ServerConfig{Name: "test", HTTPPort: 8080, SSHPort: 2222, LogLevel: "invalid", DefaultBackend: BackendDocker, EnabledBackends: []string{BackendDocker}},
 			wantErr: true,
 		},
 	}
