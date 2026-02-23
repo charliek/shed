@@ -14,45 +14,45 @@ default_image: shed-base:latest
 # Add more as needed for your workflow
 credentials:
   git_ssh:
-    source: ~/.ssh
+    source: /home/charliek/.ssh
     target: /mnt/ssh-host
     readonly: true
 
   git_config:
-    source: ~/.gitconfig
+    source: /home/charliek/.gitconfig
     target: /root/.gitconfig
     readonly: true
 
   # Claude Code - container-specific credentials
   claude:
-    source: ~/.shed/mounts/claude
+    source: /home/charliek/.shed/mounts/claude
     target: /root/.claude
     readonly: false
 
   # OpenCode - 3 directories for data, state, and cache
   opencode_data:
-    source: ~/.shed/mounts/opencode/share
+    source: /home/charliek/.shed/mounts/opencode/share
     target: /root/.local/share/opencode
     readonly: false
 
   opencode_state:
-    source: ~/.shed/mounts/opencode/state
+    source: /home/charliek/.shed/mounts/opencode/state
     target: /root/.local/state/opencode
     readonly: false
 
   opencode_cache:
-    source: ~/.shed/mounts/opencode/cache
+    source: /home/charliek/.shed/mounts/opencode/cache
     target: /root/.cache/opencode
     readonly: false
 
   # GitHub CLI - credentials and config
   gh:
-    source: ~/.shed/mounts/gh
+    source: /home/charliek/.shed/mounts/gh
     target: /root/.config/gh
     readonly: false
 
 # Environment file with GIT_SSH_COMMAND for SSH key access
-env_file: ~/.shed/env
+env_file: /home/charliek/.shed/env
 
 # Debug logging for development
 log_level: debug
