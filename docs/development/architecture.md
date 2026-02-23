@@ -43,6 +43,7 @@ flowchart TB
 |-----------|-------------|
 | `shed` | CLI binary for developer machines (macOS, Linux) |
 | `shed-server` | Server binary exposing HTTP + SSH APIs (Linux) |
+| `shed-agent` | Agent binary running inside Firecracker VMs (Linux) |
 | `shed-base` | Docker image with pre-installed dev tools |
 
 ## Communication Protocols
@@ -143,6 +144,18 @@ SSH server implementation using `gliderlabs/ssh`. Routes connections to containe
 ### `internal/sshconfig`
 
 Parses and generates SSH config files. Manages the shed-specific block in `~/.ssh/config`.
+
+### `internal/firecracker`
+
+Firecracker backend: VM lifecycle, vsock communication, TAP networking, rootfs management, metadata persistence, and credential transfer.
+
+### `internal/agentproto`
+
+Binary protocol for framed messages over vsock between shed-server and shed-agent.
+
+### `internal/backend`
+
+Backend interface that Docker and Firecracker backends both implement.
 
 ### `internal/provision`
 

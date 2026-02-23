@@ -5,6 +5,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -94,8 +95,13 @@ func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) 
 
 	if err := vsockClient.Exec(ctx, opts); err != nil {
 		// tmux server might not be running
-		if strings.Contains(err.Error(), "no server running") || strings.Contains(err.Error(), "exit code") {
-			return []config.Session{}, nil // No sessions
+		if strings.Contains(err.Error(), "no server running") {
+			return []config.Session{}, nil
+		}
+		// tmux exits 1 when there are no sessions
+		var exitErr *ExitError
+		if errors.As(err, &exitErr) && exitErr.Code == 1 {
+			return []config.Session{}, nil
 		}
 		return nil, fmt.Errorf("failed to list sessions: %w", err)
 	}
@@ -143,6 +149,8 @@ func (b *FirecrackerBackend) KillSession(ctx context.Context, shedName, sessionN
 	}
 
 	if err := vsockClient.Exec(ctx, opts); err != nil {
+		// These are tmux stderr strings captured by the agent, not Go error types,
+		// so string matching is the correct approach here.
 		if strings.Contains(err.Error(), "no server running") {
 			return config.ErrSessionNotFoundSentinel
 		}

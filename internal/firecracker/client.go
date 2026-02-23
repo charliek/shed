@@ -5,6 +5,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
@@ -119,13 +121,20 @@ func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err 
 	//   index = allocatedIP - gateway - 1
 	usedIndices := make(map[int]bool)
 	gatewayIP := net.ParseIP(c.netMgr.Gateway()).To4()
-	gatewayInt := ipToUint32(gatewayIP)
+	gatewayInt, err := ipToUint32(gatewayIP)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid gateway IP: %w", err)
+	}
 	for ip := range c.usedIPs {
 		parsed := net.ParseIP(ip).To4()
 		if parsed == nil {
 			continue
 		}
-		index := int(ipToUint32(parsed) - gatewayInt - 1)
+		parsedInt, err := ipToUint32(parsed)
+		if err != nil {
+			continue
+		}
+		index := int(parsedInt - gatewayInt - 1)
 		if index >= 0 {
 			usedIndices[index] = true
 		}
@@ -192,7 +201,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Check if instance already exists
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
-		return nil, fmt.Errorf("shed %q already exists", req.Name)
+		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
 	// Allocate resources
@@ -360,6 +369,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
 		return nil, err
 	}
 
@@ -412,13 +424,27 @@ func (c *Client) ListSheds(ctx context.Context) ([]config.Shed, error) {
 func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
 		return err
 	}
 
-	// Stop if running
+	// Stop if running — best effort, continue with cleanup regardless
 	if meta.Status == config.StatusRunning {
 		if _, err := c.StopShed(ctx, name); err != nil {
-			return fmt.Errorf("failed to stop shed: %w", err)
+			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
+			// Force-kill by PID as fallback
+			if meta.PID > 0 {
+				if !isFirecrackerProcess(meta.PID) {
+					log.Printf("Warning: PID %d is not a Firecracker process, skipping SIGKILL during delete of %s", meta.PID, name)
+				} else {
+					_ = syscall.Kill(meta.PID, syscall.SIGKILL)
+					if !waitForProcessExit(meta.PID, 2*time.Second) {
+						log.Printf("Warning: PID %d did not exit within timeout during delete of %s", meta.PID, name)
+					}
+				}
+			}
 		}
 	}
 
@@ -443,13 +469,16 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
 		return nil, err
 	}
 
 	if meta.Status == config.StatusRunning {
 		vm := &VM{meta: meta, cfg: c.cfg}
 		if vm.IsRunning() {
-			return nil, fmt.Errorf("shed %q is already running", name)
+			return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyRunningSentinel, name)
 		}
 		// VM died, reset status
 		meta.Status = config.StatusStopped
@@ -520,11 +549,14 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
 		return nil, err
 	}
 
 	if meta.Status != config.StatusRunning {
-		return nil, fmt.Errorf("shed %q is not running", name)
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
 	}
 
 	// Get or create VM handle
@@ -567,6 +599,9 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return "", fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
 		return "", err
 	}
 

@@ -6,6 +6,7 @@ package firecracker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -186,12 +187,11 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 			return fmt.Errorf("%s hook timed out after %v: %w", hookType, timeout, ctx.Err())
 		}
 
-		// Try to extract exit code from error message
+		// Extract exit code from typed error
 		exitCode := 1
-		if strings.Contains(err.Error(), "exit code") {
-			if _, scanErr := fmt.Sscanf(err.Error(), "command exited with code %d", &exitCode); scanErr != nil {
-				exitCode = 1
-			}
+		var exitErr *ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.Code
 		}
 
 		// Get last few lines for error context
