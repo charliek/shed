@@ -524,10 +524,16 @@ func (c *Client) runProvisioning(ctx context.Context, containerID, shedName stri
 // captureInstalledPaths captures PATH from an interactive shell and persists
 // it to /etc/profile.d/ so login shells (used by subsequent hooks) inherit
 // tools installed by the install hook (e.g., bun adds itself to ~/.bashrc).
+// Also detects mise shims directory, since mise doesn't modify .bashrc.
 func (c *Client) captureInstalledPaths(ctx context.Context, containerID string) error {
 	cmd := []string{
 		"bash", "-c",
-		`bash -ic 'echo "$PATH"' 2>/dev/null | tail -1 | xargs -I{} bash -c 'echo "export PATH=\"{}\"" > /etc/profile.d/shed-installed-tools.sh'`,
+		`PATH_VAL=$(bash -ic 'echo "$PATH"' 2>/dev/null | tail -1)
+MISE_SHIMS="$HOME/.local/share/mise/shims"
+if [ -d "$MISE_SHIMS" ] && ! echo "$PATH_VAL" | grep -q "$MISE_SHIMS"; then
+  PATH_VAL="$MISE_SHIMS:$PATH_VAL"
+fi
+echo "export PATH=\"$PATH_VAL\"" > /etc/profile.d/shed-installed-tools.sh`,
 	}
 	execConfig := container.ExecOptions{Cmd: cmd}
 	execResp, err := c.docker.ContainerExecCreate(ctx, containerID, execConfig)

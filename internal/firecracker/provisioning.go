@@ -209,8 +209,17 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 // captureInstalledPaths captures PATH from an interactive shell and persists
 // it to /etc/profile.d/ so login shells (used by subsequent hooks) inherit
 // tools installed by the install hook (e.g., bun adds itself to ~/.bashrc).
+// Also detects mise shims directory, since mise doesn't modify .bashrc.
 func (p *Provisioner) captureInstalledPaths(ctx context.Context) error {
-	cmd := `bash -ic 'echo "$PATH"' 2>/dev/null | tail -1 | xargs -I{} bash -c 'echo "export PATH=\"{}\"" > /etc/profile.d/shed-installed-tools.sh'`
+	cmd := `
+PATH_VAL=$(bash -ic 'echo "$PATH"' 2>/dev/null | tail -1)
+# mise doesn't add shims to .bashrc; detect and prepend if present
+MISE_SHIMS="$HOME/.local/share/mise/shims"
+if [ -d "$MISE_SHIMS" ] && ! echo "$PATH_VAL" | grep -q "$MISE_SHIMS"; then
+  PATH_VAL="$MISE_SHIMS:$PATH_VAL"
+fi
+echo "export PATH=\"$PATH_VAL\"" > /etc/profile.d/shed-installed-tools.sh
+`
 	opts := backend.ExecOptions{
 		Cmd:        []string{"bash", "-c", cmd},
 		WorkingDir: "/",
