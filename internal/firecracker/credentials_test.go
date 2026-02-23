@@ -160,13 +160,3 @@ func TestCreateTarArchiveEmptyDirectory(t *testing.T) {
 		t.Error("createTarArchive() returned empty data for empty directory")
 	}
 }
-
-func TestMaxBase64CommandSize(t *testing.T) {
-	// Verify the constant is reasonable
-	if MaxBase64CommandSize <= 0 {
-		t.Error("MaxBase64CommandSize should be positive")
-	}
-	if MaxBase64CommandSize > 1024*1024 {
-		t.Errorf("MaxBase64CommandSize = %d, seems too large (> 1MB)", MaxBase64CommandSize)
-	}
-}

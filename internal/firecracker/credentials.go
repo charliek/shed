@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -207,30 +206,19 @@ func (ct *CredentialTransfer) addToTar(tw *tar.Writer, sourcePath, archivePath s
 	return nil
 }
 
-// MaxBase64CommandSize is the maximum size for base64-encoded data passed via shell arguments.
-// Shell argument limits vary by system (128KB-256KB typically), so we use a conservative limit.
-const MaxBase64CommandSize = 100 * 1024 // 100KB
-
 // extractTarInVM extracts a gzipped tar archive in the VM via vsock.
+// The tar data is streamed via stdin to avoid shell argument size limits.
 func (ct *CredentialTransfer) extractTarInVM(ctx context.Context, tarData []byte, extractDir string) error {
-	// Encode tar data as base64 to pass through command line safely
-	// This avoids issues with stdin piping through vsock
-	encoded := base64.StdEncoding.EncodeToString(tarData)
-
-	// Check if encoded data exceeds shell argument limits
-	if len(encoded) > MaxBase64CommandSize {
-		return fmt.Errorf("credential data too large: %d bytes encoded exceeds %d byte limit", len(encoded), MaxBase64CommandSize)
-	}
-
-	// Decode and extract in one command, then fix ownership
+	// Extract from stdin and fix ownership.
 	// The -p flag preserves permissions, but we need to fix ownership
 	// because files extracted from tar have original owner/group which
-	// may not exist or be appropriate in the VM
-	tarCmd := fmt.Sprintf("echo %s | base64 -d | tar -xzpf - -C %q && chown -R root:root %q", encoded, extractDir, extractDir)
+	// may not exist or be appropriate in the VM.
+	tarCmd := fmt.Sprintf("tar --no-same-owner -xzpf - -C %q", extractDir)
 
 	var outputBuf strings.Builder
 	opts := backend.ExecOptions{
 		Cmd:        []string{"/bin/sh", "-c", tarCmd},
+		Stdin:      io.NopCloser(bytes.NewReader(tarData)),
 		Stdout:     &nopWriteCloser{&outputBuf},
 		Stderr:     &nopWriteCloser{&outputBuf},
 		WorkingDir: "/",
