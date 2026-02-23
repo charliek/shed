@@ -254,8 +254,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
 		}
-		if rmErr := DeleteRootfs(c.cfg.InstanceDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete rootfs for %s: %v", req.Name, rmErr)
+		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
+			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
 		c.ReleaseIP(ipAddress)
 		c.ReleaseCID(cid)
@@ -271,8 +271,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
 		}
-		if rmErr := DeleteRootfs(c.cfg.InstanceDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete rootfs for %s: %v", req.Name, rmErr)
+		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
+			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
@@ -282,8 +282,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
 		}
-		if rmErr := DeleteRootfs(c.cfg.InstanceDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete rootfs for %s: %v", req.Name, rmErr)
+		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
+			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to start VM: %w", err)
@@ -298,8 +298,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
 		}
-		if rmErr := DeleteRootfs(c.cfg.InstanceDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete rootfs for %s: %v", req.Name, rmErr)
+		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
+			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
@@ -590,7 +590,7 @@ func (c *Client) cloneRepo(ctx context.Context, vsock *VsockClient, repo string)
 	}
 
 	if err := vsock.Exec(ctx, opts); err != nil {
-		return fmt.Errorf("git clone failed: %w (output: %s)", err, output.String())
+		return fmt.Errorf("git clone failed: %w", err)
 	}
 
 	return nil

@@ -59,9 +59,7 @@ func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error)
 
 	if err := p.vsock.Exec(ctx, opts); err != nil {
 		// Check if file doesn't exist (expected case - no config file)
-		if strings.Contains(stderr.String(), "No such file") ||
-			strings.Contains(err.Error(), "exit code") {
-			// No config found - return empty config (no-op)
+		if strings.Contains(stderr.String(), "No such file") {
 			return &provision.Config{
 				Env: make(map[string]string),
 			}, nil
@@ -86,7 +84,10 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 
 	// Run install hook if requested and not already run
 	if runInstall && cfg.HasInstallHook() {
-		installRan, _ := state.HasInstallRun(ctx)
+		installRan, err := state.HasInstallRun(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to check install state: %w", err)
+		}
 		if !installRan {
 			fmt.Fprintln(p.output, "Running install hook...")
 			if err := p.runHook(ctx, cfg, provision.HookTypeInstall, cfg.Hooks.Install); err != nil {
@@ -303,8 +304,7 @@ func NewProvisionState(vsock *VsockClient) *ProvisionState {
 func (s *ProvisionState) HasInstallRun(ctx context.Context) (bool, error) {
 	state, err := s.readStateFile(ctx)
 	if err != nil {
-		// File doesn't exist means install hasn't run - this is expected
-		return false, nil
+		return false, err
 	}
 	return state[stateKeyInstall] == "true", nil
 }
@@ -387,6 +387,9 @@ func (s *ProvisionState) readStateFile(ctx context.Context) (map[string]string, 
 	}
 
 	if err := s.vsock.Exec(ctx, opts); err != nil {
+		if strings.Contains(stderr.String(), "No such file") {
+			return nil, nil
+		}
 		return nil, err
 	}
 

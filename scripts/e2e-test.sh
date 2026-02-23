@@ -32,14 +32,26 @@ TIMESTAMP=$(date +%s)
 while [[ $# -gt 0 ]]; do
     case $1 in
         --backend)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                echo "Error: --backend requires a value (docker, firecracker, or both)"
+                exit 1
+            fi
             BACKEND="$2"
             shift 2
             ;;
         --repo)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                echo "Error: --repo requires a URL value"
+                exit 1
+            fi
             REPO="$2"
             shift 2
             ;;
         --timeout)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                echo "Error: --timeout requires a numeric value (minutes)"
+                exit 1
+            fi
             TIMEOUT_MINUTES="$2"
             shift 2
             ;;
@@ -208,8 +220,8 @@ run_backend_tests() {
     echo ""
     echo "Step 5: Run test suite"
     local test_output
-    test_output=$("$SHED" exec "$test_name" -- bash -c "export PATH=/root/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
-    if echo "$test_output" | grep -qiE "pass|passed"; then
+    test_output=$("$SHED" exec "$test_name" -- bash -c "set -o pipefail && export PATH=/root/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
+    if [ $? -eq 0 ]; then
         log_pass "Test suite"
     else
         log_fail "Test suite" "$test_output"
@@ -277,8 +289,8 @@ run_backend_tests() {
     # 9. TESTS AFTER RESTART
     echo ""
     echo "Step 9: Run tests after restart"
-    test_output=$("$SHED" exec "$test_name" -- bash -c "export PATH=/root/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
-    if echo "$test_output" | grep -qiE "pass|passed"; then
+    test_output=$("$SHED" exec "$test_name" -- bash -c "set -o pipefail && export PATH=/root/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
+    if [ $? -eq 0 ]; then
         log_pass "Test suite after restart"
     else
         log_fail "Test suite after restart" "$test_output"

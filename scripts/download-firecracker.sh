@@ -40,6 +40,7 @@ FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${F
 echo "URL: $FC_URL"
 
 TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 curl -fL "$FC_URL" | tar -xz -C "$TMP_DIR"
 
 # Download checksums
@@ -49,6 +50,15 @@ curl -fL -o "$TMP_DIR/checksums.txt" "$CHECKSUM_URL"
 # Find and copy binaries
 FC_BIN=$(find "$TMP_DIR" -name "firecracker-*" -type f | head -1)
 JAILER_BIN=$(find "$TMP_DIR" -name "jailer-*" -type f | head -1)
+
+if [ -z "$FC_BIN" ]; then
+    echo "ERROR: firecracker binary not found in archive"
+    exit 1
+fi
+if [ -z "$JAILER_BIN" ]; then
+    echo "ERROR: jailer binary not found in archive"
+    exit 1
+fi
 
 if [ -n "$FC_BIN" ]; then
     FC_BASENAME=$(basename "$FC_BIN")
@@ -126,8 +136,6 @@ else
 fi
 echo "Downloaded minimal kernel to $OUTPUT_DIR/vmlinux-minimal.bin"
 echo "(Use this if you don't need Docker container support)"
-
-rm -rf "$TMP_DIR"
 
 # Verify installation
 echo ""

@@ -529,6 +529,10 @@ func (c *Client) captureInstalledPaths(ctx context.Context, containerID string) 
 	cmd := []string{
 		"bash", "-c",
 		`PATH_VAL=$(bash -ic 'echo "$PATH"' 2>/dev/null | tail -1)
+if [ -z "$PATH_VAL" ]; then
+  echo "ERROR: failed to capture PATH" >&2
+  exit 1
+fi
 MISE_SHIMS="$HOME/.local/share/mise/shims"
 if [ -d "$MISE_SHIMS" ] && ! echo "$PATH_VAL" | grep -q "$MISE_SHIMS"; then
   PATH_VAL="$MISE_SHIMS:$PATH_VAL"
@@ -546,5 +550,13 @@ echo "export PATH=\"$PATH_VAL\"" > /etc/profile.d/shed-installed-tools.sh`,
 	}
 	defer attachResp.Close()
 	_, _ = io.Copy(io.Discard, attachResp.Reader)
+
+	inspectResp, err := c.docker.ContainerExecInspect(ctx, execResp.ID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect exec: %w", err)
+	}
+	if inspectResp.ExitCode != 0 {
+		return fmt.Errorf("captureInstalledPaths failed with exit code %d", inspectResp.ExitCode)
+	}
 	return nil
 }

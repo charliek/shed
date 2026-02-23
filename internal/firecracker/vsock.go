@@ -170,6 +170,10 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 			// Signal stdin EOF at the protocol level
 			_ = writeMessage(agentproto.MsgTypeStdinEOF, nil)
 		}()
+	} else {
+		// No stdin provided; immediately signal EOF so commands
+		// like cat or tar don't hang waiting for input.
+		_ = writeMessage(agentproto.MsgTypeStdinEOF, nil)
 	}
 
 	// Read output from connection

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -59,9 +60,14 @@ func (vm *VM) Start(ctx context.Context) error {
 	// - IP configuration in kernel autoconf format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>
 	// - cgroup_enable=memory for Docker cgroup support
 	// The "off" at the end disables DHCP/BOOTP which can block boot on some kernels
+	_, ipNet, err := net.ParseCIDR(vm.cfg.BridgeCIDR)
+	if err != nil {
+		return fmt.Errorf("invalid bridge CIDR %q: %w", vm.cfg.BridgeCIDR, err)
+	}
+	netmask := fmt.Sprintf("%d.%d.%d.%d", ipNet.Mask[0], ipNet.Mask[1], ipNet.Mask[2], ipNet.Mask[3])
 	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:255.255.255.0::eth0:off cgroup_enable=memory cgroup_memory=1",
-		vm.meta.IPAddress, vm.netMgr.Gateway(),
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1",
+		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask,
 	)
 
 	fcCfg := firecracker.Config{
@@ -272,9 +278,10 @@ func (vm *VM) IsRunning() bool {
 		return false
 	}
 
-	// Send signal 0 to check if process exists
+	// Send signal 0 to check if process exists.
+	// EPERM means the process exists but we lack permission to signal it.
 	err = process.Signal(syscall.Signal(0))
-	return err == nil
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // generateMACAddress generates a MAC address based on the CID.

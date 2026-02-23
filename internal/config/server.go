@@ -362,6 +362,9 @@ func (c *FirecrackerConfig) Validate() error {
 	if c.DefaultMemoryMB < 128 {
 		return fmt.Errorf("default_memory_mb must be at least 128")
 	}
+	if c.DefaultDiskGB < 1 {
+		return fmt.Errorf("default_disk_gb must be at least 1")
+	}
 
 	// Validate vsock ports
 	if c.ConsolePort == 0 {

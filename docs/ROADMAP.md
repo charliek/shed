@@ -65,7 +65,7 @@ The copy approach is the default since most credential use cases are read-only. 
 Since Firecracker doesn't support virtiofs or 9p filesystem passthrough, the best alternative for live mounts is SSHFS over vsock.
 
 **Architecture:**
-```
+```text
 Host: socat VSOCK-LISTEN:12345,fork EXEC:"/usr/lib/openssh/sftp-server"
 Guest: sshfs -o vsock=2:12345 unused_host:/path /mount/point
 ```
@@ -118,6 +118,12 @@ Support for distributed development environments:
 - Shared networking
 - Service discovery
 - Orchestration integration
+
+## Deferred Upgrades
+
+- Update Firecracker to v1.10.x (latest stable) for performance and security improvements.
+- Update `go.mod` toolchain directive to Go 1.24.x to match current development environment.
+- Fix `docker cp` permissions in `download-firecracker.sh` (temp container may leak on early exit from `docker cp`).
 
 ## General Quality
 

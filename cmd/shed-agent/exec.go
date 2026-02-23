@@ -312,6 +312,8 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 				// Client signaled end of stdin; close the pipe so the
 				// command sees EOF (e.g. tar xzpf - finishes reading).
 				return
+			case MsgTypeResize:
+				// Resize is only meaningful for PTY sessions; ignore in non-PTY mode.
 			default:
 				if len(data) > 0 {
 					if _, err := stdin.Write(data); err != nil {
