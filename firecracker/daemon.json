@@ -1,0 +1,11 @@
+{
+    "storage-driver": "vfs",
+    "iptables": false,
+    "bridge": "none",
+    "exec-opts": ["native.cgroupdriver=cgroupfs"],
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    }
+}

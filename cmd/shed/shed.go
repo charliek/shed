@@ -66,6 +66,9 @@ var (
 	createNoSync      bool
 	createSyncProfile string
 	createTimeout     time.Duration
+	createBackend     string
+	createCPUs        int
+	createMemory      int
 	startTimeout      time.Duration
 	listAll           bool
 	deleteKeep        bool
@@ -79,6 +82,9 @@ func init() {
 	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")
 	createCmd.Flags().StringVar(&createSyncProfile, "sync-profile", "", "Profile to sync after creation (default: 'default')")
 	createCmd.Flags().DurationVar(&createTimeout, "timeout", 0, "Timeout for create operation (default: from config or 10m)")
+	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: docker or firecracker (default: server default)")
+	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker only)")
+	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker only)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
@@ -96,6 +102,18 @@ func init() {
 
 func runCreate(cmd *cobra.Command, args []string) error {
 	name := args[0]
+
+	// Validate backend flag
+	if createBackend != "" && createBackend != config.BackendDocker && createBackend != config.BackendFirecracker {
+		return fmt.Errorf("invalid backend %q: must be %q or %q", createBackend, config.BackendDocker, config.BackendFirecracker)
+	}
+
+	if createCPUs < 0 {
+		return fmt.Errorf("invalid cpus %d: must be at least 0", createCPUs)
+	}
+	if createMemory < 0 {
+		return fmt.Errorf("invalid memory %d: must be at least 0 MB", createMemory)
+	}
 
 	entry, serverName, err := getServerEntry()
 	if err != nil {
@@ -116,11 +134,28 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	client := NewAPIClientFromEntry(entry, timeout)
+
+	info, err := client.GetInfo()
+	if err != nil {
+		return fmt.Errorf("failed to fetch server info: %w", err)
+	}
+
+	resolvedBackend, warning, err := resolveCreateBackend(info, createBackend, createCPUs, createMemory)
+	if err != nil {
+		return err
+	}
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
+
 	req := &config.CreateShedRequest{
 		Name:        name,
 		Repo:        createRepo,
 		Image:       createImage,
 		NoProvision: createNoProvision,
+		Backend:     resolvedBackend,
+		CPUs:        createCPUs,
+		MemoryMB:    createMemory,
 	}
 
 	shed, err := client.CreateShed(req)
@@ -141,10 +176,52 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	printSuccess("Created shed %s on %s", name, serverName)
+	printSuccess("Created shed %s on %s (backend: %s)", name, serverName, resolvedBackend)
 	fmt.Printf("\nConnect with:\n  shed console %s\n", name)
 
 	return nil
+}
+
+func resolveCreateBackend(info *config.ServerInfo, requested string, cpus, memory int) (string, string, error) {
+	if info == nil {
+		return "", "", fmt.Errorf("server info is required")
+	}
+	if len(info.EnabledBackends) == 0 {
+		return "", "", fmt.Errorf("server does not advertise enabled backends")
+	}
+	if info.DefaultBackend == "" {
+		return "", "", fmt.Errorf("server does not advertise a default backend")
+	}
+
+	enabled := make(map[string]bool, len(info.EnabledBackends))
+	for _, backend := range info.EnabledBackends {
+		enabled[backend] = true
+	}
+
+	backend := requested
+	if backend == "" {
+		backend = info.DefaultBackend
+	}
+
+	if !enabled[backend] {
+		return "", "", fmt.Errorf("backend %q is not enabled on server", backend)
+	}
+
+	switch backend {
+	case config.BackendFirecracker:
+		if cpus != 0 && cpus < 1 {
+			return "", "", fmt.Errorf("invalid cpus %d: must be at least 1", cpus)
+		}
+		if memory != 0 && memory < 128 {
+			return "", "", fmt.Errorf("invalid memory %d: must be at least 128 MB", memory)
+		}
+	case config.BackendDocker:
+		if cpus != 0 || memory != 0 {
+			return backend, "Warning: --cpus and --memory flags are ignored for docker backend", nil
+		}
+	}
+
+	return backend, "", nil
 }
 
 func runList(cmd *cobra.Command, args []string) error {

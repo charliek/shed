@@ -106,10 +106,12 @@ func ValidateSessionName(name string) error {
 
 // ServerInfo is returned by GET /api/info.
 type ServerInfo struct {
-	Name     string `json:"name"`
-	Version  string `json:"version"`
-	SSHPort  int    `json:"ssh_port"`
-	HTTPPort int    `json:"http_port"`
+	Name            string   `json:"name"`
+	Version         string   `json:"version"`
+	SSHPort         int      `json:"ssh_port"`
+	HTTPPort        int      `json:"http_port"`
+	DefaultBackend  string   `json:"default_backend"`
+	EnabledBackends []string `json:"enabled_backends"`
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.
@@ -134,6 +136,16 @@ type CreateShedRequest struct {
 	Repo        string `json:"repo,omitempty"`
 	Image       string `json:"image,omitempty"`
 	NoProvision bool   `json:"no_provision,omitempty"`
+
+	// Backend specifies which backend to use ("docker" or "firecracker")
+	// If empty, uses the server's default backend
+	Backend string `json:"backend,omitempty"`
+
+	// CPUs specifies the number of vCPUs (firecracker only)
+	CPUs int `json:"cpus,omitempty"`
+
+	// MemoryMB specifies the memory in MB (firecracker only)
+	MemoryMB int `json:"memory_mb,omitempty"`
 }
 
 // APIError represents an error response from the API.
@@ -165,6 +177,7 @@ const (
 	ErrShedAlreadyStopped = "SHED_ALREADY_STOPPED"
 	ErrInvalidShedName    = "INVALID_SHED_NAME"
 	ErrCloneFailed        = "CLONE_FAILED"
+	ErrBackendNotEnabled  = "BACKEND_NOT_ENABLED"
 	ErrBackendError       = "BACKEND_ERROR"
 	ErrInternalError      = "INTERNAL_ERROR"
 	ErrSessionNotFound    = "SESSION_NOT_FOUND"

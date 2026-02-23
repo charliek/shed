@@ -1,0 +1,14 @@
+[Unit]
+Description=Network Setup for Firecracker VM
+DefaultDependencies=no
+After=local-fs.target
+Before=network-online.target docker.service shed-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/network-setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

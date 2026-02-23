@@ -1,12 +1,14 @@
-.PHONY: build build-cli build-server test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all docs docs-serve
+.PHONY: build build-cli build-server build-agent test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all docs docs-serve firecracker-rootfs download-firecracker
+
+GOARCH ?= $(shell go env GOARCH)
 
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X github.com/charliek/shed/internal/version.Version=$(VERSION) -X github.com/charliek/shed/internal/version.GitCommit=$(GIT_COMMIT) -X github.com/charliek/shed/internal/version.BuildDate=$(BUILD_DATE)"
 
-# Build both binaries
-build: build-cli build-server
+# Build all binaries
+build: build-cli build-server build-agent
 
 # Build CLI only
 build-cli:
@@ -15,6 +17,10 @@ build-cli:
 # Build server only
 build-server:
 	go build $(LDFLAGS) -o bin/shed-server ./cmd/shed-server
+
+# Build shed-agent only (for Firecracker VMs)
+build-agent:
+	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-agent ./cmd/shed-agent
 
 # Run all unit tests
 test:
@@ -32,6 +38,8 @@ release:
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-linux-arm64 ./cmd/shed
 	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/shed-server-linux-amd64 ./cmd/shed-server
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-server-linux-arm64 ./cmd/shed-server
+	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/shed-agent-linux-amd64 ./cmd/shed-agent
+	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-agent-linux-arm64 ./cmd/shed-agent
 
 # Clean build artifacts
 clean:
@@ -83,3 +91,13 @@ docs:
 docs-serve:
 	uv sync --group docs
 	uv run mkdocs serve
+
+# Firecracker targets
+
+# Build Firecracker rootfs image
+firecracker-rootfs: build-agent
+	./scripts/build-firecracker-rootfs.sh
+
+# Download Firecracker binary and kernel
+download-firecracker:
+	./scripts/download-firecracker.sh

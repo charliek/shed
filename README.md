@@ -9,6 +9,7 @@ Shed is a lightweight tool for managing persistent, containerized development en
 - **Multi-Server** - Manage sheds across home servers and cloud VPS instances
 - **IDE Integration** - Native Cursor/VS Code support via SSH Remote
 - **AI-Ready** - Pre-configured for Claude Code and OpenCode workflows
+- **Dual Backend** - Choose between Docker containers or Firecracker microVMs
 
 ## Quick Start
 
@@ -49,10 +50,40 @@ shed console my-project
 shed ssh-config >> ~/.ssh/config
 ```
 
+## Backends
+
+### Docker (Default)
+
+Uses Docker containers with bind mounts for credential passthrough. Best for:
+- Quick setup (just needs Docker installed)
+- Shared filesystem access with host
+- Lower resource overhead
+
+### Firecracker
+
+Uses Firecracker microVMs for stronger isolation. Best for:
+- Security-sensitive workloads
+- Full VM-level isolation
+- Running Docker inside the shed
+
+```bash
+# Create with Firecracker backend
+shed create myproject --backend=firecracker
+
+# With custom resources
+shed create myproject --backend=firecracker --cpus=4 --memory=8192
+
+# Clone a private repo (requires SSH credentials configured)
+shed create myproject --backend=firecracker --repo=git@github.com:user/repo.git
+```
+
+See [Firecracker Installation](docs/firecracker_install.md) and [Firecracker Operations](docs/firecracker_howto.md) for setup and usage details.
+
 ## Requirements
 
 - **Client**: macOS or Linux with Go 1.24+
-- **Server**: Linux with Docker installed
+- **Server (Docker)**: Linux with Docker installed
+- **Server (Firecracker)**: Linux with KVM support
 - **Network**: Tailscale (or any private network) connecting all machines
 
 ## Architecture
@@ -62,6 +93,10 @@ Shed consists of two binaries:
 - **`shed`** - CLI for developer machines
 - **`shed-server`** - Server daemon exposing HTTP API (port 8080) and SSH server (port 2222)
 
+The server supports two backends:
+- **Docker** (default) - Uses Docker containers with bind mounts for credentials
+- **Firecracker** - Uses microVMs with vsock communication for better isolation
+
 ```
 Developer Machine                    Remote Server
 ┌─────────────────┐                 ┌─────────────────────────────────┐
@@ -69,13 +104,14 @@ Developer Machine                    Remote Server
 └─────────────────┘                 │  ├── HTTP API (CRUD operations) │
                                     │  └── SSH Server (terminal/IDE)  │
                                     │              │                   │
-                                    │              ▼                   │
-                                    │  ┌──────────────────────┐       │
-                                    │  │      Docker          │       │
-                                    │  │  ┌────────────────┐  │       │
-                                    │  │  │  shed-myproj   │  │       │
-                                    │  │  └────────────────┘  │       │
-                                    │  └──────────────────────┘       │
+                                    │      ┌───────┴───────┐          │
+                                    │      ▼               ▼          │
+                                    │  ┌────────┐    ┌────────────┐   │
+                                    │  │ Docker │    │ Firecracker│   │
+                                    │  │ ┌────┐ │    │  ┌──────┐  │   │
+                                    │  │ │shed│ │    │  │ VM   │  │   │
+                                    │  │ └────┘ │    │  └──────┘  │   │
+                                    │  └────────┘    └────────────┘   │
                                     └─────────────────────────────────┘
 ```
 
@@ -170,12 +206,31 @@ name: my-server
 http_port: 8080
 ssh_port: 2222
 default_image: shed-base:latest
+
+# enabled_backends:
+#   - docker
+#   - firecracker
+# default_backend: docker  # Firecracker is Linux-only
+
 credentials:
-  git-ssh:
+  ssh:
     source: ~/.ssh
     target: /root/.ssh
     readonly: true
+  gitconfig:
+    source: ~/.gitconfig
+    target: /root/.gitconfig
+    readonly: true
 env_file: ~/.shed/env
+
+# Firecracker-specific config (only needed if firecracker is enabled)
+# firecracker:
+#   kernel_path: /var/lib/shed/firecracker/vmlinux.bin
+#   base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+#   instance_dir: /var/lib/shed/firecracker/instances
+#   socket_dir: /var/run/shed/firecracker
+#   default_cpus: 2
+#   default_memory_mb: 4096
 ```
 
 ## Security Model

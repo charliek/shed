@@ -103,15 +103,7 @@ func (b *DockerBackend) execInContainer(ctx context.Context, containerID string,
 	}
 
 	// Create exec configuration
-	execConfig := container.ExecOptions{
-		Cmd:          cmd,
-		AttachStdin:  opts.Stdin != nil,
-		AttachStdout: opts.Stdout != nil,
-		AttachStderr: opts.Stderr != nil,
-		Tty:          opts.TTY,
-		Env:          opts.Env,
-		WorkingDir:   config.WorkspacePath,
-	}
+	execConfig := buildExecConfig(cmd, opts)
 
 	execResp, err := dockerClient.ContainerExecCreate(ctx, containerID, execConfig)
 	if err != nil {
@@ -196,6 +188,23 @@ func (b *DockerBackend) execInContainer(ctx context.Context, containerID string,
 	}
 
 	return nil
+}
+
+func buildExecConfig(cmd []string, opts backend.ExecOptions) container.ExecOptions {
+	workingDir := opts.WorkingDir
+	if workingDir == "" {
+		workingDir = config.WorkspacePath
+	}
+
+	return container.ExecOptions{
+		Cmd:          cmd,
+		AttachStdin:  opts.Stdin != nil,
+		AttachStdout: opts.Stdout != nil,
+		AttachStderr: opts.Stderr != nil,
+		Tty:          opts.TTY,
+		Env:          opts.Env,
+		WorkingDir:   workingDir,
+	}
 }
 
 // GetNetworkEndpoint returns the network endpoint (IP) for a shed.

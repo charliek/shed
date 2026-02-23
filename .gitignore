@@ -3,6 +3,8 @@ bin/
 dist/
 /shed
 /shed-server
+/shed-agent
+firecracker/shed-agent
 *.exe
 *.exe~
 *.dll

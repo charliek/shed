@@ -19,6 +19,9 @@ type ExecOptions struct {
 	// Env contains additional environment variables.
 	Env []string
 
+	// WorkingDir overrides the default working directory (/workspace).
+	WorkingDir string
+
 	// InitialSize is the initial terminal size (if TTY is true).
 	InitialSize *TerminalSize
 
