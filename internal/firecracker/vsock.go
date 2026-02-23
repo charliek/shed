@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -24,17 +23,6 @@ type VsockClient struct {
 	socketPath  string
 	consolePort uint32
 	healthPort  uint32
-}
-
-type lockedWriter struct {
-	mu *sync.Mutex
-	w  io.Writer
-}
-
-func (lw *lockedWriter) Write(p []byte) (int, error) {
-	lw.mu.Lock()
-	defer lw.mu.Unlock()
-	return lw.w.Write(p)
 }
 
 // NewVsockClient creates a new VsockClient.
@@ -159,25 +147,28 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	// Channel to signal when output is done
 	done := make(chan error, 2)
 
-	// Copy stdin to connection
+	// Copy stdin to connection as framed protocol messages.
+	// The agent reads protocol-framed messages (readMessageWithTimeout),
+	// so raw bytes would be misinterpreted as frame headers.
+	// When stdin ends, send a MsgTypeStdinEOF message so the agent closes
+	// the command's stdin pipe. We do NOT call CloseWrite() on the connection
+	// because that tears down the vsock UDS before output/exit code arrive.
 	if opts.Stdin != nil {
 		go func() {
-			lockedWriter := &lockedWriter{
-				mu: writeMu,
-				w:  conn,
-			}
-			if _, err := io.Copy(lockedWriter, opts.Stdin); err != nil {
-				// Log stdin errors but don't fail - often expected on disconnect
-				if !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "EOF") {
-					log.Printf("Warning: stdin copy failed: %v", err)
+			buf := make([]byte, 4096)
+			for {
+				n, err := opts.Stdin.Read(buf)
+				if n > 0 {
+					if writeErr := writeMessage(agentproto.MsgTypeData, buf[:n]); writeErr != nil {
+						break
+					}
+				}
+				if err != nil {
+					break
 				}
 			}
-			// Signal EOF by closing write side if possible
-			writeMu.Lock()
-			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
-				_ = cw.CloseWrite()
-			}
-			writeMu.Unlock()
+			// Signal stdin EOF at the protocol level
+			_ = writeMessage(agentproto.MsgTypeStdinEOF, nil)
 		}()
 	}
 

@@ -9,12 +9,10 @@ Follow-up improvements to consider after the initial Firecracker backend merges.
 - Disable root SSH login by default in the Firecracker rootfs and switch to a non-root user workflow.
 - Improve `ipToUint32` handling in `internal/firecracker/network.go` (explicit errors for invalid IPv4).
 - Add deeper graceful shutdown handling for `shed-agent` connection goroutines (beyond basic timeout-driven exit).
-- Evaluate shell-operator behavior for Docker/Firecracker exec and document quoting expectations.
 - Consider stricter validation defaults for Firecracker configs (additional guardrails beyond `vsock_base_cid`).
 - Atomic metadata save: write metadata to a temp file then rename to prevent orphaned resources on partial failure.
 - Replace string-matching error detection with typed sentinel errors (e.g., `ErrShedNotFound`) across firecracker and router packages.
 - Add metadata JSON version field for forward/backward compatibility of the metadata format.
-- Add comprehensive test coverage for `shellEscape()` in `backend.go`.
 - Consider reducing `MaxMessageSize` (16MB) or adding streaming for large messages in agentproto.
 - Document integration test strategy (requires KVM, can't be automated in CI without nested virtualization).
 - Revisit Firecracker kernel source strategy:
@@ -23,6 +21,26 @@ Follow-up improvements to consider after the initial Firecracker backend merges.
   - Decide on default kernel source and provide an explicit fallback path (e.g., config/flag to select kernel).
   - Define an update cadence and security review notes for kernel artifacts.
   - If switching defaults, update docs and add a brief migration note.
+
+## Firecracker E2E Gaps (Deferred)
+
+Issues found during e2e testing that are non-blocking but should be addressed:
+
+### Credential Transfer Size Limit
+- Current limit: 100KB base64 (~75KB raw) per credential via shell argument
+- Large credentials fail (Claude config ~5MB, OpenCode ~3.7MB)
+- Fix options: stdin-based transfer (now possible with framed stdin), chunked transfers, or dedicated file-transfer vsock port
+- Most credentials (SSH keys, git config, gh CLI) are well under the limit
+
+### Stop/Start Service Resilience
+- Partial fix: network-setup.sh cleans known stale PID locations (PostgreSQL, Redis)
+- General solution: configurable stop timeout, pre-shutdown hooks, or startup hook best practices
+- Startup hooks should handle stale state from unclean prior shutdown (PID files, lock files, shared memory segments)
+
+### Kernel Version
+- Current kernel 4.14.174 (Weave Ignite) triggers systemd warning about baseline 4.15
+- Cosmetic only, no functional impact
+- Tracked under existing "Revisit Firecracker kernel source strategy" item
 
 ## Firecracker Live Mounts (SSHFS over vsock)
 

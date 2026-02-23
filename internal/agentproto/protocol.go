@@ -18,6 +18,7 @@ const (
 	MsgTypeSignal         byte = 0x03
 	MsgTypeExitCode       byte = 0x04
 	MsgTypeData           byte = 0x05
+	MsgTypeStdinEOF       byte = 0x06
 	MsgTypeHealthRequest  byte = 0x10
 	MsgTypeHealthResponse byte = 0x11
 )

@@ -51,6 +51,9 @@ func (vm *VM) Start(ctx context.Context) error {
 	// Remove old socket if it exists
 	os.Remove(socketPath)
 
+	// Remove old vsock socket if it exists (prevents "Address in use" on restart)
+	os.Remove(filepath.Join(socketDir, fmt.Sprintf("%s.vsock", vm.meta.Name)))
+
 	// Build firecracker configuration
 	// Kernel args include:
 	// - IP configuration in kernel autoconf format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>

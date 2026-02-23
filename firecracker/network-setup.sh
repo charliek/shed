@@ -55,4 +55,18 @@ ip route add default via "$GATEWAY" 2>/dev/null || true
 # Configure DNS
 echo "nameserver $DNS" > /etc/resolv.conf
 
+# Configure hosts file for localhost resolution
+cat > /etc/hosts << HOSTS_EOF
+127.0.0.1 localhost
+::1 localhost ip6-localhost ip6-loopback
+HOSTS_EOF
+
+# Clean stale runtime state from unclean VM shutdown.
+# The rootfs overlay persists across stop/start, but services expect
+# clean state on boot. Remove stale PID/socket files.
+rm -rf /var/run/postgresql /var/run/redis /var/run/sshd
+mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql 2>/dev/null || true
+mkdir -p /var/run/redis && chown redis:redis /var/run/redis 2>/dev/null || true
+mkdir -p /var/run/sshd
+
 echo "Network configuration complete"

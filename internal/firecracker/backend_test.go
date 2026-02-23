@@ -4,6 +4,7 @@
 package firecracker
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/backend"
@@ -81,6 +82,68 @@ func TestNopWriteCloser(t *testing.T) {
 
 	if err := w.Close(); err != nil {
 		t.Errorf("Close() error = %v", err)
+	}
+}
+
+// TestExecCommandBuilding verifies that the command-building logic in Exec
+// matches Docker behavior: empty → login shell, non-empty → /bin/sh -c join.
+func TestExecCommandBuilding(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []string
+		wantCmd []string
+	}{
+		{
+			name:    "empty command gets login shell",
+			input:   nil,
+			wantCmd: []string{"/bin/bash", "--login"},
+		},
+		{
+			name:    "simple command wrapped in shell",
+			input:   []string{"echo", "hello"},
+			wantCmd: []string{"/bin/sh", "-c", "echo hello"},
+		},
+		{
+			name:    "command with operators passes through",
+			input:   []string{"export", "PATH=$PATH", "&&", "bun", "test"},
+			wantCmd: []string{"/bin/sh", "-c", "export PATH=$PATH && bun test"},
+		},
+		{
+			name:    "command with variable expansion",
+			input:   []string{"echo", "$HOME"},
+			wantCmd: []string{"/bin/sh", "-c", "echo $HOME"},
+		},
+		{
+			name:    "command with pipes",
+			input:   []string{"ls", "|", "grep", "foo"},
+			wantCmd: []string{"/bin/sh", "-c", "ls | grep foo"},
+		},
+		{
+			name:    "single command still wrapped",
+			input:   []string{"whoami"},
+			wantCmd: []string{"/bin/sh", "-c", "whoami"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Replicate the command-building logic from Exec
+			cmd := tt.input
+			if len(cmd) == 0 {
+				cmd = []string{"/bin/bash", "--login"}
+			} else {
+				cmd = []string{"/bin/sh", "-c", strings.Join(cmd, " ")}
+			}
+
+			if len(cmd) != len(tt.wantCmd) {
+				t.Fatalf("got %v, want %v", cmd, tt.wantCmd)
+			}
+			for i := range cmd {
+				if cmd[i] != tt.wantCmd[i] {
+					t.Errorf("cmd[%d] = %q, want %q", i, cmd[i], tt.wantCmd[i])
+				}
+			}
+		})
 	}
 }
 

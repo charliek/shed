@@ -64,8 +64,33 @@ func handleExecConnection(conn net.Conn) {
 		cmd.Dir = "/"
 	}
 
-	// Set environment
-	cmd.Env = append(os.Environ(), req.Env...)
+	// Build environment: system env + request-provided env
+	env := append(os.Environ(), req.Env...)
+
+	// Ensure essential variables have defaults if not set.
+	// The systemd service environment may not include HOME, USER, etc.
+	// Scripts with set -u fail when referencing unset variables.
+	essentialDefaults := [][2]string{
+		{"HOME", "/root"},
+		{"USER", "root"},
+		{"PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		{"SHELL", "/bin/bash"},
+		{"LANG", "C.UTF-8"},
+	}
+	for _, kv := range essentialDefaults {
+		key := kv[0]
+		found := false
+		for _, e := range env {
+			if strings.HasPrefix(e, key+"=") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			env = append(env, key+"="+kv[1])
+		}
+	}
+	cmd.Env = env
 
 	// Only set TERM if not already provided by the caller
 	hasTerm := false
@@ -153,6 +178,8 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 				} else if err := cmd.Process.Signal(syscall.Signal(sig.Signal)); err != nil {
 					log.Printf("Warning: failed to send signal %d: %v", sig.Signal, err)
 				}
+			case MsgTypeStdinEOF:
+				// Ignored in PTY mode — PTY doesn't have a separate stdin pipe
 			default:
 				// Data from stdin
 				if len(data) > 0 {
@@ -271,7 +298,8 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 				}
 				return
 			}
-			if msgType == MsgTypeSignal {
+			switch msgType {
+			case MsgTypeSignal:
 				var sig SignalMessage
 				if err := json.Unmarshal(data, &sig); err != nil {
 					log.Printf("Warning: failed to unmarshal signal message: %v", err)
@@ -280,9 +308,15 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 				} else if err := cmd.Process.Signal(syscall.Signal(sig.Signal)); err != nil {
 					log.Printf("Warning: failed to send signal %d: %v", sig.Signal, err)
 				}
-			} else if len(data) > 0 {
-				if _, err := stdin.Write(data); err != nil {
-					log.Printf("Warning: failed to write to stdin: %v", err)
+			case MsgTypeStdinEOF:
+				// Client signaled end of stdin; close the pipe so the
+				// command sees EOF (e.g. tar xzpf - finishes reading).
+				return
+			default:
+				if len(data) > 0 {
+					if _, err := stdin.Write(data); err != nil {
+						log.Printf("Warning: failed to write to stdin: %v", err)
+					}
 				}
 			}
 		}

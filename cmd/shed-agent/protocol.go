@@ -17,6 +17,7 @@ const (
 	MsgTypeSignal         = agentproto.MsgTypeSignal
 	MsgTypeExitCode       = agentproto.MsgTypeExitCode
 	MsgTypeData           = agentproto.MsgTypeData
+	MsgTypeStdinEOF       = agentproto.MsgTypeStdinEOF
 	MsgTypeHealthRequest  = agentproto.MsgTypeHealthRequest
 	MsgTypeHealthResponse = agentproto.MsgTypeHealthResponse
 )

@@ -110,7 +110,7 @@ func (e *Executor) runHook(ctx context.Context, containerID string, hookType Hoo
 	// Build the command to run the script and tee output to log file
 	// We use bash to handle script execution and output redirection
 	cmd := []string{
-		"bash", "-c",
+		"bash", "--login", "-c",
 		fmt.Sprintf(`
 			set -o pipefail
 			chmod +x %q 2>/dev/null || true

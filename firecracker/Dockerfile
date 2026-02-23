@@ -14,6 +14,10 @@ RUN apt-get update && apt-get install -y \
     dbus \
     # Docker
     docker.io \
+    # Utilities needed by provisioning hooks
+    sudo \
+    unzip \
+    ca-certificates \
     # Development tools
     tmux \
     git \

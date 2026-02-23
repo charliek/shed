@@ -171,9 +171,10 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 	if len(cmd) == 0 {
 		cmd = []string{"/bin/bash", "--login"}
 	} else {
-		if containsShellOperators(cmd) {
-			cmd = []string{"/bin/sh", "-c", buildShellCommand(cmd)}
-		}
+		// Wrap command in shell to support operators like &&, ||, |, etc.
+		// SSH sends the command as space-separated tokens.
+		// The shell parses operators correctly.
+		cmd = []string{"/bin/sh", "-c", strings.Join(cmd, " ")}
 	}
 	opts.Cmd = cmd
 
@@ -181,46 +182,6 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 	vsockPath := filepath.Join(b.client.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
 	vsockClient := NewVsockClient(vsockPath, b.client.cfg.ConsolePort, b.client.cfg.HealthPort)
 	return vsockClient.Exec(ctx, opts)
-}
-
-func containsShellOperators(cmd []string) bool {
-	for _, token := range cmd {
-		if isShellOperatorToken(token) {
-			return true
-		}
-	}
-	return false
-}
-
-func isShellOperatorToken(token string) bool {
-	switch token {
-	case "&&", "||", "|", ";", "&", ">", ">>", "<", "2>", "2>>", "|&", "(", ")":
-		return true
-	default:
-		return false
-	}
-}
-
-func buildShellCommand(cmd []string) string {
-	parts := make([]string, 0, len(cmd))
-	for _, token := range cmd {
-		if isShellOperatorToken(token) {
-			parts = append(parts, token)
-			continue
-		}
-		parts = append(parts, shellEscape(token))
-	}
-	return strings.Join(parts, " ")
-}
-
-func shellEscape(arg string) string {
-	if arg == "" {
-		return "''"
-	}
-	if !strings.ContainsAny(arg, " \t\n'\"\\$&;|<>`()") {
-		return arg
-	}
-	return "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
 }
 
 // GetNetworkEndpoint returns the network endpoint (IP) for a shed.

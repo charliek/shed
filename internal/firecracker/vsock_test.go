@@ -5,12 +5,14 @@ package firecracker
 
 import (
 	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/charliek/shed/internal/agentproto"
+	"github.com/charliek/shed/internal/backend"
 )
 
 func TestNewVsockClient(t *testing.T) {
@@ -260,6 +262,105 @@ func TestWaitForHealth_Timeout(t *testing.T) {
 	err := client.WaitForHealth(ctx, 1*time.Second)
 	if err == nil {
 		t.Fatal("WaitForHealth() expected error on timeout, got nil")
+	}
+}
+
+func TestExecStdinFraming(t *testing.T) {
+	// Verify that stdin data sent through Exec is properly framed as
+	// MsgTypeData protocol messages, not raw bytes.
+	tmpDir := mustTempDir(t, "vsock-test")
+	socketPath := tmpDir + "/test.sock"
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Track received messages on the server side
+	type received struct {
+		msgType byte
+		data    []byte
+	}
+	serverDone := make(chan []received, 1)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- nil
+			return
+		}
+		defer conn.Close()
+
+		// Vsock handshake
+		buf := make([]byte, 256)
+		n, _ := conn.Read(buf)
+		_ = n
+		_, _ = conn.Write([]byte("OK 1024\n"))
+
+		// Read all messages
+		var msgs []received
+		for {
+			msgType, data, err := agentproto.ReadMessage(conn)
+			if err != nil {
+				break
+			}
+			msgs = append(msgs, received{msgType, data})
+
+			// After exec request, send back exit code so client terminates
+			if msgType == agentproto.MsgTypeExecRequest {
+				_ = agentproto.WriteMessage(conn, agentproto.MsgTypeExitCode, []byte(`{"code":0}`))
+			}
+		}
+		serverDone <- msgs
+	}()
+
+	client := NewVsockClient(socketPath, 1024, 1025)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stdinData := "hello from stdin"
+	opts := backend.ExecOptions{
+		Cmd:   []string{"cat"},
+		Stdin: io.NopCloser(strings.NewReader(stdinData)),
+		TTY:   false,
+	}
+
+	// Exec may return nil or an error (connection closes after exit code)
+	_ = client.Exec(ctx, opts)
+
+	// Check what the server received
+	msgs := <-serverDone
+	if len(msgs) < 1 {
+		t.Fatal("server received no messages")
+	}
+
+	// First message should be exec request
+	if msgs[0].msgType != agentproto.MsgTypeExecRequest {
+		t.Errorf("first message type = %d, want %d (ExecRequest)", msgs[0].msgType, agentproto.MsgTypeExecRequest)
+	}
+
+	// Look for MsgTypeData messages containing our stdin data
+	var stdinReceived []byte
+	for _, msg := range msgs {
+		if msg.msgType == agentproto.MsgTypeData {
+			stdinReceived = append(stdinReceived, msg.data...)
+		}
+	}
+	if string(stdinReceived) != stdinData {
+		t.Errorf("stdin data = %q, want %q", string(stdinReceived), stdinData)
+	}
+
+	// Verify MsgTypeStdinEOF was sent after stdin data
+	foundEOF := false
+	for _, msg := range msgs {
+		if msg.msgType == agentproto.MsgTypeStdinEOF {
+			foundEOF = true
+			break
+		}
+	}
+	if !foundEOF {
+		t.Error("expected MsgTypeStdinEOF message after stdin data, but none found")
 	}
 }
 

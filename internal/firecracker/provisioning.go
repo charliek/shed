@@ -100,6 +100,14 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 			}
 			fmt.Fprintln(p.output, "Install hook complete")
 			_ = state.MarkInstallComplete(ctx)
+
+			// Capture installed tool paths for subsequent hooks.
+			// Install hooks often modify ~/.bashrc (e.g., bun adds PATH).
+			// Non-interactive shells don't source .bashrc, so we persist
+			// the PATH to /etc/profile.d/ which login shells source.
+			if err := p.captureInstalledPaths(ctx); err != nil {
+				fmt.Fprintf(p.errOut, "Warning: failed to capture installed paths: %v\n", err)
+			}
 		}
 	}
 
@@ -164,7 +172,7 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 	multiWriter := io.MultiWriter(p.output, &outputBuf)
 
 	opts := backend.ExecOptions{
-		Cmd:        []string{"bash", "-c", cmd},
+		Cmd:        []string{"bash", "--login", "-c", cmd},
 		Env:        env,
 		Stdout:     &nopWriteCloser{multiWriter},
 		Stderr:     &nopWriteCloser{p.errOut},
@@ -196,6 +204,19 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 	}
 
 	return nil
+}
+
+// captureInstalledPaths captures PATH from an interactive shell and persists
+// it to /etc/profile.d/ so login shells (used by subsequent hooks) inherit
+// tools installed by the install hook (e.g., bun adds itself to ~/.bashrc).
+func (p *Provisioner) captureInstalledPaths(ctx context.Context) error {
+	cmd := `bash -ic 'echo "$PATH"' 2>/dev/null | tail -1 | xargs -I{} bash -c 'echo "export PATH=\"{}\"" > /etc/profile.d/shed-installed-tools.sh'`
+	opts := backend.ExecOptions{
+		Cmd:        []string{"bash", "-c", cmd},
+		WorkingDir: "/",
+		TTY:        false,
+	}
+	return p.vsock.Exec(ctx, opts)
 }
 
 // ensureLogDir creates the log directory in the VM if it doesn't exist.
