@@ -8,8 +8,17 @@ import (
 	"time"
 )
 
-// Sentinel errors for session operations.
+// Sentinel errors for shed and session operations.
 var (
+	// ErrShedNotFoundSentinel is returned when a shed does not exist.
+	ErrShedNotFoundSentinel = errors.New("shed not found")
+
+	// ErrShedAlreadyExistsSentinel is returned when creating a shed that already exists.
+	ErrShedAlreadyExistsSentinel = errors.New("shed already exists")
+
+	// ErrShedAlreadyRunningSentinel is returned when starting a shed that is already running.
+	ErrShedAlreadyRunningSentinel = errors.New("shed is already running")
+
 	// ErrSessionNotFoundSentinel is returned when a tmux session does not exist.
 	ErrSessionNotFoundSentinel = errors.New("session not found")
 

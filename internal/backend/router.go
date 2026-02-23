@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -185,7 +186,7 @@ func (r *Router) backendForShed(ctx context.Context, name string) (Backend, *con
 	}
 
 	if foundBackend == nil {
-		return nil, nil, fmt.Errorf("shed %q not found", name)
+		return nil, nil, fmt.Errorf("shed %q: %w", name, config.ErrShedNotFoundSentinel)
 	}
 
 	return foundBackend, foundShed, nil
@@ -195,5 +196,9 @@ func isShedNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, config.ErrShedNotFoundSentinel) {
+		return true
+	}
+	// Fallback for backends that haven't adopted sentinel errors yet (e.g. Docker)
 	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }

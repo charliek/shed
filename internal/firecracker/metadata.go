@@ -93,7 +93,9 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 	return &meta, nil
 }
 
-// Save writes the metadata to the instance directory.
+// Save writes the metadata to the instance directory atomically.
+// It writes to a temporary file and renames, which is atomic on Linux ext4
+// when source and dest are in the same directory.
 func (m *Metadata) Save(instanceDir string) error {
 	if err := validateInstanceName(m.Name); err != nil {
 		return err
@@ -110,8 +112,25 @@ func (m *Metadata) Save(instanceDir string) error {
 	}
 
 	path := MetadataPath(instanceDir, m.Name)
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	tmpFile, err := os.CreateTemp(dir, ".metadata-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp metadata file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write metadata: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to close temp metadata file: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename metadata: %w", err)
 	}
 
 	return nil

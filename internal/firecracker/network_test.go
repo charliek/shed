@@ -4,6 +4,7 @@
 package firecracker
 
 import (
+	"errors"
 	"net"
 	"testing"
 )
@@ -26,6 +27,13 @@ func TestNewNetworkManager_InvalidCIDR(t *testing.T) {
 	_, err := NewNetworkManager("fc-br0", "invalid-cidr", "fc-tap")
 	if err == nil {
 		t.Error("NewNetworkManager() expected error for invalid CIDR")
+	}
+}
+
+func TestNewNetworkManager_IPv6Rejected(t *testing.T) {
+	_, err := NewNetworkManager("fc-br0", "fd00::1/64", "fc-tap")
+	if err == nil {
+		t.Error("NewNetworkManager() expected error for IPv6 CIDR")
 	}
 }
 
@@ -158,11 +166,32 @@ func TestIPToUint32(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.ip, func(t *testing.T) {
 			ip := net.ParseIP(tt.ip)
-			got := ipToUint32(ip)
+			got, err := ipToUint32(ip)
+			if err != nil {
+				t.Fatalf("ipToUint32(%v) unexpected error: %v", tt.ip, err)
+			}
 			if got != tt.want {
 				t.Errorf("ipToUint32(%v) = %#x, want %#x", tt.ip, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIPToUint32_NilIP(t *testing.T) {
+	_, err := ipToUint32(nil)
+	if !errors.Is(err, ErrInvalidIPv4) {
+		t.Errorf("ipToUint32(nil) error = %v, want ErrInvalidIPv4", err)
+	}
+}
+
+func TestIPToUint32_InvalidIPv6(t *testing.T) {
+	ip := net.ParseIP("::1")
+	_, err := ipToUint32(ip)
+	if err == nil {
+		t.Error("ipToUint32(::1) expected error for IPv6 address")
+	}
+	if !errors.Is(err, ErrInvalidIPv4) {
+		t.Errorf("ipToUint32(::1) error = %v, want ErrInvalidIPv4", err)
 	}
 }
 
@@ -203,7 +232,10 @@ func TestIPRoundTrip(t *testing.T) {
 	for _, ipStr := range ips {
 		t.Run(ipStr, func(t *testing.T) {
 			ip := net.ParseIP(ipStr)
-			n := ipToUint32(ip)
+			n, err := ipToUint32(ip)
+			if err != nil {
+				t.Fatalf("ipToUint32(%v) unexpected error: %v", ipStr, err)
+			}
 			back := uint32ToIP(n)
 
 			// Compare as strings since net.IP comparison can be tricky

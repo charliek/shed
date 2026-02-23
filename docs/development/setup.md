@@ -66,14 +66,19 @@ shed/
 │   │   ├── create.go       # create command
 │   │   ├── console.go      # console command
 │   │   └── ...
-│   └── shed-server/        # Server binary
-│       ├── main.go         # Entry point
-│       ├── serve.go        # serve command
-│       └── install.go      # systemd install
+│   ├── shed-server/        # Server binary
+│   │   ├── main.go         # Entry point
+│   │   ├── serve.go        # serve command
+│   │   └── install.go      # systemd install
+│   └── shed-agent/         # Firecracker VM agent binary
+│       └── main.go
 ├── internal/
 │   ├── api/                # HTTP API handlers
+│   ├── agentproto/         # Vsock binary protocol
+│   ├── backend/            # Backend interface
 │   ├── config/             # Configuration types
 │   ├── docker/             # Docker client wrapper
+│   ├── firecracker/        # Firecracker backend
 │   ├── sshd/               # SSH server
 │   ├── sshconfig/          # SSH config management
 │   ├── provision/          # Provisioning hooks
@@ -81,7 +86,10 @@ shed/
 │   ├── tunnels/            # SSH tunnel management
 │   └── version/            # Version information
 ├── scripts/
-│   └── build-image.sh      # Build shed-base image
+│   ├── build-image.sh              # Build shed-base Docker image
+│   ├── build-firecracker-rootfs.sh # Build Firecracker rootfs
+│   ├── build-firecracker-kernel.sh # Build custom 6.1 kernel
+│   └── download-firecracker.sh     # Download Firecracker binary
 ├── configs/
 │   ├── server.example.yaml
 │   └── server.dev.yaml

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -182,23 +183,32 @@ func (vm *VM) Stop(ctx context.Context) error {
 
 	// Wait for the machine to stop
 	waitErr := vm.machine.Wait(shutdownCtx)
-	if waitErr != nil {
-		// Force kill if graceful shutdown fails
-		if vm.meta.PID > 0 {
-			_ = syscall.Kill(vm.meta.PID, syscall.SIGKILL)
+	if waitErr != nil && vm.meta.PID > 0 {
+		// Graceful shutdown timed out — force kill
+		if !isFirecrackerProcess(vm.meta.PID) {
+			log.Printf("Warning: PID %d is not a Firecracker process, skipping SIGKILL", vm.meta.PID)
+			if shutdownErr != nil {
+				return shutdownErr
+			}
+			return waitErr
+		} else if err := syscall.Kill(vm.meta.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("failed to kill VM after shutdown timeout: %w", err)
 		}
-	}
-
-	switch {
-	case shutdownErr != nil && waitErr != nil:
-		return fmt.Errorf("graceful shutdown failed: %w; wait failed: %v", shutdownErr, waitErr)
-	case shutdownErr != nil:
-		return shutdownErr
-	case waitErr != nil:
-		return waitErr
-	default:
+		if !waitForProcessExit(vm.meta.PID, 2*time.Second) {
+			log.Printf("Warning: VM %s PID %d did not exit within timeout after SIGKILL", vm.meta.Name, vm.meta.PID)
+		}
+		log.Printf("VM %s force-killed after graceful shutdown timeout", vm.meta.Name)
 		return nil
 	}
+	if waitErr != nil && vm.meta.PID <= 0 {
+		log.Printf("Warning: VM %s wait failed but no PID available for force-kill", vm.meta.Name)
+	}
+
+	// Return shutdown error if the API call itself failed (not timeout)
+	if shutdownErr != nil {
+		return shutdownErr
+	}
+	return waitErr
 }
 
 // cleanupSockets removes the API and vsock socket files for this VM.
@@ -225,6 +235,10 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 	}
 
 	// Try SIGTERM first
+	if !isFirecrackerProcess(vm.meta.PID) {
+		log.Printf("Warning: PID %d is not a Firecracker process, skipping signal", vm.meta.PID)
+		return nil
+	}
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return nil
@@ -249,7 +263,9 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 		}
 
 		if time.Now().After(deadline) {
-			if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			if !isFirecrackerProcess(vm.meta.PID) {
+				log.Printf("Warning: PID %d is not a Firecracker process, skipping SIGKILL", vm.meta.PID)
+			} else if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 				return fmt.Errorf("failed to kill VM after timeout: %w", err)
 			}
 			return nil
@@ -257,13 +273,28 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
-			if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			if !isFirecrackerProcess(vm.meta.PID) {
+				log.Printf("Warning: PID %d is not a Firecracker process, skipping SIGKILL", vm.meta.PID)
+			} else if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 				return fmt.Errorf("context canceled, failed to kill VM: %w", err)
 			}
 			return ctx.Err()
 		case <-ticker.C:
 		}
 	}
+}
+
+// waitForProcessExit polls until a process exits or timeout expires.
+// Returns true if the process exited, false if the timeout was reached.
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }
 
 // IsRunning checks if the VM is currently running.
@@ -282,6 +313,17 @@ func (vm *VM) IsRunning() bool {
 	// EPERM means the process exists but we lack permission to signal it.
 	err = process.Signal(syscall.Signal(0))
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// isFirecrackerProcess checks if the given PID belongs to a Firecracker process
+// by reading /proc/<pid>/cmdline. Returns false if the process doesn't exist
+// or doesn't look like a Firecracker process (indicating PID reuse).
+func isFirecrackerProcess(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false // Process gone or not readable
+	}
+	return strings.Contains(string(data), "firecracker")
 }
 
 // generateMACAddress generates a MAC address based on the CID.

@@ -6,7 +6,7 @@ This guide covers the installation and setup of the Firecracker backend for shed
 
 - Linux host with KVM support
 - Root access (for network setup)
-- Docker (for building rootfs and downloading kernel)
+- Docker (for building rootfs)
 - Go 1.24+ (for building shed-agent)
 
 ## 1. Check KVM Support
@@ -31,11 +31,14 @@ Run the download script to get Firecracker and a compatible kernel:
 ```
 
 This installs:
-- `/usr/local/bin/firecracker` - Firecracker binary
-- `/var/lib/shed/firecracker/vmlinux.bin` - Linux kernel (from Weave Ignite, with Docker support)
-- `/var/lib/shed/firecracker/vmlinux-minimal.bin` - Minimal kernel (fallback, no Docker support)
+- `/usr/local/bin/firecracker` - Firecracker binary (v1.14.1)
+- `/var/lib/shed/firecracker/vmlinux.bin` - CI 6.1 kernel (quick-start fallback)
 
-**Note:** The script requires Docker to extract the kernel from the `weaveworks/ignite-kernel` image.
+For a Docker-capable kernel with full BPF/cgroup support, build a custom kernel:
+```bash
+./scripts/build-firecracker-kernel.sh
+```
+This overwrites `/var/lib/shed/firecracker/vmlinux.bin` with the custom kernel. Requires ~2GB disk space and build tools (`sudo apt install build-essential flex bison libelf-dev bc libssl-dev`).
 
 ## 3. Build the Rootfs Image
 
@@ -334,16 +337,20 @@ error setting cgroup config for procHooks process: bpf_prog_query(BPF_CGROUP_DEV
 failed: invalid argument
 ```
 
-This means the kernel lacks BPF cgroup support. The default kernel downloaded by `download-firecracker.sh` (from Weave Ignite) has BPF support. If you're using the minimal kernel (`vmlinux-minimal.bin`), switch to the default kernel which has:
+This means the kernel lacks BPF cgroup support. The custom 6.1 kernel built by `build-firecracker-kernel.sh` has full BPF support. If you're using the CI fallback kernel, build a custom kernel which includes:
 - `CONFIG_BPF=y`
 - `CONFIG_BPF_SYSCALL=y`
 - `CONFIG_CGROUP_BPF=y`
 
-To switch kernels, update `kernel_path` in your server.yaml:
+To build and use the Docker-capable kernel:
+```bash
+./scripts/build-firecracker-kernel.sh
+```
+
+Then ensure `kernel_path` in your server.yaml points to the built kernel:
 ```yaml
 firecracker:
-  kernel_path: /var/lib/shed/firecracker/vmlinux.bin  # Full kernel with Docker support
-  # kernel_path: /var/lib/shed/firecracker/vmlinux-minimal.bin  # Minimal kernel (no Docker)
+  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
 ```
 
 ## Network Architecture

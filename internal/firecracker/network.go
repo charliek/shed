@@ -4,11 +4,11 @@
 package firecracker
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os/exec"
-	"strings"
 
 	"github.com/vishvananda/netlink"
 )
@@ -27,6 +27,9 @@ func NewNetworkManager(bridgeName, bridgeCIDR, tapPrefix string) (*NetworkManage
 	ip, network, err := net.ParseCIDR(bridgeCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("invalid bridge CIDR %q: %w", bridgeCIDR, err)
+	}
+	if ip.To4() == nil {
+		return nil, fmt.Errorf("bridge CIDR %q must be IPv4", bridgeCIDR)
 	}
 
 	return &NetworkManager{
@@ -52,7 +55,10 @@ func (nm *NetworkManager) AllocateIP(index int) (string, error) {
 	copy(ip, nm.gateway)
 
 	// Convert IP to uint32 for proper arithmetic across octets
-	ipInt := ipToUint32(ip)
+	ipInt, err := ipToUint32(ip)
+	if err != nil {
+		return "", fmt.Errorf("invalid gateway IP: %w", err)
+	}
 	ipInt += uint32(index + 1)
 	allocated := uint32ToIP(ipInt)
 	if nm.network != nil && !nm.network.Contains(allocated) {
@@ -62,13 +68,16 @@ func (nm *NetworkManager) AllocateIP(index int) (string, error) {
 	return allocated.String(), nil
 }
 
+// ErrInvalidIPv4 is returned when an IP address is not a valid IPv4 address.
+var ErrInvalidIPv4 = errors.New("not a valid IPv4 address")
+
 // ipToUint32 converts an IPv4 address to a uint32.
-func ipToUint32(ip net.IP) uint32 {
+func ipToUint32(ip net.IP) (uint32, error) {
 	ip = ip.To4()
 	if ip == nil {
-		return 0
+		return 0, ErrInvalidIPv4
 	}
-	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3]), nil
 }
 
 // uint32ToIP converts a uint32 to an IPv4 address.
@@ -130,7 +139,8 @@ func (nm *NetworkManager) DeleteTAPDevice(name string) error {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
 		// Device doesn't exist, nothing to do
-		if strings.Contains(err.Error(), "not found") {
+		var lnfErr netlink.LinkNotFoundError
+		if errors.As(err, &lnfErr) {
 			return nil
 		}
 		return fmt.Errorf("failed to find TAP device %s: %w", name, err)

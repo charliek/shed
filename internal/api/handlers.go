@@ -270,7 +270,21 @@ func mapDockerError(err error) (int, string, string) {
 		}
 	}
 
-	// Check for common error messages
+	// Check for backend-agnostic sentinel errors
+	if errors.Is(err, config.ErrShedNotFoundSentinel) {
+		return http.StatusNotFound, config.ErrShedNotFound, err.Error()
+	}
+	if errors.Is(err, config.ErrShedAlreadyExistsSentinel) {
+		return http.StatusConflict, config.ErrShedAlreadyExists, err.Error()
+	}
+	if errors.Is(err, config.ErrShedAlreadyRunningSentinel) {
+		return http.StatusConflict, config.ErrShedAlreadyRunning, err.Error()
+	}
+	if errors.Is(err, config.ErrShedNotRunningSentinel) {
+		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
+	}
+
+	// Check for common error messages (fallback for backends without sentinel errors)
 	errMsg := err.Error()
 	if strings.Contains(errMsg, "not found") {
 		return http.StatusNotFound, config.ErrShedNotFound, sanitizeErrorMessage(errMsg, "not found")

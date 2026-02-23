@@ -1,0 +1,16 @@
+# Kernel config fragment for Docker support inside Firecracker VMs.
+#
+# The Firecracker CI 6.1 config already includes all configs needed for
+# our Docker setup (vfs driver, cgroupfs, host networking, no iptables):
+#
+#   BPF:        CONFIG_BPF=y, CONFIG_BPF_SYSCALL=y, CONFIG_CGROUP_BPF=y
+#   Cgroups:    CONFIG_CGROUPS=y, CONFIG_MEMCG=y, CONFIG_CGROUP_PIDS=y
+#   Overlay:    CONFIG_OVERLAY_FS=y
+#   Namespaces: CONFIG_NAMESPACES=y, CONFIG_USER_NS=y, CONFIG_PID_NS=y, CONFIG_NET_NS=y
+#   Network:    CONFIG_BRIDGE=y, CONFIG_VETH=y, CONFIG_NETFILTER=y
+#
+# This fragment is an extension point for future additions. Lines below
+# are merged into the base config before building.
+
+# Uncomment if live mounts (SSHFS over vsock) are needed:
+# CONFIG_FUSE_FS=y

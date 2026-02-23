@@ -18,6 +18,15 @@ import (
 	"github.com/charliek/shed/internal/backend"
 )
 
+// ExitError is returned when a command executed via vsock exits with a non-zero code.
+type ExitError struct {
+	Code int
+}
+
+func (e *ExitError) Error() string {
+	return fmt.Sprintf("command exited with code %d", e.Code)
+}
+
 // VsockClient handles vsock communication with the guest agent via Firecracker's UDS.
 type VsockClient struct {
 	socketPath  string
@@ -198,7 +207,7 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 					return
 				}
 				if exitMsg.Code != 0 {
-					done <- fmt.Errorf("command exited with code %d", exitMsg.Code)
+					done <- &ExitError{Code: exitMsg.Code}
 				} else {
 					done <- nil
 				}
