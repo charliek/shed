@@ -19,7 +19,7 @@ import (
 )
 
 // handleExecConnection handles a connection on the console port.
-func handleExecConnection(conn net.Conn) {
+func handleExecConnection(conn net.Conn, user *userInfo) {
 	defer conn.Close()
 
 	// Read the exec request
@@ -53,6 +53,14 @@ func handleExecConnection(conn net.Conn) {
 	// Create the command
 	cmd := exec.Command(req.Cmd[0], req.Cmd[1:]...)
 
+	// Run as non-root user if resolved at startup
+	if user != nil {
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
+		}
+		cmd.SysProcAttr.Credential = user.cred
+	}
+
 	// Set working directory
 	workDir := req.WorkingDir
 	if workDir == "" {
@@ -67,12 +75,26 @@ func handleExecConnection(conn net.Conn) {
 	// Build environment: system env + request-provided env
 	env := append(os.Environ(), req.Env...)
 
+	// When running as a non-root user, force HOME and USER to match the
+	// resolved user. The systemd service runs as root and sets USER=root
+	// in the inherited environment, which must be overridden.
+	if user != nil {
+		env = setEnv(env, "HOME", user.homeDir)
+		env = setEnv(env, "USER", user.name)
+	}
+
 	// Ensure essential variables have defaults if not set.
 	// The systemd service environment may not include HOME, USER, etc.
 	// Scripts with set -u fail when referencing unset variables.
+	homeDir := "/root"
+	userName := "root"
+	if user != nil {
+		homeDir = user.homeDir
+		userName = user.name
+	}
 	essentialDefaults := [][2]string{
-		{"HOME", "/root"},
-		{"USER", "root"},
+		{"HOME", homeDir},
+		{"USER", userName},
 		{"PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 		{"SHELL", "/bin/bash"},
 		{"LANG", "C.UTF-8"},
@@ -410,4 +432,16 @@ func isTimeout(err error) bool {
 		return true
 	}
 	return false
+}
+
+// setEnv sets or replaces an environment variable in the given slice.
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }

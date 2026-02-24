@@ -59,8 +59,11 @@ func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error)
 	}
 
 	if err := p.vsock.Exec(ctx, opts); err != nil {
-		// Check if file doesn't exist (expected case - no config file)
-		if strings.Contains(stderr.String(), "No such file") {
+		// Check if file doesn't exist (expected case - no config file).
+		// The vsock protocol merges stdout and stderr into a single stream,
+		// so check both for the "No such file" indicator.
+		combined := stdout.String() + stderr.String()
+		if strings.Contains(combined, "No such file") {
 			return &provision.Config{
 				Env: make(map[string]string),
 			}, nil
@@ -219,7 +222,7 @@ MISE_SHIMS="$HOME/.local/share/mise/shims"
 if [ -d "$MISE_SHIMS" ] && ! echo "$PATH_VAL" | grep -q "$MISE_SHIMS"; then
   PATH_VAL="$MISE_SHIMS:$PATH_VAL"
 fi
-echo "export PATH=\"$PATH_VAL\"" > /etc/profile.d/shed-installed-tools.sh
+echo "export PATH=\"$PATH_VAL\"" | sudo tee /etc/profile.d/shed-installed-tools.sh > /dev/null
 `
 	opts := backend.ExecOptions{
 		Cmd:        []string{"bash", "-c", cmd},
@@ -230,9 +233,13 @@ echo "export PATH=\"$PATH_VAL\"" > /etc/profile.d/shed-installed-tools.sh
 }
 
 // ensureLogDir creates the log directory in the VM if it doesn't exist.
+// The directory is pre-created in the rootfs owned by shed, but this is a
+// safety net for edge cases. Uses sudo since /var/log is a system path.
 func (p *Provisioner) ensureLogDir(ctx context.Context) error {
+	cmd := fmt.Sprintf("sudo mkdir -p %s && sudo chown shed:shed %s && sudo chmod 755 %s",
+		provision.LogDir, provision.LogDir, provision.LogDir)
 	opts := backend.ExecOptions{
-		Cmd:        []string{"mkdir", "-p", provision.LogDir},
+		Cmd:        []string{"/bin/sh", "-c", cmd},
 		WorkingDir: "/",
 		TTY:        false,
 	}
@@ -361,10 +368,12 @@ func (s *ProvisionState) writeStateFile(ctx context.Context, state map[string]st
 		content.WriteString(fmt.Sprintf("%s=%s\n", key, escapeStateValue(value)))
 	}
 
-	// Use heredoc to safely write content
-	cmd := fmt.Sprintf(`mkdir -p %s && cat > %s << 'SHED_EOF'
+	// Use heredoc to safely write content.
+	// The log dir is pre-created and owned by shed, so the state file write
+	// works without sudo. Use sudo mkdir as a safety net fallback.
+	cmd := fmt.Sprintf(`sudo mkdir -p %s && sudo chown shed:shed %s && cat > %s << 'SHED_EOF'
 %s
-SHED_EOF`, provision.LogDir, stateFilePath, content.String())
+SHED_EOF`, provision.LogDir, provision.LogDir, stateFilePath, content.String())
 
 	opts := backend.ExecOptions{
 		Cmd:        []string{"bash", "-c", cmd},
@@ -387,7 +396,10 @@ func (s *ProvisionState) readStateFile(ctx context.Context) (map[string]string, 
 	}
 
 	if err := s.vsock.Exec(ctx, opts); err != nil {
-		if strings.Contains(stderr.String(), "No such file") {
+		// The vsock protocol merges stdout and stderr into a single stream,
+		// so check both for the "No such file" indicator.
+		combined := stdout.String() + stderr.String()
+		if strings.Contains(combined, "No such file") {
 			return nil, nil
 		}
 		return nil, err

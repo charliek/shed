@@ -60,7 +60,7 @@ Firecracker VMs don't support bind mounts like Docker. Instead, credentials conf
    - Archived on the host using tar
    - Transferred to the VM via vsock
    - Extracted to the target location
-   - Ownership is set to root:root
+   - Ownership is set to shed:shed (user-home paths) or root:root (system paths)
 
 2. Changes to credentials on the host after VM starts won't be reflected in the VM until restart
 

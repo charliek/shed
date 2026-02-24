@@ -86,7 +86,7 @@ func TestNopWriteCloser(t *testing.T) {
 }
 
 // TestExecCommandBuilding verifies that the command-building logic in Exec
-// matches Docker behavior: empty → login shell, non-empty → /bin/sh -c join.
+// wraps commands correctly: empty → login shell, non-empty → bash --login -c join.
 func TestExecCommandBuilding(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -99,29 +99,29 @@ func TestExecCommandBuilding(t *testing.T) {
 			wantCmd: []string{"/bin/bash", "--login"},
 		},
 		{
-			name:    "simple command wrapped in shell",
+			name:    "simple command wrapped in login shell",
 			input:   []string{"echo", "hello"},
-			wantCmd: []string{"/bin/sh", "-c", "echo hello"},
+			wantCmd: []string{"/bin/bash", "--login", "-c", "echo hello"},
 		},
 		{
 			name:    "command with operators passes through",
 			input:   []string{"export", "PATH=$PATH", "&&", "bun", "test"},
-			wantCmd: []string{"/bin/sh", "-c", "export PATH=$PATH && bun test"},
+			wantCmd: []string{"/bin/bash", "--login", "-c", "export PATH=$PATH && bun test"},
 		},
 		{
 			name:    "command with variable expansion",
 			input:   []string{"echo", "$HOME"},
-			wantCmd: []string{"/bin/sh", "-c", "echo $HOME"},
+			wantCmd: []string{"/bin/bash", "--login", "-c", "echo $HOME"},
 		},
 		{
 			name:    "command with pipes",
 			input:   []string{"ls", "|", "grep", "foo"},
-			wantCmd: []string{"/bin/sh", "-c", "ls | grep foo"},
+			wantCmd: []string{"/bin/bash", "--login", "-c", "ls | grep foo"},
 		},
 		{
 			name:    "single command still wrapped",
 			input:   []string{"whoami"},
-			wantCmd: []string{"/bin/sh", "-c", "whoami"},
+			wantCmd: []string{"/bin/bash", "--login", "-c", "whoami"},
 		},
 	}
 
@@ -132,7 +132,7 @@ func TestExecCommandBuilding(t *testing.T) {
 			if len(cmd) == 0 {
 				cmd = []string{"/bin/bash", "--login"}
 			} else {
-				cmd = []string{"/bin/sh", "-c", strings.Join(cmd, " ")}
+				cmd = []string{"/bin/bash", "--login", "-c", strings.Join(cmd, " ")}
 			}
 
 			if len(cmd) != len(tt.wantCmd) {

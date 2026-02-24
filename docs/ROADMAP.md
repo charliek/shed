@@ -6,7 +6,7 @@ This document outlines planned future enhancements for Shed.
 
 Follow-up improvements to consider after the initial Firecracker backend merges.
 
-- Disable root SSH login by default in the Firecracker rootfs and switch to a non-root user workflow.
+- ~~Disable root SSH login by default in the Firecracker rootfs and switch to a non-root user workflow.~~ **Done** — shed-agent now runs commands as the `shed` user (UID 1000), matching the Docker backend's non-root model.
 - Add deeper graceful shutdown handling for `shed-agent` connection goroutines (beyond basic timeout-driven exit).
 - Consider stricter validation defaults for Firecracker configs (additional guardrails beyond `vsock_base_cid`).
 - Add metadata JSON version field for forward/backward compatibility of the metadata format.
