@@ -13,20 +13,13 @@ Follow-up improvements to consider after the initial Firecracker backend merges.
 - Consider reducing `MaxMessageSize` (16MB) or adding streaming for large messages in agentproto.
 - Document integration test strategy (requires KVM, can't be automated in CI without nested virtualization).
 
-## Firecracker E2E Gaps (Deferred)
+## Firecracker Graceful Shutdown (Deferred)
 
-Issues found during e2e testing that are non-blocking but should be addressed:
+Remaining improvement for stop/start resilience after most e2e gaps were resolved:
 
-### Credential Transfer Size Limit
-- Current limit: 100KB base64 (~75KB raw) per credential via shell argument
-- Large credentials fail (Claude config ~5MB, OpenCode ~3.7MB)
-- Fix options: stdin-based transfer (now possible with framed stdin), chunked transfers, or dedicated file-transfer vsock port
-- Most credentials (SSH keys, git config, gh CLI) are well under the limit
-
-### Stop/Start Service Resilience
-- Partial fix: network-setup.sh cleans known stale PID locations (PostgreSQL, Redis)
-- General solution: configurable stop timeout, pre-shutdown hooks, or startup hook best practices
-- Startup hooks should handle stale state from unclean prior shutdown (PID files, lock files, shared memory segments)
+- Boot cleanup now handles stale PIDs, shared memory, lock files, and temp files (via `network-setup.sh`)
+- Still deferred: configurable stop timeout, pre-shutdown hooks for graceful service termination
+- Still deferred: startup hook best practices documentation
 
 ## Firecracker Live Mounts (SSHFS over vsock)
 

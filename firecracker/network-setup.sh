@@ -63,10 +63,26 @@ HOSTS_EOF
 
 # Clean stale runtime state from unclean VM shutdown.
 # The rootfs overlay persists across stop/start, but services expect
-# clean state on boot. Remove stale PID/socket files.
+# clean state on boot. Remove stale PID files, sockets, lock files,
+# and shared memory segments left by killed processes.
+
+# Service-specific runtime directories (remove and recreate with correct ownership)
 rm -rf /var/run/postgresql /var/run/redis /var/run/sshd
 mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql 2>/dev/null || true
 mkdir -p /var/run/redis && chown redis:redis /var/run/redis 2>/dev/null || true
 mkdir -p /var/run/sshd
+
+# Additional known service PID files
+rm -f /var/run/mysqld/mysqld.pid /var/run/nginx.pid /var/run/docker.pid /var/run/crond.pid 2>/dev/null || true
+mkdir -p /var/run/mysqld && chown mysql:mysql /var/run/mysqld 2>/dev/null || true
+
+# Shared memory cleanup (e.g., PostgreSQL POSIX shared memory segments)
+rm -rf /dev/shm/* 2>/dev/null || true
+
+# Lock file cleanup
+rm -f /var/lock/*.lock /run/lock/*.lock 2>/dev/null || true
+
+# Temp file cleanup (stale sockets, lock files from previous boot)
+find /tmp -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 
 echo "Network configuration complete"
