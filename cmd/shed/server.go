@@ -120,6 +120,25 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "added",
+			Name:   name,
+			Details: struct {
+				Host     string `json:"host"`
+				HTTPPort int    `json:"http_port"`
+				SSHPort  int    `json:"ssh_port"`
+				Default  bool   `json:"default"`
+			}{
+				Host:     host,
+				HTTPPort: info.HTTPPort,
+				SSHPort:  info.SSHPort,
+				Default:  clientConfig.DefaultServer == name,
+			},
+		})
+	}
+
 	printSuccess("Added server %s (%s:%d)", name, host, info.HTTPPort)
 	if clientConfig.DefaultServer == name {
 		fmt.Println("  Set as default server")
@@ -129,19 +148,48 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 }
 
 func runServerList(cmd *cobra.Command, args []string) error {
-	if len(clientConfig.Servers) == 0 {
-		fmt.Println("No servers configured.")
-		fmt.Println("\nTo add a server:")
-		fmt.Println("  shed server add <hostname>")
-		return nil
-	}
-
 	// Sort server names for consistent output
 	names := make([]string, 0, len(clientConfig.Servers))
 	for name := range clientConfig.Servers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+
+	if jsonFlag {
+		type serverJSON struct {
+			Name     string `json:"name"`
+			Host     string `json:"host"`
+			HTTPPort int    `json:"http_port"`
+			SSHPort  int    `json:"ssh_port"`
+			Status   string `json:"status"`
+			Default  bool   `json:"default"`
+		}
+		result := make([]serverJSON, 0, len(names))
+		for _, name := range names {
+			entry := clientConfig.Servers[name]
+			client := NewAPIClientFromEntry(&entry, DefaultTimeout)
+			status := "offline"
+			if client.Ping() {
+				status = "online"
+			}
+			result = append(result, serverJSON{
+				Name:     name,
+				Host:     entry.Host,
+				HTTPPort: entry.HTTPPort,
+				SSHPort:  entry.SSHPort,
+				Status:   status,
+				Default:  name == clientConfig.DefaultServer,
+			})
+		}
+		return outputJSON(result)
+	}
+
+	if len(clientConfig.Servers) == 0 {
+		fmt.Println("No servers configured.")
+		fmt.Println("\nTo add a server:")
+		fmt.Println("  shed server add <hostname>")
+		return nil
+	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tHOST\tHTTP\tSSH\tSTATUS\tDEFAULT")
@@ -181,6 +229,14 @@ func runServerRemove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "removed",
+			Name:   name,
+		})
+	}
+
 	printSuccess("Removed server %s", name)
 	return nil
 }
@@ -194,6 +250,14 @@ func runServerSetDefault(cmd *cobra.Command, args []string) error {
 
 	if err := clientConfig.Save(); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "set-default",
+			Name:   name,
+		})
 	}
 
 	printSuccess("Set %s as default server", name)

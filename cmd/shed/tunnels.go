@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,7 +22,6 @@ var (
 	tunnelReplace     bool
 	tunnelStopAll     bool
 	tunnelListVerbose bool
-	tunnelListJSON    bool
 )
 
 var tunnelsCmd = &cobra.Command{
@@ -108,7 +106,6 @@ func init() {
 
 	// tunnels list flags
 	tunnelsListCmd.Flags().BoolVarP(&tunnelListVerbose, "verbose", "v", false, "Show detailed port mappings")
-	tunnelsListCmd.Flags().BoolVar(&tunnelListJSON, "json", false, "Output as JSON")
 
 	// tunnels config flags
 	tunnelsConfigCmd.Flags().StringArrayVarP(&tunnelProfiles, "profile", "p", nil, "Profile to preview")
@@ -174,6 +171,10 @@ func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports 
 func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	shedName := args[0]
 
+	if jsonFlag && !tunnelBackground {
+		return fmt.Errorf("--json requires --background (-d) for tunnel start")
+	}
+
 	// Find the server hosting this shed
 	serverName, entry, err := findShedServer(shedName)
 	if err != nil {
@@ -206,7 +207,10 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		}
 		if alive {
 			if !tunnelReplace {
-				// Prompt for replacement
+				if jsonFlag {
+					return fmt.Errorf("tunnel already running for %s; use --replace with --json", shedName)
+				}
+
 				fmt.Printf("Tunnel already running for %s (profile: %s, PID %d).\n",
 					shedName, existingEntry.Profile, existingEntry.PID)
 
@@ -226,7 +230,9 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 				}
 			}
 
-			fmt.Println("Stopping existing tunnel...")
+			if !jsonFlag {
+				fmt.Println("Stopping existing tunnel...")
+			}
 			if err := mgr.Stop(shedName); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to stop existing tunnel: %v\n", err)
 			}
@@ -266,6 +272,21 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		if err := mgr.StartBackground(shedName, serverName, entry, allPorts, profileName); err != nil {
 			return fmt.Errorf("failed to start tunnel: %w", err)
 		}
+		if jsonFlag {
+			return outputJSON(ActionResult{
+				Status: "ok",
+				Action: "started",
+				Name:   shedName,
+				Server: serverName,
+				Details: struct {
+					Profile string                `json:"profile"`
+					Ports   []tunnels.PortMapping `json:"ports"`
+				}{
+					Profile: profileName,
+					Ports:   allPorts,
+				},
+			})
+		}
 		printSuccess("Tunnel started for %s (profile: %s)", shedName, profileName)
 		fmt.Println("Forwarding:")
 		for _, pm := range allPorts {
@@ -273,11 +294,13 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// Start in foreground
-		fmt.Printf("Starting tunnel to %s (Ctrl+C to stop)...\n", shedName)
-		for _, pm := range allPorts {
-			fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
+		if !jsonFlag {
+			fmt.Printf("Starting tunnel to %s (Ctrl+C to stop)...\n", shedName)
+			for _, pm := range allPorts {
+				fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
+			}
+			fmt.Println()
 		}
-		fmt.Println()
 
 		// This replaces the current process
 		if err := mgr.StartForeground(shedName, serverName, entry, allPorts, profileName); err != nil {
@@ -297,16 +320,36 @@ func runTunnelsStop(cmd *cobra.Command, args []string) error {
 	if tunnelStopAll {
 		allTunnels := mgr.State().GetAllTunnels()
 		if len(allTunnels) == 0 {
+			if jsonFlag {
+				return outputJSON(ActionResult{
+					Status: "ok",
+					Action: "stopped",
+				})
+			}
 			fmt.Println("No tunnels running.")
 			return nil
 		}
 
+		stopped := make([]string, 0)
 		for shedName := range allTunnels {
 			if err := mgr.Stop(shedName); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to stop tunnel for %s: %v\n", shedName, err)
 			} else {
-				printSuccess("Stopped tunnel for %s", shedName)
+				stopped = append(stopped, shedName)
+				if !jsonFlag {
+					printSuccess("Stopped tunnel for %s", shedName)
+				}
 			}
+		}
+		sort.Strings(stopped)
+		if jsonFlag {
+			return outputJSON(ActionResult{
+				Status: "ok",
+				Action: "stopped",
+				Details: struct {
+					Stopped []string `json:"stopped"`
+				}{Stopped: stopped},
+			})
 		}
 		return nil
 	}
@@ -325,6 +368,14 @@ func runTunnelsStop(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to stop tunnel: %w", err)
 	}
 
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "stopped",
+			Name:   shedName,
+		})
+	}
+
 	printSuccess("Stopped tunnel for %s", shedName)
 	return nil
 }
@@ -341,9 +392,12 @@ func runTunnelsList(cmd *cobra.Command, args []string) error {
 	}
 
 	allTunnels := mgr.State().GetAllTunnels()
+	if allTunnels == nil {
+		allTunnels = make(map[string]tunnels.TunnelEntry)
+	}
 
-	if tunnelListJSON {
-		return outputTunnelsJSON(allTunnels)
+	if jsonFlag {
+		return outputJSON(allTunnels)
 	}
 
 	if len(allTunnels) == 0 {
@@ -404,6 +458,20 @@ func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if jsonFlag {
+		return outputJSON(struct {
+			Shed    string                `json:"shed"`
+			Server  string                `json:"server"`
+			Profile string                `json:"profile"`
+			Ports   []tunnels.PortMapping `json:"ports"`
+		}{
+			Shed:    shedName,
+			Server:  serverName,
+			Profile: profileName,
+			Ports:   allPorts,
+		})
+	}
+
 	fmt.Printf("Tunnel configuration for %s\n", shedName)
 	fmt.Printf("Server: %s\n", serverName)
 	fmt.Printf("Profile: %s\n", profileName)
@@ -420,15 +488,6 @@ func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s\n", strings.Join(mgr.BuildSSHArgs(shedName, entry, allPorts), " "))
 	}
 
-	return nil
-}
-
-func outputTunnelsJSON(entries map[string]tunnels.TunnelEntry) error {
-	data, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-	fmt.Println(string(data))
 	return nil
 }
 

@@ -16,6 +16,7 @@ var (
 	serverFlag  string
 	verboseFlag bool
 	configFlag  string
+	jsonFlag    bool
 
 	// Loaded configuration
 	clientConfig *config.ClientConfig
@@ -31,6 +32,11 @@ on one or more shed servers.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// JSON mode suppresses verbose output to keep stdout machine-readable
+		if jsonFlag {
+			verboseFlag = false
+		}
+
 		// Skip config loading for version command
 		if cmd.Name() == "version" {
 			return nil
@@ -52,12 +58,24 @@ on one or more shed servers.`,
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if jsonFlag {
+			return outputJSON(struct {
+				Version   string `json:"version"`
+				GitCommit string `json:"git_commit"`
+				BuildDate string `json:"build_date"`
+			}{
+				Version:   version.Version,
+				GitCommit: version.GitCommit,
+				BuildDate: version.BuildDate,
+			})
+		}
 		if verboseFlag {
 			fmt.Println(version.FullInfo())
 		} else {
 			fmt.Printf("shed %s\n", version.Info())
 		}
+		return nil
 	},
 }
 
@@ -66,6 +84,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&serverFlag, "server", "s", "", "Server to use (default: configured default)")
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().StringVarP(&configFlag, "config", "c", "", "Path to config file")
+	rootCmd.PersistentFlags().BoolVar(&jsonFlag, "json", false, "Output as JSON")
 
 	// Add subcommand defined in this file
 	rootCmd.AddCommand(versionCmd)
@@ -73,7 +92,11 @@ func init() {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if jsonFlag {
+			_ = outputError(err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -91,12 +114,20 @@ func getServerEntry() (*config.ServerEntry, string, error) {
 }
 
 // printSuccess prints a success message with a checkmark.
+// In JSON mode, this is a no-op; callers emit structured output instead.
 func printSuccess(format string, args ...interface{}) {
+	if jsonFlag {
+		return
+	}
 	fmt.Printf("✓ "+format+"\n", args...)
 }
 
 // printError prints an error message with suggestions.
+// In JSON mode, this is a no-op; errors are returned and handled by main().
 func printError(msg string, suggestions ...string) {
+	if jsonFlag {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
 	if len(suggestions) > 0 {
 		fmt.Fprintln(os.Stderr, "\nTry:")
@@ -119,11 +150,15 @@ func ensureRunningShed(client *APIClient, name string) (*config.Shed, error) {
 	}
 
 	// Auto-start the shed
-	fmt.Printf("Starting shed %s...\n", name)
+	if !jsonFlag {
+		fmt.Printf("Starting shed %s...\n", name)
+	}
 	shed, err = client.StartShed(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start shed: %w", err)
 	}
-	printSuccess("Shed %s started", name)
+	if !jsonFlag {
+		printSuccess("Shed %s started", name)
+	}
 	return shed, nil
 }

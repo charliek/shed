@@ -74,7 +74,13 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Capture output for log file
 	var logBuffer bytes.Buffer
-	multiWriter := io.MultiWriter(os.Stdout, &logBuffer)
+	var multiWriter io.Writer
+	if jsonFlag {
+		// In JSON mode, only capture to log buffer, suppress stdout
+		multiWriter = &logBuffer
+	} else {
+		multiWriter = io.MultiWriter(os.Stdout, &logBuffer)
+	}
 	syncer.SetOutput(multiWriter)
 
 	if verboseFlag {
@@ -121,6 +127,19 @@ func runSync(cmd *cobra.Command, args []string) error {
 		if err := syncer.SaveSyncLog(ctx, logBuffer.String(), name, entry); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save sync log: %v\n", err)
 		}
+	}
+
+	if jsonFlag {
+		action := "synced"
+		if syncDryRun {
+			action = "dry-run"
+		}
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: action,
+			Name:   name,
+			Server: serverName,
+		})
 	}
 
 	if syncDryRun {
