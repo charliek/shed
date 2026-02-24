@@ -17,9 +17,8 @@ Follow-up improvements to consider after the initial Firecracker backend merges.
 
 Remaining improvement for stop/start resilience after most e2e gaps were resolved:
 
-- Boot cleanup now handles stale PIDs, shared memory, lock files, and temp files (via `network-setup.sh`)
+- Boot cleanup handles generic stale state (shared memory, lock files, temp files) via `network-setup.sh`; service-specific cleanup moved to startup hooks (documented in provisioning guide)
 - Still deferred: configurable stop timeout, pre-shutdown hooks for graceful service termination
-- Still deferred: startup hook best practices documentation
 
 ## Firecracker Live Mounts (SSHFS over vsock)
 

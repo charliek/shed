@@ -107,6 +107,12 @@ echo "PostgreSQL installed"
 #!/bin/bash
 set -euo pipefail
 
+# Clean stale PostgreSQL state from prior stop
+sudo rm -rf /var/run/postgresql
+sudo mkdir -p /var/run/postgresql
+sudo chown postgres:postgres /var/run/postgresql 2>/dev/null || true
+sudo rm -f /var/lib/postgresql/16/main/postmaster.pid 2>/dev/null || true
+
 # Start PostgreSQL if not running
 if ! pg_isready -q 2>/dev/null; then
     echo "Starting PostgreSQL..."
@@ -120,6 +126,37 @@ fi
 
 echo "PostgreSQL is ready"
 ```
+
+## Startup Hook Best Practices
+
+### Handling Stale State After Stop/Start
+
+When you run `shed stop`, services are killed without a chance to clean up — leaving stale PID files, sockets, and shared memory. On the next `shed start`, these stale files can prevent services from restarting. This applies to both Docker and Firecracker backends (only `shed delete` + `shed create` gives a clean slate).
+
+Your startup hook should clean stale runtime state **before** starting services:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Clean stale PostgreSQL state from prior stop
+sudo rm -rf /var/run/postgresql
+sudo mkdir -p /var/run/postgresql
+sudo chown postgres:postgres /var/run/postgresql 2>/dev/null || true
+sudo rm -f /var/lib/postgresql/16/main/postmaster.pid 2>/dev/null || true
+
+# Start PostgreSQL
+if ! pg_isready -q 2>/dev/null; then
+    sudo pg_ctlcluster 16 main start
+fi
+```
+
+**Key points:**
+
+- Remove and recreate runtime directories (`/var/run/<service>`) with correct ownership
+- Remove stale PID files from data directories (e.g., `postmaster.pid`)
+- Guard commands with `2>/dev/null || true` so cleanup is safe on first boot (e.g., `chown` won't fail if the service user doesn't exist yet, `rm` won't fail if PID files are missing)
+- This pattern works identically on Docker and Firecracker
 
 ## Environment Variables
 
