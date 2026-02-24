@@ -40,6 +40,25 @@ func init() {
 	rootCmd.AddCommand(sshConfigCmd)
 }
 
+type sshEntryJSON struct {
+	Name           string `json:"name"`
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	User           string `json:"user"`
+	KnownHostsFile string `json:"known_hosts_file"`
+}
+
+type sshConfigInstallResult struct {
+	Path    string   `json:"path"`
+	Added   []string `json:"added"`
+	Removed []string `json:"removed"`
+}
+
+type sshConfigUninstallResult struct {
+	Path    string   `json:"path"`
+	Removed []string `json:"removed"`
+}
+
 func runSSHConfig(cmd *cobra.Command, args []string) error {
 	// Validate mutually exclusive flags
 	if sshConfigInstall && sshConfigUninstall {
@@ -71,6 +90,9 @@ func runSSHConfig(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(sheds) == 0 {
+		if jsonFlag {
+			return outputJSON(make([]sshEntryJSON, 0))
+		}
 		fmt.Println("No sheds found.")
 		fmt.Println("\nTo create a shed:")
 		fmt.Println("  shed create <name>")
@@ -85,7 +107,21 @@ func runSSHConfig(cmd *cobra.Command, args []string) error {
 		return runSSHConfigInstall(entries)
 	}
 
-	// Default: print config
+	// Default: print config (or JSON)
+	if jsonFlag {
+		result := make([]sshEntryJSON, 0, len(entries))
+		for _, e := range entries {
+			result = append(result, sshEntryJSON{
+				Name:           e.Name,
+				Host:           e.Host,
+				Port:           e.Port,
+				User:           e.User,
+				KnownHostsFile: e.KnownHostsFile,
+			})
+		}
+		return outputJSON(result)
+	}
+
 	printSSHConfig(entries)
 	return nil
 }
@@ -203,39 +239,63 @@ func runSSHConfigInstall(entries []sshconfig.Entry) error {
 
 	// Show diff
 	if !diff.HasChanges() && parsed.HasManagedBlock {
+		if jsonFlag {
+			return outputJSON(ActionResult{
+				Status: "ok",
+				Action: "installed",
+				Details: sshConfigInstallResult{
+					Path:    sshConfigPath,
+					Added:   []string{},
+					Removed: []string{},
+				},
+			})
+		}
 		fmt.Println("SSH config is already up to date.")
 		return nil
 	}
 
-	fmt.Printf("SSH config file: %s\n\n", sshConfigPath)
+	if !jsonFlag {
+		fmt.Printf("SSH config file: %s\n\n", sshConfigPath)
 
-	if len(diff.Additions) > 0 {
-		fmt.Println("Entries to add:")
-		for _, name := range diff.Additions {
-			fmt.Printf("  + %s\n", name)
+		if len(diff.Additions) > 0 {
+			fmt.Println("Entries to add:")
+			for _, name := range diff.Additions {
+				fmt.Printf("  + %s\n", name)
+			}
 		}
-	}
 
-	if len(diff.Removals) > 0 {
-		fmt.Println("Entries to remove:")
-		for _, name := range diff.Removals {
-			fmt.Printf("  - %s\n", name)
+		if len(diff.Removals) > 0 {
+			fmt.Println("Entries to remove:")
+			for _, name := range diff.Removals {
+				fmt.Printf("  - %s\n", name)
+			}
 		}
-	}
 
-	if len(diff.Unchanged) > 0 && verboseFlag {
-		fmt.Println("Entries unchanged:")
-		for _, name := range diff.Unchanged {
-			fmt.Printf("  = %s\n", name)
+		if len(diff.Unchanged) > 0 && verboseFlag {
+			fmt.Println("Entries unchanged:")
+			for _, name := range diff.Unchanged {
+				fmt.Printf("  = %s\n", name)
+			}
 		}
-	}
 
-	if !parsed.HasManagedBlock && len(entries) > 0 {
-		fmt.Println("\nManaged block will be created.")
+		if !parsed.HasManagedBlock && len(entries) > 0 {
+			fmt.Println("\nManaged block will be created.")
+		}
 	}
 
 	// Dry run - stop here
 	if sshConfigDryRun {
+		if jsonFlag {
+			return outputJSON(ActionResult{
+				Status: "ok",
+				Action: "dry-run",
+				Details: sshConfigInstallResult{
+					Path:    sshConfigPath,
+					Added:   diff.Additions,
+					Removed: diff.Removals,
+				},
+			})
+		}
 		fmt.Println("\n(dry run - no changes made)")
 		return nil
 	}
@@ -244,6 +304,18 @@ func runSSHConfigInstall(entries []sshconfig.Entry) error {
 	err = sshconfig.Write(sshConfigPath, parsed.BeforeBlock, entries, parsed.AfterBlock)
 	if err != nil {
 		return fmt.Errorf("failed to write SSH config: %w", err)
+	}
+
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "installed",
+			Details: sshConfigInstallResult{
+				Path:    sshConfigPath,
+				Added:   diff.Additions,
+				Removed: diff.Removals,
+			},
+		})
 	}
 
 	printSuccess("Updated SSH config at %s", sshConfigPath)
@@ -266,6 +338,16 @@ func runSSHConfigUninstall() error {
 	data, err := os.ReadFile(sshConfigPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if jsonFlag {
+				return outputJSON(ActionResult{
+					Status: "ok",
+					Action: "uninstalled",
+					Details: sshConfigUninstallResult{
+						Path:    sshConfigPath,
+						Removed: []string{},
+					},
+				})
+			}
 			fmt.Println("No SSH config file found.")
 			return nil
 		}
@@ -276,19 +358,46 @@ func runSSHConfigUninstall() error {
 	parsed := sshconfig.Parse(string(data))
 
 	if !parsed.HasManagedBlock {
+		if jsonFlag {
+			return outputJSON(ActionResult{
+				Status: "ok",
+				Action: "uninstalled",
+				Details: sshConfigUninstallResult{
+					Path:    sshConfigPath,
+					Removed: []string{},
+				},
+			})
+		}
 		fmt.Println("No shed-managed entries found in SSH config.")
 		return nil
 	}
 
-	// Show what will be removed
-	fmt.Printf("SSH config file: %s\n\n", sshConfigPath)
-	fmt.Println("Entries to remove:")
-	for _, entry := range parsed.ManagedEntries {
-		fmt.Printf("  - %s\n", entry.Name)
+	names := make([]string, 0, len(parsed.ManagedEntries))
+	for _, e := range parsed.ManagedEntries {
+		names = append(names, e.Name)
+	}
+
+	if !jsonFlag {
+		// Show what will be removed
+		fmt.Printf("SSH config file: %s\n\n", sshConfigPath)
+		fmt.Println("Entries to remove:")
+		for _, name := range names {
+			fmt.Printf("  - %s\n", name)
+		}
 	}
 
 	// Dry run - stop here
 	if sshConfigDryRun {
+		if jsonFlag {
+			return outputJSON(ActionResult{
+				Status: "ok",
+				Action: "dry-run",
+				Details: sshConfigUninstallResult{
+					Path:    sshConfigPath,
+					Removed: names,
+				},
+			})
+		}
 		fmt.Println("\n(dry run - no changes made)")
 		return nil
 	}
@@ -297,6 +406,17 @@ func runSSHConfigUninstall() error {
 	err = sshconfig.Remove(sshConfigPath)
 	if err != nil {
 		return fmt.Errorf("failed to update SSH config: %w", err)
+	}
+
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "uninstalled",
+			Details: sshConfigUninstallResult{
+				Path:    sshConfigPath,
+				Removed: names,
+			},
+		})
 	}
 
 	printSuccess("Removed shed-managed entries from %s", sshConfigPath)

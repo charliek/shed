@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -176,6 +177,16 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status:  "ok",
+			Action:  "created",
+			Name:    name,
+			Server:  serverName,
+			Details: shed,
+		})
+	}
+
 	printSuccess("Created shed %s on %s (backend: %s)", name, serverName, resolvedBackend)
 	fmt.Printf("\nConnect with:\n  shed console %s\n", name)
 
@@ -277,17 +288,38 @@ func runList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Sort by name (applies to both JSON and table output)
+	sort.Slice(allSheds, func(i, j int) bool {
+		return allSheds[i].shed.Name < allSheds[j].shed.Name
+	})
+
+	if jsonFlag {
+		type shedJSON struct {
+			Name      string    `json:"name"`
+			Server    string    `json:"server"`
+			Status    string    `json:"status"`
+			CreatedAt time.Time `json:"created_at"`
+			Backend   string    `json:"backend,omitempty"`
+		}
+		result := make([]shedJSON, 0, len(allSheds))
+		for _, s := range allSheds {
+			result = append(result, shedJSON{
+				Name:      s.shed.Name,
+				Server:    s.server,
+				Status:    s.shed.Status,
+				CreatedAt: s.shed.CreatedAt,
+				Backend:   s.shed.Backend,
+			})
+		}
+		return outputJSON(result)
+	}
+
 	if len(allSheds) == 0 {
 		fmt.Println("No sheds found.")
 		fmt.Println("\nTo create a shed:")
 		fmt.Println("  shed create <name>")
 		return nil
 	}
-
-	// Sort by name
-	sort.Slice(allSheds, func(i, j int) bool {
-		return allSheds[i].shed.Name < allSheds[j].shed.Name
-	})
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if listAll {
@@ -311,6 +343,11 @@ func runList(cmd *cobra.Command, args []string) error {
 
 func runDelete(cmd *cobra.Command, args []string) error {
 	name := args[0]
+
+	// In JSON mode, require --force to avoid interactive prompts
+	if jsonFlag && !deleteForce {
+		return fmt.Errorf("--force is required when using --json")
+	}
 
 	// Find the server for this shed
 	serverName, entry, err := findShedServer(name)
@@ -351,6 +388,15 @@ func runDelete(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "deleted",
+			Name:   name,
+			Server: serverName,
+		})
+	}
+
 	printSuccess("Deleted shed %s", name)
 	return nil
 }
@@ -388,6 +434,16 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status:  "ok",
+			Action:  "started",
+			Name:    name,
+			Server:  serverName,
+			Details: shed,
+		})
+	}
+
 	printSuccess("Started shed %s", name)
 	return nil
 }
@@ -419,6 +475,16 @@ func runStop(cmd *cobra.Command, args []string) error {
 		if verboseFlag {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
+	}
+
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status:  "ok",
+			Action:  "stopped",
+			Name:    name,
+			Server:  serverName,
+			Details: shed,
+		})
 	}
 
 	printSuccess("Stopped shed %s", name)
@@ -539,8 +605,13 @@ func autoSyncAfterCreate(ctx context.Context, shedName string, entry *config.Ser
 		}
 	}
 
-	fmt.Printf("Syncing %s profile...\n", profile)
+	if !jsonFlag {
+		fmt.Printf("Syncing %s profile...\n", profile)
+	}
 
 	syncer := sync.NewSyncer(cfg)
+	if jsonFlag {
+		syncer.SetOutput(io.Discard)
+	}
 	return syncer.SyncProfile(ctx, profile, shedName, entry, false)
 }

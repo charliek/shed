@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -12,10 +11,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-var (
-	sessionsAllFlag  bool
-	sessionsJSONFlag bool
-)
+var sessionsAllFlag bool
 
 var sessionsCmd = &cobra.Command{
 	Use:   "sessions [shed-name]",
@@ -47,7 +43,6 @@ Example:
 
 func init() {
 	sessionsCmd.Flags().BoolVarP(&sessionsAllFlag, "all", "a", false, "List sessions from all servers")
-	sessionsCmd.Flags().BoolVar(&sessionsJSONFlag, "json", false, "Output as JSON")
 
 	sessionsCmd.AddCommand(sessionsKillCmd)
 	rootCmd.AddCommand(sessionsCmd)
@@ -113,8 +108,11 @@ func runSessions(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if sessionsJSONFlag {
-		return printSessionsJSON(allSessions)
+	if jsonFlag {
+		if allSessions == nil {
+			allSessions = make([]config.Session, 0)
+		}
+		return outputJSON(allSessions)
 	}
 	return printSessionsTable(allSessions)
 }
@@ -132,6 +130,17 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 	client := NewAPIClientFromEntry(entry, DefaultTimeout)
 	if err := client.KillSession(shedName, sessionName); err != nil {
 		return fmt.Errorf("failed to kill session: %w", err)
+	}
+
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "killed",
+			Name:   sessionName,
+			Details: struct {
+				Shed string `json:"shed"`
+			}{Shed: shedName},
+		})
 	}
 
 	printSuccess("Killed session %q in shed %q", sessionName, shedName)
@@ -165,12 +174,6 @@ func printSessionsTable(sessions []config.Session) error {
 	}
 
 	return w.Flush()
-}
-
-func printSessionsJSON(sessions []config.Session) error {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(sessions)
 }
 
 func formatTimeAgo(t time.Time) string {
