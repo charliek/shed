@@ -39,6 +39,10 @@ RUN apt-get update && apt-get install -y \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
+# Install mise (version manager) - matches Docker base image
+RUN curl https://mise.run | sh
+ENV PATH="/root/.local/share/mise/shims:/root/.local/bin:${PATH}"
+
 # Configure systemd
 # Remove unnecessary services
 RUN rm -f /lib/systemd/system/multi-user.target.wants/* \
