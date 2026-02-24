@@ -63,20 +63,13 @@ HOSTS_EOF
 
 # Clean stale runtime state from unclean VM shutdown.
 # The rootfs overlay persists across stop/start, but services expect
-# clean state on boot. Remove stale PID files, sockets, lock files,
-# and shared memory segments left by killed processes.
+# clean state on boot. Generic system-level cleanup only —
+# service-specific cleanup belongs in the startup hook.
 
-# Service-specific runtime directories (remove and recreate with correct ownership)
-rm -rf /var/run/postgresql /var/run/redis /var/run/sshd
-mkdir -p /var/run/postgresql && chown postgres:postgres /var/run/postgresql 2>/dev/null || true
-mkdir -p /var/run/redis && chown redis:redis /var/run/redis 2>/dev/null || true
+# Ensure sshd run directory exists (rootfs-level service)
 mkdir -p /var/run/sshd
 
-# Additional known service PID files
-rm -f /var/run/mysqld/mysqld.pid /var/run/nginx.pid /var/run/docker.pid /var/run/crond.pid 2>/dev/null || true
-mkdir -p /var/run/mysqld && chown mysql:mysql /var/run/mysqld 2>/dev/null || true
-
-# Shared memory cleanup (e.g., PostgreSQL POSIX shared memory segments)
+# Shared memory cleanup (e.g., stale POSIX shared memory segments)
 rm -rf /dev/shm/* 2>/dev/null || true
 
 # Lock file cleanup
