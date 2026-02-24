@@ -20,35 +20,35 @@ credentials:
 
   git_config:
     source: /home/charliek/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
   # Claude Code - container-specific credentials
   claude:
     source: /home/charliek/.shed/mounts/claude
-    target: /root/.claude
+    target: /home/shed/.claude
     readonly: false
 
   # OpenCode - 3 directories for data, state, and cache
   opencode_data:
     source: /home/charliek/.shed/mounts/opencode/share
-    target: /root/.local/share/opencode
+    target: /home/shed/.local/share/opencode
     readonly: false
 
   opencode_state:
     source: /home/charliek/.shed/mounts/opencode/state
-    target: /root/.local/state/opencode
+    target: /home/shed/.local/state/opencode
     readonly: false
 
   opencode_cache:
     source: /home/charliek/.shed/mounts/opencode/cache
-    target: /root/.cache/opencode
+    target: /home/shed/.cache/opencode
     readonly: false
 
   # GitHub CLI - credentials and config
   gh:
     source: /home/charliek/.shed/mounts/gh
-    target: /root/.config/gh
+    target: /home/shed/.config/gh
     readonly: false
 
 # Environment file with GIT_SSH_COMMAND for SSH key access

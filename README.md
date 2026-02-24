@@ -215,11 +215,11 @@ default_image: shed-base:latest
 credentials:
   ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
   gitconfig:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 env_file: ~/.shed/env
 

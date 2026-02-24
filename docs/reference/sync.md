@@ -37,9 +37,9 @@ features:
     description: "Sync shell config and git settings"
     paths:
       - source: ~/.gitconfig
-        target: /root/.gitconfig
+        target: /home/shed/.gitconfig
       - source: ~/.bashrc
-        target: /root/.bashrc
+        target: /home/shed/.bashrc
 
   scripts:
     description: "Sync custom scripts"

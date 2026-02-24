@@ -68,10 +68,10 @@ Firecracker VMs don't support bind mounts like Docker. Instead, credentials conf
 
 ```bash
 # Check SSH keys were transferred
-shed exec myproject -- ls -la /root/.ssh/
+shed exec myproject -- ls -la /home/shed/.ssh/
 
 # Check git config
-shed exec myproject -- cat /root/.gitconfig
+shed exec myproject -- cat /home/shed/.gitconfig
 
 # Test SSH access to GitHub
 shed exec myproject -- ssh -T git@github.com
@@ -86,7 +86,7 @@ For private repos, ensure:
 ```bash
 # Example env file for SSH git access
 cat ~/.shed/env
-GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519
+GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /home/shed/.ssh/id_ed25519
 ```
 
 Warning: The `GIT_SSH_COMMAND` above disables host key checking with `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null`, which is insecure and intended only for CI or ephemeral environments; prefer pre-populating `known_hosts` with `ssh-keyscan` or using a dedicated deploy key.

@@ -290,6 +290,14 @@ func (s *Syncer) createTarWithPattern(ctx context.Context, source string, patter
 	return stdout.Bytes(), nil
 }
 
+// isSystemPath returns true if the path requires root privileges to write.
+func isSystemPath(path string) bool {
+	return strings.HasPrefix(path, "/etc/") ||
+		strings.HasPrefix(path, "/usr/") ||
+		strings.HasPrefix(path, "/var/") ||
+		strings.HasPrefix(path, "/opt/")
+}
+
 // transferViaSsh transfers tar data to the container and extracts it.
 func (s *Syncer) transferViaSsh(ctx context.Context, tarData []byte, extractDir, sourcePath, targetName string, isDir bool, shedName string, serverEntry *config.ServerEntry) error {
 	if serverEntry == nil {
@@ -302,16 +310,24 @@ func (s *Syncer) transferViaSsh(ctx context.Context, tarData []byte, extractDir,
 	// We need to handle the case where source and target names might differ
 	sourceBaseName := filepath.Base(sourcePath)
 
+	// Use sudo for system paths (files owned by root), run as shed user otherwise.
+	// Without sudo, tar defaults to --no-same-owner so files are owned by the
+	// connected user (shed), which is correct for user-writable paths like /home/shed.
+	sudoPrefix := ""
+	if isSystemPath(extractDir) {
+		sudoPrefix = "sudo "
+	}
+
 	var extractCmd string
 	if sourceBaseName == targetName || isDir {
 		// Names match or it's a directory - simple extraction
 		// Use %q to properly quote paths with special characters
-		extractCmd = fmt.Sprintf("mkdir -p %q && tar xzpf - -C %q", extractDir, extractDir)
+		extractCmd = fmt.Sprintf("%smkdir -p %q && %star xzpf - -C %q", sudoPrefix, extractDir, sudoPrefix, extractDir)
 	} else {
 		// File with different name - extract and rename
 		// Use %q to properly quote paths with special characters
-		extractCmd = fmt.Sprintf("mkdir -p %q && tar xzpf - -C %q && mv %q/%q %q/%q",
-			extractDir, extractDir, extractDir, sourceBaseName, extractDir, targetName)
+		extractCmd = fmt.Sprintf("%smkdir -p %q && %star xzpf - -C %q && %smv %q/%q %q/%q",
+			sudoPrefix, extractDir, sudoPrefix, extractDir, sudoPrefix, extractDir, sourceBaseName, extractDir, targetName)
 	}
 
 	args := []string{
@@ -349,13 +365,14 @@ func (s *Syncer) runPostSyncHook(ctx context.Context, hook PostSyncHook, shedNam
 
 	// Note: hook.Run is user-defined in sync.yaml, so we pass it as-is without escaping.
 	// Users expect their shell command to run exactly as written.
+	// Prefix with sudo so hooks that need root (e.g. update-ca-certificates) work.
 	args := []string{
 		"-p", strconv.Itoa(serverEntry.SSHPort),
 		"-o", "UserKnownHostsFile=" + knownHostsPath,
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "BatchMode=yes",
 		shedName + "@" + serverEntry.Host,
-		hook.Run,
+		"sudo " + hook.Run,
 	}
 
 	cmd := exec.CommandContext(ctx, "ssh", args...)
@@ -392,7 +409,9 @@ func (s *Syncer) SaveSyncLog(ctx context.Context, logContent string, shedName st
 	knownHostsPath := config.GetKnownHostsPath()
 
 	// Create log directory and write log
-	cmdStr := fmt.Sprintf("mkdir -p %s && cat > %s", filepath.Dir(provision.SyncLog), provision.SyncLog)
+	// Use sudo + tee since the log directory may be owned by root,
+	// and shell redirect (>) wouldn't inherit sudo
+	cmdStr := fmt.Sprintf("sudo mkdir -p %s && sudo tee %s > /dev/null", filepath.Dir(provision.SyncLog), provision.SyncLog)
 
 	args := []string{
 		"-p", strconv.Itoa(serverEntry.SSHPort),

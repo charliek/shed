@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/config"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -121,6 +122,7 @@ func LoadConfigFromContainer(ctx context.Context, docker *client.Client, contain
 func readFileFromContainer(ctx context.Context, docker *client.Client, containerID, path string) ([]byte, error) {
 	execConfig := container.ExecOptions{
 		Cmd:          []string{"cat", path},
+		User:         config.ContainerUser,
 		AttachStdout: true,
 		AttachStderr: true,
 	}

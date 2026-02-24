@@ -63,17 +63,17 @@ default_image: shed-base:latest
 credentials:
   git-ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
 
   git-config:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
   claude:
     source: ~/.claude
-    target: /root/.claude
+    target: /home/shed/.claude
     readonly: false
 
 env_file: ~/.shed/env
@@ -121,37 +121,37 @@ credentials:
   # SSH keys for git
   git-ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
 
   # Git configuration
   git-config:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
   # Claude Code config (needs write for token refresh)
   claude:
     source: ~/.claude
-    target: /root/.claude
+    target: /home/shed/.claude
     readonly: false
 
   # GitHub CLI
   gh:
     source: ~/.config/gh
-    target: /root/.config/gh
+    target: /home/shed/.config/gh
     readonly: true
 
   # AWS credentials
   aws:
     source: ~/.aws
-    target: /root/.aws
+    target: /home/shed/.aws
     readonly: true
 
   # GCP credentials
   gcloud:
     source: ~/.config/gcloud
-    target: /root/.config/gcloud
+    target: /home/shed/.config/gcloud
     readonly: true
 ```
 

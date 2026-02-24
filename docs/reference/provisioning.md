@@ -59,7 +59,7 @@ After the install hook completes, shed captures the PATH (including any addition
 For example, if your install hook runs `curl -fsSL https://bun.sh/install | bash`, bun's installer adds `~/.bun/bin` to `~/.bashrc`. Shed detects this and writes:
 
 ```bash
-export PATH="/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+export PATH="/home/shed/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 ```
 
 to `/etc/profile.d/shed-installed-tools.sh`. Since startup hooks run as login shells (`bash --login -c`), they automatically source this file and inherit the installed tools.

@@ -140,6 +140,11 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to start container: %w", err)
 	}
 
+	// Fix workspace ownership for the non-root shed user
+	if err := c.fixWorkspaceOwnership(ctx, resp.ID); err != nil {
+		log.Printf("Warning: failed to fix workspace ownership: %v", err)
+	}
+
 	// Clone repository if specified
 	if req.Repo != "" {
 		if err := c.cloneRepo(ctx, resp.ID, req.Repo); err != nil {
@@ -173,6 +178,7 @@ func (c *Client) cloneRepo(ctx context.Context, containerID, repo string) error 
 		WorkingDir:   config.WorkspacePath,
 		AttachStdout: true,
 		AttachStderr: true,
+		User:         config.ContainerUser,
 	}
 
 	execResp, err := c.docker.ContainerExecCreate(ctx, containerID, execConfig)
@@ -293,6 +299,12 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		return nil, fmt.Errorf("failed to start container: %w", err)
 	}
 
+	// Fix workspace ownership for the non-root shed user
+	// (handles migrated volumes from old root-based containers)
+	if err := c.fixWorkspaceOwnership(ctx, shed.ContainerID); err != nil {
+		log.Printf("Warning: failed to fix workspace ownership: %v", err)
+	}
+
 	// Run startup hook only (install already ran on create)
 	if err := c.runProvisioning(ctx, shed.ContainerID, name, false, os.Stdout, os.Stderr); err != nil {
 		log.Printf("Warning: startup hook failed: %v", err)
@@ -350,6 +362,7 @@ func (c *Client) AttachToShed(ctx context.Context, name string, tty bool) (types
 		AttachStderr: true,
 		Tty:          tty,
 		WorkingDir:   config.WorkspacePath,
+		User:         config.ContainerUser,
 	}
 
 	execResp, err := c.docker.ContainerExecCreate(ctx, containerName, execConfig)
@@ -537,9 +550,9 @@ MISE_SHIMS="$HOME/.local/share/mise/shims"
 if [ -d "$MISE_SHIMS" ] && ! echo "$PATH_VAL" | grep -q "$MISE_SHIMS"; then
   PATH_VAL="$MISE_SHIMS:$PATH_VAL"
 fi
-echo "export PATH=\"$PATH_VAL\"" > /etc/profile.d/shed-installed-tools.sh`,
+echo "export PATH=\"$PATH_VAL\"" | sudo tee /etc/profile.d/shed-installed-tools.sh > /dev/null`,
 	}
-	execConfig := container.ExecOptions{Cmd: cmd}
+	execConfig := container.ExecOptions{Cmd: cmd, User: config.ContainerUser}
 	execResp, err := c.docker.ContainerExecCreate(ctx, containerID, execConfig)
 	if err != nil {
 		return err
@@ -557,6 +570,54 @@ echo "export PATH=\"$PATH_VAL\"" > /etc/profile.d/shed-installed-tools.sh`,
 	}
 	if inspectResp.ExitCode != 0 {
 		return fmt.Errorf("captureInstalledPaths failed with exit code %d", inspectResp.ExitCode)
+	}
+	return nil
+}
+
+// fixWorkspaceOwnership ensures the workspace and home directory intermediates
+// are owned by the shed user. Docker creates parent directories as root when
+// setting up bind mounts (e.g. /home/shed/.local/state/ for an opencode mount
+// at /home/shed/.local/state/opencode). Without this fix, tools like mise
+// can't create sibling directories.
+func (c *Client) fixWorkspaceOwnership(ctx context.Context, containerID string) error {
+	homeDir := fmt.Sprintf("/home/%s", config.ContainerUser)
+	cmd := []string{
+		"bash", "-c",
+		fmt.Sprintf(`user="%s"
+# Fix workspace
+owner=$(stat -c %%U %s 2>/dev/null)
+if [ "$owner" != "$user" ]; then chown "$user:$user" %s; fi
+# Fix home directory intermediates created by Docker bind mounts
+for dir in %s/.local %s/.local/state %s/.local/share %s/.cache %s/.config; do
+  if [ -d "$dir" ] && [ "$(stat -c %%U "$dir")" != "$user" ]; then
+    chown "$user:$user" "$dir"
+  fi
+done`,
+			config.ContainerUser,
+			config.WorkspacePath, config.WorkspacePath,
+			homeDir, homeDir, homeDir, homeDir, homeDir),
+	}
+	execConfig := container.ExecOptions{
+		Cmd:  cmd,
+		User: "root",
+	}
+	execResp, err := c.docker.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return err
+	}
+	attachResp, err := c.docker.ContainerExecAttach(ctx, execResp.ID, container.ExecStartOptions{})
+	if err != nil {
+		return err
+	}
+	defer attachResp.Close()
+	_, _ = io.Copy(io.Discard, attachResp.Reader)
+
+	inspectResp, err := c.docker.ContainerExecInspect(ctx, execResp.ID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect exec: %w", err)
+	}
+	if inspectResp.ExitCode != 0 {
+		return fmt.Errorf("fixWorkspaceOwnership failed with exit code %d", inspectResp.ExitCode)
 	}
 	return nil
 }
