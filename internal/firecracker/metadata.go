@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// MetadataVersion is the current metadata schema version.
+const MetadataVersion = 1
+
 // ErrInstanceNotFound is returned when a requested instance does not exist.
 var ErrInstanceNotFound = errors.New("instance not found")
 
@@ -21,6 +24,9 @@ var ErrInvalidInstanceName = errors.New("invalid instance name")
 
 // Metadata represents the persistent state of a VM instance.
 type Metadata struct {
+	// Version is the metadata schema version
+	Version int `json:"version"`
+
 	// Name is the shed name
 	Name string `json:"name"`
 
@@ -90,6 +96,11 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
+	// Backward compat: files written before version field existed
+	if meta.Version == 0 {
+		meta.Version = 1
+	}
+
 	return &meta, nil
 }
 
@@ -105,6 +116,8 @@ func (m *Metadata) Save(instanceDir string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create instance directory: %w", err)
 	}
+
+	m.Version = MetadataVersion
 
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
