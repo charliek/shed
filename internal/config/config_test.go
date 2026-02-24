@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestContainerName(t *testing.T) {
@@ -302,6 +303,179 @@ func TestValidateSessionName(t *testing.T) {
 			err := ValidateSessionName(tt.input)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateSessionName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// validFirecrackerConfig returns a FirecrackerConfig that passes validation.
+// It uses /dev/null for file paths since those must exist on disk.
+func validFirecrackerConfig() *FirecrackerConfig {
+	return &FirecrackerConfig{
+		KernelPath:      "/dev/null",
+		BaseRootfs:      "/dev/null",
+		InstanceDir:     "/tmp/shed-test-instances",
+		SocketDir:       "/tmp/shed-test-sockets",
+		DefaultCPUs:     2,
+		DefaultMemoryMB: 4096,
+		DefaultDiskGB:   20,
+		VsockBaseCID:    100,
+		ConsolePort:     1024,
+		HealthPort:      1025,
+		StartTimeout:    Duration(30 * time.Second),
+		StopTimeout:     Duration(10 * time.Second),
+		BridgeName:      "shed-br0",
+		BridgeCIDR:      "172.30.0.1/24",
+		TAPPrefix:       "shed-tap",
+	}
+}
+
+func TestFirecrackerConfigValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		modify  func(*FirecrackerConfig)
+		wantErr bool
+	}{
+		{
+			name:    "valid defaults",
+			modify:  func(c *FirecrackerConfig) {},
+			wantErr: false,
+		},
+		// Upper bounds
+		{
+			name:    "cpus at max",
+			modify:  func(c *FirecrackerConfig) { c.DefaultCPUs = MaxFirecrackerCPUs },
+			wantErr: false,
+		},
+		{
+			name:    "cpus over max",
+			modify:  func(c *FirecrackerConfig) { c.DefaultCPUs = MaxFirecrackerCPUs + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "memory at max",
+			modify:  func(c *FirecrackerConfig) { c.DefaultMemoryMB = MaxFirecrackerMemoryMB },
+			wantErr: false,
+		},
+		{
+			name:    "memory over max",
+			modify:  func(c *FirecrackerConfig) { c.DefaultMemoryMB = MaxFirecrackerMemoryMB + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "disk at max",
+			modify:  func(c *FirecrackerConfig) { c.DefaultDiskGB = MaxFirecrackerDiskGB },
+			wantErr: false,
+		},
+		{
+			name:    "disk over max",
+			modify:  func(c *FirecrackerConfig) { c.DefaultDiskGB = MaxFirecrackerDiskGB + 1 },
+			wantErr: true,
+		},
+		// CID bounds
+		{
+			name:    "vsock cid at max",
+			modify:  func(c *FirecrackerConfig) { c.VsockBaseCID = MaxVsockCID },
+			wantErr: false,
+		},
+		{
+			name:    "vsock cid over max",
+			modify:  func(c *FirecrackerConfig) { c.VsockBaseCID = MaxVsockCID + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "vsock cid below min",
+			modify:  func(c *FirecrackerConfig) { c.VsockBaseCID = 2 },
+			wantErr: true,
+		},
+		// Port bounds
+		{
+			name:    "console port at max",
+			modify:  func(c *FirecrackerConfig) { c.ConsolePort = MaxVsockPort },
+			wantErr: false,
+		},
+		{
+			name:    "console port over max",
+			modify:  func(c *FirecrackerConfig) { c.ConsolePort = MaxVsockPort + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "health port over max",
+			modify:  func(c *FirecrackerConfig) { c.HealthPort = MaxVsockPort + 1 },
+			wantErr: true,
+		},
+		// Timeout bounds
+		{
+			name:    "start timeout at min",
+			modify:  func(c *FirecrackerConfig) { c.StartTimeout = Duration(MinTimeout) },
+			wantErr: false,
+		},
+		{
+			name:    "start timeout below min",
+			modify:  func(c *FirecrackerConfig) { c.StartTimeout = Duration(500 * time.Millisecond) },
+			wantErr: true,
+		},
+		{
+			name:    "start timeout at max",
+			modify:  func(c *FirecrackerConfig) { c.StartTimeout = Duration(MaxTimeout) },
+			wantErr: false,
+		},
+		{
+			name:    "start timeout over max",
+			modify:  func(c *FirecrackerConfig) { c.StartTimeout = Duration(MaxTimeout + time.Second) },
+			wantErr: true,
+		},
+		{
+			name:    "stop timeout below min",
+			modify:  func(c *FirecrackerConfig) { c.StopTimeout = Duration(100 * time.Millisecond) },
+			wantErr: true,
+		},
+		{
+			name:    "stop timeout over max",
+			modify:  func(c *FirecrackerConfig) { c.StopTimeout = Duration(MaxTimeout + time.Minute) },
+			wantErr: true,
+		},
+		{
+			name:    "zero timeout allowed",
+			modify:  func(c *FirecrackerConfig) { c.StartTimeout = 0; c.StopTimeout = 0 },
+			wantErr: false,
+		},
+		// Path existence
+		{
+			name:    "kernel path missing",
+			modify:  func(c *FirecrackerConfig) { c.KernelPath = "/nonexistent/vmlinux.bin" },
+			wantErr: true,
+		},
+		{
+			name:    "rootfs path missing",
+			modify:  func(c *FirecrackerConfig) { c.BaseRootfs = "/nonexistent/rootfs.ext4" },
+			wantErr: true,
+		},
+		// Lower bounds still work
+		{
+			name:    "cpus below min",
+			modify:  func(c *FirecrackerConfig) { c.DefaultCPUs = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "memory below min",
+			modify:  func(c *FirecrackerConfig) { c.DefaultMemoryMB = 64 },
+			wantErr: true,
+		},
+		{
+			name:    "disk below min",
+			modify:  func(c *FirecrackerConfig) { c.DefaultDiskGB = 0 },
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validFirecrackerConfig()
+			tt.modify(cfg)
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

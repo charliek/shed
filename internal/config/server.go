@@ -89,6 +89,17 @@ type FirecrackerConfig struct {
 	TAPPrefix string `yaml:"tap_prefix"`
 }
 
+// Firecracker validation upper bounds.
+const (
+	MaxFirecrackerCPUs            = 32
+	MaxFirecrackerMemoryMB        = 256 * 1024 // 256 GB
+	MaxFirecrackerDiskGB          = 1024       // 1 TB
+	MaxVsockCID            uint32 = 65535
+	MaxVsockPort           uint32 = 65535
+	MinTimeout                    = 1 * time.Second
+	MaxTimeout                    = 30 * time.Minute
+)
+
 // Duration is a wrapper around time.Duration for YAML marshaling
 type Duration time.Duration
 
@@ -355,23 +366,38 @@ func (c *FirecrackerConfig) Validate() error {
 		return fmt.Errorf("socket_dir is required")
 	}
 
-	// Validate CPU and memory minimums
+	// Validate CPU and memory bounds
 	if c.DefaultCPUs < 1 {
 		return fmt.Errorf("default_cpus must be at least 1")
+	}
+	if c.DefaultCPUs > MaxFirecrackerCPUs {
+		return fmt.Errorf("default_cpus must be at most %d", MaxFirecrackerCPUs)
 	}
 	if c.DefaultMemoryMB < 128 {
 		return fmt.Errorf("default_memory_mb must be at least 128")
 	}
+	if c.DefaultMemoryMB > MaxFirecrackerMemoryMB {
+		return fmt.Errorf("default_memory_mb must be at most %d", MaxFirecrackerMemoryMB)
+	}
 	if c.DefaultDiskGB < 1 {
 		return fmt.Errorf("default_disk_gb must be at least 1")
+	}
+	if c.DefaultDiskGB > MaxFirecrackerDiskGB {
+		return fmt.Errorf("default_disk_gb must be at most %d", MaxFirecrackerDiskGB)
 	}
 
 	// Validate vsock ports
 	if c.ConsolePort == 0 {
 		return fmt.Errorf("console_port must be set")
 	}
+	if c.ConsolePort > MaxVsockPort {
+		return fmt.Errorf("console_port must be at most %d", MaxVsockPort)
+	}
 	if c.HealthPort == 0 {
 		return fmt.Errorf("health_port must be set")
+	}
+	if c.HealthPort > MaxVsockPort {
+		return fmt.Errorf("health_port must be at most %d", MaxVsockPort)
 	}
 	if c.ConsolePort == c.HealthPort {
 		return fmt.Errorf("console_port and health_port must be different")
@@ -379,6 +405,37 @@ func (c *FirecrackerConfig) Validate() error {
 
 	if c.VsockBaseCID < 3 {
 		return fmt.Errorf("vsock_base_cid must be at least 3 (0-2 are reserved)")
+	}
+	if c.VsockBaseCID > MaxVsockCID {
+		return fmt.Errorf("vsock_base_cid must be at most %d", MaxVsockCID)
+	}
+
+	// Validate timeouts
+	startTimeout := time.Duration(c.StartTimeout)
+	if startTimeout != 0 {
+		if startTimeout < MinTimeout {
+			return fmt.Errorf("start_timeout must be at least %s", MinTimeout)
+		}
+		if startTimeout > MaxTimeout {
+			return fmt.Errorf("start_timeout must be at most %s", MaxTimeout)
+		}
+	}
+	stopTimeout := time.Duration(c.StopTimeout)
+	if stopTimeout != 0 {
+		if stopTimeout < MinTimeout {
+			return fmt.Errorf("stop_timeout must be at least %s", MinTimeout)
+		}
+		if stopTimeout > MaxTimeout {
+			return fmt.Errorf("stop_timeout must be at most %s", MaxTimeout)
+		}
+	}
+
+	// Validate kernel and rootfs paths exist
+	if _, err := os.Stat(c.KernelPath); err != nil {
+		return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
+	}
+	if _, err := os.Stat(c.BaseRootfs); err != nil {
+		return fmt.Errorf("base_rootfs does not exist: %s", c.BaseRootfs)
 	}
 
 	// Validate network configuration

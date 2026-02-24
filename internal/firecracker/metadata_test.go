@@ -288,3 +288,83 @@ func TestListInstances_NonexistentDir(t *testing.T) {
 		t.Errorf("ListInstances() = %v, want nil for nonexistent dir", names)
 	}
 }
+
+func TestMetadataVersion(t *testing.T) {
+	t.Run("save sets current version", func(t *testing.T) {
+		dir := mustTempDir(t, "metadata-version")
+
+		meta := testMetadata("version-test")
+		meta.Version = 0
+
+		if err := meta.Save(dir); err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+
+		loaded, err := LoadMetadata(dir, "version-test")
+		if err != nil {
+			t.Fatalf("LoadMetadata() error = %v", err)
+		}
+
+		if loaded.Version != MetadataVersion {
+			t.Errorf("Version = %d, want %d", loaded.Version, MetadataVersion)
+		}
+	})
+
+	t.Run("load missing version as 1", func(t *testing.T) {
+		dir := mustTempDir(t, "metadata-version")
+
+		// Write raw JSON without version field
+		instanceDir := filepath.Join(dir, "no-version")
+		if err := os.MkdirAll(instanceDir, 0755); err != nil {
+			t.Fatalf("failed to create instance dir: %v", err)
+		}
+
+		raw := `{"name":"no-version","status":"stopped","created_at":"2024-01-01T00:00:00Z","backend":"firecracker","cid":100}`
+		metaPath := filepath.Join(instanceDir, "metadata.json")
+		if err := os.WriteFile(metaPath, []byte(raw), 0644); err != nil {
+			t.Fatalf("failed to write metadata: %v", err)
+		}
+
+		loaded, err := LoadMetadata(dir, "no-version")
+		if err != nil {
+			t.Fatalf("LoadMetadata() error = %v", err)
+		}
+
+		if loaded.Version != 1 {
+			t.Errorf("Version = %d, want 1", loaded.Version)
+		}
+	})
+
+	t.Run("version present in JSON output", func(t *testing.T) {
+		dir := mustTempDir(t, "metadata-version")
+
+		meta := testMetadata("json-version")
+		if err := meta.Save(dir); err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+
+		data, err := os.ReadFile(MetadataPath(dir, "json-version"))
+		if err != nil {
+			t.Fatalf("failed to read metadata file: %v", err)
+		}
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("failed to parse raw JSON: %v", err)
+		}
+
+		versionRaw, ok := raw["version"]
+		if !ok {
+			t.Fatal("version key missing from JSON output")
+		}
+
+		var version int
+		if err := json.Unmarshal(versionRaw, &version); err != nil {
+			t.Fatalf("failed to parse version value: %v", err)
+		}
+
+		if version != MetadataVersion {
+			t.Errorf("version in JSON = %d, want %d", version, MetadataVersion)
+		}
+	})
+}

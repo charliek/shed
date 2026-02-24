@@ -102,6 +102,7 @@ nav:
       - HTTP API: reference/api.md
   - Development:
       - Setup: development/setup.md
+      - Testing: development/testing.md
       - Architecture: development/architecture.md
   - Roadmap: ROADMAP.md
 
