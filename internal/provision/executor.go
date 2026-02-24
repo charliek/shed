@@ -175,10 +175,10 @@ func (e *Executor) runHook(ctx context.Context, containerID string, hookType Hoo
 }
 
 // ensureLogDir creates the log directory in the container if it doesn't exist.
-// Runs as root and sets open permissions so the shed user can write log files.
+// Runs as root and sets ownership to the shed user with standard permissions.
 func (e *Executor) ensureLogDir(ctx context.Context, containerID string) error {
 	execConfig := container.ExecOptions{
-		Cmd:  []string{"bash", "-c", fmt.Sprintf("mkdir -p %s && chmod 777 %s", LogDir, LogDir)},
+		Cmd:  []string{"bash", "-c", fmt.Sprintf("mkdir -p %s && chown %s:%s %s && chmod 755 %s", LogDir, config.ContainerUser, config.ContainerUser, LogDir, LogDir)},
 		User: "root",
 	}
 

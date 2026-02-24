@@ -31,6 +31,9 @@ RUN userdel -r ubuntu 2>/dev/null || true \
     && echo 'shed ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/shed \
     && chmod 0440 /etc/sudoers.d/shed
 
+# Pre-create log directory so shed user can write logs without root
+RUN mkdir -p /var/log/shed && chown shed:shed /var/log/shed
+
 # Node.js 22.x
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
