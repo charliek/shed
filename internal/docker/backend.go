@@ -204,6 +204,7 @@ func buildExecConfig(cmd []string, opts backend.ExecOptions) container.ExecOptio
 		Tty:          opts.TTY,
 		Env:          opts.Env,
 		WorkingDir:   workingDir,
+		User:         config.ContainerUser,
 	}
 }
 

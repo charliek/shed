@@ -15,12 +15,12 @@ default_image: shed-base:latest
 credentials:
   git_ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
 
   git_config:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
 # No env file for dev - set env vars directly if needed

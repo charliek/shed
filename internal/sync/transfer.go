@@ -306,11 +306,13 @@ func (s *Syncer) transferViaSsh(ctx context.Context, tarData []byte, extractDir,
 	if sourceBaseName == targetName || isDir {
 		// Names match or it's a directory - simple extraction
 		// Use %q to properly quote paths with special characters
-		extractCmd = fmt.Sprintf("mkdir -p %q && tar xzpf - -C %q", extractDir, extractDir)
+		// Use sudo so sync works for both system paths and user-writable paths
+		extractCmd = fmt.Sprintf("sudo mkdir -p %q && sudo tar xzpf - -C %q", extractDir, extractDir)
 	} else {
 		// File with different name - extract and rename
 		// Use %q to properly quote paths with special characters
-		extractCmd = fmt.Sprintf("mkdir -p %q && tar xzpf - -C %q && mv %q/%q %q/%q",
+		// Use sudo so sync works for both system paths and user-writable paths
+		extractCmd = fmt.Sprintf("sudo mkdir -p %q && sudo tar xzpf - -C %q && sudo mv %q/%q %q/%q",
 			extractDir, extractDir, extractDir, sourceBaseName, extractDir, targetName)
 	}
 
@@ -349,13 +351,14 @@ func (s *Syncer) runPostSyncHook(ctx context.Context, hook PostSyncHook, shedNam
 
 	// Note: hook.Run is user-defined in sync.yaml, so we pass it as-is without escaping.
 	// Users expect their shell command to run exactly as written.
+	// Prefix with sudo so hooks that need root (e.g. update-ca-certificates) work.
 	args := []string{
 		"-p", strconv.Itoa(serverEntry.SSHPort),
 		"-o", "UserKnownHostsFile=" + knownHostsPath,
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "BatchMode=yes",
 		shedName + "@" + serverEntry.Host,
-		hook.Run,
+		"sudo " + hook.Run,
 	}
 
 	cmd := exec.CommandContext(ctx, "ssh", args...)
@@ -392,7 +395,9 @@ func (s *Syncer) SaveSyncLog(ctx context.Context, logContent string, shedName st
 	knownHostsPath := config.GetKnownHostsPath()
 
 	// Create log directory and write log
-	cmdStr := fmt.Sprintf("mkdir -p %s && cat > %s", filepath.Dir(provision.SyncLog), provision.SyncLog)
+	// Use sudo + tee since the log directory may be owned by root,
+	// and shell redirect (>) wouldn't inherit sudo
+	cmdStr := fmt.Sprintf("sudo mkdir -p %s && sudo tee %s > /dev/null", filepath.Dir(provision.SyncLog), provision.SyncLog)
 
 	args := []string{
 		"-p", strconv.Itoa(serverEntry.SSHPort),

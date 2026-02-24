@@ -451,7 +451,7 @@ Mounts are defined in server config and applied to all containers:
 credentials:
   git_ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
 ```
 
@@ -985,27 +985,27 @@ default_image: shed-base:latest
 credentials:
   git_ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
     
   git_config:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
     
   claude:
     source: ~/.claude
-    target: /root/.claude
+    target: /home/shed/.claude
     readonly: false  # Needs write for token refresh
     
   opencode:
     source: ~/.config/opencode
-    target: /root/.config/opencode
+    target: /home/shed/.config/opencode
     readonly: true
     
   gh:
     source: ~/.config/gh
-    target: /root/.config/gh
+    target: /home/shed/.config/gh
     readonly: true
 
 # Environment file to source
@@ -1665,11 +1665,11 @@ default_image: shed-base:latest
 credentials:
   git_ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
   git_config:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
 # Optional: skip claude/opencode mounts for basic testing

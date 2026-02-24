@@ -209,6 +209,9 @@ const (
 	BackendFirecracker = "firecracker"
 )
 
+// ContainerUser is the non-root user that runs inside Docker containers.
+const ContainerUser = "shed"
+
 // ContainerPrefix is prepended to shed names for Docker containers.
 const ContainerPrefix = "shed-"
 

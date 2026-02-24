@@ -140,6 +140,7 @@ func (c *Client) execCommand(ctx context.Context, containerName string, cmd []st
 		Cmd:          cmd,
 		AttachStdout: true,
 		AttachStderr: true,
+		User:         config.ContainerUser,
 	}
 
 	execResp, err := c.docker.ContainerExecCreate(ctx, containerName, execConfig)

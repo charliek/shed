@@ -23,16 +23,13 @@ RUN apt-get update && apt-get install -y \
 # unzip: for extracting archives in provisioning scripts
 # sudo: for provisioning scripts that need elevated privileges
 
-# mise
-RUN curl https://mise.run | sh
-ENV PATH="/root/.local/share/mise/shims:/root/.local/bin:${PATH}"
-
-# RUN mise install \
-#     java@temurin-21 \
-#     node@lts \
-#     uv \
-#     gh 
-
+# Create non-root shed user (UID 1000) with passwordless sudo (devcontainer pattern)
+# Ubuntu 24.04 ships a default 'ubuntu' user at UID 1000; remove it first so
+# bind-mounted host files (typically owned by UID 1000) are readable by shed.
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && useradd -m -s /bin/bash -u 1000 shed \
+    && echo 'shed ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/shed \
+    && chmod 0440 /etc/sudoers.d/shed
 
 # Node.js 22.x
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
@@ -53,13 +50,19 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Switch to shed user for user-level tool installs
+USER shed
+
+# mise
+RUN curl https://mise.run | sh
+ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:${PATH}"
+
 # UV + Python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-RUN /root/.local/bin/uv python install 3.13
+RUN /home/shed/.local/bin/uv python install 3.13
 
 # Shell customization - colored prompt showing shed name and path
-# Append to /root/.bashrc (runs last for login shells, after Ubuntu's default PS1)
-RUN echo 'export PS1="\\[\\033[1;36m\\][\\[\\033[1;32m\\]shed:\\${SHED_NAME:-dev}\\[\\033[1;36m\\]]\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ "' >> /root/.bashrc
+RUN echo 'export PS1="\\[\\033[1;36m\\][\\[\\033[1;32m\\]shed:\\${SHED_NAME:-dev}\\[\\033[1;36m\\]]\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ "' >> /home/shed/.bashrc
 
 WORKDIR /workspace
 

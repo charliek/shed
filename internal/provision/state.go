@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/charliek/shed/internal/config"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -122,6 +123,7 @@ func (s *State) writeStateFile(ctx context.Context, containerID string, state ma
 
 	execConfig := container.ExecOptions{
 		Cmd:          cmd,
+		User:         config.ContainerUser,
 		AttachStdout: true,
 		AttachStderr: true,
 	}
@@ -160,6 +162,7 @@ func (s *State) readStateFile(ctx context.Context, containerID string) (map[stri
 
 	execConfig := container.ExecOptions{
 		Cmd:          cmd,
+		User:         config.ContainerUser,
 		AttachStdout: true,
 		AttachStderr: true,
 	}
@@ -230,6 +233,7 @@ func (s *State) readLogFile(ctx context.Context, containerID string, logPath str
 
 	execConfig := container.ExecOptions{
 		Cmd:          cmd,
+		User:         config.ContainerUser,
 		AttachStdout: true,
 		AttachStderr: true,
 	}

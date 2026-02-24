@@ -28,27 +28,27 @@ default_backend: docker
 credentials:
   git_ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
 
   git_config:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
   claude:
     source: ~/.claude
-    target: /root/.claude
+    target: /home/shed/.claude
     readonly: false  # Needs write access for token refresh
 
   opencode:
     source: ~/.config/opencode
-    target: /root/.config/opencode
+    target: /home/shed/.config/opencode
     readonly: true
 
   gh:
     source: ~/.config/gh
-    target: /root/.config/gh
+    target: /home/shed/.config/gh
     readonly: true
 
 # Environment file path

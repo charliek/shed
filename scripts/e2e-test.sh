@@ -198,7 +198,7 @@ run_backend_tests() {
 
     # Bun
     local bun_output
-    bun_output=$("$SHED" exec "$test_name" -- bash -c "command -v bun || ls /root/.bun/bin/bun" 2>&1)
+    bun_output=$("$SHED" exec "$test_name" -- bash -c "command -v bun || ls \$HOME/.bun/bin/bun" 2>&1)
     if [ $? -eq 0 ]; then
         log_pass "Bun is installed"
     else
@@ -209,7 +209,7 @@ run_backend_tests() {
     echo ""
     echo "Step 4: Push database schema"
     local db_output
-    db_output=$("$SHED" exec "$test_name" -- bash -c "export PATH=/root/.bun/bin:\$PATH && cd /workspace/apps/api && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo bun run db:push:ci" 2>&1)
+    db_output=$("$SHED" exec "$test_name" -- bash -c "export PATH=\$HOME/.bun/bin:\$PATH && cd /workspace/apps/api && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo bun run db:push:ci" 2>&1)
     if [ $? -eq 0 ]; then
         log_pass "Database schema push"
     else
@@ -220,7 +220,7 @@ run_backend_tests() {
     echo ""
     echo "Step 5: Run test suite"
     local test_output
-    test_output=$("$SHED" exec "$test_name" -- bash -c "set -o pipefail && export PATH=/root/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
+    test_output=$("$SHED" exec "$test_name" -- bash -c "set -o pipefail && export PATH=\$HOME/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
     if [ $? -eq 0 ]; then
         log_pass "Test suite"
     else
@@ -289,7 +289,7 @@ run_backend_tests() {
     # 9. TESTS AFTER RESTART
     echo ""
     echo "Step 9: Run tests after restart"
-    test_output=$("$SHED" exec "$test_name" -- bash -c "set -o pipefail && export PATH=/root/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
+    test_output=$("$SHED" exec "$test_name" -- bash -c "set -o pipefail && export PATH=\$HOME/.bun/bin:\$PATH && cd /workspace && DATABASE_URL=postgresql://dev:dev@localhost:5432/sltstodo REDIS_URL=redis://localhost:6379 bun test 2>&1 | tail -20" 2>&1)
     if [ $? -eq 0 ]; then
         log_pass "Test suite after restart"
     else

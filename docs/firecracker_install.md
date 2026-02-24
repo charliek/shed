@@ -138,11 +138,11 @@ default_backend: firecracker
 credentials:
   ssh:
     source: ~/.ssh
-    target: /root/.ssh
+    target: /home/shed/.ssh
     readonly: true
   gitconfig:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
 # Environment variables passed to git clone and provisioning hooks
@@ -173,7 +173,7 @@ To clone private repositories via SSH, create an env file with the `GIT_SSH_COMM
 ```bash
 mkdir -p ~/.shed
 cat > ~/.shed/env << 'EOF'
-GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /root/.ssh/id_ed25519
+GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /home/shed/.ssh/id_ed25519
 EOF
 ```
 

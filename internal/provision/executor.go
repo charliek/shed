@@ -125,6 +125,7 @@ func (e *Executor) runHook(ctx context.Context, containerID string, hookType Hoo
 		WorkingDir:   config.WorkspacePath,
 		AttachStdout: true,
 		AttachStderr: true,
+		User:         config.ContainerUser,
 	}
 
 	// Create exec
@@ -174,9 +175,11 @@ func (e *Executor) runHook(ctx context.Context, containerID string, hookType Hoo
 }
 
 // ensureLogDir creates the log directory in the container if it doesn't exist.
+// Runs as root and sets open permissions so the shed user can write log files.
 func (e *Executor) ensureLogDir(ctx context.Context, containerID string) error {
 	execConfig := container.ExecOptions{
-		Cmd: []string{"mkdir", "-p", LogDir},
+		Cmd:  []string{"bash", "-c", fmt.Sprintf("mkdir -p %s && chmod 777 %s", LogDir, LogDir)},
+		User: "root",
 	}
 
 	execResp, err := e.docker.ContainerExecCreate(ctx, containerID, execConfig)

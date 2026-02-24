@@ -62,33 +62,33 @@ credentials:
     readonly: true
   git_config:
     source: ~/.gitconfig
-    target: /root/.gitconfig
+    target: /home/shed/.gitconfig
     readonly: true
 
   # Claude Code - container-specific credentials
   claude:
     source: ~/.shed/mounts/claude
-    target: /root/.claude
+    target: /home/shed/.claude
     readonly: false
 
   # OpenCode - data, state, and cache directories
   opencode_data:
     source: ~/.shed/mounts/opencode/share
-    target: /root/.local/share/opencode
+    target: /home/shed/.local/share/opencode
     readonly: false
   opencode_state:
     source: ~/.shed/mounts/opencode/state
-    target: /root/.local/state/opencode
+    target: /home/shed/.local/state/opencode
     readonly: false
   opencode_cache:
     source: ~/.shed/mounts/opencode/cache
-    target: /root/.cache/opencode
+    target: /home/shed/.cache/opencode
     readonly: false
 
   # GitHub CLI
   gh:
     source: ~/.shed/mounts/gh
-    target: /root/.config/gh
+    target: /home/shed/.config/gh
     readonly: false
 
 env_file: ~/.shed/env
