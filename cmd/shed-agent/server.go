@@ -69,7 +69,8 @@ func NewServer(consolePort, healthPort uint32) *Server {
 	} else {
 		groupIDs, err := u.GroupIds()
 		if err != nil {
-			log.Printf("Warning: failed to get supplementary groups for shed: %v", err)
+			log.Printf("Warning: failed to get supplementary groups for shed, running commands as root: %v", err)
+			return s
 		}
 		var groups []uint32
 		for _, gidStr := range groupIDs {
