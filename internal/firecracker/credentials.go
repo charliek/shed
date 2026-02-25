@@ -80,8 +80,10 @@ func (ct *CredentialTransfer) transferCredential(ctx context.Context, name strin
 		extractDir = filepath.Dir(target)
 	}
 
-	// First, ensure the target directory exists in the VM
-	mkdirCmd := fmt.Sprintf("mkdir -p %q", extractDir)
+	// First, ensure the target directory exists in the VM.
+	// Use sudo for system paths since commands run as shed user.
+	sp := sudoPrefix(extractDir)
+	mkdirCmd := fmt.Sprintf("%smkdir -p %q", sp, extractDir)
 	mkdirOpts := backend.ExecOptions{
 		Cmd:        []string{"/bin/sh", "-c", mkdirCmd},
 		WorkingDir: "/",
@@ -103,7 +105,7 @@ func (ct *CredentialTransfer) transferCredential(ctx context.Context, name strin
 				return err
 			}
 			// Rename if source and target basenames differ
-			renameCmd := fmt.Sprintf("mv %q %q", tempTarget, target)
+			renameCmd := fmt.Sprintf("%smv %q %q", sp, tempTarget, target)
 			renameOpts := backend.ExecOptions{
 				Cmd:        []string{"/bin/sh", "-c", renameCmd},
 				WorkingDir: "/",
@@ -206,6 +208,24 @@ func (ct *CredentialTransfer) addToTar(tw *tar.Writer, sourcePath, archivePath s
 	return nil
 }
 
+// isSystemPath returns true if the path requires root privileges to write.
+func isSystemPath(path string) bool {
+	return strings.HasPrefix(path, "/etc/") ||
+		strings.HasPrefix(path, "/usr/") ||
+		strings.HasPrefix(path, "/var/") ||
+		strings.HasPrefix(path, "/opt/") ||
+		strings.HasPrefix(path, "/mnt/")
+}
+
+// sudoPrefix returns "sudo " for system paths, empty string otherwise.
+// Commands run as the shed user by default; system paths need sudo.
+func sudoPrefix(path string) string {
+	if isSystemPath(path) {
+		return "sudo "
+	}
+	return ""
+}
+
 // extractTarInVM extracts a gzipped tar archive in the VM via vsock.
 // The tar data is streamed via stdin to avoid shell argument size limits.
 func (ct *CredentialTransfer) extractTarInVM(ctx context.Context, tarData []byte, extractDir string) error {
@@ -213,7 +233,15 @@ func (ct *CredentialTransfer) extractTarInVM(ctx context.Context, tarData []byte
 	// The -p flag preserves permissions, but we need to fix ownership
 	// because files extracted from tar have original owner/group which
 	// may not exist or be appropriate in the VM.
-	tarCmd := fmt.Sprintf("tar --no-same-owner -xzpf - -C %q", extractDir)
+	// Use sudo for system paths since commands run as shed user.
+	// After extraction to system paths, chown files to shed user so
+	// credentials are accessible while preserving original permissions
+	// (e.g. SSH keys at /mnt/ssh-host keep 0600 mode).
+	sp := sudoPrefix(extractDir)
+	tarCmd := fmt.Sprintf("%star --no-same-owner -xzpf - -C %q", sp, extractDir)
+	if sp != "" {
+		tarCmd += fmt.Sprintf(" && %schown -R shed:shed %q", sp, extractDir)
+	}
 
 	var outputBuf strings.Builder
 	opts := backend.ExecOptions{

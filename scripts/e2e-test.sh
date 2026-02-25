@@ -174,6 +174,37 @@ run_backend_tests() {
         log_fail "Basic exec (echo hello)" "$exec_output"
     fi
 
+    # 2b. NON-ROOT USER
+    echo ""
+    echo "Step 2b: Verify non-root user context"
+
+    # whoami should return shed
+    local whoami_output
+    whoami_output=$("$SHED" exec "$test_name" -- whoami 2>&1)
+    if echo "$whoami_output" | grep -q "shed"; then
+        log_pass "Commands run as shed user"
+    else
+        log_fail "Commands run as shed user" "$whoami_output"
+    fi
+
+    # /workspace should be owned by shed
+    local owner_output
+    owner_output=$("$SHED" exec "$test_name" -- stat -c '%U' /workspace 2>&1)
+    if echo "$owner_output" | grep -q "shed"; then
+        log_pass "Workspace owned by shed"
+    else
+        log_fail "Workspace owned by shed" "$owner_output"
+    fi
+
+    # Passwordless sudo should work
+    local sudo_output
+    sudo_output=$("$SHED" exec "$test_name" -- sudo -n whoami 2>&1)
+    if echo "$sudo_output" | grep -q "root"; then
+        log_pass "Passwordless sudo works"
+    else
+        log_fail "Passwordless sudo works" "$sudo_output"
+    fi
+
     # 3. SERVICES: Verify provisioning worked
     echo ""
     echo "Step 3: Verify provisioned services"

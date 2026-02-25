@@ -239,6 +239,7 @@ Shed is designed for single-user scenarios where:
 - All machines are connected via Tailscale (or similar private network)
 - The developer owns/controls all machines
 - Network access implies trust
+- Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo
 
 **Not suitable for:**
 - Multi-tenant environments

@@ -7,11 +7,21 @@ import (
 	"context"
 	"log"
 	"net"
+	"os/user"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mdlayher/vsock"
 )
+
+// userInfo holds resolved user credentials for spawning processes.
+type userInfo struct {
+	cred    *syscall.Credential
+	homeDir string
+	name    string
+}
 
 const (
 	// DefaultConsolePort is the vsock port for console/exec connections.
@@ -29,6 +39,9 @@ type Server struct {
 	consoleListener net.Listener
 	healthListener  net.Listener
 
+	// Resolved non-root user for spawning processes (nil = run as root)
+	user *userInfo
+
 	// For graceful shutdown
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -38,12 +51,34 @@ type Server struct {
 // NewServer creates a new Server.
 func NewServer(consolePort, healthPort uint32) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{
+	s := &Server{
 		consolePort: consolePort,
 		healthPort:  healthPort,
 		ctx:         ctx,
 		cancel:      cancel,
 	}
+
+	// Resolve the non-root "shed" user at startup.
+	// If lookup fails (degraded rootfs), fall back to running as root.
+	if u, err := user.Lookup("shed"); err != nil {
+		log.Printf("Warning: shed user not found, running commands as root: %v", err)
+	} else if uid, err := strconv.ParseUint(u.Uid, 10, 32); err != nil {
+		log.Printf("Warning: failed to parse shed UID %q: %v", u.Uid, err)
+	} else if gid, err := strconv.ParseUint(u.Gid, 10, 32); err != nil {
+		log.Printf("Warning: failed to parse shed GID %q: %v", u.Gid, err)
+	} else {
+		s.user = &userInfo{
+			cred: &syscall.Credential{
+				Uid: uint32(uid),
+				Gid: uint32(gid),
+			},
+			homeDir: u.HomeDir,
+			name:    u.Username,
+		}
+		log.Printf("Resolved shed user: uid=%d gid=%d home=%s", uid, gid, u.HomeDir)
+	}
+
+	return s
 }
 
 // Start starts the vsock listeners.
@@ -82,7 +117,7 @@ func (s *Server) Start() error {
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
-				handleExecConnection(conn)
+				handleExecConnection(conn, s.user)
 			}()
 		}
 	}()

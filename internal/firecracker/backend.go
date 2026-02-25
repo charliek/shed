@@ -179,10 +179,11 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 	if len(cmd) == 0 {
 		cmd = []string{"/bin/bash", "--login"}
 	} else {
-		// Wrap command in shell to support operators like &&, ||, |, etc.
-		// SSH sends the command as space-separated tokens.
-		// The shell parses operators correctly.
-		cmd = []string{"/bin/sh", "-c", strings.Join(cmd, " ")}
+		// Wrap command in a login shell to support operators like &&, ||, |, etc.
+		// SSH sends the command as space-separated tokens; the shell parses them.
+		// Use bash --login so /etc/profile.d/ scripts are sourced, making tools
+		// installed by provisioning hooks (e.g. mise shims) available in PATH.
+		cmd = []string{"/bin/bash", "--login", "-c", strings.Join(cmd, " ")}
 	}
 	opts.Cmd = cmd
 
