@@ -77,7 +77,7 @@ var (
 )
 
 func init() {
-	createCmd.Flags().StringVarP(&createRepo, "repo", "r", "", "Git repository URL to clone")
+	createCmd.Flags().StringVarP(&createRepo, "repo", "r", "", "Git repository (owner/repo shorthand or full URL) to clone")
 	createCmd.Flags().StringVarP(&createImage, "image", "i", "", "Docker image to use")
 	createCmd.Flags().BoolVar(&createNoProvision, "no-provision", false, "Skip running provisioning hooks")
 	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")

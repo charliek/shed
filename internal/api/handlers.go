@@ -71,6 +71,14 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Expand repo shorthand (e.g., "owner/repo" -> "git@github.com:owner/repo.git")
+	// and validate the resulting URL
+	req.Repo = config.ExpandRepoShorthand(req.Repo)
+	if err := config.ValidateGitRepoURL(req.Repo); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRepoURL, err.Error())
+		return
+	}
+
 	// Use default image if not specified
 	if req.Image == "" {
 		req.Image = s.cfg.DefaultImage

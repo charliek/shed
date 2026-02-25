@@ -185,6 +185,7 @@ const (
 	ErrShedAlreadyRunning = "SHED_ALREADY_RUNNING"
 	ErrShedAlreadyStopped = "SHED_ALREADY_STOPPED"
 	ErrInvalidShedName    = "INVALID_SHED_NAME"
+	ErrInvalidRepoURL     = "INVALID_REPO_URL"
 	ErrCloneFailed        = "CLONE_FAILED"
 	ErrBackendNotEnabled  = "BACKEND_NOT_ENABLED"
 	ErrBackendError       = "BACKEND_ERROR"

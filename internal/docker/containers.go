@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"os"
-	"regexp"
-	"strings"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -20,63 +17,10 @@ import (
 	"github.com/charliek/shed/internal/provision"
 )
 
-// gitSSHRegex matches git@host:path format (e.g., git@github.com:user/repo.git)
-var gitSSHRegex = regexp.MustCompile(`^git@[a-zA-Z0-9][a-zA-Z0-9.-]*:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:\.git)?$`)
-
-// ValidateGitRepoURL validates that a git repository URL is well-formed.
-// Accepts https://, git://, ssh://, and git@host:path formats.
-func ValidateGitRepoURL(repoURL string) error {
-	if repoURL == "" {
-		return nil // Empty is valid (no repo to clone)
-	}
-
-	// Check for git@host:path format first (SCP-like syntax)
-	if strings.HasPrefix(repoURL, "git@") {
-		if !gitSSHRegex.MatchString(repoURL) {
-			return fmt.Errorf("invalid git SSH URL format: %s", repoURL)
-		}
-		return nil
-	}
-
-	// Parse as standard URL
-	parsed, err := url.Parse(repoURL)
-	if err != nil {
-		return fmt.Errorf("invalid repository URL: %w", err)
-	}
-
-	// Validate scheme
-	validSchemes := map[string]bool{
-		"https": true,
-		"http":  true,
-		"git":   true,
-		"ssh":   true,
-	}
-	if !validSchemes[parsed.Scheme] {
-		return fmt.Errorf("unsupported URL scheme %q: must be https, http, git, or ssh", parsed.Scheme)
-	}
-
-	// Validate host is present
-	if parsed.Host == "" {
-		return fmt.Errorf("repository URL must have a host")
-	}
-
-	// Validate path is present (should have at least /user/repo or /repo)
-	if parsed.Path == "" || parsed.Path == "/" {
-		return fmt.Errorf("repository URL must have a path")
-	}
-
-	return nil
-}
-
 // CreateShed creates a new shed with a volume, container, and optionally clones a repository.
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	// Validate shed name
 	if err := config.ValidateShedName(req.Name); err != nil {
-		return nil, err
-	}
-
-	// Validate repository URL if provided
-	if err := ValidateGitRepoURL(req.Repo); err != nil {
 		return nil, err
 	}
 
