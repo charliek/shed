@@ -81,6 +81,10 @@ func NewServer(consolePort, healthPort uint32) *Server {
 			}
 			groups = append(groups, uint32(g))
 		}
+		if len(groups) == 0 {
+			log.Printf("Warning: shed has no valid supplementary groups, running commands as root")
+			return s
+		}
 
 		s.user = &userInfo{
 			cred: &syscall.Credential{
