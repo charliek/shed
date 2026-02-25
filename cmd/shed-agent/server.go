@@ -67,15 +67,30 @@ func NewServer(consolePort, healthPort uint32) *Server {
 	} else if gid, err := strconv.ParseUint(u.Gid, 10, 32); err != nil {
 		log.Printf("Warning: failed to parse shed GID %q: %v", u.Gid, err)
 	} else {
+		groupIDs, err := u.GroupIds()
+		if err != nil {
+			log.Printf("Warning: failed to get supplementary groups for shed: %v", err)
+		}
+		var groups []uint32
+		for _, gidStr := range groupIDs {
+			g, err := strconv.ParseUint(gidStr, 10, 32)
+			if err != nil {
+				log.Printf("Warning: failed to parse group ID %q: %v", gidStr, err)
+				continue
+			}
+			groups = append(groups, uint32(g))
+		}
+
 		s.user = &userInfo{
 			cred: &syscall.Credential{
-				Uid: uint32(uid),
-				Gid: uint32(gid),
+				Uid:    uint32(uid),
+				Gid:    uint32(gid),
+				Groups: groups,
 			},
 			homeDir: u.HomeDir,
 			name:    u.Username,
 		}
-		log.Printf("Resolved shed user: uid=%d gid=%d home=%s", uid, gid, u.HomeDir)
+		log.Printf("Resolved shed user: uid=%d gid=%d groups=%v home=%s", uid, gid, groups, u.HomeDir)
 	}
 
 	return s
