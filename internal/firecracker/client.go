@@ -559,6 +559,30 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
 	}
 
+	// Run shutdown hook before stopping the VM.
+	// Allocate up to half the stop timeout for the hook, capped at 30s.
+	stopTimeout := c.cfg.StopTimeout.Duration()
+	hookBudget := stopTimeout / 2
+	if hookBudget > 30*time.Second {
+		hookBudget = 30 * time.Second
+	}
+
+	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
+	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort)
+	provisioner := NewProvisioner(vsockClient, name)
+	provisioner.SetOutput(os.Stdout, os.Stderr)
+
+	hookCtx, hookCancel := context.WithTimeout(ctx, hookBudget)
+	defer hookCancel()
+	cfg, err := provisioner.LoadConfig(hookCtx)
+	if err != nil {
+		log.Printf("Warning: failed to load provision config for shutdown hook: %v", err)
+	} else if cfg.HasShutdownHook() {
+		if err := provisioner.RunShutdownHook(hookCtx, cfg); err != nil {
+			log.Printf("Warning: shutdown hook failed: %v", err)
+		}
+	}
+
 	// Get or create VM handle
 	c.mu.Lock()
 	vm := c.vms[name]

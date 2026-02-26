@@ -133,6 +133,26 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 	return nil
 }
 
+// RunShutdownHook runs the shutdown hook if configured.
+// Returns nil if no shutdown hook is configured.
+func (p *Provisioner) RunShutdownHook(ctx context.Context, cfg *provision.Config) error {
+	if cfg == nil || !cfg.HasShutdownHook() {
+		return nil
+	}
+
+	fmt.Fprintln(p.output, "Running shutdown hook...")
+	if err := p.runHook(ctx, cfg, provision.HookTypeShutdown, cfg.Hooks.Shutdown); err != nil {
+		if hookErr, ok := err.(*provision.HookError); ok {
+			fmt.Fprintf(p.errOut, "Shutdown hook failed (exit code %d)\n", hookErr.ExitCode)
+			fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
+			fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
+		}
+		return err
+	}
+	fmt.Fprintln(p.output, "Shutdown hook complete")
+	return nil
+}
+
 // runHook executes a provisioning hook script in the VM.
 func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookType provision.HookType, scriptPath string) error {
 	// Apply timeout to context, respecting parent context deadline
@@ -272,6 +292,8 @@ func (p *Provisioner) logFileForHook(hookType provision.HookType) string {
 		return provision.InstallLog
 	case provision.HookTypeStartup:
 		return provision.StartupLog
+	case provision.HookTypeShutdown:
+		return provision.ShutdownLog
 	default:
 		return filepath.Join(provision.LogDir, string(hookType)+".log")
 	}

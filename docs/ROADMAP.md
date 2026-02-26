@@ -7,7 +7,7 @@ This document outlines planned future enhancements for Shed.
 Follow-up improvements to consider after the initial Firecracker backend merges.
 
 - ~~Disable root SSH login by default in the Firecracker rootfs and switch to a non-root user workflow.~~ **Done** — shed-agent now runs commands as the `shed` user (UID 1000), matching the Docker backend's non-root model.
-- Add deeper graceful shutdown handling for `shed-agent` connection goroutines (beyond basic timeout-driven exit).
+- ~~Add deeper graceful shutdown handling for `shed-agent` connection goroutines (beyond basic timeout-driven exit).~~ **Done** — `Stop()` now uses a 5s drain timeout so hung connections don't block VM shutdown.
 - Consider stricter validation defaults for Firecracker configs (additional guardrails beyond `vsock_base_cid`).
 - Add metadata JSON version field for forward/backward compatibility of the metadata format.
 - Consider reducing `MaxMessageSize` (16MB) or adding streaming for large messages in agentproto.
@@ -18,7 +18,7 @@ Follow-up improvements to consider after the initial Firecracker backend merges.
 Remaining improvement for stop/start resilience after most e2e gaps were resolved:
 
 - Boot cleanup handles generic stale state (shared memory, lock files, temp files) via `network-setup.sh`; service-specific cleanup moved to startup hooks (documented in provisioning guide)
-- Still deferred: configurable stop timeout, pre-shutdown hooks for graceful service termination
+- ~~Still deferred: configurable stop timeout, pre-shutdown hooks for graceful service termination~~ **Done** — `hooks.shutdown` in `provision.yaml` runs before `shed stop`/`shed delete`, with time budget of `min(stopTimeout/2, 30s)`
 
 ## Firecracker Live Mounts (SSHFS over vsock)
 

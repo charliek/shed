@@ -32,6 +32,7 @@ Place `.shed/provision.yaml` in your repository root. Shed detects and executes 
 |-------|------|-------------|
 | `hooks.install` | string | Script that runs once on shed create |
 | `hooks.startup` | string | Script that runs on every start |
+| `hooks.shutdown` | string | Script that runs before shed stop |
 | `env` | map | Custom environment variables |
 
 ## Hooks
@@ -51,6 +52,18 @@ Runs every time the shed starts. Use for:
 - Starting services
 - Verifying dependencies
 - Runtime configuration
+
+### Shutdown Hook
+
+Runs before the shed stops (on `shed stop` and `shed delete`). Use for:
+
+- Gracefully stopping databases (e.g., `pg_ctl stop`)
+- Flushing caches (e.g., `redis-cli shutdown`)
+- Saving application state
+
+The shutdown hook has a time budget of half the configured stop timeout (capped at 30s). If the hook exceeds this budget or fails, the shed still stops — hook failures are logged as warnings.
+
+**Note:** The shutdown hook is currently supported on the Firecracker backend only. Docker containers stop via `docker stop`, which sends SIGTERM directly.
 
 ## PATH Propagation
 
@@ -131,9 +144,17 @@ echo "PostgreSQL is ready"
 
 ### Handling Stale State After Stop/Start
 
-When you run `shed stop`, services are killed without a chance to clean up — leaving stale PID files, sockets, and shared memory. On the next `shed start`, these stale files can prevent services from restarting. This applies to both Docker and Firecracker backends (only `shed delete` + `shed create` gives a clean slate).
+When services aren't stopped gracefully before `shed stop`, they leave stale PID files, sockets, and shared memory. On the next `shed start`, these stale files can prevent services from restarting.
 
-Your startup hook should clean stale runtime state **before** starting services:
+The best approach is to use a **shutdown hook** to stop services gracefully before the VM exits. The startup hook then serves as a safety net for cases where the shutdown hook wasn't available or failed:
+
+```yaml
+hooks:
+  startup: .shed/scripts/startup.sh
+  shutdown: .shed/scripts/shutdown.sh
+```
+
+Your startup hook should still clean stale runtime state **before** starting services (backward compatibility):
 
 ```bash
 #!/bin/bash
@@ -182,6 +203,10 @@ On `shed create`: The container starts, the repository is cloned, then the insta
 
 On `shed start`: Only the startup hook runs.
 
+On `shed stop`: The shutdown hook runs (if configured), then the shed stops.
+
+On `shed delete`: Calls stop (which runs the shutdown hook), then deletes the shed.
+
 ## Skipping Provisioning
 
 ```bash
@@ -196,6 +221,7 @@ If provisioning fails, check the logs in the container:
 shed console myproject
 cat /var/log/shed/install.log
 cat /var/log/shed/startup.log
+cat /var/log/shed/shutdown.log
 ```
 
 **Common issues:**
