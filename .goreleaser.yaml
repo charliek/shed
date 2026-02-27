@@ -1,0 +1,108 @@
+version: 2
+
+project_name: shed
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: shed
+    binary: shed
+    main: ./cmd/shed
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+  - id: shed-server
+    binary: shed-server
+    main: ./cmd/shed-server
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+  - id: shed-agent
+    binary: shed-agent
+    main: ./cmd/shed-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+archives:
+  - id: shed
+    ids:
+      - shed
+    formats:
+      - tar.gz
+    name_template: "shed_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+  - id: shed-server
+    ids:
+      - shed-server
+    formats:
+      - tar.gz
+    name_template: "shed-server_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+  - id: shed-agent
+    ids:
+      - shed-agent
+    formats:
+      - tar.gz
+    name_template: "shed-agent_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: charliek
+    name: shed
+  draft: false
+  prerelease: auto
+  mode: replace
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
