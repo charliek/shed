@@ -15,6 +15,7 @@ Create `.shed/provision.yaml` in your repository root:
 hooks:
   install: scripts/provision/install.sh
   startup: scripts/provision/startup.sh
+  shutdown: scripts/provision/shutdown.sh
 
 env:
   MY_VAR: "my_value"
@@ -64,6 +65,8 @@ Runs before the shed stops (on `shed stop` and `shed delete`). Use for:
 The shutdown hook has a time budget of half the configured stop timeout (capped at 30s). If the hook exceeds this budget or fails, the shed still stops — hook failures are logged as warnings.
 
 **Note:** The shutdown hook is currently supported on the Firecracker backend only. Docker containers stop via `docker stop`, which sends SIGTERM directly.
+
+After the shutdown hook completes, the agent enforces a 5-second drain timeout on active connections before the VM exits. This gives in-flight exec and file transfer operations time to finish cleanly.
 
 ## PATH Propagation
 

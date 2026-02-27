@@ -62,7 +62,8 @@ Firecracker VMs don't support bind mounts like Docker. Instead, credentials conf
    - Extracted to the target location
    - Ownership is set to shed:shed (user-home paths) or root:root (system paths)
 
-2. Changes to credentials on the host after VM starts won't be reflected in the VM until restart
+2. **Read-only credentials** (`readonly: true`): No live sync. Changes on the host or in the VM are not propagated until the next restart.
+3. **Writable credentials** (`readonly: false`): Synced bidirectionally while the VM is running. The agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files via tar-over-vsock and writes them to the source directory. Host-side changes push to all running VMs. Echo suppression (2-second cooldown) prevents changes from bouncing back.
 
 ### Verifying Credentials
 
@@ -107,6 +108,14 @@ Shed supports automatic provisioning via `.shed/provision.yaml` in your reposito
    - Credentials are refreshed
    - Startup hook runs (install hook is skipped)
 
+3. **On Stop**:
+   - Shutdown hook runs (if configured)
+   - VM is stopped
+
+4. **On Delete**:
+   - Shutdown hook runs (via stop)
+   - VM and instance data are removed
+
 ### Skip Provisioning
 
 ```bash
@@ -123,6 +132,9 @@ shed exec myproject -- cat /var/log/shed/install.log
 # View startup hook output
 shed exec myproject -- cat /var/log/shed/startup.log
 
+# View shutdown hook output
+shed exec myproject -- cat /var/log/shed/shutdown.log
+
 # Check provisioning state
 shed exec myproject -- cat /var/log/shed/.provision_state
 ```
@@ -133,6 +145,7 @@ shed exec myproject -- cat /var/log/shed/.provision_state
 hooks:
   install: .shed/scripts/install.sh    # Runs once on create
   startup: .shed/scripts/startup.sh    # Runs on every start
+  shutdown: .shed/scripts/shutdown.sh  # Runs before stop/delete
 
 env:
   MY_VAR: "value"
@@ -326,10 +339,10 @@ sudo rm -f /var/run/shed/firecracker/*.sock
 
 ## Docker Inside VMs
 
-Docker is pre-installed in the rootfs and configured with the `vfs` storage driver for maximum reliability in VM environments.
+Docker is pre-installed in the rootfs and configured with the `vfs` storage driver for maximum reliability in VM environments. The `shed` user is in the `docker` group, so commands work without `sudo`.
 
 ```bash
-# Run Docker commands inside the VM
+# Run Docker commands inside the VM (no sudo needed)
 shed exec myproject -- docker run hello-world
 
 # Check Docker status

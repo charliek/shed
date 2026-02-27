@@ -20,7 +20,7 @@ Remaining improvement for stop/start resilience after most e2e gaps were resolve
 - Boot cleanup handles generic stale state (shared memory, lock files, temp files) via `network-setup.sh`; service-specific cleanup moved to startup hooks (documented in provisioning guide)
 - ~~Still deferred: configurable stop timeout, pre-shutdown hooks for graceful service termination~~ **Done** — `hooks.shutdown` in `provision.yaml` runs before `shed stop`/`shed delete`, with time budget of `min(stopTimeout/2, 30s)`
 
-## Bidirectional Credential Sync (In Progress)
+## Bidirectional Credential Sync
 
 Event-driven bidirectional sync for writable credential mounts (e.g., `gh`, `claude`, `opencode`). Changes inside a VM (token refreshes) sync back to the host, and host-side changes push to all running VMs.
 

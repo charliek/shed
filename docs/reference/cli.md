@@ -77,7 +77,7 @@ shed create <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--repo` | `-r` | None | GitHub repo to clone |
+| `--repo` | `-r` | None | Repository to clone (`owner/repo` shorthand or full URL) |
 | `--server` | `-s` | Default server | Target server |
 | `--image` | `-i` | Server default | Base Docker image |
 | `--no-provision` | | `false` | Skip provisioning hooks |

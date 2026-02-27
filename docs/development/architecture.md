@@ -52,6 +52,9 @@ flowchart TB
 |----------|------|---------|
 | HTTP | 8080 | REST API for CRUD operations, server discovery |
 | SSH | 2222 | Terminal access, IDE remote connections |
+| vsock | 1024 | VM console I/O (Firecracker) |
+| vsock | 1025 | Agent health checks (Firecracker) |
+| vsock | 1026 | Credential change notifications (Firecracker) |
 
 ## Naming Conventions
 
@@ -147,11 +150,11 @@ Parses and generates SSH config files. Manages the shed-specific block in `~/.ss
 
 ### `internal/firecracker`
 
-Firecracker backend: VM lifecycle, vsock communication, TAP networking, rootfs management, metadata persistence, and credential transfer.
+Firecracker backend: VM lifecycle, vsock communication, TAP networking, rootfs management, metadata persistence, credential transfer, and bidirectional credential sync.
 
 ### `internal/agentproto`
 
-Binary protocol for framed messages over vsock between shed-server and shed-agent.
+Binary protocol for framed messages over vsock between shed-server and shed-agent. Message types cover exec, file transfer, health checks, and credential change notifications.
 
 ### `internal/backend`
 

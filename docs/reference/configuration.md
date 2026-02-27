@@ -102,7 +102,8 @@ log_level: info
 Credentials are made available to sheds. The method depends on the backend:
 
 - **Docker**: Credentials are bind-mounted (live sync with host)
-- **Firecracker**: Credentials are copied at create/start time (no live sync)
+- **Firecracker (read-only)**: Credentials are copied at create/start time via tar-over-vsock; no live sync
+- **Firecracker (writable)**: Credentials are copied at create/start time and synced bidirectionally via fsnotify + vsock (port 1026) while the VM is running
 
 ```yaml
 credentials:
@@ -112,7 +113,7 @@ credentials:
     readonly: true           # Optional, default false
 ```
 
-**Note:** For Firecracker, changes to credentials on the host after shed start won't be reflected in the VM until the next restart.
+**Note:** For Firecracker, only read-only credentials lack live sync — changes on either side require a restart. Writable credentials (`readonly: false`) sync bidirectionally while the VM is running: host-side changes push to the VM, and in-VM changes (e.g., token refreshes) sync back to the host with 2-second echo suppression.
 
 **Common credential mounts:**
 
@@ -176,6 +177,7 @@ firecracker:
   vsock_base_cid: 100
   console_port: 1024
   health_port: 1025
+  notify_port: 1026
   start_timeout: 120s
   stop_timeout: 10s
   bridge_name: shed-br0
@@ -193,6 +195,11 @@ firecracker:
 | `socket_dir` | string | - | Directory for API/vsock sockets |
 | `default_cpus` | int | `2` | Default vCPUs per VM |
 | `default_memory_mb` | int | `4096` | Default memory per VM (MB) |
+| `default_disk_gb` | int | `20` | Default disk size per VM (GB) |
+| `vsock_base_cid` | int | `100` | Starting CID for vsock guest addressing |
+| `console_port` | int | `1024` | Vsock port for VM console I/O |
+| `health_port` | int | `1025` | Vsock port for agent health checks |
+| `notify_port` | int | `1026` | Vsock port for credential change notifications |
 | `start_timeout` | duration | `30s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
 | `bridge_name` | string | `shed-br0` | Linux bridge name |

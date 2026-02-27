@@ -93,7 +93,7 @@ Creates a new shed.
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `name` | Yes | - | Shed name (alphanumeric + hyphens) |
-| `repo` | No | null | GitHub repo to clone |
+| `repo` | No | null | Repository to clone (`owner/repo` shorthand or full URL) |
 | `image` | No | Server config | Base Docker image |
 
 **Response (201 Created):**
@@ -113,6 +113,7 @@ Creates a new shed.
 | Code | Description |
 |------|-------------|
 | 400 | Invalid name format |
+| 400 | Invalid repository URL |
 | 409 | Shed already exists |
 | 500 | Docker or clone failure |
 
