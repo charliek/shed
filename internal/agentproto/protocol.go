@@ -21,7 +21,21 @@ const (
 	MsgTypeStdinEOF       byte = 0x06
 	MsgTypeHealthRequest  byte = 0x10
 	MsgTypeHealthResponse byte = 0x11
+
+	MsgTypeNotifySetup byte = 0x12 // Host → Agent: setup notification watchers
+	MsgTypeFileChanged byte = 0x13 // Agent → Host: credential file changed
 )
+
+// NotifySetupMessage is sent from host to agent to configure credential watchers.
+type NotifySetupMessage struct {
+	Credentials map[string]string `json:"credentials"` // name → target path in VM
+}
+
+// FileChangedMessage is sent from agent to host when credential files change.
+type FileChangedMessage struct {
+	Credential string   `json:"credential"` // credential mount name (e.g., "gh")
+	Files      []string `json:"files"`      // relative paths that changed
+}
 
 // ExecRequest is sent to execute a command.
 type ExecRequest struct {

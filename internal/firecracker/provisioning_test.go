@@ -141,7 +141,7 @@ func TestUnescapeStateValue(t *testing.T) {
 }
 
 func TestNewProvisioner(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "test-shed")
 
 	if p.vsock != vsock {
@@ -159,7 +159,7 @@ func TestNewProvisioner(t *testing.T) {
 }
 
 func TestProvisionerBuildEnv(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "my-shed")
 
 	cfg := &provision.Config{
@@ -208,7 +208,7 @@ func TestProvisionerBuildEnv(t *testing.T) {
 }
 
 func TestProvisionerBuildEnvEmpty(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "test")
 
 	cfg := &provision.Config{
@@ -224,7 +224,7 @@ func TestProvisionerBuildEnvEmpty(t *testing.T) {
 }
 
 func TestLogFileForHook(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "test")
 
 	tests := []struct {
@@ -248,7 +248,7 @@ func TestLogFileForHook(t *testing.T) {
 }
 
 func TestRunProvisioningNilConfig(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "test")
 
 	// Nil config should be a no-op
@@ -258,7 +258,7 @@ func TestRunProvisioningNilConfig(t *testing.T) {
 }
 
 func TestRunProvisioningNoHooks(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "test")
 
 	cfg := &provision.Config{
@@ -272,7 +272,7 @@ func TestRunProvisioningNoHooks(t *testing.T) {
 }
 
 func TestRunShutdownHookNilConfig(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "test")
 
 	// Nil config should be a no-op (no panic)
@@ -280,7 +280,7 @@ func TestRunShutdownHookNilConfig(t *testing.T) {
 }
 
 func TestRunShutdownHookNoHook(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	p := NewProvisioner(vsock, "test")
 
 	cfg := &provision.Config{
@@ -292,7 +292,7 @@ func TestRunShutdownHookNoHook(t *testing.T) {
 }
 
 func TestNewProvisionState(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	state := NewProvisionState(vsock)
 
 	if state.vsock != vsock {

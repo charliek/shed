@@ -147,7 +147,7 @@ func (vm *VM) Start(ctx context.Context) error {
 
 	// Wait for the agent to be healthy
 	vsockPath := filepath.Join(socketDir, fmt.Sprintf("%s.vsock", vm.meta.Name))
-	vsockClient := NewVsockClient(vsockPath, vm.cfg.ConsolePort, vm.cfg.HealthPort)
+	vsockClient := NewVsockClient(vsockPath, vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort)
 	if err := vsockClient.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
 		// Try to stop the VM on failure
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {
