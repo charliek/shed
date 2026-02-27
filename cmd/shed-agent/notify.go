@@ -28,9 +28,9 @@ type credentialWatcher struct {
 	watcher *fsnotify.Watcher
 
 	// debounce state: per-credential pending file sets
-	mu       sync.Mutex
-	pending  map[string]map[string]bool // credential → set of relative paths
-	timers   map[string]*time.Timer     // credential → debounce timer
+	mu      sync.Mutex
+	pending map[string]map[string]bool // credential → set of relative paths
+	timers  map[string]*time.Timer     // credential → debounce timer
 }
 
 const debounceInterval = 500 * time.Millisecond
@@ -90,7 +90,9 @@ func (cw *credentialWatcher) start(done <-chan struct{}) {
 			// If a new directory was created, watch it too
 			if event.Has(fsnotify.Create) {
 				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					cw.watcher.Add(event.Name)
+					if err := cw.watcher.Add(event.Name); err != nil {
+						log.Printf("Failed to watch new directory %s: %v", event.Name, err)
+					}
 				}
 			}
 

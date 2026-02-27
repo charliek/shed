@@ -159,7 +159,9 @@ func (cw *CredentialWatcher) run() {
 			// If a new directory was created, watch it
 			if event.Has(fsnotify.Create) {
 				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					cw.watcher.Add(event.Name)
+					if err := cw.watcher.Add(event.Name); err != nil {
+						log.Printf("Failed to watch new directory %s: %v", event.Name, err)
+					}
 				}
 			}
 

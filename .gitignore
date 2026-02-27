@@ -28,6 +28,7 @@ vendor/
 # IDE and editor
 .idea/
 .vscode/
+.claude/settings.local.json
 *.swp
 *.swo
 *~

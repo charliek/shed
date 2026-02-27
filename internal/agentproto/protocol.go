@@ -22,8 +22,8 @@ const (
 	MsgTypeHealthRequest  byte = 0x10
 	MsgTypeHealthResponse byte = 0x11
 
-	MsgTypeNotifySetup  byte = 0x12 // Host → Agent: setup notification watchers
-	MsgTypeFileChanged  byte = 0x13 // Agent → Host: credential file changed
+	MsgTypeNotifySetup byte = 0x12 // Host → Agent: setup notification watchers
+	MsgTypeFileChanged byte = 0x13 // Agent → Host: credential file changed
 )
 
 // NotifySetupMessage is sent from host to agent to configure credential watchers.

@@ -33,7 +33,7 @@ type Client struct {
 	usedIPs  map[string]string // IP -> name
 
 	// Credential sync
-	credWatcher     *CredentialWatcher                  // host-side fsnotify watcher
+	credWatcher     *CredentialWatcher                   // host-side fsnotify watcher
 	notifyListeners map[string]*CredentialNotifyListener // name -> per-VM notification listener
 }
 
