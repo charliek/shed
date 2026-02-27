@@ -275,10 +275,8 @@ func TestRunShutdownHookNilConfig(t *testing.T) {
 	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
 	p := NewProvisioner(vsock, "test")
 
-	// Nil config should be a no-op
-	if err := p.RunShutdownHook(context.Background(), nil); err != nil {
-		t.Errorf("RunShutdownHook(nil config) = %v, want nil", err)
-	}
+	// Nil config should be a no-op (no panic)
+	p.RunShutdownHook(context.Background(), nil)
 }
 
 func TestRunShutdownHookNoHook(t *testing.T) {
@@ -289,10 +287,8 @@ func TestRunShutdownHookNoHook(t *testing.T) {
 		Env: map[string]string{},
 	}
 
-	// Config with no shutdown hook should be a no-op
-	if err := p.RunShutdownHook(context.Background(), cfg); err != nil {
-		t.Errorf("RunShutdownHook(no hook) = %v, want nil", err)
-	}
+	// Config with no shutdown hook should be a no-op (no panic)
+	p.RunShutdownHook(context.Background(), cfg)
 }
 
 func TestNewProvisionState(t *testing.T) {

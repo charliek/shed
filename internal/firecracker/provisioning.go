@@ -134,23 +134,25 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 }
 
 // RunShutdownHook runs the shutdown hook if configured.
-// Returns nil if no shutdown hook is configured.
-func (p *Provisioner) RunShutdownHook(ctx context.Context, cfg *provision.Config) error {
+// Failures are logged as warnings but never returned — shutdown hooks
+// must not block VM shutdown.
+func (p *Provisioner) RunShutdownHook(ctx context.Context, cfg *provision.Config) {
 	if cfg == nil || !cfg.HasShutdownHook() {
-		return nil
+		return
 	}
 
 	fmt.Fprintln(p.output, "Running shutdown hook...")
 	if err := p.runHook(ctx, cfg, provision.HookTypeShutdown, cfg.Hooks.Shutdown); err != nil {
 		if hookErr, ok := err.(*provision.HookError); ok {
-			fmt.Fprintf(p.errOut, "Shutdown hook failed (exit code %d)\n", hookErr.ExitCode)
+			fmt.Fprintf(p.errOut, "Warning: shutdown hook failed (exit code %d)\n", hookErr.ExitCode)
 			fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
 			fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
+		} else {
+			fmt.Fprintf(p.errOut, "Warning: shutdown hook failed: %v\n", err)
 		}
-		return err
+		return
 	}
 	fmt.Fprintln(p.output, "Shutdown hook complete")
-	return nil
 }
 
 // runHook executes a provisioning hook script in the VM.

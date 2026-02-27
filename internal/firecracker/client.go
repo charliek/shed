@@ -578,9 +578,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	if err != nil {
 		log.Printf("Warning: failed to load provision config for shutdown hook: %v", err)
 	} else if cfg.HasShutdownHook() {
-		if err := provisioner.RunShutdownHook(hookCtx, cfg); err != nil {
-			log.Printf("Warning: shutdown hook failed: %v", err)
-		}
+		provisioner.RunShutdownHook(hookCtx, cfg)
 	}
 
 	// Get or create VM handle
