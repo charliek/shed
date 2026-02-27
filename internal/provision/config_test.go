@@ -21,6 +21,7 @@ func TestLoadConfig_ShedYAML(t *testing.T) {
 hooks:
   install: scripts/install.sh
   startup: scripts/startup.sh
+  shutdown: scripts/shutdown.sh
 env:
   MY_VAR: my_value
   ANOTHER_VAR: "another value"
@@ -41,6 +42,9 @@ env:
 	}
 	if cfg.Hooks.Startup != "scripts/startup.sh" {
 		t.Errorf("Startup hook = %q, want %q", cfg.Hooks.Startup, "scripts/startup.sh")
+	}
+	if cfg.Hooks.Shutdown != "scripts/shutdown.sh" {
+		t.Errorf("Shutdown hook = %q, want %q", cfg.Hooks.Shutdown, "scripts/shutdown.sh")
 	}
 
 	// Verify env
@@ -70,48 +74,64 @@ func TestLoadConfig_NoConfig(t *testing.T) {
 
 func TestConfig_HasHooks(t *testing.T) {
 	tests := []struct {
-		name       string
-		config     Config
-		hasInstall bool
-		hasStartup bool
-		hasAny     bool
+		name        string
+		config      Config
+		hasInstall  bool
+		hasStartup  bool
+		hasShutdown bool
+		hasAny      bool
 	}{
 		{
-			name:       "empty config",
-			config:     Config{},
-			hasInstall: false,
-			hasStartup: false,
-			hasAny:     false,
+			name:        "empty config",
+			config:      Config{},
+			hasInstall:  false,
+			hasStartup:  false,
+			hasShutdown: false,
+			hasAny:      false,
 		},
 		{
 			name: "install only",
 			config: Config{
 				Hooks: HooksConfig{Install: "install.sh"},
 			},
-			hasInstall: true,
-			hasStartup: false,
-			hasAny:     true,
+			hasInstall:  true,
+			hasStartup:  false,
+			hasShutdown: false,
+			hasAny:      true,
 		},
 		{
 			name: "startup only",
 			config: Config{
 				Hooks: HooksConfig{Startup: "startup.sh"},
 			},
-			hasInstall: false,
-			hasStartup: true,
-			hasAny:     true,
+			hasInstall:  false,
+			hasStartup:  true,
+			hasShutdown: false,
+			hasAny:      true,
 		},
 		{
-			name: "both hooks",
+			name: "shutdown only",
+			config: Config{
+				Hooks: HooksConfig{Shutdown: "shutdown.sh"},
+			},
+			hasInstall:  false,
+			hasStartup:  false,
+			hasShutdown: true,
+			hasAny:      true,
+		},
+		{
+			name: "all hooks",
 			config: Config{
 				Hooks: HooksConfig{
-					Install: "install.sh",
-					Startup: "startup.sh",
+					Install:  "install.sh",
+					Startup:  "startup.sh",
+					Shutdown: "shutdown.sh",
 				},
 			},
-			hasInstall: true,
-			hasStartup: true,
-			hasAny:     true,
+			hasInstall:  true,
+			hasStartup:  true,
+			hasShutdown: true,
+			hasAny:      true,
 		},
 	}
 
@@ -122,6 +142,9 @@ func TestConfig_HasHooks(t *testing.T) {
 			}
 			if got := tt.config.HasStartupHook(); got != tt.hasStartup {
 				t.Errorf("HasStartupHook() = %v, want %v", got, tt.hasStartup)
+			}
+			if got := tt.config.HasShutdownHook(); got != tt.hasShutdown {
+				t.Errorf("HasShutdownHook() = %v, want %v", got, tt.hasShutdown)
 			}
 			if got := tt.config.HasAnyHooks(); got != tt.hasAny {
 				t.Errorf("HasAnyHooks() = %v, want %v", got, tt.hasAny)

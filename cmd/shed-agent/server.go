@@ -171,7 +171,13 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// drainTimeout is the maximum time to wait for active connections to finish
+// before forcing shutdown. This prevents hung connection handlers from blocking
+// VM shutdown indefinitely.
+const drainTimeout = 5 * time.Second
+
 // Stop stops the vsock listeners and waits for active connections to finish.
+// If connections don't drain within drainTimeout, shutdown proceeds anyway.
 func (s *Server) Stop() {
 	// Signal shutdown
 	s.cancel()
@@ -184,9 +190,19 @@ func (s *Server) Stop() {
 		s.healthListener.Close()
 	}
 
-	// Wait for active connections to finish
-	s.wg.Wait()
-	log.Printf("Server stopped gracefully")
+	// Wait for active connections to finish, with timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Printf("Server stopped gracefully")
+	case <-time.After(drainTimeout):
+		log.Printf("Server drain timeout (%v) reached, forcing exit", drainTimeout)
+	}
 }
 
 // handleHealthConnection handles a health check connection.

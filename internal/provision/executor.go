@@ -25,18 +25,20 @@ const (
 
 // Log file paths in the container.
 const (
-	LogDir     = "/var/log/shed"
-	InstallLog = "/var/log/shed/install.log"
-	StartupLog = "/var/log/shed/startup.log"
-	SyncLog    = "/var/log/shed/sync.log"
+	LogDir      = "/var/log/shed"
+	InstallLog  = "/var/log/shed/install.log"
+	StartupLog  = "/var/log/shed/startup.log"
+	ShutdownLog = "/var/log/shed/shutdown.log"
+	SyncLog     = "/var/log/shed/sync.log"
 )
 
 // HookType identifies which type of hook is being run.
 type HookType string
 
 const (
-	HookTypeInstall HookType = "install"
-	HookTypeStartup HookType = "startup"
+	HookTypeInstall  HookType = "install"
+	HookTypeStartup  HookType = "startup"
+	HookTypeShutdown HookType = "shutdown"
 )
 
 // Executor runs provisioning hooks in containers.
@@ -81,6 +83,15 @@ func (e *Executor) RunStartup(ctx context.Context, containerID string) error {
 		return nil
 	}
 	return e.runHook(ctx, containerID, HookTypeStartup, e.config.Hooks.Startup)
+}
+
+// RunShutdown runs the shutdown hook if configured.
+// Returns nil if no shutdown hook is configured.
+func (e *Executor) RunShutdown(ctx context.Context, containerID string) error {
+	if !e.config.HasShutdownHook() {
+		return nil
+	}
+	return e.runHook(ctx, containerID, HookTypeShutdown, e.config.Hooks.Shutdown)
 }
 
 // runHook executes a hook script in the container.
@@ -227,6 +238,8 @@ func (e *Executor) logFileForHook(hookType HookType) string {
 		return InstallLog
 	case HookTypeStartup:
 		return StartupLog
+	case HookTypeShutdown:
+		return ShutdownLog
 	default:
 		return filepath.Join(LogDir, string(hookType)+".log")
 	}

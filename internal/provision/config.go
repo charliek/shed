@@ -45,6 +45,8 @@ type HooksConfig struct {
 	Install string `yaml:"install,omitempty"`
 	// Startup is the path to the startup script (runs on every start)
 	Startup string `yaml:"startup,omitempty"`
+	// Shutdown is the path to the shutdown script (runs before stop)
+	Shutdown string `yaml:"shutdown,omitempty"`
 }
 
 // ShedProvisionYAML is the name of the shed provision config file.
@@ -95,9 +97,14 @@ func (c *Config) HasStartupHook() bool {
 	return c != nil && c.Hooks.Startup != ""
 }
 
+// HasShutdownHook returns true if a shutdown hook is configured.
+func (c *Config) HasShutdownHook() bool {
+	return c != nil && c.Hooks.Shutdown != ""
+}
+
 // HasAnyHooks returns true if any hooks are configured.
 func (c *Config) HasAnyHooks() bool {
-	return c.HasInstallHook() || c.HasStartupHook()
+	return c.HasInstallHook() || c.HasStartupHook() || c.HasShutdownHook()
 }
 
 // LoadConfigFromContainer loads provisioning configuration from within a Docker container.

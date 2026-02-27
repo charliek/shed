@@ -233,6 +233,7 @@ func TestLogFileForHook(t *testing.T) {
 	}{
 		{provision.HookTypeInstall, provision.InstallLog},
 		{provision.HookTypeStartup, provision.StartupLog},
+		{provision.HookTypeShutdown, provision.ShutdownLog},
 		{provision.HookType("custom"), "/var/log/shed/custom.log"},
 	}
 
@@ -268,6 +269,26 @@ func TestRunProvisioningNoHooks(t *testing.T) {
 	if err := p.RunProvisioning(context.Background(), cfg, true); err != nil {
 		t.Errorf("RunProvisioning(no hooks) = %v, want nil", err)
 	}
+}
+
+func TestRunShutdownHookNilConfig(t *testing.T) {
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	p := NewProvisioner(vsock, "test")
+
+	// Nil config should be a no-op (no panic)
+	p.RunShutdownHook(context.Background(), nil)
+}
+
+func TestRunShutdownHookNoHook(t *testing.T) {
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	p := NewProvisioner(vsock, "test")
+
+	cfg := &provision.Config{
+		Env: map[string]string{},
+	}
+
+	// Config with no shutdown hook should be a no-op (no panic)
+	p.RunShutdownHook(context.Background(), cfg)
 }
 
 func TestNewProvisionState(t *testing.T) {
