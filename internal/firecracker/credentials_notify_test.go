@@ -163,42 +163,89 @@ func TestExtractTarToHost_SymlinkRejected(t *testing.T) {
 func TestExtractTarToHost_OversizedFile(t *testing.T) {
 	destDir := mustTempDir(t, "extract-test")
 
-	// Create a tar.gz with a file that claims to be larger than maxCredentialFileSize.
-	// We write only a small amount of actual data but set the header size large.
-	// io.LimitReader will truncate to maxCredentialFileSize.
+	// Create a tar.gz with a file larger than maxCredentialFileSize.
+	// The io.LimitReader in extractTarToHost should truncate the output
+	// to exactly maxCredentialFileSize bytes.
+	oversizedLen := maxCredentialFileSize + 1024
 	var buf bytes.Buffer
 	gzw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gzw)
 
-	// Write a small file to verify truncation: 16 bytes of actual content
-	// but header claims a large size. The tar reader will read up to header.Size
-	// bytes, but LimitReader caps it.
-	smallContent := []byte("credential-data!")
 	if err := tw.WriteHeader(&tar.Header{
-		Name: "small.txt",
+		Name: "big.txt",
 		Mode: 0600,
-		Size: int64(len(smallContent)),
+		Size: int64(oversizedLen),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tw.Write(smallContent); err != nil {
-		t.Fatal(err)
+	// Write oversized data in chunks
+	chunk := make([]byte, 32*1024)
+	for i := range chunk {
+		chunk[i] = 'A'
+	}
+	written := 0
+	for written < oversizedLen {
+		n := oversizedLen - written
+		if n > len(chunk) {
+			n = len(chunk)
+		}
+		if _, err := tw.Write(chunk[:n]); err != nil {
+			t.Fatal(err)
+		}
+		written += n
 	}
 
 	tw.Close()
 	gzw.Close()
 
-	// Normal small file should extract fine (well under the limit)
 	if err := extractTarToHost(buf.Bytes(), destDir); err != nil {
 		t.Fatalf("extractTarToHost() error = %v", err)
 	}
 
-	got, err := os.ReadFile(filepath.Join(destDir, "small.txt"))
+	got, err := os.ReadFile(filepath.Join(destDir, "big.txt"))
 	if err != nil {
 		t.Fatalf("failed to read extracted file: %v", err)
 	}
-	if string(got) != string(smallContent) {
-		t.Errorf("extracted content = %q, want %q", string(got), string(smallContent))
+	if len(got) != maxCredentialFileSize {
+		t.Errorf("extracted file size = %d, want %d (truncated to maxCredentialFileSize)", len(got), maxCredentialFileSize)
+	}
+}
+
+func TestExtractTarToHost_SymlinkEscape(t *testing.T) {
+	destDir := mustTempDir(t, "extract-test")
+	outsideDir := mustTempDir(t, "outside")
+
+	// Plant a symlink inside destDir that points outside
+	if err := os.Symlink(outsideDir, filepath.Join(destDir, "escape")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a tar with a file targeting the symlinked directory
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+
+	content := []byte("should-not-land-outside")
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape/pwned.txt",
+		Mode: 0644,
+		Size: int64(len(content)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+	gzw.Close()
+
+	if err := extractTarToHost(buf.Bytes(), destDir); err != nil {
+		t.Fatalf("extractTarToHost() error = %v", err)
+	}
+
+	// The file should NOT have been written to the outside directory
+	if _, err := os.Stat(filepath.Join(outsideDir, "pwned.txt")); !os.IsNotExist(err) {
+		t.Errorf("file was written outside destDir via symlink, got err = %v", err)
 	}
 }
 

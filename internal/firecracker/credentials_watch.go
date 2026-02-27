@@ -5,6 +5,7 @@ package firecracker
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -94,7 +95,9 @@ func (cw *CredentialWatcher) Start(ctx context.Context) error {
 
 // Stop stops watching and waits for completion.
 func (cw *CredentialWatcher) Stop() {
-	cw.cancel()
+	if cw.cancel != nil {
+		cw.cancel()
+	}
 	if cw.watcher != nil {
 		cw.watcher.Close() // unblocks run() select on Events/Errors channels
 	}
@@ -185,7 +188,10 @@ func (cw *CredentialWatcher) run() {
 func (cw *CredentialWatcher) addRecursiveWatch(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			if path == root {
+				return fmt.Errorf("cannot access credential root %s: %w", root, err)
+			}
+			return nil // skip inaccessible subdirectories
 		}
 		if info.IsDir() {
 			if watchErr := cw.watcher.Add(path); watchErr != nil {

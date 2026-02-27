@@ -60,7 +60,9 @@ func (nl *CredentialNotifyListener) Start(ctx context.Context, name string) {
 
 // Stop stops the notification listener and waits for it to finish.
 func (nl *CredentialNotifyListener) Stop() {
-	nl.cancel()
+	if nl.cancel != nil {
+		nl.cancel()
+	}
 	nl.wg.Wait()
 }
 
@@ -135,9 +137,14 @@ func (nl *CredentialNotifyListener) connectAndListen() error {
 
 	log.Printf("[%s] Notify connection established, watching %d credentials", nl.name, len(credentials))
 
+	// Per-connection context — canceling this unblocks the close-helper
+	// goroutine when connectAndListen returns (connection drop / error).
+	connCtx, connCancel := context.WithCancel(nl.ctx)
+	defer connCancel()
+
 	// Close the connection when context is canceled so ReadMessage unblocks.
 	go func() {
-		<-nl.ctx.Done()
+		<-connCtx.Done()
 		conn.Close()
 	}()
 
@@ -203,10 +210,11 @@ func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []st
 	args := []string{"tar", "-czf", "-", "-C", target}
 	args = append(args, escapedFiles...)
 
-	var tarBuf, stderrBuf bytes.Buffer
+	tarBuf := &limitedBuffer{max: maxCredentialArchiveSize}
+	var stderrBuf bytes.Buffer
 	opts := backend.ExecOptions{
 		Cmd:        args,
-		Stdout:     &nopWriteCloser{&tarBuf},
+		Stdout:     &nopWriteCloser{tarBuf},
 		Stderr:     &nopWriteCloser{&stderrBuf},
 		WorkingDir: "/",
 		TTY:        false,
@@ -223,7 +231,7 @@ func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []st
 
 	// Extract tar to host source directory
 	source := mount.Source
-	if err := extractTarToHost(tarBuf.Bytes(), source); err != nil {
+	if err := extractTarToHost(tarBuf.buf.Bytes(), source); err != nil {
 		return fmt.Errorf("failed to extract to host: %w", err)
 	}
 
@@ -234,6 +242,50 @@ func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []st
 // credential tar archive. Credential files are small (keys, tokens, configs);
 // this limit prevents decompression bombs.
 const maxCredentialFileSize = 10 * 1024 * 1024 // 10 MB
+
+// maxCredentialArchiveSize is the maximum allowed total size for a credential
+// tar archive streamed from the VM. This prevents OOM from runaway tar output.
+const maxCredentialArchiveSize = 50 * 1024 * 1024 // 50 MB
+
+// limitedBuffer wraps a bytes.Buffer and caps total bytes written.
+type limitedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (lb *limitedBuffer) Write(p []byte) (int, error) {
+	if lb.buf.Len()+len(p) > lb.max {
+		return 0, fmt.Errorf("credential archive exceeds %d byte limit", lb.max)
+	}
+	return lb.buf.Write(p)
+}
+
+// securePath validates that the resolved target path stays within destDir,
+// preventing symlink-following writes outside the destination.
+func securePath(destDir, cleanName string) (string, error) {
+	targetPath := filepath.Join(destDir, cleanName)
+	// Resolve symlinks in the parent directory
+	parentDir := filepath.Dir(targetPath)
+	resolvedParent, err := filepath.EvalSymlinks(parentDir)
+	if err != nil {
+		// Parent doesn't exist yet — that's fine, MkdirAll will create it.
+		// Resolve as much of the path as exists.
+		resolvedParent, err = filepath.EvalSymlinks(destDir)
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve destination: %w", err)
+		}
+		targetPath = filepath.Join(resolvedParent, cleanName)
+	} else {
+		targetPath = filepath.Join(resolvedParent, filepath.Base(targetPath))
+	}
+
+	// Verify the resolved path is still under destDir
+	resolvedDest, _ := filepath.EvalSymlinks(destDir)
+	if !strings.HasPrefix(targetPath, resolvedDest+string(filepath.Separator)) && targetPath != resolvedDest {
+		return "", fmt.Errorf("path escapes destination: %s", cleanName)
+	}
+	return targetPath, nil
+}
 
 // extractTarToHost extracts a gzipped tar archive to the given host directory.
 func extractTarToHost(tarData []byte, destDir string) error {
@@ -259,7 +311,11 @@ func extractTarToHost(tarData []byte, destDir string) error {
 			continue // skip suspicious paths
 		}
 
-		targetPath := filepath.Join(destDir, cleanName)
+		targetPath, err := securePath(destDir, cleanName)
+		if err != nil {
+			log.Printf("Skipping path %q: %v", header.Name, err)
+			continue
+		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:

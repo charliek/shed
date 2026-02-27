@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -111,7 +112,10 @@ func (cw *credentialWatcher) start(done <-chan struct{}) {
 func (cw *credentialWatcher) addRecursiveWatch(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip inaccessible paths
+			if path == root {
+				return fmt.Errorf("cannot access credential root %s: %w", root, err)
+			}
+			return nil // skip inaccessible subdirectories
 		}
 		if info.IsDir() {
 			if watchErr := cw.watcher.Add(path); watchErr != nil {
