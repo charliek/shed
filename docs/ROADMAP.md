@@ -32,9 +32,7 @@ Event-driven bidirectional sync for writable credential mounts (e.g., `gh`, `cla
 - Host-side changes push to all running VMs via the existing `transferCredential()` mechanism
 - Echo suppression (2s cooldown) prevents changes from bouncing back to the originating VM
 
-**Status:** Core implementation complete. Remaining:
-- Rebuild rootfs with updated `shed-agent` binary (includes fsnotify support)
-- End-to-end testing with real Firecracker VMs
+**Status:** Complete. Merged in PR #16.
 
 **Architecture note:** The SSHFS-over-vsock approach previously considered here was superseded by this event-driven design. SSHFS would have required FUSE in the kernel, `sshfs` in the rootfs, and an sftp-server per mount. The notification approach is lighter weight and only transfers changed files.
 
