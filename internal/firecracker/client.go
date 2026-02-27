@@ -31,6 +31,10 @@ type Client struct {
 	vms      map[string]*VM    // name -> VM
 	usedCIDs map[uint32]string // CID -> name
 	usedIPs  map[string]string // IP -> name
+
+	// Credential sync
+	credWatcher     *CredentialWatcher                  // host-side fsnotify watcher
+	notifyListeners map[string]*CredentialNotifyListener // name -> per-VM notification listener
 }
 
 // NewClient creates a new Firecracker client.
@@ -41,17 +45,27 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*
 	}
 
 	client := &Client{
-		cfg:       cfg,
-		serverCfg: serverCfg,
-		netMgr:    netMgr,
-		vms:       make(map[string]*VM),
-		usedCIDs:  make(map[uint32]string),
-		usedIPs:   make(map[string]string),
+		cfg:             cfg,
+		serverCfg:       serverCfg,
+		netMgr:          netMgr,
+		vms:             make(map[string]*VM),
+		usedCIDs:        make(map[uint32]string),
+		usedIPs:         make(map[string]string),
+		notifyListeners: make(map[string]*CredentialNotifyListener),
 	}
 
 	// Load existing instances to populate CID and IP maps
 	if err := client.loadExistingInstances(); err != nil {
 		return nil, fmt.Errorf("failed to load existing instances: %w", err)
+	}
+
+	// Start host-side credential watcher for bidirectional sync
+	if serverCfg != nil && len(serverCfg.Credentials) > 0 {
+		client.credWatcher = NewCredentialWatcher(serverCfg)
+		if err := client.credWatcher.Start(context.Background()); err != nil {
+			log.Printf("Warning: failed to start credential watcher: %v", err)
+			client.credWatcher = nil
+		}
 	}
 
 	return client, nil
@@ -80,6 +94,19 @@ func (c *Client) loadExistingInstances() error {
 
 // Close closes the client and releases resources.
 func (c *Client) Close() error {
+	// Stop all notification listeners
+	c.mu.Lock()
+	for name, nl := range c.notifyListeners {
+		nl.Stop()
+		delete(c.notifyListeners, name)
+	}
+	c.mu.Unlock()
+
+	// Stop the credential watcher
+	if c.credWatcher != nil {
+		c.credWatcher.Stop()
+	}
+
 	return nil
 }
 
@@ -321,7 +348,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Get vsock client for setup operations
 	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort)
+	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
 
 	// Transfer credentials
 	if c.serverCfg != nil {
@@ -331,6 +358,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			// Continue - credentials are optional
 		}
 	}
+
+	// Start credential notification listener for bidirectional sync
+	c.startNotifyListener(req.Name, vsockClient)
 
 	// Clone repo if specified
 	if req.Repo != "" {
@@ -511,7 +541,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 
 	// Get vsock client for setup operations
 	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort)
+	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
 
 	// Refresh credentials on start
 	if c.serverCfg != nil {
@@ -521,6 +551,9 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 			// Continue - credentials are optional
 		}
 	}
+
+	// Start credential notification listener for bidirectional sync
+	c.startNotifyListener(name, vsockClient)
 
 	// Run startup hook only (not install)
 	provisioner := NewProvisioner(vsockClient, name)
@@ -559,6 +592,9 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
 	}
 
+	// Stop notification listener before shutting down
+	c.stopNotifyListener(name)
+
 	// Run shutdown hook before stopping the VM.
 	// Allocate up to half the stop timeout for the hook, capped at 30s.
 	stopTimeout := c.cfg.StopTimeout.Duration()
@@ -568,7 +604,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	}
 
 	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort)
+	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
 	provisioner := NewProvisioner(vsockClient, name)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 
@@ -667,4 +703,55 @@ func (c *Client) buildEnvForGit() []string {
 	}
 
 	return env
+}
+
+// startNotifyListener starts a credential notification listener for a VM.
+// Note: Uses context.Background() because the listener must outlive the HTTP
+// request that creates/starts the VM. The listener is stopped explicitly via
+// stopNotifyListener when the VM is stopped or deleted.
+func (c *Client) startNotifyListener(name string, vsockClient *VsockClient) {
+	if c.serverCfg == nil {
+		return
+	}
+
+	// Check if there are any writable credentials
+	hasWritable := false
+	for _, mount := range c.serverCfg.Credentials {
+		if !mount.ReadOnly {
+			hasWritable = true
+			break
+		}
+	}
+	if !hasWritable {
+		return
+	}
+
+	listener := NewCredentialNotifyListener(vsockClient, c.serverCfg, c.credWatcher)
+	listener.Start(context.Background(), name)
+
+	// Register VM with the credential watcher for host→VM pushes
+	if c.credWatcher != nil {
+		c.credWatcher.RegisterVM(name, vsockClient)
+	}
+
+	c.mu.Lock()
+	c.notifyListeners[name] = listener
+	c.mu.Unlock()
+}
+
+// stopNotifyListener stops the credential notification listener for a VM.
+func (c *Client) stopNotifyListener(name string) {
+	c.mu.Lock()
+	nl := c.notifyListeners[name]
+	delete(c.notifyListeners, name)
+	c.mu.Unlock()
+
+	if nl != nil {
+		nl.Stop()
+	}
+
+	// Unregister VM from the credential watcher
+	if c.credWatcher != nil {
+		c.credWatcher.UnregisterVM(name)
+	}
 }

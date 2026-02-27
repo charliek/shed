@@ -322,6 +322,7 @@ func validFirecrackerConfig() *FirecrackerConfig {
 		VsockBaseCID:    100,
 		ConsolePort:     1024,
 		HealthPort:      1025,
+		NotifyPort:      1026,
 		StartTimeout:    Duration(30 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
 		BridgeName:      "shed-br0",

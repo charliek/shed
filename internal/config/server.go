@@ -73,6 +73,9 @@ type FirecrackerConfig struct {
 	// HealthPort is the vsock port for health checks
 	HealthPort uint32 `yaml:"health_port"`
 
+	// NotifyPort is the vsock port for credential change notifications
+	NotifyPort uint32 `yaml:"notify_port"`
+
 	// StartTimeout is the timeout for VM startup
 	StartTimeout Duration `yaml:"start_timeout"`
 
@@ -140,6 +143,7 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 		VsockBaseCID:    100,
 		ConsolePort:     1024,
 		HealthPort:      1025,
+		NotifyPort:      1026,
 		StartTimeout:    Duration(30 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
 		BridgeName:      "shed-br0",
@@ -265,6 +269,10 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		}
 	}
 
+	if cfg.Firecracker != nil {
+		cfg.Firecracker.applyDefaults()
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -350,6 +358,14 @@ func (c *ServerConfig) normalizeBackends() {
 	}
 }
 
+// applyDefaults fills in zero-valued fields with defaults so existing configs
+// without newer fields (e.g. notify_port) continue to work.
+func (c *FirecrackerConfig) applyDefaults() {
+	if c.NotifyPort == 0 {
+		c.NotifyPort = 1026
+	}
+}
+
 // Validate checks that the Firecracker configuration is valid.
 func (c *FirecrackerConfig) Validate() error {
 	// Validate paths exist
@@ -399,8 +415,14 @@ func (c *FirecrackerConfig) Validate() error {
 	if c.HealthPort > MaxVsockPort {
 		return fmt.Errorf("health_port must be at most %d", MaxVsockPort)
 	}
-	if c.ConsolePort == c.HealthPort {
-		return fmt.Errorf("console_port and health_port must be different")
+	if c.NotifyPort == 0 {
+		return fmt.Errorf("notify_port must be set")
+	}
+	if c.NotifyPort > MaxVsockPort {
+		return fmt.Errorf("notify_port must be at most %d", MaxVsockPort)
+	}
+	if c.ConsolePort == c.HealthPort || c.ConsolePort == c.NotifyPort || c.HealthPort == c.NotifyPort {
+		return fmt.Errorf("console_port, health_port, and notify_port must all be different")
 	}
 
 	if c.VsockBaseCID < 3 {

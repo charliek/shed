@@ -29,15 +29,20 @@ const (
 
 	// DefaultHealthPort is the vsock port for health checks.
 	DefaultHealthPort = 1025
+
+	// DefaultNotifyPort is the vsock port for credential change notifications.
+	DefaultNotifyPort = 1026
 )
 
 // Server handles vsock connections from the host.
 type Server struct {
 	consolePort uint32
 	healthPort  uint32
+	notifyPort  uint32
 
 	consoleListener net.Listener
 	healthListener  net.Listener
+	notifyListener  net.Listener
 
 	// Resolved non-root user for spawning processes (nil = run as root)
 	user *userInfo
@@ -49,11 +54,12 @@ type Server struct {
 }
 
 // NewServer creates a new Server.
-func NewServer(consolePort, healthPort uint32) *Server {
+func NewServer(consolePort, healthPort, notifyPort uint32) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		consolePort: consolePort,
 		healthPort:  healthPort,
+		notifyPort:  notifyPort,
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -117,6 +123,14 @@ func (s *Server) Start() error {
 		return err
 	}
 
+	// Start notify listener
+	s.notifyListener, err = vsock.Listen(s.notifyPort, nil)
+	if err != nil {
+		s.consoleListener.Close()
+		s.healthListener.Close()
+		return err
+	}
+
 	// Accept console connections
 	s.wg.Add(1)
 	go func() {
@@ -167,7 +181,31 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	log.Printf("Listening on vsock ports: console=%d, health=%d", s.consolePort, s.healthPort)
+	// Accept notification connections
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			conn, err := s.notifyListener.Accept()
+			if err != nil {
+				select {
+				case <-s.ctx.Done():
+					return
+				default:
+					log.Printf("Notify accept error: %v", err)
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+			}
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				handleNotifyConnection(conn)
+			}()
+		}
+	}()
+
+	log.Printf("Listening on vsock ports: console=%d, health=%d, notify=%d", s.consolePort, s.healthPort, s.notifyPort)
 	return nil
 }
 
@@ -188,6 +226,9 @@ func (s *Server) Stop() {
 	}
 	if s.healthListener != nil {
 		s.healthListener.Close()
+	}
+	if s.notifyListener != nil {
+		s.notifyListener.Close()
 	}
 
 	// Wait for active connections to finish, with timeout

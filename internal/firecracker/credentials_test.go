@@ -13,7 +13,7 @@ import (
 )
 
 func TestNewCredentialTransfer(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	serverCfg := &config.ServerConfig{}
 	ct := NewCredentialTransfer(vsock, serverCfg)
 
@@ -26,7 +26,7 @@ func TestNewCredentialTransfer(t *testing.T) {
 }
 
 func TestTransferAllNilConfig(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	ct := NewCredentialTransfer(vsock, nil)
 
 	// Nil config should return nil (no-op)
@@ -36,7 +36,7 @@ func TestTransferAllNilConfig(t *testing.T) {
 }
 
 func TestTransferAllEmptyCredentials(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	serverCfg := &config.ServerConfig{
 		Credentials: map[string]config.MountConfig{},
 	}
@@ -62,7 +62,7 @@ func TestCreateTarArchiveSingleFile(t *testing.T) {
 		t.Fatalf("failed to stat test file: %v", err)
 	}
 
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	ct := NewCredentialTransfer(vsock, nil)
 
 	data, err := ct.createTarArchive(testFile, info)
@@ -95,7 +95,7 @@ func TestCreateTarArchiveDirectory(t *testing.T) {
 		t.Fatalf("failed to stat cred dir: %v", err)
 	}
 
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	ct := NewCredentialTransfer(vsock, nil)
 
 	data, err := ct.createTarArchive(credDir, info)
@@ -109,7 +109,7 @@ func TestCreateTarArchiveDirectory(t *testing.T) {
 }
 
 func TestCreateTarArchiveNonexistentSource(t *testing.T) {
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	ct := NewCredentialTransfer(vsock, nil)
 
 	// Create a fake FileInfo from a real file, then try to archive a nonexistent path
@@ -147,7 +147,7 @@ func TestCreateTarArchiveEmptyDirectory(t *testing.T) {
 		t.Fatalf("failed to stat empty dir: %v", err)
 	}
 
-	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	vsock := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 	ct := NewCredentialTransfer(vsock, nil)
 
 	data, err := ct.createTarArchive(emptyDir, info)

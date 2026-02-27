@@ -20,50 +20,33 @@ Remaining improvement for stop/start resilience after most e2e gaps were resolve
 - Boot cleanup handles generic stale state (shared memory, lock files, temp files) via `network-setup.sh`; service-specific cleanup moved to startup hooks (documented in provisioning guide)
 - ~~Still deferred: configurable stop timeout, pre-shutdown hooks for graceful service termination~~ **Done** — `hooks.shutdown` in `provision.yaml` runs before `shed stop`/`shed delete`, with time budget of `min(stopTimeout/2, 30s)`
 
-## Firecracker Live Mounts (SSHFS over vsock)
+## Bidirectional Credential Sync (In Progress)
 
-### Use Case
+Event-driven bidirectional sync for writable credential mounts (e.g., `gh`, `claude`, `opencode`). Changes inside a VM (token refreshes) sync back to the host, and host-side changes push to all running VMs.
 
-Some workflows need live two-way sync between host and VM:
-- Editable credential files that may be refreshed during a session
-- Shared project files that need host-side tooling access
-- Development workflows where host IDE edits should reflect immediately in VM
+**How it works:**
+- Agent runs `fsnotify` watchers on writable credential target paths inside the VM
+- On file change, agent sends a `MsgTypeFileChanged` notification to the host over a persistent vsock connection (port 1026)
+- Host pulls just the changed files via tar-over-vsock and writes them to the host source directory
+- Host runs its own `fsnotify` watcher on credential source directories
+- Host-side changes push to all running VMs via the existing `transferCredential()` mechanism
+- Echo suppression (2s cooldown) prevents changes from bouncing back to the originating VM
 
-### Current Behavior
+**Status:** Core implementation complete. Remaining:
+- Rebuild rootfs with updated `shed-agent` binary (includes fsnotify support)
+- End-to-end testing with real Firecracker VMs
 
-Credentials are copied at create/start time via tar over vsock. This works well for:
-- SSH keys (read-only)
-- Git config (read-only)
-- AI agent credentials (read-only)
+**Architecture note:** The SSHFS-over-vsock approach previously considered here was superseded by this event-driven design. SSHFS would have required FUSE in the kernel, `sshfs` in the rootfs, and an sftp-server per mount. The notification approach is lighter weight and only transfers changed files.
 
-The copy approach is the default since most credential use cases are read-only. Changes on the host after VM starts won't be reflected in the VM, and changes in the VM won't sync back to the host.
+## Notification Channel Enhancements (Deferred)
 
-### Proposed Solution: SSHFS over vsock
+Future uses for the persistent agent↔host notification port (1026) established by credential sync:
 
-Since Firecracker doesn't support virtiofs or 9p filesystem passthrough, the best alternative for live mounts is SSHFS over vsock.
-
-**Architecture:**
-```text
-Host: socat VSOCK-LISTEN:12345,fork EXEC:"/usr/lib/openssh/sftp-server"
-Guest: sshfs -o vsock=2:12345 unused_host:/path /mount/point
-```
-
-**Requirements:**
-1. Kernel FUSE support (verify CONFIG_FUSE_FS=y in kernel)
-2. Add `sshfs` to rootfs image
-3. Start sftp-server listener on host for each credential mount
-4. Mount management in shed-agent (mount on start, unmount on stop)
-
-**Key Research:**
-- https://github.com/firecracker-microvm/firecracker/issues/889
-- https://github.com/firecracker-microvm/firecracker/issues/1180
-- Performance: SSHFS has moderate overhead vs local FS
-
-**Complexity:** Medium - no Firecracker changes needed, uses existing vsock
-
-### Priority
-
-Low - current copy approach works for most credential use cases. This would be implemented if users request live sync functionality.
+- **Health heartbeats over notification channel** — replace the current 500ms polling during VM startup (`WaitForHealth`) with agent-pushed heartbeats. Eliminates repeated connection open/close cycles.
+- **Agent-pushed resource metrics** — CPU/memory/disk usage pushed from agent at configurable intervals. Enables `shed status` to show live resource usage without exec overhead.
+- **Process event notifications** — agent notifies host when provisioning hooks finish, services crash, or long-running processes exit. Enables reactive orchestration.
+- **Log streaming** — structured log events from inside the VM pushed over the notification channel. Alternative to SSH-based log tailing.
+- **Provisioning pipeline over persistent connection** — consolidate the sequential exec calls during provisioning into a single persistent connection to reduce vsock connection overhead.
 
 ## Other Potential Enhancements
 
@@ -88,6 +71,10 @@ Enhanced resource management:
 - Memory overcommit policies
 - I/O bandwidth limits
 - Network rate limiting
+
+### Virtiofs Support
+
+If Firecracker adds virtiofs ([issue #1180](https://github.com/firecracker-microvm/firecracker/issues/1180)), replace the tar-over-vsock credential sync with proper filesystem passthrough for live mounts. Would eliminate the need for the notification channel approach for file sync, though the channel remains valuable for other agent→host communication.
 
 ### Multi-node Sheds
 

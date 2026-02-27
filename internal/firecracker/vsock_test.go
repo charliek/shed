@@ -16,7 +16,7 @@ import (
 )
 
 func TestNewVsockClient(t *testing.T) {
-	client := NewVsockClient("/tmp/test.vsock", 1024, 1025)
+	client := NewVsockClient("/tmp/test.vsock", 1024, 1025, 1026)
 
 	if client.socketPath != "/tmp/test.vsock" {
 		t.Errorf("socketPath = %v, want /tmp/test.vsock", client.socketPath)
@@ -26,6 +26,9 @@ func TestNewVsockClient(t *testing.T) {
 	}
 	if client.healthPort != 1025 {
 		t.Errorf("healthPort = %v, want 1025", client.healthPort)
+	}
+	if client.notifyPort != 1026 {
+		t.Errorf("notifyPort = %v, want 1026", client.notifyPort)
 	}
 }
 
@@ -44,7 +47,7 @@ func TestNewVsockClient_DifferentValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := NewVsockClient(tt.socketPath, tt.consolePort, tt.healthPort)
+			client := NewVsockClient(tt.socketPath, tt.consolePort, tt.healthPort, 1026)
 
 			if client.socketPath != tt.socketPath {
 				t.Errorf("socketPath = %v, want %v", client.socketPath, tt.socketPath)
@@ -60,7 +63,7 @@ func TestNewVsockClient_DifferentValues(t *testing.T) {
 }
 
 func TestDialWithContext_NonexistentSocket(t *testing.T) {
-	client := NewVsockClient("/tmp/nonexistent-socket-path.sock", 1024, 1025)
+	client := NewVsockClient("/tmp/nonexistent-socket-path.sock", 1024, 1025, 1026)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -101,7 +104,7 @@ func TestDialWithContext_ContextCancelled(t *testing.T) {
 		}
 	}()
 
-	client := NewVsockClient(socketPath, 1024, 1025)
+	client := NewVsockClient(socketPath, 1024, 1025, 1026)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -141,7 +144,7 @@ func TestDialWithContext_BadResponse(t *testing.T) {
 		}
 	}()
 
-	client := NewVsockClient(socketPath, 1024, 1025)
+	client := NewVsockClient(socketPath, 1024, 1025, 1026)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -183,7 +186,7 @@ func TestDialWithContext_Success(t *testing.T) {
 		}
 	}()
 
-	client := NewVsockClient(socketPath, 1024, 1025)
+	client := NewVsockClient(socketPath, 1024, 1025, 1026)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -201,7 +204,7 @@ func TestDialWithContext_Success(t *testing.T) {
 }
 
 func TestCheckHealth_NonexistentSocket(t *testing.T) {
-	client := NewVsockClient("/tmp/nonexistent.sock", 1024, 1025)
+	client := NewVsockClient("/tmp/nonexistent.sock", 1024, 1025, 1026)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -243,7 +246,7 @@ func TestCheckHealth_Success(t *testing.T) {
 		}
 	}()
 
-	client := NewVsockClient(socketPath, 1024, 1025)
+	client := NewVsockClient(socketPath, 1024, 1025, 1026)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -256,7 +259,7 @@ func TestCheckHealth_Success(t *testing.T) {
 
 func TestWaitForHealth_Timeout(t *testing.T) {
 	// Use a nonexistent socket so health checks always fail
-	client := NewVsockClient("/tmp/nonexistent.sock", 1024, 1025)
+	client := NewVsockClient("/tmp/nonexistent.sock", 1024, 1025, 1026)
 
 	ctx := context.Background()
 	err := client.WaitForHealth(ctx, 1*time.Second)
@@ -315,7 +318,7 @@ func TestExecStdinFraming(t *testing.T) {
 		serverDone <- msgs
 	}()
 
-	client := NewVsockClient(socketPath, 1024, 1025)
+	client := NewVsockClient(socketPath, 1024, 1025, 1026)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

@@ -17,13 +17,14 @@ func main() {
 	// Parse flags
 	consolePort := flag.Uint("console-port", DefaultConsolePort, "vsock port for console connections")
 	healthPort := flag.Uint("health-port", DefaultHealthPort, "vsock port for health checks")
+	notifyPort := flag.Uint("notify-port", DefaultNotifyPort, "vsock port for credential change notifications")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("shed-agent starting...")
 
 	// Create and start server
-	server := NewServer(uint32(*consolePort), uint32(*healthPort))
+	server := NewServer(uint32(*consolePort), uint32(*healthPort), uint32(*notifyPort))
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}

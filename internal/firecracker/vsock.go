@@ -32,15 +32,17 @@ type VsockClient struct {
 	socketPath  string
 	consolePort uint32
 	healthPort  uint32
+	notifyPort  uint32
 }
 
 // NewVsockClient creates a new VsockClient.
 // socketPath is the path to Firecracker's vsock Unix domain socket.
-func NewVsockClient(socketPath string, consolePort, healthPort uint32) *VsockClient {
+func NewVsockClient(socketPath string, consolePort, healthPort, notifyPort uint32) *VsockClient {
 	return &VsockClient{
 		socketPath:  socketPath,
 		consolePort: consolePort,
 		healthPort:  healthPort,
+		notifyPort:  notifyPort,
 	}
 }
 
