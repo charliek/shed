@@ -138,7 +138,7 @@ func TestResolveCredential(t *testing.T) {
 	}{
 		{"/home/user/.config/gh/hosts.yml", "gh"},
 		{"/home/user/.claude/.credentials.json", "claude"},
-		{"/home/user/.ssh/id_rsa", ""},       // readonly, should not resolve
+		{"/home/user/.ssh/id_rsa", ""},        // readonly, should not resolve
 		{"/home/user/.config/other/file", ""}, // no match
 		{"/home/user/.config/gh", "gh"},       // exact match
 	}

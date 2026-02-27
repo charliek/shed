@@ -34,13 +34,13 @@ type CredentialWatcher struct {
 	vms map[string]*watchedVM // VM name → VM info
 
 	// Echo suppression: tracks which VM+credential combos to skip
-	echoMu     sync.Mutex
+	echoMu        sync.Mutex
 	echoCooldowns map[string]time.Time // "vmName:credName" → expiry time
 
 	// Debounce state
 	debounceMu sync.Mutex
-	pending    map[string]bool          // credential names with pending changes
-	timers     map[string]*time.Timer   // credential name → debounce timer
+	pending    map[string]bool        // credential names with pending changes
+	timers     map[string]*time.Timer // credential name → debounce timer
 
 	ctx    context.Context
 	cancel context.CancelFunc
