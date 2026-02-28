@@ -9,6 +9,7 @@ Complete reference for the `shed` command-line interface.
 | `--server` | `-s` | Target server (overrides default) |
 | `--verbose` | `-v` | Enable debug output |
 | `--config` | `-c` | Config file path (default: `~/.shed/config.yaml`) |
+| `--json` | | Emit structured JSON to stdout (suppresses verbose output) |
 
 ## Server Management
 
@@ -150,6 +151,8 @@ shed delete <name> [flags]
 | `--keep-volume` | | `false` | Preserve workspace data |
 | `--force` | `-f` | `false` | Skip confirmation |
 
+**Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
+
 ## Interactive Access
 
 ### shed console
@@ -218,7 +221,6 @@ shed sessions [shed-name] [flags]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--all` | `-a` | `false` | List from all servers |
-| `--json` | | `false` | Output as JSON |
 
 **Examples:**
 
@@ -293,7 +295,6 @@ shed tunnels list [flags]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--verbose` | `-v` | `false` | Show detailed info |
-| `--json` | | `false` | Output as JSON |
 
 ### shed tunnels config
 
