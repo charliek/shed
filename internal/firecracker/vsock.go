@@ -164,8 +164,11 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	// When stdin ends, send a MsgTypeStdinEOF message so the agent closes
 	// the command's stdin pipe. We do NOT call CloseWrite() on the connection
 	// because that tears down the vsock UDS before output/exit code arrive.
+	var stdinDone chan struct{}
 	if opts.Stdin != nil {
+		stdinDone = make(chan struct{})
 		go func() {
+			defer close(stdinDone)
 			buf := make([]byte, 4096)
 			for {
 				n, err := opts.Stdin.Read(buf)
@@ -229,6 +232,11 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	// Wait for completion or context cancellation
 	select {
 	case err := <-done:
+		// Wait for the stdin goroutine to finish so that all writes
+		// (including MsgTypeStdinEOF) complete before defer conn.Close().
+		if stdinDone != nil {
+			<-stdinDone
+		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
