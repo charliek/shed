@@ -172,6 +172,7 @@ cat /var/lib/shed/firecracker/instances/myproject/metadata.json
 Example output:
 ```json
 {
+  "version": 1,
   "name": "myproject",
   "status": "running",
   "created_at": "2024-01-15T10:30:00Z",

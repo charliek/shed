@@ -8,10 +8,10 @@ Follow-up improvements to consider after the initial Firecracker backend merges.
 
 - ~~Disable root SSH login by default in the Firecracker rootfs and switch to a non-root user workflow.~~ **Done** — shed-agent now runs commands as the `shed` user (UID 1000), matching the Docker backend's non-root model.
 - ~~Add deeper graceful shutdown handling for `shed-agent` connection goroutines (beyond basic timeout-driven exit).~~ **Done** — `Stop()` now uses a 5s drain timeout so hung connections don't block VM shutdown.
-- Consider stricter validation defaults for Firecracker configs (additional guardrails beyond `vsock_base_cid`).
-- Add metadata JSON version field for forward/backward compatibility of the metadata format.
+- ~~Consider stricter validation defaults for Firecracker configs (additional guardrails beyond `vsock_base_cid`).~~ **Done** — upper-bound validation added for CPUs, memory, disk, vsock CID/ports, and timeouts; kernel/rootfs paths checked at startup.
+- ~~Add metadata JSON version field for forward/backward compatibility of the metadata format.~~ **Done** — `MetadataVersion = 1`, backward-compat for pre-version files.
 - Consider reducing `MaxMessageSize` (16MB) or adding streaming for large messages in agentproto.
-- Document integration test strategy (requires KVM, can't be automated in CI without nested virtualization).
+- ~~Document integration test strategy (requires KVM, can't be automated in CI without nested virtualization).~~ **Done** — `docs/development/testing.md` covers unit, integration, and e2e tiers.
 
 ## Firecracker Graceful Shutdown (Deferred)
 

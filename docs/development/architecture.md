@@ -179,6 +179,7 @@ Shed relies on network-level trust:
 - Assumes all machines are on a private network (Tailscale)
 - No authentication on HTTP API
 - SSH accepts all keys (network access = trust)
+- Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo
 - Not suitable for multi-tenant or public deployments
 
 ## Container Lifecycle
