@@ -2,6 +2,8 @@
 
 This guide covers installing and configuring `shed-server` on a Linux server.
 
+For macOS with the VZ backend, see [VZ Setup](vz-setup.md) instead.
+
 ## Prerequisites
 
 - Linux server (Ubuntu 20.04+, Debian 11+, or RHEL/Fedora)

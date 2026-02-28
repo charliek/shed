@@ -10,7 +10,7 @@ import (
 func TestResolveCreateBackend(t *testing.T) {
 	info := &config.ServerInfo{
 		DefaultBackend:  config.BackendFirecracker,
-		EnabledBackends: []string{config.BackendDocker, config.BackendFirecracker},
+		EnabledBackends: []string{config.BackendDocker, config.BackendFirecracker, config.BackendVZ},
 	}
 
 	t.Run("default backend", func(t *testing.T) {
@@ -33,6 +33,19 @@ func TestResolveCreateBackend(t *testing.T) {
 		}
 		if backend != config.BackendDocker {
 			t.Fatalf("backend = %q, want %q", backend, config.BackendDocker)
+		}
+		if warning != "" {
+			t.Fatalf("unexpected warning: %s", warning)
+		}
+	})
+
+	t.Run("requested vz backend enabled", func(t *testing.T) {
+		backend, warning, err := resolveCreateBackend(info, config.BackendVZ, 0, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if backend != config.BackendVZ {
+			t.Fatalf("backend = %q, want %q", backend, config.BackendVZ)
 		}
 		if warning != "" {
 			t.Fatalf("unexpected warning: %s", warning)
@@ -67,6 +80,18 @@ func TestResolveCreateBackend(t *testing.T) {
 		_, _, err := resolveCreateBackend(info, config.BackendFirecracker, 0, 64)
 		if err == nil {
 			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("validate vz resources", func(t *testing.T) {
+		_, _, err := resolveCreateBackend(info, config.BackendVZ, config.MaxVZCPUs+1, 0)
+		if err == nil {
+			t.Fatal("expected cpu upper-bound error")
+		}
+
+		_, _, err = resolveCreateBackend(info, config.BackendVZ, 0, 64)
+		if err == nil {
+			t.Fatal("expected memory lower-bound error")
 		}
 	})
 

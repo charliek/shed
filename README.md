@@ -9,7 +9,7 @@ Shed is a lightweight tool for managing persistent, containerized development en
 - **Multi-Server** - Manage sheds across home servers and cloud VPS instances
 - **IDE Integration** - Native Cursor/VS Code support via SSH Remote
 - **AI-Ready** - Pre-configured for Claude Code and OpenCode workflows
-- **Dual Backend** - Choose between Docker containers or Firecracker microVMs
+- **Multiple Backends** - Docker containers, Firecracker microVMs (Linux), or Apple VZ virtual machines (macOS Apple Silicon)
 
 ## Quick Start
 
@@ -79,11 +79,29 @@ shed create myproject --backend=firecracker --repo=git@github.com:user/repo.git
 
 See [Firecracker Installation](docs/firecracker_install.md) and [Firecracker Operations](docs/firecracker_howto.md) for setup and usage details.
 
+### VZ (macOS)
+
+Uses Apple's Virtualization.framework for native Linux VMs on macOS. Best for:
+- Local development on macOS with full VM isolation
+- Running Docker inside the shed (no Docker Desktop needed)
+- Same vsock + agent architecture as Firecracker
+
+```bash
+# Create with VZ backend
+shed create myproject --backend=vz
+
+# With custom resources
+shed create myproject --backend=vz --cpus=4 --memory=8192
+```
+
+See [VZ Setup](docs/getting-started/vz-setup.md) and [VZ Operations](docs/reference/vz-operations.md) for setup and usage details.
+
 ## Requirements
 
 - **Client**: macOS or Linux with Go 1.24+
 - **Server (Docker)**: Linux with Docker installed
 - **Server (Firecracker)**: Linux with KVM support
+- **Server (VZ)**: macOS 13+ (Ventura) on Apple Silicon (arm64)
 - **Network**: Tailscale (or any private network) connecting all machines
 
 ## Architecture
@@ -93,26 +111,27 @@ Shed consists of two binaries:
 - **`shed`** - CLI for developer machines
 - **`shed-server`** - Server daemon exposing HTTP API (port 8080) and SSH server (port 2222)
 
-The server supports two backends:
+The server supports three backends:
 - **Docker** (default) - Uses Docker containers with bind mounts for credentials
-- **Firecracker** - Uses microVMs with vsock communication for better isolation
+- **Firecracker** - Uses microVMs with vsock communication for better isolation (Linux only)
+- **VZ** - Uses Apple Virtualization.framework VMs via vfkit (macOS Apple Silicon only)
 
 ```
-Developer Machine                    Remote Server
-┌─────────────────┐                 ┌─────────────────────────────────┐
-│    shed CLI     │ ──HTTP/SSH───▶ │  shed-server                    │
-└─────────────────┘                 │  ├── HTTP API (CRUD operations) │
-                                    │  └── SSH Server (terminal/IDE)  │
-                                    │              │                   │
-                                    │      ┌───────┴───────┐          │
-                                    │      ▼               ▼          │
-                                    │  ┌────────┐    ┌────────────┐   │
-                                    │  │ Docker │    │ Firecracker│   │
-                                    │  │ ┌────┐ │    │  ┌──────┐  │   │
-                                    │  │ │shed│ │    │  │ VM   │  │   │
-                                    │  │ └────┘ │    │  └──────┘  │   │
-                                    │  └────────┘    └────────────┘   │
-                                    └─────────────────────────────────┘
+Developer Machine                    Remote Server / Local Mac
+┌─────────────────┐                 ┌──────────────────────────────────────┐
+│    shed CLI     │ ──HTTP/SSH───▶ │  shed-server                         │
+└─────────────────┘                 │  ├── HTTP API (CRUD operations)      │
+                                    │  └── SSH Server (terminal/IDE)       │
+                                    │              │                        │
+                                    │      ┌───────┼───────┐               │
+                                    │      ▼       ▼       ▼               │
+                                    │  ┌──────┐ ┌──────┐ ┌────┐           │
+                                    │  │Docker│ │  FC  │ │ VZ │           │
+                                    │  │┌────┐│ │┌────┐│ │┌──┐│           │
+                                    │  ││shed││ ││ VM ││ ││VM││           │
+                                    │  │└────┘│ │└────┘│ │└──┘│           │
+                                    │  └──────┘ └──────┘ └────┘           │
+                                    └──────────────────────────────────────┘
 ```
 
 ## CLI Commands
@@ -209,8 +228,9 @@ default_image: shed-base:latest
 
 # enabled_backends:
 #   - docker
-#   - firecracker
-# default_backend: docker  # Firecracker is Linux-only
+#   - firecracker  # Linux only
+#   - vz           # macOS Apple Silicon only
+# default_backend: docker
 
 credentials:
   ssh:
@@ -229,6 +249,16 @@ env_file: ~/.shed/env
 #   base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
 #   instance_dir: /var/lib/shed/firecracker/instances
 #   socket_dir: /var/run/shed/firecracker
+#   default_cpus: 2
+#   default_memory_mb: 4096
+
+# VZ-specific config (only needed if vz is enabled, macOS Apple Silicon only)
+# vz:
+#   vfkit_path: vfkit
+#   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+#   base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+#   instance_dir: ~/Library/Application Support/shed/vz/instances
+#   socket_dir: ~/Library/Application Support/shed/vz/sockets
 #   default_cpus: 2
 #   default_memory_mb: 4096
 ```

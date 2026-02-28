@@ -1,7 +1,4 @@
-//go:build linux
-// +build linux
-
-package firecracker
+package vmutil
 
 import (
 	"context"
@@ -24,24 +21,20 @@ const (
 )
 
 // CredentialWatcher watches host credential directories for changes and
-// pushes them to all running VMs. It handles echo suppression to avoid
-// pushing changes back to the VM that originated them.
+// pushes them to all running VMs.
 type CredentialWatcher struct {
 	serverCfg *config.ServerConfig
 	watcher   *fsnotify.Watcher
 
-	// Registered VMs for pushing changes
 	mu  sync.RWMutex
-	vms map[string]*watchedVM // VM name → VM info
+	vms map[string]*watchedVM
 
-	// Echo suppression: tracks which VM+credential combos to skip
 	echoMu        sync.Mutex
-	echoCooldowns map[string]time.Time // "vmName:credName" → expiry time
+	echoCooldowns map[string]time.Time
 
-	// Debounce state
 	debounceMu sync.Mutex
-	pending    map[string]bool        // credential names with pending changes
-	timers     map[string]*time.Timer // credential name → debounce timer
+	pending    map[string]bool
+	timers     map[string]*time.Timer
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -49,7 +42,7 @@ type CredentialWatcher struct {
 }
 
 type watchedVM struct {
-	vsock *VsockClient
+	agent *AgentClient
 	name  string
 }
 
@@ -74,7 +67,6 @@ func (cw *CredentialWatcher) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Watch writable credential source directories
 	for name, mount := range cw.serverCfg.Credentials {
 		if mount.ReadOnly {
 			continue
@@ -99,16 +91,16 @@ func (cw *CredentialWatcher) Stop() {
 		cw.cancel()
 	}
 	if cw.watcher != nil {
-		cw.watcher.Close() // unblocks run() select on Events/Errors channels
+		cw.watcher.Close()
 	}
 	cw.wg.Wait()
 }
 
 // RegisterVM registers a running VM for credential push notifications.
-func (cw *CredentialWatcher) RegisterVM(name string, vsock *VsockClient) {
+func (cw *CredentialWatcher) RegisterVM(name string, agent *AgentClient) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
-	cw.vms[name] = &watchedVM{vsock: vsock, name: name}
+	cw.vms[name] = &watchedVM{agent: agent, name: name}
 }
 
 // UnregisterVM removes a VM from credential push notifications.
@@ -127,10 +119,24 @@ func (cw *CredentialWatcher) SuppressEcho(vmName, credName string) {
 	cw.echoCooldowns[key] = time.Now().Add(echoCooldown)
 }
 
+// echoPruneThreshold is the map size at which expired entries are pruned.
+const echoPruneThreshold = 100
+
 // isEchoSuppressed checks if pushing a credential to a VM should be skipped.
 func (cw *CredentialWatcher) isEchoSuppressed(vmName, credName string) bool {
 	cw.echoMu.Lock()
 	defer cw.echoMu.Unlock()
+
+	// Prune expired entries when the map grows past the threshold.
+	if len(cw.echoCooldowns) > echoPruneThreshold {
+		now := time.Now()
+		for k, exp := range cw.echoCooldowns {
+			if now.After(exp) {
+				delete(cw.echoCooldowns, k)
+			}
+		}
+	}
+
 	key := vmName + ":" + credName
 	expiry, ok := cw.echoCooldowns[key]
 	if !ok {
@@ -159,7 +165,6 @@ func (cw *CredentialWatcher) run() {
 				continue
 			}
 
-			// If a new directory was created, watch it
 			if event.Has(fsnotify.Create) {
 				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
 					if err := cw.addRecursiveWatch(event.Name); err != nil {
@@ -191,7 +196,7 @@ func (cw *CredentialWatcher) addRecursiveWatch(root string) error {
 			if path == root {
 				return fmt.Errorf("cannot access credential root %s: %w", root, err)
 			}
-			return nil // skip inaccessible subdirectories
+			return nil
 		}
 		if info.IsDir() {
 			if watchErr := cw.watcher.Add(path); watchErr != nil {
@@ -203,7 +208,6 @@ func (cw *CredentialWatcher) addRecursiveWatch(root string) error {
 }
 
 // resolveCredential finds which credential a file path belongs to.
-// It picks the longest matching source path to avoid ambiguity when credential paths share a prefix.
 func (cw *CredentialWatcher) resolveCredential(absPath string) string {
 	var bestName string
 	var bestLen int
@@ -262,8 +266,8 @@ func (cw *CredentialWatcher) syncCredentialToVMs(credName string) {
 			continue
 		}
 
-		ct := NewCredentialTransfer(vm.vsock, cw.serverCfg)
-		if err := ct.transferCredential(cw.ctx, credName, mount); err != nil {
+		ct := NewCredentialTransfer(vm.agent, cw.serverCfg)
+		if err := ct.TransferCredential(cw.ctx, credName, mount); err != nil {
 			log.Printf("[%s] Failed to push credential %q: %v", vm.name, credName, err)
 		} else {
 			log.Printf("[%s] Pushed credential %q", vm.name, credName)

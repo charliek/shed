@@ -18,6 +18,7 @@ import (
 	"github.com/charliek/shed/internal/docker"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/sshd"
+	"github.com/charliek/shed/internal/vz"
 )
 
 const (
@@ -69,6 +70,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 			}
 			log.Printf("Initialized Firecracker backend")
 			backends[backend.TypeFirecracker] = firecracker.NewBackend(fcClient)
+
+		case config.BackendVZ:
+			vzCfg := cfg.VZ
+			if vzCfg == nil {
+				return fmt.Errorf("vz backend enabled but vz config is missing")
+			}
+			vzClient, err := vz.NewClient(vzCfg, cfg)
+			if err != nil {
+				return fmt.Errorf("failed to create vz client: %w", err)
+			}
+			log.Printf("Initialized VZ backend")
+			backends[backend.TypeVZ] = vz.NewBackend(vzClient)
 
 		default:
 			return fmt.Errorf("unknown backend type: %s", backendType)

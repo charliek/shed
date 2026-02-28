@@ -42,8 +42,8 @@ flowchart TB
 | Component | Description |
 |-----------|-------------|
 | `shed` | CLI binary for developer machines (macOS, Linux) |
-| `shed-server` | Server binary exposing HTTP + SSH APIs (Linux) |
-| `shed-agent` | Agent binary running inside Firecracker VMs (Linux) |
+| `shed-server` | Server binary exposing HTTP + SSH APIs (Linux, macOS) |
+| `shed-agent` | Agent binary running inside Firecracker and VZ VMs (Linux) |
 | `shed-base` | Docker image with pre-installed dev tools |
 
 ## Communication Protocols
@@ -52,9 +52,9 @@ flowchart TB
 |----------|------|---------|
 | HTTP | 8080 | REST API for CRUD operations, server discovery |
 | SSH | 2222 | Terminal access, IDE remote connections |
-| vsock | 1024 | VM console I/O (Firecracker) |
-| vsock | 1025 | Agent health checks (Firecracker) |
-| vsock | 1026 | Credential change notifications (Firecracker) |
+| vsock | 1024 | VM console I/O (Firecracker, VZ) |
+| vsock | 1025 | Agent health checks (Firecracker, VZ) |
+| vsock | 1026 | Credential change notifications (Firecracker, VZ) |
 
 ## Naming Conventions
 
@@ -148,9 +148,17 @@ SSH server implementation using `gliderlabs/ssh`. Routes connections to containe
 
 Parses and generates SSH config files. Manages the shed-specific block in `~/.ssh/config`.
 
+### `internal/vmutil`
+
+Shared VM agent communication code used by both Firecracker and VZ backends. Contains the `Dialer` interface (the core abstraction differing between backends), `AgentClient` (exec, health checks), `NotifyConn` (persistent auto-reconnecting connections), provisioning, and credential transfer/sync. No build tags — all platform-specificity lives in the `Dialer` implementations.
+
 ### `internal/firecracker`
 
-Firecracker backend: VM lifecycle, vsock communication, TAP networking, rootfs management, metadata persistence, credential transfer, and bidirectional credential sync.
+Firecracker backend (Linux only): VM lifecycle via Firecracker SDK, TAP networking, rootfs management, metadata persistence. Implements `vmutil.Dialer` with the CONNECT/OK vsock handshake over a single Unix socket.
+
+### `internal/vz`
+
+VZ backend (macOS Apple Silicon only): VM lifecycle via vfkit subprocess, NAT networking, rootfs management, metadata persistence. Implements `vmutil.Dialer` with direct per-port Unix socket connections (no handshake needed).
 
 ### `internal/agentproto`
 
@@ -158,7 +166,7 @@ Binary protocol for framed messages over vsock between shed-server and shed-agen
 
 ### `internal/backend`
 
-Backend interface that Docker and Firecracker backends both implement.
+Backend interface that Docker, Firecracker, and VZ backends all implement.
 
 ### `internal/provision`
 

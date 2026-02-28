@@ -146,14 +146,14 @@ type CreateShedRequest struct {
 	Image       string `json:"image,omitempty"`
 	NoProvision bool   `json:"no_provision,omitempty"`
 
-	// Backend specifies which backend to use ("docker" or "firecracker")
+	// Backend specifies which backend to use ("docker", "firecracker", or "vz")
 	// If empty, uses the server's default backend
 	Backend string `json:"backend,omitempty"`
 
-	// CPUs specifies the number of vCPUs (firecracker only)
+	// CPUs specifies the number of vCPUs (firecracker/vz only)
 	CPUs int `json:"cpus,omitempty"`
 
-	// MemoryMB specifies the memory in MB (firecracker only)
+	// MemoryMB specifies the memory in MB (firecracker/vz only)
 	MemoryMB int `json:"memory_mb,omitempty"`
 }
 
@@ -208,6 +208,7 @@ const (
 const (
 	BackendDocker      = "docker"
 	BackendFirecracker = "firecracker"
+	BackendVZ          = "vz"
 )
 
 // ContainerUser is the non-root user that runs inside Docker containers.

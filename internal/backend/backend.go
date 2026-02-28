@@ -13,8 +13,10 @@ type Type string
 const (
 	// TypeDocker is the Docker-based backend.
 	TypeDocker Type = "docker"
-	// TypeFirecracker is the Firecracker-based backend (future).
+	// TypeFirecracker is the Firecracker-based backend.
 	TypeFirecracker Type = "firecracker"
+	// TypeVZ is the Apple Virtualization.framework-based backend (macOS only).
+	TypeVZ Type = "vz"
 )
 
 // Backend defines the interface for shed execution backends.

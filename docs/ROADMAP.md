@@ -74,6 +74,14 @@ Enhanced resource management:
 
 If Firecracker adds virtiofs ([issue #1180](https://github.com/firecracker-microvm/firecracker/issues/1180)), replace the tar-over-vsock credential sync with proper filesystem passthrough for live mounts. Would eliminate the need for the notification channel approach for file sync, though the channel remains valuable for other agent→host communication.
 
+### Intel macOS VZ Support
+
+Expand the VZ backend beyond Apple Silicon to support Intel macOS hosts.
+
+- Add architecture-aware VZ rootfs build support (`linux/amd64` path in `scripts/build-vz-rootfs.sh`)
+- Validate vfkit + kernel boot flow on Intel Macs
+- Add Intel-specific setup and troubleshooting documentation
+
 ### Multi-node Sheds
 
 Support for distributed development environments:

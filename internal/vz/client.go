@@ -1,7 +1,7 @@
-//go:build linux
-// +build linux
+//go:build darwin
+// +build darwin
 
-package firecracker
+package vz
 
 import (
 	"context"
@@ -9,9 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
-	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,42 +21,30 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
-// Client manages Firecracker VM instances.
+// Client manages VZ VM instances.
 type Client struct {
-	cfg       *config.FirecrackerConfig
+	cfg       *config.VZConfig
 	serverCfg *config.ServerConfig
-	netMgr    *NetworkManager
 
-	mu       sync.Mutex
-	vms      map[string]*VM    // name -> VM
-	usedCIDs map[uint32]string // CID -> name
-	usedIPs  map[string]string // IP -> name
+	mu  sync.Mutex
+	vms map[string]*VM // name -> VM
 
 	// Credential sync
 	credWatcher     *vmutil.CredentialWatcher                   // host-side fsnotify watcher
 	notifyListeners map[string]*vmutil.CredentialNotifyListener // name -> per-VM notification listener
 }
 
-// NewClient creates a new Firecracker client.
-func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*Client, error) {
-	netMgr, err := NewNetworkManager(cfg.BridgeName, cfg.BridgeCIDR, cfg.TAPPrefix)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create network manager: %w", err)
+// NewClient creates a new VZ client.
+func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig) (*Client, error) {
+	if runtime.GOARCH != "arm64" {
+		return nil, fmt.Errorf("vz backend currently supports macOS Apple Silicon (arm64) only")
 	}
 
 	client := &Client{
 		cfg:             cfg,
 		serverCfg:       serverCfg,
-		netMgr:          netMgr,
 		vms:             make(map[string]*VM),
-		usedCIDs:        make(map[uint32]string),
-		usedIPs:         make(map[string]string),
 		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
-	}
-
-	// Load existing instances to populate CID and IP maps
-	if err := client.loadExistingInstances(); err != nil {
-		return nil, fmt.Errorf("failed to load existing instances: %w", err)
 	}
 
 	// Start host-side credential watcher for bidirectional sync
@@ -70,27 +57,6 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*
 	}
 
 	return client, nil
-}
-
-// loadExistingInstances loads metadata for existing instances.
-func (c *Client) loadExistingInstances() error {
-	names, err := ListInstances(c.cfg.InstanceDir)
-	if err != nil {
-		return err
-	}
-
-	for _, name := range names {
-		meta, err := LoadMetadata(c.cfg.InstanceDir, name)
-		if err != nil {
-			log.Printf("Warning: skipping instance %q with invalid metadata: %v", name, err)
-			continue
-		}
-
-		c.usedCIDs[meta.CID] = name
-		c.usedIPs[meta.IPAddress] = name
-	}
-
-	return nil
 }
 
 // Close closes the client and releases resources.
@@ -111,113 +77,13 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// Config returns the Firecracker configuration.
-func (c *Client) Config() *config.FirecrackerConfig {
-	return c.cfg
-}
-
-// MaxVsockCID is the maximum valid CID for vsock connections.
-const MaxVsockCID uint32 = 65535
-
-// AllocateCID allocates and reserves a new CID for a VM.
-func (c *Client) AllocateCID(name string) (uint32, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	cid := c.cfg.VsockBaseCID
-	for cid <= MaxVsockCID {
-		if _, used := c.usedCIDs[cid]; !used {
-			c.usedCIDs[cid] = name
-			return cid, nil
-		}
-		cid++
-	}
-	return 0, fmt.Errorf("all CIDs exhausted (checked %d to %d)", c.cfg.VsockBaseCID, MaxVsockCID)
-}
-
-// AllocateNetwork allocates a TAP device and IP address for a VM.
-func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	usedIndices := make(map[int]bool)
-	gatewayIP := net.ParseIP(c.netMgr.Gateway()).To4()
-	gatewayInt, err := ipToUint32(gatewayIP)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid gateway IP: %w", err)
-	}
-	for ip := range c.usedIPs {
-		parsed := net.ParseIP(ip).To4()
-		if parsed == nil {
-			continue
-		}
-		parsedInt, err := ipToUint32(parsed)
-		if err != nil {
-			continue
-		}
-		index := int(parsedInt - gatewayInt - 1)
-		if index >= 0 {
-			usedIndices[index] = true
-		}
-	}
-
-	index, err := c.netMgr.FindAvailableTAPIndex(usedIndices)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to find available TAP index: %w", err)
-	}
-	tapDevice = c.netMgr.TAPDeviceName(index)
-	ipAddress, err = c.netMgr.AllocateIP(index)
-	if err != nil {
-		return "", "", err
-	}
-
-	c.usedIPs[ipAddress] = name
-
-	return tapDevice, ipAddress, nil
-}
-
-// ReleaseCID releases a reserved CID.
-func (c *Client) ReleaseCID(cid uint32) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	delete(c.usedCIDs, cid)
-}
-
-// ReleaseIP releases a reserved IP address.
-func (c *Client) ReleaseIP(ip string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	delete(c.usedIPs, ip)
-}
-
-// RegisterInstance registers a CID and IP as used by an instance.
-func (c *Client) RegisterInstance(name string, cid uint32, ip string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.usedCIDs[cid] = name
-	c.usedIPs[ip] = name
-}
-
-// UnregisterInstance removes a CID and IP from the used maps.
-func (c *Client) UnregisterInstance(name string, cid uint32, ip string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	delete(c.usedCIDs, cid)
-	delete(c.usedIPs, ip)
-}
-
 // newAgentClient creates a vmutil.AgentClient for the given instance name.
 func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
-	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", name))
-	dialer := NewFirecrackerDialer(vsockPath)
+	dialer := NewVZDialer(c.cfg.SocketDir, name)
 	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
 }
 
-// CreateShed creates a new Firecracker-based shed.
+// CreateShed creates a new VZ-based shed.
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
@@ -227,49 +93,31 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
-	cid, err := c.AllocateCID(req.Name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate CID: %w", err)
-	}
-	tapDevice, ipAddress, err := c.AllocateNetwork(req.Name)
-	if err != nil {
-		c.ReleaseCID(cid)
-		return nil, fmt.Errorf("failed to allocate network: %w", err)
-	}
-
-	if err := c.netMgr.CreateTAPDevice(tapDevice); err != nil {
-		c.ReleaseIP(ipAddress)
-		c.ReleaseCID(cid)
-		return nil, fmt.Errorf("failed to create TAP device: %w", err)
-	}
-
-	rootfsPath, err := CopyRootfs(c.cfg.BaseRootfs, c.cfg.InstanceDir, req.Name)
-	if err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
-		c.ReleaseIP(ipAddress)
-		c.ReleaseCID(cid)
-		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
-	}
-
 	cpus := req.CPUs
 	if cpus == 0 {
 		cpus = c.cfg.DefaultCPUs
 	}
+	if cpus < 1 || cpus > config.MaxVZCPUs {
+		return nil, fmt.Errorf("invalid cpus %d: must be between 1 and %d", cpus, config.MaxVZCPUs)
+	}
 	memoryMB := req.MemoryMB
 	if memoryMB == 0 {
 		memoryMB = c.cfg.DefaultMemoryMB
+	}
+	if memoryMB < 128 || memoryMB > config.MaxVZMemoryMB {
+		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
+	}
+
+	rootfsPath, err := CopyRootfs(c.cfg.BaseRootfs, c.cfg.InstanceDir, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
 	meta := &Metadata{
 		Name:       req.Name,
 		Status:     config.StatusStopped,
 		CreatedAt:  time.Now(),
-		Backend:    config.BackendFirecracker,
-		CID:        cid,
-		IPAddress:  ipAddress,
-		TAPDevice:  tapDevice,
+		Backend:    config.BackendVZ,
 		CPUs:       cpus,
 		MemoryMB:   memoryMB,
 		RootfsPath: rootfsPath,
@@ -277,54 +125,30 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
-		c.ReleaseIP(ipAddress)
-		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	c.RegisterInstance(req.Name, cid, ipAddress)
-
-	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
-	if err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		c.UnregisterInstance(req.Name, cid, ipAddress)
-		return nil, fmt.Errorf("failed to create VM: %w", err)
-	}
+	vm := CreateVM(meta, c.cfg)
 
 	if err := vm.Start(ctx); err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
-		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
 
 	meta.Status = config.StatusRunning
+	meta.PID = vm.meta.PID
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {
 			log.Printf("Warning: failed to stop VM: %v", stopErr)
 		}
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
-		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
@@ -371,7 +195,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		Status:      meta.Status,
 		CreatedAt:   meta.CreatedAt,
 		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
+		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
 		Backend:     meta.Backend,
 	}, nil
 }
@@ -404,7 +228,7 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		Status:      status,
 		CreatedAt:   meta.CreatedAt,
 		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
+		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
 		Backend:     meta.Backend,
 	}, nil
 }
@@ -448,8 +272,8 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 			delete(c.vms, name)
 			c.mu.Unlock()
 			if meta.PID > 0 {
-				if !isFirecrackerProcess(meta.PID) {
-					log.Printf("Warning: PID %d is not a Firecracker process, skipping SIGKILL during delete of %s", meta.PID, name)
+				if !isVfkitProcess(meta.PID) {
+					log.Printf("Warning: PID %d is not a vfkit process, skipping SIGKILL during delete of %s", meta.PID, name)
 				} else {
 					_ = syscall.Kill(meta.PID, syscall.SIGKILL)
 					if !waitForProcessExit(meta.PID, 2*time.Second) {
@@ -459,12 +283,6 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 			}
 		}
 	}
-
-	if err := c.netMgr.DeleteTAPDevice(meta.TAPDevice); err != nil {
-		log.Printf("Warning: failed to delete TAP device %s: %v", meta.TAPDevice, err)
-	}
-
-	c.UnregisterInstance(name, meta.CID, meta.IPAddress)
 
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
@@ -492,10 +310,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		meta.PID = 0
 	}
 
-	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create VM: %w", err)
-	}
+	vm := CreateVM(meta, c.cfg)
 
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start VM: %w", err)
@@ -543,7 +358,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		Status:      meta.Status,
 		CreatedAt:   meta.CreatedAt,
 		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
+		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
 		Backend:     meta.Backend,
 	}, nil
 }
@@ -578,11 +393,11 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 
 	hookCtx, hookCancel := context.WithTimeout(ctx, hookBudget)
 	defer hookCancel()
-	cfg, err := provisioner.LoadConfig(hookCtx)
+	provCfg, err := provisioner.LoadConfig(hookCtx)
 	if err != nil {
 		log.Printf("Warning: failed to load provision config for shutdown hook: %v", err)
-	} else if cfg.HasShutdownHook() {
-		provisioner.RunShutdownHook(hookCtx, cfg)
+	} else if provCfg.HasShutdownHook() {
+		provisioner.RunShutdownHook(hookCtx, provCfg)
 	}
 
 	// Get or create VM handle
@@ -613,14 +428,15 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		Status:      meta.Status,
 		CreatedAt:   meta.CreatedAt,
 		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
+		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
 		Backend:     meta.Backend,
 	}, nil
 }
 
-// GetNetworkEndpoint returns the IP address for a shed.
+// GetNetworkEndpoint returns the network endpoint for a shed.
+// VZ uses NAT, so the endpoint is always localhost.
 func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, error) {
-	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	_, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
 			return "", fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
@@ -628,7 +444,7 @@ func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, e
 		return "", err
 	}
 
-	return meta.IPAddress, nil
+	return "127.0.0.1", nil
 }
 
 // cloneRepo clones a git repository into the VM's workspace.

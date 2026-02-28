@@ -9,7 +9,7 @@ Shed is a lightweight tool for managing persistent, containerized development en
 - **Multi-Server** - Manage sheds across home servers and cloud VPS instances
 - **IDE Integration** - Native Cursor/VS Code support via SSH Remote
 - **AI-Ready** - Pre-configured for Claude Code and OpenCode workflows
-- **Dual Backend** - Choose between Docker containers or Firecracker microVMs
+- **Multiple Backends** - Docker containers, Firecracker microVMs (Linux), or Apple VZ virtual machines (macOS Apple Silicon)
 
 ## Architecture
 
@@ -18,10 +18,11 @@ Shed consists of two binaries:
 - **`shed`** - CLI for developer machines (macOS, Linux)
 - **`shed-server`** - Server daemon exposing HTTP API (port 8080) and SSH server (port 2222)
 
-The server supports two backends (enabled per server configuration):
+The server supports three backends (enabled per server configuration):
 
 - **Docker** (default) - Uses Docker containers with bind mounts
-- **Firecracker** - Uses microVMs with vsock communication (Linux-only)
+- **Firecracker** - Uses microVMs with vsock communication (Linux only)
+- **VZ** - Uses Apple Virtualization.framework VMs via vfkit (macOS Apple Silicon only)
 
 You can set a server default backend and optionally override it per shed with `shed create --backend=...` when that backend is enabled on the server.
 
@@ -40,6 +41,9 @@ flowchart LR
             subgraph fc["Firecracker"]
                 VM1["microVM"]
             end
+            subgraph vz["VZ"]
+                VM2["macOS VM"]
+            end
         end
         SERVER --> backends
     end
@@ -55,6 +59,7 @@ flowchart LR
 | Client | macOS or Linux with Go 1.24+ |
 | Server (Docker) | Linux with Docker installed |
 | Server (Firecracker) | Linux with KVM support |
+| Server (VZ) | macOS 13+ (Ventura) on Apple Silicon (arm64) |
 | Network | Tailscale (or any private network) connecting all machines |
 
 ## Quick Links
@@ -65,6 +70,8 @@ flowchart LR
 - [Server Setup](getting-started/server-setup.md) - Install shed-server
 - [Firecracker Installation](firecracker_install.md) - Set up Firecracker backend
 - [Firecracker Operations](firecracker_howto.md) - Using Firecracker sheds
+- [VZ Setup](getting-started/vz-setup.md) - Set up VZ backend (macOS)
+- [VZ Operations](reference/vz-operations.md) - Using VZ sheds
 - [Roadmap](ROADMAP.md) - Future enhancements
 
 ## Security Model
