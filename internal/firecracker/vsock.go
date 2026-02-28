@@ -235,7 +235,11 @@ func (c *VsockClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 		// Wait for the stdin goroutine to finish so that all writes
 		// (including MsgTypeStdinEOF) complete before defer conn.Close().
 		if stdinDone != nil {
-			<-stdinDone
+			select {
+			case <-stdinDone:
+			case <-ctx.Done():
+				// Intentional teardown/cancel: skip waiting for stdin flush.
+			}
 		}
 		return err
 	case <-ctx.Done():
