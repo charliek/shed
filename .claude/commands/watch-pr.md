@@ -21,8 +21,8 @@ Use `$ARGUMENTS` as an optional PR number. If not provided, use the PR associate
    - If any required checks failed, proceed to step 4
 
 4. **Handle CI failures**: Diagnose and fix
-   - Identify the failed check and get its run ID from `gh pr checks <number>`
-   - Fetch failure logs: `gh run view <run-id> --log-failed`
+   - Identify the failed check from `gh pr checks <number>` — the output includes a link column with the run URL containing the run ID
+   - Fetch failure logs using that run ID: `gh run view <run-id> --log-failed`
    - Examine the repo's CI config to understand what the check does
    - Determine the fix from the logs and CI config — do not hardcode any CI job names or language-specific commands
    - Run equivalent local checks to verify the fix before pushing
