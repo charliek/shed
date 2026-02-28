@@ -389,7 +389,7 @@ func (s *ProvisionState) writeStateFile(ctx context.Context, state map[string]st
 	// Build content with escaped values to handle newlines safely
 	var content strings.Builder
 	for key, value := range state {
-		content.WriteString(fmt.Sprintf("%s=%s\n", key, escapeStateValue(value)))
+		fmt.Fprintf(&content, "%s=%s\n", key, escapeStateValue(value))
 	}
 
 	// Use heredoc to safely write content.

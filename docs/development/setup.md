@@ -4,7 +4,7 @@ This guide covers setting up a development environment for contributing to Shed.
 
 ## Prerequisites
 
-- Go 1.24 or later
+- [mise](https://mise.jdx.dev/) (manages Go, golangci-lint, and other tool versions)
 - Docker (for building the base image and testing)
 - Make
 - Git
@@ -16,6 +16,13 @@ This guide covers setting up a development environment for contributing to Shed.
 ```bash
 git clone https://github.com/charliek/shed.git
 cd shed
+```
+
+### Install Tools
+
+```bash
+# Install Go, golangci-lint, and other tools defined in .mise.toml
+mise install
 ```
 
 ### Build
@@ -217,8 +224,8 @@ make check
 ### Installing Tools
 
 ```bash
-# golangci-lint
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.5
+# Go and golangci-lint are managed by mise (see .mise.toml)
+mise install
 
 # hadolint (for Dockerfile linting)
 # macOS: brew install hadolint

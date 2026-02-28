@@ -29,9 +29,9 @@ jobs:
         run: go test ./...
 
       - name: Run Linter
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: v1.64.5
+          version: v2.10.1
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6

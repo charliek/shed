@@ -1,26 +1,31 @@
+version: "2"
+
 linters:
+  default: none
   enable:
     - errcheck
     - staticcheck
     - unused
     - govet
     - ineffassign
+    - misspell
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (net/http.ResponseWriter).Write
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+      - path: _test\.go
+        linters:
+          - unused
+
+formatters:
+  enable:
     - gofmt
     - goimports
-    - gosimple
-    - misspell
-
-linters-settings:
-  errcheck:
-    exclude-functions:
-      - (io.Closer).Close
-      - (net/http.ResponseWriter).Write
-
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-    - path: _test\.go
-      linters:
-        - unused

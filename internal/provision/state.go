@@ -106,7 +106,7 @@ func (s *State) writeStateFile(ctx context.Context, containerID string, state ma
 	// Build the content
 	var content strings.Builder
 	for key, value := range state {
-		content.WriteString(fmt.Sprintf("%s=%s\n", key, value))
+		fmt.Fprintf(&content, "%s=%s\n", key, value)
 	}
 
 	// Encode content as base64 to safely pass through shell without delimiter issues.
