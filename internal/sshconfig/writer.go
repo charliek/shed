@@ -37,12 +37,12 @@ type Diff struct {
 func GenerateEntry(entry Entry) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("Host %s\n", entry.Name))
-	sb.WriteString(fmt.Sprintf("    HostName %s\n", entry.Host))
-	sb.WriteString(fmt.Sprintf("    Port %d\n", entry.Port))
-	sb.WriteString(fmt.Sprintf("    User %s\n", entry.User))
+	fmt.Fprintf(&sb, "Host %s\n", entry.Name)
+	fmt.Fprintf(&sb, "    HostName %s\n", entry.Host)
+	fmt.Fprintf(&sb, "    Port %d\n", entry.Port)
+	fmt.Fprintf(&sb, "    User %s\n", entry.User)
 	if entry.KnownHostsFile != "" {
-		sb.WriteString(fmt.Sprintf("    UserKnownHostsFile %s\n", entry.KnownHostsFile))
+		fmt.Fprintf(&sb, "    UserKnownHostsFile %s\n", entry.KnownHostsFile)
 	}
 
 	return sb.String()
@@ -58,7 +58,7 @@ func GenerateManagedBlock(entries []Entry) string {
 
 	sb.WriteString(BeginMarker + "\n")
 	sb.WriteString("# Do not edit manually - managed by shed CLI\n")
-	sb.WriteString(fmt.Sprintf("# Last updated: %s\n", time.Now().UTC().Format(time.RFC3339)))
+	fmt.Fprintf(&sb, "# Last updated: %s\n", time.Now().UTC().Format(time.RFC3339))
 	sb.WriteString("\n")
 
 	// Sort entries by name for consistent output
