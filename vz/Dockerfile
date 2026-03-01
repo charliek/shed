@@ -150,7 +150,8 @@ ENV PATH="/home/shed/.local/bin:${PATH}"
 
 # mise (version manager)
 RUN curl https://mise.run | sh
-RUN echo 'eval "$(mise activate bash)"' >> /home/shed/.bashrc
+RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/shed/.bashrc \
+    && echo 'eval "$(mise activate bash)"' >> /home/shed/.bashrc
 ENV PATH="/home/shed/.local/share/mise/shims:${PATH}"
 
 RUN mise use -g \
