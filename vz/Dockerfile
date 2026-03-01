@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # System essentials
     systemd \
     systemd-sysv \
+    systemd-resolved \
     dbus \
     # Utilities needed by provisioning hooks
     sudo \
@@ -47,7 +48,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build essentials (for compiling code)
     build-essential \
     # Linux kernel (needed for VZ LinuxBootloader and in-VM modules)
+    # initramfs-tools is a recommended dep of linux-image-generic that
+    # --no-install-recommends drops; it's required to generate initrd.
     linux-image-generic \
+    initramfs-tools \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
