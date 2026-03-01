@@ -18,8 +18,6 @@ RUN apt-get update && apt-get install -y \
     systemd \
     systemd-sysv \
     dbus \
-    # Docker
-    docker.io \
     # Utilities needed by provisioning hooks
     sudo \
     unzip \
@@ -48,6 +46,22 @@ RUN apt-get update && apt-get install -y \
     # Linux kernel (needed for VZ LinuxBootloader and in-VM modules)
     linux-image-generic \
     # Clean up
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CE from official Docker repo (needed for docker-compose-plugin)
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && printf "Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nSigned-By: /etc/apt/keyrings/docker.asc\n" \
+       "$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")" \
+       > /etc/apt/sources.list.d/docker.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       docker-ce \
+       docker-ce-cli \
+       containerd.io \
+       docker-buildx-plugin \
+       docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22.x
