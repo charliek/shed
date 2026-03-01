@@ -72,7 +72,12 @@ func (nc *NotifyConn) run(handler NotifyHandler) {
 		default:
 		}
 
-		err := nc.connectAndListen(handler)
+		connected, err := nc.connectAndListen(handler)
+		if connected {
+			// A connection was established (even if it later failed).
+			// Reset backoff so the next retry starts fresh.
+			backoff = time.Second
+		}
 		if err != nil {
 			select {
 			case <-nc.ctx.Done():
@@ -89,24 +94,22 @@ func (nc *NotifyConn) run(handler NotifyHandler) {
 					backoff = maxBackoff
 				}
 			}
-		} else {
-			// Reset backoff after a successful connection so the next
-			// retry starts fresh rather than at the previously escalated delay.
-			backoff = time.Second
 		}
 	}
 }
 
 // connectAndListen connects, calls handler.OnConnect, then reads messages.
-func (nc *NotifyConn) connectAndListen(handler NotifyHandler) error {
+// It returns connected=true if a connection was successfully established
+// (even if it later encountered an error), so callers can reset backoff.
+func (nc *NotifyConn) connectAndListen(handler NotifyHandler) (connected bool, err error) {
 	conn, err := nc.dialer.Dial(nc.ctx, nc.port)
 	if err != nil {
-		return fmt.Errorf("failed to dial notify port: %w", err)
+		return false, fmt.Errorf("failed to dial notify port: %w", err)
 	}
 	defer conn.Close()
 
 	if err := handler.OnConnect(conn); err != nil {
-		return fmt.Errorf("handler OnConnect failed: %w", err)
+		return false, fmt.Errorf("handler OnConnect failed: %w", err)
 	}
 
 	// Per-connection context — canceling this unblocks the close-helper
@@ -124,12 +127,12 @@ func (nc *NotifyConn) connectAndListen(handler NotifyHandler) error {
 		msgType, data, err := agentproto.ReadMessage(conn)
 		if err != nil {
 			if nc.ctx.Err() != nil {
-				return nil // graceful shutdown
+				return true, nil // graceful shutdown
 			}
 			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("connection closed by agent")
+				return true, fmt.Errorf("connection closed by agent")
 			}
-			return fmt.Errorf("read error: %w", err)
+			return true, fmt.Errorf("read error: %w", err)
 		}
 
 		if err := handler.OnMessage(msgType, data); err != nil {

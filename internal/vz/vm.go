@@ -259,7 +259,12 @@ func (vm *VM) IsRunning() bool {
 	// Send signal 0 to check if process exists.
 	// EPERM means the process exists but we lack permission to signal it.
 	err = process.Signal(syscall.Signal(0))
-	return err == nil || errors.Is(err, syscall.EPERM)
+	if err != nil && !errors.Is(err, syscall.EPERM) {
+		return false
+	}
+
+	// Guard against PID reuse: verify the process is actually vfkit.
+	return isVfkitProcess(vm.meta.PID)
 }
 
 // waitForProcessExit polls until a process exits or timeout expires.

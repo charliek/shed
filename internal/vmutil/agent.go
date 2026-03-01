@@ -103,6 +103,11 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	}
 	defer conn.Close()
 
+	// execDone is closed when Exec returns, allowing spawned goroutines to
+	// detect completion and exit even if ctx is still alive.
+	execDone := make(chan struct{})
+	defer close(execDone)
+
 	// Build exec request
 	workingDir := opts.WorkingDir
 	if workingDir == "" {
@@ -159,6 +164,8 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 					}
 				case <-ctx.Done():
 					return
+				case <-execDone:
+					return
 				}
 			}
 		}()
@@ -168,11 +175,8 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	done := make(chan error, 2)
 
 	// Copy stdin to connection as framed protocol messages.
-	var stdinDone chan struct{}
 	if opts.Stdin != nil {
-		stdinDone = make(chan struct{})
 		go func() {
-			defer close(stdinDone)
 			buf := make([]byte, 4096)
 			for {
 				n, err := opts.Stdin.Read(buf)
@@ -198,7 +202,7 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 			msgType, data, err := agentproto.ReadMessage(conn)
 			if err != nil {
 				if err == io.EOF {
-					done <- nil
+					done <- fmt.Errorf("connection closed before exit code received")
 					return
 				}
 				done <- err
@@ -232,12 +236,6 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	// Wait for completion or context cancellation
 	select {
 	case err := <-done:
-		if stdinDone != nil {
-			select {
-			case <-stdinDone:
-			case <-ctx.Done():
-			}
-		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
