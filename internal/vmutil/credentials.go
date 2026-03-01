@@ -149,6 +149,12 @@ func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo) 
 
 // addToTar adds a file or directory entry to the tar archive.
 func (ct *CredentialTransfer) addToTar(tw *tar.Writer, sourcePath, archivePath string, fi os.FileInfo) error {
+	// Skip special files that tar doesn't support (sockets, devices, named pipes).
+	mode := fi.Mode()
+	if mode&(os.ModeSocket|os.ModeDevice|os.ModeNamedPipe|os.ModeCharDevice) != 0 {
+		return nil
+	}
+
 	var link string
 	if fi.Mode()&os.ModeSymlink != 0 {
 		var err error

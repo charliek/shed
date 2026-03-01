@@ -39,6 +39,14 @@ if [ -n "$INTERFACE" ]; then
     fi
 fi
 
+# Ensure /etc/resolv.conf points to systemd-resolved stub.
+# Docker overwrites resolv.conf during image build, so we restore the symlink.
+if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf)" != "../run/systemd/resolve/stub-resolv.conf" ]; then
+    rm -f /etc/resolv.conf
+    ln -s ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    echo "Restored resolv.conf symlink to systemd-resolved stub"
+fi
+
 # Configure hosts file for localhost resolution
 cat > /etc/hosts << HOSTS_EOF
 127.0.0.1 localhost $(hostname)
