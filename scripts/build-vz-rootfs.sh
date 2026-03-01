@@ -101,6 +101,7 @@ docker run --rm --privileged \
     -v "$OUTPUT_DIR:/output" \
     --platform linux/arm64 \
     ubuntu:24.04 bash -c "
+        set -euo pipefail
         apt-get update && apt-get install -y e2fsprogs >/dev/null 2>&1
         truncate -s $ROOTFS_SIZE /output/base-rootfs.ext4
         mkfs.ext4 -F /output/base-rootfs.ext4
@@ -123,6 +124,7 @@ KERNEL_PATH="$OUTPUT_DIR/vmlinux"
 docker run --rm --platform linux/arm64 \
     -v "$OUTPUT_DIR:/output" \
     shed-vz-rootfs:latest bash -c "
+        set -euo pipefail
         VMLINUZ=\$(ls /boot/vmlinuz-* 2>/dev/null | head -1)
         if [ -z \"\$VMLINUZ\" ]; then
             echo 'ERROR: No kernel found in /boot/'

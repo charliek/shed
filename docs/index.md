@@ -42,7 +42,7 @@ flowchart LR
                 VM1["microVM"]
             end
             subgraph vz["VZ"]
-                VM2["macOS VM"]
+                VM2["Linux VM"]
             end
         end
         SERVER --> backends

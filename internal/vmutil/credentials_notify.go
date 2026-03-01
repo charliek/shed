@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"archive/tar"
 
@@ -155,7 +156,9 @@ func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []st
 		TTY:        false,
 	}
 
-	if err := nl.agent.Exec(context.Background(), opts); err != nil {
+	execCtx, execCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer execCancel()
+	if err := nl.agent.Exec(execCtx, opts); err != nil {
 		return fmt.Errorf("failed to tar changed files: %w (stderr: %s)", err, stderrBuf.String())
 	}
 

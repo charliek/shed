@@ -41,7 +41,7 @@ fi
 
 # Configure hosts file for localhost resolution
 cat > /etc/hosts << HOSTS_EOF
-127.0.0.1 localhost
+127.0.0.1 localhost $(hostname)
 ::1 localhost ip6-localhost ip6-loopback
 HOSTS_EOF
 

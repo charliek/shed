@@ -2,7 +2,7 @@
     "storage-driver": "vfs",
     "iptables": false,
     "bridge": "none",
-    "exec-opts": ["native.cgroupdriver=cgroupfs"],
+    "exec-opts": ["native.cgroupdriver=systemd"],
     "log-driver": "json-file",
     "log-opts": {
         "max-size": "10m",

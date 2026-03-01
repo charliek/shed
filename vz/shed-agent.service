@@ -1,5 +1,5 @@
 [Unit]
-Description=Shed Agent - vsock communication daemon
+Description=Shed Agent - virtio communication daemon
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=3

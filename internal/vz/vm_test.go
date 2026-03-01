@@ -58,7 +58,7 @@ func TestBuildVfkitArgs(t *testing.T) {
 		}
 	}
 
-	// Should have exactly 3 --device flags (1 block + 3 vsock)
+	// Should have exactly 4 --device flags (1 block + 3 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
 	if deviceCount != 4 {
 		t.Errorf("expected 4 --device flags (1 block + 3 vsock), got %d", deviceCount)
@@ -108,12 +108,16 @@ func TestCleanupSockets(t *testing.T) {
 	// Create socket files
 	for _, port := range []uint32{1024, 1025, 1026} {
 		path := filepath.Join(tmpDir, fmt.Sprintf("test-vm-%d.sock", port))
-		os.WriteFile(path, nil, 0600)
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatalf("Failed to create socket file %s: %v", path, err)
+		}
 	}
 
 	// Also create a socket for a different VM to make sure it's not deleted
 	otherSocket := filepath.Join(tmpDir, "other-vm-1024.sock")
-	os.WriteFile(otherSocket, nil, 0600)
+	if err := os.WriteFile(otherSocket, nil, 0600); err != nil {
+		t.Fatalf("Failed to create socket file %s: %v", otherSocket, err)
+	}
 
 	vm := &VM{meta: meta, cfg: cfg}
 	vm.cleanupSockets()

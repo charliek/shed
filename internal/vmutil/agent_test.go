@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,12 +138,12 @@ func TestCheckHealthBadResponse(t *testing.T) {
 }
 
 func TestWaitForHealth(t *testing.T) {
-	calls := 0
+	var calls int32
 	dialer := &pipeDialer{
 		handler: func(conn net.Conn) {
 			defer conn.Close()
-			calls++
-			if calls < 3 {
+			n := atomic.AddInt32(&calls, 1)
+			if n < 3 {
 				// Close connection to simulate unhealthy
 				return
 			}
@@ -156,8 +157,8 @@ func TestWaitForHealth(t *testing.T) {
 	if err != nil {
 		t.Errorf("WaitForHealth() error = %v", err)
 	}
-	if calls < 3 {
-		t.Errorf("expected at least 3 health check attempts, got %d", calls)
+	if atomic.LoadInt32(&calls) < 3 {
+		t.Errorf("expected at least 3 health check attempts, got %d", atomic.LoadInt32(&calls))
 	}
 }
 
@@ -377,14 +378,18 @@ func TestExecWorkingDir(t *testing.T) {
 		Cmd: []string{"ls"},
 		TTY: false,
 	}
-	client.Exec(context.Background(), opts)
+	if err := client.Exec(context.Background(), opts); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
 	if receivedReq.WorkingDir != "/workspace" {
 		t.Errorf("default WorkingDir = %q, want %q", receivedReq.WorkingDir, "/workspace")
 	}
 
 	// Test custom working dir
 	opts.WorkingDir = "/tmp"
-	client.Exec(context.Background(), opts)
+	if err := client.Exec(context.Background(), opts); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
 	if receivedReq.WorkingDir != "/tmp" {
 		t.Errorf("custom WorkingDir = %q, want %q", receivedReq.WorkingDir, "/tmp")
 	}
