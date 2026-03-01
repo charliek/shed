@@ -45,6 +45,8 @@ RUN apt-get update && apt-get install -y \
     netcat-openbsd \
     # Build essentials (for compiling code)
     build-essential \
+    # Linux kernel (needed for VZ LinuxBootloader and in-VM modules)
+    linux-image-generic \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
@@ -125,6 +127,10 @@ RUN chmod +x /usr/local/bin/network-setup.sh
 # Copy network setup systemd service
 COPY network-setup.service /etc/systemd/system/network-setup.service
 RUN SYSTEMD_OFFLINE=1 systemctl enable network-setup
+
+# Load vsock modules at boot (required for shed-agent communication with host)
+RUN mkdir -p /etc/modules-load.d && \
+    printf "%s\n" vsock vmw_vsock_virtio_transport > /etc/modules-load.d/vsock.conf
 
 # Enable systemd-networkd for DHCP
 RUN SYSTEMD_OFFLINE=1 systemctl enable systemd-networkd systemd-resolved

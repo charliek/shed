@@ -221,9 +221,10 @@ default_backend: vz
 vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+  initrd_path: ~/Library/Application Support/shed/vz/initrd.img
   base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
   instance_dir: ~/Library/Application Support/shed/vz/instances
-  socket_dir: ~/Library/Application Support/shed/vz/sockets
+  socket_dir: ~/.shed/vz/sockets
   default_cpus: 2
   default_memory_mb: 4096
   default_disk_gb: 20
@@ -240,9 +241,10 @@ vz:
 |-------|------|---------|-------------|
 | `vfkit_path` | string | `vfkit` | Path to vfkit binary |
 | `kernel_path` | string | - | Path to decompressed Linux kernel |
+| `initrd_path` | string | - | Path to initial RAM disk image |
 | `base_rootfs` | string | - | Path to base rootfs ext4 image |
 | `instance_dir` | string | - | Directory for VM instances |
-| `socket_dir` | string | - | Directory for vsock Unix sockets |
+| `socket_dir` | string | - | Directory for vsock Unix sockets (must not contain spaces) |
 | `default_cpus` | int | `2` | Default vCPUs per VM |
 | `default_memory_mb` | int | `4096` | Default memory per VM (MB) |
 | `default_disk_gb` | int | `20` | Default disk size per VM (GB) |

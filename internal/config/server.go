@@ -103,13 +103,18 @@ type VZConfig struct {
 	// KernelPath is the path to the decompressed Linux kernel
 	KernelPath string `yaml:"kernel_path"`
 
+	// InitrdPath is the path to the initial RAM disk image
+	InitrdPath string `yaml:"initrd_path"`
+
 	// BaseRootfs is the path to the base rootfs image
 	BaseRootfs string `yaml:"base_rootfs"`
 
 	// InstanceDir is the directory for instance data
 	InstanceDir string `yaml:"instance_dir"`
 
-	// SocketDir is the directory for vsock Unix sockets
+	// SocketDir is the directory for vsock Unix sockets.
+	// NOTE: This path must not contain spaces. vfkit URL-encodes socket paths,
+	// turning spaces into %20, which causes connection failures.
 	SocketDir string `yaml:"socket_dir"`
 
 	// DefaultCPUs is the default number of vCPUs for new VMs
@@ -142,9 +147,10 @@ func DefaultVZConfig() *VZConfig {
 	return &VZConfig{
 		VfkitPath:       "vfkit",
 		KernelPath:      ExpandPath("~/Library/Application Support/shed/vz/vmlinux"),
+		InitrdPath:      ExpandPath("~/Library/Application Support/shed/vz/initrd.img"),
 		BaseRootfs:      ExpandPath("~/Library/Application Support/shed/vz/base-rootfs.ext4"),
 		InstanceDir:     ExpandPath("~/Library/Application Support/shed/vz/instances"),
-		SocketDir:       ExpandPath("~/Library/Application Support/shed/vz/sockets"),
+		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
 		DefaultCPUs:     2,
 		DefaultMemoryMB: 4096,
 		DefaultDiskGB:   20,
@@ -156,11 +162,18 @@ func DefaultVZConfig() *VZConfig {
 	}
 }
 
-// applyDefaults fills in zero-valued fields with defaults.
+// applyDefaults fills in zero-valued fields with defaults and expands ~ in paths.
 func (c *VZConfig) applyDefaults() {
 	if c.NotifyPort == 0 {
 		c.NotifyPort = 1026
 	}
+
+	// Expand ~ in paths
+	c.KernelPath = ExpandPath(c.KernelPath)
+	c.InitrdPath = ExpandPath(c.InitrdPath)
+	c.BaseRootfs = ExpandPath(c.BaseRootfs)
+	c.InstanceDir = ExpandPath(c.InstanceDir)
+	c.SocketDir = ExpandPath(c.SocketDir)
 }
 
 // Validate checks that the VZ configuration is valid.
@@ -244,9 +257,14 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	// Validate kernel and rootfs paths exist
+	// Validate kernel, initrd, and rootfs paths exist
 	if _, err := os.Stat(c.KernelPath); err != nil {
 		return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
+	}
+	if c.InitrdPath != "" {
+		if _, err := os.Stat(c.InitrdPath); err != nil {
+			return fmt.Errorf("vz: initrd_path does not exist: %s", c.InitrdPath)
+		}
 	}
 	if _, err := os.Stat(c.BaseRootfs); err != nil {
 		return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)

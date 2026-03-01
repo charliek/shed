@@ -102,7 +102,7 @@ ps aux | grep vfkit
 Each VM creates per-port Unix sockets:
 
 ```bash
-ls ~/Library/Application\ Support/shed/vz/sockets/
+ls ~/.shed/vz/sockets/
 # myproject-1024.sock  (console)
 # myproject-1025.sock  (health)
 # myproject-1026.sock  (notify)
@@ -130,7 +130,15 @@ docker run hello-world
 
 ```bash
 # Connect to the health port socket
-nc -U ~/Library/Application\ Support/shed/vz/sockets/myproject-1025.sock
+nc -U ~/.shed/vz/sockets/myproject-1025.sock
+```
+
+### View console log
+
+Each VM writes boot and console output to a log file:
+
+```bash
+cat ~/Library/Application\ Support/shed/vz/instances/myproject/console.log
 ```
 
 ### Check vfkit process

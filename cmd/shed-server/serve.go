@@ -22,12 +22,19 @@ import (
 )
 
 const (
-	// DefaultHostKeyPath is the default path for the SSH host key
-	DefaultHostKeyPath = "/etc/shed/host_key"
-
 	// shutdownTimeout is the maximum time to wait for graceful shutdown
 	shutdownTimeout = 30 * time.Second
 )
+
+// defaultHostKeyPath returns the default path for the SSH host key.
+// Uses /etc/shed/host_key when running as root (Linux servers), otherwise
+// falls back to ~/.shed/host_key (macOS development without sudo).
+func defaultHostKeyPath() string {
+	if os.Getuid() == 0 {
+		return "/etc/shed/host_key"
+	}
+	return config.ExpandPath("~/.shed/host_key")
+}
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -95,7 +102,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer be.Close()
 
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, DefaultHostKeyPath, cfg.SSHPort, cfg.Terminal)
+	sshServer, err := sshd.NewServer(be, defaultHostKeyPath(), cfg.SSHPort, cfg.Terminal)
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}

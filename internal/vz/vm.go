@@ -93,18 +93,30 @@ func (vm *VM) Start(ctx context.Context) error {
 func (vm *VM) buildVfkitArgs() []string {
 	kernelArgs := "console=hvc0 root=/dev/vda rw init=/sbin/init"
 
+	bootloader := fmt.Sprintf("linux,kernel=%s,cmdline=%s", vm.cfg.KernelPath, kernelArgs)
+	if vm.cfg.InitrdPath != "" {
+		bootloader = fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", vm.cfg.KernelPath, vm.cfg.InitrdPath, kernelArgs)
+	}
+
+	// Console log for debugging boot issues (writes guest console to a file)
+	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
+
 	args := []string{
 		"--cpus", fmt.Sprintf("%d", vm.meta.CPUs),
 		"--memory", fmt.Sprintf("%d", vm.meta.MemoryMB),
-		"--bootloader", fmt.Sprintf("linux,kernel=%s,cmdline=%s", vm.cfg.KernelPath, kernelArgs),
+		"--bootloader", bootloader,
 		"--device", fmt.Sprintf("virtio-blk,path=%s", vm.meta.RootfsPath),
+		"--device", "virtio-net,nat",
+		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLogPath),
 	}
 
-	// Add vsock devices — one per port
+	// Add vsock devices — one per port.
+	// NOTE: SocketDir must not contain spaces. vfkit URL-encodes the socketURL
+	// parameter, turning spaces into %20, which causes connection failures.
 	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort}
 	for _, port := range ports {
 		socketPath := filepath.Join(vm.cfg.SocketDir, fmt.Sprintf("%s-%d.sock", vm.meta.Name, port))
-		args = append(args, "--device", fmt.Sprintf("virtio-vsock,port=%d,socketURL=unix://%s,listen", port, socketPath))
+		args = append(args, "--device", fmt.Sprintf("virtio-vsock,port=%d,socketURL=%s,connect", port, socketPath))
 	}
 
 	return args

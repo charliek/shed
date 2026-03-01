@@ -122,8 +122,9 @@ KERNEL_PATH="$OUTPUT_DIR/vmlinux"
 # Extract the kernel from the Docker image
 # The kernel is at /boot/vmlinuz-* in Ubuntu images; we need the decompressed version
 docker run --rm --platform linux/arm64 \
+    --entrypoint /bin/bash \
     -v "$OUTPUT_DIR:/output" \
-    shed-vz-rootfs:latest bash -c "
+    shed-vz-rootfs:latest -c "
         set -euo pipefail
         VMLINUZ=\$(ls /boot/vmlinuz-* 2>/dev/null | head -1)
         if [ -z \"\$VMLINUZ\" ]; then
@@ -132,23 +133,41 @@ docker run --rm --platform linux/arm64 \
         fi
         echo \"Found kernel: \$VMLINUZ\"
 
-        # Try to extract decompressed kernel
-        # ARM64 kernels are often gzip-compressed
-        if file \"\$VMLINUZ\" | grep -q 'gzip'; then
-            echo 'Decompressing gzip kernel...'
-            zcat \"\$VMLINUZ\" > /output/vmlinux
-        elif file \"\$VMLINUZ\" | grep -q 'PE32+'; then
-            # ARM64 EFI stub kernels - copy as-is, vfkit can handle them
-            echo 'ARM64 EFI stub kernel, copying directly...'
-            cp \"\$VMLINUZ\" /output/vmlinux
+        # ARM64 vmlinuz files are gzip-compressed; decompress for VZ LinuxBootloader.
+        # Use zcat unconditionally — if the file isn't gzip, zcat will fail and
+        # we fall back to copying as-is.
+        if zcat \"\$VMLINUZ\" > /output/vmlinux 2>/dev/null; then
+            echo 'Decompressed gzip kernel'
         else
-            echo 'Copying kernel as-is...'
+            echo 'Kernel not gzip-compressed, copying as-is...'
             cp \"\$VMLINUZ\" /output/vmlinux
         fi
         echo 'Kernel extracted successfully'
     "
 
 echo "Extracted kernel: $KERNEL_PATH"
+
+# Step 6: Extract initrd
+echo ""
+echo "=== Step 6: Extracting initrd ==="
+INITRD_PATH="$OUTPUT_DIR/initrd.img"
+
+docker run --rm --platform linux/arm64 \
+    --entrypoint /bin/bash \
+    -v "$OUTPUT_DIR:/output" \
+    shed-vz-rootfs:latest -c "
+        set -euo pipefail
+        INITRD=\$(ls /boot/initrd.img-* 2>/dev/null | head -1)
+        if [ -z \"\$INITRD\" ]; then
+            echo 'ERROR: No initrd found in /boot/'
+            exit 1
+        fi
+        echo \"Found initrd: \$INITRD\"
+        cp \"\$INITRD\" /output/initrd.img
+        echo 'Initrd extracted successfully'
+    "
+
+echo "Extracted initrd: $INITRD_PATH"
 
 # Clean up the shed-agent binary from the build directory
 rm -f "$VZ_DIR/shed-agent"
@@ -157,6 +176,7 @@ echo ""
 echo "=== Build Complete ==="
 echo "Rootfs image: $ROOTFS_PATH"
 echo "Kernel: $KERNEL_PATH"
+echo "Initrd: $INITRD_PATH"
 echo ""
 echo "Next steps:"
 echo "1. Install vfkit: brew install vfkit"

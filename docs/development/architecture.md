@@ -220,5 +220,5 @@ stateDiagram-v2
 | Path | Purpose |
 |------|---------|
 | `/etc/shed/server.yaml` | Server configuration |
-| `/etc/shed/host_key` | SSH host private key |
+| `/etc/shed/host_key` or `~/.shed/host_key` | SSH host private key (root vs. non-root) |
 | `~/.shed/env` | Environment variables for containers |

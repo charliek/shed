@@ -1,0 +1,71 @@
+# Shed Server macOS Development Configuration
+#
+# Use this for local development on Apple Silicon:
+#   shed-server serve --config ./configs/server.localmac.yaml
+
+name: localmac-dev
+
+http_port: 8080
+ssh_port: 2222
+
+default_image: shed-base:latest
+
+credentials:
+  git_ssh:
+    source: ~/.ssh
+    target: /mnt/ssh-host
+    readonly: true
+
+  git_config:
+    source: ~/.gitconfig
+    target: /home/shed/.gitconfig
+    readonly: true
+
+  claude:
+    source: ~/.shed/mounts/claude
+    target: /home/shed/.claude
+    readonly: false
+
+  opencode_data:
+    source: ~/.shed/mounts/opencode/share
+    target: /home/shed/.local/share/opencode
+    readonly: false
+
+  opencode_state:
+    source: ~/.shed/mounts/opencode/state
+    target: /home/shed/.local/state/opencode
+    readonly: false
+
+  opencode_cache:
+    source: ~/.shed/mounts/opencode/cache
+    target: /home/shed/.cache/opencode
+    readonly: false
+
+  gh:
+    source: ~/.shed/mounts/gh
+    target: /home/shed/.config/gh
+    readonly: false
+
+env_file: ~/.shed/env
+
+log_level: debug
+
+enabled_backends:
+  - vz
+default_backend: vz
+
+vz:
+  vfkit_path: vfkit
+  kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+  initrd_path: ~/Library/Application Support/shed/vz/initrd.img
+  base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+  instance_dir: ~/Library/Application Support/shed/vz/instances
+  socket_dir: ~/.shed/vz/sockets
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  console_port: 1024
+  health_port: 1025
+  notify_port: 1026
+  start_timeout: 60s
+  stop_timeout: 10s

@@ -199,11 +199,11 @@ shed sessions --all
 
 ## Server Setup
 
-See [docs/SERVER_SETUP.md](docs/SERVER_SETUP.md) for detailed server installation and configuration instructions.
+See [Server Setup](docs/getting-started/server-setup.md) for detailed server installation and configuration instructions.
 
 ## Development
 
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for building from source and contributing.
+See [Development Setup](docs/development/setup.md) for building from source and contributing.
 
 ## Configuration
 
@@ -256,9 +256,10 @@ env_file: ~/.shed/env
 # vz:
 #   vfkit_path: vfkit
 #   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+#   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
 #   base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
 #   instance_dir: ~/Library/Application Support/shed/vz/instances
-#   socket_dir: ~/Library/Application Support/shed/vz/sockets
+#   socket_dir: ~/.shed/vz/sockets
 #   default_cpus: 2
 #   default_memory_mb: 4096
 ```

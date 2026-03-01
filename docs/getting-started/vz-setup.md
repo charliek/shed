@@ -38,7 +38,7 @@ make build
 
 ### 3. Build the VZ rootfs
 
-The rootfs build script creates an ext4 disk image and extracts the kernel:
+The rootfs build script creates an ext4 disk image, extracts the kernel, and extracts the initrd:
 
 ```bash
 ./scripts/build-vz-rootfs.sh
@@ -48,6 +48,7 @@ This produces:
 
 - `~/Library/Application Support/shed/vz/base-rootfs.ext4` - Root filesystem
 - `~/Library/Application Support/shed/vz/vmlinux` - Decompressed kernel
+- `~/Library/Application Support/shed/vz/initrd.img` - Initial RAM disk
 
 You can override the output directory with `OUTPUT_DIR`:
 
@@ -59,7 +60,7 @@ OUTPUT_DIR=/path/to/output ./scripts/build-vz-rootfs.sh
 
 ```bash
 mkdir -p ~/Library/Application\ Support/shed/vz/instances
-mkdir -p ~/Library/Application\ Support/shed/vz/sockets
+mkdir -p ~/.shed/vz/sockets
 ```
 
 ### 5. Configure the server
@@ -78,9 +79,10 @@ default_backend: vz
 vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+  initrd_path: ~/Library/Application Support/shed/vz/initrd.img
   base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
   instance_dir: ~/Library/Application Support/shed/vz/instances
-  socket_dir: ~/Library/Application Support/shed/vz/sockets
+  socket_dir: ~/.shed/vz/sockets  # Must not contain spaces (vfkit limitation)
   default_cpus: 2
   default_memory_mb: 4096
   default_disk_gb: 20
@@ -149,10 +151,10 @@ The rootfs is a standard ext4 image, same as Firecracker. Each instance gets its
 : Check that you're running macOS 13+ (Ventura or later).
 
 **VM fails to boot**
-: Verify `kernel_path` and `base_rootfs` point to valid files. Check that the rootfs was built successfully.
+: Verify `kernel_path`, `initrd_path`, and `base_rootfs` point to valid files. Check that the rootfs was built successfully. Check the console log at `<instance_dir>/<name>/console.log` for boot messages.
 
 **Health check timeout**
-: Check that vsock socket files exist in the socket directory. Verify vfkit is running with `ps aux | grep vfkit`.
+: Check that vsock socket files exist in `~/.shed/vz/sockets/`. Verify vfkit is running with `ps aux | grep vfkit`. Check the console log for systemd boot errors.
 
 **Permission denied**
 : Ensure the entitlements plist is applied to the binary via code signing.

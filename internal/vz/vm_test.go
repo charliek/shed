@@ -24,6 +24,7 @@ func TestBuildVfkitArgs(t *testing.T) {
 	cfg := &config.VZConfig{
 		VfkitPath:   "vfkit",
 		KernelPath:  "/tmp/vmlinux",
+		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
 		HealthPort:  1025,
@@ -49,19 +50,29 @@ func TestBuildVfkitArgs(t *testing.T) {
 		t.Errorf("expected rootfs path in args, got: %s", argsStr)
 	}
 
-	// Check vsock devices for each port
+	// Check virtio-net NAT device
+	if !strings.Contains(argsStr, "virtio-net,nat") {
+		t.Errorf("expected virtio-net,nat in args, got: %s", argsStr)
+	}
+
+	// Check virtio-serial console log device
+	if !strings.Contains(argsStr, "virtio-serial,logFilePath=") {
+		t.Errorf("expected virtio-serial console log in args, got: %s", argsStr)
+	}
+
+	// Check vsock devices for each port (connect mode, no unix:// prefix)
 	for _, port := range []uint32{1024, 1025, 1026} {
 		socketPath := filepath.Join(cfg.SocketDir, fmt.Sprintf("test-vm-%d.sock", port))
-		expected := fmt.Sprintf("port=%d,socketURL=unix://%s,listen", port, socketPath)
+		expected := fmt.Sprintf("port=%d,socketURL=%s,connect", port, socketPath)
 		if !strings.Contains(argsStr, expected) {
 			t.Errorf("expected vsock device for port %d in args, got: %s", port, argsStr)
 		}
 	}
 
-	// Should have exactly 4 --device flags (1 block + 3 vsock)
+	// Should have exactly 6 --device flags (1 block + 1 net + 1 serial + 3 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 4 {
-		t.Errorf("expected 4 --device flags (1 block + 3 vsock), got %d", deviceCount)
+	if deviceCount != 6 {
+		t.Errorf("expected 6 --device flags (1 block + 1 net + 1 serial + 3 vsock), got %d", deviceCount)
 	}
 }
 
@@ -69,6 +80,7 @@ func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 	meta := &Metadata{Name: "test-vm", CPUs: 2, MemoryMB: 4096, RootfsPath: "/tmp/rootfs.ext4"}
 	cfg := &config.VZConfig{
 		KernelPath:  "/tmp/vmlinux",
+		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
 		HealthPort:  1025,
