@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -143,7 +144,10 @@ func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []st
 		return nil
 	}
 
-	args := []string{"tar", "-czf", "-", "-C", target}
+	// Ephemeral files (e.g. SQLite WAL, git lock files) may be deleted between
+	// the fsnotify event and this tar invocation. --ignore-failed-read makes tar
+	// skip missing files instead of exiting fatally with code 2.
+	args := []string{"tar", "--ignore-failed-read", "-czf", "-", "-C", target}
 	args = append(args, escapedFiles...)
 
 	tarBuf := &limitedBuffer{max: maxCredentialArchiveSize}
@@ -159,7 +163,21 @@ func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []st
 	execCtx, execCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer execCancel()
 	if err := nl.agent.Exec(execCtx, opts); err != nil {
-		return fmt.Errorf("failed to tar changed files: %w (stderr: %s)", err, stderrBuf.String())
+		// With --ignore-failed-read, tar exits 1 when files vanish between
+		// notification and archival. This is expected for ephemeral files
+		// (WAL, lock files) and the archive still contains surviving files.
+		var exitErr *ExitError
+		if errors.As(err, &exitErr) && exitErr.Code == 1 {
+			log.Printf("[%s] tar exited with code 1 for %q (some files missing), continuing with partial archive", nl.name, credName)
+		} else {
+			return fmt.Errorf("failed to tar changed files: %w (stderr: %s)", err, stderrBuf.String())
+		}
+	}
+
+	// All notified files may have been removed before tar ran (e.g. a
+	// transient WAL file that was checkpointed away). Nothing to extract.
+	if tarBuf.buf.Len() == 0 {
+		return nil
 	}
 
 	if nl.watcher != nil {

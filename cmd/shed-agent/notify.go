@@ -181,9 +181,19 @@ func (cw *credentialWatcher) flushCredential(credName string) {
 		return
 	}
 
+	// Ephemeral files (SQLite WAL, git lock files, etc.) may be deleted
+	// between the fsnotify event and this flush. Filter them out to avoid
+	// sending the host a list of files that no longer exist.
+	target := cw.credentials[credName]
 	var fileList []string
 	for f := range files {
+		if _, err := os.Stat(filepath.Join(target, f)); err != nil {
+			continue
+		}
 		fileList = append(fileList, f)
+	}
+	if len(fileList) == 0 {
+		return
 	}
 
 	msg := FileChangedMessage{
