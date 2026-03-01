@@ -23,11 +23,42 @@ credentials:
     target: /home/shed/.gitconfig
     readonly: true
 
-  # Claude Code - container-specific credentials
+  # Claude Code - credentials and settings
   claude:
     source: /home/charliek/.shed/mounts/claude
     target: /home/shed/.claude
     readonly: false
+    exclude:
+      - "debug/*"
+      - "file-history/*"
+      - "plans/*"
+      - "backups/*"
+      - "cache/*"
+      - "tasks/*"
+      - "todos/*"
+      - "paste-cache/*"
+      - "shell-snapshots/*"
+      - "session-env/*"
+      - "downloads/*"
+      - "telemetry/*"
+
+  # Codex CLI - credentials and config
+  codex:
+    source: /home/charliek/.shed/mounts/codex
+    target: /home/shed/.codex
+    readonly: false
+    exclude:
+      - "sessions/*"
+      - "archived_sessions/*"
+      - "vendor_imports/*"
+      - "log/*"
+      - "tmp/*"
+      - "shell_snapshots/*"
+      - "sqlite/*"
+      - "*.sqlite"
+      - "*.sqlite-shm"
+      - "*.sqlite-wal"
+      - "models_cache.json"
 
   # OpenCode - data and state directories
   opencode_data:

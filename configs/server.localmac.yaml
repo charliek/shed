@@ -25,6 +25,36 @@ credentials:
     source: ~/.shed/mounts/claude
     target: /home/shed/.claude
     readonly: false
+    exclude:
+      - "debug/*"
+      - "file-history/*"
+      - "plans/*"
+      - "backups/*"
+      - "cache/*"
+      - "tasks/*"
+      - "todos/*"
+      - "paste-cache/*"
+      - "shell-snapshots/*"
+      - "session-env/*"
+      - "downloads/*"
+      - "telemetry/*"
+
+  codex:
+    source: ~/.shed/mounts/codex
+    target: /home/shed/.codex
+    readonly: false
+    exclude:
+      - "sessions/*"
+      - "archived_sessions/*"
+      - "vendor_imports/*"
+      - "log/*"
+      - "tmp/*"
+      - "shell_snapshots/*"
+      - "sqlite/*"
+      - "*.sqlite"
+      - "*.sqlite-shm"
+      - "*.sqlite-wal"
+      - "models_cache.json"
 
   opencode_data:
     source: ~/.shed/mounts/opencode/share
