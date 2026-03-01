@@ -29,21 +29,28 @@ credentials:
     target: /home/shed/.claude
     readonly: false
 
-  # OpenCode - 3 directories for data, state, and cache
+  # OpenCode - data and state directories
   opencode_data:
     source: /home/charliek/.shed/mounts/opencode/share
     target: /home/shed/.local/share/opencode
     readonly: false
+    exclude:
+      - "*.db"
+      - "*.db-shm"
+      - "*.db-wal"
+      - "log/*"
+      - "storage/*"
 
   opencode_state:
     source: /home/charliek/.shed/mounts/opencode/state
     target: /home/shed/.local/state/opencode
     readonly: false
 
-  opencode_cache:
-    source: /home/charliek/.shed/mounts/opencode/cache
-    target: /home/shed/.cache/opencode
-    readonly: false
+  # Disabled - ephemeral cache that auto-regenerates on first opencode launch
+  # opencode_cache:
+  #   source: /home/charliek/.shed/mounts/opencode/cache
+  #   target: /home/shed/.cache/opencode
+  #   readonly: false
 
   # GitHub CLI - credentials and config
   gh:

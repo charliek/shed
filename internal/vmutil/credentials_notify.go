@@ -72,11 +72,15 @@ type credentialNotifyHandler struct {
 func (h *credentialNotifyHandler) OnConnect(conn net.Conn) error {
 	// Build credential mappings (only writable ones)
 	credentials := make(map[string]string)
+	excludes := make(map[string][]string)
 	for name, mount := range h.nl.serverCfg.Credentials {
 		if mount.ReadOnly {
 			continue
 		}
 		credentials[name] = mount.Target
+		if len(mount.Exclude) > 0 {
+			excludes[name] = mount.Exclude
+		}
 	}
 
 	if len(credentials) == 0 {
@@ -87,6 +91,7 @@ func (h *credentialNotifyHandler) OnConnect(conn net.Conn) error {
 	// Send setup message
 	setup := agentproto.NotifySetupMessage{
 		Credentials: credentials,
+		Excludes:    excludes,
 	}
 	setupData, err := json.Marshal(setup)
 	if err != nil {
@@ -135,6 +140,9 @@ func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []st
 		cleaned := filepath.Clean(f)
 		if strings.HasPrefix(cleaned, "..") || filepath.IsAbs(cleaned) {
 			log.Printf("[%s] Skipping suspicious path: %s", nl.name, f)
+			continue
+		}
+		if mount.MatchesExclude(cleaned) {
 			continue
 		}
 		escapedFiles = append(escapedFiles, cleaned)

@@ -690,6 +690,44 @@ func TestDefaultVZConfig(t *testing.T) {
 	}
 }
 
+func TestMountConfigMatchesExclude(t *testing.T) {
+	m := MountConfig{
+		Exclude: []string{"*.db", "*.db-shm", "*.db-wal", "log/*", "storage/*"},
+	}
+
+	tests := []struct {
+		relPath string
+		want    bool
+	}{
+		{"opencode.db", true},
+		{"opencode.db-shm", true},
+		{"opencode.db-wal", true},
+		{"log/output.log", true},
+		{"storage/data.bin", true},
+		{"auth.json", false},
+		{"config.yaml", false},
+		{"nested/auth.json", false},
+		// Patterns only match the final path component by default
+		{"nested/opencode.db", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.relPath, func(t *testing.T) {
+			got := m.MatchesExclude(tt.relPath)
+			if got != tt.want {
+				t.Errorf("MatchesExclude(%q) = %v, want %v", tt.relPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMountConfigMatchesExcludeEmpty(t *testing.T) {
+	m := MountConfig{}
+	if m.MatchesExclude("anything.db") {
+		t.Error("MatchesExclude should return false with no patterns")
+	}
+}
+
 func TestVZConfigApplyDefaults(t *testing.T) {
 	cfg := &VZConfig{}
 	cfg.applyDefaults()

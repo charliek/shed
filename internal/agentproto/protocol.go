@@ -28,7 +28,8 @@ const (
 
 // NotifySetupMessage is sent from host to agent to configure credential watchers.
 type NotifySetupMessage struct {
-	Credentials map[string]string `json:"credentials"` // name → target path in VM
+	Credentials map[string]string   `json:"credentials"`          // name → target path in VM
+	Excludes    map[string][]string `json:"excludes,omitempty"`   // name → exclude patterns
 }
 
 // FileChangedMessage is sent from agent to host when credential files change.

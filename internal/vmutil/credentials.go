@@ -59,7 +59,7 @@ func (ct *CredentialTransfer) TransferCredential(ctx context.Context, name strin
 		return fmt.Errorf("failed to stat source %s: %w", source, err)
 	}
 
-	tarData, err := ct.createTarArchive(source, info)
+	tarData, err := ct.createTarArchive(source, info, mount.Exclude)
 	if err != nil {
 		return fmt.Errorf("failed to create tar archive: %w", err)
 	}
@@ -106,7 +106,8 @@ func (ct *CredentialTransfer) TransferCredential(ctx context.Context, name strin
 }
 
 // createTarArchive creates a gzipped tar archive of the source path.
-func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo) ([]byte, error) {
+// Files whose relative path matches any of the exclude patterns are skipped.
+func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo, exclude []string) ([]byte, error) {
 	var buf bytes.Buffer
 	gzw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gzw)
@@ -123,6 +124,13 @@ func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo) 
 			}
 
 			if relPath == "." {
+				return nil
+			}
+
+			if matchesExclude(relPath, exclude) {
+				if fi.IsDir() {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 
@@ -145,6 +153,16 @@ func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo) 
 	}
 
 	return buf.Bytes(), nil
+}
+
+// matchesExclude reports whether relPath matches any of the given glob patterns.
+func matchesExclude(relPath string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matched, _ := filepath.Match(pattern, relPath); matched {
+			return true
+		}
+	}
+	return false
 }
 
 // addToTar adds a file or directory entry to the tar archive.

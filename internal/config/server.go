@@ -342,9 +342,21 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 
 // MountConfig represents a bind mount configuration.
 type MountConfig struct {
-	Source   string `yaml:"source"`
-	Target   string `yaml:"target"`
-	ReadOnly bool   `yaml:"readonly"`
+	Source   string   `yaml:"source"`
+	Target   string   `yaml:"target"`
+	ReadOnly bool     `yaml:"readonly"`
+	Exclude  []string `yaml:"exclude,omitempty"`
+}
+
+// MatchesExclude reports whether the given relative path matches any of the
+// mount's exclude patterns. Patterns use filepath.Match glob syntax.
+func (m MountConfig) MatchesExclude(relPath string) bool {
+	for _, pattern := range m.Exclude {
+		if matched, _ := filepath.Match(pattern, relPath); matched {
+			return true
+		}
+	}
+	return false
 }
 
 // DefaultServerConfig returns a ServerConfig with default values.

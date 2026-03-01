@@ -28,7 +28,7 @@ func TestCreateTarArchiveSingleFile(t *testing.T) {
 
 	ct := &CredentialTransfer{}
 	info, _ := os.Stat(testFile)
-	tarData, err := ct.createTarArchive(testFile, info)
+	tarData, err := ct.createTarArchive(testFile, info, nil)
 	if err != nil {
 		t.Fatalf("createTarArchive() error = %v", err)
 	}
@@ -61,7 +61,7 @@ func TestCreateTarArchiveDirectory(t *testing.T) {
 
 	ct := &CredentialTransfer{}
 	info, _ := os.Stat(credDir)
-	tarData, err := ct.createTarArchive(credDir, info)
+	tarData, err := ct.createTarArchive(credDir, info, nil)
 	if err != nil {
 		t.Fatalf("createTarArchive() error = %v", err)
 	}
@@ -81,6 +81,86 @@ func TestCreateTarArchiveDirectory(t *testing.T) {
 	}
 	if !names[filepath.Join("subdir", "config")] {
 		t.Error("expected subdir/config in tar archive")
+	}
+}
+
+func TestCreateTarArchiveWithExclude(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "cred-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create a directory with files — some should be excluded
+	credDir := filepath.Join(tmpDir, "opencode")
+	os.MkdirAll(filepath.Join(credDir, "log"), 0755)
+	os.MkdirAll(filepath.Join(credDir, "storage"), 0755)
+	os.WriteFile(filepath.Join(credDir, "auth.json"), []byte(`{"token":"abc"}`), 0600)
+	os.WriteFile(filepath.Join(credDir, "opencode.db"), []byte("sqlitedata"), 0600)
+	os.WriteFile(filepath.Join(credDir, "opencode.db-shm"), []byte("shm"), 0600)
+	os.WriteFile(filepath.Join(credDir, "opencode.db-wal"), []byte("wal"), 0600)
+	os.WriteFile(filepath.Join(credDir, "log", "output.log"), []byte("logdata"), 0600)
+	os.WriteFile(filepath.Join(credDir, "storage", "data.bin"), []byte("bindata"), 0600)
+
+	exclude := []string{"*.db", "*.db-shm", "*.db-wal", "log/*", "storage/*"}
+
+	ct := &CredentialTransfer{}
+	info, _ := os.Stat(credDir)
+	tarData, err := ct.createTarArchive(credDir, info, exclude)
+	if err != nil {
+		t.Fatalf("createTarArchive() error = %v", err)
+	}
+
+	entries := extractTarEntries(t, tarData)
+	names := make(map[string]bool)
+	for _, e := range entries {
+		names[e.name] = true
+	}
+
+	// auth.json should be included
+	if !names["auth.json"] {
+		t.Error("expected auth.json in tar archive")
+	}
+
+	// Excluded files should NOT be present
+	for _, excluded := range []string{"opencode.db", "opencode.db-shm", "opencode.db-wal", "log/output.log", "storage/data.bin"} {
+		if names[excluded] {
+			t.Errorf("expected %s to be excluded from tar archive", excluded)
+		}
+	}
+}
+
+func TestMatchesExclude(t *testing.T) {
+	patterns := []string{"*.db", "*.db-shm", "*.db-wal", "log/*"}
+
+	tests := []struct {
+		relPath string
+		want    bool
+	}{
+		{"opencode.db", true},
+		{"test.db-shm", true},
+		{"test.db-wal", true},
+		{"log/output.log", true},
+		{"auth.json", false},
+		{"config.yaml", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.relPath, func(t *testing.T) {
+			got := matchesExclude(tt.relPath, patterns)
+			if got != tt.want {
+				t.Errorf("matchesExclude(%q) = %v, want %v", tt.relPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesExcludeEmpty(t *testing.T) {
+	if matchesExclude("anything.db", nil) {
+		t.Error("matchesExclude should return false with nil patterns")
+	}
+	if matchesExclude("anything.db", []string{}) {
+		t.Error("matchesExclude should return false with empty patterns")
 	}
 }
 

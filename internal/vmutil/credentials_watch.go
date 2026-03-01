@@ -208,9 +208,12 @@ func (cw *CredentialWatcher) addRecursiveWatch(root string) error {
 }
 
 // resolveCredential finds which credential a file path belongs to.
+// Returns empty string if the path doesn't belong to any credential or
+// if the relative path within the credential matches an exclude pattern.
 func (cw *CredentialWatcher) resolveCredential(absPath string) string {
 	var bestName string
 	var bestLen int
+	var bestMount config.MountConfig
 	for name, mount := range cw.serverCfg.Credentials {
 		if mount.ReadOnly {
 			continue
@@ -219,7 +222,18 @@ func (cw *CredentialWatcher) resolveCredential(absPath string) string {
 			if len(mount.Source) > bestLen {
 				bestName = name
 				bestLen = len(mount.Source)
+				bestMount = mount
 			}
+		}
+	}
+	if bestName == "" {
+		return ""
+	}
+	// Check if the relative path matches an exclude pattern
+	if len(bestMount.Exclude) > 0 && absPath != bestMount.Source {
+		rel, err := filepath.Rel(bestMount.Source, absPath)
+		if err == nil && bestMount.MatchesExclude(rel) {
+			return ""
 		}
 	}
 	return bestName

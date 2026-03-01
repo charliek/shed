@@ -30,16 +30,23 @@ credentials:
     source: ~/.shed/mounts/opencode/share
     target: /home/shed/.local/share/opencode
     readonly: false
+    exclude:
+      - "*.db"
+      - "*.db-shm"
+      - "*.db-wal"
+      - "log/*"
+      - "storage/*"
 
   opencode_state:
     source: ~/.shed/mounts/opencode/state
     target: /home/shed/.local/state/opencode
     readonly: false
 
-  opencode_cache:
-    source: ~/.shed/mounts/opencode/cache
-    target: /home/shed/.cache/opencode
-    readonly: false
+  # Disabled - ephemeral cache that auto-regenerates on first opencode launch
+  # opencode_cache:
+  #   source: ~/.shed/mounts/opencode/cache
+  #   target: /home/shed/.cache/opencode
+  #   readonly: false
 
   gh:
     source: ~/.shed/mounts/gh
