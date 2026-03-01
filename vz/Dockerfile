@@ -25,9 +25,12 @@ RUN apt-get update && apt-get install -y \
     # Development tools
     tmux \
     git \
+    gh \
     curl \
     wget \
     vim \
+    neovim \
+    jed \
     nano \
     htop \
     jq \
@@ -62,25 +65,6 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        containerd.io \
        docker-buildx-plugin \
        docker-compose-plugin \
-    && rm -rf /var/lib/apt/lists/*
-
-# Node.js 22.x
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# Claude Code
-RUN npm install -g @anthropic-ai/claude-code
-
-# OpenCode
-RUN npm i -g opencode-ai
-
-# GitHub CLI
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure systemd
@@ -162,16 +146,45 @@ RUN mkdir -p /etc/systemd/network && \
 # Switch to shed user for user-level tool installs
 USER shed
 
+ENV PATH="/home/shed/.local/bin:${PATH}"
+
 # mise (version manager)
 RUN curl https://mise.run | sh
-ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:${PATH}"
+RUN echo 'eval "$(mise activate bash)"' >> /home/shed/.bashrc
+ENV PATH="/home/shed/.local/share/mise/shims:${PATH}"
+
+RUN mise use -g \
+    node@lts \
+    github:charliek/prox \
+    github:charliek/envsecrets
+
+# Claude Code
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# OpenCode
+RUN curl -fsSL https://opencode.ai/install | bash
+
+# Cursor CLI (agent)
+RUN curl https://cursor.com/install -fsS | bash
+
+# Codex cli 
+RUN npm i -g @openai/codex
 
 # UV + Python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN /home/shed/.local/bin/uv python install 3.13
 
-# Shell customization - colored prompt showing shed name and path
-RUN echo 'export PS1="\\[\\033[1;36m\\][\\[\\033[1;32m\\]shed:\\${SHED_NAME:-dev}\\[\\033[1;36m\\]]\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ "' >> /home/shed/.bashrc
+# Shell customization - colored prompt showing shed name, path, and git branch
+RUN cat >> /home/shed/.bashrc << 'PROMPT_EOF'
+__git_prompt() {
+    local branch
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null) || return
+    local dirty=""
+    [ -n "$(git status --porcelain 2>/dev/null)" ] && dirty=$'\001\033[31m\002✗'
+    printf " \001\033[01;32m\002(%s)%s\001\033[00m\002" "$branch" "$dirty"
+}
+export PS1='\[\033[1;36m\][\[\033[1;32m\]shed:${SHED_NAME:-dev}\[\033[1;36m\]]\[\033[0m\] \[\033[01;34m\]\w\[\033[00m\]$(__git_prompt) \$ '
+PROMPT_EOF
 
 # Switch back to root for systemd entrypoint
 USER root
