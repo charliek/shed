@@ -33,76 +33,56 @@ func NewFirecrackerDialer(socketPath string) *FirecrackerDialer {
 // 3. Read response "OK <port>\n"
 // 4. Then the connection is bridged to the guest
 func (d *FirecrackerDialer) Dial(ctx context.Context, port uint32) (net.Conn, error) {
-	type dialResult struct {
-		conn net.Conn
-		err  error
+	// Use context-aware dialing so cancellation unblocks the connect.
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", d.socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to vsock socket: %w", err)
 	}
-	result := make(chan dialResult, 1)
-	done := make(chan struct{})
 
+	// Close conn on ctx cancel so handshake I/O is bounded.
+	cancelDone := make(chan struct{})
 	go func() {
-		conn, err := net.Dial("unix", d.socketPath)
-		if err != nil {
-			select {
-			case result <- dialResult{nil, fmt.Errorf("failed to connect to vsock socket: %w", err)}:
-			case <-done:
-			}
-			return
-		}
-
-		connectCmd := fmt.Sprintf("CONNECT %d\n", port)
-		if _, err := conn.Write([]byte(connectCmd)); err != nil {
-			conn.Close()
-			select {
-			case result <- dialResult{nil, fmt.Errorf("failed to send CONNECT command: %w", err)}:
-			case <-done:
-			}
-			return
-		}
-
-		reader := bufio.NewReader(conn)
-		response, err := reader.ReadString('\n')
-		if err != nil {
-			conn.Close()
-			select {
-			case result <- dialResult{nil, fmt.Errorf("failed to read CONNECT response: %w", err)}:
-			case <-done:
-			}
-			return
-		}
-
-		response = strings.TrimSpace(response)
-		if !strings.HasPrefix(response, "OK ") {
-			conn.Close()
-			select {
-			case result <- dialResult{nil, fmt.Errorf("vsock CONNECT failed: %s", response)}:
-			case <-done:
-			}
-			return
-		}
-
-		wrapped := &vsockConn{Conn: conn, reader: reader}
 		select {
-		case result <- dialResult{wrapped, nil}:
-		case <-done:
-			_ = conn.Close()
+		case <-ctx.Done():
+			conn.Close()
+		case <-cancelDone:
 		}
 	}()
 
-	select {
-	case r := <-result:
-		return r.conn, r.err
-	case <-ctx.Done():
-		close(done)
-		select {
-		case r := <-result:
-			if r.conn != nil {
-				_ = r.conn.Close()
-			}
-		default:
-		}
+	// handshakeFailed closes the cancel goroutine and the connection.
+	handshakeFailed := func(fmtStr string, args ...interface{}) (net.Conn, error) {
+		close(cancelDone)
+		conn.Close()
+		return nil, fmt.Errorf(fmtStr, args...)
+	}
+
+	connectCmd := fmt.Sprintf("CONNECT %d\n", port)
+	if _, err := conn.Write([]byte(connectCmd)); err != nil {
+		return handshakeFailed("failed to send CONNECT command: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		return handshakeFailed("failed to read CONNECT response: %w", err)
+	}
+
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "OK ") {
+		return handshakeFailed("vsock CONNECT failed: %s", response)
+	}
+
+	// Handshake succeeded — stop the cancel-close goroutine.
+	close(cancelDone)
+
+	// The cancel goroutine may have already selected ctx.Done() and closed
+	// conn before observing cancelDone. Check for that race.
+	if ctx.Err() != nil {
+		conn.Close()
 		return nil, ctx.Err()
 	}
+
+	return &vsockConn{Conn: conn, reader: reader}, nil
 }
 
 // vsockConn wraps a net.Conn with a buffered reader for the initial handshake.

@@ -358,6 +358,124 @@ func TestExecResizeGoroutineExitsOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestExecEOFBeforeExitCode(t *testing.T) {
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			agentproto.ReadMessage(conn) // exec request
+			agentproto.ReadMessage(conn) // stdin EOF
+			// Close connection without sending exit code
+		},
+	}
+
+	client := NewAgentClient(dialer, 1024, 1025, 1026)
+
+	opts := backend.ExecOptions{
+		Cmd: []string{"crash"},
+		TTY: false,
+	}
+
+	err := client.Exec(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Exec() expected error when connection closes before exit code")
+	}
+	if !strings.Contains(err.Error(), "connection closed before exit code received") {
+		t.Errorf("Exec() error = %q, want error about connection closed before exit code", err.Error())
+	}
+}
+
+func TestExecResizeGoroutineExitsOnCompletion(t *testing.T) {
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			agentproto.ReadMessage(conn) // exec request
+			agentproto.ReadMessage(conn) // stdin EOF
+			time.Sleep(50 * time.Millisecond)
+			agentproto.WriteExitCode(conn, 0)
+		},
+	}
+
+	client := NewAgentClient(dialer, 1024, 1025, 1026)
+
+	resizeCh := make(chan backend.TerminalSize)
+	opts := backend.ExecOptions{
+		Cmd:        []string{"echo", "test"},
+		TTY:        true,
+		ResizeChan: resizeCh,
+	}
+
+	// Use a background context that will NOT be cancelled.
+	// The resize goroutine must exit via execDone, not ctx.Done().
+	err := client.Exec(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+
+	// After Exec returns, try sending to the resize channel.
+	// If the goroutine exited (via execDone), nobody is receiving, so the
+	// send blocks until timeout — that's the success case.
+	// If the goroutine is still alive, it consumes the send — that's a failure.
+	select {
+	case resizeCh <- backend.TerminalSize{Width: 80, Height: 24}:
+		t.Fatal("resize goroutine is still running after Exec returned")
+	case <-time.After(200 * time.Millisecond):
+		// Good: nobody consumed the send, goroutine has exited
+	}
+}
+
+// blockingReader is a reader that blocks until its context is cancelled.
+type blockingReader struct {
+	ctx context.Context
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func (r *blockingReader) Close() error {
+	return nil
+}
+
+func TestExecStdinDoesNotBlockAfterCompletion(t *testing.T) {
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			agentproto.ReadMessage(conn) // exec request
+			// Don't read stdin — just send exit code immediately
+			time.Sleep(50 * time.Millisecond)
+			agentproto.WriteExitCode(conn, 0)
+		},
+	}
+
+	client := NewAgentClient(dialer, 1024, 1025, 1026)
+
+	// Create a context that we'll cancel after the test to clean up the blocking reader
+	readerCtx, readerCancel := context.WithCancel(context.Background())
+	defer readerCancel()
+
+	opts := backend.ExecOptions{
+		Cmd:   []string{"true"},
+		Stdin: &blockingReader{ctx: readerCtx},
+		TTY:   false,
+	}
+
+	// Exec should return promptly even though stdin is blocking
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Exec(context.Background(), opts)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Exec() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Exec() did not return within 5 seconds — stdin is blocking completion")
+	}
+}
+
 func TestExecWorkingDir(t *testing.T) {
 	var receivedReq agentproto.ExecRequest
 
