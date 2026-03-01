@@ -114,6 +114,8 @@ credentials:
     readonly: true           # Optional, default false
 ```
 
+**Missing sources:** If a credential's source path does not exist on the host, it is skipped with a log warning. The credential is not transferred to the VM and is not registered for bidirectional sync. Create the source directory on the host before starting the shed to enable sync.
+
 **Note:** For Firecracker and VZ, only read-only credentials lack live sync — changes on either side require a restart. Writable credentials (`readonly: false`) sync bidirectionally while the VM is running: host-side changes push to the VM, and in-VM changes (e.g., token refreshes) sync back to the host with 2-second echo suppression.
 
 **Common credential mounts:**

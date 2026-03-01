@@ -57,10 +57,20 @@ func (vm *VM) Start(ctx context.Context) error {
 	}
 
 	cmd := exec.Command(vm.cfg.VfkitPath, args...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+
+	// Redirect vfkit output to the console log instead of server stderr.
+	// This captures vfkit INFO lines and tcpproxy retry noise for debugging
+	// without cluttering the server log.
+	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
+	consoleLog, err := os.OpenFile(consoleLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open console log: %w", err)
+	}
+	cmd.Stdout = consoleLog
+	cmd.Stderr = consoleLog
 
 	if err := cmd.Start(); err != nil {
+		consoleLog.Close()
 		return fmt.Errorf("failed to start vfkit: %w", err)
 	}
 
@@ -70,10 +80,14 @@ func (vm *VM) Start(ctx context.Context) error {
 	// Reap the child process in the background to prevent zombies
 	waitCh := make(chan struct{})
 	vm.waitCh = waitCh
-	go func(cmd *exec.Cmd, done chan struct{}) {
-		_ = cmd.Wait()
+	go func(cmd *exec.Cmd, done chan struct{}, logFile *os.File) {
+		err := cmd.Wait()
+		logFile.Close()
+		if err != nil {
+			log.Printf("[%s] vfkit exited unexpectedly: %v", vm.meta.Name, err)
+		}
 		close(done)
-	}(cmd, waitCh)
+	}(cmd, waitCh, consoleLog)
 
 	// Wait for the agent to be healthy
 	dialer := NewVZDialer(vm.cfg.SocketDir, vm.meta.Name)
