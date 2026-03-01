@@ -250,6 +250,11 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 		}
 	}
 
+	// Close the PTY master to unblock the output goroutine. Without this,
+	// ptmx.Read() can block indefinitely after the process exits because
+	// the PTY master doesn't always deliver EOF promptly on Linux.
+	ptmx.Close()
+
 	// Wait for output to be flushed before sending exit code
 	outputWg.Wait()
 
