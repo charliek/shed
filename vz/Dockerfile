@@ -147,6 +147,11 @@ RUN mkdir -p /etc/systemd/network && \
     "DHCP=yes" \
     > /etc/systemd/network/80-dhcp.network
 
+# Enable IPv4 forwarding so Docker bridge networks can reach the internet.
+# Without this, containers on docker-compose networks cannot route through
+# the VM's enp0s1 interface to the VZ NAT gateway.
+RUN printf "net.ipv4.ip_forward=1\n" > /etc/sysctl.d/99-docker-forward.conf
+
 # Switch to shed user for user-level tool installs
 USER shed
 
