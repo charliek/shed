@@ -7,12 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"path/filepath"
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // Compile-time check that FirecrackerBackend implements backend.Backend.
@@ -80,33 +79,26 @@ func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) 
 		return nil, config.ErrShedNotRunningSentinel
 	}
 
-	// Execute tmux list-sessions via vsock
-	vsockPath := filepath.Join(b.client.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, b.client.cfg.ConsolePort, b.client.cfg.HealthPort, b.client.cfg.NotifyPort)
+	agent := b.client.newAgentClient(meta.Name)
 
-	// Create a simple exec to run tmux list-sessions
-	// We'll capture output and parse it
 	var output strings.Builder
 	opts := backend.ExecOptions{
 		Cmd:    []string{"tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_attached}:#{session_windows}"},
-		Stdout: &nopWriteCloser{&output},
+		Stdout: vmutil.NopWriteCloser(&output),
 		TTY:    false,
 	}
 
-	if err := vsockClient.Exec(ctx, opts); err != nil {
-		// tmux server might not be running
+	if err := agent.Exec(ctx, opts); err != nil {
 		if strings.Contains(err.Error(), "no server running") {
 			return []config.Session{}, nil
 		}
-		// tmux exits 1 when there are no sessions
-		var exitErr *ExitError
+		var exitErr *vmutil.ExitError
 		if errors.As(err, &exitErr) && exitErr.Code == 1 {
 			return []config.Session{}, nil
 		}
 		return nil, fmt.Errorf("failed to list sessions: %w", err)
 	}
 
-	// Parse output
 	sessions := []config.Session{}
 	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
 	for _, line := range lines {
@@ -139,18 +131,14 @@ func (b *FirecrackerBackend) KillSession(ctx context.Context, shedName, sessionN
 		return config.ErrShedNotRunningSentinel
 	}
 
-	// Execute tmux kill-session via vsock
-	vsockPath := filepath.Join(b.client.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, b.client.cfg.ConsolePort, b.client.cfg.HealthPort, b.client.cfg.NotifyPort)
+	agent := b.client.newAgentClient(meta.Name)
 
 	opts := backend.ExecOptions{
 		Cmd: []string{"tmux", "kill-session", "-t", sessionName},
 		TTY: false,
 	}
 
-	if err := vsockClient.Exec(ctx, opts); err != nil {
-		// These are tmux stderr strings captured by the agent, not Go error types,
-		// so string matching is the correct approach here.
+	if err := agent.Exec(ctx, opts); err != nil {
 		if strings.Contains(err.Error(), "no server running") {
 			return config.ErrSessionNotFoundSentinel
 		}
@@ -174,39 +162,19 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 		return config.ErrShedNotRunningSentinel
 	}
 
-	// Build command - if empty, use default login shell
 	cmd := opts.Cmd
 	if len(cmd) == 0 {
 		cmd = []string{"/bin/bash", "--login"}
 	} else {
-		// Wrap command in a login shell to support operators like &&, ||, |, etc.
-		// SSH sends the command as space-separated tokens; the shell parses them.
-		// Use bash --login so /etc/profile.d/ scripts are sourced, making tools
-		// installed by provisioning hooks (e.g. mise shims) available in PATH.
 		cmd = []string{"/bin/bash", "--login", "-c", strings.Join(cmd, " ")}
 	}
 	opts.Cmd = cmd
 
-	// Execute via vsock
-	vsockPath := filepath.Join(b.client.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, b.client.cfg.ConsolePort, b.client.cfg.HealthPort, b.client.cfg.NotifyPort)
-	return vsockClient.Exec(ctx, opts)
+	agent := b.client.newAgentClient(meta.Name)
+	return agent.Exec(ctx, opts)
 }
 
 // GetNetworkEndpoint returns the network endpoint (IP) for a shed.
 func (b *FirecrackerBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
 	return b.client.GetNetworkEndpoint(ctx, shedName)
-}
-
-// nopWriteCloser wraps an io.Writer to implement io.WriteCloser.
-type nopWriteCloser struct {
-	w io.Writer
-}
-
-func (n *nopWriteCloser) Write(p []byte) (int, error) {
-	return n.w.Write(p)
-}
-
-func (n *nopWriteCloser) Close() error {
-	return nil
 }

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 
@@ -86,6 +87,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.CreateShed(r.Context(), req)
 	if err != nil {
+		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
 		code, errCode, msg := mapDockerError(err)
 		writeError(w, code, errCode, msg)
 		return

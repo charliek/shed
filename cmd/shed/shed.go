@@ -83,9 +83,9 @@ func init() {
 	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")
 	createCmd.Flags().StringVar(&createSyncProfile, "sync-profile", "", "Profile to sync after creation (default: 'default')")
 	createCmd.Flags().DurationVar(&createTimeout, "timeout", 0, "Timeout for create operation (default: from config or 10m)")
-	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: docker or firecracker (default: server default)")
-	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker only)")
-	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker only)")
+	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: docker, firecracker, or vz (default: server default)")
+	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker/vz only)")
+	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
@@ -105,8 +105,12 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
 	// Validate backend flag
-	if createBackend != "" && createBackend != config.BackendDocker && createBackend != config.BackendFirecracker {
-		return fmt.Errorf("invalid backend %q: must be %q or %q", createBackend, config.BackendDocker, config.BackendFirecracker)
+	if createBackend != "" &&
+		createBackend != config.BackendDocker &&
+		createBackend != config.BackendFirecracker &&
+		createBackend != config.BackendVZ {
+		return fmt.Errorf("invalid backend %q: must be %q, %q, or %q",
+			createBackend, config.BackendDocker, config.BackendFirecracker, config.BackendVZ)
 	}
 
 	if createCPUs < 0 {
@@ -225,6 +229,19 @@ func resolveCreateBackend(info *config.ServerInfo, requested string, cpus, memor
 		}
 		if memory != 0 && memory < 128 {
 			return "", "", fmt.Errorf("invalid memory %d: must be at least 128 MB", memory)
+		}
+	case config.BackendVZ:
+		if cpus != 0 && cpus < 1 {
+			return "", "", fmt.Errorf("invalid cpus %d: must be at least 1", cpus)
+		}
+		if cpus > config.MaxVZCPUs {
+			return "", "", fmt.Errorf("invalid cpus %d: must be at most %d", cpus, config.MaxVZCPUs)
+		}
+		if memory != 0 && memory < 128 {
+			return "", "", fmt.Errorf("invalid memory %d: must be at least 128 MB", memory)
+		}
+		if memory > config.MaxVZMemoryMB {
+			return "", "", fmt.Errorf("invalid memory %d: must be at most %d MB", memory, config.MaxVZMemoryMB)
 		}
 	case config.BackendDocker:
 		if cpus != 0 || memory != 0 {

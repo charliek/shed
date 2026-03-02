@@ -77,7 +77,7 @@ shed/
 │   │   ├── main.go         # Entry point
 │   │   ├── serve.go        # serve command
 │   │   └── install.go      # systemd install
-│   └── shed-agent/         # Firecracker VM agent binary
+│   └── shed-agent/         # In-VM agent binary (Firecracker and VZ)
 │       └── main.go
 ├── internal/
 │   ├── api/                # HTTP API handlers
@@ -86,6 +86,8 @@ shed/
 │   ├── config/             # Configuration types
 │   ├── docker/             # Docker client wrapper
 │   ├── firecracker/        # Firecracker backend
+│   ├── vz/                 # VZ backend (macOS, build tag: darwin)
+│   ├── vmutil/             # Shared VM utilities (AgentClient, Dialer)
 │   ├── sshd/               # SSH server
 │   ├── sshconfig/          # SSH config management
 │   ├── provision/          # Provisioning hooks
@@ -96,10 +98,15 @@ shed/
 │   ├── build-image.sh              # Build shed-base Docker image
 │   ├── build-firecracker-rootfs.sh # Build Firecracker rootfs
 │   ├── build-firecracker-kernel.sh # Build custom 6.1 kernel
+│   ├── build-vz-rootfs.sh          # Build VZ rootfs, kernel, and initrd
 │   └── download-firecracker.sh     # Download Firecracker binary
+├── vz/                                # VZ Dockerfile and assets
+│   ├── Dockerfile
+│   └── ...
 ├── configs/
 │   ├── server.example.yaml
-│   └── server.dev.yaml
+│   ├── server.dev.yaml
+│   └── server.localmac.yaml           # macOS VZ development config
 ├── docs/
 ├── Makefile
 └── go.mod

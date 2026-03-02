@@ -23,8 +23,10 @@ import (
 type credentialWatcher struct {
 	// credentials maps credential name → target path in the VM
 	credentials map[string]string
-	conn        net.Conn
-	writeMu     sync.Mutex
+	// excludes maps credential name → exclude glob patterns
+	excludes map[string][]string
+	conn     net.Conn
+	writeMu  sync.Mutex
 
 	watcher *fsnotify.Watcher
 
@@ -37,14 +39,19 @@ type credentialWatcher struct {
 const debounceInterval = 500 * time.Millisecond
 
 // newCredentialWatcher creates a watcher for the given credential paths.
-func newCredentialWatcher(conn net.Conn, credentials map[string]string) (*credentialWatcher, error) {
+func newCredentialWatcher(conn net.Conn, credentials map[string]string, excludes map[string][]string) (*credentialWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 
+	if excludes == nil {
+		excludes = make(map[string][]string)
+	}
+
 	cw := &credentialWatcher{
 		credentials: credentials,
+		excludes:    excludes,
 		conn:        conn,
 		watcher:     watcher,
 		pending:     make(map[string]map[string]bool),
@@ -181,9 +188,24 @@ func (cw *credentialWatcher) flushCredential(credName string) {
 		return
 	}
 
+	// Ephemeral files (SQLite WAL, git lock files, etc.) may be deleted
+	// between the fsnotify event and this flush. Filter them out to avoid
+	// sending the host a list of files that no longer exist.
+	// Also skip files matching exclude patterns.
+	target := cw.credentials[credName]
+	patterns := cw.excludes[credName]
 	var fileList []string
 	for f := range files {
+		if agentMatchesExclude(f, patterns) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(target, f)); err != nil {
+			continue
+		}
 		fileList = append(fileList, f)
+	}
+	if len(fileList) == 0 {
+		return
 	}
 
 	msg := FileChangedMessage{
@@ -243,7 +265,7 @@ func handleNotifyConnection(conn net.Conn) {
 		log.Printf("  %s → %s", name, path)
 	}
 
-	cw, err := newCredentialWatcher(conn, setup.Credentials)
+	cw, err := newCredentialWatcher(conn, setup.Credentials, setup.Excludes)
 	if err != nil {
 		log.Printf("Failed to create credential watcher: %v", err)
 		return
@@ -265,4 +287,14 @@ func handleNotifyConnection(conn net.Conn) {
 
 	cw.start(done)
 	log.Printf("Notify connection closed")
+}
+
+// agentMatchesExclude reports whether relPath matches any of the given glob patterns.
+func agentMatchesExclude(relPath string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matched, _ := filepath.Match(pattern, relPath); matched {
+			return true
+		}
+	}
+	return false
 }

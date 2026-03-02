@@ -1,7 +1,4 @@
-//go:build linux
-// +build linux
-
-package firecracker
+package vmutil
 
 import (
 	"archive/tar"
@@ -19,32 +16,28 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// CredentialTransfer handles copying credentials from host to VM via vsock.
-// Since Firecracker doesn't support virtiofs or 9p filesystem passthrough,
-// credentials are copied at create/start time rather than mounted live.
+// CredentialTransfer handles copying credentials from host to VM via the agent.
 type CredentialTransfer struct {
-	vsock     *VsockClient
+	agent     *AgentClient
 	serverCfg *config.ServerConfig
 }
 
 // NewCredentialTransfer creates a new CredentialTransfer.
-func NewCredentialTransfer(vsock *VsockClient, serverCfg *config.ServerConfig) *CredentialTransfer {
+func NewCredentialTransfer(agent *AgentClient, serverCfg *config.ServerConfig) *CredentialTransfer {
 	return &CredentialTransfer{
-		vsock:     vsock,
+		agent:     agent,
 		serverCfg: serverCfg,
 	}
 }
 
 // TransferAll transfers all configured credentials to the VM.
-// Errors are logged but don't fail the operation (matches Docker behavior of optional mounts).
 func (ct *CredentialTransfer) TransferAll(ctx context.Context) error {
 	if ct.serverCfg == nil || len(ct.serverCfg.Credentials) == 0 {
 		return nil
 	}
 
 	for name, mount := range ct.serverCfg.Credentials {
-		if err := ct.transferCredential(ctx, name, mount); err != nil {
-			// Log warning but continue (matches Docker behavior of optional mounts)
+		if err := ct.TransferCredential(ctx, name, mount); err != nil {
 			log.Printf("Warning: failed to transfer credential %q: %v", name, err)
 		}
 	}
@@ -52,36 +45,30 @@ func (ct *CredentialTransfer) TransferAll(ctx context.Context) error {
 	return nil
 }
 
-// transferCredential transfers a single credential from host to VM.
-func (ct *CredentialTransfer) transferCredential(ctx context.Context, name string, mount config.MountConfig) error {
+// TransferCredential transfers a single credential from host to VM.
+func (ct *CredentialTransfer) TransferCredential(ctx context.Context, name string, mount config.MountConfig) error {
 	source := mount.Source
 	target := mount.Target
 
-	// Check if source exists
 	info, err := os.Stat(source)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("Credential %q source does not exist: %s", name, source)
-			return nil // Not an error, just skip
+			return nil
 		}
 		return fmt.Errorf("failed to stat source %s: %w", source, err)
 	}
 
-	// Create tar archive of the source
-	tarData, err := ct.createTarArchive(source, info)
+	tarData, err := ct.createTarArchive(source, info, mount.Exclude)
 	if err != nil {
 		return fmt.Errorf("failed to create tar archive: %w", err)
 	}
 
-	// Determine extraction directory and create it
 	extractDir := target
 	if !info.IsDir() {
-		// For files, extract to the parent directory
 		extractDir = filepath.Dir(target)
 	}
 
-	// First, ensure the target directory exists in the VM.
-	// Use sudo for system paths since commands run as shed user.
 	sp := sudoPrefix(extractDir)
 	mkdirCmd := fmt.Sprintf("%smkdir -p %q", sp, extractDir)
 	mkdirOpts := backend.ExecOptions{
@@ -89,60 +76,61 @@ func (ct *CredentialTransfer) transferCredential(ctx context.Context, name strin
 		WorkingDir: "/",
 		TTY:        false,
 	}
-	if err := ct.vsock.Exec(ctx, mkdirOpts); err != nil {
+	if err := ct.agent.Exec(ctx, mkdirOpts); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", extractDir, err)
 	}
 
-	// For files, we need to handle renaming if the target basename differs from source
 	if !info.IsDir() {
 		sourceBasename := filepath.Base(source)
 		targetBasename := filepath.Base(target)
 
 		if sourceBasename != targetBasename {
-			// Extract to temp location then rename
 			tempTarget := filepath.Join(extractDir, sourceBasename)
 			if err := ct.extractTarInVM(ctx, tarData, extractDir); err != nil {
 				return err
 			}
-			// Rename if source and target basenames differ
 			renameCmd := fmt.Sprintf("%smv %q %q", sp, tempTarget, target)
 			renameOpts := backend.ExecOptions{
 				Cmd:        []string{"/bin/sh", "-c", renameCmd},
 				WorkingDir: "/",
 				TTY:        false,
 			}
-			if err := ct.vsock.Exec(ctx, renameOpts); err != nil {
+			if err := ct.agent.Exec(ctx, renameOpts); err != nil {
 				return fmt.Errorf("failed to rename %s to %s: %w", tempTarget, target, err)
 			}
 			return nil
 		}
 	}
 
-	// Extract tar archive in the VM
 	return ct.extractTarInVM(ctx, tarData, extractDir)
 }
 
 // createTarArchive creates a gzipped tar archive of the source path.
-func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo) ([]byte, error) {
+// Files whose relative path matches any of the exclude patterns are skipped.
+func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo, exclude []string) ([]byte, error) {
 	var buf bytes.Buffer
 	gzw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gzw)
 
 	if info.IsDir() {
-		// Walk directory and add all files
 		err := filepath.Walk(source, func(path string, fi os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 
-			// Get relative path
 			relPath, err := filepath.Rel(source, path)
 			if err != nil {
 				return err
 			}
 
-			// Skip the root directory itself
 			if relPath == "." {
+				return nil
+			}
+
+			if matchesExclude(relPath, exclude) {
+				if fi.IsDir() {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 
@@ -152,7 +140,6 @@ func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo) 
 			return nil, err
 		}
 	} else {
-		// Single file - use basename as the name in the archive
 		if err := ct.addToTar(tw, source, filepath.Base(source), info); err != nil {
 			return nil, err
 		}
@@ -168,9 +155,24 @@ func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo) 
 	return buf.Bytes(), nil
 }
 
+// matchesExclude reports whether relPath matches any of the given glob patterns.
+func matchesExclude(relPath string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matched, _ := filepath.Match(pattern, relPath); matched {
+			return true
+		}
+	}
+	return false
+}
+
 // addToTar adds a file or directory entry to the tar archive.
 func (ct *CredentialTransfer) addToTar(tw *tar.Writer, sourcePath, archivePath string, fi os.FileInfo) error {
-	// Handle symlinks
+	// Skip special files that tar doesn't support (sockets, devices, named pipes).
+	mode := fi.Mode()
+	if mode&(os.ModeSocket|os.ModeDevice|os.ModeNamedPipe|os.ModeCharDevice) != 0 {
+		return nil
+	}
+
 	var link string
 	if fi.Mode()&os.ModeSymlink != 0 {
 		var err error
@@ -185,14 +187,12 @@ func (ct *CredentialTransfer) addToTar(tw *tar.Writer, sourcePath, archivePath s
 		return err
 	}
 
-	// Use the relative/archive path
 	header.Name = archivePath
 
 	if err := tw.WriteHeader(header); err != nil {
 		return err
 	}
 
-	// Write file content if it's a regular file
 	if fi.Mode().IsRegular() {
 		f, err := os.Open(sourcePath)
 		if err != nil {
@@ -218,7 +218,6 @@ func isSystemPath(path string) bool {
 }
 
 // sudoPrefix returns "sudo " for system paths, empty string otherwise.
-// Commands run as the shed user by default; system paths need sudo.
 func sudoPrefix(path string) string {
 	if isSystemPath(path) {
 		return "sudo "
@@ -226,17 +225,8 @@ func sudoPrefix(path string) string {
 	return ""
 }
 
-// extractTarInVM extracts a gzipped tar archive in the VM via vsock.
-// The tar data is streamed via stdin to avoid shell argument size limits.
+// extractTarInVM extracts a gzipped tar archive in the VM via the agent.
 func (ct *CredentialTransfer) extractTarInVM(ctx context.Context, tarData []byte, extractDir string) error {
-	// Extract from stdin and fix ownership.
-	// The -p flag preserves permissions, but we need to fix ownership
-	// because files extracted from tar have original owner/group which
-	// may not exist or be appropriate in the VM.
-	// Use sudo for system paths since commands run as shed user.
-	// After extraction to system paths, chown files to shed user so
-	// credentials are accessible while preserving original permissions
-	// (e.g. SSH keys at /mnt/ssh-host keep 0600 mode).
 	sp := sudoPrefix(extractDir)
 	tarCmd := fmt.Sprintf("%star --no-same-owner -xzpf - -C %q", sp, extractDir)
 	if sp != "" {
@@ -247,13 +237,13 @@ func (ct *CredentialTransfer) extractTarInVM(ctx context.Context, tarData []byte
 	opts := backend.ExecOptions{
 		Cmd:        []string{"/bin/sh", "-c", tarCmd},
 		Stdin:      io.NopCloser(bytes.NewReader(tarData)),
-		Stdout:     &nopWriteCloser{&outputBuf},
-		Stderr:     &nopWriteCloser{&outputBuf},
+		Stdout:     NopWriteCloser(&outputBuf),
+		Stderr:     NopWriteCloser(&outputBuf),
 		WorkingDir: "/",
 		TTY:        false,
 	}
 
-	if err := ct.vsock.Exec(ctx, opts); err != nil {
+	if err := ct.agent.Exec(ctx, opts); err != nil {
 		return fmt.Errorf("failed to extract tar in VM: %w (output: %s)", err, outputBuf.String())
 	}
 

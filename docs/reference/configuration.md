@@ -87,23 +87,24 @@ log_level: info
 | `name` | string | `shed-server` | Server identifier |
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
-| `enabled_backends` | list | `[docker]` | Backends this server supports (`docker`, `firecracker`) |
+| `enabled_backends` | list | `[docker]` | Backends this server supports (`docker`, `firecracker`, `vz`) |
 | `default_backend` | string | `docker` | Default backend used when none is specified |
 | `default_image` | string | `shed-base:latest` | Default Docker image for sheds |
 | `credentials` | map | `{}` | Credentials to mount/copy into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
+| `vz` | object | - | VZ-specific configuration (see below) |
 
-**Note:** Firecracker is only supported on Linux. On macOS, only `docker` can be enabled.
+**Note:** Firecracker is only supported on Linux. VZ is only supported on macOS Apple Silicon (arm64).
 
 ### Credentials
 
 Credentials are made available to sheds. The method depends on the backend:
 
 - **Docker**: Credentials are bind-mounted (live sync with host)
-- **Firecracker (read-only)**: Credentials are copied at create/start time via tar-over-vsock; no live sync
-- **Firecracker (writable)**: Credentials are copied at create/start time and synced bidirectionally via fsnotify + vsock (port 1026) while the VM is running
+- **Firecracker/VZ (read-only)**: Credentials are copied at create/start time via tar-over-vsock; no live sync
+- **Firecracker/VZ (writable)**: Credentials are copied at create/start time and synced bidirectionally via fsnotify + vsock (port 1026) while the VM is running
 
 ```yaml
 credentials:
@@ -113,7 +114,9 @@ credentials:
     readonly: true           # Optional, default false
 ```
 
-**Note:** For Firecracker, only read-only credentials lack live sync — changes on either side require a restart. Writable credentials (`readonly: false`) sync bidirectionally while the VM is running: host-side changes push to the VM, and in-VM changes (e.g., token refreshes) sync back to the host with 2-second echo suppression.
+**Missing sources:** If a credential's source path does not exist on the host, it is skipped with a log warning. The credential is not transferred to the VM and is not registered for bidirectional sync. Create the source directory on the host before starting the shed to enable sync.
+
+**Note:** For Firecracker and VZ, only read-only credentials lack live sync — changes on either side require a restart. Writable credentials (`readonly: false`) sync bidirectionally while the VM is running: host-side changes push to the VM, and in-VM changes (e.g., token refreshes) sync back to the host with 2-second echo suppression.
 
 **Common credential mounts:**
 
@@ -207,6 +210,53 @@ firecracker:
 | `tap_prefix` | string | `shed-tap` | TAP device name prefix |
 
 See [Firecracker Installation](../firecracker_install.md) for setup details.
+
+## VZ Configuration
+
+When enabling the VZ backend on macOS Apple Silicon, configure the VZ-specific settings:
+
+```yaml
+enabled_backends:
+  - vz
+default_backend: vz
+
+vz:
+  vfkit_path: vfkit
+  kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+  initrd_path: ~/Library/Application Support/shed/vz/initrd.img
+  base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+  instance_dir: ~/Library/Application Support/shed/vz/instances
+  socket_dir: ~/.shed/vz/sockets
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  console_port: 1024
+  health_port: 1025
+  notify_port: 1026
+  start_timeout: 60s
+  stop_timeout: 10s
+```
+
+### VZ Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `vfkit_path` | string | `vfkit` | Path to vfkit binary |
+| `kernel_path` | string | - | Path to decompressed Linux kernel |
+| `initrd_path` | string | - | Path to initial RAM disk image |
+| `base_rootfs` | string | - | Path to base rootfs ext4 image |
+| `instance_dir` | string | - | Directory for VM instances |
+| `socket_dir` | string | - | Directory for vsock Unix sockets (must not contain spaces) |
+| `default_cpus` | int | `2` | Default vCPUs per VM |
+| `default_memory_mb` | int | `4096` | Default memory per VM (MB) |
+| `default_disk_gb` | int | `20` | Default disk size per VM (GB) |
+| `console_port` | int | `1024` | Vsock port for VM console I/O |
+| `health_port` | int | `1025` | Vsock port for agent health checks |
+| `notify_port` | int | `1026` | Vsock port for credential change notifications |
+| `start_timeout` | duration | `60s` | VM startup timeout |
+| `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
+
+See [VZ Setup](../getting-started/vz-setup.md) for setup details.
 
 ## Environment File
 

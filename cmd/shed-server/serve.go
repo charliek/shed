@@ -18,15 +18,23 @@ import (
 	"github.com/charliek/shed/internal/docker"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/sshd"
+	"github.com/charliek/shed/internal/vz"
 )
 
 const (
-	// DefaultHostKeyPath is the default path for the SSH host key
-	DefaultHostKeyPath = "/etc/shed/host_key"
-
 	// shutdownTimeout is the maximum time to wait for graceful shutdown
 	shutdownTimeout = 30 * time.Second
 )
+
+// defaultHostKeyPath returns the default path for the SSH host key.
+// Uses /etc/shed/host_key when running as root (Linux servers), otherwise
+// falls back to ~/.shed/host_key (macOS development without sudo).
+func defaultHostKeyPath() string {
+	if os.Getuid() == 0 {
+		return "/etc/shed/host_key"
+	}
+	return config.ExpandPath("~/.shed/host_key")
+}
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -70,6 +78,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 			log.Printf("Initialized Firecracker backend")
 			backends[backend.TypeFirecracker] = firecracker.NewBackend(fcClient)
 
+		case config.BackendVZ:
+			vzCfg := cfg.VZ
+			if vzCfg == nil {
+				return fmt.Errorf("vz backend enabled but vz config is missing")
+			}
+			vzClient, err := vz.NewClient(vzCfg, cfg)
+			if err != nil {
+				return fmt.Errorf("failed to create vz client: %w", err)
+			}
+			log.Printf("Initialized VZ backend")
+			backends[backend.TypeVZ] = vz.NewBackend(vzClient)
+
 		default:
 			return fmt.Errorf("unknown backend type: %s", backendType)
 		}
@@ -82,7 +102,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer be.Close()
 
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, DefaultHostKeyPath, cfg.SSHPort, cfg.Terminal)
+	sshServer, err := sshd.NewServer(be, defaultHostKeyPath(), cfg.SSHPort, cfg.Terminal)
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}

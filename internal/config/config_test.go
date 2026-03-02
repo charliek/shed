@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -121,6 +122,35 @@ func TestServerConfigValidation(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestServerConfigVZPlatformValidation(t *testing.T) {
+	cfg := &ServerConfig{
+		Name:            "test",
+		HTTPPort:        8080,
+		SSHPort:         2222,
+		LogLevel:        "info",
+		DefaultBackend:  BackendVZ,
+		EnabledBackends: []string{BackendVZ},
+		VZ:              validVZConfig(),
+	}
+
+	err := cfg.Validate()
+	if runtime.GOOS != "darwin" {
+		if err == nil || !strings.Contains(err.Error(), "vz backend is only supported on macOS") {
+			t.Fatalf("expected macOS platform validation error, got: %v", err)
+		}
+		return
+	}
+	if runtime.GOARCH != "arm64" {
+		if err == nil || !strings.Contains(err.Error(), "Apple Silicon (arm64)") {
+			t.Fatalf("expected arm64 platform validation error, got: %v", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("expected valid VZ config on darwin/arm64, got: %v", err)
 	}
 }
 
@@ -479,5 +509,237 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// validVZConfig returns a VZConfig that passes validation.
+// It uses /dev/null for file paths since those must exist on disk.
+func validVZConfig() *VZConfig {
+	return &VZConfig{
+		VfkitPath:       "vfkit",
+		KernelPath:      "/dev/null",
+		BaseRootfs:      "/dev/null",
+		InstanceDir:     "/tmp/shed-test-vz-instances",
+		SocketDir:       "/tmp/shed-test-vz-sockets",
+		DefaultCPUs:     2,
+		DefaultMemoryMB: 4096,
+		DefaultDiskGB:   20,
+		ConsolePort:     1024,
+		HealthPort:      1025,
+		NotifyPort:      1026,
+		StartTimeout:    Duration(60 * time.Second),
+		StopTimeout:     Duration(10 * time.Second),
+	}
+}
+
+func TestVZConfigValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		modify  func(*VZConfig)
+		wantErr bool
+	}{
+		{
+			name:    "valid defaults",
+			modify:  func(c *VZConfig) {},
+			wantErr: false,
+		},
+		// Required fields
+		{
+			name:    "missing vfkit_path",
+			modify:  func(c *VZConfig) { c.VfkitPath = "" },
+			wantErr: true,
+		},
+		{
+			name:    "missing kernel_path",
+			modify:  func(c *VZConfig) { c.KernelPath = "" },
+			wantErr: true,
+		},
+		{
+			name:    "missing base_rootfs",
+			modify:  func(c *VZConfig) { c.BaseRootfs = "" },
+			wantErr: true,
+		},
+		{
+			name:    "missing instance_dir",
+			modify:  func(c *VZConfig) { c.InstanceDir = "" },
+			wantErr: true,
+		},
+		{
+			name:    "missing socket_dir",
+			modify:  func(c *VZConfig) { c.SocketDir = "" },
+			wantErr: true,
+		},
+		// CPU and memory bounds
+		{
+			name:    "cpus below min",
+			modify:  func(c *VZConfig) { c.DefaultCPUs = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "cpus over max",
+			modify:  func(c *VZConfig) { c.DefaultCPUs = MaxVZCPUs + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "memory below min",
+			modify:  func(c *VZConfig) { c.DefaultMemoryMB = 64 },
+			wantErr: true,
+		},
+		{
+			name:    "memory over max",
+			modify:  func(c *VZConfig) { c.DefaultMemoryMB = MaxVZMemoryMB + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "disk below min",
+			modify:  func(c *VZConfig) { c.DefaultDiskGB = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "disk over max",
+			modify:  func(c *VZConfig) { c.DefaultDiskGB = MaxVZDiskGB + 1 },
+			wantErr: true,
+		},
+		// Port validation
+		{
+			name:    "console port zero",
+			modify:  func(c *VZConfig) { c.ConsolePort = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "console port over max",
+			modify:  func(c *VZConfig) { c.ConsolePort = MaxVsockPort + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "health port zero",
+			modify:  func(c *VZConfig) { c.HealthPort = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "notify port zero",
+			modify:  func(c *VZConfig) { c.NotifyPort = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "duplicate ports",
+			modify:  func(c *VZConfig) { c.ConsolePort = 1024; c.HealthPort = 1024 },
+			wantErr: true,
+		},
+		// Timeout validation
+		{
+			name:    "start timeout below min",
+			modify:  func(c *VZConfig) { c.StartTimeout = Duration(500 * time.Millisecond) },
+			wantErr: true,
+		},
+		{
+			name:    "start timeout over max",
+			modify:  func(c *VZConfig) { c.StartTimeout = Duration(MaxTimeout + time.Second) },
+			wantErr: true,
+		},
+		{
+			name:    "zero timeout allowed",
+			modify:  func(c *VZConfig) { c.StartTimeout = 0; c.StopTimeout = 0 },
+			wantErr: false,
+		},
+		// Path existence
+		{
+			name:    "kernel path missing",
+			modify:  func(c *VZConfig) { c.KernelPath = "/nonexistent/vmlinux" },
+			wantErr: true,
+		},
+		{
+			name:    "rootfs path missing",
+			modify:  func(c *VZConfig) { c.BaseRootfs = "/nonexistent/rootfs.ext4" },
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validVZConfig()
+			tt.modify(cfg)
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDefaultVZConfig(t *testing.T) {
+	cfg := DefaultVZConfig()
+
+	if cfg.VfkitPath != "vfkit" {
+		t.Errorf("VfkitPath = %q, want %q", cfg.VfkitPath, "vfkit")
+	}
+	if cfg.DefaultCPUs != 2 {
+		t.Errorf("DefaultCPUs = %d, want 2", cfg.DefaultCPUs)
+	}
+	if cfg.DefaultMemoryMB != 4096 {
+		t.Errorf("DefaultMemoryMB = %d, want 4096", cfg.DefaultMemoryMB)
+	}
+	if cfg.ConsolePort != 1024 {
+		t.Errorf("ConsolePort = %d, want 1024", cfg.ConsolePort)
+	}
+	if cfg.HealthPort != 1025 {
+		t.Errorf("HealthPort = %d, want 1025", cfg.HealthPort)
+	}
+	if cfg.NotifyPort != 1026 {
+		t.Errorf("NotifyPort = %d, want 1026", cfg.NotifyPort)
+	}
+}
+
+func TestMountConfigMatchesExclude(t *testing.T) {
+	m := MountConfig{
+		Exclude: []string{"*.db", "*.db-shm", "*.db-wal", "log/*", "storage/*"},
+	}
+
+	tests := []struct {
+		relPath string
+		want    bool
+	}{
+		{"opencode.db", true},
+		{"opencode.db-shm", true},
+		{"opencode.db-wal", true},
+		{"log/output.log", true},
+		{"storage/data.bin", true},
+		{"auth.json", false},
+		{"config.yaml", false},
+		{"nested/auth.json", false},
+		// Patterns only match the final path component by default
+		{"nested/opencode.db", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.relPath, func(t *testing.T) {
+			got := m.MatchesExclude(tt.relPath)
+			if got != tt.want {
+				t.Errorf("MatchesExclude(%q) = %v, want %v", tt.relPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMountConfigMatchesExcludeEmpty(t *testing.T) {
+	m := MountConfig{}
+	if m.MatchesExclude("anything.db") {
+		t.Error("MatchesExclude should return false with no patterns")
+	}
+}
+
+func TestVZConfigApplyDefaults(t *testing.T) {
+	cfg := &VZConfig{}
+	cfg.applyDefaults()
+
+	if cfg.NotifyPort != 1026 {
+		t.Errorf("NotifyPort = %d after applyDefaults, want 1026", cfg.NotifyPort)
+	}
+
+	// Should not overwrite non-zero value
+	cfg2 := &VZConfig{NotifyPort: 2000}
+	cfg2.applyDefaults()
+	if cfg2.NotifyPort != 2000 {
+		t.Errorf("NotifyPort = %d after applyDefaults, want 2000", cfg2.NotifyPort)
 	}
 }

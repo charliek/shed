@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 func TestNewBackend(t *testing.T) {
@@ -21,7 +22,7 @@ func TestNewBackend(t *testing.T) {
 
 	client := &Client{
 		cfg:       cfg,
-		serverCfg: nil, // Not needed for this test
+		serverCfg: nil,
 		netMgr:    netMgr,
 		vms:       make(map[string]*VM),
 		usedCIDs:  make(map[uint32]string),
@@ -49,7 +50,7 @@ func TestBackendType(t *testing.T) {
 
 	client := &Client{
 		cfg:       cfg,
-		serverCfg: nil, // Not needed for this test
+		serverCfg: nil,
 		netMgr:    netMgr,
 		vms:       make(map[string]*VM),
 		usedCIDs:  make(map[uint32]string),
@@ -63,13 +64,12 @@ func TestBackendType(t *testing.T) {
 }
 
 func TestBackendImplementsInterface(t *testing.T) {
-	// This is a compile-time check, but let's verify at runtime too
 	var _ backend.Backend = (*FirecrackerBackend)(nil)
 }
 
 func TestNopWriteCloser(t *testing.T) {
 	var buf []byte
-	w := &nopWriteCloser{w: &byteWriter{buf: &buf}}
+	w := vmutil.NopWriteCloser(&byteWriter{buf: &buf})
 
 	data := []byte("test data")
 	n, err := w.Write(data)
@@ -86,7 +86,7 @@ func TestNopWriteCloser(t *testing.T) {
 }
 
 // TestExecCommandBuilding verifies that the command-building logic in Exec
-// wraps commands correctly: empty → login shell, non-empty → bash --login -c join.
+// wraps commands correctly: empty -> login shell, non-empty -> bash --login -c join.
 func TestExecCommandBuilding(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -127,7 +127,6 @@ func TestExecCommandBuilding(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Replicate the command-building logic from Exec
 			cmd := tt.input
 			if len(cmd) == 0 {
 				cmd = []string{"/bin/bash", "--login"}

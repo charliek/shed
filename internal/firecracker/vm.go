@@ -20,6 +20,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // VM represents a running Firecracker VM instance.
@@ -147,8 +148,9 @@ func (vm *VM) Start(ctx context.Context) error {
 
 	// Wait for the agent to be healthy
 	vsockPath := filepath.Join(socketDir, fmt.Sprintf("%s.vsock", vm.meta.Name))
-	vsockClient := NewVsockClient(vsockPath, vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort)
-	if err := vsockClient.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
+	dialer := NewFirecrackerDialer(vsockPath)
+	agent := vmutil.NewAgentClient(dialer, vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort)
+	if err := agent.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
 		// Try to stop the VM on failure
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {
 			log.Printf("Warning: failed to stop VM after health check failure: %v", stopErr)

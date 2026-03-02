@@ -19,6 +19,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // Client manages Firecracker VM instances.
@@ -33,8 +34,8 @@ type Client struct {
 	usedIPs  map[string]string // IP -> name
 
 	// Credential sync
-	credWatcher     *CredentialWatcher                   // host-side fsnotify watcher
-	notifyListeners map[string]*CredentialNotifyListener // name -> per-VM notification listener
+	credWatcher     *vmutil.CredentialWatcher                   // host-side fsnotify watcher
+	notifyListeners map[string]*vmutil.CredentialNotifyListener // name -> per-VM notification listener
 }
 
 // NewClient creates a new Firecracker client.
@@ -51,7 +52,7 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*
 		vms:             make(map[string]*VM),
 		usedCIDs:        make(map[uint32]string),
 		usedIPs:         make(map[string]string),
-		notifyListeners: make(map[string]*CredentialNotifyListener),
+		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -61,7 +62,7 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*
 
 	// Start host-side credential watcher for bidirectional sync
 	if serverCfg != nil && len(serverCfg.Credentials) > 0 {
-		client.credWatcher = NewCredentialWatcher(serverCfg)
+		client.credWatcher = vmutil.NewCredentialWatcher(serverCfg)
 		if err := client.credWatcher.Start(context.Background()); err != nil {
 			log.Printf("Warning: failed to start credential watcher: %v", err)
 			client.credWatcher = nil
@@ -116,12 +117,9 @@ func (c *Client) Config() *config.FirecrackerConfig {
 }
 
 // MaxVsockCID is the maximum valid CID for vsock connections.
-// CID 0 and 1 are reserved, and the maximum is 2^32-1, but we use a
-// reasonable upper bound to prevent resource exhaustion.
 const MaxVsockCID uint32 = 65535
 
 // AllocateCID allocates and reserves a new CID for a VM.
-// Returns an error if all CIDs in the range [VsockBaseCID, MaxVsockCID] are exhausted.
 func (c *Client) AllocateCID(name string) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -138,14 +136,10 @@ func (c *Client) AllocateCID(name string) (uint32, error) {
 }
 
 // AllocateNetwork allocates a TAP device and IP address for a VM.
-// The IP is marked as used immediately to prevent race conditions with parallel allocations.
 func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Build map of used indices by computing offset from the gateway IP.
-	// AllocateIP(index) returns gateway + index + 1, so the reverse is:
-	//   index = allocatedIP - gateway - 1
 	usedIndices := make(map[int]bool)
 	gatewayIP := net.ParseIP(c.netMgr.Gateway()).To4()
 	gatewayInt, err := ipToUint32(gatewayIP)
@@ -167,7 +161,6 @@ func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err 
 		}
 	}
 
-	// Find available index
 	index, err := c.netMgr.FindAvailableTAPIndex(usedIndices)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to find available TAP index: %w", err)
@@ -178,7 +171,6 @@ func (c *Client) AllocateNetwork(name string) (tapDevice, ipAddress string, err 
 		return "", "", err
 	}
 
-	// Mark IP as used immediately to prevent race conditions with parallel allocations
 	c.usedIPs[ipAddress] = name
 
 	return tapDevice, ipAddress, nil
@@ -201,7 +193,6 @@ func (c *Client) ReleaseIP(ip string) {
 }
 
 // RegisterInstance registers a CID and IP as used by an instance.
-// This is idempotent - safe to call if already registered (e.g., IP was pre-registered by AllocateNetwork).
 func (c *Client) RegisterInstance(name string, cid uint32, ip string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -219,19 +210,23 @@ func (c *Client) UnregisterInstance(name string, cid uint32, ip string) {
 	delete(c.usedIPs, ip)
 }
 
+// newAgentClient creates a vmutil.AgentClient for the given instance name.
+func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
+	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", name))
+	dialer := NewFirecrackerDialer(vsockPath)
+	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
+}
+
 // CreateShed creates a new Firecracker-based shed.
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
-	// Validate name
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
 	}
 
-	// Check if instance already exists
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
-	// Allocate resources
 	cid, err := c.AllocateCID(req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate CID: %w", err)
@@ -242,14 +237,12 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to allocate network: %w", err)
 	}
 
-	// Create TAP device
 	if err := c.netMgr.CreateTAPDevice(tapDevice); err != nil {
 		c.ReleaseIP(ipAddress)
 		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to create TAP device: %w", err)
 	}
 
-	// Copy rootfs
 	rootfsPath, err := CopyRootfs(c.cfg.BaseRootfs, c.cfg.InstanceDir, req.Name)
 	if err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
@@ -260,7 +253,6 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
-	// Determine CPU and memory
 	cpus := req.CPUs
 	if cpus == 0 {
 		cpus = c.cfg.DefaultCPUs
@@ -270,7 +262,6 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		memoryMB = c.cfg.DefaultMemoryMB
 	}
 
-	// Create metadata
 	meta := &Metadata{
 		Name:       req.Name,
 		Status:     config.StatusStopped,
@@ -285,7 +276,6 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		Repo:       req.Repo,
 	}
 
-	// Save metadata
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
@@ -298,10 +288,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	// Register instance
 	c.RegisterInstance(req.Name, cid, ipAddress)
 
-	// Create and start VM
 	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
 	if err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
@@ -325,7 +313,6 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
 
-	// Update metadata to running
 	meta.Status = config.StatusRunning
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {
@@ -341,38 +328,33 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	// Store VM reference
 	c.mu.Lock()
 	c.vms[req.Name] = vm
 	c.mu.Unlock()
 
-	// Get vsock client for setup operations
-	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
+	agent := c.newAgentClient(meta.Name)
 
 	// Transfer credentials
 	if c.serverCfg != nil {
-		credTransfer := NewCredentialTransfer(vsockClient, c.serverCfg)
+		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
 		if err := credTransfer.TransferAll(ctx); err != nil {
 			log.Printf("Warning: credential transfer failed: %v", err)
-			// Continue - credentials are optional
 		}
 	}
 
 	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(req.Name, vsockClient)
+	c.startNotifyListener(req.Name, agent)
 
 	// Clone repo if specified
 	if req.Repo != "" {
-		if err := c.cloneRepo(ctx, vsockClient, req.Repo); err != nil {
+		if err := c.cloneRepo(ctx, agent, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
-			// Continue - repo clone failure is not fatal, shed is still usable
 		}
 	}
 
 	// Run provisioning
 	if !req.NoProvision {
-		provisioner := NewProvisioner(vsockClient, req.Name)
+		provisioner := vmutil.NewProvisioner(agent, req.Name)
 		provisioner.SetOutput(os.Stdout, os.Stderr)
 		cfg, err := provisioner.LoadConfig(ctx)
 		if err != nil {
@@ -380,7 +362,6 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		} else {
 			if err := provisioner.RunProvisioning(ctx, cfg, true); err != nil {
 				log.Printf("Warning: provisioning failed: %v", err)
-				// Continue - provisioning failure is not fatal
 			}
 		}
 	}
@@ -390,7 +371,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		Status:      meta.Status,
 		CreatedAt:   meta.CreatedAt,
 		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name), // Pseudo container ID for compatibility
+		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
 		Backend:     meta.Backend,
 	}, nil
 }
@@ -405,12 +386,10 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		return nil, err
 	}
 
-	// Check if VM is actually running
 	status := meta.Status
 	if status == config.StatusRunning {
 		vm := &VM{meta: meta, cfg: c.cfg}
 		if !vm.IsRunning() {
-			// Update status if VM died
 			meta.Status = config.StatusStopped
 			meta.PID = 0
 			if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -460,11 +439,14 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		return err
 	}
 
-	// Stop if running — best effort, continue with cleanup regardless
 	if meta.Status == config.StatusRunning {
 		if _, err := c.StopShed(ctx, name); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
-			// Force-kill by PID as fallback
+			// StopShed failed — clean up resources it would have released
+			c.stopNotifyListener(name)
+			c.mu.Lock()
+			delete(c.vms, name)
+			c.mu.Unlock()
 			if meta.PID > 0 {
 				if !isFirecrackerProcess(meta.PID) {
 					log.Printf("Warning: PID %d is not a Firecracker process, skipping SIGKILL during delete of %s", meta.PID, name)
@@ -478,16 +460,12 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		}
 	}
 
-	// Delete TAP device
 	if err := c.netMgr.DeleteTAPDevice(meta.TAPDevice); err != nil {
-		// Log but continue
 		log.Printf("Warning: failed to delete TAP device %s: %v", meta.TAPDevice, err)
 	}
 
-	// Unregister instance
 	c.UnregisterInstance(name, meta.CID, meta.IPAddress)
 
-	// Delete instance directory (includes rootfs and metadata)
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
 	}
@@ -510,12 +488,10 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		if vm.IsRunning() {
 			return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyRunningSentinel, name)
 		}
-		// VM died, reset status
 		meta.Status = config.StatusStopped
 		meta.PID = 0
 	}
 
-	// Create and start VM
 	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create VM: %w", err)
@@ -525,7 +501,6 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
 
-	// Update metadata
 	meta.Status = config.StatusRunning
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {
@@ -534,29 +509,25 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	// Store VM reference
 	c.mu.Lock()
 	c.vms[name] = vm
 	c.mu.Unlock()
 
-	// Get vsock client for setup operations
-	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
+	agent := c.newAgentClient(meta.Name)
 
 	// Refresh credentials on start
 	if c.serverCfg != nil {
-		credTransfer := NewCredentialTransfer(vsockClient, c.serverCfg)
+		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
 		if err := credTransfer.TransferAll(ctx); err != nil {
 			log.Printf("Warning: credential transfer failed: %v", err)
-			// Continue - credentials are optional
 		}
 	}
 
 	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(name, vsockClient)
+	c.startNotifyListener(name, agent)
 
 	// Run startup hook only (not install)
-	provisioner := NewProvisioner(vsockClient, name)
+	provisioner := vmutil.NewProvisioner(agent, name)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {
@@ -564,7 +535,6 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	} else {
 		if err := provisioner.RunProvisioning(ctx, cfg, false); err != nil {
 			log.Printf("Warning: startup hook failed: %v", err)
-			// Continue - hook failure is not fatal
 		}
 	}
 
@@ -595,17 +565,15 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	// Stop notification listener before shutting down
 	c.stopNotifyListener(name)
 
-	// Run shutdown hook before stopping the VM.
-	// Allocate up to half the stop timeout for the hook, capped at 30s.
+	// Run shutdown hook before stopping the VM
 	stopTimeout := c.cfg.StopTimeout.Duration()
 	hookBudget := stopTimeout / 2
 	if hookBudget > 30*time.Second {
 		hookBudget = 30 * time.Second
 	}
 
-	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", meta.Name))
-	vsockClient := NewVsockClient(vsockPath, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
-	provisioner := NewProvisioner(vsockClient, name)
+	agent := c.newAgentClient(meta.Name)
+	provisioner := vmutil.NewProvisioner(agent, name)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 
 	hookCtx, hookCancel := context.WithTimeout(ctx, hookBudget)
@@ -626,19 +594,16 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		vm = &VM{meta: meta, cfg: c.cfg}
 	}
 
-	// Stop VM
 	if err := vm.Stop(ctx); err != nil {
 		return nil, fmt.Errorf("failed to stop VM: %w", err)
 	}
 
-	// Update metadata
 	meta.Status = config.StatusStopped
 	meta.PID = 0
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	// Remove VM reference
 	c.mu.Lock()
 	delete(c.vms, name)
 	c.mu.Unlock()
@@ -667,22 +632,20 @@ func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, e
 }
 
 // cloneRepo clones a git repository into the VM's workspace.
-func (c *Client) cloneRepo(ctx context.Context, vsock *VsockClient, repo string) error {
-	// Build environment variables for git
+func (c *Client) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, repo string) error {
 	env := c.buildEnvForGit()
 
-	// Capture output for logging
 	var output strings.Builder
 	opts := backend.ExecOptions{
 		Cmd:        []string{"git", "clone", repo, "."},
 		Env:        env,
-		Stdout:     &nopWriteCloser{io.MultiWriter(&output, os.Stdout)},
-		Stderr:     &nopWriteCloser{io.MultiWriter(&output, os.Stderr)},
+		Stdout:     vmutil.NopWriteCloser(io.MultiWriter(&output, os.Stdout)),
+		Stderr:     vmutil.NopWriteCloser(io.MultiWriter(&output, os.Stderr)),
 		WorkingDir: config.WorkspacePath,
 		TTY:        false,
 	}
 
-	if err := vsock.Exec(ctx, opts); err != nil {
+	if err := agent.Exec(ctx, opts); err != nil {
 		return fmt.Errorf("git clone failed: %w", err)
 	}
 
@@ -697,7 +660,6 @@ func (c *Client) buildEnvForGit() []string {
 		return env
 	}
 
-	// Add configured environment variables (GIT_SSH_COMMAND, etc.)
 	for key, value := range c.serverCfg.EnvVars {
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
@@ -706,15 +668,11 @@ func (c *Client) buildEnvForGit() []string {
 }
 
 // startNotifyListener starts a credential notification listener for a VM.
-// Note: Uses context.Background() because the listener must outlive the HTTP
-// request that creates/starts the VM. The listener is stopped explicitly via
-// stopNotifyListener when the VM is stopped or deleted.
-func (c *Client) startNotifyListener(name string, vsockClient *VsockClient) {
+func (c *Client) startNotifyListener(name string, agent *vmutil.AgentClient) {
 	if c.serverCfg == nil {
 		return
 	}
 
-	// Check if there are any writable credentials
 	hasWritable := false
 	for _, mount := range c.serverCfg.Credentials {
 		if !mount.ReadOnly {
@@ -726,12 +684,12 @@ func (c *Client) startNotifyListener(name string, vsockClient *VsockClient) {
 		return
 	}
 
-	listener := NewCredentialNotifyListener(vsockClient, c.serverCfg, c.credWatcher)
+	listener := vmutil.NewCredentialNotifyListener(agent, c.serverCfg, c.credWatcher)
 	listener.Start(context.Background(), name)
 
-	// Register VM with the credential watcher for host→VM pushes
+	// Register VM with the credential watcher for host->VM pushes
 	if c.credWatcher != nil {
-		c.credWatcher.RegisterVM(name, vsockClient)
+		c.credWatcher.RegisterVM(name, agent)
 	}
 
 	c.mu.Lock()
@@ -750,7 +708,6 @@ func (c *Client) stopNotifyListener(name string) {
 		nl.Stop()
 	}
 
-	// Unregister VM from the credential watcher
 	if c.credWatcher != nil {
 		c.credWatcher.UnregisterVM(name)
 	}

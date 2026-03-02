@@ -23,27 +23,65 @@ credentials:
     target: /home/shed/.gitconfig
     readonly: true
 
-  # Claude Code - container-specific credentials
+  # Claude Code - credentials and settings
   claude:
     source: /home/charliek/.shed/mounts/claude
     target: /home/shed/.claude
     readonly: false
+    exclude:
+      - "debug/*"
+      - "file-history/*"
+      - "plans/*"
+      - "backups/*"
+      - "cache/*"
+      - "tasks/*"
+      - "todos/*"
+      - "paste-cache/*"
+      - "shell-snapshots/*"
+      - "session-env/*"
+      - "downloads/*"
+      - "telemetry/*"
 
-  # OpenCode - 3 directories for data, state, and cache
+  # Codex CLI - credentials and config
+  codex:
+    source: /home/charliek/.shed/mounts/codex
+    target: /home/shed/.codex
+    readonly: false
+    exclude:
+      - "sessions/*"
+      - "archived_sessions/*"
+      - "vendor_imports/*"
+      - "log/*"
+      - "tmp/*"
+      - "shell_snapshots/*"
+      - "sqlite/*"
+      - "*.sqlite"
+      - "*.sqlite-shm"
+      - "*.sqlite-wal"
+      - "models_cache.json"
+
+  # OpenCode - data and state directories
   opencode_data:
     source: /home/charliek/.shed/mounts/opencode/share
     target: /home/shed/.local/share/opencode
     readonly: false
+    exclude:
+      - "*.db"
+      - "*.db-shm"
+      - "*.db-wal"
+      - "log/*"
+      - "storage/*"
 
   opencode_state:
     source: /home/charliek/.shed/mounts/opencode/state
     target: /home/shed/.local/state/opencode
     readonly: false
 
-  opencode_cache:
-    source: /home/charliek/.shed/mounts/opencode/cache
-    target: /home/shed/.cache/opencode
-    readonly: false
+  # Disabled - ephemeral cache that auto-regenerates on first opencode launch
+  # opencode_cache:
+  #   source: /home/charliek/.shed/mounts/opencode/cache
+  #   target: /home/shed/.cache/opencode
+  #   readonly: false
 
   # GitHub CLI - credentials and config
   gh:

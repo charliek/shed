@@ -92,6 +92,7 @@ nav:
       - Quick Start: getting-started/quick-start.md
       - Server Setup: getting-started/server-setup.md
       - Firecracker Setup: firecracker_install.md
+      - VZ Setup (macOS): getting-started/vz-setup.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
@@ -99,6 +100,7 @@ nav:
       - File Sync: reference/sync.md
       - Provisioning: reference/provisioning.md
       - Firecracker Operations: firecracker_howto.md
+      - VZ Operations (macOS): reference/vz-operations.md
       - HTTP API: reference/api.md
   - Development:
       - Setup: development/setup.md

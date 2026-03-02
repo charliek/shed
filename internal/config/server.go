@@ -37,6 +37,9 @@ type ServerConfig struct {
 	// Firecracker contains Firecracker-specific configuration
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
 
+	// VZ contains Apple Virtualization.framework-specific configuration (macOS only)
+	VZ *VZConfig `yaml:"vz,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
 }
@@ -92,6 +95,184 @@ type FirecrackerConfig struct {
 	TAPPrefix string `yaml:"tap_prefix"`
 }
 
+// VZConfig contains Apple Virtualization.framework-specific configuration.
+type VZConfig struct {
+	// VfkitPath is the path to the vfkit binary
+	VfkitPath string `yaml:"vfkit_path"`
+
+	// KernelPath is the path to the decompressed Linux kernel
+	KernelPath string `yaml:"kernel_path"`
+
+	// InitrdPath is the path to the initial RAM disk image
+	InitrdPath string `yaml:"initrd_path"`
+
+	// BaseRootfs is the path to the base rootfs image
+	BaseRootfs string `yaml:"base_rootfs"`
+
+	// InstanceDir is the directory for instance data
+	InstanceDir string `yaml:"instance_dir"`
+
+	// SocketDir is the directory for vsock Unix sockets.
+	// NOTE: This path must not contain spaces. vfkit URL-encodes socket paths,
+	// turning spaces into %20, which causes connection failures.
+	SocketDir string `yaml:"socket_dir"`
+
+	// DefaultCPUs is the default number of vCPUs for new VMs
+	DefaultCPUs int `yaml:"default_cpus"`
+
+	// DefaultMemoryMB is the default memory in MB for new VMs
+	DefaultMemoryMB int `yaml:"default_memory_mb"`
+
+	// DefaultDiskGB is the default disk size in GB for new VMs
+	DefaultDiskGB int `yaml:"default_disk_gb"`
+
+	// ConsolePort is the vsock port for console/exec connections
+	ConsolePort uint32 `yaml:"console_port"`
+
+	// HealthPort is the vsock port for health checks
+	HealthPort uint32 `yaml:"health_port"`
+
+	// NotifyPort is the vsock port for credential change notifications
+	NotifyPort uint32 `yaml:"notify_port"`
+
+	// StartTimeout is the timeout for VM startup
+	StartTimeout Duration `yaml:"start_timeout"`
+
+	// StopTimeout is the timeout for graceful VM shutdown
+	StopTimeout Duration `yaml:"stop_timeout"`
+}
+
+// DefaultVZConfig returns a VZConfig with default values.
+func DefaultVZConfig() *VZConfig {
+	return &VZConfig{
+		VfkitPath:       "vfkit",
+		KernelPath:      ExpandPath("~/Library/Application Support/shed/vz/vmlinux"),
+		InitrdPath:      ExpandPath("~/Library/Application Support/shed/vz/initrd.img"),
+		BaseRootfs:      ExpandPath("~/Library/Application Support/shed/vz/base-rootfs.ext4"),
+		InstanceDir:     ExpandPath("~/Library/Application Support/shed/vz/instances"),
+		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
+		DefaultCPUs:     2,
+		DefaultMemoryMB: 4096,
+		DefaultDiskGB:   20,
+		ConsolePort:     1024,
+		HealthPort:      1025,
+		NotifyPort:      1026,
+		StartTimeout:    Duration(60 * time.Second),
+		StopTimeout:     Duration(10 * time.Second),
+	}
+}
+
+// applyDefaults fills in zero-valued fields with defaults and expands ~ in paths.
+func (c *VZConfig) applyDefaults() {
+	if c.NotifyPort == 0 {
+		c.NotifyPort = 1026
+	}
+
+	// Expand ~ in paths
+	c.KernelPath = ExpandPath(c.KernelPath)
+	c.InitrdPath = ExpandPath(c.InitrdPath)
+	c.BaseRootfs = ExpandPath(c.BaseRootfs)
+	c.InstanceDir = ExpandPath(c.InstanceDir)
+	c.SocketDir = ExpandPath(c.SocketDir)
+}
+
+// Validate checks that the VZ configuration is valid.
+func (c *VZConfig) Validate() error {
+	if c.VfkitPath == "" {
+		return fmt.Errorf("vfkit_path is required")
+	}
+	if c.KernelPath == "" {
+		return fmt.Errorf("kernel_path is required")
+	}
+	if c.BaseRootfs == "" {
+		return fmt.Errorf("base_rootfs is required")
+	}
+	if c.InstanceDir == "" {
+		return fmt.Errorf("instance_dir is required")
+	}
+	if c.SocketDir == "" {
+		return fmt.Errorf("socket_dir is required")
+	}
+
+	// Validate CPU and memory bounds
+	if c.DefaultCPUs < 1 {
+		return fmt.Errorf("vz: default_cpus must be at least 1")
+	}
+	if c.DefaultCPUs > MaxVZCPUs {
+		return fmt.Errorf("vz: default_cpus must be at most %d", MaxVZCPUs)
+	}
+	if c.DefaultMemoryMB < 128 {
+		return fmt.Errorf("vz: default_memory_mb must be at least 128")
+	}
+	if c.DefaultMemoryMB > MaxVZMemoryMB {
+		return fmt.Errorf("vz: default_memory_mb must be at most %d", MaxVZMemoryMB)
+	}
+	if c.DefaultDiskGB < 1 {
+		return fmt.Errorf("vz: default_disk_gb must be at least 1")
+	}
+	if c.DefaultDiskGB > MaxVZDiskGB {
+		return fmt.Errorf("vz: default_disk_gb must be at most %d", MaxVZDiskGB)
+	}
+
+	// Validate vsock ports
+	if c.ConsolePort == 0 {
+		return fmt.Errorf("vz: console_port must be set")
+	}
+	if c.ConsolePort > MaxVsockPort {
+		return fmt.Errorf("vz: console_port must be at most %d", MaxVsockPort)
+	}
+	if c.HealthPort == 0 {
+		return fmt.Errorf("vz: health_port must be set")
+	}
+	if c.HealthPort > MaxVsockPort {
+		return fmt.Errorf("vz: health_port must be at most %d", MaxVsockPort)
+	}
+	if c.NotifyPort == 0 {
+		return fmt.Errorf("vz: notify_port must be set")
+	}
+	if c.NotifyPort > MaxVsockPort {
+		return fmt.Errorf("vz: notify_port must be at most %d", MaxVsockPort)
+	}
+	if c.ConsolePort == c.HealthPort || c.ConsolePort == c.NotifyPort || c.HealthPort == c.NotifyPort {
+		return fmt.Errorf("vz: console_port, health_port, and notify_port must all be different")
+	}
+
+	// Validate timeouts
+	startTimeout := time.Duration(c.StartTimeout)
+	if startTimeout != 0 {
+		if startTimeout < MinTimeout {
+			return fmt.Errorf("vz: start_timeout must be at least %s", MinTimeout)
+		}
+		if startTimeout > MaxTimeout {
+			return fmt.Errorf("vz: start_timeout must be at most %s", MaxTimeout)
+		}
+	}
+	stopTimeout := time.Duration(c.StopTimeout)
+	if stopTimeout != 0 {
+		if stopTimeout < MinTimeout {
+			return fmt.Errorf("vz: stop_timeout must be at least %s", MinTimeout)
+		}
+		if stopTimeout > MaxTimeout {
+			return fmt.Errorf("vz: stop_timeout must be at most %s", MaxTimeout)
+		}
+	}
+
+	// Validate kernel, initrd, and rootfs paths exist
+	if _, err := os.Stat(c.KernelPath); err != nil {
+		return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
+	}
+	if c.InitrdPath != "" {
+		if _, err := os.Stat(c.InitrdPath); err != nil {
+			return fmt.Errorf("vz: initrd_path does not exist: %s", c.InitrdPath)
+		}
+	}
+	if _, err := os.Stat(c.BaseRootfs); err != nil {
+		return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)
+	}
+
+	return nil
+}
+
 // Firecracker validation upper bounds.
 const (
 	MaxFirecrackerCPUs            = 32
@@ -101,6 +282,13 @@ const (
 	MaxVsockPort           uint32 = 65535
 	MinTimeout                    = 1 * time.Second
 	MaxTimeout                    = 30 * time.Minute
+)
+
+// VZ validation upper bounds (decoupled from Firecracker).
+const (
+	MaxVZCPUs     = 32
+	MaxVZMemoryMB = 256 * 1024 // 256 GB
+	MaxVZDiskGB   = 1024       // 1 TB
 )
 
 // Duration is a wrapper around time.Duration for YAML marshaling
@@ -154,9 +342,21 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 
 // MountConfig represents a bind mount configuration.
 type MountConfig struct {
-	Source   string `yaml:"source"`
-	Target   string `yaml:"target"`
-	ReadOnly bool   `yaml:"readonly"`
+	Source   string   `yaml:"source"`
+	Target   string   `yaml:"target"`
+	ReadOnly bool     `yaml:"readonly"`
+	Exclude  []string `yaml:"exclude,omitempty"`
+}
+
+// MatchesExclude reports whether the given relative path matches any of the
+// mount's exclude patterns. Patterns use filepath.Match glob syntax.
+func (m MountConfig) MatchesExclude(relPath string) bool {
+	for _, pattern := range m.Exclude {
+		if matched, _ := filepath.Match(pattern, relPath); matched {
+			return true
+		}
+	}
+	return false
 }
 
 // DefaultServerConfig returns a ServerConfig with default values.
@@ -273,6 +473,10 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		cfg.Firecracker.applyDefaults()
 	}
 
+	if cfg.VZ != nil {
+		cfg.VZ.applyDefaults()
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -306,13 +510,13 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	if !isValidBackend(c.DefaultBackend) {
-		return fmt.Errorf("invalid default_backend: %s (must be docker or firecracker)", c.DefaultBackend)
+		return fmt.Errorf("invalid default_backend: %s (must be docker, firecracker, or vz)", c.DefaultBackend)
 	}
 
 	enabled := make(map[string]bool, len(c.EnabledBackends))
 	for _, backend := range c.EnabledBackends {
 		if !isValidBackend(backend) {
-			return fmt.Errorf("invalid enabled_backends entry: %s (must be docker or firecracker)", backend)
+			return fmt.Errorf("invalid enabled_backends entry: %s (must be docker, firecracker, or vz)", backend)
 		}
 		enabled[backend] = true
 	}
@@ -325,6 +529,13 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("firecracker backend is only supported on linux")
 	}
 
+	if runtime.GOOS != "darwin" && enabled[BackendVZ] {
+		return fmt.Errorf("vz backend is only supported on macOS")
+	}
+	if runtime.GOARCH != "arm64" && enabled[BackendVZ] {
+		return fmt.Errorf("vz backend currently supports macOS Apple Silicon (arm64) only")
+	}
+
 	// Validate Firecracker config if enabled
 	if enabled[BackendFirecracker] {
 		if c.Firecracker == nil {
@@ -335,11 +546,21 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	// Validate VZ config if enabled
+	if enabled[BackendVZ] {
+		if c.VZ == nil {
+			return fmt.Errorf("vz configuration is required when backend is enabled")
+		}
+		if err := c.VZ.Validate(); err != nil {
+			return fmt.Errorf("vz config: %w", err)
+		}
+	}
+
 	return nil
 }
 
 func isValidBackend(backend string) bool {
-	return backend == BackendDocker || backend == BackendFirecracker
+	return backend == BackendDocker || backend == BackendFirecracker || backend == BackendVZ
 }
 
 func (c *ServerConfig) normalizeBackends() {

@@ -5,6 +5,7 @@ dist/
 /shed-server
 /shed-agent
 firecracker/shed-agent
+vz/shed-agent
 *.exe
 *.exe~
 *.dll

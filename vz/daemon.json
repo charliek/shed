@@ -1,0 +1,10 @@
+{
+    "storage-driver": "vfs",
+    "bridge": "none",
+    "exec-opts": ["native.cgroupdriver=systemd"],
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    }
+}
