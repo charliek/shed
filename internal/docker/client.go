@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 
 	"github.com/docker/docker/api/types/mount"
@@ -68,8 +69,16 @@ func (c *Client) buildMounts(shedName string) []mount.Mount {
 		Target: config.WorkspacePath,
 	})
 
-	// Add credential mounts from config
-	for _, cred := range c.config.Credentials {
+	// Add credential mounts from config, skipping missing sources
+	for name, cred := range c.config.Credentials {
+		if _, err := os.Stat(cred.Source); err != nil {
+			if os.IsNotExist(err) {
+				log.Printf("Warning: credential %q source does not exist, skipping mount: %s", name, cred.Source)
+				continue
+			}
+			log.Printf("Warning: credential %q source inaccessible, skipping mount: %v", name, err)
+			continue
+		}
 		mounts = append(mounts, mount.Mount{
 			Type:     mount.TypeBind,
 			Source:   cred.Source,
