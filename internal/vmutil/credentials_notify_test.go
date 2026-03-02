@@ -20,11 +20,11 @@ func TestCredentialNotifyOnConnect(t *testing.T) {
 		Credentials: map[string]config.MountConfig{
 			"ssh": {
 				Source:  "/host/.ssh",
-				Target: "/home/shed/.ssh",
+				Target:  "/home/shed/.ssh",
 				Exclude: []string{"*.sock"},
 			},
 			"gh": {
-				Source:  "/host/.config/gh",
+				Source: "/host/.config/gh",
 				Target: "/home/shed/.config/gh",
 			},
 			"readonly-cred": {
@@ -264,9 +264,9 @@ func TestExtractTarToHostSkipsSymlinks(t *testing.T) {
 
 	// Regular file
 	tw.WriteHeader(&tar.Header{
-		Name: "real.txt",
-		Mode: 0644,
-		Size: 4,
+		Name:     "real.txt",
+		Mode:     0644,
+		Size:     4,
 		Typeflag: tar.TypeReg,
 	})
 	tw.Write([]byte("real"))
@@ -351,7 +351,6 @@ func TestExtractTarToHostSkipsOversizedFiles(t *testing.T) {
 
 	assertFileContent(t, filepath.Join(destDir, "small.txt"), "small")
 }
-
 
 // assertFileContent reads a file and checks its content.
 func assertFileContent(t *testing.T, path, want string) {
