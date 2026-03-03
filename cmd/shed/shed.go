@@ -508,6 +508,9 @@ func shedSSHString(shedName, serverName string) string {
 // formatUptime formats the time since creation as a human-readable duration.
 func formatUptime(t time.Time) string {
 	d := time.Since(t)
+	if d < 0 {
+		return "0m"
+	}
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) % 24
 	minutes := int(d.Minutes()) % 60
