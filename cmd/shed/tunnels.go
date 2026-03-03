@@ -16,8 +16,8 @@ import (
 )
 
 var (
-	tunnelProfiles    []string
-	tunnelPorts       []string
+	tunnelProfiles   []string
+	tunnelPorts      []string
 	tunnelBackground bool
 	tunnelReplace    bool
 	tunnelStopAll    bool
