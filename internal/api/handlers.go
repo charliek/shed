@@ -89,7 +89,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stream progress via SSE if the client requests it
-	if r.Header.Get("Accept") == "text/event-stream" {
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		s.handleCreateShedSSE(w, r, req)
 		return
 	}
@@ -179,6 +179,7 @@ drain:
 func writeSSEEvent(w http.ResponseWriter, eventType string, data any) {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
+		log.Printf("writeSSEEvent: failed to marshal %s event: %v", eventType, err)
 		return
 	}
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, string(jsonData))
