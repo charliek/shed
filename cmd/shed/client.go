@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -190,6 +193,115 @@ func (c *APIClient) CreateShed(req *config.CreateShedRequest) (*config.Shed, err
 		return nil, err
 	}
 	return &shed, nil
+}
+
+// CreateShedWithProgress creates a new shed and streams progress events via SSE.
+func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, onProgress func(backend.ProgressEvent)) (*config.Shed, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.createTimeout)
+	defer cancel()
+
+	bodyData, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/sheds", bytes.NewReader(bodyData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+		}
+		return nil, fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.parseError(resp)
+	}
+
+	return c.readSSEStream(resp.Body, onProgress)
+}
+
+// readSSEStream parses an SSE event stream, calling onProgress for progress events
+// and returning the final Shed from the complete event.
+//
+// This implements the key parts of the SSE specification:
+//   - "event:" sets the event type for the next dispatch
+//   - "data:" lines are concatenated (with newlines) to form the event payload
+//   - Lines starting with ":" are comments (used for keep-alive pings)
+//   - A blank line dispatches the accumulated event
+func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.ProgressEvent)) (*config.Shed, error) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
+
+	var eventType string
+	var dataBuf strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Blank line dispatches the accumulated event
+		if line == "" {
+			if dataBuf.Len() > 0 {
+				data := dataBuf.String()
+				dataBuf.Reset()
+
+				switch eventType {
+				case "progress":
+					var event backend.ProgressEvent
+					if err := json.Unmarshal([]byte(data), &event); err == nil && onProgress != nil {
+						onProgress(event)
+					}
+				case "complete":
+					var shed config.Shed
+					if err := json.Unmarshal([]byte(data), &shed); err != nil {
+						return nil, fmt.Errorf("failed to parse complete event: %w", err)
+					}
+					return &shed, nil
+				case "error":
+					var apiErr config.APIError
+					if err := json.Unmarshal([]byte(data), &apiErr); err != nil {
+						return nil, fmt.Errorf("server error: %s", data)
+					}
+					return nil, fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+				}
+			}
+			eventType = ""
+			continue
+		}
+
+		// Comments (including keep-alive pings)
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+
+		if strings.HasPrefix(line, "data:") {
+			value := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(value)
+			continue
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading event stream: %w", err)
+	}
+
+	return nil, fmt.Errorf("event stream ended without a complete or error event")
 }
 
 // GetShed retrieves a specific shed by name.

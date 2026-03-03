@@ -39,6 +39,7 @@ func (ct *CredentialTransfer) TransferAll(ctx context.Context) error {
 	for name, mount := range ct.serverCfg.Credentials {
 		if err := ct.TransferCredential(ctx, name, mount); err != nil {
 			log.Printf("Warning: failed to transfer credential %q: %v", name, err)
+			backend.ProgressWarning(ctx, "credentials", fmt.Sprintf("Failed to transfer credential %q: %v", name, err))
 		}
 	}
 
@@ -54,6 +55,7 @@ func (ct *CredentialTransfer) TransferCredential(ctx context.Context, name strin
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("Credential %q source does not exist: %s", name, source)
+			backend.ProgressWarning(ctx, "credentials", fmt.Sprintf("Credential %q source does not exist, skipping: %s", name, source))
 			return nil
 		}
 		return fmt.Errorf("failed to stat source %s: %w", source, err)

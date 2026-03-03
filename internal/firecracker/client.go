@@ -227,6 +227,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
+	backend.Progress(ctx, "network", "Allocating network resources...")
 	cid, err := c.AllocateCID(req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate CID: %w", err)
@@ -243,6 +244,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to create TAP device: %w", err)
 	}
 
+	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
 	rootfsPath, err := CopyRootfs(c.cfg.BaseRootfs, c.cfg.InstanceDir, req.Name)
 	if err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
@@ -302,6 +304,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
+	backend.Progress(ctx, "vm", "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
@@ -336,6 +339,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Transfer credentials
 	if c.serverCfg != nil {
+		backend.Progress(ctx, "credentials", "Transferring credentials...")
 		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
 		if err := credTransfer.TransferAll(ctx); err != nil {
 			log.Printf("Warning: credential transfer failed: %v", err)
@@ -347,6 +351,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Clone repo if specified
 	if req.Repo != "" {
+		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := c.cloneRepo(ctx, agent, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
 		}
