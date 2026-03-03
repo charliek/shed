@@ -72,7 +72,7 @@ func init() {
 func runServerAdd(cmd *cobra.Command, args []string) error {
 	host := args[0]
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Connecting to %s:%d...\n", host, serverAddPort)
 	}
 

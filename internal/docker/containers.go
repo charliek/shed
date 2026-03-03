@@ -111,14 +111,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	return &config.Shed{
-		Name:        req.Name,
-		Status:      config.StatusRunning,
-		CreatedAt:   createdAt,
-		Repo:        req.Repo,
-		ContainerID: resp.ID,
-		Backend:     config.BackendDocker,
-	}, nil
+	return c.GetShed(ctx, req.Name)
 }
 
 // cloneRepo clones a git repository into the container's workspace.
@@ -350,6 +343,17 @@ func containerToShed(ctr container.Summary) config.Shed {
 
 	status := containerStateToStatus(ctr.State)
 
+	// Extract IP address from first network
+	var ipAddress string
+	if ctr.NetworkSettings != nil {
+		for _, net := range ctr.NetworkSettings.Networks {
+			if net.IPAddress != "" {
+				ipAddress = net.IPAddress
+				break
+			}
+		}
+	}
+
 	return config.Shed{
 		Name:        name,
 		Status:      status,
@@ -357,6 +361,7 @@ func containerToShed(ctr container.Summary) config.Shed {
 		Repo:        repo,
 		ContainerID: ctr.ID,
 		Backend:     backend,
+		IPAddress:   ipAddress,
 	}
 }
 
@@ -379,6 +384,17 @@ func inspectToShed(ctr container.InspectResponse) *config.Shed {
 
 	status := inspectStateToStatus(ctr.State)
 
+	// Extract IP address from first network
+	var ipAddress string
+	if ctr.NetworkSettings != nil {
+		for _, net := range ctr.NetworkSettings.Networks {
+			if net.IPAddress != "" {
+				ipAddress = net.IPAddress
+				break
+			}
+		}
+	}
+
 	return &config.Shed{
 		Name:        name,
 		Status:      status,
@@ -386,6 +402,7 @@ func inspectToShed(ctr container.InspectResponse) *config.Shed {
 		Repo:        repo,
 		ContainerID: ctr.ID,
 		Backend:     backend,
+		IPAddress:   ipAddress,
 	}
 }
 

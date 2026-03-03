@@ -57,7 +57,7 @@ func runSessions(cmd *cobra.Command, args []string) error {
 			client := NewAPIClientFromEntry(&entry, DefaultTimeout)
 			resp, err := client.ListAllSessions()
 			if err != nil {
-				if verboseFlag {
+				if verboseLevel > 0 {
 					fmt.Fprintf(os.Stderr, "Warning: could not query server %s: %v\n", serverName, err)
 				}
 				continue

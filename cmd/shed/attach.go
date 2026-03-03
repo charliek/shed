@@ -78,7 +78,7 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Attaching to session %q in %s on %s...\n", attachSessionFlag, name, serverName)
 	}
 

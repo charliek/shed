@@ -13,10 +13,10 @@ import (
 
 var (
 	// Global flags
-	serverFlag  string
-	verboseFlag bool
-	configFlag  string
-	jsonFlag    bool
+	serverFlag   string
+	verboseLevel int
+	configFlag   string
+	jsonFlag     bool
 
 	// Loaded configuration
 	clientConfig *config.ClientConfig
@@ -34,7 +34,7 @@ on one or more shed servers.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// JSON mode suppresses verbose output to keep stdout machine-readable
 		if jsonFlag {
-			verboseFlag = false
+			verboseLevel = 0
 		}
 
 		// Skip config loading for version command
@@ -70,7 +70,7 @@ var versionCmd = &cobra.Command{
 				BuildDate: version.BuildDate,
 			})
 		}
-		if verboseFlag {
+		if verboseLevel > 0 {
 			fmt.Println(version.FullInfo())
 		} else {
 			fmt.Printf("shed %s\n", version.Info())
@@ -82,7 +82,7 @@ var versionCmd = &cobra.Command{
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVarP(&serverFlag, "server", "s", "", "Server to use (default: configured default)")
-	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose output")
+	rootCmd.PersistentFlags().CountVarP(&verboseLevel, "verbose", "v", "Increase verbosity (-v, -vv)")
 	rootCmd.PersistentFlags().StringVarP(&configFlag, "config", "c", "", "Path to config file")
 	rootCmd.PersistentFlags().BoolVar(&jsonFlag, "json", false, "Output as JSON")
 

@@ -83,7 +83,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 	syncer.SetOutput(multiWriter)
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Syncing to shed %s on %s...\n", name, serverName)
 	}
 

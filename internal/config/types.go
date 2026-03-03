@@ -65,6 +65,11 @@ type Shed struct {
 	Repo        string    `json:"repo,omitempty" yaml:"repo,omitempty"`
 	ContainerID string    `json:"container_id" yaml:"container_id"`
 	Backend     string    `json:"backend,omitempty" yaml:"backend,omitempty"`
+	IPAddress   string    `json:"ip_address,omitempty" yaml:"ip_address,omitempty"`
+	CPUs        int       `json:"cpus,omitempty" yaml:"cpus,omitempty"`
+	MemoryMB    int       `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
+	PID         int       `json:"pid,omitempty" yaml:"pid,omitempty"`
+	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
 }
 
 // Shed status constants.
