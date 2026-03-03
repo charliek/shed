@@ -108,6 +108,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
 	}
 
+	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
 	rootfsPath, err := CopyRootfs(c.cfg.BaseRootfs, c.cfg.InstanceDir, req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
@@ -133,6 +134,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	vm := CreateVM(meta, c.cfg)
 
+	backend.Progress(ctx, "vm", "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
@@ -160,6 +162,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Transfer credentials
 	if c.serverCfg != nil {
+		backend.Progress(ctx, "credentials", "Transferring credentials...")
 		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
 		if err := credTransfer.TransferAll(ctx); err != nil {
 			log.Printf("Warning: credential transfer failed: %v", err)
@@ -171,6 +174,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Clone repo if specified
 	if req.Repo != "" {
+		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := c.cloneRepo(ctx, agent, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
 		}

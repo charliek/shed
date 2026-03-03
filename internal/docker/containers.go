@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/provision"
 )
@@ -33,6 +34,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	containerName := config.ContainerName(req.Name)
 
 	// Create the workspace volume
+	backend.Progress(ctx, "volume", "Creating workspace volume...")
 	if err := c.CreateVolume(ctx, req.Name); err != nil {
 		return nil, fmt.Errorf("failed to create volume: %w", err)
 	}
@@ -69,6 +71,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	// Create the container
+	backend.Progress(ctx, "container", "Creating container...")
 	resp, err := c.docker.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
 	if err != nil {
 		// Clean up volume on failure
@@ -77,6 +80,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	// Start the container
+	backend.Progress(ctx, "start", "Starting container...")
 	if err := c.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		// Clean up on failure
 		_ = c.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
@@ -91,6 +95,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Clone repository if specified
 	if req.Repo != "" {
+		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := c.cloneRepo(ctx, resp.ID, req.Repo); err != nil {
 			// Log warning but don't fail - container is still usable
 			// The error will be noted in the shed status
@@ -100,6 +105,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Run provisioning hooks if not disabled
 	if !req.NoProvision {
+		backend.Progress(ctx, "provision", "Running provisioning...")
 		if err := c.runProvisioning(ctx, resp.ID, req.Name, true, os.Stdout, os.Stderr); err != nil {
 			log.Printf("Warning: provisioning failed: %v", err)
 		}

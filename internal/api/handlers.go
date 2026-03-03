@@ -3,10 +3,12 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
 	"github.com/go-chi/chi/v5"
@@ -55,6 +57,7 @@ func (s *Server) handleListSheds(w http.ResponseWriter, r *http.Request) {
 
 // handleCreateShed creates a new shed.
 // POST /api/sheds
+// If the client sends Accept: text/event-stream, progress is streamed as SSE.
 func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	var req config.CreateShedRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -85,6 +88,12 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		req.Image = s.cfg.DefaultImage
 	}
 
+	// Stream progress via SSE if the client requests it
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		s.handleCreateShedSSE(w, r, req)
+		return
+	}
+
 	shed, err := s.backend.CreateShed(r.Context(), req)
 	if err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
@@ -94,6 +103,86 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, shed)
+}
+
+// handleCreateShedSSE streams create progress as Server-Sent Events.
+func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req config.CreateShedRequest) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	events := make(chan backend.ProgressEvent, 16)
+	progressFn := func(event backend.ProgressEvent) {
+		select {
+		case events <- event:
+		default:
+		}
+	}
+
+	ctx := backend.ContextWithProgress(r.Context(), progressFn)
+
+	type createResult struct {
+		shed *config.Shed
+		err  error
+	}
+	done := make(chan createResult, 1)
+
+	go func() {
+		shed, err := s.backend.CreateShed(ctx, req)
+		done <- createResult{shed, err}
+	}()
+
+	// Stream progress events until creation completes.
+	// Uses select to avoid closing the events channel (which would race with sends).
+	var res createResult
+	streaming := true
+	for streaming {
+		select {
+		case event := <-events:
+			writeSSEEvent(w, "progress", event)
+			flusher.Flush()
+		case res = <-done:
+			streaming = false
+		}
+	}
+
+	// Drain any remaining buffered progress events
+drain:
+	for {
+		select {
+		case event := <-events:
+			writeSSEEvent(w, "progress", event)
+			flusher.Flush()
+		default:
+			break drain
+		}
+	}
+
+	if res.err != nil {
+		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, res.err)
+		_, errCode, msg := mapDockerError(res.err)
+		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
+	} else {
+		writeSSEEvent(w, "complete", res.shed)
+	}
+	flusher.Flush()
+}
+
+// writeSSEEvent writes a single Server-Sent Event.
+func writeSSEEvent(w http.ResponseWriter, eventType string, data any) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("writeSSEEvent: failed to marshal %s event: %v", eventType, err)
+		return
+	}
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, string(jsonData))
 }
 
 // handleGetShed returns a single shed by name.
