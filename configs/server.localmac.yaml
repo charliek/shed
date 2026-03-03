@@ -13,7 +13,7 @@ default_image: shed-base:latest
 credentials:
   git_ssh:
     source: ~/.ssh
-    target: /mnt/ssh-host
+    target: /home/shed/.ssh
     readonly: true
 
   git_config:
