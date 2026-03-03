@@ -103,6 +103,14 @@ RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d && \
     "PasswordAuthentication no" \
     > /etc/ssh/sshd_config.d/10-shed.conf
 
+# SSH client compatibility: ignore macOS-specific config directives
+# (UseKeychain, AddKeysToAgent) that may be present in transferred host SSH configs
+RUN mkdir -p /etc/ssh/ssh_config.d && \
+    printf "%s\n" \
+    "Host *" \
+    "    IgnoreUnknown UseKeychain,AddKeysToAgent" \
+    > /etc/ssh/ssh_config.d/10-macos-compat.conf
+
 # Create non-root shed user (UID 1000) with passwordless sudo (devcontainer pattern)
 # Ubuntu 24.04 ships a default 'ubuntu' user at UID 1000; remove it first so
 # files created inside the VM are owned by shed (UID 1000).
