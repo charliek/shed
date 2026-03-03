@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync/atomic"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -120,11 +119,7 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 	flusher.Flush()
 
 	events := make(chan backend.ProgressEvent, 16)
-	var closed atomic.Bool
 	progressFn := func(event backend.ProgressEvent) {
-		if closed.Load() {
-			return
-		}
 		select {
 		case events <- event:
 		default:
@@ -141,17 +136,35 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 
 	go func() {
 		shed, err := s.backend.CreateShed(ctx, req)
-		closed.Store(true)
-		close(events)
 		done <- createResult{shed, err}
 	}()
 
-	for event := range events {
-		writeSSEEvent(w, "progress", event)
-		flusher.Flush()
+	// Stream progress events until creation completes.
+	// Uses select to avoid closing the events channel (which would race with sends).
+	var res createResult
+	streaming := true
+	for streaming {
+		select {
+		case event := <-events:
+			writeSSEEvent(w, "progress", event)
+			flusher.Flush()
+		case res = <-done:
+			streaming = false
+		}
 	}
 
-	res := <-done
+	// Drain any remaining buffered progress events
+drain:
+	for {
+		select {
+		case event := <-events:
+			writeSSEEvent(w, "progress", event)
+			flusher.Flush()
+		default:
+			break drain
+		}
+	}
+
 	if res.err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, res.err)
 		_, errCode, msg := mapDockerError(res.err)

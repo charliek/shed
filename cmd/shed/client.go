@@ -297,6 +297,30 @@ func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.Progre
 		}
 	}
 
+	// Handle a final event if EOF occurs before a trailing blank line.
+	if dataBuf.Len() > 0 {
+		data := dataBuf.String()
+		switch eventType {
+		case "complete":
+			var shed config.Shed
+			if err := json.Unmarshal([]byte(data), &shed); err != nil {
+				return nil, fmt.Errorf("failed to parse complete event: %w", err)
+			}
+			return &shed, nil
+		case "error":
+			var apiErr config.APIError
+			if err := json.Unmarshal([]byte(data), &apiErr); err != nil {
+				return nil, fmt.Errorf("server error: %s", data)
+			}
+			return nil, fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+		case "progress":
+			var event backend.ProgressEvent
+			if err := json.Unmarshal([]byte(data), &event); err == nil && onProgress != nil {
+				onProgress(event)
+			}
+		}
+	}
+
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading event stream: %w", err)
 	}
