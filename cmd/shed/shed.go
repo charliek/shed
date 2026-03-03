@@ -128,7 +128,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Creating shed %s on %s...\n", name, serverName)
 	}
 
@@ -284,7 +284,7 @@ func runList(cmd *cobra.Command, args []string) error {
 			client := NewAPIClientFromEntry(&e, DefaultTimeout)
 			resp, err := client.ListSheds()
 			if err != nil {
-				if verboseFlag {
+				if verboseLevel > 0 {
 					fmt.Fprintf(os.Stderr, "Warning: could not reach %s: %v\n", name, err)
 				}
 				continue
@@ -310,7 +310,7 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	// Save updated cache
 	if err := clientConfig.Save(); err != nil {
-		if verboseFlag {
+		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
 	}
@@ -322,21 +322,40 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	if jsonFlag {
 		type shedJSON struct {
-			Name      string    `json:"name"`
-			Server    string    `json:"server"`
-			Status    string    `json:"status"`
-			CreatedAt time.Time `json:"created_at"`
-			Backend   string    `json:"backend,omitempty"`
+			Name       string    `json:"name"`
+			Server     string    `json:"server"`
+			Status     string    `json:"status"`
+			CreatedAt  time.Time `json:"created_at"`
+			Backend    string    `json:"backend,omitempty"`
+			IPAddress  string    `json:"ip_address,omitempty"`
+			CPUs       int       `json:"cpus,omitempty"`
+			MemoryMB   int       `json:"memory_mb,omitempty"`
+			Repo       string    `json:"repo,omitempty"`
+			PID        int       `json:"pid,omitempty"`
+			RootfsPath string    `json:"rootfs_path,omitempty"`
+			SSH        string    `json:"ssh,omitempty"`
+			Uptime     string    `json:"uptime,omitempty"`
 		}
 		result := make([]shedJSON, 0, len(allSheds))
 		for _, s := range allSheds {
-			result = append(result, shedJSON{
-				Name:      s.shed.Name,
-				Server:    s.server,
-				Status:    s.shed.Status,
-				CreatedAt: s.shed.CreatedAt,
-				Backend:   s.shed.Backend,
-			})
+			sj := shedJSON{
+				Name:       s.shed.Name,
+				Server:     s.server,
+				Status:     s.shed.Status,
+				CreatedAt:  s.shed.CreatedAt,
+				Backend:    s.shed.Backend,
+				IPAddress:  s.shed.IPAddress,
+				CPUs:       s.shed.CPUs,
+				MemoryMB:   s.shed.MemoryMB,
+				Repo:       s.shed.Repo,
+				PID:        s.shed.PID,
+				RootfsPath: s.shed.RootfsPath,
+			}
+			if s.shed.Status == config.StatusRunning {
+				sj.SSH = shedSSHString(s.shed.Name, s.server)
+				sj.Uptime = formatUptime(s.shed.CreatedAt)
+			}
+			result = append(result, sj)
 		}
 		return outputJSON(result)
 	}
@@ -348,24 +367,168 @@ func runList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Tier 3: key-value display (verboseLevel >= 2)
+	if verboseLevel >= 2 {
+		for i, s := range allSheds {
+			if i > 0 {
+				fmt.Println("---")
+			}
+			fmt.Printf("Name:           %s\n", s.shed.Name)
+			fmt.Printf("Status:         %s\n", s.shed.Status)
+			fmt.Printf("Backend:        %s\n", valueOrDash(s.shed.Backend))
+			if listAll {
+				fmt.Printf("Server:         %s\n", s.server)
+			}
+			fmt.Printf("Created:        %s\n", s.shed.CreatedAt.Format("2006-01-02 15:04:05"))
+			if s.shed.Status == config.StatusRunning {
+				fmt.Printf("Uptime:         %s\n", formatUptime(s.shed.CreatedAt))
+			}
+
+			// Network section
+			if s.shed.IPAddress != "" || s.shed.Status == config.StatusRunning {
+				fmt.Println()
+				fmt.Println("Network:")
+				if s.shed.IPAddress != "" {
+					fmt.Printf("  IP:           %s\n", s.shed.IPAddress)
+				}
+				if s.shed.Status == config.StatusRunning {
+					fmt.Printf("  SSH:          %s\n", shedSSHString(s.shed.Name, s.server))
+				}
+			}
+
+			// Resources section
+			if s.shed.CPUs > 0 || s.shed.MemoryMB > 0 {
+				fmt.Println()
+				fmt.Println("Resources:")
+				if s.shed.CPUs > 0 {
+					fmt.Printf("  CPUs:         %d\n", s.shed.CPUs)
+				}
+				if s.shed.MemoryMB > 0 {
+					fmt.Printf("  Memory:       %d MB\n", s.shed.MemoryMB)
+				}
+			}
+
+			// Repo
+			if s.shed.Repo != "" {
+				fmt.Println()
+				fmt.Printf("Repo:           %s\n", s.shed.Repo)
+			}
+
+			// Runtime section
+			if s.shed.PID > 0 || s.shed.ContainerID != "" || s.shed.RootfsPath != "" {
+				fmt.Println()
+				fmt.Println("Runtime:")
+				if s.shed.PID > 0 {
+					fmt.Printf("  PID:          %d\n", s.shed.PID)
+				}
+				if s.shed.ContainerID != "" {
+					fmt.Printf("  Container ID: %s\n", s.shed.ContainerID)
+				}
+				if s.shed.RootfsPath != "" {
+					fmt.Printf("  Rootfs:       %s\n", s.shed.RootfsPath)
+				}
+			}
+			fmt.Println()
+		}
+		return nil
+	}
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+
+	// Tier 2: verbose table (verboseLevel == 1)
+	if verboseLevel >= 1 {
+		if listAll {
+			fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tREPO\tUPTIME")
+		} else {
+			fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tREPO\tUPTIME")
+		}
+		for _, s := range allSheds {
+			ssh := "-"
+			uptime := "-"
+			if s.shed.Status == config.StatusRunning {
+				ssh = shedSSHString(s.shed.Name, s.server)
+				uptime = formatUptime(s.shed.CreatedAt)
+			}
+			ip := valueOrDash(s.shed.IPAddress)
+			resources := "-"
+			if s.shed.CPUs > 0 && s.shed.MemoryMB > 0 {
+				resources = fmt.Sprintf("%dc/%dMB", s.shed.CPUs, s.shed.MemoryMB)
+			} else if s.shed.CPUs > 0 {
+				resources = fmt.Sprintf("%dc", s.shed.CPUs)
+			} else if s.shed.MemoryMB > 0 {
+				resources = fmt.Sprintf("%dMB", s.shed.MemoryMB)
+			}
+			repo := valueOrDash(s.shed.Repo)
+			if listAll {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, repo, uptime)
+			} else {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, repo, uptime)
+			}
+		}
+		w.Flush()
+		return nil
+	}
+
+	// Tier 1: default table
 	if listAll {
-		fmt.Fprintln(w, "NAME\tSERVER\tSTATUS\tCREATED")
+		fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tCREATED")
 	} else {
-		fmt.Fprintln(w, "NAME\tSTATUS\tCREATED")
+		fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tCREATED")
 	}
 
 	for _, s := range allSheds {
 		created := s.shed.CreatedAt.Format("2006-01-02 15:04")
+		ssh := "-"
+		if s.shed.Status == config.StatusRunning {
+			ssh = shedSSHString(s.shed.Name, s.server)
+		}
 		if listAll {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.shed.Name, s.server, s.shed.Status, created)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+				s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, created)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\n", s.shed.Name, s.shed.Status, created)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+				s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, created)
 		}
 	}
 
 	w.Flush()
 	return nil
+}
+
+// shedSSHString returns the SSH connection string for a shed.
+func shedSSHString(shedName, serverName string) string {
+	if entry, ok := clientConfig.Servers[serverName]; ok {
+		return fmt.Sprintf("%s@%s:%d", shedName, entry.Host, entry.SSHPort)
+	}
+	return shedName
+}
+
+// formatUptime formats the time since creation as a human-readable duration.
+func formatUptime(t time.Time) string {
+	d := time.Since(t)
+	if d < 0 {
+		return "0m"
+	}
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh", days, hours)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dm", minutes)
+}
+
+// valueOrDash returns the value if non-empty, otherwise "-".
+func valueOrDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func runDelete(cmd *cobra.Command, args []string) error {
@@ -410,7 +573,7 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// Remove from cache
 	clientConfig.RemoveShedCache(name)
 	if err := clientConfig.Save(); err != nil {
-		if verboseFlag {
+		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
 	}
@@ -436,7 +599,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Starting shed %s on %s...\n", name, serverName)
 	}
 
@@ -456,7 +619,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Update cache
 	clientConfig.CacheShed(name, serverName, shed.Status)
 	if err := clientConfig.Save(); err != nil {
-		if verboseFlag {
+		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
 	}
@@ -483,7 +646,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Stopping shed %s on %s...\n", name, serverName)
 	}
 
@@ -499,7 +662,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	// Update cache
 	clientConfig.CacheShed(name, serverName, shed.Status)
 	if err := clientConfig.Save(); err != nil {
-		if verboseFlag {
+		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
 	}
@@ -523,14 +686,14 @@ func runStop(cmd *cobra.Command, args []string) error {
 func stopTunnelsForShed(name string) {
 	mgr, err := tunnels.NewManager()
 	if err != nil {
-		if verboseFlag {
+		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to initialize tunnel manager: %v\n", err)
 		}
 		return
 	}
 	if err := mgr.StopAllTunnelsForShed(name); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to stop tunnel for %s: %v\n", name, err)
-	} else if verboseFlag {
+	} else if verboseLevel > 0 {
 		fmt.Printf("Stopped tunnel for %s\n", name)
 	}
 }

@@ -156,7 +156,7 @@ func getAllShedsInfo() ([]shedInfo, error) {
 		client := NewAPIClientFromEntry(&entryCopy, DefaultTimeout)
 		resp, err := client.ListSheds()
 		if err != nil {
-			if verboseFlag {
+			if verboseLevel > 0 {
 				fmt.Fprintf(os.Stderr, "Warning: could not reach %s: %v\n", serverName, err)
 			}
 			continue
@@ -175,7 +175,7 @@ func getAllShedsInfo() ([]shedInfo, error) {
 
 	// Save updated cache
 	if err := clientConfig.Save(); err != nil {
-		if verboseFlag {
+		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
 	}
@@ -271,7 +271,7 @@ func runSSHConfigInstall(entries []sshconfig.Entry) error {
 			}
 		}
 
-		if len(diff.Unchanged) > 0 && verboseFlag {
+		if len(diff.Unchanged) > 0 && verboseLevel > 0 {
 			fmt.Println("Entries unchanged:")
 			for _, name := range diff.Unchanged {
 				fmt.Printf("  = %s\n", name)

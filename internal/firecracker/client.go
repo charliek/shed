@@ -378,6 +378,11 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		Repo:        meta.Repo,
 		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
 		Backend:     meta.Backend,
+		IPAddress:   meta.IPAddress,
+		CPUs:        meta.CPUs,
+		MemoryMB:    meta.MemoryMB,
+		PID:         meta.PID,
+		RootfsPath:  meta.RootfsPath,
 	}, nil
 }
 
@@ -411,6 +416,11 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		Repo:        meta.Repo,
 		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
 		Backend:     meta.Backend,
+		IPAddress:   meta.IPAddress,
+		CPUs:        meta.CPUs,
+		MemoryMB:    meta.MemoryMB,
+		PID:         meta.PID,
+		RootfsPath:  meta.RootfsPath,
 	}, nil
 }
 
@@ -550,6 +560,11 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		Repo:        meta.Repo,
 		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
 		Backend:     meta.Backend,
+		IPAddress:   meta.IPAddress,
+		CPUs:        meta.CPUs,
+		MemoryMB:    meta.MemoryMB,
+		PID:         meta.PID,
+		RootfsPath:  meta.RootfsPath,
 	}, nil
 }
 
@@ -620,6 +635,11 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		Repo:        meta.Repo,
 		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
 		Backend:     meta.Backend,
+		IPAddress:   meta.IPAddress,
+		CPUs:        meta.CPUs,
+		MemoryMB:    meta.MemoryMB,
+		PID:         meta.PID,
+		RootfsPath:  meta.RootfsPath,
 	}, nil
 }
 

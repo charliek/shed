@@ -98,7 +98,7 @@ func sshToShed(name string, command []string) error {
 		return err
 	}
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Connecting to %s on %s...\n", name, serverName)
 	}
 

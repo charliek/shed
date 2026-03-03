@@ -16,12 +16,11 @@ import (
 )
 
 var (
-	tunnelProfiles    []string
-	tunnelPorts       []string
-	tunnelBackground  bool
-	tunnelReplace     bool
-	tunnelStopAll     bool
-	tunnelListVerbose bool
+	tunnelProfiles   []string
+	tunnelPorts      []string
+	tunnelBackground bool
+	tunnelReplace    bool
+	tunnelStopAll    bool
 )
 
 var tunnelsCmd = &cobra.Command{
@@ -103,9 +102,6 @@ func init() {
 
 	// tunnels stop flags
 	tunnelsStopCmd.Flags().BoolVar(&tunnelStopAll, "all", false, "Stop all tunnels")
-
-	// tunnels list flags
-	tunnelsListCmd.Flags().BoolVarP(&tunnelListVerbose, "verbose", "v", false, "Show detailed port mappings")
 
 	// tunnels config flags
 	tunnelsConfigCmd.Flags().StringArrayVarP(&tunnelProfiles, "profile", "p", nil, "Profile to preview")
@@ -255,7 +251,7 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Show what we're doing
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Printf("Starting tunnel to %s on %s\n", shedName, serverName)
 		fmt.Println("Port mappings:")
 		for _, pm := range allPorts {
@@ -414,7 +410,7 @@ func runTunnelsList(cmd *cobra.Command, args []string) error {
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 
-	if tunnelListVerbose {
+	if verboseLevel > 0 {
 		fmt.Fprintln(w, "SHED\tPROFILE\tPID\tPORTS\tSTARTED\tSERVER")
 		for _, name := range names {
 			entry := allTunnels[name]
@@ -483,7 +479,7 @@ func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
-	if verboseFlag {
+	if verboseLevel > 0 {
 		fmt.Println("SSH command:")
 		fmt.Printf("  %s\n", strings.Join(mgr.BuildSSHArgs(shedName, entry, allPorts), " "))
 	}
