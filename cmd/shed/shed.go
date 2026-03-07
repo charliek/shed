@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -71,6 +72,7 @@ var (
 	createBackend     string
 	createCPUs        int
 	createMemory      int
+	createLocalDir    string
 	startTimeout      time.Duration
 	listAll           bool
 	deleteKeep        bool
@@ -87,6 +89,7 @@ func init() {
 	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: docker, firecracker, or vz (default: server default)")
 	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker/vz only)")
 	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
+	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a local directory as the workspace (mutually exclusive with --repo)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
@@ -119,6 +122,28 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 	if createMemory < 0 {
 		return fmt.Errorf("invalid memory %d: must be at least 0 MB", createMemory)
+	}
+
+	// Validate --local-dir flag
+	if createLocalDir != "" && createRepo != "" {
+		return fmt.Errorf("--local-dir and --repo are mutually exclusive")
+	}
+	if createLocalDir != "" {
+		absDir, err := filepath.Abs(createLocalDir)
+		if err != nil {
+			return fmt.Errorf("invalid local-dir path: %w", err)
+		}
+		info, err := os.Stat(absDir)
+		if err != nil {
+			return fmt.Errorf("local-dir %q does not exist: %w", absDir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("local-dir %q is not a directory", absDir)
+		}
+		if strings.Contains(absDir, ",") {
+			return fmt.Errorf("local-dir path must not contain commas (incompatible with VirtioFS device arguments)")
+		}
+		createLocalDir = absDir
 	}
 
 	entry, serverName, err := getServerEntry()
@@ -162,6 +187,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		Backend:     resolvedBackend,
 		CPUs:        createCPUs,
 		MemoryMB:    createMemory,
+		LocalDir:    createLocalDir,
 	}
 
 	shed, err := client.CreateShedWithProgress(req, func(event backend.ProgressEvent) {
@@ -333,6 +359,7 @@ func runList(cmd *cobra.Command, args []string) error {
 			Repo       string    `json:"repo,omitempty"`
 			PID        int       `json:"pid,omitempty"`
 			RootfsPath string    `json:"rootfs_path,omitempty"`
+			LocalDir   string    `json:"local_dir,omitempty"`
 			SSH        string    `json:"ssh,omitempty"`
 			Uptime     string    `json:"uptime,omitempty"`
 		}
@@ -350,6 +377,7 @@ func runList(cmd *cobra.Command, args []string) error {
 				Repo:       s.shed.Repo,
 				PID:        s.shed.PID,
 				RootfsPath: s.shed.RootfsPath,
+				LocalDir:   s.shed.LocalDir,
 			}
 			if s.shed.Status == config.StatusRunning {
 				sj.SSH = shedSSHString(s.shed.Name, s.server)
@@ -408,10 +436,14 @@ func runList(cmd *cobra.Command, args []string) error {
 				}
 			}
 
-			// Repo
+			// Repo / Local Dir
 			if s.shed.Repo != "" {
 				fmt.Println()
 				fmt.Printf("Repo:           %s\n", s.shed.Repo)
+			}
+			if s.shed.LocalDir != "" {
+				fmt.Println()
+				fmt.Printf("Local Dir:      %s\n", s.shed.LocalDir)
 			}
 
 			// Runtime section
@@ -438,9 +470,9 @@ func runList(cmd *cobra.Command, args []string) error {
 	// Tier 2: verbose table (verboseLevel == 1)
 	if verboseLevel >= 1 {
 		if listAll {
-			fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tREPO\tUPTIME")
+			fmt.Fprintln(w, "NAME\tSERVER\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tUPTIME")
 		} else {
-			fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tREPO\tUPTIME")
+			fmt.Fprintln(w, "NAME\tBACKEND\tSTATUS\tSSH\tIP\tRESOURCES\tSOURCE\tUPTIME")
 		}
 		for _, s := range allSheds {
 			ssh := "-"
@@ -458,13 +490,16 @@ func runList(cmd *cobra.Command, args []string) error {
 			} else if s.shed.MemoryMB > 0 {
 				resources = fmt.Sprintf("%dMB", s.shed.MemoryMB)
 			}
-			repo := valueOrDash(s.shed.Repo)
+			source := valueOrDash(s.shed.Repo)
+			if s.shed.LocalDir != "" {
+				source = s.shed.LocalDir
+			}
 			if listAll {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, repo, uptime)
+					s.shed.Name, s.server, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, uptime)
 			} else {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, repo, uptime)
+					s.shed.Name, valueOrDash(s.shed.Backend), s.shed.Status, ssh, ip, resources, source, uptime)
 			}
 		}
 		w.Flush()

@@ -33,10 +33,12 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	containerName := config.ContainerName(req.Name)
 
-	// Create the workspace volume
-	backend.Progress(ctx, "volume", "Creating workspace volume...")
-	if err := c.CreateVolume(ctx, req.Name); err != nil {
-		return nil, fmt.Errorf("failed to create volume: %w", err)
+	// Create the workspace volume (skip when using a local directory bind mount)
+	if req.LocalDir == "" {
+		backend.Progress(ctx, "volume", "Creating workspace volume...")
+		if err := c.CreateVolume(ctx, req.Name); err != nil {
+			return nil, fmt.Errorf("failed to create volume: %w", err)
+		}
 	}
 
 	// Build container configuration
@@ -50,6 +52,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if req.Repo != "" {
 		labels[config.LabelShedRepo] = req.Repo
 	}
+	if req.LocalDir != "" {
+		labels[config.LabelShedLocalDir] = req.LocalDir
+	}
 
 	containerConfig := &container.Config{
 		Image:  image,
@@ -59,7 +64,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	hostConfig := &container.HostConfig{
-		Mounts:      c.buildMounts(req.Name),
+		Mounts:      c.buildMounts(req.Name, req.LocalDir),
 		NetworkMode: "bridge",
 		RestartPolicy: container.RestartPolicy{
 			Name: container.RestartPolicyUnlessStopped,
@@ -74,8 +79,10 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	backend.Progress(ctx, "container", "Creating container...")
 	resp, err := c.docker.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
 	if err != nil {
-		// Clean up volume on failure
-		_ = c.DeleteVolume(ctx, req.Name)
+		// Clean up volume on failure (only if we created one)
+		if req.LocalDir == "" {
+			_ = c.DeleteVolume(ctx, req.Name)
+		}
 		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
 
@@ -84,17 +91,28 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if err := c.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		// Clean up on failure
 		_ = c.docker.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		_ = c.DeleteVolume(ctx, req.Name)
+		if req.LocalDir == "" {
+			_ = c.DeleteVolume(ctx, req.Name)
+		}
 		return nil, fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// Fix workspace ownership for the non-root shed user
-	if err := c.fixWorkspaceOwnership(ctx, resp.ID); err != nil {
-		log.Printf("Warning: failed to fix workspace ownership: %v", err)
+	// Fix permissions for the non-root shed user
+	if req.LocalDir != "" {
+		// Remap container shed user UID/GID to match host workspace owner.
+		// This avoids chowning the bind-mounted host directory, which would
+		// destructively change file ownership on Linux.
+		if err := c.fixLocalDirPermissions(ctx, resp.ID); err != nil {
+			log.Printf("Warning: failed to fix local dir permissions: %v", err)
+		}
+	} else {
+		if err := c.fixWorkspaceOwnership(ctx, resp.ID); err != nil {
+			log.Printf("Warning: failed to fix workspace ownership: %v", err)
+		}
 	}
 
-	// Clone repository if specified
-	if req.Repo != "" {
+	// Clone repository if specified (skip when using local dir — the directory IS the workspace)
+	if req.Repo != "" && req.LocalDir == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := c.cloneRepo(ctx, resp.ID, req.Repo); err != nil {
 			// Log warning but don't fail - container is still usable
@@ -202,6 +220,12 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
 	containerName := config.ContainerName(name)
 
+	// Check if this shed uses a local directory (no volume to delete)
+	isLocalDir := false
+	if ctr, err := c.docker.ContainerInspect(ctx, containerName); err == nil {
+		isLocalDir = ctr.Config.Labels[config.LabelShedLocalDir] != ""
+	}
+
 	// Remove container (force removal if running)
 	if err := c.docker.ContainerRemove(ctx, containerName, container.RemoveOptions{
 		Force:         true,
@@ -212,10 +236,9 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		}
 	}
 
-	// Remove volume unless keepVolume is true
-	if !keepVolume {
+	// Remove volume unless keepVolume is true or this is a local-dir shed
+	if !keepVolume && !isLocalDir {
 		if err := c.DeleteVolume(ctx, name); err != nil {
-			// Log warning but don't fail if volume doesn't exist
 			log.Printf("Warning: failed to delete volume: %v", err)
 		}
 	}
@@ -242,10 +265,16 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		return nil, fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// Fix workspace ownership for the non-root shed user
-	// (handles migrated volumes from old root-based containers)
-	if err := c.fixWorkspaceOwnership(ctx, shed.ContainerID); err != nil {
-		log.Printf("Warning: failed to fix workspace ownership: %v", err)
+	// Fix permissions for the non-root shed user
+	if shed.LocalDir != "" {
+		if err := c.fixLocalDirPermissions(ctx, shed.ContainerID); err != nil {
+			log.Printf("Warning: failed to fix local dir permissions: %v", err)
+		}
+	} else {
+		// Handles migrated volumes from old root-based containers
+		if err := c.fixWorkspaceOwnership(ctx, shed.ContainerID); err != nil {
+			log.Printf("Warning: failed to fix workspace ownership: %v", err)
+		}
 	}
 
 	// Run startup hook only (install already ran on create)
@@ -330,6 +359,7 @@ func containerToShed(ctr container.Summary) config.Shed {
 
 	name := labels[config.LabelShedName]
 	repo := labels[config.LabelShedRepo]
+	localDir := labels[config.LabelShedLocalDir]
 	// Default to docker for backwards compatibility with existing containers
 	backend := labels[config.LabelShedBackend]
 	if backend == "" {
@@ -362,6 +392,7 @@ func containerToShed(ctr container.Summary) config.Shed {
 		ContainerID: ctr.ID,
 		Backend:     backend,
 		IPAddress:   ipAddress,
+		LocalDir:    localDir,
 	}
 }
 
@@ -371,6 +402,7 @@ func inspectToShed(ctr container.InspectResponse) *config.Shed {
 
 	name := labels[config.LabelShedName]
 	repo := labels[config.LabelShedRepo]
+	localDir := labels[config.LabelShedLocalDir]
 	// Default to docker for backwards compatibility with existing containers
 	backend := labels[config.LabelShedBackend]
 	if backend == "" {
@@ -403,6 +435,7 @@ func inspectToShed(ctr container.InspectResponse) *config.Shed {
 		ContainerID: ctr.ID,
 		Backend:     backend,
 		IPAddress:   ipAddress,
+		LocalDir:    localDir,
 	}
 }
 
@@ -585,6 +618,66 @@ done`,
 	}
 	if inspectResp.ExitCode != 0 {
 		return fmt.Errorf("fixWorkspaceOwnership failed with exit code %d", inspectResp.ExitCode)
+	}
+	return nil
+}
+
+// fixLocalDirPermissions remaps the container's shed user UID/GID to match
+// the bind-mounted workspace directory owner. This avoids running chown on
+// the host directory, which would destructively change file ownership on Linux.
+func (c *Client) fixLocalDirPermissions(ctx context.Context, containerID string) error {
+	homeDir := fmt.Sprintf("/home/%s", config.ContainerUser)
+	cmd := []string{
+		"bash", "-c",
+		fmt.Sprintf(`user="%s"
+# Detect workspace owner UID/GID
+WS_UID=$(stat -c %%u %s)
+WS_GID=$(stat -c %%g %s)
+SHED_UID=$(id -u "$user")
+SHED_GID=$(id -g "$user")
+
+# Remap shed user/group if UID doesn't match
+if [ "$WS_UID" != "$SHED_UID" ]; then
+  usermod -u "$WS_UID" "$user" 2>/dev/null
+  chown -R "$user" "%s"
+fi
+if [ "$WS_GID" != "$SHED_GID" ]; then
+  groupmod -g "$WS_GID" "$user" 2>/dev/null
+  chgrp -R "$user" "%s"
+fi
+
+# Fix home directory intermediates created by Docker bind mounts
+for dir in %s/.local %s/.local/state %s/.local/share %s/.cache %s/.config; do
+  if [ -d "$dir" ] && [ "$(stat -c %%U "$dir")" != "$user" ]; then
+    chown "$user:$user" "$dir"
+  fi
+done`,
+			config.ContainerUser,
+			config.WorkspacePath, config.WorkspacePath,
+			homeDir, homeDir,
+			homeDir, homeDir, homeDir, homeDir, homeDir),
+	}
+	execConfig := container.ExecOptions{
+		Cmd:  cmd,
+		User: "root",
+	}
+	execResp, err := c.docker.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return err
+	}
+	attachResp, err := c.docker.ContainerExecAttach(ctx, execResp.ID, container.ExecStartOptions{})
+	if err != nil {
+		return err
+	}
+	defer attachResp.Close()
+	_, _ = io.Copy(io.Discard, attachResp.Reader)
+
+	inspectResp, err := c.docker.ContainerExecInspect(ctx, execResp.ID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect exec: %w", err)
+	}
+	if inspectResp.ExitCode != 0 {
+		return fmt.Errorf("fixLocalDirPermissions failed with exit code %d", inspectResp.ExitCode)
 	}
 	return nil
 }

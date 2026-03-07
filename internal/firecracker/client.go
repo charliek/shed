@@ -219,6 +219,10 @@ func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
 
 // CreateShed creates a new Firecracker-based shed.
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+	if req.LocalDir != "" {
+		return nil, fmt.Errorf("--local-dir is not supported on the firecracker backend (planned for future release)")
+	}
+
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
 	}

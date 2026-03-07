@@ -37,6 +37,9 @@ shed create my-project
 
 # Or clone a repository
 shed create my-project --repo git@github.com:user/repo.git
+
+# Or mount a local directory as the workspace
+shed create my-project --local-dir ~/projects/my-project
 ```
 
 ### 4. Connect
@@ -138,7 +141,7 @@ Developer Machine                    Remote Server / Local Mac
 
 ```bash
 # Shed Management
-shed create <name> [--repo URL]  # Create a new shed
+shed create <name> [--repo URL]  # Create a new shed (or --local-dir PATH)
 shed list                        # List all sheds on the current server
 shed start <name>                # Start a stopped shed
 shed stop <name>                 # Stop a running shed

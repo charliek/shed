@@ -124,6 +124,11 @@ func (vm *VM) buildVfkitArgs() []string {
 		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLogPath),
 	}
 
+	// Add VirtioFS shared directory if a local dir is configured
+	if vm.meta.LocalDir != "" {
+		args = append(args, "--device", fmt.Sprintf("virtio-fs,sharedDir=%s,mountTag=%s", vm.meta.LocalDir, config.VirtioFSMountTag))
+	}
+
 	// Add vsock devices — one per port.
 	// NOTE: SocketDir must not contain spaces. vfkit URL-encodes the socketURL
 	// parameter, turning spaces into %20, which causes connection failures.

@@ -53,6 +53,9 @@ type Metadata struct {
 
 	// Repo is the optional git repository URL
 	Repo string `json:"repo,omitempty"`
+
+	// LocalDir is the host directory mounted via VirtioFS (if set)
+	LocalDir string `json:"local_dir,omitempty"`
 }
 
 const metadataFilename = "metadata.json"

@@ -38,6 +38,9 @@ shed create my-project
 
 # Or clone a repository
 shed create my-project --repo git@github.com:user/repo.git
+
+# Or mount a local directory as the workspace
+shed create my-project --local-dir ~/projects/my-project
 ```
 
 ## Connect

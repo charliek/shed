@@ -123,6 +123,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		MemoryMB:   memoryMB,
 		RootfsPath: rootfsPath,
 		Repo:       req.Repo,
+		LocalDir:   req.LocalDir,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -160,6 +161,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	agent := c.newAgentClient(meta.Name)
 
+	// Mount VirtioFS workspace if local dir is configured
+	if req.LocalDir != "" {
+		backend.Progress(ctx, "mount", "Mounting local directory via VirtioFS...")
+		if err := c.mountVirtioFS(ctx, agent); err != nil {
+			// VirtioFS mount is essential for --local-dir; fail the create
+			if stopErr := vm.Stop(context.Background()); stopErr != nil {
+				log.Printf("Warning: failed to stop VM after mount failure: %v", stopErr)
+			}
+			return nil, fmt.Errorf("VirtioFS mount failed for local dir %s: %w", req.LocalDir, err)
+		}
+	}
+
 	// Transfer credentials
 	if c.serverCfg != nil {
 		backend.Progress(ctx, "credentials", "Transferring credentials...")
@@ -172,8 +185,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// Start credential notification listener for bidirectional sync
 	c.startNotifyListener(req.Name, agent)
 
-	// Clone repo if specified
-	if req.Repo != "" {
+	// Clone repo if specified (skip when using local dir)
+	if req.Repo != "" && req.LocalDir == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := c.cloneRepo(ctx, agent, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
@@ -194,19 +207,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   "127.0.0.1",
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	return metadataToShed(meta, "127.0.0.1"), nil
 }
 
 // GetShed returns a shed by name.
@@ -237,19 +238,9 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		ipAddress = "127.0.0.1"
 	}
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   ipAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	shed := metadataToShed(meta, ipAddress)
+	shed.Status = status // may differ from meta.Status after staleness check
+	return shed, nil
 }
 
 // ListSheds returns all sheds.
@@ -349,6 +340,17 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 
 	agent := c.newAgentClient(meta.Name)
 
+	// Re-mount VirtioFS workspace on start (mount doesn't persist across reboots)
+	if meta.LocalDir != "" {
+		if err := c.mountVirtioFS(ctx, agent); err != nil {
+			// VirtioFS mount is essential for --local-dir; stop the VM and fail
+			if stopErr := vm.Stop(context.Background()); stopErr != nil {
+				log.Printf("Warning: failed to stop VM after mount failure: %v", stopErr)
+			}
+			return nil, fmt.Errorf("VirtioFS mount failed on start for local dir %s: %w", meta.LocalDir, err)
+		}
+	}
+
 	// Refresh credentials on start
 	if c.serverCfg != nil {
 		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
@@ -372,19 +374,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		}
 	}
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   "127.0.0.1",
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	return metadataToShed(meta, "127.0.0.1"), nil
 }
 
 // StopShed stops a running shed.
@@ -447,19 +437,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	delete(c.vms, name)
 	c.mu.Unlock()
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   "",
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	return metadataToShed(meta, ""), nil
 }
 
 // GetNetworkEndpoint returns the network endpoint for a shed.
@@ -474,6 +452,44 @@ func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, e
 	}
 
 	return "127.0.0.1", nil
+}
+
+// metadataToShed converts VZ metadata to a config.Shed response.
+func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
+	return &config.Shed{
+		Name:        meta.Name,
+		Status:      meta.Status,
+		CreatedAt:   meta.CreatedAt,
+		Repo:        meta.Repo,
+		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
+		Backend:     meta.Backend,
+		IPAddress:   ipAddress,
+		CPUs:        meta.CPUs,
+		MemoryMB:    meta.MemoryMB,
+		PID:         meta.PID,
+		RootfsPath:  meta.RootfsPath,
+		LocalDir:    meta.LocalDir,
+	}
+}
+
+// mountVirtioFS mounts the VirtioFS shared directory inside the guest VM.
+func (c *Client) mountVirtioFS(ctx context.Context, agent *vmutil.AgentClient) error {
+	// Mount the VirtioFS share tagged "workspace" at the workspace path.
+	// Apple's VirtioFS transparently maps UIDs, so no chown is needed.
+	mountCmd := fmt.Sprintf(
+		"modprobe virtiofs 2>/dev/null; mkdir -p %s && mount -t virtiofs %s %s",
+		config.WorkspacePath, config.VirtioFSMountTag, config.WorkspacePath,
+	)
+	opts := backend.ExecOptions{
+		Cmd:    []string{"sudo", "sh", "-c", mountCmd},
+		Stdout: vmutil.NopWriteCloser(io.Discard),
+		Stderr: vmutil.NopWriteCloser(os.Stderr),
+		TTY:    false,
+	}
+	if err := agent.Exec(ctx, opts); err != nil {
+		return fmt.Errorf("virtiofs mount failed (kernel may lack CONFIG_VIRTIO_FS support): %w", err)
+	}
+	return nil
 }
 
 // cloneRepo clones a git repository into the VM's workspace.
