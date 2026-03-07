@@ -7,7 +7,7 @@ Complete reference for the `shed` command-line interface.
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--server` | `-s` | Target server (overrides default) |
-| `--verbose` | `-v` | Enable debug output |
+| `--verbose` | `-v` | Increase output verbosity (`-v` for expanded, `-vv` for full detail) |
 | `--config` | `-c` | Config file path (default: `~/.shed/config.yaml`) |
 | `--json` | | Emit structured JSON to stdout (suppresses verbose output) |
 
@@ -117,13 +117,23 @@ shed list [flags]
 | `--server` | `-s` | Default | List from specific server |
 | `--all` | `-a` | false | List from all servers |
 
-**Output:**
+**Output (default):**
 
 ```
-SERVER          NAME          STATUS     CREATED          REPO
-mini-desktop    codelens      running    2 hours ago      charliek/codelens
-mini-desktop    mcp-test      stopped    3 days ago       -
+NAME          BACKEND    STATUS     SSH                              CREATED
+codelens      docker     running    codelens@mini-desktop:2222       2026-01-20 10:30
+mcp-test      docker     stopped    -                                2026-01-17 14:00
 ```
+
+**Output with `-v` (expanded):**
+
+```
+NAME          BACKEND    STATUS     SSH                              IP             RESOURCES    SOURCE              UPTIME
+codelens      docker     running    codelens@mini-desktop:2222       172.17.0.2     2c/4096MB    charliek/codelens    2h30m
+mcp-test      docker     stopped    -                                -              -            -                    -
+```
+
+With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections.
 
 ### shed start
 

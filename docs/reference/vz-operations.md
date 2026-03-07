@@ -79,15 +79,10 @@ credentials:
 Provisioning hooks work identically to Firecracker — they execute commands in the VM via vsock. Place a `.shed/provision.yaml` in your repository:
 
 ```yaml
-install:
-  - name: Install dependencies
-    run: npm install
-startup:
-  - name: Start services
-    run: docker compose up -d
-shutdown:
-  - name: Stop services
-    run: docker compose down
+hooks:
+  install: scripts/provision/install.sh
+  startup: scripts/provision/startup.sh
+  shutdown: scripts/provision/shutdown.sh
 ```
 
 See [Provisioning](provisioning.md) for details.

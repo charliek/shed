@@ -36,7 +36,9 @@ Returns server metadata and capabilities.
   "name": "mini-desktop",
   "version": "1.0.0",
   "ssh_port": 2222,
-  "http_port": 8080
+  "http_port": 8080,
+  "default_backend": "docker",
+  "enabled_backends": ["docker"]
 }
 ```
 
@@ -69,11 +71,16 @@ Lists all sheds on this server.
       "created_at": "2026-01-20T10:30:00Z",
       "repo": "charliek/codelens",
       "backend": "docker",
-      "container_id": "abc123..."
+      "container_id": "abc123...",
+      "ip_address": "172.17.0.2",
+      "cpus": 2,
+      "memory_mb": 4096
     }
   ]
 }
 ```
+
+Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, and `local_dir` are omitted when empty or zero.
 
 **Status values:** `running`, `stopped`, `starting`, `error`
 
@@ -110,9 +117,41 @@ Creates a new shed.
   "created_at": "2026-01-20T10:30:00Z",
   "repo": "charliek/codelens",
   "backend": "docker",
-  "container_id": "abc123..."
+  "container_id": "abc123...",
+  "ip_address": "172.17.0.2",
+  "cpus": 2,
+  "memory_mb": 4096
 }
 ```
+
+#### SSE Progress Streaming
+
+The create endpoint supports real-time progress streaming via Server-Sent Events. To opt in, set the `Accept` header:
+
+```
+Accept: text/event-stream
+```
+
+The server streams events as the shed is created:
+
+```
+event: progress
+data: {"message":"Pulling image shed-base:latest..."}
+
+event: progress
+data: {"message":"Creating container..."}
+
+event: complete
+data: {"name":"codelens","status":"running",...}
+```
+
+| Event | Description |
+|-------|-------------|
+| `progress` | Status update with a `message` field |
+| `complete` | Final shed object (same shape as the synchronous response) |
+| `error` | Error object with `code` and `message` fields |
+
+Without the `Accept: text/event-stream` header, the endpoint behaves synchronously and returns the shed object directly.
 
 **Errors:**
 
