@@ -73,6 +73,8 @@ shed=true
 shed.name={name}
 shed.created={ISO8601 timestamp}
 shed.repo={owner/repo}
+shed.backend={docker|firecracker|vz}
+shed.local_dir={host path}
 ```
 
 ## Data Flows
@@ -101,9 +103,13 @@ sequenceDiagram
     participant Server
     participant Docker
 
-    CLI->>Server: POST /api/sheds {name, repo}
-    Server->>Docker: Create volume
-    Server->>Docker: Create container
+    CLI->>Server: POST /api/sheds {name, repo, local_dir}
+    alt local_dir specified
+        Server->>Docker: Create container (bind mount)
+    else
+        Server->>Docker: Create volume
+        Server->>Docker: Create container
+    end
     Server->>Docker: Start container
     alt repo specified
         Server->>Docker: git clone in container

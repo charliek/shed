@@ -70,6 +70,7 @@ type Shed struct {
 	MemoryMB    int       `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
 	PID         int       `json:"pid,omitempty" yaml:"pid,omitempty"`
 	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
+	LocalDir    string    `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
 }
 
 // Shed status constants.
@@ -160,6 +161,10 @@ type CreateShedRequest struct {
 
 	// MemoryMB specifies the memory in MB (firecracker/vz only)
 	MemoryMB int `json:"memory_mb,omitempty"`
+
+	// LocalDir mounts a host directory as the workspace instead of creating
+	// a volume. Mutually exclusive with Repo.
+	LocalDir string `json:"local_dir,omitempty"`
 }
 
 // APIError represents an error response from the API.
@@ -198,15 +203,17 @@ const (
 	ErrSessionNotFound    = "SESSION_NOT_FOUND"
 	ErrInvalidSessionName = "INVALID_SESSION_NAME"
 	ErrTmuxNotAvailable   = "TMUX_NOT_AVAILABLE"
+	ErrInvalidLocalDir    = "INVALID_LOCAL_DIR"
 )
 
 // Docker label keys for shed containers.
 const (
-	LabelShed        = "shed"
-	LabelShedName    = "shed.name"
-	LabelShedCreated = "shed.created"
-	LabelShedRepo    = "shed.repo"
-	LabelShedBackend = "shed.backend"
+	LabelShed         = "shed"
+	LabelShedName     = "shed.name"
+	LabelShedCreated  = "shed.created"
+	LabelShedRepo     = "shed.repo"
+	LabelShedBackend  = "shed.backend"
+	LabelShedLocalDir = "shed.local_dir"
 )
 
 // Backend type constants for Shed.Backend field.
@@ -240,3 +247,6 @@ func VolumeName(shedName string) string {
 
 // WorkspacePath is the path where the workspace volume is mounted in containers.
 const WorkspacePath = "/workspace"
+
+// VirtioFSMountTag is the mount tag used for VirtioFS shared directories.
+const VirtioFSMountTag = "workspace"

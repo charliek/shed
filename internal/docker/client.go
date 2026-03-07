@@ -58,16 +58,26 @@ func (c *Client) Config() *config.ServerConfig {
 	return c.config
 }
 
-// buildMounts creates mount configurations for credentials from server config.
-func (c *Client) buildMounts(shedName string) []mount.Mount {
+// buildMounts creates mount configurations for the workspace and credentials.
+// If localDir is non-empty, a bind mount is used instead of a named volume.
+func (c *Client) buildMounts(shedName string, localDir string) []mount.Mount {
 	mounts := make([]mount.Mount, 0, len(c.config.Credentials)+1)
 
-	// Add workspace volume mount
-	mounts = append(mounts, mount.Mount{
-		Type:   mount.TypeVolume,
-		Source: config.VolumeName(shedName),
-		Target: config.WorkspacePath,
-	})
+	if localDir != "" {
+		// Bind mount host directory as workspace
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: localDir,
+			Target: config.WorkspacePath,
+		})
+	} else {
+		// Named volume for workspace
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeVolume,
+			Source: config.VolumeName(shedName),
+			Target: config.WorkspacePath,
+		})
+	}
 
 	// Add credential mounts from config, skipping missing sources
 	for name, cred := range c.config.Credentials {

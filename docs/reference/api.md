@@ -68,6 +68,7 @@ Lists all sheds on this server.
       "status": "running",
       "created_at": "2026-01-20T10:30:00Z",
       "repo": "charliek/codelens",
+      "backend": "docker",
       "container_id": "abc123..."
     }
   ]
@@ -95,6 +96,10 @@ Creates a new shed.
 | `name` | Yes | - | Shed name (alphanumeric + hyphens) |
 | `repo` | No | null | Repository to clone (`owner/repo` shorthand or full URL) |
 | `image` | No | Server config | Base Docker image |
+| `backend` | No | Server default | Backend to use: `docker`, `firecracker`, or `vz` |
+| `local_dir` | No | null | Absolute path to host directory to mount as workspace (mutually exclusive with `repo`) |
+| `cpus` | No | Backend default | Number of vCPUs (firecracker/vz only) |
+| `memory_mb` | No | Backend default | Memory in MB (firecracker/vz only) |
 
 **Response (201 Created):**
 
@@ -104,6 +109,7 @@ Creates a new shed.
   "status": "running",
   "created_at": "2026-01-20T10:30:00Z",
   "repo": "charliek/codelens",
+  "backend": "docker",
   "container_id": "abc123..."
 }
 ```
@@ -114,6 +120,7 @@ Creates a new shed.
 |------|-------------|
 | 400 | Invalid name format |
 | 400 | Invalid repository URL |
+| 400 | Invalid local directory path |
 | 409 | Shed already exists |
 | 500 | Docker or clone failure |
 

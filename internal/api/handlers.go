@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
@@ -73,6 +75,39 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidShedName, err.Error())
 		return
+	}
+
+	// Validate local_dir and repo are mutually exclusive
+	if req.LocalDir != "" && req.Repo != "" {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, "local_dir and repo are mutually exclusive")
+		return
+	}
+
+	// Validate local_dir exists on the server
+	if req.LocalDir != "" {
+		if !filepath.IsAbs(req.LocalDir) {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, "local_dir must be an absolute path")
+			return
+		}
+		if strings.Contains(req.LocalDir, ",") {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, "local_dir path must not contain commas")
+			return
+		}
+		info, err := os.Stat(req.LocalDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q does not exist", req.LocalDir))
+			} else if os.IsPermission(err) {
+				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q: permission denied", req.LocalDir))
+			} else {
+				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q: %v", req.LocalDir, err))
+			}
+			return
+		}
+		if !info.IsDir() {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q is not a directory", req.LocalDir))
+			return
+		}
 	}
 
 	// Expand repo shorthand (e.g., "owner/repo" -> "git@github.com:owner/repo.git")

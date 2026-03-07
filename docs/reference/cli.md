@@ -81,6 +81,7 @@ shed create <name> [flags]
 | `--repo` | `-r` | None | Repository to clone (`owner/repo` shorthand or full URL) |
 | `--server` | `-s` | Default server | Target server |
 | `--image` | `-i` | Server default | Base Docker image |
+| `--local-dir` | | None | Mount a local host directory as the workspace (mutually exclusive with `--repo`) |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
@@ -95,7 +96,13 @@ shed create stbot --repo charliek/stbot --server cloud-vps
 shed create myproj --sync-profile full
 shed create myproj --no-sync
 shed create bigproj --repo org/large-repo --timeout 30m
+
+# Mount a local directory as the workspace
+shed create myproj --local-dir ~/projects/myproj
 ```
+
+!!! note "Local directory mounts"
+    When using `--local-dir`, the specified host directory is mounted directly as the workspace. No volume is created and `--repo` cannot be used. For Docker, this uses a bind mount. For VZ, this uses VirtioFS. Firecracker does not support local directory mounts.
 
 ### shed list
 

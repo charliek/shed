@@ -15,6 +15,9 @@ shed create myproject --backend=vz
 # With a git repository
 shed create myproject --backend=vz --repo=git@github.com:user/repo.git
 
+# With a local directory (mounted via VirtioFS)
+shed create myproject --backend=vz --local-dir=/path/to/project
+
 # With custom resources
 shed create myproject --backend=vz --cpus=4 --memory=8192
 ```
@@ -37,6 +40,18 @@ shed delete myproject
 ```bash
 shed list
 ```
+
+## Local Directory Mounting
+
+When using `--local-dir`, the host directory is shared with the VM via VirtioFS and mounted at `/workspace` inside the guest. Changes on either side are immediately visible to the other.
+
+```bash
+shed create myproject --backend=vz --local-dir=~/projects/myapp
+shed console myproject
+# Inside the VM: ls /workspace shows the contents of ~/projects/myapp
+```
+
+`--local-dir` is mutually exclusive with `--repo`. If the VirtioFS mount fails (e.g., the guest kernel lacks `CONFIG_VIRTIO_FS`), the create or start operation will fail with an error.
 
 ## Credentials
 

@@ -74,6 +74,45 @@ func TestBuildVfkitArgs(t *testing.T) {
 	if deviceCount != 6 {
 		t.Errorf("expected 6 --device flags (1 block + 1 net + 1 serial + 3 vsock), got %d", deviceCount)
 	}
+
+	// No VirtioFS device when LocalDir is empty
+	if strings.Contains(argsStr, "virtio-fs") {
+		t.Error("should not have virtio-fs device when LocalDir is empty")
+	}
+}
+
+func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
+	meta := &Metadata{
+		Name:       "test-vm",
+		CPUs:       2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/rootfs.ext4",
+		LocalDir:   "/Users/charlie/projects/myapp",
+	}
+	cfg := &config.VZConfig{
+		KernelPath:  "/tmp/vmlinux",
+		InstanceDir: "",
+		SocketDir:   "/tmp/sockets",
+		ConsolePort: 1024,
+		HealthPort:  1025,
+		NotifyPort:  1026,
+	}
+
+	vm := &VM{meta: meta, cfg: cfg}
+	args := vm.buildVfkitArgs()
+	argsStr := strings.Join(args, " ")
+
+	// Should have VirtioFS device
+	expected := fmt.Sprintf("virtio-fs,sharedDir=/Users/charlie/projects/myapp,mountTag=%s", config.VirtioFSMountTag)
+	if !strings.Contains(argsStr, expected) {
+		t.Errorf("expected VirtioFS device %q in args, got: %s", expected, argsStr)
+	}
+
+	// Should have 7 --device flags (1 block + 1 net + 1 serial + 1 virtio-fs + 3 vsock)
+	deviceCount := strings.Count(argsStr, "--device")
+	if deviceCount != 7 {
+		t.Errorf("expected 7 --device flags, got %d", deviceCount)
+	}
 }
 
 func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
