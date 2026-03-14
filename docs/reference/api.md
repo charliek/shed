@@ -128,13 +128,13 @@ Creates a new shed.
 
 The create endpoint supports real-time progress streaming via Server-Sent Events. To opt in, set the `Accept` header:
 
-```
+```http
 Accept: text/event-stream
 ```
 
 The server streams events as the shed is created:
 
-```
+```text
 event: progress
 data: {"message":"Pulling image shed-base:latest..."}
 

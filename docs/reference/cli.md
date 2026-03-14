@@ -119,7 +119,7 @@ shed list [flags]
 
 **Output (default):**
 
-```
+```text
 NAME          BACKEND    STATUS     SSH                              CREATED
 codelens      docker     running    codelens@mini-desktop:2222       2026-01-20 10:30
 mcp-test      docker     stopped    -                                2026-01-17 14:00
@@ -127,7 +127,7 @@ mcp-test      docker     stopped    -                                2026-01-17 
 
 **Output with `-v` (expanded):**
 
-```
+```text
 NAME          BACKEND    STATUS     SSH                              IP             RESOURCES    SOURCE              UPTIME
 codelens      docker     running    codelens@mini-desktop:2222       172.17.0.2     2c/4096MB    charliek/codelens    2h30m
 mcp-test      docker     stopped    -                                -              -            -                    -

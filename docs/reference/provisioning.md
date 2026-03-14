@@ -181,7 +181,7 @@ fi
 - Remove and recreate runtime directories (`/var/run/<service>`) with correct ownership
 - Remove stale PID files from data directories (e.g., `postmaster.pid`)
 - Guard commands with `2>/dev/null || true` so cleanup is safe on first boot (e.g., `chown` won't fail if the service user doesn't exist yet, `rm` won't fail if PID files are missing)
-- This pattern works identically on Docker, Firecracker, and VZ
+- This startup-hook stale-state cleanup pattern works identically on Docker, Firecracker, and VZ
 
 ## Environment Variables
 
