@@ -2,10 +2,11 @@
 
 Shed supports in-repo provisioning scripts that run automatically when sheds start. These scripts are version-controlled with your code.
 
-Provisioning works with both backends:
+Provisioning works with all three backends:
 
 - **Docker**: Hooks execute via `docker exec`
 - **Firecracker**: Hooks execute via vsock
+- **VZ**: Hooks execute via vsock (same mechanism as Firecracker)
 
 ## Quick Start
 
@@ -64,7 +65,7 @@ Runs before the shed stops (on `shed stop` and `shed delete`). Use for:
 
 The shutdown hook has a time budget of half the configured stop timeout (capped at 30s). If the hook exceeds this budget or fails, the shed still stops — hook failures are logged as warnings.
 
-**Note:** The shutdown hook is currently supported on the Firecracker backend only. Docker containers stop via `docker stop`, which sends SIGTERM directly.
+**Note:** The shutdown hook is supported on the Firecracker and VZ backends. Docker containers stop via `docker stop`, which sends SIGTERM directly.
 
 After the shutdown hook completes, the agent enforces a 5-second drain timeout on active connections before the VM exits. This gives in-flight exec and file transfer operations time to finish cleanly.
 
@@ -180,7 +181,7 @@ fi
 - Remove and recreate runtime directories (`/var/run/<service>`) with correct ownership
 - Remove stale PID files from data directories (e.g., `postmaster.pid`)
 - Guard commands with `2>/dev/null || true` so cleanup is safe on first boot (e.g., `chown` won't fail if the service user doesn't exist yet, `rm` won't fail if PID files are missing)
-- This pattern works identically on Docker and Firecracker
+- This startup-hook stale-state cleanup pattern works identically on Docker, Firecracker, and VZ
 
 ## Environment Variables
 

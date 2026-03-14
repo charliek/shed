@@ -22,7 +22,7 @@ Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to se
 
 ## Project Structure
 
-- `cmd/shed/` — CLI binary (single-file commands, all in `shed.go`)
+- `cmd/shed/` — CLI binary (command handlers split across `shed.go`, `console.go`, `attach.go`, `sessions.go`, `tunnels.go`, `sync.go`, `ssh_config.go`, etc.)
 - `cmd/shed-server/` — Server daemon binary
 - `cmd/shed-agent/` — In-VM agent binary (Firecracker/VZ)
 - `internal/api/` — HTTP API handlers (Chi router)
