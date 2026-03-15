@@ -58,11 +58,11 @@ default_image: shed-base:latest
 
 credentials:
   # Git credentials
-  git_ssh:
+  git-ssh:
     source: ~/.ssh
-    target: /mnt/ssh-host
+    target: /home/shed/.ssh
     readonly: true
-  git_config:
+  git-config:
     source: ~/.gitconfig
     target: /home/shed/.gitconfig
     readonly: true
@@ -74,15 +74,15 @@ credentials:
     readonly: false
 
   # OpenCode - data, state, and cache directories
-  opencode_data:
+  opencode-data:
     source: ~/.shed/mounts/opencode/share
     target: /home/shed/.local/share/opencode
     readonly: false
-  opencode_state:
+  opencode-state:
     source: ~/.shed/mounts/opencode/state
     target: /home/shed/.local/state/opencode
     readonly: false
-  opencode_cache:
+  opencode-cache:
     source: ~/.shed/mounts/opencode/cache
     target: /home/shed/.cache/opencode
     readonly: false
@@ -96,6 +96,8 @@ credentials:
 env_file: ~/.shed/env
 log_level: info
 ```
+
+**Credential source paths:** The example above uses curated directories under `~/.shed/mounts/` as credential sources. This lets you prepare separate credential sets for your sheds. You can also mount host paths directly (e.g., `source: ~/.ssh`, `source: ~/.claude`) as shown in the [VZ Setup](vz-setup.md) guide. Both approaches work identically. See the [configuration reference](../reference/configuration.md#credentials) for details.
 
 ### 4. Create Environment File
 
