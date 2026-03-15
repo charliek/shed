@@ -97,25 +97,107 @@ sequenceDiagram
 
 ### Shed Creation
 
-```mermaid
-sequenceDiagram
-    participant CLI
-    participant Server
-    participant Docker
+For the user-facing lifecycle documentation (what happens at each step across all backends), see [Provisioning: Shed Lifecycle](../reference/provisioning.md#shed-lifecycle).
 
-    CLI->>Server: POST /api/sheds {name, repo, local_dir}
-    alt local_dir specified
-        Server->>Docker: Create container (bind mount)
-    else
-        Server->>Docker: Create volume
-        Server->>Docker: Create container
-    end
-    Server->>Docker: Start container
-    alt repo specified
-        Server->>Docker: git clone in container
-    end
-    Server-->>CLI: {name, status, ...}
-```
+The diagrams below show the internal implementation flow for each backend.
+
+=== "Docker"
+
+    ```mermaid
+    sequenceDiagram
+        participant CLI
+        participant Server
+        participant Docker
+
+        CLI->>Server: POST /api/sheds {name, repo, local_dir}
+        alt local_dir specified
+            Server->>Docker: Create container (bind mount + credential bind mounts)
+        else
+            Server->>Docker: Create volume
+            Server->>Docker: Create container (volume + credential bind mounts)
+        end
+        Server->>Docker: Start container
+        Server->>Docker: Fix workspace ownership (chown)
+        alt repo specified
+            Server->>Docker: git clone via docker exec
+        end
+        Server->>Docker: Run install hook via docker exec
+        Server->>Docker: Capture PATH → /etc/profile.d/
+        Server->>Docker: Run startup hook via docker exec
+        Server-->>CLI: {name, status, ...}
+        CLI->>CLI: Auto-sync default profile via SSH+tar
+    ```
+
+=== "Firecracker"
+
+    ```mermaid
+    sequenceDiagram
+        participant CLI
+        participant Server
+        participant VM as Firecracker VM
+        participant Agent as shed-agent
+
+        CLI->>Server: POST /api/sheds {name, repo, local_dir}
+        Server->>Server: Copy base rootfs to instance dir
+        Server->>Server: Allocate CID, TAP device, IP address
+        Server->>VM: Spawn Firecracker process
+        Server->>Agent: Wait for agent health (poll vsock:1025)
+        Agent-->>Server: Healthy
+        Server->>Agent: Transfer credentials via tar-over-vsock
+        alt repo specified
+            Server->>Agent: git clone via vsock exec
+        end
+        Server->>Agent: Run install hook via vsock exec
+        Server->>Agent: Capture PATH → /etc/profile.d/
+        Server->>Agent: Run startup hook via vsock exec
+        Server-->>CLI: {name, status, ...}
+        CLI->>CLI: Auto-sync default profile via SSH+tar
+    ```
+
+=== "VZ"
+
+    ```mermaid
+    sequenceDiagram
+        participant CLI
+        participant Server
+        participant vfkit
+        participant Agent as shed-agent
+
+        CLI->>Server: POST /api/sheds {name, repo, local_dir}
+        Server->>Server: Copy base rootfs to instance dir
+        Server->>Server: Classify credentials (VirtioFS vs tar)
+        Server->>vfkit: Spawn vfkit with VirtioFS devices
+        Note right of vfkit: Devices: rootfs, local-dir share,<br/>credential directory shares
+        Server->>Agent: Wait for agent health (poll vsock:1025)
+        Agent-->>Server: Healthy
+        alt local-dir specified
+            Server->>Agent: Mount VirtioFS share at /workspace
+        end
+        Server->>Agent: Mount VirtioFS credential directories
+        Server->>Agent: Transfer file credentials via tar-over-vsock
+        alt repo specified
+            Server->>Agent: git clone via vsock exec
+        end
+        Server->>Agent: Run install hook via vsock exec
+        Server->>Agent: Capture PATH → /etc/profile.d/
+        Server->>Agent: Run startup hook via vsock exec
+        Server-->>CLI: {name, status, ...}
+        CLI->>CLI: Auto-sync default profile via SSH+tar
+    ```
+
+### Credential Mechanisms
+
+Each backend handles credentials differently based on its isolation model:
+
+**Docker** — Credentials are bind-mounted into the container at creation time. They persist across stop/start and reflect host changes immediately (live sync). Configured in `server.yaml` under `credentials`.
+
+**Firecracker** — No bind mount support. All credentials are transferred as gzipped tar archives over vsock on every `create` and `start`. Writable credentials (`readonly: false`) are synced bidirectionally: the agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files and pushes host-side changes to all running VMs.
+
+**VZ** — Hybrid approach. `classifyCredentials()` in `internal/vz/client.go` splits credentials by type:
+
+- **Directory credentials** get VirtioFS shares added as vfkit device arguments at VM launch, then mounted inside the guest. Changes are immediately visible on both sides (like Docker bind mounts).
+- **Single-file credentials** cannot use VirtioFS (it only supports directories), so they use the same tar-over-vsock transfer as Firecracker.
+- Writable tar-transferred credentials use the same fsnotify + vsock bidirectional sync as Firecracker.
 
 ### SSH Connection
 

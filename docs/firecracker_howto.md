@@ -98,23 +98,7 @@ Shed supports automatic provisioning via `.shed/provision.yaml` in your reposito
 
 ### Provisioning Flow
 
-1. **On Create** (with `--repo`):
-   - Credentials are transferred
-   - Repository is cloned
-   - Install hook runs (if configured)
-   - Startup hook runs (if configured)
-
-2. **On Start** (restart):
-   - Credentials are refreshed
-   - Startup hook runs (install hook is skipped)
-
-3. **On Stop**:
-   - Shutdown hook runs (if configured)
-   - VM is stopped
-
-4. **On Delete**:
-   - Shutdown hook runs (via stop)
-   - VM and instance data are removed
+Provisioning hooks work the same as all backends — credentials are transferred via tar-over-vsock, then hooks execute via vsock. For the full sequence of operations during create, start, stop, and delete (including when credentials and mounts are set up relative to hooks), see [Shed Lifecycle](reference/provisioning.md#shed-lifecycle).
 
 ### Skip Provisioning
 
