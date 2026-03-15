@@ -384,18 +384,18 @@ SHED_EOF`, provision.LogDir, provision.LogDir, stateFilePath, content.String())
 
 // readStateFile reads provisioning state from the VM.
 func (s *ProvisionState) readStateFile(ctx context.Context) (map[string]string, error) {
-	var stdout, stderr strings.Builder
+	var stdout strings.Builder
 	opts := backend.ExecOptions{
-		Cmd:        []string{"cat", stateFilePath},
+		Cmd:        []string{"sh", "-c", fmt.Sprintf("test -f %s && cat %s", stateFilePath, stateFilePath)},
 		Stdout:     NopWriteCloser(&stdout),
-		Stderr:     NopWriteCloser(&stderr),
 		WorkingDir: "/",
 		TTY:        false,
 	}
 
 	if err := s.agent.Exec(ctx, opts); err != nil {
-		combined := stdout.String() + stderr.String()
-		if strings.Contains(combined, "No such file") {
+		// test -f returns exit code 1 when file doesn't exist (expected on first run)
+		var exitErr *ExitError
+		if errors.As(err, &exitErr) {
 			return nil, nil
 		}
 		return nil, err
