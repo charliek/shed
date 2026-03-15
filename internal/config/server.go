@@ -358,9 +358,21 @@ type MountConfig struct {
 // MatchesExclude reports whether the given relative path matches any of the
 // mount's exclude patterns. Patterns use filepath.Match glob syntax.
 func (m MountConfig) MatchesExclude(relPath string) bool {
-	for _, pattern := range m.Exclude {
+	return MatchesExcludePatterns(relPath, m.Exclude)
+}
+
+// MatchesExcludePatterns reports whether relPath matches any of the given glob
+// patterns. Patterns like "dir/*" also match the directory itself and deeply
+// nested paths (e.g., "dir/sub/deep/file").
+func MatchesExcludePatterns(relPath string, patterns []string) bool {
+	for _, pattern := range patterns {
 		if matched, _ := filepath.Match(pattern, relPath); matched {
 			return true
+		}
+		if dir, ok := strings.CutSuffix(pattern, "/*"); ok {
+			if relPath == dir || strings.HasPrefix(relPath, dir+"/") {
+				return true
+			}
 		}
 	}
 	return false

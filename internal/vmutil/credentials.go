@@ -159,12 +159,7 @@ func (ct *CredentialTransfer) createTarArchive(source string, info os.FileInfo, 
 
 // matchesExclude reports whether relPath matches any of the given glob patterns.
 func matchesExclude(relPath string, patterns []string) bool {
-	for _, pattern := range patterns {
-		if matched, _ := filepath.Match(pattern, relPath); matched {
-			return true
-		}
-	}
-	return false
+	return config.MatchesExcludePatterns(relPath, patterns)
 }
 
 // addToTar adds a file or directory entry to the tar archive.

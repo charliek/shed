@@ -93,13 +93,14 @@ func TestCreateTarArchiveWithExclude(t *testing.T) {
 
 	// Create a directory with files — some should be excluded
 	credDir := filepath.Join(tmpDir, "opencode")
-	os.MkdirAll(filepath.Join(credDir, "log"), 0755)
+	os.MkdirAll(filepath.Join(credDir, "log", "sub"), 0755)
 	os.MkdirAll(filepath.Join(credDir, "storage"), 0755)
 	os.WriteFile(filepath.Join(credDir, "auth.json"), []byte(`{"token":"abc"}`), 0600)
 	os.WriteFile(filepath.Join(credDir, "opencode.db"), []byte("sqlitedata"), 0600)
 	os.WriteFile(filepath.Join(credDir, "opencode.db-shm"), []byte("shm"), 0600)
 	os.WriteFile(filepath.Join(credDir, "opencode.db-wal"), []byte("wal"), 0600)
 	os.WriteFile(filepath.Join(credDir, "log", "output.log"), []byte("logdata"), 0600)
+	os.WriteFile(filepath.Join(credDir, "log", "sub", "nested.log"), []byte("nestedlog"), 0600)
 	os.WriteFile(filepath.Join(credDir, "storage", "data.bin"), []byte("bindata"), 0600)
 
 	exclude := []string{"*.db", "*.db-shm", "*.db-wal", "log/*", "storage/*"}
@@ -122,8 +123,8 @@ func TestCreateTarArchiveWithExclude(t *testing.T) {
 		t.Error("expected auth.json in tar archive")
 	}
 
-	// Excluded files should NOT be present
-	for _, excluded := range []string{"opencode.db", "opencode.db-shm", "opencode.db-wal", "log/output.log", "storage/data.bin"} {
+	// Excluded files and directories should NOT be present
+	for _, excluded := range []string{"opencode.db", "opencode.db-shm", "opencode.db-wal", "log", "log/output.log", "log/sub", "log/sub/nested.log", "storage", "storage/data.bin"} {
 		if names[excluded] {
 			t.Errorf("expected %s to be excluded from tar archive", excluded)
 		}
@@ -141,6 +142,8 @@ func TestMatchesExclude(t *testing.T) {
 		{"test.db-shm", true},
 		{"test.db-wal", true},
 		{"log/output.log", true},
+		{"log", true},
+		{"log/sub/deep", true},
 		{"auth.json", false},
 		{"config.yaml", false},
 	}
