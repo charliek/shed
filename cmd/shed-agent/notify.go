@@ -290,10 +290,16 @@ func handleNotifyConnection(conn net.Conn) {
 }
 
 // agentMatchesExclude reports whether relPath matches any of the given glob patterns.
+// Patterns like "dir/*" also match the directory itself and deeply nested paths.
 func agentMatchesExclude(relPath string, patterns []string) bool {
 	for _, pattern := range patterns {
 		if matched, _ := filepath.Match(pattern, relPath); matched {
 			return true
+		}
+		if dir, ok := strings.CutSuffix(pattern, "/*"); ok {
+			if relPath == dir || strings.HasPrefix(relPath, dir+"/") {
+				return true
+			}
 		}
 	}
 	return false
