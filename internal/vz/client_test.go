@@ -228,6 +228,181 @@ func TestGetShedNotFound(t *testing.T) {
 	}
 }
 
+func TestClassifyCredentialsDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+	creds := map[string]config.MountConfig{
+		"ssh": {Source: tmpDir, Target: "/home/shed/.ssh", ReadOnly: true},
+	}
+
+	virtioFS, tarOnly := classifyCredentials(creds)
+
+	if len(virtioFS) != 1 {
+		t.Fatalf("expected 1 VirtioFS credential, got %d", len(virtioFS))
+	}
+	if _, ok := virtioFS["ssh"]; !ok {
+		t.Error("expected 'ssh' in VirtioFS map")
+	}
+	if len(tarOnly) != 0 {
+		t.Errorf("expected 0 tar-only credentials, got %d", len(tarOnly))
+	}
+}
+
+func TestClassifyCredentialsSingleFile(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(tmpFile, []byte("[user]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	creds := map[string]config.MountConfig{
+		"git": {Source: tmpFile, Target: "/home/shed/.gitconfig", ReadOnly: true},
+	}
+
+	virtioFS, tarOnly := classifyCredentials(creds)
+
+	if len(virtioFS) != 0 {
+		t.Errorf("expected 0 VirtioFS credentials, got %d", len(virtioFS))
+	}
+	if len(tarOnly) != 1 {
+		t.Fatalf("expected 1 tar-only credential, got %d", len(tarOnly))
+	}
+	if _, ok := tarOnly["git"]; !ok {
+		t.Error("expected 'git' in tarOnly map")
+	}
+}
+
+func TestClassifyCredentialsMissing(t *testing.T) {
+	creds := map[string]config.MountConfig{
+		"gone": {Source: "/nonexistent/path", Target: "/home/shed/.gone"},
+	}
+
+	virtioFS, tarOnly := classifyCredentials(creds)
+
+	if len(virtioFS) != 0 {
+		t.Errorf("expected 0 VirtioFS credentials, got %d", len(virtioFS))
+	}
+	if len(tarOnly) != 0 {
+		t.Errorf("expected 0 tar-only credentials, got %d", len(tarOnly))
+	}
+}
+
+func TestClassifyCredentialsMixed(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(tmpFile, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	creds := map[string]config.MountConfig{
+		"dir_cred":  {Source: tmpDir, Target: "/home/shed/.dir"},
+		"file_cred": {Source: tmpFile, Target: "/home/shed/.file"},
+		"missing":   {Source: "/nonexistent", Target: "/home/shed/.missing"},
+	}
+
+	virtioFS, tarOnly := classifyCredentials(creds)
+
+	if len(virtioFS) != 1 {
+		t.Fatalf("expected 1 VirtioFS credential, got %d", len(virtioFS))
+	}
+	if _, ok := virtioFS["dir_cred"]; !ok {
+		t.Error("expected 'dir_cred' in VirtioFS map")
+	}
+	if len(tarOnly) != 1 {
+		t.Fatalf("expected 1 tar-only credential, got %d", len(tarOnly))
+	}
+	if _, ok := tarOnly["file_cred"]; !ok {
+		t.Error("expected 'file_cred' in tarOnly map")
+	}
+}
+
+func TestClassifyCredentialsWithExcludes(t *testing.T) {
+	tmpDir := t.TempDir()
+	creds := map[string]config.MountConfig{
+		"claude": {
+			Source:   tmpDir,
+			Target:   "/home/shed/.claude",
+			ReadOnly: false,
+			Exclude:  []string{"debug/*", "cache/*"},
+		},
+	}
+
+	virtioFS, tarOnly := classifyCredentials(creds)
+
+	// Directory credentials with excludes should still use VirtioFS
+	// (excludes only mattered for tar transfer size, not VirtioFS)
+	if len(virtioFS) != 1 {
+		t.Fatalf("expected 1 VirtioFS credential, got %d", len(virtioFS))
+	}
+	if _, ok := virtioFS["claude"]; !ok {
+		t.Error("expected 'claude' in VirtioFS map")
+	}
+	if len(tarOnly) != 0 {
+		t.Errorf("expected 0 tar-only credentials, got %d", len(tarOnly))
+	}
+}
+
+func TestHasWritableTarCredentials(t *testing.T) {
+	tests := []struct {
+		name     string
+		tarOnly  map[string]config.MountConfig
+		expected bool
+	}{
+		{
+			name:     "empty",
+			tarOnly:  map[string]config.MountConfig{},
+			expected: false,
+		},
+		{
+			name: "readonly_only",
+			tarOnly: map[string]config.MountConfig{
+				"git": {ReadOnly: true},
+			},
+			expected: false,
+		},
+		{
+			name: "writable",
+			tarOnly: map[string]config.MountConfig{
+				"config": {ReadOnly: false},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasWritableTarCredentials(tt.tarOnly)
+			if got != tt.expected {
+				t.Errorf("hasWritableTarCredentials() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBuildCredentialShares(t *testing.T) {
+	creds := map[string]config.MountConfig{
+		"ssh": {Source: "/home/user/.ssh", Target: "/home/shed/.ssh"},
+		"gh":  {Source: "/home/user/.config/gh", Target: "/home/shed/.config/gh"},
+	}
+
+	shares := buildCredentialShares(creds)
+
+	if len(shares) != 2 {
+		t.Fatalf("expected 2 shares, got %d", len(shares))
+	}
+
+	// Build a map for order-independent checking
+	shareMap := make(map[string]string)
+	for _, s := range shares {
+		shareMap[s.MountTag] = s.SourceDir
+	}
+
+	if shareMap["cred-ssh"] != "/home/user/.ssh" {
+		t.Error("expected cred-ssh share with source /home/user/.ssh")
+	}
+	if shareMap["cred-gh"] != "/home/user/.config/gh" {
+		t.Error("expected cred-gh share with source /home/user/.config/gh")
+	}
+}
+
 func TestCreateShedValidatesResources(t *testing.T) {
 	tmpDir := t.TempDir()
 	baseRootfs := filepath.Join(tmpDir, "base-rootfs.ext4")

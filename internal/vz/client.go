@@ -133,7 +133,15 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
+	// Classify credentials before VM creation so VirtioFS devices are
+	// included in the vfkit command-line arguments at launch time.
+	var virtioFSCreds, tarOnlyCreds map[string]config.MountConfig
+	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
+		virtioFSCreds, tarOnlyCreds = classifyCredentials(c.serverCfg.Credentials)
+	}
+
 	vm := CreateVM(meta, c.cfg)
+	vm.credentialShares = buildCredentialShares(virtioFSCreds)
 
 	backend.Progress(ctx, "vm", "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
@@ -164,7 +172,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// Mount VirtioFS workspace if local dir is configured
 	if req.LocalDir != "" {
 		backend.Progress(ctx, "mount", "Mounting local directory via VirtioFS...")
-		if err := c.mountVirtioFS(ctx, agent); err != nil {
+		if err := c.mountVirtioFSShare(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
 			// VirtioFS mount is essential for --local-dir; fail the create
 			if stopErr := vm.Stop(context.Background()); stopErr != nil {
 				log.Printf("Warning: failed to stop VM after mount failure: %v", stopErr)
@@ -173,17 +181,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	// Transfer credentials
-	if c.serverCfg != nil {
-		backend.Progress(ctx, "credentials", "Transferring credentials...")
-		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
-		if err := credTransfer.TransferAll(ctx); err != nil {
-			log.Printf("Warning: credential transfer failed: %v", err)
-		}
-	}
-
-	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(req.Name, agent)
+	// Mount and transfer credentials
+	c.setupCredentials(ctx, agent, req.Name, virtioFSCreds, tarOnlyCreds)
 
 	// Clone repo if specified (skip when using local dir)
 	if req.Repo != "" && req.LocalDir == "" {
@@ -320,7 +319,15 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		meta.PID = 0
 	}
 
+	// Classify credentials before VM creation so VirtioFS devices are
+	// included in the vfkit command-line arguments at launch time.
+	var virtioFSCreds, tarOnlyCreds map[string]config.MountConfig
+	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
+		virtioFSCreds, tarOnlyCreds = classifyCredentials(c.serverCfg.Credentials)
+	}
+
 	vm := CreateVM(meta, c.cfg)
+	vm.credentialShares = buildCredentialShares(virtioFSCreds)
 
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start VM: %w", err)
@@ -342,7 +349,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 
 	// Re-mount VirtioFS workspace on start (mount doesn't persist across reboots)
 	if meta.LocalDir != "" {
-		if err := c.mountVirtioFS(ctx, agent); err != nil {
+		if err := c.mountVirtioFSShare(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
 			// VirtioFS mount is essential for --local-dir; stop the VM and fail
 			if stopErr := vm.Stop(context.Background()); stopErr != nil {
 				log.Printf("Warning: failed to stop VM after mount failure: %v", stopErr)
@@ -351,16 +358,8 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		}
 	}
 
-	// Refresh credentials on start
-	if c.serverCfg != nil {
-		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
-		if err := credTransfer.TransferAll(ctx); err != nil {
-			log.Printf("Warning: credential transfer failed: %v", err)
-		}
-	}
-
-	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(name, agent)
+	// Mount and transfer credentials
+	c.setupCredentials(ctx, agent, name, virtioFSCreds, tarOnlyCreds)
 
 	// Run startup hook only (not install)
 	provisioner := vmutil.NewProvisioner(agent, name)
@@ -472,24 +471,114 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 	}
 }
 
-// mountVirtioFS mounts the VirtioFS shared directory inside the guest VM.
-func (c *Client) mountVirtioFS(ctx context.Context, agent *vmutil.AgentClient) error {
-	// Mount the VirtioFS share tagged "workspace" at the workspace path.
-	// Apple's VirtioFS transparently maps UIDs, so no chown is needed.
-	mountCmd := fmt.Sprintf(
-		"modprobe virtiofs 2>/dev/null; mkdir -p %s && mount -t virtiofs %s %s",
-		config.WorkspacePath, config.VirtioFSMountTag, config.WorkspacePath,
-	)
+// mountVirtioFSShare mounts a VirtioFS share inside the guest VM.
+// Apple's VirtioFS transparently maps UIDs, so no chown is needed.
+func (c *Client) mountVirtioFSShare(ctx context.Context, agent *vmutil.AgentClient, mountTag, target string, readOnly bool) error {
+	mountOpts := "rw"
+	if readOnly {
+		mountOpts = "ro"
+	}
+	// Use positional parameters to avoid shell interpolation of target/tag values.
+	mountCmd := `modprobe virtiofs 2>/dev/null; mkdir -p "$1" && mount -t virtiofs -o "$2" "$3" "$1"`
 	opts := backend.ExecOptions{
-		Cmd:    []string{"sudo", "sh", "-c", mountCmd},
+		Cmd:    []string{"sudo", "sh", "-c", mountCmd, "sh", target, mountOpts, mountTag},
 		Stdout: vmutil.NopWriteCloser(io.Discard),
 		Stderr: vmutil.NopWriteCloser(os.Stderr),
 		TTY:    false,
 	}
 	if err := agent.Exec(ctx, opts); err != nil {
-		return fmt.Errorf("virtiofs mount failed (kernel may lack CONFIG_VIRTIO_FS support): %w", err)
+		return fmt.Errorf("virtiofs mount failed for %s at %s: %w", mountTag, target, err)
 	}
 	return nil
+}
+
+// classifyCredentials splits credentials into VirtioFS-eligible (directories)
+// and tar-only (single files). Missing sources are logged and skipped.
+func classifyCredentials(credentials map[string]config.MountConfig) (virtioFS map[string]config.MountConfig, tarOnly map[string]config.MountConfig) {
+	virtioFS = make(map[string]config.MountConfig)
+	tarOnly = make(map[string]config.MountConfig)
+
+	for name, mount := range credentials {
+		info, err := os.Stat(mount.Source)
+		if err != nil {
+			if os.IsNotExist(err) {
+				log.Printf("Credential %q source does not exist, skipping: %s", name, mount.Source)
+			} else {
+				log.Printf("Warning: failed to stat credential %q source %s: %v", name, mount.Source, err)
+			}
+			continue
+		}
+
+		if info.IsDir() {
+			virtioFS[name] = mount
+		} else {
+			tarOnly[name] = mount
+		}
+	}
+
+	return virtioFS, tarOnly
+}
+
+// buildCredentialShares creates VirtioFS share entries from classified credentials.
+func buildCredentialShares(creds map[string]config.MountConfig) []credentialVirtioFS {
+	shares := make([]credentialVirtioFS, 0, len(creds))
+	for name, mount := range creds {
+		shares = append(shares, credentialVirtioFS{
+			SourceDir: mount.Source,
+			MountTag:  config.CredentialMountTag(name),
+		})
+	}
+	return shares
+}
+
+// setupCredentials mounts VirtioFS credential shares, transfers tar-only credentials,
+// and starts the notify listener if needed.
+func (c *Client) setupCredentials(ctx context.Context, agent *vmutil.AgentClient, shedName string, virtioFSCreds, tarOnlyCreds map[string]config.MountConfig) {
+	// Mount VirtioFS credential shares (directory credentials)
+	if len(virtioFSCreds) > 0 {
+		backend.Progress(ctx, "credentials", "Mounting credentials via VirtioFS...")
+		if err := c.mountAllCredentialVirtioFS(ctx, agent, virtioFSCreds); err != nil {
+			log.Printf("Warning: VirtioFS credential mount failed: %v", err)
+		}
+	}
+
+	// Transfer single-file credentials via tar (VirtioFS only shares directories)
+	if len(tarOnlyCreds) > 0 {
+		backend.Progress(ctx, "credentials", "Transferring file credentials...")
+		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
+		for name, mount := range tarOnlyCreds {
+			if err := credTransfer.TransferCredential(ctx, name, mount); err != nil {
+				log.Printf("Warning: failed to transfer credential %q: %v", name, err)
+			}
+		}
+	}
+
+	// Start credential notification listener only if there are writable tar-only credentials.
+	// VirtioFS credentials don't need the notify/watch sync infrastructure.
+	if hasWritableTarCredentials(tarOnlyCreds) {
+		c.startNotifyListener(shedName, agent)
+	}
+}
+
+// mountAllCredentialVirtioFS mounts all VirtioFS credential shares inside the guest.
+func (c *Client) mountAllCredentialVirtioFS(ctx context.Context, agent *vmutil.AgentClient, creds map[string]config.MountConfig) error {
+	for name, mount := range creds {
+		mountTag := config.CredentialMountTag(name)
+		if err := c.mountVirtioFSShare(ctx, agent, mountTag, mount.Target, mount.ReadOnly); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hasWritableTarCredentials reports whether any tar-only credentials are writable.
+func hasWritableTarCredentials(tarOnly map[string]config.MountConfig) bool {
+	for _, mount := range tarOnly {
+		if !mount.ReadOnly {
+			return true
+		}
+	}
+	return false
 }
 
 // cloneRepo clones a git repository into the VM's workspace.

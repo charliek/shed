@@ -115,6 +115,128 @@ func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
 	}
 }
 
+func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
+	meta := &Metadata{
+		Name:       "test-vm",
+		CPUs:       2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/rootfs.ext4",
+	}
+	cfg := &config.VZConfig{
+		KernelPath:  "/tmp/vmlinux",
+		InstanceDir: "",
+		SocketDir:   "/tmp/sockets",
+		ConsolePort: 1024,
+		HealthPort:  1025,
+		NotifyPort:  1026,
+	}
+
+	vm := &VM{
+		meta: meta,
+		cfg:  cfg,
+		credentialShares: []credentialVirtioFS{
+			{SourceDir: "/Users/charlie/.ssh", MountTag: "cred-git_ssh"},
+			{SourceDir: "/Users/charlie/.config/gh", MountTag: "cred-gh"},
+		},
+	}
+	args := vm.buildVfkitArgs()
+	argsStr := strings.Join(args, " ")
+
+	// Check credential VirtioFS devices
+	if !strings.Contains(argsStr, "virtio-fs,sharedDir=/Users/charlie/.ssh,mountTag=cred-git_ssh") {
+		t.Error("expected VirtioFS device for git_ssh credential")
+	}
+	if !strings.Contains(argsStr, "virtio-fs,sharedDir=/Users/charlie/.config/gh,mountTag=cred-gh") {
+		t.Error("expected VirtioFS device for gh credential")
+	}
+
+	// Should have 8 --device flags (1 block + 1 net + 1 serial + 2 virtio-fs creds + 3 vsock)
+	deviceCount := strings.Count(argsStr, "--device")
+	if deviceCount != 8 {
+		t.Errorf("expected 8 --device flags, got %d", deviceCount)
+	}
+
+	// No workspace VirtioFS device (LocalDir is empty)
+	if strings.Contains(argsStr, fmt.Sprintf("mountTag=%s", config.VirtioFSMountTag)) {
+		t.Error("should not have workspace virtio-fs device when LocalDir is empty")
+	}
+}
+
+func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
+	meta := &Metadata{
+		Name:       "test-vm",
+		CPUs:       2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/rootfs.ext4",
+		LocalDir:   "/Users/charlie/projects/myapp",
+	}
+	cfg := &config.VZConfig{
+		KernelPath:  "/tmp/vmlinux",
+		InstanceDir: "",
+		SocketDir:   "/tmp/sockets",
+		ConsolePort: 1024,
+		HealthPort:  1025,
+		NotifyPort:  1026,
+	}
+
+	vm := &VM{
+		meta: meta,
+		cfg:  cfg,
+		credentialShares: []credentialVirtioFS{
+			{SourceDir: "/Users/charlie/.claude", MountTag: "cred-claude"},
+		},
+	}
+	args := vm.buildVfkitArgs()
+	argsStr := strings.Join(args, " ")
+
+	// Should have workspace VirtioFS
+	if !strings.Contains(argsStr, fmt.Sprintf("mountTag=%s", config.VirtioFSMountTag)) {
+		t.Error("expected workspace VirtioFS device")
+	}
+
+	// Should have credential VirtioFS
+	if !strings.Contains(argsStr, "virtio-fs,sharedDir=/Users/charlie/.claude,mountTag=cred-claude") {
+		t.Error("expected VirtioFS device for claude credential")
+	}
+
+	// Should have 8 --device flags (1 block + 1 net + 1 serial + 1 workspace virtio-fs + 1 cred virtio-fs + 3 vsock)
+	deviceCount := strings.Count(argsStr, "--device")
+	if deviceCount != 8 {
+		t.Errorf("expected 8 --device flags, got %d", deviceCount)
+	}
+}
+
+func TestBuildVfkitArgsNoCredentialShares(t *testing.T) {
+	meta := &Metadata{
+		Name:       "test-vm",
+		CPUs:       2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/rootfs.ext4",
+	}
+	cfg := &config.VZConfig{
+		KernelPath:  "/tmp/vmlinux",
+		InstanceDir: "",
+		SocketDir:   "/tmp/sockets",
+		ConsolePort: 1024,
+		HealthPort:  1025,
+		NotifyPort:  1026,
+	}
+
+	vm := &VM{meta: meta, cfg: cfg, credentialShares: nil}
+	args := vm.buildVfkitArgs()
+	argsStr := strings.Join(args, " ")
+
+	// Should have 6 --device flags (1 block + 1 net + 1 serial + 3 vsock) — no virtio-fs
+	deviceCount := strings.Count(argsStr, "--device")
+	if deviceCount != 6 {
+		t.Errorf("expected 6 --device flags with no credential shares, got %d", deviceCount)
+	}
+
+	if strings.Contains(argsStr, "virtio-fs") {
+		t.Error("should not have any virtio-fs device with no credentials and no LocalDir")
+	}
+}
+
 func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 	meta := &Metadata{Name: "test-vm", CPUs: 2, MemoryMB: 4096, RootfsPath: "/tmp/rootfs.ext4"}
 	cfg := &config.VZConfig{

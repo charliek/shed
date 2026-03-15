@@ -250,3 +250,9 @@ const WorkspacePath = "/workspace"
 
 // VirtioFSMountTag is the mount tag used for VirtioFS shared directories.
 const VirtioFSMountTag = "workspace"
+
+// CredentialMountTag returns the VirtioFS mount tag for a credential share.
+// Tags use the format "cred-{name}" to avoid collisions with the workspace tag.
+func CredentialMountTag(name string) string {
+	return "cred-" + name
+}

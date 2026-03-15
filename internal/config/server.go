@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -13,6 +14,12 @@ import (
 
 	"github.com/charliek/shed/internal/terminal"
 )
+
+// validCredentialName matches names starting with an alphanumeric character,
+// followed by alphanumerics, underscores, or hyphens. Credential names are
+// used as VirtioFS mount tags (cred-{name}), so they must not contain spaces,
+// commas, or other special characters.
+var validCredentialName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
 // ServerConfig represents the server-side configuration.
 type ServerConfig struct {
@@ -439,6 +446,11 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 	// Expand and validate paths in credentials
 	for name, mount := range cfg.Credentials {
+		// Credential names must be safe for use as VirtioFS mount tags
+		if !validCredentialName.MatchString(name) {
+			return nil, fmt.Errorf("credential name %q must contain only alphanumeric characters, underscores, and hyphens", name)
+		}
+
 		source := filepath.Clean(ExpandPath(mount.Source))
 		target := filepath.Clean(mount.Target)
 
@@ -450,6 +462,11 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		// Target must be an absolute path
 		if !filepath.IsAbs(target) {
 			return nil, fmt.Errorf("credential %q target must be an absolute path: %s", name, mount.Target)
+		}
+
+		// Source paths with commas break vfkit VirtioFS device arguments
+		if strings.Contains(source, ",") {
+			return nil, fmt.Errorf("credential %q source path must not contain commas: %s", name, source)
 		}
 
 		mount.Source = source

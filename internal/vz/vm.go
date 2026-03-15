@@ -19,15 +19,22 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
+// credentialVirtioFS describes a VirtioFS share for a credential directory.
+type credentialVirtioFS struct {
+	SourceDir string
+	MountTag  string
+}
+
 // VM represents a running VZ VM instance managed by a vfkit subprocess.
 //
 // VM is not safe for concurrent use. Callers (e.g. Client) must serialize
 // calls to Start and Stop.
 type VM struct {
-	meta   *Metadata
-	cfg    *config.VZConfig
-	cmd    *exec.Cmd
-	waitCh chan struct{} // closed when cmd.Wait() completes (process reaped)
+	meta             *Metadata
+	cfg              *config.VZConfig
+	cmd              *exec.Cmd
+	waitCh           chan struct{} // closed when cmd.Wait() completes (process reaped)
+	credentialShares []credentialVirtioFS
 }
 
 // CreateVM creates a new VM instance (but does not start it).
@@ -127,6 +134,11 @@ func (vm *VM) buildVfkitArgs() []string {
 	// Add VirtioFS shared directory if a local dir is configured
 	if vm.meta.LocalDir != "" {
 		args = append(args, "--device", fmt.Sprintf("virtio-fs,sharedDir=%s,mountTag=%s", vm.meta.LocalDir, config.VirtioFSMountTag))
+	}
+
+	// Add VirtioFS shared directories for credential mounts
+	for _, share := range vm.credentialShares {
+		args = append(args, "--device", fmt.Sprintf("virtio-fs,sharedDir=%s,mountTag=%s", share.SourceDir, share.MountTag))
 	}
 
 	// Add vsock devices — one per port.
