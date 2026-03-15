@@ -26,7 +26,8 @@ VZ_DIR="$PROJECT_ROOT/vz"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/Library/Application Support/shed/vz}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-20G}"  # 20GB default
 
-# Known variants (must match Dockerfile stage names: shed-vz-<variant>)
+# Built-in variants surfaced by --all and --help. Explicit --variant values
+# are forwarded to Docker so custom shed-vz-<name> stages can be built too.
 KNOWN_VARIANTS="base default typescript"
 
 # Defaults
@@ -38,6 +39,11 @@ FORCE_KERNEL=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "ERROR: --variant requires a value"
+                echo "Run '$0 --help' for usage."
+                exit 1
+            fi
             VARIANT="$2"
             shift 2
             ;;
@@ -74,17 +80,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Validate variant name
-validate_variant() {
+# Warn (but don't block) if the variant is not in KNOWN_VARIANTS.
+# Custom stages like shed-vz-rust are valid if they exist in the Dockerfile.
+warn_unknown_variant() {
     local variant="$1"
     for known in $KNOWN_VARIANTS; do
         if [ "$variant" = "$known" ]; then
             return 0
         fi
     done
-    echo "ERROR: Unknown variant '$variant'"
-    echo "Available variants: $KNOWN_VARIANTS"
-    exit 1
+    echo "WARNING: '$variant' is not a built-in variant ($KNOWN_VARIANTS)"
+    echo "         Attempting to build Docker target 'shed-vz-${variant}'..."
 }
 
 # Variables for cleanup
@@ -272,7 +278,7 @@ if [ "$BUILD_ALL" = true ]; then
         build_variant "$v"
     done
 else
-    validate_variant "$VARIANT"
+    warn_unknown_variant "$VARIANT"
     build_variant "$VARIANT"
 fi
 

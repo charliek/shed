@@ -303,11 +303,12 @@ func (c *VZConfig) ResolveImage(image string) (string, error) {
 	if path, ok := c.Images[image]; ok {
 		return path, nil
 	}
-	if filepath.IsAbs(image) {
-		if _, err := os.Stat(image); err != nil {
-			return "", fmt.Errorf("image path does not exist: %s", image)
+	expanded := ExpandPath(image)
+	if filepath.IsAbs(expanded) {
+		if _, err := os.Stat(expanded); err != nil {
+			return "", fmt.Errorf("image path does not exist: %s", expanded)
 		}
-		return image, nil
+		return expanded, nil
 	}
 	available := make([]string, 0, len(c.Images))
 	for name := range c.Images {

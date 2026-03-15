@@ -867,6 +867,17 @@ func TestVZConfigResolveImage(t *testing.T) {
 		}
 	})
 
+	t.Run("tilde path expands", func(t *testing.T) {
+		// ~/.. should be expanded and treated as an absolute path
+		path, err := cfg.ResolveImage("~/../../dev/null")
+		if err != nil {
+			t.Fatalf("ResolveImage(~/../../dev/null) error = %v", err)
+		}
+		if !filepath.IsAbs(path) {
+			t.Errorf("expected absolute path, got %q", path)
+		}
+	})
+
 	t.Run("empty images map", func(t *testing.T) {
 		emptyCfg := &VZConfig{Images: map[string]string{}}
 		_, err := emptyCfg.ResolveImage("anything")
