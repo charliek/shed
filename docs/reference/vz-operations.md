@@ -76,16 +76,9 @@ credentials:
 
 ## Provisioning
 
-Provisioning hooks work identically to Firecracker — they execute commands in the VM via vsock. Place a `.shed/provision.yaml` in your repository:
+Provisioning hooks execute in the VM via vsock, identically to Firecracker. Directory credentials are mounted via VirtioFS; single-file credentials are transferred via tar-over-vsock. Both are set up before hooks run.
 
-```yaml
-hooks:
-  install: scripts/provision/install.sh
-  startup: scripts/provision/startup.sh
-  shutdown: scripts/provision/shutdown.sh
-```
-
-See [Provisioning](provisioning.md) for details.
+For the full sequence of operations during create, start, stop, and delete (including how VZ differs from other backends), see [Shed Lifecycle](provisioning.md#shed-lifecycle). For hook configuration, see [Provisioning](provisioning.md).
 
 ## Inspecting VMs
 

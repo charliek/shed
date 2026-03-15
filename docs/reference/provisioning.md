@@ -8,6 +8,76 @@ Provisioning works with all three backends:
 - **Firecracker**: Hooks execute via vsock
 - **VZ**: Hooks execute via vsock (same mechanism as Firecracker)
 
+## Shed Lifecycle
+
+Understanding the full sequence of events during shed operations helps you know what's available at each stage — for example, credentials are set up before hooks run, so your install script can use SSH keys or API tokens.
+
+### Create Sequence
+
+When you run `shed create`, the following steps execute in order:
+
+| Step | Docker | Firecracker | VZ |
+|------|--------|-------------|-----|
+| 1. Storage setup | Create named volume (or bind mount for `--local-dir`) | Copy base rootfs to instance directory | Copy base rootfs to instance directory |
+| 2. Container/VM start | Create and start container | Spawn Firecracker process, allocate TAP device and IP, wait for agent health | Spawn vfkit process, wait for agent health |
+| 3. Local-dir mount | Already bind-mounted at container creation | Not supported | VirtioFS mount at `/workspace` |
+| 4. Credential setup | Already bind-mounted at container creation | All credentials transferred via tar-over-vsock | Directory credentials mounted via VirtioFS; single-file credentials transferred via tar-over-vsock |
+| 5. Repo clone | `git clone` in `/workspace` (skipped if `--local-dir`) | Same | Same |
+| 6. Install hook | Runs via `docker exec`; state file marks completion | Runs via vsock; state file marks completion | Same as Firecracker |
+| 7. PATH capture | Captures installed tool paths to `/etc/profile.d/shed-installed-tools.sh` | Same | Same |
+| 8. Startup hook | Runs via `docker exec` | Runs via vsock | Same as Firecracker |
+| 9. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same | Same |
+
+Steps 1–8 are server-side. Step 9 runs on the CLI client after the server returns.
+
+### Start Sequence
+
+When you run `shed start` on a stopped shed, the sequence is shorter:
+
+| Step | Docker | Firecracker | VZ |
+|------|--------|-------------|-----|
+| 1. Container/VM start | Start existing container | Spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
+| 2. Local-dir re-mount | Bind mount persists across restarts | Not supported | VirtioFS re-mount (mounts do not persist across VM reboots) |
+| 3. Credential refresh | Bind mounts persist (no action needed) | All credentials re-transferred via tar-over-vsock | Directory credentials re-mounted via VirtioFS; file credentials re-transferred via tar |
+| 4. Startup hook | Runs (install hook skipped — state file records it already ran) | Same | Same |
+
+No storage setup, repo clone, install hook, or auto-sync on start.
+
+### Stop Sequence
+
+| Step | Docker | Firecracker | VZ |
+|------|--------|-------------|-----|
+| 1. Shutdown hook | Not supported — Docker sends SIGTERM directly | Runs via vsock (budget: half of stop timeout, max 30s) | Same as Firecracker |
+| 2. Agent drain | N/A | 5-second drain timeout for in-flight operations | Same as Firecracker |
+| 3. Process stop | `docker stop` (SIGTERM, then SIGKILL after timeout) | Firecracker API shutdown, SIGKILL fallback | vfkit SIGTERM, then SIGKILL fallback |
+
+### Delete Sequence
+
+`shed delete` calls stop (running the shutdown hook if supported), then removes all resources — container and volume for Docker, instance directory for VM backends.
+
+### Backend Differences at a Glance
+
+| Feature | Docker | Firecracker | VZ |
+|---------|--------|-------------|-----|
+| Credential mechanism | Bind mount | Tar-over-vsock | VirtioFS (directories) + tar-over-vsock (files) |
+| Local-dir support | Bind mount | Not supported | VirtioFS |
+| Shutdown hook | Not supported | Supported | Supported |
+| Credential live sync | Automatic via bind mount | Bidirectional via fsnotify + vsock | VirtioFS for directories; fsnotify + vsock for tar-transferred files |
+| Workspace persistence | Named volume (survives stop/start) | Rootfs image (survives stop/start) | Rootfs image (survives stop/start) |
+
+### Error Handling
+
+Not all failures during create are fatal:
+
+| Step | On failure |
+|------|-----------|
+| Storage setup, container/VM start, agent health check | **Fatal** — create fails, resources cleaned up |
+| Local-dir mount (VZ) | **Fatal** — VM stopped, create fails |
+| Credential setup | Warning logged, create continues |
+| Repo clone | Warning logged, create continues |
+| Provisioning hooks | Warning logged, create continues |
+| Auto-sync | Warning logged, create continues |
+
 ## Quick Start
 
 Create `.shed/provision.yaml` in your repository root:
@@ -200,16 +270,6 @@ env:
   DATABASE_URL: "postgresql://localhost/myapp"
   NODE_ENV: "development"
 ```
-
-## Lifecycle
-
-On `shed create`: The container starts, the repository is cloned, then the install hook runs followed by the startup hook.
-
-On `shed start`: Only the startup hook runs.
-
-On `shed stop`: The shutdown hook runs (if configured), then the shed stops.
-
-On `shed delete`: Calls stop (which runs the shutdown hook), then deletes the shed.
 
 ## Skipping Provisioning
 
