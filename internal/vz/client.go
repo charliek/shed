@@ -478,12 +478,10 @@ func (c *Client) mountVirtioFSShare(ctx context.Context, agent *vmutil.AgentClie
 	if readOnly {
 		mountOpts = "ro"
 	}
-	mountCmd := fmt.Sprintf(
-		"modprobe virtiofs 2>/dev/null; mkdir -p %q && mount -t virtiofs -o %s %s %q",
-		target, mountOpts, mountTag, target,
-	)
+	// Use positional parameters to avoid shell interpolation of target/tag values.
+	mountCmd := `modprobe virtiofs 2>/dev/null; mkdir -p "$1" && mount -t virtiofs -o "$2" "$3" "$1"`
 	opts := backend.ExecOptions{
-		Cmd:    []string{"sudo", "sh", "-c", mountCmd},
+		Cmd:    []string{"sudo", "sh", "-c", mountCmd, "sh", target, mountOpts, mountTag},
 		Stdout: vmutil.NopWriteCloser(io.Discard),
 		Stderr: vmutil.NopWriteCloser(os.Stderr),
 		TTY:    false,
