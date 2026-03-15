@@ -795,3 +795,124 @@ func TestVZConfigApplyDefaults(t *testing.T) {
 		t.Errorf("NotifyPort = %d after applyDefaults, want 2000", cfg2.NotifyPort)
 	}
 }
+
+func TestVZConfigApplyDefaultsExpandsImagePaths(t *testing.T) {
+	cfg := &VZConfig{
+		Images: map[string]string{
+			"base":    "~/shed/base.ext4",
+			"default": "/absolute/path.ext4",
+		},
+	}
+	cfg.applyDefaults()
+
+	home, _ := os.UserHomeDir()
+	want := filepath.Join(home, "shed/base.ext4")
+	if cfg.Images["base"] != want {
+		t.Errorf("Images[base] = %q, want %q", cfg.Images["base"], want)
+	}
+	if cfg.Images["default"] != "/absolute/path.ext4" {
+		t.Errorf("Images[default] = %q, want %q", cfg.Images["default"], "/absolute/path.ext4")
+	}
+}
+
+func TestVZConfigResolveImage(t *testing.T) {
+	cfg := &VZConfig{
+		Images: map[string]string{
+			"base":       "/dev/null",
+			"default":    "/dev/null",
+			"typescript": "/dev/null",
+		},
+	}
+
+	t.Run("named variant", func(t *testing.T) {
+		path, err := cfg.ResolveImage("base")
+		if err != nil {
+			t.Fatalf("ResolveImage(base) error = %v", err)
+		}
+		if path != "/dev/null" {
+			t.Errorf("ResolveImage(base) = %q, want /dev/null", path)
+		}
+	})
+
+	t.Run("absolute path exists", func(t *testing.T) {
+		path, err := cfg.ResolveImage("/dev/null")
+		if err != nil {
+			t.Fatalf("ResolveImage(/dev/null) error = %v", err)
+		}
+		if path != "/dev/null" {
+			t.Errorf("ResolveImage(/dev/null) = %q, want /dev/null", path)
+		}
+	})
+
+	t.Run("absolute path missing", func(t *testing.T) {
+		_, err := cfg.ResolveImage("/nonexistent/file.ext4")
+		if err == nil {
+			t.Fatal("ResolveImage should fail for missing absolute path")
+		}
+		if !strings.Contains(err.Error(), "does not exist") {
+			t.Errorf("error = %q, want 'does not exist'", err.Error())
+		}
+	})
+
+	t.Run("unknown variant", func(t *testing.T) {
+		_, err := cfg.ResolveImage("rust")
+		if err == nil {
+			t.Fatal("ResolveImage should fail for unknown variant")
+		}
+		if !strings.Contains(err.Error(), "unknown image") {
+			t.Errorf("error = %q, want 'unknown image'", err.Error())
+		}
+		if !strings.Contains(err.Error(), "base") {
+			t.Errorf("error should list available variants, got: %q", err.Error())
+		}
+	})
+
+	t.Run("tilde path expands", func(t *testing.T) {
+		// ~/.. should be expanded and treated as an absolute path
+		path, err := cfg.ResolveImage("~/../../dev/null")
+		if err != nil {
+			t.Fatalf("ResolveImage(~/../../dev/null) error = %v", err)
+		}
+		if !filepath.IsAbs(path) {
+			t.Errorf("expected absolute path, got %q", path)
+		}
+	})
+
+	t.Run("empty images map", func(t *testing.T) {
+		emptyCfg := &VZConfig{Images: map[string]string{}}
+		_, err := emptyCfg.ResolveImage("anything")
+		if err == nil {
+			t.Fatal("ResolveImage should fail with empty images map")
+		}
+		if !strings.Contains(err.Error(), "no image variants configured") {
+			t.Errorf("error = %q, want 'no image variants configured'", err.Error())
+		}
+	})
+}
+
+func TestVZConfigValidateImages(t *testing.T) {
+	t.Run("valid image paths", func(t *testing.T) {
+		cfg := validVZConfig()
+		cfg.Images = map[string]string{
+			"base": "/dev/null",
+		}
+		err := cfg.Validate()
+		if err != nil {
+			t.Errorf("Validate() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("invalid image path", func(t *testing.T) {
+		cfg := validVZConfig()
+		cfg.Images = map[string]string{
+			"base": "/nonexistent/rootfs.ext4",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() should fail for missing image path")
+		}
+		if !strings.Contains(err.Error(), "image \"base\" path does not exist") {
+			t.Errorf("error = %q, want image path error", err.Error())
+		}
+	})
+}

@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all docs docs-serve firecracker-rootfs download-firecracker
+.PHONY: build build-cli build-server build-agent test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -101,3 +101,17 @@ firecracker-rootfs: build-agent
 # Download Firecracker binary and kernel
 download-firecracker:
 	./scripts/download-firecracker.sh
+
+# VZ rootfs targets
+
+# Build default VZ rootfs image
+vz-rootfs: build-agent
+	./scripts/build-vz-rootfs.sh
+
+# Build base VZ rootfs image (minimal)
+vz-rootfs-base: build-agent
+	./scripts/build-vz-rootfs.sh --variant base
+
+# Build all VZ rootfs image variants
+vz-rootfs-all: build-agent
+	./scripts/build-vz-rootfs.sh --all

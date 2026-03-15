@@ -56,6 +56,9 @@ type Metadata struct {
 
 	// LocalDir is the host directory mounted via VirtioFS (if set)
 	LocalDir string `json:"local_dir,omitempty"`
+
+	// Image is the image variant name used to create this instance
+	Image string `json:"image,omitempty"`
 }
 
 const metadataFilename = "metadata.json"

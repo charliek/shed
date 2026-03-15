@@ -80,7 +80,7 @@ shed create <name> [flags]
 |------|-------|---------|-------------|
 | `--repo` | `-r` | None | Repository to clone (`owner/repo` shorthand or full URL) |
 | `--server` | `-s` | Default server | Target server |
-| `--image` | `-i` | Server default | Base Docker image |
+| `--image` | `-i` | Server default | Image to use (Docker image name for Docker backend, [variant name](vz-images.md) for VZ) |
 | `--local-dir` | | None | Mount a local host directory as the workspace (mutually exclusive with `--repo`) |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |

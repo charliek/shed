@@ -1,11 +1,23 @@
-# Dockerfile for building VZ (Apple Virtualization.framework) rootfs image
-# This creates a minimal Ubuntu 24.04 system with Docker, tmux, and shed-agent
-# Differences from Firecracker:
-# - Uses hvc0 console (virtio console) instead of ttyS0
-# - Uses DHCP networking (VZ provides NAT) instead of static IP
-# - Targets linux/arm64 for Apple Silicon
+# Multi-stage Dockerfile for VZ (Apple Virtualization.framework) rootfs images
+#
+# Stages:
+#   shed-vz-base       - Minimal: shed infrastructure + basic dev tools
+#   shed-vz-devtools   - Internal: adds mise, Node.js, Claude Code, UV, Python
+#   shed-vz-default    - Full: all coding agents and language runtimes
+#   shed-vz-typescript - Focused: Node.js/TypeScript + Claude Code
+#
+# Build a specific variant:
+#   docker buildx build --platform linux/arm64 --target shed-vz-base -t shed-vz-base:latest --load .
+#   docker buildx build --platform linux/arm64 --target shed-vz-default -t shed-vz-default:latest --load .
+#
+# Or use the build script:
+#   ./scripts/build-vz-rootfs.sh --variant base
 
-FROM ubuntu:24.04
+# =============================================================================
+# Stage: shed-vz-base
+# Everything shed needs to function + basic development tools.
+# =============================================================================
+FROM ubuntu:24.04 AS shed-vz-base
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -160,39 +172,8 @@ RUN mkdir -p /etc/systemd/network && \
 # the VM's enp0s1 interface to the VZ NAT gateway.
 RUN printf "net.ipv4.ip_forward=1\n" > /etc/sysctl.d/99-docker-forward.conf
 
-# Switch to shed user for user-level tool installs
-USER shed
-
-ENV PATH="/home/shed/.local/bin:${PATH}"
-
-# mise (version manager)
-RUN curl https://mise.run | sh
-RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/shed/.bashrc \
-    && echo 'eval "$(mise activate bash)"' >> /home/shed/.bashrc
-ENV PATH="/home/shed/.local/share/mise/shims:${PATH}"
-
-RUN mise use -g \
-    node@lts \
-    github:charliek/prox \
-    github:charliek/envsecrets
-
-# Claude Code
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-# OpenCode
-RUN curl -fsSL https://opencode.ai/install | bash
-
-# Cursor CLI (agent)
-RUN curl https://cursor.com/install -fsS | bash
-
-# Codex cli 
-RUN npm i -g @openai/codex
-
-# UV + Python
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-RUN /home/shed/.local/bin/uv python install 3.13
-
 # Shell customization - colored prompt showing shed name, path, and git branch
+USER shed
 RUN cat >> /home/shed/.bashrc << 'PROMPT_EOF'
 __git_prompt() {
     local branch
@@ -203,12 +184,77 @@ __git_prompt() {
 }
 export PS1='\[\033[1;36m\][\[\033[1;32m\]shed:${SHED_NAME:-dev}\[\033[1;36m\]]\[\033[0m\] \[\033[01;34m\]\w\[\033[00m\]$(__git_prompt) \$ '
 PROMPT_EOF
-
-# Switch back to root for systemd entrypoint
 USER root
 
 # Set default working directory
 WORKDIR /workspace
 
 # Set the init system as entrypoint
+ENTRYPOINT ["/sbin/init"]
+
+
+# =============================================================================
+# Stage: shed-vz-devtools (internal)
+# Shared tooling layer: mise, Node.js, Claude Code, UV, Python.
+# Not intended for direct use — serves as base for default and typescript.
+# =============================================================================
+FROM shed-vz-base AS shed-vz-devtools
+
+USER shed
+
+ENV PATH="/home/shed/.local/bin:${PATH}"
+
+# mise (version manager)
+RUN curl https://mise.run | sh
+RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/shed/.bashrc \
+    && echo 'eval "$(mise activate bash)"' >> /home/shed/.bashrc
+ENV PATH="/home/shed/.local/share/mise/shims:${PATH}"
+
+RUN mise use -g node@lts
+
+# Claude Code
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# UV + Python
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN /home/shed/.local/bin/uv python install 3.13
+
+
+# =============================================================================
+# Stage: shed-vz-default
+# Full development experience with all coding agents and language runtimes.
+# =============================================================================
+FROM shed-vz-devtools AS shed-vz-default
+
+# Additional mise tools
+RUN mise use -g \
+    github:charliek/prox \
+    github:charliek/envsecrets
+
+# OpenCode
+RUN curl -fsSL https://opencode.ai/install | bash
+
+# Cursor CLI (agent)
+RUN curl https://cursor.com/install -fsS | bash
+
+# Codex cli
+RUN npm i -g @openai/codex
+
+USER root
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/sbin/init"]
+
+
+# =============================================================================
+# Stage: shed-vz-typescript
+# TypeScript-focused: Node.js tooling + Claude Code, fewer coding agents.
+# =============================================================================
+FROM shed-vz-devtools AS shed-vz-typescript
+
+USER root
+
+WORKDIR /workspace
+
 ENTRYPOINT ["/sbin/init"]

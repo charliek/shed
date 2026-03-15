@@ -102,7 +102,7 @@ Creates a new shed.
 |-------|----------|---------|-------------|
 | `name` | Yes | - | Shed name (alphanumeric + hyphens) |
 | `repo` | No | null | Repository to clone (`owner/repo` shorthand or full URL) |
-| `image` | No | Server config | Base Docker image |
+| `image` | No | Server config | Image to use (Docker image name for Docker backend, variant name for VZ) |
 | `backend` | No | Server default | Backend to use: `docker`, `firecracker`, or `vz` |
 | `local_dir` | No | null | Absolute path to host directory to mount as workspace (mutually exclusive with `repo`) |
 | `cpus` | No | Backend default | Number of vCPUs (firecracker/vz only) |

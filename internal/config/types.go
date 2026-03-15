@@ -71,6 +71,7 @@ type Shed struct {
 	PID         int       `json:"pid,omitempty" yaml:"pid,omitempty"`
 	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
 	LocalDir    string    `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
+	Image       string    `json:"image,omitempty" yaml:"image,omitempty"`
 }
 
 // Shed status constants.

@@ -108,8 +108,17 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
 	}
 
+	rootfsSource := c.cfg.BaseRootfs
+	if req.Image != "" {
+		resolved, err := c.cfg.ResolveImage(req.Image)
+		if err != nil {
+			return nil, err
+		}
+		rootfsSource = resolved
+	}
+
 	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
-	rootfsPath, err := CopyRootfs(c.cfg.BaseRootfs, c.cfg.InstanceDir, req.Name)
+	rootfsPath, err := CopyRootfs(rootfsSource, c.cfg.InstanceDir, req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
@@ -124,6 +133,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		RootfsPath: rootfsPath,
 		Repo:       req.Repo,
 		LocalDir:   req.LocalDir,
+		Image:      req.Image,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -468,6 +478,7 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 		PID:         meta.PID,
 		RootfsPath:  meta.RootfsPath,
 		LocalDir:    meta.LocalDir,
+		Image:       meta.Image,
 	}
 }
 
