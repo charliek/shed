@@ -690,6 +690,55 @@ func TestDefaultVZConfig(t *testing.T) {
 	}
 }
 
+func TestCredentialMountTag(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"claude", "cred-claude"},
+		{"git_ssh", "cred-git_ssh"},
+		{"gh", "cred-gh"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CredentialMountTag(tt.name)
+			if got != tt.want {
+				t.Errorf("CredentialMountTag(%q) = %q, want %q", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCredentialNameValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		valid bool
+	}{
+		{"claude", true},
+		{"git_ssh", true},
+		{"git-config", true},
+		{"MyApp123", true},
+		{"a", true},
+		{"has space", false},
+		{"has,comma", false},
+		{"has.dot", false},
+		{"has/slash", false},
+		{"-leading-hyphen", false},
+		{"_leading-underscore", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validCredentialName.MatchString(tt.name)
+			if got != tt.valid {
+				t.Errorf("validCredentialName.MatchString(%q) = %v, want %v", tt.name, got, tt.valid)
+			}
+		})
+	}
+}
+
 func TestMountConfigMatchesExclude(t *testing.T) {
 	m := MountConfig{
 		Exclude: []string{"*.db", "*.db-shm", "*.db-wal", "log/*", "storage/*"},
