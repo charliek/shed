@@ -252,7 +252,11 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+  base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+  images:
+    base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+    default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+    typescript: ~/Library/Application Support/shed/vz/typescript-rootfs.ext4
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2
@@ -272,7 +276,8 @@ vz:
 | `vfkit_path` | string | `vfkit` | Path to vfkit binary |
 | `kernel_path` | string | - | Path to decompressed Linux kernel |
 | `initrd_path` | string | - | Path to initial RAM disk image |
-| `base_rootfs` | string | - | Path to base rootfs ext4 image |
+| `base_rootfs` | string | - | Path to default rootfs ext4 image (used when `--image` is not specified) |
+| `images` | map | - | Named image variants mapping variant name to rootfs path (see [VZ Image Variants](vz-images.md)) |
 | `instance_dir` | string | - | Directory for VM instances |
 | `socket_dir` | string | - | Directory for vsock Unix sockets (must not contain spaces) |
 | `default_cpus` | int | `2` | Default vCPUs per VM |

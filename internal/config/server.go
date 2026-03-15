@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -113,8 +114,12 @@ type VZConfig struct {
 	// InitrdPath is the path to the initial RAM disk image
 	InitrdPath string `yaml:"initrd_path"`
 
-	// BaseRootfs is the path to the base rootfs image
+	// BaseRootfs is the path to the base rootfs image (used when no --image is specified)
 	BaseRootfs string `yaml:"base_rootfs"`
+
+	// Images maps variant names to rootfs paths for per-shed image selection.
+	// Users can reference these with: shed create mydev --image typescript
+	Images map[string]string `yaml:"images,omitempty"`
 
 	// InstanceDir is the directory for instance data
 	InstanceDir string `yaml:"instance_dir"`
@@ -155,7 +160,7 @@ func DefaultVZConfig() *VZConfig {
 		VfkitPath:       "vfkit",
 		KernelPath:      ExpandPath("~/Library/Application Support/shed/vz/vmlinux"),
 		InitrdPath:      ExpandPath("~/Library/Application Support/shed/vz/initrd.img"),
-		BaseRootfs:      ExpandPath("~/Library/Application Support/shed/vz/base-rootfs.ext4"),
+		BaseRootfs:      ExpandPath("~/Library/Application Support/shed/vz/default-rootfs.ext4"),
 		InstanceDir:     ExpandPath("~/Library/Application Support/shed/vz/instances"),
 		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
 		DefaultCPUs:     2,
@@ -181,6 +186,11 @@ func (c *VZConfig) applyDefaults() {
 	c.BaseRootfs = ExpandPath(c.BaseRootfs)
 	c.InstanceDir = ExpandPath(c.InstanceDir)
 	c.SocketDir = ExpandPath(c.SocketDir)
+
+	// Expand ~ in image paths
+	for name, path := range c.Images {
+		c.Images[name] = ExpandPath(path)
+	}
 }
 
 // Validate checks that the VZ configuration is valid.
@@ -277,7 +287,37 @@ func (c *VZConfig) Validate() error {
 		return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)
 	}
 
+	// Validate image variant paths exist
+	for name, path := range c.Images {
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("vz: image %q path does not exist: %s", name, path)
+		}
+	}
+
 	return nil
+}
+
+// ResolveImage resolves an image name to a rootfs path using the Images map.
+// It checks named variants first, then absolute paths as an escape hatch.
+func (c *VZConfig) ResolveImage(image string) (string, error) {
+	if path, ok := c.Images[image]; ok {
+		return path, nil
+	}
+	if filepath.IsAbs(image) {
+		if _, err := os.Stat(image); err != nil {
+			return "", fmt.Errorf("image path does not exist: %s", image)
+		}
+		return image, nil
+	}
+	available := make([]string, 0, len(c.Images))
+	for name := range c.Images {
+		available = append(available, name)
+	}
+	sort.Strings(available)
+	if len(available) > 0 {
+		return "", fmt.Errorf("unknown image %q; available variants: %s", image, strings.Join(available, ", "))
+	}
+	return "", fmt.Errorf("unknown image %q; no image variants configured (set vz.images in server config)", image)
 }
 
 // Firecracker validation upper bounds.

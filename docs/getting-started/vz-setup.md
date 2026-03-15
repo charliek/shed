@@ -44,11 +44,21 @@ The rootfs build script creates an ext4 disk image, extracts the kernel, and ext
 ./scripts/build-vz-rootfs.sh
 ```
 
-This produces:
+This builds the `default` variant and produces:
 
-- `~/Library/Application Support/shed/vz/base-rootfs.ext4` - Root filesystem
+- `~/Library/Application Support/shed/vz/default-rootfs.ext4` - Root filesystem
 - `~/Library/Application Support/shed/vz/vmlinux` - Decompressed kernel
 - `~/Library/Application Support/shed/vz/initrd.img` - Initial RAM disk
+
+You can build other variants with `--variant`:
+
+```bash
+./scripts/build-vz-rootfs.sh --variant base        # Minimal image
+./scripts/build-vz-rootfs.sh --variant typescript   # TypeScript focused
+./scripts/build-vz-rootfs.sh --all                  # All variants
+```
+
+See [VZ Image Variants](../reference/vz-images.md) for details on available variants.
 
 You can override the output directory with `OUTPUT_DIR`:
 
@@ -80,7 +90,7 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+  base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets  # Must not contain spaces (vfkit limitation)
   default_cpus: 2

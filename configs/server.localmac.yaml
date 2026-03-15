@@ -95,7 +95,11 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+  base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+  images:
+    base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+    default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+    typescript: ~/Library/Application Support/shed/vz/typescript-rootfs.ext4
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2

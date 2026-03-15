@@ -118,11 +118,6 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use default image if not specified
-	if req.Image == "" {
-		req.Image = s.cfg.DefaultImage
-	}
-
 	// Stream progress via SSE if the client requests it
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		s.handleCreateShedSSE(w, r, req)
