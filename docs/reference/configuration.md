@@ -102,9 +102,11 @@ log_level: info
 
 Credentials are made available to sheds. The method depends on the backend:
 
-- **Docker**: Credentials are bind-mounted (live sync with host)
-- **Firecracker/VZ (read-only)**: Credentials are copied at create/start time via tar-over-vsock; no live sync
-- **Firecracker/VZ (writable)**: Credentials are copied at create/start time and synced bidirectionally via fsnotify + vsock (port 1026) while the VM is running
+- **Docker**: Bind-mounted into the container (live sync with host).
+- **Firecracker (read-only)**: Copied at create/start time via tar-over-vsock; no live sync.
+- **Firecracker (writable)**: Copied at create/start time and synced bidirectionally via fsnotify + vsock (port 1026) while the VM is running.
+- **VZ (directory credentials)**: Mounted via VirtioFS (live sync with host, like Docker bind mounts).
+- **VZ (single-file credentials)**: Transferred via tar-over-vsock. Read-only files have no live sync; writable files sync bidirectionally like Firecracker.
 
 ```yaml
 credentials:
@@ -116,7 +118,7 @@ credentials:
 
 **Missing sources:** If a credential's source path does not exist on the host, it is skipped with a log warning. The credential is not transferred to the VM and is not registered for bidirectional sync. Create the source directory on the host before starting the shed to enable sync.
 
-**Note:** For Firecracker and VZ, only read-only credentials lack live sync — changes on either side require a restart. Writable credentials (`readonly: false`) sync bidirectionally while the VM is running: host-side changes push to the VM, and in-VM changes (e.g., token refreshes) sync back to the host with 2-second echo suppression.
+**Note:** For Firecracker, only read-only credentials lack live sync — writable credentials sync bidirectionally while the VM is running with 2-second echo suppression. For VZ, directory credentials always have live sync via VirtioFS regardless of the `readonly` setting. Only VZ single-file credentials use tar transfer and follow the same sync rules as Firecracker.
 
 **Common credential mounts:**
 
@@ -158,6 +160,32 @@ credentials:
     target: /home/shed/.config/gcloud
     readonly: true
 ```
+
+### Exclude Patterns
+
+For tar-transferred credentials (Firecracker, and VZ single-file credentials), you can specify glob patterns to exclude files from transfer and sync:
+
+```yaml
+credentials:
+  claude:
+    source: ~/.claude
+    target: /home/shed/.claude
+    readonly: false
+    exclude:
+      - "*.db"
+      - "*.db-shm"
+      - "*.db-wal"
+      - "log/*"
+      - "storage/*"
+```
+
+| Detail | Description |
+|--------|-------------|
+| Syntax | `filepath.Match` glob patterns (e.g., `*.db`, `log/*`) |
+| Directory patterns | `dir/*` also excludes the directory itself and all nested content |
+| Scope | Applied during tar archive creation and agent-side fsnotify filtering |
+| Docker | Ignored — Docker bind mounts the entire source path |
+| VZ VirtioFS | Ignored — VirtioFS mounts entire directories |
 
 ## Firecracker Configuration
 
