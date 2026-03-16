@@ -306,7 +306,10 @@ func (c *VZConfig) ResolveImage(image string) (string, error) {
 	expanded := ExpandPath(image)
 	if filepath.IsAbs(expanded) {
 		if _, err := os.Stat(expanded); err != nil {
-			return "", fmt.Errorf("image path does not exist: %s", expanded)
+			if os.IsNotExist(err) {
+				return "", fmt.Errorf("%w: image path does not exist: %q", ErrUnknownImageSentinel, expanded)
+			}
+			return "", fmt.Errorf("failed to stat image path %q: %w", expanded, err)
 		}
 		return expanded, nil
 	}
