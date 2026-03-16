@@ -27,6 +27,9 @@ var (
 
 	// ErrShedNotRunningSentinel is returned when an operation requires a running shed.
 	ErrShedNotRunningSentinel = errors.New("shed is not running")
+
+	// ErrUnknownImageSentinel is returned when a requested image variant does not exist.
+	ErrUnknownImageSentinel = errors.New("unknown image")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -199,6 +202,7 @@ const (
 	ErrInvalidRepoURL     = "INVALID_REPO_URL"
 	ErrCloneFailed        = "CLONE_FAILED"
 	ErrBackendNotEnabled  = "BACKEND_NOT_ENABLED"
+	ErrUnknownImage       = "UNKNOWN_IMAGE"
 	ErrBackendError       = "BACKEND_ERROR"
 	ErrInternalError      = "INTERNAL_ERROR"
 	ErrSessionNotFound    = "SESSION_NOT_FOUND"

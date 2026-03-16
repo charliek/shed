@@ -3,10 +3,12 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
@@ -120,5 +122,55 @@ func TestCreateShed_LocalDirIsFile(t *testing.T) {
 	resp := parseErrorResponse(t, w)
 	if resp.Error.Code != config.ErrInvalidLocalDir {
 		t.Errorf("expected error code %q, got %q", config.ErrInvalidLocalDir, resp.Error.Code)
+	}
+}
+
+func TestMapBackendError_UnknownImage(t *testing.T) {
+	err := fmt.Errorf("%w %q; available variants: base, default", config.ErrUnknownImageSentinel, "rust")
+	code, errCode, msg := mapBackendError(err)
+	if code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", code)
+	}
+	if errCode != config.ErrUnknownImage {
+		t.Errorf("expected %q, got %q", config.ErrUnknownImage, errCode)
+	}
+	if !strings.Contains(msg, "unknown image") {
+		t.Errorf("expected message to contain 'unknown image', got %q", msg)
+	}
+}
+
+func TestMapBackendError_GenericPassthrough(t *testing.T) {
+	err := fmt.Errorf("disk full: cannot copy rootfs")
+	code, _, msg := mapBackendError(err)
+	if code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", code)
+	}
+	if msg != "disk full: cannot copy rootfs" {
+		t.Errorf("expected passthrough message, got %q", msg)
+	}
+}
+
+func TestMapBackendError_SentinelErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantErr  string
+	}{
+		{"not found", fmt.Errorf("%w: mydev", config.ErrShedNotFoundSentinel), http.StatusNotFound, config.ErrShedNotFound},
+		{"already exists", fmt.Errorf("%w: mydev", config.ErrShedAlreadyExistsSentinel), http.StatusConflict, config.ErrShedAlreadyExists},
+		{"already running", fmt.Errorf("%w: mydev", config.ErrShedAlreadyRunningSentinel), http.StatusConflict, config.ErrShedAlreadyRunning},
+		{"not running", fmt.Errorf("%w: mydev", config.ErrShedNotRunningSentinel), http.StatusConflict, config.ErrShedAlreadyStopped},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, errCode, _ := mapBackendError(tt.err)
+			if code != tt.wantCode {
+				t.Errorf("code = %d, want %d", code, tt.wantCode)
+			}
+			if errCode != tt.wantErr {
+				t.Errorf("errCode = %q, want %q", errCode, tt.wantErr)
+			}
+		})
 	}
 }

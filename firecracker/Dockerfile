@@ -151,6 +151,17 @@ USER shed
 RUN curl https://mise.run | sh
 ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:${PATH}"
 
+# Ensure mise shims and local bin are in PATH for non-interactive login shells
+# (shed exec uses bash --login -c "cmd" which sources /etc/profile.d/ but not .bashrc)
+USER root
+RUN printf '%s\n' \
+    '# Only add shed user paths for the shed user (not root)' \
+    'if [ "$(id -u)" = "1000" ]; then' \
+    '  export PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:$PATH"' \
+    'fi' \
+    > /etc/profile.d/shed-path.sh
+USER shed
+
 # UV + Python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN /home/shed/.local/bin/uv python install 3.13

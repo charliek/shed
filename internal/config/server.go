@@ -316,9 +316,9 @@ func (c *VZConfig) ResolveImage(image string) (string, error) {
 	}
 	sort.Strings(available)
 	if len(available) > 0 {
-		return "", fmt.Errorf("unknown image %q; available variants: %s", image, strings.Join(available, ", "))
+		return "", fmt.Errorf("%w %q; available variants: %s", ErrUnknownImageSentinel, image, strings.Join(available, ", "))
 	}
-	return "", fmt.Errorf("unknown image %q; no image variants configured (set vz.images in server config)", image)
+	return "", fmt.Errorf("%w %q; no image variants configured (set vz.images in server config)", ErrUnknownImageSentinel, image)
 }
 
 // Firecracker validation upper bounds.
