@@ -127,7 +127,7 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	shed, err := s.backend.CreateShed(r.Context(), req)
 	if err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
-		code, errCode, msg := mapDockerError(err)
+		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -197,7 +197,7 @@ drain:
 
 	if res.err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, res.err)
-		_, errCode, msg := mapDockerError(res.err)
+		_, errCode, msg := mapBackendError(res.err)
 		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
 	} else {
 		writeSSEEvent(w, "complete", res.shed)
@@ -222,7 +222,7 @@ func (s *Server) handleGetShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.GetShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapDockerError(err)
+		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -237,7 +237,7 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	keepVolume := r.URL.Query().Get("keep_volume") == "true"
 
 	if err := s.backend.DeleteShed(r.Context(), name, keepVolume); err != nil {
-		code, errCode, msg := mapDockerError(err)
+		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -252,7 +252,7 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.StartShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapDockerError(err)
+		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -267,7 +267,7 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 
 	shed, err := s.backend.StopShed(r.Context(), name)
 	if err != nil {
-		code, errCode, msg := mapDockerError(err)
+		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
@@ -368,38 +368,9 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, apiErr)
 }
 
-// DockerError is an error type that can be returned by the docker client
-// to indicate specific error conditions.
-type DockerError struct {
-	Code    string
-	Message string
-}
-
-func (e *DockerError) Error() string {
-	return e.Message
-}
-
-// mapDockerError maps a docker error to an HTTP status code, error code, and sanitized message.
-func mapDockerError(err error) (int, string, string) {
-	var dockerErr *DockerError
-	if errors.As(err, &dockerErr) {
-		switch dockerErr.Code {
-		case config.ErrShedNotFound:
-			return http.StatusNotFound, config.ErrShedNotFound, dockerErr.Message
-		case config.ErrShedAlreadyExists:
-			return http.StatusConflict, config.ErrShedAlreadyExists, dockerErr.Message
-		case config.ErrShedAlreadyRunning:
-			return http.StatusConflict, config.ErrShedAlreadyRunning, dockerErr.Message
-		case config.ErrShedAlreadyStopped:
-			return http.StatusConflict, config.ErrShedAlreadyStopped, dockerErr.Message
-		case config.ErrInvalidShedName:
-			return http.StatusBadRequest, config.ErrInvalidShedName, dockerErr.Message
-		case config.ErrCloneFailed:
-			return http.StatusInternalServerError, config.ErrCloneFailed, "repository clone failed"
-		}
-	}
-
-	// Check for backend-agnostic sentinel errors
+// mapBackendError maps a backend error to an HTTP status code, error code, and message.
+func mapBackendError(err error) (int, string, string) {
+	// Check sentinel errors
 	if errors.Is(err, config.ErrShedNotFoundSentinel) {
 		return http.StatusNotFound, config.ErrShedNotFound, err.Error()
 	}
@@ -412,45 +383,31 @@ func mapDockerError(err error) (int, string, string) {
 	if errors.Is(err, config.ErrShedNotRunningSentinel) {
 		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
 	}
+	if errors.Is(err, config.ErrUnknownImageSentinel) {
+		return http.StatusBadRequest, config.ErrUnknownImage, err.Error()
+	}
 
-	// Check for common error messages (fallback for backends without sentinel errors)
+	// Fallback to string matching for errors without sentinels
 	errMsg := err.Error()
 	if strings.Contains(errMsg, "not found") {
-		return http.StatusNotFound, config.ErrShedNotFound, sanitizeErrorMessage(errMsg, "not found")
+		return http.StatusNotFound, config.ErrShedNotFound, errMsg
 	}
 	if strings.Contains(errMsg, "already exists") {
-		return http.StatusConflict, config.ErrShedAlreadyExists, sanitizeErrorMessage(errMsg, "already exists")
+		return http.StatusConflict, config.ErrShedAlreadyExists, errMsg
 	}
 	if strings.Contains(errMsg, "already running") {
-		return http.StatusConflict, config.ErrShedAlreadyRunning, sanitizeErrorMessage(errMsg, "already running")
+		return http.StatusConflict, config.ErrShedAlreadyRunning, errMsg
 	}
 	if strings.Contains(errMsg, "already stopped") || strings.Contains(errMsg, "not running") {
-		return http.StatusConflict, config.ErrShedAlreadyStopped, sanitizeErrorMessage(errMsg, "not running")
+		return http.StatusConflict, config.ErrShedAlreadyStopped, errMsg
 	}
 	if strings.Contains(errMsg, "backend") && strings.Contains(errMsg, "not enabled") {
 		return http.StatusBadRequest, config.ErrBackendNotEnabled, errMsg
 	}
 
-	// For unknown errors, return a generic message to avoid leaking Docker internals
-	return http.StatusInternalServerError, config.ErrBackendError, "internal server error"
-}
-
-// sanitizeErrorMessage extracts shed-related information while hiding Docker implementation details.
-func sanitizeErrorMessage(errMsg, context string) string {
-	// Extract shed name if present in common patterns
-	if strings.Contains(errMsg, "shed ") {
-		// Try to extract shed name from patterns like 'shed "foo" not found'
-		start := strings.Index(errMsg, "shed ")
-		if start >= 0 {
-			// Find the end of the shed-related part (first sentence or line)
-			end := strings.IndexAny(errMsg[start:], ":")
-			if end > 0 {
-				return errMsg[start : start+end]
-			}
-			return errMsg[start:]
-		}
-	}
-	return context
+	// Pass through unrecognized backend errors. Shed is a developer tool
+	// where the user owns the server, so error details help debugging.
+	return http.StatusInternalServerError, config.ErrBackendError, errMsg
 }
 
 // mapSessionError maps a session-related error to an HTTP status code, error code, and message.
@@ -472,5 +429,6 @@ func mapSessionError(err error) (int, string, string) {
 		return http.StatusNotFound, config.ErrShedNotFound, errMsg
 	}
 
-	return http.StatusInternalServerError, config.ErrBackendError, "internal server error"
+	// Pass through unrecognized session errors — details help debugging.
+	return http.StatusInternalServerError, config.ErrBackendError, errMsg
 }

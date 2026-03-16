@@ -212,6 +212,17 @@ ENV PATH="/home/shed/.local/share/mise/shims:${PATH}"
 
 RUN mise use -g node@lts
 
+# Ensure mise shims and local bin are in PATH for non-interactive login shells
+# (shed exec uses bash --login -c "cmd" which sources /etc/profile.d/ but not .bashrc)
+USER root
+RUN printf '%s\n' \
+    '# Only add shed user paths for the shed user (not root)' \
+    'if [ "$(id -u)" = "1000" ]; then' \
+    '  export PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:$PATH"' \
+    'fi' \
+    > /etc/profile.d/shed-path.sh
+USER shed
+
 # Claude Code
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
