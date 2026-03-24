@@ -567,7 +567,7 @@ func (c *Client) setupCredentials(ctx context.Context, agent *vmutil.AgentClient
 	// Start credential notification listener only if there are writable tar-only credentials.
 	// VirtioFS credentials don't need the notify/watch sync infrastructure.
 	if hasWritableTarCredentials(tarOnlyCreds) {
-		c.startNotifyListener(shedName, agent)
+		c.startNotifyListener(shedName, agent, tarOnlyCreds)
 	}
 }
 
@@ -629,23 +629,14 @@ func (c *Client) buildEnvForGit() []string {
 }
 
 // startNotifyListener starts a credential notification listener for a VM.
-func (c *Client) startNotifyListener(name string, agent *vmutil.AgentClient) {
-	if c.serverCfg == nil {
+// tarOnlyCreds contains only tar-transferred credentials that need bidirectional
+// sync. VirtioFS credentials are excluded — they are live mounts.
+func (c *Client) startNotifyListener(name string, agent *vmutil.AgentClient, tarOnlyCreds map[string]config.MountConfig) {
+	if len(tarOnlyCreds) == 0 {
 		return
 	}
 
-	hasWritable := false
-	for _, mount := range c.serverCfg.Credentials {
-		if !mount.ReadOnly {
-			hasWritable = true
-			break
-		}
-	}
-	if !hasWritable {
-		return
-	}
-
-	listener := vmutil.NewCredentialNotifyListener(agent, c.serverCfg, c.credWatcher)
+	listener := vmutil.NewCredentialNotifyListener(agent, tarOnlyCreds, c.credWatcher)
 	listener.Start(context.Background(), name)
 
 	// Register VM with the credential watcher for host->VM pushes

@@ -49,7 +49,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # Claude Code
-RUN npm install -g @anthropic-ai/claude-code
+# CLAUDE_CONFIG_DIR tells Claude Code to read/write .claude.json inside ~/.claude/
+# instead of at ~/.claude.json in the home directory root. This lets credential
+# mounts of ~/.claude/ cover all Claude state without a separate file transfer.
+RUN npm install -g @anthropic-ai/claude-code \
+    && echo 'export CLAUDE_CONFIG_DIR="/home/shed/.claude"' > /etc/profile.d/claude-config.sh
+ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
 
 # OpenCode
 RUN npm i -g opencode-ai

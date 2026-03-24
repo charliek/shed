@@ -231,7 +231,13 @@ RUN printf '%s\n' \
 USER shed
 
 # Claude Code
-RUN curl -fsSL https://claude.ai/install.sh | bash
+# CLAUDE_CONFIG_DIR tells Claude Code to read/write .claude.json inside ~/.claude/
+# instead of at ~/.claude.json in the home directory root. This lets the VirtioFS
+# credential mount of ~/.claude/ cover all Claude state (credentials, settings,
+# and onboarding state) without needing a separate tar-transferred file.
+ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && sudo sh -c 'echo "export CLAUDE_CONFIG_DIR=/home/shed/.claude" > /etc/profile.d/claude-config.sh'
 
 # UV + Python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
