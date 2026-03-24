@@ -24,11 +24,10 @@ When you run `shed create`, the following steps execute in order:
 | 4. Credential setup | Already bind-mounted at container creation | All credentials transferred via tar-over-vsock | Directory credentials mounted via VirtioFS; single-file credentials transferred via tar-over-vsock |
 | 5. Repo clone | `git clone` in `/workspace` (skipped if `--local-dir`) | Same | Same |
 | 6. Install hook | Runs via `docker exec`; state file marks completion | Runs via vsock; state file marks completion | Same as Firecracker |
-| 7. PATH capture | Captures installed tool paths to `/etc/profile.d/shed-installed-tools.sh` | Same | Same |
-| 8. Startup hook | Runs via `docker exec` | Runs via vsock | Same as Firecracker |
-| 9. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same | Same |
+| 7. Startup hook | Runs via `docker exec` | Runs via vsock | Same as Firecracker |
+| 8. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same | Same |
 
-Steps 1–8 are server-side. Step 9 runs on the CLI client after the server returns.
+Steps 1–7 are server-side. Step 8 runs on the CLI client after the server returns.
 
 ### Start Sequence
 
@@ -141,23 +140,9 @@ After the shutdown hook completes, the agent enforces a 5-second drain timeout o
 
 ## PATH Propagation
 
-After the install hook completes, shed captures the PATH (including any additions made by installers to `~/.bashrc`) and persists it to `/etc/profile.d/shed-installed-tools.sh`. This ensures tools installed by the install hook are available to the startup hook and subsequent commands.
+All shed hooks run as login shells (`bash --login -c`), which source `~/.bash_profile`. The shed base images set up `~/.bash_profile` to source `~/.bashrc`, so tools that add PATH entries to `~/.bashrc` (e.g., bun, nvm) are automatically available to subsequent hooks.
 
-For example, if your install hook runs `curl -fsSL https://bun.sh/install | bash`, bun's installer adds `~/.bun/bin` to `~/.bashrc`. Shed detects this and writes:
-
-```bash
-export PATH="/home/shed/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
-```
-
-to `/etc/profile.d/shed-installed-tools.sh`. Since startup hooks run as login shells (`bash --login -c`), they automatically source this file and inherit the installed tools.
-
-Shed also detects [mise](https://mise.jdx.dev/) shims. If your install hook uses `mise use --global` to install tools, the mise shims directory (`~/.local/share/mise/shims`) is automatically included in the captured PATH.
-
-**Debugging**: If tools installed by the install hook aren't found during the startup hook, check the captured PATH:
-
-```bash
-shed exec myproject -- cat /etc/profile.d/shed-installed-tools.sh
-```
+The base images also include `/etc/profile.d/shed-path.sh` which ensures [mise](https://mise.jdx.dev/) shims and `~/.local/bin` are in PATH for login shells.
 
 ## Example: PostgreSQL Setup
 
