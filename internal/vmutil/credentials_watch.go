@@ -2,7 +2,6 @@ package vmutil
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -180,14 +179,6 @@ func (cw *CredentialWatcher) run() {
 				continue
 			}
 
-			if event.Has(fsnotify.Create) {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					if err := cw.addRecursiveWatch(event.Name); err != nil {
-						log.Printf("Failed to watch new directory %s: %v", event.Name, err)
-					}
-				}
-			}
-
 			credName := cw.resolveCredential(event.Name)
 			if credName == "" {
 				continue
@@ -202,24 +193,6 @@ func (cw *CredentialWatcher) run() {
 			log.Printf("Host credential watcher error: %v", err)
 		}
 	}
-}
-
-// addRecursiveWatch adds watches on a directory and all subdirectories.
-func (cw *CredentialWatcher) addRecursiveWatch(root string) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			if path == root {
-				return fmt.Errorf("cannot access credential root %s: %w", root, err)
-			}
-			return nil
-		}
-		if info.IsDir() {
-			if watchErr := cw.watcher.Add(path); watchErr != nil {
-				log.Printf("Warning: failed to add watch on %s: %v", path, watchErr)
-			}
-		}
-		return nil
-	})
 }
 
 // resolveCredential finds which credential a file path belongs to.
