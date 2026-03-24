@@ -119,6 +119,15 @@ RUN userdel -r ubuntu 2>/dev/null || true \
     && echo 'shed ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/shed \
     && chmod 0440 /etc/sudoers.d/shed
 
+# Set up .bash_profile to handle PATH (login shell) and source .bashrc (interactive).
+# PATH modifications belong here, not in .bashrc, to prevent shell snapshot tools
+# from capturing raw PATH assignments with unexpanded variable references.
+RUN printf '%s\n' \
+    'export PATH="/home/shed/.local/bin:$PATH"' \
+    '[ -f ~/.bashrc ] && . ~/.bashrc' \
+    > /home/shed/.bash_profile \
+    && chown shed:shed /home/shed/.bash_profile
+
 # Create workspace directory owned by shed
 RUN mkdir -p /workspace && chown shed:shed /workspace
 
@@ -151,8 +160,7 @@ USER shed
 RUN curl https://mise.run | sh
 ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:${PATH}"
 
-# Ensure mise shims and local bin are in PATH for non-interactive login shells
-# (shed exec uses bash --login -c "cmd" which sources /etc/profile.d/ but not .bashrc)
+# Ensure mise shims and local bin are in PATH for login shells via profile.d
 USER root
 RUN printf '%s\n' \
     '# Only add shed user paths for the shed user (not root)' \

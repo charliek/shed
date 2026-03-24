@@ -102,10 +102,6 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 			fmt.Fprintln(p.output, "Install hook complete")
 			backend.Progress(ctx, "provision", "Install hook complete")
 			_ = state.MarkInstallComplete(ctx)
-
-			if err := p.captureInstalledPaths(ctx); err != nil {
-				fmt.Fprintf(p.errOut, "Warning: failed to capture installed paths: %v\n", err)
-			}
 		}
 	}
 
@@ -215,26 +211,6 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 	}
 
 	return nil
-}
-
-// captureInstalledPaths captures PATH from an interactive shell and persists
-// it to /etc/profile.d/ so login shells inherit tools installed by the install hook.
-func (p *Provisioner) captureInstalledPaths(ctx context.Context) error {
-	cmd := `
-PATH_VAL=$(bash -ic 'echo "$PATH"' 2>/dev/null | tail -1)
-# mise doesn't add shims to .bashrc; detect and prepend if present
-MISE_SHIMS="$HOME/.local/share/mise/shims"
-if [ -d "$MISE_SHIMS" ] && ! echo "$PATH_VAL" | grep -q "$MISE_SHIMS"; then
-  PATH_VAL="$MISE_SHIMS:$PATH_VAL"
-fi
-echo "export PATH=\"$PATH_VAL\"" | sudo tee /etc/profile.d/shed-installed-tools.sh > /dev/null
-`
-	opts := backend.ExecOptions{
-		Cmd:        []string{"bash", "-c", cmd},
-		WorkingDir: "/",
-		TTY:        false,
-	}
-	return p.agent.Exec(ctx, opts)
 }
 
 // ensureLogDir creates the log directory in the VM if it doesn't exist.

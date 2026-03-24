@@ -506,14 +506,6 @@ func (c *Client) runProvisioning(ctx context.Context, containerID, shedName stri
 			}
 			fmt.Fprintln(stdout, "✓ Install hook complete")
 			_ = state.MarkInstallComplete(ctx, containerID)
-
-			// Capture installed tool paths for subsequent hooks.
-			// Install hooks often modify ~/.bashrc (e.g., bun adds PATH).
-			// Non-interactive shells don't source .bashrc, so we persist
-			// the PATH to /etc/profile.d/ which login shells source.
-			if err := c.captureInstalledPaths(ctx, containerID); err != nil {
-				fmt.Fprintf(stderr, "Warning: failed to capture installed paths: %v\n", err)
-			}
 		}
 	}
 
@@ -531,46 +523,6 @@ func (c *Client) runProvisioning(ctx context.Context, containerID, shedName stri
 		fmt.Fprintln(stdout, "✓ Startup hook complete")
 	}
 
-	return nil
-}
-
-// captureInstalledPaths captures PATH from an interactive shell and persists
-// it to /etc/profile.d/ so login shells (used by subsequent hooks) inherit
-// tools installed by the install hook (e.g., bun adds itself to ~/.bashrc).
-// Also detects mise shims directory, since mise doesn't modify .bashrc.
-func (c *Client) captureInstalledPaths(ctx context.Context, containerID string) error {
-	cmd := []string{
-		"bash", "-c",
-		`PATH_VAL=$(bash -ic 'echo "$PATH"' 2>/dev/null | tail -1)
-if [ -z "$PATH_VAL" ]; then
-  echo "ERROR: failed to capture PATH" >&2
-  exit 1
-fi
-MISE_SHIMS="$HOME/.local/share/mise/shims"
-if [ -d "$MISE_SHIMS" ] && ! echo "$PATH_VAL" | grep -q "$MISE_SHIMS"; then
-  PATH_VAL="$MISE_SHIMS:$PATH_VAL"
-fi
-echo "export PATH=\"$PATH_VAL\"" | sudo tee /etc/profile.d/shed-installed-tools.sh > /dev/null`,
-	}
-	execConfig := container.ExecOptions{Cmd: cmd, User: config.ContainerUser}
-	execResp, err := c.docker.ContainerExecCreate(ctx, containerID, execConfig)
-	if err != nil {
-		return err
-	}
-	attachResp, err := c.docker.ContainerExecAttach(ctx, execResp.ID, container.ExecStartOptions{})
-	if err != nil {
-		return err
-	}
-	defer attachResp.Close()
-	_, _ = io.Copy(io.Discard, attachResp.Reader)
-
-	inspectResp, err := c.docker.ContainerExecInspect(ctx, execResp.ID)
-	if err != nil {
-		return fmt.Errorf("failed to inspect exec: %w", err)
-	}
-	if inspectResp.ExitCode != 0 {
-		return fmt.Errorf("captureInstalledPaths failed with exit code %d", inspectResp.ExitCode)
-	}
 	return nil
 }
 

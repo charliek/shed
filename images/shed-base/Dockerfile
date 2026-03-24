@@ -31,6 +31,15 @@ RUN userdel -r ubuntu 2>/dev/null || true \
     && echo 'shed ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/shed \
     && chmod 0440 /etc/sudoers.d/shed
 
+# Set up .bash_profile to handle PATH (login shell) and source .bashrc (interactive).
+# PATH modifications belong here, not in .bashrc, to prevent shell snapshot tools
+# from capturing raw PATH assignments with unexpanded variable references.
+RUN printf '%s\n' \
+    'export PATH="/home/shed/.local/bin:$PATH"' \
+    '[ -f ~/.bashrc ] && . ~/.bashrc' \
+    > /home/shed/.bash_profile \
+    && chown shed:shed /home/shed/.bash_profile
+
 # Pre-create log directory so shed user can write logs without root
 RUN mkdir -p /var/log/shed && chown shed:shed /var/log/shed
 
