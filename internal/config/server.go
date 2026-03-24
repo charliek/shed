@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/charliek/shed/internal/terminal"
+	"github.com/charliek/shed/internal/vmimage"
 )
 
 // validCredentialName matches names starting with an alphanumeric character,
@@ -117,9 +118,14 @@ type VZConfig struct {
 	// BaseRootfs is the path to the base rootfs image (used when no --image is specified)
 	BaseRootfs string `yaml:"base_rootfs"`
 
-	// Images maps variant names to rootfs paths for per-shed image selection.
+	// Images maps variant names to rootfs paths or Docker image references.
 	// Users can reference these with: shed create mydev --image typescript
+	// Values can be ext4 file paths or Docker refs (e.g., "ghcr.io/charliek/shed-vz-default:v1.0.0").
 	Images map[string]string `yaml:"images,omitempty"`
+
+	// ImagesDir is the directory for converted/discovered ext4 images.
+	// Images matching {name}-rootfs.ext4 are auto-discovered as available variants.
+	ImagesDir string `yaml:"images_dir,omitempty"`
 
 	// InstanceDir is the directory for instance data
 	InstanceDir string `yaml:"instance_dir"`
@@ -161,6 +167,7 @@ func DefaultVZConfig() *VZConfig {
 		KernelPath:      ExpandPath("~/Library/Application Support/shed/vz/vmlinux"),
 		InitrdPath:      ExpandPath("~/Library/Application Support/shed/vz/initrd.img"),
 		BaseRootfs:      ExpandPath("~/Library/Application Support/shed/vz/default-rootfs.ext4"),
+		ImagesDir:       ExpandPath("~/Library/Application Support/shed/vz"),
 		InstanceDir:     ExpandPath("~/Library/Application Support/shed/vz/instances"),
 		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
 		DefaultCPUs:     2,
@@ -184,12 +191,20 @@ func (c *VZConfig) applyDefaults() {
 	c.KernelPath = ExpandPath(c.KernelPath)
 	c.InitrdPath = ExpandPath(c.InitrdPath)
 	c.BaseRootfs = ExpandPath(c.BaseRootfs)
+	c.ImagesDir = ExpandPath(c.ImagesDir)
 	c.InstanceDir = ExpandPath(c.InstanceDir)
 	c.SocketDir = ExpandPath(c.SocketDir)
 
-	// Expand ~ in image paths
-	for name, path := range c.Images {
-		c.Images[name] = ExpandPath(path)
+	// Default ImagesDir if not set
+	if c.ImagesDir == "" {
+		c.ImagesDir = ExpandPath("~/Library/Application Support/shed/vz")
+	}
+
+	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
+	for name, val := range c.Images {
+		if !vmimage.IsDockerRef(val) {
+			c.Images[name] = ExpandPath(val)
+		}
 	}
 }
 
@@ -274,54 +289,156 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	// Validate kernel, initrd, and rootfs paths exist
-	if _, err := os.Stat(c.KernelPath); err != nil {
-		return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
-	}
-	if c.InitrdPath != "" {
-		if _, err := os.Stat(c.InitrdPath); err != nil {
-			return fmt.Errorf("vz: initrd_path does not exist: %s", c.InitrdPath)
+	// Check if any image references are Docker refs (deferred validation — files
+	// won't exist on disk until first pull+convert). When Docker refs are present,
+	// kernel/initrd validation is also deferred since they're extracted during conversion.
+	hasDockerRefs := vmimage.IsDockerRef(c.BaseRootfs)
+	for _, val := range c.Images {
+		if vmimage.IsDockerRef(val) {
+			hasDockerRefs = true
+			break
 		}
 	}
-	if _, err := os.Stat(c.BaseRootfs); err != nil {
-		return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)
+
+	// Validate kernel, initrd, and rootfs paths exist (skip for Docker refs)
+	if !hasDockerRefs {
+		if _, err := os.Stat(c.KernelPath); err != nil {
+			return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
+		}
+		if c.InitrdPath != "" {
+			if _, err := os.Stat(c.InitrdPath); err != nil {
+				return fmt.Errorf("vz: initrd_path does not exist: %s", c.InitrdPath)
+			}
+		}
 	}
 
-	// Validate image variant paths exist
-	for name, path := range c.Images {
-		if _, err := os.Stat(path); err != nil {
-			return fmt.Errorf("vz: image %q path does not exist: %s", name, path)
+	if !vmimage.IsDockerRef(c.BaseRootfs) {
+		if _, err := os.Stat(c.BaseRootfs); err != nil {
+			return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)
+		}
+	}
+
+	// Validate image variant paths exist (skip Docker refs)
+	for name, val := range c.Images {
+		if !vmimage.IsDockerRef(val) {
+			if _, err := os.Stat(val); err != nil {
+				return fmt.Errorf("vz: image %q path does not exist: %s", name, val)
+			}
 		}
 	}
 
 	return nil
 }
 
-// ResolveImage resolves an image name to a rootfs path using the Images map.
-// It checks named variants first, then absolute paths as an escape hatch.
-func (c *VZConfig) ResolveImage(image string) (string, error) {
-	if path, ok := c.Images[image]; ok {
-		return path, nil
+// ResolvedImage represents the result of resolving an image name.
+// Either Path (ext4 already exists locally) or DockerRef (needs pull + conversion) is set.
+type ResolvedImage struct {
+	// Path is set when the ext4 image already exists on disk.
+	Path string
+
+	// DockerRef is set when the image needs to be pulled and converted.
+	DockerRef string
+
+	// Name is the variant name, used for caching (e.g., "default" → "default-rootfs.ext4").
+	Name string
+}
+
+// ResolveImage resolves an image name to a local ext4 path or Docker reference.
+//
+// Resolution order:
+//  1. Look up in Images map — if value is a Docker ref, check ImagesDir cache first
+//  2. Auto-discover {name}-rootfs.ext4 in ImagesDir
+//  3. Absolute path escape hatch
+//  4. Error with available variants
+func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
+	if val, ok := c.Images[image]; ok {
+		if vmimage.IsDockerRef(val) {
+			// Check if already cached locally
+			cached := filepath.Join(c.ImagesDir, vmimage.RootfsFilename(image))
+			if _, err := os.Stat(cached); err == nil {
+				// Check source sidecar for cache invalidation
+				sourceFile := filepath.Join(c.ImagesDir, vmimage.SourceFilename(image))
+				if source, err := os.ReadFile(sourceFile); err == nil && strings.TrimSpace(string(source)) == val {
+					return ResolvedImage{Path: cached, Name: image}, nil
+				}
+				// Source doesn't match — need re-conversion
+			}
+			return ResolvedImage{DockerRef: val, Name: image}, nil
+		}
+		// Filesystem path
+		return ResolvedImage{Path: val, Name: image}, nil
 	}
+
+	// Auto-discover in ImagesDir
+	if c.ImagesDir != "" {
+		discovered := filepath.Join(c.ImagesDir, vmimage.RootfsFilename(image))
+		if _, err := os.Stat(discovered); err == nil {
+			return ResolvedImage{Path: discovered, Name: image}, nil
+		}
+	}
+
+	// Absolute path escape hatch
 	expanded := ExpandPath(image)
 	if filepath.IsAbs(expanded) {
 		if _, err := os.Stat(expanded); err != nil {
 			if os.IsNotExist(err) {
-				return "", fmt.Errorf("%w: image path does not exist: %q", ErrUnknownImageSentinel, expanded)
+				return ResolvedImage{}, fmt.Errorf("%w: image path does not exist: %q", ErrUnknownImageSentinel, expanded)
 			}
-			return "", fmt.Errorf("failed to stat image path %q: %w", expanded, err)
+			return ResolvedImage{}, fmt.Errorf("failed to stat image path %q: %w", expanded, err)
 		}
-		return expanded, nil
+		return ResolvedImage{Path: expanded, Name: image}, nil
 	}
-	available := make([]string, 0, len(c.Images))
+
+	// Not found — build error with available variants
+	available := c.availableVariants()
+	if len(available) > 0 {
+		return ResolvedImage{}, fmt.Errorf("%w %q; available variants: %s", ErrUnknownImageSentinel, image, strings.Join(available, ", "))
+	}
+	return ResolvedImage{}, fmt.Errorf("%w %q; no image variants configured (set vz.images in server config)", ErrUnknownImageSentinel, image)
+}
+
+// ResolveBaseRootfs resolves the base rootfs (used when no --image flag is specified).
+// Returns a ResolvedImage that may be a local path or Docker reference.
+func (c *VZConfig) ResolveBaseRootfs() ResolvedImage {
+	if vmimage.IsDockerRef(c.BaseRootfs) {
+		cached := filepath.Join(c.ImagesDir, vmimage.RootfsFilename("_base"))
+		if _, err := os.Stat(cached); err == nil {
+			sourceFile := filepath.Join(c.ImagesDir, vmimage.SourceFilename("_base"))
+			if source, err := os.ReadFile(sourceFile); err == nil && strings.TrimSpace(string(source)) == c.BaseRootfs {
+				return ResolvedImage{Path: cached, Name: "_base"}
+			}
+		}
+		return ResolvedImage{DockerRef: c.BaseRootfs, Name: "_base"}
+	}
+	return ResolvedImage{Path: c.BaseRootfs, Name: "_base"}
+}
+
+// availableVariants returns sorted list of available image names from config and ImagesDir.
+func (c *VZConfig) availableVariants() []string {
+	seen := make(map[string]bool)
 	for name := range c.Images {
+		seen[name] = true
+	}
+	// Scan ImagesDir for discovered images
+	if c.ImagesDir != "" {
+		entries, err := os.ReadDir(c.ImagesDir)
+		if err == nil {
+			for _, e := range entries {
+				if strings.HasSuffix(e.Name(), "-rootfs.ext4") && !e.IsDir() {
+					name := strings.TrimSuffix(e.Name(), "-rootfs.ext4")
+					if name != "" && name != "_base" {
+						seen[name] = true
+					}
+				}
+			}
+		}
+	}
+	available := make([]string, 0, len(seen))
+	for name := range seen {
 		available = append(available, name)
 	}
 	sort.Strings(available)
-	if len(available) > 0 {
-		return "", fmt.Errorf("%w %q; available variants: %s", ErrUnknownImageSentinel, image, strings.Join(available, ", "))
-	}
-	return "", fmt.Errorf("%w %q; no image variants configured (set vz.images in server config)", ErrUnknownImageSentinel, image)
+	return available
 }
 
 // Firecracker validation upper bounds.

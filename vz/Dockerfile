@@ -19,6 +19,8 @@
 # =============================================================================
 FROM ubuntu:24.04 AS shed-vz-base
 
+LABEL io.shed.base-version="1"
+
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Prevent interactive prompts during package installation

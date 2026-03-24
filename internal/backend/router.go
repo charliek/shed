@@ -149,6 +149,20 @@ func (r *Router) GetNetworkEndpoint(ctx context.Context, shedName string) (strin
 	return backend.GetNetworkEndpoint(ctx, shedName)
 }
 
+// ListImages returns images from all backends.
+func (r *Router) ListImages(ctx context.Context) ([]config.ImageInfo, error) {
+	var all []config.ImageInfo
+	for _, backendType := range r.order {
+		b := r.backends[backendType]
+		images, err := b.ListImages(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("backend %s: %w", backendType, err)
+		}
+		all = append(all, images...)
+	}
+	return all, nil
+}
+
 func (r *Router) backendForCreate(req config.CreateShedRequest) (Backend, error) {
 	if req.Backend != "" {
 		backend, ok := r.backends[Type(req.Backend)]

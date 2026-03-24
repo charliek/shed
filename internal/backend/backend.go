@@ -67,4 +67,10 @@ type Backend interface {
 	// GetNetworkEndpoint returns the network endpoint (IP or hostname) for a shed.
 	// This is used for port forwarding and other network operations.
 	GetNetworkEndpoint(ctx context.Context, shedName string) (string, error)
+
+	// Images
+
+	// ListImages returns available image variants for this backend.
+	// Returns an empty list for backends that don't support image variants.
+	ListImages(ctx context.Context) ([]config.ImageInfo, error)
 }

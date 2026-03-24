@@ -44,6 +44,9 @@ func (s *Server) Router() chi.Router {
 		// Sessions (aggregate across all sheds)
 		r.Get("/sessions", s.handleListAllSessions)
 
+		// Images
+		r.Get("/images", s.handleListImages)
+
 		// Sheds
 		r.Route("/sheds", func(r chi.Router) {
 			r.Get("/", s.handleListSheds)

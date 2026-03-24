@@ -93,3 +93,8 @@ func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.Exec
 func (b *VZBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
 	return "", errNonDarwin
 }
+
+// ListImages returns an empty list on non-darwin platforms.
+func (b *VZBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	return nil, nil
+}

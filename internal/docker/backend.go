@@ -217,3 +217,8 @@ func (b *DockerBackend) GetNetworkEndpoint(ctx context.Context, shedName string)
 
 	return b.client.GetContainerIP(ctx, shed.ContainerID)
 }
+
+// ListImages returns an empty list — Docker backend uses Docker images directly.
+func (b *DockerBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	return nil, nil
+}

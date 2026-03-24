@@ -432,3 +432,17 @@ func mapSessionError(err error) (int, string, string) {
 	// Pass through unrecognized session errors — details help debugging.
 	return http.StatusInternalServerError, config.ErrBackendError, errMsg
 }
+
+// handleListImages returns available image variants across all backends.
+// GET /api/images
+func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
+	images, err := s.backend.ListImages(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, err.Error())
+		return
+	}
+	if images == nil {
+		images = []config.ImageInfo{}
+	}
+	writeJSON(w, http.StatusOK, config.ImagesResponse{Images: images})
+}

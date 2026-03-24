@@ -149,6 +149,21 @@ type SessionsResponse struct {
 	Warnings []string  `json:"warnings,omitempty"`
 }
 
+// ImageInfo describes an available image variant.
+type ImageInfo struct {
+	Name      string `json:"name"`
+	Path      string `json:"path,omitempty"`
+	DockerRef string `json:"docker_ref,omitempty"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+	Source    string `json:"source"` // "config", "discovered", or "docker"
+	Cached    bool   `json:"cached"`
+}
+
+// ImagesResponse is returned by GET /api/images.
+type ImagesResponse struct {
+	Images []ImageInfo `json:"images"`
+}
+
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
 	Name        string `json:"name"`
