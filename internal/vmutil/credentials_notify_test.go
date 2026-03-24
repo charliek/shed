@@ -37,8 +37,8 @@ func TestCredentialNotifyOnConnect(t *testing.T) {
 
 	handler := &credentialNotifyHandler{
 		nl: &CredentialNotifyListener{
-			serverCfg: serverCfg,
-			name:      "test-vm",
+			credentials: serverCfg.Credentials,
+			name:        "test-vm",
 		},
 	}
 
@@ -106,8 +106,8 @@ func TestCredentialNotifyOnConnectNoWritable(t *testing.T) {
 
 	handler := &credentialNotifyHandler{
 		nl: &CredentialNotifyListener{
-			serverCfg: serverCfg,
-			name:      "test-vm",
+			credentials: serverCfg.Credentials,
+			name:        "test-vm",
 		},
 	}
 
@@ -138,9 +138,9 @@ func TestCredentialNotifyOnMessageFileChanged(t *testing.T) {
 
 	handler := &credentialNotifyHandler{
 		nl: &CredentialNotifyListener{
-			agent:     agent,
-			serverCfg: serverCfg,
-			name:      "test-vm",
+			agent:       agent,
+			credentials: serverCfg.Credentials,
+			name:        "test-vm",
 		},
 	}
 
@@ -183,8 +183,8 @@ func TestPullChangedFilesPathValidation(t *testing.T) {
 	}
 
 	nl := &CredentialNotifyListener{
-		serverCfg: serverCfg,
-		name:      "test-vm",
+		credentials: serverCfg.Credentials,
+		name:        "test-vm",
 		// agent is nil — we expect the function to filter out bad paths
 		// and return nil when no valid files remain
 	}
@@ -206,8 +206,8 @@ func TestPullChangedFilesUnknownCredential(t *testing.T) {
 	}
 
 	nl := &CredentialNotifyListener{
-		serverCfg: serverCfg,
-		name:      "test-vm",
+		credentials: serverCfg.Credentials,
+		name:        "test-vm",
 	}
 
 	err := nl.pullChangedFiles("nonexistent", []string{"file.txt"})

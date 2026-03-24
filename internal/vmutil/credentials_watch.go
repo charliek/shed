@@ -23,8 +23,9 @@ const (
 // CredentialWatcher watches host credential directories for changes and
 // pushes them to all running VMs.
 type CredentialWatcher struct {
-	serverCfg *config.ServerConfig
-	watcher   *fsnotify.Watcher
+	serverCfg  *config.ServerConfig
+	watchedSet map[string]bool // credentials that should be watched (non-VirtioFS)
+	watcher    *fsnotify.Watcher
 
 	mu  sync.RWMutex
 	vms map[string]*watchedVM
@@ -67,10 +68,22 @@ func (cw *CredentialWatcher) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Only watch single-file (tar-transferred) credentials. Directory credentials
+	// use VirtioFS live mounts and don't need host→VM push via tar.
+	cw.watchedSet = make(map[string]bool)
 	for name, mount := range cw.serverCfg.Credentials {
 		if mount.ReadOnly {
 			continue
 		}
+		info, err := os.Stat(mount.Source)
+		if err != nil {
+			log.Printf("Warning: failed to stat credential %q source %s: %v", name, mount.Source, err)
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		cw.watchedSet[name] = true
 		if err := cw.addRecursiveWatch(mount.Source); err != nil {
 			log.Printf("Warning: failed to watch credential %q source %s: %v", name, mount.Source, err)
 		}
@@ -216,6 +229,10 @@ func (cw *CredentialWatcher) resolveCredential(absPath string) string {
 	var bestMount config.MountConfig
 	for name, mount := range cw.serverCfg.Credentials {
 		if mount.ReadOnly {
+			continue
+		}
+		// Skip credentials not in the watched set (e.g., VirtioFS live mounts)
+		if cw.watchedSet != nil && !cw.watchedSet[name] {
 			continue
 		}
 		if strings.HasPrefix(absPath, mount.Source+"/") || absPath == mount.Source {

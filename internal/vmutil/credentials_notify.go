@@ -34,19 +34,22 @@ const maxCredentialArchiveSize = 50 * 1024 * 1024 // 50 MB
 // notification port, receives FileChanged messages, and pulls changed files
 // back to the host.
 type CredentialNotifyListener struct {
-	conn      *NotifyConn
-	agent     *AgentClient
-	serverCfg *config.ServerConfig
-	watcher   *CredentialWatcher
-	name      string
+	conn        *NotifyConn
+	agent       *AgentClient
+	credentials map[string]config.MountConfig
+	watcher     *CredentialWatcher
+	name        string
 }
 
 // NewCredentialNotifyListener creates a new notification listener.
-func NewCredentialNotifyListener(agent *AgentClient, serverCfg *config.ServerConfig, watcher *CredentialWatcher) *CredentialNotifyListener {
+// The credentials map should contain only tar-transferred credentials that need
+// bidirectional sync. VirtioFS-mounted credentials are live mounts and must not
+// be included — syncing them via tar causes permission errors and data races.
+func NewCredentialNotifyListener(agent *AgentClient, credentials map[string]config.MountConfig, watcher *CredentialWatcher) *CredentialNotifyListener {
 	return &CredentialNotifyListener{
-		agent:     agent,
-		serverCfg: serverCfg,
-		watcher:   watcher,
+		agent:       agent,
+		credentials: credentials,
+		watcher:     watcher,
 	}
 }
 
@@ -73,7 +76,7 @@ func (h *credentialNotifyHandler) OnConnect(conn net.Conn) error {
 	// Build credential mappings (only writable ones)
 	credentials := make(map[string]string)
 	excludes := make(map[string][]string)
-	for name, mount := range h.nl.serverCfg.Credentials {
+	for name, mount := range h.nl.credentials {
 		if mount.ReadOnly {
 			continue
 		}
@@ -128,7 +131,7 @@ func (h *credentialNotifyHandler) OnMessage(msgType byte, data []byte) error {
 
 // pullChangedFiles extracts specific files from the VM and writes them to the host.
 func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []string) error {
-	mount, ok := nl.serverCfg.Credentials[credName]
+	mount, ok := nl.credentials[credName]
 	if !ok {
 		return fmt.Errorf("unknown credential %q", credName)
 	}

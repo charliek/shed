@@ -713,7 +713,7 @@ func (c *Client) startNotifyListener(name string, agent *vmutil.AgentClient) {
 		return
 	}
 
-	listener := vmutil.NewCredentialNotifyListener(agent, c.serverCfg, c.credWatcher)
+	listener := vmutil.NewCredentialNotifyListener(agent, c.serverCfg.Credentials, c.credWatcher)
 	listener.Start(context.Background(), name)
 
 	// Register VM with the credential watcher for host->VM pushes

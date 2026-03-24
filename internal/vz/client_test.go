@@ -176,7 +176,7 @@ func TestStartNotifyListenerNoServerCfg(t *testing.T) {
 		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
 	}
 	// Should not panic
-	client.startNotifyListener("test", nil)
+	client.startNotifyListener("test", nil, nil)
 }
 
 func TestStartNotifyListenerNoWritableCredentials(t *testing.T) {
@@ -189,7 +189,7 @@ func TestStartNotifyListenerNoWritableCredentials(t *testing.T) {
 		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
 	}
 	// Should not start a listener since all credentials are read-only
-	client.startNotifyListener("test", nil)
+	client.startNotifyListener("test", nil, nil)
 
 	client.mu.Lock()
 	count := len(client.notifyListeners)
