@@ -20,7 +20,6 @@ var imageCmd = &cobra.Command{
 	Long:  "Build, list, and manage VZ rootfs images.",
 }
 
-// Flags for image build
 var (
 	imageBuildFile      string
 	imageBuildFrom      string
@@ -74,13 +73,9 @@ func init() {
 }
 
 func runImageBuild(cmd *cobra.Command, args []string) error {
-	if imageBuildName == "" {
-		return fmt.Errorf("--name is required")
-	}
-
 	outputDir := imageBuildOutputDir
 	if outputDir == "" {
-		outputDir = config.ExpandPath("~/Library/Application Support/shed/vz")
+		outputDir = config.ExpandPath(config.DefaultVZImagesDir)
 	}
 
 	if imageBuildFrom != "" {
@@ -89,7 +84,6 @@ func runImageBuild(cmd *cobra.Command, args []string) error {
 	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir)
 }
 
-// runImageBuildFromRef converts a Docker registry image to ext4.
 func runImageBuildFromRef(ctx context.Context, outputDir string) error {
 	fmt.Printf("Converting %s to ext4 rootfs...\n", imageBuildFrom)
 
@@ -104,24 +98,16 @@ func runImageBuildFromRef(ctx context.Context, outputDir string) error {
 		return fmt.Errorf("conversion failed: %w", err)
 	}
 
-	// Write source sidecar for cache invalidation
-	sourceFile := outputDir + "/" + vmimage.SourceFilename(imageBuildName)
-	_ = os.WriteFile(sourceFile, []byte(imageBuildFrom+"\n"), 0644)
-
-	printSuccess("Built image %q at %s", imageBuildName, result.RootfsPath)
-	fmt.Printf("\nUse it with: shed create mydev --image %s\n", imageBuildName)
+	finishImageBuild(outputDir, imageBuildFrom, result.RootfsPath)
 	return nil
 }
 
-// runImageBuildFromDockerfile builds from a Dockerfile then converts to ext4.
 func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir string) error {
-	// Determine build context
 	buildContext := "."
 	if len(args) > 0 {
 		buildContext = args[0]
 	}
 
-	// Resolve Dockerfile path
 	dockerfile := imageBuildFile
 	if dockerfile == "" {
 		if _, err := os.Stat("Dockerfile.shed"); err == nil {
@@ -133,7 +119,6 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir s
 		}
 	}
 
-	// Validate base image (warn if not extending shed base)
 	if !imageBuildForce {
 		if err := validateBaseImage(dockerfile); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
@@ -143,9 +128,8 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir s
 
 	dockerTag := fmt.Sprintf("shed-vz-%s:latest", imageBuildName)
 
-	// Build Docker image
 	fmt.Printf("Building Docker image %s...\n", dockerTag)
-	buildArgs := []string{"buildx", "build", "--platform", "linux/arm64",
+	buildArgs := []string{"buildx", "build", "--platform", vmimage.DefaultPlatform,
 		"-t", dockerTag, "--load", "-f", dockerfile}
 	if imageBuildTarget != "" {
 		buildArgs = append(buildArgs, "--target", imageBuildTarget)
@@ -159,7 +143,6 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir s
 		return fmt.Errorf("docker build failed: %w", err)
 	}
 
-	// Convert to ext4
 	fmt.Printf("\nConverting to ext4 rootfs...\n")
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
 		DockerRef:     dockerTag,
@@ -172,13 +155,17 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir s
 		return fmt.Errorf("conversion failed: %w", err)
 	}
 
-	// Write source sidecar
-	sourceFile := outputDir + "/" + vmimage.SourceFilename(imageBuildName)
-	_ = os.WriteFile(sourceFile, []byte(dockerTag+"\n"), 0644)
-
-	printSuccess("Built image %q at %s", imageBuildName, result.RootfsPath)
-	fmt.Printf("\nUse it with: shed create mydev --image %s\n", imageBuildName)
+	finishImageBuild(outputDir, dockerTag, result.RootfsPath)
 	return nil
+}
+
+// finishImageBuild writes the source sidecar and prints success output.
+func finishImageBuild(outputDir, sourceRef, rootfsPath string) {
+	if err := vmimage.WriteSource(outputDir, imageBuildName, sourceRef); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to write source sidecar: %v\n", err)
+	}
+	printSuccess("Built image %q at %s", imageBuildName, rootfsPath)
+	fmt.Printf("\nUse it with: shed create mydev --image %s\n", imageBuildName)
 }
 
 func runImageList(_ *cobra.Command, _ []string) error {
@@ -202,7 +189,7 @@ func runImageList(_ *cobra.Command, _ []string) error {
 		return nil
 	}
 
-	w := newTabWriter()
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tSOURCE\tSIZE\tCACHED\tREF")
 	for _, img := range resp.Images {
 		size := "-"
@@ -223,10 +210,6 @@ func runImageList(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-func newTabWriter() *tabwriter.Writer {
-	return tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-}
-
 func formatBytes(b int64) string {
 	const gb = 1024 * 1024 * 1024
 	const mb = 1024 * 1024
@@ -236,11 +219,10 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.0f MB", float64(b)/float64(mb))
 }
 
-// validateBaseImage checks if a Dockerfile extends a shed base image.
 func validateBaseImage(dockerfile string) error {
 	data, err := os.ReadFile(dockerfile)
 	if err != nil {
-		return nil // Can't read, skip validation
+		return nil
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -248,9 +230,8 @@ func validateBaseImage(dockerfile string) error {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToUpper(trimmed), "FROM ") {
 			if strings.Contains(trimmed, "shed-vz-") {
-				return nil // Looks like it extends a shed base
+				return nil
 			}
-			// First FROM doesn't reference shed base
 			return fmt.Errorf("dockerfile does not appear to extend a shed base image (first FROM: %s)", trimmed)
 		}
 	}

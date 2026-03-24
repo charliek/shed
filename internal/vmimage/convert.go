@@ -15,6 +15,9 @@ import (
 	"github.com/distribution/reference"
 )
 
+// DefaultPlatform is the Docker platform used for VZ images (Apple Silicon).
+const DefaultPlatform = "linux/arm64"
+
 // ConvertOptions configures a Docker-to-ext4 conversion.
 type ConvertOptions struct {
 	// DockerRef is the Docker image reference to convert (e.g., "ghcr.io/charliek/shed-vz-default:v1.0.0").
@@ -28,6 +31,9 @@ type ConvertOptions struct {
 
 	// RootfsSize is the sparse ext4 image size (e.g., "20G"). Defaults to "20G".
 	RootfsSize string
+
+	// Platform is the Docker platform (e.g., "linux/arm64"). Defaults to DefaultPlatform.
+	Platform string
 
 	// ExtractKernel controls whether kernel and initrd should be extracted.
 	// If true and kernel/initrd don't already exist in OutputDir, they are extracted.
@@ -71,23 +77,45 @@ func SourceFilename(name string) string {
 	return name + "-rootfs.ext4.source"
 }
 
+// CheckCache returns the cached rootfs path if it exists and its source sidecar
+// matches expectedRef. Returns "" if not cached or stale.
+func CheckCache(imagesDir, name, expectedRef string) string {
+	rootfsPath := filepath.Join(imagesDir, RootfsFilename(name))
+	if _, err := os.Stat(rootfsPath); err != nil {
+		return ""
+	}
+	sourceFile := filepath.Join(imagesDir, SourceFilename(name))
+	source, err := os.ReadFile(sourceFile)
+	if err != nil || strings.TrimSpace(string(source)) != expectedRef {
+		return ""
+	}
+	return rootfsPath
+}
+
+// WriteSource writes the Docker ref to a sidecar file for cache invalidation tracking.
+func WriteSource(imagesDir, name, ref string) error {
+	sourceFile := filepath.Join(imagesDir, SourceFilename(name))
+	return os.WriteFile(sourceFile, []byte(ref+"\n"), 0644)
+}
+
 // Convert pulls a Docker image and converts it to an ext4 rootfs.
 // The conversion uses a privileged Docker container for ext4 creation (loop mount).
 func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 	if opts.RootfsSize == "" {
 		opts.RootfsSize = "20G"
 	}
+	if opts.Platform == "" {
+		opts.Platform = DefaultPlatform
+	}
 
 	rootfsFile := RootfsFilename(opts.Name)
 	rootfsPath := filepath.Join(opts.OutputDir, rootfsFile)
 
-	// Ensure output directory exists
 	if err := os.MkdirAll(opts.OutputDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	// Create container and export filesystem to tar
-	containerID, err := dockerCreate(ctx, opts.DockerRef)
+	containerID, err := dockerCreate(ctx, opts.Platform, opts.DockerRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container from %s: %w", opts.DockerRef, err)
 	}
@@ -105,8 +133,7 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 		return nil, fmt.Errorf("failed to export container: %w", err)
 	}
 
-	// Create ext4 image via privileged Docker container
-	if err := createExt4(ctx, tarPath, rootfsFile, opts.OutputDir, opts.RootfsSize); err != nil {
+	if err := createExt4(ctx, opts.Platform, tarPath, rootfsFile, opts.OutputDir, opts.RootfsSize); err != nil {
 		// Clean up partial rootfs on failure
 		os.Remove(rootfsPath)
 		return nil, fmt.Errorf("failed to create ext4 image: %w", err)
@@ -114,18 +141,17 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 
 	result := &ConvertResult{RootfsPath: rootfsPath}
 
-	// Extract kernel and initrd if requested
 	if opts.ExtractKernel {
 		kernelPath := filepath.Join(opts.OutputDir, "vmlinux")
 		initrdPath := filepath.Join(opts.OutputDir, "initrd.img")
 
 		if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
-			if err := extractKernel(ctx, opts.DockerRef, opts.OutputDir); err != nil {
+			if err := extractKernel(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
 				return nil, fmt.Errorf("failed to extract kernel: %w", err)
 			}
 		}
 		if _, err := os.Stat(initrdPath); os.IsNotExist(err) {
-			if err := extractInitrd(ctx, opts.DockerRef, opts.OutputDir); err != nil {
+			if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
 				return nil, fmt.Errorf("failed to extract initrd: %w", err)
 			}
 		}
@@ -137,9 +163,8 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 	return result, nil
 }
 
-// dockerCreate creates a container from the given image without starting it.
-func dockerCreate(ctx context.Context, imageRef string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "create", "--platform", "linux/arm64", imageRef)
+func dockerCreate(ctx context.Context, platform, imageRef string) (string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "create", "--platform", platform, imageRef)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -172,13 +197,13 @@ func dockerRemove(ctx context.Context, containerID string) {
 	exec.CommandContext(ctx, "docker", "rm", containerID).Run() //nolint:errcheck
 }
 
-// createExt4 creates an ext4 filesystem from a tar using a privileged Docker container.
-// This matches the approach in build-vz-rootfs.sh.
-func createExt4(ctx context.Context, tarPath, rootfsFile, outputDir, size string) error {
+// createExt4 creates an ext4 filesystem from a tar using a privileged Docker container
+// (required for loop mounting).
+func createExt4(ctx context.Context, platform, tarPath, rootfsFile, outputDir, size string) error {
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--privileged",
 		"-v", tarPath+":/tmp/rootfs.tar",
 		"-v", outputDir+":/output",
-		"--platform", "linux/arm64",
+		"--platform", platform,
 		"ubuntu:24.04", "bash", "-c",
 		fmt.Sprintf(`set -euo pipefail
 apt-get update && apt-get install -y e2fsprogs >/dev/null 2>&1
@@ -198,9 +223,8 @@ echo 'ext4 image created successfully'`, size, rootfsFile, rootfsFile, rootfsFil
 	return nil
 }
 
-// extractKernel extracts the decompressed kernel from a Docker image.
-func extractKernel(ctx context.Context, imageRef, outputDir string) error {
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", "linux/arm64",
+func extractKernel(ctx context.Context, platform, imageRef, outputDir string) error {
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", platform,
 		"--entrypoint", "/bin/bash",
 		"-v", outputDir+":/output",
 		imageRef, "-c", `set -euo pipefail
@@ -223,9 +247,8 @@ fi`)
 	return nil
 }
 
-// extractInitrd extracts the initrd from a Docker image.
-func extractInitrd(ctx context.Context, imageRef, outputDir string) error {
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", "linux/arm64",
+func extractInitrd(ctx context.Context, platform, imageRef, outputDir string) error {
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", platform,
 		"--entrypoint", "/bin/bash",
 		"-v", outputDir+":/output",
 		imageRef, "-c", `set -euo pipefail

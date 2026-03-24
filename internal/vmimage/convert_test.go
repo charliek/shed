@@ -1,6 +1,10 @@
 package vmimage
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestIsDockerRef(t *testing.T) {
 	tests := []struct {
@@ -72,5 +76,61 @@ func TestSourceFilename(t *testing.T) {
 				t.Errorf("SourceFilename(%q) = %q, want %q", tt.name, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCheckCache(t *testing.T) {
+	t.Run("hit", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4"), []byte("data"), 0644)
+		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4.source"), []byte("ghcr.io/test:v1\n"), 0644)
+
+		got := CheckCache(dir, "default", "ghcr.io/test:v1")
+		want := filepath.Join(dir, "default-rootfs.ext4")
+		if got != want {
+			t.Errorf("CheckCache() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("miss no file", func(t *testing.T) {
+		dir := t.TempDir()
+		if got := CheckCache(dir, "default", "ghcr.io/test:v1"); got != "" {
+			t.Errorf("CheckCache() = %q, want empty", got)
+		}
+	})
+
+	t.Run("stale source", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4"), []byte("data"), 0644)
+		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4.source"), []byte("ghcr.io/test:v1\n"), 0644)
+
+		if got := CheckCache(dir, "default", "ghcr.io/test:v2"); got != "" {
+			t.Errorf("CheckCache() = %q, want empty (stale source)", got)
+		}
+	})
+
+	t.Run("no sidecar file", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4"), []byte("data"), 0644)
+
+		if got := CheckCache(dir, "default", "ghcr.io/test:v1"); got != "" {
+			t.Errorf("CheckCache() = %q, want empty (no sidecar)", got)
+		}
+	})
+}
+
+func TestWriteSource(t *testing.T) {
+	dir := t.TempDir()
+	err := WriteSource(dir, "default", "ghcr.io/test:v1")
+	if err != nil {
+		t.Fatalf("WriteSource() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "default-rootfs.ext4.source"))
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if string(data) != "ghcr.io/test:v1\n" {
+		t.Errorf("source file content = %q, want %q", string(data), "ghcr.io/test:v1\n")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -29,14 +30,13 @@ func EnsureImage(ctx context.Context, resolved config.ResolvedImage, cfg *config
 
 	outputDir := cfg.ImagesDir
 	if outputDir == "" {
-		outputDir = config.ExpandPath("~/Library/Application Support/shed/vz")
+		outputDir = config.ExpandPath(config.DefaultVZImagesDir)
 	}
 
-	rootfsFile := vmimage.RootfsFilename(resolved.Name)
-	rootfsPath := filepath.Join(outputDir, rootfsFile)
-	sourceFile := filepath.Join(outputDir, vmimage.SourceFilename(resolved.Name))
+	rootfsPath := filepath.Join(outputDir, vmimage.RootfsFilename(resolved.Name))
 
-	// Acquire a file lock to prevent concurrent conversions
+	// Acquire a flock-based lock to prevent concurrent conversions.
+	// Unlike O_EXCL, flock is automatically released if the process crashes.
 	lockPath := rootfsPath + ".lock"
 	unlock, err := acquireFileLock(lockPath)
 	if err != nil {
@@ -45,17 +45,13 @@ func EnsureImage(ctx context.Context, resolved config.ResolvedImage, cfg *config
 	defer unlock()
 
 	// Re-check cache after acquiring lock (another process may have completed)
-	if _, err := os.Stat(rootfsPath); err == nil {
-		if source, err := os.ReadFile(sourceFile); err == nil && strings.TrimSpace(string(source)) == resolved.DockerRef {
-			return rootfsPath, nil
-		}
-		// Source mismatch — remove stale cache for re-conversion
-		log.Printf("Image %q source changed, re-converting from %s", resolved.Name, resolved.DockerRef)
-		os.Remove(rootfsPath)
-		os.Remove(sourceFile)
+	if cached := vmimage.CheckCache(outputDir, resolved.Name, resolved.DockerRef); cached != "" {
+		return cached, nil
 	}
 
-	// Pull and convert
+	// Stale cache — remove for re-conversion
+	os.Remove(rootfsPath)
+
 	backend.Progress(ctx, "image", fmt.Sprintf("Pulling %s...", resolved.DockerRef))
 	log.Printf("Converting Docker image %s to ext4 for variant %q", resolved.DockerRef, resolved.Name)
 
@@ -69,9 +65,8 @@ func EnsureImage(ctx context.Context, resolved config.ResolvedImage, cfg *config
 		return "", fmt.Errorf("failed to convert image %s: %w", resolved.DockerRef, err)
 	}
 
-	// Write source sidecar for cache invalidation
-	if err := os.WriteFile(sourceFile, []byte(resolved.DockerRef+"\n"), 0644); err != nil {
-		log.Printf("Warning: failed to write source sidecar %s: %v", sourceFile, err)
+	if err := vmimage.WriteSource(outputDir, resolved.Name, resolved.DockerRef); err != nil {
+		log.Printf("Warning: failed to write source sidecar: %v", err)
 	}
 
 	return result.RootfsPath, nil
@@ -82,7 +77,6 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 	seen := make(map[string]bool)
 	var images []config.ImageInfo
 
-	// Images from config
 	for name, val := range c.cfg.Images {
 		seen[name] = true
 		info := config.ImageInfo{
@@ -91,7 +85,6 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 		}
 		if vmimage.IsDockerRef(val) {
 			info.DockerRef = val
-			// Check if cached
 			cached := filepath.Join(c.cfg.ImagesDir, vmimage.RootfsFilename(name))
 			if fi, err := os.Stat(cached); err == nil {
 				info.Path = cached
@@ -108,7 +101,6 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 		images = append(images, info)
 	}
 
-	// Auto-discovered images in ImagesDir
 	if c.cfg.ImagesDir != "" {
 		entries, err := os.ReadDir(c.cfg.ImagesDir)
 		if err == nil {
@@ -136,23 +128,26 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 	return images, nil
 }
 
-// acquireFileLock creates a simple file-based lock using O_CREATE|O_EXCL.
-// Returns an unlock function to release the lock.
+// acquireFileLock acquires an exclusive flock on the given path.
+// The lock is automatically released if the process exits or crashes.
 func acquireFileLock(path string) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		if os.IsExist(err) {
-			return nil, fmt.Errorf("another conversion is in progress (lock file: %s)", path)
-		}
 		return nil, err
 	}
-	f.Close()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to acquire lock: %w", err)
+	}
 
 	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+		f.Close()
 		os.Remove(path)
 	}, nil
 }

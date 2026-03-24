@@ -164,11 +164,11 @@ type VZConfig struct {
 func DefaultVZConfig() *VZConfig {
 	return &VZConfig{
 		VfkitPath:       "vfkit",
-		KernelPath:      ExpandPath("~/Library/Application Support/shed/vz/vmlinux"),
-		InitrdPath:      ExpandPath("~/Library/Application Support/shed/vz/initrd.img"),
-		BaseRootfs:      ExpandPath("~/Library/Application Support/shed/vz/default-rootfs.ext4"),
-		ImagesDir:       ExpandPath("~/Library/Application Support/shed/vz"),
-		InstanceDir:     ExpandPath("~/Library/Application Support/shed/vz/instances"),
+		KernelPath:      ExpandPath(DefaultVZImagesDir + "/vmlinux"),
+		InitrdPath:      ExpandPath(DefaultVZImagesDir + "/initrd.img"),
+		BaseRootfs:      ExpandPath(DefaultVZImagesDir + "/default-rootfs.ext4"),
+		ImagesDir:       ExpandPath(DefaultVZImagesDir),
+		InstanceDir:     ExpandPath(DefaultVZImagesDir + "/instances"),
 		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
 		DefaultCPUs:     2,
 		DefaultMemoryMB: 4096,
@@ -197,7 +197,7 @@ func (c *VZConfig) applyDefaults() {
 
 	// Default ImagesDir if not set
 	if c.ImagesDir == "" {
-		c.ImagesDir = ExpandPath("~/Library/Application Support/shed/vz")
+		c.ImagesDir = ExpandPath(DefaultVZImagesDir)
 	}
 
 	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
@@ -353,19 +353,11 @@ type ResolvedImage struct {
 func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
 	if val, ok := c.Images[image]; ok {
 		if vmimage.IsDockerRef(val) {
-			// Check if already cached locally
-			cached := filepath.Join(c.ImagesDir, vmimage.RootfsFilename(image))
-			if _, err := os.Stat(cached); err == nil {
-				// Check source sidecar for cache invalidation
-				sourceFile := filepath.Join(c.ImagesDir, vmimage.SourceFilename(image))
-				if source, err := os.ReadFile(sourceFile); err == nil && strings.TrimSpace(string(source)) == val {
-					return ResolvedImage{Path: cached, Name: image}, nil
-				}
-				// Source doesn't match — need re-conversion
+			if cached := vmimage.CheckCache(c.ImagesDir, image, val); cached != "" {
+				return ResolvedImage{Path: cached, Name: image}, nil
 			}
 			return ResolvedImage{DockerRef: val, Name: image}, nil
 		}
-		// Filesystem path
 		return ResolvedImage{Path: val, Name: image}, nil
 	}
 
@@ -401,12 +393,8 @@ func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
 // Returns a ResolvedImage that may be a local path or Docker reference.
 func (c *VZConfig) ResolveBaseRootfs() ResolvedImage {
 	if vmimage.IsDockerRef(c.BaseRootfs) {
-		cached := filepath.Join(c.ImagesDir, vmimage.RootfsFilename("_base"))
-		if _, err := os.Stat(cached); err == nil {
-			sourceFile := filepath.Join(c.ImagesDir, vmimage.SourceFilename("_base"))
-			if source, err := os.ReadFile(sourceFile); err == nil && strings.TrimSpace(string(source)) == c.BaseRootfs {
-				return ResolvedImage{Path: cached, Name: "_base"}
-			}
+		if cached := vmimage.CheckCache(c.ImagesDir, "_base", c.BaseRootfs); cached != "" {
+			return ResolvedImage{Path: cached, Name: "_base"}
 		}
 		return ResolvedImage{DockerRef: c.BaseRootfs, Name: "_base"}
 	}
@@ -451,6 +439,9 @@ const (
 	MinTimeout                    = 1 * time.Second
 	MaxTimeout                    = 30 * time.Minute
 )
+
+// DefaultVZImagesDir is the default directory for VZ rootfs images.
+const DefaultVZImagesDir = "~/Library/Application Support/shed/vz"
 
 // VZ validation upper bounds (decoupled from Firecracker).
 const (
