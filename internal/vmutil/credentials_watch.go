@@ -84,7 +84,9 @@ func (cw *CredentialWatcher) Start(ctx context.Context) error {
 			continue
 		}
 		cw.watchedSet[name] = true
-		if err := cw.addRecursiveWatch(mount.Source); err != nil {
+		// fsnotify doesn't support watching individual files — watch the parent directory
+		parentDir := filepath.Dir(mount.Source)
+		if err := cw.watcher.Add(parentDir); err != nil {
 			log.Printf("Warning: failed to watch credential %q source %s: %v", name, mount.Source, err)
 		}
 	}

@@ -181,14 +181,11 @@ func TestStartNotifyListenerNoServerCfg(t *testing.T) {
 
 func TestStartNotifyListenerNoWritableCredentials(t *testing.T) {
 	client := &Client{
-		serverCfg: &config.ServerConfig{
-			Credentials: map[string]config.MountConfig{
-				"ssh": {Source: "/home/user/.ssh", Target: "/home/shed/.ssh", ReadOnly: true},
-			},
-		},
+		serverCfg:       nil,
 		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
 	}
-	// Should not start a listener since all credentials are read-only
+	// Empty map — no tar-only credentials to watch (readonly ones are filtered
+	// upstream by hasWritableTarCredentials before startNotifyListener is called)
 	client.startNotifyListener("test", nil, nil)
 
 	client.mu.Lock()
