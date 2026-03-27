@@ -20,6 +20,7 @@
 FROM ubuntu:24.04 AS shed-vz-base
 
 LABEL io.shed.base-version="1"
+LABEL org.opencontainers.image.source="https://github.com/charliek/shed"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
