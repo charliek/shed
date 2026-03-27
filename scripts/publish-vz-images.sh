@@ -64,8 +64,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Build and publish VZ Docker images to a container registry."
             echo ""
-            echo "Required:"
-            echo "  --version <version>  Version tag (e.g., v1.0.0)"
+            echo "Options:"
+            echo "  --version <version>  Version tag (default: derived from git describe)"
             echo ""
             echo "Options:"
             echo "  --variant <name>     Publish a specific variant only"
@@ -92,9 +92,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-    echo "ERROR: --version is required"
-    echo "Run '$0 --help' for usage."
-    exit 1
+    VERSION=$(git describe --tags --always 2>/dev/null)
+    if [ -z "$VERSION" ]; then
+        echo "ERROR: --version is required (no git tags found to derive from)"
+        echo "Run '$0 --help' for usage."
+        exit 1
+    fi
+    echo "Derived version from git: $VERSION"
 fi
 
 # Build shed-agent binary for linux/arm64
