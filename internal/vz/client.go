@@ -108,13 +108,21 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
 	}
 
-	rootfsSource := c.cfg.BaseRootfs
+	var resolved config.ResolvedImage
 	if req.Image != "" {
-		resolved, err := c.cfg.ResolveImage(req.Image)
+		var err error
+		resolved, err = c.cfg.ResolveImage(req.Image)
 		if err != nil {
 			return nil, err
 		}
-		rootfsSource = resolved
+	} else {
+		resolved = c.cfg.ResolveBaseRootfs()
+	}
+
+	// Ensure image is available locally (pulls + converts Docker refs if needed)
+	rootfsSource, err := EnsureImage(ctx, resolved, c.cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	backend.Progress(ctx, "rootfs", "Copying root filesystem...")

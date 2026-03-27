@@ -186,6 +186,15 @@ func (c *APIClient) ListSheds() (*config.ShedsResponse, error) {
 	return &sheds, nil
 }
 
+// ListImages returns available image variants from the server.
+func (c *APIClient) ListImages() (*config.ImagesResponse, error) {
+	var images config.ImagesResponse
+	if err := c.doRequest(http.MethodGet, "/api/images", nil, &images); err != nil {
+		return nil, err
+	}
+	return &images, nil
+}
+
 // CreateShed creates a new shed.
 func (c *APIClient) CreateShed(req *config.CreateShedRequest) (*config.Shed, error) {
 	var shed config.Shed

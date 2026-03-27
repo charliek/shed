@@ -22,6 +22,7 @@ The `shed-server` exposes a REST API for managing sheds.
 | GET | `/api/sheds/{name}/sessions` | List tmux sessions in shed |
 | DELETE | `/api/sheds/{name}/sessions/{session}` | Kill a tmux session |
 | GET | `/api/sessions` | List all sessions across sheds |
+| GET | `/api/images` | List available image variants |
 
 ## Server Info
 
@@ -313,3 +314,42 @@ Lists all tmux sessions across all running sheds.
   ]
 }
 ```
+
+## Images
+
+### GET /api/images
+
+Returns available image variants across all backends.
+
+**Response:**
+
+```json
+{
+  "images": [
+    {
+      "name": "base",
+      "path": "/Users/user/Library/Application Support/shed/vz/base-rootfs.ext4",
+      "docker_ref": "ghcr.io/charliek/shed-vz-base:v1.0.0",
+      "size_bytes": 2147483648,
+      "source": "config",
+      "cached": true
+    },
+    {
+      "name": "custom",
+      "path": "/Users/user/Library/Application Support/shed/vz/custom-rootfs.ext4",
+      "size_bytes": 3221225472,
+      "source": "discovered",
+      "cached": true
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Image variant name |
+| `path` | string | Local ext4 file path (empty if not cached) |
+| `docker_ref` | string | Docker image reference (empty for local-only images) |
+| `size_bytes` | int | File size in bytes (0 if not cached) |
+| `source` | string | `config` (from server config) or `discovered` (found in images_dir) |
+| `cached` | bool | Whether the ext4 file exists locally |

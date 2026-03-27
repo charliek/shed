@@ -183,3 +183,8 @@ func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.Exec
 func (b *VZBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
 	return b.client.GetNetworkEndpoint(ctx, shedName)
 }
+
+// ListImages returns available VZ image variants from config and auto-discovery.
+func (b *VZBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	return b.client.ListImages()
+}

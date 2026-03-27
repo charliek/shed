@@ -36,7 +36,24 @@ cd shed
 make build
 ```
 
-### 3. Build the VZ rootfs
+### 3. Set up VZ images
+
+#### Option A: Use published images (recommended)
+
+Configure your server to use published Docker image references. Shed auto-pulls and converts them to ext4 on first use:
+
+```yaml
+vz:
+  base_rootfs: ghcr.io/charliek/shed-vz-default:v1.0.0
+  images:
+    base: ghcr.io/charliek/shed-vz-base:v1.0.0
+    default: ghcr.io/charliek/shed-vz-default:v1.0.0
+    typescript: ghcr.io/charliek/shed-vz-typescript:v1.0.0
+```
+
+The first `shed create` will pull the image, convert it to ext4, and extract the kernel and initrd automatically.
+
+#### Option B: Build from source
 
 The rootfs build script creates an ext4 disk image, extracts the kernel, and extracts the initrd:
 

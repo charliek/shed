@@ -178,3 +178,8 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 func (b *FirecrackerBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
 	return b.client.GetNetworkEndpoint(ctx, shedName)
 }
+
+// ListImages returns an empty list — Firecracker image support is planned.
+func (b *FirecrackerBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	return nil, nil
+}

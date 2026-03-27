@@ -170,6 +170,55 @@ shed delete <name> [flags]
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
 
+## Image Management
+
+### shed image build
+
+Builds a VZ rootfs image from a Dockerfile or Docker registry image.
+
+```bash
+shed image build [flags] [context]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--file` | `-f` | `./Dockerfile.shed` or `./Dockerfile` | Dockerfile path |
+| `--from` | | | Docker image reference to convert directly (skips build) |
+| `--name` | `-n` | *required* | Image variant name |
+| `--target` | | | Docker build target stage (Dockerfile mode only) |
+| `--size` | | `20G` | Rootfs image size |
+| `--output-dir` | | `~/Library/Application Support/shed/vz/` | Output directory |
+| `--force` | | `false` | Skip base image validation warning |
+
+**Dockerfile mode:**
+
+```bash
+shed image build -f Dockerfile.shed -n myimage .
+```
+
+**Registry mode:**
+
+```bash
+shed image build --from ghcr.io/charliek/shed-vz-base:v1.0.0 -n myimage
+```
+
+### shed image list
+
+Lists available VZ image variants.
+
+```bash
+shed image list
+```
+
+**Output:**
+
+```
+NAME         SOURCE       SIZE      CACHED   REF
+base         config       2.1 GB    yes      -
+default      config       -         no       ghcr.io/charliek/shed-vz-default:v1.0.0
+typescript   discovered   3.8 GB    yes      -
+```
+
 ## Interactive Access
 
 ### shed console

@@ -243,6 +243,8 @@ See [Firecracker Installation](../firecracker_install.md) for setup details.
 
 When enabling the VZ backend on macOS Apple Silicon, configure the VZ-specific settings:
 
+Image values in `base_rootfs` and `images` can be either ext4 file paths or Docker image references. Docker refs are auto-pulled and converted to ext4 on first use.
+
 ```yaml
 enabled_backends:
   - vz
@@ -252,11 +254,12 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+  base_rootfs: ghcr.io/charliek/shed-vz-default:v1.0.0
   images:
-    base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
-    default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
-    typescript: ~/Library/Application Support/shed/vz/typescript-rootfs.ext4
+    base: ghcr.io/charliek/shed-vz-base:v1.0.0
+    default: ghcr.io/charliek/shed-vz-default:v1.0.0
+    typescript: ghcr.io/charliek/shed-vz-typescript:v1.0.0
+  images_dir: ~/Library/Application Support/shed/vz/
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2
@@ -276,8 +279,9 @@ vz:
 | `vfkit_path` | string | `vfkit` | Path to vfkit binary |
 | `kernel_path` | string | - | Path to decompressed Linux kernel |
 | `initrd_path` | string | - | Path to initial RAM disk image |
-| `base_rootfs` | string | - | Path to default rootfs ext4 image (used when `--image` is not specified) |
-| `images` | map | - | Named image variants mapping variant name to rootfs path (see [VZ Image Variants](vz-images.md)) |
+| `base_rootfs` | string | - | Default rootfs ext4 path or Docker image reference (used when `--image` is not specified) |
+| `images` | map | - | Named image variants mapping variant name to rootfs path or Docker image reference (see [VZ Image Variants](vz-images.md)) |
+| `images_dir` | string | `~/Library/Application Support/shed/vz/` | Directory for converted/auto-discovered ext4 images |
 | `instance_dir` | string | - | Directory for VM instances |
 | `socket_dir` | string | - | Directory for vsock Unix sockets (must not contain spaces) |
 | `default_cpus` | int | `2` | Default vCPUs per VM |

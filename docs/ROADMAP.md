@@ -60,6 +60,12 @@ Support for distributed development environments:
 - Service discovery
 - Orchestration integration
 
+## VZ Image Extensibility
+
+- **`shed image delete/prune`** ([#35](https://github.com/charliek/shed/issues/35)) — Cleanup for cached ext4 images (2-5 GB each).
+- **CI workflow for image publishing** ([#36](https://github.com/charliek/shed/issues/36)) — Automate `scripts/publish-vz-images.sh` via GitHub Actions on release tags.
+- **Firecracker Docker ref support** ([#37](https://github.com/charliek/shed/issues/37)) — Adopt the same Docker-ref-aware image resolution for Firecracker.
+
 ## General Quality
 
 - Revisit docstring coverage thresholds and expand public API documentation if needed.

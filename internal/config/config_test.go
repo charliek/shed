@@ -825,22 +825,22 @@ func TestVZConfigResolveImage(t *testing.T) {
 	}
 
 	t.Run("named variant", func(t *testing.T) {
-		path, err := cfg.ResolveImage("base")
+		resolved, err := cfg.ResolveImage("base")
 		if err != nil {
 			t.Fatalf("ResolveImage(base) error = %v", err)
 		}
-		if path != "/dev/null" {
-			t.Errorf("ResolveImage(base) = %q, want /dev/null", path)
+		if resolved.Path != "/dev/null" {
+			t.Errorf("ResolveImage(base).Path = %q, want /dev/null", resolved.Path)
 		}
 	})
 
 	t.Run("absolute path exists", func(t *testing.T) {
-		path, err := cfg.ResolveImage("/dev/null")
+		resolved, err := cfg.ResolveImage("/dev/null")
 		if err != nil {
 			t.Fatalf("ResolveImage(/dev/null) error = %v", err)
 		}
-		if path != "/dev/null" {
-			t.Errorf("ResolveImage(/dev/null) = %q, want /dev/null", path)
+		if resolved.Path != "/dev/null" {
+			t.Errorf("ResolveImage(/dev/null).Path = %q, want /dev/null", resolved.Path)
 		}
 	})
 
@@ -869,12 +869,12 @@ func TestVZConfigResolveImage(t *testing.T) {
 
 	t.Run("tilde path expands", func(t *testing.T) {
 		// ~/.. should be expanded and treated as an absolute path
-		path, err := cfg.ResolveImage("~/../../dev/null")
+		resolved, err := cfg.ResolveImage("~/../../dev/null")
 		if err != nil {
 			t.Fatalf("ResolveImage(~/../../dev/null) error = %v", err)
 		}
-		if !filepath.IsAbs(path) {
-			t.Errorf("expected absolute path, got %q", path)
+		if !filepath.IsAbs(resolved.Path) {
+			t.Errorf("expected absolute path, got %q", resolved.Path)
 		}
 	})
 
@@ -913,6 +913,140 @@ func TestVZConfigValidateImages(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "image \"base\" path does not exist") {
 			t.Errorf("error = %q, want image path error", err.Error())
+		}
+	})
+
+	t.Run("docker ref skips validation", func(t *testing.T) {
+		cfg := validVZConfig()
+		cfg.Images = map[string]string{
+			"custom": "ghcr.io/charliek/shed-vz-custom:v1.0.0",
+		}
+		err := cfg.Validate()
+		if err != nil {
+			t.Errorf("Validate() error = %v, want nil (Docker refs should skip path validation)", err)
+		}
+	})
+
+	t.Run("docker ref base_rootfs skips validation", func(t *testing.T) {
+		cfg := validVZConfig()
+		cfg.BaseRootfs = "ghcr.io/charliek/shed-vz-default:v1.0.0"
+		err := cfg.Validate()
+		if err != nil {
+			t.Errorf("Validate() error = %v, want nil (Docker ref base_rootfs should skip validation)", err)
+		}
+	})
+
+	t.Run("mixed docker refs and paths", func(t *testing.T) {
+		cfg := validVZConfig()
+		cfg.Images = map[string]string{
+			"local":  "/dev/null",
+			"remote": "ghcr.io/charliek/shed-vz-default:v1.0.0",
+		}
+		err := cfg.Validate()
+		if err != nil {
+			t.Errorf("Validate() error = %v, want nil", err)
+		}
+	})
+}
+
+func TestVZConfigResolveImageDockerRef(t *testing.T) {
+	t.Run("docker ref returns DockerRef field", func(t *testing.T) {
+		cfg := &VZConfig{
+			Images:    map[string]string{"default": "ghcr.io/charliek/shed-vz-default:v1.0.0"},
+			ImagesDir: t.TempDir(),
+		}
+		resolved, err := cfg.ResolveImage("default")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.DockerRef != "ghcr.io/charliek/shed-vz-default:v1.0.0" {
+			t.Errorf("DockerRef = %q, want ghcr.io/charliek/shed-vz-default:v1.0.0", resolved.DockerRef)
+		}
+		if resolved.Path != "" {
+			t.Errorf("Path = %q, want empty for uncached Docker ref", resolved.Path)
+		}
+		if resolved.Name != "default" {
+			t.Errorf("Name = %q, want default", resolved.Name)
+		}
+	})
+
+	t.Run("cached docker ref returns Path", func(t *testing.T) {
+		dir := t.TempDir()
+		// Create cached rootfs and source sidecar
+		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
+		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
+		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-vz-default:v1.0.0\n"), 0644)
+
+		cfg := &VZConfig{
+			Images:    map[string]string{"default": "ghcr.io/charliek/shed-vz-default:v1.0.0"},
+			ImagesDir: dir,
+		}
+		resolved, err := cfg.ResolveImage("default")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.Path != rootfsPath {
+			t.Errorf("Path = %q, want %q", resolved.Path, rootfsPath)
+		}
+		if resolved.DockerRef != "" {
+			t.Errorf("DockerRef = %q, want empty for cached image", resolved.DockerRef)
+		}
+	})
+
+	t.Run("stale cache triggers re-pull", func(t *testing.T) {
+		dir := t.TempDir()
+		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
+		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
+		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-vz-default:v1.0.0\n"), 0644)
+
+		cfg := &VZConfig{
+			Images:    map[string]string{"default": "ghcr.io/charliek/shed-vz-default:v2.0.0"},
+			ImagesDir: dir,
+		}
+		resolved, err := cfg.ResolveImage("default")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.DockerRef != "ghcr.io/charliek/shed-vz-default:v2.0.0" {
+			t.Errorf("DockerRef = %q, want v2.0.0 (stale cache should trigger re-pull)", resolved.DockerRef)
+		}
+	})
+
+	t.Run("auto-discover from ImagesDir", func(t *testing.T) {
+		dir := t.TempDir()
+		rootfsPath := filepath.Join(dir, "custom-rootfs.ext4")
+		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+
+		cfg := &VZConfig{
+			Images:    map[string]string{},
+			ImagesDir: dir,
+		}
+		resolved, err := cfg.ResolveImage("custom")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.Path != rootfsPath {
+			t.Errorf("Path = %q, want %q (auto-discovered)", resolved.Path, rootfsPath)
+		}
+	})
+
+	t.Run("config takes precedence over discovery", func(t *testing.T) {
+		dir := t.TempDir()
+		// Create both a discovered file and a config entry
+		os.WriteFile(filepath.Join(dir, "base-rootfs.ext4"), []byte("discovered"), 0644)
+
+		cfg := &VZConfig{
+			Images:    map[string]string{"base": "/dev/null"},
+			ImagesDir: dir,
+		}
+		resolved, err := cfg.ResolveImage("base")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.Path != "/dev/null" {
+			t.Errorf("Path = %q, want /dev/null (config should take precedence)", resolved.Path)
 		}
 	})
 }
