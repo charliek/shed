@@ -66,8 +66,6 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --version <version>  Version tag (default: derived from git describe)"
-            echo ""
-            echo "Options:"
             echo "  --variant <name>     Publish a specific variant only"
             echo "                       Available: $KNOWN_VARIANTS"
             echo "  --registry <prefix>  Registry prefix (default: ghcr.io/charliek)"
