@@ -85,10 +85,11 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 		}
 		if vmimage.IsDockerRef(val) {
 			info.DockerRef = val
-			cached := filepath.Join(c.cfg.ImagesDir, vmimage.RootfsFilename(name))
-			if fi, err := os.Stat(cached); err == nil {
+			if cached := vmimage.CheckCache(c.cfg.ImagesDir, name, val); cached != "" {
 				info.Path = cached
-				info.SizeBytes = fi.Size()
+				if fi, err := os.Stat(cached); err == nil {
+					info.SizeBytes = fi.Size()
+				}
 				info.Cached = true
 			}
 		} else {
@@ -148,6 +149,7 @@ func acquireFileLock(path string) (func(), error) {
 	return func() {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
 		f.Close()
-		os.Remove(path)
+		// Lock file is intentionally not removed — deleting it creates a race
+		// where concurrent processes can hold locks on different inodes.
 	}, nil
 }

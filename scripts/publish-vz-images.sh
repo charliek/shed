@@ -92,7 +92,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-    VERSION=$(git describe --tags --always 2>/dev/null)
+    VERSION=$(git -C "$PROJECT_ROOT" describe --tags --always 2>/dev/null)
     if [ -z "$VERSION" ]; then
         echo "ERROR: --version is required (no git tags found to derive from)"
         echo "Run '$0 --help' for usage."
