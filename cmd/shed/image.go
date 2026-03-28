@@ -395,9 +395,13 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 		return outputJSON(pruneResp)
 	}
 
+	var freedSize int64
+	for _, img := range pruneResp.Deleted {
+		freedSize += img.SizeBytes
+	}
 	msg := fmt.Sprintf("Pruned %d image(s)", len(pruneResp.Deleted))
-	if totalSize > 0 {
-		msg += fmt.Sprintf(" (freed %s)", formatBytes(totalSize))
+	if freedSize > 0 {
+		msg += fmt.Sprintf(" (freed %s)", formatBytes(freedSize))
 	}
 	printSuccess(msg)
 	return nil

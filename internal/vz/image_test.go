@@ -92,6 +92,15 @@ func TestDeleteImage(t *testing.T) {
 			wantErr: config.ErrImageInUseSentinel,
 		},
 		{
+			name:      "shed-referenced image refused",
+			imageName: "inuse",
+			setup: func(t *testing.T, client *Client, imagesDir string) {
+				createFakeImage(t, imagesDir, "inuse")
+				createFakeInstance(t, client.cfg.InstanceDir, "myshed", "inuse")
+			},
+			wantErr: config.ErrImageInUseSentinel,
+		},
+		{
 			name:      "nonexistent image",
 			imageName: "nonexistent",
 			wantErr:   config.ErrImageNotFoundSentinel,

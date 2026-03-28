@@ -169,6 +169,20 @@ func (c *Client) DeleteImage(name string) error {
 		return config.ErrImageInUseSentinel
 	}
 
+	// Refuse if any existing shed references this image
+	instances, err := ListInstances(c.cfg.InstanceDir)
+	if err == nil {
+		for _, inst := range instances {
+			meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
+			if err != nil {
+				continue
+			}
+			if meta.Image == name {
+				return config.ErrImageInUseSentinel
+			}
+		}
+	}
+
 	imagesDir := c.resolveImagesDir()
 
 	rootfsPath := filepath.Join(imagesDir, vmimage.RootfsFilename(name))
@@ -211,17 +225,18 @@ func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
 		exclude["_base"] = true
 	}
 
-	// Images referenced by existing sheds
+	// Images referenced by existing sheds — fail closed if we can't read metadata
 	instances, err := ListInstances(c.cfg.InstanceDir)
-	if err == nil {
-		for _, inst := range instances {
-			meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
-			if err != nil {
-				continue
-			}
-			if meta.Image != "" {
-				exclude[meta.Image] = true
-			}
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("listing instances: %w", err)
+	}
+	for _, inst := range instances {
+		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
+		if err != nil {
+			return nil, fmt.Errorf("reading metadata for %s: %w", inst, err)
+		}
+		if meta.Image != "" {
+			exclude[meta.Image] = true
 		}
 	}
 
@@ -261,13 +276,19 @@ func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
 		return candidates, nil
 	}
 
-	// Delete candidates
+	// Delete candidates — only report images whose rootfs was actually removed
+	var deleted []config.ImageInfo
 	for _, img := range candidates {
-		os.Remove(img.Path)
+		if err := os.Remove(img.Path); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: failed to remove %s: %v", img.Path, err)
+			continue
+		}
+		// Best-effort removal of source sidecar
 		os.Remove(filepath.Join(imagesDir, vmimage.SourceFilename(img.Name)))
+		deleted = append(deleted, img)
 	}
 
-	return candidates, nil
+	return deleted, nil
 }
 
 // acquireFileLock acquires an exclusive flock on the given path.

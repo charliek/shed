@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
@@ -392,6 +393,9 @@ func mapBackendError(err error) (int, string, string) {
 	if errors.Is(err, config.ErrImageInUseSentinel) {
 		return http.StatusConflict, config.ErrImageInUse, err.Error()
 	}
+	if errors.Is(err, config.ErrNotSupportedSentinel) {
+		return http.StatusNotImplemented, config.ErrBackendError, err.Error()
+	}
 
 	// Fallback to string matching for errors without sentinels
 	errMsg := err.Error()
@@ -470,11 +474,20 @@ func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
 // handlePruneImages removes unused cached images.
 // POST /api/images/prune?dry_run=bool
 func (s *Server) handlePruneImages(w http.ResponseWriter, r *http.Request) {
-	dryRun := r.URL.Query().Get("dry_run") == "true"
+	var dryRun bool
+	if v := r.URL.Query().Get("dry_run"); v != "" {
+		var err error
+		dryRun, err = strconv.ParseBool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, config.ErrBackendError, "invalid dry_run value: "+v)
+			return
+		}
+	}
 
 	deleted, err := s.backend.PruneImages(r.Context(), dryRun)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, config.ErrBackendError, err.Error())
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
 		return
 	}
 	if deleted == nil {
