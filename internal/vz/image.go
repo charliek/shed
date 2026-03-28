@@ -169,17 +169,18 @@ func (c *Client) DeleteImage(name string) error {
 		return config.ErrImageInUseSentinel
 	}
 
-	// Refuse if any existing shed references this image
+	// Refuse if any existing shed references this image — fail closed on errors
 	instances, err := ListInstances(c.cfg.InstanceDir)
-	if err == nil {
-		for _, inst := range instances {
-			meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
-			if err != nil {
-				continue
-			}
-			if meta.Image == name {
-				return config.ErrImageInUseSentinel
-			}
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("listing instances: %w", err)
+	}
+	for _, inst := range instances {
+		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
+		if err != nil {
+			return fmt.Errorf("reading metadata for %s: %w", inst, err)
+		}
+		if meta.Image == name {
+			return config.ErrImageInUseSentinel
 		}
 	}
 
