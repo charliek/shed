@@ -6,6 +6,7 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -96,5 +97,15 @@ func (b *FirecrackerBackend) GetNetworkEndpoint(ctx context.Context, shedName st
 
 // ListImages returns an empty list on non-linux platforms.
 func (b *FirecrackerBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	return nil, nil
+}
+
+// DeleteImage returns an error on non-linux platforms.
+func (b *FirecrackerBackend) DeleteImage(_ context.Context, _ string) error {
+	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)
+}
+
+// PruneImages returns an empty list on non-linux platforms.
+func (b *FirecrackerBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
 	return nil, nil
 }

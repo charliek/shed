@@ -398,6 +398,25 @@ func (c *APIClient) KillSession(shedName, sessionName string) error {
 	return c.doRequest(http.MethodDelete, path, nil, nil, http.StatusNoContent, http.StatusOK)
 }
 
+// DeleteImage removes a cached image by name.
+func (c *APIClient) DeleteImage(name string) error {
+	return c.doRequest(http.MethodDelete, "/api/images/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
+}
+
+// PruneImages removes unused cached images.
+// If dryRun is true, returns candidates without deleting.
+func (c *APIClient) PruneImages(dryRun bool) (*config.PruneImagesResponse, error) {
+	path := "/api/images/prune"
+	if dryRun {
+		path += "?dry_run=true"
+	}
+	var resp config.PruneImagesResponse
+	if err := c.doRequest(http.MethodPost, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Ping checks if the server is reachable.
 func (c *APIClient) Ping() bool {
 	client := &http.Client{

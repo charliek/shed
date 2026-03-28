@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -127,6 +128,146 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 	}
 
 	return images, nil
+}
+
+// resolveImagesDir returns the images directory, falling back to the default.
+func (c *Client) resolveImagesDir() string {
+	if c.cfg.ImagesDir != "" {
+		return c.cfg.ImagesDir
+	}
+	return config.ExpandPath(config.DefaultVZImagesDir)
+}
+
+// validateImageName validates that an image name is safe for filesystem operations.
+func validateImageName(name string) error {
+	if name == "" {
+		return fmt.Errorf("image name cannot be empty")
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("invalid image name: %q", name)
+	}
+	if strings.ContainsRune(name, filepath.Separator) || strings.ContainsRune(name, '/') {
+		return fmt.Errorf("invalid image name: %q", name)
+	}
+	return nil
+}
+
+// DeleteImage removes a cached image by name.
+// It deletes the ext4 rootfs and source sidecar but NOT the lock file.
+func (c *Client) DeleteImage(name string) error {
+	if err := validateImageName(name); err != nil {
+		return err
+	}
+
+	// Refuse if this image is in the config Images map
+	if _, ok := c.cfg.Images[name]; ok {
+		return config.ErrImageInUseSentinel
+	}
+
+	// Refuse if this is _base and BaseRootfs is a Docker ref (it produced this cached image)
+	if name == "_base" && vmimage.IsDockerRef(c.cfg.BaseRootfs) {
+		return config.ErrImageInUseSentinel
+	}
+
+	imagesDir := c.resolveImagesDir()
+
+	rootfsPath := filepath.Join(imagesDir, vmimage.RootfsFilename(name))
+	if err := os.Remove(rootfsPath); err != nil {
+		if os.IsNotExist(err) {
+			return config.ErrImageNotFoundSentinel
+		}
+		return fmt.Errorf("removing rootfs: %w", err)
+	}
+
+	// Best-effort removal of source sidecar (NOT the lock file)
+	os.Remove(filepath.Join(imagesDir, vmimage.SourceFilename(name)))
+
+	return nil
+}
+
+// PruneImages removes cached images not referenced by config or existing sheds.
+// If dryRun is true, returns candidates without deleting.
+func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
+	imagesDir := c.resolveImagesDir()
+
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read images directory: %w", err)
+	}
+
+	// Build exclusion set
+	exclude := make(map[string]bool)
+
+	// Config-managed images
+	for name := range c.cfg.Images {
+		exclude[name] = true
+	}
+
+	// _base if BaseRootfs is a Docker ref
+	if vmimage.IsDockerRef(c.cfg.BaseRootfs) {
+		exclude["_base"] = true
+	}
+
+	// Images referenced by existing sheds
+	instances, err := ListInstances(c.cfg.InstanceDir)
+	if err == nil {
+		for _, inst := range instances {
+			meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
+			if err != nil {
+				continue
+			}
+			if meta.Image != "" {
+				exclude[meta.Image] = true
+			}
+		}
+	}
+
+	// Find candidates
+	var candidates []config.ImageInfo
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), "-rootfs.ext4") || e.IsDir() {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), "-rootfs.ext4")
+		if name == "" || exclude[name] {
+			continue
+		}
+
+		info := config.ImageInfo{
+			Name:   name,
+			Path:   filepath.Join(imagesDir, e.Name()),
+			Cached: true,
+		}
+		if fi, err := e.Info(); err == nil {
+			info.SizeBytes = fi.Size()
+		}
+		// Read source sidecar for docker ref
+		sourceFile := filepath.Join(imagesDir, vmimage.SourceFilename(name))
+		if data, err := os.ReadFile(sourceFile); err == nil {
+			info.DockerRef = strings.TrimSpace(string(data))
+		}
+		candidates = append(candidates, info)
+	}
+
+	// Sort for deterministic output
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Name < candidates[j].Name
+	})
+
+	if dryRun {
+		return candidates, nil
+	}
+
+	// Delete candidates
+	for _, img := range candidates {
+		os.Remove(img.Path)
+		os.Remove(filepath.Join(imagesDir, vmimage.SourceFilename(img.Name)))
+	}
+
+	return candidates, nil
 }
 
 // acquireFileLock acquires an exclusive flock on the given path.

@@ -219,6 +219,54 @@ default      config       -         no       ghcr.io/charliek/shed-vz-default:v1
 typescript   discovered   3.8 GB    yes      -
 ```
 
+### shed image delete
+
+Deletes a cached VZ rootfs image.
+
+```bash
+shed image delete <name> [flags]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--force` | | `false` | Skip confirmation prompt |
+
+Removes the cached ext4 rootfs and source sidecar files. Does not affect running sheds (they use copies of the image). Config-managed images cannot be deleted — remove them from the server config first.
+
+**Note:** When using `--json`, the `--force` flag is required.
+
+**Examples:**
+
+```bash
+shed image delete myimage
+shed image delete myimage --force
+```
+
+### shed image prune
+
+Removes unused cached VZ images.
+
+```bash
+shed image prune [flags]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--force` | | `false` | Skip confirmation prompt |
+| `--dry-run` | | `false` | List candidates without deleting |
+
+Images referenced by server config or any existing shed are preserved. Only unreferenced cached images are removed.
+
+**Note:** When using `--json`, the `--force` flag is required.
+
+**Examples:**
+
+```bash
+shed image prune --dry-run       # Preview what would be removed
+shed image prune                 # Interactive confirmation
+shed image prune --force         # No confirmation
+```
+
 ## Interactive Access
 
 ### shed console

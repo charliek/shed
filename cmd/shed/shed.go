@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -582,16 +581,12 @@ func runDelete(cmd *cobra.Command, args []string) error {
 
 	// Confirm deletion unless --force
 	if !deleteForce {
-		fmt.Printf("Delete shed %q on %s? ", name, serverName)
+		prompt := fmt.Sprintf("Delete shed %q on %s? ", name, serverName)
 		if !deleteKeep {
-			fmt.Print("This will also delete the data volume. ")
+			prompt += "This will also delete the data volume. "
 		}
-		fmt.Print("[y/N] ")
-
-		reader := bufio.NewReader(os.Stdin)
-		response, _ := reader.ReadString('\n')
-		response = strings.TrimSpace(strings.ToLower(response))
-		if response != "y" && response != "yes" {
+		prompt += "[y/N] "
+		if !confirmAction(prompt) {
 			fmt.Println("Cancelled.")
 			return nil
 		}

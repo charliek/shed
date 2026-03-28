@@ -163,6 +163,41 @@ func (r *Router) ListImages(ctx context.Context) ([]config.ImageInfo, error) {
 	return all, nil
 }
 
+// DeleteImage routes to the first backend that supports image management.
+func (r *Router) DeleteImage(ctx context.Context, name string) error {
+	var lastErr error
+	for _, backendType := range r.order {
+		b := r.backends[backendType]
+		err := b.DeleteImage(ctx, name)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, config.ErrNotSupportedSentinel) {
+			lastErr = err
+			continue
+		}
+		return err
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)
+}
+
+// PruneImages aggregates prune results across all backends.
+func (r *Router) PruneImages(ctx context.Context, dryRun bool) ([]config.ImageInfo, error) {
+	var all []config.ImageInfo
+	for _, backendType := range r.order {
+		b := r.backends[backendType]
+		images, err := b.PruneImages(ctx, dryRun)
+		if err != nil {
+			return nil, fmt.Errorf("backend %s: %w", backendType, err)
+		}
+		all = append(all, images...)
+	}
+	return all, nil
+}
+
 func (r *Router) backendForCreate(req config.CreateShedRequest) (Backend, error) {
 	if req.Backend != "" {
 		backend, ok := r.backends[Type(req.Backend)]

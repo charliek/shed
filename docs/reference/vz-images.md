@@ -181,6 +181,29 @@ Converted ext4 images are cached in `images_dir` (default: `~/Library/Applicatio
 
 When the Docker ref in your config changes (e.g., updating from `v1.0.0` to `v1.1.0`), shed detects the mismatch and re-converts automatically on the next `shed create`.
 
+## Cleaning Up Images
+
+Cached images can be 2-5 GB each. Use these commands to reclaim disk space:
+
+```bash
+# Delete a specific cached image
+shed image delete myimage
+
+# Preview which images would be pruned
+shed image prune --dry-run
+
+# Remove all unused cached images
+shed image prune
+```
+
+`shed image prune` preserves images that are:
+
+- Referenced in the server config `images` map
+- Used as the `base_rootfs` (when it's a Docker reference)
+- Referenced by any existing shed's metadata
+
+Deleting a cached image does not affect running sheds — each shed uses its own copy of the rootfs. However, you'll need to re-pull/rebuild the image to create new sheds from it.
+
 ## Requirements
 
 Image conversion requires Docker with privileged container support. The ext4 creation step uses a privileged Docker container for loop mounting.
