@@ -187,6 +187,15 @@ func (c *Client) DeleteImage(name string) error {
 	imagesDir := c.resolveImagesDir()
 
 	rootfsPath := filepath.Join(imagesDir, vmimage.RootfsFilename(name))
+
+	// Acquire the same flock used by EnsureImage to prevent races with
+	// concurrent image conversions.
+	unlock, err := acquireFileLock(rootfsPath + ".lock")
+	if err != nil {
+		return fmt.Errorf("acquiring image lock: %w", err)
+	}
+	defer unlock()
+
 	if err := os.Remove(rootfsPath); err != nil {
 		if os.IsNotExist(err) {
 			return config.ErrImageNotFoundSentinel
@@ -277,15 +286,22 @@ func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
 		return candidates, nil
 	}
 
-	// Delete candidates — only report images whose rootfs was actually removed
+	// Delete candidates — acquire flock to prevent races with EnsureImage
 	var deleted []config.ImageInfo
 	for _, img := range candidates {
+		unlock, err := acquireFileLock(img.Path + ".lock")
+		if err != nil {
+			log.Printf("warning: failed to lock %s: %v", img.Path, err)
+			continue
+		}
 		if err := os.Remove(img.Path); err != nil && !os.IsNotExist(err) {
+			unlock()
 			log.Printf("warning: failed to remove %s: %v", img.Path, err)
 			continue
 		}
 		// Best-effort removal of source sidecar
 		os.Remove(filepath.Join(imagesDir, vmimage.SourceFilename(img.Name)))
+		unlock()
 		deleted = append(deleted, img)
 	}
 
