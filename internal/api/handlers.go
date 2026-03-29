@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
@@ -386,6 +387,15 @@ func mapBackendError(err error) (int, string, string) {
 	if errors.Is(err, config.ErrUnknownImageSentinel) {
 		return http.StatusBadRequest, config.ErrUnknownImage, err.Error()
 	}
+	if errors.Is(err, config.ErrImageNotFoundSentinel) {
+		return http.StatusNotFound, config.ErrImageNotFound, err.Error()
+	}
+	if errors.Is(err, config.ErrImageInUseSentinel) {
+		return http.StatusConflict, config.ErrImageInUse, err.Error()
+	}
+	if errors.Is(err, config.ErrNotSupportedSentinel) {
+		return http.StatusNotImplemented, config.ErrBackendError, err.Error()
+	}
 
 	// Fallback to string matching for errors without sentinels
 	errMsg := err.Error()
@@ -445,4 +455,44 @@ func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
 		images = []config.ImageInfo{}
 	}
 	writeJSON(w, http.StatusOK, config.ImagesResponse{Images: images})
+}
+
+// handleDeleteImage removes a cached image by name.
+// DELETE /api/images/{name}
+func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+
+	if err := s.backend.DeleteImage(r.Context(), name); err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handlePruneImages removes unused cached images.
+// POST /api/images/prune?dry_run=bool
+func (s *Server) handlePruneImages(w http.ResponseWriter, r *http.Request) {
+	var dryRun bool
+	if v := r.URL.Query().Get("dry_run"); v != "" {
+		var err error
+		dryRun, err = strconv.ParseBool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, config.ErrBackendError, "invalid dry_run value: "+v)
+			return
+		}
+	}
+
+	deleted, err := s.backend.PruneImages(r.Context(), dryRun)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	if deleted == nil {
+		deleted = []config.ImageInfo{}
+	}
+
+	writeJSON(w, http.StatusOK, config.PruneImagesResponse{Deleted: deleted})
 }

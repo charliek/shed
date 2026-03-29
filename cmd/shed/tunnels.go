@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -215,12 +214,7 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 					return fmt.Errorf("tunnel already running for %s; use --replace in non-interactive mode", shedName)
 				}
 
-				fmt.Print("Replace? [y/N] ")
-
-				reader := bufio.NewReader(os.Stdin)
-				response, _ := reader.ReadString('\n')
-				response = strings.TrimSpace(strings.ToLower(response))
-				if response != "y" && response != "yes" {
+				if !confirmAction("Replace? [y/N] ") {
 					fmt.Println("Cancelled.")
 					return nil
 				}

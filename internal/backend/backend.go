@@ -73,4 +73,13 @@ type Backend interface {
 	// ListImages returns available image variants for this backend.
 	// Returns an empty list for backends that don't support image variants.
 	ListImages(ctx context.Context) ([]config.ImageInfo, error)
+
+	// DeleteImage removes a cached image by name.
+	// Returns ErrImageNotFoundSentinel if the image doesn't exist,
+	// or ErrImageInUseSentinel if the image is referenced by config.
+	DeleteImage(ctx context.Context, name string) error
+
+	// PruneImages removes cached images not referenced by config or existing sheds.
+	// If dryRun is true, returns candidates without deleting.
+	PruneImages(ctx context.Context, dryRun bool) ([]config.ImageInfo, error)
 }

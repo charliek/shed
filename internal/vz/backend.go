@@ -188,3 +188,13 @@ func (b *VZBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (st
 func (b *VZBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	return b.client.ListImages()
 }
+
+// DeleteImage removes a cached image by name.
+func (b *VZBackend) DeleteImage(_ context.Context, name string) error {
+	return b.client.DeleteImage(name)
+}
+
+// PruneImages removes cached images not referenced by config or existing sheds.
+func (b *VZBackend) PruneImages(_ context.Context, dryRun bool) ([]config.ImageInfo, error) {
+	return b.client.PruneImages(dryRun)
+}

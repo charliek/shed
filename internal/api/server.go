@@ -45,7 +45,11 @@ func (s *Server) Router() chi.Router {
 		r.Get("/sessions", s.handleListAllSessions)
 
 		// Images
-		r.Get("/images", s.handleListImages)
+		r.Route("/images", func(r chi.Router) {
+			r.Get("/", s.handleListImages)
+			r.Delete("/{name}", s.handleDeleteImage)
+			r.Post("/prune", s.handlePruneImages)
+		})
 
 		// Sheds
 		r.Route("/sheds", func(r chi.Router) {

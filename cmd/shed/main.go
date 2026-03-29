@@ -2,8 +2,10 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -111,6 +113,15 @@ func getServerEntry() (*config.ServerEntry, string, error) {
 		return entry, serverFlag, nil
 	}
 	return clientConfig.GetDefaultServer()
+}
+
+// confirmAction prints a prompt and returns true if the user confirms with y/yes.
+func confirmAction(prompt string) bool {
+	fmt.Print(prompt)
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(strings.ToLower(response))
+	return response == "y" || response == "yes"
 }
 
 // printSuccess prints a success message with a checkmark.

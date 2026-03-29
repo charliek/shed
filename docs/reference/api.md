@@ -23,6 +23,8 @@ The `shed-server` exposes a REST API for managing sheds.
 | DELETE | `/api/sheds/{name}/sessions/{session}` | Kill a tmux session |
 | GET | `/api/sessions` | List all sessions across sheds |
 | GET | `/api/images` | List available image variants |
+| DELETE | `/api/images/{name}` | Delete a cached image |
+| POST | `/api/images/prune` | Prune unused cached images |
 
 ## Server Info
 
@@ -353,3 +355,44 @@ Returns available image variants across all backends.
 | `size_bytes` | int | File size in bytes (0 if not cached) |
 | `source` | string | `config` (from server config) or `discovered` (found in images_dir) |
 | `cached` | bool | Whether the ext4 file exists locally |
+
+### DELETE /api/images/{name}
+
+Deletes a cached image by name. Removes the ext4 rootfs and source sidecar files but preserves the lock file.
+
+**Response (204 No Content)**
+
+**Errors:**
+
+| Code | Description |
+|------|-------------|
+| 404 | Image not found |
+| 409 | Image is referenced by config |
+
+### POST /api/images/prune
+
+Removes cached images not referenced by config or any existing shed.
+
+**Query Parameters:**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `dry_run` | `false` | Return candidates without deleting |
+
+**Response (200 OK):**
+
+```json
+{
+  "deleted": [
+    {
+      "name": "old-variant",
+      "path": "/Users/user/Library/Application Support/shed/vz/old-variant-rootfs.ext4",
+      "docker_ref": "ghcr.io/example/old:v1",
+      "size_bytes": 2147483648,
+      "cached": true
+    }
+  ]
+}
+```
+
+The `deleted` array contains the images that were removed (or would be removed if `dry_run=true`).

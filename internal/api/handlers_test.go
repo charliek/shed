@@ -161,6 +161,8 @@ func TestMapBackendError_SentinelErrors(t *testing.T) {
 		{"already exists", fmt.Errorf("%w: mydev", config.ErrShedAlreadyExistsSentinel), http.StatusConflict, config.ErrShedAlreadyExists},
 		{"already running", fmt.Errorf("%w: mydev", config.ErrShedAlreadyRunningSentinel), http.StatusConflict, config.ErrShedAlreadyRunning},
 		{"not running", fmt.Errorf("%w: mydev", config.ErrShedNotRunningSentinel), http.StatusConflict, config.ErrShedAlreadyStopped},
+		{"image not found", fmt.Errorf("%w", config.ErrImageNotFoundSentinel), http.StatusNotFound, config.ErrImageNotFound},
+		{"image in use", fmt.Errorf("%w", config.ErrImageInUseSentinel), http.StatusConflict, config.ErrImageInUse},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

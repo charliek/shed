@@ -28,6 +28,10 @@ var (
 	imageBuildSize      string
 	imageBuildOutputDir string
 	imageBuildForce     bool
+
+	imageDeleteForce bool
+	imagePruneForce  bool
+	imagePruneDryRun bool
 )
 
 var imageBuildCmd = &cobra.Command{
@@ -57,6 +61,22 @@ var imageListCmd = &cobra.Command{
 	RunE:  runImageList,
 }
 
+var imageDeleteCmd = &cobra.Command{
+	Use:   "delete <name>",
+	Short: "Delete a cached VZ image",
+	Long:  "Delete a cached VZ rootfs image from the images directory.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runImageDelete,
+}
+
+var imagePruneCmd = &cobra.Command{
+	Use:   "prune",
+	Short: "Remove unused cached VZ images",
+	Long:  "Remove cached VZ images that are not referenced by config or any existing shed.",
+	Args:  cobra.NoArgs,
+	RunE:  runImagePrune,
+}
+
 func init() {
 	imageBuildCmd.Flags().StringVarP(&imageBuildFile, "file", "f", "", "Dockerfile path (default: ./Dockerfile.shed or ./Dockerfile)")
 	imageBuildCmd.Flags().StringVar(&imageBuildFrom, "from", "", "Docker image reference to convert directly (skips build)")
@@ -67,8 +87,14 @@ func init() {
 	imageBuildCmd.Flags().BoolVar(&imageBuildForce, "force", false, "Skip base image validation warning")
 	_ = imageBuildCmd.MarkFlagRequired("name")
 
+	imageDeleteCmd.Flags().BoolVar(&imageDeleteForce, "force", false, "Skip confirmation prompt")
+	imagePruneCmd.Flags().BoolVar(&imagePruneForce, "force", false, "Skip confirmation prompt")
+	imagePruneCmd.Flags().BoolVar(&imagePruneDryRun, "dry-run", false, "List candidates without deleting")
+
 	imageCmd.AddCommand(imageBuildCmd)
 	imageCmd.AddCommand(imageListCmd)
+	imageCmd.AddCommand(imageDeleteCmd)
+	imageCmd.AddCommand(imagePruneCmd)
 	rootCmd.AddCommand(imageCmd)
 }
 
@@ -217,6 +243,168 @@ func formatBytes(b int64) string {
 		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
 	}
 	return fmt.Sprintf("%.0f MB", float64(b)/float64(mb))
+}
+
+func runImageDelete(_ *cobra.Command, args []string) error {
+	name := args[0]
+
+	if jsonFlag && !imageDeleteForce {
+		return fmt.Errorf("--force is required when using --json")
+	}
+
+	entry, _, err := getServerEntry()
+	if err != nil {
+		return err
+	}
+
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+
+	// Fetch image info for confirmation prompt and success output
+	var targetImage *config.ImageInfo
+	if !imageDeleteForce {
+		resp, err := client.ListImages()
+		if err != nil {
+			return fmt.Errorf("failed to list images: %w", err)
+		}
+		for i := range resp.Images {
+			if resp.Images[i].Name == name {
+				targetImage = &resp.Images[i]
+				break
+			}
+		}
+	}
+
+	if !imageDeleteForce {
+		prompt := fmt.Sprintf("Delete image %q", name)
+		if targetImage != nil && targetImage.SizeBytes > 0 {
+			prompt += fmt.Sprintf(" (%s)", formatBytes(targetImage.SizeBytes))
+		}
+		prompt += "? [y/N] "
+		if !confirmAction(prompt) {
+			fmt.Println("Cancelled.")
+			return nil
+		}
+	}
+
+	if err := client.DeleteImage(name); err != nil {
+		return fmt.Errorf("failed to delete image: %w", err)
+	}
+
+	if jsonFlag {
+		result := ActionResult{
+			Status: "ok",
+			Action: "deleted",
+			Name:   name,
+		}
+		if targetImage != nil {
+			result.Details = targetImage
+		}
+		return outputJSON(result)
+	}
+
+	msg := fmt.Sprintf("Deleted image %s", name)
+	if targetImage != nil && targetImage.SizeBytes > 0 {
+		msg += fmt.Sprintf(" (freed %s)", formatBytes(targetImage.SizeBytes))
+	}
+	printSuccess(msg)
+	return nil
+}
+
+func runImagePrune(_ *cobra.Command, _ []string) error {
+	if jsonFlag && !imagePruneForce {
+		return fmt.Errorf("--force is required when using --json")
+	}
+
+	entry, _, err := getServerEntry()
+	if err != nil {
+		return err
+	}
+
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+
+	// First do a dry run to see candidates
+	dryResp, err := client.PruneImages(true)
+	if err != nil {
+		return fmt.Errorf("failed to check unused images: %w", err)
+	}
+
+	if len(dryResp.Deleted) == 0 {
+		if jsonFlag {
+			return outputJSON(config.PruneImagesResponse{Deleted: []config.ImageInfo{}})
+		}
+		fmt.Println("No unused images to prune.")
+		return nil
+	}
+
+	// Compute total size across all candidates
+	var totalSize int64
+	for _, img := range dryResp.Deleted {
+		totalSize += img.SizeBytes
+	}
+
+	// Show candidates table in non-JSON mode
+	if !jsonFlag {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "NAME\tSIZE\tREF")
+		for _, img := range dryResp.Deleted {
+			size := "-"
+			if img.SizeBytes > 0 {
+				size = formatBytes(img.SizeBytes)
+			}
+			ref := img.DockerRef
+			if ref == "" {
+				ref = "-"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\n", img.Name, size, ref)
+		}
+		w.Flush()
+		fmt.Println()
+	}
+
+	if imagePruneDryRun {
+		if jsonFlag {
+			return outputJSON(config.PruneImagesResponse{Deleted: dryResp.Deleted})
+		}
+		fmt.Printf("Would prune %d image(s)", len(dryResp.Deleted))
+		if totalSize > 0 {
+			fmt.Printf(" (%s)", formatBytes(totalSize))
+		}
+		fmt.Println()
+		return nil
+	}
+
+	if !imagePruneForce {
+		prompt := fmt.Sprintf("Delete %d image(s)", len(dryResp.Deleted))
+		if totalSize > 0 {
+			prompt += fmt.Sprintf(" (%s)", formatBytes(totalSize))
+		}
+		prompt += "? [y/N] "
+		if !confirmAction(prompt) {
+			fmt.Println("Cancelled.")
+			return nil
+		}
+	}
+
+	// Execute the prune
+	pruneResp, err := client.PruneImages(false)
+	if err != nil {
+		return fmt.Errorf("failed to prune images: %w", err)
+	}
+
+	if jsonFlag {
+		return outputJSON(pruneResp)
+	}
+
+	var freedSize int64
+	for _, img := range pruneResp.Deleted {
+		freedSize += img.SizeBytes
+	}
+	msg := fmt.Sprintf("Pruned %d image(s)", len(pruneResp.Deleted))
+	if freedSize > 0 {
+		msg += fmt.Sprintf(" (freed %s)", formatBytes(freedSize))
+	}
+	printSuccess(msg)
+	return nil
 }
 
 func validateBaseImage(dockerfile string) error {

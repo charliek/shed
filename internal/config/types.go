@@ -30,6 +30,15 @@ var (
 
 	// ErrUnknownImageSentinel is returned when a requested image variant does not exist.
 	ErrUnknownImageSentinel = errors.New("unknown image")
+
+	// ErrImageNotFoundSentinel is returned when a cached image does not exist.
+	ErrImageNotFoundSentinel = errors.New("image not found")
+
+	// ErrImageInUseSentinel is returned when trying to delete an image referenced by config.
+	ErrImageInUseSentinel = errors.New("image is referenced by config")
+
+	// ErrNotSupportedSentinel is returned when an operation is not supported by a backend.
+	ErrNotSupportedSentinel = errors.New("not supported by this backend")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -164,6 +173,11 @@ type ImagesResponse struct {
 	Images []ImageInfo `json:"images"`
 }
 
+// PruneImagesResponse is returned by POST /api/images/prune.
+type PruneImagesResponse struct {
+	Deleted []ImageInfo `json:"deleted"`
+}
+
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
 	Name        string `json:"name"`
@@ -218,6 +232,8 @@ const (
 	ErrCloneFailed        = "CLONE_FAILED"
 	ErrBackendNotEnabled  = "BACKEND_NOT_ENABLED"
 	ErrUnknownImage       = "UNKNOWN_IMAGE"
+	ErrImageNotFound      = "IMAGE_NOT_FOUND"
+	ErrImageInUse         = "IMAGE_IN_USE"
 	ErrBackendError       = "BACKEND_ERROR"
 	ErrInternalError      = "INTERNAL_ERROR"
 	ErrSessionNotFound    = "SESSION_NOT_FOUND"

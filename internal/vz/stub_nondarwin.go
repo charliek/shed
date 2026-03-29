@@ -6,6 +6,7 @@ package vz
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -96,5 +97,15 @@ func (b *VZBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (st
 
 // ListImages returns an empty list on non-darwin platforms.
 func (b *VZBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	return nil, nil
+}
+
+// DeleteImage returns an error on non-darwin platforms.
+func (b *VZBackend) DeleteImage(_ context.Context, _ string) error {
+	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)
+}
+
+// PruneImages returns an empty list on non-darwin platforms.
+func (b *VZBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
 	return nil, nil
 }

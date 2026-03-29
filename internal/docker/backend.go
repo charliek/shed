@@ -222,3 +222,13 @@ func (b *DockerBackend) GetNetworkEndpoint(ctx context.Context, shedName string)
 func (b *DockerBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	return nil, nil
 }
+
+// DeleteImage returns an error — Docker backend does not manage cached images.
+func (b *DockerBackend) DeleteImage(_ context.Context, _ string) error {
+	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)
+}
+
+// PruneImages returns an empty list — Docker backend does not manage cached images.
+func (b *DockerBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
+	return nil, nil
+}
