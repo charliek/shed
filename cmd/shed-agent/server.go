@@ -59,8 +59,9 @@ type Server struct {
 
 	// Active message connection (for writing plugin messages to host).
 	// msgMu protects both the connection reference and serializes writes.
-	msgMu   sync.Mutex
-	msgConn net.Conn
+	msgMu      sync.Mutex
+	msgConn    net.Conn
+	credCancel context.CancelFunc // cancels the active credential watcher, if any
 
 	// Pending request/response tracking
 	pendingMu sync.Mutex

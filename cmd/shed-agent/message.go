@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -72,8 +73,16 @@ func (s *Server) handleCredentialSetup(env *plugin.Envelope) {
 		return
 	}
 
-	// Start in a goroutine since startCredentialWatcher blocks
-	go s.startCredentialWatcher(&setup)
+	// Cancel any previous credential watcher before starting a new one.
+	// This prevents goroutine/fd leaks on reconnect.
+	s.stopCredentialWatcher()
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	s.msgMu.Lock()
+	s.credCancel = cancel
+	s.msgMu.Unlock()
+
+	go s.startCredentialWatcher(ctx, &setup)
 }
 
 // deliverResponse routes a response envelope to the pending request channel.
@@ -108,11 +117,23 @@ func (s *Server) setMessageConn(conn net.Conn) {
 
 // clearMessageConn clears the active message connection and fails pending requests.
 func (s *Server) clearMessageConn() {
+	s.stopCredentialWatcher()
+
 	s.msgMu.Lock()
 	s.msgConn = nil
 	s.msgMu.Unlock()
 
 	s.clearPending()
+}
+
+// stopCredentialWatcher cancels any running credential watcher goroutine.
+func (s *Server) stopCredentialWatcher() {
+	s.msgMu.Lock()
+	if s.credCancel != nil {
+		s.credCancel()
+		s.credCancel = nil
+	}
+	s.msgMu.Unlock()
 }
 
 // clearPending closes and removes all pending request channels.
@@ -145,7 +166,7 @@ func (s *Server) sendPluginMessage(env *plugin.Envelope) error {
 
 // startCredentialWatcher handles a system:credentials setup request.
 // It creates a credential watcher that sends change events as plugin envelopes.
-func (s *Server) startCredentialWatcher(setup *plugin.CredentialSetupPayload) {
+func (s *Server) startCredentialWatcher(ctx context.Context, setup *plugin.CredentialSetupPayload) {
 	if len(setup.Credentials) == 0 {
 		log.Printf("Credential setup: no credentials to watch")
 		return
@@ -176,7 +197,7 @@ func (s *Server) startCredentialWatcher(setup *plugin.CredentialSetupPayload) {
 		return
 	}
 
-	// Run until context is cancelled (connection closes)
-	cw.start(s.ctx.Done())
+	// Run until context is cancelled (connection closes or new setup replaces this watcher)
+	cw.start(ctx.Done())
 	log.Printf("Credential watcher stopped")
 }
