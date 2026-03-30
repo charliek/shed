@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -163,8 +164,10 @@ func (s *Server) sendPluginMessage(env *plugin.Envelope) error {
 	}
 
 	// Set a write deadline to prevent blocking all senders if the host is unresponsive.
-	s.msgConn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	defer s.msgConn.SetWriteDeadline(time.Time{}) // clear deadline
+	if err := s.msgConn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	defer func() { _ = s.msgConn.SetWriteDeadline(time.Time{}) }()
 
 	return writeMessage(s.msgConn, MsgTypePluginMessage, data)
 }
