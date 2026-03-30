@@ -107,7 +107,7 @@ curl -N -H "Accept: text/event-stream" \
 
 Messages arrive as SSE events:
 
-```
+```text
 event: message
 data: {"id":"...","namespace":"op","type":"request","payload":{...},"shed":{"name":"my-dev","backend":"vz","server":"mini"}}
 ```

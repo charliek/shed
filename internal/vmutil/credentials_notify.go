@@ -48,7 +48,7 @@ func NewCredentialNotifyListener(agent *AgentClient, credentials map[string]conf
 	}
 }
 
-// SetName sets the listener name for logging. Must be called before Handler().
+// SetName sets the listener name for logging. Must be called before PullChangedFiles.
 func (nl *CredentialNotifyListener) SetName(name string) {
 	nl.name = name
 }
