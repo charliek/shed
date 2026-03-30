@@ -84,13 +84,10 @@ func runMount9P() {
 	// Close the file descriptor; the kernel keeps it open after mount
 	f.Close()
 
-	// If not read-only, chown the mount target to the shed user.
-	// Use dynamic user resolution to avoid hardcoding UID 1000.
-	if !*readOnly {
-		if err := chownToShedUser(*target); err != nil {
-			log.Printf("mount-9p: warning: failed to chown %s: %v", *target, err)
-		}
-	}
+	// Note: do NOT chown the mount target after mount. After syscall.Mount,
+	// the target path points at the remote 9P filesystem, so chown would
+	// propagate through 9P to the host and change host directory ownership.
+	// The UID remapping layer handles ownership transparently.
 
 	log.Printf("mount-9p: mounted %s at %s (tag=%s, readonly=%v)", *addr, *target, *tag, *readOnly)
 }

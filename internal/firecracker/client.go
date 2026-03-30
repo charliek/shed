@@ -279,34 +279,37 @@ func (c *Client) mount9PInGuest(ctx context.Context, agent *vmutil.AgentClient, 
 }
 
 // metadataToShed converts Firecracker metadata to a config.Shed.
-// mount9PCredential implements vmutil.DirMountFunc for Firecracker.
-// It starts a P9 server for the credential directory and mounts it in the guest.
-// On mount failure, the P9 server is cleaned up to avoid leaked listeners.
-func (c *Client) mount9PCredential(ctx context.Context, agent *vmutil.AgentClient, name string, mount config.MountConfig) error {
-	bridgeIP := c.netMgr.Gateway()
-	srv, err := c.startP9Server(name, bridgeIP, mount.Source, mount.Target, mount.ReadOnly)
-	if err != nil {
-		return fmt.Errorf("start 9P server for credential %q: %w", name, err)
-	}
-
-	tag := config.CredentialMountTag(name)
-	if err := c.mount9PInGuest(ctx, agent, srv.Addr(), mount.Target, mount.ReadOnly, tag); err != nil {
-		// Clean up the P9 server to avoid leaked listeners
-		srv.Close()
-		// Remove from the p9Servers slice
-		c.mu.Lock()
-		servers := c.p9Servers[name]
-		for i, s := range servers {
-			if s == srv {
-				c.p9Servers[name] = append(servers[:i], servers[i+1:]...)
-				break
-			}
+// mount9PCredentialFunc returns a DirMountFunc that binds the shed name for
+// P9 server bookkeeping. The credential name from SetupCredentials is used
+// for mount tags, while shedName is used for p9Servers map registration so
+// that stopP9Servers(shedName) correctly finds and cleans up all servers.
+func (c *Client) mount9PCredentialFunc(shedName string) vmutil.DirMountFunc {
+	return func(ctx context.Context, agent *vmutil.AgentClient, credName string, mount config.MountConfig) error {
+		bridgeIP := c.netMgr.Gateway()
+		srv, err := c.startP9Server(shedName, bridgeIP, mount.Source, mount.Target, mount.ReadOnly)
+		if err != nil {
+			return fmt.Errorf("start 9P server for credential %q: %w", credName, err)
 		}
-		c.mu.Unlock()
-		return fmt.Errorf("mount 9P credential %q: %w", name, err)
-	}
 
-	return nil
+		tag := config.CredentialMountTag(credName)
+		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), mount.Target, mount.ReadOnly, tag); err != nil {
+			// Clean up the P9 server to avoid leaked listeners
+			srv.Close()
+			// Remove from the p9Servers slice
+			c.mu.Lock()
+			servers := c.p9Servers[shedName]
+			for i, s := range servers {
+				if s == srv {
+					c.p9Servers[shedName] = append(servers[:i], servers[i+1:]...)
+					break
+				}
+			}
+			c.mu.Unlock()
+			return fmt.Errorf("mount 9P credential %q: %w", credName, err)
+		}
+
+		return nil
+	}
 }
 
 func metadataToShed(meta *Metadata) *config.Shed {
@@ -486,7 +489,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
 		backend.Progress(ctx, "credentials", "Setting up credentials...")
 		dirCreds, fileCreds := vmutil.ClassifyCredentials(c.serverCfg.Credentials)
-		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, fileCreds, c.mount9PCredential)
+		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, fileCreds, c.mount9PCredentialFunc(req.Name))
 	}
 
 	// Clone repo if specified (skip when using local dir -- directory already has content)
@@ -678,7 +681,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	// Refresh credentials on start: 9P mounts for directories, tar transfer for files
 	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
 		dirCreds, fileCreds := vmutil.ClassifyCredentials(c.serverCfg.Credentials)
-		c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, fileCreds, c.mount9PCredential)
+		c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, fileCreds, c.mount9PCredentialFunc(name))
 	}
 
 	// Run startup hook only (not install)

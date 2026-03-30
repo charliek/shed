@@ -171,7 +171,7 @@ func (f *remappingFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 			gid = int(attr.GID)
 		}
 		if err := os.Lchown(f.hostPath, uid, gid); err != nil {
-			log.Printf("Warning: SetAttr lchown %s to %d:%d failed: %v", f.hostPath, uid, gid, err)
+			return err
 		}
 
 		// Strip UID/GID from the mask before delegating

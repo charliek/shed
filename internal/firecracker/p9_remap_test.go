@@ -451,8 +451,10 @@ func TestP9Server_RemappingIntegration(t *testing.T) {
 	}
 
 	hostDir := t.TempDir()
-	targetUID := os.Getuid()
-	targetGID := os.Getgid()
+	// Use non-zero target to actually exercise remapping (os.Getuid() is 0
+	// when running as root, which would select passthrough mode).
+	targetUID := 1000
+	targetGID := 1000
 
 	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", false, targetUID, targetGID)
 	if err != nil {
