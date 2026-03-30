@@ -170,6 +170,12 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 		cm.credWatcher.RegisterVM(name, agent)
 	}
 
+	// Store the conn in the map before registering/starting so that
+	// Close()/StopListener() can find and clean it up if called concurrently.
+	cm.mu.Lock()
+	cm.messageChannels[name] = conn
+	cm.mu.Unlock()
+
 	if cm.bridge != nil {
 		serverName := ""
 		if cm.serverCfg != nil {
@@ -184,8 +190,4 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 	}
 
 	conn.Start(context.Background(), handler)
-
-	cm.mu.Lock()
-	cm.messageChannels[name] = conn
-	cm.mu.Unlock()
 }
