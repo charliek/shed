@@ -14,6 +14,12 @@ import (
 )
 
 func main() {
+	// Subcommand dispatch (bounds-checked)
+	if len(os.Args) > 1 && os.Args[1] == "mount-9p" {
+		runMount9P()
+		return
+	}
+
 	// Parse flags
 	consolePort := flag.Uint("console-port", DefaultConsolePort, "vsock port for console connections")
 	healthPort := flag.Uint("health-port", DefaultHealthPort, "vsock port for health checks")

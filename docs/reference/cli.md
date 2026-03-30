@@ -102,7 +102,7 @@ shed create myproj --local-dir ~/projects/myproj
 ```
 
 !!! note "Local directory mounts"
-    When using `--local-dir`, the specified host directory is mounted directly as the workspace. No volume is created and `--repo` cannot be used. For Docker, this uses a bind mount. For VZ, this uses VirtioFS. Firecracker does not support local directory mounts.
+    When using `--local-dir`, the specified host directory is mounted directly as the workspace. No volume is created and `--repo` cannot be used. For Docker, this uses a bind mount. For VZ, this uses VirtioFS. For Firecracker, this uses 9P over the TAP bridge network.
 
 ### shed list
 

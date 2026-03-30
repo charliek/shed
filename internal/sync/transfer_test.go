@@ -15,9 +15,6 @@ func TestNewSyncer(t *testing.T) {
 	cfg := &Config{}
 	syncer := NewSyncer(cfg)
 
-	if syncer == nil {
-		t.Fatal("NewSyncer returned nil")
-	}
 	if syncer.cfg != cfg {
 		t.Error("Syncer cfg not set correctly")
 	}
