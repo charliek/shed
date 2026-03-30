@@ -7,12 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,14 +26,14 @@ type Client struct {
 	serverCfg *config.ServerConfig
 	netMgr    *NetworkManager
 
-	mu       sync.Mutex
-	vms      map[string]*VM    // name -> VM
-	usedCIDs map[uint32]string // CID -> name
-	usedIPs  map[string]string // IP -> name
+	mu        sync.Mutex
+	vms       map[string]*VM         // name -> VM
+	usedCIDs  map[uint32]string      // CID -> name
+	usedIPs   map[string]string      // IP -> name
+	p9Servers map[string][]*P9Server // name -> active 9P servers for this VM
 
 	// Credential sync
-	credWatcher     *vmutil.CredentialWatcher                   // host-side fsnotify watcher
-	notifyListeners map[string]*vmutil.CredentialNotifyListener // name -> per-VM notification listener
+	credMgr *vmutil.CredentialManager
 }
 
 // NewClient creates a new Firecracker client.
@@ -46,27 +44,19 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*
 	}
 
 	client := &Client{
-		cfg:             cfg,
-		serverCfg:       serverCfg,
-		netMgr:          netMgr,
-		vms:             make(map[string]*VM),
-		usedCIDs:        make(map[uint32]string),
-		usedIPs:         make(map[string]string),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		cfg:       cfg,
+		serverCfg: serverCfg,
+		netMgr:    netMgr,
+		vms:       make(map[string]*VM),
+		usedCIDs:  make(map[uint32]string),
+		usedIPs:   make(map[string]string),
+		p9Servers: make(map[string][]*P9Server),
+		credMgr:   vmutil.NewCredentialManager(serverCfg),
 	}
 
 	// Load existing instances to populate CID and IP maps
 	if err := client.loadExistingInstances(); err != nil {
 		return nil, fmt.Errorf("failed to load existing instances: %w", err)
-	}
-
-	// Start host-side credential watcher for bidirectional sync
-	if serverCfg != nil && len(serverCfg.Credentials) > 0 {
-		client.credWatcher = vmutil.NewCredentialWatcher(serverCfg)
-		if err := client.credWatcher.Start(context.Background()); err != nil {
-			log.Printf("Warning: failed to start credential watcher: %v", err)
-			client.credWatcher = nil
-		}
 	}
 
 	return client, nil
@@ -95,19 +85,19 @@ func (c *Client) loadExistingInstances() error {
 
 // Close closes the client and releases resources.
 func (c *Client) Close() error {
-	// Stop all notification listeners
+	// Stop all P9 servers for all VMs
 	c.mu.Lock()
-	for name, nl := range c.notifyListeners {
-		nl.Stop()
-		delete(c.notifyListeners, name)
+	for name := range c.p9Servers {
+		for _, srv := range c.p9Servers[name] {
+			if err := srv.Close(); err != nil {
+				log.Printf("Warning: failed to close P9 server for %s: %v", name, err)
+			}
+		}
 	}
+	c.p9Servers = make(map[string][]*P9Server)
 	c.mu.Unlock()
 
-	// Stop the credential watcher
-	if c.credWatcher != nil {
-		c.credWatcher.Stop()
-	}
-
+	c.credMgr.Close()
 	return nil
 }
 
@@ -217,12 +207,112 @@ func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
 	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
 }
 
-// CreateShed creates a new Firecracker-based shed.
-func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
-	if req.LocalDir != "" {
-		return nil, fmt.Errorf("--local-dir is not supported on the firecracker backend (planned for future release)")
+// startP9Server creates, starts, and registers a P9 server for a VM.
+func (c *Client) startP9Server(name, bridgeIP, hostPath, mountPath string, readOnly bool) (*P9Server, error) {
+	srv, err := NewP9Server(bridgeIP, hostPath, mountPath, readOnly)
+	if err != nil {
+		return nil, fmt.Errorf("create P9 server for %s: %w", hostPath, err)
+	}
+	srv.Start()
+
+	c.mu.Lock()
+	c.p9Servers[name] = append(c.p9Servers[name], srv)
+	c.mu.Unlock()
+
+	return srv, nil
+}
+
+// stopP9Servers stops all P9 servers for a VM and removes them from the map.
+// This is nil-safe: after server restart, loadExistingInstances does not
+// restore P9 servers, so this may find an empty/nil slice.
+func (c *Client) stopP9Servers(name string) {
+	c.mu.Lock()
+	servers := c.p9Servers[name]
+	delete(c.p9Servers, name)
+	c.mu.Unlock()
+
+	for _, srv := range servers {
+		if err := srv.Close(); err != nil {
+			log.Printf("Warning: failed to close P9 server for %s: %v", name, err)
+		}
+	}
+}
+
+// mount9PInGuest executes the mount-9p subcommand inside the guest VM via the
+// agent exec channel. The mount command runs with sudo since syscall.Mount
+// requires root privileges.
+func (c *Client) mount9PInGuest(ctx context.Context, agent *vmutil.AgentClient, serverAddr, target string, readOnly bool, tag string) error {
+	cmd := []string{"sudo", "/usr/local/bin/shed-agent", "mount-9p",
+		"--addr", serverAddr,
+		"--target", target,
+		"--tag", tag,
+	}
+	if readOnly {
+		cmd = append(cmd, "--readonly")
 	}
 
+	opts := backend.ExecOptions{
+		Cmd:    cmd,
+		Stdout: vmutil.NopWriteCloser(os.Stderr), // mount output goes to server stderr for debugging
+		Stderr: vmutil.NopWriteCloser(os.Stderr),
+		TTY:    false,
+	}
+	if err := agent.Exec(ctx, opts); err != nil {
+		return fmt.Errorf("mount-9p exec failed for %s at %s: %w", serverAddr, target, err)
+	}
+	return nil
+}
+
+// metadataToShed converts Firecracker metadata to a config.Shed.
+// mount9PCredential implements vmutil.DirMountFunc for Firecracker.
+// It starts a P9 server for the credential directory and mounts it in the guest.
+// On mount failure, the P9 server is cleaned up to avoid leaked listeners.
+func (c *Client) mount9PCredential(ctx context.Context, agent *vmutil.AgentClient, name string, mount config.MountConfig) error {
+	bridgeIP := c.netMgr.Gateway()
+	srv, err := c.startP9Server(name, bridgeIP, mount.Source, mount.Target, mount.ReadOnly)
+	if err != nil {
+		return fmt.Errorf("start 9P server for credential %q: %w", name, err)
+	}
+
+	tag := config.CredentialMountTag(name)
+	if err := c.mount9PInGuest(ctx, agent, srv.Addr(), mount.Target, mount.ReadOnly, tag); err != nil {
+		// Clean up the P9 server to avoid leaked listeners
+		srv.Close()
+		// Remove from the p9Servers slice
+		c.mu.Lock()
+		servers := c.p9Servers[name]
+		for i, s := range servers {
+			if s == srv {
+				c.p9Servers[name] = append(servers[:i], servers[i+1:]...)
+				break
+			}
+		}
+		c.mu.Unlock()
+		return fmt.Errorf("mount 9P credential %q: %w", name, err)
+	}
+
+	return nil
+}
+
+func metadataToShed(meta *Metadata) *config.Shed {
+	return &config.Shed{
+		Name:        meta.Name,
+		Status:      meta.Status,
+		CreatedAt:   meta.CreatedAt,
+		Repo:        meta.Repo,
+		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
+		Backend:     meta.Backend,
+		IPAddress:   meta.IPAddress,
+		CPUs:        meta.CPUs,
+		MemoryMB:    meta.MemoryMB,
+		PID:         meta.PID,
+		RootfsPath:  meta.RootfsPath,
+		LocalDir:    meta.LocalDir,
+	}
+}
+
+// CreateShed creates a new Firecracker-based shed.
+func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
 	}
@@ -280,6 +370,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		MemoryMB:   memoryMB,
 		RootfsPath: rootfsPath,
 		Repo:       req.Repo,
+		LocalDir:   req.LocalDir,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -341,22 +432,52 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	agent := c.newAgentClient(meta.Name)
 
-	// Transfer credentials
-	if c.serverCfg != nil {
-		backend.Progress(ctx, "credentials", "Transferring credentials...")
-		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
-		if err := credTransfer.TransferAll(ctx); err != nil {
-			log.Printf("Warning: credential transfer failed: %v", err)
+	// Mount local directory via 9P if specified
+	if req.LocalDir != "" {
+		backend.Progress(ctx, "9p", "Mounting local directory via 9P...")
+		bridgeIP := c.netMgr.Gateway()
+		srv, err := c.startP9Server(req.Name, bridgeIP, req.LocalDir, config.WorkspacePath, false)
+		if err != nil {
+			c.stopP9Servers(req.Name)
+			if stopErr := vm.Stop(context.Background()); stopErr != nil {
+				log.Printf("Warning: failed to stop VM: %v", stopErr)
+			}
+			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+			}
+			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
+				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+			}
+			c.UnregisterInstance(req.Name, cid, ipAddress)
+			return nil, fmt.Errorf("failed to start 9P server for local dir: %w", err)
+		}
+		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
+			c.stopP9Servers(req.Name)
+			if stopErr := vm.Stop(context.Background()); stopErr != nil {
+				log.Printf("Warning: failed to stop VM: %v", stopErr)
+			}
+			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+			}
+			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
+				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+			}
+			c.UnregisterInstance(req.Name, cid, ipAddress)
+			return nil, fmt.Errorf("failed to mount 9P in guest: %w", err)
 		}
 	}
 
-	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(req.Name, agent)
+	// Setup credentials: 9P mounts for directories, tar transfer for files
+	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
+		backend.Progress(ctx, "credentials", "Setting up credentials...")
+		dirCreds, fileCreds := vmutil.ClassifyCredentials(c.serverCfg.Credentials)
+		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, fileCreds, c.mount9PCredential)
+	}
 
-	// Clone repo if specified
-	if req.Repo != "" {
+	// Clone repo if specified (skip when using local dir -- directory already has content)
+	if req.Repo != "" && req.LocalDir == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
-		if err := c.cloneRepo(ctx, agent, req.Repo); err != nil {
+		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
 		}
 	}
@@ -375,19 +496,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   meta.IPAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	return metadataToShed(meta), nil
 }
 
 // GetShed returns a shed by name.
@@ -413,19 +522,9 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 		}
 	}
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   meta.IPAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	shed := metadataToShed(meta)
+	shed.Status = status
+	return shed, nil
 }
 
 // ListSheds returns all sheds.
@@ -462,7 +561,8 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		if _, err := c.StopShed(ctx, name); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
 			// StopShed failed — clean up resources it would have released
-			c.stopNotifyListener(name)
+			c.credMgr.StopListener(name)
+			c.stopP9Servers(name)
 			c.mu.Lock()
 			delete(c.vms, name)
 			c.mu.Unlock()
@@ -534,16 +634,37 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 
 	agent := c.newAgentClient(meta.Name)
 
-	// Refresh credentials on start
-	if c.serverCfg != nil {
-		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
-		if err := credTransfer.TransferAll(ctx); err != nil {
-			log.Printf("Warning: credential transfer failed: %v", err)
+	// Remount local directory via 9P if set
+	if meta.LocalDir != "" {
+		bridgeIP := c.netMgr.Gateway()
+		srv, err := c.startP9Server(name, bridgeIP, meta.LocalDir, config.WorkspacePath, false)
+		if err != nil {
+			c.stopP9Servers(name)
+			if stopErr := vm.Stop(context.Background()); stopErr != nil {
+				log.Printf("Warning: failed to stop VM: %v", stopErr)
+			}
+			meta.Status = config.StatusStopped
+			meta.PID = 0
+			_ = meta.Save(c.cfg.InstanceDir)
+			return nil, fmt.Errorf("failed to start 9P server on start: %w", err)
+		}
+		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
+			c.stopP9Servers(name)
+			if stopErr := vm.Stop(context.Background()); stopErr != nil {
+				log.Printf("Warning: failed to stop VM: %v", stopErr)
+			}
+			meta.Status = config.StatusStopped
+			meta.PID = 0
+			_ = meta.Save(c.cfg.InstanceDir)
+			return nil, fmt.Errorf("failed to mount 9P in guest on start: %w", err)
 		}
 	}
 
-	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(name, agent)
+	// Refresh credentials on start: 9P mounts for directories, tar transfer for files
+	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
+		dirCreds, fileCreds := vmutil.ClassifyCredentials(c.serverCfg.Credentials)
+		c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, fileCreds, c.mount9PCredential)
+	}
 
 	// Run startup hook only (not install)
 	provisioner := vmutil.NewProvisioner(agent, name)
@@ -557,19 +678,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		}
 	}
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   meta.IPAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	return metadataToShed(meta), nil
 }
 
 // StopShed stops a running shed.
@@ -587,27 +696,13 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	}
 
 	// Stop notification listener before shutting down
-	c.stopNotifyListener(name)
+	c.credMgr.StopListener(name)
+
+	// Stop P9 servers before shutting down
+	c.stopP9Servers(name)
 
 	// Run shutdown hook before stopping the VM
-	stopTimeout := c.cfg.StopTimeout.Duration()
-	hookBudget := stopTimeout / 2
-	if hookBudget > 30*time.Second {
-		hookBudget = 30 * time.Second
-	}
-
-	agent := c.newAgentClient(meta.Name)
-	provisioner := vmutil.NewProvisioner(agent, name)
-	provisioner.SetOutput(os.Stdout, os.Stderr)
-
-	hookCtx, hookCancel := context.WithTimeout(ctx, hookBudget)
-	defer hookCancel()
-	cfg, err := provisioner.LoadConfig(hookCtx)
-	if err != nil {
-		log.Printf("Warning: failed to load provision config for shutdown hook: %v", err)
-	} else if cfg.HasShutdownHook() {
-		provisioner.RunShutdownHook(hookCtx, cfg)
-	}
+	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
 
 	// Get or create VM handle
 	c.mu.Lock()
@@ -632,19 +727,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	delete(c.vms, name)
 	c.mu.Unlock()
 
-	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   meta.IPAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-	}, nil
+	return metadataToShed(meta), nil
 }
 
 // GetNetworkEndpoint returns the IP address for a shed.
@@ -658,86 +741,4 @@ func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, e
 	}
 
 	return meta.IPAddress, nil
-}
-
-// cloneRepo clones a git repository into the VM's workspace.
-func (c *Client) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, repo string) error {
-	env := c.buildEnvForGit()
-
-	var output strings.Builder
-	opts := backend.ExecOptions{
-		Cmd:        []string{"git", "clone", repo, "."},
-		Env:        env,
-		Stdout:     vmutil.NopWriteCloser(io.MultiWriter(&output, os.Stdout)),
-		Stderr:     vmutil.NopWriteCloser(io.MultiWriter(&output, os.Stderr)),
-		WorkingDir: config.WorkspacePath,
-		TTY:        false,
-	}
-
-	if err := agent.Exec(ctx, opts); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
-	}
-
-	return nil
-}
-
-// buildEnvForGit builds environment variables for git operations.
-func (c *Client) buildEnvForGit() []string {
-	var env []string
-
-	if c.serverCfg == nil {
-		return env
-	}
-
-	for key, value := range c.serverCfg.EnvVars {
-		env = append(env, fmt.Sprintf("%s=%s", key, value))
-	}
-
-	return env
-}
-
-// startNotifyListener starts a credential notification listener for a VM.
-func (c *Client) startNotifyListener(name string, agent *vmutil.AgentClient) {
-	if c.serverCfg == nil {
-		return
-	}
-
-	hasWritable := false
-	for _, mount := range c.serverCfg.Credentials {
-		if !mount.ReadOnly {
-			hasWritable = true
-			break
-		}
-	}
-	if !hasWritable {
-		return
-	}
-
-	listener := vmutil.NewCredentialNotifyListener(agent, c.serverCfg.Credentials, c.credWatcher)
-	listener.Start(context.Background(), name)
-
-	// Register VM with the credential watcher for host->VM pushes
-	if c.credWatcher != nil {
-		c.credWatcher.RegisterVM(name, agent)
-	}
-
-	c.mu.Lock()
-	c.notifyListeners[name] = listener
-	c.mu.Unlock()
-}
-
-// stopNotifyListener stops the credential notification listener for a VM.
-func (c *Client) stopNotifyListener(name string) {
-	c.mu.Lock()
-	nl := c.notifyListeners[name]
-	delete(c.notifyListeners, name)
-	c.mu.Unlock()
-
-	if nl != nil {
-		nl.Stop()
-	}
-
-	if c.credWatcher != nil {
-		c.credWatcher.UnregisterVM(name)
-	}
 }

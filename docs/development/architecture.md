@@ -140,10 +140,16 @@ The diagrams below show the internal implementation flow for each backend.
         CLI->>Server: POST /api/sheds {name, repo, local_dir}
         Server->>Server: Copy base rootfs to instance dir
         Server->>Server: Allocate CID, TAP device, IP address
+        Server->>Server: Classify credentials (9P vs tar)
         Server->>VM: Spawn Firecracker process
         Server->>Agent: Wait for agent health (poll vsock:1025)
         Agent-->>Server: Healthy
-        Server->>Agent: Transfer credentials via tar-over-vsock
+        alt local-dir specified
+            Server->>Server: Start 9P TCP server on bridge IP
+            Server->>Agent: Mount 9P share at /workspace
+        end
+        Server->>Agent: Mount 9P credential directories
+        Server->>Agent: Transfer file credentials via tar-over-vsock
         alt repo specified
             Server->>Agent: git clone via vsock exec
         end
@@ -191,7 +197,10 @@ Each backend handles credentials differently based on its isolation model:
 
 **Docker** — Credentials are bind-mounted into the container at creation time. They persist across stop/start and reflect host changes immediately (live sync). Configured in `server.yaml` under `credentials`.
 
-**Firecracker** — No bind mount support. All credentials are transferred as gzipped tar archives over vsock on every `create` and `start`. Writable credentials (`readonly: false`) are synced bidirectionally: the agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files and pushes host-side changes to all running VMs.
+**Firecracker** — Hybrid approach, matching VZ. `vmutil.ClassifyCredentials()` splits credentials by type:
+
+- **Directory credentials** are shared via 9P over the TAP bridge network. Each directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
+- **Single-file credentials** are transferred as gzipped tar archives over vsock on every `create` and `start`. Writable credentials (`readonly: false`) are synced bidirectionally: the agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files and pushes host-side changes to all running VMs.
 
 **VZ** — Hybrid approach. `classifyCredentials()` in `internal/vz/client.go` splits credentials by type:
 

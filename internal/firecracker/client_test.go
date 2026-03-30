@@ -4,7 +4,14 @@
 package firecracker
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/charliek/shed/internal/config"
 )
 
 func TestAllocateCID(t *testing.T) {
@@ -181,5 +188,223 @@ func TestAllocateNetwork(t *testing.T) {
 	// Verify second IP is also immediately marked as used
 	if client.usedIPs[ip2] != "vm-2" {
 		t.Error("Second IP not immediately marked as used after AllocateNetwork")
+	}
+}
+
+func TestMetadataToShed(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	meta := &Metadata{
+		Version:    1,
+		Name:       "test-vm",
+		Status:     config.StatusRunning,
+		CreatedAt:  now,
+		Backend:    config.BackendFirecracker,
+		CID:        42,
+		PID:        12345,
+		IPAddress:  "172.30.0.5",
+		TAPDevice:  "shed-tap-3",
+		CPUs:       4,
+		MemoryMB:   8192,
+		RootfsPath: "/var/lib/shed/firecracker/instances/test-vm/rootfs.ext4",
+		Repo:       "https://github.com/example/repo",
+		LocalDir:   "/home/user/projects/myproject",
+	}
+
+	shed := metadataToShed(meta)
+
+	if shed.Name != meta.Name {
+		t.Errorf("Name = %q, want %q", shed.Name, meta.Name)
+	}
+	if shed.Status != meta.Status {
+		t.Errorf("Status = %q, want %q", shed.Status, meta.Status)
+	}
+	if !shed.CreatedAt.Equal(meta.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v", shed.CreatedAt, meta.CreatedAt)
+	}
+	if shed.Repo != meta.Repo {
+		t.Errorf("Repo = %q, want %q", shed.Repo, meta.Repo)
+	}
+	expectedContainerID := fmt.Sprintf("fc-%s", meta.Name)
+	if shed.ContainerID != expectedContainerID {
+		t.Errorf("ContainerID = %q, want %q", shed.ContainerID, expectedContainerID)
+	}
+	if shed.Backend != meta.Backend {
+		t.Errorf("Backend = %q, want %q", shed.Backend, meta.Backend)
+	}
+	if shed.IPAddress != meta.IPAddress {
+		t.Errorf("IPAddress = %q, want %q", shed.IPAddress, meta.IPAddress)
+	}
+	if shed.CPUs != meta.CPUs {
+		t.Errorf("CPUs = %d, want %d", shed.CPUs, meta.CPUs)
+	}
+	if shed.MemoryMB != meta.MemoryMB {
+		t.Errorf("MemoryMB = %d, want %d", shed.MemoryMB, meta.MemoryMB)
+	}
+	if shed.PID != meta.PID {
+		t.Errorf("PID = %d, want %d", shed.PID, meta.PID)
+	}
+	if shed.RootfsPath != meta.RootfsPath {
+		t.Errorf("RootfsPath = %q, want %q", shed.RootfsPath, meta.RootfsPath)
+	}
+	if shed.LocalDir != meta.LocalDir {
+		t.Errorf("LocalDir = %q, want %q", shed.LocalDir, meta.LocalDir)
+	}
+}
+
+func TestMetadataToShed_EmptyLocalDir(t *testing.T) {
+	meta := &Metadata{
+		Name:      "no-localdir",
+		Status:    config.StatusStopped,
+		Backend:   config.BackendFirecracker,
+		IPAddress: "172.30.0.2",
+		CPUs:      2,
+		MemoryMB:  1024,
+	}
+
+	shed := metadataToShed(meta)
+
+	if shed.LocalDir != "" {
+		t.Errorf("LocalDir = %q, want empty string", shed.LocalDir)
+	}
+}
+
+func TestMetadataBackwardCompat(t *testing.T) {
+	// Test loading metadata JSON that doesn't include the local_dir field
+	// (written before 9P support was added). The LocalDir field should be
+	// empty after loading.
+	dir := mustTempDir(t, "metadata-compat")
+
+	instanceDir := filepath.Join(dir, "old-vm")
+	if err := os.MkdirAll(instanceDir, 0755); err != nil {
+		t.Fatalf("failed to create instance dir: %v", err)
+	}
+
+	// Write metadata JSON without local_dir field (pre-9P format)
+	raw := `{
+  "version": 1,
+  "name": "old-vm",
+  "status": "stopped",
+  "created_at": "2024-06-15T10:00:00Z",
+  "backend": "firecracker",
+  "cid": 100,
+  "ip_address": "172.30.0.2",
+  "tap_device": "shed-tap-0",
+  "cpus": 2,
+  "memory_mb": 4096,
+  "rootfs_path": "/var/lib/shed/firecracker/instances/old-vm/rootfs.ext4",
+  "repo": "https://github.com/example/repo"
+}`
+	metaPath := filepath.Join(instanceDir, "metadata.json")
+	if err := os.WriteFile(metaPath, []byte(raw), 0644); err != nil {
+		t.Fatalf("failed to write metadata: %v", err)
+	}
+
+	loaded, err := LoadMetadata(dir, "old-vm")
+	if err != nil {
+		t.Fatalf("LoadMetadata() error = %v", err)
+	}
+
+	// Verify LocalDir is empty (zero value)
+	if loaded.LocalDir != "" {
+		t.Errorf("LocalDir = %q, want empty string for backward-compat metadata", loaded.LocalDir)
+	}
+
+	// Verify other fields loaded correctly
+	if loaded.Name != "old-vm" {
+		t.Errorf("Name = %q, want %q", loaded.Name, "old-vm")
+	}
+	if loaded.Repo != "https://github.com/example/repo" {
+		t.Errorf("Repo = %q, want %q", loaded.Repo, "https://github.com/example/repo")
+	}
+
+	// Verify metadataToShed also works with empty LocalDir
+	shed := metadataToShed(loaded)
+	if shed.LocalDir != "" {
+		t.Errorf("metadataToShed().LocalDir = %q, want empty string", shed.LocalDir)
+	}
+}
+
+func TestMetadataBackwardCompat_WithLocalDir(t *testing.T) {
+	// Verify metadata with local_dir field loads correctly
+	dir := mustTempDir(t, "metadata-compat")
+
+	instanceDir := filepath.Join(dir, "new-vm")
+	if err := os.MkdirAll(instanceDir, 0755); err != nil {
+		t.Fatalf("failed to create instance dir: %v", err)
+	}
+
+	raw := `{
+  "version": 1,
+  "name": "new-vm",
+  "status": "running",
+  "created_at": "2024-06-15T10:00:00Z",
+  "backend": "firecracker",
+  "cid": 101,
+  "pid": 5678,
+  "ip_address": "172.30.0.3",
+  "tap_device": "shed-tap-1",
+  "cpus": 4,
+  "memory_mb": 8192,
+  "rootfs_path": "/var/lib/shed/firecracker/instances/new-vm/rootfs.ext4",
+  "local_dir": "/home/user/projects/myapp"
+}`
+	metaPath := filepath.Join(instanceDir, "metadata.json")
+	if err := os.WriteFile(metaPath, []byte(raw), 0644); err != nil {
+		t.Fatalf("failed to write metadata: %v", err)
+	}
+
+	loaded, err := LoadMetadata(dir, "new-vm")
+	if err != nil {
+		t.Fatalf("LoadMetadata() error = %v", err)
+	}
+
+	if loaded.LocalDir != "/home/user/projects/myapp" {
+		t.Errorf("LocalDir = %q, want %q", loaded.LocalDir, "/home/user/projects/myapp")
+	}
+}
+
+func TestMetadataLocalDir_RoundTrip(t *testing.T) {
+	// Save metadata with LocalDir and verify it round-trips correctly
+	dir := mustTempDir(t, "metadata-roundtrip")
+
+	meta := testMetadata("roundtrip-vm")
+	meta.LocalDir = "/tmp/test-project"
+
+	if err := meta.Save(dir); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	loaded, err := LoadMetadata(dir, "roundtrip-vm")
+	if err != nil {
+		t.Fatalf("LoadMetadata() error = %v", err)
+	}
+
+	if loaded.LocalDir != meta.LocalDir {
+		t.Errorf("LocalDir = %q, want %q", loaded.LocalDir, meta.LocalDir)
+	}
+
+	// Verify it's in the JSON
+	data, err := os.ReadFile(MetadataPath(dir, "roundtrip-vm"))
+	if err != nil {
+		t.Fatalf("failed to read metadata file: %v", err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("failed to parse raw JSON: %v", err)
+	}
+
+	localDirRaw, ok := raw["local_dir"]
+	if !ok {
+		t.Fatal("local_dir key missing from JSON output")
+	}
+
+	var localDir string
+	if err := json.Unmarshal(localDirRaw, &localDir); err != nil {
+		t.Fatalf("failed to parse local_dir value: %v", err)
+	}
+
+	if localDir != "/tmp/test-project" {
+		t.Errorf("local_dir in JSON = %q, want %q", localDir, "/tmp/test-project")
 	}
 }

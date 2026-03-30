@@ -14,17 +14,20 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
+// newTestCredMgr creates a CredentialManager with nil server config for tests.
+func newTestCredMgr() *vmutil.CredentialManager {
+	return vmutil.NewCredentialManager(nil)
+}
+
 func TestBuildEnvForGit(t *testing.T) {
-	client := &Client{
-		serverCfg: &config.ServerConfig{
-			EnvVars: map[string]string{
-				"GITHUB_TOKEN": "ghp_abc123",
-				"GIT_AUTHOR":   "test",
-			},
+	serverCfg := &config.ServerConfig{
+		EnvVars: map[string]string{
+			"GITHUB_TOKEN": "ghp_abc123",
+			"GIT_AUTHOR":   "test",
 		},
 	}
 
-	env := client.buildEnvForGit()
+	env := vmutil.BuildEnvForGit(serverCfg)
 
 	if len(env) != 2 {
 		t.Fatalf("expected 2 env vars, got %d", len(env))
@@ -44,20 +47,17 @@ func TestBuildEnvForGit(t *testing.T) {
 }
 
 func TestBuildEnvForGitNilServerCfg(t *testing.T) {
-	client := &Client{serverCfg: nil}
-	env := client.buildEnvForGit()
+	env := vmutil.BuildEnvForGit(nil)
 	if len(env) != 0 {
 		t.Errorf("expected empty env for nil serverCfg, got %v", env)
 	}
 }
 
 func TestBuildEnvForGitNoEnvVars(t *testing.T) {
-	client := &Client{
-		serverCfg: &config.ServerConfig{
-			EnvVars: map[string]string{},
-		},
+	serverCfg := &config.ServerConfig{
+		EnvVars: map[string]string{},
 	}
-	env := client.buildEnvForGit()
+	env := vmutil.BuildEnvForGit(serverCfg)
 	if len(env) != 0 {
 		t.Errorf("expected empty env for empty EnvVars, got %v", env)
 	}
@@ -81,9 +81,9 @@ func TestGetNetworkEndpoint(t *testing.T) {
 	meta.Save(tmpDir)
 
 	client := &Client{
-		cfg:             cfg,
-		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		cfg:     cfg,
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
 	}
 
 	endpoint, err := client.GetNetworkEndpoint(context.Background(), "test-vm")
@@ -103,9 +103,9 @@ func TestGetNetworkEndpointNotFound(t *testing.T) {
 	}
 
 	client := &Client{
-		cfg:             cfg,
-		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		cfg:     cfg,
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
 	}
 
 	_, err := client.GetNetworkEndpoint(context.Background(), "nonexistent")
@@ -159,9 +159,9 @@ func TestNewAgentClient(t *testing.T) {
 func TestClientClose(t *testing.T) {
 	cfg := &config.VZConfig{}
 	client := &Client{
-		cfg:             cfg,
-		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		cfg:     cfg,
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
 	}
 
 	err := client.Close()
@@ -170,39 +170,33 @@ func TestClientClose(t *testing.T) {
 	}
 }
 
-func TestStartNotifyListenerNoServerCfg(t *testing.T) {
-	client := &Client{
-		serverCfg:       nil,
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
-	}
-	// Should not panic
-	client.startNotifyListener("test", nil, nil)
+func TestCredentialManagerNoServerCfg(t *testing.T) {
+	// Creating a CredentialManager with nil serverCfg should not panic
+	credMgr := vmutil.NewCredentialManager(nil)
+	// Operations should not panic
+	credMgr.StopListener("test")
+	credMgr.Close()
 }
 
-func TestStartNotifyListenerNoWritableCredentials(t *testing.T) {
-	client := &Client{
-		serverCfg:       nil,
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+func TestCredentialManagerNoWritableCredentials(t *testing.T) {
+	// HasWritableCredentials should return false for empty/readonly credentials
+	if vmutil.HasWritableCredentials(nil) {
+		t.Error("expected false for nil credentials")
 	}
-	// Empty map — no tar-only credentials to watch (readonly ones are filtered
-	// upstream by hasWritableTarCredentials before startNotifyListener is called)
-	client.startNotifyListener("test", nil, nil)
-
-	client.mu.Lock()
-	count := len(client.notifyListeners)
-	client.mu.Unlock()
-
-	if count != 0 {
-		t.Errorf("expected 0 listeners for read-only credentials, got %d", count)
+	if vmutil.HasWritableCredentials(map[string]config.MountConfig{}) {
+		t.Error("expected false for empty credentials")
+	}
+	if vmutil.HasWritableCredentials(map[string]config.MountConfig{
+		"git": {ReadOnly: true},
+	}) {
+		t.Error("expected false for read-only credentials")
 	}
 }
 
-func TestStopNotifyListenerNoOp(t *testing.T) {
-	client := &Client{
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
-	}
+func TestStopListenerNoOp(t *testing.T) {
+	credMgr := vmutil.NewCredentialManager(nil)
 	// Should not panic when stopping a non-existent listener
-	client.stopNotifyListener("nonexistent")
+	credMgr.StopListener("nonexistent")
 }
 
 func TestGetShedNotFound(t *testing.T) {
@@ -210,9 +204,9 @@ func TestGetShedNotFound(t *testing.T) {
 		InstanceDir: t.TempDir(),
 	}
 	client := &Client{
-		cfg:             cfg,
-		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		cfg:     cfg,
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
 	}
 
 	_, err := client.GetShed(context.Background(), "nonexistent")
@@ -231,7 +225,7 @@ func TestClassifyCredentialsDirectory(t *testing.T) {
 		"ssh": {Source: tmpDir, Target: "/home/shed/.ssh", ReadOnly: true},
 	}
 
-	virtioFS, tarOnly := classifyCredentials(creds)
+	virtioFS, tarOnly := vmutil.ClassifyCredentials(creds)
 
 	if len(virtioFS) != 1 {
 		t.Fatalf("expected 1 VirtioFS credential, got %d", len(virtioFS))
@@ -254,7 +248,7 @@ func TestClassifyCredentialsSingleFile(t *testing.T) {
 		"git": {Source: tmpFile, Target: "/home/shed/.gitconfig", ReadOnly: true},
 	}
 
-	virtioFS, tarOnly := classifyCredentials(creds)
+	virtioFS, tarOnly := vmutil.ClassifyCredentials(creds)
 
 	if len(virtioFS) != 0 {
 		t.Errorf("expected 0 VirtioFS credentials, got %d", len(virtioFS))
@@ -272,7 +266,7 @@ func TestClassifyCredentialsMissing(t *testing.T) {
 		"gone": {Source: "/nonexistent/path", Target: "/home/shed/.gone"},
 	}
 
-	virtioFS, tarOnly := classifyCredentials(creds)
+	virtioFS, tarOnly := vmutil.ClassifyCredentials(creds)
 
 	if len(virtioFS) != 0 {
 		t.Errorf("expected 0 VirtioFS credentials, got %d", len(virtioFS))
@@ -295,7 +289,7 @@ func TestClassifyCredentialsMixed(t *testing.T) {
 		"missing":   {Source: "/nonexistent", Target: "/home/shed/.missing"},
 	}
 
-	virtioFS, tarOnly := classifyCredentials(creds)
+	virtioFS, tarOnly := vmutil.ClassifyCredentials(creds)
 
 	if len(virtioFS) != 1 {
 		t.Fatalf("expected 1 VirtioFS credential, got %d", len(virtioFS))
@@ -322,7 +316,7 @@ func TestClassifyCredentialsWithExcludes(t *testing.T) {
 		},
 	}
 
-	virtioFS, tarOnly := classifyCredentials(creds)
+	virtioFS, tarOnly := vmutil.ClassifyCredentials(creds)
 
 	// Directory credentials with excludes should still use VirtioFS
 	// (excludes only mattered for tar transfer size, not VirtioFS)
@@ -337,27 +331,27 @@ func TestClassifyCredentialsWithExcludes(t *testing.T) {
 	}
 }
 
-func TestHasWritableTarCredentials(t *testing.T) {
+func TestHasWritableCredentials(t *testing.T) {
 	tests := []struct {
 		name     string
-		tarOnly  map[string]config.MountConfig
+		creds    map[string]config.MountConfig
 		expected bool
 	}{
 		{
 			name:     "empty",
-			tarOnly:  map[string]config.MountConfig{},
+			creds:    map[string]config.MountConfig{},
 			expected: false,
 		},
 		{
 			name: "readonly_only",
-			tarOnly: map[string]config.MountConfig{
+			creds: map[string]config.MountConfig{
 				"git": {ReadOnly: true},
 			},
 			expected: false,
 		},
 		{
 			name: "writable",
-			tarOnly: map[string]config.MountConfig{
+			creds: map[string]config.MountConfig{
 				"config": {ReadOnly: false},
 			},
 			expected: true,
@@ -366,9 +360,9 @@ func TestHasWritableTarCredentials(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := hasWritableTarCredentials(tt.tarOnly)
+			got := vmutil.HasWritableCredentials(tt.creds)
 			if got != tt.expected {
-				t.Errorf("hasWritableTarCredentials() = %v, want %v", got, tt.expected)
+				t.Errorf("HasWritableCredentials() = %v, want %v", got, tt.expected)
 			}
 		})
 	}
@@ -412,8 +406,8 @@ func TestCreateShedValidatesResources(t *testing.T) {
 			BaseRootfs:  baseRootfs,
 			InstanceDir: tmpDir,
 		},
-		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
 	}
 
 	_, err := client.CreateShed(context.Background(), config.CreateShedRequest{
