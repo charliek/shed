@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -267,6 +268,31 @@ func getLastLines(s string, n int) string {
 		start = 0
 	}
 	return string(bytes.Join(lines[start:], []byte("\n")))
+}
+
+// RunShutdownSequence runs the shutdown hook for a VM with appropriate timeout budgeting.
+// This encapsulates the identical shutdown pattern used by both VZ and Firecracker backends.
+// Failures are logged as warnings but never cause the sequence to fail.
+func RunShutdownSequence(ctx context.Context, agent *AgentClient, name string, stopTimeout time.Duration, stdout, stderr io.Writer) {
+	hookBudget := stopTimeout / 2
+	if hookBudget > 30*time.Second {
+		hookBudget = 30 * time.Second
+	}
+
+	provisioner := NewProvisioner(agent, name)
+	provisioner.SetOutput(stdout, stderr)
+
+	hookCtx, hookCancel := context.WithTimeout(ctx, hookBudget)
+	defer hookCancel()
+
+	cfg, err := provisioner.LoadConfig(hookCtx)
+	if err != nil {
+		log.Printf("Warning: failed to load provision config for shutdown hook: %v", err)
+		return
+	}
+	if cfg.HasShutdownHook() {
+		provisioner.RunShutdownHook(hookCtx, cfg)
+	}
 }
 
 // ProvisionState tracks provisioning state in VMs via files.

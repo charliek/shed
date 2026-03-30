@@ -1,0 +1,77 @@
+# Shed Server Firecracker-focused Configuration
+#
+# Use this for testing 9P local-dir and credential mounts on Firecracker:
+#   sudo shed-server serve --config ./configs/server.localfc.yaml
+#
+# Mirrors the macOS VZ config (server.localmac.yaml) with the same
+# credential layout to verify feature parity.
+
+name: localfc-dev
+
+http_port: 8080
+ssh_port: 2222
+
+default_image: shed-base:latest
+
+credentials:
+  git_ssh:
+    source: /home/charliek/.ssh
+    target: /home/shed/.ssh
+    readonly: true
+
+  git_config:
+    source: /home/charliek/.gitconfig
+    target: /home/shed/.gitconfig
+    readonly: true
+
+  # Claude Code - credentials and settings
+  claude:
+    source: /home/charliek/.shed/mounts/claude
+    target: /home/shed/.claude
+    readonly: false
+    exclude:
+      - "debug/*"
+      - "file-history/*"
+      - "plans/*"
+      - "backups/*"
+      - "cache/*"
+      - "tasks/*"
+      - "todos/*"
+      - "paste-cache/*"
+      - "shell-snapshots/*"
+      - "session-env/*"
+      - "downloads/*"
+      - "telemetry/*"
+
+  # GitHub CLI - credentials and config
+  gh:
+    source: /home/charliek/.shed/mounts/gh
+    target: /home/shed/.config/gh
+    readonly: false
+
+# Environment file with GIT_SSH_COMMAND for SSH key access
+env_file: /home/charliek/.shed/env
+
+log_level: debug
+
+enabled_backends:
+  - firecracker
+default_backend: firecracker
+
+firecracker:
+  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
+  base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+  instance_dir: /var/lib/shed/firecracker/instances
+  socket_dir: /var/run/shed/firecracker
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  vsock_base_cid: 100
+  console_port: 1024
+  health_port: 1025
+  notify_port: 1026
+  start_timeout: 90s
+  stop_timeout: 10s
+  bridge_name: shed-br0
+  bridge_cidr: 172.30.0.1/24
+  tap_prefix: shed-tap

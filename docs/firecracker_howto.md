@@ -15,6 +15,9 @@ shed create myproject --backend=firecracker --cpus=4 --memory=8192
 
 # Create from a git repository
 shed create myproject --backend=firecracker --repo=https://github.com/user/repo.git
+
+# Mount a local host directory as the workspace (requires 9P kernel support)
+shed create myproject --backend=firecracker --local-dir ~/projects/myproject
 ```
 
 ### Starting and Stopping
@@ -52,18 +55,19 @@ shed delete myproject --force
 
 ## Credentials
 
-Firecracker VMs don't support bind mounts like Docker. Instead, credentials configured in `server.yaml` are **copied** into the VM at create and start time using tar over vsock.
+Firecracker VMs use a hybrid approach for credentials, matching the VZ backend behavior. Credentials configured in `server.yaml` are classified by type:
+
+- **Directory credentials** (e.g., `~/.ssh/`, `~/.claude/`) are mounted via 9P over the TAP bridge network. Changes are immediately visible on both sides, similar to Docker bind mounts.
+- **Single-file credentials** (e.g., `~/.gitconfig`) are transferred as tar archives over vsock on every `create` and `start`.
 
 ### How It Works
 
-1. On `shed create` and `shed start`, credentials are:
-   - Archived on the host using tar
-   - Transferred to the VM via vsock
-   - Extracted to the target location
-   - Ownership is set to shed:shed (user-home paths) or root:root (system paths)
+1. On `shed create` and `shed start`, credentials are classified automatically:
+   - **Directory sources** are mounted via 9P over the TAP bridge network. Each directory gets its own TCP-based 9P server.
+   - **File sources** are archived on the host using tar, transferred to the VM via vsock, extracted to the target location, and ownership is set to shed:shed.
 
-2. **Read-only credentials** (`readonly: true`): No live sync. Changes on the host or in the VM are not propagated until the next restart.
-3. **Writable credentials** (`readonly: false`): Synced bidirectionally while the VM is running. The agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files via tar-over-vsock and writes them to the source directory. Host-side changes push to all running VMs. Echo suppression (2-second cooldown) prevents changes from bouncing back.
+2. **Read-only credentials** (`readonly: true`): Directory mounts are enforced as read-only at the mount level. Tar-transferred file credentials have no live sync; changes are not propagated until the next restart.
+3. **Writable credentials** (`readonly: false`): Directory mounts reflect changes immediately in both directions. Writable tar-transferred file credentials are synced bidirectionally: the agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files and pushes host-side changes to all running VMs. Echo suppression (2-second cooldown) prevents changes from bouncing back.
 
 ### Verifying Credentials
 

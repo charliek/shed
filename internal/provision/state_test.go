@@ -7,9 +7,6 @@ import (
 func TestNewState(t *testing.T) {
 	// NewState should work with nil client (for unit testing struct creation)
 	state := NewState(nil)
-	if state == nil {
-		t.Fatal("NewState returned nil")
-	}
 	if state.docker != nil {
 		t.Error("Expected nil docker client")
 	}

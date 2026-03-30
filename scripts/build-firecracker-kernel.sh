@@ -14,7 +14,9 @@ set -e
 set -o pipefail
 
 # Configuration
+# Set KERNEL_TAG to pin a specific version (e.g., KERNEL_TAG=v6.1.102)
 KERNEL_MAJOR="${KERNEL_MAJOR:-6.1}"
+KERNEL_TAG="${KERNEL_TAG:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-/var/lib/shed/firecracker}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOCKER_FRAGMENT="${SCRIPT_DIR}/kernel-config-docker.fragment"
@@ -47,12 +49,18 @@ done
 # Determine latest 6.1.x tag via git ls-remote
 echo ""
 echo "=== Finding latest ${KERNEL_MAJOR}.x release ==="
-LATEST_TAG=$(git ls-remote --tags --sort=-v:refname \
-    https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
-    "v${KERNEL_MAJOR}.*" \
-    | grep -v '\^{}' \
-    | head -1 \
-    | sed 's|.*refs/tags/||')
+if [ -n "$KERNEL_TAG" ]; then
+    LATEST_TAG="$KERNEL_TAG"
+    echo "Using pinned kernel tag: ${LATEST_TAG}"
+else
+    # Use a temp file to avoid SIGPIPE with pipefail when head -1 closes early
+    _tags_tmp=$(mktemp)
+    git ls-remote --tags --sort=-v:refname \
+        https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+        "v${KERNEL_MAJOR}.*" > "$_tags_tmp" 2>/dev/null || true
+    LATEST_TAG=$(grep -v '\^{}' "$_tags_tmp" | head -1 | sed 's|.*refs/tags/||')
+    rm -f "$_tags_tmp"
+fi
 
 if [ -z "$LATEST_TAG" ]; then
     echo "ERROR: could not find a ${KERNEL_MAJOR}.x kernel tag"
@@ -86,7 +94,8 @@ esac
 # Download Firecracker CI config for 6.1
 echo ""
 echo "=== Downloading Firecracker CI kernel config (${FC_ARCH}) ==="
-FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${FC_ARCH}-6.1.config"
+FC_VERSION="${FC_VERSION:-v1.14.1}"
+FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker/${FC_VERSION}/resources/guest_configs/microvm-kernel-ci-${FC_ARCH}-6.1.config"
 curl -fL -o .config "$FC_CONFIG_URL"
 echo "Downloaded: microvm-kernel-ci-${FC_ARCH}-6.1.config"
 

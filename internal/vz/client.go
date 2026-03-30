@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,12 +29,7 @@ type Client struct {
 	mu  sync.Mutex
 	vms map[string]*VM // name -> VM
 
-	// Credential sync
-	credWatcher *vmutil.CredentialWatcher // host-side fsnotify watcher
-
-	// Message channels (generalized notify connections)
-	messageChannels map[string]*vmutil.NotifyConn // name -> per-VM message channel
-	pluginBridge    *plugin.Bridge
+	credMgr *vmutil.CredentialManager
 }
 
 // NewClient creates a new VZ client.
@@ -45,20 +39,10 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plu
 	}
 
 	client := &Client{
-		cfg:             cfg,
-		serverCfg:       serverCfg,
-		vms:             make(map[string]*VM),
-		messageChannels: make(map[string]*vmutil.NotifyConn),
-		pluginBridge:    bridge,
-	}
-
-	// Start host-side credential watcher for bidirectional sync
-	if serverCfg != nil && len(serverCfg.Credentials) > 0 {
-		client.credWatcher = vmutil.NewCredentialWatcher(serverCfg)
-		if err := client.credWatcher.Start(context.Background()); err != nil {
-			log.Printf("Warning: failed to start credential watcher: %v", err)
-			client.credWatcher = nil
-		}
+		cfg:       cfg,
+		serverCfg: serverCfg,
+		vms:       make(map[string]*VM),
+		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendVZ)),
 	}
 
 	return client, nil
@@ -66,22 +50,7 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plu
 
 // Close closes the client and releases resources.
 func (c *Client) Close() error {
-	// Stop all message channels
-	c.mu.Lock()
-	for name, ch := range c.messageChannels {
-		ch.Stop()
-		if c.pluginBridge != nil {
-			c.pluginBridge.UnregisterShed(name)
-		}
-		delete(c.messageChannels, name)
-	}
-	c.mu.Unlock()
-
-	// Stop the credential watcher
-	if c.credWatcher != nil {
-		c.credWatcher.Stop()
-	}
-
+	c.credMgr.Close()
 	return nil
 }
 
@@ -163,7 +132,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// included in the vfkit command-line arguments at launch time.
 	var virtioFSCreds, tarOnlyCreds map[string]config.MountConfig
 	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
-		virtioFSCreds, tarOnlyCreds = classifyCredentials(c.serverCfg.Credentials)
+		virtioFSCreds, tarOnlyCreds = vmutil.ClassifyCredentials(c.serverCfg.Credentials)
 	}
 
 	vm := CreateVM(meta, c.cfg)
@@ -208,12 +177,12 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	// Mount and transfer credentials
-	c.setupCredentials(ctx, agent, req.Name, virtioFSCreds, tarOnlyCreds)
+	c.credMgr.SetupCredentials(ctx, agent, req.Name, virtioFSCreds, tarOnlyCreds, c.mountVirtioFSCredential)
 
 	// Clone repo if specified (skip when using local dir)
 	if req.Repo != "" && req.LocalDir == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
-		if err := c.cloneRepo(ctx, agent, req.Repo); err != nil {
+		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
 		}
 	}
@@ -302,7 +271,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		if _, err := c.StopShed(ctx, name); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
 			// StopShed failed — clean up resources it would have released
-			c.stopMessageChannel(name)
+			c.credMgr.StopListener(name)
 			c.mu.Lock()
 			delete(c.vms, name)
 			c.mu.Unlock()
@@ -349,7 +318,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	// included in the vfkit command-line arguments at launch time.
 	var virtioFSCreds, tarOnlyCreds map[string]config.MountConfig
 	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
-		virtioFSCreds, tarOnlyCreds = classifyCredentials(c.serverCfg.Credentials)
+		virtioFSCreds, tarOnlyCreds = vmutil.ClassifyCredentials(c.serverCfg.Credentials)
 	}
 
 	vm := CreateVM(meta, c.cfg)
@@ -385,7 +354,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	}
 
 	// Mount and transfer credentials
-	c.setupCredentials(ctx, agent, name, virtioFSCreds, tarOnlyCreds)
+	c.credMgr.SetupCredentials(ctx, agent, name, virtioFSCreds, tarOnlyCreds, c.mountVirtioFSCredential)
 
 	// Run startup hook only (not install)
 	provisioner := vmutil.NewProvisioner(agent, name)
@@ -417,27 +386,10 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	}
 
 	// Stop notification listener before shutting down
-	c.stopMessageChannel(name)
+	c.credMgr.StopListener(name)
 
 	// Run shutdown hook before stopping the VM
-	stopTimeout := c.cfg.StopTimeout.Duration()
-	hookBudget := stopTimeout / 2
-	if hookBudget > 30*time.Second {
-		hookBudget = 30 * time.Second
-	}
-
-	agent := c.newAgentClient(meta.Name)
-	provisioner := vmutil.NewProvisioner(agent, name)
-	provisioner.SetOutput(os.Stdout, os.Stderr)
-
-	hookCtx, hookCancel := context.WithTimeout(ctx, hookBudget)
-	defer hookCancel()
-	provCfg, err := provisioner.LoadConfig(hookCtx)
-	if err != nil {
-		log.Printf("Warning: failed to load provision config for shutdown hook: %v", err)
-	} else if provCfg.HasShutdownHook() {
-		provisioner.RunShutdownHook(hookCtx, provCfg)
-	}
+	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
 
 	// Get or create VM handle
 	c.mu.Lock()
@@ -519,33 +471,6 @@ func (c *Client) mountVirtioFSShare(ctx context.Context, agent *vmutil.AgentClie
 	return nil
 }
 
-// classifyCredentials splits credentials into VirtioFS-eligible (directories)
-// and tar-only (single files). Missing sources are logged and skipped.
-func classifyCredentials(credentials map[string]config.MountConfig) (virtioFS map[string]config.MountConfig, tarOnly map[string]config.MountConfig) {
-	virtioFS = make(map[string]config.MountConfig)
-	tarOnly = make(map[string]config.MountConfig)
-
-	for name, mount := range credentials {
-		info, err := os.Stat(mount.Source)
-		if err != nil {
-			if os.IsNotExist(err) {
-				log.Printf("Credential %q source does not exist, skipping: %s", name, mount.Source)
-			} else {
-				log.Printf("Warning: failed to stat credential %q source %s: %v", name, mount.Source, err)
-			}
-			continue
-		}
-
-		if info.IsDir() {
-			virtioFS[name] = mount
-		} else {
-			tarOnly[name] = mount
-		}
-	}
-
-	return virtioFS, tarOnly
-}
-
 // buildCredentialShares creates VirtioFS share entries from classified credentials.
 func buildCredentialShares(creds map[string]config.MountConfig) []credentialVirtioFS {
 	shares := make([]credentialVirtioFS, 0, len(creds))
@@ -558,178 +483,9 @@ func buildCredentialShares(creds map[string]config.MountConfig) []credentialVirt
 	return shares
 }
 
-// setupCredentials mounts VirtioFS credential shares, transfers tar-only credentials,
-// and starts the notify listener if needed.
-func (c *Client) setupCredentials(ctx context.Context, agent *vmutil.AgentClient, shedName string, virtioFSCreds, tarOnlyCreds map[string]config.MountConfig) {
-	// Mount VirtioFS credential shares (directory credentials)
-	if len(virtioFSCreds) > 0 {
-		backend.Progress(ctx, "credentials", "Mounting credentials via VirtioFS...")
-		if err := c.mountAllCredentialVirtioFS(ctx, agent, virtioFSCreds); err != nil {
-			log.Printf("Warning: VirtioFS credential mount failed: %v", err)
-		}
-	}
-
-	// Transfer single-file credentials via tar (VirtioFS only shares directories)
-	if len(tarOnlyCreds) > 0 {
-		backend.Progress(ctx, "credentials", "Transferring file credentials...")
-		credTransfer := vmutil.NewCredentialTransfer(agent, c.serverCfg)
-		for name, mount := range tarOnlyCreds {
-			if err := credTransfer.TransferCredential(ctx, name, mount); err != nil {
-				log.Printf("Warning: failed to transfer credential %q: %v", name, err)
-			}
-		}
-	}
-
-	// Always start the message channel — it handles both plugin messages and
-	// credential sync. Credential sync is only configured when writable tar
-	// credentials exist.
-	c.startMessageChannel(shedName, agent, tarOnlyCreds)
-}
-
-// mountAllCredentialVirtioFS mounts all VirtioFS credential shares inside the guest.
-func (c *Client) mountAllCredentialVirtioFS(ctx context.Context, agent *vmutil.AgentClient, creds map[string]config.MountConfig) error {
-	for name, mount := range creds {
-		mountTag := config.CredentialMountTag(name)
-		if err := c.mountVirtioFSShare(ctx, agent, mountTag, mount.Target, mount.ReadOnly); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// hasWritableTarCredentials reports whether any tar-only credentials are writable.
-func hasWritableTarCredentials(tarOnly map[string]config.MountConfig) bool {
-	for _, mount := range tarOnly {
-		if !mount.ReadOnly {
-			return true
-		}
-	}
-	return false
-}
-
-// cloneRepo clones a git repository into the VM's workspace.
-func (c *Client) cloneRepo(ctx context.Context, agent *vmutil.AgentClient, repo string) error {
-	env := c.buildEnvForGit()
-
-	var output strings.Builder
-	opts := backend.ExecOptions{
-		Cmd:        []string{"git", "clone", repo, "."},
-		Env:        env,
-		Stdout:     vmutil.NopWriteCloser(io.MultiWriter(&output, os.Stdout)),
-		Stderr:     vmutil.NopWriteCloser(io.MultiWriter(&output, os.Stderr)),
-		WorkingDir: config.WorkspacePath,
-		TTY:        false,
-	}
-
-	if err := agent.Exec(ctx, opts); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
-	}
-
-	return nil
-}
-
-// buildEnvForGit builds environment variables for git operations.
-func (c *Client) buildEnvForGit() []string {
-	var env []string
-
-	if c.serverCfg == nil {
-		return env
-	}
-
-	for key, value := range c.serverCfg.EnvVars {
-		env = append(env, fmt.Sprintf("%s=%s", key, value))
-	}
-
-	return env
-}
-
-// startMessageChannel starts the generalized message channel for a VM.
-// This handles both plugin messages and credential sync via plugin envelopes.
-func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient, tarOnlyCreds map[string]config.MountConfig) {
-	// Build credential setup payload if there are writable tar-only credentials
-	var credSetup *plugin.CredentialSetupPayload
-	var credChangeFn func(string, []string)
-
-	if hasWritableTarCredentials(tarOnlyCreds) {
-		creds := make(map[string]string)
-		excludes := make(map[string][]string)
-		writableCreds := make(map[string]config.MountConfig)
-		for credName, mount := range tarOnlyCreds {
-			if !mount.ReadOnly {
-				writableCreds[credName] = mount
-				creds[credName] = mount.Target
-				if len(mount.Exclude) > 0 {
-					excludes[credName] = mount.Exclude
-				}
-			}
-		}
-		credSetup = &plugin.CredentialSetupPayload{
-			Credentials: creds,
-			Excludes:    excludes,
-		}
-
-		// Use CredentialNotifyListener for its pullChangedFiles capability.
-		// Only writable credentials are passed to limit what can be pulled.
-		credNL := vmutil.NewCredentialNotifyListener(agent, writableCreds, c.credWatcher)
-		credNL.SetName(name)
-		credChangeFn = func(credName string, files []string) {
-			if err := credNL.PullChangedFiles(credName, files); err != nil {
-				log.Printf("[%s] Failed to pull credential changes for %s: %v", name, credName, err)
-			}
-		}
-	}
-
-	// Create the combined message handler
-	handler := vmutil.NewMessageHandler(credSetup, credChangeFn, func(env *plugin.Envelope) {
-		if c.pluginBridge != nil {
-			if err := c.pluginBridge.PublishToHost(name, env); err != nil {
-				log.Printf("[%s] Failed to publish plugin message: %v", name, err)
-			}
-		}
-	})
-
-	conn := vmutil.NewNotifyConn(agent.Dialer(), agent.NotifyPort(), name)
-
-	// Register VM with the credential watcher for host->VM pushes
-	if c.credWatcher != nil && hasWritableTarCredentials(tarOnlyCreds) {
-		c.credWatcher.RegisterVM(name, agent)
-	}
-
-	// Register with plugin bridge before starting the connection to avoid
-	// a race where messages arrive before the shed is enriched with metadata.
-	if c.pluginBridge != nil {
-		c.pluginBridge.RegisterShed(name, &plugin.ShedConn{
-			Name:    name,
-			Backend: string(config.BackendVZ),
-			Server:  c.serverCfg.Name,
-			Send:    handler.SendPluginMessage,
-		})
-	}
-
-	// Start the message connection after registration is complete.
-	conn.Start(context.Background(), handler)
-
-	c.mu.Lock()
-	c.messageChannels[name] = conn
-	c.mu.Unlock()
-}
-
-// stopMessageChannel stops the message channel for a VM.
-func (c *Client) stopMessageChannel(name string) {
-	c.mu.Lock()
-	ch := c.messageChannels[name]
-	delete(c.messageChannels, name)
-	c.mu.Unlock()
-
-	if ch != nil {
-		ch.Stop()
-	}
-
-	if c.pluginBridge != nil {
-		c.pluginBridge.UnregisterShed(name)
-	}
-
-	if c.credWatcher != nil {
-		c.credWatcher.UnregisterVM(name)
-	}
+// mountVirtioFSCredential mounts a single directory credential via VirtioFS.
+// This implements vmutil.DirMountFunc for the VZ backend.
+func (c *Client) mountVirtioFSCredential(ctx context.Context, agent *vmutil.AgentClient, name string, mount config.MountConfig) error {
+	mountTag := config.CredentialMountTag(name)
+	return c.mountVirtioFSShare(ctx, agent, mountTag, mount.Target, mount.ReadOnly)
 }

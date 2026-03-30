@@ -30,9 +30,6 @@ func TestNewBackend(t *testing.T) {
 	}
 
 	b := NewBackend(client)
-	if b == nil {
-		t.Fatal("NewBackend() returned nil")
-	}
 
 	if b.client != client {
 		t.Error("backend client not set correctly")

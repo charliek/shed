@@ -34,11 +34,13 @@ This installs:
 - `/usr/local/bin/firecracker` - Firecracker binary (v1.14.1)
 - `/var/lib/shed/firecracker/vmlinux.bin` - CI 6.1 kernel (quick-start fallback)
 
-For a Docker-capable kernel with full BPF/cgroup support, build a custom kernel:
+For a Docker-capable kernel with full BPF/cgroup and 9P filesystem support, build a custom kernel:
 ```bash
 ./scripts/build-firecracker-kernel.sh
 ```
 This overwrites `/var/lib/shed/firecracker/vmlinux.bin` with the custom kernel. Requires ~2GB disk space and build tools (`sudo apt install build-essential flex bison libelf-dev bc libssl-dev`).
+
+The custom kernel includes 9P filesystem support (required for `--local-dir` and directory credential mounts). See [9P Kernel Configuration](#9p-kernel-configuration) for details.
 
 ## 3. Build the Rootfs Image
 
@@ -222,6 +224,53 @@ shed create myproject --backend=firecracker
 # Or with custom resources
 shed create myproject --backend=firecracker --cpus=4 --memory=8192
 ```
+
+## 9P Kernel Configuration
+
+The `--local-dir` flag and directory credential mounts use the 9P filesystem protocol over the TAP bridge network. This requires the following kernel configuration options to be built into the guest kernel:
+
+```
+CONFIG_NET_9P=y
+CONFIG_NET_9P_FD=y
+CONFIG_9P_FS=y
+CONFIG_9P_FS_POSIX_ACL=y
+```
+
+The custom kernel built by `build-firecracker-kernel.sh` already includes these options. If you are building your own kernel, add these options to your kernel config fragment.
+
+To verify 9P support inside a running VM:
+
+```bash
+shed exec myproject -- grep 9p /proc/filesystems
+```
+
+If the output includes `nodev	9p`, the kernel has 9P support.
+
+## Known Limitations
+
+### Server restart does not recover 9P mounts
+
+If `shed-server` restarts while VMs with `--local-dir` or directory credential mounts are running, the 9P servers are not automatically restarted. Running VMs will have stale mounts that return I/O errors. Recovery requires stopping and starting the affected sheds:
+
+```bash
+shed stop myproject
+shed start myproject
+```
+
+### UID mapping
+
+9P maps UIDs directly (1:1). Host UID 1000 corresponds to guest UID 1000. If the host user running `shed-server` has a different UID than the `shed` user inside the VM (UID 1000), file ownership may appear incorrect. This matches the behavior of VirtioFS on Linux. Apple VirtioFS has transparent UID mapping, but that is not available on Linux.
+
+### Firewall and iptables
+
+The 9P TCP servers bind to the bridge IP on dynamically assigned ports. If the host has restrictive `iptables` INPUT rules, these ports may be blocked. Ensure that traffic on the bridge network (default `172.30.0.0/24`) is allowed:
+
+```bash
+# Allow all traffic on the shed bridge interface
+sudo iptables -A INPUT -i shed-br0 -j ACCEPT
+```
+
+This rule is typically not needed if the default INPUT policy is ACCEPT, which is common on desktop Linux systems.
 
 ## Troubleshooting
 

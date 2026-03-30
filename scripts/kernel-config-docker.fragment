@@ -14,3 +14,18 @@
 
 # Uncomment if live mounts (SSHFS over vsock) are needed:
 # CONFIG_FUSE_FS=y
+
+# Firecracker v1.14.1+ CI configs enable ACPI/PCI for Amazon microVM kernels.
+# Mainline kernels must disable ACPI to avoid conflicting with MMIO transport.
+# See: https://github.com/firecracker-microvm/firecracker/issues/4881
+CONFIG_ACPI=n
+CONFIG_PCI=n
+
+# Firecracker passes virtio devices via kernel command line (virtio_mmio.device=...)
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+
+# 9P filesystem support for host directory sharing (local-dir, credential mounts)
+CONFIG_NET_9P=y
+CONFIG_NET_9P_FD=y
+CONFIG_9P_FS=y
+CONFIG_9P_FS_POSIX_ACL=y
