@@ -16,7 +16,7 @@ import (
 func TestP9Server_StartStop(t *testing.T) {
 	hostDir := t.TempDir()
 
-	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", false)
+	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", false, 0, 0)
 	if err != nil {
 		t.Fatalf("NewP9Server() error = %v", err)
 	}
@@ -62,7 +62,7 @@ func TestP9Server_StartStop(t *testing.T) {
 func TestP9Server_ReadWrite(t *testing.T) {
 	hostDir := t.TempDir()
 
-	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", false)
+	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", false, 0, 0)
 	if err != nil {
 		t.Fatalf("NewP9Server() error = %v", err)
 	}
@@ -155,7 +155,7 @@ func TestP9Server_ReadOnly(t *testing.T) {
 	// field is correctly stored.
 	hostDir := t.TempDir()
 
-	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", true)
+	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", true, 0, 0)
 	if err != nil {
 		t.Fatalf("NewP9Server() error = %v", err)
 	}
@@ -197,7 +197,7 @@ func TestP9Server_ReadOnly(t *testing.T) {
 func TestP9Server_MultipleConnections(t *testing.T) {
 	hostDir := t.TempDir()
 
-	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", false)
+	srv, err := NewP9Server("127.0.0.1", hostDir, "/workspace", false, 0, 0)
 	if err != nil {
 		t.Fatalf("NewP9Server() error = %v", err)
 	}

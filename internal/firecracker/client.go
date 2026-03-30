@@ -207,9 +207,24 @@ func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
 	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
 }
 
+// resolvePathOwner returns the UID and GID of the given path's owner.
+// This is the most reliable way to determine the target UID/GID: the owner
+// of the directory being shared IS the correct target, regardless of how
+// the server was launched (sudo, systemd, direct).
+func resolvePathOwner(hostPath string) (uid, gid int) {
+	info, err := os.Stat(hostPath)
+	if err != nil {
+		return 1000, 1000 // fallback to default shed user
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	return int(stat.Uid), int(stat.Gid)
+}
+
 // startP9Server creates, starts, and registers a P9 server for a VM.
+// It resolves the target UID/GID from the host path's owner for remapping.
 func (c *Client) startP9Server(name, bridgeIP, hostPath, mountPath string, readOnly bool) (*P9Server, error) {
-	srv, err := NewP9Server(bridgeIP, hostPath, mountPath, readOnly)
+	targetUID, targetGID := resolvePathOwner(hostPath)
+	srv, err := NewP9Server(bridgeIP, hostPath, mountPath, readOnly, targetUID, targetGID)
 	if err != nil {
 		return nil, fmt.Errorf("create P9 server for %s: %w", hostPath, err)
 	}

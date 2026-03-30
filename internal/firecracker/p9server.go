@@ -29,13 +29,26 @@ type P9Server struct {
 // NewP9Server creates a 9P server that shares hostPath over TCP. The listener
 // binds to bridgeIP on a dynamically assigned port. The server is created but
 // not yet serving; call Start to begin accepting connections.
-func NewP9Server(bridgeIP, hostPath, mountPath string, readOnly bool) (*P9Server, error) {
+//
+// When targetUID and targetGID are both 0, the server uses localfs directly
+// (passthrough mode). Otherwise, it wraps the attacher with UID/GID remapping
+// so that files created by the guest are Lchown'd to the target user.
+func NewP9Server(bridgeIP, hostPath, mountPath string, readOnly bool, targetUID, targetGID int) (*P9Server, error) {
 	listener, err := net.Listen("tcp", net.JoinHostPort(bridgeIP, "0"))
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", bridgeIP, err)
 	}
 
-	attacher := localfs.Attacher(hostPath)
+	var attacher p9.Attacher
+	inner := localfs.Attacher(hostPath)
+	if targetUID == 0 && targetGID == 0 {
+		attacher = inner
+	} else {
+		if !readOnly {
+			verifyRemappingCapability(hostPath, targetUID, targetGID)
+		}
+		attacher = newRemappingAttacher(inner, hostPath, targetUID, targetGID)
+	}
 	srv := p9.NewServer(attacher)
 
 	return &P9Server{
