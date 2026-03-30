@@ -294,7 +294,9 @@ func (s *Server) Stop() {
 	if s.httpServer != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), drainTimeout)
 		defer shutdownCancel()
-		s.httpServer.Shutdown(shutdownCtx)
+		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
 	}
 
 	// Clean up pending requests

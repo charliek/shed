@@ -100,7 +100,7 @@ func (s *Server) handlePublishRequest(w http.ResponseWriter, env *plugin.Envelop
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	case <-timer.C:
 		writeHTTPError(w, http.StatusGatewayTimeout, "TIMEOUT", "no response from host within timeout")
 	case <-s.ctx.Done():
