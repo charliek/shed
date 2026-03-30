@@ -229,7 +229,7 @@ func (s *Server) Start() error {
 
 	// Start localhost HTTP server for in-VM plugin API
 	if err := s.startHTTPServer(); err != nil {
-		log.Printf("Warning: failed to start HTTP server: %v", err)
+		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
 
 	log.Printf("Listening on vsock ports: console=%d, health=%d, message=%d; HTTP on 127.0.0.1:%d",

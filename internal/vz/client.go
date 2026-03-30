@@ -685,16 +685,15 @@ func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient, tar
 		}
 	})
 
-	// Start the notify connection with the combined handler
 	conn := vmutil.NewNotifyConn(agent.Dialer(), agent.NotifyPort(), name)
-	conn.Start(context.Background(), handler)
 
 	// Register VM with the credential watcher for host->VM pushes
 	if c.credWatcher != nil && hasWritableTarCredentials(tarOnlyCreds) {
 		c.credWatcher.RegisterVM(name, agent)
 	}
 
-	// Register with plugin bridge
+	// Register with plugin bridge before starting the connection to avoid
+	// a race where messages arrive before the shed is enriched with metadata.
 	if c.pluginBridge != nil {
 		c.pluginBridge.RegisterShed(name, &plugin.ShedConn{
 			Name:    name,
@@ -703,6 +702,9 @@ func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient, tar
 			Send:    handler.SendPluginMessage,
 		})
 	}
+
+	// Start the message connection after registration is complete.
+	conn.Start(context.Background(), handler)
 
 	c.mu.Lock()
 	c.messageChannels[name] = conn

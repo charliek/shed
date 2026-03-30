@@ -84,9 +84,9 @@ func (s *Server) deliverResponse(env *plugin.Envelope) {
 	}
 
 	s.pendingMu.Lock()
-	ch, ok := s.pending[env.InReplyTo]
-	s.pendingMu.Unlock()
+	defer s.pendingMu.Unlock()
 
+	ch, ok := s.pending[env.InReplyTo]
 	if !ok {
 		log.Printf("No pending request for response in_reply_to=%s", env.InReplyTo)
 		return

@@ -27,7 +27,10 @@ func main() {
 
 	name := *shedName
 	if name == "" {
-		h, _ := os.Hostname()
+		h, err := os.Hostname()
+		if err != nil || h == "" {
+			log.Fatalf("Failed to resolve shed name from hostname: %v", err)
+		}
 		name = h
 	}
 
