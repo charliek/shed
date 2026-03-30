@@ -18,6 +18,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -30,12 +31,15 @@ type Client struct {
 	vms map[string]*VM // name -> VM
 
 	// Credential sync
-	credWatcher     *vmutil.CredentialWatcher                   // host-side fsnotify watcher
-	notifyListeners map[string]*vmutil.CredentialNotifyListener // name -> per-VM notification listener
+	credWatcher *vmutil.CredentialWatcher // host-side fsnotify watcher
+
+	// Message channels (generalized notify connections)
+	messageChannels map[string]*vmutil.NotifyConn // name -> per-VM message channel
+	pluginBridge    *plugin.Bridge
 }
 
 // NewClient creates a new VZ client.
-func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig) (*Client, error) {
+func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
 	if runtime.GOARCH != "arm64" {
 		return nil, fmt.Errorf("vz backend currently supports macOS Apple Silicon (arm64) only")
 	}
@@ -44,7 +48,8 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig) (*Client, e
 		cfg:             cfg,
 		serverCfg:       serverCfg,
 		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
+		pluginBridge:    bridge,
 	}
 
 	// Start host-side credential watcher for bidirectional sync
@@ -61,11 +66,14 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig) (*Client, e
 
 // Close closes the client and releases resources.
 func (c *Client) Close() error {
-	// Stop all notification listeners
+	// Stop all message channels
 	c.mu.Lock()
-	for name, nl := range c.notifyListeners {
-		nl.Stop()
-		delete(c.notifyListeners, name)
+	for name, ch := range c.messageChannels {
+		ch.Stop()
+		if c.pluginBridge != nil {
+			c.pluginBridge.UnregisterShed(name)
+		}
+		delete(c.messageChannels, name)
 	}
 	c.mu.Unlock()
 
@@ -294,7 +302,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		if _, err := c.StopShed(ctx, name); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
 			// StopShed failed — clean up resources it would have released
-			c.stopNotifyListener(name)
+			c.stopMessageChannel(name)
 			c.mu.Lock()
 			delete(c.vms, name)
 			c.mu.Unlock()
@@ -409,7 +417,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	}
 
 	// Stop notification listener before shutting down
-	c.stopNotifyListener(name)
+	c.stopMessageChannel(name)
 
 	// Run shutdown hook before stopping the VM
 	stopTimeout := c.cfg.StopTimeout.Duration()
@@ -572,11 +580,10 @@ func (c *Client) setupCredentials(ctx context.Context, agent *vmutil.AgentClient
 		}
 	}
 
-	// Start credential notification listener only if there are writable tar-only credentials.
-	// VirtioFS credentials don't need the notify/watch sync infrastructure.
-	if hasWritableTarCredentials(tarOnlyCreds) {
-		c.startNotifyListener(shedName, agent, tarOnlyCreds)
-	}
+	// Always start the message channel — it handles both plugin messages and
+	// credential sync. Credential sync is only configured when writable tar
+	// credentials exist.
+	c.startMessageChannel(shedName, agent, tarOnlyCreds)
 }
 
 // mountAllCredentialVirtioFS mounts all VirtioFS credential shares inside the guest.
@@ -636,36 +643,85 @@ func (c *Client) buildEnvForGit() []string {
 	return env
 }
 
-// startNotifyListener starts a credential notification listener for a VM.
-// tarOnlyCreds contains only tar-transferred credentials that need bidirectional
-// sync. VirtioFS credentials are excluded — they are live mounts.
-func (c *Client) startNotifyListener(name string, agent *vmutil.AgentClient, tarOnlyCreds map[string]config.MountConfig) {
-	if len(tarOnlyCreds) == 0 {
-		return
+// startMessageChannel starts the generalized message channel for a VM.
+// This handles both plugin messages and credential sync via plugin envelopes.
+func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient, tarOnlyCreds map[string]config.MountConfig) {
+	// Build credential setup payload if there are writable tar-only credentials
+	var credSetup *plugin.CredentialSetupPayload
+	var credChangeFn func(string, []string)
+
+	if hasWritableTarCredentials(tarOnlyCreds) {
+		creds := make(map[string]string)
+		excludes := make(map[string][]string)
+		for credName, mount := range tarOnlyCreds {
+			if !mount.ReadOnly {
+				creds[credName] = mount.Target
+				if len(mount.Exclude) > 0 {
+					excludes[credName] = mount.Exclude
+				}
+			}
+		}
+		credSetup = &plugin.CredentialSetupPayload{
+			Credentials: creds,
+			Excludes:    excludes,
+		}
+
+		// Use CredentialNotifyListener for its pullChangedFiles capability
+		credNL := vmutil.NewCredentialNotifyListener(agent, tarOnlyCreds, c.credWatcher)
+		credNL.SetName(name)
+		credChangeFn = func(credName string, files []string) {
+			if err := credNL.PullChangedFiles(credName, files); err != nil {
+				log.Printf("[%s] Failed to pull credential changes for %s: %v", name, credName, err)
+			}
+		}
 	}
 
-	listener := vmutil.NewCredentialNotifyListener(agent, tarOnlyCreds, c.credWatcher)
-	listener.Start(context.Background(), name)
+	// Create the combined message handler
+	handler := vmutil.NewMessageHandler(credSetup, credChangeFn, func(env *plugin.Envelope) {
+		if c.pluginBridge != nil {
+			if err := c.pluginBridge.PublishToHost(name, env); err != nil {
+				log.Printf("[%s] Failed to publish plugin message: %v", name, err)
+			}
+		}
+	})
+
+	// Start the notify connection with the combined handler
+	conn := vmutil.NewNotifyConn(agent.Dialer(), agent.NotifyPort(), name)
+	conn.Start(context.Background(), handler)
 
 	// Register VM with the credential watcher for host->VM pushes
-	if c.credWatcher != nil {
+	if c.credWatcher != nil && hasWritableTarCredentials(tarOnlyCreds) {
 		c.credWatcher.RegisterVM(name, agent)
 	}
 
+	// Register with plugin bridge
+	if c.pluginBridge != nil {
+		c.pluginBridge.RegisterShed(name, &plugin.ShedConn{
+			Name:    name,
+			Backend: string(config.BackendVZ),
+			Server:  c.serverCfg.Name,
+			Send:    handler.SendPluginMessage,
+		})
+	}
+
 	c.mu.Lock()
-	c.notifyListeners[name] = listener
+	c.messageChannels[name] = conn
 	c.mu.Unlock()
 }
 
-// stopNotifyListener stops the credential notification listener for a VM.
-func (c *Client) stopNotifyListener(name string) {
+// stopMessageChannel stops the message channel for a VM.
+func (c *Client) stopMessageChannel(name string) {
 	c.mu.Lock()
-	nl := c.notifyListeners[name]
-	delete(c.notifyListeners, name)
+	ch := c.messageChannels[name]
+	delete(c.messageChannels, name)
 	c.mu.Unlock()
 
-	if nl != nil {
-		nl.Stop()
+	if ch != nil {
+		ch.Stop()
+	}
+
+	if c.pluginBridge != nil {
+		c.pluginBridge.UnregisterShed(name)
 	}
 
 	if c.credWatcher != nil {

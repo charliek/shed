@@ -19,6 +19,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -34,12 +35,15 @@ type Client struct {
 	usedIPs  map[string]string // IP -> name
 
 	// Credential sync
-	credWatcher     *vmutil.CredentialWatcher                   // host-side fsnotify watcher
-	notifyListeners map[string]*vmutil.CredentialNotifyListener // name -> per-VM notification listener
+	credWatcher *vmutil.CredentialWatcher // host-side fsnotify watcher
+
+	// Message channels (generalized notify connections)
+	messageChannels map[string]*vmutil.NotifyConn // name -> per-VM message channel
+	pluginBridge    *plugin.Bridge
 }
 
 // NewClient creates a new Firecracker client.
-func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*Client, error) {
+func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
 	netMgr, err := NewNetworkManager(cfg.BridgeName, cfg.BridgeCIDR, cfg.TAPPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create network manager: %w", err)
@@ -52,7 +56,8 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*
 		vms:             make(map[string]*VM),
 		usedCIDs:        make(map[uint32]string),
 		usedIPs:         make(map[string]string),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
+		pluginBridge:    bridge,
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -95,11 +100,14 @@ func (c *Client) loadExistingInstances() error {
 
 // Close closes the client and releases resources.
 func (c *Client) Close() error {
-	// Stop all notification listeners
+	// Stop all message channels
 	c.mu.Lock()
-	for name, nl := range c.notifyListeners {
-		nl.Stop()
-		delete(c.notifyListeners, name)
+	for name, ch := range c.messageChannels {
+		ch.Stop()
+		if c.pluginBridge != nil {
+			c.pluginBridge.UnregisterShed(name)
+		}
+		delete(c.messageChannels, name)
 	}
 	c.mu.Unlock()
 
@@ -351,7 +359,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(req.Name, agent)
+	c.startMessageChannel(req.Name, agent)
 
 	// Clone repo if specified
 	if req.Repo != "" {
@@ -462,7 +470,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		if _, err := c.StopShed(ctx, name); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
 			// StopShed failed — clean up resources it would have released
-			c.stopNotifyListener(name)
+			c.stopMessageChannel(name)
 			c.mu.Lock()
 			delete(c.vms, name)
 			c.mu.Unlock()
@@ -543,7 +551,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	}
 
 	// Start credential notification listener for bidirectional sync
-	c.startNotifyListener(name, agent)
+	c.startMessageChannel(name, agent)
 
 	// Run startup hook only (not install)
 	provisioner := vmutil.NewProvisioner(agent, name)
@@ -587,7 +595,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	}
 
 	// Stop notification listener before shutting down
-	c.stopNotifyListener(name)
+	c.stopMessageChannel(name)
 
 	// Run shutdown hook before stopping the VM
 	stopTimeout := c.cfg.StopTimeout.Duration()
@@ -696,45 +704,87 @@ func (c *Client) buildEnvForGit() []string {
 	return env
 }
 
-// startNotifyListener starts a credential notification listener for a VM.
-func (c *Client) startNotifyListener(name string, agent *vmutil.AgentClient) {
-	if c.serverCfg == nil {
-		return
-	}
-
-	hasWritable := false
-	for _, mount := range c.serverCfg.Credentials {
-		if !mount.ReadOnly {
-			hasWritable = true
-			break
+// startMessageChannel starts the generalized message channel for a VM.
+func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient) {
+	// Build credential setup if there are writable credentials
+	var credSetup *plugin.CredentialSetupPayload
+	var credChangeFn func(string, []string)
+	if c.serverCfg != nil {
+		creds := make(map[string]string)
+		excludes := make(map[string][]string)
+		for credName, mount := range c.serverCfg.Credentials {
+			if !mount.ReadOnly {
+				creds[credName] = mount.Target
+				if len(mount.Exclude) > 0 {
+					excludes[credName] = mount.Exclude
+				}
+			}
+		}
+		if len(creds) > 0 {
+			credSetup = &plugin.CredentialSetupPayload{
+				Credentials: creds,
+				Excludes:    excludes,
+			}
+			credNL := vmutil.NewCredentialNotifyListener(agent, c.serverCfg.Credentials, c.credWatcher)
+			credNL.SetName(name)
+			credChangeFn = func(credName string, files []string) {
+				if err := credNL.PullChangedFiles(credName, files); err != nil {
+					log.Printf("[%s] Failed to pull credential changes for %s: %v", name, credName, err)
+				}
+			}
 		}
 	}
-	if !hasWritable {
-		return
-	}
 
-	listener := vmutil.NewCredentialNotifyListener(agent, c.serverCfg.Credentials, c.credWatcher)
-	listener.Start(context.Background(), name)
+	// Create the combined message handler
+	handler := vmutil.NewMessageHandler(credSetup, credChangeFn, func(env *plugin.Envelope) {
+		if c.pluginBridge != nil {
+			if err := c.pluginBridge.PublishToHost(name, env); err != nil {
+				log.Printf("[%s] Failed to publish plugin message: %v", name, err)
+			}
+		}
+	})
+
+	// Start the notify connection with the combined handler
+	conn := vmutil.NewNotifyConn(agent.Dialer(), agent.NotifyPort(), name)
+	conn.Start(context.Background(), handler)
 
 	// Register VM with the credential watcher for host->VM pushes
-	if c.credWatcher != nil {
+	if c.credWatcher != nil && credSetup != nil {
 		c.credWatcher.RegisterVM(name, agent)
 	}
 
+	// Register with plugin bridge
+	if c.pluginBridge != nil {
+		serverName := ""
+		if c.serverCfg != nil {
+			serverName = c.serverCfg.Name
+		}
+		c.pluginBridge.RegisterShed(name, &plugin.ShedConn{
+			Name:    name,
+			Backend: string(config.BackendFirecracker),
+			Server:  serverName,
+			Send:    handler.SendPluginMessage,
+		})
+	}
+
 	c.mu.Lock()
-	c.notifyListeners[name] = listener
+	c.messageChannels[name] = conn
 	c.mu.Unlock()
 }
 
-// stopNotifyListener stops the credential notification listener for a VM.
-func (c *Client) stopNotifyListener(name string) {
+// stopMessageChannel stops the message channel for a VM.
+func (c *Client) stopMessageChannel(name string) {
 	c.mu.Lock()
-	nl := c.notifyListeners[name]
-	delete(c.notifyListeners, name)
+	ch := c.messageChannels[name]
+	delete(c.messageChannels, name)
 	c.mu.Unlock()
 
-	if nl != nil {
-		nl.Stop()
+	if ch != nil {
+		ch.Stop()
+	}
+
+	if c.pluginBridge != nil {
+		c.pluginBridge.UnregisterShed(name)
 	}
 
 	if c.credWatcher != nil {

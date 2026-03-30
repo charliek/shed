@@ -102,6 +102,7 @@ nav:
       - Firecracker Operations: firecracker_howto.md
       - VZ Operations (macOS): reference/vz-operations.md
       - VZ Image Variants: reference/vz-images.md
+      - Extensions: reference/extensions.md
       - HTTP API: reference/api.md
   - Development:
       - Setup: development/setup.md

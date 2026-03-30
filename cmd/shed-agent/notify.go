@@ -4,11 +4,8 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,15 +15,17 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// credentialSendFn is called when debounced credential file changes are ready.
+type credentialSendFn func(credName string, files []string) error
+
 // credentialWatcher watches credential directories for changes and sends
-// FileChanged notifications to the host over the notification connection.
+// notifications to the host via the configured send function.
 type credentialWatcher struct {
 	// credentials maps credential name → target path in the VM
 	credentials map[string]string
 	// excludes maps credential name → exclude glob patterns
 	excludes map[string][]string
-	conn     net.Conn
-	writeMu  sync.Mutex
+	sendFn   credentialSendFn
 
 	watcher *fsnotify.Watcher
 
@@ -39,7 +38,7 @@ type credentialWatcher struct {
 const debounceInterval = 500 * time.Millisecond
 
 // newCredentialWatcher creates a watcher for the given credential paths.
-func newCredentialWatcher(conn net.Conn, credentials map[string]string, excludes map[string][]string) (*credentialWatcher, error) {
+func newCredentialWatcher(sendFn credentialSendFn, credentials map[string]string, excludes map[string][]string) (*credentialWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -52,7 +51,7 @@ func newCredentialWatcher(conn net.Conn, credentials map[string]string, excludes
 	cw := &credentialWatcher{
 		credentials: credentials,
 		excludes:    excludes,
-		conn:        conn,
+		sendFn:      sendFn,
 		watcher:     watcher,
 		pending:     make(map[string]map[string]bool),
 		timers:      make(map[string]*time.Timer),
@@ -208,85 +207,11 @@ func (cw *credentialWatcher) flushCredential(credName string) {
 		return
 	}
 
-	msg := FileChangedMessage{
-		Credential: credName,
-		Files:      fileList,
-	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("Failed to marshal FileChanged message: %v", err)
-		return
-	}
-
-	cw.writeMu.Lock()
-	err = writeMessage(cw.conn, MsgTypeFileChanged, data)
-	cw.writeMu.Unlock()
-	if err != nil {
-		log.Printf("Failed to send FileChanged notification: %v", err)
+	if err := cw.sendFn(credName, fileList); err != nil {
+		log.Printf("Failed to send credential change notification: %v", err)
 	} else {
-		log.Printf("Sent FileChanged notification: credential=%s files=%v", credName, fileList)
+		log.Printf("Sent credential change notification: credential=%s files=%v", credName, fileList)
 	}
-}
-
-// handleNotifyConnection handles a persistent notification connection from the host.
-// It reads a NotifySetupMessage, starts fsnotify watchers, and sends FileChanged
-// messages when credential files are modified.
-func handleNotifyConnection(conn net.Conn) {
-	defer conn.Close()
-
-	// Read setup message
-	msgType, data, err := readMessage(conn)
-	if err != nil {
-		if err != io.EOF {
-			log.Printf("Failed to read notify setup message: %v", err)
-		}
-		return
-	}
-
-	if msgType != MsgTypeNotifySetup {
-		log.Printf("Unexpected message type on notify port: 0x%02x (expected NotifySetup)", msgType)
-		return
-	}
-
-	var setup NotifySetupMessage
-	if err := json.Unmarshal(data, &setup); err != nil {
-		log.Printf("Failed to unmarshal NotifySetup message: %v", err)
-		return
-	}
-
-	if len(setup.Credentials) == 0 {
-		log.Printf("NotifySetup: no credentials to watch")
-		return
-	}
-
-	log.Printf("NotifySetup: watching %d credentials", len(setup.Credentials))
-	for name, path := range setup.Credentials {
-		log.Printf("  %s → %s", name, path)
-	}
-
-	cw, err := newCredentialWatcher(conn, setup.Credentials, setup.Excludes)
-	if err != nil {
-		log.Printf("Failed to create credential watcher: %v", err)
-		return
-	}
-
-	// Block until connection closes (host reads from conn will fail on disconnect)
-	done := make(chan struct{})
-	go func() {
-		// Read from connection to detect disconnect
-		buf := make([]byte, 1)
-		for {
-			_, err := conn.Read(buf)
-			if err != nil {
-				close(done)
-				return
-			}
-		}
-	}()
-
-	cw.start(done)
-	log.Printf("Notify connection closed")
 }
 
 // agentMatchesExclude reports whether relPath matches any of the given glob patterns.

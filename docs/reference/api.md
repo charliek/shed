@@ -25,6 +25,10 @@ The `shed-server` exposes a REST API for managing sheds.
 | GET | `/api/images` | List available image variants |
 | DELETE | `/api/images/{name}` | Delete a cached image |
 | POST | `/api/images/prune` | Prune unused cached images |
+| GET | `/api/plugins/listeners` | List active extension listeners |
+| GET | `/api/plugins/listeners/{ns}/messages` | Subscribe to namespace (SSE) |
+| POST | `/api/plugins/listeners/{ns}/respond` | Respond to a plugin message |
+| GET | `/api/plugins/sheds` | List sheds with active message channels |
 
 ## Server Info
 
@@ -396,3 +400,59 @@ Removes cached images not referenced by config or any existing shed.
 ```
 
 The `deleted` array contains the images that were removed (or would be removed if `dry_run=true`).
+
+## Extensions
+
+Extension endpoints enable plugin communication between VMs and host processes. See [Extensions](extensions.md) for the full guide.
+
+### GET /api/plugins/listeners
+
+Lists all active extension listeners.
+
+**Response (200 OK):**
+
+```json
+{
+  "listeners": [
+    {"namespace": "op", "created_at": "2026-03-29T12:00:00Z"}
+  ]
+}
+```
+
+### GET /api/plugins/listeners/{namespace}/messages
+
+Subscribes to a namespace via SSE. One listener per namespace.
+
+**Headers:** `Accept: text/event-stream`
+
+**Errors:**
+
+| Code | Status | Description |
+|------|--------|-------------|
+| `NAMESPACE_RESERVED` | 403 | `system:*` namespaces cannot be registered |
+| `NAMESPACE_ALREADY_REGISTERED` | 409 | Namespace already has a listener |
+
+### POST /api/plugins/listeners/{namespace}/respond
+
+Sends a response back to a shed. The envelope must include `shed.name`.
+
+**Errors:**
+
+| Code | Status | Description |
+|------|--------|-------------|
+| `MISSING_SHED` | 400 | Envelope missing `shed.name` |
+| `SHED_NOT_CONNECTED` | 404 | Target shed not connected |
+
+### GET /api/plugins/sheds
+
+Lists sheds with active message channels.
+
+**Response (200 OK):**
+
+```json
+{
+  "sheds": [
+    {"name": "my-dev", "backend": "vz", "server": "mini"}
+  ]
+}
+```

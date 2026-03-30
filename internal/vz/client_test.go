@@ -83,7 +83,7 @@ func TestGetNetworkEndpoint(t *testing.T) {
 	client := &Client{
 		cfg:             cfg,
 		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
 	}
 
 	endpoint, err := client.GetNetworkEndpoint(context.Background(), "test-vm")
@@ -105,7 +105,7 @@ func TestGetNetworkEndpointNotFound(t *testing.T) {
 	client := &Client{
 		cfg:             cfg,
 		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
 	}
 
 	_, err := client.GetNetworkEndpoint(context.Background(), "nonexistent")
@@ -122,7 +122,7 @@ func TestNewClientCreation(t *testing.T) {
 		Credentials: make(map[string]config.MountConfig),
 	}
 
-	client, err := NewClient(cfg, serverCfg)
+	client, err := NewClient(cfg, serverCfg, nil)
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
@@ -161,7 +161,7 @@ func TestClientClose(t *testing.T) {
 	client := &Client{
 		cfg:             cfg,
 		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
 	}
 
 	err := client.Close()
@@ -170,39 +170,20 @@ func TestClientClose(t *testing.T) {
 	}
 }
 
-func TestStartNotifyListenerNoServerCfg(t *testing.T) {
-	client := &Client{
-		serverCfg:       nil,
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
-	}
-	// Should not panic
-	client.startNotifyListener("test", nil, nil)
-}
-
-func TestStartNotifyListenerNoWritableCredentials(t *testing.T) {
-	client := &Client{
-		serverCfg:       nil,
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
-	}
-	// Empty map — no tar-only credentials to watch (readonly ones are filtered
-	// upstream by hasWritableTarCredentials before startNotifyListener is called)
-	client.startNotifyListener("test", nil, nil)
-
-	client.mu.Lock()
-	count := len(client.notifyListeners)
-	client.mu.Unlock()
-
-	if count != 0 {
-		t.Errorf("expected 0 listeners for read-only credentials, got %d", count)
-	}
+func TestStartMessageChannelRequiresAgent(t *testing.T) {
+	// startMessageChannel always starts a NotifyConn, which requires a
+	// non-nil agent with a valid dialer. These are integration-level tests
+	// and require a real vsock connection. Unit tests for the message handler
+	// are in internal/vmutil/message_handler_test.go.
+	t.Skip("requires a real agent connection")
 }
 
 func TestStopNotifyListenerNoOp(t *testing.T) {
 	client := &Client{
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
 	}
 	// Should not panic when stopping a non-existent listener
-	client.stopNotifyListener("nonexistent")
+	client.stopMessageChannel("nonexistent")
 }
 
 func TestGetShedNotFound(t *testing.T) {
@@ -212,7 +193,7 @@ func TestGetShedNotFound(t *testing.T) {
 	client := &Client{
 		cfg:             cfg,
 		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
 	}
 
 	_, err := client.GetShed(context.Background(), "nonexistent")
@@ -413,7 +394,7 @@ func TestCreateShedValidatesResources(t *testing.T) {
 			InstanceDir: tmpDir,
 		},
 		vms:             make(map[string]*VM),
-		notifyListeners: make(map[string]*vmutil.CredentialNotifyListener),
+		messageChannels: make(map[string]*vmutil.NotifyConn),
 	}
 
 	_, err := client.CreateShed(context.Background(), config.CreateShedRequest{
