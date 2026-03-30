@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 )
 
 const nonLinuxErr = "firecracker backend is only supported on linux"
@@ -18,7 +19,7 @@ const nonLinuxErr = "firecracker backend is only supported on linux"
 type Client struct{}
 
 // NewClient returns an error on non-linux platforms.
-func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*Client, error) {
+func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, _ *plugin.Bridge) (*Client, error) {
 	return nil, errors.New(nonLinuxErr)
 }
 

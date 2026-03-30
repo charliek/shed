@@ -16,7 +16,7 @@ import (
 
 // newTestCredMgr creates a CredentialManager with nil server config for tests.
 func newTestCredMgr() *vmutil.CredentialManager {
-	return vmutil.NewCredentialManager(nil)
+	return vmutil.NewCredentialManager(nil, nil, "test")
 }
 
 func TestBuildEnvForGit(t *testing.T) {
@@ -122,7 +122,7 @@ func TestNewClientCreation(t *testing.T) {
 		Credentials: make(map[string]config.MountConfig),
 	}
 
-	client, err := NewClient(cfg, serverCfg)
+	client, err := NewClient(cfg, serverCfg, nil)
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
@@ -172,7 +172,7 @@ func TestClientClose(t *testing.T) {
 
 func TestCredentialManagerNoServerCfg(t *testing.T) {
 	// Creating a CredentialManager with nil serverCfg should not panic
-	credMgr := vmutil.NewCredentialManager(nil)
+	credMgr := vmutil.NewCredentialManager(nil, nil, "test")
 	// Operations should not panic
 	credMgr.StopListener("test")
 	credMgr.Close()
@@ -194,7 +194,7 @@ func TestCredentialManagerNoWritableCredentials(t *testing.T) {
 }
 
 func TestStopListenerNoOp(t *testing.T) {
-	credMgr := vmutil.NewCredentialManager(nil)
+	credMgr := vmutil.NewCredentialManager(nil, nil, "test")
 	// Should not panic when stopping a non-existent listener
 	credMgr.StopListener("nonexistent")
 }

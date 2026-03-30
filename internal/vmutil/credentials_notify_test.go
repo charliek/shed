@@ -4,173 +4,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/config"
 )
-
-func TestCredentialNotifyOnConnect(t *testing.T) {
-	serverCfg := &config.ServerConfig{
-		Credentials: map[string]config.MountConfig{
-			"ssh": {
-				Source:  "/host/.ssh",
-				Target:  "/home/shed/.ssh",
-				Exclude: []string{"*.sock"},
-			},
-			"gh": {
-				Source: "/host/.config/gh",
-				Target: "/home/shed/.config/gh",
-			},
-			"readonly-cred": {
-				Source:   "/host/.readonly",
-				Target:   "/home/shed/.readonly",
-				ReadOnly: true,
-			},
-		},
-	}
-
-	handler := &credentialNotifyHandler{
-		nl: &CredentialNotifyListener{
-			credentials: serverCfg.Credentials,
-			name:        "test-vm",
-		},
-	}
-
-	client, server := net.Pipe()
-	defer client.Close()
-
-	// Run OnConnect in a goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- handler.OnConnect(server)
-		server.Close()
-	}()
-
-	// Read the setup message from the client side
-	msgType, data, err := agentproto.ReadMessage(client)
-	if err != nil {
-		t.Fatalf("ReadMessage() error = %v", err)
-	}
-	if msgType != agentproto.MsgTypeNotifySetup {
-		t.Fatalf("msgType = 0x%02x, want 0x%02x", msgType, agentproto.MsgTypeNotifySetup)
-	}
-
-	var setup agentproto.NotifySetupMessage
-	if err := json.Unmarshal(data, &setup); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-
-	// Should have 2 writable credentials (ssh, gh), not readonly-cred
-	if len(setup.Credentials) != 2 {
-		t.Fatalf("len(Credentials) = %d, want 2", len(setup.Credentials))
-	}
-	if setup.Credentials["ssh"] != "/home/shed/.ssh" {
-		t.Errorf("Credentials[ssh] = %q, want %q", setup.Credentials["ssh"], "/home/shed/.ssh")
-	}
-	if setup.Credentials["gh"] != "/home/shed/.config/gh" {
-		t.Errorf("Credentials[gh] = %q, want %q", setup.Credentials["gh"], "/home/shed/.config/gh")
-	}
-	if _, ok := setup.Credentials["readonly-cred"]; ok {
-		t.Error("readonly credential should not be included")
-	}
-
-	// Excludes should only have ssh
-	if len(setup.Excludes) != 1 {
-		t.Fatalf("len(Excludes) = %d, want 1", len(setup.Excludes))
-	}
-	if len(setup.Excludes["ssh"]) != 1 || setup.Excludes["ssh"][0] != "*.sock" {
-		t.Errorf("Excludes[ssh] = %v, want [*.sock]", setup.Excludes["ssh"])
-	}
-
-	if err := <-errCh; err != nil {
-		t.Fatalf("OnConnect() error = %v", err)
-	}
-}
-
-func TestCredentialNotifyOnConnectNoWritable(t *testing.T) {
-	serverCfg := &config.ServerConfig{
-		Credentials: map[string]config.MountConfig{
-			"readonly": {
-				Source:   "/host/.readonly",
-				Target:   "/home/shed/.readonly",
-				ReadOnly: true,
-			},
-		},
-	}
-
-	handler := &credentialNotifyHandler{
-		nl: &CredentialNotifyListener{
-			credentials: serverCfg.Credentials,
-			name:        "test-vm",
-		},
-	}
-
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	// OnConnect should return nil and send nothing
-	if err := handler.OnConnect(server); err != nil {
-		t.Fatalf("OnConnect() error = %v", err)
-	}
-}
-
-func TestCredentialNotifyOnMessageFileChanged(t *testing.T) {
-	// Provide an agent backed by an errDialer so Exec fails fast
-	// instead of panicking on nil.
-	dialer := &errDialer{err: fmt.Errorf("mock dial error")}
-	agent := NewAgentClient(dialer, 1024, 1025, 1026)
-
-	serverCfg := &config.ServerConfig{
-		Credentials: map[string]config.MountConfig{
-			"ssh": {
-				Source: t.TempDir(),
-				Target: "/home/shed/.ssh",
-			},
-		},
-	}
-
-	handler := &credentialNotifyHandler{
-		nl: &CredentialNotifyListener{
-			agent:       agent,
-			credentials: serverCfg.Credentials,
-			name:        "test-vm",
-		},
-	}
-
-	changed := agentproto.FileChangedMessage{
-		Credential: "ssh",
-		Files:      []string{"id_rsa", "id_rsa.pub"},
-	}
-	data, _ := json.Marshal(changed)
-
-	// OnMessage dispatches to pullChangedFiles, which will fail (dial error)
-	// but errors are logged, not returned — so OnMessage returns nil.
-	err := handler.OnMessage(agentproto.MsgTypeFileChanged, data)
-	if err != nil {
-		t.Errorf("OnMessage() error = %v, want nil", err)
-	}
-}
-
-func TestCredentialNotifyOnMessageUnexpectedType(t *testing.T) {
-	handler := &credentialNotifyHandler{
-		nl: &CredentialNotifyListener{
-			name: "test-vm",
-		},
-	}
-
-	// Unexpected type should log but return nil
-	err := handler.OnMessage(0xFF, []byte("garbage"))
-	if err != nil {
-		t.Errorf("OnMessage() error = %v, want nil for unexpected type", err)
-	}
-}
 
 func TestPullChangedFilesPathValidation(t *testing.T) {
 	serverCfg := &config.ServerConfig{
@@ -190,13 +30,13 @@ func TestPullChangedFilesPathValidation(t *testing.T) {
 	}
 
 	// All paths should be rejected: ".." and absolute paths
-	err := nl.pullChangedFiles("ssh", []string{
+	err := nl.PullChangedFiles("ssh", []string{
 		"../../etc/passwd",
 		"/etc/shadow",
 		"../../../root/.ssh/id_rsa",
 	})
 	if err != nil {
-		t.Errorf("pullChangedFiles() error = %v, want nil (all paths rejected)", err)
+		t.Errorf("PullChangedFiles() error = %v, want nil (all paths rejected)", err)
 	}
 }
 
@@ -210,9 +50,9 @@ func TestPullChangedFilesUnknownCredential(t *testing.T) {
 		name:        "test-vm",
 	}
 
-	err := nl.pullChangedFiles("nonexistent", []string{"file.txt"})
+	err := nl.PullChangedFiles("nonexistent", []string{"file.txt"})
 	if err == nil {
-		t.Error("pullChangedFiles() expected error for unknown credential")
+		t.Error("PullChangedFiles() expected error for unknown credential")
 	}
 }
 

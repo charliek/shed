@@ -17,6 +17,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/docker"
 	"github.com/charliek/shed/internal/firecracker"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/sshd"
 	"github.com/charliek/shed/internal/vz"
 )
@@ -54,6 +55,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("HTTP port: %d", cfg.HTTPPort)
 	log.Printf("SSH port: %d", cfg.SSHPort)
 
+	// Initialize plugin system (before backends, since backends use the bridge)
+	pluginRegistry := plugin.NewRegistry()
+	pluginBridge := plugin.NewBridge(pluginRegistry)
+
 	// Initialize enabled backends
 	backends := make(map[backend.Type]backend.Backend)
 	for _, backendType := range cfg.EnabledBackends {
@@ -71,7 +76,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			if fcCfg == nil {
 				fcCfg = config.DefaultFirecrackerConfig()
 			}
-			fcClient, err := firecracker.NewClient(fcCfg, cfg)
+			fcClient, err := firecracker.NewClient(fcCfg, cfg, pluginBridge)
 			if err != nil {
 				return fmt.Errorf("failed to create firecracker client: %w", err)
 			}
@@ -83,7 +88,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			if vzCfg == nil {
 				return fmt.Errorf("vz backend enabled but vz config is missing")
 			}
-			vzClient, err := vz.NewClient(vzCfg, cfg)
+			vzClient, err := vz.NewClient(vzCfg, cfg, pluginBridge)
 			if err != nil {
 				return fmt.Errorf("failed to create vz client: %w", err)
 			}
@@ -109,7 +114,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	hostKey := sshServer.GetHostPublicKey()
 
 	// Initialize HTTP API server
-	apiServer := api.NewServer(be, cfg, hostKey)
+	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
 	router := apiServer.Router()
 
 	// Create HTTP server

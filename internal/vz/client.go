@@ -17,6 +17,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -32,7 +33,7 @@ type Client struct {
 }
 
 // NewClient creates a new VZ client.
-func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig) (*Client, error) {
+func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
 	if runtime.GOARCH != "arm64" {
 		return nil, fmt.Errorf("vz backend currently supports macOS Apple Silicon (arm64) only")
 	}
@@ -41,7 +42,7 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig) (*Client, e
 		cfg:       cfg,
 		serverCfg: serverCfg,
 		vms:       make(map[string]*VM),
-		credMgr:   vmutil.NewCredentialManager(serverCfg),
+		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendVZ)),
 	}
 
 	return client, nil

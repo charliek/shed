@@ -54,7 +54,7 @@ flowchart TB
 | SSH | 2222 | Terminal access, IDE remote connections |
 | vsock | 1024 | VM console I/O (Firecracker, VZ) |
 | vsock | 1025 | Agent health checks (Firecracker, VZ) |
-| vsock | 1026 | Credential change notifications (Firecracker, VZ) |
+| vsock | 1026 | Message bus — plugins and credential sync (Firecracker, VZ) |
 
 ## Naming Conventions
 
@@ -257,9 +257,13 @@ Firecracker backend (Linux only): VM lifecycle via Firecracker SDK, TAP networki
 
 VZ backend (macOS Apple Silicon only): VM lifecycle via vfkit subprocess, NAT networking, rootfs management, metadata persistence. Implements `vmutil.Dialer` with direct per-port Unix socket connections (no handshake needed).
 
+### `internal/plugin`
+
+Extension/plugin message bus. Defines the message envelope, namespace registry, bridge (connects API to per-shed vsock connections), and credential sync types. See [Extensions](../reference/extensions.md).
+
 ### `internal/agentproto`
 
-Binary protocol for framed messages over vsock between shed-server and shed-agent. Message types cover exec, file transfer, health checks, and credential change notifications.
+Binary protocol for framed messages over vsock between shed-server and shed-agent. Message types cover exec, file transfer, health checks, and plugin messages.
 
 ### `internal/backend`
 

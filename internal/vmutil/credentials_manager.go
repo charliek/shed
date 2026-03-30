@@ -8,6 +8,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 )
 
 // DirMountFunc is the backend-specific directory mount callback.
@@ -17,22 +18,27 @@ import (
 type DirMountFunc func(ctx context.Context, agent *AgentClient, name string, mount config.MountConfig) error
 
 // CredentialManager handles the credential lifecycle shared by VM backends.
-// It owns the host-side credential watcher and per-VM notification listeners.
+// It owns the host-side credential watcher, per-VM message channels (for both
+// plugin messages and credential sync), and the plugin bridge registration.
 type CredentialManager struct {
 	serverCfg   *config.ServerConfig
 	credWatcher *CredentialWatcher // nil if watcher failed to start (non-fatal)
+	bridge      *plugin.Bridge     // plugin message bridge (nil if plugins disabled)
+	backendName string             // "vz" or "firecracker"
 
 	mu              sync.Mutex
-	notifyListeners map[string]*CredentialNotifyListener
+	messageChannels map[string]*NotifyConn // name -> per-VM message channel
 }
 
 // NewCredentialManager creates a new CredentialManager and starts the host-side
 // credential watcher. If the watcher fails to start, it logs a warning and
 // continues with a nil watcher (non-fatal, matching existing backend behavior).
-func NewCredentialManager(serverCfg *config.ServerConfig) *CredentialManager {
+func NewCredentialManager(serverCfg *config.ServerConfig, bridge *plugin.Bridge, backendName string) *CredentialManager {
 	cm := &CredentialManager{
 		serverCfg:       serverCfg,
-		notifyListeners: make(map[string]*CredentialNotifyListener),
+		bridge:          bridge,
+		backendName:     backendName,
+		messageChannels: make(map[string]*NotifyConn),
 	}
 
 	if serverCfg != nil && len(serverCfg.Credentials) > 0 {
@@ -47,8 +53,8 @@ func NewCredentialManager(serverCfg *config.ServerConfig) *CredentialManager {
 }
 
 // SetupCredentials mounts directory credentials via the provided callback,
-// transfers file credentials via tar, and starts the notification listener
-// for bidirectional sync of writable file credentials.
+// transfers file credentials via tar, and starts the message channel for
+// plugin communication and bidirectional credential sync.
 //
 // Directory mount failures are logged as warnings (non-fatal).
 // File transfer failures are logged as warnings (non-fatal).
@@ -75,22 +81,25 @@ func (cm *CredentialManager) SetupCredentials(ctx context.Context, agent *AgentC
 		}
 	}
 
-	// Start notification listener for writable file credentials
-	if HasWritableCredentials(fileCreds) {
-		cm.startNotifyListener(shedName, agent, fileCreds)
-	}
+	// Always start the message channel — it handles both plugin messages
+	// and credential sync via plugin envelopes.
+	cm.startMessageChannel(shedName, agent, fileCreds)
 }
 
-// StopListener stops the credential notification listener for a VM
-// and unregisters it from the host-side watcher.
+// StopListener stops the message channel for a VM and unregisters it
+// from the plugin bridge and host-side credential watcher.
 func (cm *CredentialManager) StopListener(name string) {
 	cm.mu.Lock()
-	nl := cm.notifyListeners[name]
-	delete(cm.notifyListeners, name)
+	ch := cm.messageChannels[name]
+	delete(cm.messageChannels, name)
 	cm.mu.Unlock()
 
-	if nl != nil {
-		nl.Stop()
+	if ch != nil {
+		ch.Stop()
+	}
+
+	if cm.bridge != nil {
+		cm.bridge.UnregisterShed(name)
 	}
 
 	if cm.credWatcher != nil {
@@ -98,12 +107,15 @@ func (cm *CredentialManager) StopListener(name string) {
 	}
 }
 
-// Close stops all notification listeners and the credential watcher.
+// Close stops all message channels and the credential watcher.
 func (cm *CredentialManager) Close() {
 	cm.mu.Lock()
-	for name, nl := range cm.notifyListeners {
-		nl.Stop()
-		delete(cm.notifyListeners, name)
+	for name, ch := range cm.messageChannels {
+		ch.Stop()
+		if cm.bridge != nil {
+			cm.bridge.UnregisterShed(name)
+		}
+		delete(cm.messageChannels, name)
 	}
 	cm.mu.Unlock()
 
@@ -112,21 +124,70 @@ func (cm *CredentialManager) Close() {
 	}
 }
 
-// startNotifyListener starts a credential notification listener for a VM.
-func (cm *CredentialManager) startNotifyListener(name string, agent *AgentClient, fileCreds map[string]config.MountConfig) {
-	if len(fileCreds) == 0 {
-		return
+// startMessageChannel starts the generalized message channel for a VM.
+func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient, fileCreds map[string]config.MountConfig) {
+	var credSetup *plugin.CredentialSetupPayload
+	var credChangeFn func(string, []string)
+
+	if HasWritableCredentials(fileCreds) {
+		creds := make(map[string]string)
+		excludes := make(map[string][]string)
+		writableCreds := make(map[string]config.MountConfig)
+		for credName, mount := range fileCreds {
+			if !mount.ReadOnly {
+				writableCreds[credName] = mount
+				creds[credName] = mount.Target
+				if len(mount.Exclude) > 0 {
+					excludes[credName] = mount.Exclude
+				}
+			}
+		}
+		credSetup = &plugin.CredentialSetupPayload{
+			Credentials: creds,
+			Excludes:    excludes,
+		}
+
+		credNL := NewCredentialNotifyListener(agent, writableCreds, cm.credWatcher)
+		credNL.SetName(name)
+		credChangeFn = func(credName string, files []string) {
+			if err := credNL.PullChangedFiles(credName, files); err != nil {
+				log.Printf("[%s] Failed to pull credential changes for %s: %v", name, credName, err)
+			}
+		}
 	}
 
-	listener := NewCredentialNotifyListener(agent, fileCreds, cm.credWatcher)
-	listener.Start(context.Background(), name)
+	handler := NewMessageHandler(credSetup, credChangeFn, func(env *plugin.Envelope) {
+		if cm.bridge != nil {
+			if err := cm.bridge.PublishToHost(name, env); err != nil {
+				log.Printf("[%s] Failed to publish plugin message: %v", name, err)
+			}
+		}
+	})
 
-	// Register VM with the credential watcher for host->VM pushes
-	if cm.credWatcher != nil {
+	conn := NewNotifyConn(agent.Dialer(), agent.NotifyPort(), name)
+
+	if cm.credWatcher != nil && HasWritableCredentials(fileCreds) {
 		cm.credWatcher.RegisterVM(name, agent)
 	}
 
+	// Store the conn in the map before registering/starting so that
+	// Close()/StopListener() can find and clean it up if called concurrently.
 	cm.mu.Lock()
-	cm.notifyListeners[name] = listener
+	cm.messageChannels[name] = conn
 	cm.mu.Unlock()
+
+	if cm.bridge != nil {
+		serverName := ""
+		if cm.serverCfg != nil {
+			serverName = cm.serverCfg.Name
+		}
+		cm.bridge.RegisterShed(name, &plugin.ShedConn{
+			Name:    name,
+			Backend: cm.backendName,
+			Server:  serverName,
+			Send:    handler.SendPluginMessage,
+		})
+	}
+
+	conn.Start(context.Background(), handler)
 }

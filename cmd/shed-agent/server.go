@@ -5,14 +5,17 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os/user"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/mdlayher/vsock"
 )
 
@@ -30,8 +33,11 @@ const (
 	// DefaultHealthPort is the vsock port for health checks.
 	DefaultHealthPort = 1025
 
-	// DefaultNotifyPort is the vsock port for credential change notifications.
+	// DefaultNotifyPort is the vsock port for the message channel (plugins + credentials).
 	DefaultNotifyPort = 1026
+
+	// DefaultHTTPPort is the localhost port for the in-VM plugin HTTP API.
+	DefaultHTTPPort = 498
 )
 
 // Server handles vsock connections from the host.
@@ -39,13 +45,27 @@ type Server struct {
 	consolePort uint32
 	healthPort  uint32
 	notifyPort  uint32
+	httpPort    uint32
+	shedName    string
 
 	consoleListener net.Listener
 	healthListener  net.Listener
 	notifyListener  net.Listener
 
+	httpServer *http.Server
+
 	// Resolved non-root user for spawning processes (nil = run as root)
 	user *userInfo
+
+	// Active message connection (for writing plugin messages to host).
+	// msgMu protects both the connection reference and serializes writes.
+	msgMu      sync.Mutex
+	msgConn    net.Conn
+	credCancel context.CancelFunc // cancels the active credential watcher, if any
+
+	// Pending request/response tracking
+	pendingMu sync.Mutex
+	pending   map[string]chan *plugin.Envelope // request ID -> response channel
 
 	// For graceful shutdown
 	ctx    context.Context
@@ -54,12 +74,15 @@ type Server struct {
 }
 
 // NewServer creates a new Server.
-func NewServer(consolePort, healthPort, notifyPort uint32) *Server {
+func NewServer(consolePort, healthPort, notifyPort, httpPort uint32, shedName string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		consolePort: consolePort,
 		healthPort:  healthPort,
 		notifyPort:  notifyPort,
+		httpPort:    httpPort,
+		shedName:    shedName,
+		pending:     make(map[string]chan *plugin.Envelope),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -181,7 +204,7 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	// Accept notification connections
+	// Accept message channel connections (generalized notify port)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -192,7 +215,7 @@ func (s *Server) Start() error {
 				case <-s.ctx.Done():
 					return
 				default:
-					log.Printf("Notify accept error: %v", err)
+					log.Printf("Message channel accept error: %v", err)
 					time.Sleep(200 * time.Millisecond)
 					continue
 				}
@@ -200,12 +223,49 @@ func (s *Server) Start() error {
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
-				handleNotifyConnection(conn)
+				s.handleMessageConnection(conn)
 			}()
 		}
 	}()
 
-	log.Printf("Listening on vsock ports: console=%d, health=%d, notify=%d", s.consolePort, s.healthPort, s.notifyPort)
+	// Start localhost HTTP server for in-VM plugin API
+	if err := s.startHTTPServer(); err != nil {
+		return fmt.Errorf("failed to start HTTP server: %w", err)
+	}
+
+	log.Printf("Listening on vsock ports: console=%d, health=%d, message=%d; HTTP on 127.0.0.1:%d",
+		s.consolePort, s.healthPort, s.notifyPort, s.httpPort)
+	return nil
+}
+
+// startHTTPServer starts the localhost HTTP API for plugin message publishing.
+func (s *Server) startHTTPServer() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/publish", s.handlePublish)
+
+	addr := fmt.Sprintf("127.0.0.1:%d", s.httpPort)
+
+	// Bind synchronously so we detect port conflicts immediately.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+
+	s.httpServer = &http.Server{
+		Handler:        mux,
+		ReadTimeout:    60 * time.Second,
+		WriteTimeout:   60 * time.Second,
+		MaxHeaderBytes: 1 << 16, // 64 KB
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
 	return nil
 }
 
@@ -230,6 +290,18 @@ func (s *Server) Stop() {
 	if s.notifyListener != nil {
 		s.notifyListener.Close()
 	}
+
+	// Shutdown HTTP server
+	if s.httpServer != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), drainTimeout)
+		defer shutdownCancel()
+		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+	}
+
+	// Clean up pending requests
+	s.clearPending()
 
 	// Wait for active connections to finish, with timeout
 	done := make(chan struct{})

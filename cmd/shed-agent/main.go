@@ -23,14 +23,25 @@ func main() {
 	// Parse flags
 	consolePort := flag.Uint("console-port", DefaultConsolePort, "vsock port for console connections")
 	healthPort := flag.Uint("health-port", DefaultHealthPort, "vsock port for health checks")
-	notifyPort := flag.Uint("notify-port", DefaultNotifyPort, "vsock port for credential change notifications")
+	notifyPort := flag.Uint("notify-port", DefaultNotifyPort, "vsock port for message channel")
+	shedName := flag.String("shed-name", "", "shed instance name (defaults to hostname)")
+	httpPort := flag.Uint("http-port", DefaultHTTPPort, "localhost HTTP port for plugin API")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("shed-agent starting...")
 
+	name := *shedName
+	if name == "" {
+		h, err := os.Hostname()
+		if err != nil || h == "" {
+			log.Fatalf("Failed to resolve shed name from hostname: %v", err)
+		}
+		name = h
+	}
+
 	// Create and start server
-	server := NewServer(uint32(*consolePort), uint32(*healthPort), uint32(*notifyPort))
+	server := NewServer(uint32(*consolePort), uint32(*healthPort), uint32(*notifyPort), uint32(*httpPort), name)
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}

@@ -1,23 +1,19 @@
 package vmutil
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"archive/tar"
-
-	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
@@ -34,7 +30,6 @@ const maxCredentialArchiveSize = 50 * 1024 * 1024 // 50 MB
 // notification port, receives FileChanged messages, and pulls changed files
 // back to the host.
 type CredentialNotifyListener struct {
-	conn        *NotifyConn
 	agent       *AgentClient
 	credentials map[string]config.MountConfig
 	watcher     *CredentialWatcher
@@ -53,84 +48,14 @@ func NewCredentialNotifyListener(agent *AgentClient, credentials map[string]conf
 	}
 }
 
-// Start begins listening for credential change notifications from the VM.
-func (nl *CredentialNotifyListener) Start(ctx context.Context, name string) {
+// SetName sets the listener name for logging. Must be called before PullChangedFiles.
+func (nl *CredentialNotifyListener) SetName(name string) {
 	nl.name = name
-	nl.conn = NewNotifyConn(nl.agent.Dialer(), nl.agent.NotifyPort(), name)
-	nl.conn.Start(ctx, &credentialNotifyHandler{nl: nl})
 }
 
-// Stop stops the notification listener and waits for it to finish.
-func (nl *CredentialNotifyListener) Stop() {
-	if nl.conn != nil {
-		nl.conn.Stop()
-	}
-}
-
-// credentialNotifyHandler implements NotifyHandler for credential sync.
-type credentialNotifyHandler struct {
-	nl *CredentialNotifyListener
-}
-
-func (h *credentialNotifyHandler) OnConnect(conn net.Conn) error {
-	// Build credential mappings (only writable ones)
-	credentials := make(map[string]string)
-	excludes := make(map[string][]string)
-	for name, mount := range h.nl.credentials {
-		if mount.ReadOnly {
-			continue
-		}
-		credentials[name] = mount.Target
-		if len(mount.Exclude) > 0 {
-			excludes[name] = mount.Exclude
-		}
-	}
-
-	if len(credentials) == 0 {
-		log.Printf("[%s] No writable credentials to watch", h.nl.name)
-		return nil
-	}
-
-	// Send setup message
-	setup := agentproto.NotifySetupMessage{
-		Credentials: credentials,
-		Excludes:    excludes,
-	}
-	setupData, err := json.Marshal(setup)
-	if err != nil {
-		return fmt.Errorf("failed to marshal setup message: %w", err)
-	}
-	if err := agentproto.WriteMessage(conn, agentproto.MsgTypeNotifySetup, setupData); err != nil {
-		return fmt.Errorf("failed to send setup message: %w", err)
-	}
-
-	log.Printf("[%s] Notify connection established, watching %d credentials", h.nl.name, len(credentials))
-	return nil
-}
-
-func (h *credentialNotifyHandler) OnMessage(msgType byte, data []byte) error {
-	if msgType != agentproto.MsgTypeFileChanged {
-		log.Printf("[%s] Unexpected message type on notify connection: 0x%02x", h.nl.name, msgType)
-		return nil
-	}
-
-	var changed agentproto.FileChangedMessage
-	if err := json.Unmarshal(data, &changed); err != nil {
-		log.Printf("[%s] Failed to unmarshal FileChanged: %v", h.nl.name, err)
-		return nil
-	}
-
-	log.Printf("[%s] Credential %q changed: %v", h.nl.name, changed.Credential, changed.Files)
-
-	if err := h.nl.pullChangedFiles(changed.Credential, changed.Files); err != nil {
-		log.Printf("[%s] Failed to pull changed files for %q: %v", h.nl.name, changed.Credential, err)
-	}
-
-	return nil
-}
-
-// pullChangedFiles extracts specific files from the VM and writes them to the host.
-func (nl *CredentialNotifyListener) pullChangedFiles(credName string, files []string) error {
+// PullChangedFiles pulls the specified changed credential files from the VM
+// to the host. This is called when the agent reports credential file changes.
+func (nl *CredentialNotifyListener) PullChangedFiles(credName string, files []string) error {
 	mount, ok := nl.credentials[credName]
 	if !ok {
 		return fmt.Errorf("unknown credential %q", credName)

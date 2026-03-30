@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 )
 
 var errNonDarwin = errors.New("vz backend is only supported on macOS")
@@ -18,7 +19,7 @@ var errNonDarwin = errors.New("vz backend is only supported on macOS")
 type Client struct{}
 
 // NewClient returns an error on non-darwin platforms.
-func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig) (*Client, error) {
+func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, _ *plugin.Bridge) (*Client, error) {
 	return nil, errNonDarwin
 }
 

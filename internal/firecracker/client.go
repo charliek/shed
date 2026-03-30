@@ -17,6 +17,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -37,7 +38,7 @@ type Client struct {
 }
 
 // NewClient creates a new Firecracker client.
-func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*Client, error) {
+func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
 	netMgr, err := NewNetworkManager(cfg.BridgeName, cfg.BridgeCIDR, cfg.TAPPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create network manager: %w", err)
@@ -51,7 +52,7 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig) (*
 		usedCIDs:  make(map[uint32]string),
 		usedIPs:   make(map[string]string),
 		p9Servers: make(map[string][]*P9Server),
-		credMgr:   vmutil.NewCredentialManager(serverCfg),
+		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker)),
 	}
 
 	// Load existing instances to populate CID and IP maps

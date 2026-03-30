@@ -21,8 +21,7 @@ const (
 	MsgTypeHealthRequest  = agentproto.MsgTypeHealthRequest
 	MsgTypeHealthResponse = agentproto.MsgTypeHealthResponse
 
-	MsgTypeNotifySetup = agentproto.MsgTypeNotifySetup
-	MsgTypeFileChanged = agentproto.MsgTypeFileChanged
+	MsgTypePluginMessage = agentproto.MsgTypePluginMessage
 )
 
 // Type aliases for agentproto types.
@@ -30,8 +29,6 @@ type ExecRequest = agentproto.ExecRequest
 type ResizeMessage = agentproto.ResizeMessage
 type SignalMessage = agentproto.SignalMessage
 type ExitCodeMessage = agentproto.ExitCodeMessage
-type NotifySetupMessage = agentproto.NotifySetupMessage
-type FileChangedMessage = agentproto.FileChangedMessage
 
 // writeMessage writes a framed message.
 func writeMessage(w io.Writer, msgType byte, payload []byte) error {

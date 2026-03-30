@@ -22,17 +22,21 @@ const (
 	MsgTypeHealthRequest  byte = 0x10
 	MsgTypeHealthResponse byte = 0x11
 
-	MsgTypeNotifySetup byte = 0x12 // Host → Agent: setup notification watchers
-	MsgTypeFileChanged byte = 0x13 // Agent → Host: credential file changed
+	MsgTypeNotifySetup byte = 0x12 // Deprecated: replaced by MsgTypePluginMessage with system:credentials namespace
+	MsgTypeFileChanged byte = 0x13 // Deprecated: replaced by MsgTypePluginMessage with system:credentials namespace
+
+	MsgTypePluginMessage byte = 0x20 // Bidirectional: plugin envelope (JSON)
 )
 
-// NotifySetupMessage is sent from host to agent to configure credential watchers.
+// Deprecated: NotifySetupMessage is replaced by plugin.CredentialSetupPayload
+// sent via MsgTypePluginMessage in the system:credentials namespace.
 type NotifySetupMessage struct {
 	Credentials map[string]string   `json:"credentials"`        // name → target path in VM
 	Excludes    map[string][]string `json:"excludes,omitempty"` // name → exclude patterns
 }
 
-// FileChangedMessage is sent from agent to host when credential files change.
+// Deprecated: FileChangedMessage is replaced by plugin.CredentialChangedPayload
+// sent via MsgTypePluginMessage in the system:credentials namespace.
 type FileChangedMessage struct {
 	Credential string   `json:"credential"` // credential mount name (e.g., "gh")
 	Files      []string `json:"files"`      // relative paths that changed

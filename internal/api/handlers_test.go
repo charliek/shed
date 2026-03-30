@@ -20,7 +20,7 @@ func newTestServer() *Server {
 	return NewServer(nil, &config.ServerConfig{
 		Name:     "test-server",
 		HTTPPort: 8080,
-	}, "")
+	}, "", nil, nil)
 }
 
 func postCreateShed(t *testing.T, srv *Server, req config.CreateShedRequest) *httptest.ResponseRecorder {
