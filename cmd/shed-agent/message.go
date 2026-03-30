@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/charliek/shed/internal/plugin"
 )
@@ -160,6 +161,10 @@ func (s *Server) sendPluginMessage(env *plugin.Envelope) error {
 	if s.msgConn == nil {
 		return errNoConnection
 	}
+
+	// Set a write deadline to prevent blocking all senders if the host is unresponsive.
+	s.msgConn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	defer s.msgConn.SetWriteDeadline(time.Time{}) // clear deadline
 
 	return writeMessage(s.msgConn, MsgTypePluginMessage, data)
 }

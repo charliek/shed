@@ -712,8 +712,10 @@ func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient) {
 	if c.serverCfg != nil {
 		creds := make(map[string]string)
 		excludes := make(map[string][]string)
+		writableCreds := make(map[string]config.MountConfig)
 		for credName, mount := range c.serverCfg.Credentials {
 			if !mount.ReadOnly {
+				writableCreds[credName] = mount
 				creds[credName] = mount.Target
 				if len(mount.Exclude) > 0 {
 					excludes[credName] = mount.Exclude
@@ -725,7 +727,8 @@ func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient) {
 				Credentials: creds,
 				Excludes:    excludes,
 			}
-			credNL := vmutil.NewCredentialNotifyListener(agent, c.serverCfg.Credentials, c.credWatcher)
+			// Only writable credentials are passed to limit what can be pulled.
+			credNL := vmutil.NewCredentialNotifyListener(agent, writableCreds, c.credWatcher)
 			credNL.SetName(name)
 			credChangeFn = func(credName string, files []string) {
 				if err := credNL.PullChangedFiles(credName, files); err != nil {

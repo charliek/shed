@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,9 @@ import (
 const (
 	// publishTimeout is the maximum time to wait for a response to a request.
 	publishTimeout = 30 * time.Second
+
+	// writeTimeout is the maximum time to wait for a vsock write to complete.
+	writeTimeout = 10 * time.Second
 
 	// maxPublishBodySize limits the request body for POST /v1/publish.
 	maxPublishBodySize = 1 << 20 // 1 MB
@@ -55,7 +59,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Type {
 	case plugin.MessageTypeRequest:
-		s.handlePublishRequest(w, env)
+		s.handlePublishRequest(r.Context(), w, env)
 	case plugin.MessageTypeEvent:
 		s.handlePublishEvent(w, env)
 	default:
@@ -65,7 +69,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePublishRequest sends a request and waits for a response.
-func (s *Server) handlePublishRequest(w http.ResponseWriter, env *plugin.Envelope) {
+func (s *Server) handlePublishRequest(ctx context.Context, w http.ResponseWriter, env *plugin.Envelope) {
 	// Register pending response channel
 	ch := make(chan *plugin.Envelope, 1)
 	s.pendingMu.Lock()
@@ -95,14 +99,20 @@ func (s *Server) handlePublishRequest(w http.ResponseWriter, env *plugin.Envelop
 	select {
 	case resp, ok := <-ch:
 		if !ok {
-			// Channel closed — connection dropped
 			writeHTTPError(w, http.StatusServiceUnavailable, "CONNECTION_LOST", "host connection lost while waiting for response")
 			return
 		}
+		data, err := json.Marshal(resp)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, "INVALID_RESPONSE", "host returned an invalid response")
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		w.Write(data)
 	case <-timer.C:
 		writeHTTPError(w, http.StatusGatewayTimeout, "TIMEOUT", "no response from host within timeout")
+	case <-ctx.Done():
+		return // HTTP caller disconnected
 	case <-s.ctx.Done():
 		writeHTTPError(w, http.StatusServiceUnavailable, "SHUTTING_DOWN", "agent is shutting down")
 	}

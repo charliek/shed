@@ -653,8 +653,10 @@ func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient, tar
 	if hasWritableTarCredentials(tarOnlyCreds) {
 		creds := make(map[string]string)
 		excludes := make(map[string][]string)
+		writableCreds := make(map[string]config.MountConfig)
 		for credName, mount := range tarOnlyCreds {
 			if !mount.ReadOnly {
+				writableCreds[credName] = mount
 				creds[credName] = mount.Target
 				if len(mount.Exclude) > 0 {
 					excludes[credName] = mount.Exclude
@@ -666,8 +668,9 @@ func (c *Client) startMessageChannel(name string, agent *vmutil.AgentClient, tar
 			Excludes:    excludes,
 		}
 
-		// Use CredentialNotifyListener for its pullChangedFiles capability
-		credNL := vmutil.NewCredentialNotifyListener(agent, tarOnlyCreds, c.credWatcher)
+		// Use CredentialNotifyListener for its pullChangedFiles capability.
+		// Only writable credentials are passed to limit what can be pulled.
+		credNL := vmutil.NewCredentialNotifyListener(agent, writableCreds, c.credWatcher)
 		credNL.SetName(name)
 		credChangeFn = func(credName string, files []string) {
 			if err := credNL.PullChangedFiles(credName, files); err != nil {
