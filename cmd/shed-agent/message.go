@@ -19,7 +19,7 @@ import (
 func (s *Server) handleMessageConnection(conn net.Conn) {
 	defer conn.Close()
 	s.setMessageConn(conn)
-	defer s.clearMessageConn()
+	defer s.clearMessageConnIfCurrent(conn)
 
 	for {
 		msgType, data, err := readMessage(conn)
@@ -117,14 +117,19 @@ func (s *Server) setMessageConn(conn net.Conn) {
 	s.msgConn = conn
 }
 
-// clearMessageConn clears the active message connection and fails pending requests.
-func (s *Server) clearMessageConn() {
-	s.stopCredentialWatcher()
-
+// clearMessageConnIfCurrent clears the message connection only if conn is still
+// the active one. This prevents a closing connection A from blowing away the
+// state of a newer connection B that replaced it during a reconnect.
+func (s *Server) clearMessageConnIfCurrent(conn net.Conn) {
 	s.msgMu.Lock()
+	if s.msgConn != conn {
+		s.msgMu.Unlock()
+		return // a newer connection replaced us; don't touch its state
+	}
 	s.msgConn = nil
 	s.msgMu.Unlock()
 
+	s.stopCredentialWatcher()
 	s.clearPending()
 }
 
