@@ -102,7 +102,7 @@ Shed supports automatic provisioning via `.shed/provision.yaml` in your reposito
 
 ### Provisioning Flow
 
-Provisioning hooks work the same as all backends — credentials are transferred via tar-over-vsock, then hooks execute via vsock. For the full sequence of operations during create, start, stop, and delete (including when credentials and mounts are set up relative to hooks), see [Shed Lifecycle](reference/provisioning.md#shed-lifecycle).
+Provisioning hooks work the same as all backends — credentials are transferred via tar-over-vsock, then hooks execute via vsock. For the full sequence of operations during create, start, stop, and delete (including when credentials and mounts are set up relative to hooks), see [Shed Lifecycle](provisioning.md#shed-lifecycle).
 
 ### Skip Provisioning
 

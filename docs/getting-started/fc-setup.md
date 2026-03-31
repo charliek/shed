@@ -1,4 +1,4 @@
-# Firecracker Backend Installation
+# Firecracker Setup
 
 This guide covers the installation and setup of the Firecracker backend for shed. Firecracker is Linux-only and requires KVM.
 
@@ -6,8 +6,7 @@ This guide covers the installation and setup of the Firecracker backend for shed
 
 - Linux host with KVM support
 - Root access (for network setup)
-- Docker (for building rootfs)
-- Go 1.24+ (for building shed-agent)
+- Docker (for pulling and converting images, or building from source)
 
 ## 1. Check KVM Support
 
@@ -42,9 +41,25 @@ This overwrites `/var/lib/shed/firecracker/vmlinux.bin` with the custom kernel. 
 
 The custom kernel includes 9P filesystem support (required for `--local-dir` and directory credential mounts). See [9P Kernel Configuration](#9p-kernel-configuration) for details.
 
-## 3. Build the Rootfs Image
+## 3. Set Up Firecracker Images
 
-Build rootfs images that VMs will use:
+### Option A: Use published images (recommended)
+
+Configure your server to use published Docker image references. Shed auto-pulls and converts them to ext4 on first use:
+
+```yaml
+firecracker:
+  base_rootfs: ghcr.io/charliek/shed-fc-base:v1.0.0
+  images:
+    base: ghcr.io/charliek/shed-fc-base:v1.0.0
+  images_dir: /var/lib/shed/firecracker/images
+```
+
+The first `shed create` will pull the image, convert it to ext4, and cache the result automatically. See [Image Variants](../reference/images.md) for available images and configuration details.
+
+### Option B: Build from source
+
+Build rootfs images locally. Requires Go 1.24+ for compiling `shed-agent`.
 
 ```bash
 # Build the default variant

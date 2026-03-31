@@ -202,8 +202,6 @@ firecracker:
   base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
   images:
     base: ghcr.io/charliek/shed-fc-base:v1.0.0
-    default: ghcr.io/charliek/shed-fc-default:v1.0.0
-    typescript: ghcr.io/charliek/shed-fc-typescript:v1.0.0
   images_dir: /var/lib/shed/firecracker/images
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
@@ -244,7 +242,7 @@ firecracker:
 | `bridge_cidr` | string | `172.30.0.1/24` | Bridge network CIDR |
 | `tap_prefix` | string | `shed-tap` | TAP device name prefix |
 
-See [Firecracker Installation](../firecracker_install.md) for setup details.
+See [Firecracker Setup](../getting-started/fc-setup.md) for setup details.
 
 ## VZ Configuration
 
@@ -261,11 +259,9 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-default:v1.0.0
+  base_rootfs: ghcr.io/charliek/shed-vz-base:v1.0.0
   images:
     base: ghcr.io/charliek/shed-vz-base:v1.0.0
-    default: ghcr.io/charliek/shed-vz-default:v1.0.0
-    typescript: ghcr.io/charliek/shed-vz-typescript:v1.0.0
   images_dir: ~/Library/Application Support/shed/vz/
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
@@ -287,7 +283,7 @@ vz:
 | `kernel_path` | string | - | Path to decompressed Linux kernel |
 | `initrd_path` | string | - | Path to initial RAM disk image |
 | `base_rootfs` | string | - | Default rootfs ext4 path or Docker image reference (used when `--image` is not specified) |
-| `images` | map | - | Named image variants mapping variant name to rootfs path or Docker image reference (see [VZ Image Variants](vz-images.md)) |
+| `images` | map | - | Named image variants mapping variant name to rootfs path or Docker image reference (see [Image Variants](images.md)) |
 | `images_dir` | string | `~/Library/Application Support/shed/vz/` | Directory for converted/auto-discovered ext4 images |
 | `instance_dir` | string | - | Directory for VM instances |
 | `socket_dir` | string | - | Directory for vsock Unix sockets (must not contain spaces) |

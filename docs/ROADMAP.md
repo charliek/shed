@@ -60,10 +60,6 @@ Support for distributed development environments:
 - Service discovery
 - Orchestration integration
 
-## Image Publishing
-
-- **CI workflow for image publishing** ([#36](https://github.com/charliek/shed/issues/36)) — Automate `scripts/publish-vz-images.sh` and `scripts/publish-fc-images.sh` via GitHub Actions on release tags.
-
 ## General Quality
 
 - Revisit docstring coverage thresholds and expand public API documentation if needed.

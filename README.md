@@ -80,7 +80,7 @@ shed create myproject --backend=firecracker --cpus=4 --memory=8192
 shed create myproject --backend=firecracker --repo=git@github.com:user/repo.git
 ```
 
-See [Firecracker Installation](docs/firecracker_install.md) and [Firecracker Operations](docs/firecracker_howto.md) for setup and usage details.
+See [Firecracker Setup](docs/getting-started/fc-setup.md) and [Firecracker Operations](docs/reference/fc-operations.md) for setup and usage details.
 
 ### VZ (macOS)
 

@@ -68,8 +68,8 @@ flowchart LR
 - [CLI Reference](reference/cli.md) - All commands and options
 - [Configuration](reference/configuration.md) - Client and server config
 - [Server Setup](getting-started/server-setup.md) - Install shed-server
-- [Firecracker Installation](firecracker_install.md) - Set up Firecracker backend
-- [Firecracker Operations](firecracker_howto.md) - Using Firecracker sheds
+- [Firecracker Setup](getting-started/fc-setup.md) - Set up Firecracker backend
+- [Firecracker Operations](reference/fc-operations.md) - Using Firecracker sheds
 - [VZ Setup](getting-started/vz-setup.md) - Set up VZ backend (macOS)
 - [VZ Operations](reference/vz-operations.md) - Using VZ sheds
 - [Roadmap](ROADMAP.md) - Future enhancements
