@@ -254,7 +254,7 @@ func dockerRunScript(ctx context.Context, platform, imageRef, outputDir, script 
 func extractKernel(ctx context.Context, platform, imageRef, outputDir string) error {
 	return dockerRunScript(ctx, platform, imageRef, outputDir, `set -euo pipefail
 # Try VZ-style compressed kernel first (linux-image-generic)
-VMLINUZ=$(ls -v /boot/vmlinuz-* 2>/dev/null | tail -1)
+VMLINUZ=$(ls -v /boot/vmlinuz-* 2>/dev/null | tail -1 || true)
 if [ -n "$VMLINUZ" ]; then
     if zcat "$VMLINUZ" > /output/vmlinux 2>/dev/null; then
         echo 'Decompressed gzip kernel'
@@ -275,7 +275,7 @@ exit 1`)
 
 func extractInitrd(ctx context.Context, platform, imageRef, outputDir string) error {
 	return dockerRunScript(ctx, platform, imageRef, outputDir, `set -euo pipefail
-INITRD=$(ls -v /boot/initrd.img-* 2>/dev/null | tail -1)
+INITRD=$(ls -v /boot/initrd.img-* 2>/dev/null | tail -1 || true)
 if [ -z "$INITRD" ]; then
     echo 'ERROR: No initrd found in /boot/'
     exit 1
