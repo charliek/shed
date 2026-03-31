@@ -61,6 +61,12 @@ default_backend: firecracker
 firecracker:
   kernel_path: /var/lib/shed/firecracker/vmlinux.bin
   base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+  # Image variants — uncomment to enable multi-image support:
+  # images:
+  #   base: ghcr.io/charliek/shed-fc-base:v1.0.0
+  #   default: ghcr.io/charliek/shed-fc-default:v1.0.0
+  #   typescript: ghcr.io/charliek/shed-fc-typescript:v1.0.0
+  # images_dir: /var/lib/shed/firecracker/images
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2

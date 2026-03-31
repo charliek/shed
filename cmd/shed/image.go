@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 
@@ -16,8 +17,8 @@ import (
 
 var imageCmd = &cobra.Command{
 	Use:   "image",
-	Short: "Manage VZ images",
-	Long:  "Build, list, and manage VZ rootfs images.",
+	Short: "Manage rootfs images",
+	Long:  "Build, list, and manage rootfs images for VM backends.",
 }
 
 var (
@@ -36,8 +37,8 @@ var (
 
 var imageBuildCmd = &cobra.Command{
 	Use:   "build [context]",
-	Short: "Build a VZ rootfs image",
-	Long: `Build a VZ rootfs image from a Dockerfile or Docker registry image.
+	Short: "Build a rootfs image",
+	Long: `Build a rootfs image from a Dockerfile or Docker registry image.
 
 There are two modes:
 
@@ -45,34 +46,36 @@ There are two modes:
     shed image build -f Dockerfile.shed -n myimage .
 
   Registry mode (--from):
-    shed image build --from ghcr.io/charliek/shed-vz-base:v1.0.0 -n myimage
+    shed image build --from ghcr.io/org/image:v1.0.0 -n myimage
 
-The resulting ext4 image is stored in the images directory and is
-immediately available for use with: shed create mydev --image myimage`,
+The target platform is auto-detected from the host OS (linux/amd64 for
+Firecracker, linux/arm64 for VZ). The resulting ext4 image is stored in
+the images directory and is immediately available for use with:
+  shed create mydev --image myimage`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runImageBuild,
 }
 
 var imageListCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List available VZ images",
-	Long:  "List available VZ image variants from server config and auto-discovered images.",
+	Short: "List available images",
+	Long:  "List available image variants from server config and auto-discovered images.",
 	Args:  cobra.NoArgs,
 	RunE:  runImageList,
 }
 
 var imageDeleteCmd = &cobra.Command{
 	Use:   "delete <name>",
-	Short: "Delete a cached VZ image",
-	Long:  "Delete a cached VZ rootfs image from the images directory.",
+	Short: "Delete a cached image",
+	Long:  "Delete a cached rootfs image from the images directory.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runImageDelete,
 }
 
 var imagePruneCmd = &cobra.Command{
 	Use:   "prune",
-	Short: "Remove unused cached VZ images",
-	Long:  "Remove cached VZ images that are not referenced by config or any existing shed.",
+	Short: "Remove unused cached images",
+	Long:  "Remove cached images that are not referenced by config or any existing shed.",
 	Args:  cobra.NoArgs,
 	RunE:  runImagePrune,
 }
@@ -83,7 +86,7 @@ func init() {
 	imageBuildCmd.Flags().StringVarP(&imageBuildName, "name", "n", "", "Image variant name (required)")
 	imageBuildCmd.Flags().StringVar(&imageBuildTarget, "target", "", "Docker build target stage (Dockerfile mode only)")
 	imageBuildCmd.Flags().StringVar(&imageBuildSize, "size", "20G", "Rootfs image size")
-	imageBuildCmd.Flags().StringVar(&imageBuildOutputDir, "output-dir", "", "Output directory (default: ~/Library/Application Support/shed/vz/)")
+	imageBuildCmd.Flags().StringVar(&imageBuildOutputDir, "output-dir", "", "Output directory (auto-detected based on backend)")
 	imageBuildCmd.Flags().BoolVar(&imageBuildForce, "force", false, "Skip base image validation warning")
 	_ = imageBuildCmd.MarkFlagRequired("name")
 
@@ -98,19 +101,39 @@ func init() {
 	rootCmd.AddCommand(imageCmd)
 }
 
+// buildContext holds backend-specific settings for image building.
+type buildContext struct {
+	Prefix        string // Docker tag prefix ("shed-vz-" or "shed-fc-")
+	Platform      string // Docker platform ("linux/arm64" or "linux/amd64")
+	OutputDir     string // Default output directory
+	ExtractKernel bool   // Whether to extract kernel/initrd from images
+}
+
+// imageBackendContext returns build settings for the current host OS.
+// shed image build is a host-local operation — the platform is determined
+// by the host, not by server backend selection.
+func imageBackendContext() buildContext {
+	if runtime.GOOS == "linux" {
+		return buildContext{"shed-fc-", vmimage.FirecrackerPlatform, config.DefaultFirecrackerImagesDir, false}
+	}
+	return buildContext{"shed-vz-", vmimage.DefaultPlatform, config.ExpandPath(config.DefaultVZImagesDir), true}
+}
+
 func runImageBuild(cmd *cobra.Command, args []string) error {
+	bc := imageBackendContext()
+
 	outputDir := imageBuildOutputDir
 	if outputDir == "" {
-		outputDir = config.ExpandPath(config.DefaultVZImagesDir)
+		outputDir = bc.OutputDir
 	}
 
 	if imageBuildFrom != "" {
-		return runImageBuildFromRef(cmd.Context(), outputDir)
+		return runImageBuildFromRef(cmd.Context(), outputDir, bc.Platform, bc.ExtractKernel)
 	}
-	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir)
+	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, bc.Platform, bc.ExtractKernel)
 }
 
-func runImageBuildFromRef(ctx context.Context, outputDir string) error {
+func runImageBuildFromRef(ctx context.Context, outputDir, platform string, extractKernel bool) error {
 	fmt.Printf("Converting %s to ext4 rootfs...\n", imageBuildFrom)
 
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
@@ -118,7 +141,8 @@ func runImageBuildFromRef(ctx context.Context, outputDir string) error {
 		Name:          imageBuildName,
 		OutputDir:     outputDir,
 		RootfsSize:    imageBuildSize,
-		ExtractKernel: true,
+		Platform:      platform,
+		ExtractKernel: extractKernel,
 	})
 	if err != nil {
 		return fmt.Errorf("conversion failed: %w", err)
@@ -128,7 +152,7 @@ func runImageBuildFromRef(ctx context.Context, outputDir string) error {
 	return nil
 }
 
-func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir string) error {
+func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, prefix, platform string, extractKernel bool) error {
 	buildContext := "."
 	if len(args) > 0 {
 		buildContext = args[0]
@@ -152,10 +176,10 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir s
 		}
 	}
 
-	dockerTag := fmt.Sprintf("shed-vz-%s:latest", imageBuildName)
+	dockerTag := fmt.Sprintf("%s%s:latest", prefix, imageBuildName)
 
 	fmt.Printf("Building Docker image %s...\n", dockerTag)
-	buildArgs := []string{"buildx", "build", "--platform", vmimage.DefaultPlatform,
+	buildArgs := []string{"buildx", "build", "--platform", platform,
 		"-t", dockerTag, "--load", "-f", dockerfile}
 	if imageBuildTarget != "" {
 		buildArgs = append(buildArgs, "--target", imageBuildTarget)
@@ -175,7 +199,8 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir s
 		Name:          imageBuildName,
 		OutputDir:     outputDir,
 		RootfsSize:    imageBuildSize,
-		ExtractKernel: true,
+		Platform:      platform,
+		ExtractKernel: extractKernel,
 	})
 	if err != nil {
 		return fmt.Errorf("conversion failed: %w", err)
@@ -417,7 +442,7 @@ func validateBaseImage(dockerfile string) error {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToUpper(trimmed), "FROM ") {
-			if strings.Contains(trimmed, "shed-vz-") {
+			if strings.Contains(trimmed, "shed-vz-") || strings.Contains(trimmed, "shed-fc-") {
 				return nil
 			}
 			return fmt.Errorf("dockerfile does not appear to extend a shed base image (first FROM: %s)", trimmed)

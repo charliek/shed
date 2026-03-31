@@ -18,6 +18,9 @@ import (
 // DefaultPlatform is the Docker platform used for VZ images (Apple Silicon).
 const DefaultPlatform = "linux/arm64"
 
+// FirecrackerPlatform is the Docker platform used for Firecracker images (x86_64 Linux).
+const FirecrackerPlatform = "linux/amd64"
+
 // ConvertOptions configures a Docker-to-ext4 conversion.
 type ConvertOptions struct {
 	// DockerRef is the Docker image reference to convert (e.g., "ghcr.io/charliek/shed-vz-default:v1.0.0").

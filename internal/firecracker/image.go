@@ -1,32 +1,17 @@
-//go:build darwin
+//go:build linux
 
-package vz
+package firecracker
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"os"
 
-	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/vmimage"
 )
 
-// EnsureImage ensures a resolved image is available as a local ext4 file.
-// If the image is already a local path, it returns that path directly.
-// If it's a Docker reference, it pulls and converts to ext4, caching the result.
-func EnsureImage(ctx context.Context, resolved config.ResolvedImage, cfg *config.VZConfig) (string, error) {
-	mgr := vmimage.NewManager(cfg)
-	return mgr.EnsureImage(ctx, vmimage.ResolvedRef{
-		Path:      resolved.Path,
-		DockerRef: resolved.DockerRef,
-		Name:      resolved.Name,
-	}, func(stage, msg string) {
-		backend.Progress(ctx, stage, msg)
-	})
-}
-
-// ListImages returns available image variants from config and auto-discovery in ImagesDir.
+// ListImages returns available image variants from config and auto-discovery.
 func (c *Client) ListImages() ([]config.ImageInfo, error) {
 	mgr := vmimage.NewManager(c.cfg)
 	images, err := mgr.ListImages()
@@ -37,7 +22,6 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 }
 
 // DeleteImage removes a cached image by name.
-// It deletes the ext4 rootfs and source sidecar but NOT the lock file.
 func (c *Client) DeleteImage(name string) error {
 	mgr := vmimage.NewManager(c.cfg)
 	err := mgr.DeleteImage(name, c.inUseImageNames)
@@ -45,7 +29,6 @@ func (c *Client) DeleteImage(name string) error {
 }
 
 // PruneImages removes cached images not referenced by config or existing sheds.
-// If dryRun is true, returns candidates without deleting.
 func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
 	mgr := vmimage.NewManager(c.cfg)
 	images, err := mgr.PruneImages(dryRun, c.inUseImageNames)
@@ -55,17 +38,17 @@ func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
 	return toConfigImageInfos(images), nil
 }
 
-// inUseImageNames returns image names referenced by existing VZ instances.
+// inUseImageNames returns image names referenced by existing Firecracker instances.
 func (c *Client) inUseImageNames() ([]string, error) {
 	instances, err := ListInstances(c.cfg.InstanceDir)
 	if err != nil && !os.IsNotExist(err) {
-		return nil, err
+		return nil, fmt.Errorf("listing instances: %w", err)
 	}
 	var names []string
 	for _, inst := range instances {
 		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reading metadata for %s: %w", inst, err)
 		}
 		if meta.Image != "" {
 			names = append(names, meta.Image)

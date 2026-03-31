@@ -58,8 +58,18 @@ type FirecrackerConfig struct {
 	// KernelPath is the path to the Linux kernel image
 	KernelPath string `yaml:"kernel_path"`
 
-	// BaseRootfs is the path to the base rootfs image
+	// BaseRootfs is the path to the base rootfs image or a Docker image reference.
+	// Docker refs are lazily pulled and converted to ext4 on first use.
 	BaseRootfs string `yaml:"base_rootfs"`
+
+	// Images maps variant names to rootfs paths or Docker image references.
+	// Users can reference these with: shed create mydev --image typescript
+	// Values can be ext4 file paths or Docker refs (e.g., "ghcr.io/charliek/shed-fc-default:v1.0.0").
+	Images map[string]string `yaml:"images,omitempty"`
+
+	// ImagesDir is the directory for converted/discovered ext4 images.
+	// Images matching {name}-rootfs.ext4 are auto-discovered as available variants.
+	ImagesDir string `yaml:"images_dir,omitempty"`
 
 	// InstanceDir is the directory for instance data
 	InstanceDir string `yaml:"instance_dir"`
@@ -159,6 +169,21 @@ type VZConfig struct {
 	// StopTimeout is the timeout for graceful VM shutdown
 	StopTimeout Duration `yaml:"stop_timeout"`
 }
+
+// GetImages implements vmimage.ImageConfig.
+func (c *VZConfig) GetImages() map[string]string { return c.Images }
+
+// GetImagesDir implements vmimage.ImageConfig.
+func (c *VZConfig) GetImagesDir() string { return c.ImagesDir }
+
+// GetBaseRootfs implements vmimage.ImageConfig.
+func (c *VZConfig) GetBaseRootfs() string { return c.BaseRootfs }
+
+// GetPlatform implements vmimage.ImageConfig.
+func (c *VZConfig) GetPlatform() string { return "linux/arm64" }
+
+// GetExtractKernel implements vmimage.ImageConfig.
+func (c *VZConfig) GetExtractKernel() bool { return true }
 
 // DefaultVZConfig returns a VZConfig with default values.
 func DefaultVZConfig() *VZConfig {
@@ -343,17 +368,18 @@ type ResolvedImage struct {
 	Name string
 }
 
-// ResolveImage resolves an image name to a local ext4 path or Docker reference.
+// resolveImage is the shared implementation for image name resolution.
+// configKey is used in error messages (e.g., "vz.images" or "firecracker.images").
 //
 // Resolution order:
-//  1. Look up in Images map — if value is a Docker ref, check ImagesDir cache first
-//  2. Auto-discover {name}-rootfs.ext4 in ImagesDir
+//  1. Look up in images map — if value is a Docker ref, check imagesDir cache first
+//  2. Auto-discover {name}-rootfs.ext4 in imagesDir
 //  3. Absolute path escape hatch
 //  4. Error with available variants
-func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
-	if val, ok := c.Images[image]; ok {
+func resolveImage(images map[string]string, imagesDir, image, configKey string) (ResolvedImage, error) {
+	if val, ok := images[image]; ok {
 		if vmimage.IsDockerRef(val) {
-			if cached := vmimage.CheckCache(c.ImagesDir, image, val); cached != "" {
+			if cached := vmimage.CheckCache(imagesDir, image, val); cached != "" {
 				return ResolvedImage{Path: cached, Name: image}, nil
 			}
 			return ResolvedImage{DockerRef: val, Name: image}, nil
@@ -362,8 +388,8 @@ func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
 	}
 
 	// Auto-discover in ImagesDir
-	if c.ImagesDir != "" {
-		discovered := filepath.Join(c.ImagesDir, vmimage.RootfsFilename(image))
+	if imagesDir != "" {
+		discovered := filepath.Join(imagesDir, vmimage.RootfsFilename(image))
 		if _, err := os.Stat(discovered); err == nil {
 			return ResolvedImage{Path: discovered, Name: image}, nil
 		}
@@ -382,34 +408,32 @@ func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
 	}
 
 	// Not found — build error with available variants
-	available := c.availableVariants()
+	available := availableImageVariants(images, imagesDir)
 	if len(available) > 0 {
 		return ResolvedImage{}, fmt.Errorf("%w %q; available variants: %s", ErrUnknownImageSentinel, image, strings.Join(available, ", "))
 	}
-	return ResolvedImage{}, fmt.Errorf("%w %q; no image variants configured (set vz.images in server config)", ErrUnknownImageSentinel, image)
+	return ResolvedImage{}, fmt.Errorf("%w %q; no image variants configured (set %s in server config)", ErrUnknownImageSentinel, image, configKey)
 }
 
-// ResolveBaseRootfs resolves the base rootfs (used when no --image flag is specified).
-// Returns a ResolvedImage that may be a local path or Docker reference.
-func (c *VZConfig) ResolveBaseRootfs() ResolvedImage {
-	if vmimage.IsDockerRef(c.BaseRootfs) {
-		if cached := vmimage.CheckCache(c.ImagesDir, "_base", c.BaseRootfs); cached != "" {
+// resolveBaseRootfs is the shared implementation for base rootfs resolution.
+func resolveBaseRootfs(baseRootfs, imagesDir string) ResolvedImage {
+	if vmimage.IsDockerRef(baseRootfs) {
+		if cached := vmimage.CheckCache(imagesDir, "_base", baseRootfs); cached != "" {
 			return ResolvedImage{Path: cached, Name: "_base"}
 		}
-		return ResolvedImage{DockerRef: c.BaseRootfs, Name: "_base"}
+		return ResolvedImage{DockerRef: baseRootfs, Name: "_base"}
 	}
-	return ResolvedImage{Path: c.BaseRootfs, Name: "_base"}
+	return ResolvedImage{Path: baseRootfs, Name: "_base"}
 }
 
-// availableVariants returns sorted list of available image names from config and ImagesDir.
-func (c *VZConfig) availableVariants() []string {
+// availableImageVariants returns sorted list of available image names from config and imagesDir.
+func availableImageVariants(images map[string]string, imagesDir string) []string {
 	seen := make(map[string]bool)
-	for name := range c.Images {
+	for name := range images {
 		seen[name] = true
 	}
-	// Scan ImagesDir for discovered images
-	if c.ImagesDir != "" {
-		entries, err := os.ReadDir(c.ImagesDir)
+	if imagesDir != "" {
+		entries, err := os.ReadDir(imagesDir)
 		if err == nil {
 			for _, e := range entries {
 				if strings.HasSuffix(e.Name(), "-rootfs.ext4") && !e.IsDir() {
@@ -427,6 +451,16 @@ func (c *VZConfig) availableVariants() []string {
 	}
 	sort.Strings(available)
 	return available
+}
+
+// ResolveImage resolves an image name to a local ext4 path or Docker reference.
+func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
+	return resolveImage(c.Images, c.ImagesDir, image, "vz.images")
+}
+
+// ResolveBaseRootfs resolves the base rootfs (used when no --image flag is specified).
+func (c *VZConfig) ResolveBaseRootfs() ResolvedImage {
+	return resolveBaseRootfs(c.BaseRootfs, c.ImagesDir)
 }
 
 // Firecracker validation upper bounds.
@@ -477,11 +511,42 @@ func (d Duration) Duration() time.Duration {
 	return time.Duration(d)
 }
 
+// DefaultFirecrackerImagesDir is the default directory for Firecracker rootfs images.
+// This is a subdirectory of /var/lib/shed/firecracker/ to avoid mixing image files
+// with the kernel, instance directories, and sockets that already live there.
+const DefaultFirecrackerImagesDir = "/var/lib/shed/firecracker/images"
+
+// GetImages implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetImages() map[string]string { return c.Images }
+
+// GetImagesDir implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetImagesDir() string { return c.ImagesDir }
+
+// GetBaseRootfs implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetBaseRootfs() string { return c.BaseRootfs }
+
+// GetPlatform implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetPlatform() string { return "linux/amd64" }
+
+// GetExtractKernel implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetExtractKernel() bool { return false }
+
+// ResolveImage resolves an image name to a local ext4 path or Docker reference.
+func (c *FirecrackerConfig) ResolveImage(image string) (ResolvedImage, error) {
+	return resolveImage(c.Images, c.ImagesDir, image, "firecracker.images")
+}
+
+// ResolveBaseRootfs resolves the base rootfs (used when no --image flag is specified).
+func (c *FirecrackerConfig) ResolveBaseRootfs() ResolvedImage {
+	return resolveBaseRootfs(c.BaseRootfs, c.ImagesDir)
+}
+
 // DefaultFirecrackerConfig returns a FirecrackerConfig with default values.
 func DefaultFirecrackerConfig() *FirecrackerConfig {
 	return &FirecrackerConfig{
 		KernelPath:      "/var/lib/shed/firecracker/vmlinux.bin",
 		BaseRootfs:      "/var/lib/shed/firecracker/base-rootfs.ext4",
+		ImagesDir:       DefaultFirecrackerImagesDir,
 		InstanceDir:     "/var/lib/shed/firecracker/instances",
 		SocketDir:       "/var/run/shed/firecracker",
 		DefaultCPUs:     2,
@@ -766,6 +831,18 @@ func (c *FirecrackerConfig) applyDefaults() {
 	if c.NotifyPort == 0 {
 		c.NotifyPort = 1026
 	}
+
+	// Default ImagesDir if not set
+	if c.ImagesDir == "" {
+		c.ImagesDir = DefaultFirecrackerImagesDir
+	}
+
+	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
+	for name, val := range c.Images {
+		if !vmimage.IsDockerRef(val) {
+			c.Images[name] = ExpandPath(val)
+		}
+	}
 }
 
 // Validate checks that the Firecracker configuration is valid.
@@ -854,12 +931,25 @@ func (c *FirecrackerConfig) Validate() error {
 		}
 	}
 
-	// Validate kernel and rootfs paths exist
+	// Validate kernel path exists (always a local file for Firecracker)
 	if _, err := os.Stat(c.KernelPath); err != nil {
 		return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
 	}
-	if _, err := os.Stat(c.BaseRootfs); err != nil {
-		return fmt.Errorf("base_rootfs does not exist: %s", c.BaseRootfs)
+
+	// Validate base rootfs path exists (skip for Docker refs — deferred validation)
+	if !vmimage.IsDockerRef(c.BaseRootfs) {
+		if _, err := os.Stat(c.BaseRootfs); err != nil {
+			return fmt.Errorf("base_rootfs does not exist: %s", c.BaseRootfs)
+		}
+	}
+
+	// Validate image variant paths exist (skip Docker refs)
+	for name, val := range c.Images {
+		if !vmimage.IsDockerRef(val) {
+			if _, err := os.Stat(val); err != nil {
+				return fmt.Errorf("image %q path does not exist: %s", name, val)
+			}
+		}
 	}
 
 	// Validate network configuration

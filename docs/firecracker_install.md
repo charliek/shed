@@ -44,14 +44,23 @@ The custom kernel includes 9P filesystem support (required for `--local-dir` and
 
 ## 3. Build the Rootfs Image
 
-Build the base rootfs image that VMs will use:
+Build rootfs images that VMs will use:
 
 ```bash
+# Build the default variant
 ./scripts/build-firecracker-rootfs.sh
+
+# Build a specific variant
+./scripts/build-firecracker-rootfs.sh --variant base
+
+# Build all variants (base, default, typescript)
+./scripts/build-firecracker-rootfs.sh --all
 ```
 
-This creates:
-- `/var/lib/shed/firecracker/base-rootfs.ext4` - 20GB ext4 image with Ubuntu 24.04, Docker, and shed-agent
+This creates ext4 images in `/var/lib/shed/firecracker/images/`:
+- `default-rootfs.ext4` - Full development environment with all coding agents
+- `base-rootfs.ext4` - Minimal shed infrastructure + basic dev tools
+- `typescript-rootfs.ext4` - TypeScript-focused with Node.js + Claude Code
 
 ## 4. Set Up Bridge Network
 

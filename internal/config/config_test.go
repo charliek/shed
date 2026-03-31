@@ -1050,3 +1050,180 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 		}
 	})
 }
+
+func TestFirecrackerConfigResolveImage(t *testing.T) {
+	cfg := &FirecrackerConfig{
+		Images: map[string]string{
+			"base":       "/dev/null",
+			"default":    "/dev/null",
+			"typescript": "/dev/null",
+		},
+	}
+
+	t.Run("named variant", func(t *testing.T) {
+		resolved, err := cfg.ResolveImage("base")
+		if err != nil {
+			t.Fatalf("ResolveImage(base) error = %v", err)
+		}
+		if resolved.Path != "/dev/null" {
+			t.Errorf("ResolveImage(base).Path = %q, want /dev/null", resolved.Path)
+		}
+	})
+
+	t.Run("absolute path exists", func(t *testing.T) {
+		resolved, err := cfg.ResolveImage("/dev/null")
+		if err != nil {
+			t.Fatalf("ResolveImage(/dev/null) error = %v", err)
+		}
+		if resolved.Path != "/dev/null" {
+			t.Errorf("ResolveImage(/dev/null).Path = %q, want /dev/null", resolved.Path)
+		}
+	})
+
+	t.Run("unknown variant", func(t *testing.T) {
+		_, err := cfg.ResolveImage("rust")
+		if err == nil {
+			t.Fatal("ResolveImage should fail for unknown variant")
+		}
+		if !strings.Contains(err.Error(), "unknown image") {
+			t.Errorf("error = %q, want 'unknown image'", err.Error())
+		}
+		if !strings.Contains(err.Error(), "base") {
+			t.Errorf("error should list available variants, got: %q", err.Error())
+		}
+	})
+
+	t.Run("empty images map", func(t *testing.T) {
+		emptyCfg := &FirecrackerConfig{Images: map[string]string{}}
+		_, err := emptyCfg.ResolveImage("anything")
+		if err == nil {
+			t.Fatal("ResolveImage should fail with empty images map")
+		}
+		if !strings.Contains(err.Error(), "no image variants configured") {
+			t.Errorf("error = %q, want 'no image variants configured'", err.Error())
+		}
+		if !strings.Contains(err.Error(), "firecracker.images") {
+			t.Errorf("error should mention firecracker.images, got: %q", err.Error())
+		}
+	})
+}
+
+func TestFirecrackerConfigResolveImageDockerRef(t *testing.T) {
+	t.Run("docker ref returns DockerRef field", func(t *testing.T) {
+		cfg := &FirecrackerConfig{
+			Images:    map[string]string{"default": "ghcr.io/charliek/shed-fc-default:v1.0.0"},
+			ImagesDir: t.TempDir(),
+		}
+		resolved, err := cfg.ResolveImage("default")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.DockerRef != "ghcr.io/charliek/shed-fc-default:v1.0.0" {
+			t.Errorf("DockerRef = %q, want ghcr.io/charliek/shed-fc-default:v1.0.0", resolved.DockerRef)
+		}
+		if resolved.Path != "" {
+			t.Errorf("Path = %q, want empty for uncached Docker ref", resolved.Path)
+		}
+	})
+
+	t.Run("cached docker ref returns Path", func(t *testing.T) {
+		dir := t.TempDir()
+		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
+		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
+		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-fc-default:v1.0.0\n"), 0644)
+
+		cfg := &FirecrackerConfig{
+			Images:    map[string]string{"default": "ghcr.io/charliek/shed-fc-default:v1.0.0"},
+			ImagesDir: dir,
+		}
+		resolved, err := cfg.ResolveImage("default")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.Path != rootfsPath {
+			t.Errorf("Path = %q, want %q", resolved.Path, rootfsPath)
+		}
+	})
+
+	t.Run("auto-discover from ImagesDir", func(t *testing.T) {
+		dir := t.TempDir()
+		rootfsPath := filepath.Join(dir, "custom-rootfs.ext4")
+		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+
+		cfg := &FirecrackerConfig{
+			Images:    map[string]string{},
+			ImagesDir: dir,
+		}
+		resolved, err := cfg.ResolveImage("custom")
+		if err != nil {
+			t.Fatalf("ResolveImage error = %v", err)
+		}
+		if resolved.Path != rootfsPath {
+			t.Errorf("Path = %q, want %q (auto-discovered)", resolved.Path, rootfsPath)
+		}
+	})
+}
+
+func TestFirecrackerConfigResolveBaseRootfs(t *testing.T) {
+	t.Run("local path", func(t *testing.T) {
+		cfg := &FirecrackerConfig{BaseRootfs: "/var/lib/shed/firecracker/base-rootfs.ext4"}
+		resolved := cfg.ResolveBaseRootfs()
+		if resolved.Path != "/var/lib/shed/firecracker/base-rootfs.ext4" {
+			t.Errorf("Path = %q", resolved.Path)
+		}
+		if resolved.DockerRef != "" {
+			t.Errorf("DockerRef = %q, want empty", resolved.DockerRef)
+		}
+	})
+
+	t.Run("docker ref", func(t *testing.T) {
+		cfg := &FirecrackerConfig{
+			BaseRootfs: "ghcr.io/charliek/shed-fc-default:v1.0.0",
+			ImagesDir:  t.TempDir(),
+		}
+		resolved := cfg.ResolveBaseRootfs()
+		if resolved.DockerRef != "ghcr.io/charliek/shed-fc-default:v1.0.0" {
+			t.Errorf("DockerRef = %q", resolved.DockerRef)
+		}
+		if resolved.Name != "_base" {
+			t.Errorf("Name = %q, want _base", resolved.Name)
+		}
+	})
+}
+
+func TestFirecrackerConfigValidateDockerRef(t *testing.T) {
+	t.Run("docker ref in BaseRootfs passes validation", func(t *testing.T) {
+		cfg := validFirecrackerConfig()
+		cfg.BaseRootfs = "ghcr.io/charliek/shed-fc-default:v1.0.0"
+		err := cfg.Validate()
+		if err != nil {
+			t.Errorf("Validate() error = %v, want nil (Docker refs should skip path validation)", err)
+		}
+	})
+
+	t.Run("docker ref in Images skips validation", func(t *testing.T) {
+		cfg := validFirecrackerConfig()
+		cfg.Images = map[string]string{
+			"custom": "ghcr.io/charliek/shed-fc-custom:v1.0.0",
+		}
+		err := cfg.Validate()
+		if err != nil {
+			t.Errorf("Validate() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("invalid image path fails validation", func(t *testing.T) {
+		cfg := validFirecrackerConfig()
+		cfg.Images = map[string]string{
+			"base": "/nonexistent/rootfs.ext4",
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() should fail for missing image path")
+		}
+		if !strings.Contains(err.Error(), "image \"base\" path does not exist") {
+			t.Errorf("error = %q, want image path error", err.Error())
+		}
+	})
+}

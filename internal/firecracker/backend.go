@@ -179,17 +179,17 @@ func (b *FirecrackerBackend) GetNetworkEndpoint(ctx context.Context, shedName st
 	return b.client.GetNetworkEndpoint(ctx, shedName)
 }
 
-// ListImages returns an empty list — Firecracker image support is planned.
+// ListImages returns available Firecracker image variants from config and auto-discovery.
 func (b *FirecrackerBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
-	return nil, nil
+	return b.client.ListImages()
 }
 
-// DeleteImage returns an error — Firecracker backend does not manage cached images.
-func (b *FirecrackerBackend) DeleteImage(_ context.Context, _ string) error {
-	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)
+// DeleteImage removes a cached image by name.
+func (b *FirecrackerBackend) DeleteImage(_ context.Context, name string) error {
+	return b.client.DeleteImage(name)
 }
 
-// PruneImages returns an empty list — Firecracker backend does not manage cached images.
-func (b *FirecrackerBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
-	return nil, nil
+// PruneImages removes cached images not referenced by config or existing sheds.
+func (b *FirecrackerBackend) PruneImages(_ context.Context, dryRun bool) ([]config.ImageInfo, error) {
+	return b.client.PruneImages(dryRun)
 }
