@@ -106,7 +106,8 @@ type buildContext struct {
 	Prefix        string // Docker tag prefix ("shed-vz-" or "shed-fc-")
 	Platform      string // Docker platform ("linux/arm64" or "linux/amd64")
 	OutputDir     string // Default output directory
-	ExtractKernel bool   // Whether to extract kernel/initrd from images
+	ExtractKernel bool   // Whether to extract kernel from images
+	NeedsInitrd   bool   // Whether to extract initrd (VZ only)
 }
 
 // imageBackendContext returns build settings for the current host OS.
@@ -114,9 +115,21 @@ type buildContext struct {
 // by the host, not by server backend selection.
 func imageBackendContext() buildContext {
 	if runtime.GOOS == "linux" {
-		return buildContext{"shed-fc-", vmimage.FirecrackerPlatform, config.DefaultFirecrackerImagesDir, false}
+		return buildContext{
+			Prefix:        "shed-fc-",
+			Platform:      vmimage.FirecrackerPlatform,
+			OutputDir:     config.DefaultFirecrackerImagesDir,
+			ExtractKernel: true,
+			NeedsInitrd:   false,
+		}
 	}
-	return buildContext{"shed-vz-", vmimage.DefaultPlatform, config.ExpandPath(config.DefaultVZImagesDir), true}
+	return buildContext{
+		Prefix:        "shed-vz-",
+		Platform:      vmimage.DefaultPlatform,
+		OutputDir:     config.ExpandPath(config.DefaultVZImagesDir),
+		ExtractKernel: true,
+		NeedsInitrd:   true,
+	}
 }
 
 func runImageBuild(cmd *cobra.Command, args []string) error {
@@ -128,12 +141,12 @@ func runImageBuild(cmd *cobra.Command, args []string) error {
 	}
 
 	if imageBuildFrom != "" {
-		return runImageBuildFromRef(cmd.Context(), outputDir, bc.Platform, bc.ExtractKernel)
+		return runImageBuildFromRef(cmd.Context(), outputDir, bc.Platform, bc.ExtractKernel, bc.NeedsInitrd)
 	}
-	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, bc.Platform, bc.ExtractKernel)
+	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, bc.Platform, bc.ExtractKernel, bc.NeedsInitrd)
 }
 
-func runImageBuildFromRef(ctx context.Context, outputDir, platform string, extractKernel bool) error {
+func runImageBuildFromRef(ctx context.Context, outputDir, platform string, extractKernel, needsInitrd bool) error {
 	fmt.Printf("Converting %s to ext4 rootfs...\n", imageBuildFrom)
 
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
@@ -143,6 +156,7 @@ func runImageBuildFromRef(ctx context.Context, outputDir, platform string, extra
 		RootfsSize:    imageBuildSize,
 		Platform:      platform,
 		ExtractKernel: extractKernel,
+		NeedsInitrd:   needsInitrd,
 	})
 	if err != nil {
 		return fmt.Errorf("conversion failed: %w", err)
@@ -152,7 +166,7 @@ func runImageBuildFromRef(ctx context.Context, outputDir, platform string, extra
 	return nil
 }
 
-func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, prefix, platform string, extractKernel bool) error {
+func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, prefix, platform string, extractKernel, needsInitrd bool) error {
 	buildContext := "."
 	if len(args) > 0 {
 		buildContext = args[0]
@@ -201,6 +215,7 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 		RootfsSize:    imageBuildSize,
 		Platform:      platform,
 		ExtractKernel: extractKernel,
+		NeedsInitrd:   needsInitrd,
 	})
 	if err != nil {
 		return fmt.Errorf("conversion failed: %w", err)

@@ -1,7 +1,8 @@
 # Multi-stage Dockerfile for Firecracker rootfs images
 #
 # Stages:
-#   shed-fc-base       - Minimal: shed infrastructure + basic dev tools
+#   kernel-builder     - Temporary: compiles custom Firecracker kernel
+#   shed-fc-base       - Minimal: shed infrastructure + basic dev tools + kernel
 #   shed-fc-devtools   - Internal: adds mise, Node.js, Claude Code, UV, Python
 #   shed-fc-default    - Full: all coding agents and language runtimes
 #   shed-fc-typescript - Focused: Node.js/TypeScript + Claude Code
@@ -12,6 +13,43 @@
 #
 # Or use the build script:
 #   ./scripts/build-firecracker-rootfs.sh --variant base
+
+# =============================================================================
+# Stage: kernel-builder (temporary)
+# Compiles a custom Firecracker kernel with Docker, 9P, and BPF support.
+# Only the vmlinux binary is copied into the final image.
+# =============================================================================
+FROM --platform=linux/amd64 ubuntu:24.04 AS kernel-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential flex bison bc libelf-dev libssl-dev \
+    git curl ca-certificates file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin kernel and Firecracker config versions for reproducibility.
+# KERNEL_TAG: stable kernel release (6.1.x series).
+# FC_VERSION: Firecracker release whose CI config is used as the base.
+ARG KERNEL_TAG=v6.1.167
+ARG FC_VERSION=v1.14.1
+
+WORKDIR /build
+RUN git clone --depth 1 --branch ${KERNEL_TAG} \
+    https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
+
+WORKDIR /build/linux
+
+# Download Firecracker CI kernel config and merge custom fragment
+RUN curl -fL -o .config \
+    "https://raw.githubusercontent.com/firecracker-microvm/firecracker/${FC_VERSION}/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+
+COPY kernel-config-docker.fragment /tmp/fragment
+RUN if [ -x scripts/kconfig/merge_config.sh ]; then \
+        scripts/kconfig/merge_config.sh -m .config /tmp/fragment; \
+    else \
+        cat /tmp/fragment >> .config; \
+    fi && make olddefconfig
+
+RUN make -j$(nproc) vmlinux
 
 # =============================================================================
 # Stage: shed-fc-base
@@ -160,6 +198,9 @@ RUN chmod +x /usr/local/bin/network-setup.sh
 # Copy network setup systemd service
 COPY network-setup.service /etc/systemd/system/network-setup.service
 RUN SYSTEMD_OFFLINE=1 systemctl enable network-setup
+
+# Copy custom Firecracker kernel (extracted by shed during image conversion)
+COPY --from=kernel-builder /build/linux/vmlinux /boot/vmlinux
 
 # Shell customization - colored prompt showing shed name and path
 USER shed

@@ -38,9 +38,14 @@ type ConvertOptions struct {
 	// Platform is the Docker platform (e.g., "linux/arm64"). Defaults to DefaultPlatform.
 	Platform string
 
-	// ExtractKernel controls whether kernel and initrd should be extracted.
-	// If true and kernel/initrd don't already exist in OutputDir, they are extracted.
+	// ExtractKernel controls whether the kernel should be extracted from the Docker image.
+	// If true and the kernel doesn't already exist in OutputDir, it is extracted.
 	ExtractKernel bool
+
+	// NeedsInitrd controls whether an initrd should be extracted alongside the kernel.
+	// Only consulted when ExtractKernel is true.
+	// True for VZ (requires initrd for LinuxBootloader), false for Firecracker (boots directly).
+	NeedsInitrd bool
 }
 
 // ConvertResult holds the output paths from a successful conversion.
@@ -146,21 +151,26 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 
 	if opts.ExtractKernel {
 		kernelPath := filepath.Join(opts.OutputDir, "vmlinux")
-		initrdPath := filepath.Join(opts.OutputDir, "initrd.img")
 
 		if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
 			if err := extractKernel(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
 				return nil, fmt.Errorf("failed to extract kernel: %w", err)
 			}
-		}
-		if _, err := os.Stat(initrdPath); os.IsNotExist(err) {
-			if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
-				return nil, fmt.Errorf("failed to extract initrd: %w", err)
+			if _, err := os.Stat(kernelPath); err != nil {
+				return nil, fmt.Errorf("kernel extraction succeeded but file not found at %s", kernelPath)
 			}
 		}
-
 		result.KernelPath = kernelPath
-		result.InitrdPath = initrdPath
+
+		if opts.NeedsInitrd {
+			initrdPath := filepath.Join(opts.OutputDir, "initrd.img")
+			if _, err := os.Stat(initrdPath); os.IsNotExist(err) {
+				if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
+					return nil, fmt.Errorf("failed to extract initrd: %w", err)
+				}
+			}
+			result.InitrdPath = initrdPath
+		}
 	}
 
 	return result, nil
@@ -226,21 +236,12 @@ echo 'ext4 image created successfully'`, size, rootfsFile, rootfsFile, rootfsFil
 	return nil
 }
 
-func extractKernel(ctx context.Context, platform, imageRef, outputDir string) error {
+// dockerRunScript runs a bash script inside the Docker image with outputDir mounted at /output.
+func dockerRunScript(ctx context.Context, platform, imageRef, outputDir, script string) error {
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", platform,
 		"--entrypoint", "/bin/bash",
 		"-v", outputDir+":/output",
-		imageRef, "-c", `set -euo pipefail
-VMLINUZ=$(ls /boot/vmlinuz-* 2>/dev/null | head -1)
-if [ -z "$VMLINUZ" ]; then
-    echo 'ERROR: No kernel found in /boot/'
-    exit 1
-fi
-if zcat "$VMLINUZ" > /output/vmlinux 2>/dev/null; then
-    echo 'Decompressed gzip kernel'
-else
-    cp "$VMLINUZ" /output/vmlinux
-fi`)
+		imageRef, "-c", script)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -250,22 +251,34 @@ fi`)
 	return nil
 }
 
+func extractKernel(ctx context.Context, platform, imageRef, outputDir string) error {
+	return dockerRunScript(ctx, platform, imageRef, outputDir, `set -euo pipefail
+# Try VZ-style compressed kernel first (linux-image-generic)
+VMLINUZ=$(ls -v /boot/vmlinuz-* 2>/dev/null | tail -1)
+if [ -n "$VMLINUZ" ]; then
+    if zcat "$VMLINUZ" > /output/vmlinux 2>/dev/null; then
+        echo 'Decompressed gzip kernel'
+    else
+        cp "$VMLINUZ" /output/vmlinux
+    fi
+    exit 0
+fi
+# Try FC-style uncompressed kernel (custom Firecracker build)
+if [ -f /boot/vmlinux ]; then
+    cp /boot/vmlinux /output/vmlinux
+    echo 'Copied uncompressed kernel'
+    exit 0
+fi
+echo 'ERROR: No kernel found in /boot/'
+exit 1`)
+}
+
 func extractInitrd(ctx context.Context, platform, imageRef, outputDir string) error {
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", platform,
-		"--entrypoint", "/bin/bash",
-		"-v", outputDir+":/output",
-		imageRef, "-c", `set -euo pipefail
-INITRD=$(ls /boot/initrd.img-* 2>/dev/null | head -1)
+	return dockerRunScript(ctx, platform, imageRef, outputDir, `set -euo pipefail
+INITRD=$(ls -v /boot/initrd.img-* 2>/dev/null | tail -1)
 if [ -z "$INITRD" ]; then
     echo 'ERROR: No initrd found in /boot/'
     exit 1
 fi
 cp "$INITRD" /output/initrd.img`)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %w", strings.TrimSpace(stderr.String()), err)
-	}
-	return nil
 }

@@ -101,8 +101,7 @@ enabled_backends:
 default_backend: firecracker
 
 firecracker:
-  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
-  base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2
