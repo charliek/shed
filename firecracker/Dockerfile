@@ -1,7 +1,26 @@
-# Dockerfile for building Firecracker rootfs image
-# This creates a minimal Ubuntu 24.04 system with Docker, tmux, and shed-agent
+# Multi-stage Dockerfile for Firecracker rootfs images
+#
+# Stages:
+#   shed-fc-base       - Minimal: shed infrastructure + basic dev tools
+#   shed-fc-devtools   - Internal: adds mise, Node.js, Claude Code, UV, Python
+#   shed-fc-default    - Full: all coding agents and language runtimes
+#   shed-fc-typescript - Focused: Node.js/TypeScript + Claude Code
+#
+# Build a specific variant:
+#   docker buildx build --platform linux/amd64 --target shed-fc-base -t shed-fc-base:latest --load .
+#   docker buildx build --platform linux/amd64 --target shed-fc-default -t shed-fc-default:latest --load .
+#
+# Or use the build script:
+#   ./scripts/build-firecracker-rootfs.sh --variant base
 
-FROM ubuntu:24.04
+# =============================================================================
+# Stage: shed-fc-base
+# Everything shed needs to function + basic development tools.
+# =============================================================================
+FROM ubuntu:24.04 AS shed-fc-base
+
+LABEL io.shed.base-version="1"
+LABEL org.opencontainers.image.source="https://github.com/charliek/shed"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -9,7 +28,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install essential packages
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     # System essentials
     systemd \
     systemd-sysv \
@@ -57,22 +76,6 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        docker-buildx-plugin \
        docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
-
-# Node.js 22.x
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# Claude Code
-# CLAUDE_CONFIG_DIR tells Claude Code to read/write .claude.json inside ~/.claude/
-# instead of at ~/.claude.json in the home directory root. This lets credential
-# mounts of ~/.claude/ cover all Claude state without a separate file transfer.
-RUN npm install -g @anthropic-ai/claude-code \
-    && echo 'export CLAUDE_CONFIG_DIR="/home/shed/.claude"' > /etc/profile.d/claude-config.sh
-ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
-
-# OpenCode
-RUN npm i -g opencode-ai
 
 # GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -158,12 +161,35 @@ RUN chmod +x /usr/local/bin/network-setup.sh
 COPY network-setup.service /etc/systemd/system/network-setup.service
 RUN SYSTEMD_OFFLINE=1 systemctl enable network-setup
 
-# Switch to shed user for user-level tool installs
+# Shell customization - colored prompt showing shed name and path
 USER shed
+RUN echo 'export PS1="\\[\\033[1;36m\\][\\[\\033[1;32m\\]shed:\\${SHED_NAME:-dev}\\[\\033[1;36m\\]]\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ "' >> /home/shed/.bashrc
+USER root
+
+# Set default working directory
+WORKDIR /workspace
+
+# Set the init system as entrypoint
+ENTRYPOINT ["/sbin/init"]
+
+
+# =============================================================================
+# Stage: shed-fc-devtools (internal)
+# Shared tooling layer: mise, Node.js, Claude Code, UV, Python.
+# Not intended for direct use — serves as base for default and typescript.
+# =============================================================================
+FROM shed-fc-base AS shed-fc-devtools
+
+USER shed
+
+ENV PATH="/home/shed/.local/bin:${PATH}"
 
 # mise (version manager)
 RUN curl https://mise.run | sh
-ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:${PATH}"
+RUN echo 'eval "$(mise activate bash)"' >> /home/shed/.bashrc
+ENV PATH="/home/shed/.local/share/mise/shims:${PATH}"
+
+RUN mise use -g node@lts
 
 # Ensure mise shims and local bin are in PATH for login shells via profile.d
 USER root
@@ -175,18 +201,51 @@ RUN printf '%s\n' \
     > /etc/profile.d/shed-path.sh
 USER shed
 
+# Claude Code
+# CLAUDE_CONFIG_DIR tells Claude Code to read/write .claude.json inside ~/.claude/
+# instead of at ~/.claude.json in the home directory root. This lets credential
+# mounts of ~/.claude/ cover all Claude state without a separate file transfer.
+ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && sudo sh -c 'echo "export CLAUDE_CONFIG_DIR=/home/shed/.claude" > /etc/profile.d/claude-config.sh'
+
 # UV + Python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN /home/shed/.local/bin/uv python install 3.13
 
-# Shell customization - colored prompt showing shed name and path
-RUN echo 'export PS1="\\[\\033[1;36m\\][\\[\\033[1;32m\\]shed:\\${SHED_NAME:-dev}\\[\\033[1;36m\\]]\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ "' >> /home/shed/.bashrc
 
-# Switch back to root for systemd entrypoint
+# =============================================================================
+# Stage: shed-fc-default
+# Full development experience with all coding agents and language runtimes.
+# =============================================================================
+FROM shed-fc-devtools AS shed-fc-default
+
+# Additional mise tools
+RUN mise use -g \
+    github:charliek/prox \
+    github:charliek/envsecrets
+
+# OpenCode
+RUN curl -fsSL https://opencode.ai/install | bash
+
+# Codex cli
+RUN npm i -g @openai/codex
+
 USER root
 
-# Set default working directory
 WORKDIR /workspace
 
-# Set the init system as entrypoint
+ENTRYPOINT ["/sbin/init"]
+
+
+# =============================================================================
+# Stage: shed-fc-typescript
+# TypeScript-focused: Node.js tooling + Claude Code, fewer coding agents.
+# =============================================================================
+FROM shed-fc-devtools AS shed-fc-typescript
+
+USER root
+
+WORKDIR /workspace
+
 ENTRYPOINT ["/sbin/init"]

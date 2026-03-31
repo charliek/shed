@@ -18,6 +18,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -327,6 +328,7 @@ func metadataToShed(meta *Metadata) *config.Shed {
 		PID:         meta.PID,
 		RootfsPath:  meta.RootfsPath,
 		LocalDir:    meta.LocalDir,
+		Image:       meta.Image,
 	}
 }
 
@@ -338,6 +340,33 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+	}
+
+	// Resolve and ensure image before allocating network resources.
+	// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
+	// pull from Docker which can take minutes. Doing this first avoids holding
+	// scarce network resources (TAP devices, IPs) during slow operations.
+	var resolved config.ResolvedImage
+	var err error
+	if req.Image != "" {
+		resolved, err = c.cfg.ResolveImage(req.Image)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		resolved = c.cfg.ResolveBaseRootfs()
+	}
+
+	mgr := vmimage.NewManager(c.cfg)
+	rootfsSource, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
+		Path:      resolved.Path,
+		DockerRef: resolved.DockerRef,
+		Name:      resolved.Name,
+	}, func(stage, msg string) {
+		backend.Progress(ctx, stage, msg)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure image: %w", err)
 	}
 
 	backend.Progress(ctx, "network", "Allocating network resources...")
@@ -358,7 +387,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
-	rootfsPath, err := CopyRootfs(c.cfg.BaseRootfs, c.cfg.InstanceDir, req.Name)
+	rootfsPath, err := CopyRootfs(rootfsSource, c.cfg.InstanceDir, req.Name)
 	if err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
@@ -390,6 +419,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		RootfsPath: rootfsPath,
 		Repo:       req.Repo,
 		LocalDir:   req.LocalDir,
+		Image:      req.Image,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {

@@ -174,7 +174,7 @@ shed delete <name> [flags]
 
 ### shed image build
 
-Builds a VZ rootfs image from a Dockerfile or Docker registry image.
+Builds a rootfs image from a Dockerfile or Docker registry image. The target platform is auto-detected from the host OS (linux/amd64 for Firecracker, linux/arm64 for VZ).
 
 ```bash
 shed image build [flags] [context]
@@ -187,7 +187,7 @@ shed image build [flags] [context]
 | `--name` | `-n` | *required* | Image variant name |
 | `--target` | | | Docker build target stage (Dockerfile mode only) |
 | `--size` | | `20G` | Rootfs image size |
-| `--output-dir` | | `~/Library/Application Support/shed/vz/` | Output directory |
+| `--output-dir` | | auto-detected | Output directory |
 | `--force` | | `false` | Skip base image validation warning |
 
 **Dockerfile mode:**
@@ -199,12 +199,12 @@ shed image build -f Dockerfile.shed -n myimage .
 **Registry mode:**
 
 ```bash
-shed image build --from ghcr.io/charliek/shed-vz-base:v1.0.0 -n myimage
+shed image build --from ghcr.io/charliek/shed-fc-base:v1.0.0 -n myimage
 ```
 
 ### shed image list
 
-Lists available VZ image variants.
+Lists available image variants from server config and auto-discovered images.
 
 ```bash
 shed image list
@@ -221,7 +221,7 @@ typescript   discovered   3.8 GB    yes      -
 
 ### shed image delete
 
-Deletes a cached VZ rootfs image.
+Deletes a cached rootfs image from the images directory.
 
 ```bash
 shed image delete <name> [flags]
@@ -244,7 +244,7 @@ shed image delete myimage --force
 
 ### shed image prune
 
-Removes unused cached VZ images.
+Removes cached images that are not referenced by config or any existing shed.
 
 ```bash
 shed image prune [flags]
