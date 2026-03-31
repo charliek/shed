@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.1.1
+
+- Include custom Firecracker kernel in published images — users no longer need to compile a kernel or run `build-firecracker-kernel.sh` when using published images
+- Add `GetNeedsInitrd()` to ImageConfig interface to make initrd extraction optional (VZ only)
+- Update `extractKernel()` to handle both VZ-style compressed and FC-style uncompressed kernels
+- Default Firecracker `kernel_path` to `{images_dir}/vmlinux` (auto-populated from published images)
+- Defer Firecracker `kernel_path` validation when Docker refs are configured
+- Extract `hasAnyDockerRef()` and `dockerRunScript()` shared helpers
+- Update Firecracker setup docs and example configs for kernel-in-image workflow
+
 ## v0.1.0
 
 ### Features
