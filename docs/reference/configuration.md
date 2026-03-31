@@ -198,10 +198,9 @@ enabled_backends:
 default_backend: firecracker
 
 firecracker:
-  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
-  base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
   images:
-    base: ghcr.io/charliek/shed-fc-base:v1.0.0
+    base: ghcr.io/charliek/shed-fc-base:v0.1.0
   images_dir: /var/lib/shed/firecracker/images
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
@@ -223,7 +222,7 @@ firecracker:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `kernel_path` | string | - | Path to Linux kernel image |
+| `kernel_path` | string | `{images_dir}/vmlinux` | Path to Linux kernel image (auto-populated from published images) |
 | `base_rootfs` | string | - | Path or Docker ref for base rootfs (used when no `--image` specified) |
 | `images` | map | - | Named image variants (ext4 paths or Docker refs) |
 | `images_dir` | string | `/var/lib/shed/firecracker/images` | Directory for converted/discovered ext4 images |

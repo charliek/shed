@@ -26,6 +26,8 @@ Pre-built `base` images are published to `ghcr.io/charliek/` on each release:
 
 Additional variants (`default`, `typescript`) can be built locally from source. These may be published in a future release.
 
+Both VZ and Firecracker images include the kernel needed to boot the VM. For VZ, the kernel and initrd are extracted from the Ubuntu `linux-image-generic` package. For Firecracker, a custom kernel is compiled with Docker, 9P, and BPF support built in. No separate kernel build or download is needed when using published images.
+
 These images serve two purposes:
 
 1. **Direct use**: Reference them in server config as Docker refs — shed auto-pulls and converts to ext4 on first use.
@@ -301,3 +303,11 @@ du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
     | `default-rootfs.ext4` | Default variant rootfs (20GB sparse) |
     | `base-rootfs.ext4` | Base variant rootfs |
     | `typescript-rootfs.ext4` | TypeScript variant rootfs |
+
+    To build a custom kernel (for local development or advanced use):
+
+    ```bash
+    ./scripts/build-firecracker-kernel.sh
+    ```
+
+    Set `kernel_path` in your config to use the custom kernel instead of the one extracted from published images.

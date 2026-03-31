@@ -185,6 +185,9 @@ func (c *VZConfig) GetPlatform() string { return "linux/arm64" }
 // GetExtractKernel implements vmimage.ImageConfig.
 func (c *VZConfig) GetExtractKernel() bool { return true }
 
+// GetNeedsInitrd implements vmimage.ImageConfig.
+func (c *VZConfig) GetNeedsInitrd() bool { return true }
+
 // DefaultVZConfig returns a VZConfig with default values.
 func DefaultVZConfig() *VZConfig {
 	return &VZConfig{
@@ -314,19 +317,9 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	// Check if any image references are Docker refs (deferred validation — files
-	// won't exist on disk until first pull+convert). When Docker refs are present,
-	// kernel/initrd validation is also deferred since they're extracted during conversion.
-	hasDockerRefs := vmimage.IsDockerRef(c.BaseRootfs)
-	for _, val := range c.Images {
-		if vmimage.IsDockerRef(val) {
-			hasDockerRefs = true
-			break
-		}
-	}
-
-	// Validate kernel, initrd, and rootfs paths exist (skip for Docker refs)
-	if !hasDockerRefs {
+	// Defer kernel/initrd/rootfs path validation when Docker refs are present —
+	// files are extracted during first image conversion.
+	if !hasAnyDockerRef(c.BaseRootfs, c.Images) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
 		}
@@ -529,7 +522,10 @@ func (c *FirecrackerConfig) GetBaseRootfs() string { return c.BaseRootfs }
 func (c *FirecrackerConfig) GetPlatform() string { return "linux/amd64" }
 
 // GetExtractKernel implements vmimage.ImageConfig.
-func (c *FirecrackerConfig) GetExtractKernel() bool { return false }
+func (c *FirecrackerConfig) GetExtractKernel() bool { return true }
+
+// GetNeedsInitrd implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetNeedsInitrd() bool { return false }
 
 // ResolveImage resolves an image name to a local ext4 path or Docker reference.
 func (c *FirecrackerConfig) ResolveImage(image string) (ResolvedImage, error) {
@@ -544,7 +540,7 @@ func (c *FirecrackerConfig) ResolveBaseRootfs() ResolvedImage {
 // DefaultFirecrackerConfig returns a FirecrackerConfig with default values.
 func DefaultFirecrackerConfig() *FirecrackerConfig {
 	return &FirecrackerConfig{
-		KernelPath:      "/var/lib/shed/firecracker/vmlinux.bin",
+		KernelPath:      DefaultFirecrackerImagesDir + "/vmlinux",
 		BaseRootfs:      "/var/lib/shed/firecracker/base-rootfs.ext4",
 		ImagesDir:       DefaultFirecrackerImagesDir,
 		InstanceDir:     "/var/lib/shed/firecracker/instances",
@@ -837,6 +833,11 @@ func (c *FirecrackerConfig) applyDefaults() {
 		c.ImagesDir = DefaultFirecrackerImagesDir
 	}
 
+	// Default KernelPath to ImagesDir/vmlinux (extracted from published images)
+	if c.KernelPath == "" {
+		c.KernelPath = c.ImagesDir + "/vmlinux"
+	}
+
 	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
 	for name, val := range c.Images {
 		if !vmimage.IsDockerRef(val) {
@@ -931,9 +932,12 @@ func (c *FirecrackerConfig) Validate() error {
 		}
 	}
 
-	// Validate kernel path exists (always a local file for Firecracker)
-	if _, err := os.Stat(c.KernelPath); err != nil {
-		return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
+	// Defer kernel/rootfs path validation when Docker refs are present —
+	// files are extracted during first image conversion.
+	if !hasAnyDockerRef(c.BaseRootfs, c.Images) {
+		if _, err := os.Stat(c.KernelPath); err != nil {
+			return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
+		}
 	}
 
 	// Validate base rootfs path exists (skip for Docker refs — deferred validation)
@@ -1024,4 +1028,17 @@ func loadEnvFile(path string) (map[string]string, error) {
 	}
 
 	return envVars, nil
+}
+
+// hasAnyDockerRef returns true if baseRootfs or any image in the map is a Docker reference.
+func hasAnyDockerRef(baseRootfs string, images map[string]string) bool {
+	if vmimage.IsDockerRef(baseRootfs) {
+		return true
+	}
+	for _, val := range images {
+		if vmimage.IsDockerRef(val) {
+			return true
+		}
+	}
+	return false
 }

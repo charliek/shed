@@ -1226,4 +1226,26 @@ func TestFirecrackerConfigValidateDockerRef(t *testing.T) {
 			t.Errorf("error = %q, want image path error", err.Error())
 		}
 	})
+
+	t.Run("kernel_path validation deferred with Docker refs", func(t *testing.T) {
+		cfg := validFirecrackerConfig()
+		cfg.KernelPath = "/nonexistent/vmlinux"
+		cfg.BaseRootfs = "ghcr.io/charliek/shed-fc-base:v1.0.0"
+		err := cfg.Validate()
+		if err != nil {
+			t.Errorf("Validate() error = %v, want nil (kernel_path check deferred for Docker refs)", err)
+		}
+	})
+
+	t.Run("kernel_path validated without Docker refs", func(t *testing.T) {
+		cfg := validFirecrackerConfig()
+		cfg.KernelPath = "/nonexistent/vmlinux"
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() should fail for missing kernel_path without Docker refs")
+		}
+		if !strings.Contains(err.Error(), "kernel_path does not exist") {
+			t.Errorf("error = %q, want kernel_path error", err.Error())
+		}
+	})
 }

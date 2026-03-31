@@ -14,6 +14,7 @@ type testConfig struct {
 	baseRootfs    string
 	platform      string
 	extractKernel bool
+	needsInitrd   bool
 }
 
 func (c *testConfig) GetImages() map[string]string { return c.images }
@@ -21,6 +22,7 @@ func (c *testConfig) GetImagesDir() string         { return c.imagesDir }
 func (c *testConfig) GetBaseRootfs() string        { return c.baseRootfs }
 func (c *testConfig) GetPlatform() string          { return c.platform }
 func (c *testConfig) GetExtractKernel() bool       { return c.extractKernel }
+func (c *testConfig) GetNeedsInitrd() bool         { return c.needsInitrd }
 
 func newTestManager(t *testing.T) (*Manager, string) {
 	t.Helper()

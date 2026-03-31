@@ -37,7 +37,8 @@ type ImageConfig interface {
 	GetImagesDir() string
 	GetBaseRootfs() string
 	GetPlatform() string    // "linux/arm64" or "linux/amd64"
-	GetExtractKernel() bool // true for VZ, false for Firecracker
+	GetExtractKernel() bool // true for both VZ and Firecracker
+	GetNeedsInitrd() bool   // true for VZ, false for Firecracker
 }
 
 // ImageInfo describes an available image variant.
@@ -119,6 +120,7 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		Name:          ref.Name,
 		OutputDir:     outputDir,
 		ExtractKernel: m.cfg.GetExtractKernel(),
+		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
 		Platform:      m.cfg.GetPlatform(),
 	})
 	if err != nil {

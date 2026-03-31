@@ -23,7 +23,7 @@ sudo usermod -aG kvm $USER
 
 ## 2. Download Firecracker
 
-Run the download script to get Firecracker and a compatible kernel:
+Run the download script to get the Firecracker binary:
 
 ```bash
 ./scripts/download-firecracker.sh
@@ -31,31 +31,24 @@ Run the download script to get Firecracker and a compatible kernel:
 
 This installs:
 - `/usr/local/bin/firecracker` - Firecracker binary (v1.14.1)
-- `/var/lib/shed/firecracker/vmlinux.bin` - CI 6.1 kernel (quick-start fallback)
 
-For a Docker-capable kernel with full BPF/cgroup and 9P filesystem support, build a custom kernel:
-```bash
-./scripts/build-firecracker-kernel.sh
-```
-This overwrites `/var/lib/shed/firecracker/vmlinux.bin` with the custom kernel. Requires ~2GB disk space and build tools (`sudo apt install build-essential flex bison libelf-dev bc libssl-dev`).
-
-The custom kernel includes 9P filesystem support (required for `--local-dir` and directory credential mounts). See [9P Kernel Configuration](#9p-kernel-configuration) for details.
+When using published images (Option A below), the kernel is included in the image and extracted automatically. For custom kernel builds, see `scripts/build-firecracker-kernel.sh`.
 
 ## 3. Set Up Firecracker Images
 
 ### Option A: Use published images (recommended)
 
-Configure your server to use published Docker image references. Shed auto-pulls and converts them to ext4 on first use:
+Configure your server to use published Docker image references. Shed auto-pulls and converts them to ext4 on first use. Published images include a custom Firecracker kernel with Docker, 9P, and BPF support — no separate kernel build needed.
 
 ```yaml
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v1.0.0
+  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
   images:
-    base: ghcr.io/charliek/shed-fc-base:v1.0.0
+    base: ghcr.io/charliek/shed-fc-base:v0.1.0
   images_dir: /var/lib/shed/firecracker/images
 ```
 
-The first `shed create` will pull the image, convert it to ext4, and cache the result automatically. See [Image Variants](../reference/images.md) for available images and configuration details.
+The first `shed create` will pull the image, convert it to ext4, extract the kernel, and cache everything automatically. See [Image Variants](../reference/images.md) for available images and configuration details.
 
 ### Option B: Build from source
 
@@ -175,8 +168,7 @@ credentials:
 env_file: ~/.shed/env
 
 firecracker:
-  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
-  base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
+  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2
@@ -420,10 +412,10 @@ To build and use the Docker-capable kernel:
 ./scripts/build-firecracker-kernel.sh
 ```
 
-Then ensure `kernel_path` in your server.yaml points to the built kernel:
+Then set `kernel_path` in your server.yaml to point to the built kernel:
 ```yaml
 firecracker:
-  kernel_path: /var/lib/shed/firecracker/vmlinux.bin
+  kernel_path: /var/lib/shed/firecracker/vmlinux
 ```
 
 ## Network Architecture

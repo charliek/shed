@@ -19,7 +19,7 @@ KERNEL_MAJOR="${KERNEL_MAJOR:-6.1}"
 KERNEL_TAG="${KERNEL_TAG:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-/var/lib/shed/firecracker}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DOCKER_FRAGMENT="${SCRIPT_DIR}/kernel-config-docker.fragment"
+DOCKER_FRAGMENT="${SCRIPT_DIR}/../firecracker/kernel-config-docker.fragment"
 
 echo "=== Building Firecracker Kernel ==="
 echo "Kernel series: ${KERNEL_MAJOR}.x"
