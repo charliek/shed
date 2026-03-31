@@ -30,10 +30,18 @@ jobs:
           ref: ${{ github.event.inputs.version || github.ref_name }}
           fetch-depth: 0
 
-      - name: Resolve version
+      - name: Resolve and validate version
         id: version
         run: |
           VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          if [[ ! "$VERSION" =~ ^v ]]; then
+            echo "::error::Version must start with 'v' (example: v1.2.3)"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::Tag ${VERSION} does not exist"
+            exit 1
+          fi
           VERSION_BARE="${VERSION#v}"
           echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "bare=${VERSION_BARE}" >> "$GITHUB_OUTPUT"
@@ -88,10 +96,18 @@ jobs:
           ref: ${{ github.event.inputs.version || github.ref_name }}
           fetch-depth: 0
 
-      - name: Resolve version
+      - name: Resolve and validate version
         id: version
         run: |
           VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          if [[ ! "$VERSION" =~ ^v ]]; then
+            echo "::error::Version must start with 'v' (example: v1.2.3)"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::Tag ${VERSION} does not exist"
+            exit 1
+          fi
           VERSION_BARE="${VERSION#v}"
           echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "bare=${VERSION_BARE}" >> "$GITHUB_OUTPUT"
