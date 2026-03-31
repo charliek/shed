@@ -44,6 +44,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             VARIANT="$2"
+            case " $KNOWN_VARIANTS " in
+                *" $VARIANT "*) ;;
+                *)
+                    echo "ERROR: unknown variant: $VARIANT"
+                    echo "Available variants: $KNOWN_VARIANTS"
+                    exit 1
+                    ;;
+            esac
             BUILD_ALL=false
             shift 2
             ;;
@@ -90,7 +98,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-    VERSION=$(git -C "$PROJECT_ROOT" describe --tags --always 2>/dev/null)
+    if ! VERSION="$(git -C "$PROJECT_ROOT" describe --tags --always 2>/dev/null)"; then
+        VERSION=""
+    fi
     if [ -z "$VERSION" ]; then
         echo "ERROR: --version is required (no git tags found to derive from)"
         echo "Run '$0 --help' for usage."
