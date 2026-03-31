@@ -44,11 +44,9 @@ Configure your server to use published Docker image references. Shed auto-pulls 
 
 ```yaml
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-default:v1.0.0
+  base_rootfs: ghcr.io/charliek/shed-vz-base:v1.0.0
   images:
     base: ghcr.io/charliek/shed-vz-base:v1.0.0
-    default: ghcr.io/charliek/shed-vz-default:v1.0.0
-    typescript: ghcr.io/charliek/shed-vz-typescript:v1.0.0
 ```
 
 The first `shed create` will pull the image, convert it to ext4, and extract the kernel and initrd automatically.
@@ -75,7 +73,7 @@ You can build other variants with `--variant`:
 ./scripts/build-vz-rootfs.sh --all                  # All variants
 ```
 
-See [VZ Image Variants](../reference/vz-images.md) for details on available variants.
+See [Image Variants](../reference/images.md) for details on available variants.
 
 You can override the output directory with `OUTPUT_DIR`:
 

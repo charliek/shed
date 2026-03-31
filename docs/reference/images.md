@@ -1,6 +1,6 @@
-# VZ Image Variants
+# Image Variants
 
-Shed provides multiple rootfs image variants for the VZ backend. Each variant includes the core shed infrastructure (systemd, SSH, Docker, shed-agent) but differs in the development tools installed.
+Shed provides multiple rootfs image variants for the VZ and Firecracker backends. Each variant includes the core shed infrastructure (systemd, SSH, Docker, shed-agent) but differs in the development tools installed.
 
 ## Available Variants
 
@@ -17,19 +17,19 @@ Both `default` and `typescript` inherit from `devtools`, which inherits from `ba
 
 ## Published Images
 
-Pre-built images are published to `ghcr.io/charliek/` on each release:
+Pre-built `base` images are published to `ghcr.io/charliek/` on each release:
 
-| Image | Tag Format |
-|-------|-----------|
-| `ghcr.io/charliek/shed-vz-base` | `:{version}`, `:latest` |
-| `ghcr.io/charliek/shed-vz-devtools` | `:{version}`, `:latest` |
-| `ghcr.io/charliek/shed-vz-default` | `:{version}`, `:latest` |
-| `ghcr.io/charliek/shed-vz-typescript` | `:{version}`, `:latest` |
+| Image | Platform | Tag Format |
+|-------|----------|-----------|
+| `ghcr.io/charliek/shed-vz-base` | linux/arm64 (Apple Silicon) | `:{version}` |
+| `ghcr.io/charliek/shed-fc-base` | linux/amd64 (x86_64) | `:{version}` |
+
+Additional variants (`default`, `typescript`) can be built locally from source. These may be published in a future release.
 
 These images serve two purposes:
 
 1. **Direct use**: Reference them in server config as Docker refs — shed auto-pulls and converts to ext4 on first use.
-2. **Base for custom images**: Use `FROM ghcr.io/charliek/shed-vz-base:latest` in your own Dockerfile.
+2. **Base for custom images**: Use `FROM ghcr.io/charliek/shed-vz-base:v1.0.0` in your own Dockerfile.
 
 ## Server Configuration
 
@@ -37,28 +37,51 @@ These images serve two purposes:
 
 Point your config at Docker image references. Shed pulls and converts to ext4 automatically on first `shed create`:
 
-```yaml
-vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-default:v1.0.0
-  images:
-    base: ghcr.io/charliek/shed-vz-base:v1.0.0
-    default: ghcr.io/charliek/shed-vz-default:v1.0.0
-    typescript: ghcr.io/charliek/shed-vz-typescript:v1.0.0
-  images_dir: ~/Library/Application Support/shed/vz/
-```
+=== "VZ (macOS)"
+
+    ```yaml
+    vz:
+      base_rootfs: ghcr.io/charliek/shed-vz-base:v1.0.0
+      images:
+        base: ghcr.io/charliek/shed-vz-base:v1.0.0
+      images_dir: ~/Library/Application Support/shed/vz/
+    ```
+
+=== "Firecracker (Linux)"
+
+    ```yaml
+    firecracker:
+      base_rootfs: ghcr.io/charliek/shed-fc-base:v1.0.0
+      images:
+        base: ghcr.io/charliek/shed-fc-base:v1.0.0
+      images_dir: /var/lib/shed/firecracker/images
+    ```
 
 ### Using local images
 
 If you build images locally, point to ext4 file paths:
 
-```yaml
-vz:
-  base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
-  images:
-    base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
-    default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
-    typescript: ~/Library/Application Support/shed/vz/typescript-rootfs.ext4
-```
+=== "VZ (macOS)"
+
+    ```yaml
+    vz:
+      base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+      images:
+        base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+        default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+        typescript: ~/Library/Application Support/shed/vz/typescript-rootfs.ext4
+    ```
+
+=== "Firecracker (Linux)"
+
+    ```yaml
+    firecracker:
+      base_rootfs: /var/lib/shed/firecracker/images/default-rootfs.ext4
+      images:
+        base: /var/lib/shed/firecracker/images/base-rootfs.ext4
+        default: /var/lib/shed/firecracker/images/default-rootfs.ext4
+        typescript: /var/lib/shed/firecracker/images/typescript-rootfs.ext4
+    ```
 
 You can mix Docker refs and local paths in the same config.
 
@@ -92,7 +115,7 @@ shed image list
 Create a Dockerfile that extends a published shed base image:
 
 ```dockerfile
-FROM ghcr.io/charliek/shed-vz-base:latest
+FROM ghcr.io/charliek/shed-vz-base:v1.0.0
 
 USER shed
 ENV PATH="/home/shed/.local/bin:${PATH}"
@@ -108,6 +131,8 @@ USER root
 WORKDIR /workspace
 ENTRYPOINT ["/sbin/init"]
 ```
+
+Use the corresponding base image for your backend: `shed-vz-base` for VZ (linux/arm64) or `shed-fc-base` for Firecracker (linux/amd64).
 
 Build and convert to ext4:
 
@@ -131,10 +156,14 @@ shed image build --from registry.company.com/shed-custom:latest -n custom
 
 ### From source (contributing to this repo)
 
-Add a new stage to `vz/Dockerfile` that inherits from `shed-vz-base`, then build with the build script:
+Add a new stage to `vz/Dockerfile` or `firecracker/Dockerfile` that inherits from the base stage, then build with the build script:
 
 ```bash
+# VZ
 ./scripts/build-vz-rootfs.sh --variant rust
+
+# Firecracker
+./scripts/build-firecracker-rootfs.sh --variant rust
 ```
 
 ## Organization Images
@@ -177,7 +206,12 @@ shed image build -f Dockerfile.shed -n acmeco
 
 ## Image Caching
 
-Converted ext4 images are cached in `images_dir` (default: `~/Library/Application Support/shed/vz/`). A `.source` sidecar file tracks which Docker ref produced each image.
+Converted ext4 images are cached in `images_dir`. A `.source` sidecar file tracks which Docker ref produced each image.
+
+| Backend | Default cache directory |
+|---------|----------------------|
+| VZ | `~/Library/Application Support/shed/vz/` |
+| Firecracker | `/var/lib/shed/firecracker/images/` |
 
 When the Docker ref in your config changes (e.g., updating from `v1.0.0` to `v1.1.0`), shed detects the mismatch and re-converts automatically on the next `shed create`.
 
@@ -213,36 +247,57 @@ Image conversion requires Docker with privileged container support. The ext4 cre
 Each variant produces a 20GB sparse ext4 image. Actual disk usage is much smaller (typically 2-5GB depending on the variant). Use `du -sh` to check actual usage:
 
 ```bash
+# VZ
 du -sh ~/Library/Application\ Support/shed/vz/*-rootfs.ext4
+
+# Firecracker
+du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
 ```
 
 ## Building from Source
 
-Build the default variant locally:
+=== "VZ (macOS)"
 
-```bash
-./scripts/build-vz-rootfs.sh
-```
+    ```bash
+    # Build the default variant
+    ./scripts/build-vz-rootfs.sh
 
-Build a specific variant:
+    # Build a specific variant
+    ./scripts/build-vz-rootfs.sh --variant base
+    ./scripts/build-vz-rootfs.sh --variant typescript
 
-```bash
-./scripts/build-vz-rootfs.sh --variant base
-./scripts/build-vz-rootfs.sh --variant typescript
-```
+    # Build all variants
+    ./scripts/build-vz-rootfs.sh --all
+    ```
 
-Build all variants:
+    Output files are placed in `~/Library/Application Support/shed/vz/`:
 
-```bash
-./scripts/build-vz-rootfs.sh --all
-```
+    | File | Description |
+    |------|-------------|
+    | `default-rootfs.ext4` | Default variant rootfs (20GB sparse) |
+    | `base-rootfs.ext4` | Base variant rootfs |
+    | `typescript-rootfs.ext4` | TypeScript variant rootfs |
+    | `vmlinux` | Decompressed Linux kernel (shared) |
+    | `initrd.img` | Initial RAM disk (shared) |
 
-Output files are placed in `~/Library/Application Support/shed/vz/`:
+=== "Firecracker (Linux)"
 
-| File | Description |
-|------|-------------|
-| `default-rootfs.ext4` | Default variant rootfs (20GB sparse) |
-| `base-rootfs.ext4` | Base variant rootfs |
-| `typescript-rootfs.ext4` | TypeScript variant rootfs |
-| `vmlinux` | Decompressed Linux kernel (shared) |
-| `initrd.img` | Initial RAM disk (shared) |
+    ```bash
+    # Build the default variant
+    ./scripts/build-firecracker-rootfs.sh
+
+    # Build a specific variant
+    ./scripts/build-firecracker-rootfs.sh --variant base
+    ./scripts/build-firecracker-rootfs.sh --variant typescript
+
+    # Build all variants
+    ./scripts/build-firecracker-rootfs.sh --all
+    ```
+
+    Output files are placed in `/var/lib/shed/firecracker/images/`:
+
+    | File | Description |
+    |------|-------------|
+    | `default-rootfs.ext4` | Default variant rootfs (20GB sparse) |
+    | `base-rootfs.ext4` | Base variant rootfs |
+    | `typescript-rootfs.ext4` | TypeScript variant rootfs |
