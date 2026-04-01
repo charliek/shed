@@ -31,7 +31,9 @@ Both VZ and Firecracker images include the kernel needed to boot the VM. For VZ,
 These images serve two purposes:
 
 1. **Direct use**: Reference them in server config as Docker refs — shed auto-pulls and converts to ext4 on first use.
-2. **Base for custom images**: Use `FROM ghcr.io/charliek/shed-vz-base:v1.0.0` in your own Dockerfile.
+2. **Base for custom images**: Use `FROM ghcr.io/charliek/shed-vz-base:{version}` in your own Dockerfile.
+
+Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
 
 ## Server Configuration
 
@@ -43,9 +45,9 @@ Point your config at Docker image references. Shed pulls and converts to ext4 au
 
     ```yaml
     vz:
-      base_rootfs: ghcr.io/charliek/shed-vz-base:v1.0.0
+      base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
       images:
-        base: ghcr.io/charliek/shed-vz-base:v1.0.0
+        base: ghcr.io/charliek/shed-vz-base:{version}
       images_dir: ~/Library/Application Support/shed/vz/
     ```
 
@@ -53,9 +55,9 @@ Point your config at Docker image references. Shed pulls and converts to ext4 au
 
     ```yaml
     firecracker:
-      base_rootfs: ghcr.io/charliek/shed-fc-base:v1.0.0
+      base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
       images:
-        base: ghcr.io/charliek/shed-fc-base:v1.0.0
+        base: ghcr.io/charliek/shed-fc-base:{version}
       images_dir: /var/lib/shed/firecracker/images
     ```
 
@@ -117,7 +119,7 @@ shed image list
 Create a Dockerfile that extends a published shed base image:
 
 ```dockerfile
-FROM ghcr.io/charliek/shed-vz-base:v1.0.0
+FROM ghcr.io/charliek/shed-vz-base:{version}
 
 USER shed
 ENV PATH="/home/shed/.local/bin:${PATH}"
@@ -178,7 +180,7 @@ Maintain a repo with a Dockerfile that extends a published base:
 
 ```
 shed-acmeco/
-  Dockerfile.shed     # FROM ghcr.io/charliek/shed-vz-base:v1.0.0
+  Dockerfile.shed     # FROM ghcr.io/charliek/shed-vz-base:{version}
 ```
 
 Developers clone the repo and run:
@@ -215,7 +217,7 @@ Converted ext4 images are cached in `images_dir`. A `.source` sidecar file track
 | VZ | `~/Library/Application Support/shed/vz/` |
 | Firecracker | `/var/lib/shed/firecracker/images/` |
 
-When the Docker ref in your config changes (e.g., updating from `v1.0.0` to `v1.1.0`), shed detects the mismatch and re-converts automatically on the next `shed create`.
+When the Docker ref in your config changes (e.g., after a version bump), shed detects the mismatch and re-converts automatically on the next `shed create`.
 
 ## Cleaning Up Images
 

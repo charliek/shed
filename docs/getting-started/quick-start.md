@@ -5,7 +5,10 @@ Get up and running with Shed in a few minutes.
 ## Prerequisites
 
 - Go 1.24+ (for building from source)
-- A Linux server with Docker installed
+- A server running `shed-server` with one of:
+    - **macOS Apple Silicon** — VZ backend (Virtualization.framework via vfkit)
+    - **Linux with KVM** — Firecracker backend (microVMs)
+    - **Linux with Docker** — Docker backend (containers)
 - Tailscale (or other private network) connecting your machines
 
 ## Install the CLI
@@ -114,7 +117,9 @@ shed tunnels start myproj -t 3000:3000 -d
 
 ## Next Steps
 
-- [Server Setup](server-setup.md) - Install shed-server on your machines
+- [VZ Setup (macOS)](vz-setup.md) - Set up the VZ backend on Apple Silicon
+- [Firecracker Setup (Linux)](fc-setup.md) - Set up the Firecracker backend
+- [Server Setup (Docker)](server-setup.md) - Set up the Docker backend
 - [CLI Reference](../reference/cli.md) - All available commands
 - [Configuration](../reference/configuration.md) - Client and server config options
 - [Tunnels](../reference/tunnels.md) - Port forwarding configuration

@@ -153,11 +153,22 @@ shed attach <name>               # Attach to tmux session (persistent)
 shed attach <name> -S <session>  # Attach to named session
 shed exec <name> <cmd>           # Run command in shed
 
+# Image Management
+shed image build                 # Build a custom rootfs image
+shed image list                  # List cached images
+shed image delete <name>         # Delete a cached image
+shed image prune                 # Remove unused cached images
+
 # Session Management
 shed sessions                    # List all sessions on default server
 shed sessions <name>             # List sessions in a specific shed
 shed sessions --all              # List sessions across all servers
 shed sessions kill <shed> <session>  # Kill a session
+
+# Port Forwarding
+shed tunnels start <name> -t <ports>  # Forward ports from a shed
+shed tunnels stop <name>              # Stop port forwarding
+shed tunnels list                     # List active tunnels
 
 # Server & IDE
 shed server add <name>           # Add a server to client config
@@ -227,13 +238,12 @@ servers:
 name: my-server
 http_port: 8080
 ssh_port: 2222
-default_image: shed-base:latest
 
-# enabled_backends:
-#   - docker
-#   - firecracker  # Linux only
-#   - vz           # macOS Apple Silicon only
-# default_backend: docker
+enabled_backends:
+  - vz           # macOS Apple Silicon
+  # - firecracker  # Linux with KVM
+  # - docker       # Linux with Docker
+default_backend: vz
 
 credentials:
   ssh:
@@ -246,26 +256,26 @@ credentials:
     readonly: true
 env_file: ~/.shed/env
 
-# Firecracker-specific config (only needed if firecracker is enabled)
-# firecracker:
-#   kernel_path: /var/lib/shed/firecracker/vmlinux.bin
-#   base_rootfs: /var/lib/shed/firecracker/base-rootfs.ext4
-#   instance_dir: /var/lib/shed/firecracker/instances
-#   socket_dir: /var/run/shed/firecracker
-#   default_cpus: 2
-#   default_memory_mb: 4096
+# VZ backend (macOS Apple Silicon)
+vz:
+  base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
+  images:
+    base: ghcr.io/charliek/shed-vz-base:{version}
+  images_dir: ~/Library/Application Support/shed/vz/
+  default_cpus: 2
+  default_memory_mb: 4096
 
-# VZ-specific config (only needed if vz is enabled, macOS Apple Silicon only)
-# vz:
-#   vfkit_path: vfkit
-#   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
-#   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-#   base_rootfs: ~/Library/Application Support/shed/vz/base-rootfs.ext4
-#   instance_dir: ~/Library/Application Support/shed/vz/instances
-#   socket_dir: ~/.shed/vz/sockets
+# Firecracker backend (Linux with KVM)
+# firecracker:
+#   base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
+#   images:
+#     base: ghcr.io/charliek/shed-fc-base:{version}
+#   images_dir: /var/lib/shed/firecracker/images
 #   default_cpus: 2
 #   default_memory_mb: 4096
 ```
+
+Replace `{version}` with the version matching your `shed` binary — run `shed version` to check. See [Configuration](docs/reference/configuration.md) for all options.
 
 ## Security Model
 

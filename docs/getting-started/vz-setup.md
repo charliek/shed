@@ -44,10 +44,12 @@ Configure your server to use published Docker image references. Shed auto-pulls 
 
 ```yaml
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-base:v1.0.0
+  base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
   images:
-    base: ghcr.io/charliek/shed-vz-base:v1.0.0
+    base: ghcr.io/charliek/shed-vz-base:{version}
 ```
+
+Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
 
 The first `shed create` will pull the image, convert it to ext4, and extract the kernel and initrd automatically.
 
