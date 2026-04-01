@@ -218,6 +218,8 @@ firecracker:
   tap_prefix: shed-tap
 ```
 
+Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
+
 ### Firecracker Fields
 
 | Field | Type | Default | Description |

@@ -202,6 +202,8 @@ shed image build -f Dockerfile.shed -n myimage .
 shed image build --from ghcr.io/charliek/shed-fc-base:{version} -n myimage
 ```
 
+Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
+
 ### shed image list
 
 Lists available image variants from server config and auto-discovered images.
