@@ -199,7 +199,7 @@ shed image build -f Dockerfile.shed -n myimage .
 **Registry mode:**
 
 ```bash
-shed image build --from ghcr.io/charliek/shed-fc-base:v1.0.0 -n myimage
+shed image build --from ghcr.io/charliek/shed-fc-base:{version} -n myimage
 ```
 
 ### shed image list
@@ -215,7 +215,7 @@ shed image list
 ```
 NAME         SOURCE       SIZE      CACHED   REF
 base         config       2.1 GB    yes      -
-default      config       -         no       ghcr.io/charliek/shed-vz-default:v1.0.0
+default      config       -         no       ghcr.io/charliek/shed-vz-default:{version}
 typescript   discovered   3.8 GB    yes      -
 ```
 

@@ -198,9 +198,9 @@ enabled_backends:
 default_backend: firecracker
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
+  base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
   images:
-    base: ghcr.io/charliek/shed-fc-base:v0.1.0
+    base: ghcr.io/charliek/shed-fc-base:{version}
   images_dir: /var/lib/shed/firecracker/images
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
@@ -258,9 +258,9 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-base:v1.0.0
+  base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
   images:
-    base: ghcr.io/charliek/shed-vz-base:v1.0.0
+    base: ghcr.io/charliek/shed-vz-base:{version}
   images_dir: ~/Library/Application Support/shed/vz/
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets

@@ -42,11 +42,13 @@ Configure your server to use published Docker image references. Shed auto-pulls 
 
 ```yaml
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
+  base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
   images:
-    base: ghcr.io/charliek/shed-fc-base:v0.1.0
+    base: ghcr.io/charliek/shed-fc-base:{version}
   images_dir: /var/lib/shed/firecracker/images
 ```
+
+Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
 
 The first `shed create` will pull the image, convert it to ext4, extract the kernel, and cache everything automatically. See [Image Variants](../reference/images.md) for available images and configuration details.
 
@@ -168,7 +170,7 @@ credentials:
 env_file: ~/.shed/env
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
+  base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2

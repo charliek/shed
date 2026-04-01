@@ -335,7 +335,7 @@ Returns available image variants across all backends.
     {
       "name": "base",
       "path": "/Users/user/Library/Application Support/shed/vz/base-rootfs.ext4",
-      "docker_ref": "ghcr.io/charliek/shed-vz-base:v1.0.0",
+      "docker_ref": "ghcr.io/charliek/shed-vz-base:v0.1.2",
       "size_bytes": 2147483648,
       "source": "config",
       "cached": true
