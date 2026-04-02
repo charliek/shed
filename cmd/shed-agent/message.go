@@ -34,19 +34,12 @@ func (s *Server) handleNotifyConnection(conn net.Conn) {
 		return
 	}
 
-	// Check if this is a transient health check (request/response, then close).
-	if msgType == MsgTypePluginMessage {
-		var env plugin.Envelope
-		if err := json.Unmarshal(data, &env); err == nil {
-			if env.Namespace == plugin.NamespaceHealth && env.Type == plugin.MessageTypeRequest {
-				s.handleHealthRequest(conn, &env)
-				return
-			}
-		}
-	}
-
-	// Not a health check — this is the persistent message channel.
-	// Promote to msgConn and start heartbeats.
+	// The persistent message channel starts with a system:health handshake
+	// from the host. Respond to it, then promote this connection and start heartbeats.
+	// Transient health checks (from WaitForHealth during startup) use the same
+	// protocol but close the connection after one exchange — the agent handles
+	// both identically, and clearMessageConnIfCurrent safely cleans up when
+	// the transient connection closes.
 	s.setMessageConn(conn)
 	defer s.clearMessageConnIfCurrent(conn)
 

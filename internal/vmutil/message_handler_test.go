@@ -20,29 +20,51 @@ func TestMessageHandlerOnConnect(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	// Read the credential setup message in background
+	// Read both messages sent by OnConnect: health handshake + credential setup
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+
+		// First message: system:health handshake
 		msgType, data, err := agentproto.ReadMessage(server)
 		if err != nil {
-			t.Errorf("ReadMessage: %v", err)
+			t.Errorf("ReadMessage (health): %v", err)
 			return
 		}
 		if msgType != agentproto.MsgTypePluginMessage {
-			t.Errorf("msgType = 0x%02x, want 0x%02x", msgType, agentproto.MsgTypePluginMessage)
+			t.Errorf("health msgType = 0x%02x, want 0x%02x", msgType, agentproto.MsgTypePluginMessage)
+		}
+		var healthEnv plugin.Envelope
+		if err := json.Unmarshal(data, &healthEnv); err != nil {
+			t.Errorf("unmarshal health: %v", err)
 			return
 		}
-		var env plugin.Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			t.Errorf("unmarshal: %v", err)
+		if healthEnv.Namespace != plugin.NamespaceHealth {
+			t.Errorf("health namespace = %q, want %q", healthEnv.Namespace, plugin.NamespaceHealth)
+		}
+		if healthEnv.Type != plugin.MessageTypeRequest {
+			t.Errorf("health type = %q, want %q", healthEnv.Type, plugin.MessageTypeRequest)
+		}
+
+		// Second message: system:credentials setup
+		msgType, data, err = agentproto.ReadMessage(server)
+		if err != nil {
+			t.Errorf("ReadMessage (creds): %v", err)
 			return
 		}
-		if env.Namespace != plugin.NamespaceCredentials {
-			t.Errorf("namespace = %q, want %q", env.Namespace, plugin.NamespaceCredentials)
+		if msgType != agentproto.MsgTypePluginMessage {
+			t.Errorf("creds msgType = 0x%02x, want 0x%02x", msgType, agentproto.MsgTypePluginMessage)
 		}
-		if env.Type != plugin.MessageTypeRequest {
-			t.Errorf("type = %q, want %q", env.Type, plugin.MessageTypeRequest)
+		var credEnv plugin.Envelope
+		if err := json.Unmarshal(data, &credEnv); err != nil {
+			t.Errorf("unmarshal creds: %v", err)
+			return
+		}
+		if credEnv.Namespace != plugin.NamespaceCredentials {
+			t.Errorf("creds namespace = %q, want %q", credEnv.Namespace, plugin.NamespaceCredentials)
+		}
+		if credEnv.Type != plugin.MessageTypeRequest {
+			t.Errorf("creds type = %q, want %q", credEnv.Type, plugin.MessageTypeRequest)
 		}
 	}()
 
@@ -60,9 +82,33 @@ func TestMessageHandlerOnConnectNoCreds(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
+	// OnConnect always sends a health handshake, even with no credentials
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		msgType, data, err := agentproto.ReadMessage(server)
+		if err != nil {
+			t.Errorf("ReadMessage: %v", err)
+			return
+		}
+		if msgType != agentproto.MsgTypePluginMessage {
+			t.Errorf("msgType = 0x%02x, want 0x%02x", msgType, agentproto.MsgTypePluginMessage)
+		}
+		var env plugin.Envelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			t.Errorf("unmarshal: %v", err)
+			return
+		}
+		if env.Namespace != plugin.NamespaceHealth {
+			t.Errorf("namespace = %q, want %q", env.Namespace, plugin.NamespaceHealth)
+		}
+	}()
+
 	if err := handler.OnConnect(client); err != nil {
 		t.Fatalf("OnConnect with nil cred setup: %v", err)
 	}
+
+	<-done
 }
 
 func TestMessageHandlerDispatchCredentialChanged(t *testing.T) {
@@ -173,11 +219,15 @@ func TestMessageHandlerSendPluginMessage(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
+	// OnConnect sends a health handshake — drain it in background
+	go func() {
+		agentproto.ReadMessage(server) // discard health handshake
+	}()
 	handler.OnConnect(client)
 
 	env := plugin.NewEnvelope("op", plugin.MessageTypeResponse, json.RawMessage(`{"result":"ok"}`))
 
-	// Read in background
+	// Read the actual plugin message in background
 	done := make(chan struct{})
 	var readType byte
 	var readData []byte

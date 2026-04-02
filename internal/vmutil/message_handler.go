@@ -52,11 +52,20 @@ func NewMessageHandler(credSetup *plugin.CredentialSetupPayload, credChangeFn fu
 }
 
 // OnConnect implements NotifyHandler. It stores the connection and sends
-// credential setup via a system:credentials envelope if configured.
+// an initial system:health request (as a handshake to trigger agent-side
+// connection promotion and heartbeats), followed by credential setup if configured.
 func (h *MessageHandler) OnConnect(conn net.Conn) error {
 	h.writeMu.Lock()
 	h.conn = conn
 	h.writeMu.Unlock()
+
+	// Always send a health request as the first message. This serves as a
+	// handshake that triggers the agent to promote this connection to the
+	// persistent message channel and start heartbeats.
+	healthEnv := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeRequest, nil)
+	if err := h.sendEnvelope(healthEnv); err != nil {
+		return fmt.Errorf("send health handshake: %w", err)
+	}
 
 	if h.credSetup != nil && len(h.credSetup.Credentials) > 0 {
 		payloadData, err := json.Marshal(h.credSetup)
@@ -81,18 +90,17 @@ func (h *MessageHandler) OnMessage(msgType byte, data []byte) error {
 			return fmt.Errorf("invalid plugin envelope: %w", err)
 		}
 
-		// Route system namespace events to their handlers.
-		// These are consumed here and not forwarded to pluginFn.
-		if env.Type == plugin.MessageTypeEvent {
-			switch env.Namespace {
-			case plugin.NamespaceCredentials:
-				return h.handleCredentialChanged(&env)
-			case plugin.NamespaceHealth:
-				if h.healthFn != nil {
-					h.healthFn(&env)
-				}
-				return nil
+		// Consume all system:health messages (events, responses) — never forward to pluginFn.
+		if env.Namespace == plugin.NamespaceHealth {
+			if env.Type == plugin.MessageTypeEvent && h.healthFn != nil {
+				h.healthFn(&env)
 			}
+			return nil
+		}
+
+		// Route system:credentials events to credential handler.
+		if env.Namespace == plugin.NamespaceCredentials && env.Type == plugin.MessageTypeEvent {
+			return h.handleCredentialChanged(&env)
 		}
 
 		// Route all other plugin messages to the callback
