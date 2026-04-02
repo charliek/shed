@@ -180,6 +180,10 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 				log.Printf("[%s] Invalid heartbeat payload: %v", name, err)
 				return
 			}
+			if payload.StartedAt.IsZero() {
+				log.Printf("[%s] Ignoring heartbeat with zero started_at", name)
+				return
+			}
 			cm.healthTracker.Update(name, payload.StartedAt)
 		}
 	}

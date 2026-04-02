@@ -498,7 +498,11 @@ func runList(cmd *cobra.Command, args []string) error {
 			uptime := "-"
 			if s.shed.Status == config.StatusRunning {
 				ssh = shedSSHString(s.shed.Name, s.server)
-				uptime = formatUptime(s.shed.CreatedAt)
+				if s.shed.StartedAt != nil {
+					uptime = formatUptime(*s.shed.StartedAt)
+				} else {
+					uptime = formatUptime(s.shed.CreatedAt)
+				}
 			}
 			ip := valueOrDash(s.shed.IPAddress)
 			resources := "-"

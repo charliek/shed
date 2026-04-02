@@ -224,6 +224,10 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 				log.Printf("Warning: failed to save updated metadata for %q: %v", name, err)
 			}
 			status = config.StatusStopped
+			// Clean up stale health state for the stopped VM
+			if ht := c.credMgr.HealthTracker(); ht != nil {
+				ht.Remove(name)
+			}
 		}
 	}
 
