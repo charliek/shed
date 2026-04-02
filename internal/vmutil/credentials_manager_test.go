@@ -7,7 +7,7 @@ import (
 )
 
 func TestNewCredentialManager_NilConfig(t *testing.T) {
-	cm := NewCredentialManager(nil, nil, "test")
+	cm := NewCredentialManager(nil, nil, "test", nil)
 	if cm == nil {
 		t.Fatal("NewCredentialManager returned nil")
 	}
@@ -28,7 +28,7 @@ func TestNewCredentialManager_EmptyCredentials(t *testing.T) {
 		Credentials: map[string]config.MountConfig{},
 	}
 
-	cm := NewCredentialManager(serverCfg, nil, "test")
+	cm := NewCredentialManager(serverCfg, nil, "test", nil)
 	if cm == nil {
 		t.Fatal("NewCredentialManager returned nil")
 	}
@@ -41,7 +41,7 @@ func TestNewCredentialManager_EmptyCredentials(t *testing.T) {
 }
 
 func TestCredentialManager_StopListenerNoOp(t *testing.T) {
-	cm := NewCredentialManager(nil, nil, "test")
+	cm := NewCredentialManager(nil, nil, "test", nil)
 
 	cm.StopListener("nonexistent-vm")
 	cm.StopListener("nonexistent-vm")
@@ -50,7 +50,7 @@ func TestCredentialManager_StopListenerNoOp(t *testing.T) {
 }
 
 func TestCredentialManager_Close(t *testing.T) {
-	cm := NewCredentialManager(nil, nil, "test")
+	cm := NewCredentialManager(nil, nil, "test", nil)
 	cm.Close()
 	cm.Close()
 }
@@ -60,7 +60,7 @@ func TestCredentialManager_CloseWithEmptyListeners(t *testing.T) {
 		Credentials: map[string]config.MountConfig{},
 	}
 
-	cm := NewCredentialManager(serverCfg, nil, "test")
+	cm := NewCredentialManager(serverCfg, nil, "test", nil)
 
 	cm.mu.Lock()
 	listenerCount := len(cm.messageChannels)
@@ -74,7 +74,7 @@ func TestCredentialManager_CloseWithEmptyListeners(t *testing.T) {
 }
 
 func TestCredentialManager_StopListenerThenClose(t *testing.T) {
-	cm := NewCredentialManager(nil, nil, "test")
+	cm := NewCredentialManager(nil, nil, "test", nil)
 
 	cm.StopListener("vm-1")
 	cm.StopListener("vm-2")

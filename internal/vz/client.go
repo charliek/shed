@@ -42,7 +42,7 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plu
 		cfg:       cfg,
 		serverCfg: serverCfg,
 		vms:       make(map[string]*VM),
-		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendVZ)),
+		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendVZ), vmutil.NewHealthTracker()),
 	}
 
 	return client, nil
@@ -57,7 +57,7 @@ func (c *Client) Close() error {
 // newAgentClient creates a vmutil.AgentClient for the given instance name.
 func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
 	dialer := NewVZDialer(c.cfg.SocketDir, name)
-	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
+	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.NotifyPort)
 }
 
 // CreateShed creates a new VZ-based shed.
@@ -234,6 +234,17 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 
 	shed := metadataToShed(meta, ipAddress)
 	shed.Status = status // may differ from meta.Status after staleness check
+
+	// Populate health data from in-memory tracker for running VMs.
+	if status == config.StatusRunning {
+		if ht := c.credMgr.HealthTracker(); ht != nil {
+			if hs, ok := ht.Get(name); ok {
+				shed.LastHealthy = &hs.LastSeen
+				shed.StartedAt = &hs.AgentStartedAt
+			}
+		}
+	}
+
 	return shed, nil
 }
 

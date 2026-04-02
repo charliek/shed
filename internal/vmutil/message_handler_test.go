@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/plugin"
@@ -13,7 +14,7 @@ func TestMessageHandlerOnConnect(t *testing.T) {
 	setup := &plugin.CredentialSetupPayload{
 		Credentials: map[string]string{"gh": "/home/shed/.config/gh"},
 	}
-	handler := NewMessageHandler(setup, nil, nil)
+	handler := NewMessageHandler(setup, nil, nil, nil)
 
 	client, server := net.Pipe()
 	defer client.Close()
@@ -53,7 +54,7 @@ func TestMessageHandlerOnConnect(t *testing.T) {
 }
 
 func TestMessageHandlerOnConnectNoCreds(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil)
+	handler := NewMessageHandler(nil, nil, nil, nil)
 
 	client, server := net.Pipe()
 	defer client.Close()
@@ -70,7 +71,7 @@ func TestMessageHandlerDispatchCredentialChanged(t *testing.T) {
 	handler := NewMessageHandler(nil, func(cred string, files []string) {
 		gotCred = cred
 		gotFiles = files
-	}, nil)
+	}, nil, nil)
 
 	changed := plugin.CredentialChangedPayload{
 		Credential: "gh",
@@ -92,9 +93,52 @@ func TestMessageHandlerDispatchCredentialChanged(t *testing.T) {
 	}
 }
 
-func TestMessageHandlerDispatchPluginMessage(t *testing.T) {
+func TestMessageHandlerDispatchHealthEvent(t *testing.T) {
 	var received *plugin.Envelope
 	handler := NewMessageHandler(nil, nil, func(env *plugin.Envelope) {
+		received = env
+	}, nil)
+
+	payload := plugin.HeartbeatPayload{StartedAt: time.Now()}
+	payloadData, _ := json.Marshal(payload)
+	env := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeEvent, payloadData)
+	data, _ := json.Marshal(env)
+
+	if err := handler.OnMessage(agentproto.MsgTypePluginMessage, data); err != nil {
+		t.Fatalf("OnMessage health event: %v", err)
+	}
+
+	if received == nil {
+		t.Fatal("expected health callback to be called")
+	}
+	if received.Namespace != plugin.NamespaceHealth {
+		t.Errorf("namespace = %q, want %q", received.Namespace, plugin.NamespaceHealth)
+	}
+}
+
+func TestMessageHandlerHealthEventNotForwardedToPluginFn(t *testing.T) {
+	pluginCalled := false
+	handler := NewMessageHandler(nil, nil, nil, func(env *plugin.Envelope) {
+		pluginCalled = true
+	})
+
+	payload := plugin.HeartbeatPayload{StartedAt: time.Now()}
+	payloadData, _ := json.Marshal(payload)
+	env := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeEvent, payloadData)
+	data, _ := json.Marshal(env)
+
+	if err := handler.OnMessage(agentproto.MsgTypePluginMessage, data); err != nil {
+		t.Fatalf("OnMessage health event: %v", err)
+	}
+
+	if pluginCalled {
+		t.Error("system:health event should not be forwarded to pluginFn")
+	}
+}
+
+func TestMessageHandlerDispatchPluginMessage(t *testing.T) {
+	var received *plugin.Envelope
+	handler := NewMessageHandler(nil, nil, nil, func(env *plugin.Envelope) {
 		received = env
 	})
 
@@ -114,7 +158,7 @@ func TestMessageHandlerDispatchPluginMessage(t *testing.T) {
 }
 
 func TestMessageHandlerUnknownTypeLogged(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil)
+	handler := NewMessageHandler(nil, nil, nil, nil)
 
 	// Should not error, just log
 	if err := handler.OnMessage(0xFF, []byte("unknown")); err != nil {
@@ -123,7 +167,7 @@ func TestMessageHandlerUnknownTypeLogged(t *testing.T) {
 }
 
 func TestMessageHandlerSendPluginMessage(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil)
+	handler := NewMessageHandler(nil, nil, nil, nil)
 
 	client, server := net.Pipe()
 	defer client.Close()
@@ -166,7 +210,7 @@ func TestMessageHandlerSendPluginMessage(t *testing.T) {
 }
 
 func TestMessageHandlerSendNoConnection(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil)
+	handler := NewMessageHandler(nil, nil, nil, nil)
 
 	env := plugin.NewEnvelope("op", plugin.MessageTypeResponse, nil)
 	err := handler.SendPluginMessage(env)

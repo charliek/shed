@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/plugin"
 )
 
 // ExitError is returned when a command executed via the agent exits with a non-zero code.
@@ -25,16 +26,14 @@ func (e *ExitError) Error() string {
 type AgentClient struct {
 	dialer      Dialer
 	consolePort uint32
-	healthPort  uint32
 	notifyPort  uint32
 }
 
 // NewAgentClient creates a new AgentClient.
-func NewAgentClient(dialer Dialer, consolePort, healthPort, notifyPort uint32) *AgentClient {
+func NewAgentClient(dialer Dialer, consolePort, notifyPort uint32) *AgentClient {
 	return &AgentClient{
 		dialer:      dialer,
 		consolePort: consolePort,
-		healthPort:  healthPort,
 		notifyPort:  notifyPort,
 	}
 }
@@ -49,27 +48,47 @@ func (c *AgentClient) Dialer() Dialer {
 	return c.dialer
 }
 
-// CheckHealth checks if the agent is healthy.
+// CheckHealth checks if the agent is healthy by sending a system:health
+// request envelope over the message channel (notify port). The connection
+// is transient — opened for the check and closed immediately after.
 func (c *AgentClient) CheckHealth(ctx context.Context) error {
-	conn, err := c.dialer.Dial(ctx, c.healthPort)
+	conn, err := c.dialer.Dial(ctx, c.notifyPort)
 	if err != nil {
-		return fmt.Errorf("failed to connect to health port: %w", err)
+		return fmt.Errorf("failed to connect to message port: %w", err)
 	}
 	defer conn.Close()
 
-	// Send health request
-	if err := agentproto.WriteMessage(conn, agentproto.MsgTypeHealthRequest, nil); err != nil {
+	// Build and send health request envelope
+	reqEnv := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeRequest, nil)
+	reqData, err := json.Marshal(reqEnv)
+	if err != nil {
+		return fmt.Errorf("failed to marshal health request: %w", err)
+	}
+	if err := agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, reqData); err != nil {
 		return fmt.Errorf("failed to send health request: %w", err)
 	}
 
 	// Read health response
-	msgType, _, err := agentproto.ReadMessage(conn)
+	msgType, respData, err := agentproto.ReadMessage(conn)
 	if err != nil {
 		return fmt.Errorf("failed to read health response: %w", err)
 	}
+	if msgType != agentproto.MsgTypePluginMessage {
+		return fmt.Errorf("unexpected message type: 0x%02x", msgType)
+	}
 
-	if msgType != agentproto.MsgTypeHealthResponse {
-		return fmt.Errorf("unexpected response type: %d", msgType)
+	var respEnv plugin.Envelope
+	if err := json.Unmarshal(respData, &respEnv); err != nil {
+		return fmt.Errorf("invalid health response envelope: %w", err)
+	}
+	if respEnv.Namespace != plugin.NamespaceHealth {
+		return fmt.Errorf("unexpected response namespace: %s", respEnv.Namespace)
+	}
+	if respEnv.Type != plugin.MessageTypeResponse {
+		return fmt.Errorf("unexpected response type: %s", respEnv.Type)
+	}
+	if respEnv.InReplyTo != reqEnv.ID {
+		return fmt.Errorf("response in_reply_to mismatch: got %s, want %s", respEnv.InReplyTo, reqEnv.ID)
 	}
 
 	return nil

@@ -27,7 +27,6 @@ func TestBuildVfkitArgs(t *testing.T) {
 		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
-		HealthPort:  1025,
 		NotifyPort:  1026,
 	}
 
@@ -61,7 +60,7 @@ func TestBuildVfkitArgs(t *testing.T) {
 	}
 
 	// Check vsock devices for each port (connect mode, no unix:// prefix)
-	for _, port := range []uint32{1024, 1025, 1026} {
+	for _, port := range []uint32{1024, 1026} {
 		socketPath := filepath.Join(cfg.SocketDir, fmt.Sprintf("test-vm-%d.sock", port))
 		expected := fmt.Sprintf("port=%d,socketURL=%s,connect", port, socketPath)
 		if !strings.Contains(argsStr, expected) {
@@ -69,10 +68,10 @@ func TestBuildVfkitArgs(t *testing.T) {
 		}
 	}
 
-	// Should have exactly 6 --device flags (1 block + 1 net + 1 serial + 3 vsock)
+	// Should have exactly 5 --device flags (1 block + 1 net + 1 serial + 2 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 6 {
-		t.Errorf("expected 6 --device flags (1 block + 1 net + 1 serial + 3 vsock), got %d", deviceCount)
+	if deviceCount != 5 {
+		t.Errorf("expected 5 --device flags (1 block + 1 net + 1 serial + 2 vsock), got %d", deviceCount)
 	}
 
 	// No VirtioFS device when LocalDir is empty
@@ -94,7 +93,6 @@ func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
 		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
-		HealthPort:  1025,
 		NotifyPort:  1026,
 	}
 
@@ -108,10 +106,10 @@ func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
 		t.Errorf("expected VirtioFS device %q in args, got: %s", expected, argsStr)
 	}
 
-	// Should have 7 --device flags (1 block + 1 net + 1 serial + 1 virtio-fs + 3 vsock)
+	// Should have 6 --device flags (1 block + 1 net + 1 serial + 1 virtio-fs + 2 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 7 {
-		t.Errorf("expected 7 --device flags, got %d", deviceCount)
+	if deviceCount != 6 {
+		t.Errorf("expected 6 --device flags, got %d", deviceCount)
 	}
 }
 
@@ -127,7 +125,6 @@ func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
 		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
-		HealthPort:  1025,
 		NotifyPort:  1026,
 	}
 
@@ -150,10 +147,10 @@ func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
 		t.Error("expected VirtioFS device for gh credential")
 	}
 
-	// Should have 8 --device flags (1 block + 1 net + 1 serial + 2 virtio-fs creds + 3 vsock)
+	// Should have 7 --device flags (1 block + 1 net + 1 serial + 2 virtio-fs creds + 2 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 8 {
-		t.Errorf("expected 8 --device flags, got %d", deviceCount)
+	if deviceCount != 7 {
+		t.Errorf("expected 7 --device flags, got %d", deviceCount)
 	}
 
 	// No workspace VirtioFS device (LocalDir is empty)
@@ -175,7 +172,6 @@ func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
 		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
-		HealthPort:  1025,
 		NotifyPort:  1026,
 	}
 
@@ -199,10 +195,10 @@ func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
 		t.Error("expected VirtioFS device for claude credential")
 	}
 
-	// Should have 8 --device flags (1 block + 1 net + 1 serial + 1 workspace virtio-fs + 1 cred virtio-fs + 3 vsock)
+	// Should have 7 --device flags (1 block + 1 net + 1 serial + 1 workspace virtio-fs + 1 cred virtio-fs + 2 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 8 {
-		t.Errorf("expected 8 --device flags, got %d", deviceCount)
+	if deviceCount != 7 {
+		t.Errorf("expected 7 --device flags, got %d", deviceCount)
 	}
 }
 
@@ -218,7 +214,6 @@ func TestBuildVfkitArgsNoCredentialShares(t *testing.T) {
 		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
-		HealthPort:  1025,
 		NotifyPort:  1026,
 	}
 
@@ -226,10 +221,10 @@ func TestBuildVfkitArgsNoCredentialShares(t *testing.T) {
 	args := vm.buildVfkitArgs()
 	argsStr := strings.Join(args, " ")
 
-	// Should have 6 --device flags (1 block + 1 net + 1 serial + 3 vsock) — no virtio-fs
+	// Should have 5 --device flags (1 block + 1 net + 1 serial + 2 vsock) — no virtio-fs
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 6 {
-		t.Errorf("expected 6 --device flags with no credential shares, got %d", deviceCount)
+	if deviceCount != 5 {
+		t.Errorf("expected 5 --device flags with no credential shares, got %d", deviceCount)
 	}
 
 	if strings.Contains(argsStr, "virtio-fs") {
@@ -244,7 +239,6 @@ func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 		InstanceDir: "",
 		SocketDir:   "/tmp/sockets",
 		ConsolePort: 1024,
-		HealthPort:  1025,
 		NotifyPort:  1026,
 	}
 
@@ -274,12 +268,11 @@ func TestCleanupSockets(t *testing.T) {
 	cfg := &config.VZConfig{
 		SocketDir:   tmpDir,
 		ConsolePort: 1024,
-		HealthPort:  1025,
 		NotifyPort:  1026,
 	}
 
 	// Create socket files
-	for _, port := range []uint32{1024, 1025, 1026} {
+	for _, port := range []uint32{1024, 1026} {
 		path := filepath.Join(tmpDir, fmt.Sprintf("test-vm-%d.sock", port))
 		if err := os.WriteFile(path, nil, 0600); err != nil {
 			t.Fatalf("Failed to create socket file %s: %v", path, err)
@@ -296,7 +289,7 @@ func TestCleanupSockets(t *testing.T) {
 	vm.cleanupSockets()
 
 	// Check that our sockets are gone
-	for _, port := range []uint32{1024, 1025, 1026} {
+	for _, port := range []uint32{1024, 1026} {
 		path := filepath.Join(tmpDir, fmt.Sprintf("test-vm-%d.sock", port))
 		if _, err := os.Stat(path); err == nil {
 			t.Errorf("socket %s should have been removed", path)

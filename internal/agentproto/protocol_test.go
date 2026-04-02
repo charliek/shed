@@ -10,7 +10,7 @@ import (
 func TestWriteMessage_Empty(t *testing.T) {
 	var buf bytes.Buffer
 
-	err := WriteMessage(&buf, MsgTypeHealthRequest, nil)
+	err := WriteMessage(&buf, MsgTypePluginMessage, nil)
 	if err != nil {
 		t.Fatalf("WriteMessage() error = %v", err)
 	}
@@ -21,8 +21,8 @@ func TestWriteMessage_Empty(t *testing.T) {
 		t.Errorf("wrote %d bytes, want 5", len(data))
 	}
 
-	if data[0] != MsgTypeHealthRequest {
-		t.Errorf("message type = %#x, want %#x", data[0], MsgTypeHealthRequest)
+	if data[0] != MsgTypePluginMessage {
+		t.Errorf("message type = %#x, want %#x", data[0], MsgTypePluginMessage)
 	}
 
 	length := binary.BigEndian.Uint32(data[1:5])
@@ -86,7 +86,7 @@ func TestReadMessage_Valid(t *testing.T) {
 func TestReadMessage_Empty(t *testing.T) {
 	// Create an empty payload message
 	var buf bytes.Buffer
-	buf.WriteByte(MsgTypeHealthResponse)
+	buf.WriteByte(MsgTypePluginMessage)
 	binary.Write(&buf, binary.BigEndian, uint32(0))
 
 	msgType, data, err := ReadMessage(&buf)
@@ -94,8 +94,8 @@ func TestReadMessage_Empty(t *testing.T) {
 		t.Fatalf("ReadMessage() error = %v", err)
 	}
 
-	if msgType != MsgTypeHealthResponse {
-		t.Errorf("message type = %#x, want %#x", msgType, MsgTypeHealthResponse)
+	if msgType != MsgTypePluginMessage {
+		t.Errorf("message type = %#x, want %#x", msgType, MsgTypePluginMessage)
 	}
 
 	if data != nil {
@@ -144,8 +144,7 @@ func TestReadWriteRoundTrip(t *testing.T) {
 		msgType byte
 		payload []byte
 	}{
-		{"empty health request", MsgTypeHealthRequest, nil},
-		{"empty health response", MsgTypeHealthResponse, nil},
+		{"empty plugin message", MsgTypePluginMessage, nil},
 		{"data message", MsgTypeData, []byte("some output data")},
 		{"exec request", MsgTypeExecRequest, []byte(`{"cmd":["ls","-la"]}`)},
 		{"exit code", MsgTypeExitCode, []byte(`{"code":0}`)},
@@ -215,8 +214,7 @@ func TestMessageTypes(t *testing.T) {
 		MsgTypeSignal,
 		MsgTypeExitCode,
 		MsgTypeData,
-		MsgTypeHealthRequest,
-		MsgTypeHealthResponse,
+		MsgTypePluginMessage,
 	}
 
 	seen := make(map[byte]bool)

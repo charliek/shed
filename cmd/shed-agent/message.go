@@ -21,6 +21,13 @@ func (s *Server) handleMessageConnection(conn net.Conn) {
 	s.setMessageConn(conn)
 	defer s.clearMessageConnIfCurrent(conn)
 
+	// Per-connection context ensures the heartbeat goroutine exits when
+	// this connection handler returns (on read error, EOF, or server shutdown).
+	connCtx, connCancel := context.WithCancel(s.ctx)
+	defer connCancel()
+
+	go s.runHeartbeat(connCtx)
+
 	for {
 		msgType, data, err := readMessage(conn)
 		if err != nil {
@@ -36,15 +43,53 @@ func (s *Server) handleMessageConnection(conn net.Conn) {
 
 		switch msgType {
 		case MsgTypePluginMessage:
-			s.handlePluginMessage(data)
+			s.handlePluginMessage(conn, data)
 		default:
 			log.Printf("Unknown message type on message channel: 0x%02x", msgType)
 		}
 	}
 }
 
+// runHeartbeat sends periodic system:health events on the persistent connection.
+// It sends one immediately, then ticks at s.heartbeatInterval.
+// Exits on context cancellation or send error.
+func (s *Server) runHeartbeat(ctx context.Context) {
+	sendHeartbeat := func() error {
+		payload := plugin.HeartbeatPayload{StartedAt: s.startedAt}
+		payloadData, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal heartbeat: %w", err)
+		}
+		env := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeEvent, payloadData)
+		return s.sendPluginMessage(env)
+	}
+
+	// Send immediately on connect
+	if err := sendHeartbeat(); err != nil {
+		log.Printf("Heartbeat send failed: %v", err)
+		return
+	}
+
+	ticker := time.NewTicker(s.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := sendHeartbeat(); err != nil {
+				log.Printf("Heartbeat send failed: %v", err)
+				return
+			}
+		}
+	}
+}
+
 // handlePluginMessage processes an incoming plugin envelope from the host.
-func (s *Server) handlePluginMessage(data []byte) {
+// conn is the connection that carried the request, used for direct replies
+// (e.g. system:health) that should not route through the global sendPluginMessage path.
+func (s *Server) handlePluginMessage(conn net.Conn, data []byte) {
 	var env plugin.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		log.Printf("Invalid plugin envelope: %v", err)
@@ -57,13 +102,32 @@ func (s *Server) handlePluginMessage(data []byte) {
 		s.deliverResponse(&env)
 	case plugin.MessageTypeRequest:
 		// System namespace handlers
-		if env.Namespace == plugin.NamespaceCredentials {
+		switch env.Namespace {
+		case plugin.NamespaceHealth:
+			s.handleHealthRequest(conn, &env)
+		case plugin.NamespaceCredentials:
 			s.handleCredentialSetup(&env)
-			return
+		default:
+			log.Printf("Plugin request from host: namespace=%s (no local handler)", env.Namespace)
 		}
-		log.Printf("Plugin request from host: namespace=%s (no local handler)", env.Namespace)
 	default:
 		log.Printf("Plugin message from host: namespace=%s type=%s (no local handler)", env.Namespace, env.Type)
+	}
+}
+
+// handleHealthRequest responds to a system:health request by writing directly
+// to the request connection. This avoids the global sendPluginMessage/msgConn
+// path, which is important during startup when transient health poll connections
+// briefly occupy msgConn.
+func (s *Server) handleHealthRequest(conn net.Conn, env *plugin.Envelope) {
+	resp := plugin.NewResponse(env.ID, plugin.NamespaceHealth, nil)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("Failed to marshal health response: %v", err)
+		return
+	}
+	if err := writeMessage(conn, MsgTypePluginMessage, data); err != nil {
+		log.Printf("Failed to write health response: %v", err)
 	}
 }
 

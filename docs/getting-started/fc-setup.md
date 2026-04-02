@@ -178,7 +178,7 @@ firecracker:
   default_disk_gb: 20
   vsock_base_cid: 100
   console_port: 1024
-  health_port: 1025
+  notify_port: 1026
   start_timeout: 120s
   stop_timeout: 10s
   bridge_name: shed-br0

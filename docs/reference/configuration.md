@@ -209,7 +209,6 @@ firecracker:
   default_disk_gb: 20
   vsock_base_cid: 100
   console_port: 1024
-  health_port: 1025
   notify_port: 1026
   start_timeout: 120s
   stop_timeout: 10s
@@ -235,8 +234,7 @@ Replace `{version}` with the version matching your `shed` binary — run `shed v
 | `default_disk_gb` | int | `20` | Default disk size per VM (GB) |
 | `vsock_base_cid` | int | `100` | Starting CID for vsock guest addressing |
 | `console_port` | int | `1024` | Vsock port for VM console I/O |
-| `health_port` | int | `1025` | Vsock port for agent health checks |
-| `notify_port` | int | `1026` | Vsock port for credential change notifications |
+| `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins, credentials) |
 | `start_timeout` | duration | `30s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
 | `bridge_name` | string | `shed-br0` | Linux bridge name |
@@ -270,7 +268,6 @@ vz:
   default_memory_mb: 4096
   default_disk_gb: 20
   console_port: 1024
-  health_port: 1025
   notify_port: 1026
   start_timeout: 60s
   stop_timeout: 10s
@@ -292,8 +289,7 @@ vz:
 | `default_memory_mb` | int | `4096` | Default memory per VM (MB) |
 | `default_disk_gb` | int | `20` | Default disk size per VM (GB) |
 | `console_port` | int | `1024` | Vsock port for VM console I/O |
-| `health_port` | int | `1025` | Vsock port for agent health checks |
-| `notify_port` | int | `1026` | Vsock port for credential change notifications |
+| `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins, credentials) |
 | `start_timeout` | duration | `60s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
 

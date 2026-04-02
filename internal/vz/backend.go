@@ -70,7 +70,7 @@ func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, er
 // newAgentClient creates a vmutil.AgentClient for the given instance name.
 func (b *VZBackend) newAgentClient(name string) *vmutil.AgentClient {
 	dialer := NewVZDialer(b.client.cfg.SocketDir, name)
-	return vmutil.NewAgentClient(dialer, b.client.cfg.ConsolePort, b.client.cfg.HealthPort, b.client.cfg.NotifyPort)
+	return vmutil.NewAgentClient(dialer, b.client.cfg.ConsolePort, b.client.cfg.NotifyPort)
 }
 
 // ListSessions returns all tmux sessions in a shed.

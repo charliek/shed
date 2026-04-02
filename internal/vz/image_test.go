@@ -278,29 +278,3 @@ func TestPruneImages(t *testing.T) {
 		}
 	})
 }
-
-func TestValidateImageName(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		wantErr bool
-	}{
-		{"valid", "myimage", false},
-		{"valid with hyphen", "my-image", false},
-		{"valid with underscore", "my_image", false},
-		{"empty", "", true},
-		{"dot-dot", "..", true},
-		{"contains dot-dot", "foo..bar", true},
-		{"path separator", "foo/bar", true},
-		{"leading dot-dot slash", "../etc", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateImageName(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("validateImageName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
-			}
-		})
-	}
-}

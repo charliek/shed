@@ -71,19 +71,21 @@ func ValidateShedName(name string) error {
 
 // Shed represents a development environment container.
 type Shed struct {
-	Name        string    `json:"name" yaml:"name"`
-	Status      string    `json:"status" yaml:"status"`
-	CreatedAt   time.Time `json:"created_at" yaml:"created_at"`
-	Repo        string    `json:"repo,omitempty" yaml:"repo,omitempty"`
-	ContainerID string    `json:"container_id" yaml:"container_id"`
-	Backend     string    `json:"backend,omitempty" yaml:"backend,omitempty"`
-	IPAddress   string    `json:"ip_address,omitempty" yaml:"ip_address,omitempty"`
-	CPUs        int       `json:"cpus,omitempty" yaml:"cpus,omitempty"`
-	MemoryMB    int       `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
-	PID         int       `json:"pid,omitempty" yaml:"pid,omitempty"`
-	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
-	LocalDir    string    `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
-	Image       string    `json:"image,omitempty" yaml:"image,omitempty"`
+	Name        string     `json:"name" yaml:"name"`
+	Status      string     `json:"status" yaml:"status"`
+	CreatedAt   time.Time  `json:"created_at" yaml:"created_at"`
+	Repo        string     `json:"repo,omitempty" yaml:"repo,omitempty"`
+	ContainerID string     `json:"container_id" yaml:"container_id"`
+	Backend     string     `json:"backend,omitempty" yaml:"backend,omitempty"`
+	IPAddress   string     `json:"ip_address,omitempty" yaml:"ip_address,omitempty"`
+	CPUs        int        `json:"cpus,omitempty" yaml:"cpus,omitempty"`
+	MemoryMB    int        `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
+	PID         int        `json:"pid,omitempty" yaml:"pid,omitempty"`
+	RootfsPath  string     `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
+	LocalDir    string     `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
+	Image       string     `json:"image,omitempty" yaml:"image,omitempty"`
+	LastHealthy *time.Time `json:"last_healthy,omitempty" yaml:"last_healthy,omitempty"` // last heartbeat from agent (VM backends only)
+	StartedAt   *time.Time `json:"started_at,omitempty" yaml:"started_at,omitempty"`     // agent boot time from heartbeat (VM backends only)
 }
 
 // Shed status constants.

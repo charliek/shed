@@ -347,20 +347,22 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	if jsonFlag {
 		type shedJSON struct {
-			Name       string    `json:"name"`
-			Server     string    `json:"server"`
-			Status     string    `json:"status"`
-			CreatedAt  time.Time `json:"created_at"`
-			Backend    string    `json:"backend,omitempty"`
-			IPAddress  string    `json:"ip_address,omitempty"`
-			CPUs       int       `json:"cpus,omitempty"`
-			MemoryMB   int       `json:"memory_mb,omitempty"`
-			Repo       string    `json:"repo,omitempty"`
-			PID        int       `json:"pid,omitempty"`
-			RootfsPath string    `json:"rootfs_path,omitempty"`
-			LocalDir   string    `json:"local_dir,omitempty"`
-			SSH        string    `json:"ssh,omitempty"`
-			Uptime     string    `json:"uptime,omitempty"`
+			Name        string     `json:"name"`
+			Server      string     `json:"server"`
+			Status      string     `json:"status"`
+			CreatedAt   time.Time  `json:"created_at"`
+			Backend     string     `json:"backend,omitempty"`
+			IPAddress   string     `json:"ip_address,omitempty"`
+			CPUs        int        `json:"cpus,omitempty"`
+			MemoryMB    int        `json:"memory_mb,omitempty"`
+			Repo        string     `json:"repo,omitempty"`
+			PID         int        `json:"pid,omitempty"`
+			RootfsPath  string     `json:"rootfs_path,omitempty"`
+			LocalDir    string     `json:"local_dir,omitempty"`
+			SSH         string     `json:"ssh,omitempty"`
+			Uptime      string     `json:"uptime,omitempty"`
+			LastHealthy *time.Time `json:"last_healthy,omitempty"`
+			StartedAt   *time.Time `json:"started_at,omitempty"`
 		}
 		result := make([]shedJSON, 0, len(allSheds))
 		for _, s := range allSheds {
@@ -380,7 +382,14 @@ func runList(cmd *cobra.Command, args []string) error {
 			}
 			if s.shed.Status == config.StatusRunning {
 				sj.SSH = shedSSHString(s.shed.Name, s.server)
-				sj.Uptime = formatUptime(s.shed.CreatedAt)
+				sj.LastHealthy = s.shed.LastHealthy
+				sj.StartedAt = s.shed.StartedAt
+				// Use agent boot time for uptime if available, fall back to creation time
+				if s.shed.StartedAt != nil {
+					sj.Uptime = formatUptime(*s.shed.StartedAt)
+				} else {
+					sj.Uptime = formatUptime(s.shed.CreatedAt)
+				}
 			}
 			result = append(result, sj)
 		}
@@ -408,7 +417,18 @@ func runList(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Printf("Created:        %s\n", s.shed.CreatedAt.Format("2006-01-02 15:04:05"))
 			if s.shed.Status == config.StatusRunning {
-				fmt.Printf("Uptime:         %s\n", formatUptime(s.shed.CreatedAt))
+				// Use agent boot time for uptime if available
+				if s.shed.StartedAt != nil {
+					fmt.Printf("Uptime:         %s\n", formatUptime(*s.shed.StartedAt))
+				} else {
+					fmt.Printf("Uptime:         %s\n", formatUptime(s.shed.CreatedAt))
+				}
+				// Show health status
+				if s.shed.LastHealthy != nil {
+					fmt.Printf("Health:         %s ago\n", formatUptime(*s.shed.LastHealthy))
+				} else {
+					fmt.Printf("Health:         unknown\n")
+				}
 			}
 
 			// Network section

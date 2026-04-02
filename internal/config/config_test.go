@@ -351,7 +351,6 @@ func validFirecrackerConfig() *FirecrackerConfig {
 		DefaultDiskGB:   20,
 		VsockBaseCID:    100,
 		ConsolePort:     1024,
-		HealthPort:      1025,
 		NotifyPort:      1026,
 		StartTimeout:    Duration(30 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
@@ -428,11 +427,6 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 		{
 			name:    "console port over max",
 			modify:  func(c *FirecrackerConfig) { c.ConsolePort = MaxVsockPort + 1 },
-			wantErr: true,
-		},
-		{
-			name:    "health port over max",
-			modify:  func(c *FirecrackerConfig) { c.HealthPort = MaxVsockPort + 1 },
 			wantErr: true,
 		},
 		// Timeout bounds
@@ -525,7 +519,6 @@ func validVZConfig() *VZConfig {
 		DefaultMemoryMB: 4096,
 		DefaultDiskGB:   20,
 		ConsolePort:     1024,
-		HealthPort:      1025,
 		NotifyPort:      1026,
 		StartTimeout:    Duration(60 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
@@ -612,18 +605,13 @@ func TestVZConfigValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "health port zero",
-			modify:  func(c *VZConfig) { c.HealthPort = 0 },
-			wantErr: true,
-		},
-		{
 			name:    "notify port zero",
 			modify:  func(c *VZConfig) { c.NotifyPort = 0 },
 			wantErr: true,
 		},
 		{
 			name:    "duplicate ports",
-			modify:  func(c *VZConfig) { c.ConsolePort = 1024; c.HealthPort = 1024 },
+			modify:  func(c *VZConfig) { c.ConsolePort = 1026; c.NotifyPort = 1026 },
 			wantErr: true,
 		},
 		// Timeout validation
@@ -681,9 +669,6 @@ func TestDefaultVZConfig(t *testing.T) {
 	}
 	if cfg.ConsolePort != 1024 {
 		t.Errorf("ConsolePort = %d, want 1024", cfg.ConsolePort)
-	}
-	if cfg.HealthPort != 1025 {
-		t.Errorf("HealthPort = %d, want 1025", cfg.HealthPort)
 	}
 	if cfg.NotifyPort != 1026 {
 		t.Errorf("NotifyPort = %d, want 1026", cfg.NotifyPort)

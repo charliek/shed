@@ -92,10 +92,7 @@ type FirecrackerConfig struct {
 	// ConsolePort is the vsock port for console/exec connections
 	ConsolePort uint32 `yaml:"console_port"`
 
-	// HealthPort is the vsock port for health checks
-	HealthPort uint32 `yaml:"health_port"`
-
-	// NotifyPort is the vsock port for credential change notifications
+	// NotifyPort is the vsock port for the message channel (health checks, plugins, credentials)
 	NotifyPort uint32 `yaml:"notify_port"`
 
 	// StartTimeout is the timeout for VM startup
@@ -157,10 +154,7 @@ type VZConfig struct {
 	// ConsolePort is the vsock port for console/exec connections
 	ConsolePort uint32 `yaml:"console_port"`
 
-	// HealthPort is the vsock port for health checks
-	HealthPort uint32 `yaml:"health_port"`
-
-	// NotifyPort is the vsock port for credential change notifications
+	// NotifyPort is the vsock port for the message channel (health checks, plugins, credentials)
 	NotifyPort uint32 `yaml:"notify_port"`
 
 	// StartTimeout is the timeout for VM startup
@@ -202,7 +196,6 @@ func DefaultVZConfig() *VZConfig {
 		DefaultMemoryMB: 4096,
 		DefaultDiskGB:   20,
 		ConsolePort:     1024,
-		HealthPort:      1025,
 		NotifyPort:      1026,
 		StartTimeout:    Duration(60 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
@@ -281,20 +274,14 @@ func (c *VZConfig) Validate() error {
 	if c.ConsolePort > MaxVsockPort {
 		return fmt.Errorf("vz: console_port must be at most %d", MaxVsockPort)
 	}
-	if c.HealthPort == 0 {
-		return fmt.Errorf("vz: health_port must be set")
-	}
-	if c.HealthPort > MaxVsockPort {
-		return fmt.Errorf("vz: health_port must be at most %d", MaxVsockPort)
-	}
 	if c.NotifyPort == 0 {
 		return fmt.Errorf("vz: notify_port must be set")
 	}
 	if c.NotifyPort > MaxVsockPort {
 		return fmt.Errorf("vz: notify_port must be at most %d", MaxVsockPort)
 	}
-	if c.ConsolePort == c.HealthPort || c.ConsolePort == c.NotifyPort || c.HealthPort == c.NotifyPort {
-		return fmt.Errorf("vz: console_port, health_port, and notify_port must all be different")
+	if c.ConsolePort == c.NotifyPort {
+		return fmt.Errorf("vz: console_port and notify_port must be different")
 	}
 
 	// Validate timeouts
@@ -550,7 +537,6 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 		DefaultDiskGB:   20,
 		VsockBaseCID:    100,
 		ConsolePort:     1024,
-		HealthPort:      1025,
 		NotifyPort:      1026,
 		StartTimeout:    Duration(30 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
@@ -889,20 +875,14 @@ func (c *FirecrackerConfig) Validate() error {
 	if c.ConsolePort > MaxVsockPort {
 		return fmt.Errorf("console_port must be at most %d", MaxVsockPort)
 	}
-	if c.HealthPort == 0 {
-		return fmt.Errorf("health_port must be set")
-	}
-	if c.HealthPort > MaxVsockPort {
-		return fmt.Errorf("health_port must be at most %d", MaxVsockPort)
-	}
 	if c.NotifyPort == 0 {
 		return fmt.Errorf("notify_port must be set")
 	}
 	if c.NotifyPort > MaxVsockPort {
 		return fmt.Errorf("notify_port must be at most %d", MaxVsockPort)
 	}
-	if c.ConsolePort == c.HealthPort || c.ConsolePort == c.NotifyPort || c.HealthPort == c.NotifyPort {
-		return fmt.Errorf("console_port, health_port, and notify_port must all be different")
+	if c.ConsolePort == c.NotifyPort {
+		return fmt.Errorf("console_port and notify_port must be different")
 	}
 
 	if c.VsockBaseCID < 3 {
