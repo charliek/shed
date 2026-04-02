@@ -14,20 +14,64 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 )
 
-// handleMessageConnection handles the persistent message channel connection.
-// It dispatches incoming messages by type to the appropriate handler.
-func (s *Server) handleMessageConnection(conn net.Conn) {
+// handleNotifyConnection handles a connection on the notify port. It reads the
+// first message to determine the connection type:
+//   - Transient health check (system:health request): respond inline and close
+//   - Persistent message channel: promote to msgConn, start heartbeats, enter read loop
+func (s *Server) handleNotifyConnection(conn net.Conn) {
 	defer conn.Close()
+
+	// Read the first message to determine connection type.
+	msgType, data, err := readMessage(conn)
+	if err != nil {
+		if err != io.EOF {
+			select {
+			case <-s.ctx.Done():
+			default:
+				log.Printf("Notify connection read error: %v", err)
+			}
+		}
+		return
+	}
+
+	// Check if this is a transient health check (request/response, then close).
+	if msgType == MsgTypePluginMessage {
+		var env plugin.Envelope
+		if err := json.Unmarshal(data, &env); err == nil {
+			if env.Namespace == plugin.NamespaceHealth && env.Type == plugin.MessageTypeRequest {
+				s.handleHealthRequest(conn, &env)
+				return
+			}
+		}
+	}
+
+	// Not a health check — this is the persistent message channel.
+	// Promote to msgConn and start heartbeats.
 	s.setMessageConn(conn)
 	defer s.clearMessageConnIfCurrent(conn)
 
-	// Per-connection context ensures the heartbeat goroutine exits when
-	// this connection handler returns (on read error, EOF, or server shutdown).
 	connCtx, connCancel := context.WithCancel(s.ctx)
 	defer connCancel()
 
 	go s.runHeartbeat(connCtx)
 
+	// Process the first message we already read, then enter the read loop.
+	s.dispatchMessage(conn, msgType, data)
+	s.readMessageLoop(conn)
+}
+
+// dispatchMessage routes a single message by type.
+func (s *Server) dispatchMessage(conn net.Conn, msgType byte, data []byte) {
+	switch msgType {
+	case MsgTypePluginMessage:
+		s.handlePluginMessage(conn, data)
+	default:
+		log.Printf("Unknown message type on message channel: 0x%02x", msgType)
+	}
+}
+
+// readMessageLoop reads and dispatches messages until the connection closes.
+func (s *Server) readMessageLoop(conn net.Conn) {
 	for {
 		msgType, data, err := readMessage(conn)
 		if err != nil {
@@ -40,13 +84,7 @@ func (s *Server) handleMessageConnection(conn net.Conn) {
 			}
 			return
 		}
-
-		switch msgType {
-		case MsgTypePluginMessage:
-			s.handlePluginMessage(conn, data)
-		default:
-			log.Printf("Unknown message type on message channel: 0x%02x", msgType)
-		}
+		s.dispatchMessage(conn, msgType, data)
 	}
 }
 
