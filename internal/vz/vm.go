@@ -98,7 +98,7 @@ func (vm *VM) Start(ctx context.Context) error {
 
 	// Wait for the agent to be healthy
 	dialer := NewVZDialer(vm.cfg.SocketDir, vm.meta.Name)
-	agent := vmutil.NewAgentClient(dialer, vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort)
+	agent := vmutil.NewAgentClient(dialer, vm.cfg.ConsolePort, vm.cfg.NotifyPort)
 	if err := agent.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
 		// Try to stop the VM on failure
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {
@@ -144,7 +144,7 @@ func (vm *VM) buildVfkitArgs() []string {
 	// Add vsock devices — one per port.
 	// NOTE: SocketDir must not contain spaces. vfkit URL-encodes the socketURL
 	// parameter, turning spaces into %20, which causes connection failures.
-	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort}
+	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.NotifyPort}
 	for _, port := range ports {
 		socketPath := filepath.Join(vm.cfg.SocketDir, fmt.Sprintf("%s-%d.sock", vm.meta.Name, port))
 		args = append(args, "--device", fmt.Sprintf("virtio-vsock,port=%d,socketURL=%s,connect", port, socketPath))
@@ -261,7 +261,7 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 
 // cleanupSockets removes vsock socket files for this VM.
 func (vm *VM) cleanupSockets() {
-	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort}
+	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.NotifyPort}
 	for _, port := range ports {
 		socketPath := filepath.Join(vm.cfg.SocketDir, fmt.Sprintf("%s-%d.sock", vm.meta.Name, port))
 		os.Remove(socketPath)

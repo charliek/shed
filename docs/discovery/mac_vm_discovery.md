@@ -130,7 +130,7 @@ shed-agent (vsock port 1024)       shed-agent (vsock port 1024)
     [identical binary]                 [identical binary]
 ```
 
-- **shed-agent** runs unchanged in the VZ VM -- same Linux binary, same vsock listener on port 1024/1025
+- **shed-agent** runs unchanged in the VZ VM -- same Linux binary, same vsock listeners on ports 1024/1026
 - **agentproto** framing protocol works unchanged -- same message types, same encoding
 - **Host-side vsock client** needs minor adaptation: remove the Firecracker `CONNECT/OK` handshake, connect directly to the per-port Unix socket
 

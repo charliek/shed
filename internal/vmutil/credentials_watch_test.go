@@ -17,7 +17,7 @@ func TestCredentialWatcherRegisterUnregister(t *testing.T) {
 
 	cw := NewCredentialWatcher(serverCfg)
 
-	agent := NewAgentClient(nil, 1024, 1025, 1026)
+	agent := NewAgentClient(nil, 1024, 1026)
 	cw.RegisterVM("vm1", agent)
 
 	cw.mu.RLock()

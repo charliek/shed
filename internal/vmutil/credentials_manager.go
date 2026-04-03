@@ -2,6 +2,7 @@ package vmutil
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -21,10 +22,11 @@ type DirMountFunc func(ctx context.Context, agent *AgentClient, name string, mou
 // It owns the host-side credential watcher, per-VM message channels (for both
 // plugin messages and credential sync), and the plugin bridge registration.
 type CredentialManager struct {
-	serverCfg   *config.ServerConfig
-	credWatcher *CredentialWatcher // nil if watcher failed to start (non-fatal)
-	bridge      *plugin.Bridge     // plugin message bridge (nil if plugins disabled)
-	backendName string             // "vz" or "firecracker"
+	serverCfg     *config.ServerConfig
+	credWatcher   *CredentialWatcher // nil if watcher failed to start (non-fatal)
+	bridge        *plugin.Bridge     // plugin message bridge (nil if plugins disabled)
+	backendName   string             // "vz" or "firecracker"
+	healthTracker *HealthTracker     // tracks per-VM heartbeat state
 
 	mu              sync.Mutex
 	messageChannels map[string]*NotifyConn // name -> per-VM message channel
@@ -33,11 +35,12 @@ type CredentialManager struct {
 // NewCredentialManager creates a new CredentialManager and starts the host-side
 // credential watcher. If the watcher fails to start, it logs a warning and
 // continues with a nil watcher (non-fatal, matching existing backend behavior).
-func NewCredentialManager(serverCfg *config.ServerConfig, bridge *plugin.Bridge, backendName string) *CredentialManager {
+func NewCredentialManager(serverCfg *config.ServerConfig, bridge *plugin.Bridge, backendName string, healthTracker *HealthTracker) *CredentialManager {
 	cm := &CredentialManager{
 		serverCfg:       serverCfg,
 		bridge:          bridge,
 		backendName:     backendName,
+		healthTracker:   healthTracker,
 		messageChannels: make(map[string]*NotifyConn),
 	}
 
@@ -86,6 +89,11 @@ func (cm *CredentialManager) SetupCredentials(ctx context.Context, agent *AgentC
 	cm.startMessageChannel(shedName, agent, fileCreds)
 }
 
+// HealthTracker returns the health tracker for querying VM health state.
+func (cm *CredentialManager) HealthTracker() *HealthTracker {
+	return cm.healthTracker
+}
+
 // StopListener stops the message channel for a VM and unregisters it
 // from the plugin bridge and host-side credential watcher.
 func (cm *CredentialManager) StopListener(name string) {
@@ -105,6 +113,10 @@ func (cm *CredentialManager) StopListener(name string) {
 	if cm.credWatcher != nil {
 		cm.credWatcher.UnregisterVM(name)
 	}
+
+	if cm.healthTracker != nil {
+		cm.healthTracker.Remove(name)
+	}
 }
 
 // Close stops all message channels and the credential watcher.
@@ -114,6 +126,9 @@ func (cm *CredentialManager) Close() {
 		ch.Stop()
 		if cm.bridge != nil {
 			cm.bridge.UnregisterShed(name)
+		}
+		if cm.healthTracker != nil {
+			cm.healthTracker.Remove(name)
 		}
 		delete(cm.messageChannels, name)
 	}
@@ -156,7 +171,24 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 		}
 	}
 
-	handler := NewMessageHandler(credSetup, credChangeFn, func(env *plugin.Envelope) {
+	// Health heartbeat callback: update the tracker with agent boot time.
+	var healthFn func(env *plugin.Envelope)
+	if cm.healthTracker != nil {
+		healthFn = func(env *plugin.Envelope) {
+			var payload plugin.HeartbeatPayload
+			if err := json.Unmarshal(env.Payload, &payload); err != nil {
+				log.Printf("[%s] Invalid heartbeat payload: %v", name, err)
+				return
+			}
+			if payload.StartedAt.IsZero() {
+				log.Printf("[%s] Ignoring heartbeat with zero started_at", name)
+				return
+			}
+			cm.healthTracker.Update(name, payload.StartedAt)
+		}
+	}
+
+	handler := NewMessageHandler(credSetup, credChangeFn, healthFn, func(env *plugin.Envelope) {
 		if cm.bridge != nil {
 			if err := cm.bridge.PublishToHost(name, env); err != nil {
 				log.Printf("[%s] Failed to publish plugin message: %v", name, err)

@@ -53,7 +53,7 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, br
 		usedCIDs:  make(map[uint32]string),
 		usedIPs:   make(map[string]string),
 		p9Servers: make(map[string][]*P9Server),
-		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker)),
+		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -206,7 +206,7 @@ func (c *Client) UnregisterInstance(name string, cid uint32, ip string) {
 func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
 	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", name))
 	dialer := NewFirecrackerDialer(vsockPath)
-	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.HealthPort, c.cfg.NotifyPort)
+	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.NotifyPort)
 }
 
 // resolvePathOwner returns the UID and GID of the given path's owner.
@@ -568,11 +568,26 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 				log.Printf("Warning: failed to save updated metadata for %q: %v", name, err)
 			}
 			status = config.StatusStopped
+			// Clean up stale health state for the stopped VM
+			if ht := c.credMgr.HealthTracker(); ht != nil {
+				ht.Remove(name)
+			}
 		}
 	}
 
 	shed := metadataToShed(meta)
 	shed.Status = status
+
+	// Populate health data from in-memory tracker for running VMs.
+	if status == config.StatusRunning {
+		if ht := c.credMgr.HealthTracker(); ht != nil {
+			if hs, ok := ht.Get(name); ok {
+				shed.LastHealthy = &hs.LastSeen
+				shed.StartedAt = &hs.AgentStartedAt
+			}
+		}
+	}
+
 	return shed, nil
 }
 

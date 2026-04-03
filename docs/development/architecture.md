@@ -53,8 +53,7 @@ flowchart TB
 | HTTP | 8080 | REST API for CRUD operations, server discovery |
 | SSH | 2222 | Terminal access, IDE remote connections |
 | vsock | 1024 | VM console I/O (Firecracker, VZ) |
-| vsock | 1025 | Agent health checks (Firecracker, VZ) |
-| vsock | 1026 | Message bus — plugins and credential sync (Firecracker, VZ) |
+| vsock | 1026 | Message bus — health checks, plugins, credential sync (Firecracker, VZ) |
 
 ## Naming Conventions
 
@@ -142,7 +141,7 @@ The diagrams below show the internal implementation flow for each backend.
         Server->>Server: Allocate CID, TAP device, IP address
         Server->>Server: Classify credentials (9P vs tar)
         Server->>VM: Spawn Firecracker process
-        Server->>Agent: Wait for agent health (poll vsock:1025)
+        Server->>Agent: Wait for agent health (poll vsock:1026)
         Agent-->>Server: Healthy
         alt local-dir specified
             Server->>Server: Start 9P TCP server on bridge IP
@@ -174,7 +173,7 @@ The diagrams below show the internal implementation flow for each backend.
         Server->>Server: Classify credentials (VirtioFS vs tar)
         Server->>vfkit: Spawn vfkit with VirtioFS devices
         Note right of vfkit: Devices: rootfs, local-dir share,<br/>credential directory shares
-        Server->>Agent: Wait for agent health (poll vsock:1025)
+        Server->>Agent: Wait for agent health (poll vsock:1026)
         Agent-->>Server: Healthy
         alt local-dir specified
             Server->>Agent: Mount VirtioFS share at /workspace

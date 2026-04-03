@@ -13,15 +13,12 @@ const MaxMessageSize = 16 * 1024 * 1024
 
 // Message types for the vsock protocol.
 const (
-	MsgTypeExecRequest    byte = 0x01
-	MsgTypeResize         byte = 0x02
-	MsgTypeSignal         byte = 0x03
-	MsgTypeExitCode       byte = 0x04
-	MsgTypeData           byte = 0x05
-	MsgTypeStdinEOF       byte = 0x06
-	MsgTypeHealthRequest  byte = 0x10
-	MsgTypeHealthResponse byte = 0x11
-
+	MsgTypeExecRequest byte = 0x01
+	MsgTypeResize      byte = 0x02
+	MsgTypeSignal      byte = 0x03
+	MsgTypeExitCode    byte = 0x04
+	MsgTypeData        byte = 0x05
+	MsgTypeStdinEOF    byte = 0x06
 	MsgTypeNotifySetup byte = 0x12 // Deprecated: replaced by MsgTypePluginMessage with system:credentials namespace
 	MsgTypeFileChanged byte = 0x13 // Deprecated: replaced by MsgTypePluginMessage with system:credentials namespace
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/charliek/shed/internal/agentproto"
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/plugin"
 )
 
 func TestExitError(t *testing.T) {
@@ -23,7 +24,7 @@ func TestExitError(t *testing.T) {
 
 func TestNewAgentClient(t *testing.T) {
 	// Use a nil dialer since we're just testing construction
-	client := NewAgentClient(nil, 1024, 1025, 1026)
+	client := NewAgentClient(nil, 1024, 1026)
 	if client == nil {
 		t.Fatal("NewAgentClient() returned nil")
 	}
@@ -87,53 +88,155 @@ func (d *errDialer) Dial(ctx context.Context, port uint32) (net.Conn, error) {
 	return nil, d.err
 }
 
-func TestCheckHealth(t *testing.T) {
-	dialer := &pipeDialer{
-		handler: func(conn net.Conn) {
-			defer conn.Close()
-			// Read the health request
-			msgType, _, err := agentproto.ReadMessage(conn)
-			if err != nil {
-				return
-			}
-			if msgType != agentproto.MsgTypeHealthRequest {
-				return
-			}
-			// Send health response
-			agentproto.WriteMessage(conn, agentproto.MsgTypeHealthResponse, nil)
-		},
+// healthHandler reads a system:health request envelope and responds with a
+// matching response envelope. Used by health check tests.
+func healthHandler(conn net.Conn) {
+	defer conn.Close()
+	msgType, data, err := agentproto.ReadMessage(conn)
+	if err != nil || msgType != agentproto.MsgTypePluginMessage {
+		return
 	}
+	var env plugin.Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return
+	}
+	if env.Namespace != plugin.NamespaceHealth || env.Type != plugin.MessageTypeRequest {
+		return
+	}
+	resp := plugin.NewResponse(env.ID, plugin.NamespaceHealth, nil)
+	respData, _ := json.Marshal(resp)
+	agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, respData)
+}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
-	err := client.CheckHealth(context.Background())
-	if err != nil {
+func TestCheckHealth(t *testing.T) {
+	dialer := &pipeDialer{handler: healthHandler}
+	client := NewAgentClient(dialer, 1024, 1026)
+	if err := client.CheckHealth(context.Background()); err != nil {
 		t.Errorf("CheckHealth() error = %v", err)
 	}
 }
 
 func TestCheckHealthDialError(t *testing.T) {
 	dialer := &errDialer{err: io.ErrClosedPipe}
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 	err := client.CheckHealth(context.Background())
 	if err == nil {
 		t.Error("CheckHealth() expected error when dial fails")
 	}
 }
 
-func TestCheckHealthBadResponse(t *testing.T) {
+func TestCheckHealthBadFrameType(t *testing.T) {
 	dialer := &pipeDialer{
 		handler: func(conn net.Conn) {
 			defer conn.Close()
 			agentproto.ReadMessage(conn)
-			// Send wrong message type
+			// Send wrong frame type (not MsgTypePluginMessage)
 			agentproto.WriteMessage(conn, agentproto.MsgTypeData, nil)
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 	err := client.CheckHealth(context.Background())
 	if err == nil {
-		t.Error("CheckHealth() expected error for wrong response type")
+		t.Error("CheckHealth() expected error for wrong frame type")
+	}
+	if !strings.Contains(err.Error(), "unexpected message type") {
+		t.Errorf("CheckHealth() error = %q, want error about unexpected message type", err.Error())
+	}
+}
+
+func TestCheckHealthWrongNamespace(t *testing.T) {
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			msgType, data, _ := agentproto.ReadMessage(conn)
+			if msgType != agentproto.MsgTypePluginMessage {
+				return
+			}
+			var env plugin.Envelope
+			json.Unmarshal(data, &env)
+			// Respond with wrong namespace
+			resp := plugin.NewResponse(env.ID, plugin.NamespaceCredentials, nil)
+			respData, _ := json.Marshal(resp)
+			agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, respData)
+		},
+	}
+
+	client := NewAgentClient(dialer, 1024, 1026)
+	err := client.CheckHealth(context.Background())
+	if err == nil {
+		t.Error("CheckHealth() expected error for wrong namespace")
+	}
+	if !strings.Contains(err.Error(), "unexpected response namespace") {
+		t.Errorf("CheckHealth() error = %q, want error about unexpected namespace", err.Error())
+	}
+}
+
+func TestCheckHealthWrongType(t *testing.T) {
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			msgType, data, _ := agentproto.ReadMessage(conn)
+			if msgType != agentproto.MsgTypePluginMessage {
+				return
+			}
+			var env plugin.Envelope
+			json.Unmarshal(data, &env)
+			// Respond with event instead of response
+			resp := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeEvent, nil)
+			respData, _ := json.Marshal(resp)
+			agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, respData)
+		},
+	}
+
+	client := NewAgentClient(dialer, 1024, 1026)
+	err := client.CheckHealth(context.Background())
+	if err == nil {
+		t.Error("CheckHealth() expected error for wrong message type")
+	}
+	if !strings.Contains(err.Error(), "unexpected response type") {
+		t.Errorf("CheckHealth() error = %q, want error about unexpected response type", err.Error())
+	}
+}
+
+func TestCheckHealthMismatchedInReplyTo(t *testing.T) {
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			agentproto.ReadMessage(conn)
+			// Respond with wrong InReplyTo
+			resp := plugin.NewResponse("wrong-id", plugin.NamespaceHealth, nil)
+			respData, _ := json.Marshal(resp)
+			agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, respData)
+		},
+	}
+
+	client := NewAgentClient(dialer, 1024, 1026)
+	err := client.CheckHealth(context.Background())
+	if err == nil {
+		t.Error("CheckHealth() expected error for mismatched InReplyTo")
+	}
+	if !strings.Contains(err.Error(), "in_reply_to mismatch") {
+		t.Errorf("CheckHealth() error = %q, want error about in_reply_to mismatch", err.Error())
+	}
+}
+
+func TestCheckHealthMalformedJSON(t *testing.T) {
+	dialer := &pipeDialer{
+		handler: func(conn net.Conn) {
+			defer conn.Close()
+			agentproto.ReadMessage(conn)
+			agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, []byte("not json"))
+		},
+	}
+
+	client := NewAgentClient(dialer, 1024, 1026)
+	err := client.CheckHealth(context.Background())
+	if err == nil {
+		t.Error("CheckHealth() expected error for malformed JSON")
+	}
+	if !strings.Contains(err.Error(), "invalid health response envelope") {
+		t.Errorf("CheckHealth() error = %q, want error about invalid envelope", err.Error())
 	}
 }
 
@@ -147,12 +250,11 @@ func TestWaitForHealth(t *testing.T) {
 				// Close connection to simulate unhealthy
 				return
 			}
-			agentproto.ReadMessage(conn)
-			agentproto.WriteMessage(conn, agentproto.MsgTypeHealthResponse, nil)
+			healthHandler(conn) // reuse — note: healthHandler defers Close too, but double-close on pipe is safe
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 	err := client.WaitForHealth(context.Background(), 10*time.Second)
 	if err != nil {
 		t.Errorf("WaitForHealth() error = %v", err)
@@ -170,7 +272,7 @@ func TestWaitForHealthTimeout(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 	err := client.WaitForHealth(context.Background(), 1*time.Second)
 	if err == nil {
 		t.Error("WaitForHealth() expected timeout error")
@@ -205,7 +307,7 @@ func TestExecSimpleCommand(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	var output strings.Builder
 	opts := backend.ExecOptions{
@@ -233,7 +335,7 @@ func TestExecNonZeroExit(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	opts := backend.ExecOptions{
 		Cmd: []string{"false"},
@@ -280,7 +382,7 @@ func TestExecWithStdin(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	var output strings.Builder
 	opts := backend.ExecOptions{
@@ -310,7 +412,7 @@ func TestExecContextCancellation(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -341,7 +443,7 @@ func TestExecResizeGoroutineExitsOnContextCancel(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	resizeCh := make(chan backend.TerminalSize)
 	opts := backend.ExecOptions{
@@ -368,7 +470,7 @@ func TestExecEOFBeforeExitCode(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	opts := backend.ExecOptions{
 		Cmd: []string{"crash"},
@@ -395,7 +497,7 @@ func TestExecResizeGoroutineExitsOnCompletion(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	resizeCh := make(chan backend.TerminalSize)
 	opts := backend.ExecOptions{
@@ -448,7 +550,7 @@ func TestExecStdinDoesNotBlockAfterCompletion(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	// Create a context that we'll cancel after the test to clean up the blocking reader
 	readerCtx, readerCancel := context.WithCancel(context.Background())
@@ -489,7 +591,7 @@ func TestExecWorkingDir(t *testing.T) {
 		},
 	}
 
-	client := NewAgentClient(dialer, 1024, 1025, 1026)
+	client := NewAgentClient(dialer, 1024, 1026)
 
 	// Test default working dir
 	opts := backend.ExecOptions{

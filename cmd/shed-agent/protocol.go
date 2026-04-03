@@ -11,16 +11,13 @@ import (
 
 // Re-export constants from agentproto for local use.
 const (
-	MaxMessageSize        = agentproto.MaxMessageSize
-	MsgTypeExecRequest    = agentproto.MsgTypeExecRequest
-	MsgTypeResize         = agentproto.MsgTypeResize
-	MsgTypeSignal         = agentproto.MsgTypeSignal
-	MsgTypeExitCode       = agentproto.MsgTypeExitCode
-	MsgTypeData           = agentproto.MsgTypeData
-	MsgTypeStdinEOF       = agentproto.MsgTypeStdinEOF
-	MsgTypeHealthRequest  = agentproto.MsgTypeHealthRequest
-	MsgTypeHealthResponse = agentproto.MsgTypeHealthResponse
-
+	MaxMessageSize       = agentproto.MaxMessageSize
+	MsgTypeExecRequest   = agentproto.MsgTypeExecRequest
+	MsgTypeResize        = agentproto.MsgTypeResize
+	MsgTypeSignal        = agentproto.MsgTypeSignal
+	MsgTypeExitCode      = agentproto.MsgTypeExitCode
+	MsgTypeData          = agentproto.MsgTypeData
+	MsgTypeStdinEOF      = agentproto.MsgTypeStdinEOF
 	MsgTypePluginMessage = agentproto.MsgTypePluginMessage
 )
 

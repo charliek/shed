@@ -149,7 +149,7 @@ func (vm *VM) Start(ctx context.Context) error {
 	// Wait for the agent to be healthy
 	vsockPath := filepath.Join(socketDir, fmt.Sprintf("%s.vsock", vm.meta.Name))
 	dialer := NewFirecrackerDialer(vsockPath)
-	agent := vmutil.NewAgentClient(dialer, vm.cfg.ConsolePort, vm.cfg.HealthPort, vm.cfg.NotifyPort)
+	agent := vmutil.NewAgentClient(dialer, vm.cfg.ConsolePort, vm.cfg.NotifyPort)
 	if err := agent.WaitForHealth(ctx, vm.cfg.StartTimeout.Duration()); err != nil {
 		// Try to stop the VM on failure
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {

@@ -44,7 +44,7 @@ func testFirecrackerConfig(tmpDir string) *config.FirecrackerConfig {
 		DefaultCPUs:     2,
 		DefaultMemoryMB: 512,
 		ConsolePort:     1024,
-		HealthPort:      1025,
+		NotifyPort:      1026,
 		StartTimeout:    config.Duration(60 * time.Second),
 		StopTimeout:     config.Duration(30 * time.Second),
 	}

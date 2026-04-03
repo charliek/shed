@@ -429,10 +429,10 @@ ls -la /var/run/shed/firecracker/myproject.vsock
 # Install socat if needed
 sudo apt install socat
 
-# Connect to the UDS and send CONNECT to a port (e.g., health port 1025)
-printf "CONNECT 1025\n" | socat - UNIX-CONNECT:/var/run/shed/firecracker/myproject.vsock
+# Connect to the UDS and send CONNECT to a port (e.g., message port 1026)
+printf "CONNECT 1026\n" | socat - UNIX-CONNECT:/var/run/shed/firecracker/myproject.vsock
 
-# A successful connection returns "OK 1025"
+# A successful connection returns "OK 1026"
 ```
 
 **Note:** The vsock protocol works as follows:

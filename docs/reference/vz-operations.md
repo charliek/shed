@@ -107,8 +107,7 @@ Each VM creates per-port Unix sockets:
 ```bash
 ls ~/.shed/vz/sockets/
 # myproject-1024.sock  (console)
-# myproject-1025.sock  (health)
-# myproject-1026.sock  (notify)
+# myproject-1026.sock  (message bus: health, plugins, credentials)
 ```
 
 ## Networking
@@ -132,8 +131,8 @@ docker run hello-world
 ### Manual health check
 
 ```bash
-# Connect to the health port socket
-nc -U ~/.shed/vz/sockets/myproject-1025.sock
+# Connect to the message bus socket (health checks use system:health namespace)
+nc -U ~/.shed/vz/sockets/myproject-1026.sock
 ```
 
 ### View console log

@@ -30,26 +30,26 @@ const (
 	// DefaultConsolePort is the vsock port for console/exec connections.
 	DefaultConsolePort = 1024
 
-	// DefaultHealthPort is the vsock port for health checks.
-	DefaultHealthPort = 1025
-
-	// DefaultNotifyPort is the vsock port for the message channel (plugins + credentials).
+	// DefaultNotifyPort is the vsock port for the message channel (health, plugins, credentials).
 	DefaultNotifyPort = 1026
 
 	// DefaultHTTPPort is the localhost port for the in-VM plugin HTTP API.
 	DefaultHTTPPort = 498
 )
 
+// DefaultHeartbeatInterval is the default interval between health heartbeats.
+const DefaultHeartbeatInterval = 15 * time.Second
+
 // Server handles vsock connections from the host.
 type Server struct {
-	consolePort uint32
-	healthPort  uint32
-	notifyPort  uint32
-	httpPort    uint32
-	shedName    string
+	consolePort       uint32
+	notifyPort        uint32
+	httpPort          uint32
+	shedName          string
+	startedAt         time.Time
+	heartbeatInterval time.Duration
 
 	consoleListener net.Listener
-	healthListener  net.Listener
 	notifyListener  net.Listener
 
 	httpServer *http.Server
@@ -74,17 +74,18 @@ type Server struct {
 }
 
 // NewServer creates a new Server.
-func NewServer(consolePort, healthPort, notifyPort, httpPort uint32, shedName string) *Server {
+func NewServer(consolePort, notifyPort, httpPort uint32, shedName string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		consolePort: consolePort,
-		healthPort:  healthPort,
-		notifyPort:  notifyPort,
-		httpPort:    httpPort,
-		shedName:    shedName,
-		pending:     make(map[string]chan *plugin.Envelope),
-		ctx:         ctx,
-		cancel:      cancel,
+		consolePort:       consolePort,
+		notifyPort:        notifyPort,
+		httpPort:          httpPort,
+		shedName:          shedName,
+		startedAt:         time.Now(),
+		heartbeatInterval: DefaultHeartbeatInterval,
+		pending:           make(map[string]chan *plugin.Envelope),
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 
 	// Resolve the non-root "shed" user at startup.
@@ -139,18 +140,10 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	// Start health listener
-	s.healthListener, err = vsock.Listen(s.healthPort, nil)
-	if err != nil {
-		s.consoleListener.Close()
-		return err
-	}
-
-	// Start notify listener
+	// Start notify listener (handles health checks, plugins, credentials)
 	s.notifyListener, err = vsock.Listen(s.notifyPort, nil)
 	if err != nil {
 		s.consoleListener.Close()
-		s.healthListener.Close()
 		return err
 	}
 
@@ -179,32 +172,7 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	// Accept health connections
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		for {
-			conn, err := s.healthListener.Accept()
-			if err != nil {
-				select {
-				case <-s.ctx.Done():
-					// Graceful shutdown, don't log error
-					return
-				default:
-					log.Printf("Health accept error: %v", err)
-					time.Sleep(200 * time.Millisecond)
-					continue
-				}
-			}
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				s.handleHealthConnection(conn)
-			}()
-		}
-	}()
-
-	// Accept message channel connections (generalized notify port)
+	// Accept message channel connections (health, plugins, credentials)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -223,7 +191,7 @@ func (s *Server) Start() error {
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
-				s.handleMessageConnection(conn)
+				s.handleNotifyConnection(conn)
 			}()
 		}
 	}()
@@ -233,8 +201,8 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
 
-	log.Printf("Listening on vsock ports: console=%d, health=%d, message=%d; HTTP on 127.0.0.1:%d",
-		s.consolePort, s.healthPort, s.notifyPort, s.httpPort)
+	log.Printf("Listening on vsock ports: console=%d, message=%d; HTTP on 127.0.0.1:%d",
+		s.consolePort, s.notifyPort, s.httpPort)
 	return nil
 }
 
@@ -284,9 +252,6 @@ func (s *Server) Stop() {
 	if s.consoleListener != nil {
 		s.consoleListener.Close()
 	}
-	if s.healthListener != nil {
-		s.healthListener.Close()
-	}
 	if s.notifyListener != nil {
 		s.notifyListener.Close()
 	}
@@ -315,28 +280,5 @@ func (s *Server) Stop() {
 		log.Printf("Server stopped gracefully")
 	case <-time.After(drainTimeout):
 		log.Printf("Server drain timeout (%v) reached, forcing exit", drainTimeout)
-	}
-}
-
-// handleHealthConnection handles a health check connection.
-func (s *Server) handleHealthConnection(conn net.Conn) {
-	defer conn.Close()
-
-	// Read the health request
-	msgType, _, err := readMessage(conn)
-	if err != nil {
-		log.Printf("Failed to read health request: %v", err)
-		return
-	}
-
-	if msgType != MsgTypeHealthRequest {
-		log.Printf("Unexpected message type on health port: %d", msgType)
-		return
-	}
-
-	// Send health response
-	if err := writeMessage(conn, MsgTypeHealthResponse, nil); err != nil {
-		log.Printf("Failed to write health response: %v", err)
-		return
 	}
 }

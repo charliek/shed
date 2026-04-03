@@ -260,6 +260,7 @@ Namespaces prefixed with `system:` are reserved for shed internal use and cannot
 
 | Namespace | Purpose |
 |-----------|---------|
+| `system:health` | Agent health checks during VM startup |
 | `system:credentials` | Credential file sync between host and VM |
 
 ## Limitations
