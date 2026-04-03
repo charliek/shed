@@ -8,8 +8,8 @@ Shed provides multiple rootfs image variants for the VZ and Firecracker backends
 |---------|-------------|---------------|-------------------|
 | `base` | Minimal. Core tools only. | None | None |
 | `devtools` | Foundation layer with version manager and runtimes. | Claude Code | Node.js (LTS), Python 3.13 |
-| `default` | Full experience. All tools and agents. | Claude Code, OpenCode, Cursor CLI, Codex CLI | Node.js (LTS), Python 3.13 |
-| `experimental` | Default + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering. | Claude Code, OpenCode, Cursor CLI, Codex CLI | Node.js (LTS), Python 3.13 |
+| `default` | Full experience. All tools and agents. | Claude Code, OpenCode, Codex CLI, Cursor CLI (VZ only) | Node.js (LTS), Python 3.13 |
+| `experimental` | Default + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering. | Claude Code, OpenCode, Codex CLI, Cursor CLI (VZ only) | Node.js (LTS), Python 3.13 |
 
 All variants include: systemd, SSH, Docker CE, git, gh, curl, wget, vim, neovim, tmux, htop, jq, ripgrep, tree, build-essential, and the shed-agent.
 
@@ -55,6 +55,7 @@ Point your config at Docker image references. Shed pulls and converts to ext4 au
       base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
       images:
         base: ghcr.io/charliek/shed-vz-base:{version}
+        experimental: ghcr.io/charliek/shed-vz-experimental:{version}
       images_dir: ~/Library/Application Support/shed/vz/
     ```
 
@@ -65,6 +66,7 @@ Point your config at Docker image references. Shed pulls and converts to ext4 au
       base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
       images:
         base: ghcr.io/charliek/shed-fc-base:{version}
+        experimental: ghcr.io/charliek/shed-fc-experimental:{version}
       images_dir: /var/lib/shed/firecracker/images
     ```
 
