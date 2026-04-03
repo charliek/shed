@@ -8,6 +8,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // handleSFTP handles the "sftp" subsystem request by executing sftp-server
@@ -74,7 +75,11 @@ func (s *Server) handleSFTP(sess ssh.Session) {
 
 	if err := s.backend.Exec(ctx, shedName, opts); err != nil {
 		log.Printf("SFTP: exec failed for shed %s: %v", shedName, err)
-		_ = sess.Exit(1)
+		if exitErr, ok := err.(*vmutil.ExitError); ok {
+			_ = sess.Exit(exitErr.Code)
+		} else {
+			_ = sess.Exit(1)
+		}
 		return
 	}
 
