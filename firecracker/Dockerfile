@@ -291,9 +291,9 @@ ENTRYPOINT ["/sbin/init"]
 # =============================================================================
 FROM shed-fc-default AS shed-fc-experimental
 
-COPY --from=shed-extensions /bin/shed-ssh-agent /usr/local/bin/shed-ssh-agent
-COPY --from=shed-extensions /bin/shed-aws-proxy /usr/local/bin/shed-aws-proxy
-COPY --from=shed-extensions /bin/shed-ext /usr/local/bin/shed-ext
+COPY --from=shed-extensions /usr/local/bin/shed-ssh-agent /usr/local/bin/shed-ssh-agent
+COPY --from=shed-extensions /usr/local/bin/shed-aws-proxy /usr/local/bin/shed-aws-proxy
+COPY --from=shed-extensions /usr/local/bin/shed-ext /usr/local/bin/shed-ext
 COPY --from=shed-extensions /etc/systemd/system/shed-ssh-agent.service /etc/systemd/system/
 COPY --from=shed-extensions /etc/systemd/system/shed-aws-proxy.service /etc/systemd/system/
 COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
