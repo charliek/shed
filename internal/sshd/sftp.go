@@ -44,6 +44,11 @@ func (s *Server) handleSFTP(sess ssh.Session) {
 			_ = sess.Exit(1)
 			return
 		}
+	}
+
+	// Wait for a shed that is still starting up (either just auto-started above,
+	// or already mid-startup from another concurrent connection).
+	if shed.Status == config.StatusStopped || shed.Status == config.StatusStarting {
 		if err := s.waitForReady(ctx, shedName); err != nil {
 			fmt.Fprintf(sess.Stderr(), "Error: shed not ready: %v\n", err)
 			_ = sess.Exit(1)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 const (
@@ -72,8 +73,11 @@ func (s *Server) handleSession(sess ssh.Session) {
 			_ = sess.Exit(1)
 			return
 		}
+	}
 
-		// Wait for the container to be ready.
+	// Wait for a shed that is still starting up (either just auto-started above,
+	// or already mid-startup from another concurrent connection).
+	if shed.Status == config.StatusStopped || shed.Status == config.StatusStarting {
 		if err := s.waitForReady(ctx, shedName); err != nil {
 			log.Printf("Shed %s not ready: %v", shedName, err)
 			fmt.Fprintf(sess.Stderr(), "Error: shed not ready: %v\n", err)
@@ -102,8 +106,12 @@ func (s *Server) handleSession(sess ssh.Session) {
 	// Execute in the container.
 	if err := s.execInContainer(ctx, sess, shed); err != nil {
 		log.Printf("Exec failed for shed %s: %v", shedName, err)
-		// Don't write error to stderr here as it may have already been closed.
-		_ = sess.Exit(1)
+		// Propagate the actual exit code when available.
+		if exitErr, ok := err.(*vmutil.ExitError); ok {
+			_ = sess.Exit(exitErr.Code)
+		} else {
+			_ = sess.Exit(1)
+		}
 		return
 	}
 
