@@ -62,6 +62,11 @@ func NewServer(b backend.Backend, hostKeyPath string, port int, termConfig *term
 			"session":      ssh.DefaultSessionHandler,
 			"direct-tcpip": s.handleDirectTCPIP,
 		},
+		SubsystemHandlers: map[string]ssh.SubsystemHandler{
+			"sftp": func(sess ssh.Session) {
+				s.handleSFTP(sess)
+			},
+		},
 	}
 
 	// Add the host key to the server.

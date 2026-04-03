@@ -72,8 +72,9 @@ func handleExecConnection(conn net.Conn, user *userInfo) {
 		cmd.Dir = "/"
 	}
 
-	// Build environment: system env + request-provided env
-	env := append(os.Environ(), req.Env...)
+	// Build environment: system env + environment.d + request-provided env
+	env := append(os.Environ(), loadEnvironmentD("/etc/environment.d")...)
+	env = append(env, req.Env...)
 
 	// When running as a non-root user, force HOME and USER to match the
 	// resolved user. The systemd service runs as root and sets USER=root
