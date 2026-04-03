@@ -805,7 +805,7 @@ func TestVZConfigResolveImage(t *testing.T) {
 		Images: map[string]string{
 			"base":       "/dev/null",
 			"default":    "/dev/null",
-			"typescript": "/dev/null",
+			"experimental": "/dev/null",
 		},
 	}
 
@@ -1041,7 +1041,7 @@ func TestFirecrackerConfigResolveImage(t *testing.T) {
 		Images: map[string]string{
 			"base":       "/dev/null",
 			"default":    "/dev/null",
-			"typescript": "/dev/null",
+			"experimental": "/dev/null",
 		},
 	}
 

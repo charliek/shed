@@ -58,6 +58,14 @@ Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to se
 | Firecracker | Linux (KVM) | microVM | Rootfs ext4 image |
 | VZ | macOS (Apple Silicon) | VM via vfkit | Rootfs ext4 or VirtioFS (`--local-dir`) |
 
+## VM Images
+
+VZ and Firecracker use multi-stage Dockerfiles (`vz/Dockerfile`, `firecracker/Dockerfile`) to build rootfs ext4 images. Variants: `base`, `default`, `experimental`. The `experimental` variant layers [shed-extensions](https://github.com/charliek/shed-extensions) guest binaries via `COPY --from=` a published multi-arch Docker image, pinned by `ARG SHED_EXT_VERSION`.
+
+- Build locally: `./scripts/build-vz-rootfs.sh --variant experimental`
+- Local dev with shed-extensions changes: `--shed-ext-version dev` (after building the shed-extensions Docker image locally)
+- See `docs/reference/images.md` for full variant docs and build instructions
+
 ## Documentation
 
 Docs use MkDocs Material. See `mkdocs.yml` for style guidelines (top comment block). Key rules:

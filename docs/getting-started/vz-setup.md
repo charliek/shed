@@ -70,8 +70,8 @@ This builds the `default` variant and produces:
 You can build other variants with `--variant`:
 
 ```bash
-./scripts/build-vz-rootfs.sh --variant base        # Minimal image
-./scripts/build-vz-rootfs.sh --variant typescript   # TypeScript focused
+./scripts/build-vz-rootfs.sh --variant base           # Minimal image
+./scripts/build-vz-rootfs.sh --variant experimental   # Default + credential brokering
 ./scripts/build-vz-rootfs.sh --all                  # All variants
 ```
 

@@ -40,7 +40,7 @@ All notable changes to this project will be documented in this file.
 
 - Switch to VirtioFS for credential mounts
 - Add Docker CE networking in guest VMs
-- Add multiple image variants with multi-stage Dockerfile (base, default, typescript)
+- Add multiple image variants with multi-stage Dockerfile (base, default, experimental)
 - Fix DNS resolution and credential transfer
 
 ### Fixes

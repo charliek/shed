@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 VZ_DIR="$PROJECT_ROOT/vz"
 REGISTRY="${REGISTRY:-ghcr.io/charliek}"
-KNOWN_VARIANTS="base devtools default typescript"
+KNOWN_VARIANTS="base devtools default experimental"
 
 # Defaults
 VERSION=""

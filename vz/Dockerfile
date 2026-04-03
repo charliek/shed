@@ -1,10 +1,10 @@
 # Multi-stage Dockerfile for VZ (Apple Virtualization.framework) rootfs images
 #
 # Stages:
-#   shed-vz-base       - Minimal: shed infrastructure + basic dev tools
-#   shed-vz-devtools   - Internal: adds mise, Node.js, Claude Code, UV, Python
-#   shed-vz-default    - Full: all coding agents and language runtimes
-#   shed-vz-typescript - Focused: Node.js/TypeScript + Claude Code
+#   shed-vz-base         - Minimal: shed infrastructure + basic dev tools
+#   shed-vz-devtools     - Internal: adds mise, Node.js, Claude Code, UV, Python
+#   shed-vz-default      - Full: all coding agents and language runtimes
+#   shed-vz-experimental - Default + shed-extensions credential brokering
 #
 # Build a specific variant:
 #   docker buildx build --platform linux/arm64 --target shed-vz-base -t shed-vz-base:latest --load .
@@ -12,6 +12,11 @@
 #
 # Or use the build script:
 #   ./scripts/build-vz-rootfs.sh --variant base
+
+# Bump this when shed-extensions releases a new version.
+# The experimental variant pulls binaries from this tag.
+ARG SHED_EXT_VERSION=v0.2.0
+FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
 # =============================================================================
 # Stage: shed-vz-base
@@ -208,7 +213,7 @@ ENTRYPOINT ["/sbin/init"]
 # =============================================================================
 # Stage: shed-vz-devtools (internal)
 # Shared tooling layer: mise, Node.js, Claude Code, UV, Python.
-# Not intended for direct use — serves as base for default and typescript.
+# Not intended for direct use — serves as base for default and experimental.
 # =============================================================================
 FROM shed-vz-base AS shed-vz-devtools
 
@@ -275,10 +280,21 @@ ENTRYPOINT ["/sbin/init"]
 
 
 # =============================================================================
-# Stage: shed-vz-typescript
-# TypeScript-focused: Node.js tooling + Claude Code, fewer coding agents.
+# Stage: shed-vz-experimental
+# Default tools + shed-extensions credential brokering (SSH agent, AWS proxy).
+# See https://github.com/charliek/shed-extensions for details.
 # =============================================================================
-FROM shed-vz-devtools AS shed-vz-typescript
+FROM shed-vz-default AS shed-vz-experimental
+
+COPY --from=shed-extensions /bin/shed-ssh-agent /usr/local/bin/shed-ssh-agent
+COPY --from=shed-extensions /bin/shed-aws-proxy /usr/local/bin/shed-aws-proxy
+COPY --from=shed-extensions /bin/shed-ext /usr/local/bin/shed-ext
+COPY --from=shed-extensions /etc/systemd/system/shed-ssh-agent.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/systemd/system/shed-aws-proxy.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
+
+# Enable shed-extensions services
+RUN SYSTEMD_OFFLINE=1 systemctl enable shed-ssh-agent shed-aws-proxy
 
 USER root
 

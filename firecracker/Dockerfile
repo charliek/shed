@@ -1,11 +1,11 @@
 # Multi-stage Dockerfile for Firecracker rootfs images
 #
 # Stages:
-#   kernel-builder     - Temporary: compiles custom Firecracker kernel
-#   shed-fc-base       - Minimal: shed infrastructure + basic dev tools + kernel
-#   shed-fc-devtools   - Internal: adds mise, Node.js, Claude Code, UV, Python
-#   shed-fc-default    - Full: all coding agents and language runtimes
-#   shed-fc-typescript - Focused: Node.js/TypeScript + Claude Code
+#   kernel-builder       - Temporary: compiles custom Firecracker kernel
+#   shed-fc-base         - Minimal: shed infrastructure + basic dev tools + kernel
+#   shed-fc-devtools     - Internal: adds mise, Node.js, Claude Code, UV, Python
+#   shed-fc-default      - Full: all coding agents and language runtimes
+#   shed-fc-experimental - Default + shed-extensions credential brokering
 #
 # Build a specific variant:
 #   docker buildx build --platform linux/amd64 --target shed-fc-base -t shed-fc-base:latest --load .
@@ -13,6 +13,11 @@
 #
 # Or use the build script:
 #   ./scripts/build-firecracker-rootfs.sh --variant base
+
+# Bump this when shed-extensions releases a new version.
+# The experimental variant pulls binaries from this tag.
+ARG SHED_EXT_VERSION=v0.2.0
+FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
 # =============================================================================
 # Stage: kernel-builder (temporary)
@@ -217,7 +222,7 @@ ENTRYPOINT ["/sbin/init"]
 # =============================================================================
 # Stage: shed-fc-devtools (internal)
 # Shared tooling layer: mise, Node.js, Claude Code, UV, Python.
-# Not intended for direct use — serves as base for default and typescript.
+# Not intended for direct use — serves as base for default and experimental.
 # =============================================================================
 FROM shed-fc-base AS shed-fc-devtools
 
@@ -280,10 +285,21 @@ ENTRYPOINT ["/sbin/init"]
 
 
 # =============================================================================
-# Stage: shed-fc-typescript
-# TypeScript-focused: Node.js tooling + Claude Code, fewer coding agents.
+# Stage: shed-fc-experimental
+# Default tools + shed-extensions credential brokering (SSH agent, AWS proxy).
+# See https://github.com/charliek/shed-extensions for details.
 # =============================================================================
-FROM shed-fc-devtools AS shed-fc-typescript
+FROM shed-fc-default AS shed-fc-experimental
+
+COPY --from=shed-extensions /bin/shed-ssh-agent /usr/local/bin/shed-ssh-agent
+COPY --from=shed-extensions /bin/shed-aws-proxy /usr/local/bin/shed-aws-proxy
+COPY --from=shed-extensions /bin/shed-ext /usr/local/bin/shed-ext
+COPY --from=shed-extensions /etc/systemd/system/shed-ssh-agent.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/systemd/system/shed-aws-proxy.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
+
+# Enable shed-extensions services
+RUN SYSTEMD_OFFLINE=1 systemctl enable shed-ssh-agent shed-aws-proxy
 
 USER root
 
