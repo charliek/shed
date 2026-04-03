@@ -226,6 +226,12 @@ GET /api/plugins/sheds
 }
 ```
 
+## shed-extensions
+
+The `experimental` image variant comes with [shed-extensions](https://charliek.github.io/shed-extensions/) pre-installed, providing SSH agent forwarding and AWS credential proxying. Create a shed with `--image experimental` and run `shed-host-agent` on the host to enable credential brokering.
+
+shed-extensions is a concrete implementation built on this plugin bus. The extensions.md page documents the bus itself; see the [shed-extensions documentation](https://charliek.github.io/shed-extensions/) for credential brokering setup and usage.
+
 ## Use Cases
 
 ### 1Password CLI proxy

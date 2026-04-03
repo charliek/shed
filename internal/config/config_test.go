@@ -803,9 +803,9 @@ func TestVZConfigApplyDefaultsExpandsImagePaths(t *testing.T) {
 func TestVZConfigResolveImage(t *testing.T) {
 	cfg := &VZConfig{
 		Images: map[string]string{
-			"base":       "/dev/null",
-			"default":    "/dev/null",
-			"typescript": "/dev/null",
+			"base":         "/dev/null",
+			"default":      "/dev/null",
+			"experimental": "/dev/null",
 		},
 	}
 
@@ -1039,9 +1039,9 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 func TestFirecrackerConfigResolveImage(t *testing.T) {
 	cfg := &FirecrackerConfig{
 		Images: map[string]string{
-			"base":       "/dev/null",
-			"default":    "/dev/null",
-			"typescript": "/dev/null",
+			"base":         "/dev/null",
+			"default":      "/dev/null",
+			"experimental": "/dev/null",
 		},
 	}
 

@@ -218,7 +218,7 @@ shed image list
 NAME         SOURCE       SIZE      CACHED   REF
 base         config       2.1 GB    yes      -
 default      config       -         no       ghcr.io/charliek/shed-vz-default:{version}
-typescript   discovered   3.8 GB    yes      -
+experimental discovered   3.8 GB    yes      -
 ```
 
 ### shed image delete

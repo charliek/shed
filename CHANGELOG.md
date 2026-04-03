@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- Replace `typescript` image variant with `experimental` (default + shed-extensions credential brokering)
+- Publish `shed-vz-experimental` and `shed-fc-experimental` images to ghcr.io
+- Add `--shed-ext-version` flag to build scripts for local development
+
 ## v0.1.2
 
 - Fix kernel extraction failing on Firecracker images due to `set -euo pipefail` aborting on glob mismatch before reaching the `/boot/vmlinux` fallback path

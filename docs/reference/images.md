@@ -8,12 +8,12 @@ Shed provides multiple rootfs image variants for the VZ and Firecracker backends
 |---------|-------------|---------------|-------------------|
 | `base` | Minimal. Core tools only. | None | None |
 | `devtools` | Foundation layer with version manager and runtimes. | Claude Code | Node.js (LTS), Python 3.13 |
-| `default` | Full experience. All tools and agents. | Claude Code, OpenCode, Cursor CLI, Codex CLI | Node.js (LTS), Python 3.13 |
-| `typescript` | TypeScript focused. Node.js + Claude Code. | Claude Code | Node.js (LTS), Python 3.13 |
+| `default` | Full experience. All tools and agents. | Claude Code, OpenCode, Codex CLI, Cursor CLI (VZ only) | Node.js (LTS), Python 3.13 |
+| `experimental` | Default + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering. | Claude Code, OpenCode, Codex CLI, Cursor CLI (VZ only) | Node.js (LTS), Python 3.13 |
 
 All variants include: systemd, SSH, Docker CE, git, gh, curl, wget, vim, neovim, tmux, htop, jq, ripgrep, tree, build-essential, and the shed-agent.
 
-Both `default` and `typescript` inherit from `devtools`, which inherits from `base`. All variants share the same kernel and core system.
+`default` inherits from `devtools`, which inherits from `base`. `experimental` inherits from `default`, adding SSH agent forwarding and AWS credential proxy from [shed-extensions](https://charliek.github.io/shed-extensions/). All variants share the same kernel and core system.
 
 ## Published Images
 
@@ -24,7 +24,14 @@ Pre-built `base` images are published to `ghcr.io/charliek/` on each release:
 | `ghcr.io/charliek/shed-vz-base` | linux/arm64 (Apple Silicon) | `:{version}` |
 | `ghcr.io/charliek/shed-fc-base` | linux/amd64 (x86_64) | `:{version}` |
 
-Additional variants (`default`, `typescript`) can be built locally from source. These may be published in a future release.
+The `experimental` variant is also published:
+
+| Image | Platform | Tag Format |
+|-------|----------|-----------|
+| `ghcr.io/charliek/shed-vz-experimental` | linux/arm64 (Apple Silicon) | `:{version}` |
+| `ghcr.io/charliek/shed-fc-experimental` | linux/amd64 (x86_64) | `:{version}` |
+
+Additional variants (`default`) can be built locally from source.
 
 Both VZ and Firecracker images include the kernel needed to boot the VM. For VZ, the kernel and initrd are extracted from the Ubuntu `linux-image-generic` package. For Firecracker, a custom kernel is compiled with Docker, 9P, and BPF support built in. No separate kernel build or download is needed when using published images.
 
@@ -48,6 +55,7 @@ Point your config at Docker image references. Shed pulls and converts to ext4 au
       base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
       images:
         base: ghcr.io/charliek/shed-vz-base:{version}
+        experimental: ghcr.io/charliek/shed-vz-experimental:{version}
       images_dir: ~/Library/Application Support/shed/vz/
     ```
 
@@ -58,6 +66,7 @@ Point your config at Docker image references. Shed pulls and converts to ext4 au
       base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
       images:
         base: ghcr.io/charliek/shed-fc-base:{version}
+        experimental: ghcr.io/charliek/shed-fc-experimental:{version}
       images_dir: /var/lib/shed/firecracker/images
     ```
 
@@ -73,7 +82,7 @@ If you build images locally, point to ext4 file paths:
       images:
         base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
         default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
-        typescript: ~/Library/Application Support/shed/vz/typescript-rootfs.ext4
+        experimental: ~/Library/Application Support/shed/vz/experimental-rootfs.ext4
     ```
 
 === "Firecracker (Linux)"
@@ -84,7 +93,7 @@ If you build images locally, point to ext4 file paths:
       images:
         base: /var/lib/shed/firecracker/images/base-rootfs.ext4
         default: /var/lib/shed/firecracker/images/default-rootfs.ext4
-        typescript: /var/lib/shed/firecracker/images/typescript-rootfs.ext4
+        experimental: /var/lib/shed/firecracker/images/experimental-rootfs.ext4
     ```
 
 You can mix Docker refs and local paths in the same config.
@@ -96,7 +105,7 @@ The `base_rootfs` field is used when no `--image` flag is specified. The `images
 Create a shed with a specific variant:
 
 ```bash
-shed create myproject --image typescript
+shed create myproject --image experimental
 shed create tools --image base
 ```
 
@@ -268,7 +277,7 @@ du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
 
     # Build a specific variant
     ./scripts/build-vz-rootfs.sh --variant base
-    ./scripts/build-vz-rootfs.sh --variant typescript
+    ./scripts/build-vz-rootfs.sh --variant experimental
 
     # Build all variants
     ./scripts/build-vz-rootfs.sh --all
@@ -280,7 +289,7 @@ du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
     |------|-------------|
     | `default-rootfs.ext4` | Default variant rootfs (20GB sparse) |
     | `base-rootfs.ext4` | Base variant rootfs |
-    | `typescript-rootfs.ext4` | TypeScript variant rootfs |
+    | `experimental-rootfs.ext4` | Experimental variant rootfs (default + shed-extensions) |
     | `vmlinux` | Decompressed Linux kernel (shared) |
     | `initrd.img` | Initial RAM disk (shared) |
 
@@ -292,7 +301,7 @@ du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
 
     # Build a specific variant
     ./scripts/build-firecracker-rootfs.sh --variant base
-    ./scripts/build-firecracker-rootfs.sh --variant typescript
+    ./scripts/build-firecracker-rootfs.sh --variant experimental
 
     # Build all variants
     ./scripts/build-firecracker-rootfs.sh --all
@@ -304,7 +313,7 @@ du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
     |------|-------------|
     | `default-rootfs.ext4` | Default variant rootfs (20GB sparse) |
     | `base-rootfs.ext4` | Base variant rootfs |
-    | `typescript-rootfs.ext4` | TypeScript variant rootfs |
+    | `experimental-rootfs.ext4` | Experimental variant rootfs (default + shed-extensions) |
 
     To build a custom kernel (for local development or advanced use):
 

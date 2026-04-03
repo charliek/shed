@@ -63,7 +63,7 @@ type FirecrackerConfig struct {
 	BaseRootfs string `yaml:"base_rootfs"`
 
 	// Images maps variant names to rootfs paths or Docker image references.
-	// Users can reference these with: shed create mydev --image typescript
+	// Users can reference these with: shed create mydev --image experimental
 	// Values can be ext4 file paths or Docker refs (e.g., "ghcr.io/charliek/shed-fc-default:v1.0.0").
 	Images map[string]string `yaml:"images,omitempty"`
 
@@ -126,7 +126,7 @@ type VZConfig struct {
 	BaseRootfs string `yaml:"base_rootfs"`
 
 	// Images maps variant names to rootfs paths or Docker image references.
-	// Users can reference these with: shed create mydev --image typescript
+	// Users can reference these with: shed create mydev --image experimental
 	// Values can be ext4 file paths or Docker refs (e.g., "ghcr.io/charliek/shed-vz-default:v1.0.0").
 	Images map[string]string `yaml:"images,omitempty"`
 

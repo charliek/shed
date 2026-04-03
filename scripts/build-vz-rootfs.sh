@@ -12,7 +12,7 @@
 # Usage:
 #   ./scripts/build-vz-rootfs.sh                      # Build default variant
 #   ./scripts/build-vz-rootfs.sh --variant base        # Build base variant
-#   ./scripts/build-vz-rootfs.sh --variant typescript   # Build typescript variant
+#   ./scripts/build-vz-rootfs.sh --variant experimental  # Build experimental variant
 #   ./scripts/build-vz-rootfs.sh --all                  # Build all variants
 #   ./scripts/build-vz-rootfs.sh --force-kernel         # Force kernel re-extraction
 
@@ -28,12 +28,13 @@ ROOTFS_SIZE="${ROOTFS_SIZE:-20G}"  # 20GB default
 
 # Built-in variants surfaced by --all and --help. Explicit --variant values
 # are forwarded to Docker so custom shed-vz-<name> stages can be built too.
-KNOWN_VARIANTS="base default typescript"
+KNOWN_VARIANTS="base default experimental"
 
 # Defaults
 VARIANT="default"
 BUILD_ALL=false
 FORCE_KERNEL=false
+SHED_EXT_VERSION=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -55,6 +56,15 @@ while [[ $# -gt 0 ]]; do
             FORCE_KERNEL=true
             shift
             ;;
+        --shed-ext-version)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "ERROR: --shed-ext-version requires a value"
+                echo "Run '$0 --help' for usage."
+                exit 1
+            fi
+            SHED_EXT_VERSION="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -65,6 +75,8 @@ while [[ $# -gt 0 ]]; do
             echo "                     Available variants: $KNOWN_VARIANTS"
             echo "  --all              Build all variants"
             echo "  --force-kernel     Force kernel/initrd re-extraction even if files exist"
+            echo "  --shed-ext-version Override shed-extensions image version for experimental variant"
+            echo "                     (e.g., 'dev' to use a locally-built image)"
             echo "  --help, -h         Show this help message"
             echo ""
             echo "Environment variables:"
@@ -215,7 +227,11 @@ build_variant() {
     echo ""
     echo "=== Building Docker image ($docker_tag) ==="
     cd "$VZ_DIR"
-    if ! docker buildx build --platform linux/arm64 --target "$docker_target" -t "$docker_tag" --load .; then
+    local build_args=()
+    if [ -n "$SHED_EXT_VERSION" ]; then
+        build_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
+    fi
+    if ! docker buildx build --platform linux/arm64 --target "$docker_target" -t "$docker_tag" "${build_args[@]}" --load .; then
         echo "ERROR: Docker build failed for variant '$variant'"
         echo "Hint: Ensure Docker Desktop has buildx enabled for linux/arm64"
         exit 1

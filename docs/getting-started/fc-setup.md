@@ -63,14 +63,14 @@ Build rootfs images locally. Requires Go 1.24+ for compiling `shed-agent`.
 # Build a specific variant
 ./scripts/build-firecracker-rootfs.sh --variant base
 
-# Build all variants (base, default, typescript)
+# Build all variants (base, default, experimental)
 ./scripts/build-firecracker-rootfs.sh --all
 ```
 
 This creates ext4 images in `/var/lib/shed/firecracker/images/`:
 - `default-rootfs.ext4` - Full development environment with all coding agents
 - `base-rootfs.ext4` - Minimal shed infrastructure + basic dev tools
-- `typescript-rootfs.ext4` - TypeScript-focused with Node.js + Claude Code
+- `experimental-rootfs.ext4` - Default + shed-extensions credential brokering
 
 ## 4. Set Up Bridge Network
 
