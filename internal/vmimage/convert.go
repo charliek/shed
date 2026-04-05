@@ -39,7 +39,7 @@ type ConvertOptions struct {
 	Platform string
 
 	// ExtractKernel controls whether the kernel should be extracted from the Docker image.
-	// If true and the kernel doesn't already exist in OutputDir, it is extracted.
+	// If true, the kernel is always extracted to OutputDir, overwriting any existing file.
 	ExtractKernel bool
 
 	// NeedsInitrd controls whether an initrd should be extracted alongside the kernel.
