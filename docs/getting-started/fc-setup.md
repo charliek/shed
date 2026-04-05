@@ -154,17 +154,12 @@ enabled_backends:
   - firecracker
 default_backend: firecracker
 
-# Credentials are copied into VMs at create/start time
-# (Firecracker doesn't support bind mounts like Docker)
+# Credentials are mounted into VMs via 9P
 credentials:
-  ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-  gitconfig:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
+  claude:
+    source: ~/.claude
+    target: /home/shed/.claude
+    readonly: false
 
 # Environment variables passed to git clone and provisioning hooks
 env_file: ~/.shed/env

@@ -117,14 +117,6 @@ vz:
   stop_timeout: 10s
 
 credentials:
-  git-ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-  git-config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
   claude:
     source: ~/.claude
     target: /home/shed/.claude

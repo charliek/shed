@@ -8,7 +8,7 @@ This document outlines planned future enhancements for Shed.
 
 ## Notification Channel Enhancements
 
-Future uses for the persistent agent↔host notification port (1026) established by credential sync:
+Future uses for the persistent agent↔host notification port (1026):
 
 - **Agent-pushed resource metrics** — CPU/memory/disk usage pushed from agent at configurable intervals. Enables `shed status` to show live resource usage without exec overhead.
 - **Process event notifications** — agent notifies host when provisioning hooks finish, services crash, or long-running processes exit. Enables reactive orchestration.
@@ -39,9 +39,9 @@ Enhanced resource management:
 - I/O bandwidth limits
 - Network rate limiting
 
-### Virtiofs Support
+### Virtiofs Support for Firecracker
 
-If Firecracker adds virtiofs ([issue #1180](https://github.com/firecracker-microvm/firecracker/issues/1180)), replace the tar-over-vsock credential sync with proper filesystem passthrough for live mounts. Would eliminate the need for the notification channel approach for file sync, though the channel remains valuable for other agent→host communication.
+If Firecracker adds virtiofs ([issue #1180](https://github.com/firecracker-microvm/firecracker/issues/1180)), credentials and local-dir mounts could use virtiofs instead of 9P for improved performance. The VZ backend already uses VirtioFS via Apple's Virtualization.framework.
 
 ### Intel macOS VZ Support
 

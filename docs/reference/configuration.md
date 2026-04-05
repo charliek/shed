@@ -61,16 +61,6 @@ ssh_port: 2222
 default_image: shed-base:latest
 
 credentials:
-  git-ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-
-  git-config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
-
   claude:
     source: ~/.claude
     target: /home/shed/.claude
@@ -90,7 +80,7 @@ log_level: info
 | `enabled_backends` | list | `[docker]` | Backends this server supports (`docker`, `firecracker`, `vz`) |
 | `default_backend` | string | `docker` | Default backend used when none is specified |
 | `default_image` | string | `shed-base:latest` | Default Docker image for sheds |
-| `credentials` | map | `{}` | Credentials to mount/copy into sheds |
+| `credentials` | map | `{}` | Credential directories to mount into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
@@ -100,42 +90,30 @@ log_level: info
 
 ### Credentials
 
-Credentials are made available to sheds. The method depends on the backend:
+Credentials are directories from the host that are shared with sheds. The method depends on the backend:
 
-- **Docker**: Bind-mounted into the container (live sync with host).
-- **Firecracker (read-only)**: Copied at create/start time via tar-over-vsock; no live sync.
-- **Firecracker (writable)**: Copied at create/start time and synced bidirectionally via fsnotify + vsock (port 1026) while the VM is running.
-- **VZ (directory credentials)**: Mounted via VirtioFS (live sync with host, like Docker bind mounts).
-- **VZ (single-file credentials)**: Transferred via tar-over-vsock. Read-only files have no live sync; writable files sync bidirectionally like Firecracker.
+- **Docker**: Bind-mounted into the container.
+- **Firecracker**: Mounted via 9P over the TAP bridge network.
+- **VZ**: Mounted via VirtioFS.
+
+All three mechanisms provide live filesystem sharing -- changes on either side are immediately visible to the other.
 
 ```yaml
 credentials:
   name:
-    source: /host/path      # Path on the host (~ supported)
+    source: /host/path      # Path on the host (~ supported, must be a directory)
     target: /container/path  # Path inside shed
     readonly: true           # Optional, default false
 ```
 
-**Missing sources:** If a credential's source path does not exist on the host, it is skipped with a log warning. The credential is not transferred to the VM and is not registered for bidirectional sync. Create the source directory on the host before starting the shed to enable sync.
+**Credentials must be directories.** Single-file credentials are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the shed-extensions SSH agent forwarding instead of mounting `~/.ssh`.
 
-**Note:** For Firecracker, only read-only credentials lack live sync — writable credentials sync bidirectionally while the VM is running with 2-second echo suppression. For VZ, directory credentials always have live sync via VirtioFS regardless of the `readonly` setting. Only VZ single-file credentials use tar transfer and follow the same sync rules as Firecracker.
+**Missing sources:** If a credential's source path does not exist on the host, it is skipped with a log warning. Create the source directory on the host before starting the shed.
 
 **Common credential mounts:**
 
 ```yaml
 credentials:
-  # SSH keys for git
-  git-ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-
-  # Git configuration
-  git-config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
-
   # Claude Code config (needs write for token refresh)
   claude:
     source: ~/.claude
@@ -163,7 +141,7 @@ credentials:
 
 ### Exclude Patterns
 
-For tar-transferred credentials (Firecracker, and VZ single-file credentials), you can specify glob patterns to exclude files from transfer and sync:
+The credential config accepts an `exclude` field with glob patterns. This field is currently accepted but has no effect on VM backends -- VirtioFS and 9P mount entire directories. Exclude patterns are used by [`shed sync`](sync.md) path mappings. The field is retained for forward compatibility.
 
 ```yaml
 credentials:
@@ -178,14 +156,6 @@ credentials:
       - "log/*"
       - "storage/*"
 ```
-
-| Detail | Description |
-|--------|-------------|
-| Syntax | `filepath.Match` glob patterns (e.g., `*.db`, `log/*`) |
-| Directory patterns | `dir/*` also excludes the directory itself and all nested content |
-| Scope | Applied during tar archive creation and agent-side fsnotify filtering |
-| Docker | Ignored — Docker bind mounts the entire source path |
-| VZ VirtioFS | Ignored — VirtioFS mounts entire directories |
 
 ## Firecracker Configuration
 
@@ -234,7 +204,7 @@ Replace `{version}` with the version matching your `shed` binary — run `shed v
 | `default_disk_gb` | int | `20` | Default disk size per VM (GB) |
 | `vsock_base_cid` | int | `100` | Starting CID for vsock guest addressing |
 | `console_port` | int | `1024` | Vsock port for VM console I/O |
-| `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins, credentials) |
+| `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins) |
 | `start_timeout` | duration | `30s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
 | `bridge_name` | string | `shed-br0` | Linux bridge name |
@@ -289,7 +259,7 @@ vz:
 | `default_memory_mb` | int | `4096` | Default memory per VM (MB) |
 | `default_disk_gb` | int | `20` | Default disk size per VM (GB) |
 | `console_port` | int | `1024` | Vsock port for VM console I/O |
-| `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins, credentials) |
+| `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins) |
 | `start_timeout` | duration | `60s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
 

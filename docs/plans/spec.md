@@ -449,10 +449,10 @@ Mounts are defined in server config and applied to all containers:
 
 ```yaml
 credentials:
-  git_ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
+  claude:
+    source: ~/.claude
+    target: /home/shed/.claude
+    readonly: false
 ```
 
 #### 3.4.3 Environment Variables
@@ -983,16 +983,6 @@ default_image: shed-base:latest
 # Credentials to mount into containers
 # Paths support ~ expansion
 credentials:
-  git_ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-    
-  git_config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
-    
   claude:
     source: ~/.claude
     target: /home/shed/.claude
@@ -1663,16 +1653,12 @@ default_image: shed-base:latest
 # For local dev, credentials can point to your actual home dir
 # or use test fixtures
 credentials:
-  git_ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-  git_config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
+  claude:
+    source: ~/.claude
+    target: /home/shed/.claude
+    readonly: false
 
-# Optional: skip claude/opencode mounts for basic testing
+# Optional: skip credentials for basic testing
 # credentials: {}
 
 env_file: ""  # Empty for dev, no env vars injected

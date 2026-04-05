@@ -21,7 +21,7 @@ When you run `shed create`, the following steps execute in order:
 | 1. Storage setup | Create named volume (or bind mount for `--local-dir`) | Copy base rootfs to instance directory | Copy base rootfs to instance directory |
 | 2. Container/VM start | Create and start container | Spawn Firecracker process, allocate TAP device and IP, wait for agent health | Spawn vfkit process, wait for agent health |
 | 3. Local-dir mount | Already bind-mounted at container creation | Not supported | VirtioFS mount at `/workspace` |
-| 4. Credential setup | Already bind-mounted at container creation | All credentials transferred via tar-over-vsock | Directory credentials mounted via VirtioFS; single-file credentials transferred via tar-over-vsock |
+| 4. Credential setup | Already bind-mounted at container creation | All credentials mounted via 9P | All credentials mounted via VirtioFS |
 | 5. Repo clone | `git clone` in `/workspace` (skipped if `--local-dir`) | Same | Same |
 | 6. Install hook | Runs via `docker exec`; state file marks completion | Runs via vsock; state file marks completion | Same as Firecracker |
 | 7. Startup hook | Runs via `docker exec` | Runs via vsock | Same as Firecracker |
@@ -37,7 +37,7 @@ When you run `shed start` on a stopped shed, the sequence is shorter:
 |------|--------|-------------|-----|
 | 1. Container/VM start | Start existing container | Spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
 | 2. Local-dir re-mount | Bind mount persists across restarts | Not supported | VirtioFS re-mount (mounts do not persist across VM reboots) |
-| 3. Credential refresh | Bind mounts persist (no action needed) | All credentials re-transferred via tar-over-vsock | Directory credentials re-mounted via VirtioFS; file credentials re-transferred via tar |
+| 3. Credential refresh | Bind mounts persist (no action needed) | All credentials re-mounted via 9P | All credentials re-mounted via VirtioFS |
 | 4. Startup hook | Runs (install hook skipped — state file records it already ran) | Same | Same |
 
 No storage setup, repo clone, install hook, or auto-sync on start.
@@ -58,10 +58,10 @@ No storage setup, repo clone, install hook, or auto-sync on start.
 
 | Feature | Docker | Firecracker | VZ |
 |---------|--------|-------------|-----|
-| Credential mechanism | Bind mount | Tar-over-vsock | VirtioFS (directories) + tar-over-vsock (files) |
+| Credential mechanism | Bind mount | 9P mount | VirtioFS mount |
 | Local-dir support | Bind mount | Not supported | VirtioFS |
 | Shutdown hook | Not supported | Supported | Supported |
-| Credential live sync | Automatic via bind mount | Bidirectional via fsnotify + vsock | VirtioFS for directories; fsnotify + vsock for tar-transferred files |
+| Credential live sync | Automatic via bind mount | Automatic via 9P | Automatic via VirtioFS |
 | Workspace persistence | Named volume (survives stop/start) | Rootfs image (survives stop/start) | Rootfs image (survives stop/start) |
 
 ### Error Handling

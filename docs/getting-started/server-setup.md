@@ -57,16 +57,6 @@ ssh_port: 2222
 default_image: shed-base:latest
 
 credentials:
-  # Git credentials
-  git-ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-  git-config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
-
   # Claude Code - container-specific credentials
   claude:
     source: ~/.shed/mounts/claude
@@ -97,7 +87,7 @@ env_file: ~/.shed/env
 log_level: info
 ```
 
-**Credential source paths:** The example above uses curated directories under `~/.shed/mounts/` as credential sources. This lets you prepare separate credential sets for your sheds. You can also mount host paths directly (e.g., `source: ~/.ssh`, `source: ~/.claude`) as shown in the [VZ Setup](vz-setup.md) guide. Both approaches work identically. See the [configuration reference](../reference/configuration.md#credentials) for details.
+**Credential source paths:** The example above uses curated directories under `~/.shed/mounts/` as credential sources. This lets you prepare separate credential sets for your sheds. You can also mount host paths directly (e.g., `source: ~/.claude`) as shown in the [VZ Setup](vz-setup.md) guide. Both approaches work identically. See the [configuration reference](../reference/configuration.md#credentials) for details.
 
 ### 4. Create Environment File
 

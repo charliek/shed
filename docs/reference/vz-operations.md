@@ -55,19 +55,14 @@ shed console myproject
 
 ## Credentials
 
-Credentials work the same way as Firecracker — they're transferred via tar-over-vsock at create and start time.
+All credentials configured in `server.yaml` are mounted into VZ VMs via VirtioFS. Changes are immediately visible on both sides, similar to Docker bind mounts.
 
-- **Read-only credentials**: Copied once at create/start. Changes on host require a restart.
-- **Writable credentials**: Synced bidirectionally while the VM is running. Host-side changes push to the VM via fsnotify, and in-VM changes (e.g., token refreshes) sync back to the host.
+Read-only credentials (`readonly: true`) are enforced as read-only at the mount level. Writable credentials (`readonly: false`) reflect changes immediately in both directions.
 
 Configure credentials in `server.yaml`:
 
 ```yaml
 credentials:
-  git-ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
   claude:
     source: ~/.claude
     target: /home/shed/.claude
@@ -76,7 +71,7 @@ credentials:
 
 ## Provisioning
 
-Provisioning hooks execute in the VM via vsock, identically to Firecracker. Directory credentials are mounted via VirtioFS; single-file credentials are transferred via tar-over-vsock. Both are set up before hooks run.
+Provisioning hooks execute in the VM via vsock, identically to Firecracker. Credentials are mounted via VirtioFS before hooks run.
 
 For the full sequence of operations during create, start, stop, and delete (including how VZ differs from other backends), see [Shed Lifecycle](provisioning.md#shed-lifecycle). For hook configuration, see [Provisioning](provisioning.md).
 
@@ -107,7 +102,7 @@ Each VM creates per-port Unix sockets:
 ```bash
 ls ~/.shed/vz/sockets/
 # myproject-1024.sock  (console)
-# myproject-1026.sock  (message bus: health, plugins, credentials)
+# myproject-1026.sock  (message bus: health, plugins)
 ```
 
 ## Networking
