@@ -3,7 +3,8 @@
 
 # End-to-end test for Shed CLI
 # Tests full lifecycle with a real repo, provisioning, services, and stop/start cycle.
-# Requires a running shed-server and configured backends.
+# Designed for Linux (Firecracker) servers; VZ support is experimental.
+# Requires a running shed-server with the target backend configured.
 #
 # Usage:
 #   ./scripts/e2e-test.sh [--backend firecracker|vz] [--repo URL] [--timeout MINUTES]
