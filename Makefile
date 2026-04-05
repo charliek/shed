@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent test test-integration release clean dev-server dev-cli check coverage lint-dockerfile lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent test test-integration release clean dev-server dev-cli check coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -75,12 +75,8 @@ coverage:
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 
-# Lint Dockerfile (requires hadolint)
-lint-dockerfile:
-	hadolint images/shed-base/Dockerfile
-
-# Run all linting (Go + Dockerfile)
-lint-all: lint lint-dockerfile
+# Run all linting (Go only)
+lint-all: lint
 
 # Build documentation
 docs:

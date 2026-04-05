@@ -44,10 +44,11 @@ Returns server metadata and capabilities.
   "version": "1.0.0",
   "ssh_port": 2222,
   "http_port": 8080,
-  "default_backend": "docker",
-  "enabled_backends": ["docker"]
+  "backend": "vz"
 }
 ```
+
+The `backend` field reflects the resolved backend for this server (`vz` or `firecracker`). When the server is configured with `default_backend: detect`, this field shows the auto-detected value.
 
 ### GET /api/ssh-host-key
 
@@ -77,9 +78,8 @@ Lists all sheds on this server.
       "status": "running",
       "created_at": "2026-01-20T10:30:00Z",
       "repo": "charliek/codelens",
-      "backend": "docker",
-      "container_id": "abc123...",
-      "ip_address": "172.17.0.2",
+      "backend": "vz",
+      "ip_address": "192.168.64.2",
       "cpus": 2,
       "memory_mb": 4096
     }
@@ -109,11 +109,11 @@ Creates a new shed.
 |-------|----------|---------|-------------|
 | `name` | Yes | - | Shed name (alphanumeric + hyphens) |
 | `repo` | No | null | Repository to clone (`owner/repo` shorthand or full URL) |
-| `image` | No | Server config | Image to use (Docker image name for Docker backend, variant name for VZ) |
-| `backend` | No | Server default | Backend to use: `docker`, `firecracker`, or `vz` |
+| `image` | No | Server config | Image variant name (see [Image Variants](images.md)) |
+| `backend` | No | Server default | Backend to use: `firecracker`, `vz`, or `detect` |
 | `local_dir` | No | null | Absolute path to host directory to mount as workspace (mutually exclusive with `repo`) |
-| `cpus` | No | Backend default | Number of vCPUs (firecracker/vz only) |
-| `memory_mb` | No | Backend default | Memory in MB (firecracker/vz only) |
+| `cpus` | No | Backend default | Number of vCPUs |
+| `memory_mb` | No | Backend default | Memory in MB |
 
 **Response (201 Created):**
 
@@ -123,9 +123,8 @@ Creates a new shed.
   "status": "running",
   "created_at": "2026-01-20T10:30:00Z",
   "repo": "charliek/codelens",
-  "backend": "docker",
-  "container_id": "abc123...",
-  "ip_address": "172.17.0.2",
+  "backend": "vz",
+  "ip_address": "192.168.64.2",
   "cpus": 2,
   "memory_mb": 4096
 }
@@ -146,7 +145,7 @@ event: progress
 data: {"message":"Pulling image shed-base:latest..."}
 
 event: progress
-data: {"message":"Creating container..."}
+data: {"message":"Creating VM..."}
 
 event: complete
 data: {"name":"codelens","status":"running",...}
@@ -168,7 +167,7 @@ Without the `Accept: text/event-stream` header, the endpoint behaves synchronous
 | 400 | Invalid repository URL |
 | 400 | Invalid local directory path |
 | 409 | Shed already exists |
-| 500 | Docker or clone failure |
+| 500 | Backend or clone failure |
 
 ### GET /api/sheds/{name}
 
@@ -182,7 +181,7 @@ Gets details for a specific shed.
   "status": "running",
   "created_at": "2026-01-20T10:30:00Z",
   "repo": "charliek/codelens",
-  "container_id": "abc123..."
+  "backend": "vz"
 }
 ```
 
@@ -195,12 +194,6 @@ Gets details for a specific shed.
 ### DELETE /api/sheds/{name}
 
 Deletes a shed and its data.
-
-**Query Parameters:**
-
-| Param | Default | Description |
-|-------|---------|-------------|
-| `keep_volume` | false | Preserve workspace volume |
 
 **Response (204 No Content)**
 

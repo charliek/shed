@@ -14,21 +14,21 @@ flowchart TB
         CLI --> HOSTS
     end
 
-    subgraph server1["Server A"]
+    subgraph server1["Server A (macOS)"]
         SERVER1["shed-server"]
-        subgraph docker1["Docker"]
-            C1["shed-codelens"]
-            C2["shed-mcp-test"]
+        subgraph vz1["VZ"]
+            VM1["shed-codelens"]
+            VM2["shed-mcp-test"]
         end
-        SERVER1 -->|"manage"| docker1
+        SERVER1 -->|"manage"| vz1
     end
 
-    subgraph server2["Server B"]
+    subgraph server2["Server B (Linux)"]
         SERVER2["shed-server"]
-        subgraph docker2["Docker"]
-            C3["shed-stbot"]
+        subgraph fc1["Firecracker"]
+            VM3["shed-stbot"]
         end
-        SERVER2 -->|"manage"| docker2
+        SERVER2 -->|"manage"| fc1
     end
 
     CLI -->|"HTTP :8080"| SERVER1
@@ -44,7 +44,6 @@ flowchart TB
 | `shed` | CLI binary for developer machines (macOS, Linux) |
 | `shed-server` | Server binary exposing HTTP + SSH APIs (Linux, macOS) |
 | `shed-agent` | Agent binary running inside Firecracker and VZ VMs (Linux) |
-| `shed-base` | Docker image with pre-installed dev tools |
 
 ## Communication Protocols
 
@@ -59,22 +58,8 @@ flowchart TB
 
 | Resource | Format | Example |
 |----------|--------|---------|
-| Container | `shed-{name}` | `shed-codelens` |
-| Volume | `shed-{name}-workspace` | `shed-codelens-workspace` |
+| VM | `shed-{name}` | `shed-codelens` |
 | SSH Host | `shed-{name}` | `shed-codelens` (in SSH config) |
-
-## Docker Labels
-
-All shed-managed containers are tagged:
-
-```
-shed=true
-shed.name={name}
-shed.created={ISO8601 timestamp}
-shed.repo={owner/repo}
-shed.backend={docker|firecracker|vz}
-shed.local_dir={host path}
-```
 
 ## Data Flows
 
@@ -99,33 +84,6 @@ sequenceDiagram
 For the user-facing lifecycle documentation (what happens at each step across all backends), see [Provisioning: Shed Lifecycle](../reference/provisioning.md#shed-lifecycle).
 
 The diagrams below show the internal implementation flow for each backend.
-
-=== "Docker"
-
-    ```mermaid
-    sequenceDiagram
-        participant CLI
-        participant Server
-        participant Docker
-
-        CLI->>Server: POST /api/sheds {name, repo, local_dir}
-        alt local_dir specified
-            Server->>Docker: Create container (bind mount + credential bind mounts)
-        else
-            Server->>Docker: Create volume
-            Server->>Docker: Create container (volume + credential bind mounts)
-        end
-        Server->>Docker: Start container
-        Server->>Docker: Fix workspace ownership (chown)
-        alt repo specified
-            Server->>Docker: git clone via docker exec
-        end
-        Server->>Docker: Run install hook via docker exec
-        Server->>Docker: Capture PATH → /etc/profile.d/
-        Server->>Docker: Run startup hook via docker exec
-        Server-->>CLI: {name, status, ...}
-        CLI->>CLI: Auto-sync default profile via SSH+tar
-    ```
 
 === "Firecracker"
 
@@ -190,8 +148,6 @@ The diagrams below show the internal implementation flow for each backend.
 
 Each backend handles credentials differently based on its isolation model. All credentials must be directories.
 
-**Docker** — Credentials are bind-mounted into the container at creation time. They persist across stop/start and reflect host changes immediately. Configured in `server.yaml` under `credentials`.
-
 **Firecracker** — Credentials are mounted via 9P over the TAP bridge network. Each credential directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
 
 **VZ** — Credentials are mounted via VirtioFS. Each credential directory gets a VirtioFS share added as a vfkit device argument at VM launch, then mounted inside the guest. Changes are immediately visible on both sides.
@@ -203,12 +159,12 @@ sequenceDiagram
     participant User
     participant CLI
     participant SSHServer
-    participant Container
+    participant Agent as shed-agent
 
     User->>CLI: shed console myproj
     CLI->>SSHServer: SSH as "myproj" user
-    SSHServer->>Container: docker exec -it
-    Container-->>User: Interactive shell
+    SSHServer->>Agent: exec via vsock
+    Agent-->>User: Interactive shell
 ```
 
 ## Internal Packages
@@ -221,13 +177,9 @@ HTTP API handlers and routing. Uses standard `net/http` with Chi router.
 
 Configuration types and loading for both client and server configs.
 
-### `internal/docker`
-
-Docker client wrapper for container and volume operations.
-
 ### `internal/sshd`
 
-SSH server implementation using `gliderlabs/ssh`. Routes connections to containers based on username.
+SSH server implementation using `gliderlabs/ssh`. Routes connections to VMs based on username.
 
 ### `internal/sshconfig`
 
@@ -255,7 +207,7 @@ Binary protocol for framed messages over vsock between shed-server and shed-agen
 
 ### `internal/backend`
 
-Backend interface that Docker, Firecracker, and VZ backends all implement.
+Backend interface that Firecracker and VZ backends implement.
 
 ### `internal/provision`
 
@@ -263,7 +215,7 @@ Handles in-repo provisioning hooks (`.shed/provision.yaml`).
 
 ### `internal/sync`
 
-Client-side file synchronization to containers.
+Client-side file synchronization to VMs.
 
 ### `internal/tunnels`
 
@@ -279,7 +231,7 @@ Shed relies on network-level trust:
 - Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo
 - Not suitable for multi-tenant or public deployments
 
-## Container Lifecycle
+## Shed Lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -310,4 +262,4 @@ stateDiagram-v2
 |------|---------|
 | `/etc/shed/server.yaml` | Server configuration |
 | `/etc/shed/host_key` or `~/.shed/host_key` | SSH host private key (root vs. non-root) |
-| `~/.shed/env` | Environment variables for containers |
+| `~/.shed/env` | Environment variables for VMs |

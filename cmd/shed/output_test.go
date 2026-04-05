@@ -142,7 +142,7 @@ func TestActionResultWithDetails(t *testing.T) {
 		Name:   "myproj",
 		Details: struct {
 			Backend string `json:"backend"`
-		}{Backend: "docker"},
+		}{Backend: "vz"},
 	}
 	if err := outputJSON(result); err != nil {
 		t.Fatalf("outputJSON returned error: %v", err)
@@ -163,8 +163,8 @@ func TestActionResultWithDetails(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected details to be an object, got %T", parsed["details"])
 	}
-	if details["backend"] != "docker" {
-		t.Errorf("expected backend=docker, got %v", details["backend"])
+	if details["backend"] != "vz" {
+		t.Errorf("expected backend=vz, got %v", details["backend"])
 	}
 }
 

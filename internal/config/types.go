@@ -136,12 +136,11 @@ func ValidateSessionName(name string) error {
 
 // ServerInfo is returned by GET /api/info.
 type ServerInfo struct {
-	Name            string   `json:"name"`
-	Version         string   `json:"version"`
-	SSHPort         int      `json:"ssh_port"`
-	HTTPPort        int      `json:"http_port"`
-	DefaultBackend  string   `json:"default_backend"`
-	EnabledBackends []string `json:"enabled_backends"`
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+	SSHPort  int    `json:"ssh_port"`
+	HTTPPort int    `json:"http_port"`
+	Backend  string `json:"backend"`
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.
@@ -166,7 +165,7 @@ type ImageInfo struct {
 	Path      string `json:"path,omitempty"`
 	DockerRef string `json:"docker_ref,omitempty"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
-	Source    string `json:"source"` // "config", "discovered", or "docker"
+	Source    string `json:"source"` // "config" or "discovered"
 	Cached    bool   `json:"cached"`
 }
 
@@ -187,8 +186,8 @@ type CreateShedRequest struct {
 	Image       string `json:"image,omitempty"`
 	NoProvision bool   `json:"no_provision,omitempty"`
 
-	// Backend specifies which backend to use ("docker", "firecracker", or "vz")
-	// If empty, uses the server's default backend
+	// Backend specifies which backend to use ("firecracker" or "vz").
+	// If empty, uses the server's configured backend.
 	Backend string `json:"backend,omitempty"`
 
 	// CPUs specifies the number of vCPUs (firecracker/vz only)
@@ -244,44 +243,12 @@ const (
 	ErrInvalidLocalDir    = "INVALID_LOCAL_DIR"
 )
 
-// Docker label keys for shed containers.
-const (
-	LabelShed         = "shed"
-	LabelShedName     = "shed.name"
-	LabelShedCreated  = "shed.created"
-	LabelShedRepo     = "shed.repo"
-	LabelShedBackend  = "shed.backend"
-	LabelShedLocalDir = "shed.local_dir"
-)
-
 // Backend type constants for Shed.Backend field.
 const (
-	BackendDocker      = "docker"
 	BackendFirecracker = "firecracker"
 	BackendVZ          = "vz"
+	BackendDetect      = "detect"
 )
-
-// ContainerUser is the non-root user that runs inside Docker containers.
-const ContainerUser = "shed"
-
-// ContainerPrefix is prepended to shed names for Docker containers.
-const ContainerPrefix = "shed-"
-
-// VolumePrefix is prepended to shed names for Docker volumes.
-const VolumePrefix = "shed-"
-
-// VolumeSuffix is appended to shed names for Docker volumes.
-const VolumeSuffix = "-workspace"
-
-// ContainerName returns the Docker container name for a shed.
-func ContainerName(shedName string) string {
-	return ContainerPrefix + shedName
-}
-
-// VolumeName returns the Docker volume name for a shed.
-func VolumeName(shedName string) string {
-	return VolumePrefix + shedName + VolumeSuffix
-}
 
 // WorkspacePath is the path where the workspace volume is mounted in containers.
 const WorkspacePath = "/workspace"

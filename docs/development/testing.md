@@ -7,7 +7,6 @@ This document covers Shed's testing strategy, how to run each tier of tests, and
 | Tier | Scope | Build Tags | Requirements | CI |
 |------|-------|------------|--------------|-----|
 | Unit | Pure logic, no external deps | None (or `linux` for Firecracker) | Go toolchain | Yes |
-| Integration | Docker API, real containers | `integration` | Docker daemon | Yes |
 | E2E (Firecracker) | Full VM lifecycle via API | `e2e` | KVM, root, Firecracker assets | No |
 
 ## Running Tests
@@ -32,17 +31,6 @@ Firecracker unit tests (metadata, rootfs, networking) use the `linux` build tag 
 go test ./internal/firecracker/...
 ```
 
-### Integration Tests
-
-Integration tests require a running Docker daemon and use the `integration` build tag:
-
-```bash
-make test-integration
-
-# Or directly
-go test -v -tags=integration ./integration/...
-```
-
 ### E2E (Firecracker)
 
 Firecracker e2e tests exercise the full VM lifecycle: create, start, exec, stop, delete. They require KVM access, root privileges, and pre-built Firecracker assets.
@@ -65,8 +53,9 @@ sudo go test -v -tags=e2e ./e2e/firecracker/...
 | Tag | Purpose | Example |
 |-----|---------|---------|
 | `//go:build linux` | Code that uses Linux-only APIs (vsock, TAP, etc.) | `internal/firecracker/*.go` |
-| `//go:build integration` | Tests requiring Docker | `integration/*_test.go` |
 | `//go:build e2e` | Tests requiring KVM + Firecracker | `e2e/firecracker/*_test.go` |
+
+The `integration` build tag was previously used for Docker backend tests and may still appear in older branches.
 
 All `internal/firecracker/` source and test files carry the `linux` build tag because they depend on Linux-specific syscalls (vsock, netlink).
 

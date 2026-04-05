@@ -270,7 +270,6 @@ Namespaces prefixed with `system:` are reserved for shed internal use and cannot
 
 ## Limitations
 
-- Extensions are available for **VZ and Firecracker** backends only (Docker containers do not use vsock)
 - One listener per namespace (additional registrations are rejected)
 - Guest-side subscribe (receiving host-initiated messages) is not yet supported
 - The agent HTTP endpoint uses plain HTTP (HTTPS support planned)

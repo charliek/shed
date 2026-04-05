@@ -2,9 +2,8 @@
 
 Shed supports in-repo provisioning scripts that run automatically when sheds start. These scripts are version-controlled with your code.
 
-Provisioning works with all three backends:
+Provisioning works with both VM backends:
 
-- **Docker**: Hooks execute via `docker exec`
 - **Firecracker**: Hooks execute via vsock
 - **VZ**: Hooks execute via vsock (same mechanism as Firecracker)
 
@@ -16,16 +15,16 @@ Understanding the full sequence of events during shed operations helps you know 
 
 When you run `shed create`, the following steps execute in order:
 
-| Step | Docker | Firecracker | VZ |
-|------|--------|-------------|-----|
-| 1. Storage setup | Create named volume (or bind mount for `--local-dir`) | Copy base rootfs to instance directory | Copy base rootfs to instance directory |
-| 2. Container/VM start | Create and start container | Spawn Firecracker process, allocate TAP device and IP, wait for agent health | Spawn vfkit process, wait for agent health |
-| 3. Local-dir mount | Already bind-mounted at container creation | Not supported | VirtioFS mount at `/workspace` |
-| 4. Credential setup | Already bind-mounted at container creation | All credentials mounted via 9P | All credentials mounted via VirtioFS |
-| 5. Repo clone | `git clone` in `/workspace` (skipped if `--local-dir`) | Same | Same |
-| 6. Install hook | Runs via `docker exec`; state file marks completion | Runs via vsock; state file marks completion | Same as Firecracker |
-| 7. Startup hook | Runs via `docker exec` | Runs via vsock | Same as Firecracker |
-| 8. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same | Same |
+| Step | Firecracker | VZ |
+|------|-------------|-----|
+| 1. Storage setup | Copy base rootfs to instance directory | Copy base rootfs to instance directory |
+| 2. VM start | Spawn Firecracker process, allocate TAP device and IP, wait for agent health | Spawn vfkit process, wait for agent health |
+| 3. Local-dir mount | Not supported | VirtioFS mount at `/workspace` |
+| 4. Credential setup | All credentials mounted via 9P | All credentials mounted via VirtioFS |
+| 5. Repo clone | `git clone` in `/workspace` (skipped if `--local-dir`) | Same |
+| 6. Install hook | Runs via vsock; state file marks completion | Same as Firecracker |
+| 7. Startup hook | Runs via vsock | Same as Firecracker |
+| 8. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same |
 
 Steps 1–7 are server-side. Step 8 runs on the CLI client after the server returns.
 
@@ -33,36 +32,36 @@ Steps 1–7 are server-side. Step 8 runs on the CLI client after the server retu
 
 When you run `shed start` on a stopped shed, the sequence is shorter:
 
-| Step | Docker | Firecracker | VZ |
-|------|--------|-------------|-----|
-| 1. Container/VM start | Start existing container | Spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
-| 2. Local-dir re-mount | Bind mount persists across restarts | Not supported | VirtioFS re-mount (mounts do not persist across VM reboots) |
-| 3. Credential refresh | Bind mounts persist (no action needed) | All credentials re-mounted via 9P | All credentials re-mounted via VirtioFS |
-| 4. Startup hook | Runs (install hook skipped — state file records it already ran) | Same | Same |
+| Step | Firecracker | VZ |
+|------|-------------|-----|
+| 1. VM start | Spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
+| 2. Local-dir re-mount | Not supported | VirtioFS re-mount (mounts do not persist across VM reboots) |
+| 3. Credential refresh | All credentials re-mounted via 9P | All credentials re-mounted via VirtioFS |
+| 4. Startup hook | Runs (install hook skipped — state file records it already ran) | Same |
 
 No storage setup, repo clone, install hook, or auto-sync on start.
 
 ### Stop Sequence
 
-| Step | Docker | Firecracker | VZ |
-|------|--------|-------------|-----|
-| 1. Shutdown hook | Not supported — Docker sends SIGTERM directly | Runs via vsock (budget: half of stop timeout, max 30s) | Same as Firecracker |
-| 2. Agent drain | N/A | 5-second drain timeout for in-flight operations | Same as Firecracker |
-| 3. Process stop | `docker stop` (SIGTERM, then SIGKILL after timeout) | Firecracker API shutdown, SIGKILL fallback | vfkit SIGTERM, then SIGKILL fallback |
+| Step | Firecracker | VZ |
+|------|-------------|-----|
+| 1. Shutdown hook | Runs via vsock (budget: half of stop timeout, max 30s) | Same as Firecracker |
+| 2. Agent drain | 5-second drain timeout for in-flight operations | Same as Firecracker |
+| 3. Process stop | Firecracker API shutdown, SIGKILL fallback | vfkit SIGTERM, then SIGKILL fallback |
 
 ### Delete Sequence
 
-`shed delete` calls stop (running the shutdown hook if supported), then removes all resources — container and volume for Docker, instance directory for VM backends.
+`shed delete` calls stop (running the shutdown hook), then removes all resources (instance directory and rootfs).
 
 ### Backend Differences at a Glance
 
-| Feature | Docker | Firecracker | VZ |
-|---------|--------|-------------|-----|
-| Credential mechanism | Bind mount | 9P mount | VirtioFS mount |
-| Local-dir support | Bind mount | Not supported | VirtioFS |
-| Shutdown hook | Not supported | Supported | Supported |
-| Credential live sync | Automatic via bind mount | Automatic via 9P | Automatic via VirtioFS |
-| Workspace persistence | Named volume (survives stop/start) | Rootfs image (survives stop/start) | Rootfs image (survives stop/start) |
+| Feature | Firecracker | VZ |
+|---------|-------------|-----|
+| Credential mechanism | 9P mount | VirtioFS mount |
+| Local-dir support | Not supported | VirtioFS |
+| Shutdown hook | Supported | Supported |
+| Credential live sync | Automatic via 9P | Automatic via VirtioFS |
+| Workspace persistence | Rootfs image (survives stop/start) | Rootfs image (survives stop/start) |
 
 ### Error Handling
 
@@ -70,7 +69,7 @@ Not all failures during create are fatal:
 
 | Step | On failure |
 |------|-----------|
-| Storage setup, container/VM start, agent health check | **Fatal** — create fails, resources cleaned up |
+| Storage setup, VM start, agent health check | **Fatal** — create fails, resources cleaned up |
 | Local-dir mount (VZ) | **Fatal** — VM stopped, create fails |
 | Credential setup | Warning logged, create continues |
 | Repo clone | Warning logged, create continues |
@@ -134,7 +133,7 @@ Runs before the shed stops (on `shed stop` and `shed delete`). Use for:
 
 The shutdown hook has a time budget of half the configured stop timeout (capped at 30s). If the hook exceeds this budget or fails, the shed still stops — hook failures are logged as warnings.
 
-**Note:** The shutdown hook is supported on the Firecracker and VZ backends. Docker containers stop via `docker stop`, which sends SIGTERM directly.
+**Note:** The shutdown hook is supported on both the Firecracker and VZ backends.
 
 After the shutdown hook completes, the agent enforces a 5-second drain timeout on active connections before the VM exits. This gives in-flight exec and file transfer operations time to finish cleanly.
 
@@ -236,7 +235,7 @@ fi
 - Remove and recreate runtime directories (`/var/run/<service>`) with correct ownership
 - Remove stale PID files from data directories (e.g., `postmaster.pid`)
 - Guard commands with `2>/dev/null || true` so cleanup is safe on first boot (e.g., `chown` won't fail if the service user doesn't exist yet, `rm` won't fail if PID files are missing)
-- This startup-hook stale-state cleanup pattern works identically on Docker, Firecracker, and VZ
+- This startup-hook stale-state cleanup pattern works identically on Firecracker and VZ
 
 ## Environment Variables
 
@@ -273,7 +272,7 @@ Shed sets these variables automatically:
 | Variable | Description |
 |----------|-------------|
 | `SHED_CONTAINER` | Always `true` in shed containers |
-| `SHED_NAME` | Container name (e.g., `myproject`) |
+| `SHED_NAME` | Shed name (e.g., `myproject`) |
 | `SHED_WORKSPACE` | Workspace path (`/workspace`) |
 
 Add custom variables in `provision.yaml`:
@@ -292,7 +291,7 @@ shed create myproject --repo github.com/user/repo --no-provision
 
 ## Debugging
 
-If provisioning fails, check the logs in the container:
+If provisioning fails, check the logs in the shed:
 
 ```bash
 shed console myproject
@@ -305,7 +304,7 @@ cat /var/log/shed/shutdown.log
 
 - **Script not executable**: Shed automatically runs `chmod +x` before executing
 - **Missing dependencies**: Install script should handle all dependencies
-- **Non-zero exit**: Hook failures are logged as warnings but container creation continues
+- **Non-zero exit**: Hook failures are logged as warnings but shed creation continues
 
 !!! tip "Environment Detection"
     Check if running in a shed container using `[ "$SHED_CONTAINER" = "true" ]`.

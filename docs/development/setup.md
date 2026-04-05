@@ -5,7 +5,7 @@ This guide covers setting up a development environment for contributing to Shed.
 ## Prerequisites
 
 - [mise](https://mise.jdx.dev/) (manages Go, golangci-lint, and other tool versions)
-- Docker (for building the base image and testing)
+- Docker (for building rootfs images)
 - Make
 - Git
 
@@ -84,7 +84,6 @@ shed/
 │   ├── agentproto/         # Vsock binary protocol
 │   ├── backend/            # Backend interface
 │   ├── config/             # Configuration types
-│   ├── docker/             # Docker client wrapper
 │   ├── firecracker/        # Firecracker backend
 │   ├── vz/                 # VZ backend (macOS, build tag: darwin)
 │   ├── vmutil/             # Shared VM utilities (AgentClient, Dialer)
@@ -95,7 +94,6 @@ shed/
 │   ├── tunnels/            # SSH tunnel management
 │   └── version/            # Version information
 ├── scripts/
-│   ├── build-image.sh              # Build shed-base Docker image
 │   ├── build-firecracker-rootfs.sh # Build Firecracker rootfs
 │   ├── build-firecracker-kernel.sh # Build custom 6.1 kernel
 │   ├── build-vz-rootfs.sh          # Build VZ rootfs, kernel, and initrd
@@ -194,24 +192,12 @@ func TestValidateShedName(t *testing.T) {
 }
 ```
 
-### Integration Tests
+### E2E Tests
 
-Use build tags for Docker-dependent tests:
-
-```go
-//go:build integration
-
-package docker
-
-func TestCreateShed_Integration(t *testing.T) {
-    // Test with real Docker
-}
-```
-
-Run integration tests:
+End-to-end tests exercise the full VM lifecycle using a running shed-server:
 
 ```bash
-go test -tags=integration ./...
+./scripts/e2e-test.sh --backend firecracker
 ```
 
 ## Continuous Integration
@@ -255,14 +241,6 @@ make docs-serve
 
 ```bash
 LOG_LEVEL=debug ./bin/shed-server serve
-```
-
-### Docker Inspection
-
-```bash
-docker ps --filter "label=shed=true"
-docker inspect shed-myproject
-docker logs shed-myproject
 ```
 
 ### API Testing

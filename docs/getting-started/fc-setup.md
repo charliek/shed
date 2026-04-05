@@ -150,7 +150,6 @@ name: shed-server
 http_port: 8080
 ssh_port: 2222
 enabled_backends:
-  - docker
   - firecracker
 default_backend: firecracker
 

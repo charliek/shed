@@ -33,7 +33,7 @@ type Envelope struct {
 // ShedInfo identifies the shed instance that originated or is targeted by a message.
 type ShedInfo struct {
 	Name    string `json:"name"`    // shed instance name
-	Backend string `json:"backend"` // "vz", "firecracker", "docker"
+	Backend string `json:"backend"` // "vz" or "firecracker"
 	Server  string `json:"server"`  // server name from config
 }
 

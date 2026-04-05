@@ -3,12 +3,13 @@
 
 # End-to-end test for Shed CLI
 # Tests full lifecycle with a real repo, provisioning, services, and stop/start cycle.
-# Requires a running shed-server and configured backends.
+# Designed for Linux (Firecracker) servers; VZ support is experimental.
+# Requires a running shed-server with the target backend configured.
 #
 # Usage:
-#   ./scripts/e2e-test.sh [--backend docker|firecracker|both] [--repo URL] [--timeout MINUTES]
+#   ./scripts/e2e-test.sh [--backend firecracker|vz] [--repo URL] [--timeout MINUTES]
 #
-# Defaults: --backend both --repo git@github.com:charliek/sltstodo.git --timeout 25
+# Defaults: --backend firecracker --repo git@github.com:charliek/sltstodo.git --timeout 25
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -23,7 +24,7 @@ else
 fi
 
 # Defaults
-BACKEND="both"
+BACKEND="firecracker"
 REPO="git@github.com:charliek/sltstodo.git"
 TIMEOUT_MINUTES=25
 TIMESTAMP=$(date +%s)
@@ -33,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --backend)
             if [[ -z "${2:-}" || "$2" == --* ]]; then
-                echo "Error: --backend requires a value (docker, firecracker, or both)"
+                echo "Error: --backend requires a value (firecracker or vz)"
                 exit 1
             fi
             BACKEND="$2"
@@ -56,7 +57,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)
-            echo "Usage: $0 [--backend docker|firecracker|both] [--repo URL] [--timeout MINUTES]"
+            echo "Usage: $0 [--backend firecracker|vz] [--repo URL] [--timeout MINUTES]"
             exit 0
             ;;
         *)
@@ -348,18 +349,14 @@ run_backend_tests() {
 
 # Run tests for selected backends
 case "$BACKEND" in
-    docker)
-        run_backend_tests docker
-        ;;
     firecracker)
         run_backend_tests firecracker
         ;;
-    both)
-        run_backend_tests docker
-        run_backend_tests firecracker
+    vz)
+        run_backend_tests vz
         ;;
     *)
-        echo "Unknown backend: $BACKEND (use docker, firecracker, or both)"
+        echo "Unknown backend: $BACKEND (use firecracker or vz)"
         exit 1
         ;;
 esac

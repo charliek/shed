@@ -3,23 +3,59 @@
 package provision
 
 import (
-	"bytes"
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
-	"github.com/charliek/shed/internal/config"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	"gopkg.in/yaml.v3"
 )
 
 // DefaultHookTimeout is the default timeout for hook execution.
 const DefaultHookTimeout = 30 * time.Minute
+
+// Default environment variables set by shed in containers/VMs.
+const (
+	EnvShedContainer = "SHED_CONTAINER"
+	EnvShedName      = "SHED_NAME"
+	EnvShedWorkspace = "SHED_WORKSPACE"
+)
+
+// Log file paths in the container/VM.
+const (
+	LogDir      = "/var/log/shed"
+	InstallLog  = "/var/log/shed/install.log"
+	StartupLog  = "/var/log/shed/startup.log"
+	ShutdownLog = "/var/log/shed/shutdown.log"
+	SyncLog     = "/var/log/shed/sync.log"
+)
+
+// HookType identifies which type of hook is being run.
+type HookType string
+
+const (
+	HookTypeInstall  HookType = "install"
+	HookTypeStartup  HookType = "startup"
+	HookTypeShutdown HookType = "shutdown"
+)
+
+// HookError represents an error from a failed hook execution.
+type HookError struct {
+	HookType   HookType
+	ExitCode   int
+	LogFile    string
+	LastOutput string
+	Err        error // Optional underlying error
+}
+
+func (e *HookError) Error() string {
+	return fmt.Sprintf("%s hook failed (exit code %d)", e.HookType, e.ExitCode)
+}
+
+// Unwrap returns the underlying error for errors.Is/As compatibility.
+func (e *HookError) Unwrap() error {
+	return e.Err
+}
 
 // Config holds provisioning configuration loaded from a repository.
 type Config struct {
@@ -105,69 +141,6 @@ func (c *Config) HasShutdownHook() bool {
 // HasAnyHooks returns true if any hooks are configured.
 func (c *Config) HasAnyHooks() bool {
 	return c.HasInstallHook() || c.HasStartupHook() || c.HasShutdownHook()
-}
-
-// LoadConfigFromContainer loads provisioning configuration from within a Docker container.
-// It reads the config files via docker exec since the workspace is in the container.
-func LoadConfigFromContainer(ctx context.Context, docker *client.Client, containerID, workspacePath string) (*Config, error) {
-	shedPath := filepath.Join(workspacePath, ShedProvisionYAML)
-	if content, err := readFileFromContainer(ctx, docker, containerID, shedPath); err == nil {
-		cfg, err := parseShedConfigContent(content)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse %s: %w", ShedProvisionYAML, err)
-		}
-		return cfg, nil
-	}
-
-	// No config found - return empty config (no-op)
-	return &Config{
-		Env: make(map[string]string),
-	}, nil
-}
-
-// readFileFromContainer reads a file from within a Docker container.
-func readFileFromContainer(ctx context.Context, docker *client.Client, containerID, path string) ([]byte, error) {
-	execConfig := container.ExecOptions{
-		Cmd:          []string{"cat", path},
-		User:         config.ContainerUser,
-		AttachStdout: true,
-		AttachStderr: true,
-	}
-
-	execResp, err := docker.ContainerExecCreate(ctx, containerID, execConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	attachResp, err := docker.ContainerExecAttach(ctx, execResp.ID, container.ExecStartOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer attachResp.Close()
-
-	// Read output
-	var stdout, stderr bytes.Buffer
-	_, err = stdcopy.StdCopy(&stdout, &stderr, attachResp.Reader)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check exit code
-	inspectResp, err := docker.ContainerExecInspect(ctx, execResp.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	if inspectResp.ExitCode != 0 {
-		// File doesn't exist or other error
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg == "" {
-			errMsg = fmt.Sprintf("command failed with exit code %d", inspectResp.ExitCode)
-		}
-		return nil, fmt.Errorf("%s (exit code %d)", errMsg, inspectResp.ExitCode)
-	}
-
-	return stdout.Bytes(), nil
 }
 
 // parseShedConfigContent parses .shed/provision.yaml content.

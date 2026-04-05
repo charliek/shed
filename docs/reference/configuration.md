@@ -77,26 +77,24 @@ log_level: info
 | `name` | string | `shed-server` | Server identifier |
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
-| `enabled_backends` | list | `[docker]` | Backends this server supports (`docker`, `firecracker`, `vz`) |
-| `default_backend` | string | `docker` | Default backend used when none is specified |
-| `default_image` | string | `shed-base:latest` | Default Docker image for sheds |
+| `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
+| `default_image` | string | `shed-base:latest` | Default image for sheds |
 | `credentials` | map | `{}` | Credential directories to mount into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
 
-**Note:** Firecracker is only supported on Linux. VZ is only supported on macOS Apple Silicon (arm64).
+**Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
 
 ### Credentials
 
 Credentials are directories from the host that are shared with sheds. The method depends on the backend:
 
-- **Docker**: Bind-mounted into the container.
 - **Firecracker**: Mounted via 9P over the TAP bridge network.
 - **VZ**: Mounted via VirtioFS.
 
-All three mechanisms provide live filesystem sharing -- changes on either side are immediately visible to the other.
+Both mechanisms provide live filesystem sharing -- changes on either side are immediately visible to the other.
 
 ```yaml
 credentials:
@@ -162,9 +160,6 @@ credentials:
 When enabling Firecracker, configure the Firecracker-specific settings:
 
 ```yaml
-enabled_backends:
-  - docker
-  - firecracker
 default_backend: firecracker
 
 firecracker:
@@ -220,8 +215,6 @@ When enabling the VZ backend on macOS Apple Silicon, configure the VZ-specific s
 Image values in `base_rootfs` and `images` can be either ext4 file paths or Docker image references. Docker refs are auto-pulled and converted to ext4 on first use.
 
 ```yaml
-enabled_backends:
-  - vz
 default_backend: vz
 
 vz:

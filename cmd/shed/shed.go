@@ -80,12 +80,12 @@ var (
 
 func init() {
 	createCmd.Flags().StringVarP(&createRepo, "repo", "r", "", "Git repository (owner/repo shorthand or full URL) to clone")
-	createCmd.Flags().StringVarP(&createImage, "image", "i", "", "Docker image to use")
+	createCmd.Flags().StringVarP(&createImage, "image", "i", "", "Image variant to use")
 	createCmd.Flags().BoolVar(&createNoProvision, "no-provision", false, "Skip running provisioning hooks")
 	createCmd.Flags().BoolVar(&createNoSync, "no-sync", false, "Skip syncing default profile")
 	createCmd.Flags().StringVar(&createSyncProfile, "sync-profile", "", "Profile to sync after creation (default: 'default')")
 	createCmd.Flags().DurationVar(&createTimeout, "timeout", 0, "Timeout for create operation (default: from config or 10m)")
-	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: docker, firecracker, or vz (default: server default)")
+	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: firecracker or vz (default: server default)")
 	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker/vz only)")
 	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
 	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a local directory as the workspace (mutually exclusive with --repo)")
@@ -109,11 +109,10 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 	// Validate backend flag
 	if createBackend != "" &&
-		createBackend != config.BackendDocker &&
 		createBackend != config.BackendFirecracker &&
 		createBackend != config.BackendVZ {
-		return fmt.Errorf("invalid backend %q: must be %q, %q, or %q",
-			createBackend, config.BackendDocker, config.BackendFirecracker, config.BackendVZ)
+		return fmt.Errorf("invalid backend %q: must be %q or %q",
+			createBackend, config.BackendFirecracker, config.BackendVZ)
 	}
 
 	if createCPUs < 0 {
@@ -236,25 +235,17 @@ func resolveCreateBackend(info *config.ServerInfo, requested string, cpus, memor
 	if info == nil {
 		return "", "", fmt.Errorf("server info is required")
 	}
-	if len(info.EnabledBackends) == 0 {
-		return "", "", fmt.Errorf("server does not advertise enabled backends")
-	}
-	if info.DefaultBackend == "" {
-		return "", "", fmt.Errorf("server does not advertise a default backend")
-	}
-
-	enabled := make(map[string]bool, len(info.EnabledBackends))
-	for _, backend := range info.EnabledBackends {
-		enabled[backend] = true
+	if info.Backend == "" {
+		return "", "", fmt.Errorf("server does not advertise a backend")
 	}
 
 	backend := requested
 	if backend == "" {
-		backend = info.DefaultBackend
+		backend = info.Backend
 	}
 
-	if !enabled[backend] {
-		return "", "", fmt.Errorf("backend %q is not enabled on server", backend)
+	if backend != info.Backend {
+		return "", "", fmt.Errorf("backend %q does not match server backend %q", backend, info.Backend)
 	}
 
 	switch backend {
@@ -277,10 +268,6 @@ func resolveCreateBackend(info *config.ServerInfo, requested string, cpus, memor
 		}
 		if memory > config.MaxVZMemoryMB {
 			return "", "", fmt.Errorf("invalid memory %d: must be at most %d MB", memory, config.MaxVZMemoryMB)
-		}
-	case config.BackendDocker:
-		if cpus != 0 || memory != 0 {
-			return backend, "Warning: --cpus and --memory flags are ignored for docker backend", nil
 		}
 	}
 

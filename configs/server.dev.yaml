@@ -1,4 +1,4 @@
-# Shed Server Development Configuration
+# Shed Server Development Configuration (macOS)
 #
 # Use this for local development and testing:
 #   shed-server serve --config ./configs/server.dev.yaml
@@ -8,10 +8,11 @@ name: localhost-dev
 http_port: 8080
 ssh_port: 2222
 
-default_image: shed-base:latest
-
 # No env file for dev - set env vars directly if needed
 env_file: ""
 
 # Debug logging for development
 log_level: debug
+
+# Auto-detect backend (vz on macOS, firecracker on Linux)
+default_backend: detect

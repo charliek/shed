@@ -80,7 +80,10 @@ shed create <name> [flags]
 |------|-------|---------|-------------|
 | `--repo` | `-r` | None | Repository to clone (`owner/repo` shorthand or full URL) |
 | `--server` | `-s` | Default server | Target server |
-| `--image` | `-i` | Server default | Image to use (Docker image name for Docker backend, [variant name](images.md) for VZ/Firecracker) |
+| `--image` | `-i` | Server default | Image [variant name](images.md) to use |
+| `--backend` | | Server default | Backend to use: `firecracker` or `vz` |
+| `--cpus` | | Server default | Number of vCPUs |
+| `--memory` | | Server default | Memory in MB |
 | `--local-dir` | | None | Mount a local host directory as the workspace (mutually exclusive with `--repo`) |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
@@ -102,7 +105,7 @@ shed create myproj --local-dir ~/projects/myproj
 ```
 
 !!! note "Local directory mounts"
-    When using `--local-dir`, the specified host directory is mounted directly as the workspace. No volume is created and `--repo` cannot be used. For Docker, this uses a bind mount. For VZ, this uses VirtioFS. For Firecracker, this uses 9P over the TAP bridge network.
+    When using `--local-dir`, the specified host directory is mounted directly as the workspace. No volume is created and `--repo` cannot be used. VZ uses VirtioFS; Firecracker uses 9P over TCP.
 
 ### shed list
 
@@ -121,16 +124,16 @@ shed list [flags]
 
 ```text
 NAME          BACKEND    STATUS     SSH                              CREATED
-codelens      docker     running    codelens@mini-desktop:2222       2026-01-20 10:30
-mcp-test      docker     stopped    -                                2026-01-17 14:00
+codelens      vz         running    codelens@mini-desktop:2222       2026-01-20 10:30
+mcp-test      vz         stopped    -                                2026-01-17 14:00
 ```
 
 **Output with `-v` (expanded):**
 
 ```text
 NAME          BACKEND    STATUS     SSH                              IP             RESOURCES    SOURCE              UPTIME
-codelens      docker     running    codelens@mini-desktop:2222       172.17.0.2     2c/4096MB    charliek/codelens    2h30m
-mcp-test      docker     stopped    -                                -              -            -                    -
+codelens      vz         running    codelens@mini-desktop:2222       192.168.64.2   2c/4096MB    charliek/codelens    2h30m
+mcp-test      vz         stopped    -                                -              -            -                    -
 ```
 
 With `-vv`, each shed is displayed as a grouped key-value detail view with network, resources, and runtime sections.
@@ -165,7 +168,7 @@ shed delete <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--keep-volume` | | `false` | Preserve workspace data |
+| `--keep-volume` | | `false` | Keep the data volume |
 | `--force` | `-f` | `false` | Skip confirmation |
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
@@ -279,7 +282,7 @@ Opens an interactive shell in a shed.
 shed console <name>
 ```
 
-Opens `/bin/bash` in the container. If the shed is stopped, it will be started automatically.
+Opens `/bin/bash` in the shed. If the shed is stopped, it will be started automatically.
 
 ### shed exec
 
@@ -429,7 +432,7 @@ shed tunnels config <shed> [flags]
 
 ### shed sync
 
-Syncs local files to a shed container.
+Syncs local files to a shed.
 
 ```bash
 shed sync <name> [flags]
