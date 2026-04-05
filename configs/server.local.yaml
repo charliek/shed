@@ -8,7 +8,6 @@ name: localhost-dev
 http_port: 8080
 ssh_port: 2222
 
-default_image: shed-base:latest
 
 credentials:
   # Claude Code - credentials and settings
@@ -83,9 +82,6 @@ env_file: /home/charliek/.shed/env
 # Debug logging for development
 log_level: debug
 
-enabled_backends:
-  - docker
-  - firecracker
 default_backend: firecracker
 
 firecracker:

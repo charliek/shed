@@ -8,8 +8,6 @@ name: localmac-dev
 http_port: 8080
 ssh_port: 2222
 
-default_image: shed-base:latest
-
 credentials:
   claude:
     source: ~/.shed/mounts/claude
@@ -64,8 +62,6 @@ env_file: ~/.shed/env
 
 log_level: debug
 
-enabled_backends:
-  - vz
 default_backend: vz
 
 vz:

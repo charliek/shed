@@ -114,8 +114,7 @@ func generateUnitFile(u *user.User) string {
 
 	template := `[Unit]
 Description=Shed Development Environment Server
-After=network.target docker.service
-Requires=docker.service
+After=network.target
 
 [Service]
 Type=simple

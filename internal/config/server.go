@@ -34,14 +34,10 @@ type ServerConfig struct {
 	LogLevel     string                 `yaml:"log_level"`
 	Terminal     *terminal.Config       `yaml:"terminal"`
 
-	// EnabledBackends specifies the backend types this server supports.
-	EnabledBackends []string `yaml:"enabled_backends,omitempty"`
-
-	// DefaultBackend specifies the default backend type: "docker" or "firecracker"
+	// DefaultBackend specifies the backend type: "vz", "firecracker", or "detect".
+	// When set to "detect", the backend is chosen based on the platform
+	// (vz on macOS/arm64, firecracker on linux).
 	DefaultBackend string `yaml:"default_backend,omitempty"`
-
-	// Backend is deprecated (use default_backend instead).
-	Backend string `yaml:"backend,omitempty"`
 
 	// Firecracker contains Firecracker-specific configuration
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
@@ -580,16 +576,14 @@ func MatchesExcludePatterns(relPath string, patterns []string) bool {
 // DefaultServerConfig returns a ServerConfig with default values.
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Name:            "shed-server",
-		HTTPPort:        8080,
-		SSHPort:         2222,
-		DefaultImage:    "shed-base:latest",
-		Credentials:     make(map[string]MountConfig),
-		LogLevel:        "info",
-		Terminal:        terminal.DefaultConfig(),
-		EnvVars:         make(map[string]string),
-		DefaultBackend:  BackendDocker,
-		EnabledBackends: []string{BackendDocker},
+		Name:           "shed-server",
+		HTTPPort:       8080,
+		SSHPort:        2222,
+		Credentials:    make(map[string]MountConfig),
+		LogLevel:       "info",
+		Terminal:       terminal.DefaultConfig(),
+		EnvVars:        make(map[string]string),
+		DefaultBackend: BackendDetect,
 	}
 }
 
@@ -643,9 +637,8 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if cfg.SSHPort == 0 {
 		cfg.SSHPort = 2222
 	}
-	if cfg.DefaultImage == "" {
-		cfg.DefaultImage = "shed-base:latest"
-	}
+	// DefaultImage is unused for VM backends (they use BaseRootfs),
+	// but keep the field for potential future use.
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
@@ -741,45 +734,38 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("invalid log_level: %s (must be debug, info, warn, or error)", c.LogLevel)
 	}
 
-	if len(c.EnabledBackends) == 0 {
-		return fmt.Errorf("enabled_backends must include at least one backend")
-	}
-
 	if c.DefaultBackend == "" {
 		return fmt.Errorf("default_backend is required")
 	}
 
 	if !isValidBackend(c.DefaultBackend) {
-		return fmt.Errorf("invalid default_backend: %s (must be docker, firecracker, or vz)", c.DefaultBackend)
+		return fmt.Errorf("invalid default_backend: %s (must be firecracker, vz, or detect)", c.DefaultBackend)
 	}
 
-	enabled := make(map[string]bool, len(c.EnabledBackends))
-	for _, backend := range c.EnabledBackends {
-		if !isValidBackend(backend) {
-			return fmt.Errorf("invalid enabled_backends entry: %s (must be docker, firecracker, or vz)", backend)
+	// Resolve detect to the actual backend
+	if c.DefaultBackend == BackendDetect {
+		resolved, err := ResolveBackend(BackendDetect, runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			return fmt.Errorf("default_backend: %w", err)
 		}
-		enabled[backend] = true
+		c.DefaultBackend = resolved
 	}
 
-	if !enabled[c.DefaultBackend] {
-		return fmt.Errorf("default_backend %q must be in enabled_backends", c.DefaultBackend)
-	}
-
-	if runtime.GOOS != "linux" && enabled[BackendFirecracker] {
+	if runtime.GOOS != "linux" && c.DefaultBackend == BackendFirecracker {
 		return fmt.Errorf("firecracker backend is only supported on linux")
 	}
 
-	if runtime.GOOS != "darwin" && enabled[BackendVZ] {
+	if runtime.GOOS != "darwin" && c.DefaultBackend == BackendVZ {
 		return fmt.Errorf("vz backend is only supported on macOS")
 	}
-	if runtime.GOARCH != "arm64" && enabled[BackendVZ] {
+	if runtime.GOARCH != "arm64" && c.DefaultBackend == BackendVZ {
 		return fmt.Errorf("vz backend currently supports macOS Apple Silicon (arm64) only")
 	}
 
 	// Validate Firecracker config if enabled
-	if enabled[BackendFirecracker] {
+	if c.DefaultBackend == BackendFirecracker {
 		if c.Firecracker == nil {
-			return fmt.Errorf("firecracker configuration is required when backend is enabled")
+			return fmt.Errorf("firecracker configuration is required when backend is firecracker")
 		}
 		if err := c.Firecracker.Validate(); err != nil {
 			return fmt.Errorf("firecracker config: %w", err)
@@ -787,9 +773,9 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	// Validate VZ config if enabled
-	if enabled[BackendVZ] {
+	if c.DefaultBackend == BackendVZ {
 		if c.VZ == nil {
-			return fmt.Errorf("vz configuration is required when backend is enabled")
+			return fmt.Errorf("vz configuration is required when backend is vz")
 		}
 		if err := c.VZ.Validate(); err != nil {
 			return fmt.Errorf("vz config: %w", err)
@@ -800,22 +786,29 @@ func (c *ServerConfig) Validate() error {
 }
 
 func isValidBackend(backend string) bool {
-	return backend == BackendDocker || backend == BackendFirecracker || backend == BackendVZ
+	return backend == BackendFirecracker || backend == BackendVZ || backend == BackendDetect
+}
+
+// ResolveBackend resolves a backend string to a concrete backend type.
+// When backend is "detect", it selects based on the platform:
+// darwin/arm64 → vz, linux → firecracker.
+func ResolveBackend(backend, goos, goarch string) (string, error) {
+	if backend != BackendDetect {
+		return backend, nil
+	}
+	switch {
+	case goos == "darwin" && goarch == "arm64":
+		return BackendVZ, nil
+	case goos == "linux":
+		return BackendFirecracker, nil
+	default:
+		return "", fmt.Errorf("cannot auto-detect backend for %s/%s: set default_backend explicitly to 'vz' or 'firecracker'", goos, goarch)
+	}
 }
 
 func (c *ServerConfig) normalizeBackends() {
-	if c.DefaultBackend == "" && c.Backend != "" {
-		c.DefaultBackend = c.Backend
-	}
 	if c.DefaultBackend == "" {
-		c.DefaultBackend = BackendDocker
-	}
-	if len(c.EnabledBackends) == 0 {
-		if c.Backend != "" {
-			c.EnabledBackends = []string{c.Backend}
-		} else {
-			c.EnabledBackends = []string{c.DefaultBackend}
-		}
+		c.DefaultBackend = BackendDetect
 	}
 }
 

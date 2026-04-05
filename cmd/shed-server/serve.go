@@ -15,7 +15,6 @@ import (
 	"github.com/charliek/shed/internal/api"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
-	"github.com/charliek/shed/internal/docker"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/sshd"
@@ -59,50 +58,35 @@ func runServe(cmd *cobra.Command, args []string) error {
 	pluginRegistry := plugin.NewRegistry()
 	pluginBridge := plugin.NewBridge(pluginRegistry)
 
-	// Initialize enabled backends
-	backends := make(map[backend.Type]backend.Backend)
-	for _, backendType := range cfg.EnabledBackends {
-		switch backendType {
-		case config.BackendDocker:
-			dockerClient, err := docker.NewClient(cfg)
-			if err != nil {
-				return fmt.Errorf("failed to create docker client: %w", err)
-			}
-			log.Printf("Connected to Docker")
-			backends[backend.TypeDocker] = docker.NewBackend(dockerClient)
-
-		case config.BackendFirecracker:
-			fcCfg := cfg.Firecracker
-			if fcCfg == nil {
-				fcCfg = config.DefaultFirecrackerConfig()
-			}
-			fcClient, err := firecracker.NewClient(fcCfg, cfg, pluginBridge)
-			if err != nil {
-				return fmt.Errorf("failed to create firecracker client: %w", err)
-			}
-			log.Printf("Initialized Firecracker backend")
-			backends[backend.TypeFirecracker] = firecracker.NewBackend(fcClient)
-
-		case config.BackendVZ:
-			vzCfg := cfg.VZ
-			if vzCfg == nil {
-				return fmt.Errorf("vz backend enabled but vz config is missing")
-			}
-			vzClient, err := vz.NewClient(vzCfg, cfg, pluginBridge)
-			if err != nil {
-				return fmt.Errorf("failed to create vz client: %w", err)
-			}
-			log.Printf("Initialized VZ backend")
-			backends[backend.TypeVZ] = vz.NewBackend(vzClient)
-
-		default:
-			return fmt.Errorf("unknown backend type: %s", backendType)
+	// Initialize the configured backend
+	var be backend.Backend
+	switch cfg.DefaultBackend {
+	case config.BackendFirecracker:
+		fcCfg := cfg.Firecracker
+		if fcCfg == nil {
+			fcCfg = config.DefaultFirecrackerConfig()
 		}
-	}
+		fcClient, err := firecracker.NewClient(fcCfg, cfg, pluginBridge)
+		if err != nil {
+			return fmt.Errorf("failed to create firecracker client: %w", err)
+		}
+		log.Printf("Initialized Firecracker backend")
+		be = firecracker.NewBackend(fcClient)
 
-	be, err := backend.NewRouter(backend.Type(cfg.DefaultBackend), backends)
-	if err != nil {
-		return fmt.Errorf("failed to initialize backend router: %w", err)
+	case config.BackendVZ:
+		vzCfg := cfg.VZ
+		if vzCfg == nil {
+			return fmt.Errorf("vz backend enabled but vz config is missing")
+		}
+		vzClient, err := vz.NewClient(vzCfg, cfg, pluginBridge)
+		if err != nil {
+			return fmt.Errorf("failed to create vz client: %w", err)
+		}
+		log.Printf("Initialized VZ backend")
+		be = vz.NewBackend(vzClient)
+
+	default:
+		return fmt.Errorf("unsupported backend type: %s", cfg.DefaultBackend)
 	}
 	defer be.Close()
 

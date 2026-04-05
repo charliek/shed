@@ -9,47 +9,6 @@ import (
 	"time"
 )
 
-func TestContainerName(t *testing.T) {
-	tests := []struct {
-		name     string
-		shedName string
-		want     string
-	}{
-		{"simple", "myapp", "shed-myapp"},
-		{"with-hyphen", "my-app", "shed-my-app"},
-		{"numbers", "app123", "shed-app123"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ContainerName(tt.shedName)
-			if got != tt.want {
-				t.Errorf("ContainerName(%q) = %q, want %q", tt.shedName, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestVolumeName(t *testing.T) {
-	tests := []struct {
-		name     string
-		shedName string
-		want     string
-	}{
-		{"simple", "myapp", "shed-myapp-workspace"},
-		{"with-hyphen", "my-app", "shed-my-app-workspace"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := VolumeName(tt.shedName)
-			if got != tt.want {
-				t.Errorf("VolumeName(%q) = %q, want %q", tt.shedName, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestNewAPIError(t *testing.T) {
 	err := NewAPIError(ErrShedNotFound, "Shed 'test' not found")
 
@@ -70,22 +29,71 @@ func TestServerConfigDefaults(t *testing.T) {
 	if cfg.SSHPort != 2222 {
 		t.Errorf("SSHPort = %d, want 2222", cfg.SSHPort)
 	}
-	if cfg.DefaultImage != "shed-base:latest" {
-		t.Errorf("DefaultImage = %q, want %q", cfg.DefaultImage, "shed-base:latest")
+	if cfg.DefaultBackend != BackendDetect {
+		t.Errorf("DefaultBackend = %q, want %q", cfg.DefaultBackend, BackendDetect)
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
 	}
 }
 
+func TestResolveBackend(t *testing.T) {
+	t.Run("detect on darwin/arm64", func(t *testing.T) {
+		got, err := ResolveBackend(BackendDetect, "darwin", "arm64")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != BackendVZ {
+			t.Errorf("ResolveBackend = %q, want %q", got, BackendVZ)
+		}
+	})
+
+	t.Run("detect on linux", func(t *testing.T) {
+		got, err := ResolveBackend(BackendDetect, "linux", "amd64")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != BackendFirecracker {
+			t.Errorf("ResolveBackend = %q, want %q", got, BackendFirecracker)
+		}
+	})
+
+	t.Run("detect on unsupported platform", func(t *testing.T) {
+		_, err := ResolveBackend(BackendDetect, "windows", "amd64")
+		if err == nil {
+			t.Fatal("expected error for unsupported platform")
+		}
+	})
+
+	t.Run("explicit backend passes through", func(t *testing.T) {
+		got, err := ResolveBackend(BackendVZ, "linux", "amd64")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != BackendVZ {
+			t.Errorf("ResolveBackend = %q, want %q", got, BackendVZ)
+		}
+	})
+
+	t.Run("docker is not valid", func(t *testing.T) {
+		if isValidBackend("docker") {
+			t.Error("docker should not be a valid backend")
+		}
+	})
+}
+
 func TestServerConfigValidation(t *testing.T) {
+	// Use the platform-appropriate backend for a valid config
+	validBackend, validBackendCfg := platformTestBackend(t)
+
 	validConfig := &ServerConfig{
-		Name:            "test",
-		HTTPPort:        8080,
-		SSHPort:         2222,
-		LogLevel:        "info",
-		DefaultBackend:  BackendDocker,
-		EnabledBackends: []string{BackendDocker},
+		Name:           "test",
+		HTTPPort:       8080,
+		SSHPort:        2222,
+		LogLevel:       "info",
+		DefaultBackend: validBackend,
+		Firecracker:    validBackendCfg.fc,
+		VZ:             validBackendCfg.vz,
 	}
 
 	tests := []struct {
@@ -100,17 +108,22 @@ func TestServerConfigValidation(t *testing.T) {
 		},
 		{
 			name:    "missing name",
-			cfg:     &ServerConfig{HTTPPort: 8080, SSHPort: 2222, LogLevel: "info", DefaultBackend: BackendDocker, EnabledBackends: []string{BackendDocker}},
+			cfg:     &ServerConfig{HTTPPort: 8080, SSHPort: 2222, LogLevel: "info", DefaultBackend: validBackend, Firecracker: validBackendCfg.fc, VZ: validBackendCfg.vz},
 			wantErr: true,
 		},
 		{
 			name:    "invalid http port",
-			cfg:     &ServerConfig{Name: "test", HTTPPort: 0, SSHPort: 2222, LogLevel: "info", DefaultBackend: BackendDocker, EnabledBackends: []string{BackendDocker}},
+			cfg:     &ServerConfig{Name: "test", HTTPPort: 0, SSHPort: 2222, LogLevel: "info", DefaultBackend: validBackend, Firecracker: validBackendCfg.fc, VZ: validBackendCfg.vz},
 			wantErr: true,
 		},
 		{
 			name:    "invalid log level",
-			cfg:     &ServerConfig{Name: "test", HTTPPort: 8080, SSHPort: 2222, LogLevel: "invalid", DefaultBackend: BackendDocker, EnabledBackends: []string{BackendDocker}},
+			cfg:     &ServerConfig{Name: "test", HTTPPort: 8080, SSHPort: 2222, LogLevel: "invalid", DefaultBackend: validBackend, Firecracker: validBackendCfg.fc, VZ: validBackendCfg.vz},
+			wantErr: true,
+		},
+		{
+			name:    "docker backend rejected",
+			cfg:     &ServerConfig{Name: "test", HTTPPort: 8080, SSHPort: 2222, LogLevel: "info", DefaultBackend: "docker"},
 			wantErr: true,
 		},
 	}
@@ -125,15 +138,34 @@ func TestServerConfigValidation(t *testing.T) {
 	}
 }
 
+// backendConfigs holds platform-specific backend configs for tests.
+type backendConfigs struct {
+	fc *FirecrackerConfig
+	vz *VZConfig
+}
+
+// platformTestBackend returns the backend type and config appropriate for the current platform.
+func platformTestBackend(t *testing.T) (string, backendConfigs) {
+	t.Helper()
+	switch {
+	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
+		return BackendVZ, backendConfigs{vz: validVZConfig()}
+	case runtime.GOOS == "linux":
+		return BackendFirecracker, backendConfigs{fc: validFirecrackerConfig()}
+	default:
+		t.Skipf("no backend available for %s/%s", runtime.GOOS, runtime.GOARCH)
+		return "", backendConfigs{}
+	}
+}
+
 func TestServerConfigVZPlatformValidation(t *testing.T) {
 	cfg := &ServerConfig{
-		Name:            "test",
-		HTTPPort:        8080,
-		SSHPort:         2222,
-		LogLevel:        "info",
-		DefaultBackend:  BackendVZ,
-		EnabledBackends: []string{BackendVZ},
-		VZ:              validVZConfig(),
+		Name:           "test",
+		HTTPPort:       8080,
+		SSHPort:        2222,
+		LogLevel:       "info",
+		DefaultBackend: BackendVZ,
+		VZ:             validVZConfig(),
 	}
 
 	err := cfg.Validate()
@@ -813,7 +845,14 @@ func TestCredentialSourceMustBeDirectory(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfgYAML := "name: test-server\ncredentials:\n  testcred:\n    source: " + tt.source + "\n    target: /home/shed/.test\n"
+			backend, bcfg := platformTestBackend(t)
+			cfgYAML := "name: test-server\ndefault_backend: " + backend + "\ncredentials:\n  testcred:\n    source: " + tt.source + "\n    target: /home/shed/.test\n"
+			if bcfg.vz != nil {
+				cfgYAML += "vz:\n  vfkit_path: vfkit\n  kernel_path: /dev/null\n  base_rootfs: /dev/null\n  instance_dir: /tmp/test-instances\n  socket_dir: /tmp/test-sockets\n  default_cpus: 2\n  default_memory_mb: 4096\n  default_disk_gb: 20\n  console_port: 1024\n  notify_port: 1026\n"
+			}
+			if bcfg.fc != nil {
+				cfgYAML += "firecracker:\n  kernel_path: /tmp/vmlinux\n  base_rootfs: /tmp/test-rootfs.ext4\n  instance_dir: /tmp/test-instances\n  images_dir: /tmp/test-images\n"
+			}
 			cfgPath := filepath.Join(t.TempDir(), "server.yaml")
 			if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0644); err != nil {
 				t.Fatal(err)

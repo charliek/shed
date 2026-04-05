@@ -55,7 +55,7 @@ theme:
     text: Roboto
     code: Roboto Mono
   icon:
-    logo: material/docker
+    logo: material/server
 
 plugins:
   - search
@@ -90,9 +90,8 @@ nav:
   - Home: index.md
   - Getting Started:
       - Quick Start: getting-started/quick-start.md
-      - Server Setup: getting-started/server-setup.md
-      - Firecracker Setup: getting-started/fc-setup.md
       - VZ Setup (macOS): getting-started/vz-setup.md
+      - Firecracker Setup: getting-started/fc-setup.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md

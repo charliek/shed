@@ -11,8 +11,6 @@ name: localfc-dev
 http_port: 8080
 ssh_port: 2222
 
-default_image: shed-base:latest
-
 credentials:
   # Claude Code - credentials and settings
   claude:
@@ -44,8 +42,6 @@ env_file: /home/charliek/.shed/env
 
 log_level: debug
 
-enabled_backends:
-  - firecracker
 default_backend: firecracker
 
 firecracker:

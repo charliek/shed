@@ -1,6 +1,6 @@
 # Image Variants
 
-Shed provides multiple rootfs image variants for the VZ and Firecracker backends. Each variant includes the core shed infrastructure (systemd, SSH, Docker, shed-agent) but differs in the development tools installed.
+Shed provides multiple rootfs image variants for the VZ and Firecracker backends. Each variant includes the core shed infrastructure (systemd, SSH, Docker CE, shed-agent) but differs in the development tools installed.
 
 ## Available Variants
 

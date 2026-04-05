@@ -8,8 +8,9 @@ Get up and running with Shed in a few minutes.
 - A server running `shed-server` with one of:
     - **macOS Apple Silicon** — VZ backend (Virtualization.framework via vfkit)
     - **Linux with KVM** — Firecracker backend (microVMs)
-    - **Linux with Docker** — Docker backend (containers)
 - Tailscale (or other private network) connecting your machines
+
+The `detect` backend (the default) automatically selects VZ on macOS and Firecracker on Linux, so you typically don't need to specify a backend.
 
 ## Install the CLI
 
@@ -54,7 +55,7 @@ shed create my-project --local-dir ~/projects/my-project
 shed console my-project
 ```
 
-Opens a bash shell in the container. Exits when you disconnect.
+Opens a bash shell in the VM. Exits when you disconnect.
 
 ### Persistent Session
 
@@ -119,7 +120,6 @@ shed tunnels start myproj -t 3000:3000 -d
 
 - [VZ Setup (macOS)](vz-setup.md) - Set up the VZ backend on Apple Silicon
 - [Firecracker Setup (Linux)](fc-setup.md) - Set up the Firecracker backend
-- [Server Setup (Docker)](server-setup.md) - Set up the Docker backend
 - [CLI Reference](../reference/cli.md) - All available commands
 - [Configuration](../reference/configuration.md) - Client and server config options
 - [Extensions](../reference/extensions.md) - Credential brokering with the experimental image variant
