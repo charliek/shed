@@ -181,18 +181,9 @@ firecracker:
   tap_prefix: shed-tap
 ```
 
-### Configure SSH for Private Repos
+### Configure Private Repo Access
 
-To clone private repositories via SSH, create an env file with the `GIT_SSH_COMMAND`:
-
-```bash
-mkdir -p ~/.shed
-cat > ~/.shed/env << 'EOF'
-GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /home/shed/.ssh/id_ed25519
-EOF
-```
-
-**Note:** Adjust the SSH key path if you use a different key type (e.g., `id_rsa`).
+Private Git authentication is handled via shed-extensions SSH agent forwarding. For Git configuration inside the VM (e.g., `.gitconfig`), use `shed sync` to push it as a dotfile rather than mounting single files as credentials.
 
 ## 6. Create Required Directories
 

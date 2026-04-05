@@ -139,7 +139,7 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	// Start notify listener (handles health checks, plugins, credentials)
+	// Start notify listener (handles health checks, plugins)
 	s.notifyListener, err = vsock.Listen(s.notifyPort, nil)
 	if err != nil {
 		s.consoleListener.Close()
