@@ -30,7 +30,7 @@ const (
 	// DefaultConsolePort is the vsock port for console/exec connections.
 	DefaultConsolePort = 1024
 
-	// DefaultNotifyPort is the vsock port for the message channel (health, plugins, credentials).
+	// DefaultNotifyPort is the vsock port for the message channel (health, plugins).
 	DefaultNotifyPort = 1026
 
 	// DefaultHTTPPort is the localhost port for the in-VM plugin HTTP API.
@@ -59,9 +59,8 @@ type Server struct {
 
 	// Active message connection (for writing plugin messages to host).
 	// msgMu protects both the connection reference and serializes writes.
-	msgMu      sync.Mutex
-	msgConn    net.Conn
-	credCancel context.CancelFunc // cancels the active credential watcher, if any
+	msgMu   sync.Mutex
+	msgConn net.Conn
 
 	// Pending request/response tracking
 	pendingMu sync.Mutex
@@ -140,7 +139,7 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	// Start notify listener (handles health checks, plugins, credentials)
+	// Start notify listener (handles health checks, plugins)
 	s.notifyListener, err = vsock.Listen(s.notifyPort, nil)
 	if err != nil {
 		s.consoleListener.Close()
@@ -172,7 +171,7 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	// Accept message channel connections (health, plugins, credentials)
+	// Accept message channel connections (health, plugins)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()

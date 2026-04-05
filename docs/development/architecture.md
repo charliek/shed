@@ -53,7 +53,7 @@ flowchart TB
 | HTTP | 8080 | REST API for CRUD operations, server discovery |
 | SSH | 2222 | Terminal access, IDE remote connections |
 | vsock | 1024 | VM console I/O (Firecracker, VZ) |
-| vsock | 1026 | Message bus — health checks, plugins, credential sync (Firecracker, VZ) |
+| vsock | 1026 | Message bus — health checks, plugins (Firecracker, VZ) |
 
 ## Naming Conventions
 
@@ -139,7 +139,6 @@ The diagrams below show the internal implementation flow for each backend.
         CLI->>Server: POST /api/sheds {name, repo, local_dir}
         Server->>Server: Copy base rootfs to instance dir
         Server->>Server: Allocate CID, TAP device, IP address
-        Server->>Server: Classify credentials (9P vs tar)
         Server->>VM: Spawn Firecracker process
         Server->>Agent: Wait for agent health (poll vsock:1026)
         Agent-->>Server: Healthy
@@ -148,7 +147,6 @@ The diagrams below show the internal implementation flow for each backend.
             Server->>Agent: Mount 9P share at /workspace
         end
         Server->>Agent: Mount 9P credential directories
-        Server->>Agent: Transfer file credentials via tar-over-vsock
         alt repo specified
             Server->>Agent: git clone via vsock exec
         end
@@ -170,7 +168,6 @@ The diagrams below show the internal implementation flow for each backend.
 
         CLI->>Server: POST /api/sheds {name, repo, local_dir}
         Server->>Server: Copy base rootfs to instance dir
-        Server->>Server: Classify credentials (VirtioFS vs tar)
         Server->>vfkit: Spawn vfkit with VirtioFS devices
         Note right of vfkit: Devices: rootfs, local-dir share,<br/>credential directory shares
         Server->>Agent: Wait for agent health (poll vsock:1026)
@@ -179,7 +176,6 @@ The diagrams below show the internal implementation flow for each backend.
             Server->>Agent: Mount VirtioFS share at /workspace
         end
         Server->>Agent: Mount VirtioFS credential directories
-        Server->>Agent: Transfer file credentials via tar-over-vsock
         alt repo specified
             Server->>Agent: git clone via vsock exec
         end
@@ -192,20 +188,13 @@ The diagrams below show the internal implementation flow for each backend.
 
 ### Credential Mechanisms
 
-Each backend handles credentials differently based on its isolation model:
+Each backend handles credentials differently based on its isolation model. All credentials must be directories.
 
-**Docker** — Credentials are bind-mounted into the container at creation time. They persist across stop/start and reflect host changes immediately (live sync). Configured in `server.yaml` under `credentials`.
+**Docker** — Credentials are bind-mounted into the container at creation time. They persist across stop/start and reflect host changes immediately. Configured in `server.yaml` under `credentials`.
 
-**Firecracker** — Hybrid approach, matching VZ. `vmutil.ClassifyCredentials()` splits credentials by type:
+**Firecracker** — Credentials are mounted via 9P over the TAP bridge network. Each credential directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
 
-- **Directory credentials** are shared via 9P over the TAP bridge network. Each directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
-- **Single-file credentials** are transferred as gzipped tar archives over vsock on every `create` and `start`. Writable credentials (`readonly: false`) are synced bidirectionally: the agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files and pushes host-side changes to all running VMs.
-
-**VZ** — Hybrid approach. `classifyCredentials()` in `internal/vz/client.go` splits credentials by type:
-
-- **Directory credentials** get VirtioFS shares added as vfkit device arguments at VM launch, then mounted inside the guest. Changes are immediately visible on both sides (like Docker bind mounts).
-- **Single-file credentials** cannot use VirtioFS (it only supports directories), so they use the same tar-over-vsock transfer as Firecracker.
-- Writable tar-transferred credentials use the same fsnotify + vsock bidirectional sync as Firecracker.
+**VZ** — Credentials are mounted via VirtioFS. Each credential directory gets a VirtioFS share added as a vfkit device argument at VM launch, then mounted inside the guest. Changes are immediately visible on both sides.
 
 ### SSH Connection
 
@@ -246,7 +235,7 @@ Parses and generates SSH config files. Manages the shed-specific block in `~/.ss
 
 ### `internal/vmutil`
 
-Shared VM agent communication code used by both Firecracker and VZ backends. Contains the `Dialer` interface (the core abstraction differing between backends), `AgentClient` (exec, health checks), `NotifyConn` (persistent auto-reconnecting connections), provisioning, and credential transfer/sync. No build tags — all platform-specificity lives in the `Dialer` implementations.
+Shared VM agent communication code used by both Firecracker and VZ backends. Contains the `Dialer` interface (the core abstraction differing between backends), `AgentClient` (exec, health checks), `NotifyConn` (persistent auto-reconnecting connections), and provisioning. No build tags -- all platform-specificity lives in the `Dialer` implementations.
 
 ### `internal/firecracker`
 
@@ -258,7 +247,7 @@ VZ backend (macOS Apple Silicon only): VM lifecycle via vfkit subprocess, NAT ne
 
 ### `internal/plugin`
 
-Extension/plugin message bus. Defines the message envelope, namespace registry, bridge (connects API to per-shed vsock connections), and credential sync types. See [Extensions](../reference/extensions.md).
+Extension/plugin message bus. Defines the message envelope, namespace registry, and bridge (connects API to per-shed vsock connections). See [Extensions](../reference/extensions.md).
 
 ### `internal/agentproto`
 

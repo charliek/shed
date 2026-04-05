@@ -11,21 +11,17 @@ import (
 )
 
 func TestMessageHandlerOnConnect(t *testing.T) {
-	setup := &plugin.CredentialSetupPayload{
-		Credentials: map[string]string{"gh": "/home/shed/.config/gh"},
-	}
-	handler := NewMessageHandler(setup, nil, nil, nil)
+	handler := NewMessageHandler(nil, nil)
 
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
 
-	// Read both messages sent by OnConnect: health handshake + credential setup
+	// OnConnect sends a health handshake
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 
-		// First message: system:health handshake
 		msgType, data, err := agentproto.ReadMessage(server)
 		if err != nil {
 			t.Errorf("ReadMessage (health): %v", err)
@@ -45,27 +41,6 @@ func TestMessageHandlerOnConnect(t *testing.T) {
 		if healthEnv.Type != plugin.MessageTypeRequest {
 			t.Errorf("health type = %q, want %q", healthEnv.Type, plugin.MessageTypeRequest)
 		}
-
-		// Second message: system:credentials setup
-		msgType, data, err = agentproto.ReadMessage(server)
-		if err != nil {
-			t.Errorf("ReadMessage (creds): %v", err)
-			return
-		}
-		if msgType != agentproto.MsgTypePluginMessage {
-			t.Errorf("creds msgType = 0x%02x, want 0x%02x", msgType, agentproto.MsgTypePluginMessage)
-		}
-		var credEnv plugin.Envelope
-		if err := json.Unmarshal(data, &credEnv); err != nil {
-			t.Errorf("unmarshal creds: %v", err)
-			return
-		}
-		if credEnv.Namespace != plugin.NamespaceCredentials {
-			t.Errorf("creds namespace = %q, want %q", credEnv.Namespace, plugin.NamespaceCredentials)
-		}
-		if credEnv.Type != plugin.MessageTypeRequest {
-			t.Errorf("creds type = %q, want %q", credEnv.Type, plugin.MessageTypeRequest)
-		}
 	}()
 
 	if err := handler.OnConnect(client); err != nil {
@@ -75,73 +50,9 @@ func TestMessageHandlerOnConnect(t *testing.T) {
 	<-done
 }
 
-func TestMessageHandlerOnConnectNoCreds(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil, nil)
-
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-
-	// OnConnect always sends a health handshake, even with no credentials
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		msgType, data, err := agentproto.ReadMessage(server)
-		if err != nil {
-			t.Errorf("ReadMessage: %v", err)
-			return
-		}
-		if msgType != agentproto.MsgTypePluginMessage {
-			t.Errorf("msgType = 0x%02x, want 0x%02x", msgType, agentproto.MsgTypePluginMessage)
-		}
-		var env plugin.Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			t.Errorf("unmarshal: %v", err)
-			return
-		}
-		if env.Namespace != plugin.NamespaceHealth {
-			t.Errorf("namespace = %q, want %q", env.Namespace, plugin.NamespaceHealth)
-		}
-	}()
-
-	if err := handler.OnConnect(client); err != nil {
-		t.Fatalf("OnConnect with nil cred setup: %v", err)
-	}
-
-	<-done
-}
-
-func TestMessageHandlerDispatchCredentialChanged(t *testing.T) {
-	var gotCred string
-	var gotFiles []string
-	handler := NewMessageHandler(nil, func(cred string, files []string) {
-		gotCred = cred
-		gotFiles = files
-	}, nil, nil)
-
-	changed := plugin.CredentialChangedPayload{
-		Credential: "gh",
-		Files:      []string{"hosts.yml"},
-	}
-	changedData, _ := json.Marshal(changed)
-	env := plugin.NewEnvelope(plugin.NamespaceCredentials, plugin.MessageTypeEvent, changedData)
-	data, _ := json.Marshal(env)
-
-	if err := handler.OnMessage(agentproto.MsgTypePluginMessage, data); err != nil {
-		t.Fatalf("OnMessage credential changed: %v", err)
-	}
-
-	if gotCred != "gh" {
-		t.Errorf("credential = %q, want %q", gotCred, "gh")
-	}
-	if len(gotFiles) != 1 || gotFiles[0] != "hosts.yml" {
-		t.Errorf("files = %v, want [hosts.yml]", gotFiles)
-	}
-}
-
 func TestMessageHandlerDispatchHealthEvent(t *testing.T) {
 	var received *plugin.Envelope
-	handler := NewMessageHandler(nil, nil, func(env *plugin.Envelope) {
+	handler := NewMessageHandler(func(env *plugin.Envelope) {
 		received = env
 	}, nil)
 
@@ -164,7 +75,7 @@ func TestMessageHandlerDispatchHealthEvent(t *testing.T) {
 
 func TestMessageHandlerHealthEventNotForwardedToPluginFn(t *testing.T) {
 	pluginCalled := false
-	handler := NewMessageHandler(nil, nil, nil, func(env *plugin.Envelope) {
+	handler := NewMessageHandler(nil, func(env *plugin.Envelope) {
 		pluginCalled = true
 	})
 
@@ -184,7 +95,7 @@ func TestMessageHandlerHealthEventNotForwardedToPluginFn(t *testing.T) {
 
 func TestMessageHandlerDispatchPluginMessage(t *testing.T) {
 	var received *plugin.Envelope
-	handler := NewMessageHandler(nil, nil, nil, func(env *plugin.Envelope) {
+	handler := NewMessageHandler(nil, func(env *plugin.Envelope) {
 		received = env
 	})
 
@@ -204,7 +115,7 @@ func TestMessageHandlerDispatchPluginMessage(t *testing.T) {
 }
 
 func TestMessageHandlerUnknownTypeLogged(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil, nil)
+	handler := NewMessageHandler(nil, nil)
 
 	// Should not error, just log
 	if err := handler.OnMessage(0xFF, []byte("unknown")); err != nil {
@@ -213,7 +124,7 @@ func TestMessageHandlerUnknownTypeLogged(t *testing.T) {
 }
 
 func TestMessageHandlerSendPluginMessage(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil, nil)
+	handler := NewMessageHandler(nil, nil)
 
 	client, server := net.Pipe()
 	defer client.Close()
@@ -260,7 +171,7 @@ func TestMessageHandlerSendPluginMessage(t *testing.T) {
 }
 
 func TestMessageHandlerSendNoConnection(t *testing.T) {
-	handler := NewMessageHandler(nil, nil, nil, nil)
+	handler := NewMessageHandler(nil, nil)
 
 	env := plugin.NewEnvelope("op", plugin.MessageTypeResponse, nil)
 	err := handler.SendPluginMessage(env)

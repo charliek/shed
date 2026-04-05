@@ -156,7 +156,7 @@ func TestCheckHealthWrongNamespace(t *testing.T) {
 			var env plugin.Envelope
 			json.Unmarshal(data, &env)
 			// Respond with wrong namespace
-			resp := plugin.NewResponse(env.ID, plugin.NamespaceCredentials, nil)
+			resp := plugin.NewResponse(env.ID, "system:other", nil)
 			respData, _ := json.Marshal(resp)
 			agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, respData)
 		},

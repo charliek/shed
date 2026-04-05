@@ -55,30 +55,17 @@ shed delete myproject --force
 
 ## Credentials
 
-Firecracker VMs use a hybrid approach for credentials, matching the VZ backend behavior. Credentials configured in `server.yaml` are classified by type:
+All credentials configured in `server.yaml` are mounted into Firecracker VMs via 9P over the TAP bridge network. Each credential directory gets its own TCP-based 9P server. Changes are immediately visible on both sides, similar to Docker bind mounts.
 
-- **Directory credentials** (e.g., `~/.ssh/`, `~/.claude/`) are mounted via 9P over the TAP bridge network. Changes are immediately visible on both sides, similar to Docker bind mounts.
-- **Single-file credentials** (e.g., `~/.gitconfig`) are transferred as tar archives over vsock on every `create` and `start`.
-
-### How It Works
-
-1. On `shed create` and `shed start`, credentials are classified automatically:
-   - **Directory sources** are mounted via 9P over the TAP bridge network. Each directory gets its own TCP-based 9P server.
-   - **File sources** are archived on the host using tar, transferred to the VM via vsock, extracted to the target location, and ownership is set to shed:shed.
-
-2. **Read-only credentials** (`readonly: true`): Directory mounts are enforced as read-only at the mount level. Tar-transferred file credentials have no live sync; changes are not propagated until the next restart.
-3. **Writable credentials** (`readonly: false`): Directory mounts reflect changes immediately in both directions. Writable tar-transferred file credentials are synced bidirectionally: the agent watches target paths with fsnotify and sends change notifications to the host over vsock port 1026. The host pulls changed files and pushes host-side changes to all running VMs. Echo suppression (2-second cooldown) prevents changes from bouncing back.
+Read-only credentials (`readonly: true`) are enforced as read-only at the mount level. Writable credentials (`readonly: false`) reflect changes immediately in both directions.
 
 ### Verifying Credentials
 
 ```bash
-# Check SSH keys were transferred
-shed exec myproject -- ls -la /home/shed/.ssh/
+# Check credential directories were mounted
+shed exec myproject -- ls -la /home/shed/.claude/
 
-# Check git config
-shed exec myproject -- cat /home/shed/.gitconfig
-
-# Test SSH access to GitHub
+# Test SSH access to GitHub (with shed-extensions SSH agent forwarding)
 shed exec myproject -- ssh -T git@github.com
 ```
 
@@ -102,7 +89,7 @@ Shed supports automatic provisioning via `.shed/provision.yaml` in your reposito
 
 ### Provisioning Flow
 
-Provisioning hooks work the same as all backends — credentials are transferred via tar-over-vsock, then hooks execute via vsock. For the full sequence of operations during create, start, stop, and delete (including when credentials and mounts are set up relative to hooks), see [Shed Lifecycle](provisioning.md#shed-lifecycle).
+Provisioning hooks work the same as all backends — credentials are mounted via 9P, then hooks execute via vsock. For the full sequence of operations during create, start, stop, and delete (including when credentials and mounts are set up relative to hooks), see [Shed Lifecycle](provisioning.md#shed-lifecycle).
 
 ### Skip Provisioning
 

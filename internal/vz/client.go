@@ -128,15 +128,12 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	// Classify credentials before VM creation so VirtioFS devices are
-	// included in the vfkit command-line arguments at launch time.
-	var virtioFSCreds, tarOnlyCreds map[string]config.MountConfig
-	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
-		virtioFSCreds, tarOnlyCreds = vmutil.ClassifyCredentials(c.serverCfg.Credentials)
-	}
+	// Filter credentials to those with existing source directories.
+	// Non-existent sources are skipped to avoid vfkit VirtioFS failures.
+	dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
 
 	vm := CreateVM(meta, c.cfg)
-	vm.credentialShares = buildCredentialShares(virtioFSCreds)
+	vm.credentialShares = buildCredentialShares(dirCreds)
 
 	backend.Progress(ctx, "vm", "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
@@ -176,8 +173,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	// Mount and transfer credentials
-	c.credMgr.SetupCredentials(ctx, agent, req.Name, virtioFSCreds, tarOnlyCreds, c.mountVirtioFSCredential)
+	// Mount credentials
+	c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mountVirtioFSCredential)
 
 	// Clone repo if specified (skip when using local dir)
 	if req.Repo != "" && req.LocalDir == "" {
@@ -329,15 +326,11 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		meta.PID = 0
 	}
 
-	// Classify credentials before VM creation so VirtioFS devices are
-	// included in the vfkit command-line arguments at launch time.
-	var virtioFSCreds, tarOnlyCreds map[string]config.MountConfig
-	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
-		virtioFSCreds, tarOnlyCreds = vmutil.ClassifyCredentials(c.serverCfg.Credentials)
-	}
+	// Filter credentials to those with existing source directories.
+	dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
 
 	vm := CreateVM(meta, c.cfg)
-	vm.credentialShares = buildCredentialShares(virtioFSCreds)
+	vm.credentialShares = buildCredentialShares(dirCreds)
 
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start VM: %w", err)
@@ -368,8 +361,8 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		}
 	}
 
-	// Mount and transfer credentials
-	c.credMgr.SetupCredentials(ctx, agent, name, virtioFSCreds, tarOnlyCreds, c.mountVirtioFSCredential)
+	// Mount credentials
+	c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, c.mountVirtioFSCredential)
 
 	// Run startup hook only (not install)
 	provisioner := vmutil.NewProvisioner(agent, name)

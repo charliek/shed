@@ -136,8 +136,6 @@ func (s *Server) handlePluginMessage(conn net.Conn, data []byte) {
 		switch env.Namespace {
 		case plugin.NamespaceHealth:
 			s.handleHealthRequest(conn, &env)
-		case plugin.NamespaceCredentials:
-			s.handleCredentialSetup(&env)
 		default:
 			log.Printf("Plugin request from host: namespace=%s (no local handler)", env.Namespace)
 		}
@@ -160,26 +158,6 @@ func (s *Server) handleHealthRequest(conn net.Conn, env *plugin.Envelope) {
 	if err := writeMessage(conn, MsgTypePluginMessage, data); err != nil {
 		log.Printf("Failed to write health response: %v", err)
 	}
-}
-
-// handleCredentialSetup processes a system:credentials setup request.
-func (s *Server) handleCredentialSetup(env *plugin.Envelope) {
-	var setup plugin.CredentialSetupPayload
-	if err := json.Unmarshal(env.Payload, &setup); err != nil {
-		log.Printf("Invalid credential setup payload: %v", err)
-		return
-	}
-
-	// Cancel any previous credential watcher before starting a new one.
-	// This prevents goroutine/fd leaks on reconnect.
-	s.stopCredentialWatcher()
-
-	ctx, cancel := context.WithCancel(s.ctx)
-	s.msgMu.Lock()
-	s.credCancel = cancel
-	s.msgMu.Unlock()
-
-	go s.startCredentialWatcher(ctx, &setup)
 }
 
 // deliverResponse routes a response envelope to the pending request channel.
@@ -224,18 +202,7 @@ func (s *Server) clearMessageConnIfCurrent(conn net.Conn) {
 	s.msgConn = nil
 	s.msgMu.Unlock()
 
-	s.stopCredentialWatcher()
 	s.clearPending()
-}
-
-// stopCredentialWatcher cancels any running credential watcher goroutine.
-func (s *Server) stopCredentialWatcher() {
-	s.msgMu.Lock()
-	if s.credCancel != nil {
-		s.credCancel()
-		s.credCancel = nil
-	}
-	s.msgMu.Unlock()
 }
 
 // clearPending closes and removes all pending request channels.
@@ -270,42 +237,4 @@ func (s *Server) sendPluginMessage(env *plugin.Envelope) error {
 	defer func() { _ = s.msgConn.SetWriteDeadline(time.Time{}) }()
 
 	return writeMessage(s.msgConn, MsgTypePluginMessage, data)
-}
-
-// startCredentialWatcher handles a system:credentials setup request.
-// It creates a credential watcher that sends change events as plugin envelopes.
-func (s *Server) startCredentialWatcher(ctx context.Context, setup *plugin.CredentialSetupPayload) {
-	if len(setup.Credentials) == 0 {
-		log.Printf("Credential setup: no credentials to watch")
-		return
-	}
-
-	log.Printf("Credential setup: watching %d credentials", len(setup.Credentials))
-	for name, path := range setup.Credentials {
-		log.Printf("  %s → %s", name, path)
-	}
-
-	// Send function wraps changes in a plugin envelope
-	sendFn := func(credName string, files []string) error {
-		payload := plugin.CredentialChangedPayload{
-			Credential: credName,
-			Files:      files,
-		}
-		payloadData, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		env := plugin.NewEnvelope(plugin.NamespaceCredentials, plugin.MessageTypeEvent, payloadData)
-		return s.sendPluginMessage(env)
-	}
-
-	cw, err := newCredentialWatcher(sendFn, setup.Credentials, setup.Excludes)
-	if err != nil {
-		log.Printf("Failed to create credential watcher: %v", err)
-		return
-	}
-
-	// Run until context is cancelled (connection closes or new setup replaces this watcher)
-	cw.start(ctx.Done())
-	log.Printf("Credential watcher stopped")
 }

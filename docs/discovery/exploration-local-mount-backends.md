@@ -32,19 +32,12 @@ Currently, shed creates isolated workspaces (Docker volumes or ext4 images) and 
 - Bind mounts are native — Docker Desktop handles the host↔VM layer transparently
 
 ### VZ Backend
-- Workspace: ext4 rootfs image, no shared filesystem
-- Credentials: Bidirectional sync via vsock + fsnotify + tar archives
-  - Host→VM: `CredentialTransfer` (tar over agent exec)
-  - VM→Host: `CredentialNotifyListener` (fsnotify → `FileChangedMessage` → tar pull)
-  - 500ms debounce, 2s echo suppression, 50MB archive / 10MB file limits
-- No VirtioFS or 9p support currently
+- Workspace: ext4 rootfs image, or VirtioFS mount with `--local-dir`
+- Credentials: Mounted via VirtioFS (live filesystem sharing)
 - vfkit subprocess manages VM lifecycle
 
 ### Existing Sync Infrastructure
 - `internal/sync/`: Client-side SSH+tar transfer (host→container only, not bidirectional)
-- `internal/vmutil/credentials_watch.go`: Host-side fsnotify watcher with debounce
-- `internal/vmutil/credentials_notify.go`: VM→host notification listener with security validation
-- `cmd/shed-agent/notify.go`: Guest-side fsnotify watcher for credential directories
 - `internal/agentproto/`: Framed message protocol over vsock (16MB max frame)
 
 ---
@@ -176,8 +169,10 @@ mount -t virtiofs workspace /home/shed/workspace
 
 ## Approach 3: Extend Credential Sync to Workspace (VZ Backend)
 
-### How It Works
-Reuse the existing bidirectional credential sync infrastructure (`fsnotify` + tar over vsock) but apply it to the entire workspace directory instead of just credentials.
+**Note:** This approach is no longer viable — the tar-based credential sync infrastructure it references has been removed. Credentials now use native mounts (VirtioFS/9P) only.
+
+### How It Works (Historical)
+This approach proposed reusing the bidirectional credential sync infrastructure (fsnotify + tar over vsock) for workspace sync.
 
 ### Implementation
 Conceptually: add the local directory as a "credential" mount that happens to be the workspace:
@@ -195,7 +190,7 @@ credentials:
       - "*.pyc"
 ```
 
-The existing `CredentialWatcher` (host→VM) and `CredentialNotifyListener` (VM→host) would handle sync.
+The credential sync infrastructure (now removed) would have handled sync.
 
 ### What Would Need to Change
 

@@ -11,16 +11,6 @@ ssh_port: 2222
 default_image: shed-base:latest
 
 credentials:
-  git_ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-
-  git_config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
-
   claude:
     source: ~/.shed/mounts/claude
     target: /home/shed/.claude
