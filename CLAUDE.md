@@ -13,7 +13,7 @@ make build          # Build all binaries (shed, shed-server, shed-agent) into bi
 make test           # Run all unit tests
 make lint           # Run golangci-lint
 make fmt            # Format code with gofmt
-make check          # Run test + lint
+make check          # Run lint + test
 make coverage       # Tests with coverage report
 ```
 
@@ -40,7 +40,7 @@ Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to se
 - **Formatting**: `gofmt` — run `make fmt` before committing
 - **Linting**: `golangci-lint` — run `make lint`
 - **Tests**: Table-driven tests with `t.Run()`. Place `_test.go` files alongside source.
-- **Build tags**: `linux` for Firecracker code, `darwin` for VZ code, `e2e` for VM integration tests
+- **Build tags**: `linux` for Firecracker code, `darwin` for VZ code, `e2e` for Firecracker VM tests (requires KVM)
 - **Config types**: All in `internal/config/types.go`
 - **Workspace path**: `/workspace` inside VMs (see `config.WorkspacePath`)
 - **VM user**: `shed` (UID 1000) with passwordless sudo

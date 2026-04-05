@@ -194,10 +194,10 @@ func TestValidateShedName(t *testing.T) {
 
 ### E2E Tests
 
-Firecracker e2e tests exercise the full VM lifecycle. They require KVM access and root privileges:
+End-to-end tests exercise the full VM lifecycle using a running shed-server:
 
 ```bash
-sudo go test -v -tags=e2e ./e2e/firecracker/...
+./scripts/e2e-test.sh --backend firecracker
 ```
 
 ## Continuous Integration

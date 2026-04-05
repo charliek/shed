@@ -10,7 +10,7 @@ Get up and running with Shed in a few minutes.
     - **Linux with KVM** — Firecracker backend (microVMs)
 - Tailscale (or other private network) connecting your machines
 
-The `detect` backend (the default) automatically selects VZ on macOS and Firecracker on Linux, so you typically don't need to specify a backend.
+The `detect` backend (the default) automatically selects VZ on macOS Apple Silicon and Firecracker on Linux, so you typically don't need to specify a backend.
 
 ## Install the CLI
 
