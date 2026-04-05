@@ -278,23 +278,7 @@ Deleting a cached image does not affect running sheds — each shed uses its own
 
 Image conversion requires Docker with privileged container support. The ext4 creation step uses a privileged Docker container for loop mounting.
 
-### VZ Kernel Compatibility
-
-For VZ, the kernel and initrd on disk must match the kernel modules in the rootfs image. When using `shed image build --from` with a published image, the rootfs is converted to ext4 but the kernel and initrd are **not** automatically updated. If the published image contains a different kernel version than what's on disk, the VM may fail to boot.
-
-To extract a matching kernel from a published image:
-
-```bash
-OUTPUT_DIR="$HOME/Library/Application Support/shed/vz"
-docker run --rm --platform linux/arm64 --entrypoint /bin/bash \
-    -v "$OUTPUT_DIR:/output" \
-    ghcr.io/charliek/shed-vz-base:{version} -c '
-    zcat /boot/vmlinuz-* > /output/vmlinux
-    cp /boot/initrd.img-* /output/initrd.img
-'
-```
-
-This is not needed when building from source with `build-vz-rootfs.sh`, which extracts the kernel automatically. Firecracker also extracts the kernel during image conversion — verify that `kernel_path` matches the converted image when using `shed image build --from`.
+For VZ images, the kernel and initrd are automatically extracted alongside the rootfs during conversion. Both `shed image build --from` and the auto-pull on `shed create` handle this — no manual kernel extraction is needed.
 
 ## Disk Space
 

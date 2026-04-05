@@ -39,7 +39,7 @@ type ConvertOptions struct {
 	Platform string
 
 	// ExtractKernel controls whether the kernel should be extracted from the Docker image.
-	// If true and the kernel doesn't already exist in OutputDir, it is extracted.
+	// If true, the kernel is always extracted to OutputDir, overwriting any existing file.
 	ExtractKernel bool
 
 	// NeedsInitrd controls whether an initrd should be extracted alongside the kernel.
@@ -152,22 +152,15 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 	if opts.ExtractKernel {
 		kernelPath := filepath.Join(opts.OutputDir, "vmlinux")
 
-		if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
-			if err := extractKernel(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
-				return nil, fmt.Errorf("failed to extract kernel: %w", err)
-			}
-			if _, err := os.Stat(kernelPath); err != nil {
-				return nil, fmt.Errorf("kernel extraction succeeded but file not found at %s", kernelPath)
-			}
+		if err := extractKernel(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
+			return nil, fmt.Errorf("failed to extract kernel: %w", err)
 		}
 		result.KernelPath = kernelPath
 
 		if opts.NeedsInitrd {
 			initrdPath := filepath.Join(opts.OutputDir, "initrd.img")
-			if _, err := os.Stat(initrdPath); os.IsNotExist(err) {
-				if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
-					return nil, fmt.Errorf("failed to extract initrd: %w", err)
-				}
+			if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
+				return nil, fmt.Errorf("failed to extract initrd: %w", err)
 			}
 			result.InitrdPath = initrdPath
 		}
