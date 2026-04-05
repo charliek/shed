@@ -87,6 +87,13 @@ func (s *Server) readMessageLoop(conn net.Conn) {
 func (s *Server) runHeartbeat(ctx context.Context) {
 	sendHeartbeat := func() error {
 		payload := plugin.HeartbeatPayload{StartedAt: s.startedAt}
+
+		// Include per-extension health if extensions are enabled.
+		extHealth := s.collectExtensionHealth()
+		if len(extHealth) > 0 {
+			payload.Extensions = extHealth
+		}
+
 		payloadData, err := json.Marshal(payload)
 		if err != nil {
 			return fmt.Errorf("marshal heartbeat: %w", err)
@@ -148,6 +155,9 @@ func (s *Server) handlePluginMessage(conn net.Conn, data []byte) {
 // to the request connection. This avoids the global sendPluginMessage/msgConn
 // path, which is important during startup when transient health poll connections
 // briefly occupy msgConn.
+//
+// If the request includes a HealthRequestPayload with extension namespaces,
+// the agent activates the corresponding systemd units (idempotent).
 func (s *Server) handleHealthRequest(conn net.Conn, env *plugin.Envelope) {
 	resp := plugin.NewResponse(env.ID, plugin.NamespaceHealth, nil)
 	data, err := json.Marshal(resp)
@@ -157,6 +167,20 @@ func (s *Server) handleHealthRequest(conn net.Conn, env *plugin.Envelope) {
 	}
 	if err := writeMessage(conn, MsgTypePluginMessage, data); err != nil {
 		log.Printf("Failed to write health response: %v", err)
+	}
+
+	// Parse the optional extensions payload from the health handshake.
+	// Transient health polls (WaitForHealth/CheckHealth) send nil payload —
+	// only the persistent message channel handshake includes extensions.
+	if len(env.Payload) > 0 {
+		var reqPayload plugin.HealthRequestPayload
+		if err := json.Unmarshal(env.Payload, &reqPayload); err != nil {
+			log.Printf("Failed to parse health request payload: %v", err)
+			return
+		}
+		if len(reqPayload.Extensions) > 0 {
+			s.enableExtensions(reqPayload.Extensions)
+		}
 	}
 }
 

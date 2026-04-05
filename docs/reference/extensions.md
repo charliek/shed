@@ -226,11 +226,100 @@ GET /api/plugins/sheds
 }
 ```
 
+## Extension Management
+
+Extensions can be selectively enabled via server configuration. The agent reads extension manifests from the VM image and activates only the configured ones.
+
+### Server Configuration
+
+```yaml
+extensions:
+  enabled:
+    - ssh-agent
+    - aws-credentials
+```
+
+When `extensions` is omitted from the config, no extensions are activated.
+
+### Extension Manifests
+
+Each extension provides a manifest file in `/etc/shed-extensions.d/`:
+
+```yaml
+# /etc/shed-extensions.d/ssh-agent.yaml
+namespace: ssh-agent
+systemd_unit: shed-ext-ssh-agent.service
+description: SSH agent forwarding via shed message bus
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `namespace` | Yes | Plugin namespace (must match server config) |
+| `systemd_unit` | Yes | Systemd unit to enable |
+| `description` | No | Human-readable description |
+
+### Activation Flow
+
+1. Server sends the enabled extensions list in the health handshake
+2. Agent reads manifests from `/etc/shed-extensions.d/`
+3. Agent runs `systemctl enable --now` for each enabled extension
+4. Extensions not in the enabled list remain inactive
+
+Extensions are **enable-only** — they persist until VM restart. Runtime disabling is not supported.
+
+### Extension Health
+
+The agent periodically checks each enabled extension at two levels:
+
+- **guest**: Is the systemd service running? (`systemctl is-active`)
+- **host**: Can the extension reach the host agent end-to-end? (bus ping round-trip)
+
+Health status is included in heartbeats and visible via `shed list -vv`:
+
+```
+Extensions:
+  aws-credentials:     guest=running  host=connected
+  ssh-agent:           guest=running  host=connected
+```
+
+### Naming Convention
+
+| Component | Pattern | Example |
+|-----------|---------|---------|
+| Guest binary | `shed-ext-<namespace>` | `shed-ext-ssh-agent` |
+| Systemd unit | `shed-ext-<namespace>.service` | `shed-ext-ssh-agent.service` |
+| Manifest | `<namespace>.yaml` | `ssh-agent.yaml` |
+| Host binary | `shed-ext-<purpose>-host` | `shed-ext-credentials-host` |
+
+### SDK
+
+The `github.com/charliek/shed/sdk` Go module provides shared types and clients for building extensions:
+
+- `sdk.Envelope` — Universal message format
+- `sdk.BusClient` — Guest-side HTTP publisher to shed-agent
+- `sdk.HostClient` — Host-side SSE subscriber to shed-server
+
+```go
+import "github.com/charliek/shed/sdk"
+
+// Guest-side: publish a request
+bus := sdk.NewBusClient(sdk.DefaultPublishURL, sdk.DefaultBusTimeout)
+resp, err := bus.Publish(ctx, "my-namespace", payload)
+
+// Host-side: subscribe to messages
+host := sdk.NewHostClient(sdk.WithServerURL("http://localhost:8080"))
+ch := host.Subscribe(ctx, "my-namespace")
+for env := range ch {
+    // handle message, send response
+    host.Respond(ctx, "my-namespace", responseEnv)
+}
+```
+
 ## shed-extensions
 
-The `experimental` image variant comes with [shed-extensions](https://charliek.github.io/shed-extensions/) pre-installed, providing SSH agent forwarding and AWS credential proxying. Create a shed with `--image experimental` and run `shed-host-agent` on the host to enable credential brokering.
+The `experimental` image variant comes with [shed-extensions](https://charliek.github.io/shed-extensions/) pre-installed, providing SSH agent forwarding and AWS credential proxying. Create a shed with `--image experimental`, enable extensions in your server config, and run the host agent to enable credential brokering.
 
-shed-extensions is a concrete implementation built on this plugin bus. The extensions.md page documents the bus itself; see the [shed-extensions documentation](https://charliek.github.io/shed-extensions/) for credential brokering setup and usage.
+shed-extensions is a concrete implementation built on this plugin bus. See the [shed-extensions documentation](https://charliek.github.io/shed-extensions/) for credential brokering setup and usage.
 
 ## Use Cases
 

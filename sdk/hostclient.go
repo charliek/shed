@@ -1,0 +1,197 @@
+package sdk
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+)
+
+const (
+	defaultServerURL    = "http://localhost:8080"
+	maxReconnectBackoff = 30 * time.Second
+	initialBackoff      = 1 * time.Second
+)
+
+// HostClient connects to shed-server's plugin API to receive and respond to messages.
+// Used by host-side extension binaries.
+type HostClient struct {
+	serverURL  string
+	httpClient *http.Client
+	logger     *slog.Logger
+}
+
+// HostClientOption configures a HostClient.
+type HostClientOption func(*HostClient)
+
+// WithServerURL sets the shed-server URL.
+func WithServerURL(url string) HostClientOption {
+	return func(c *HostClient) {
+		c.serverURL = strings.TrimRight(url, "/")
+	}
+}
+
+// WithHTTPClient sets a custom HTTP client.
+func WithHTTPClient(hc *http.Client) HostClientOption {
+	return func(c *HostClient) {
+		c.httpClient = hc
+	}
+}
+
+// WithLogger sets a custom logger.
+func WithLogger(logger *slog.Logger) HostClientOption {
+	return func(c *HostClient) {
+		c.logger = logger
+	}
+}
+
+// NewHostClient creates a new HostClient with the given options.
+func NewHostClient(opts ...HostClientOption) *HostClient {
+	c := &HostClient{
+		serverURL:  defaultServerURL,
+		httpClient: &http.Client{},
+		logger:     slog.Default(),
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// Subscribe connects to the SSE stream for the given namespace and returns a
+// channel of envelopes. The channel is closed when the context is cancelled
+// or the connection is permanently lost. Reconnects automatically on transient
+// failures with exponential backoff.
+func (c *HostClient) Subscribe(ctx context.Context, namespace string) <-chan *Envelope {
+	ch := make(chan *Envelope, 32)
+	go c.subscribeLoop(ctx, namespace, ch)
+	return ch
+}
+
+func (c *HostClient) subscribeLoop(ctx context.Context, namespace string, ch chan<- *Envelope) {
+	defer close(ch)
+
+	backoff := initialBackoff
+	for {
+		start := time.Now()
+		err := c.streamMessages(ctx, namespace, ch)
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Reset backoff if the connection was stable for a while
+		if time.Since(start) > 60*time.Second {
+			backoff = initialBackoff
+		}
+
+		c.logger.Warn("SSE connection lost, reconnecting",
+			"namespace", namespace,
+			"error", err,
+			"backoff", backoff,
+		)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, maxReconnectBackoff)
+	}
+}
+
+func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch chan<- *Envelope) error {
+	url := fmt.Sprintf("%s/api/plugins/listeners/%s/messages", c.serverURL, namespace)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("connecting: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+	}
+
+	c.logger.Info("SSE connected", "namespace", namespace)
+
+	scanner := bufio.NewScanner(resp.Body)
+	var dataBuf bytes.Buffer
+	dataLines := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if data, ok := strings.CutPrefix(line, "data:"); ok {
+			data = strings.TrimSpace(data)
+			// Per SSE spec, multiple data: lines are joined with newlines
+			if dataLines > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(data)
+			dataLines++
+			continue
+		}
+
+		// Empty line signals end of event
+		if line == "" && dataBuf.Len() > 0 {
+			var env Envelope
+			if err := json.Unmarshal(dataBuf.Bytes(), &env); err != nil {
+				c.logger.Warn("failed to parse SSE event", "error", err)
+			} else {
+				select {
+				case ch <- &env:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			dataBuf.Reset()
+			dataLines = 0
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("reading stream: %w", err)
+	}
+	return errors.New("stream closed by server")
+}
+
+// Respond sends a response envelope back to shed-server for routing to the
+// originating shed.
+func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelope) error {
+	url := fmt.Sprintf("%s/api/plugins/listeners/%s/respond", c.serverURL, namespace)
+
+	body, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshaling response: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("sending response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}

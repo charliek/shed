@@ -25,6 +25,9 @@ type MessageHandler struct {
 	// Callback for incoming plugin messages from the VM.
 	pluginFn func(env *plugin.Envelope)
 
+	// Extension namespaces the server wants the agent to enable.
+	enabledExtensions []string
+
 	// Connection captured in OnConnect, used for writes.
 	conn    net.Conn
 	writeMu sync.Mutex
@@ -33,25 +36,38 @@ type MessageHandler struct {
 // NewMessageHandler creates a handler for the generalized message channel.
 //   - healthFn: called for system:health heartbeat events (nil if no health tracking)
 //   - pluginFn: called for incoming plugin messages from the VM
-func NewMessageHandler(healthFn func(env *plugin.Envelope), pluginFn func(env *plugin.Envelope)) *MessageHandler {
+//   - enabledExtensions: extension namespaces to include in the health handshake (nil if none)
+func NewMessageHandler(healthFn func(env *plugin.Envelope), pluginFn func(env *plugin.Envelope), enabledExtensions []string) *MessageHandler {
 	return &MessageHandler{
-		healthFn: healthFn,
-		pluginFn: pluginFn,
+		healthFn:          healthFn,
+		pluginFn:          pluginFn,
+		enabledExtensions: enabledExtensions,
 	}
 }
 
 // OnConnect implements NotifyHandler. It stores the connection and sends
 // an initial system:health request (as a handshake to trigger agent-side
-// connection promotion and heartbeats).
+// connection promotion and heartbeats). The handshake includes the list of
+// enabled extensions for the agent to activate.
 func (h *MessageHandler) OnConnect(conn net.Conn) error {
 	h.writeMu.Lock()
 	h.conn = conn
 	h.writeMu.Unlock()
 
-	// Always send a health request as the first message. This serves as a
-	// handshake that triggers the agent to promote this connection to the
-	// persistent message channel and start heartbeats.
-	healthEnv := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeRequest, nil)
+	// Build health request payload with enabled extensions.
+	var payload json.RawMessage
+	if len(h.enabledExtensions) > 0 {
+		reqPayload := plugin.HealthRequestPayload{
+			Extensions: h.enabledExtensions,
+		}
+		var err error
+		payload, err = json.Marshal(reqPayload)
+		if err != nil {
+			return fmt.Errorf("marshal health request payload: %w", err)
+		}
+	}
+
+	healthEnv := plugin.NewEnvelope(plugin.NamespaceHealth, plugin.MessageTypeRequest, payload)
 	if err := h.sendEnvelope(healthEnv); err != nil {
 		return fmt.Errorf("send health handshake: %w", err)
 	}

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -334,22 +336,23 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	if jsonFlag {
 		type shedJSON struct {
-			Name        string     `json:"name"`
-			Server      string     `json:"server"`
-			Status      string     `json:"status"`
-			CreatedAt   time.Time  `json:"created_at"`
-			Backend     string     `json:"backend,omitempty"`
-			IPAddress   string     `json:"ip_address,omitempty"`
-			CPUs        int        `json:"cpus,omitempty"`
-			MemoryMB    int        `json:"memory_mb,omitempty"`
-			Repo        string     `json:"repo,omitempty"`
-			PID         int        `json:"pid,omitempty"`
-			RootfsPath  string     `json:"rootfs_path,omitempty"`
-			LocalDir    string     `json:"local_dir,omitempty"`
-			SSH         string     `json:"ssh,omitempty"`
-			Uptime      string     `json:"uptime,omitempty"`
-			LastHealthy *time.Time `json:"last_healthy,omitempty"`
-			StartedAt   *time.Time `json:"started_at,omitempty"`
+			Name        string                                `json:"name"`
+			Server      string                                `json:"server"`
+			Status      string                                `json:"status"`
+			CreatedAt   time.Time                             `json:"created_at"`
+			Backend     string                                `json:"backend,omitempty"`
+			IPAddress   string                                `json:"ip_address,omitempty"`
+			CPUs        int                                   `json:"cpus,omitempty"`
+			MemoryMB    int                                   `json:"memory_mb,omitempty"`
+			Repo        string                                `json:"repo,omitempty"`
+			PID         int                                   `json:"pid,omitempty"`
+			RootfsPath  string                                `json:"rootfs_path,omitempty"`
+			LocalDir    string                                `json:"local_dir,omitempty"`
+			SSH         string                                `json:"ssh,omitempty"`
+			Uptime      string                                `json:"uptime,omitempty"`
+			LastHealthy *time.Time                            `json:"last_healthy,omitempty"`
+			StartedAt   *time.Time                            `json:"started_at,omitempty"`
+			Extensions  map[string]config.ExtensionHealthInfo `json:"extensions,omitempty"`
 		}
 		result := make([]shedJSON, 0, len(allSheds))
 		for _, s := range allSheds {
@@ -371,6 +374,7 @@ func runList(cmd *cobra.Command, args []string) error {
 				sj.SSH = shedSSHString(s.shed.Name, s.server)
 				sj.LastHealthy = s.shed.LastHealthy
 				sj.StartedAt = s.shed.StartedAt
+				sj.Extensions = s.shed.Extensions
 				// Use agent boot time for uptime if available, fall back to creation time
 				if s.shed.StartedAt != nil {
 					sj.Uptime = formatUptime(*s.shed.StartedAt)
@@ -415,6 +419,17 @@ func runList(cmd *cobra.Command, args []string) error {
 					fmt.Printf("Health:         %s ago\n", formatUptime(*s.shed.LastHealthy))
 				} else {
 					fmt.Printf("Health:         unknown\n")
+				}
+
+				// Show extension health (sorted for consistent output)
+				if len(s.shed.Extensions) > 0 {
+					fmt.Println()
+					fmt.Println("Extensions:")
+					names := slices.Sorted(maps.Keys(s.shed.Extensions))
+					for _, ns := range names {
+						ext := s.shed.Extensions[ns]
+						fmt.Printf("  %-20s guest=%-8s host=%s\n", ns+":", ext.Guest, ext.Host)
+					}
 				}
 			}
 

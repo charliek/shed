@@ -66,6 +66,11 @@ type Server struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan *plugin.Envelope // request ID -> response channel
 
+	// Extension management
+	extensions   map[string]*extensionState
+	extensionsMu sync.RWMutex
+	manifestDir  string // default "/etc/shed-extensions.d"
+
 	// For graceful shutdown
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -83,6 +88,7 @@ func NewServer(consolePort, notifyPort, httpPort uint32, shedName string) *Serve
 		startedAt:         time.Now(),
 		heartbeatInterval: DefaultHeartbeatInterval,
 		pending:           make(map[string]chan *plugin.Envelope),
+		manifestDir:       "/etc/shed-extensions.d",
 		ctx:               ctx,
 		cancel:            cancel,
 	}

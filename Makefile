@@ -22,9 +22,10 @@ build-server:
 build-agent:
 	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-agent ./cmd/shed-agent
 
-# Run all unit tests
+# Run all unit tests (including SDK submodule)
 test:
 	go test -v ./...
+	cd sdk && go test -v ./...
 
 # Run integration tests (requires Docker)
 test-integration:
@@ -54,17 +55,20 @@ dev-server:
 dev-cli:
 	go run ./cmd/shed $(ARGS)
 
-# Format code
+# Format code (including SDK submodule)
 fmt:
 	go fmt ./...
+	cd sdk && go fmt ./...
 
-# Run linter
+# Run linter (including SDK submodule)
 lint:
 	golangci-lint run
+	cd sdk && go vet ./...
 
-# Tidy dependencies
+# Tidy dependencies (including SDK submodule)
 tidy:
 	go mod tidy
+	cd sdk && go mod tidy
 
 # Run all checks (lint + test)
 check: lint test

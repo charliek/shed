@@ -242,6 +242,12 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 			if hs, ok := ht.Get(name); ok {
 				shed.LastHealthy = &hs.LastSeen
 				shed.StartedAt = &hs.AgentStartedAt
+				if len(hs.Extensions) > 0 {
+					shed.Extensions = make(map[string]config.ExtensionHealthInfo, len(hs.Extensions))
+					for ns, eh := range hs.Extensions {
+						shed.Extensions[ns] = config.ExtensionHealthInfo{Guest: eh.Guest, Host: eh.Host}
+					}
+				}
 			}
 		}
 	}
