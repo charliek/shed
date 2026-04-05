@@ -765,6 +765,74 @@ func TestMountConfigMatchesExcludeEmpty(t *testing.T) {
 	}
 }
 
+func TestCredentialSourceMustBeDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a file and a directory for testing
+	filePath := filepath.Join(tmpDir, "gitconfig")
+	if err := os.WriteFile(filePath, []byte("[user]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dirPath := filepath.Join(tmpDir, "ssh")
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a symlink to the directory
+	symlinkPath := filepath.Join(tmpDir, "ssh-link")
+	if err := os.Symlink(dirPath, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		source    string
+		wantError bool
+	}{
+		{
+			name:      "directory_source_accepted",
+			source:    dirPath,
+			wantError: false,
+		},
+		{
+			name:      "file_source_rejected",
+			source:    filePath,
+			wantError: true,
+		},
+		{
+			name:      "nonexistent_source_accepted",
+			source:    filepath.Join(tmpDir, "does-not-exist"),
+			wantError: false,
+		},
+		{
+			name:      "symlink_to_directory_accepted",
+			source:    symlinkPath,
+			wantError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfgYAML := "name: test-server\ncredentials:\n  testcred:\n    source: " + tt.source + "\n    target: /home/shed/.test\n"
+			cfgPath := filepath.Join(t.TempDir(), "server.yaml")
+			if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := LoadServerConfigFromPath(cfgPath)
+			if tt.wantError && err == nil {
+				t.Error("expected error for file source, got nil")
+			}
+			if !tt.wantError && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if tt.wantError && err != nil && !strings.Contains(err.Error(), "not a directory") {
+				t.Errorf("error should mention 'not a directory', got: %v", err)
+			}
+		})
+	}
+}
+
 func TestVZConfigApplyDefaults(t *testing.T) {
 	cfg := &VZConfig{}
 	cfg.applyDefaults()

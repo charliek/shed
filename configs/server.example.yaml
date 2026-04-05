@@ -26,16 +26,6 @@ default_backend: docker
 # Each entry creates a bind mount from host to container
 # Paths support ~ expansion
 credentials:
-  git_ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-
-  git_config:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
-    readonly: true
-
   claude:
     source: ~/.claude
     target: /home/shed/.claude

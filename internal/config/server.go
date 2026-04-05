@@ -680,6 +680,18 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 			return nil, fmt.Errorf("credential %q source path must not contain commas: %s", name, source)
 		}
 
+		// Credential sources must be directories. Single-file credentials are
+		// no longer supported — use shed sync for individual files instead.
+		// Missing sources are OK (skipped at runtime with a warning).
+		if info, err := os.Stat(source); err == nil && !info.IsDir() {
+			return nil, fmt.Errorf(
+				"credential %q source %s is a file, not a directory; "+
+					"only directory credentials are supported — "+
+					"use 'shed sync' for single-file configs like .gitconfig",
+				name, source,
+			)
+		}
+
 		mount.Source = source
 		mount.Target = target
 		cfg.Credentials[name] = mount
