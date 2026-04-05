@@ -851,7 +851,7 @@ func TestCredentialSourceMustBeDirectory(t *testing.T) {
 				cfgYAML += "vz:\n  vfkit_path: vfkit\n  kernel_path: /dev/null\n  base_rootfs: /dev/null\n  instance_dir: /tmp/test-instances\n  socket_dir: /tmp/test-sockets\n  default_cpus: 2\n  default_memory_mb: 4096\n  default_disk_gb: 20\n  console_port: 1024\n  notify_port: 1026\n"
 			}
 			if bcfg.fc != nil {
-				cfgYAML += "firecracker:\n  kernel_path: /tmp/vmlinux\n  base_rootfs: /tmp/test-rootfs.ext4\n  instance_dir: /tmp/test-instances\n  images_dir: /tmp/test-images\n"
+				cfgYAML += "firecracker:\n  kernel_path: /dev/null\n  base_rootfs: /dev/null\n  instance_dir: /tmp/test-instances\n  socket_dir: /tmp/test-sockets\n  default_cpus: 2\n  default_memory_mb: 4096\n  default_disk_gb: 20\n  vsock_base_cid: 100\n  console_port: 1024\n  notify_port: 1026\n  bridge_name: shed-br0\n  bridge_cidr: 172.30.0.1/24\n  tap_prefix: shed-tap\n"
 			}
 			cfgPath := filepath.Join(t.TempDir(), "server.yaml")
 			if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0644); err != nil {
