@@ -96,7 +96,7 @@ log_level: info
 # default_backend: firecracker
 #
 # firecracker:
-#   binary_path: /usr/local/bin/firecracker
+#   kernel_path: /var/lib/shed/firecracker/vmlinux
 #   base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
 #   images:
 #     base: ghcr.io/charliek/shed-fc-base:{version}

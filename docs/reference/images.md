@@ -294,7 +294,7 @@ docker run --rm --platform linux/arm64 --entrypoint /bin/bash \
 '
 ```
 
-This is not needed when building from source with `build-vz-rootfs.sh`, which extracts the kernel automatically. Firecracker images embed the kernel in the rootfs and are not affected.
+This is not needed when building from source with `build-vz-rootfs.sh`, which extracts the kernel automatically. Firecracker also extracts the kernel during image conversion — verify that `kernel_path` matches the converted image when using `shed image build --from`.
 
 ## Disk Space
 

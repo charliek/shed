@@ -248,7 +248,7 @@ Files are read in alphabetical order — later files can override values from ea
 
 The `experimental` image variant uses this mechanism to configure shed-extensions:
 
-```
+```dotenv
 # /etc/environment.d/shed-extensions.conf
 SSH_AUTH_SOCK=/run/shed-extensions/ssh-agent.sock
 AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:499/credentials
