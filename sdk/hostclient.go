@@ -41,7 +41,9 @@ func WithServerURL(url string) HostClientOption {
 // WithHTTPClient sets a custom HTTP client.
 func WithHTTPClient(hc *http.Client) HostClientOption {
 	return func(c *HostClient) {
-		c.httpClient = hc
+		if hc != nil {
+			c.httpClient = hc
+		}
 	}
 }
 

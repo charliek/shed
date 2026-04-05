@@ -67,9 +67,10 @@ type Server struct {
 	pending   map[string]chan *plugin.Envelope // request ID -> response channel
 
 	// Extension management
-	extensions   map[string]*extensionState
-	extensionsMu sync.RWMutex
-	manifestDir  string // default "/etc/shed-extensions.d"
+	extensions      map[string]*extensionState
+	extensionsMu    sync.RWMutex
+	manifestDir     string // default "/etc/shed-extensions.d"
+	healthCheckOnce sync.Once
 
 	// For graceful shutdown
 	ctx    context.Context

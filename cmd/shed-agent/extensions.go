@@ -136,9 +136,11 @@ func (s *Server) enableExtensions(enabled []string) {
 		s.extensions[ns] = state
 	}
 
-	// Start extension health checking if extensions were activated
+	// Start extension health checking exactly once, even across reconnects.
 	if len(s.extensions) > 0 {
-		go s.runExtensionHealthChecks(s.ctx)
+		s.healthCheckOnce.Do(func() {
+			go s.runExtensionHealthChecks(s.ctx)
+		})
 	}
 }
 
@@ -246,21 +248,30 @@ func (s *Server) checkExtensions(ctx context.Context, busClient *sdk.BusClient) 
 	s.extensionsMu.Unlock()
 }
 
+// systemctlTimeout is the maximum time to wait for a systemctl command.
+const systemctlTimeout = 10 * time.Second
+
 // isUnitActive checks if a systemd unit is currently active.
 func isUnitActive(unit string) bool {
-	cmd := exec.Command("systemctl", "is-active", "--quiet", unit)
+	ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit)
 	return cmd.Run() == nil
 }
 
 // isUnitFailed checks if a systemd unit has failed.
 func isUnitFailed(unit string) bool {
-	cmd := exec.Command("systemctl", "is-failed", "--quiet", unit)
+	ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "is-failed", "--quiet", unit)
 	return cmd.Run() == nil
 }
 
 // systemctlEnableNow enables and starts a systemd unit.
 func systemctlEnableNow(unit string) error {
-	cmd := exec.Command("systemctl", "enable", "--now", unit)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "enable", "--now", unit)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
