@@ -238,4 +238,3 @@ func (s *Server) sendPluginMessage(env *plugin.Envelope) error {
 
 	return writeMessage(s.msgConn, MsgTypePluginMessage, data)
 }
-
