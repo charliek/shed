@@ -84,7 +84,7 @@ shed create <name> [flags]
 | `--backend` | | Server default | Backend to use: `firecracker` or `vz` |
 | `--cpus` | | Server default | Number of vCPUs |
 | `--memory` | | Server default | Memory in MB |
-| `--local-dir` | | None | Mount a local host directory as the workspace (VZ only, mutually exclusive with `--repo`) |
+| `--local-dir` | | None | Mount a local host directory as the workspace (mutually exclusive with `--repo`) |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
