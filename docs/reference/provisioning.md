@@ -240,6 +240,34 @@ fi
 
 ## Environment Variables
 
+### environment.d (VZ and Firecracker)
+
+The shed agent loads environment variables from `/etc/environment.d/*.conf` files following the [systemd environment.d convention](https://www.freedesktop.org/software/systemd/man/latest/environment.d.html). These variables are injected into all exec sessions (`shed exec`, `shed console`, `shed attach`, provisioning hooks).
+
+Files are read in alphabetical order — later files can override values from earlier ones. Each file contains one `KEY=VALUE` pair per line. Blank lines and lines starting with `#` are ignored.
+
+The `experimental` image variant uses this mechanism to configure shed-extensions:
+
+```dotenv
+# /etc/environment.d/shed-extensions.conf
+SSH_AUTH_SOCK=/run/shed-extensions/ssh-agent.sock
+AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:499/credentials
+```
+
+To add your own environment variables, create a `.conf` file in your image Dockerfile or via a provisioning install hook:
+
+```bash
+# In a provisioning install hook
+sudo tee /etc/environment.d/90-myapp.conf << 'EOF'
+DATABASE_URL=postgresql://localhost/myapp
+REDIS_URL=redis://localhost:6379
+EOF
+```
+
+Use numeric prefixes (e.g., `90-`) to control ordering relative to other files.
+
+### Shed-managed variables
+
 Shed sets these variables automatically:
 
 | Variable | Description |

@@ -68,3 +68,37 @@ env_file: ~/.shed/env
 
 # Logging level: debug, info, warn, error
 log_level: info
+
+# --- VZ Backend (macOS Apple Silicon) ---
+# Uncomment and configure to use the VZ backend instead of Docker.
+#
+# enabled_backends:
+#   - vz
+# default_backend: vz
+#
+# vz:
+#   vfkit_path: vfkit
+#   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+#   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
+#   base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
+#   images:
+#     base: ghcr.io/charliek/shed-vz-base:{version}
+#     experimental: ghcr.io/charliek/shed-vz-experimental:{version}
+#   images_dir: ~/Library/Application Support/shed/vz/
+#   instance_dir: ~/Library/Application Support/shed/vz/instances
+#   socket_dir: ~/.shed/vz/sockets
+
+# --- Firecracker Backend (Linux with KVM) ---
+# Uncomment and configure to use the Firecracker backend instead of Docker.
+#
+# enabled_backends:
+#   - firecracker
+# default_backend: firecracker
+#
+# firecracker:
+#   kernel_path: /var/lib/shed/firecracker/vmlinux
+#   base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
+#   images:
+#     base: ghcr.io/charliek/shed-fc-base:{version}
+#     experimental: ghcr.io/charliek/shed-fc-experimental:{version}
+#   images_dir: /var/lib/shed/firecracker/images

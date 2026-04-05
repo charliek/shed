@@ -10,7 +10,6 @@ This document outlines planned future enhancements for Shed.
 
 Future uses for the persistent agent↔host notification port (1026) established by credential sync:
 
-- **Health heartbeats over notification channel** — replace the current 500ms polling during VM startup (`WaitForHealth`) with agent-pushed heartbeats. Eliminates repeated connection open/close cycles.
 - **Agent-pushed resource metrics** — CPU/memory/disk usage pushed from agent at configurable intervals. Enables `shed status` to show live resource usage without exec overhead.
 - **Process event notifications** — agent notifies host when provisioning hooks finish, services crash, or long-running processes exit. Enables reactive orchestration.
 - **Log streaming** — structured log events from inside the VM pushed over the notification channel. Alternative to SSH-based log tailing.

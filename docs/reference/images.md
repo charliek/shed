@@ -13,7 +13,30 @@ Shed provides multiple rootfs image variants for the VZ and Firecracker backends
 
 All variants include: systemd, SSH, Docker CE, git, gh, curl, wget, vim, neovim, tmux, htop, jq, ripgrep, tree, build-essential, and the shed-agent.
 
-`default` inherits from `devtools`, which inherits from `base`. `experimental` inherits from `default`, adding SSH agent forwarding and AWS credential proxy from [shed-extensions](https://charliek.github.io/shed-extensions/). All variants share the same kernel and core system.
+`default` inherits from `devtools`, which inherits from `base`. `experimental` inherits from `default`. All variants share the same kernel and core system.
+
+### Experimental Variant
+
+The `experimental` variant adds [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering on top of `default`. It includes:
+
+- **`shed-ssh-agent`** — SSH agent proxy that forwards key operations to your Mac (private keys never enter the VM)
+- **`shed-aws-proxy`** — AWS credential proxy that vends short-lived STS tokens via the host
+- **`shed-ext`** — CLI for checking extension connectivity and health
+- Pre-configured `SSH_AUTH_SOCK` and `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variables
+
+**When to use:** You want SSH agent forwarding and/or AWS credential proxying without long-lived credentials entering the VM.
+
+**Prerequisite:** The `shed-host-agent` binary must be running on your host machine. See the [shed-extensions quick start](https://charliek.github.io/shed-extensions/getting-started/quick-start/) for setup.
+
+```bash
+shed create mydev --image experimental
+```
+
+For local development on shed-extensions itself, use the `--shed-ext-version` flag when building images:
+
+```bash
+./scripts/build-vz-rootfs.sh --variant experimental --shed-ext-version dev
+```
 
 ## Published Images
 
@@ -254,6 +277,24 @@ Deleting a cached image does not affect running sheds — each shed uses its own
 ## Requirements
 
 Image conversion requires Docker with privileged container support. The ext4 creation step uses a privileged Docker container for loop mounting.
+
+### VZ Kernel Compatibility
+
+For VZ, the kernel and initrd on disk must match the kernel modules in the rootfs image. When using `shed image build --from` with a published image, the rootfs is converted to ext4 but the kernel and initrd are **not** automatically updated. If the published image contains a different kernel version than what's on disk, the VM may fail to boot.
+
+To extract a matching kernel from a published image:
+
+```bash
+OUTPUT_DIR="$HOME/Library/Application Support/shed/vz"
+docker run --rm --platform linux/arm64 --entrypoint /bin/bash \
+    -v "$OUTPUT_DIR:/output" \
+    ghcr.io/charliek/shed-vz-base:{version} -c '
+    zcat /boot/vmlinuz-* > /output/vmlinux
+    cp /boot/initrd.img-* /output/initrd.img
+'
+```
+
+This is not needed when building from source with `build-vz-rootfs.sh`, which extracts the kernel automatically. Firecracker also extracts the kernel during image conversion — verify that `kernel_path` matches the converted image when using `shed image build --from`.
 
 ## Disk Space
 
