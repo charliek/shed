@@ -38,7 +38,7 @@ func TestNotifyConnStartStop(t *testing.T) {
 		handler: func(conn net.Conn) {
 			defer conn.Close()
 			// Send a message, then hang until connection closes
-			agentproto.WriteMessage(conn, agentproto.MsgTypeFileChanged, []byte(`{"credential":"test"}`))
+			agentproto.WriteMessage(conn, agentproto.MsgTypePluginMessage, []byte(`{"credential":"test"}`))
 			// Block until closed
 			buf := make([]byte, 1)
 			conn.Read(buf)

@@ -10,7 +10,6 @@ require (
 	github.com/distribution/reference v0.6.0
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.1-0.20251224190957-6fb280e993d4
-	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/go-chi/chi/v5 v5.2.4
 	github.com/google/uuid v1.6.0

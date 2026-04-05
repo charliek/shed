@@ -12,10 +12,6 @@ func TestNewCredentialManager_NilConfig(t *testing.T) {
 		t.Fatal("NewCredentialManager returned nil")
 	}
 
-	if cm.credWatcher != nil {
-		t.Error("credWatcher should be nil when serverCfg is nil")
-	}
-
 	if cm.messageChannels == nil {
 		t.Error("messageChannels should be initialized, got nil")
 	}
@@ -31,10 +27,6 @@ func TestNewCredentialManager_EmptyCredentials(t *testing.T) {
 	cm := NewCredentialManager(serverCfg, nil, "test", nil)
 	if cm == nil {
 		t.Fatal("NewCredentialManager returned nil")
-	}
-
-	if cm.credWatcher != nil {
-		t.Error("credWatcher should be nil when credentials map is empty")
 	}
 
 	cm.Close()

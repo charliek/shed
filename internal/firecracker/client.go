@@ -516,11 +516,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	// Setup credentials: 9P mounts for directories, tar transfer for files
-	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
-		backend.Progress(ctx, "credentials", "Setting up credentials...")
-		dirCreds, fileCreds := vmutil.ClassifyCredentials(c.serverCfg.Credentials)
-		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, fileCreds, c.mount9PCredentialFunc(req.Name))
+	// Mount credentials via 9P
+	{
+		dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
+		if len(dirCreds) > 0 {
+			backend.Progress(ctx, "credentials", "Setting up credentials...")
+		}
+		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mount9PCredentialFunc(req.Name))
 	}
 
 	// Clone repo if specified (skip when using local dir -- directory already has content)
@@ -724,10 +726,10 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		}
 	}
 
-	// Refresh credentials on start: 9P mounts for directories, tar transfer for files
-	if c.serverCfg != nil && len(c.serverCfg.Credentials) > 0 {
-		dirCreds, fileCreds := vmutil.ClassifyCredentials(c.serverCfg.Credentials)
-		c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, fileCreds, c.mount9PCredentialFunc(name))
+	// Refresh credentials on start: 9P mounts for directories
+	{
+		dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
+		c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, c.mount9PCredentialFunc(name))
 	}
 
 	// Run startup hook only (not install)

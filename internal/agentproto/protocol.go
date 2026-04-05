@@ -19,25 +19,9 @@ const (
 	MsgTypeExitCode    byte = 0x04
 	MsgTypeData        byte = 0x05
 	MsgTypeStdinEOF    byte = 0x06
-	MsgTypeNotifySetup byte = 0x12 // Deprecated: replaced by MsgTypePluginMessage with system:credentials namespace
-	MsgTypeFileChanged byte = 0x13 // Deprecated: replaced by MsgTypePluginMessage with system:credentials namespace
 
 	MsgTypePluginMessage byte = 0x20 // Bidirectional: plugin envelope (JSON)
 )
-
-// Deprecated: NotifySetupMessage is replaced by plugin.CredentialSetupPayload
-// sent via MsgTypePluginMessage in the system:credentials namespace.
-type NotifySetupMessage struct {
-	Credentials map[string]string   `json:"credentials"`        // name → target path in VM
-	Excludes    map[string][]string `json:"excludes,omitempty"` // name → exclude patterns
-}
-
-// Deprecated: FileChangedMessage is replaced by plugin.CredentialChangedPayload
-// sent via MsgTypePluginMessage in the system:credentials namespace.
-type FileChangedMessage struct {
-	Credential string   `json:"credential"` // credential mount name (e.g., "gh")
-	Files      []string `json:"files"`      // relative paths that changed
-}
 
 // ExecRequest is sent to execute a command.
 type ExecRequest struct {
