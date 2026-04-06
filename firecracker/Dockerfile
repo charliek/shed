@@ -16,7 +16,7 @@
 
 # Bump this when shed-extensions releases a new version.
 # The experimental variant pulls binaries from this tag.
-ARG SHED_EXT_VERSION=v0.2.0
+ARG SHED_EXT_VERSION=v0.3.0
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
 # =============================================================================
