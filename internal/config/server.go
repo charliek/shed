@@ -45,8 +45,58 @@ type ServerConfig struct {
 	// VZ contains Apple Virtualization.framework-specific configuration (macOS only)
 	VZ *VZConfig `yaml:"vz,omitempty"`
 
+	// Extensions configures which extensions the agent should enable in VMs.
+	Extensions *ExtensionsConfig `yaml:"extensions,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
+}
+
+// ExtensionsConfig configures which extensions the agent should enable.
+type ExtensionsConfig struct {
+	// Enabled lists the extension namespaces to activate in VMs
+	// (e.g., ["ssh-agent", "aws-credentials"]).
+	Enabled []string `yaml:"enabled"`
+}
+
+// Validate checks that all extension namespaces are valid and unique.
+func (e *ExtensionsConfig) Validate() error {
+	seen := make(map[string]bool, len(e.Enabled))
+	for _, ns := range e.Enabled {
+		if ns == "" {
+			return fmt.Errorf("extension namespace must not be empty")
+		}
+		if seen[ns] {
+			return fmt.Errorf("duplicate extension namespace: %q", ns)
+		}
+		seen[ns] = true
+		// Reuse the plugin namespace validation rules (printable ASCII, no spaces,
+		// max 128 chars, rejects "system:" prefix).
+		if err := validateExtensionNamespace(ns); err != nil {
+			return fmt.Errorf("invalid extension namespace %q: %w", ns, err)
+		}
+	}
+	return nil
+}
+
+// validateExtensionNamespace checks that a namespace is valid for extension use.
+// Rules: non-empty, printable ASCII only, no spaces, max 128 chars, no "system:" prefix.
+func validateExtensionNamespace(namespace string) error {
+	if len(namespace) > 128 {
+		return fmt.Errorf("must be at most 128 characters")
+	}
+	if strings.HasPrefix(namespace, "system:") {
+		return fmt.Errorf("prefix \"system:\" is reserved for internal use")
+	}
+	for _, r := range namespace {
+		if r == ' ' {
+			return fmt.Errorf("must not contain spaces")
+		}
+		if r < 0x20 || r > 0x7E {
+			return fmt.Errorf("must contain only printable ASCII characters")
+		}
+	}
+	return nil
 }
 
 // FirecrackerConfig contains Firecracker-specific configuration.
@@ -779,6 +829,13 @@ func (c *ServerConfig) Validate() error {
 		}
 		if err := c.VZ.Validate(); err != nil {
 			return fmt.Errorf("vz config: %w", err)
+		}
+	}
+
+	// Validate extension config if present
+	if c.Extensions != nil {
+		if err := c.Extensions.Validate(); err != nil {
+			return fmt.Errorf("extensions config: %w", err)
 		}
 	}
 

@@ -286,15 +286,13 @@ ENTRYPOINT ["/sbin/init"]
 # =============================================================================
 FROM shed-vz-default AS shed-vz-experimental
 
-COPY --from=shed-extensions /usr/local/bin/shed-ssh-agent /usr/local/bin/shed-ssh-agent
-COPY --from=shed-extensions /usr/local/bin/shed-aws-proxy /usr/local/bin/shed-aws-proxy
-COPY --from=shed-extensions /usr/local/bin/shed-ext /usr/local/bin/shed-ext
-COPY --from=shed-extensions /etc/systemd/system/shed-ssh-agent.service /etc/systemd/system/
-COPY --from=shed-extensions /etc/systemd/system/shed-aws-proxy.service /etc/systemd/system/
+COPY --from=shed-extensions /usr/local/bin/shed-ext-ssh-agent /usr/local/bin/shed-ext-ssh-agent
+COPY --from=shed-extensions /usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials
+COPY --from=shed-extensions /etc/systemd/system/shed-ext-ssh-agent.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/
 COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
-
-# Enable shed-extensions services
-RUN SYSTEMD_OFFLINE=1 systemctl enable shed-ssh-agent shed-aws-proxy
+COPY --from=shed-extensions /etc/shed-extensions.d/ /etc/shed-extensions.d/
+# Units ship disabled — shed-agent enables them from server config
 
 USER root
 

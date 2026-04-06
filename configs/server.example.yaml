@@ -54,6 +54,14 @@ env_file: ~/.shed/env
 # Logging level: debug, info, warn, error
 log_level: info
 
+# Extensions to enable in VMs
+# Each entry is a namespace name matching a manifest in /etc/shed-extensions.d/
+# The agent activates corresponding systemd units at VM startup.
+# extensions:
+#   enabled:
+#     - ssh-agent
+#     - aws-credentials
+
 # --- VZ Backend (macOS Apple Silicon) ---
 # vz:
 #   vfkit_path: vfkit

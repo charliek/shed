@@ -119,8 +119,14 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 				log.Printf("[%s] Ignoring heartbeat with zero started_at", name)
 				return
 			}
-			cm.healthTracker.Update(name, payload.StartedAt)
+			cm.healthTracker.Update(name, payload.StartedAt, payload.Extensions)
 		}
+	}
+
+	// Extract enabled extensions from server config (nil-safe).
+	var enabledExtensions []string
+	if cm.serverCfg != nil && cm.serverCfg.Extensions != nil {
+		enabledExtensions = cm.serverCfg.Extensions.Enabled
 	}
 
 	handler := NewMessageHandler(healthFn, func(env *plugin.Envelope) {
@@ -129,7 +135,7 @@ func (cm *CredentialManager) startMessageChannel(name string, agent *AgentClient
 				log.Printf("[%s] Failed to publish plugin message: %v", name, err)
 			}
 		}
-	})
+	}, enabledExtensions)
 
 	conn := NewNotifyConn(agent.Dialer(), agent.NotifyPort(), name)
 

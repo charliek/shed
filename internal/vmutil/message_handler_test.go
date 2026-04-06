@@ -11,7 +11,7 @@ import (
 )
 
 func TestMessageHandlerOnConnect(t *testing.T) {
-	handler := NewMessageHandler(nil, nil)
+	handler := NewMessageHandler(nil, nil, nil)
 
 	client, server := net.Pipe()
 	defer client.Close()
@@ -54,7 +54,7 @@ func TestMessageHandlerDispatchHealthEvent(t *testing.T) {
 	var received *plugin.Envelope
 	handler := NewMessageHandler(func(env *plugin.Envelope) {
 		received = env
-	}, nil)
+	}, nil, nil)
 
 	payload := plugin.HeartbeatPayload{StartedAt: time.Now()}
 	payloadData, _ := json.Marshal(payload)
@@ -75,9 +75,9 @@ func TestMessageHandlerDispatchHealthEvent(t *testing.T) {
 
 func TestMessageHandlerHealthEventNotForwardedToPluginFn(t *testing.T) {
 	pluginCalled := false
-	handler := NewMessageHandler(nil, func(env *plugin.Envelope) {
+	handler := NewMessageHandler(nil, func(_ *plugin.Envelope) {
 		pluginCalled = true
-	})
+	}, nil)
 
 	payload := plugin.HeartbeatPayload{StartedAt: time.Now()}
 	payloadData, _ := json.Marshal(payload)
@@ -97,7 +97,7 @@ func TestMessageHandlerDispatchPluginMessage(t *testing.T) {
 	var received *plugin.Envelope
 	handler := NewMessageHandler(nil, func(env *plugin.Envelope) {
 		received = env
-	})
+	}, nil)
 
 	env := plugin.NewEnvelope("op", plugin.MessageTypeRequest, json.RawMessage(`{"cmd":"read"}`))
 	data, _ := json.Marshal(env)
@@ -115,7 +115,7 @@ func TestMessageHandlerDispatchPluginMessage(t *testing.T) {
 }
 
 func TestMessageHandlerUnknownTypeLogged(t *testing.T) {
-	handler := NewMessageHandler(nil, nil)
+	handler := NewMessageHandler(nil, nil, nil)
 
 	// Should not error, just log
 	if err := handler.OnMessage(0xFF, []byte("unknown")); err != nil {
@@ -124,7 +124,7 @@ func TestMessageHandlerUnknownTypeLogged(t *testing.T) {
 }
 
 func TestMessageHandlerSendPluginMessage(t *testing.T) {
-	handler := NewMessageHandler(nil, nil)
+	handler := NewMessageHandler(nil, nil, nil)
 
 	client, server := net.Pipe()
 	defer client.Close()
@@ -171,7 +171,7 @@ func TestMessageHandlerSendPluginMessage(t *testing.T) {
 }
 
 func TestMessageHandlerSendNoConnection(t *testing.T) {
-	handler := NewMessageHandler(nil, nil)
+	handler := NewMessageHandler(nil, nil, nil)
 
 	env := plugin.NewEnvelope("op", plugin.MessageTypeResponse, nil)
 	err := handler.SendPluginMessage(env)
