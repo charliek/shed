@@ -129,6 +129,8 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 	c.logger.Info("SSE connected", "namespace", namespace)
 
 	scanner := bufio.NewScanner(resp.Body)
+	const maxSSEEventSize = 1 << 20 // 1 MiB — envelopes can carry large payloads
+	scanner.Buffer(make([]byte, 0, 64*1024), maxSSEEventSize)
 	var dataBuf bytes.Buffer
 	dataLines := 0
 
