@@ -276,7 +276,7 @@ The agent periodically checks each enabled extension at two levels:
 
 Health status is included in heartbeats and visible via `shed list -vv`:
 
-```
+```text
 Extensions:
   aws-credentials:     guest=running  host=connected
   ssh-agent:           guest=running  host=connected

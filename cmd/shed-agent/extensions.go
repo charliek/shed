@@ -174,6 +174,10 @@ func (s *Server) runExtensionHealthChecks(ctx context.Context) {
 		5*time.Second, // HTTP client timeout; per-ping uses shorter context timeout
 	)
 
+	// Run one check immediately so the next heartbeat has accurate data
+	// rather than reporting host=unknown until the first ticker fires.
+	s.checkExtensions(ctx, busClient)
+
 	ticker := time.NewTicker(s.heartbeatInterval)
 	defer ticker.Stop()
 
