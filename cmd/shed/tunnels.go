@@ -160,8 +160,8 @@ func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports 
 func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	shedName := args[0]
 
-	if jsonFlag && !tunnelBackground {
-		return fmt.Errorf("--json requires --background (-d) for tunnel start")
+	if jsonFlag {
+		return fmt.Errorf("--json is not supported for tunnel start")
 	}
 
 	serverName, entry, err := findShedServer(shedName)
@@ -280,29 +280,9 @@ func startBackgroundTunnel(mgr *tunnels.Manager, shedName, serverName, serverAdd
 		return fmt.Errorf("failed to save tunnel state: %w", err)
 	}
 
-	// Fork a child to stay alive as the tunnel daemon.
-	// The child inherits the open listeners and blocks on signal.
-	// We (the parent) print status and exit.
-	//
-	// For simplicity in this initial implementation, we just stay alive
-	// in the foreground when -d is used. A future version can detach properly.
-	// The PID is saved so `shed tunnels stop` works.
-
-	if jsonFlag {
-		return outputJSON(ActionResult{
-			Status: "ok",
-			Action: "started",
-			Name:   shedName,
-			Details: struct {
-				Profile string                `json:"profile"`
-				Ports   []tunnels.PortMapping `json:"ports"`
-			}{
-				Profile: profile,
-				Ports:   ports,
-			},
-		})
-	}
-
+	// The tunnel daemon keeps this process alive. The PID is saved to state
+	// so `shed tunnels stop` can send SIGTERM to tear it down.
+	// A future version could fork/detach for true daemonization.
 	printSuccess("Tunnel started for %s (profile: %s, PID %d)", shedName, profile, os.Getpid())
 	fmt.Println("Forwarding:")
 	for _, pm := range ports {

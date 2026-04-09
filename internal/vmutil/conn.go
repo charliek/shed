@@ -31,15 +31,23 @@ func (c *BufferedConn) CloseWrite() error {
 // in both directions until one side closes or errors. Blocks until both
 // directions complete.
 func BidirectionalCopy(a, b io.ReadWriter) {
+	closeWrite := func(rw io.ReadWriter) {
+		if cw, ok := rw.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(a, b)
+		closeWrite(a) // signal EOF to reader on a
 	}()
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(b, a)
+		closeWrite(b) // signal EOF to reader on b
 	}()
 	wg.Wait()
 }

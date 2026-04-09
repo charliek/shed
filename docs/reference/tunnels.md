@@ -20,7 +20,7 @@ shed tunnels start myproj -t 3000 -d
 
 When you start a tunnel, the CLI opens a local TCP listener on the specified port. For each incoming connection, it establishes a tunnel to the shed VM via the shed-server Connect API (`GET /api/sheds/{name}/connect/{port}`). Traffic flows bidirectionally between the local port and the VM service.
 
-```
+```text
 localhost:3000  -->  shed-server Connect API  -->  VM service :3000
 ```
 
