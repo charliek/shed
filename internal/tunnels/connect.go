@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // ConnectClient dials shed VMs via the shed-server Connect API.
@@ -46,21 +48,12 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		if resp.Body != nil {
+			resp.Body.Close()
+		}
 		conn.Close()
 		return nil, fmt.Errorf("connect API returned HTTP %d (expected 101)", resp.StatusCode)
 	}
 
-	// Return the connection with the buffered reader to drain any data read past the response.
-	return &connectConn{Conn: conn, reader: reader}, nil
-}
-
-// connectConn wraps a net.Conn with a bufio.Reader to handle data buffered
-// during the HTTP upgrade response read.
-type connectConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *connectConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
+	return &vmutil.BufferedConn{Conn: conn, Reader: reader}, nil
 }

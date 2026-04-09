@@ -160,53 +160,12 @@ func (s *Server) Start() error {
 	}
 
 	// Accept console connections
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		for {
-			conn, err := s.consoleListener.Accept()
-			if err != nil {
-				select {
-				case <-s.ctx.Done():
-					// Graceful shutdown, don't log error
-					return
-				default:
-					log.Printf("Console accept error: %v", err)
-					time.Sleep(200 * time.Millisecond)
-					continue
-				}
-			}
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				handleExecConnection(conn, s.user)
-			}()
-		}
-	}()
+	s.acceptLoop(s.consoleListener, "Console", func(conn net.Conn) {
+		handleExecConnection(conn, s.user)
+	})
 
 	// Accept message channel connections (health, plugins)
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		for {
-			conn, err := s.notifyListener.Accept()
-			if err != nil {
-				select {
-				case <-s.ctx.Done():
-					return
-				default:
-					log.Printf("Message channel accept error: %v", err)
-					time.Sleep(200 * time.Millisecond)
-					continue
-				}
-			}
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				s.handleNotifyConnection(conn)
-			}()
-		}
-	}()
+	s.acceptLoop(s.notifyListener, "Message channel", s.handleNotifyConnection)
 
 	// Start TCP proxy listener (for DialService / Connect API)
 	s.tcpProxyListener, err = vsock.Listen(s.tcpProxyPort, nil)
@@ -217,28 +176,7 @@ func (s *Server) Start() error {
 	}
 
 	// Accept TCP proxy connections
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		for {
-			conn, err := s.tcpProxyListener.Accept()
-			if err != nil {
-				select {
-				case <-s.ctx.Done():
-					return
-				default:
-					log.Printf("TCP proxy accept error: %v", err)
-					time.Sleep(200 * time.Millisecond)
-					continue
-				}
-			}
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				handleTCPProxyConnection(conn)
-			}()
-		}
-	}()
+	s.acceptLoop(s.tcpProxyListener, "TCP proxy", handleTCPProxyConnection)
 
 	// Start localhost HTTP server for in-VM plugin API
 	if err := s.startHTTPServer(); err != nil {
@@ -279,6 +217,33 @@ func (s *Server) startHTTPServer() error {
 	}()
 
 	return nil
+}
+
+// acceptLoop starts a goroutine that accepts connections on the listener and
+// dispatches each to the handler function. Exits cleanly on context cancellation.
+func (s *Server) acceptLoop(listener net.Listener, name string, handler func(net.Conn)) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-s.ctx.Done():
+					return
+				default:
+					log.Printf("%s accept error: %v", name, err)
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+			}
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				handler(conn)
+			}()
+		}
+	}()
 }
 
 // drainTimeout is the maximum time to wait for active connections to finish

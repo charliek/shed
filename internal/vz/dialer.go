@@ -83,16 +83,5 @@ func (d *VZDialer) DialService(ctx context.Context, tcpProxyPort uint32, service
 		return nil, fmt.Errorf("CONNECT %d failed: %s", servicePort, msg)
 	}
 
-	return &bufferedConn{Conn: conn, reader: reader}, nil
-}
-
-// bufferedConn wraps a net.Conn with a bufio.Reader to ensure any bytes
-// buffered during the CONNECT handshake are returned on subsequent reads.
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
+	return &vmutil.BufferedConn{Conn: conn, Reader: reader}, nil
 }

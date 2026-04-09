@@ -3,10 +3,11 @@ package tunnels
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
+
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // Tunnel represents an active local TCP listener that bridges to a shed VM
@@ -75,17 +76,7 @@ func (t *Tunnel) handleConn(clientConn net.Conn) {
 	}
 	defer vmConn.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(vmConn, clientConn)
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(clientConn, vmConn)
-	}()
-	wg.Wait()
+	vmutil.BidirectionalCopy(clientConn, vmConn)
 }
 
 // Stop stops the tunnel, closing the listener and waiting for connections to drain.

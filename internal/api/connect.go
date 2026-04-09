@@ -2,13 +2,12 @@ package api
 
 import (
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"strconv"
-	"sync"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmutil"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -67,17 +66,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Connect API: tunnel %s:%d established", shedName, port)
 
 	// Bidirectional proxy.
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(vmConn, clientConn)
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(clientConn, vmConn)
-	}()
-	wg.Wait()
+	vmutil.BidirectionalCopy(clientConn, vmConn)
 	clientConn.Close()
 	vmConn.Close()
 
