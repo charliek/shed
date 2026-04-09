@@ -21,14 +21,14 @@ func handleTCPProxyConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// Read the CONNECT line with a deadline.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReaderSize(conn, 64)
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		writeProxyErr(conn, "failed to read command")
 		return
 	}
-	conn.SetReadDeadline(time.Time{}) // clear deadline
+	_ = conn.SetReadDeadline(time.Time{}) // clear deadline
 
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "CONNECT ") {
@@ -57,35 +57,29 @@ func handleTCPProxyConnection(conn net.Conn) {
 		return
 	}
 
-	// Bidirectional copy with proper shutdown.
+	// Bidirectional copy. Uses reader (not conn directly) for client->target
+	// to drain any data buffered during the CONNECT handshake read.
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// conn -> target
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, reader) // use reader to drain any buffered data
-		// Half-close: signal target we're done sending.
+		_, _ = io.Copy(targetConn, reader)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
 	}()
-
-	// target -> conn
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, targetConn)
-		// Half-close: signal client we're done sending.
+		_, _ = io.Copy(conn, targetConn)
 		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
 	}()
-
 	wg.Wait()
 	targetConn.Close()
 }
 
 func writeProxyErr(conn net.Conn, msg string) {
 	log.Printf("TCP proxy: %s", msg)
-	conn.Write([]byte("ERR " + msg + "\n"))
+	_, _ = conn.Write([]byte("ERR " + msg + "\n"))
 }
