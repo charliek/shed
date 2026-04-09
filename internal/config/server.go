@@ -203,6 +203,9 @@ type VZConfig struct {
 	// NotifyPort is the vsock port for the message channel (health checks, plugins, credentials)
 	NotifyPort uint32 `yaml:"notify_port"`
 
+	// TCPProxyPort is the vsock port for the TCP proxy (used by DialService to reach VM services)
+	TCPProxyPort uint32 `yaml:"tcp_proxy_port"`
+
 	// StartTimeout is the timeout for VM startup
 	StartTimeout Duration `yaml:"start_timeout"`
 
@@ -243,6 +246,7 @@ func DefaultVZConfig() *VZConfig {
 		DefaultDiskGB:   20,
 		ConsolePort:     1024,
 		NotifyPort:      1026,
+		TCPProxyPort:    1028,
 		StartTimeout:    Duration(60 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
 	}
@@ -252,6 +256,9 @@ func DefaultVZConfig() *VZConfig {
 func (c *VZConfig) applyDefaults() {
 	if c.NotifyPort == 0 {
 		c.NotifyPort = 1026
+	}
+	if c.TCPProxyPort == 0 {
+		c.TCPProxyPort = 1028
 	}
 
 	// Expand ~ in paths
@@ -326,8 +333,14 @@ func (c *VZConfig) Validate() error {
 	if c.NotifyPort > MaxVsockPort {
 		return fmt.Errorf("vz: notify_port must be at most %d", MaxVsockPort)
 	}
-	if c.ConsolePort == c.NotifyPort {
-		return fmt.Errorf("vz: console_port and notify_port must be different")
+	if c.TCPProxyPort == 0 {
+		return fmt.Errorf("vz: tcp_proxy_port must be set")
+	}
+	if c.TCPProxyPort > MaxVsockPort {
+		return fmt.Errorf("vz: tcp_proxy_port must be at most %d", MaxVsockPort)
+	}
+	if c.ConsolePort == c.NotifyPort || c.ConsolePort == c.TCPProxyPort || c.NotifyPort == c.TCPProxyPort {
+		return fmt.Errorf("vz: console_port, notify_port, and tcp_proxy_port must all be different")
 	}
 
 	// Validate timeouts

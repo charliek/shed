@@ -1,19 +1,27 @@
 # Tunnels
 
-Shed supports SSH tunnels for port forwarding, allowing you to access services running in shed containers from your local machine.
+Shed tunnels provide port forwarding from your local machine to services running inside shed VMs. Tunnels use the shed-server [Connect API](api.md#connect-api) to establish TCP streams into VMs, working identically on both VZ and Firecracker backends.
 
 ## Quick Start
 
 Forward port 3000 from a shed to your local machine:
 
 ```bash
-shed tunnels start myproj -t 3000:3000
+shed tunnels start myproj -t 3000
 ```
 
 Run in background:
 
 ```bash
-shed tunnels start myproj -t 3000:3000 -d
+shed tunnels start myproj -t 3000 -d
+```
+
+## How It Works
+
+When you start a tunnel, the CLI opens a local TCP listener on the specified port. For each incoming connection, it establishes a tunnel to the shed VM via the shed-server Connect API (`GET /api/sheds/{name}/connect/{port}`). Traffic flows bidirectionally between the local port and the VM service.
+
+```text
+localhost:3000  -->  shed-server Connect API  -->  VM service :3000
 ```
 
 ## Configuration
@@ -21,36 +29,23 @@ shed tunnels start myproj -t 3000:3000 -d
 Create `~/.shed/tunnels.yaml` to define reusable tunnel profiles:
 
 ```yaml
-profiles:
-  webdev:
-    description: "Web development ports"
-    ports:
-      - local: 3000
-        remote: 3000
-      - local: 5173
-        remote: 5173
+sheds:
+  myproj:
+    profiles:
+      webdev:
+        - "3000"
+        - "5173"
 
-  database:
-    description: "Database access"
-    ports:
-      - local: 5432
-        remote: 5432
-      - local: 6379
-        remote: 6379
+      database:
+        - "5432"
+        - "6379"
 
-  full:
-    description: "All development ports"
-    ports:
-      - local: 3000
-        remote: 3000
-      - local: 5173
-        remote: 5173
-      - local: 5432
-        remote: 5432
-      - local: 6379
-        remote: 6379
-      - local: 8080
-        remote: 8080
+      full:
+        - "3000"
+        - "5173"
+        - "5432"
+        - "6379"
+        - "8080"
 ```
 
 ## Commands
@@ -64,7 +59,7 @@ shed tunnels start <shed> [flags]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--profile` | `-p` | None | Use a defined profile (repeatable) |
-| `--tunnel` | `-t` | None | Port mapping (local:remote or just port) |
+| `--tunnel` | `-t` | None | Port mapping (`local:remote` or just `port`) |
 | `--background` | `-d` | `false` | Run in background |
 | `--replace` | | `false` | Replace existing tunnel without prompting |
 
@@ -72,22 +67,19 @@ shed tunnels start <shed> [flags]
 
 ```bash
 # Single port
-shed tunnels start myproj -t 3000:3000
-
-# Port shorthand (equivalent to -t 3000:3000)
 shed tunnels start myproj -t 3000
 
+# Different local and remote ports
+shed tunnels start myproj -t 4501:4096
+
 # Multiple ports
-shed tunnels start myproj -t 3000:3000 -t 5432:5432
+shed tunnels start myproj -t 3000 -t 5432
 
 # Using a profile
 shed tunnels start myproj -p webdev
 
-# Merging multiple profiles
-shed tunnels start myproj -p webdev -p database
-
-# Background mode
-shed tunnels start myproj -p webdev -d
+# Merging profiles with extra ports
+shed tunnels start myproj -p webdev -t 5432 -d
 ```
 
 ### Stop Tunnels
@@ -96,19 +88,9 @@ shed tunnels start myproj -p webdev -d
 shed tunnels stop [shed] [flags]
 ```
 
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--all` | | `false` | Stop all tunnels |
-
-**Examples:**
-
-```bash
-# Stop tunnels for specific shed
-shed tunnels stop myproj
-
-# Stop all tunnels
-shed tunnels stop --all
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--all` | `false` | Stop all tunnels |
 
 ### List Tunnels
 
@@ -118,16 +100,8 @@ shed tunnels list [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--verbose` | `-v` | `false` | Show detailed info |
+| `--verbose` | `-v` | `false` | Show detailed info (PID, ports, server) |
 | `--json` | | `false` | Output as JSON |
-
-**Output:**
-
-```
-SHED        LOCAL    REMOTE   STATUS
-myproj      3000     3000     active
-myproj      5432     5432     active
-```
 
 ### Preview Configuration
 
@@ -135,70 +109,43 @@ myproj      5432     5432     active
 shed tunnels config <shed> [flags]
 ```
 
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--profile` | `-p` | None | Profile to preview |
-| `--tunnel` | `-t` | None | Additional tunnels to include |
+Shows the port mappings and server address that would be used, without starting tunnels.
 
-Shows what tunnels would be created based on the configuration.
+## Background Mode
 
-## Configuration Reference
+When running with `-d`, the tunnel process stays alive in the background:
 
-### Profile Fields
+- The process PID is saved to `~/.shed/tunnels.state`
+- Use `shed tunnels list` to see active tunnels
+- Use `shed tunnels stop <shed>` to terminate
+- Dead tunnel processes are automatically cleaned up on next `list` or `start`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `description` | string | Human-readable description |
-| `ports` | list | Port mappings |
-| `ports[].local` | int | Local port to listen on |
-| `ports[].remote` | int | Remote port in container |
+## Port Conflicts
+
+If a local port is already in use, the tunnel will fail to start with a descriptive error. Use a different local port:
+
+```bash
+shed tunnels start myproj -t 3001:3000
+```
 
 ## Common Use Cases
 
 ### Web Development
 
-Forward a development server:
-
 ```bash
-shed tunnels start myproj -t 3000:3000 -d
+shed tunnels start myproj -t 3000 -d
 # Access at http://localhost:3000
 ```
 
 ### Database Access
 
-Connect to PostgreSQL in a shed:
-
 ```bash
-shed tunnels start myproj -t 5432:5432 -d
+shed tunnels start myproj -t 5432 -d
 psql -h localhost -p 5432 -U postgres mydb
 ```
 
 ### Multiple Services
 
-Forward all development ports:
-
 ```bash
 shed tunnels start myproj -p full -d
-```
-
-## Background Mode
-
-When running with `-d`, tunnels run as a background process:
-
-- Tunnels persist until explicitly stopped
-- Use `shed tunnels list` to see active tunnels
-- Use `shed tunnels stop` to terminate
-
-## Port Conflicts
-
-If a local port is already in use, the tunnel will fail to start. Check for conflicts:
-
-```bash
-lsof -i :3000
-```
-
-Use a different local port if needed:
-
-```bash
-shed tunnels start myproj -t 3001:3000
 ```

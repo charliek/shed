@@ -82,23 +82,5 @@ func (d *FirecrackerDialer) Dial(ctx context.Context, port uint32) (net.Conn, er
 		return nil, ctx.Err()
 	}
 
-	return &vsockConn{Conn: conn, reader: reader}, nil
-}
-
-// vsockConn wraps a net.Conn with a buffered reader for the initial handshake.
-type vsockConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *vsockConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
-}
-
-// CloseWrite forwards CloseWrite if the underlying connection supports it.
-func (c *vsockConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return nil
+	return &vmutil.BufferedConn{Conn: conn, Reader: reader}, nil
 }

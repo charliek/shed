@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -24,19 +27,20 @@ var (
 
 var tunnelsCmd = &cobra.Command{
 	Use:   "tunnels",
-	Short: "Manage SSH tunnels to sheds",
-	Long: `Manage SSH port forwarding tunnels to shed containers.
+	Short: "Manage tunnels to sheds",
+	Long: `Manage port forwarding tunnels to shed containers.
 
 Tunnels allow you to access services running inside sheds from your
-local machine (e.g., web servers, databases, OpenCode).
+local machine (e.g., web servers, databases, dev servers).
 
-Configuration is stored in ~/.shed/tunnels.yaml`,
+Tunnels use the shed-server Connect API to establish TCP streams
+into VMs. Configuration is stored in ~/.shed/tunnels.yaml`,
 }
 
 var tunnelsStartCmd = &cobra.Command{
 	Use:   "start <shed>",
-	Short: "Start SSH tunnels to a shed",
-	Long: `Start SSH port forwarding tunnels to a shed.
+	Short: "Start tunnels to a shed",
+	Long: `Start port forwarding tunnels to a shed.
 
 By default, runs in the foreground (Ctrl+C to stop).
 Use -d/--background to run as a daemon.
@@ -53,8 +57,8 @@ Examples:
 
 var tunnelsStopCmd = &cobra.Command{
 	Use:   "stop [shed]",
-	Short: "Stop SSH tunnels",
-	Long: `Stop SSH tunnels for a shed.
+	Short: "Stop tunnels",
+	Long: `Stop tunnels for a shed.
 
 Examples:
   shed tunnels stop myproj    # Stop tunnels for myproj
@@ -66,7 +70,7 @@ Examples:
 var tunnelsListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List active tunnels",
-	Long: `List all active SSH tunnels.
+	Long: `List all active tunnels.
 
 Examples:
   shed tunnels list           # Basic list
@@ -81,8 +85,7 @@ var tunnelsConfigCmd = &cobra.Command{
 	Short: "Preview tunnel configuration",
 	Long: `Preview tunnel configuration without starting.
 
-Shows the ports that would be forwarded and the SSH command
-that would be executed.
+Shows the ports that would be forwarded.
 
 Examples:
   shed tunnels config myproj          # Show default profile
@@ -93,20 +96,16 @@ Examples:
 }
 
 func init() {
-	// tunnels start flags
 	tunnelsStartCmd.Flags().StringArrayVarP(&tunnelProfiles, "profile", "p", nil, "Profile to use (repeatable for merging)")
 	tunnelsStartCmd.Flags().StringArrayVarP(&tunnelPorts, "tunnel", "t", nil, "Explicit tunnel - \"3000\" or \"3001:3000\" (repeatable)")
 	tunnelsStartCmd.Flags().BoolVarP(&tunnelBackground, "background", "d", false, "Run as background daemon")
 	tunnelsStartCmd.Flags().BoolVar(&tunnelReplace, "replace", false, "Replace existing tunnel without prompting")
 
-	// tunnels stop flags
 	tunnelsStopCmd.Flags().BoolVar(&tunnelStopAll, "all", false, "Stop all tunnels")
 
-	// tunnels config flags
 	tunnelsConfigCmd.Flags().StringArrayVarP(&tunnelProfiles, "profile", "p", nil, "Profile to preview")
 	tunnelsConfigCmd.Flags().StringArrayVarP(&tunnelPorts, "tunnel", "t", nil, "Additional tunnels to include")
 
-	// Add subcommands
 	tunnelsCmd.AddCommand(tunnelsStartCmd)
 	tunnelsCmd.AddCommand(tunnelsStopCmd)
 	tunnelsCmd.AddCommand(tunnelsListCmd)
@@ -116,23 +115,19 @@ func init() {
 }
 
 // collectPortMappings gathers port mappings from profiles and explicit ports.
-// Returns the port mappings, a profile name string, and any error.
 func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports []string, cmdName string) ([]tunnels.PortMapping, string, error) {
 	var allPorts []tunnels.PortMapping
 
-	// If no profiles specified and no explicit tunnels, use "default" profile
 	effectiveProfiles := profiles
 	if len(profiles) == 0 && len(ports) == 0 {
 		effectiveProfiles = []string{"default"}
 	}
 
-	// Load ports from profiles
 	profileName := ""
 	if len(effectiveProfiles) > 0 {
 		for _, profile := range effectiveProfiles {
 			mappings, err := mgr.Config().GetPortMappings(shedName, profile)
 			if err != nil {
-				// Check if it's just no config for this shed
 				if errors.Is(err, tunnels.ErrNoTunnelConfig) {
 					printError(fmt.Sprintf("No tunnel config for shed %q", shedName),
 						"Add configuration to ~/.shed/tunnels.yaml",
@@ -146,7 +141,6 @@ func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports 
 		profileName = strings.Join(effectiveProfiles, "+")
 	}
 
-	// Add explicit tunnels
 	if len(ports) > 0 {
 		explicitPorts, err := tunnels.ParsePortMappings(ports)
 		if err != nil {
@@ -166,36 +160,32 @@ func collectPortMappings(mgr *tunnels.Manager, shedName string, profiles, ports 
 func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	shedName := args[0]
 
-	if jsonFlag && !tunnelBackground {
-		return fmt.Errorf("--json requires --background (-d) for tunnel start")
+	if jsonFlag {
+		return fmt.Errorf("--json is not supported for tunnel start")
 	}
 
-	// Find the server hosting this shed
 	serverName, entry, err := findShedServer(shedName)
 	if err != nil {
 		return err
 	}
 
-	// Ensure the shed is running (auto-start if stopped)
+	// Ensure the shed is running
 	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
 	if _, err := ensureRunningShed(client, shedName); err != nil {
 		return err
 	}
 
-	// Create tunnel manager
 	mgr, err := tunnels.NewManager()
 	if err != nil {
 		return fmt.Errorf("failed to initialize tunnel manager: %w", err)
 	}
 
-	// Clean up dead tunnels first
 	if err := mgr.CleanupDeadTunnels(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to clean up dead tunnels: %v\n", err)
 	}
 
 	// Check for existing tunnel
 	if existingEntry, ok := mgr.State().GetTunnel(shedName); ok {
-		// Check if process is still alive
 		alive, err := mgr.CheckHealth(shedName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to check tunnel health: %v\n", err)
@@ -205,21 +195,16 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 				if jsonFlag {
 					return fmt.Errorf("tunnel already running for %s; use --replace with --json", shedName)
 				}
-
 				fmt.Printf("Tunnel already running for %s (profile: %s, PID %d).\n",
 					shedName, existingEntry.Profile, existingEntry.PID)
-
-				// Check if stdin is interactive before prompting
 				if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
 					return fmt.Errorf("tunnel already running for %s; use --replace in non-interactive mode", shedName)
 				}
-
 				if !confirmAction("Replace? [y/N] ") {
 					fmt.Println("Cancelled.")
 					return nil
 				}
 			}
-
 			if !jsonFlag {
 				fmt.Println("Stopping existing tunnel...")
 			}
@@ -234,69 +219,86 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
 	if len(allPorts) == 0 {
 		return fmt.Errorf("no ports to forward")
 	}
-
-	// Check for port conflicts
 	if err := mgr.CheckPortConflicts(allPorts); err != nil {
 		return err
 	}
 
-	// Show what we're doing
-	if verboseLevel > 0 {
-		fmt.Printf("Starting tunnel to %s on %s\n", shedName, serverName)
-		fmt.Println("Port mappings:")
-		for _, pm := range allPorts {
-			fmt.Printf("  localhost:%d -> container:%d\n", pm.Local, pm.Remote)
-		}
-		fmt.Println()
-		fmt.Println("SSH command:")
-		fmt.Printf("  %s\n", strings.Join(mgr.BuildSSHArgs(shedName, entry, allPorts), " "))
-		fmt.Println()
-	}
+	// Resolve shed-server address for the Connect API
+	serverAddr := fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)
 
 	if tunnelBackground {
-		// Start as daemon
-		if err := mgr.StartBackground(shedName, serverName, entry, allPorts, profileName); err != nil {
-			return fmt.Errorf("failed to start tunnel: %w", err)
-		}
-		if jsonFlag {
-			return outputJSON(ActionResult{
-				Status: "ok",
-				Action: "started",
-				Name:   shedName,
-				Server: serverName,
-				Details: struct {
-					Profile string                `json:"profile"`
-					Ports   []tunnels.PortMapping `json:"ports"`
-				}{
-					Profile: profileName,
-					Ports:   allPorts,
-				},
-			})
-		}
-		printSuccess("Tunnel started for %s (profile: %s)", shedName, profileName)
-		fmt.Println("Forwarding:")
-		for _, pm := range allPorts {
-			fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
-		}
-	} else {
-		// Start in foreground
-		if !jsonFlag {
-			fmt.Printf("Starting tunnel to %s (Ctrl+C to stop)...\n", shedName)
-			for _, pm := range allPorts {
-				fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
-			}
-			fmt.Println()
-		}
-
-		// This replaces the current process
-		if err := mgr.StartForeground(shedName, serverName, entry, allPorts, profileName); err != nil {
-			return fmt.Errorf("failed to start tunnel: %w", err)
-		}
+		// Start tunnels, save state, and stay alive as a daemon process.
+		// Re-exec ourselves with a --daemon flag to detach from the terminal.
+		return startBackgroundTunnel(mgr, shedName, serverName, serverAddr, allPorts, profileName)
 	}
+
+	// Foreground mode: start tunnels and block on signal.
+	return runForegroundTunnel(mgr, shedName, serverAddr, allPorts, profileName)
+}
+
+func runForegroundTunnel(mgr *tunnels.Manager, shedName, serverAddr string, ports []tunnels.PortMapping, profile string) error {
+	activeTunnels, err := mgr.StartTunnels(serverAddr, shedName, ports)
+	if err != nil {
+		return fmt.Errorf("failed to start tunnels: %w", err)
+	}
+
+	fmt.Printf("Tunnels to %s (Ctrl+C to stop):\n", shedName)
+	for _, t := range activeTunnels {
+		pm := t.Port()
+		fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
+	}
+	fmt.Println()
+
+	// Block until signal
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+
+	fmt.Println("\nStopping tunnels...")
+	for _, t := range activeTunnels {
+		t.Stop()
+	}
+
+	return nil
+}
+
+func startBackgroundTunnel(mgr *tunnels.Manager, shedName, serverName, serverAddr string, ports []tunnels.PortMapping, profile string) error {
+	// Start the tunnels in this process.
+	activeTunnels, err := mgr.StartTunnels(serverAddr, shedName, ports)
+	if err != nil {
+		return fmt.Errorf("failed to start tunnels: %w", err)
+	}
+
+	// Save state with our own PID so stop/list can find us.
+	if err := mgr.SaveBackground(shedName, serverName, profile, os.Getpid(), ports); err != nil {
+		for _, t := range activeTunnels {
+			t.Stop()
+		}
+		return fmt.Errorf("failed to save tunnel state: %w", err)
+	}
+
+	// The tunnel daemon keeps this process alive. The PID is saved to state
+	// so `shed tunnels stop` can send SIGTERM to tear it down.
+	// A future version could fork/detach for true daemonization.
+	printSuccess("Tunnel started for %s (profile: %s, PID %d)", shedName, profile, os.Getpid())
+	fmt.Println("Forwarding:")
+	for _, pm := range ports {
+		fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
+	}
+
+	// Block until signal (daemon behavior)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+
+	for _, t := range activeTunnels {
+		t.Stop()
+	}
+	mgr.State().RemoveTunnel(shedName)
+	_ = mgr.State().Save()
 
 	return nil
 }
@@ -311,10 +313,7 @@ func runTunnelsStop(cmd *cobra.Command, args []string) error {
 		allTunnels := mgr.State().GetAllTunnels()
 		if len(allTunnels) == 0 {
 			if jsonFlag {
-				return outputJSON(ActionResult{
-					Status: "ok",
-					Action: "stopped",
-				})
+				return outputJSON(ActionResult{Status: "ok", Action: "stopped"})
 			}
 			fmt.Println("No tunnels running.")
 			return nil
@@ -349,7 +348,6 @@ func runTunnelsStop(cmd *cobra.Command, args []string) error {
 	}
 
 	shedName := args[0]
-
 	if _, ok := mgr.State().GetTunnel(shedName); !ok {
 		return fmt.Errorf("no tunnel running for shed %q", shedName)
 	}
@@ -359,13 +357,8 @@ func runTunnelsStop(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonFlag {
-		return outputJSON(ActionResult{
-			Status: "ok",
-			Action: "stopped",
-			Name:   shedName,
-		})
+		return outputJSON(ActionResult{Status: "ok", Action: "stopped", Name: shedName})
 	}
-
 	printSuccess("Stopped tunnel for %s", shedName)
 	return nil
 }
@@ -376,7 +369,6 @@ func runTunnelsList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize tunnel manager: %w", err)
 	}
 
-	// Clean up dead tunnels first
 	if err := mgr.CleanupDeadTunnels(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to clean up dead tunnels: %v\n", err)
 	}
@@ -395,7 +387,6 @@ func runTunnelsList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Sort by shed name
 	names := make([]string, 0, len(allTunnels))
 	for name := range allTunnels {
 		names = append(names, name)
@@ -403,7 +394,6 @@ func runTunnelsList(cmd *cobra.Command, args []string) error {
 	sort.Strings(names)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-
 	if verboseLevel > 0 {
 		fmt.Fprintln(w, "SHED\tPROFILE\tPID\tPORTS\tSTARTED\tSERVER")
 		for _, name := range names {
@@ -423,7 +413,6 @@ func runTunnelsList(cmd *cobra.Command, args []string) error {
 				name, entry.Profile, portCount, started)
 		}
 	}
-
 	w.Flush()
 	return nil
 }
@@ -431,7 +420,6 @@ func runTunnelsList(cmd *cobra.Command, args []string) error {
 func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 	shedName := args[0]
 
-	// Find the server hosting this shed
 	serverName, entry, err := findShedServer(shedName)
 	if err != nil {
 		return err
@@ -442,40 +430,37 @@ func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize tunnel manager: %w", err)
 	}
 
-	// Collect port mappings
 	allPorts, profileName, err := collectPortMappings(mgr, shedName, tunnelProfiles, tunnelPorts, "config")
 	if err != nil {
 		return err
 	}
 
+	serverAddr := fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)
+
 	if jsonFlag {
 		return outputJSON(struct {
-			Shed    string                `json:"shed"`
-			Server  string                `json:"server"`
-			Profile string                `json:"profile"`
-			Ports   []tunnels.PortMapping `json:"ports"`
+			Shed       string                `json:"shed"`
+			Server     string                `json:"server"`
+			ServerAddr string                `json:"server_addr"`
+			Profile    string                `json:"profile"`
+			Ports      []tunnels.PortMapping `json:"ports"`
 		}{
-			Shed:    shedName,
-			Server:  serverName,
-			Profile: profileName,
-			Ports:   allPorts,
+			Shed:       shedName,
+			Server:     serverName,
+			ServerAddr: serverAddr,
+			Profile:    profileName,
+			Ports:      allPorts,
 		})
 	}
 
 	fmt.Printf("Tunnel configuration for %s\n", shedName)
-	fmt.Printf("Server: %s\n", serverName)
+	fmt.Printf("Server: %s (%s)\n", serverName, serverAddr)
 	fmt.Printf("Profile: %s\n", profileName)
 	fmt.Println()
 
 	fmt.Println("Port mappings:")
 	for _, pm := range allPorts {
 		fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
-	}
-	fmt.Println()
-
-	if verboseLevel > 0 {
-		fmt.Println("SSH command:")
-		fmt.Printf("  %s\n", strings.Join(mgr.BuildSSHArgs(shedName, entry, allPorts), " "))
 	}
 
 	return nil

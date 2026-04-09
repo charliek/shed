@@ -552,6 +552,7 @@ func validVZConfig() *VZConfig {
 		DefaultDiskGB:   20,
 		ConsolePort:     1024,
 		NotifyPort:      1026,
+		TCPProxyPort:    1028,
 		StartTimeout:    Duration(60 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
 	}
@@ -642,8 +643,28 @@ func TestVZConfigValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "duplicate ports",
+			name:    "tcp proxy port zero",
+			modify:  func(c *VZConfig) { c.TCPProxyPort = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "tcp proxy port over max",
+			modify:  func(c *VZConfig) { c.TCPProxyPort = MaxVsockPort + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "duplicate console and notify ports",
 			modify:  func(c *VZConfig) { c.ConsolePort = 1026; c.NotifyPort = 1026 },
+			wantErr: true,
+		},
+		{
+			name:    "duplicate console and tcp proxy ports",
+			modify:  func(c *VZConfig) { c.TCPProxyPort = c.ConsolePort },
+			wantErr: true,
+		},
+		{
+			name:    "duplicate notify and tcp proxy ports",
+			modify:  func(c *VZConfig) { c.TCPProxyPort = c.NotifyPort },
 			wantErr: true,
 		},
 		// Timeout validation
@@ -704,6 +725,9 @@ func TestDefaultVZConfig(t *testing.T) {
 	}
 	if cfg.NotifyPort != 1026 {
 		t.Errorf("NotifyPort = %d, want 1026", cfg.NotifyPort)
+	}
+	if cfg.TCPProxyPort != 1028 {
+		t.Errorf("TCPProxyPort = %d, want 1028", cfg.TCPProxyPort)
 	}
 }
 
@@ -880,11 +904,18 @@ func TestVZConfigApplyDefaults(t *testing.T) {
 		t.Errorf("NotifyPort = %d after applyDefaults, want 1026", cfg.NotifyPort)
 	}
 
-	// Should not overwrite non-zero value
-	cfg2 := &VZConfig{NotifyPort: 2000}
+	if cfg.TCPProxyPort != 1028 {
+		t.Errorf("TCPProxyPort = %d after applyDefaults, want 1028", cfg.TCPProxyPort)
+	}
+
+	// Should not overwrite non-zero values
+	cfg2 := &VZConfig{NotifyPort: 2000, TCPProxyPort: 2002}
 	cfg2.applyDefaults()
 	if cfg2.NotifyPort != 2000 {
 		t.Errorf("NotifyPort = %d after applyDefaults, want 2000", cfg2.NotifyPort)
+	}
+	if cfg2.TCPProxyPort != 2002 {
+		t.Errorf("TCPProxyPort = %d after applyDefaults, want 2002", cfg2.TCPProxyPort)
 	}
 }
 

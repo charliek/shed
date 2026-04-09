@@ -23,6 +23,7 @@ func main() {
 	// Parse flags
 	consolePort := flag.Uint("console-port", DefaultConsolePort, "vsock port for console connections")
 	notifyPort := flag.Uint("notify-port", DefaultNotifyPort, "vsock port for message channel")
+	tcpProxyPort := flag.Uint("tcp-proxy-port", DefaultTCPProxyPort, "vsock port for TCP proxy (DialService)")
 	shedName := flag.String("shed-name", "", "shed instance name (defaults to hostname)")
 	httpPort := flag.Uint("http-port", DefaultHTTPPort, "localhost HTTP port for plugin API")
 	flag.Parse()
@@ -40,7 +41,7 @@ func main() {
 	}
 
 	// Create and start server
-	server := NewServer(uint32(*consolePort), uint32(*notifyPort), uint32(*httpPort), name)
+	server := NewServer(uint32(*consolePort), uint32(*notifyPort), uint32(*tcpProxyPort), uint32(*httpPort), name)
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}

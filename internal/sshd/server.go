@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/gliderlabs/ssh"
@@ -219,19 +218,19 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 		return
 	}
 
-	// Get network endpoint to forward to
-	containerIP, err := s.backend.GetNetworkEndpoint(ctx, shed.Name)
-	if err != nil {
-		log.Printf("Port forward: cannot get network endpoint for %s: %v", user, err)
-		_ = newChan.Reject(gossh.ConnectionFailed, "cannot get network endpoint")
+	// Validate port range (SSH protocol uses uint32, TCP ports are uint16).
+	if d.DestPort > 65535 {
+		log.Printf("Port forward denied: invalid port %d for user %s", d.DestPort, user)
+		_ = newChan.Reject(gossh.ConnectionFailed, "invalid port number")
 		return
 	}
 
-	// Connect to container's port
-	dest := net.JoinHostPort(containerIP, strconv.FormatUint(uint64(d.DestPort), 10))
-	dconn, err := net.DialTimeout("tcp", dest, 30*time.Second)
+	// Connect to the service inside the VM via DialService.
+	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer dialCancel()
+	dconn, err := s.backend.DialService(dialCtx, shed.Name, uint16(d.DestPort))
 	if err != nil {
-		log.Printf("Port forward: failed to connect to %s: %v", dest, err)
+		log.Printf("Port forward: DialService failed for %s port %d: %v", user, d.DestPort, err)
 		_ = newChan.Reject(gossh.ConnectionFailed, err.Error())
 		return
 	}
@@ -244,7 +243,7 @@ func (s *Server) handleDirectTCPIP(srv *ssh.Server, conn *gossh.ServerConn,
 	}
 	go gossh.DiscardRequests(reqs)
 
-	log.Printf("Port forward established: %s -> %s", user, dest)
+	log.Printf("Port forward established: %s -> %s:%d", user, shed.Name, d.DestPort)
 
 	// Bidirectional proxy
 	go func() {

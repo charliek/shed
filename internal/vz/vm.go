@@ -144,7 +144,7 @@ func (vm *VM) buildVfkitArgs() []string {
 	// Add vsock devices — one per port.
 	// NOTE: SocketDir must not contain spaces. vfkit URL-encodes the socketURL
 	// parameter, turning spaces into %20, which causes connection failures.
-	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.NotifyPort}
+	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.NotifyPort, vm.cfg.TCPProxyPort}
 	for _, port := range ports {
 		socketPath := filepath.Join(vm.cfg.SocketDir, fmt.Sprintf("%s-%d.sock", vm.meta.Name, port))
 		args = append(args, "--device", fmt.Sprintf("virtio-vsock,port=%d,socketURL=%s,connect", port, socketPath))
@@ -261,7 +261,7 @@ func (vm *VM) stopByPID(ctx context.Context) error {
 
 // cleanupSockets removes vsock socket files for this VM.
 func (vm *VM) cleanupSockets() {
-	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.NotifyPort}
+	ports := []uint32{vm.cfg.ConsolePort, vm.cfg.NotifyPort, vm.cfg.TCPProxyPort}
 	for _, port := range ports {
 		socketPath := filepath.Join(vm.cfg.SocketDir, fmt.Sprintf("%s-%d.sock", vm.meta.Name, port))
 		os.Remove(socketPath)

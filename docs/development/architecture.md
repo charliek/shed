@@ -49,10 +49,11 @@ flowchart TB
 
 | Protocol | Port | Purpose |
 |----------|------|---------|
-| HTTP | 8080 | REST API for CRUD operations, server discovery |
-| SSH | 2222 | Terminal access, IDE remote connections |
+| HTTP | 8080 | REST API for CRUD operations, Connect API, server discovery |
+| SSH | 2222 | Terminal access (exec, attach), IDE remote connections |
 | vsock | 1024 | VM console I/O (Firecracker, VZ) |
 | vsock | 1026 | Message bus — health checks, plugins (Firecracker, VZ) |
+| vsock | 1028 | TCP proxy — DialService tunnels into VM services (Firecracker, VZ) |
 
 ## Naming Conventions
 
@@ -167,11 +168,31 @@ sequenceDiagram
     Agent-->>User: Interactive shell
 ```
 
+## DialService and Connect API
+
+`DialService` is the foundational primitive for opening TCP connections into VMs. It abstracts the per-backend connectivity:
+
+- **VZ:** Dials the vsock TCP proxy port (1028) via a Unix socket, performs a CONNECT handshake (`CONNECT <port>\n` / `OK\n`), and returns a raw TCP connection to the target port inside the VM.
+- **Firecracker:** Dials the VM's bridge IP directly over TCP (no proxy needed since VMs have routable IPs).
+
+The **Connect API** (`GET /api/sheds/{name}/connect/{port}`) exposes `DialService` to external processes via HTTP upgrade (101 Switching Protocols). After the upgrade, the connection is a raw bidirectional byte stream.
+
+**Consumers:**
+
+- `shed tunnels` CLI — opens local ports, bridges connections through Connect API
+- SSH port forwarding (`handleDirectTCPIP`) — uses `DialService` directly (same process)
+- Proxy extension (`shed-ext-proxy`) — uses Connect API for reverse proxying
+
+**Two primitives for two jobs:**
+
+- TCP tunneling (ports, services, proxy): Connect API / `DialService`
+- Interactive sessions (exec, attach): SSH / vsock binary framed protocol
+
 ## Internal Packages
 
 ### `internal/api`
 
-HTTP API handlers and routing. Uses standard `net/http` with Chi router.
+HTTP API handlers and routing. Uses standard `net/http` with Chi router. Includes the Connect API endpoint for TCP tunneling.
 
 ### `internal/config`
 

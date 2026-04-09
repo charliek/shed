@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
@@ -111,6 +112,61 @@ func TestGetNetworkEndpointNotFound(t *testing.T) {
 	_, err := client.GetNetworkEndpoint(context.Background(), "nonexistent")
 	if err == nil {
 		t.Error("GetNetworkEndpoint() expected error for nonexistent shed")
+	}
+}
+
+func TestDialServiceNotFound(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.VZConfig{
+		InstanceDir:  tmpDir,
+		TCPProxyPort: 1028,
+	}
+
+	client := &Client{
+		cfg:     cfg,
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
+	}
+
+	_, err := client.DialService(context.Background(), "nonexistent", 8080)
+	if err == nil {
+		t.Fatal("DialService() expected error for nonexistent shed")
+	}
+	expected := fmt.Sprintf("%s: %s", config.ErrShedNotFoundSentinel, "nonexistent")
+	if err.Error() != expected {
+		t.Errorf("error = %q, want %q", err.Error(), expected)
+	}
+}
+
+func TestDialServiceNotRunning(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.VZConfig{
+		InstanceDir:  tmpDir,
+		SocketDir:    tmpDir,
+		TCPProxyPort: 1028,
+	}
+
+	// Create metadata for a stopped VM
+	meta := &Metadata{
+		Name:   "stopped-vm",
+		Status: config.StatusStopped,
+	}
+	if err := meta.Save(tmpDir); err != nil {
+		t.Fatalf("save metadata: %v", err)
+	}
+
+	client := &Client{
+		cfg:     cfg,
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
+	}
+
+	_, err := client.DialService(context.Background(), "stopped-vm", 8080)
+	if err == nil {
+		t.Fatal("DialService() expected error for stopped shed")
+	}
+	if !strings.Contains(err.Error(), config.ErrShedNotRunningSentinel.Error()) {
+		t.Errorf("error = %q, want to contain %q", err.Error(), config.ErrShedNotRunningSentinel.Error())
 	}
 }
 

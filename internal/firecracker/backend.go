@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
@@ -177,6 +178,11 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 // GetNetworkEndpoint returns the network endpoint (IP) for a shed.
 func (b *FirecrackerBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
 	return b.client.GetNetworkEndpoint(ctx, shedName)
+}
+
+// DialService opens a TCP connection to a port inside a running shed's VM.
+func (b *FirecrackerBackend) DialService(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
+	return b.client.DialService(ctx, shedName, port)
 }
 
 // ListImages returns available Firecracker image variants from config and auto-discovery.

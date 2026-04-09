@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"runtime"
 	"sync"
@@ -443,6 +444,24 @@ func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, e
 	}
 
 	return "127.0.0.1", nil
+}
+
+// DialService opens a TCP connection to a service port inside a running VZ shed.
+// It dials the vsock TCP proxy port and performs a CONNECT handshake.
+func (c *Client) DialService(ctx context.Context, name string, port uint16) (net.Conn, error) {
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	if meta.Status != config.StatusRunning {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
+	}
+
+	dialer := NewVZDialer(c.cfg.SocketDir, name)
+	return dialer.DialService(ctx, c.cfg.TCPProxyPort, port)
 }
 
 // metadataToShed converts VZ metadata to a config.Shed response.
