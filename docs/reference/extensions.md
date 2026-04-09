@@ -343,7 +343,7 @@ A reverse proxy on the host listens to a `proxy` namespace. Sheds send `event` m
 }
 ```
 
-The proxy updates its routing table based on shed metadata.
+The proxy extension uses the [Connect API](api.md#connect-api) to route traffic into VMs via `DialService`. See the [proxy integration design](../discovery/proxy_integration_design.md) for the full architecture.
 
 ### Activity monitoring
 

@@ -25,6 +25,7 @@ The `shed-server` exposes a REST API for managing sheds.
 | GET | `/api/images` | List available image variants |
 | DELETE | `/api/images/{name}` | Delete a cached image |
 | POST | `/api/images/prune` | Prune unused cached images |
+| GET | `/api/sheds/{name}/connect/{port}` | TCP tunnel via HTTP upgrade |
 | GET | `/api/plugins/listeners` | List active extension listeners |
 | GET | `/api/plugins/listeners/{ns}/messages` | Subscribe to namespace (SSE) |
 | POST | `/api/plugins/listeners/{ns}/respond` | Respond to a plugin message |
@@ -393,6 +394,42 @@ Removes cached images not referenced by config or any existing shed.
 ```
 
 The `deleted` array contains the images that were removed (or would be removed if `dry_run=true`).
+
+## Connect API
+
+The Connect API provides TCP tunnels into shed VMs via HTTP upgrade. This is the foundation for port forwarding (tunnels) and the proxy extension.
+
+### GET /api/sheds/{name}/connect/{port}
+
+Opens a raw TCP tunnel to a port inside a running shed VM.
+
+**Request headers:**
+
+```
+Connection: Upgrade
+Upgrade: shed-tcp
+```
+
+**Success response:** `101 Switching Protocols`
+
+After the 101 response, the connection becomes a bidirectional byte stream to the target port inside the VM. The server uses `DialService` internally — for VZ this goes through the vsock TCP proxy (port 1028), for Firecracker it connects directly to the bridge IP.
+
+**Error responses:**
+
+| Status | Code | Description |
+|--------|------|-------------|
+| 400 | `INVALID_PORT` | Port must be 1-65535 |
+| 404 | `SHED_NOT_FOUND` | Shed does not exist |
+| 502 | `CONNECT_FAILED` | Could not connect to the port (service not running) |
+| 503 | `SHED_NOT_RUNNING` | Shed is not running |
+
+**Security:** The Connect API has the same access control as other API endpoints — network-level only (Tailscale, firewall). It connects to the VM's loopback interface and does not support arbitrary destinations.
+
+**Consumers:**
+
+- `shed tunnels` CLI uses Connect API for port forwarding
+- The proxy extension (`shed-ext-proxy`) uses Connect API for reverse proxying
+- SSH port forwarding (`ssh -L`) uses `DialService` internally via `handleDirectTCPIP`
 
 ## Extensions
 

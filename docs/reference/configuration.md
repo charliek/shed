@@ -232,6 +232,7 @@ vz:
   default_disk_gb: 20
   console_port: 1024
   notify_port: 1026
+  tcp_proxy_port: 1028
   start_timeout: 60s
   stop_timeout: 10s
 ```
@@ -253,6 +254,7 @@ vz:
 | `default_disk_gb` | int | `20` | Default disk size per VM (GB) |
 | `console_port` | int | `1024` | Vsock port for VM console I/O |
 | `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins) |
+| `tcp_proxy_port` | int | `1028` | Vsock port for TCP proxy (used by DialService for tunnels and Connect API) |
 | `start_timeout` | duration | `60s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
 

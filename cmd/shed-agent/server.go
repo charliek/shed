@@ -35,6 +35,9 @@ const (
 
 	// DefaultHTTPPort is the localhost port for the in-VM plugin HTTP API.
 	DefaultHTTPPort = 498
+
+	// DefaultTCPProxyPort is the vsock port for the TCP proxy (DialService).
+	DefaultTCPProxyPort = 1028
 )
 
 // DefaultHeartbeatInterval is the default interval between health heartbeats.
@@ -44,13 +47,15 @@ const DefaultHeartbeatInterval = 15 * time.Second
 type Server struct {
 	consolePort       uint32
 	notifyPort        uint32
+	tcpProxyPort      uint32
 	httpPort          uint32
 	shedName          string
 	startedAt         time.Time
 	heartbeatInterval time.Duration
 
-	consoleListener net.Listener
-	notifyListener  net.Listener
+	consoleListener  net.Listener
+	notifyListener   net.Listener
+	tcpProxyListener net.Listener
 
 	httpServer *http.Server
 
@@ -79,11 +84,12 @@ type Server struct {
 }
 
 // NewServer creates a new Server.
-func NewServer(consolePort, notifyPort, httpPort uint32, shedName string) *Server {
+func NewServer(consolePort, notifyPort, tcpProxyPort, httpPort uint32, shedName string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		consolePort:       consolePort,
 		notifyPort:        notifyPort,
+		tcpProxyPort:      tcpProxyPort,
 		httpPort:          httpPort,
 		shedName:          shedName,
 		startedAt:         time.Now(),
@@ -202,13 +208,45 @@ func (s *Server) Start() error {
 		}
 	}()
 
+	// Start TCP proxy listener (for DialService / Connect API)
+	s.tcpProxyListener, err = vsock.Listen(s.tcpProxyPort, nil)
+	if err != nil {
+		s.consoleListener.Close()
+		s.notifyListener.Close()
+		return err
+	}
+
+	// Accept TCP proxy connections
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			conn, err := s.tcpProxyListener.Accept()
+			if err != nil {
+				select {
+				case <-s.ctx.Done():
+					return
+				default:
+					log.Printf("TCP proxy accept error: %v", err)
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+			}
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				handleTCPProxyConnection(conn)
+			}()
+		}
+	}()
+
 	// Start localhost HTTP server for in-VM plugin API
 	if err := s.startHTTPServer(); err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
 
-	log.Printf("Listening on vsock ports: console=%d, message=%d; HTTP on 127.0.0.1:%d",
-		s.consolePort, s.notifyPort, s.httpPort)
+	log.Printf("Listening on vsock ports: console=%d, message=%d, tcp_proxy=%d; HTTP on 127.0.0.1:%d",
+		s.consolePort, s.notifyPort, s.tcpProxyPort, s.httpPort)
 	return nil
 }
 
@@ -260,6 +298,9 @@ func (s *Server) Stop() {
 	}
 	if s.notifyListener != nil {
 		s.notifyListener.Close()
+	}
+	if s.tcpProxyListener != nil {
+		s.tcpProxyListener.Close()
 	}
 
 	// Shutdown HTTP server

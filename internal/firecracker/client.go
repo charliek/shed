@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -813,4 +814,23 @@ func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, e
 	}
 
 	return meta.IPAddress, nil
+}
+
+// DialService opens a TCP connection to a service port inside a running Firecracker shed.
+// Firecracker VMs have routable bridge IPs, so this dials directly.
+func (c *Client) DialService(ctx context.Context, name string, port uint16) (net.Conn, error) {
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	if meta.Status != config.StatusRunning {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
+	}
+
+	addr := net.JoinHostPort(meta.IPAddress, strconv.FormatUint(uint64(port), 10))
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
 }

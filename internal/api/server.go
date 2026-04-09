@@ -77,6 +77,9 @@ func (s *Server) Router() chi.Router {
 				// Sessions within a shed
 				r.Get("/sessions", s.handleListSessions)
 				r.Delete("/sessions/{session}", s.handleKillSession)
+
+				// Connect API: TCP tunnel via HTTP upgrade
+				r.Get("/connect/{port}", s.handleConnect)
 			})
 		})
 	})

@@ -4,12 +4,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
-	"strconv"
 	"syscall"
 	"time"
-
-	"github.com/charliek/shed/internal/config"
 )
 
 // Manager handles tunnel lifecycle operations.
@@ -54,124 +50,59 @@ func (m *Manager) State() *TunnelState {
 	return m.state
 }
 
-// BuildSSHArgs constructs the SSH command arguments for port forwarding.
-func (m *Manager) BuildSSHArgs(shedName string, serverEntry *config.ServerEntry, ports []PortMapping) []string {
-	knownHostsPath := config.GetKnownHostsPath()
-
-	args := []string{
-		"ssh",
-		"-N", // No remote command
-		"-T", // No pseudo-terminal
-		"-p", strconv.Itoa(serverEntry.SSHPort),
-		"-o", "UserKnownHostsFile=" + knownHostsPath,
-		"-o", "StrictHostKeyChecking=yes",
-		"-o", fmt.Sprintf("ServerAliveInterval=%d", m.config.SSH.ServerAliveInterval),
-		"-o", fmt.Sprintf("ServerAliveCountMax=%d", m.config.SSH.ServerAliveCountMax),
-		"-o", fmt.Sprintf("ConnectTimeout=%d", m.config.SSH.ConnectTimeout),
-		"-o", "ExitOnForwardFailure=yes",
-	}
+// StartTunnels starts tunnels for all port mappings using the Connect API.
+// Returns the active tunnels that the caller should manage (stop on shutdown).
+func (m *Manager) StartTunnels(serverAddr, shedName string, ports []PortMapping) ([]*Tunnel, error) {
+	client := NewConnectClient(serverAddr)
+	var tunnels []*Tunnel
 
 	for _, pm := range ports {
-		args = append(args, "-L", fmt.Sprintf("%d:localhost:%d", pm.Local, pm.Remote))
+		tun := NewTunnel(client, shedName, pm)
+		if err := tun.Start(); err != nil {
+			// Clean up already-started tunnels
+			for _, started := range tunnels {
+				started.Stop()
+			}
+			return nil, err
+		}
+		tunnels = append(tunnels, tun)
 	}
 
-	args = append(args, shedName+"@"+serverEntry.Host)
-	return args
+	return tunnels, nil
 }
 
-// StartForeground starts a tunnel in the foreground using syscall.Exec.
-// This replaces the current process.
-func (m *Manager) StartForeground(shedName, serverName string, serverEntry *config.ServerEntry, ports []PortMapping, profile string) error {
-	args := m.BuildSSHArgs(shedName, serverEntry, ports)
-
-	sshPath, err := exec.LookPath("ssh")
-	if err != nil {
-		return fmt.Errorf("ssh not found in PATH: %w", err)
-	}
-
-	// Note: We don't save state for foreground tunnels since the process
-	// replaces the current one and we can't track the PID
-
-	if err := syscall.Exec(sshPath, args, os.Environ()); err != nil {
-		return fmt.Errorf("failed to exec ssh: %w", err)
-	}
-
-	return nil
-}
-
-// StartBackground starts a tunnel as a background daemon.
-func (m *Manager) StartBackground(shedName, serverName string, serverEntry *config.ServerEntry, ports []PortMapping, profile string) error {
-	args := m.BuildSSHArgs(shedName, serverEntry, ports)
-
-	sshPath, err := exec.LookPath("ssh")
-	if err != nil {
-		return fmt.Errorf("ssh not found in PATH: %w", err)
-	}
-
-	cmd := exec.Command(sshPath, args[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Create new session (detach from terminal)
-	}
-
-	// Open /dev/null for proper process detachment
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", os.DevNull, err)
-	}
-	defer devNull.Close()
-
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
-	cmd.Stdin = devNull
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start ssh: %w", err)
-	}
-
-	// Save state
+// SaveBackground saves the state for a background tunnel daemon.
+func (m *Manager) SaveBackground(shedName, serverName, profile string, pid int, ports []PortMapping) error {
 	m.state.SetTunnel(shedName, TunnelEntry{
 		ShedName:   shedName,
 		Profile:    profile,
-		PID:        cmd.Process.Pid,
+		PID:        pid,
 		Ports:      ports,
 		StartedAt:  time.Now(),
 		ServerName: serverName,
 	})
-
-	if err := m.state.Save(); err != nil {
-		// Rollback: kill the process and remove from in-memory state
-		_ = m.killProcess(cmd.Process.Pid)
-		m.state.RemoveTunnel(shedName)
-		return fmt.Errorf("failed to save tunnel state: %w", err)
-	}
-
-	return nil
+	return m.state.Save()
 }
 
-// Stop stops a tunnel for a shed.
+// Stop stops a tunnel for a shed by signaling its daemon process.
 func (m *Manager) Stop(shedName string) error {
 	entry, ok := m.state.GetTunnel(shedName)
 	if !ok {
 		return fmt.Errorf("no tunnel found for shed %q", shedName)
 	}
 
-	// Process might already be dead, just clean up state regardless of error
 	_ = m.killProcess(entry.PID)
-
 	m.state.RemoveTunnel(shedName)
 	return m.state.Save()
 }
 
-// StopAllTunnelsForShed stops all tunnels for a shed (used when shed is stopped/deleted).
+// StopAllTunnelsForShed stops any tunnel for a specific shed.
 func (m *Manager) StopAllTunnelsForShed(shedName string) error {
 	entry, ok := m.state.GetTunnel(shedName)
 	if !ok {
-		return nil // No tunnel to stop
+		return nil
 	}
-
-	// Process might already be dead, just clean up state regardless of error
 	_ = m.killProcess(entry.PID)
-
 	m.state.RemoveTunnel(shedName)
 	return m.state.Save()
 }
@@ -179,7 +110,6 @@ func (m *Manager) StopAllTunnelsForShed(shedName string) error {
 // StopAll stops all tunnels.
 func (m *Manager) StopAll() error {
 	for shedName, entry := range m.state.GetAllTunnels() {
-		// Process might already be dead, continue cleaning up regardless of error
 		_ = m.killProcess(entry.PID)
 		m.state.RemoveTunnel(shedName)
 	}
@@ -192,7 +122,6 @@ func (m *Manager) CheckHealth(shedName string) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-
 	return m.isProcessAlive(entry.PID), nil
 }
 
@@ -205,7 +134,6 @@ func (m *Manager) CleanupDeadTunnels() error {
 			changed = true
 		}
 	}
-
 	if changed {
 		return m.state.Save()
 	}
@@ -213,9 +141,7 @@ func (m *Manager) CleanupDeadTunnels() error {
 }
 
 // CheckPortConflict checks if a local port is available.
-// Returns a descriptive error if the port is in use.
 func (m *Manager) CheckPortConflict(port int) error {
-	// First check our own state for conflicts
 	if shedName, entry := m.state.FindTunnelUsingPort(port); entry != nil {
 		if m.isProcessAlive(entry.PID) {
 			duration := time.Since(entry.StartedAt)
@@ -224,13 +150,11 @@ func (m *Manager) CheckPortConflict(port int) error {
 		}
 	}
 
-	// Try to bind to the port to check if it's free
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return fmt.Errorf("port %d is already in use. Check with: lsof -i :%d", port, port)
 	}
 	listener.Close()
-
 	return nil
 }
 
@@ -244,29 +168,22 @@ func (m *Manager) CheckPortConflicts(ports []PortMapping) error {
 	return nil
 }
 
-// killProcess sends SIGTERM to a process.
 func (m *Manager) killProcess(pid int) error {
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return err
 	}
-
 	return process.Signal(syscall.SIGTERM)
 }
 
-// isProcessAlive checks if a process is still running.
 func (m *Manager) isProcessAlive(pid int) bool {
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
-
-	// Signal 0 checks if process exists without sending a signal
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
+	return process.Signal(syscall.Signal(0)) == nil
 }
 
-// formatDuration formats a duration in a human-readable way.
 func formatDuration(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%ds", int(d.Seconds()))
