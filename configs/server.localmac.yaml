@@ -18,29 +18,11 @@ credentials:
     source: ~/.shed/mounts/codex
     target: /home/shed/.codex
     readonly: false
-    exclude:
-      - "sessions/*"
-      - "archived_sessions/*"
-      - "vendor_imports/*"
-      - "log/*"
-      - "tmp/*"
-      - "shell_snapshots/*"
-      - "sqlite/*"
-      - "*.sqlite"
-      - "*.sqlite-shm"
-      - "*.sqlite-wal"
-      - "models_cache.json"
 
   opencode_data:
     source: ~/.shed/mounts/opencode/share
     target: /home/shed/.local/share/opencode
     readonly: false
-    exclude:
-      - "*.db"
-      - "*.db-shm"
-      - "*.db-wal"
-      - "log/*"
-      - "storage/*"
 
   opencode_state:
     source: ~/.shed/mounts/opencode/state
@@ -62,17 +44,28 @@ env_file: ~/.shed/env
 
 log_level: debug
 
+extensions:
+  enabled:
+    - ssh-agent
+    - aws-credentials
+
 default_backend: vz
 
 vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+  # base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+  # images:
+  #   base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
+  #   default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+  #   experimental: ~/Library/Application Support/shed/vz/experimental-rootfs.ext4
+
+  base_rootfs: ghcr.io/charliek/shed-vz-experimental:v0.3.0
   images:
-    base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
-    default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
-    experimental: ~/Library/Application Support/shed/vz/experimental-rootfs.ext4
+    base: ghcr.io/charliek/shed-vz-base:v0.3.0
+    experimental: ghcr.io/charliek/shed-vz-experimental:v0.3.0
+  
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2
