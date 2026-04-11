@@ -286,18 +286,24 @@ ENTRYPOINT ["/sbin/init"]
 
 # =============================================================================
 # Stage: shed-fc-experimental
-# Default tools + shed-extensions credential brokering (SSH agent, AWS proxy).
+# Default tools + shed-extensions credential brokering (SSH agent, AWS proxy, Docker credentials).
 # See https://github.com/charliek/shed-extensions for details.
 # =============================================================================
 FROM shed-fc-default AS shed-fc-experimental
 
 COPY --from=shed-extensions /usr/local/bin/shed-ext-ssh-agent /usr/local/bin/shed-ext-ssh-agent
 COPY --from=shed-extensions /usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials
+COPY --from=shed-extensions /usr/local/bin/docker-credential-shed /usr/local/bin/docker-credential-shed
 COPY --from=shed-extensions /etc/systemd/system/shed-ext-ssh-agent.service /etc/systemd/system/
 COPY --from=shed-extensions /etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/
 COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
 COPY --from=shed-extensions /etc/shed-extensions.d/ /etc/shed-extensions.d/
 # Units ship disabled — shed-agent enables them from server config
+
+# Configure Docker inside the guest to use shed credential helper
+RUN mkdir -p /home/shed/.docker && \
+    echo '{"credsStore": "shed"}' > /home/shed/.docker/config.json && \
+    chown -R shed:shed /home/shed/.docker
 
 USER root
 

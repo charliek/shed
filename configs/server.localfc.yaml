@@ -17,19 +17,6 @@ credentials:
     source: /home/charliek/.shed/mounts/claude
     target: /home/shed/.claude
     readonly: false
-    exclude:
-      - "debug/*"
-      - "file-history/*"
-      - "plans/*"
-      - "backups/*"
-      - "cache/*"
-      - "tasks/*"
-      - "todos/*"
-      - "paste-cache/*"
-      - "shell-snapshots/*"
-      - "session-env/*"
-      - "downloads/*"
-      - "telemetry/*"
 
   # GitHub CLI - credentials and config
   gh:
