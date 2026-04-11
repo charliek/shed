@@ -48,6 +48,7 @@ extensions:
   enabled:
     - ssh-agent
     - aws-credentials
+    - docker-credentials
 
 default_backend: vz
 
