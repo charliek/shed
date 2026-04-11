@@ -85,6 +85,55 @@ archives:
     files:
       - none*
 
+  - id: shed-homebrew
+    ids:
+      - shed
+      - shed-server
+    formats:
+      - tar.gz
+    name_template: "shed-homebrew_{{ .Os }}_{{ .Arch }}"
+    files:
+      - src: configs/server.example.yaml
+        dst: .
+        strip_parent: true
+
+brews:
+  - name: shed
+    ids:
+      - shed-homebrew
+    repository:
+      owner: charliek
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/charliek/shed"
+    description: "CLI and server for managing persistent VM-based dev environments"
+    license: "MIT"
+    dependencies:
+      - name: vfkit
+    install: |
+      bin.install "shed"
+      bin.install "shed-server"
+      (etc/"shed").mkpath
+      (etc/"shed").install "server.example.yaml" => "server.yaml" unless (etc/"shed/server.yaml").exist?
+    service: |
+      run [opt_bin/"shed-server", "serve", "--config", etc/"shed/server.yaml"]
+      keep_alive true
+      log_path var/"log/shed-server.log"
+      error_log_path var/"log/shed-server.log"
+    caveats: |
+      The shed-server config has been installed to:
+        #{HOMEBREW_PREFIX}/etc/shed/server.yaml
+
+      To start shed-server as a background service:
+        brew services start shed
+
+      Logs: #{var}/log/shed-server.log
+
+      Note: shed-server requires Docker for VM image management.
+    test: |
+      system bin/"shed", "version"
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
