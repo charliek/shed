@@ -111,6 +111,7 @@ brews:
     license: "MIT"
     dependencies:
       - name: vfkit
+        os: mac
     install: |
       bin.install "shed"
       bin.install "shed-server"
