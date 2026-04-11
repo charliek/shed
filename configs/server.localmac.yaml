@@ -62,10 +62,10 @@ vz:
   #   default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
   #   experimental: ~/Library/Application Support/shed/vz/experimental-rootfs.ext4
 
-  base_rootfs: ghcr.io/charliek/shed-vz-experimental:v0.3.0
+  base_rootfs: ghcr.io/charliek/shed-vz-experimental:v0.3.1
   images:
-    base: ghcr.io/charliek/shed-vz-base:v0.3.0
-    experimental: ghcr.io/charliek/shed-vz-experimental:v0.3.0
+    base: ghcr.io/charliek/shed-vz-base:v0.3.1
+    experimental: ghcr.io/charliek/shed-vz-experimental:v0.3.1
   
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
