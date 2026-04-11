@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.1
+
+- Add Docker credential helper to experimental images (docker-credential-shed, guest Docker config)
+- Enable `docker-credentials` namespace in local dev server config
+- Bump shed-extensions to v0.3.1
+- Add DialService, Connect API, and vsock TCP proxy (#62)
+- Run initial extension health check immediately (#61)
+
 ## v0.2.0
 
 - Replace `typescript` image variant with `experimental` (default + shed-extensions credential brokering)
