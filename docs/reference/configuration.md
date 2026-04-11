@@ -82,6 +82,7 @@ log_level: info
 | `credentials` | map | `{}` | Credential directories to mount into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
+| `extensions` | object | `{}` | Extensions to activate in VMs (see [Extensions](extensions.md)) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
 
@@ -154,6 +155,20 @@ credentials:
       - "log/*"
       - "storage/*"
 ```
+
+## Extensions
+
+Extensions are activated per-VM by listing their namespace names. The agent reads manifests from `/etc/shed-extensions.d/` in the VM image and enables the matching systemd units at startup. When `extensions` is omitted, no extensions are activated.
+
+```yaml
+extensions:
+  enabled:
+    - ssh-agent
+    - aws-credentials
+    - docker-credentials
+```
+
+See [Extensions](extensions.md) for the full guide on the message bus, manifests, SDK, and health reporting.
 
 ## Firecracker Configuration
 

@@ -21,6 +21,7 @@ The `experimental` variant adds [shed-extensions](https://charliek.github.io/she
 
 - **`shed-ssh-agent`** — SSH agent proxy that forwards key operations to your Mac (private keys never enter the VM)
 - **`shed-aws-proxy`** — AWS credential proxy that vends short-lived STS tokens via the host
+- **`docker-credential-shed`** — Docker credential helper that delegates registry authentication to the host via the message bus. Guest Docker is pre-configured with `{"credsStore": "shed"}` so `docker pull` from private registries works without storing credentials in the VM.
 - **`shed-ext`** — CLI for checking extension connectivity and health
 - Pre-configured `SSH_AUTH_SOCK` and `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variables
 

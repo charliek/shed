@@ -240,7 +240,7 @@ Client-side file synchronization to VMs.
 
 ### `internal/tunnels`
 
-SSH tunnel management for port forwarding.
+Connect API-based tunnel management for port forwarding.
 
 ## Security Model
 
