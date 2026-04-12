@@ -218,6 +218,7 @@ brews:
             #     - docker-credentials
 
             firecracker:
+              kernel_path: /var/lib/shed/firecracker/images/vmlinux
               base_rootfs: ghcr.io/charliek/shed-fc-base:v{{ .Version }}
               images:
                 base: ghcr.io/charliek/shed-fc-base:v{{ .Version }}
