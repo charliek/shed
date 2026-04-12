@@ -93,9 +93,7 @@ archives:
       - tar.gz
     name_template: "shed-homebrew_{{ .Os }}_{{ .Arch }}"
     files:
-      - src: configs/server.example.yaml
-        dst: .
-        strip_parent: true
+      - none*
 
 brews:
   - name: shed
@@ -116,7 +114,128 @@ brews:
       bin.install "shed"
       bin.install "shed-server"
       (etc/"shed").mkpath
-      (etc/"shed").install "server.example.yaml" => "server.yaml" unless (etc/"shed/server.yaml").exist?
+      unless (etc/"shed/server.yaml").exist?
+        if OS.mac?
+          (etc/"shed/server.yaml").write <<~YAML
+            # Shed Server Configuration
+            # Full reference: https://github.com/charliek/shed/blob/main/configs/server.example.yaml
+
+            name: my-server
+
+            http_port: 8080
+            ssh_port: 2222
+
+            default_backend: vz
+            log_level: info
+
+            # Credentials to mount into VMs
+            # Using ~/.shed/mounts/ keeps host and VM configs separate.
+            # credentials:
+            #   claude:
+            #     source: ~/.shed/mounts/claude
+            #     target: /home/shed/.claude
+            #     readonly: false
+            #   codex:
+            #     source: ~/.shed/mounts/codex
+            #     target: /home/shed/.codex
+            #     readonly: false
+            #   opencode_data:
+            #     source: ~/.shed/mounts/opencode/share
+            #     target: /home/shed/.local/share/opencode
+            #     readonly: false
+            #   opencode_state:
+            #     source: ~/.shed/mounts/opencode/state
+            #     target: /home/shed/.local/state/opencode
+            #     readonly: false
+            #   gh:
+            #     source: ~/.shed/mounts/gh
+            #     target: /home/shed/.config/gh
+            #     readonly: false
+
+            # Environment file (KEY=value per line, injected into VMs)
+            # env_file: ~/.shed/env
+
+            # Extensions to enable in VMs (requires shed-host-agent)
+            # extensions:
+            #   enabled:
+            #     - ssh-agent
+            #     - aws-credentials
+            #     - docker-credentials
+
+            vz:
+              vfkit_path: vfkit
+              kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+              initrd_path: ~/Library/Application Support/shed/vz/initrd.img
+              base_rootfs: ghcr.io/charliek/shed-vz-experimental:v{{ .Version }}
+              images:
+                base: ghcr.io/charliek/shed-vz-base:v{{ .Version }}
+                experimental: ghcr.io/charliek/shed-vz-experimental:v{{ .Version }}
+              instance_dir: ~/Library/Application Support/shed/vz/instances
+              socket_dir: ~/.shed/vz/sockets
+              default_cpus: 2
+              default_memory_mb: 4096
+              default_disk_gb: 20
+              start_timeout: 60s
+              stop_timeout: 10s
+          YAML
+        else
+          (etc/"shed/server.yaml").write <<~YAML
+            # Shed Server Configuration
+            # Full reference: https://github.com/charliek/shed/blob/main/configs/server.example.yaml
+
+            name: my-server
+
+            http_port: 8080
+            ssh_port: 2222
+
+            default_backend: firecracker
+            log_level: info
+
+            # Credentials to mount into VMs
+            # Using ~/.shed/mounts/ keeps host and VM configs separate.
+            # credentials:
+            #   claude:
+            #     source: ~/.shed/mounts/claude
+            #     target: /home/shed/.claude
+            #     readonly: false
+            #   codex:
+            #     source: ~/.shed/mounts/codex
+            #     target: /home/shed/.codex
+            #     readonly: false
+            #   gh:
+            #     source: ~/.shed/mounts/gh
+            #     target: /home/shed/.config/gh
+            #     readonly: false
+
+            # Environment file (KEY=value per line, injected into VMs)
+            # env_file: ~/.shed/env
+
+            # Extensions to enable in VMs (requires shed-host-agent)
+            # extensions:
+            #   enabled:
+            #     - ssh-agent
+            #     - aws-credentials
+            #     - docker-credentials
+
+            firecracker:
+              kernel_path: /var/lib/shed/firecracker/images/vmlinux
+              base_rootfs: ghcr.io/charliek/shed-fc-base:v{{ .Version }}
+              images:
+                base: ghcr.io/charliek/shed-fc-base:v{{ .Version }}
+              instance_dir: /var/lib/shed/firecracker/instances
+              socket_dir: /var/run/shed/firecracker
+              default_cpus: 2
+              default_memory_mb: 4096
+              default_disk_gb: 20
+              vsock_base_cid: 100
+              start_timeout: 90s
+              stop_timeout: 10s
+              bridge_name: shed-br0
+              bridge_cidr: 172.30.0.1/24
+              tap_prefix: shed-tap
+          YAML
+        end
+      end
     service: |
       run [opt_bin/"shed-server", "serve", "--config", etc/"shed/server.yaml"]
       keep_alive true
@@ -126,7 +245,8 @@ brews:
       The shed-server config has been installed to:
         #{HOMEBREW_PREFIX}/etc/shed/server.yaml
 
-      To start shed-server as a background service:
+      Edit the config to enable credential mounts and extensions,
+      then start shed-server as a background service:
         brew services start shed
 
       Logs: #{var}/log/shed-server.log
