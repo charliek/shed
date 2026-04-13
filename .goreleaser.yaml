@@ -155,7 +155,10 @@ brews:
             # Environment file (KEY=value per line, injected into VMs)
             # env_file: ~/.shed/env
 
-            # Extensions to enable in VMs (requires shed-host-agent)
+            # Extensions provide credential brokering from host to VM.
+            # Requires shed-host-agent to be installed and running:
+            #   brew install shed-host-agent
+            #   brew services start shed-host-agent
             # extensions:
             #   enabled:
             #     - ssh-agent
@@ -210,7 +213,10 @@ brews:
             # Environment file (KEY=value per line, injected into VMs)
             # env_file: ~/.shed/env
 
-            # Extensions to enable in VMs (requires shed-host-agent)
+            # Extensions provide credential brokering from host to VM.
+            # Requires shed-host-agent to be installed and running:
+            #   brew install shed-host-agent
+            #   brew services start shed-host-agent
             # extensions:
             #   enabled:
             #     - ssh-agent
@@ -248,6 +254,10 @@ brews:
       Edit the config to enable credential mounts and extensions,
       then start shed-server as a background service:
         brew services start shed
+
+      To enable extensions (SSH agent forwarding, AWS credentials,
+      Docker credentials), also install the host agent:
+        brew install shed-host-agent
 
       Logs: #{var}/log/shed-server.log
 
