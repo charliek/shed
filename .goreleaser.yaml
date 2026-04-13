@@ -244,8 +244,9 @@ brews:
       end
     post_install: |
       if OS.mac?
-        entitlements = Pathname.new(Dir.tmpdir)/"shed-entitlements.plist"
-        entitlements.write <<~XML
+        require "tempfile"
+        tmp = Tempfile.new(["shed-entitlements", ".plist"])
+        tmp.write <<~XML
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -255,9 +256,11 @@ brews:
           </dict>
           </plist>
         XML
+        tmp.flush
         system "codesign", "--force", "--sign", "-",
-               "--entitlements", entitlements.to_s,
+               "--entitlements", tmp.path,
                "#{bin}/shed-server"
+        tmp.close!
       end
     service: |
       run [opt_bin/"shed-server", "serve", "--config", etc/"shed/server.yaml"]
