@@ -59,10 +59,10 @@ The first `shed create` pulls the VM image from the container registry and conve
 
 ```bash
 brew services list                  # check status
-brew services log shed              # view server logs
-brew services log shed-host-agent   # view host agent logs
 brew services restart shed          # restart after config changes
 ```
+
+Logs are at `$(brew --prefix)/var/log/shed-server.log` and `$(brew --prefix)/var/log/shed-host-agent.log`.
 
 ## Build from Source (Alternative)
 
