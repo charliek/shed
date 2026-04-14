@@ -4,25 +4,48 @@ Get up and running with Shed in a few minutes.
 
 ## Prerequisites
 
-- Go 1.24+ (for building from source)
-- A server running `shed-server` with one of:
-    - **macOS Apple Silicon** — VZ backend (Virtualization.framework via vfkit)
-    - **Linux with KVM** — Firecracker backend (microVMs)
-- Tailscale (or other private network) connecting your machines
+- **macOS Apple Silicon** — Homebrew (recommended) or Go 1.24+ for source builds
+- **Linux with KVM** — Go 1.24+ for source builds
+- Docker (for VM image management)
+- Tailscale (or other private network) if connecting to remote servers
 
-The `detect` backend (the default) automatically selects VZ on macOS Apple Silicon and Firecracker on Linux, so you typically don't need to specify a backend.
+## Install
 
-## Install the CLI
+### Homebrew (macOS, Recommended)
 
 ```bash
-# Build from source
+brew install charliek/tap/shed
+```
+
+This installs both `shed` (CLI) and `shed-server`, generates a default server config with the VZ backend, codesigns the server binary, and sets up a launchd service.
+
+For credential brokering (SSH agent forwarding, AWS credentials, Docker registry auth), also install the host agent:
+
+```bash
+brew install charliek/tap/shed-host-agent
+```
+
+Edit the server config at `$(brew --prefix)/etc/shed/server.yaml` to configure credentials and extensions, then start the services:
+
+```bash
+brew services start shed
+brew services start shed-host-agent  # if installed
+```
+
+See [VZ Setup](vz-setup.md) for the full macOS setup guide.
+
+### Build from Source
+
+```bash
 git clone https://github.com/charliek/shed.git
 cd shed
 make build
 
-# Or install directly
+# Or install the CLI only
 go install github.com/charliek/shed/cmd/shed@latest
 ```
+
+See [VZ Setup](vz-setup.md) or [Firecracker Setup](fc-setup.md) for server setup instructions when building from source.
 
 ## Add a Server
 
