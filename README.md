@@ -13,13 +13,25 @@ Shed is a lightweight tool for managing persistent, VM-based development environ
 
 ## Quick Start
 
-### 1. Install the CLI
+### 1. Install
+
+#### Homebrew (macOS, Recommended)
 
 ```bash
-# Build from source
+brew install charliek/tap/shed
+brew install charliek/tap/shed-host-agent  # optional: credential brokering
+```
+
+This installs `shed` (CLI) and `shed-server`, generates a default server config, codesigns the server binary, and sets up launchd services. See [VZ Setup](docs/getting-started/vz-setup.md) for the full macOS setup guide.
+
+#### Build from Source
+
+```bash
+git clone https://github.com/charliek/shed.git
+cd shed
 make build
 
-# Or install directly
+# Or install the CLI only
 go install github.com/charliek/shed/cmd/shed@latest
 ```
 
@@ -94,17 +106,18 @@ See [Firecracker Setup](docs/getting-started/fc-setup.md) and [Firecracker Opera
 
 ## Requirements
 
-- **Client**: macOS or Linux with Go 1.24+
-- **Server (VZ)**: macOS 13+ (Ventura) on Apple Silicon (arm64)
-- **Server (Firecracker)**: Linux with KVM support
+- **Client**: macOS or Linux (Homebrew or Go 1.24+ for source builds)
+- **Server (VZ)**: macOS 13+ (Ventura) on Apple Silicon (arm64), Docker
+- **Server (Firecracker)**: Linux with KVM support, Docker
 - **Network**: Tailscale (or any private network) connecting all machines
 
 ## Architecture
 
-Shed consists of two binaries:
+Shed consists of three binaries:
 
 - **`shed`** - CLI for developer machines
 - **`shed-server`** - Server daemon exposing HTTP API (port 8080) and SSH server (port 2222)
+- **`shed-host-agent`** - Optional host-side credential brokering daemon (from [shed-extensions](https://github.com/charliek/shed-extensions))
 
 The server supports two backends:
 - **VZ** - Uses Apple Virtualization.framework VMs via vfkit (macOS Apple Silicon only)
