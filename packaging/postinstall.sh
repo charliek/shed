@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
 
-# Reload systemd to pick up the unit file
-systemctl daemon-reload
-
-# Enable the service (but do NOT start it)
-systemctl enable shed-server.service || true
+# Guard against non-systemd environments (chroots, container builds)
+if command -v systemctl >/dev/null 2>&1 && systemctl --system 2>/dev/null; then
+    systemctl daemon-reload
+    systemctl enable shed-server.service || true
+fi
 
 echo ""
 echo "shed-server has been installed and enabled."

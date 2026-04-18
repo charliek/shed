@@ -5,6 +5,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -15,12 +16,16 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/firecracker"
 )
+
+// httpClient is used for all downloads, with a 5-minute timeout to prevent hangs.
+var httpClient = &http.Client{Timeout: 5 * time.Minute}
 
 const (
 	defaultFirecrackerVersion = "v1.14.1"
@@ -69,7 +74,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	// Step 3: Download Firecracker
 	fmt.Println()
 	fmt.Println("=== Firecracker ===")
-	if err := ensureFirecracker(defaultFirecrackerVersion); err != nil {
+	if err := ensureFirecracker(cmd.Context(), defaultFirecrackerVersion); err != nil {
 		return fmt.Errorf("failed to install firecracker: %w", err)
 	}
 
@@ -165,12 +170,12 @@ func loadBridgeConfig() (bridgeName, bridgeCIDR, tapPrefix string) {
 
 // ensureFirecracker downloads and installs the firecracker and jailer binaries
 // if they are not already installed at the expected version.
-func ensureFirecracker(version string) error {
+func ensureFirecracker(ctx context.Context, version string) error {
 	// Check if already installed at the right version
 	if out, err := exec.Command(firecrackerBinPath, "--version").CombinedOutput(); err == nil {
 		if strings.Contains(string(out), strings.TrimPrefix(version, "v")) {
 			fmt.Printf("Firecracker %s already installed\n", version)
-			return ensureKernel(version)
+			return ensureKernel(ctx, version)
 		}
 	}
 
@@ -189,7 +194,11 @@ func ensureFirecracker(version string) error {
 		version, version, fcArch)
 	fmt.Printf("Downloading Firecracker %s for %s...\n", version, fcArch)
 
-	resp, err := http.Get(url) //nolint:gosec
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
@@ -268,11 +277,11 @@ func ensureFirecracker(version string) error {
 		return fmt.Errorf("no firecracker binaries found in archive")
 	}
 
-	return ensureKernel(version)
+	return ensureKernel(ctx, version)
 }
 
 // ensureKernel downloads the CI fallback kernel if one doesn't exist.
-func ensureKernel(version string) error {
+func ensureKernel(ctx context.Context, _ string) error {
 	kernelPath := config.DefaultFirecrackerImagesDir + "/vmlinux"
 
 	if _, err := os.Stat(kernelPath); err == nil {
@@ -300,7 +309,11 @@ func ensureKernel(version string) error {
 	fmt.Printf("Downloading CI kernel (fallback)...\n")
 	fmt.Println("  (For full Docker support, build a custom kernel: ./scripts/build-firecracker-kernel.sh)")
 
-	resp, err := http.Get(url) //nolint:gosec
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("kernel download failed: %w", err)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("kernel download failed: %w", err)
 	}

@@ -54,10 +54,6 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 	}
 
 	images := imgCfg.GetImages()
-	if len(images) == 0 {
-		fmt.Println("No images configured in server.yaml.")
-		return nil
-	}
 
 	// Filter to specific variant if requested
 	if pullVariant != "" {
