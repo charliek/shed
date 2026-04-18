@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.2
+
+- Add `.deb` package support via GoReleaser nfpm for Linux (Ubuntu/Pop!OS) deployment
+- Add `shed-server setup` command for automated Firecracker infrastructure provisioning (Linux-only)
+- Add `shed-server pull-images` command to pre-cache VM images from Docker refs (cross-platform)
+- Add Homebrew tap automation via GoReleaser
+- Add VZ entitlement codesigning in Homebrew post_install
+- Improve Homebrew config with platform-specific defaults and extensions guidance
+- Update docs for Homebrew install workflow
+
 ## v0.3.1
 
 - Add Docker credential helper to experimental images (docker-credential-shed, guest Docker config)
