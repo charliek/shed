@@ -5,6 +5,7 @@ project_name: shed
 before:
   hooks:
     - go mod tidy
+    - sh -c 'sed "s/{{"{{"}}VERSION{{"}}"}}/{{ .Version }}/g" packaging/server.yaml.tmpl > packaging/server.yaml.generated'
 
 builds:
   - id: shed
@@ -290,6 +291,43 @@ brews:
       Note: shed-server requires Docker for VM image management.
     test: |
       system bin/"shed", "version"
+
+nfpms:
+  - id: shed-deb
+    package_name: shed
+    file_name_template: "shed_{{ .Version }}_{{ .Arch }}"
+    vendor: charliek
+    homepage: "https://github.com/charliek/shed"
+    maintainer: "Charlie Knudsen"
+    description: "CLI and server for managing persistent VM-based dev environments"
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/local/bin
+    ids:
+      - shed
+      - shed-server
+    contents:
+      - src: packaging/shed-server.service
+        dst: /etc/systemd/system/shed-server.service
+        type: config
+      - src: packaging/server.yaml.generated
+        dst: /etc/shed/server.yaml
+        type: "config|noreplace"
+      - dst: /var/lib/shed/firecracker/instances
+        type: dir
+        file_info:
+          mode: 0755
+      - dst: /var/lib/shed/firecracker/images
+        type: dir
+        file_info:
+          mode: 0755
+      - dst: /var/run/shed/firecracker
+        type: dir
+        file_info:
+          mode: 0755
+    scripts:
+      postinstall: packaging/postinstall.sh
 
 checksum:
   name_template: "checksums.txt"

@@ -58,6 +58,9 @@ __debug_bin*
 Thumbs.db
 ehthumbs.db
 
+# Packaging build artifacts
+packaging/server.yaml.generated
+
 # Documentation build
 site-build/
 .venv/

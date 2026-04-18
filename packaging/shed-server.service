@@ -1,0 +1,14 @@
+[Unit]
+Description=Shed Development Environment Server
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/shed-server serve --config /etc/shed/server.yaml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

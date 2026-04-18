@@ -1,0 +1,56 @@
+# Shed Server Configuration
+# Full reference: https://github.com/charliek/shed/blob/main/configs/server.example.yaml
+
+name: my-server
+
+http_port: 8080
+ssh_port: 2222
+
+default_backend: firecracker
+log_level: info
+
+# Credentials to mount into VMs
+# Using ~/.shed/mounts/ keeps host and VM configs separate.
+# credentials:
+#   claude:
+#     source: /root/.shed/mounts/claude
+#     target: /home/shed/.claude
+#     readonly: false
+#   codex:
+#     source: /root/.shed/mounts/codex
+#     target: /home/shed/.codex
+#     readonly: false
+#   gh:
+#     source: /root/.shed/mounts/gh
+#     target: /home/shed/.config/gh
+#     readonly: false
+
+# Environment file (KEY=value per line, injected into VMs)
+# env_file: /root/.shed/env
+
+# Extensions provide credential brokering from host to VM.
+# Requires shed-host-agent to be installed and running.
+# extensions:
+#   enabled:
+#     - ssh-agent
+#     - aws-credentials
+#     - docker-credentials
+
+firecracker:
+  kernel_path: /var/lib/shed/firecracker/images/vmlinux
+  base_rootfs: ghcr.io/charliek/shed-fc-base:v{{VERSION}}
+  images:
+    base: ghcr.io/charliek/shed-fc-base:v{{VERSION}}
+  instance_dir: /var/lib/shed/firecracker/instances
+  socket_dir: /var/run/shed/firecracker
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  vsock_base_cid: 100
+  console_port: 1024
+  notify_port: 1026
+  start_timeout: 90s
+  stop_timeout: 10s
+  bridge_name: shed-br0
+  bridge_cidr: 172.30.0.1/24
+  tap_prefix: shed-tap
