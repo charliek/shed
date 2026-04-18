@@ -5,7 +5,7 @@ Get up and running with Shed in a few minutes.
 ## Prerequisites
 
 - **macOS Apple Silicon** — Homebrew (recommended) or Go 1.24+ for source builds
-- **Linux with KVM** — Go 1.24+ for source builds
+- **Linux with KVM** — deb package (recommended) or Go 1.24+ for source builds
 - Docker (for VM image management)
 - Tailscale (or other private network) if connecting to remote servers
 
@@ -33,6 +33,29 @@ brew services start shed-host-agent  # if installed
 ```
 
 See [VZ Setup](vz-setup.md) for the full macOS setup guide.
+
+### deb Package (Linux, Recommended)
+
+Download and install the `.deb` from the [latest release](https://github.com/charliek/shed/releases):
+
+```bash
+wget https://github.com/charliek/shed/releases/download/v{version}/shed_{version}_amd64.deb
+sudo dpkg -i shed_{version}_amd64.deb
+```
+
+Replace `{version}` with the version you want to install (e.g., `0.3.2`).
+
+This installs `shed` (CLI) and `shed-server`, generates a default Firecracker server config, and sets up a systemd service.
+
+Complete the Firecracker infrastructure setup:
+
+```bash
+sudo shed-server setup
+sudo shed-server pull-images
+sudo systemctl start shed-server
+```
+
+See [Firecracker Setup](fc-setup.md) for the full Linux setup guide.
 
 ### Build from Source
 
