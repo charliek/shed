@@ -15,11 +15,10 @@ This guide covers the installation and setup of the Firecracker backend for shed
 Download and install the `.deb` from the [latest release](https://github.com/charliek/shed/releases):
 
 ```bash
-wget https://github.com/charliek/shed/releases/download/v{version}/shed_{version}_amd64.deb
-sudo dpkg -i shed_{version}_amd64.deb
+VERSION=0.3.2  # replace with desired version
+wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed_${VERSION}_amd64.deb
+sudo dpkg -i shed_${VERSION}_amd64.deb
 ```
-
-Replace `{version}` with the version you want to install (e.g., `0.3.2`).
 
 This installs:
 
