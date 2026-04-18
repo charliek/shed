@@ -18,6 +18,21 @@ credentials:
     target: /home/shed/.claude
     readonly: false
 
+  codex:
+    source: /home/charliek/.shed/mounts/codex
+    target: /home/shed/.codex
+    readonly: false
+
+  opencode_data:
+    source: /home/charliek/.shed/mounts/opencode/share
+    target: /home/shed/.local/share/opencode
+    readonly: false
+
+  opencode_state:
+    source: /home/charliek/.shed/mounts/opencode/state
+    target: /home/shed/.local/state/opencode
+    readonly: false
+
   # GitHub CLI - credentials and config
   gh:
     source: /home/charliek/.shed/mounts/gh
@@ -29,12 +44,19 @@ env_file: /home/charliek/.shed/env
 
 log_level: debug
 
+extensions:
+  enabled:
+    - ssh-agent
+    - aws-credentials
+    - docker-credentials
+
 default_backend: firecracker
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
+  base_rootfs: ghcr.io/charliek/shed-fc-experimental:v0.3.1
   images:
-    base: ghcr.io/charliek/shed-fc-base:v0.1.0
+    base: ghcr.io/charliek/shed-fc-base:v0.3.1
+    experimental: ghcr.io/charliek/shed-fc-experimental:v0.3.1
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2
