@@ -66,6 +66,14 @@ These images serve two purposes:
 
 Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
 
+To pre-cache images before the first `shed create`:
+
+```bash
+sudo shed-server pull-images
+```
+
+This pulls all configured image variants and converts them to ext4, so the first shed creation is fast.
+
 ## Server Configuration
 
 ### Using published images (recommended)

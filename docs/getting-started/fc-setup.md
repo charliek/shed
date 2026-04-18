@@ -4,13 +4,162 @@ This guide covers the installation and setup of the Firecracker backend for shed
 
 ## Prerequisites
 
-- Linux host with KVM support
-- Root access (for network setup)
-- Docker (for pulling and converting images, or building from source)
+- Linux host with KVM support (`/dev/kvm`)
+- Root access (for network and capability setup)
+- Docker CE (for pulling and converting images). Install from [Docker's official repository](https://docs.docker.com/engine/install/ubuntu/), not the `docker.io` package in Ubuntu's default repositories.
 
-## 1. Check KVM Support
+## 1. Install shed
 
-Firecracker requires hardware virtualization (KVM). Verify it's available:
+### deb Package (Recommended)
+
+Download and install the `.deb` from the [latest release](https://github.com/charliek/shed/releases):
+
+```bash
+VERSION=0.3.2  # replace with desired version
+wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed_${VERSION}_amd64.deb
+sudo dpkg -i shed_${VERSION}_amd64.deb
+```
+
+This installs:
+
+- `shed` CLI and `shed-server` binaries to `/usr/local/bin/`
+- Default Firecracker server config at `/etc/shed/server.yaml`
+- Systemd unit file (enabled but not started)
+
+### Build from Source (Alternative)
+
+```bash
+git clone https://github.com/charliek/shed.git
+cd shed
+make build
+```
+
+If building from source, use `shed-server install` to create the systemd service, or run `shed-server serve` directly.
+
+## 2. Run Automated Setup
+
+The `setup` command handles all Firecracker infrastructure in a single step:
+
+```bash
+sudo shed-server setup
+```
+
+This performs:
+
+| Step | What it does |
+|------|-------------|
+| KVM check | Verifies `/dev/kvm` is available |
+| Docker check | Verifies Docker CE is installed |
+| Firecracker | Downloads Firecracker v1.14.1 and jailer to `/usr/local/bin/` |
+| Kernel | Downloads a fallback CI kernel to `/var/lib/shed/firecracker/images/vmlinux` |
+| Directories | Creates `/var/lib/shed/firecracker/{instances,images}` and `/var/run/shed/firecracker/` |
+| Bridge | Creates `shed-br0` at `172.30.0.1/24` |
+| NAT | Enables IP forwarding and iptables masquerade rules |
+| Capabilities | Sets `CAP_NET_ADMIN` on `shed-server` and `firecracker` |
+
+The command is idempotent — safe to re-run after upgrades or if something needs to be reconfigured.
+
+## 3. Pre-cache Images (Optional)
+
+Pull and convert VM images before creating your first shed:
+
+```bash
+sudo shed-server pull-images
+```
+
+This downloads the configured Docker image, converts it to ext4, and extracts the kernel. Without this step, the first `shed create` performs the conversion automatically (which takes a few minutes).
+
+## 4. Configure
+
+Edit `/etc/shed/server.yaml` to configure credentials and extensions:
+
+```yaml
+name: my-server
+
+http_port: 8080
+ssh_port: 2222
+
+default_backend: firecracker
+log_level: info
+
+# Credentials to mount into VMs via 9P
+credentials:
+  claude:
+    source: /root/.shed/mounts/claude
+    target: /home/shed/.claude
+    readonly: false
+
+# Environment variables passed to git clone and provisioning hooks
+env_file: /root/.shed/env
+
+# Extensions provide credential brokering from host to VM.
+# Requires shed-host-agent to be installed and running.
+# extensions:
+#   enabled:
+#     - ssh-agent
+#     - aws-credentials
+#     - docker-credentials
+
+firecracker:
+  base_rootfs: ghcr.io/charliek/shed-fc-base:v{version}
+  images:
+    base: ghcr.io/charliek/shed-fc-base:v{version}
+  instance_dir: /var/lib/shed/firecracker/instances
+  socket_dir: /var/run/shed/firecracker
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  vsock_base_cid: 100
+  console_port: 1024
+  notify_port: 1026
+  start_timeout: 120s
+  stop_timeout: 10s
+  bridge_name: shed-br0
+  bridge_cidr: 172.30.0.1/24
+  tap_prefix: shed-tap
+```
+
+Replace `{version}` with the version matching your `shed` binary — run `shed version` to check. The deb package generates this config with the correct version automatically.
+
+### Private Repo Access
+
+Private Git authentication is handled via shed-extensions SSH agent forwarding. For Git configuration inside the VM (e.g., `.gitconfig`), use `shed sync` to push it as a dotfile rather than mounting single files as credentials.
+
+## 5. Start the Server
+
+```bash
+sudo systemctl start shed-server
+```
+
+Check status:
+
+```bash
+sudo systemctl status shed-server
+```
+
+View logs:
+
+```bash
+sudo journalctl -u shed-server -f
+```
+
+The service starts automatically on reboot since the deb package enables it during installation.
+
+## 6. Create a Firecracker Shed
+
+```bash
+# Create a shed with the Firecracker backend
+shed create myproject --backend=firecracker
+
+# Or with custom resources
+shed create myproject --backend=firecracker --cpus=4 --memory=8192
+```
+
+## Manual Setup Reference
+
+The sections below document the individual steps that `shed-server setup` automates. Use these if you need to customize the setup or are building from source without the deb package.
+
+### Check KVM Support
 
 ```bash
 # Check if KVM is available
@@ -21,7 +170,7 @@ sudo usermod -aG kvm $USER
 # Log out and back in for changes to take effect
 ```
 
-## 2. Download Firecracker
+### Download Firecracker
 
 Run the download script to get the Firecracker binary:
 
@@ -29,14 +178,11 @@ Run the download script to get the Firecracker binary:
 ./scripts/download-firecracker.sh
 ```
 
-This installs:
-- `/usr/local/bin/firecracker` - Firecracker binary (v1.14.1)
+This installs `/usr/local/bin/firecracker` (v1.14.1). When using published images, the kernel is included in the image and extracted automatically.
 
-When using published images (Option A below), the kernel is included in the image and extracted automatically. For custom kernel builds, see `scripts/build-firecracker-kernel.sh`.
+### Set Up Images
 
-## 3. Set Up Firecracker Images
-
-### Option A: Use published images (recommended)
+#### Option A: Use published images (recommended)
 
 Configure your server to use published Docker image references. Shed auto-pulls and converts them to ext4 on first use. Published images include a custom Firecracker kernel with Docker, 9P, and BPF support — no separate kernel build needed.
 
@@ -50,9 +196,9 @@ firecracker:
 
 Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
 
-The first `shed create` will pull the image, convert it to ext4, extract the kernel, and cache everything automatically. See [Image Variants](../reference/images.md) for available images and configuration details.
+See [Image Variants](../reference/images.md) for available images and configuration details.
 
-### Option B: Build from source
+#### Option B: Build from source
 
 Build rootfs images locally. Requires Go 1.24+ for compiling `shed-agent`.
 
@@ -67,25 +213,21 @@ Build rootfs images locally. Requires Go 1.24+ for compiling `shed-agent`.
 ./scripts/build-firecracker-rootfs.sh --all
 ```
 
-This creates ext4 images in `/var/lib/shed/firecracker/images/`:
-- `default-rootfs.ext4` - Full development environment with all coding agents
-- `base-rootfs.ext4` - Minimal shed infrastructure + basic dev tools
-- `experimental-rootfs.ext4` - Default + shed-extensions credential brokering
+This creates ext4 images in `/var/lib/shed/firecracker/images/`.
 
-## 4. Set Up Bridge Network
+### Set Up Bridge Network
 
 Firecracker VMs need a bridge network for connectivity. This is a one-time setup.
 
-### Create the Bridge
+#### Create the Bridge
 
 ```bash
-# Create bridge
 sudo ip link add shed-br0 type bridge
 sudo ip addr add 172.30.0.1/24 dev shed-br0
 sudo ip link set shed-br0 up
 ```
 
-### Enable IP Forwarding
+#### Enable IP Forwarding
 
 ```bash
 # Enable IP forwarding (temporary)
@@ -96,18 +238,15 @@ echo "net.ipv4.ip_forward = 1" | sudo tee /etc/sysctl.d/99-ip-forward.conf
 sudo sysctl -p /etc/sysctl.d/99-ip-forward.conf
 ```
 
-### Configure NAT for Internet Access
+#### Configure NAT for Internet Access
 
 ```bash
-# Add NAT rule for outbound traffic
 sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/24 -j MASQUERADE
-
-# Allow forwarding
 sudo iptables -A FORWARD -i shed-br0 -j ACCEPT
 sudo iptables -A FORWARD -o shed-br0 -j ACCEPT
 ```
 
-### Make Network Persistent (Optional)
+#### Make Network Persistent (Optional)
 
 To persist the bridge across reboots, create a systemd-networkd configuration:
 
@@ -141,50 +280,7 @@ sudo apt install iptables-persistent
 sudo netfilter-persistent save
 ```
 
-## 5. Configure shed-server
-
-Update your `server.yaml` to enable the Firecracker backend:
-
-```yaml
-name: shed-server
-http_port: 8080
-ssh_port: 2222
-enabled_backends:
-  - firecracker
-default_backend: firecracker
-
-# Credentials are mounted into VMs via 9P
-credentials:
-  claude:
-    source: ~/.claude
-    target: /home/shed/.claude
-    readonly: false
-
-# Environment variables passed to git clone and provisioning hooks
-env_file: ~/.shed/env
-
-firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
-  instance_dir: /var/lib/shed/firecracker/instances
-  socket_dir: /var/run/shed/firecracker
-  default_cpus: 2
-  default_memory_mb: 4096
-  default_disk_gb: 20
-  vsock_base_cid: 100
-  console_port: 1024
-  notify_port: 1026
-  start_timeout: 120s
-  stop_timeout: 10s
-  bridge_name: shed-br0
-  bridge_cidr: 172.30.0.1/24
-  tap_prefix: shed-tap
-```
-
-### Configure Private Repo Access
-
-Private Git authentication is handled via shed-extensions SSH agent forwarding. For Git configuration inside the VM (e.g., `.gitconfig`), use `shed sync` to push it as a dotfile rather than mounting single files as credentials.
-
-## 6. Create Required Directories
+### Create Required Directories
 
 ```bash
 sudo mkdir -p /var/lib/shed/firecracker/instances
@@ -193,40 +289,19 @@ sudo chown -R $USER:$USER /var/lib/shed/firecracker
 sudo chown -R $USER:$USER /var/run/shed/firecracker
 ```
 
-## 7. Set Capabilities (Alternative to Running as Root)
+### Set Capabilities (Alternative to Running as Root)
 
-To run shed-server without sudo, grant capabilities to BOTH binaries:
+To run shed-server without sudo, grant capabilities to both binaries:
 
 ```bash
-# Both binaries need CAP_NET_ADMIN for TAP device creation
-sudo setcap cap_net_admin+ep ./bin/shed-server
+sudo setcap cap_net_admin+ep /usr/local/bin/shed-server
 sudo setcap cap_net_admin+ep /usr/local/bin/firecracker
 
-# Verify capabilities are set
-getcap ./bin/shed-server /usr/local/bin/firecracker
+# Verify
+getcap /usr/local/bin/shed-server /usr/local/bin/firecracker
 ```
 
-**Note:** Firecracker is spawned as a child process, and Linux capabilities don't inherit to child processes. That's why both binaries need the capability set directly.
-
-## 8. Start the Server
-
-```bash
-# With capabilities set (from step 7)
-shed-server serve
-
-# Or run as root
-sudo shed-server serve
-```
-
-## 9. Create a Firecracker Shed
-
-```bash
-# Create a shed with the Firecracker backend
-shed create myproject --backend=firecracker
-
-# Or with custom resources
-shed create myproject --backend=firecracker --cpus=4 --memory=8192
-```
+Firecracker is spawned as a child process, and Linux capabilities don't inherit to child processes. That's why both binaries need the capability set directly.
 
 ## 9P Kernel Configuration
 
@@ -239,7 +314,7 @@ CONFIG_9P_FS=y
 CONFIG_9P_FS_POSIX_ACL=y
 ```
 
-The custom kernel built by `build-firecracker-kernel.sh` already includes these options. If you are building your own kernel, add these options to your kernel config fragment.
+The custom kernel built by `build-firecracker-kernel.sh` already includes these options. Published images also include a compatible kernel. If you are building your own kernel, add these options to your kernel config fragment.
 
 To verify 9P support inside a running VM:
 
@@ -295,7 +370,7 @@ sudo usermod -aG kvm $USER
 failed to find bridge shed-br0
 ```
 
-Solution: Create the bridge network (see step 4).
+Solution: Run `sudo shed-server setup` or create the bridge network manually (see Manual Setup Reference above).
 
 ### TAP Device Creation Failed
 
@@ -309,7 +384,7 @@ or
 Could not create the network device: Open tap device failed: ... Resource busy
 ```
 
-Solution: Run shed-server as root or with CAP_NET_ADMIN capability on BOTH binaries:
+Solution: Run shed-server as root or with CAP_NET_ADMIN capability on both binaries:
 ```bash
 sudo shed-server serve
 

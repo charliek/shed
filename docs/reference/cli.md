@@ -479,6 +479,73 @@ shed ssh-config --all --install       # Apply changes
 shed ssh-config --uninstall           # Remove managed block
 ```
 
+## Server Commands
+
+These commands are part of `shed-server`, the server daemon binary.
+
+### shed-server setup
+
+Sets up Firecracker infrastructure on a Linux host. Idempotent and safe to re-run.
+
+```bash
+sudo shed-server setup
+```
+
+| Step | Description |
+|------|-------------|
+| KVM check | Verifies `/dev/kvm` is available |
+| Docker check | Verifies Docker CE is installed |
+| Firecracker | Downloads and installs Firecracker and jailer binaries |
+| Kernel | Downloads fallback CI kernel if none exists |
+| Directories | Creates `/var/lib/shed/firecracker/` and `/var/run/shed/firecracker/` |
+| Bridge | Creates `shed-br0` bridge network |
+| NAT | Enables IP forwarding and iptables masquerade rules |
+| Capabilities | Sets `CAP_NET_ADMIN` on `shed-server` and `firecracker` binaries |
+
+Linux only. Not available on macOS.
+
+### shed-server pull-images
+
+Pre-caches VM images by pulling Docker refs and converting to ext4.
+
+```bash
+shed-server pull-images [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--variant` | All | Pull a specific image variant only |
+| `--config` | Auto-detect | Path to server config file |
+
+**Examples:**
+
+```bash
+sudo shed-server pull-images                  # Pull all configured variants
+sudo shed-server pull-images --variant base   # Pull only the base variant
+```
+
+Works on both macOS (VZ) and Linux (Firecracker). Uses the images configured in `server.yaml` for the active backend.
+
+### shed-server install
+
+Installs shed-server as a systemd service. Alternative to the deb package for manual binary installs.
+
+```bash
+sudo shed-server install
+```
+
+Creates a systemd unit file at `/etc/systemd/system/shed-server.service` and enables it. Does not start the service.
+
+### shed-server uninstall
+
+Removes the shed-server systemd service.
+
+```bash
+sudo shed-server uninstall
+```
+
+Stops the service, disables it, and removes the unit file.
+
 ## Utility
 
 ### shed version
