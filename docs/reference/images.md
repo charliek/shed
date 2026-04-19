@@ -304,9 +304,9 @@ When the Docker ref in your config changes (for example after a version bump), s
 Cached images can be 2–5 GB each, and every running shed adds another 2–5 GB for its instance rootfs. Use these commands to reclaim disk space:
 
 ```bash
-# Delete a specific cached image (will not free disk if the image
-# shares an inode with another cached name, e.g. _base hardlinked
-# to experimental — remove both to reclaim)
+# Delete a specific cached image (refused if it is currently referenced
+# by the config images: map, or if it is _base while base_rootfs is a
+# Docker ref, or if an existing shed still depends on it)
 shed image delete myimage
 
 # Preview which images would be pruned
@@ -315,6 +315,8 @@ shed image prune --dry-run
 # Remove all unused or stale cached images
 shed image prune
 ```
+
+When `_base` shares an inode with a variant (because `base_rootfs` and an `images:` entry point at the same Docker ref), `shed image delete _base` is refused — `_base` is still backing the configured `base_rootfs`. Freeing that shared storage requires bumping the `base_rootfs` ref in config (or removing the `base_rootfs` field entirely) and then running `shed image prune`. The [cookbook](#cookbook-upgrading-image-versions-and-reclaiming-disk) below walks through the version-bump case.
 
 `shed image prune` preserves an image only when it matches the current config. Specifically, a cached `.ext4` is preserved when:
 

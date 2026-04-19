@@ -276,9 +276,34 @@ func (m *Manager) PruneImages(dryRun bool, inUseNames func() ([]string, error)) 
 	// delete a file the config explicitly points at.
 	exclude := make(map[string]bool)
 
+	// excludeLocalPath protects the on-disk file a local-path config entry
+	// points at. If the path lives inside imagesDir and follows the
+	// {name}-rootfs.ext4 convention, exclude that derived name — otherwise
+	// the directory scan could match a candidate with a different name
+	// than the config map key and delete a file the config depends on.
+	excludeLocalPath := func(ref string) {
+		if ref == "" {
+			return
+		}
+		if filepath.Dir(ref) != imagesDir {
+			return
+		}
+		base := filepath.Base(ref)
+		if !strings.HasSuffix(base, "-rootfs.ext4") {
+			return
+		}
+		derivedName := strings.TrimSuffix(base, "-rootfs.ext4")
+		if derivedName != "" {
+			exclude[derivedName] = true
+		}
+	}
+
 	for name, ref := range m.cfg.GetImages() {
 		if !IsDockerRef(ref) {
+			// Legacy: protect the config map key. Also protect the
+			// on-disk file the path actually points at (they may differ).
 			exclude[name] = true
+			excludeLocalPath(ref)
 			continue
 		}
 		if cached := CheckCache(imagesDir, name, ref); cached != "" {
@@ -286,9 +311,15 @@ func (m *Manager) PruneImages(dryRun bool, inUseNames func() ([]string, error)) 
 		}
 	}
 
-	if base := m.cfg.GetBaseRootfs(); IsDockerRef(base) {
-		if cached := CheckCache(imagesDir, "_base", base); cached != "" {
-			exclude["_base"] = true
+	if base := m.cfg.GetBaseRootfs(); base != "" {
+		if IsDockerRef(base) {
+			if cached := CheckCache(imagesDir, "_base", base); cached != "" {
+				exclude["_base"] = true
+			}
+		} else {
+			// Local-path base_rootfs: protect its on-disk file if it
+			// lives in imagesDir (mirrors the images: branch above).
+			excludeLocalPath(base)
 		}
 	}
 

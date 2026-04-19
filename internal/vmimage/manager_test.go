@@ -406,6 +406,57 @@ func TestPruneImages(t *testing.T) {
 			t.Errorf("local-path variant file should still exist: %v", err)
 		}
 	})
+
+	t.Run("local-path pointing at in-dir file with different basename protects derived name", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		mgr.cfg.(*testConfig).baseRootfs = "/elsewhere/ignored.ext4" // not in imagesDir, not docker
+
+		// Create an image at imagesDir/base-rootfs.ext4 and configure the
+		// variant `prod` to point at it. Prune should protect
+		// `base-rootfs.ext4` even though the config map key is `prod`.
+		target := filepath.Join(imagesDir, RootfsFilename("base"))
+		if err := os.WriteFile(target, []byte("shared"), 0644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		mgr.cfg.(*testConfig).images["prod"] = target
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "base" {
+				t.Errorf("base-rootfs.ext4 should be protected via local-path derivation, got %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Errorf("shared local file should still exist after prune: %v", err)
+		}
+	})
+
+	t.Run("local-path base_rootfs pointing at in-dir file protects derived name", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		mgr.cfg.(*testConfig).images = map[string]string{} // no variants
+
+		target := filepath.Join(imagesDir, RootfsFilename("experimental"))
+		if err := os.WriteFile(target, []byte("shared-base"), 0644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		mgr.cfg.(*testConfig).baseRootfs = target
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "experimental" {
+				t.Errorf("experimental-rootfs.ext4 should be protected as local base_rootfs target, got %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Errorf("shared base_rootfs file should still exist after prune: %v", err)
+		}
+	})
 }
 
 func TestLinkCachedImage(t *testing.T) {

@@ -144,6 +144,11 @@ func LinkCachedImage(imagesDir, sourceName, targetName, ref string) error {
 	}
 
 	if err := WriteSource(imagesDir, targetName, ref); err != nil {
+		// Keep the "no partial state on error" contract: a successful
+		// rename already replaced targetPath, so tearing it down here
+		// avoids leaving a rootfs with a missing/stale sidecar behind.
+		_ = os.Remove(targetPath)
+		_ = os.Remove(filepath.Join(imagesDir, SourceFilename(targetName)))
 		return fmt.Errorf("writing source sidecar for %q: %w", targetName, err)
 	}
 
