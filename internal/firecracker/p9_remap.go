@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package firecracker
 
@@ -8,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/hugelgupf/p9/p9"
 )
@@ -157,9 +158,10 @@ func (f *remappingFile) GetAttr(req p9.AttrMask) (p9.QID, p9.AttrMask, p9.Attr, 
 	return qid, mask, attr, nil
 }
 
-// SetAttr implements p9.File.SetAttr. localfs.SetAttr returns ENOSYS for
-// UID/GID changes, so we handle ownership via os.Lchown directly and
-// delegate remaining attributes to the inner file.
+// SetAttr implements p9.File.SetAttr. localfs.SetAttr only supports Size
+// (truncate) and silently ignores MTime/CTime; it returns ENOSYS for
+// everything else (Permissions, UID, GID, ATime). We handle the common
+// attributes directly on the host filesystem and delegate only Size.
 func (f *remappingFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 	if valid.UID || valid.GID {
 		uid := -1
@@ -173,17 +175,74 @@ func (f *remappingFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 		if err := os.Lchown(f.hostPath, uid, gid); err != nil {
 			return err
 		}
-
-		// Strip UID/GID from the mask before delegating
 		valid.UID = false
 		valid.GID = false
 	}
 
-	// Delegate remaining attributes (if any) to inner file
+	if valid.Permissions || valid.ATime || valid.MTime {
+		// Lstat to detect symlinks. os.Chmod and os.Chtimes follow
+		// symlinks, which would let a guest modify files outside the
+		// shared directory by creating a symlink. Skip these operations
+		// on symlinks (matching the safety of os.Lchown above).
+		info, err := os.Lstat(f.hostPath)
+		if err != nil {
+			return err
+		}
+		isSymlink := info.Mode()&os.ModeSymlink != 0
+
+		if valid.Permissions {
+			if !isSymlink {
+				if err := os.Chmod(f.hostPath, os.FileMode(attr.Permissions)); err != nil {
+					return err
+				}
+			}
+			valid.Permissions = false
+		}
+
+		if valid.ATime || valid.MTime {
+			stat := info.Sys().(*syscall.Stat_t)
+			atime := time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
+			mtime := info.ModTime()
+
+			if valid.ATime {
+				if valid.ATimeNotSystemTime {
+					atime = time.Unix(int64(attr.ATimeSeconds), int64(attr.ATimeNanoSeconds))
+				} else {
+					atime = time.Now()
+				}
+			}
+			if valid.MTime {
+				if valid.MTimeNotSystemTime {
+					mtime = time.Unix(int64(attr.MTimeSeconds), int64(attr.MTimeNanoSeconds))
+				} else {
+					mtime = time.Now()
+				}
+			}
+
+			if !isSymlink {
+				if err := os.Chtimes(f.hostPath, atime, mtime); err != nil {
+					return err
+				}
+			}
+			valid.ATime = false
+			valid.MTime = false
+			valid.ATimeNotSystemTime = false
+			valid.MTimeNotSystemTime = false
+			valid.CTime = false // CTime is set by the kernel, not user-settable
+		}
+	}
+
+	// Delegate remaining attributes (Size) to inner file
 	if !valid.Empty() {
 		return f.File.SetAttr(valid, attr)
 	}
 	return nil
+}
+
+// UnlinkAt implements p9.File.UnlinkAt. localfs does not implement UnlinkAt
+// (returns ENOSYS), so we perform the removal directly on the host filesystem.
+func (f *remappingFile) UnlinkAt(name string, flags uint32) error {
+	return os.Remove(filepath.Join(f.hostPath, name))
 }
 
 // Link implements p9.File.Link. Unwrap the target before delegating so

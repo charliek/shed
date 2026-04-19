@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package firecracker
 
@@ -137,6 +136,50 @@ func TestRemappingGetAttrPassesNonRoot(t *testing.T) {
 	// Current user is non-root; UID should pass through unchanged
 	if int(attr.UID) != os.Geteuid() {
 		t.Errorf("UID = %d, want %d (unchanged)", attr.UID, os.Geteuid())
+	}
+}
+
+func TestRemappingUnlinkAt(t *testing.T) {
+	hostDir := t.TempDir()
+
+	// Create a file and a subdirectory to unlink
+	testFile := filepath.Join(hostDir, "deleteme")
+	if err := os.WriteFile(testFile, []byte("data"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	testDir := filepath.Join(hostDir, "removedir")
+	if err := os.Mkdir(testDir, 0755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	inner := localfs.Attacher(hostDir)
+	att := newRemappingAttacher(inner, hostDir, 1000, 1000)
+
+	root, err := att.Attach()
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer root.Close()
+
+	// Unlink the file
+	if err := root.UnlinkAt("deleteme", 0); err != nil {
+		t.Fatalf("UnlinkAt file: %v", err)
+	}
+	if _, err := os.Stat(testFile); !os.IsNotExist(err) {
+		t.Errorf("file still exists after UnlinkAt")
+	}
+
+	// Unlink the directory
+	if err := root.UnlinkAt("removedir", 0); err != nil {
+		t.Fatalf("UnlinkAt dir: %v", err)
+	}
+	if _, err := os.Stat(testDir); !os.IsNotExist(err) {
+		t.Errorf("directory still exists after UnlinkAt")
+	}
+
+	// Unlink non-existent file should return error
+	if err := root.UnlinkAt("nonexistent", 0); err == nil {
+		t.Error("UnlinkAt nonexistent should return error")
 	}
 }
 
@@ -338,6 +381,177 @@ func TestRemappingSymlinkLchown(t *testing.T) {
 	targetStat := targetInfo.Sys().(*syscall.Stat_t)
 	if int(targetStat.Uid) != 0 {
 		t.Errorf("target UID = %d, want 0 (unchanged)", targetStat.Uid)
+	}
+}
+
+func TestRemappingSetAttrChmod(t *testing.T) {
+	hostDir := t.TempDir()
+
+	testFile := filepath.Join(hostDir, "chmod-test")
+	if err := os.WriteFile(testFile, []byte("data"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	inner := localfs.Attacher(hostDir)
+	att := newRemappingAttacher(inner, hostDir, 1000, 1000)
+
+	root, err := att.Attach()
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer root.Close()
+
+	_, child, err := root.Walk([]string{"chmod-test"})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	defer child.Close()
+
+	// Change permissions to 0755
+	err = child.SetAttr(
+		p9.SetAttrMask{Permissions: true},
+		p9.SetAttr{Permissions: 0755},
+	)
+	if err != nil {
+		t.Fatalf("SetAttr Permissions: %v", err)
+	}
+
+	info, err := os.Lstat(testFile)
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0755 {
+		t.Errorf("permissions = %o, want 0755", got)
+	}
+}
+
+func TestRemappingSetAttrTimestamps(t *testing.T) {
+	hostDir := t.TempDir()
+
+	testFile := filepath.Join(hostDir, "time-test")
+	if err := os.WriteFile(testFile, []byte("data"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	inner := localfs.Attacher(hostDir)
+	att := newRemappingAttacher(inner, hostDir, 1000, 1000)
+
+	root, err := att.Attach()
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer root.Close()
+
+	_, child, err := root.Walk([]string{"time-test"})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	defer child.Close()
+
+	// Set explicit timestamps (2024-01-01 00:00:00 UTC)
+	wantTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	err = child.SetAttr(
+		p9.SetAttrMask{
+			ATime:              true,
+			MTime:              true,
+			ATimeNotSystemTime: true,
+			MTimeNotSystemTime: true,
+		},
+		p9.SetAttr{
+			ATimeSeconds:     uint64(wantTime.Unix()),
+			ATimeNanoSeconds: 0,
+			MTimeSeconds:     uint64(wantTime.Unix()),
+			MTimeNanoSeconds: 0,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SetAttr timestamps: %v", err)
+	}
+
+	info, err := os.Lstat(testFile)
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	if got := info.ModTime().Unix(); got != wantTime.Unix() {
+		t.Errorf("mtime = %d, want %d", got, wantTime.Unix())
+	}
+
+	stat := info.Sys().(*syscall.Stat_t)
+	if got := stat.Atim.Sec; got != wantTime.Unix() {
+		t.Errorf("atime = %d, want %d", got, wantTime.Unix())
+	}
+}
+
+func TestRemappingSetAttrSkipsSymlinks(t *testing.T) {
+	hostDir := t.TempDir()
+
+	// Create a target file and a symlink to it
+	targetFile := filepath.Join(hostDir, "target")
+	if err := os.WriteFile(targetFile, []byte("data"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink("target", filepath.Join(hostDir, "link")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	inner := localfs.Attacher(hostDir)
+	att := newRemappingAttacher(inner, hostDir, 1000, 1000)
+
+	root, err := att.Attach()
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer root.Close()
+
+	_, link, err := root.Walk([]string{"link"})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	defer link.Close()
+
+	// SetAttr with Permissions on a symlink should succeed (no error)
+	// but NOT modify the target file's permissions
+	err = link.SetAttr(
+		p9.SetAttrMask{Permissions: true},
+		p9.SetAttr{Permissions: 0777},
+	)
+	if err != nil {
+		t.Fatalf("SetAttr Permissions on symlink: %v", err)
+	}
+
+	info, err := os.Lstat(targetFile)
+	if err != nil {
+		t.Fatalf("Lstat target: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0644 {
+		t.Errorf("target permissions = %o, want 0644 (unchanged)", got)
+	}
+
+	// SetAttr with timestamps on a symlink should succeed
+	// but NOT modify the target file's timestamps
+	origInfo, _ := os.Lstat(targetFile)
+	origMtime := origInfo.ModTime()
+
+	err = link.SetAttr(
+		p9.SetAttrMask{
+			MTime:              true,
+			MTimeNotSystemTime: true,
+		},
+		p9.SetAttr{
+			MTimeSeconds:     uint64(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC).Unix()),
+			MTimeNanoSeconds: 0,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SetAttr timestamps on symlink: %v", err)
+	}
+
+	info, err = os.Lstat(targetFile)
+	if err != nil {
+		t.Fatalf("Lstat target after chtimes: %v", err)
+	}
+	if got := info.ModTime(); got != origMtime {
+		t.Errorf("target mtime changed to %v, want %v (unchanged)", got, origMtime)
 	}
 }
 
