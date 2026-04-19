@@ -294,8 +294,8 @@ brews:
 
 nfpms:
   - id: shed-deb
-    package_name: shed
-    file_name_template: "shed_{{ .Version }}_{{ .Arch }}"
+    package_name: shed-server
+    file_name_template: "shed-server_{{ .Version }}_{{ .Arch }}"
     vendor: charliek
     homepage: "https://github.com/charliek/shed"
     maintainer: "Charlie Knudsen"
@@ -307,6 +307,8 @@ nfpms:
     ids:
       - shed
       - shed-server
+    conflicts:
+      - shed
     contents:
       - src: packaging/shed-server.service
         dst: /etc/systemd/system/shed-server.service
