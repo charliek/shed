@@ -260,7 +260,7 @@ shed image prune [flags]
 | `--force` | | `false` | Skip confirmation prompt |
 | `--dry-run` | | `false` | List candidates without deleting |
 
-Images referenced by server config or any existing shed are preserved. Only unreferenced cached images are removed.
+A cached `.ext4` is preserved only if it is referenced by the current server config **and** its `.source` sidecar matches the current Docker ref (or the entry is a local path), or if it is referenced by an existing shed's metadata. Stale caches left behind after a config ref bump are reclaimed; see the [upgrade-and-reclaim cookbook](images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) for the full flow.
 
 **Note:** When using `--json`, the `--force` flag is required.
 
@@ -524,7 +524,7 @@ sudo shed-server pull-images                  # Pull all configured variants
 sudo shed-server pull-images --variant base   # Pull only the base variant
 ```
 
-Works on both macOS (VZ) and Linux (Firecracker). Uses the images configured in `server.yaml` for the active backend.
+Works on both macOS (VZ) and Linux (Firecracker). Uses the images configured in `server.yaml` for the active backend. When `base_rootfs` shares a Docker ref with any `images:` entry, the `_base` cache is hardlinked to the matching variant rather than being re-pulled — `shed create` without `--image` is then immediate. See the [on-disk layout](images.md#on-disk-layout) and [upgrade cookbook](images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) in the images reference.
 
 ### shed-server install
 
