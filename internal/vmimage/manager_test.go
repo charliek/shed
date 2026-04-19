@@ -205,6 +205,16 @@ func TestPruneImages(t *testing.T) {
 		createFakeImage(t, imagesDir, "unused1")
 		createFakeImage(t, imagesDir, "unused2")
 		createFakeImage(t, imagesDir, "_base")
+		// Align _base's sidecar with the config's baseRootfs so the source-aware
+		// exclusion keeps it. The matching-sidecar behavior has its own subtest
+		// below; this one exercises the name-based exclusion path.
+		if err := os.WriteFile(
+			filepath.Join(imagesDir, SourceFilename("_base")),
+			[]byte(mgr.cfg.GetBaseRootfs()+"\n"),
+			0644,
+		); err != nil {
+			t.Fatalf("write _base sidecar: %v", err)
+		}
 
 		deleted, err := mgr.PruneImages(false, inUseNames("shedref"))
 		if err != nil {
@@ -280,6 +290,120 @@ func TestPruneImages(t *testing.T) {
 		}
 		if len(deleted) != 1 || deleted[0].Name != "_base" {
 			t.Errorf("expected [_base], got %+v", deleted)
+		}
+	})
+
+	t.Run("stale _base pruned when source mismatches", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// createFakeImage writes a .source of "ghcr.io/example/_base:v1" — stale
+		// versus the testConfig baseRootfs of "ghcr.io/example/base:v1".
+		createFakeImage(t, imagesDir, "_base")
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		var pruned []string
+		for _, d := range deleted {
+			pruned = append(pruned, d.Name)
+		}
+		found := false
+		for _, n := range pruned {
+			if n == "_base" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected _base in prune list, got %v", pruned)
+		}
+	})
+
+	t.Run("matching _base preserved", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		createFakeImage(t, imagesDir, "_base")
+		// Align sidecar with config baseRootfs so CheckCache returns a hit.
+		sidecar := filepath.Join(imagesDir, SourceFilename("_base"))
+		if err := os.WriteFile(sidecar, []byte(mgr.cfg.GetBaseRootfs()+"\n"), 0644); err != nil {
+			t.Fatalf("write sidecar: %v", err)
+		}
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "_base" {
+				t.Errorf("_base should be preserved when sidecar matches, got pruned: %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(imagesDir, RootfsFilename("_base"))); err != nil {
+			t.Errorf("_base rootfs should still exist: %v", err)
+		}
+	})
+
+	t.Run("stale variant pruned when source mismatches", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// createFakeImage writes sidecar "ghcr.io/example/managed:v1" which
+		// matches the managed ref. Overwrite with a stale ref to simulate a
+		// config-ref bump that hasn't been followed by a re-pull yet.
+		createFakeImage(t, imagesDir, "managed")
+		staleSidecar := filepath.Join(imagesDir, SourceFilename("managed"))
+		if err := os.WriteFile(staleSidecar, []byte("ghcr.io/example/managed:v0\n"), 0644); err != nil {
+			t.Fatalf("write stale sidecar: %v", err)
+		}
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		found := false
+		for _, d := range deleted {
+			if d.Name == "managed" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected stale variant 'managed' to be pruned, got %+v", deleted)
+		}
+	})
+
+	t.Run("matching variant preserved", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// createFakeImage writes sidecar that matches the managed ref exactly.
+		createFakeImage(t, imagesDir, "managed")
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "managed" {
+				t.Errorf("managed variant should be preserved when sidecar matches, got %+v", deleted)
+			}
+		}
+	})
+
+	t.Run("local-path variant always preserved regardless of sidecar", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// Configure a local-path variant and drop a stale-looking file at
+		// that path to confirm prune never touches it.
+		localPath := filepath.Join(imagesDir, RootfsFilename("custom"))
+		if err := os.WriteFile(localPath, []byte("local-custom"), 0644); err != nil {
+			t.Fatalf("write local image: %v", err)
+		}
+		mgr.cfg.(*testConfig).images["custom"] = localPath
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "custom" {
+				t.Errorf("local-path variant should be preserved unconditionally, got %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(localPath); err != nil {
+			t.Errorf("local-path variant file should still exist: %v", err)
 		}
 	})
 }

@@ -268,17 +268,28 @@ func (m *Manager) PruneImages(dryRun bool, inUseNames func() ([]string, error)) 
 		return nil, fmt.Errorf("failed to read images directory: %w", err)
 	}
 
-	// Build exclusion set
+	// Build exclusion set. For Docker-ref entries, exclusion is source-aware:
+	// a cached variant or _base is protected only if its .source sidecar
+	// matches the current config ref. After a config bump (e.g. v0.3.3 →
+	// v0.3.4), the stale cache file no longer matches and becomes a prune
+	// candidate. Local-path entries are unconditionally excluded — we never
+	// delete a file the config explicitly points at.
 	exclude := make(map[string]bool)
 
-	// Config-managed images
-	for name := range m.cfg.GetImages() {
-		exclude[name] = true
+	for name, ref := range m.cfg.GetImages() {
+		if !IsDockerRef(ref) {
+			exclude[name] = true
+			continue
+		}
+		if cached := CheckCache(imagesDir, name, ref); cached != "" {
+			exclude[name] = true
+		}
 	}
 
-	// _base if BaseRootfs is a Docker ref
-	if IsDockerRef(m.cfg.GetBaseRootfs()) {
-		exclude["_base"] = true
+	if base := m.cfg.GetBaseRootfs(); IsDockerRef(base) {
+		if cached := CheckCache(imagesDir, "_base", base); cached != "" {
+			exclude["_base"] = true
+		}
 	}
 
 	// Images referenced by existing sheds — fail closed if we can't read metadata
