@@ -103,18 +103,38 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 		pulled++
 	}
 
-	// Also pull the base rootfs if it's a Docker ref not already covered
+	// Hydrate _base from base_rootfs. If base_rootfs shares a Docker ref
+	// with any cached variant in the full config, hardlink _base to that
+	// variant (zero extra disk). Otherwise pull a fresh copy. This makes
+	// `shed create` (no --image) immediate after `pull-images`, which
+	// previously skipped _base whenever the ref matched a variant.
 	baseRootfs := imgCfg.GetBaseRootfs()
 	if vmimage.IsDockerRef(baseRootfs) {
-		alreadyPulled := false
-		for _, ref := range images {
-			if ref == baseRootfs {
-				alreadyPulled = true
+		imagesDir := imgCfg.GetImagesDir()
+		var linkFrom string
+		for name, ref := range imgCfg.GetImages() {
+			if ref != baseRootfs || !vmimage.IsDockerRef(ref) {
+				continue
+			}
+			if vmimage.CheckCache(imagesDir, name, ref) != "" {
+				linkFrom = name
 				break
 			}
 		}
-		if !alreadyPulled {
-			fmt.Printf("Pulling base rootfs (%s)...\n", baseRootfs)
+
+		linked := false
+		if linkFrom != "" {
+			if err := vmimage.LinkCachedImage(imagesDir, linkFrom, "_base", baseRootfs); err != nil {
+				fmt.Printf("  [warn] hardlink of _base to %s failed (%v); falling back to full pull\n", linkFrom, err)
+			} else {
+				fmt.Printf("Done: _base (linked to %s)\n", linkFrom)
+				pulled++
+				linked = true
+			}
+		}
+
+		if !linked {
+			fmt.Printf("Pulling _base (%s)...\n", baseRootfs)
 			_, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 				DockerRef: baseRootfs,
 				Name:      "_base",
@@ -124,7 +144,7 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return fmt.Errorf("failed to pull base rootfs: %w", err)
 			}
-			fmt.Println("Done: base rootfs")
+			fmt.Println("Done: _base")
 			pulled++
 		}
 	}

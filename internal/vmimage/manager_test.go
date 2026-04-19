@@ -2,9 +2,13 @@ package vmimage
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // testConfig implements ImageConfig for testing.
@@ -276,6 +280,156 @@ func TestPruneImages(t *testing.T) {
 		}
 		if len(deleted) != 1 || deleted[0].Name != "_base" {
 			t.Errorf("expected [_base], got %+v", deleted)
+		}
+	})
+}
+
+func TestLinkCachedImage(t *testing.T) {
+	t.Run("hardlinks to variant and writes matching sidecar", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		ref := "ghcr.io/example/experimental:v1"
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", ref); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		sourcePath := filepath.Join(imagesDir, RootfsFilename("experimental"))
+		targetPath := filepath.Join(imagesDir, RootfsFilename("_base"))
+
+		srcInfo, err := os.Stat(sourcePath)
+		if err != nil {
+			t.Fatalf("stat source: %v", err)
+		}
+		dstInfo, err := os.Stat(targetPath)
+		if err != nil {
+			t.Fatalf("stat target: %v", err)
+		}
+
+		// Inode match — proves hardlink, not copy.
+		srcSys, srcOK := srcInfo.Sys().(*syscall.Stat_t)
+		dstSys, dstOK := dstInfo.Sys().(*syscall.Stat_t)
+		if !srcOK || !dstOK {
+			t.Skip("syscall.Stat_t not available on this platform")
+		}
+		if srcSys.Ino != dstSys.Ino {
+			t.Errorf("inode mismatch: source %d, target %d (expected hardlink)", srcSys.Ino, dstSys.Ino)
+		}
+		if dstSys.Nlink < 2 {
+			t.Errorf("expected Nlink >= 2 after hardlink, got %d", dstSys.Nlink)
+		}
+
+		// Sidecar matches the provided ref.
+		sidecar, err := os.ReadFile(filepath.Join(imagesDir, SourceFilename("_base")))
+		if err != nil {
+			t.Fatalf("read sidecar: %v", err)
+		}
+		if got := string(sidecar); got != ref+"\n" {
+			t.Errorf("sidecar = %q, want %q", got, ref+"\n")
+		}
+	})
+
+	t.Run("atomic replace preserves open fds on stale target", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		// Pre-existing stale _base with old contents.
+		stalePath := filepath.Join(imagesDir, RootfsFilename("_base"))
+		staleContent := []byte("stale-content")
+		if err := os.WriteFile(stalePath, staleContent, 0644); err != nil {
+			t.Fatalf("write stale target: %v", err)
+		}
+
+		// Open the stale file BEFORE the link runs.
+		f, err := os.Open(stalePath)
+		if err != nil {
+			t.Fatalf("open stale: %v", err)
+		}
+		defer f.Close()
+
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", "ghcr.io/example/experimental:v1"); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		// The held fd still points at the unlinked inode and reads the old content.
+		got, err := io.ReadAll(f)
+		if err != nil {
+			t.Fatalf("read from held fd: %v", err)
+		}
+		if string(got) != string(staleContent) {
+			t.Errorf("held fd read = %q, want %q (unlinked inode should survive)", got, staleContent)
+		}
+
+		// The new target name now matches the experimental variant.
+		newContent, err := os.ReadFile(stalePath)
+		if err != nil {
+			t.Fatalf("read new target: %v", err)
+		}
+		if string(newContent) != "fake-rootfs" {
+			t.Errorf("new target content = %q, want %q", newContent, "fake-rootfs")
+		}
+	})
+
+	t.Run("returns error and leaves no partial state when source is missing", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		// No source image created.
+
+		err := LinkCachedImage(imagesDir, "missing", "_base", "ghcr.io/example/missing:v1")
+		if err == nil {
+			t.Fatal("expected error for missing source, got nil")
+		}
+
+		// No target and no sidecar should have been created.
+		if _, err := os.Stat(filepath.Join(imagesDir, RootfsFilename("_base"))); !os.IsNotExist(err) {
+			t.Errorf("_base-rootfs.ext4 should not exist after failure: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(imagesDir, SourceFilename("_base"))); !os.IsNotExist(err) {
+			t.Errorf("_base source sidecar should not exist after failure: %v", err)
+		}
+	})
+
+	t.Run("blocks while _base .lock is held by another caller", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		targetPath := filepath.Join(imagesDir, RootfsFilename("_base"))
+		unlockHeld, err := acquireFileLock(targetPath + ".lock")
+		if err != nil {
+			t.Fatalf("acquire holder lock: %v", err)
+		}
+
+		var (
+			wg      sync.WaitGroup
+			linkErr error
+			done    = make(chan struct{})
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			linkErr = LinkCachedImage(imagesDir, "experimental", "_base", "ghcr.io/example/experimental:v1")
+			close(done)
+		}()
+
+		// The link call must block while the other holder keeps the lock.
+		select {
+		case <-done:
+			unlockHeld()
+			t.Fatal("LinkCachedImage returned before lock was released")
+		case <-time.After(100 * time.Millisecond):
+			// expected — still blocked
+		}
+
+		unlockHeld()
+		select {
+		case <-done:
+			// unblocked as expected
+		case <-time.After(5 * time.Second):
+			t.Fatal("LinkCachedImage did not return after lock release")
+		}
+
+		wg.Wait()
+		if linkErr != nil {
+			t.Errorf("LinkCachedImage unexpected error: %v", linkErr)
 		}
 	})
 }

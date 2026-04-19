@@ -106,6 +106,50 @@ func WriteSource(imagesDir, name, ref string) error {
 	return os.WriteFile(sourceFile, []byte(ref+"\n"), 0644)
 }
 
+// LinkCachedImage hardlinks an existing cached ext4 under sourceName to
+// targetName in the same imagesDir and writes targetName's .source sidecar
+// so callers see a matching cache entry.
+//
+// It acquires targetName's .lock flock for the duration of the rename and
+// sidecar write, serializing against EnsureImage / DeleteImage / PruneImages.
+// The replace uses link-to-tmp + rename to stay atomic and preserve any open
+// FDs an in-flight CopyRootfs holds against the old target inode.
+//
+// Returns an error if os.Link fails (e.g. cross-device, missing source, or
+// permission issue). Callers should treat this as a signal to fall back to
+// a full pull. No partial state is left on error.
+func LinkCachedImage(imagesDir, sourceName, targetName, ref string) error {
+	sourcePath := filepath.Join(imagesDir, RootfsFilename(sourceName))
+	targetPath := filepath.Join(imagesDir, RootfsFilename(targetName))
+
+	if _, err := os.Stat(sourcePath); err != nil {
+		return fmt.Errorf("source image %q: %w", sourceName, err)
+	}
+
+	unlock, err := acquireFileLock(targetPath + ".lock")
+	if err != nil {
+		return fmt.Errorf("acquiring lock for %q: %w", targetName, err)
+	}
+	defer unlock()
+
+	tmpPath := fmt.Sprintf("%s.tmp.%d", targetPath, os.Getpid())
+	_ = os.Remove(tmpPath)
+	if err := os.Link(sourcePath, tmpPath); err != nil {
+		return fmt.Errorf("linking %s -> %s: %w", sourcePath, tmpPath, err)
+	}
+
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("renaming %s -> %s: %w", tmpPath, targetPath, err)
+	}
+
+	if err := WriteSource(imagesDir, targetName, ref); err != nil {
+		return fmt.Errorf("writing source sidecar for %q: %w", targetName, err)
+	}
+
+	return nil
+}
+
 // Convert pulls a Docker image and converts it to an ext4 rootfs.
 // The conversion uses a privileged Docker container for ext4 creation (loop mount).
 func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
