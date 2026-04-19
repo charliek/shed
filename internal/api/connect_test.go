@@ -160,27 +160,55 @@ func TestHandleConnectSuccess(t *testing.T) {
 		t.Errorf("Upgrade header = %q, want %q", resp.Header.Get("Upgrade"), "shed-tcp")
 	}
 
-	// Verify bidirectional data flow. Writing 20 bytes fits in the kernel
-	// send buffer, so the Write does not block and we can call both
-	// synchronously.
-	testData := "hello through tunnel"
-	if _, err := conn.Write([]byte(testData)); err != nil {
+	// Verify bidirectional data flow end-to-end. Writing these small payloads
+	// fits in the kernel send buffer, so Write does not block.
+	//
+	// Client → VM direction.
+	clientToVM := "hello through tunnel"
+	nw, err := conn.Write([]byte(clientToVM))
+	if err != nil {
 		t.Fatalf("write data: %v", err)
+	}
+	if nw != len(clientToVM) {
+		t.Fatalf("short write: %d of %d", nw, len(clientToVM))
 	}
 	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatalf("close write: %v", err)
 	}
 
 	if err := clientSideConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("set vm-side deadline: %v", err)
+		t.Fatalf("set vm-side read deadline: %v", err)
 	}
-	received := make([]byte, len(testData))
-	n, err := io.ReadFull(clientSideConn, received)
-	if err != nil {
+	received := make([]byte, len(clientToVM))
+	if _, err := io.ReadFull(clientSideConn, received); err != nil {
 		t.Fatalf("read from VM side: %v", err)
 	}
-	if string(received[:n]) != testData {
-		t.Errorf("received = %q, want %q", string(received[:n]), testData)
+	if string(received) != clientToVM {
+		t.Errorf("received = %q, want %q", string(received), clientToVM)
+	}
+
+	// VM → client direction.
+	vmToClient := "reply from vm"
+	if err := clientSideConn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set vm-side write deadline: %v", err)
+	}
+	nw, err = clientSideConn.Write([]byte(vmToClient))
+	if err != nil {
+		t.Fatalf("vm-side write: %v", err)
+	}
+	if nw != len(vmToClient) {
+		t.Fatalf("vm-side short write: %d of %d", nw, len(vmToClient))
+	}
+	if err := clientSideConn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("vm-side close write: %v", err)
+	}
+
+	clientReceived := make([]byte, len(vmToClient))
+	if _, err := io.ReadFull(conn, clientReceived); err != nil {
+		t.Fatalf("read on client side: %v", err)
+	}
+	if string(clientReceived) != vmToClient {
+		t.Errorf("client received = %q, want %q", string(clientReceived), vmToClient)
 	}
 }
 
