@@ -94,23 +94,22 @@ func TestHandleConnectShedNotRunning(t *testing.T) {
 // HTTP upgrade handshake and bidirectional byte flow through
 // vmutil.BidirectionalCopy.
 //
-// Known flake: this test has intermittently timed out on Linux CI (Go 1.24.x)
-// when the server's io.Copy(pipe, TCP) goroutine inside BidirectionalCopy
-// exits before propagating bytes — leaving the peer copy goroutine blocked
-// forever on pipe.Read, because net.Pipe has no CloseWrite so the EOF
-// signal from the first goroutine's closeWrite call is a no-op. Production
-// code uses real TCP / vsock conns (both support CloseWrite), so this is a
-// test-setup artifact, not a shed regression.
+// The mock VM side uses a real TCP loopback socketpair rather than
+// net.Pipe. net.Pipe has no CloseWrite, so BidirectionalCopy's EOF
+// propagation (which calls CloseWrite on the peer when one direction
+// exits) is a no-op, and the test would race under load on Linux CI —
+// one copy goroutine could exit early and the other would block forever
+// on pipe.Read, running up the full test timeout. Real TCP has working
+// CloseWrite, matching the production Firecracker / VZ vsock conns that
+// BidirectionalCopy was designed against.
 //
-// The SetDeadline calls below cap any recurrence at ~5 seconds with a clear
-// "i/o timeout" error instead of a 10-minute test timeout. If this flake
-// recurs frequently, consider hardening BidirectionalCopy to fully Close
-// the peer when one direction exits (careful: changes production half-close
-// semantics for long-lived tunnels).
+// SetDeadline calls are belt-and-suspenders: any future unexpected
+// blockage surfaces as a fast "i/o timeout" error instead of hanging.
 func TestHandleConnectSuccess(t *testing.T) {
-	// Create a backend that returns a pipe for DialService.
-	serverConn, clientSideConn := net.Pipe()
-	t.Cleanup(func() { _ = clientSideConn.Close() })
+	// Build a mock-VM side as a real TCP socketpair so CloseWrite works.
+	// serverConn goes into the handler via DialService; clientSideConn is
+	// the test's view of what the "VM" would send/receive.
+	serverConn, clientSideConn := tcpSocketPair(t)
 
 	be := &testBackend{
 		dialFunc: func(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
@@ -161,26 +160,97 @@ func TestHandleConnectSuccess(t *testing.T) {
 		t.Errorf("Upgrade header = %q, want %q", resp.Header.Get("Upgrade"), "shed-tcp")
 	}
 
-	// Verify bidirectional data flow. Writing 20 bytes fits in the kernel
-	// send buffer, so the Write does not block and we can call both
-	// synchronously — avoids a scheduling race the prior goroutine form had.
-	testData := "hello through tunnel"
-	if _, err := conn.Write([]byte(testData)); err != nil {
+	// Verify bidirectional data flow end-to-end. Writing these small payloads
+	// fits in the kernel send buffer, so Write does not block.
+	//
+	// Client → VM direction.
+	clientToVM := "hello through tunnel"
+	nw, err := conn.Write([]byte(clientToVM))
+	if err != nil {
 		t.Fatalf("write data: %v", err)
+	}
+	if nw != len(clientToVM) {
+		t.Fatalf("short write: %d of %d", nw, len(clientToVM))
 	}
 	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatalf("close write: %v", err)
 	}
 
 	if err := clientSideConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("set pipe deadline: %v", err)
+		t.Fatalf("set vm-side read deadline: %v", err)
 	}
-	received := make([]byte, len(testData))
-	n, err := io.ReadFull(clientSideConn, received)
-	if err != nil {
+	received := make([]byte, len(clientToVM))
+	if _, err := io.ReadFull(clientSideConn, received); err != nil {
 		t.Fatalf("read from VM side: %v", err)
 	}
-	if string(received[:n]) != testData {
-		t.Errorf("received = %q, want %q", string(received[:n]), testData)
+	if string(received) != clientToVM {
+		t.Errorf("received = %q, want %q", string(received), clientToVM)
+	}
+
+	// VM → client direction.
+	vmToClient := "reply from vm"
+	if err := clientSideConn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set vm-side write deadline: %v", err)
+	}
+	nw, err = clientSideConn.Write([]byte(vmToClient))
+	if err != nil {
+		t.Fatalf("vm-side write: %v", err)
+	}
+	if nw != len(vmToClient) {
+		t.Fatalf("vm-side short write: %d of %d", nw, len(vmToClient))
+	}
+	if err := clientSideConn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("vm-side close write: %v", err)
+	}
+
+	clientReceived := make([]byte, len(vmToClient))
+	if _, err := io.ReadFull(conn, clientReceived); err != nil {
+		t.Fatalf("read on client side: %v", err)
+	}
+	if string(clientReceived) != vmToClient {
+		t.Errorf("client received = %q, want %q", string(clientReceived), vmToClient)
+	}
+}
+
+// tcpSocketPair returns two connected TCP conns on loopback. Both ends
+// support CloseWrite, matching real production conns (vsock / TCP) and
+// avoiding the net.Pipe EOF-propagation quirk inside BidirectionalCopy.
+func tcpSocketPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	type acceptResult struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan acceptResult, 1)
+	go func() {
+		c, err := ln.Accept()
+		ch <- acceptResult{c, err}
+	}()
+
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	dialed, err := dialer.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial mock vm: %v", err)
+	}
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			_ = dialed.Close()
+			t.Fatalf("accept mock vm: %v", r.err)
+		}
+		t.Cleanup(func() { _ = r.c.Close() })
+		t.Cleanup(func() { _ = dialed.Close() })
+		return r.c, dialed
+	case <-time.After(5 * time.Second):
+		_ = dialed.Close()
+		t.Fatalf("timeout setting up mock vm socketpair")
+		return nil, nil
 	}
 }
