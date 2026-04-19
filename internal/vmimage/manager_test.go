@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -605,6 +606,147 @@ func TestLinkCachedImage(t *testing.T) {
 		wg.Wait()
 		if linkErr != nil {
 			t.Errorf("LinkCachedImage unexpected error: %v", linkErr)
+		}
+	})
+
+	t.Run("cleans legacy pid-suffixed tmp orphan before linking", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		// Simulate a crashed prior run that left a 20GB-sized (we use
+		// small bytes in the test) orphan with an arbitrary PID suffix.
+		orphan := filepath.Join(imagesDir, RootfsFilename("_base")+".tmp.99999")
+		if err := os.WriteFile(orphan, []byte("stale-orphan"), 0644); err != nil {
+			t.Fatalf("seed orphan: %v", err)
+		}
+
+		ref := "ghcr.io/example/experimental:v1"
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", ref); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+			t.Errorf("legacy pid-suffixed orphan should have been swept: %v", err)
+		}
+
+		srcInfo, _ := os.Stat(filepath.Join(imagesDir, RootfsFilename("experimental")))
+		dstInfo, err := os.Stat(filepath.Join(imagesDir, RootfsFilename("_base")))
+		if err != nil {
+			t.Fatalf("stat target: %v", err)
+		}
+		if srcInfo.Sys().(*syscall.Stat_t).Ino != dstInfo.Sys().(*syscall.Stat_t).Ino {
+			t.Errorf("target should be linked to source after sweep+link")
+		}
+
+		sidecar, err := os.ReadFile(filepath.Join(imagesDir, SourceFilename("_base")))
+		if err != nil {
+			t.Fatalf("read sidecar: %v", err)
+		}
+		if got := strings.TrimSpace(string(sidecar)); got != ref {
+			t.Errorf("sidecar = %q, want %q", got, ref)
+		}
+	})
+
+	t.Run("cleans fixed-name tmp orphan before linking", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		orphan := filepath.Join(imagesDir, RootfsFilename("_base")+".tmp")
+		if err := os.WriteFile(orphan, []byte("stale-fixed"), 0644); err != nil {
+			t.Fatalf("seed orphan: %v", err)
+		}
+
+		ref := "ghcr.io/example/experimental:v1"
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", ref); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+			t.Errorf("fixed-name orphan should have been swept: %v", err)
+		}
+
+		srcInfo, _ := os.Stat(filepath.Join(imagesDir, RootfsFilename("experimental")))
+		dstInfo, _ := os.Stat(filepath.Join(imagesDir, RootfsFilename("_base")))
+		if srcInfo.Sys().(*syscall.Stat_t).Ino != dstInfo.Sys().(*syscall.Stat_t).Ino {
+			t.Errorf("target should be linked to source after sweep+link")
+		}
+	})
+
+	t.Run("cleans multiple pid-suffixed orphans in one call", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		orphans := []string{
+			filepath.Join(imagesDir, RootfsFilename("_base")+".tmp.11111"),
+			filepath.Join(imagesDir, RootfsFilename("_base")+".tmp.22222"),
+			filepath.Join(imagesDir, RootfsFilename("_base")+".tmp.33333"),
+		}
+		for _, o := range orphans {
+			if err := os.WriteFile(o, []byte("stale"), 0644); err != nil {
+				t.Fatalf("seed orphan %s: %v", o, err)
+			}
+		}
+
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", "ghcr.io/example/experimental:v1"); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		for _, o := range orphans {
+			if _, err := os.Stat(o); !os.IsNotExist(err) {
+				t.Errorf("orphan %s should have been swept, got %v", o, err)
+			}
+		}
+
+		srcInfo, _ := os.Stat(filepath.Join(imagesDir, RootfsFilename("experimental")))
+		dstInfo, _ := os.Stat(filepath.Join(imagesDir, RootfsFilename("_base")))
+		if srcInfo.Sys().(*syscall.Stat_t).Ino != dstInfo.Sys().(*syscall.Stat_t).Ino {
+			t.Errorf("target should be linked to source after sweeping orphans")
+		}
+	})
+
+	t.Run("sweep does not touch siblings or operator scratch files", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		// A different variant's tmp file must survive the sweep.
+		siblingTmp := filepath.Join(imagesDir, RootfsFilename("default")+".tmp.99999")
+		if err := os.WriteFile(siblingTmp, []byte("other-variant"), 0644); err != nil {
+			t.Fatalf("seed sibling tmp: %v", err)
+		}
+
+		// Operator scratch file using our target's prefix but a non-digit
+		// suffix must NOT match the sweep.
+		scratch := filepath.Join(imagesDir, RootfsFilename("_base")+".tmp.keep")
+		if err := os.WriteFile(scratch, []byte("operator-scratch"), 0644); err != nil {
+			t.Fatalf("seed scratch: %v", err)
+		}
+
+		// Pre-seed a legitimate sidecar + lock for the target; the sweep
+		// must not match these either (they end in .source / .lock, not .tmp*).
+		preSidecar := filepath.Join(imagesDir, SourceFilename("_base"))
+		if err := os.WriteFile(preSidecar, []byte("prior-ref\n"), 0644); err != nil {
+			t.Fatalf("seed sidecar: %v", err)
+		}
+		preLock := filepath.Join(imagesDir, RootfsFilename("_base")+".lock")
+		if err := os.WriteFile(preLock, []byte{}, 0644); err != nil {
+			t.Fatalf("seed lock: %v", err)
+		}
+
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", "ghcr.io/example/experimental:v1"); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		for _, p := range []string{siblingTmp, scratch, preLock} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("sweep incorrectly removed %s: %v", p, err)
+			}
+		}
+		// Sidecar was legitimately overwritten by the successful call;
+		// just assert it still exists and holds the new ref.
+		if data, err := os.ReadFile(preSidecar); err != nil {
+			t.Errorf("sidecar disappeared: %v", err)
+		} else if strings.TrimSpace(string(data)) != "ghcr.io/example/experimental:v1" {
+			t.Errorf("sidecar = %q, want ref updated by call", string(data))
 		}
 	})
 }

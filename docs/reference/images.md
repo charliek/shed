@@ -275,6 +275,7 @@ When the Docker ref in your config changes (for example after a version bump), s
     | `{name}-rootfs.ext4` | Cached variant rootfs (20GB sparse, 2–5GB actual). One per entry in `firecracker.images:`. |
     | `{name}-rootfs.ext4.source` | Docker ref this cache was built from. Used by `shed image prune` to detect stale caches. |
     | `{name}-rootfs.ext4.lock` | Empty flock file. Preserved across deletes to avoid a lock-inode race — safe to ignore. |
+    | `{name}-rootfs.ext4.tmp` | Transient file that may briefly exist while a cached variant is being hardlinked into `_base` (or any other cache slot). Swept on the next invocation of the hydration path if left behind by a crash — no manual cleanup needed. |
     | `_base-rootfs.ext4` (+ `.source`, `.lock`) | Backing cache for `firecracker.base_rootfs` (the fallback used when `shed create` is invoked without `--image`). Stored as a hardlink to a matching variant when refs align, otherwise a full copy. |
     | `vmlinux` | Extracted kernel (~40MB). |
 
@@ -291,6 +292,7 @@ When the Docker ref in your config changes (for example after a version bump), s
     | `{name}-rootfs.ext4` | Cached variant rootfs (20GB sparse, 2–5GB actual). One per entry in `vz.images:`. |
     | `{name}-rootfs.ext4.source` | Docker ref this cache was built from. Used by `shed image prune` to detect stale caches. |
     | `{name}-rootfs.ext4.lock` | Empty flock file. Preserved across deletes — safe to ignore. |
+    | `{name}-rootfs.ext4.tmp` | Transient file that may briefly exist while a cached variant is being hardlinked into `_base` (or any other cache slot). Swept on the next invocation of the hydration path if left behind by a crash — no manual cleanup needed. |
     | `_base-rootfs.ext4` (+ `.source`, `.lock`) | Backing cache for `vz.base_rootfs`. Stored as a hardlink to a matching variant when refs align, otherwise a full copy. |
     | `vmlinux` | Extracted kernel. |
     | `initrd.img` | Extracted initial RAM disk (VZ requires this; Firecracker boots directly from `vmlinux`). |

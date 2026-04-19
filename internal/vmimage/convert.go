@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -106,6 +107,66 @@ func WriteSource(imagesDir, name, ref string) error {
 	return os.WriteFile(sourceFile, []byte(ref+"\n"), 0644)
 }
 
+// sweepStaleTmp removes orphan tmp files for a single target produced by
+// a prior crashed LinkCachedImage call. It matches only:
+//   - {base}.tmp              — the current fixed tmp name.
+//   - {base}.tmp.<digits>     — the legacy PID-suffixed tmp name from
+//     pre-v0.3.6 builds (fmt.Sprintf("%s.tmp.%d", ...)).
+//
+// Any other suffix (e.g. .keep, .bak, .tmp.tmp) is left alone so operator
+// scratch files in the images directory are never collected.
+//
+// Caller MUST hold {targetPath}.lock — the sweep and the subsequent
+// os.Link must run under the same flock, otherwise a concurrent writer
+// could have an in-flight {base}.tmp that this sweep would destroy.
+//
+// os.Remove failures other than os.IsNotExist are logged but non-fatal:
+// if the stale file is the fixed {base}.tmp, the subsequent os.Link
+// will surface the problem via EEXIST; legacy PID-suffixed orphans that
+// resist removal become visible to the operator via the log line rather
+// than turning into silent long-lived leaks.
+func sweepStaleTmp(targetPath string) error {
+	dir := filepath.Dir(targetPath)
+	base := filepath.Base(targetPath)
+	prefix := base + ".tmp"
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", dir, err)
+	}
+
+	for _, e := range entries {
+		n := e.Name()
+		if !strings.HasPrefix(n, prefix) {
+			continue
+		}
+		suffix := n[len(prefix):]
+		if suffix != "" && !isLegacyPIDSuffix(suffix) {
+			continue
+		}
+		p := filepath.Join(dir, n)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: failed to remove stale tmp %s: %v", p, err)
+		}
+	}
+	return nil
+}
+
+// isLegacyPIDSuffix reports whether s is "." followed by one or more
+// decimal digits, matching the pre-v0.3.6 tmp-file naming convention
+// fmt.Sprintf("%s.tmp.%d", targetPath, os.Getpid()).
+func isLegacyPIDSuffix(s string) bool {
+	if len(s) < 2 || s[0] != '.' {
+		return false
+	}
+	for _, r := range s[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // LinkCachedImage hardlinks an existing cached ext4 under sourceName to
 // targetName in the same imagesDir and writes targetName's .source sidecar
 // so callers see a matching cache entry.
@@ -132,8 +193,19 @@ func LinkCachedImage(imagesDir, sourceName, targetName, ref string) error {
 	}
 	defer unlock()
 
-	tmpPath := fmt.Sprintf("%s.tmp.%d", targetPath, os.Getpid())
-	_ = os.Remove(tmpPath)
+	// Sweep stale tmp orphans for this exact target only — must not
+	// match siblings (other variants) or operator scratch files.
+	// Matches "{base}.tmp" (the fixed tmp name used below) and the
+	// legacy "{base}.tmp.<digits>" name produced by pre-v0.3.6 builds
+	// that crashed between os.Link and os.Rename.
+	if err := sweepStaleTmp(targetPath); err != nil {
+		return fmt.Errorf("scanning for stale tmp files: %w", err)
+	}
+
+	// Fixed tmp name: the target's .lock flock already serializes all
+	// writers, so a PID suffix adds nothing. A stable name is what lets
+	// the sweep above self-heal across crashes.
+	tmpPath := targetPath + ".tmp"
 	if err := os.Link(sourcePath, tmpPath); err != nil {
 		return fmt.Errorf("linking %s -> %s: %w", sourcePath, tmpPath, err)
 	}
