@@ -482,6 +482,79 @@ func TestRemappingSetAttrTimestamps(t *testing.T) {
 	}
 }
 
+func TestRemappingSetAttrSkipsSymlinks(t *testing.T) {
+	hostDir := t.TempDir()
+
+	// Create a target file and a symlink to it
+	targetFile := filepath.Join(hostDir, "target")
+	if err := os.WriteFile(targetFile, []byte("data"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink("target", filepath.Join(hostDir, "link")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	inner := localfs.Attacher(hostDir)
+	att := newRemappingAttacher(inner, hostDir, 1000, 1000)
+
+	root, err := att.Attach()
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer root.Close()
+
+	_, link, err := root.Walk([]string{"link"})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	defer link.Close()
+
+	// SetAttr with Permissions on a symlink should succeed (no error)
+	// but NOT modify the target file's permissions
+	err = link.SetAttr(
+		p9.SetAttrMask{Permissions: true},
+		p9.SetAttr{Permissions: 0777},
+	)
+	if err != nil {
+		t.Fatalf("SetAttr Permissions on symlink: %v", err)
+	}
+
+	info, err := os.Lstat(targetFile)
+	if err != nil {
+		t.Fatalf("Lstat target: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0644 {
+		t.Errorf("target permissions = %o, want 0644 (unchanged)", got)
+	}
+
+	// SetAttr with timestamps on a symlink should succeed
+	// but NOT modify the target file's timestamps
+	origInfo, _ := os.Lstat(targetFile)
+	origMtime := origInfo.ModTime()
+
+	err = link.SetAttr(
+		p9.SetAttrMask{
+			MTime:              true,
+			MTimeNotSystemTime: true,
+		},
+		p9.SetAttr{
+			MTimeSeconds:     uint64(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC).Unix()),
+			MTimeNanoSeconds: 0,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SetAttr timestamps on symlink: %v", err)
+	}
+
+	info, err = os.Lstat(targetFile)
+	if err != nil {
+		t.Fatalf("Lstat target after chtimes: %v", err)
+	}
+	if got := info.ModTime(); got != origMtime {
+		t.Errorf("target mtime changed to %v, want %v (unchanged)", got, origMtime)
+	}
+}
+
 func TestRemappingSetAttrChown(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root")

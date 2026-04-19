@@ -179,46 +179,57 @@ func (f *remappingFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 		valid.GID = false
 	}
 
-	if valid.Permissions {
-		if err := os.Chmod(f.hostPath, os.FileMode(attr.Permissions)); err != nil {
-			return err
-		}
-		valid.Permissions = false
-	}
-
-	if valid.ATime || valid.MTime {
-		// Read current times so we only change what was requested.
+	if valid.Permissions || valid.ATime || valid.MTime {
+		// Lstat to detect symlinks. os.Chmod and os.Chtimes follow
+		// symlinks, which would let a guest modify files outside the
+		// shared directory by creating a symlink. Skip these operations
+		// on symlinks (matching the safety of os.Lchown above).
 		info, err := os.Lstat(f.hostPath)
 		if err != nil {
 			return err
 		}
-		stat := info.Sys().(*syscall.Stat_t)
-		atime := time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
-		mtime := info.ModTime()
+		isSymlink := info.Mode()&os.ModeSymlink != 0
 
-		if valid.ATime {
-			if valid.ATimeNotSystemTime {
-				atime = time.Unix(int64(attr.ATimeSeconds), int64(attr.ATimeNanoSeconds))
-			} else {
-				atime = time.Now()
+		if valid.Permissions {
+			if !isSymlink {
+				if err := os.Chmod(f.hostPath, os.FileMode(attr.Permissions)); err != nil {
+					return err
+				}
 			}
-		}
-		if valid.MTime {
-			if valid.MTimeNotSystemTime {
-				mtime = time.Unix(int64(attr.MTimeSeconds), int64(attr.MTimeNanoSeconds))
-			} else {
-				mtime = time.Now()
-			}
+			valid.Permissions = false
 		}
 
-		if err := os.Chtimes(f.hostPath, atime, mtime); err != nil {
-			return err
+		if valid.ATime || valid.MTime {
+			stat := info.Sys().(*syscall.Stat_t)
+			atime := time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
+			mtime := info.ModTime()
+
+			if valid.ATime {
+				if valid.ATimeNotSystemTime {
+					atime = time.Unix(int64(attr.ATimeSeconds), int64(attr.ATimeNanoSeconds))
+				} else {
+					atime = time.Now()
+				}
+			}
+			if valid.MTime {
+				if valid.MTimeNotSystemTime {
+					mtime = time.Unix(int64(attr.MTimeSeconds), int64(attr.MTimeNanoSeconds))
+				} else {
+					mtime = time.Now()
+				}
+			}
+
+			if !isSymlink {
+				if err := os.Chtimes(f.hostPath, atime, mtime); err != nil {
+					return err
+				}
+			}
+			valid.ATime = false
+			valid.MTime = false
+			valid.ATimeNotSystemTime = false
+			valid.MTimeNotSystemTime = false
+			valid.CTime = false // CTime is set by the kernel, not user-settable
 		}
-		valid.ATime = false
-		valid.MTime = false
-		valid.ATimeNotSystemTime = false
-		valid.MTimeNotSystemTime = false
-		valid.CTime = false // CTime is set by the kernel, not user-settable
 	}
 
 	// Delegate remaining attributes (Size) to inner file
