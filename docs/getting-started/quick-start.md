@@ -39,9 +39,9 @@ See [VZ Setup](vz-setup.md) for the full macOS setup guide.
 Download and install the `.deb` from the [latest release](https://github.com/charliek/shed/releases):
 
 ```bash
-VERSION=0.3.2  # replace with desired version
-wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed_${VERSION}_amd64.deb
-sudo dpkg -i shed_${VERSION}_amd64.deb
+VERSION=0.3.3  # replace with desired version
+wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
+sudo dpkg -i shed-server_${VERSION}_amd64.deb
 ```
 
 This installs `shed` (CLI) and `shed-server`, generates a default Firecracker server config, and sets up a systemd service.
