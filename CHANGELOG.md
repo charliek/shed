@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.3
+
+- **Breaking (deb only):** Rename deb package `shed` → `shed-server` and the release artifact to `shed-server_<version>_<arch>.deb` to avoid silent collisions with Ubuntu's `shed` hex editor. Add `Conflicts: shed` so the two packages can never coexist. Hosts on the old v0.3.2 deb need to `sudo apt purge shed && sudo dpkg -i shed-server_0.3.3_*.deb` (the old binary at `/usr/local/bin/shed-server` may have been silently removed by an `apt upgrade` — `readlink /proc/$(pidof shed-server)/exe` showing `(deleted)` confirms this)
+- Document the deb as the primary Linux install path (#71)
+- Align `configs/server.local.yaml` (localfc) with localmac defaults (extensions, mounts, images)
+
 ## v0.3.2
 
 - Add `.deb` package support via GoReleaser nfpm for Linux (Ubuntu/Pop!OS) deployment
