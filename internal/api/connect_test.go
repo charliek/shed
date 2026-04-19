@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -89,9 +90,28 @@ func TestHandleConnectShedNotRunning(t *testing.T) {
 	}
 }
 
+// TestHandleConnectSuccess verifies the /api/sheds/{name}/connect/{port}
+// HTTP upgrade handshake and bidirectional byte flow through
+// vmutil.BidirectionalCopy.
+//
+// Known flake: this test has intermittently timed out on Linux CI (Go 1.24.x)
+// when the server's io.Copy(pipe, TCP) goroutine inside BidirectionalCopy
+// exits before propagating bytes — leaving the peer copy goroutine blocked
+// forever on pipe.Read, because net.Pipe has no CloseWrite so the EOF
+// signal from the first goroutine's closeWrite call is a no-op. Production
+// code uses real TCP / vsock conns (both support CloseWrite), so this is a
+// test-setup artifact, not a shed regression.
+//
+// The SetDeadline calls below cap any recurrence at ~5 seconds with a clear
+// "i/o timeout" error instead of a 10-minute test timeout. If this flake
+// recurs frequently, consider hardening BidirectionalCopy to fully Close
+// the peer when one direction exits (careful: changes production half-close
+// semantics for long-lived tunnels).
 func TestHandleConnectSuccess(t *testing.T) {
 	// Create a backend that returns a pipe for DialService.
 	serverConn, clientSideConn := net.Pipe()
+	t.Cleanup(func() { _ = clientSideConn.Close() })
+
 	be := &testBackend{
 		dialFunc: func(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
 			if shedName != "myvm" || port != 8080 {
@@ -104,14 +124,18 @@ func TestHandleConnectSuccess(t *testing.T) {
 
 	// Start a real HTTP server (httptest.NewRecorder doesn't support Hijacker).
 	ts := httptest.NewServer(srv.Router())
-	defer ts.Close()
+	t.Cleanup(ts.Close)
 
 	// Make a raw TCP connection to the test server.
 	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() { _ = conn.Close() })
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set tcp deadline: %v", err)
+	}
 
 	// Send the upgrade request.
 	req := "GET /api/sheds/myvm/connect/8080 HTTP/1.1\r\n" +
@@ -137,15 +161,20 @@ func TestHandleConnectSuccess(t *testing.T) {
 		t.Errorf("Upgrade header = %q, want %q", resp.Header.Get("Upgrade"), "shed-tcp")
 	}
 
-	// Verify bidirectional data flow.
-	// Write from the HTTP client side, read from the "VM" side.
+	// Verify bidirectional data flow. Writing 20 bytes fits in the kernel
+	// send buffer, so the Write does not block and we can call both
+	// synchronously — avoids a scheduling race the prior goroutine form had.
 	testData := "hello through tunnel"
-	go func() {
-		conn.Write([]byte(testData))
-		// Close write side so the server's io.Copy returns.
-		conn.(*net.TCPConn).CloseWrite()
-	}()
+	if _, err := conn.Write([]byte(testData)); err != nil {
+		t.Fatalf("write data: %v", err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("close write: %v", err)
+	}
 
+	if err := clientSideConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set pipe deadline: %v", err)
+	}
 	received := make([]byte, len(testData))
 	n, err := io.ReadFull(clientSideConn, received)
 	if err != nil {
@@ -154,5 +183,4 @@ func TestHandleConnectSuccess(t *testing.T) {
 	if string(received[:n]) != testData {
 		t.Errorf("received = %q, want %q", string(received[:n]), testData)
 	}
-	clientSideConn.Close()
 }
