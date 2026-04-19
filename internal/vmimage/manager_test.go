@@ -2,9 +2,13 @@ package vmimage
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // testConfig implements ImageConfig for testing.
@@ -201,6 +205,16 @@ func TestPruneImages(t *testing.T) {
 		createFakeImage(t, imagesDir, "unused1")
 		createFakeImage(t, imagesDir, "unused2")
 		createFakeImage(t, imagesDir, "_base")
+		// Align _base's sidecar with the config's baseRootfs so the source-aware
+		// exclusion keeps it. The matching-sidecar behavior has its own subtest
+		// below; this one exercises the name-based exclusion path.
+		if err := os.WriteFile(
+			filepath.Join(imagesDir, SourceFilename("_base")),
+			[]byte(mgr.cfg.GetBaseRootfs()+"\n"),
+			0644,
+		); err != nil {
+			t.Fatalf("write _base sidecar: %v", err)
+		}
 
 		deleted, err := mgr.PruneImages(false, inUseNames("shedref"))
 		if err != nil {
@@ -276,6 +290,321 @@ func TestPruneImages(t *testing.T) {
 		}
 		if len(deleted) != 1 || deleted[0].Name != "_base" {
 			t.Errorf("expected [_base], got %+v", deleted)
+		}
+	})
+
+	t.Run("stale _base pruned when source mismatches", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// createFakeImage writes a .source of "ghcr.io/example/_base:v1" — stale
+		// versus the testConfig baseRootfs of "ghcr.io/example/base:v1".
+		createFakeImage(t, imagesDir, "_base")
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		var pruned []string
+		for _, d := range deleted {
+			pruned = append(pruned, d.Name)
+		}
+		found := false
+		for _, n := range pruned {
+			if n == "_base" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected _base in prune list, got %v", pruned)
+		}
+	})
+
+	t.Run("matching _base preserved", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		createFakeImage(t, imagesDir, "_base")
+		// Align sidecar with config baseRootfs so CheckCache returns a hit.
+		sidecar := filepath.Join(imagesDir, SourceFilename("_base"))
+		if err := os.WriteFile(sidecar, []byte(mgr.cfg.GetBaseRootfs()+"\n"), 0644); err != nil {
+			t.Fatalf("write sidecar: %v", err)
+		}
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "_base" {
+				t.Errorf("_base should be preserved when sidecar matches, got pruned: %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(imagesDir, RootfsFilename("_base"))); err != nil {
+			t.Errorf("_base rootfs should still exist: %v", err)
+		}
+	})
+
+	t.Run("stale variant pruned when source mismatches", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// createFakeImage writes sidecar "ghcr.io/example/managed:v1" which
+		// matches the managed ref. Overwrite with a stale ref to simulate a
+		// config-ref bump that hasn't been followed by a re-pull yet.
+		createFakeImage(t, imagesDir, "managed")
+		staleSidecar := filepath.Join(imagesDir, SourceFilename("managed"))
+		if err := os.WriteFile(staleSidecar, []byte("ghcr.io/example/managed:v0\n"), 0644); err != nil {
+			t.Fatalf("write stale sidecar: %v", err)
+		}
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		found := false
+		for _, d := range deleted {
+			if d.Name == "managed" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected stale variant 'managed' to be pruned, got %+v", deleted)
+		}
+	})
+
+	t.Run("matching variant preserved", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// createFakeImage writes sidecar that matches the managed ref exactly.
+		createFakeImage(t, imagesDir, "managed")
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "managed" {
+				t.Errorf("managed variant should be preserved when sidecar matches, got %+v", deleted)
+			}
+		}
+	})
+
+	t.Run("local-path variant always preserved regardless of sidecar", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		// Configure a local-path variant and drop a stale-looking file at
+		// that path to confirm prune never touches it.
+		localPath := filepath.Join(imagesDir, RootfsFilename("custom"))
+		if err := os.WriteFile(localPath, []byte("local-custom"), 0644); err != nil {
+			t.Fatalf("write local image: %v", err)
+		}
+		mgr.cfg.(*testConfig).images["custom"] = localPath
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "custom" {
+				t.Errorf("local-path variant should be preserved unconditionally, got %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(localPath); err != nil {
+			t.Errorf("local-path variant file should still exist: %v", err)
+		}
+	})
+
+	t.Run("local-path pointing at in-dir file with different basename protects derived name", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		mgr.cfg.(*testConfig).baseRootfs = "/elsewhere/ignored.ext4" // not in imagesDir, not docker
+
+		// Create an image at imagesDir/base-rootfs.ext4 and configure the
+		// variant `prod` to point at it. Prune should protect
+		// `base-rootfs.ext4` even though the config map key is `prod`.
+		target := filepath.Join(imagesDir, RootfsFilename("base"))
+		if err := os.WriteFile(target, []byte("shared"), 0644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		mgr.cfg.(*testConfig).images["prod"] = target
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "base" {
+				t.Errorf("base-rootfs.ext4 should be protected via local-path derivation, got %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Errorf("shared local file should still exist after prune: %v", err)
+		}
+	})
+
+	t.Run("local-path base_rootfs pointing at in-dir file protects derived name", func(t *testing.T) {
+		mgr, imagesDir := newTestManager(t)
+		mgr.cfg.(*testConfig).images = map[string]string{} // no variants
+
+		target := filepath.Join(imagesDir, RootfsFilename("experimental"))
+		if err := os.WriteFile(target, []byte("shared-base"), 0644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		mgr.cfg.(*testConfig).baseRootfs = target
+
+		deleted, err := mgr.PruneImages(false, noInUseNames)
+		if err != nil {
+			t.Fatalf("PruneImages error: %v", err)
+		}
+		for _, d := range deleted {
+			if d.Name == "experimental" {
+				t.Errorf("experimental-rootfs.ext4 should be protected as local base_rootfs target, got %+v", deleted)
+			}
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Errorf("shared base_rootfs file should still exist after prune: %v", err)
+		}
+	})
+}
+
+func TestLinkCachedImage(t *testing.T) {
+	t.Run("hardlinks to variant and writes matching sidecar", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		ref := "ghcr.io/example/experimental:v1"
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", ref); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		sourcePath := filepath.Join(imagesDir, RootfsFilename("experimental"))
+		targetPath := filepath.Join(imagesDir, RootfsFilename("_base"))
+
+		srcInfo, err := os.Stat(sourcePath)
+		if err != nil {
+			t.Fatalf("stat source: %v", err)
+		}
+		dstInfo, err := os.Stat(targetPath)
+		if err != nil {
+			t.Fatalf("stat target: %v", err)
+		}
+
+		// Inode match — proves hardlink, not copy.
+		srcSys, srcOK := srcInfo.Sys().(*syscall.Stat_t)
+		dstSys, dstOK := dstInfo.Sys().(*syscall.Stat_t)
+		if !srcOK || !dstOK {
+			t.Skip("syscall.Stat_t not available on this platform")
+		}
+		if srcSys.Ino != dstSys.Ino {
+			t.Errorf("inode mismatch: source %d, target %d (expected hardlink)", srcSys.Ino, dstSys.Ino)
+		}
+		if dstSys.Nlink < 2 {
+			t.Errorf("expected Nlink >= 2 after hardlink, got %d", dstSys.Nlink)
+		}
+
+		// Sidecar matches the provided ref.
+		sidecar, err := os.ReadFile(filepath.Join(imagesDir, SourceFilename("_base")))
+		if err != nil {
+			t.Fatalf("read sidecar: %v", err)
+		}
+		if got := string(sidecar); got != ref+"\n" {
+			t.Errorf("sidecar = %q, want %q", got, ref+"\n")
+		}
+	})
+
+	t.Run("atomic replace preserves open fds on stale target", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		// Pre-existing stale _base with old contents.
+		stalePath := filepath.Join(imagesDir, RootfsFilename("_base"))
+		staleContent := []byte("stale-content")
+		if err := os.WriteFile(stalePath, staleContent, 0644); err != nil {
+			t.Fatalf("write stale target: %v", err)
+		}
+
+		// Open the stale file BEFORE the link runs.
+		f, err := os.Open(stalePath)
+		if err != nil {
+			t.Fatalf("open stale: %v", err)
+		}
+		defer f.Close()
+
+		if err := LinkCachedImage(imagesDir, "experimental", "_base", "ghcr.io/example/experimental:v1"); err != nil {
+			t.Fatalf("LinkCachedImage error: %v", err)
+		}
+
+		// The held fd still points at the unlinked inode and reads the old content.
+		got, err := io.ReadAll(f)
+		if err != nil {
+			t.Fatalf("read from held fd: %v", err)
+		}
+		if string(got) != string(staleContent) {
+			t.Errorf("held fd read = %q, want %q (unlinked inode should survive)", got, staleContent)
+		}
+
+		// The new target name now matches the experimental variant.
+		newContent, err := os.ReadFile(stalePath)
+		if err != nil {
+			t.Fatalf("read new target: %v", err)
+		}
+		if string(newContent) != "fake-rootfs" {
+			t.Errorf("new target content = %q, want %q", newContent, "fake-rootfs")
+		}
+	})
+
+	t.Run("returns error and leaves no partial state when source is missing", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		// No source image created.
+
+		err := LinkCachedImage(imagesDir, "missing", "_base", "ghcr.io/example/missing:v1")
+		if err == nil {
+			t.Fatal("expected error for missing source, got nil")
+		}
+
+		// No target and no sidecar should have been created.
+		if _, err := os.Stat(filepath.Join(imagesDir, RootfsFilename("_base"))); !os.IsNotExist(err) {
+			t.Errorf("_base-rootfs.ext4 should not exist after failure: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(imagesDir, SourceFilename("_base"))); !os.IsNotExist(err) {
+			t.Errorf("_base source sidecar should not exist after failure: %v", err)
+		}
+	})
+
+	t.Run("blocks while _base .lock is held by another caller", func(t *testing.T) {
+		imagesDir := t.TempDir()
+		createFakeImage(t, imagesDir, "experimental")
+
+		targetPath := filepath.Join(imagesDir, RootfsFilename("_base"))
+		unlockHeld, err := acquireFileLock(targetPath + ".lock")
+		if err != nil {
+			t.Fatalf("acquire holder lock: %v", err)
+		}
+
+		var (
+			wg      sync.WaitGroup
+			linkErr error
+			done    = make(chan struct{})
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			linkErr = LinkCachedImage(imagesDir, "experimental", "_base", "ghcr.io/example/experimental:v1")
+			close(done)
+		}()
+
+		// The link call must block while the other holder keeps the lock.
+		select {
+		case <-done:
+			unlockHeld()
+			t.Fatal("LinkCachedImage returned before lock was released")
+		case <-time.After(100 * time.Millisecond):
+			// expected — still blocked
+		}
+
+		unlockHeld()
+		select {
+		case <-done:
+			// unblocked as expected
+		case <-time.After(5 * time.Second):
+			t.Fatal("LinkCachedImage did not return after lock release")
+		}
+
+		wg.Wait()
+		if linkErr != nil {
+			t.Errorf("LinkCachedImage unexpected error: %v", linkErr)
 		}
 	})
 }

@@ -69,6 +69,8 @@ sudo shed-server pull-images
 
 This downloads the configured Docker image, converts it to ext4, and extracts the kernel. Without this step, the first `shed create` performs the conversion automatically (which takes a few minutes).
 
+Cached images live under `/var/lib/shed/firecracker/images/`. See the [image storage reference](../reference/images.md#on-disk-layout) for the full layout and the [upgrade-and-reclaim cookbook](../reference/images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) for how to bump image versions and free disk space.
+
 ## 4. Configure
 
 Edit `/etc/shed/server.yaml` to configure credentials and extensions:

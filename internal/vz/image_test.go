@@ -197,6 +197,16 @@ func TestPruneImages(t *testing.T) {
 		createFakeImage(t, imagesDir, "unused1")
 		createFakeImage(t, imagesDir, "unused2")
 		createFakeImage(t, imagesDir, "_base")
+		// Align _base's sidecar with the config's baseRootfs so the source-aware
+		// exclusion keeps it; otherwise the mismatch would make _base a prune
+		// candidate. Source-awareness is covered by its own subtest.
+		if err := os.WriteFile(
+			filepath.Join(imagesDir, vmimage.SourceFilename("_base")),
+			[]byte(client.cfg.GetBaseRootfs()+"\n"),
+			0644,
+		); err != nil {
+			t.Fatalf("write _base sidecar: %v", err)
+		}
 
 		// Create a shed referencing "shedref"
 		createFakeInstance(t, client.cfg.InstanceDir, "myshed", "shedref")

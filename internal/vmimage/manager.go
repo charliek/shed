@@ -268,17 +268,59 @@ func (m *Manager) PruneImages(dryRun bool, inUseNames func() ([]string, error)) 
 		return nil, fmt.Errorf("failed to read images directory: %w", err)
 	}
 
-	// Build exclusion set
+	// Build exclusion set. For Docker-ref entries, exclusion is source-aware:
+	// a cached variant or _base is protected only if its .source sidecar
+	// matches the current config ref. After a config bump (e.g. v0.3.3 →
+	// v0.3.4), the stale cache file no longer matches and becomes a prune
+	// candidate. Local-path entries are unconditionally excluded — we never
+	// delete a file the config explicitly points at.
 	exclude := make(map[string]bool)
 
-	// Config-managed images
-	for name := range m.cfg.GetImages() {
-		exclude[name] = true
+	// excludeLocalPath protects the on-disk file a local-path config entry
+	// points at. If the path lives inside imagesDir and follows the
+	// {name}-rootfs.ext4 convention, exclude that derived name — otherwise
+	// the directory scan could match a candidate with a different name
+	// than the config map key and delete a file the config depends on.
+	excludeLocalPath := func(ref string) {
+		if ref == "" {
+			return
+		}
+		if filepath.Dir(ref) != imagesDir {
+			return
+		}
+		base := filepath.Base(ref)
+		if !strings.HasSuffix(base, "-rootfs.ext4") {
+			return
+		}
+		derivedName := strings.TrimSuffix(base, "-rootfs.ext4")
+		if derivedName != "" {
+			exclude[derivedName] = true
+		}
 	}
 
-	// _base if BaseRootfs is a Docker ref
-	if IsDockerRef(m.cfg.GetBaseRootfs()) {
-		exclude["_base"] = true
+	for name, ref := range m.cfg.GetImages() {
+		if !IsDockerRef(ref) {
+			// Legacy: protect the config map key. Also protect the
+			// on-disk file the path actually points at (they may differ).
+			exclude[name] = true
+			excludeLocalPath(ref)
+			continue
+		}
+		if cached := CheckCache(imagesDir, name, ref); cached != "" {
+			exclude[name] = true
+		}
+	}
+
+	if base := m.cfg.GetBaseRootfs(); base != "" {
+		if IsDockerRef(base) {
+			if cached := CheckCache(imagesDir, "_base", base); cached != "" {
+				exclude["_base"] = true
+			}
+		} else {
+			// Local-path base_rootfs: protect its on-disk file if it
+			// lives in imagesDir (mirrors the images: branch above).
+			excludeLocalPath(base)
+		}
 	}
 
 	// Images referenced by existing sheds — fail closed if we can't read metadata

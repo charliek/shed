@@ -114,7 +114,7 @@ This builds the `default` variant. Build other variants with `--variant`:
 ./scripts/build-vz-rootfs.sh --all                    # All variants
 ```
 
-See [Image Variants](../reference/images.md) for details.
+See [Image Variants](../reference/images.md) for details. Cached images and per-shed rootfs copies live under `~/Library/Application Support/shed/vz/` — see the [on-disk layout reference](../reference/images.md#on-disk-layout) and the [upgrade-and-reclaim cookbook](../reference/images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) for how to manage disk space.
 
 ### 4. Create directories
 
