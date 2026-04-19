@@ -67,6 +67,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd \
     # Build essentials (for compiling code)
     build-essential \
+    # Sandbox (used by Codex CLI)
+    bubblewrap \
     # Linux kernel (needed for VZ LinuxBootloader and in-VM modules)
     # initramfs-tools is a recommended dep of linux-image-generic that
     # --no-install-recommends drops; it's required to generate initrd.

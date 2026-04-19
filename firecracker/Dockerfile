@@ -101,6 +101,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd \
     # Build essentials (for compiling code)
     build-essential \
+    # Sandbox (used by Codex CLI)
+    bubblewrap \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
@@ -207,9 +209,18 @@ RUN SYSTEMD_OFFLINE=1 systemctl enable network-setup
 # Copy custom Firecracker kernel (extracted by shed during image conversion)
 COPY --from=kernel-builder /build/linux/vmlinux /boot/vmlinux
 
-# Shell customization - colored prompt showing shed name and path
+# Shell customization - colored prompt showing shed name, path, and git branch
 USER shed
-RUN echo 'export PS1="\\[\\033[1;36m\\][\\[\\033[1;32m\\]shed:\\${SHED_NAME:-dev}\\[\\033[1;36m\\]]\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\]\\$ "' >> /home/shed/.bashrc
+RUN cat >> /home/shed/.bashrc << 'PROMPT_EOF'
+__git_prompt() {
+    local branch
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null) || return
+    local dirty=""
+    [ -n "$(git status --porcelain 2>/dev/null)" ] && dirty=$'\001\033[31m\002✗'
+    printf " \001\033[01;32m\002(%s)%s\001\033[00m\002" "$branch" "$dirty"
+}
+export PS1='\[\033[1;36m\][\[\033[1;32m\]shed:${SHED_NAME:-dev}\[\033[1;36m\]]\[\033[0m\] \[\033[01;34m\]\w\[\033[00m\]$(__git_prompt) \$ '
+PROMPT_EOF
 USER root
 
 # Set default working directory

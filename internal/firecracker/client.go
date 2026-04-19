@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package firecracker
 
@@ -220,7 +219,15 @@ func resolvePathOwner(hostPath string) (uid, gid int) {
 		return 1000, 1000 // fallback to default shed user
 	}
 	stat := info.Sys().(*syscall.Stat_t)
-	return int(stat.Uid), int(stat.Gid)
+	uid, gid = int(stat.Uid), int(stat.Gid)
+	// Root-owned directories trigger passthrough mode in NewP9Server
+	// (no UID remapping), which causes credential mounts to appear as
+	// root inside the guest. Fall back to the shed user UID so the
+	// remapping attacher activates and the guest sees correct ownership.
+	if uid == 0 {
+		return 1000, 1000
+	}
+	return uid, gid
 }
 
 // startP9Server creates, starts, and registers a P9 server for a VM.
