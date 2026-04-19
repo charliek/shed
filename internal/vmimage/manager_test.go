@@ -751,6 +751,35 @@ func TestLinkCachedImage(t *testing.T) {
 	})
 }
 
+func TestIsLegacyPIDSuffix(t *testing.T) {
+	tests := []struct {
+		name   string
+		suffix string
+		want   bool
+	}{
+		{"single digit", ".0", true},
+		{"multi-digit", ".221507", true},
+		{"empty", "", false},
+		{"dot only", ".", false},
+		{"no leading dot", "221507", false},
+		{"letters", ".abc", false},
+		{"mixed digits and letters", ".123abc", false},
+		{"letters then digits", ".abc123", false},
+		{"trailing non-digit", ".123.", false},
+		{"operator scratch suffix", ".keep", false},
+		{"operator bak suffix", ".bak", false},
+		{"dot plus space", ". ", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isLegacyPIDSuffix(tt.suffix)
+			if got != tt.want {
+				t.Errorf("isLegacyPIDSuffix(%q) = %v, want %v", tt.suffix, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidateImageName(t *testing.T) {
 	tests := []struct {
 		name    string
