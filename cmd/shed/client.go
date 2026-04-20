@@ -465,9 +465,12 @@ func (c *APIClient) SystemPrune(opts SystemPruneOptions) (*config.PruneReport, e
 	if opts.DryRun {
 		q = append(q, "dry_run=true")
 	}
-	if opts.Until > 0 {
-		q = append(q, "until="+opts.Until.String())
-	}
+	// Always send Until on the wire — a zero value from the user
+	// means "prune any age" and must reach the handler, otherwise
+	// the handler's 72h default would override their explicit intent.
+	// The CLI's cobra default (72h) is still preserved: flag unset →
+	// systemPruneFlagUntil == 72h → we send until=72h0m0s explicitly.
+	q = append(q, "until="+opts.Until.String())
 	if opts.LogTailBytes > 0 {
 		q = append(q, fmt.Sprintf("log_tail_bytes=%d", opts.LogTailBytes))
 	}
