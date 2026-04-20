@@ -220,6 +220,77 @@ func TestHandleSystemPrune_InvalidDryRun(t *testing.T) {
 	}
 }
 
+func TestHandleSystemPrune_DefaultUntil_72h(t *testing.T) {
+	// Regression for Codex #2: omitting `until` must default to 72h. The
+	// previous handler left opts.Until=0, which the backend interprets
+	// as "any age" — directly calling POST /api/system/prune?scope=instances
+	// would then delete every stopped instance regardless of how recent.
+	be := &fakeBackend{pruneReport: config.PruneReport{ServerName: "x"}}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?scope=instances", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got, want := be.lastPruneOpts.Until, 72*time.Hour; got != want {
+		t.Errorf("default Until = %v, want %v", got, want)
+	}
+}
+
+func TestHandleSystemPrune_ExplicitUntilZero_AnyAge(t *testing.T) {
+	// Explicit until=0s must preserve the "any age" escape hatch.
+	be := &fakeBackend{pruneReport: config.PruneReport{ServerName: "x"}}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?scope=instances&until=0s", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := be.lastPruneOpts.Until; got != 0 {
+		t.Errorf("explicit until=0s: got %v, want 0", got)
+	}
+}
+
+func TestHandleSystemPrune_LogTailCap(t *testing.T) {
+	// Regression for Codex #8: unbounded log_tail_bytes would allow a
+	// client to allocate arbitrary memory on the daemon. Cap is 64 MiB.
+	be := &fakeBackend{}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?log_tail_bytes=1073741824", nil) // 1 GiB
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleSystemPrune_UsesInvalidRequestErrCode(t *testing.T) {
+	// Regression for CR finding B: 400 responses must use the dedicated
+	// ErrInvalidRequest code so clients switching on the error code field
+	// can distinguish bad input from backend errors.
+	be := &fakeBackend{}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?scope=nonsense", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !jsonContains(w.Body.String(), `"code":"`+config.ErrInvalidRequest+`"`) {
+		t.Errorf("expected error code %s in body, got: %s", config.ErrInvalidRequest, w.Body.String())
+	}
+}
+
 func TestHandleSystemPrune_EmptyScope(t *testing.T) {
 	// No scope flags — backend gets PruneOptions with all flags false and
 	// applies its own defaults.

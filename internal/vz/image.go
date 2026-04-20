@@ -5,6 +5,7 @@ package vz
 import (
 	"context"
 	"errors"
+	"log"
 	"os"
 
 	"github.com/charliek/shed/internal/backend"
@@ -64,6 +65,12 @@ func (c *Client) inUseImageNames() ([]string, error) {
 // instances whose names are NOT in skipSheds. Used by Prune's dry-run path
 // to simulate the post-instance-delete state so image candidates reflect
 // the fleet after instance deletions.
+//
+// Malformed metadata on a single instance is treated as "cannot confirm
+// image usage" — we skip-and-warn rather than failing the whole scan,
+// matching ListSheds' behavior. The upstream Manager.PruneImages still
+// fails-closed when its closure errors, so the protection is intact:
+// we only contribute names we could verify.
 func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, error) {
 	instances, err := ListInstances(c.cfg.InstanceDir)
 	if err != nil && !os.IsNotExist(err) {
@@ -76,7 +83,14 @@ func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, err
 		}
 		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
 		if err != nil {
-			return nil, err
+			// Don't let a single corrupt metadata.json block the whole
+			// prune path; log and move on. A malformed shed's image
+			// reference can't be confirmed, so its image becomes a
+			// potential prune candidate — which is the safe, user-visible
+			// behavior (the user can `shed delete --force` the broken
+			// shed and retry).
+			log.Printf("Warning: inUseImageNames: skipping instance %q with invalid metadata: %v", inst, err)
+			continue
 		}
 		if meta.Image != "" {
 			names = append(names, meta.Image)

@@ -25,6 +25,17 @@ func RootfsPath(instanceDir, name string) string {
 // Pre-clean a stale dst: the kernel primitives (Clonefile / FICLONE)
 // both require dst to not exist. A prior failed create may have left
 // rootfs.ext4 behind; remove it first (ignoring "already gone").
+//
+// CONCURRENCY: this function assumes a single-writer-per-shed-name
+// contract. Higher-level code in CreateShed performs a LoadMetadata
+// existence check before calling in, but that check has a TOCTOU window
+// with the metadata Save. Two concurrent `shed create` calls for the
+// same name could both pass the existence check; the unconditional
+// os.Remove(dst) here would let the second caller delete the first
+// caller's newly-cloned rootfs. In practice the window is narrow
+// (microseconds to a few seconds) and shed names are user-supplied and
+// rarely raced. A per-name mutex would close the race at the cost of
+// serializing creates; out of scope for this change.
 func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 	dst := RootfsPath(instanceDir, name)
 
@@ -54,10 +65,23 @@ func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 	// durability until the next FS commit, and the negligible cost on a
 	// cloned inode isn't worth the "did the next create-then-crash lose
 	// the instance?" hazard.
+	//
+	// Delayed-writeback errors (ENOSPC, EIO) surface here — return the
+	// error with dst removed so the create aborts cleanly rather than
+	// silently booting a VM on broken storage.
 	f, err := os.OpenFile(dst, os.O_RDWR, 0)
-	if err == nil {
-		_ = f.Sync()
+	if err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to reopen rootfs for sync: %w", err)
+	}
+	if syncErr := f.Sync(); syncErr != nil {
 		f.Close()
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to sync rootfs: %w", syncErr)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to close rootfs after sync: %w", closeErr)
 	}
 
 	return dst, nil

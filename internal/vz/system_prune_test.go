@@ -163,12 +163,33 @@ func TestPrune_Instances_UntilZero_AnyAge(t *testing.T) {
 	}
 }
 
-func TestPrune_Instances_RunningNeverPruned(t *testing.T) {
+// TestPrune_MtimeSnapshotBeatsStalenessResave verifies the plan-mandated
+// ordering: mtime(metadata.json) is captured BEFORE ListSheds. ListSheds's
+// stale-running→stopped re-check rewrites metadata.json and would
+// otherwise bump mtime past the age threshold, making the shed ineligible
+// for pruning despite being old.
+//
+// We seed a "running" shed with no underlying vfkit process and an mtime
+// 30 days in the past. ListSheds flips the status to stopped and resaves
+// (mtime = now). The prune pass should still see the shed as a candidate
+// because the snapshot was taken first. Without the snapshot, the post-
+// resave mtime would make the shed look "too recent" against the 72h
+// threshold.
+//
+// NOTE: This test does NOT prove that a live running shed is never
+// pruned — that's a separate invariant upheld by `collectInstanceCandidates`
+// filtering on `Status == StatusStopped`. See TestPrune_Instances_AgeFilter
+// for the running-shed protection check (api-dev is running and lands in
+// Skipped, not Items). A fully process-level "is vfkit actually running"
+// test would require a vfkit fixture and is out of scope for unit tests.
+func TestPrune_MtimeSnapshotBeatsStalenessResave(t *testing.T) {
 	c, _, instanceDir := newPruneTestClient(t)
-	// Running shed, backdated way past the threshold.
+	// Seed a shed whose metadata.json claims "running" but no actual
+	// vfkit process backs it. ListSheds's staleness pass will flip it to
+	// stopped and resave metadata.
 	meta := &Metadata{
 		Version: MetadataVersion,
-		Name:    "running-shed",
+		Name:    "stale-running",
 		Status:  config.StatusRunning,
 		Backend: "vz",
 	}
@@ -176,7 +197,7 @@ func TestPrune_Instances_RunningNeverPruned(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 	past := time.Now().Add(-30 * 24 * time.Hour)
-	_ = os.Chtimes(MetadataPath(instanceDir, "running-shed"), past, past)
+	_ = os.Chtimes(MetadataPath(instanceDir, "stale-running"), past, past)
 
 	report, err := c.Prune(context.Background(), backend.PruneOptions{
 		Instances: true,
@@ -185,24 +206,14 @@ func TestPrune_Instances_RunningNeverPruned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	// Check the GetShed staleness pass: because we have no vfkit process
-	// running for this name, GetShed will flip status to "stopped" and
-	// resave metadata (which bumps mtime). The prune candidate collection
-	// uses the PRE-ListSheds mtime snapshot, so the shed appears as a
-	// candidate — but with an updated status of "stopped" from GetShed.
-	//
-	// This is exactly why the plan mandates the mtime snapshot happen
-	// BEFORE ListSheds. Assert the mechanic directly: the shed should
-	// now appear in Items as an instance delete (snapshot said it was
-	// old enough; ListSheds said it's stopped).
 	found := false
 	for _, it := range report.Items {
-		if it.Name == "running-shed" {
+		if it.Name == "stale-running" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected running-shed (now stopped via stale-check) to prune thanks to mtime snapshot, got %v", report.Items)
+		t.Errorf("mtime snapshot must beat staleness resave — expected stale-running to be pruned despite ListSheds bumping mtime. Got items %+v", report.Items)
 	}
 }
 
@@ -450,4 +461,157 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestPrune_EmptyImagesDir_NoCWDScan (Codex #7 regression) verifies the
+// handler-level guard: when ImagesDir is blank, orphan and image sweep
+// must be skipped rather than scanning the process's current directory.
+func TestPrune_EmptyImagesDir_NoCWDScan(t *testing.T) {
+	c, _, instanceDir := newPruneTestClient(t)
+	c.cfg.ImagesDir = "" // no images dir configured
+
+	// A sibling file in CWD that would LOOK like an orphan if the code
+	// incorrectly scanned ".". The test's working dir is the vz package;
+	// drop a decoy into a temp dir we chdir into to verify no scan occurs
+	// even when there IS a matching file in cwd.
+	decoyDir := t.TempDir()
+	decoyPath := filepath.Join(decoyDir, "decoy-rootfs.ext4.tmp")
+	if err := os.WriteFile(decoyPath, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldCWD, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(oldCWD) })
+	if err := os.Chdir(decoyDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a stopped shed so the instances path has something to do —
+	// that ensures the test isn't a trivial no-op.
+	seedStoppedShed(t, instanceDir, "old", "", 1024, 0, 5*24*time.Hour)
+
+	report, err := c.Prune(context.Background(), backend.PruneOptions{
+		Orphans:   true,
+		Instances: true,
+		Until:     72 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	// The decoy must not show up as a candidate or skipped.
+	for _, it := range report.Items {
+		if strings.Contains(it.Path, "decoy-rootfs.ext4.tmp") {
+			t.Errorf("empty ImagesDir leaked a CWD scan: item %+v", it)
+		}
+	}
+	for _, s := range report.Skipped {
+		if strings.Contains(s.Path, "decoy-rootfs.ext4.tmp") {
+			t.Errorf("empty ImagesDir leaked a CWD scan: skipped %+v", s)
+		}
+	}
+	// Instance path should still work.
+	if len(report.Items) == 0 {
+		t.Errorf("instance prune should still happen even with empty ImagesDir; got zero items")
+	}
+}
+
+// TestPrune_LockOrphan_IsSkippedNotDeleted (Codex #4 regression): a
+// `.lock` sidecar without its parent rootfs must be reported as a
+// SkippedItem with a clear reason, NOT as a PrunedItem (since sweepOrphan
+// never removes lock files).
+func TestPrune_LockOrphan_IsSkippedNotDeleted(t *testing.T) {
+	c, imagesDir, _ := newPruneTestClient(t)
+
+	// Orphan .lock — no parent rootfs, no concurrent conversion.
+	lockPath := filepath.Join(imagesDir, "dead-rootfs.ext4.lock")
+	if err := os.WriteFile(lockPath, []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := c.Prune(context.Background(), backend.PruneOptions{Orphans: true})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	// Must NOT appear in Items.
+	for _, it := range report.Items {
+		if it.Path == lockPath {
+			t.Errorf(".lock orphan appeared in Items (should be Skipped only): %+v", it)
+		}
+	}
+	// Must appear in Skipped with "retained" reason.
+	found := false
+	for _, s := range report.Skipped {
+		if s.Path == lockPath && strings.Contains(s.Reason, "retained") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected .lock orphan skipped with 'retained' reason, got %+v", report.Skipped)
+	}
+	// File must still exist (never removed).
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Errorf(".lock orphan was removed: %v", err)
+	}
+}
+
+// TestPrune_Logs_DryRunShowsCandidates (Codex #1 regression): `--logs`
+// candidates must appear in the dry-run report so the CLI's dry-run-first
+// flow doesn't exit before truncation can happen.
+func TestPrune_Logs_DryRunShowsCandidates(t *testing.T) {
+	c, _, instanceDir := newPruneTestClient(t)
+
+	seedStoppedShed(t, instanceDir, "chatty", "", 0, 0, 0)
+	dir := InstanceDir(instanceDir, "chatty")
+	if err := os.WriteFile(filepath.Join(dir, consoleLogFilename), make([]byte, 10*1024*1024), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := c.Prune(context.Background(), backend.PruneOptions{
+		Logs:         true,
+		LogTailBytes: 4096,
+		DryRun:       true,
+	})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	found := false
+	for _, it := range report.Items {
+		if it.Kind == "console_log" && it.Name == "chatty" && it.Action == "truncated" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("dry-run with --logs should show the candidate; got items %+v", report.Items)
+	}
+	// Dry-run must NOT mutate the file.
+	fi, err := os.Stat(filepath.Join(dir, consoleLogFilename))
+	if err != nil || fi.Size() != 10*1024*1024 {
+		t.Errorf("dry-run mutated the console.log (size %d)", fi.Size())
+	}
+}
+
+// TestTryAcquireFileLock_NoCreate (Codex #3 regression): dry-run probe
+// must not create a new .lock file as a side effect.
+func TestTryAcquireFileLock_NoCreate(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "nonexistent.lock")
+
+	// Pre-check: no file present.
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("precondition: lock file should not exist, got err=%v", err)
+	}
+
+	release, held, err := vmimage.TryAcquireFileLock(lockPath)
+	if err != nil {
+		t.Fatalf("TryAcquireFileLock: %v", err)
+	}
+	if !held {
+		t.Errorf("held=false for nonexistent lock; should be treated as 'nothing to contend'")
+	}
+	if release != nil {
+		release()
+	}
+	// The probe must not have created the file.
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Errorf("TryAcquireFileLock created the lock file; it should be a no-op for missing locks")
+	}
 }

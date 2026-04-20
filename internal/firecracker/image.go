@@ -5,6 +5,7 @@ package firecracker
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/charliek/shed/internal/config"
@@ -45,8 +46,13 @@ func (c *Client) inUseImageNames() ([]string, error) {
 
 // inUseImageNamesExcept returns image names referenced by existing
 // Firecracker instances whose names are NOT in skipSheds. Used by Prune's
-// dry-run path to simulate the post-instance-delete state so image
-// candidates reflect the fleet after instance deletions.
+// dry-run path to simulate the post-instance-delete state.
+//
+// Malformed metadata on a single instance is skip-and-warn rather than a
+// hard failure — matches ListSheds and keeps the prune path operable when
+// one shed's metadata got corrupted. The closure still returns only the
+// image references we could verify, so Manager.PruneImages' fail-closed
+// protection on the names it receives is intact.
 func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, error) {
 	instances, err := ListInstances(c.cfg.InstanceDir)
 	if err != nil && !os.IsNotExist(err) {
@@ -59,7 +65,8 @@ func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, err
 		}
 		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
 		if err != nil {
-			return nil, fmt.Errorf("reading metadata for %s: %w", inst, err)
+			log.Printf("Warning: inUseImageNames: skipping instance %q with invalid metadata: %v", inst, err)
+			continue
 		}
 		if meta.Image != "" {
 			names = append(names, meta.Image)

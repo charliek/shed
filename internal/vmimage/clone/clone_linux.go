@@ -36,7 +36,12 @@ func tryPlatformClone(src, dst string) (Strategy, error) {
 		_ = os.Remove(dst) // clean the half-built dst before the next strategy
 		return StrategyUnknown, err
 	}
+	// IoctlFileClone succeeded: dst now contains a full clone. If Close
+	// fails we must still remove the dst — the caller's next strategy
+	// opens with O_EXCL and would otherwise fail with a stale dst left
+	// behind. (CodeRabbit review 1.3.)
 	if err := dstF.Close(); err != nil {
+		_ = os.Remove(dst)
 		return StrategyUnknown, err
 	}
 	return StrategyFICLONE, nil

@@ -24,6 +24,9 @@ func RootfsPath(instanceDir, name string) string {
 //
 // Both FICLONE and copy_file_range require dst to not already exist;
 // pre-clean any stale dst before invoking the chain.
+//
+// CONCURRENCY: single-writer-per-shed-name is assumed. See the matching
+// comment in internal/vz/rootfs.go for details on the TOCTOU window.
 func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 	dst := RootfsPath(instanceDir, name)
 
@@ -48,11 +51,22 @@ func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 	}
 	log.Printf("rootfs strategy=%s src=%s dst=%s logical_bytes=%d", strategy, baseRootfs, dst, logical)
 
-	// Sync on every path so crash recovery semantics stay uniform.
+	// Sync on every path so crash recovery semantics stay uniform, and
+	// surface delayed-writeback errors (ENOSPC, EIO) rather than silently
+	// booting a VM on broken storage.
 	f, err := os.OpenFile(dst, os.O_RDWR, 0)
-	if err == nil {
-		_ = f.Sync()
+	if err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to reopen rootfs for sync: %w", err)
+	}
+	if syncErr := f.Sync(); syncErr != nil {
 		f.Close()
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to sync rootfs: %w", syncErr)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to close rootfs after sync: %w", closeErr)
 	}
 
 	return dst, nil

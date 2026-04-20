@@ -30,6 +30,16 @@ func (s *Server) handleSystemDF(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, usage)
 }
 
+// defaultPruneUntil is applied when the `until` query param is omitted.
+// Explicit `until=0s` preserves its "any age" meaning for power users who
+// genuinely want to prune every stopped instance regardless of age.
+const defaultPruneUntil = 72 * time.Hour
+
+// maxLogTailBytes caps the server-side allocation for console log tail
+// preservation. Without this, a request like log_tail_bytes=20GB on a 20GB
+// console.log would allocate a 20GB buffer and OOM the daemon.
+const maxLogTailBytes = 64 * 1024 * 1024 // 64 MiB
+
 // handleSystemPrune runs a disk cleanup pass. Scope flags are passed as
 // repeated `scope=` query params (any of images, instances, logs, orphans).
 // When no scope is specified, defaults to images+instances+orphans (NOT
@@ -41,11 +51,10 @@ func (s *Server) handleSystemPrune(w http.ResponseWriter, r *http.Request) {
 
 	var opts backend.PruneOptions
 
-	// dry_run
 	if v := q.Get("dry_run"); v != "" {
 		dryRun, err := strconv.ParseBool(v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, config.ErrBackendError, "invalid dry_run value: "+v)
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid dry_run value: "+v)
 			return
 		}
 		opts.DryRun = dryRun
@@ -64,30 +73,41 @@ func (s *Server) handleSystemPrune(w http.ResponseWriter, r *http.Request) {
 		case "orphans":
 			opts.Orphans = true
 		default:
-			writeError(w, http.StatusBadRequest, config.ErrBackendError, "unknown scope: "+s)
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "unknown scope: "+s)
 			return
 		}
 	}
 
-	// until
-	if v := q.Get("until"); v != "" {
-		d, err := time.ParseDuration(v)
+	// `until` param: present-and-parseable wins; absent falls back to the
+	// 72h default. An explicit until=0s is valid and means "any age."
+	//
+	// Distinguishing "omitted" from "explicit 0" requires the map lookup
+	// rather than q.Get(), since an empty-string value is not the same as
+	// a missing key for our purposes.
+	if vals, ok := q["until"]; ok && len(vals) > 0 && vals[0] != "" {
+		d, err := time.ParseDuration(vals[0])
 		if err != nil {
-			writeError(w, http.StatusBadRequest, config.ErrBackendError, "invalid until value: "+v)
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid until value: "+vals[0])
 			return
 		}
 		if d < 0 {
-			writeError(w, http.StatusBadRequest, config.ErrBackendError, "until must be non-negative")
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "until must be non-negative")
 			return
 		}
 		opts.Until = d
+	} else {
+		opts.Until = defaultPruneUntil
 	}
 
-	// log_tail_bytes
 	if v := q.Get("log_tail_bytes"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, config.ErrBackendError, "invalid log_tail_bytes: "+v)
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid log_tail_bytes: "+v)
+			return
+		}
+		if n > maxLogTailBytes {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest,
+				"log_tail_bytes exceeds server cap of "+strconv.FormatInt(maxLogTailBytes, 10))
 			return
 		}
 		opts.LogTailBytes = n
@@ -95,6 +115,20 @@ func (s *Server) handleSystemPrune(w http.ResponseWriter, r *http.Request) {
 
 	report, err := s.backend.Prune(r.Context(), opts)
 	if err != nil {
+		// Surface partial progress even on error: the backend may have
+		// deleted instances before an image-prune step failed, and the
+		// client needs visibility into what actually happened.
+		if report.Totals.Items > 0 {
+			if report.Items == nil {
+				report.Items = []config.PrunedItem{}
+			}
+			if report.Skipped == nil {
+				report.Skipped = []config.SkippedItem{}
+			}
+			report.Notes = append(report.Notes, "partial failure: "+err.Error())
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return

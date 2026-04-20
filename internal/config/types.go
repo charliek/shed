@@ -392,6 +392,7 @@ const (
 	ErrInvalidSessionName = "INVALID_SESSION_NAME"
 	ErrTmuxNotAvailable   = "TMUX_NOT_AVAILABLE"
 	ErrInvalidLocalDir    = "INVALID_LOCAL_DIR"
+	ErrInvalidRequest     = "INVALID_REQUEST"
 )
 
 // Backend type constants for Shed.Backend field.

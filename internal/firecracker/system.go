@@ -261,6 +261,7 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		Skipped:    []config.SkippedItem{},
 	}
 
+	// Step 1: snapshot mtimes BEFORE ListSheds.
 	mtimes := snapshotMetadataMtimes(c.cfg.InstanceDir)
 
 	var instanceCandidates []instanceCandidate
@@ -273,15 +274,16 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		report.Skipped = append(report.Skipped, skipped...)
 	}
 
+	// Empty ImagesDir guard (Codex #7) — os.ReadDir("") reads CWD.
 	var orphanCandidates []orphanCandidate
-	if opts.Orphans {
+	if opts.Orphans && c.cfg.ImagesDir != "" {
 		cands, skipped := collectOrphanCandidates(c.cfg.ImagesDir)
 		orphanCandidates = cands
 		report.Skipped = append(report.Skipped, skipped...)
 	}
 
 	var imageCandidates []vmimage.ImageInfo
-	if opts.Images {
+	if opts.Images && c.cfg.ImagesDir != "" {
 		skipSet := make(map[string]bool, len(instanceCandidates))
 		for _, ic := range instanceCandidates {
 			skipSet[ic.name] = true
@@ -296,6 +298,19 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		imageCandidates = cands
 	}
 
+	// FC has no per-instance console.log; collect the skip reasons as
+	// candidates-that-will-be-skipped so dry-run reflects the real result.
+	var logSkips []config.SkippedItem
+	if opts.Logs {
+		names, _ := ListInstances(c.cfg.InstanceDir)
+		for _, name := range names {
+			logSkips = append(logSkips, config.SkippedItem{
+				Kind: "console_log", Name: name,
+				Reason: "firecracker does not write a per-instance console log",
+			})
+		}
+	}
+
 	for _, ic := range instanceCandidates {
 		report.Items = append(report.Items, ic.toPrunedItem(opts.DryRun))
 	}
@@ -305,6 +320,7 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	for _, img := range imageCandidates {
 		report.Items = append(report.Items, imageToPrunedItem(img, opts.DryRun))
 	}
+	report.Skipped = append(report.Skipped, logSkips...)
 
 	if opts.DryRun {
 		finalizeReport(&report)
@@ -324,10 +340,11 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		report.Items = append(report.Items, ic.toPrunedItem(false))
 	}
 
-	if opts.Images {
+	if opts.Images && c.cfg.ImagesDir != "" {
 		mgr := vmimage.NewManager(c.cfg)
 		deleted, err := mgr.PruneImages(false, c.inUseImageNames)
 		if err != nil {
+			finalizeReport(&report)
 			return report, fmt.Errorf("image prune: %w", err)
 		}
 		for _, img := range deleted {
@@ -345,18 +362,6 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 				continue
 			}
 			report.Items = append(report.Items, oc.toPrunedItem(false))
-		}
-	}
-
-	if opts.Logs {
-		// Firecracker has no per-instance console.log; record a no-op skip
-		// for every shed so JSON consumers see the explicit result.
-		names, _ := ListInstances(c.cfg.InstanceDir)
-		for _, name := range names {
-			report.Skipped = append(report.Skipped, config.SkippedItem{
-				Kind: "console_log", Name: name,
-				Reason: "firecracker does not write a per-instance console log",
-			})
 		}
 	}
 
@@ -533,6 +538,15 @@ func collectOrphanCandidates(imagesDir string) ([]orphanCandidate, []config.Skip
 			continue
 		}
 
+		// .lock orphans: preserved, reported as skipped (Codex #4).
+		if kind == "lock" {
+			skipped = append(skipped, config.SkippedItem{
+				Kind: kind, Path: path,
+				Reason: "lock file retained (inode-reuse race safety)",
+			})
+			continue
+		}
+
 		if kind == "tmp" && now.Sub(fi.ModTime()) < tmpOrphanMinAge {
 			skipped = append(skipped, config.SkippedItem{
 				Kind: kind, Path: path,
@@ -580,12 +594,7 @@ func sweepOrphan(imagesDir string, oc orphanCandidate) bool {
 		return false
 	}
 	defer release()
-
-	if oc.kind == "lock" {
-		// Leave the canonical .lock in place; see VZ sweepOrphan.
-		return true
-	}
-
+	// `.lock` orphans are filtered upstream; oc.kind is "tmp" or "source".
 	if err := os.Remove(oc.path); err != nil {
 		return errors.Is(err, os.ErrNotExist)
 	}

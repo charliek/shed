@@ -310,7 +310,9 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		Skipped:    []config.SkippedItem{},
 	}
 
-	// Step 1: snapshot mtimes BEFORE ListSheds.
+	// Step 1: snapshot mtimes BEFORE ListSheds. Plan-mandated: ListSheds
+	// can refresh mtime via its stale-running→stopped re-check, which would
+	// otherwise reset the age clock and confuse the age filter.
 	mtimes := snapshotMetadataMtimes(c.cfg.InstanceDir)
 
 	// Step 2a: instance candidates.
@@ -324,17 +326,20 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		report.Skipped = append(report.Skipped, skipped...)
 	}
 
-	// Step 2b: orphan candidates.
+	// Step 2b: orphan candidates. Skipped: empty ImagesDir means there's
+	// no configured cache, and passing "" to os.ReadDir would scan the
+	// daemon's working directory (Codex review).
 	var orphanCandidates []orphanCandidate
-	if opts.Orphans {
+	if opts.Orphans && c.cfg.ImagesDir != "" {
 		cands, skipped := collectOrphanCandidates(c.cfg.ImagesDir)
 		orphanCandidates = cands
 		report.Skipped = append(report.Skipped, skipped...)
 	}
 
 	// Step 2c: image candidates (dry-run, respects candidate deletions).
+	// Same empty-ImagesDir guard for safety.
 	var imageCandidates []vmimage.ImageInfo
-	if opts.Images {
+	if opts.Images && c.cfg.ImagesDir != "" {
 		skipSet := make(map[string]bool, len(instanceCandidates))
 		for _, ic := range instanceCandidates {
 			skipSet[ic.name] = true
@@ -349,6 +354,15 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		imageCandidates = cands
 	}
 
+	// Step 2d: log-truncation candidates. Critical: these must be
+	// collected during the candidate phase — NOT the execute phase — or
+	// the dry-run-first CLI flow sees zero candidates and exits before
+	// anything can be truncated. (Codex review #1.)
+	var logCandidates []logCandidate
+	if opts.Logs {
+		logCandidates = c.collectLogCandidates(opts.LogTailBytes)
+	}
+
 	// Populate candidate Items for dry-run display. On execute we'll
 	// rebuild with post-action Freed numbers — but for instances/orphans
 	// the pre-delete attributed bytes are exactly what we want to show.
@@ -361,6 +375,9 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	for _, img := range imageCandidates {
 		report.Items = append(report.Items, imageToPrunedItem(img, opts.DryRun))
 	}
+	for _, lc := range logCandidates {
+		report.Items = append(report.Items, lc.toPrunedItem(opts.DryRun))
+	}
 
 	if opts.DryRun {
 		finalizeReport(&report)
@@ -372,7 +389,6 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 
 	// 3a: delete candidate instances via DeleteShed (handles TAP/cred
 	// cleanup correctly and re-checks running state under its own lock).
-	deletedSheds := 0
 	for _, ic := range instanceCandidates {
 		if err := c.DeleteShed(ctx, ic.name, false); err != nil {
 			report.Skipped = append(report.Skipped, config.SkippedItem{
@@ -382,15 +398,17 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 			continue
 		}
 		report.Items = append(report.Items, ic.toPrunedItem(false))
-		deletedSheds++
 	}
 
 	// 3b: real image prune. ListInstances no longer sees deleted sheds,
 	// so the unmodified inUseImageNames closure returns the correct set.
-	if opts.Images {
+	// On error we still return the report (with Items populated from 3a)
+	// so the client sees partial progress rather than a bare 500.
+	if opts.Images && c.cfg.ImagesDir != "" {
 		mgr := vmimage.NewManager(c.cfg)
 		deleted, err := mgr.PruneImages(false, c.inUseImageNames)
 		if err != nil {
+			finalizeReport(&report)
 			return report, fmt.Errorf("image prune: %w", err)
 		}
 		for _, img := range deleted {
@@ -414,9 +432,16 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 
 	// 3d: truncate console.log on surviving VZ sheds.
 	if opts.Logs {
-		truncated, skipped := c.truncateConsoleLogs(opts.LogTailBytes)
-		report.Items = append(report.Items, truncated...)
-		report.Skipped = append(report.Skipped, skipped...)
+		for _, lc := range logCandidates {
+			if err := truncateConsoleLogInPlace(lc.path, lc.origSize, opts.LogTailBytes); err != nil {
+				report.Skipped = append(report.Skipped, config.SkippedItem{
+					Kind: "console_log", Name: lc.shedName, Path: lc.path,
+					Reason: fmt.Sprintf("truncate failed: %v", err),
+				})
+				continue
+			}
+			report.Items = append(report.Items, lc.toPrunedItem(false))
+		}
 	}
 
 	finalizeReport(&report)
@@ -578,6 +603,11 @@ func (oc orphanCandidate) toPrunedItem(dry bool) config.PrunedItem {
 // collectOrphanCandidates scans imagesDir for sidecars whose parent rootfs
 // is absent, after verifying the canonical `.lock` is NOT held by a live
 // conversion and the file is not a very-fresh `.tmp`.
+//
+// `.lock` orphans are NEVER candidates — sweepOrphan refuses to remove them
+// to avoid the inode-reuse race (see Manager.PruneImages). Instead they're
+// reported as SkippedItem with reason "lock file retained" so the report
+// doesn't lie about what will/did happen. (Codex review #4.)
 func collectOrphanCandidates(imagesDir string) ([]orphanCandidate, []config.SkippedItem) {
 	var candidates []orphanCandidate
 	var skipped []config.SkippedItem
@@ -610,6 +640,16 @@ func collectOrphanCandidates(imagesDir string) ([]orphanCandidate, []config.Skip
 			continue
 		}
 
+		// .lock orphans: preserved, not deleted. Recorded as SkippedItem
+		// so the report accurately reflects the no-op.
+		if kind == "lock" {
+			skipped = append(skipped, config.SkippedItem{
+				Kind: kind, Path: path,
+				Reason: "lock file retained (inode-reuse race safety)",
+			})
+			continue
+		}
+
 		// .tmp files younger than tmpOrphanMinAge are almost certainly an
 		// in-flight EnsureImage. Skip with reason.
 		if kind == "tmp" && now.Sub(fi.ModTime()) < tmpOrphanMinAge {
@@ -620,8 +660,11 @@ func collectOrphanCandidates(imagesDir string) ([]orphanCandidate, []config.Skip
 			continue
 		}
 
-		// Confirm the canonical lock is NOT held. A conversion can write a
-		// .tmp before the ext4 exists, holding the .lock the whole time.
+		// Confirm the canonical lock is NOT held. A conversion can write
+		// a .tmp before the ext4 exists, holding the .lock the whole time.
+		// TryAcquireFileLock treats a missing .lock as "nothing to contend
+		// with" so we don't pollute the cache dir with new lock files
+		// during dry-run probes.
 		lockPath := filepath.Join(imagesDir, base+".lock")
 		release, held, err := vmimage.TryAcquireFileLock(lockPath)
 		if err != nil {
@@ -651,8 +694,8 @@ func collectOrphanCandidates(imagesDir string) ([]orphanCandidate, []config.Skip
 
 // sweepOrphan re-acquires the canonical flock and deletes the sidecar.
 // Returns false on any failure — the caller should record a SkippedItem.
-// Never removes the .lock file itself when that's the orphan (matches
-// Manager.DeleteImage convention: unlinking locks creates a race).
+// `.lock` orphans are filtered out upstream in collectOrphanCandidates so
+// by the time sweepOrphan runs, oc.kind is "tmp" or "source".
 func sweepOrphan(imagesDir string, oc orphanCandidate) bool {
 	base := filepath.Base(oc.path)
 	rootfsBase, _ := classifySidecar(base)
@@ -665,14 +708,6 @@ func sweepOrphan(imagesDir string, oc orphanCandidate) bool {
 		return false
 	}
 	defer release()
-
-	if oc.kind == "lock" {
-		// The .lock IS the canonical lock — leave it in place to avoid
-		// the race documented in Manager.PruneImages. Treat the orphan
-		// as "handled" conceptually: the parent ext4 is gone, the lock
-		// is dormant, and the next conversion will flock+reuse the inode.
-		return true
-	}
 
 	if err := os.Remove(oc.path); err != nil {
 		// Treat "already gone" as success — another sweep beat us to it.
@@ -702,51 +737,72 @@ func imageToPrunedItem(img vmimage.ImageInfo, dry bool) config.PrunedItem {
 	}
 }
 
-// truncateConsoleLogs shrinks each surviving VZ shed's console.log to its
-// last tailBytes. Uses ftruncate-in-place + rewrite-tail so vfkit's
-// O_APPEND fd keeps writing past the new EOF.
-//
-// Small lost-writes race: writes between our read-tail and our truncate
-// disappear. For a debug aid this is acceptable.
-func (c *Client) truncateConsoleLogs(tailBytes int64) ([]config.PrunedItem, []config.SkippedItem) {
-	var done []config.PrunedItem
-	var skipped []config.SkippedItem
+// logCandidate is a console.log file eligible for truncation. Captured
+// during the candidate phase so dry-run reports honor --logs, matching
+// how instance/orphan/image candidates flow.
+type logCandidate struct {
+	shedName  string
+	path      string
+	origSize  int64
+	tailBytes int64
+}
+
+func (lc logCandidate) toPrunedItem(dry bool) config.PrunedItem {
+	freed := lc.origSize - lc.tailBytes
+	reason := fmt.Sprintf("would keep last %s", humanBytes(lc.tailBytes))
+	if !dry {
+		reason = fmt.Sprintf("kept last %s", humanBytes(lc.tailBytes))
+	}
+	return config.PrunedItem{
+		Kind: "console_log", Name: lc.shedName, Path: lc.path,
+		Action: "truncated",
+		Freed:  config.DiskSize{LogicalBytes: freed, PhysicalBytes: freed},
+		Reason: reason,
+	}
+}
+
+// collectLogCandidates returns one logCandidate per VZ shed whose
+// console.log is larger than tailBytes. Pure read — no mutation — so
+// it's safe to run unconditionally during the candidate phase.
+func (c *Client) collectLogCandidates(tailBytes int64) []logCandidate {
+	var cands []logCandidate
 
 	names, err := ListInstances(c.cfg.InstanceDir)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 	for _, name := range names {
 		consolePath := filepath.Join(InstanceDir(c.cfg.InstanceDir, name), consoleLogFilename)
 		fi, err := os.Stat(consolePath)
 		if err != nil {
-			continue // no log — nothing to do (skip silently, not a candidate)
+			continue // no log — nothing to report
 		}
 		if fi.Size() <= tailBytes {
-			skipped = append(skipped, config.SkippedItem{
-				Kind: "console_log", Name: name, Path: consolePath,
-				Reason: fmt.Sprintf("size %d ≤ tail %d", fi.Size(), tailBytes),
-			})
-			continue
+			continue // already small enough; skip silently (don't clutter)
 		}
-
-		origSize := fi.Size()
-		if err := truncateConsoleLogInPlace(consolePath, origSize, tailBytes); err != nil {
-			skipped = append(skipped, config.SkippedItem{
-				Kind: "console_log", Name: name, Path: consolePath,
-				Reason: fmt.Sprintf("truncate failed: %v", err),
-			})
-			continue
-		}
-		freed := origSize - tailBytes
-		done = append(done, config.PrunedItem{
-			Kind: "console_log", Name: name, Path: consolePath,
-			Action: "truncated",
-			Freed:  config.DiskSize{LogicalBytes: freed, PhysicalBytes: freed},
-			Reason: fmt.Sprintf("kept last %d bytes", tailBytes),
+		cands = append(cands, logCandidate{
+			shedName:  name,
+			path:      consolePath,
+			origSize:  fi.Size(),
+			tailBytes: tailBytes,
 		})
 	}
-	return done, skipped
+	return cands
+}
+
+// humanBytes is a tiny helper for log reasons. Avoids pulling in the
+// CLI's formatSize (different package).
+func humanBytes(n int64) string {
+	const mb = 1024 * 1024
+	const kb = 1024
+	switch {
+	case n >= mb:
+		return fmt.Sprintf("%.1f MiB", float64(n)/float64(mb))
+	case n >= kb:
+		return fmt.Sprintf("%.1f KiB", float64(n)/float64(kb))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 // truncateConsoleLogInPlace truncates path to 0 and rewrites the last

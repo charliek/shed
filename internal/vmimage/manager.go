@@ -442,19 +442,27 @@ func TryAcquireFileLockBlocking(path string) (func(), error) {
 
 // TryAcquireFileLock attempts a non-blocking exclusive flock on path.
 // Returns held=true with a release function if the lock was acquired;
-// held=false (with release=nil, err=nil) if another process holds it.
-// Other I/O errors are returned as err.
+// held=false (with release=nil, err=nil) if another process holds it OR
+// the lock file does not exist. Other I/O errors are returned as err.
 //
 // This is the "is a conversion running right now?" probe used by
 // orphan-sweep in `shed system prune`. If the lock is live we must NOT
 // touch the sibling sidecars.
+//
+// Unlike acquireFileLock (blocking path used by image conversion), this
+// does NOT create the lock file if it's absent. A missing lock file is
+// treated as "nothing to contend with" so dry-run prune can probe without
+// side effects (Codex review: dry-run must not mutate disk).
 func TryAcquireFileLock(path string) (release func(), held bool, err error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return nil, false, err
-	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No lock file = no contending conversion. Caller may proceed
+			// without holding a lock. Returning held=false with nil err
+			// would be ambiguous; signal success via held=true and a
+			// no-op release so callers treat it uniformly.
+			return func() {}, true, nil
+		}
 		return nil, false, err
 	}
 
