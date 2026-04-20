@@ -584,7 +584,10 @@ func TestPrune_Logs_DryRunShowsCandidates(t *testing.T) {
 	}
 	// Dry-run must NOT mutate the file.
 	fi, err := os.Stat(filepath.Join(dir, consoleLogFilename))
-	if err != nil || fi.Size() != 10*1024*1024 {
+	if err != nil {
+		t.Fatalf("stat console.log after dry-run: %v", err)
+	}
+	if fi.Size() != 10*1024*1024 {
 		t.Errorf("dry-run mutated the console.log (size %d)", fi.Size())
 	}
 }

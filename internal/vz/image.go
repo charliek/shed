@@ -5,7 +5,6 @@ package vz
 import (
 	"context"
 	"errors"
-	"log"
 	"os"
 
 	"github.com/charliek/shed/internal/backend"
@@ -83,14 +82,16 @@ func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, err
 		}
 		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
 		if err != nil {
-			// Don't let a single corrupt metadata.json block the whole
-			// prune path; log and move on. A malformed shed's image
-			// reference can't be confirmed, so its image becomes a
-			// potential prune candidate — which is the safe, user-visible
-			// behavior (the user can `shed delete --force` the broken
-			// shed and retry).
-			log.Printf("Warning: inUseImageNames: skipping instance %q with invalid metadata: %v", inst, err)
-			continue
+			// Only the race-condition case (instance removed between
+			// ListInstances and LoadMetadata) is safe to skip silently.
+			// Any other error (malformed JSON, I/O failure, permission
+			// denied) means we cannot confirm in-use images and must
+			// fail closed, not fail open — otherwise prune might
+			// reclaim an image that's actually referenced.
+			if errors.Is(err, ErrInstanceNotFound) {
+				continue
+			}
+			return nil, err
 		}
 		if meta.Image != "" {
 			names = append(names, meta.Image)

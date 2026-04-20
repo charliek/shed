@@ -51,10 +51,17 @@ func (s *Server) handleSystemPrune(w http.ResponseWriter, r *http.Request) {
 
 	var opts backend.PruneOptions
 
-	if v := q.Get("dry_run"); v != "" {
-		dryRun, err := strconv.ParseBool(v)
+	// Reject present-but-empty scalar params. `?dry_run=` previously fell
+	// through as DryRun=false and a malformed request became an execute
+	// request (CodeRabbit major finding).
+	if vals, ok := q["dry_run"]; ok {
+		if len(vals) == 0 || vals[0] == "" {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "dry_run must not be empty")
+			return
+		}
+		dryRun, err := strconv.ParseBool(vals[0])
 		if err != nil {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid dry_run value: "+v)
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid dry_run value: "+vals[0])
 			return
 		}
 		opts.DryRun = dryRun
@@ -84,7 +91,14 @@ func (s *Server) handleSystemPrune(w http.ResponseWriter, r *http.Request) {
 	// Distinguishing "omitted" from "explicit 0" requires the map lookup
 	// rather than q.Get(), since an empty-string value is not the same as
 	// a missing key for our purposes.
-	if vals, ok := q["until"]; ok && len(vals) > 0 && vals[0] != "" {
+	// Present-but-empty `until=` is rejected rather than falling through
+	// to the default (avoids silent ambiguity with malformed clients).
+	// Absent key → 72h default.
+	if vals, ok := q["until"]; ok {
+		if len(vals) == 0 || vals[0] == "" {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "until must not be empty")
+			return
+		}
 		d, err := time.ParseDuration(vals[0])
 		if err != nil {
 			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid until value: "+vals[0])
@@ -99,10 +113,14 @@ func (s *Server) handleSystemPrune(w http.ResponseWriter, r *http.Request) {
 		opts.Until = defaultPruneUntil
 	}
 
-	if v := q.Get("log_tail_bytes"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
+	if vals, ok := q["log_tail_bytes"]; ok {
+		if len(vals) == 0 || vals[0] == "" {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "log_tail_bytes must not be empty")
+			return
+		}
+		n, err := strconv.ParseInt(vals[0], 10, 64)
 		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid log_tail_bytes: "+v)
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid log_tail_bytes: "+vals[0])
 			return
 		}
 		if n > maxLogTailBytes {

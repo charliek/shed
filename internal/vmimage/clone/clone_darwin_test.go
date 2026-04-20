@@ -9,7 +9,7 @@ import (
 )
 
 // TestCloneFile_Darwin_IsClonefile asserts that on darwin/APFS (the only
-// supported VZ configuration) the native strategyegy is selected. This catches
+// supported VZ configuration) the native strategy is selected. This catches
 // regressions where the build tag drifts or unix.Clonefile moves behind a
 // newer errno we haven't folded into isFallback.
 func TestCloneFile_Darwin_IsClonefile(t *testing.T) {
@@ -23,11 +23,15 @@ func TestCloneFile_Darwin_IsClonefile(t *testing.T) {
 
 	strategy, err := CloneFile(src, dst)
 	if err != nil {
-		// ENOTSUP from a non-APFS tmpfs-like FS is the one legitimate
-		// reason to skip; any other error is a real failure.
-		t.Skipf("CloneFile failed on darwin (non-APFS tmp dir?): %v", err)
+		// Only skip when the filesystem doesn't support clonefile —
+		// any other error is a real regression that should fail the
+		// test rather than be hidden by t.Skip.
+		if isFallback(err) {
+			t.Skipf("CloneFile fallback on darwin (non-APFS tmp dir?): %v", err)
+		}
+		t.Fatalf("CloneFile failed on darwin: %v", err)
 	}
 	if strategy != StrategyClonefile {
-		t.Errorf("strategyegy = %v, want StrategyClonefile (run on APFS)", strategy)
+		t.Errorf("strategy = %v, want StrategyClonefile (run on APFS)", strategy)
 	}
 }

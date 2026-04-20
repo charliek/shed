@@ -31,7 +31,7 @@ func TestCloneFile_Linux_Strategy(t *testing.T) {
 	// vary widely. The fallback chain is the guarantee, not the exact
 	// winner. We only fail if we got Unknown.
 	if strategy == StrategyUnknown {
-		t.Errorf("strategyegy = Unknown; want a concrete strategyegy")
+		t.Errorf("strategy = Unknown; want a concrete strategy")
 	}
 
 	got, err := os.ReadFile(dst)
@@ -71,7 +71,7 @@ func TestCloneFile_Linux_CopyFileRange_ShortCopyLoop(t *testing.T) {
 		t.Fatalf("CloneFile: %v", err)
 	}
 	if strategy == StrategyUnknown {
-		t.Fatalf("strategyegy = Unknown")
+		t.Fatalf("strategy = Unknown")
 	}
 
 	got, err := os.ReadFile(dst)
@@ -79,6 +79,6 @@ func TestCloneFile_Linux_CopyFileRange_ShortCopyLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, data) {
-		t.Errorf("4 MiB clone dst mismatch (strategyegy=%s)", strategy)
+		t.Errorf("4 MiB clone dst mismatch (strategy=%s)", strategy)
 	}
 }

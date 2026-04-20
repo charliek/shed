@@ -38,6 +38,9 @@ func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 		return "", fmt.Errorf("failed to clean stale rootfs: %w", err)
 	}
+	if err := syncDir(dir); err != nil {
+		return "", fmt.Errorf("failed to sync instance directory after cleanup: %w", err)
+	}
 
 	strategy, err := clone.CloneFile(baseRootfs, dst)
 	if err != nil {
@@ -68,8 +71,23 @@ func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 		_ = os.Remove(dst)
 		return "", fmt.Errorf("failed to close rootfs after sync: %w", closeErr)
 	}
+	if err := syncDir(dir); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to sync instance directory: %w", err)
+	}
 
 	return dst, nil
+}
+
+// syncDir fsyncs a directory so pending create/unlink metadata is on
+// stable storage. See the matching helper in internal/vz/rootfs.go.
+func syncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // DeleteRootfs removes the rootfs image for an instance.

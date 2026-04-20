@@ -144,6 +144,11 @@ func CloneFile(src, dst string) (Strategy, error) {
 // ioCopy is the universal fallback. Creates dst and streams src through
 // userspace. Preserves source mode (0644 on base rootfs) via os.Create's
 // umask-masked 0666 — identical to the pre-clone CopyRootfs behavior.
+//
+// Close errors are explicitly propagated: io.Copy can succeed while a
+// deferred flush on Close fails (late ENOSPC is the classic case).
+// Returning success there would leave a truncated rootfs treated as
+// valid, so we close explicitly and unlink on failure.
 func ioCopy(src, dst string) error {
 	sf, err := os.Open(src)
 	if err != nil {
@@ -156,11 +161,15 @@ func ioCopy(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create dst: %w", err)
 	}
-	defer df.Close()
 
 	if _, err := io.Copy(df, sf); err != nil {
+		df.Close()
 		_ = os.Remove(dst)
 		return fmt.Errorf("copy: %w", err)
+	}
+	if err := df.Close(); err != nil {
+		_ = os.Remove(dst)
+		return fmt.Errorf("close dst: %w", err)
 	}
 	return nil
 }

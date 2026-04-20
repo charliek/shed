@@ -202,8 +202,17 @@ func renderDF(w io.Writer, du config.DiskUsage, verbose bool) {
 	if du.Initrd != nil {
 		imageFiles++
 	}
+	// Per-shed FILES count includes rootfs + optional console_log + any
+	// OtherFiles (typically metadata.json). Matches countFiles() used for
+	// the multi-server aggregate footer.
+	shedFiles := 0
 	runningCount, stoppedCount := 0, 0
 	for _, s := range du.Sheds {
+		shedFiles++ // rootfs
+		if s.ConsoleLog != nil {
+			shedFiles++
+		}
+		shedFiles += len(s.OtherFiles)
 		if s.Status == config.StatusRunning {
 			runningCount++
 		} else {
@@ -217,12 +226,12 @@ func renderDF(w io.Writer, du config.DiskUsage, verbose bool) {
 		imageFiles, formatSize(du.Totals.Images.LogicalBytes), formatSize(du.Totals.Images.PhysicalBytes))
 	shedLabel := fmt.Sprintf("sheds (%d stopped, %d run)", stoppedCount, runningCount)
 	fmt.Fprintf(tw, "%s\t%d\t%s\t%s\n",
-		shedLabel, len(du.Sheds),
+		shedLabel, shedFiles,
 		formatSize(du.Totals.Sheds.LogicalBytes), formatSize(du.Totals.Sheds.PhysicalBytes))
 	fmt.Fprintf(tw, "orphans\t%d\t%s\t%s\n",
 		len(du.Orphans), formatSize(du.Totals.Orphans.LogicalBytes), formatSize(du.Totals.Orphans.PhysicalBytes))
 	fmt.Fprintf(tw, "TOTAL\t%d\t%s\t%s\n",
-		imageFiles+len(du.Sheds)+len(du.Orphans),
+		imageFiles+shedFiles+len(du.Orphans),
 		formatSize(du.Totals.All.LogicalBytes), formatSize(du.Totals.All.PhysicalBytes))
 	tw.Flush()
 

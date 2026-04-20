@@ -25,6 +25,8 @@ The `shed-server` exposes a REST API for managing sheds.
 | GET | `/api/images` | List available image variants |
 | DELETE | `/api/images/{name}` | Delete a cached image |
 | POST | `/api/images/prune` | Prune unused cached images |
+| GET | `/api/system/df` | Disk usage report (image cache, sheds, orphans) |
+| POST | `/api/system/prune` | Scoped disk cleanup (dry-run, images/instances/logs/orphans) |
 | GET | `/api/sheds/{name}/connect/{port}` | TCP tunnel via HTTP upgrade |
 | GET | `/api/plugins/listeners` | List active extension listeners |
 | GET | `/api/plugins/listeners/{ns}/messages` | Subscribe to namespace (SSE) |
@@ -411,24 +413,24 @@ Returns disk usage information for the server: image cache, per-instance rootfs 
   "images": [
     {
       "name": "default",
-      "path": "/var/lib/shed/vz/default-rootfs.ext4",
+      "path": "/Users/alice/Library/Application Support/shed/vz/default-rootfs.ext4",
       "docker_ref": "ghcr.io/example/default:v1",
       "size": {"logical_bytes": 5368709120, "physical_bytes": 4831838208}
     },
     {
       "name": "_base",
-      "path": "/var/lib/shed/vz/_base-rootfs.ext4",
+      "path": "/Users/alice/Library/Application Support/shed/vz/_base-rootfs.ext4",
       "size": {"logical_bytes": 5368709120, "physical_bytes": 0},
       "is_base": true
     }
   ],
   "kernel": {
-    "path": "/var/lib/shed/vz/vmlinux",
+    "path": "/Users/alice/Library/Application Support/shed/vz/vmlinux",
     "size": {"logical_bytes": 8388608, "physical_bytes": 8388608},
     "kind": "kernel"
   },
   "initrd": {
-    "path": "/var/lib/shed/vz/initrd",
+    "path": "/Users/alice/Library/Application Support/shed/vz/initrd.img",
     "size": {"logical_bytes": 102400, "physical_bytes": 102400},
     "kind": "initrd"
   },
@@ -438,12 +440,12 @@ Returns disk usage information for the server: image cache, per-instance rootfs 
       "status": "running",
       "image": "default",
       "rootfs": {
-        "path": "/var/lib/shed/vz/instances/api-dev/rootfs.ext4",
+        "path": "/Users/alice/Library/Application Support/shed/vz/instances/api-dev/rootfs.ext4",
         "size": {"logical_bytes": 2147483648, "physical_bytes": 2147483648},
         "kind": "rootfs"
       },
       "console_log": {
-        "path": "/var/lib/shed/vz/instances/api-dev/console.log",
+        "path": "/Users/alice/Library/Application Support/shed/vz/instances/api-dev/console.log",
         "size": {"logical_bytes": 819200, "physical_bytes": 819200},
         "kind": "console_log"
       },
@@ -453,7 +455,7 @@ Returns disk usage information for the server: image cache, per-instance rootfs 
   ],
   "orphans": [
     {
-      "path": "/var/lib/shed/vz/stale-rootfs.ext4.lock",
+      "path": "/Users/alice/Library/Application Support/shed/vz/stale-rootfs.ext4.lock",
       "size": {"logical_bytes": 0, "physical_bytes": 0},
       "kind": "lock"
     }

@@ -375,7 +375,7 @@ Each variant produces a 20GB sparse ext4 image. Actual disk usage is much smalle
 
 If the filesystem doesn't support reflink (e.g. ext4 without the `reflink=1` option, tmpfs), the backend falls back to Linux's `copy_file_range(2)` or finally to a userspace copy. The strategy is logged once per `shed create` on the server, with format:
 
-```
+```text
 rootfs strategy=<clonefile|ficlone|copy_file_range|io_copy> src=... dst=... logical_bytes=...
 ```
 

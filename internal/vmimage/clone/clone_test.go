@@ -22,9 +22,9 @@ func randomBytes(t *testing.T, n int) []byte {
 }
 
 func TestCloneFile_NativeStrategy(t *testing.T) {
-	// The platform strategyegy is whichever the build-tagged file selects.
+	// The platform strategy is whichever the build-tagged file selects.
 	// We only assert: (1) clone succeeds, (2) dst is byte-identical to src.
-	// The strategyegy identity is logged for operators, not gated on here.
+	// The strategy identity is logged for operators, not gated on here.
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	dst := filepath.Join(dir, "dst")
@@ -39,7 +39,7 @@ func TestCloneFile_NativeStrategy(t *testing.T) {
 		t.Fatalf("CloneFile: %v", err)
 	}
 	if strategy == StrategyUnknown {
-		t.Errorf("got StrategyUnknown; want a concrete strategyegy")
+		t.Errorf("got StrategyUnknown; want a concrete strategy")
 	}
 
 	got, err := os.ReadFile(dst)
@@ -54,7 +54,7 @@ func TestCloneFile_NativeStrategy(t *testing.T) {
 func TestCloneFile_Fallback_IOCopy(t *testing.T) {
 	// ForceFallback disables all platform primitives so we exercise the
 	// universal io.Copy path. This keeps the fallback regression-tested
-	// even on hosts where every native strategyegy happens to succeed.
+	// even on hosts where every native strategy happens to succeed.
 	restore := ForceFallback(true)
 	defer restore()
 
@@ -72,7 +72,7 @@ func TestCloneFile_Fallback_IOCopy(t *testing.T) {
 		t.Fatalf("CloneFile: %v", err)
 	}
 	if strategy != StrategyIOCopy {
-		t.Errorf("strategyegy = %v, want StrategyIOCopy", strategy)
+		t.Errorf("strategy = %v, want StrategyIOCopy", strategy)
 	}
 	got, err := os.ReadFile(dst)
 	if err != nil {

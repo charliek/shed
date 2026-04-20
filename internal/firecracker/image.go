@@ -5,7 +5,6 @@ package firecracker
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 
 	"github.com/charliek/shed/internal/config"
@@ -65,8 +64,13 @@ func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, err
 		}
 		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
 		if err != nil {
-			log.Printf("Warning: inUseImageNames: skipping instance %q with invalid metadata: %v", inst, err)
-			continue
+			// Only tolerate the list-then-load race; all other errors
+			// (malformed JSON, I/O failure) must fail closed so we don't
+			// accidentally mark a still-referenced image as unused.
+			if errors.Is(err, ErrInstanceNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("reading metadata for %s: %w", inst, err)
 		}
 		if meta.Image != "" {
 			names = append(names, meta.Image)
