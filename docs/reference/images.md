@@ -371,19 +371,23 @@ The common end-to-end flow when bumping image refs (for example, moving config f
 
 ## Disk Space
 
-Each variant produces a 20GB sparse ext4 image. Actual disk usage is much smaller (typically 2–5GB depending on the variant). Each running shed adds another 2–5GB for its own rootfs copy.
+Each variant produces a 20GB sparse ext4 image. Actual disk usage is much smaller (typically 2–5GB depending on the variant). When a shed is created, its rootfs starts out sharing disk extents with the base image via `clonefile` on macOS/APFS or `FICLONE` (ext4/xfs/btrfs reflink) on Linux — the copy is near-instant and adds near-zero physical bytes until the VM begins writing. Writes diverge on a CoW basis from that point, so long-lived sheds grow gradually.
 
-Use `du -sh` to check actual usage:
+If the filesystem doesn't support reflink (e.g. ext4 without the `reflink=1` option, tmpfs), the backend falls back to Linux's `copy_file_range(2)` or finally to a userspace copy. The strategy is logged once per `shed create` on the server, with format:
+
+```
+rootfs strategy=<clonefile|ficlone|copy_file_range|io_copy> src=... dst=... logical_bytes=...
+```
+
+To see current disk consumption, prefer `shed system df` (reports both apparent and allocated bytes and surfaces the APFS extent-sharing overcount caveat):
 
 ```bash
-# VZ
-du -sh ~/Library/Application\ Support/shed/vz/*-rootfs.ext4
-du -sh ~/Library/Application\ Support/shed/vz/instances/*
-
-# Firecracker
-du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
-du -sh /var/lib/shed/firecracker/instances/*
+shed system df
+shed system df -v    # per-image and per-shed rows
+shed system df --json | jq
 ```
+
+`du -sh` works too but is noisy on APFS because each reflink reference counts against every file that holds it.
 
 ## Requirements
 
