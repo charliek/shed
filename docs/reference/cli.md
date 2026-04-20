@@ -272,6 +272,39 @@ shed image prune                 # Interactive confirmation
 shed image prune --force         # No confirmation
 ```
 
+## System (Disk Usage)
+
+### shed system df
+
+Shows disk usage for shed servers: image cache, per-instance rootfs copies, kernel/initrd, and orphan sidecar files.
+
+```bash
+shed system df [flags]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--all` | | `false` | Query every configured server (client-side fan-out) |
+| `--server` | `-s` | (default server) | Target a specific server (global flag) |
+| `--verbose` | `-v` | | Show per-image, per-shed, kernel, and orphan rows (global flag) |
+| `--json` | | `false` | Emit machine-readable JSON (global flag) |
+
+The rollup view groups files into four categories — images (including kernel and initrd), sheds (per-instance rootfs + console logs), orphans (stale `.lock`/`.tmp`/`.source` files), and totals. `-v` breaks each category into per-file rows.
+
+Both **logical** (apparent) and **physical** (allocated) bytes are reported. Physical bytes come from `stat.Blocks * 512`. On filesystems that support extent sharing (APFS clonefile, ext4/xfs reflink, hardlinks), the same bytes may be attributed to multiple files — so summed physical totals may overcount actual on-disk usage. A note on every report calls this out.
+
+**Multi-server (`--all`):** runs concurrently across every configured server. Offline or older servers (returning errors or 404) are reported inline without aborting; the command exits 0. In `--json` mode the response is `{servers: [{server_name, usage?, error?}, ...]}`.
+
+**Examples:**
+
+```bash
+shed system df                 # Rollup for the active server
+shed system df -v              # Per-image and per-shed detail
+shed system df --json | jq     # Pipe the raw wire type to jq
+shed system df --all           # Fan out across all configured servers
+shed system df -s mini2 --json # Query one specific server in JSON
+```
+
 ## Interactive Access
 
 ### shed console

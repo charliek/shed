@@ -56,6 +56,11 @@ func (s *Server) Router() chi.Router {
 			r.Post("/prune", s.handlePruneImages)
 		})
 
+		// System (disk reporting + future prune)
+		r.Route("/system", func(r chi.Router) {
+			r.Get("/df", s.handleSystemDF)
+		})
+
 		// Plugins / Extensions
 		r.Route("/plugins", func(r chi.Router) {
 			r.Get("/listeners", s.handleListListeners)

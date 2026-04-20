@@ -395,6 +395,91 @@ Removes cached images not referenced by config or any existing shed.
 
 The `deleted` array contains the images that were removed (or would be removed if `dry_run=true`).
 
+## System
+
+### GET /api/system/df
+
+Returns disk usage information for the server: image cache, per-instance rootfs copies and console logs, kernel/initrd, and orphan sidecar files.
+
+**Response (200 OK):**
+
+```json
+{
+  "server_name": "prod-mac",
+  "backend": "vz",
+  "generated_at": "2026-04-20T11:23:45Z",
+  "images": [
+    {
+      "name": "default",
+      "path": "/var/lib/shed/vz/default-rootfs.ext4",
+      "docker_ref": "ghcr.io/example/default:v1",
+      "size": {"logical_bytes": 5368709120, "physical_bytes": 4831838208}
+    },
+    {
+      "name": "_base",
+      "path": "/var/lib/shed/vz/_base-rootfs.ext4",
+      "size": {"logical_bytes": 5368709120, "physical_bytes": 0},
+      "is_base": true
+    }
+  ],
+  "kernel": {
+    "path": "/var/lib/shed/vz/vmlinux",
+    "size": {"logical_bytes": 8388608, "physical_bytes": 8388608},
+    "kind": "kernel"
+  },
+  "initrd": {
+    "path": "/var/lib/shed/vz/initrd",
+    "size": {"logical_bytes": 102400, "physical_bytes": 102400},
+    "kind": "initrd"
+  },
+  "sheds": [
+    {
+      "name": "api-dev",
+      "status": "running",
+      "image": "default",
+      "rootfs": {
+        "path": "/var/lib/shed/vz/instances/api-dev/rootfs.ext4",
+        "size": {"logical_bytes": 2147483648, "physical_bytes": 2147483648},
+        "kind": "rootfs"
+      },
+      "console_log": {
+        "path": "/var/lib/shed/vz/instances/api-dev/console.log",
+        "size": {"logical_bytes": 819200, "physical_bytes": 819200},
+        "kind": "console_log"
+      },
+      "other_files": [],
+      "total": {"logical_bytes": 2148302848, "physical_bytes": 2148302848}
+    }
+  ],
+  "orphans": [
+    {
+      "path": "/var/lib/shed/vz/stale-rootfs.ext4.lock",
+      "size": {"logical_bytes": 0, "physical_bytes": 0},
+      "kind": "lock"
+    }
+  ],
+  "totals": {
+    "images":  {"logical_bytes": 10737418240, "physical_bytes": 4840226816},
+    "sheds":   {"logical_bytes": 2148302848,  "physical_bytes": 2148302848},
+    "orphans": {"logical_bytes": 0,           "physical_bytes": 0},
+    "all":     {"logical_bytes": 12885721088, "physical_bytes": 6988529664}
+  },
+  "notes": [
+    "physical bytes may overcount shared extents on APFS (clonefile) or hardlinks"
+  ]
+}
+```
+
+**Field notes:**
+
+- `backend` is `"vz"`, `"firecracker"`, or `"none"` (the last when the native backend isn't available on this platform).
+- `console_log` is always absent on Firecracker (the FC SDK writes to stderr, not a per-instance file).
+- `initrd` is VZ-only — Firecracker has no initrd.
+- `physical_bytes` comes from `stat.Blocks * 512`. Files that share extents via clonefile/FICLONE or hardlinks may have those bytes counted against each referencing file, inflating sums.
+- `is_base` marks the runtime-managed `_base-rootfs.ext4` cache.
+
+**Multi-server aggregation:** the server never fans out; `shed system df --all` issues one request per configured server from the client and assembles the per-server results.
+
 ## Connect API
 
 The Connect API provides TCP tunnels into shed VMs via HTTP upgrade. This is the foundation for port forwarding (tunnels) and the proxy extension.

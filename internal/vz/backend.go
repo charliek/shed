@@ -204,3 +204,8 @@ func (b *VZBackend) DeleteImage(_ context.Context, name string) error {
 func (b *VZBackend) PruneImages(_ context.Context, dryRun bool) ([]config.ImageInfo, error) {
 	return b.client.PruneImages(dryRun)
 }
+
+// DiskUsage returns disk-usage information for the VZ server.
+func (b *VZBackend) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
+	return b.client.DiskUsage(ctx)
+}

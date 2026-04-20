@@ -417,6 +417,15 @@ func (c *APIClient) PruneImages(dryRun bool) (*config.PruneImagesResponse, error
 	return &resp, nil
 }
 
+// GetSystemDF retrieves disk usage information for the server.
+func (c *APIClient) GetSystemDF() (*config.DiskUsage, error) {
+	var du config.DiskUsage
+	if err := c.doRequest(http.MethodGet, "/api/system/df", nil, &du); err != nil {
+		return nil, err
+	}
+	return &du, nil
+}
+
 // Ping checks if the server is reachable.
 func (c *APIClient) Ping() bool {
 	client := &http.Client{

@@ -116,3 +116,10 @@ func (b *VZBackend) DeleteImage(_ context.Context, _ string) error {
 func (b *VZBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
 	return nil, nil
 }
+
+// DiskUsage returns an empty disk-usage report on non-darwin platforms.
+// Read-only system queries never error on a non-native backend — they just
+// report "no local state," matching the ListImages precedent.
+func (b *VZBackend) DiskUsage(_ context.Context) (config.DiskUsage, error) {
+	return config.DiskUsage{Backend: "none"}, nil
+}
