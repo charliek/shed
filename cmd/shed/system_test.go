@@ -179,3 +179,72 @@ func TestCountFiles(t *testing.T) {
 		t.Errorf("countFiles = %d, want 8", got)
 	}
 }
+
+func samplePruneReport(dry bool) config.PruneReport {
+	return config.PruneReport{
+		DryRun:     dry,
+		ServerName: "prod-mac",
+		Scope:      []string{"images", "instances", "orphans"},
+		Until:      "72h0m0s",
+		Items: []config.PrunedItem{
+			{Kind: "image", Name: "old-variant", Path: "/v/old.ext4", Action: "deleted", Freed: config.DiskSize{LogicalBytes: 5 << 30, PhysicalBytes: 4 << 30}},
+			{Kind: "instance", Name: "api-old", Action: "deleted", Reason: "stopped 5d ago", Freed: config.DiskSize{LogicalBytes: 2 << 30, PhysicalBytes: 2 << 30}},
+			{Kind: "tmp", Path: "/v/stale.ext4.tmp", Action: "deleted", Freed: config.DiskSize{LogicalBytes: 8192, PhysicalBytes: 8192}},
+		},
+		Skipped: []config.SkippedItem{
+			{Kind: "instance", Name: "api-dev", Reason: "cannot prune running shed"},
+			{Kind: "instance", Name: "api-test", Reason: "too recent (3h < 72h)"},
+		},
+		Totals: config.PruneReportTotals{
+			Freed: config.DiskSize{LogicalBytes: (5 << 30) + (2 << 30) + 8192, PhysicalBytes: (4 << 30) + (2 << 30) + 8192},
+			Items: 3,
+		},
+		Notes: []string{"physical bytes are attributed"},
+	}
+}
+
+func TestRenderPrune_DryRun(t *testing.T) {
+	var buf bytes.Buffer
+	renderPrune(&buf, samplePruneReport(true))
+	got := buf.String()
+	for _, want := range []string{
+		"SERVER: prod-mac (dry-run)",
+		"--until 72h0m0s",
+		"scope=images+instances+orphans",
+		"IMAGES (1,",
+		"old-variant",
+		"INSTANCES (1,",
+		"api-old",
+		"stopped 5d ago",
+		"ORPHANS (1,",
+		"stale.ext4.tmp",
+		"SKIPPED (2)",
+		"cannot prune running shed",
+		"too recent",
+		"TOTAL TO FREE:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("dry-run render missing %q.\nOUTPUT:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderPrune_Execute(t *testing.T) {
+	var buf bytes.Buffer
+	renderPrune(&buf, samplePruneReport(false))
+	got := buf.String()
+	if strings.Contains(got, "dry-run") {
+		t.Errorf("execute output leaked dry-run marker: %s", got)
+	}
+	if !strings.Contains(got, "FREED:") {
+		t.Errorf("execute output missing FREED footer: %s", got)
+	}
+}
+
+func TestDeletedShedNames(t *testing.T) {
+	r := samplePruneReport(false)
+	names := deletedShedNames(&r)
+	if len(names) != 1 || names[0] != "api-old" {
+		t.Errorf("deletedShedNames = %v, want [api-old]", names)
+	}
+}

@@ -209,3 +209,8 @@ func (b *VZBackend) PruneImages(_ context.Context, dryRun bool) ([]config.ImageI
 func (b *VZBackend) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 	return b.client.DiskUsage(ctx)
 }
+
+// Prune runs the disk cleanup pass. See backend.PruneOptions for semantics.
+func (b *VZBackend) Prune(ctx context.Context, opts backend.PruneOptions) (config.PruneReport, error) {
+	return b.client.Prune(ctx, opts)
+}

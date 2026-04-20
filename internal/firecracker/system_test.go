@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/vmimage"
 )
@@ -64,6 +65,38 @@ func TestDiskUsage_Empty_FC(t *testing.T) {
 	}
 	if du.Initrd != nil {
 		t.Errorf("Initrd must be nil on Firecracker, got %v", du.Initrd)
+	}
+}
+
+func TestPrune_FC_LogsSkippedWithReason(t *testing.T) {
+	client, _, instanceDir := newSystemTestClient(t)
+
+	// A stopped shed — exists just so `--logs` has something to iterate.
+	meta := testMetadata("some-shed")
+	meta.Status = config.StatusStopped
+	if err := meta.Save(instanceDir); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := client.Prune(context.Background(), backend.PruneOptions{Logs: true})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	// FC should have NO truncated console logs in Items...
+	for _, it := range report.Items {
+		if it.Kind == "console_log" {
+			t.Errorf("FC prune produced console_log Item %+v; FC has no console.log", it)
+		}
+	}
+	// ...and should have a skipped entry explaining why.
+	found := false
+	for _, s := range report.Skipped {
+		if s.Kind == "console_log" && s.Name == "some-shed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected skipped console_log entry for some-shed, got %+v", report.Skipped)
 	}
 }
 

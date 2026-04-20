@@ -123,3 +123,9 @@ func (b *VZBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, 
 func (b *VZBackend) DiskUsage(_ context.Context) (config.DiskUsage, error) {
 	return config.DiskUsage{Backend: "none"}, nil
 }
+
+// Prune is a mutating operation; the non-native stub returns the sentinel
+// so callers get a clear "not supported" signal (matches DeleteImage).
+func (b *VZBackend) Prune(_ context.Context, _ backend.PruneOptions) (config.PruneReport, error) {
+	return config.PruneReport{}, fmt.Errorf("prune: %w", config.ErrNotSupportedSentinel)
+}

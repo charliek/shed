@@ -95,4 +95,9 @@ type Backend interface {
 	// console logs, kernel/initrd, and orphan sidecar files. Client-side
 	// state under ~/.shed/ is out of scope.
 	DiskUsage(ctx context.Context) (config.DiskUsage, error)
+
+	// Prune removes items selected by opts. DryRun returns the report
+	// without mutating. Age-based instance pruning uses mtime(metadata.json)
+	// as the "last touched" proxy — see opts.Until.
+	Prune(ctx context.Context, opts PruneOptions) (config.PruneReport, error)
 }

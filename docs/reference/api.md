@@ -480,6 +480,87 @@ Returns disk usage information for the server: image cache, per-instance rootfs 
 
 **Multi-server aggregation:** the server never fans out; `shed system df --all` issues one request per configured server from the client and assembles the per-server results.
 
+### POST /api/system/prune
+
+Runs a disk cleanup pass. Returns a report of what was (or would be) removed or truncated. Dry-run returns the same shape without mutating.
+
+**Query parameters:**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `scope` | (default scope) | Repeatable. One of `images`, `instances`, `logs`, `orphans`. When omitted, the backend applies the default: `images + instances + orphans`. Unknown values return 400. |
+| `dry_run` | `false` | If true, return candidates without mutating. |
+| `until` | `72h` | Go `time.Duration` string. Stopped instances whose `mtime(metadata.json)` is younger than `now - until` are skipped. `0s` = any age. Negative values return 400. |
+| `log_tail_bytes` | `0` | Size console logs are truncated to when the `logs` scope is active. `0` uses the server default (5 MiB). |
+
+**Scope rules:**
+
+- `images` — runs `vmimage.Manager.PruneImages`; refuses images referenced by config or any surviving instance.
+- `instances` — deletes stopped sheds older than `until`. Uses `Client.DeleteShed` internally so TAP devices (Firecracker) and credential state are cleaned up correctly. Running sheds are never pruned.
+- `orphans` — removes `.tmp`/`.source` sidecars whose parent rootfs is absent, gated by a non-blocking `flock()` probe on the canonical `.lock` and a 1-hour minimum age for `.tmp` files. The canonical `.lock` file itself is always preserved.
+- `logs` — Firecracker: no-op (FC has no per-instance console log; each shed gets a `SkippedItem`). VZ: truncates `console.log` in place to `log_tail_bytes`.
+
+**Internal ordering (within a single Prune call):**
+
+1. Snapshot `mtime(metadata.json)` for every instance **before** calling `ListSheds` (which can refresh mtime via its staleness re-check).
+2. Collect candidates for instances, orphans, and images (image dry-run uses `inUseImageNamesExcept(<candidate sheds>)` to simulate the post-instance-delete state).
+3. If `dry_run`, return. Otherwise: delete instances first so their image references drop from `inUseImageNames`, then prune images, then sweep orphans, then truncate logs.
+
+**Response (200 OK):**
+
+```json
+{
+  "dry_run": false,
+  "server_name": "prod-mac",
+  "scope": ["images", "instances", "orphans"],
+  "until": "72h0m0s",
+  "items": [
+    {
+      "kind": "instance",
+      "name": "api-old",
+      "action": "deleted",
+      "freed": {"logical_bytes": 2147483648, "physical_bytes": 2147483648},
+      "reason": "deleted (stopped 5d)"
+    },
+    {
+      "kind": "image",
+      "name": "old-variant",
+      "path": "/var/lib/shed/vz/old-variant-rootfs.ext4",
+      "action": "deleted",
+      "freed": {"logical_bytes": 5368709120, "physical_bytes": 5368709120}
+    },
+    {
+      "kind": "tmp",
+      "path": "/var/lib/shed/vz/stale-rootfs.ext4.tmp",
+      "action": "deleted",
+      "freed": {"logical_bytes": 4096, "physical_bytes": 4096}
+    }
+  ],
+  "skipped": [
+    {"kind": "instance", "name": "api-dev", "reason": "cannot prune running shed"},
+    {"kind": "instance", "name": "api-test", "reason": "too recent (3h < 72h)"},
+    {"kind": "tmp", "path": "/var/lib/shed/vz/live-rootfs.ext4.tmp", "reason": "lock held (conversion in progress)"}
+  ],
+  "notes": [
+    "physical bytes are attributed (stat.Blocks*512); clonefile/FICLONE clones and hardlinks may report bytes that won't actually be reclaimed"
+  ],
+  "totals": {
+    "freed": {"logical_bytes": 7516196864, "physical_bytes": 7516196864},
+    "items": 3
+  }
+}
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | Invalid `dry_run`, `until`, `log_tail_bytes`, or an unknown `scope` value |
+| 500 | Backend error during prune |
+| 501 | Backend does not support prune (e.g., the VZ stub on non-darwin hosts) |
+
+**Timeouts:** the CLI uses a 10-minute client timeout for this endpoint since large fleets can exceed the default 30-second window used by list/get endpoints.
+
 ## Connect API
 
 The Connect API provides TCP tunnels into shed VMs via HTTP upgrade. This is the foundation for port forwarding (tunnels) and the proxy extension.

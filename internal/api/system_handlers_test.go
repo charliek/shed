@@ -15,10 +15,14 @@ import (
 )
 
 // fakeBackend implements backend.Backend for system handler tests.
-// Only DiskUsage is wired; other methods panic if called.
+// Only DiskUsage and Prune are wired; other methods panic if called.
 type fakeBackend struct {
-	usage config.DiskUsage
-	err   error
+	usage       config.DiskUsage
+	err         error
+	pruneReport config.PruneReport
+	pruneErr    error
+	// captured so the test can assert what the handler forwarded.
+	lastPruneOpts backend.PruneOptions
 }
 
 func (f *fakeBackend) Type() backend.Type { return backend.TypeVZ }
@@ -65,6 +69,11 @@ func (f *fakeBackend) PruneImages(ctx context.Context, dryRun bool) ([]config.Im
 
 func (f *fakeBackend) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 	return f.usage, f.err
+}
+
+func (f *fakeBackend) Prune(ctx context.Context, opts backend.PruneOptions) (config.PruneReport, error) {
+	f.lastPruneOpts = opts
+	return f.pruneReport, f.pruneErr
 }
 
 func newSystemTestServer(be backend.Backend) *Server {
@@ -135,6 +144,100 @@ func TestHandleSystemDF_BackendError(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleSystemPrune_ParsesQueryParams(t *testing.T) {
+	be := &fakeBackend{
+		pruneReport: config.PruneReport{DryRun: true, ServerName: "x"},
+	}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?scope=images&scope=instances&dry_run=true&until=72h&log_tail_bytes=1024", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	opts := be.lastPruneOpts
+	if !opts.Images || !opts.Instances {
+		t.Errorf("scopes parsed as %+v, want Images+Instances", opts)
+	}
+	if opts.Logs || opts.Orphans {
+		t.Errorf("unexpected scope enabled: %+v", opts)
+	}
+	if !opts.DryRun {
+		t.Errorf("DryRun should be true")
+	}
+	if opts.Until != 72*time.Hour {
+		t.Errorf("Until = %v, want 72h", opts.Until)
+	}
+	if opts.LogTailBytes != 1024 {
+		t.Errorf("LogTailBytes = %d, want 1024", opts.LogTailBytes)
+	}
+}
+
+func TestHandleSystemPrune_UnknownScope(t *testing.T) {
+	be := &fakeBackend{}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?scope=bogus", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !jsonContains(w.Body.String(), "unknown scope") {
+		t.Errorf("expected 'unknown scope' in error body, got %s", w.Body.String())
+	}
+}
+
+func TestHandleSystemPrune_InvalidUntil(t *testing.T) {
+	be := &fakeBackend{}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?until=not-a-duration", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleSystemPrune_InvalidDryRun(t *testing.T) {
+	be := &fakeBackend{}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune?dry_run=maybe", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestHandleSystemPrune_EmptyScope(t *testing.T) {
+	// No scope flags — backend gets PruneOptions with all flags false and
+	// applies its own defaults.
+	be := &fakeBackend{
+		pruneReport: config.PruneReport{ServerName: "x"},
+	}
+	srv := newSystemTestServer(be)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/system/prune", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	opts := be.lastPruneOpts
+	if opts.Images || opts.Instances || opts.Logs || opts.Orphans {
+		t.Errorf("expected all scope flags false (server applies defaults), got %+v", opts)
 	}
 }
 

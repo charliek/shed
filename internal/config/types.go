@@ -270,6 +270,66 @@ type SystemDFResponse struct {
 	Servers []DiskUsageOrError `json:"servers"`
 }
 
+// PrunedItem describes one file or object removed (or proposed for removal)
+// by `shed system prune`.
+type PrunedItem struct {
+	// Kind is one of: "image" | "rootfs" | "console_log" | "metadata" |
+	// "instance" | "lock" | "tmp" | "source".
+	Kind string `json:"kind"`
+	Path string `json:"path,omitempty"`
+	// Name is the shed or image name when applicable.
+	Name string `json:"name,omitempty"`
+	// Action is "deleted" or "truncated".
+	Action string `json:"action"`
+	// Freed is the bytes attributed to this item. For clones or hardlinks
+	// the physical count reflects attribution, not necessarily reclamation —
+	// see PruneReport.Notes.
+	Freed DiskSize `json:"freed"`
+	// Reason is a human-readable justification (e.g. "stopped 5d ago").
+	Reason string `json:"reason,omitempty"`
+}
+
+// SkippedItem is an entity the prune pass inspected but left alone, with a
+// short reason. Examples: running shed; stopped but too recent; lock held
+// by an in-flight conversion; malformed metadata.
+type SkippedItem struct {
+	Kind   string `json:"kind"`
+	Name   string `json:"name,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// PruneReportTotals summarizes what the prune pass did (or would do).
+type PruneReportTotals struct {
+	Freed DiskSize `json:"freed"`
+	Items int      `json:"items"`
+}
+
+// PruneReport is the payload returned by POST /api/system/prune.
+type PruneReport struct {
+	DryRun     bool              `json:"dry_run"`
+	ServerName string            `json:"server_name"`
+	Scope      []string          `json:"scope"`
+	Until      string            `json:"until"`
+	Items      []PrunedItem      `json:"items"`
+	Skipped    []SkippedItem     `json:"skipped,omitempty"`
+	Notes      []string          `json:"notes,omitempty"`
+	Totals     PruneReportTotals `json:"totals"`
+}
+
+// PruneReportOrError is one entry in a multi-server aggregated response.
+type PruneReportOrError struct {
+	ServerName string       `json:"server_name"`
+	Report     *PruneReport `json:"report,omitempty"`
+	Error      string       `json:"error,omitempty"`
+}
+
+// SystemPruneResponse is the client-side aggregation of per-server prune
+// results from `shed system prune --all`. Never returned by the API directly.
+type SystemPruneResponse struct {
+	Servers []PruneReportOrError `json:"servers"`
+}
+
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
 	Name        string `json:"name"`

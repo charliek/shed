@@ -432,3 +432,44 @@ func acquireFileLock(path string) (func(), error) {
 		// where concurrent processes can hold locks on different inodes.
 	}, nil
 }
+
+// TryAcquireFileLockBlocking takes an exclusive flock on path and blocks
+// until it's available. Use this from tests that need to simulate a
+// live conversion holding the lock.
+func TryAcquireFileLockBlocking(path string) (func(), error) {
+	return acquireFileLock(path)
+}
+
+// TryAcquireFileLock attempts a non-blocking exclusive flock on path.
+// Returns held=true with a release function if the lock was acquired;
+// held=false (with release=nil, err=nil) if another process holds it.
+// Other I/O errors are returned as err.
+//
+// This is the "is a conversion running right now?" probe used by
+// orphan-sweep in `shed system prune`. If the lock is live we must NOT
+// touch the sibling sidecars.
+func TryAcquireFileLock(path string) (release func(), held bool, err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, false, err
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		// EWOULDBLOCK means someone else holds it — NOT an error.
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to acquire lock: %w", err)
+	}
+
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+		f.Close()
+		// Lock file intentionally not removed — see acquireFileLock.
+	}, true, nil
+}

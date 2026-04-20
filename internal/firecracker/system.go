@@ -5,16 +5,26 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/diskstat"
 	"github.com/charliek/shed/internal/vmimage"
 )
+
+// Default tail size for log truncation (FC currently has no console.log,
+// so this exists only for future parity).
+const defaultLogTailBytes = 5 * 1024 * 1024
+
+// Skip very fresh .tmp files: a conversion writes to .tmp before rename,
+// so treating those as orphans would race.
+const tmpOrphanMinAge = time.Hour
 
 // DiskUsage returns disk-usage information for everything the Firecracker
 // backend manages on the local server: image cache, per-instance rootfs
@@ -233,4 +243,396 @@ func classifySidecar(filename string) (baseRootfs, kind string) {
 		return filename[:idx+len(suffix)], "tmp"
 	}
 	return "", ""
+}
+
+// Prune removes items selected by opts. See backend.PruneOptions for flag
+// semantics. Mirrors the VZ implementation except:
+//   - No console.log handling (FC has no per-instance console log).
+//   - DeleteShed also frees TAP devices and unregisters CID/IP.
+func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.PruneReport, error) {
+	opts = normalizePruneOptions(opts)
+
+	report := config.PruneReport{
+		DryRun:     opts.DryRun,
+		ServerName: c.serverCfg.Name,
+		Scope:      scopeFlags(opts),
+		Until:      opts.Until.String(),
+		Items:      []config.PrunedItem{},
+		Skipped:    []config.SkippedItem{},
+	}
+
+	mtimes := snapshotMetadataMtimes(c.cfg.InstanceDir)
+
+	var instanceCandidates []instanceCandidate
+	if opts.Instances {
+		cands, skipped, err := c.collectInstanceCandidates(ctx, mtimes, opts.Until)
+		if err != nil {
+			return report, err
+		}
+		instanceCandidates = cands
+		report.Skipped = append(report.Skipped, skipped...)
+	}
+
+	var orphanCandidates []orphanCandidate
+	if opts.Orphans {
+		cands, skipped := collectOrphanCandidates(c.cfg.ImagesDir)
+		orphanCandidates = cands
+		report.Skipped = append(report.Skipped, skipped...)
+	}
+
+	var imageCandidates []vmimage.ImageInfo
+	if opts.Images {
+		skipSet := make(map[string]bool, len(instanceCandidates))
+		for _, ic := range instanceCandidates {
+			skipSet[ic.name] = true
+		}
+		mgr := vmimage.NewManager(c.cfg)
+		cands, err := mgr.PruneImages(true, func() ([]string, error) {
+			return c.inUseImageNamesExcept(skipSet)
+		})
+		if err != nil {
+			return report, fmt.Errorf("dry-run image prune: %w", err)
+		}
+		imageCandidates = cands
+	}
+
+	for _, ic := range instanceCandidates {
+		report.Items = append(report.Items, ic.toPrunedItem(opts.DryRun))
+	}
+	for _, oc := range orphanCandidates {
+		report.Items = append(report.Items, oc.toPrunedItem(opts.DryRun))
+	}
+	for _, img := range imageCandidates {
+		report.Items = append(report.Items, imageToPrunedItem(img, opts.DryRun))
+	}
+
+	if opts.DryRun {
+		finalizeReport(&report)
+		return report, nil
+	}
+
+	report.Items = report.Items[:0]
+
+	for _, ic := range instanceCandidates {
+		if err := c.DeleteShed(ctx, ic.name, false); err != nil {
+			report.Skipped = append(report.Skipped, config.SkippedItem{
+				Kind: "instance", Name: ic.name,
+				Reason: fmt.Sprintf("delete failed: %v", err),
+			})
+			continue
+		}
+		report.Items = append(report.Items, ic.toPrunedItem(false))
+	}
+
+	if opts.Images {
+		mgr := vmimage.NewManager(c.cfg)
+		deleted, err := mgr.PruneImages(false, c.inUseImageNames)
+		if err != nil {
+			return report, fmt.Errorf("image prune: %w", err)
+		}
+		for _, img := range deleted {
+			report.Items = append(report.Items, imageToPrunedItem(img, false))
+		}
+	}
+
+	if opts.Orphans {
+		for _, oc := range orphanCandidates {
+			if ok := sweepOrphan(c.cfg.ImagesDir, oc); !ok {
+				report.Skipped = append(report.Skipped, config.SkippedItem{
+					Kind: oc.kind, Path: oc.path,
+					Reason: "lock now held or removal failed",
+				})
+				continue
+			}
+			report.Items = append(report.Items, oc.toPrunedItem(false))
+		}
+	}
+
+	if opts.Logs {
+		// Firecracker has no per-instance console.log; record a no-op skip
+		// for every shed so JSON consumers see the explicit result.
+		names, _ := ListInstances(c.cfg.InstanceDir)
+		for _, name := range names {
+			report.Skipped = append(report.Skipped, config.SkippedItem{
+				Kind: "console_log", Name: name,
+				Reason: "firecracker does not write a per-instance console log",
+			})
+		}
+	}
+
+	finalizeReport(&report)
+	return report, nil
+}
+
+func normalizePruneOptions(opts backend.PruneOptions) backend.PruneOptions {
+	if !opts.Images && !opts.Instances && !opts.Logs && !opts.Orphans {
+		opts.Images = true
+		opts.Instances = true
+		opts.Orphans = true
+	}
+	if opts.LogTailBytes == 0 {
+		opts.LogTailBytes = defaultLogTailBytes
+	}
+	return opts
+}
+
+func scopeFlags(opts backend.PruneOptions) []string {
+	var scope []string
+	if opts.Images {
+		scope = append(scope, "images")
+	}
+	if opts.Instances {
+		scope = append(scope, "instances")
+	}
+	if opts.Logs {
+		scope = append(scope, "logs")
+	}
+	if opts.Orphans {
+		scope = append(scope, "orphans")
+	}
+	return scope
+}
+
+// snapshotMetadataMtimes must run BEFORE ListSheds (since ListSheds can
+// refresh metadata mtime on stale-running→stopped detection).
+func snapshotMetadataMtimes(instanceDir string) map[string]time.Time {
+	mtimes := make(map[string]time.Time)
+	names, err := ListInstances(instanceDir)
+	if err != nil {
+		return mtimes
+	}
+	for _, name := range names {
+		fi, err := os.Stat(MetadataPath(instanceDir, name))
+		if err != nil {
+			continue
+		}
+		mtimes[name] = fi.ModTime()
+	}
+	return mtimes
+}
+
+type instanceCandidate struct {
+	name  string
+	image string
+	age   time.Duration
+	size  config.DiskSize
+}
+
+func (ic instanceCandidate) toPrunedItem(dry bool) config.PrunedItem {
+	reason := fmt.Sprintf("stopped %s", humanDuration(ic.age))
+	if !dry {
+		reason = fmt.Sprintf("deleted (stopped %s)", humanDuration(ic.age))
+	}
+	return config.PrunedItem{
+		Kind: "instance", Name: ic.name, Action: "deleted",
+		Freed: ic.size, Reason: reason,
+	}
+}
+
+func (c *Client) collectInstanceCandidates(ctx context.Context, mtimes map[string]time.Time, until time.Duration) ([]instanceCandidate, []config.SkippedItem, error) {
+	sheds, err := c.ListSheds(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing sheds: %w", err)
+	}
+	var cands []instanceCandidate
+	var skipped []config.SkippedItem
+	now := time.Now()
+	for _, shed := range sheds {
+		if shed.Status != config.StatusStopped {
+			skipped = append(skipped, config.SkippedItem{
+				Kind: "instance", Name: shed.Name,
+				Reason: "cannot prune " + shed.Status + " shed",
+			})
+			continue
+		}
+		mtime, ok := mtimes[shed.Name]
+		if !ok {
+			continue
+		}
+		age := now.Sub(mtime)
+		if until > 0 && age < until {
+			skipped = append(skipped, config.SkippedItem{
+				Kind: "instance", Name: shed.Name,
+				Reason: fmt.Sprintf("too recent (%s < %s)", humanDuration(age), humanDuration(until)),
+			})
+			continue
+		}
+		cands = append(cands, instanceCandidate{
+			name:  shed.Name,
+			image: shed.Image,
+			age:   age,
+			size:  instanceSize(c.cfg.InstanceDir, shed.Name),
+		})
+	}
+	return cands, skipped, nil
+}
+
+func instanceSize(instanceDir, name string) config.DiskSize {
+	var size config.DiskSize
+	dir := InstanceDir(instanceDir, name)
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		logical, physical, err := diskstat.Stat(path)
+		if err == nil {
+			size.LogicalBytes += logical
+			size.PhysicalBytes += physical
+		}
+		return nil
+	})
+	return size
+}
+
+type orphanCandidate struct {
+	path string
+	kind string
+	size config.DiskSize
+}
+
+func (oc orphanCandidate) toPrunedItem(dry bool) config.PrunedItem {
+	reason := ""
+	if dry {
+		reason = "orphan (no matching rootfs)"
+	}
+	return config.PrunedItem{
+		Kind: oc.kind, Path: oc.path, Action: "deleted",
+		Freed: oc.size, Reason: reason,
+	}
+}
+
+func collectOrphanCandidates(imagesDir string) ([]orphanCandidate, []config.SkippedItem) {
+	var candidates []orphanCandidate
+	var skipped []config.SkippedItem
+
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		return nil, nil
+	}
+
+	presentRootfs := make(map[string]bool)
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), "-rootfs.ext4") {
+			presentRootfs[e.Name()] = true
+		}
+	}
+
+	now := time.Now()
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		base, kind := classifySidecar(name)
+		if base == "" || presentRootfs[base] {
+			continue
+		}
+		path := filepath.Join(imagesDir, name)
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+
+		if kind == "tmp" && now.Sub(fi.ModTime()) < tmpOrphanMinAge {
+			skipped = append(skipped, config.SkippedItem{
+				Kind: kind, Path: path,
+				Reason: fmt.Sprintf("too recent (%s < %s)", humanDuration(now.Sub(fi.ModTime())), humanDuration(tmpOrphanMinAge)),
+			})
+			continue
+		}
+
+		lockPath := filepath.Join(imagesDir, base+".lock")
+		release, held, err := vmimage.TryAcquireFileLock(lockPath)
+		if err != nil {
+			skipped = append(skipped, config.SkippedItem{
+				Kind: kind, Path: path,
+				Reason: fmt.Sprintf("lock probe failed: %v", err),
+			})
+			continue
+		}
+		if !held {
+			skipped = append(skipped, config.SkippedItem{
+				Kind: kind, Path: path,
+				Reason: "lock held (conversion in progress)",
+			})
+			continue
+		}
+		release()
+
+		logical, physical, _ := diskstat.Stat(path)
+		candidates = append(candidates, orphanCandidate{
+			path: path, kind: kind,
+			size: config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
+		})
+	}
+	return candidates, skipped
+}
+
+func sweepOrphan(imagesDir string, oc orphanCandidate) bool {
+	base := filepath.Base(oc.path)
+	rootfsBase, _ := classifySidecar(base)
+	if rootfsBase == "" {
+		return false
+	}
+	lockPath := filepath.Join(imagesDir, rootfsBase+".lock")
+	release, held, err := vmimage.TryAcquireFileLock(lockPath)
+	if err != nil || !held {
+		return false
+	}
+	defer release()
+
+	if oc.kind == "lock" {
+		// Leave the canonical .lock in place; see VZ sweepOrphan.
+		return true
+	}
+
+	if err := os.Remove(oc.path); err != nil {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	return true
+}
+
+func imageToPrunedItem(img vmimage.ImageInfo, dry bool) config.PrunedItem {
+	size := config.DiskSize{LogicalBytes: img.SizeBytes}
+	if img.Path != "" {
+		if logical, physical, err := diskstat.Stat(img.Path); err == nil {
+			size.LogicalBytes = logical
+			size.PhysicalBytes = physical
+		}
+	}
+	reason := ""
+	if dry {
+		reason = "unreferenced image"
+	}
+	return config.PrunedItem{
+		Kind: "image", Name: img.Name, Path: img.Path, Action: "deleted",
+		Freed: size, Reason: reason,
+	}
+}
+
+func finalizeReport(r *config.PruneReport) {
+	for _, item := range r.Items {
+		r.Totals.Freed.LogicalBytes += item.Freed.LogicalBytes
+		r.Totals.Freed.PhysicalBytes += item.Freed.PhysicalBytes
+	}
+	r.Totals.Items = len(r.Items)
+	r.Notes = append(r.Notes,
+		"physical bytes are attributed (stat.Blocks*512); clonefile/FICLONE clones and hardlinks may report bytes that won't actually be reclaimed",
+	)
+}
+
+func humanDuration(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int64(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int64(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int64(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int64(d.Hours()/24))
+	}
 }
