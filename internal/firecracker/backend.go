@@ -199,3 +199,13 @@ func (b *FirecrackerBackend) DeleteImage(_ context.Context, name string) error {
 func (b *FirecrackerBackend) PruneImages(_ context.Context, dryRun bool) ([]config.ImageInfo, error) {
 	return b.client.PruneImages(dryRun)
 }
+
+// DiskUsage returns disk-usage information for the Firecracker server.
+func (b *FirecrackerBackend) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
+	return b.client.DiskUsage(ctx)
+}
+
+// Prune runs the disk cleanup pass. See backend.PruneOptions for semantics.
+func (b *FirecrackerBackend) Prune(ctx context.Context, opts backend.PruneOptions) (config.PruneReport, error) {
+	return b.client.Prune(ctx, opts)
+}

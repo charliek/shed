@@ -432,3 +432,55 @@ func acquireFileLock(path string) (func(), error) {
 		// where concurrent processes can hold locks on different inodes.
 	}, nil
 }
+
+// TryAcquireFileLockBlocking takes an exclusive flock on path and blocks
+// until it's available. Use this from tests that need to simulate a
+// live conversion holding the lock.
+func TryAcquireFileLockBlocking(path string) (func(), error) {
+	return acquireFileLock(path)
+}
+
+// TryAcquireFileLock attempts a non-blocking exclusive flock on path.
+// Return values:
+//   - held=true with a non-nil release if the lock was acquired.
+//   - held=true with a no-op release if the lock file does NOT exist
+//     ("nothing to contend with" — safe for dry-run probes since we
+//     never create the file as a side effect).
+//   - held=false with release=nil, err=nil if another process holds it.
+//   - Any other I/O error is returned as err with held=false.
+//
+// This is the "is a conversion running right now?" probe used by
+// orphan-sweep in `shed system prune`. If the lock is live we must NOT
+// touch the sibling sidecars.
+//
+// Unlike acquireFileLock (blocking path used by image conversion), this
+// does NOT create the lock file if it's absent — required so dry-run
+// prune can probe without mutating disk.
+func TryAcquireFileLock(path string) (release func(), held bool, err error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No lock file = no contending conversion. Caller may proceed
+			// without holding a lock. Returning held=false with nil err
+			// would be ambiguous; signal success via held=true and a
+			// no-op release so callers treat it uniformly.
+			return func() {}, true, nil
+		}
+		return nil, false, err
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		// EWOULDBLOCK means someone else holds it — NOT an error.
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to acquire lock: %w", err)
+	}
+
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+		f.Close()
+		// Lock file intentionally not removed — see acquireFileLock.
+	}, true, nil
+}

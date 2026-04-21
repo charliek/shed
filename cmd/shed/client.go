@@ -417,6 +417,73 @@ func (c *APIClient) PruneImages(dryRun bool) (*config.PruneImagesResponse, error
 	return &resp, nil
 }
 
+// GetSystemDF retrieves disk usage information for the server.
+func (c *APIClient) GetSystemDF() (*config.DiskUsage, error) {
+	var du config.DiskUsage
+	if err := c.doRequest(http.MethodGet, "/api/system/df", nil, &du); err != nil {
+		return nil, err
+	}
+	return &du, nil
+}
+
+// SystemPruneOptions mirrors backend.PruneOptions for the CLI → API path.
+// Using a client-local struct avoids pulling the backend package into the
+// CLI (which doesn't need the rest of the Backend interface).
+type SystemPruneOptions struct {
+	Images       bool
+	Instances    bool
+	Logs         bool
+	Orphans      bool
+	DryRun       bool
+	Until        time.Duration
+	LogTailBytes int64
+}
+
+// pruneTimeout bounds prune requests. Large fleets can exceed DefaultTimeout;
+// use a generous ceiling modeled on create rather than 30s.
+const pruneTimeout = 10 * time.Minute
+
+// SystemPrune triggers a prune pass on the server and returns the report.
+// Scope flags are added as repeatable `scope=` query params; an empty scope
+// (all flags false) lets the server apply its default (images + instances
+// + orphans, no logs).
+func (c *APIClient) SystemPrune(opts SystemPruneOptions) (*config.PruneReport, error) {
+	path := "/api/system/prune"
+	q := make([]string, 0, 6)
+	if opts.Images {
+		q = append(q, "scope=images")
+	}
+	if opts.Instances {
+		q = append(q, "scope=instances")
+	}
+	if opts.Logs {
+		q = append(q, "scope=logs")
+	}
+	if opts.Orphans {
+		q = append(q, "scope=orphans")
+	}
+	if opts.DryRun {
+		q = append(q, "dry_run=true")
+	}
+	// Always send Until on the wire — a zero value from the user
+	// means "prune any age" and must reach the handler, otherwise
+	// the handler's 72h default would override their explicit intent.
+	// The CLI's cobra default (72h) is still preserved: flag unset →
+	// systemPruneFlagUntil == 72h → we send until=72h0m0s explicitly.
+	q = append(q, "until="+opts.Until.String())
+	if opts.LogTailBytes > 0 {
+		q = append(q, fmt.Sprintf("log_tail_bytes=%d", opts.LogTailBytes))
+	}
+	if len(q) > 0 {
+		path += "?" + strings.Join(q, "&")
+	}
+	var report config.PruneReport
+	if err := c.doRequestWithTimeout(http.MethodPost, path, nil, &report, pruneTimeout); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
 // Ping checks if the server is reachable.
 func (c *APIClient) Ping() bool {
 	client := &http.Client{

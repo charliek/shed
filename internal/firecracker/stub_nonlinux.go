@@ -116,3 +116,15 @@ func (b *FirecrackerBackend) DeleteImage(_ context.Context, _ string) error {
 func (b *FirecrackerBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
 	return nil, nil
 }
+
+// DiskUsage returns an empty disk-usage report on non-linux platforms.
+// Read-only system queries never error on a non-native backend — they just
+// report "no local state," matching the ListImages precedent.
+func (b *FirecrackerBackend) DiskUsage(_ context.Context) (config.DiskUsage, error) {
+	return config.DiskUsage{Backend: "none"}, nil
+}
+
+// Prune is a mutating operation; the non-native stub returns the sentinel.
+func (b *FirecrackerBackend) Prune(_ context.Context, _ backend.PruneOptions) (config.PruneReport, error) {
+	return config.PruneReport{}, fmt.Errorf("prune: %w", config.ErrNotSupportedSentinel)
+}

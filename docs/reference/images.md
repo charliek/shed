@@ -371,19 +371,16 @@ The common end-to-end flow when bumping image refs (for example, moving config f
 
 ## Disk Space
 
-Each variant produces a 20GB sparse ext4 image. Actual disk usage is much smaller (typically 2–5GB depending on the variant). Each running shed adds another 2–5GB for its own rootfs copy.
+Each variant is a 20 GB sparse ext4 image; actual usage is typically 2–5 GB depending on what the variant installed. Per-shed rootfs copies start out sharing extents with `_base` on reflink-capable filesystems (APFS, btrfs, xfs-reflink, ext4 with `reflink=1`) and grow copy-on-write as the VM writes. On non-reflink filesystems the rootfs is materialized as a full copy.
 
-Use `du -sh` to check actual usage:
+To measure usage, use `shed system df`:
 
 ```bash
-# VZ
-du -sh ~/Library/Application\ Support/shed/vz/*-rootfs.ext4
-du -sh ~/Library/Application\ Support/shed/vz/instances/*
-
-# Firecracker
-du -sh /var/lib/shed/firecracker/images/*-rootfs.ext4
-du -sh /var/lib/shed/firecracker/instances/*
+shed system df
+shed system df -v
 ```
+
+See [Disk Management](disk-management.md) for the full reflink strategy chain, the APFS extent-sharing caveat, how to check reflink support on Linux, and how to reclaim space with `shed system prune`.
 
 ## Requirements
 

@@ -272,6 +272,87 @@ shed image prune                 # Interactive confirmation
 shed image prune --force         # No confirmation
 ```
 
+## System (Disk Usage)
+
+### shed system df
+
+Shows disk usage for shed servers: image cache, per-instance rootfs copies, kernel/initrd, and orphan sidecar files.
+
+```bash
+shed system df [flags]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--all` | | `false` | Query every configured server (client-side fan-out) |
+| `--server` | `-s` | (default server) | Target a specific server (global flag) |
+| `--verbose` | `-v` | | Show per-image, per-shed, kernel, and orphan rows (global flag) |
+| `--json` | | `false` | Emit machine-readable JSON (global flag) |
+
+The rollup view groups files into four categories — images (including kernel and initrd), sheds (per-instance rootfs + console logs), orphans (stale `.lock`/`.tmp`/`.source` files), and totals. `-v` breaks each category into per-file rows.
+
+Both **logical** (apparent) and **physical** (allocated) bytes are reported. Physical bytes come from `stat.Blocks * 512`. On filesystems that support extent sharing (APFS clonefile, ext4/xfs reflink, hardlinks), the same bytes may be attributed to multiple files — so summed physical totals may overcount actual on-disk usage. A note on every report calls this out.
+
+**Multi-server (`--all`):** runs concurrently across every configured server. Offline or older servers (returning errors or 404) are reported inline without aborting; the command exits 0. In `--json` mode the response is `{servers: [{server_name, usage?, error?}, ...]}`.
+
+**Examples:**
+
+```bash
+shed system df                 # Rollup for the active server
+shed system df -v              # Per-image and per-shed detail
+shed system df --json | jq     # Pipe the raw wire type to jq
+shed system df --all           # Fan out across all configured servers
+shed system df -s mini2 --json # Query one specific server in JSON
+```
+
+### shed system prune
+
+Reclaims disk space by deleting unused images, stopped instances past an age threshold, and orphaned sidecar files. Optionally truncates VZ `console.log` files.
+
+```bash
+shed system prune [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--images` | `false` | Prune unreferenced cached images |
+| `--instances` | `false` | Prune stopped instances older than `--until` |
+| `--logs` | `false` | Truncate VZ `console.log` files (opt-in; no-op on Firecracker) |
+| `--orphans` | `false` | Remove `.tmp`/`.source` sidecars whose parent rootfs is gone |
+| `--dry-run` | `false` | Show candidates without mutating |
+| `--force` | `false` | Skip confirmation prompt; required with `--json` for the execute path |
+| `--until` | `72h` | Stopped-instance age threshold via `mtime(metadata.json)`. `0s` = any age |
+| `--log-tail-bytes` | `0` | Console log truncation target (`0` = server default, 5 MiB) |
+| `--all` | `false` | Prune on every configured server (client-side fan-out) |
+| `--server` (`-s`) | (default server) | Target a specific server (global flag) |
+| `--json` | `false` | Emit machine-readable JSON (global flag) |
+
+**Scope semantics:** flags are additive. If none of `--images/--instances/--logs/--orphans` is set, the server applies its default scope: images + instances + orphans (NOT logs, which is always opt-in).
+
+**Dry-run-first UX:** the command always previews candidates before mutating. Without `--force` the CLI prints the candidate table and prompts for confirmation. With `--force` it executes immediately. With `--dry-run` it previews and exits.
+
+**Age filtering:** stopped instances are pruned only when `mtime(metadata.json) < now - --until`. The mtime snapshot is captured before the staleness re-check that `shed list` would otherwise trigger, so transient running→stopped transitions don't reset the clock. `--until 0s` disables the age gate.
+
+**Orphan safety:** a sidecar (`.tmp`, `.source`, or `.lock`) is treated as an orphan only when its parent `{name}-rootfs.ext4` is absent **and** a non-blocking `flock()` on `{name}-rootfs.ext4.lock` succeeds (i.e., no conversion is in flight). `.tmp` files younger than 1 hour are skipped unconditionally. The canonical `.lock` file is never removed even when abandoned, to avoid the inode-reuse race documented in `shed image prune`.
+
+**Console log truncation (VZ only):** when `--logs` is set, each surviving VZ shed's `console.log` is truncated to its last `--log-tail-bytes` in place (preserves inode so `vfkit`'s `O_APPEND` file descriptor keeps writing past the new EOF). Firecracker does not produce a per-instance console log, so `--logs` is a silent no-op for FC sheds.
+
+**Freed bytes caveat:** reported `physical_bytes` come from `stat.Blocks * 512` and are attributed to each file — they reflect how much the filesystem said each file occupied, not how much disk is actually reclaimed. Files that share extents via clonefile/FICLONE clones or hardlinks may report bytes that won't be reclaimed until the last reference is removed. Compare `shed system df` before and after for true reclamation.
+
+**JSON + destructive:** `--json` without `--force` blocks the execute path. `--dry-run --json` is always allowed.
+
+**Examples:**
+
+```bash
+shed system prune --dry-run            # Preview default scope
+shed system prune                      # Preview + interactive confirm
+shed system prune --force              # Execute without prompt
+shed system prune --instances --until 1h --force
+shed system prune --logs --log-tail-bytes 1048576 --force
+shed system prune --all --force        # Prune every configured server
+shed system prune --json --dry-run     # Machine-readable preview
+```
+
 ## Interactive Access
 
 ### shed console

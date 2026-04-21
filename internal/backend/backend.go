@@ -87,4 +87,17 @@ type Backend interface {
 	// PruneImages removes cached images not referenced by config or existing sheds.
 	// If dryRun is true, returns candidates without deleting.
 	PruneImages(ctx context.Context, dryRun bool) ([]config.ImageInfo, error)
+
+	// System
+
+	// DiskUsage returns disk-usage information for everything this backend
+	// manages on the local server: image cache, per-instance rootfs copies,
+	// console logs, kernel/initrd, and orphan sidecar files. Client-side
+	// state under ~/.shed/ is out of scope.
+	DiskUsage(ctx context.Context) (config.DiskUsage, error)
+
+	// Prune removes items selected by opts. DryRun returns the report
+	// without mutating. Age-based instance pruning uses mtime(metadata.json)
+	// as the "last touched" proxy — see opts.Until.
+	Prune(ctx context.Context, opts PruneOptions) (config.PruneReport, error)
 }

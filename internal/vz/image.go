@@ -57,14 +57,40 @@ func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
 
 // inUseImageNames returns image names referenced by existing VZ instances.
 func (c *Client) inUseImageNames() ([]string, error) {
+	return c.inUseImageNamesExcept(nil)
+}
+
+// inUseImageNamesExcept returns image names referenced by existing VZ
+// instances whose names are NOT in skipSheds. Used by Prune's dry-run path
+// to simulate the post-instance-delete state so image candidates reflect
+// the fleet after instance deletions.
+//
+// Malformed metadata on a single instance is treated as "cannot confirm
+// image usage" — we skip-and-warn rather than failing the whole scan,
+// matching ListSheds' behavior. The upstream Manager.PruneImages still
+// fails-closed when its closure errors, so the protection is intact:
+// we only contribute names we could verify.
+func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, error) {
 	instances, err := ListInstances(c.cfg.InstanceDir)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	var names []string
 	for _, inst := range instances {
+		if skipSheds[inst] {
+			continue
+		}
 		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
 		if err != nil {
+			// Only the race-condition case (instance removed between
+			// ListInstances and LoadMetadata) is safe to skip silently.
+			// Any other error (malformed JSON, I/O failure, permission
+			// denied) means we cannot confirm in-use images and must
+			// fail closed, not fail open — otherwise prune might
+			// reclaim an image that's actually referenced.
+			if errors.Is(err, ErrInstanceNotFound) {
+				continue
+			}
 			return nil, err
 		}
 		if meta.Image != "" {

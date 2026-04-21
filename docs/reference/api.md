@@ -25,6 +25,8 @@ The `shed-server` exposes a REST API for managing sheds.
 | GET | `/api/images` | List available image variants |
 | DELETE | `/api/images/{name}` | Delete a cached image |
 | POST | `/api/images/prune` | Prune unused cached images |
+| GET | `/api/system/df` | Disk usage report (image cache, sheds, orphans) |
+| POST | `/api/system/prune` | Scoped disk cleanup (dry-run, images/instances/logs/orphans) |
 | GET | `/api/sheds/{name}/connect/{port}` | TCP tunnel via HTTP upgrade |
 | GET | `/api/plugins/listeners` | List active extension listeners |
 | GET | `/api/plugins/listeners/{ns}/messages` | Subscribe to namespace (SSE) |
@@ -394,6 +396,172 @@ Removes cached images not referenced by config or any existing shed.
 ```
 
 The `deleted` array contains the images that were removed (or would be removed if `dry_run=true`).
+
+## System
+
+### GET /api/system/df
+
+Returns disk usage information for the server: image cache, per-instance rootfs copies and console logs, kernel/initrd, and orphan sidecar files.
+
+**Response (200 OK):**
+
+```json
+{
+  "server_name": "prod-mac",
+  "backend": "vz",
+  "generated_at": "2026-04-20T11:23:45Z",
+  "images": [
+    {
+      "name": "default",
+      "path": "/Users/alice/Library/Application Support/shed/vz/default-rootfs.ext4",
+      "docker_ref": "ghcr.io/example/default:v1",
+      "size": {"logical_bytes": 5368709120, "physical_bytes": 4831838208}
+    },
+    {
+      "name": "_base",
+      "path": "/Users/alice/Library/Application Support/shed/vz/_base-rootfs.ext4",
+      "size": {"logical_bytes": 5368709120, "physical_bytes": 0},
+      "is_base": true
+    }
+  ],
+  "kernel": {
+    "path": "/Users/alice/Library/Application Support/shed/vz/vmlinux",
+    "size": {"logical_bytes": 8388608, "physical_bytes": 8388608},
+    "kind": "kernel"
+  },
+  "initrd": {
+    "path": "/Users/alice/Library/Application Support/shed/vz/initrd.img",
+    "size": {"logical_bytes": 102400, "physical_bytes": 102400},
+    "kind": "initrd"
+  },
+  "sheds": [
+    {
+      "name": "api-dev",
+      "status": "running",
+      "image": "default",
+      "rootfs": {
+        "path": "/Users/alice/Library/Application Support/shed/vz/instances/api-dev/rootfs.ext4",
+        "size": {"logical_bytes": 2147483648, "physical_bytes": 2147483648},
+        "kind": "rootfs"
+      },
+      "console_log": {
+        "path": "/Users/alice/Library/Application Support/shed/vz/instances/api-dev/console.log",
+        "size": {"logical_bytes": 819200, "physical_bytes": 819200},
+        "kind": "console_log"
+      },
+      "other_files": [],
+      "total": {"logical_bytes": 2148302848, "physical_bytes": 2148302848}
+    }
+  ],
+  "orphans": [
+    {
+      "path": "/Users/alice/Library/Application Support/shed/vz/stale-rootfs.ext4.lock",
+      "size": {"logical_bytes": 0, "physical_bytes": 0},
+      "kind": "lock"
+    }
+  ],
+  "totals": {
+    "images":  {"logical_bytes": 10737418240, "physical_bytes": 4840226816},
+    "sheds":   {"logical_bytes": 2148302848,  "physical_bytes": 2148302848},
+    "orphans": {"logical_bytes": 0,           "physical_bytes": 0},
+    "all":     {"logical_bytes": 12885721088, "physical_bytes": 6988529664}
+  },
+  "notes": [
+    "physical bytes may overcount shared extents on APFS (clonefile) or hardlinks"
+  ]
+}
+```
+
+**Field notes:**
+
+- `backend` is `"vz"`, `"firecracker"`, or `"none"` (the last when the native backend isn't available on this platform).
+- `console_log` is always absent on Firecracker (the FC SDK writes to stderr, not a per-instance file).
+- `initrd` is VZ-only — Firecracker has no initrd.
+- `physical_bytes` comes from `stat.Blocks * 512`. Files that share extents via clonefile/FICLONE or hardlinks may have those bytes counted against each referencing file, inflating sums.
+- `is_base` marks the runtime-managed `_base-rootfs.ext4` cache.
+
+**Multi-server aggregation:** the server never fans out; `shed system df --all` issues one request per configured server from the client and assembles the per-server results.
+
+### POST /api/system/prune
+
+Runs a disk cleanup pass. Returns a report of what was (or would be) removed or truncated. Dry-run returns the same shape without mutating.
+
+**Query parameters:**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `scope` | (default scope) | Repeatable. One of `images`, `instances`, `logs`, `orphans`. When omitted, the backend applies the default: `images + instances + orphans`. Unknown values return 400. |
+| `dry_run` | `false` | If true, return candidates without mutating. |
+| `until` | `72h` | Go `time.Duration` string. Stopped instances whose `mtime(metadata.json)` is younger than `now - until` are skipped. `0s` = any age. Negative values return 400. |
+| `log_tail_bytes` | `0` | Size console logs are truncated to when the `logs` scope is active. `0` uses the server default (5 MiB). |
+
+**Scope rules:**
+
+- `images` — runs `vmimage.Manager.PruneImages`; refuses images referenced by config or any surviving instance.
+- `instances` — deletes stopped sheds older than `until`. Uses `Client.DeleteShed` internally so TAP devices (Firecracker) and credential state are cleaned up correctly. Running sheds are never pruned.
+- `orphans` — removes `.tmp`/`.source` sidecars whose parent rootfs is absent, gated by a non-blocking `flock()` probe on the canonical `.lock` and a 1-hour minimum age for `.tmp` files. The canonical `.lock` file itself is always preserved.
+- `logs` — Firecracker: no-op (FC has no per-instance console log; each shed gets a `SkippedItem`). VZ: truncates `console.log` in place to `log_tail_bytes`.
+
+**Internal ordering (within a single Prune call):**
+
+1. Snapshot `mtime(metadata.json)` for every instance **before** calling `ListSheds` (which can refresh mtime via its staleness re-check).
+2. Collect candidates for instances, orphans, and images (image dry-run uses `inUseImageNamesExcept(<candidate sheds>)` to simulate the post-instance-delete state).
+3. If `dry_run`, return. Otherwise: delete instances first so their image references drop from `inUseImageNames`, then prune images, then sweep orphans, then truncate logs.
+
+**Response (200 OK):**
+
+```json
+{
+  "dry_run": false,
+  "server_name": "prod-mac",
+  "scope": ["images", "instances", "orphans"],
+  "until": "72h0m0s",
+  "items": [
+    {
+      "kind": "instance",
+      "name": "api-old",
+      "action": "deleted",
+      "freed": {"logical_bytes": 2147483648, "physical_bytes": 2147483648},
+      "reason": "deleted (stopped 5d)"
+    },
+    {
+      "kind": "image",
+      "name": "old-variant",
+      "path": "/var/lib/shed/vz/old-variant-rootfs.ext4",
+      "action": "deleted",
+      "freed": {"logical_bytes": 5368709120, "physical_bytes": 5368709120}
+    },
+    {
+      "kind": "tmp",
+      "path": "/var/lib/shed/vz/stale-rootfs.ext4.tmp",
+      "action": "deleted",
+      "freed": {"logical_bytes": 4096, "physical_bytes": 4096}
+    }
+  ],
+  "skipped": [
+    {"kind": "instance", "name": "api-dev", "reason": "cannot prune running shed"},
+    {"kind": "instance", "name": "api-test", "reason": "too recent (3h < 72h)"},
+    {"kind": "tmp", "path": "/var/lib/shed/vz/live-rootfs.ext4.tmp", "reason": "lock held (conversion in progress)"}
+  ],
+  "notes": [
+    "physical bytes are attributed (stat.Blocks*512); clonefile/FICLONE clones and hardlinks may report bytes that won't actually be reclaimed"
+  ],
+  "totals": {
+    "freed": {"logical_bytes": 7516196864, "physical_bytes": 7516196864},
+    "items": 3
+  }
+}
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | Invalid `dry_run`, `until`, `log_tail_bytes`, or an unknown `scope` value |
+| 500 | Backend error during prune |
+| 501 | Backend does not support prune (e.g., the VZ stub on non-darwin hosts) |
+
+**Timeouts:** the CLI uses a 10-minute client timeout for this endpoint since large fleets can exceed the default 30-second window used by list/get endpoints.
 
 ## Connect API
 

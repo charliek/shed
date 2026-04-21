@@ -186,6 +186,150 @@ type PruneImagesResponse struct {
 	Deleted []ImageInfo `json:"deleted"`
 }
 
+// DiskSize captures both apparent (logical) and allocated (physical) bytes.
+// PhysicalBytes comes from stat.Blocks * 512. On APFS and other reflink-capable
+// filesystems, a file's st_blocks counts cloned-but-unmodified extents against
+// every referencing file, so summing PhysicalBytes across files that share
+// extents (via clonefile, FICLONE, or hardlinks) overcounts the actual on-disk
+// usage. This is accepted for v1 and surfaced in DiskUsage.Notes.
+type DiskSize struct {
+	LogicalBytes  int64 `json:"logical_bytes"`
+	PhysicalBytes int64 `json:"physical_bytes"`
+}
+
+// FileEntry describes a single file with its size and classification.
+type FileEntry struct {
+	Path string   `json:"path"`
+	Size DiskSize `json:"size"`
+	// Kind is one of: "rootfs" | "console_log" | "kernel" | "initrd" |
+	// "lock" | "tmp" | "source" | "metadata".
+	Kind string `json:"kind,omitempty"`
+}
+
+// ImageDiskEntry is the df view of a cached image variant, carrying both
+// logical and physical bytes. Kept separate from ImageInfo so /api/images
+// wire format stays stable.
+type ImageDiskEntry struct {
+	Name      string   `json:"name"`
+	Path      string   `json:"path"`
+	DockerRef string   `json:"docker_ref,omitempty"`
+	Size      DiskSize `json:"size"`
+	// IsBase is true for the _base-rootfs.ext4 cache entry.
+	IsBase bool `json:"is_base,omitempty"`
+}
+
+// ShedDiskEntry describes one shed's per-instance disk footprint.
+type ShedDiskEntry struct {
+	Name       string      `json:"name"`
+	Status     string      `json:"status"`
+	Image      string      `json:"image,omitempty"`
+	Rootfs     FileEntry   `json:"rootfs"`
+	ConsoleLog *FileEntry  `json:"console_log,omitempty"` // nil for Firecracker
+	OtherFiles []FileEntry `json:"other_files,omitempty"`
+	Total      DiskSize    `json:"total"`
+}
+
+// DiskUsageTotals aggregates bytes across df sections.
+type DiskUsageTotals struct {
+	Images  DiskSize `json:"images"` // includes kernel + initrd
+	Sheds   DiskSize `json:"sheds"`
+	Orphans DiskSize `json:"orphans"`
+	All     DiskSize `json:"all"`
+}
+
+// DiskUsage is the payload returned by GET /api/system/df.
+type DiskUsage struct {
+	ServerName  string    `json:"server_name"`
+	Backend     string    `json:"backend"` // "vz" | "firecracker" | "none"
+	GeneratedAt time.Time `json:"generated_at"`
+
+	Images []ImageDiskEntry `json:"images"`
+	Kernel *FileEntry       `json:"kernel,omitempty"`
+	Initrd *FileEntry       `json:"initrd,omitempty"` // VZ only
+
+	Sheds   []ShedDiskEntry `json:"sheds"`
+	Orphans []FileEntry     `json:"orphans"`
+
+	Totals DiskUsageTotals `json:"totals"`
+
+	// Notes carries advisory caveats (APFS overcount, hardlink double-count, etc.).
+	Notes []string `json:"notes,omitempty"`
+}
+
+// DiskUsageOrError is one entry in a multi-server SystemDFResponse.
+// Exactly one of Usage or Error is populated.
+type DiskUsageOrError struct {
+	ServerName string     `json:"server_name"`
+	Usage      *DiskUsage `json:"usage,omitempty"`
+	Error      string     `json:"error,omitempty"`
+}
+
+// SystemDFResponse is the client-side aggregation of per-server df results
+// produced by `shed system df --all`. Never returned by the API directly.
+type SystemDFResponse struct {
+	Servers []DiskUsageOrError `json:"servers"`
+}
+
+// PrunedItem describes one file or object removed (or proposed for removal)
+// by `shed system prune`.
+type PrunedItem struct {
+	// Kind is one of: "image" | "rootfs" | "console_log" | "metadata" |
+	// "instance" | "lock" | "tmp" | "source".
+	Kind string `json:"kind"`
+	Path string `json:"path,omitempty"`
+	// Name is the shed or image name when applicable.
+	Name string `json:"name,omitempty"`
+	// Action is "deleted" or "truncated".
+	Action string `json:"action"`
+	// Freed is the bytes attributed to this item. For clones or hardlinks
+	// the physical count reflects attribution, not necessarily reclamation —
+	// see PruneReport.Notes.
+	Freed DiskSize `json:"freed"`
+	// Reason is a human-readable justification (e.g. "stopped 5d ago").
+	Reason string `json:"reason,omitempty"`
+}
+
+// SkippedItem is an entity the prune pass inspected but left alone, with a
+// short reason. Examples: running shed; stopped but too recent; lock held
+// by an in-flight conversion; malformed metadata.
+type SkippedItem struct {
+	Kind   string `json:"kind"`
+	Name   string `json:"name,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// PruneReportTotals summarizes what the prune pass did (or would do).
+type PruneReportTotals struct {
+	Freed DiskSize `json:"freed"`
+	Items int      `json:"items"`
+}
+
+// PruneReport is the payload returned by POST /api/system/prune.
+type PruneReport struct {
+	DryRun     bool              `json:"dry_run"`
+	ServerName string            `json:"server_name"`
+	Scope      []string          `json:"scope"`
+	Until      string            `json:"until"`
+	Items      []PrunedItem      `json:"items"`
+	Skipped    []SkippedItem     `json:"skipped,omitempty"`
+	Notes      []string          `json:"notes,omitempty"`
+	Totals     PruneReportTotals `json:"totals"`
+}
+
+// PruneReportOrError is one entry in a multi-server aggregated response.
+type PruneReportOrError struct {
+	ServerName string       `json:"server_name"`
+	Report     *PruneReport `json:"report,omitempty"`
+	Error      string       `json:"error,omitempty"`
+}
+
+// SystemPruneResponse is the client-side aggregation of per-server prune
+// results from `shed system prune --all`. Never returned by the API directly.
+type SystemPruneResponse struct {
+	Servers []PruneReportOrError `json:"servers"`
+}
+
 // CreateShedRequest is the request body for POST /api/sheds.
 type CreateShedRequest struct {
 	Name        string `json:"name"`
@@ -248,6 +392,7 @@ const (
 	ErrInvalidSessionName = "INVALID_SESSION_NAME"
 	ErrTmuxNotAvailable   = "TMUX_NOT_AVAILABLE"
 	ErrInvalidLocalDir    = "INVALID_LOCAL_DIR"
+	ErrInvalidRequest     = "INVALID_REQUEST"
 )
 
 // Backend type constants for Shed.Backend field.
