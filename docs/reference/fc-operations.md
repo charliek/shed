@@ -222,17 +222,19 @@ shed exec myproject -- curl -I https://google.com
 
 ### VM Disk Layout
 
-Each VM has a copy of the base rootfs:
+Each VM has its own rootfs derived from the base image:
 
 ```text
 /var/lib/shed/firecracker/instances/myproject/
 ├── metadata.json    # VM configuration and state
-└── rootfs.ext4      # VM's root filesystem (copy of base)
+└── rootfs.ext4      # VM's root filesystem (reflink of base when supported)
 
 /var/run/shed/firecracker/  # Runtime sockets (when VM is running)
 ├── myproject.sock   # Firecracker API socket
 └── myproject.vsock  # vsock UDS for guest communication
 ```
+
+On reflink-capable filesystems (btrfs, xfs with reflink, ext4 with `reflink=1` on kernel 6.7+), the per-shed rootfs shares extents with `_base` and adds near-zero physical bytes at create time; writes diverge copy-on-write. On non-reflink ext4 the rootfs is materialized as a full copy (~2–5 GB). See [Disk Management](disk-management.md) for the strategy chain, how to check reflink support, and how to measure per-shed cost.
 
 ### Expanding Disk Space
 

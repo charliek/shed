@@ -92,6 +92,8 @@ shed create my-project --repo git@github.com:user/repo.git
 shed create my-project --local-dir ~/projects/my-project
 ```
 
+Once you have a few sheds, `shed system df` shows what's on disk and `shed system prune` reclaims unused space. See [Disk Management](../reference/disk-management.md).
+
 ## Connect
 
 ### Direct Shell

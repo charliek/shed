@@ -371,23 +371,16 @@ The common end-to-end flow when bumping image refs (for example, moving config f
 
 ## Disk Space
 
-Each variant produces a 20GB sparse ext4 image. Actual disk usage is much smaller (typically 2–5GB depending on the variant). When a shed is created, its rootfs starts out sharing disk extents with the base image via `clonefile` on macOS/APFS or `FICLONE` (ext4/xfs/btrfs reflink) on Linux — the copy is near-instant and adds near-zero physical bytes until the VM begins writing. Writes diverge on a CoW basis from that point, so long-lived sheds grow gradually.
+Each variant is a 20 GB sparse ext4 image; actual usage is typically 2–5 GB depending on what the variant installed. Per-shed rootfs copies start out sharing extents with `_base` on reflink-capable filesystems (APFS, btrfs, xfs-reflink, ext4 with `reflink=1`) and grow copy-on-write as the VM writes. On non-reflink filesystems the rootfs is materialized as a full copy.
 
-If the filesystem doesn't support reflink (e.g. ext4 without the `reflink=1` option, tmpfs), the backend falls back to Linux's `copy_file_range(2)` or finally to a userspace copy. The strategy is logged once per `shed create` on the server, with format:
-
-```text
-rootfs strategy=<clonefile|ficlone|copy_file_range|io_copy> src=... dst=... logical_bytes=...
-```
-
-To see current disk consumption, prefer `shed system df` (reports both apparent and allocated bytes and surfaces the APFS extent-sharing overcount caveat):
+To measure usage, use `shed system df`:
 
 ```bash
 shed system df
-shed system df -v    # per-image and per-shed rows
-shed system df --json | jq
+shed system df -v
 ```
 
-`du -sh` works too but is noisy on APFS because each reflink reference counts against every file that holds it.
+See [Disk Management](disk-management.md) for the full reflink strategy chain, the APFS extent-sharing caveat, how to check reflink support on Linux, and how to reclaim space with `shed system prune`.
 
 ## Requirements
 
