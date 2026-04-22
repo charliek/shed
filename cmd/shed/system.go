@@ -694,24 +694,3 @@ func sumFreedLogical(items []config.PrunedItem) int64 {
 	}
 	return sum
 }
-
-// formatSize renders a byte count with sensible units. Unlike the coarse
-// formatBytes in image.go (GB/MB only), this handles B through GB because df
-// surfaces everything from bytes (lock files) to multi-GB rootfs images.
-func formatSize(b int64) string {
-	const (
-		gb = 1024 * 1024 * 1024
-		mb = 1024 * 1024
-		kb = 1024
-	)
-	switch {
-	case b >= gb:
-		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
-	case b >= mb:
-		return fmt.Sprintf("%.1f MB", float64(b)/float64(mb))
-	case b >= kb:
-		return fmt.Sprintf("%.1f KB", float64(b)/float64(kb))
-	default:
-		return fmt.Sprintf("%d B", b)
-	}
-}

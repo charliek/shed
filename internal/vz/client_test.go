@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/vmutil"
@@ -282,6 +283,60 @@ func TestBuildCredentialShares(t *testing.T) {
 	}
 	if shareMap["cred-gh"] != "/home/user/.config/gh" {
 		t.Error("expected cred-gh share with source /home/user/.config/gh")
+	}
+}
+
+// TestAcquireCreateLock covers the lock that closes the CreateShed /
+// CopyRootfs TOCTOU race described in rootfs.go: same-name acquires must
+// serialize; different-name acquires must run in parallel.
+func TestAcquireCreateLock(t *testing.T) {
+	tests := []struct {
+		name        string
+		firstName   string
+		secondName  string
+		shouldBlock bool
+	}{
+		{"same name serializes", "same", "same", true},
+		{"different names do not block", "a", "b", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{}
+			release1 := c.acquireCreateLock(tt.firstName)
+
+			acquired := make(chan struct{})
+			go func() {
+				release2 := c.acquireCreateLock(tt.secondName)
+				close(acquired)
+				release2()
+			}()
+
+			if tt.shouldBlock {
+				select {
+				case <-acquired:
+					release1()
+					t.Fatal("second acquireCreateLock should have blocked")
+				case <-time.After(100 * time.Millisecond):
+					// expected: still blocked on the first holder
+				}
+				release1()
+				select {
+				case <-acquired:
+					// expected: unblocked after release
+				case <-time.After(time.Second):
+					t.Fatal("second acquireCreateLock did not proceed after release")
+				}
+			} else {
+				defer release1()
+				select {
+				case <-acquired:
+					// expected: different names run in parallel
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("acquireCreateLock for different names must not block")
+				}
+			}
+		})
 	}
 }
 

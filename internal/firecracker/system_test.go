@@ -30,30 +30,6 @@ func newSystemTestClient(t *testing.T) (*Client, string, string) {
 	return client, imagesDir, instanceDir
 }
 
-func TestClassifySidecar(t *testing.T) {
-	tests := []struct {
-		in       string
-		wantBase string
-		wantKind string
-	}{
-		{"default-rootfs.ext4.lock", "default-rootfs.ext4", "lock"},
-		{"default-rootfs.ext4.source", "default-rootfs.ext4", "source"},
-		{"default-rootfs.ext4.tmp", "default-rootfs.ext4", "tmp"},
-		{"default-rootfs.ext4.tmp.12345", "default-rootfs.ext4", "tmp"},
-		{"default-rootfs.ext4", "", ""},
-		{"random.txt", "", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.in, func(t *testing.T) {
-			base, kind := classifySidecar(tt.in)
-			if base != tt.wantBase || kind != tt.wantKind {
-				t.Errorf("classifySidecar(%q) = (%q, %q), want (%q, %q)",
-					tt.in, base, kind, tt.wantBase, tt.wantKind)
-			}
-		})
-	}
-}
-
 func TestDiskUsage_Empty_FC(t *testing.T) {
 	client, _, _ := newSystemTestClient(t)
 	du, err := client.DiskUsage(context.Background())

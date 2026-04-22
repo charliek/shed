@@ -260,7 +260,7 @@ func runImageList(_ *cobra.Command, _ []string) error {
 	for _, img := range resp.Images {
 		size := "-"
 		if img.SizeBytes > 0 {
-			size = formatBytes(img.SizeBytes)
+			size = formatSize(img.SizeBytes)
 		}
 		cached := "no"
 		if img.Cached {
@@ -274,15 +274,6 @@ func runImageList(_ *cobra.Command, _ []string) error {
 	}
 	w.Flush()
 	return nil
-}
-
-func formatBytes(b int64) string {
-	const gb = 1024 * 1024 * 1024
-	const mb = 1024 * 1024
-	if b >= gb {
-		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
-	}
-	return fmt.Sprintf("%.0f MB", float64(b)/float64(mb))
 }
 
 func runImageDelete(_ *cobra.Command, args []string) error {
@@ -317,7 +308,7 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 	if !imageDeleteForce {
 		prompt := fmt.Sprintf("Delete image %q", name)
 		if targetImage != nil && targetImage.SizeBytes > 0 {
-			prompt += fmt.Sprintf(" (%s)", formatBytes(targetImage.SizeBytes))
+			prompt += fmt.Sprintf(" (%s)", formatSize(targetImage.SizeBytes))
 		}
 		prompt += "? [y/N] "
 		if !confirmAction(prompt) {
@@ -344,7 +335,7 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 
 	msg := fmt.Sprintf("Deleted image %s", name)
 	if targetImage != nil && targetImage.SizeBytes > 0 {
-		msg += fmt.Sprintf(" (freed %s)", formatBytes(targetImage.SizeBytes))
+		msg += fmt.Sprintf(" (freed %s)", formatSize(targetImage.SizeBytes))
 	}
 	printSuccess(msg)
 	return nil
@@ -389,7 +380,7 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 		for _, img := range dryResp.Deleted {
 			size := "-"
 			if img.SizeBytes > 0 {
-				size = formatBytes(img.SizeBytes)
+				size = formatSize(img.SizeBytes)
 			}
 			ref := img.DockerRef
 			if ref == "" {
@@ -407,7 +398,7 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 		}
 		fmt.Printf("Would prune %d image(s)", len(dryResp.Deleted))
 		if totalSize > 0 {
-			fmt.Printf(" (%s)", formatBytes(totalSize))
+			fmt.Printf(" (%s)", formatSize(totalSize))
 		}
 		fmt.Println()
 		return nil
@@ -416,7 +407,7 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 	if !imagePruneForce {
 		prompt := fmt.Sprintf("Delete %d image(s)", len(dryResp.Deleted))
 		if totalSize > 0 {
-			prompt += fmt.Sprintf(" (%s)", formatBytes(totalSize))
+			prompt += fmt.Sprintf(" (%s)", formatSize(totalSize))
 		}
 		prompt += "? [y/N] "
 		if !confirmAction(prompt) {
@@ -441,7 +432,7 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 	}
 	msg := fmt.Sprintf("Pruned %d image(s)", len(pruneResp.Deleted))
 	if freedSize > 0 {
-		msg += fmt.Sprintf(" (freed %s)", formatBytes(freedSize))
+		msg += fmt.Sprintf(" (freed %s)", formatSize(freedSize))
 	}
 	printSuccess(msg)
 	return nil
