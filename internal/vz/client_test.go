@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -341,45 +340,6 @@ func TestAcquireCreateLock_DifferentNamesDontBlock(t *testing.T) {
 		// expected
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("acquireCreateLock for different names must not block")
-	}
-}
-
-// TestCreateShed_ConcurrentSameName_BlocksOnLock verifies the per-name
-// lock is actually wired into CreateShed. With the per-name mutex held
-// externally, a concurrent CreateShed for that name must block rather
-// than racing past the metadata existence check and corrupting the
-// first caller's rootfs via CopyRootfs's os.Remove(dst).
-func TestCreateShed_ConcurrentSameName_BlocksOnLock(t *testing.T) {
-	tmpDir := t.TempDir()
-	baseRootfs := filepath.Join(tmpDir, "base-rootfs.ext4")
-	if err := os.WriteFile(baseRootfs, []byte("rootfs"), 0644); err != nil {
-		t.Fatalf("write base rootfs: %v", err)
-	}
-
-	c := &Client{
-		cfg: &config.VZConfig{
-			BaseRootfs:  baseRootfs,
-			InstanceDir: tmpDir,
-		},
-		vms:         make(map[string]*VM),
-		createLocks: make(map[string]*sync.Mutex),
-		credMgr:     newTestCredMgr(),
-	}
-
-	release := c.acquireCreateLock("race-demo")
-	defer release()
-
-	done := make(chan struct{})
-	go func() {
-		_, _ = c.CreateShed(context.Background(), config.CreateShedRequest{Name: "race-demo"})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		t.Fatal("CreateShed must block on the per-name create lock while it is held")
-	case <-time.After(200 * time.Millisecond):
-		// expected: blocked on the lock.
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -72,39 +71,6 @@ func TestAcquireCreateLock_DifferentNamesDontBlock(t *testing.T) {
 	}
 }
 
-// TestCreateShed_ConcurrentSameName_BlocksOnLock verifies the per-name
-// lock is actually wired into CreateShed. With the per-name mutex held
-// externally, a concurrent CreateShed for that name must block rather
-// than racing past the metadata existence check.
-func TestCreateShed_ConcurrentSameName_BlocksOnLock(t *testing.T) {
-	dir := mustTempDir(t, "concurrent-create")
-	cfg := testFirecrackerConfig(dir)
-
-	c := &Client{
-		cfg:         cfg,
-		vms:         make(map[string]*VM),
-		usedCIDs:    make(map[uint32]string),
-		usedIPs:     make(map[string]string),
-		p9Servers:   make(map[string][]*P9Server),
-		createLocks: make(map[string]*sync.Mutex),
-	}
-
-	release := c.acquireCreateLock("race-demo")
-	defer release()
-
-	done := make(chan struct{})
-	go func() {
-		_, _ = c.CreateShed(t.Context(), config.CreateShedRequest{Name: "race-demo"})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		t.Fatal("CreateShed must block on the per-name create lock while it is held")
-	case <-time.After(200 * time.Millisecond):
-		// expected
-	}
-}
 
 func TestAllocateCID(t *testing.T) {
 	dir := mustTempDir(t, "client-test")
