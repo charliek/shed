@@ -8,11 +8,103 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
 )
+
+// TestAcquireCreateLock_SerializesSameName verifies that two
+// acquireCreateLock calls for the same shed name serialize — the second
+// blocks until the first releases. This is the lock that closes the
+// CreateShed / CopyRootfs TOCTOU race described in rootfs.go.
+func TestAcquireCreateLock_SerializesSameName(t *testing.T) {
+	c := &Client{}
+
+	release1 := c.acquireCreateLock("same")
+
+	acquired := make(chan struct{})
+	go func() {
+		release2 := c.acquireCreateLock("same")
+		close(acquired)
+		release2()
+	}()
+
+	select {
+	case <-acquired:
+		release1()
+		t.Fatal("second acquireCreateLock for same name should have blocked")
+	case <-time.After(100 * time.Millisecond):
+		// expected
+	}
+
+	release1()
+
+	select {
+	case <-acquired:
+		// expected
+	case <-time.After(time.Second):
+		t.Fatal("second acquireCreateLock did not proceed after release")
+	}
+}
+
+// TestAcquireCreateLock_DifferentNamesDontBlock verifies that concurrent
+// creates for distinct names still run in parallel.
+func TestAcquireCreateLock_DifferentNamesDontBlock(t *testing.T) {
+	c := &Client{}
+
+	release1 := c.acquireCreateLock("a")
+	defer release1()
+
+	acquired := make(chan struct{})
+	go func() {
+		release2 := c.acquireCreateLock("b")
+		close(acquired)
+		release2()
+	}()
+
+	select {
+	case <-acquired:
+		// expected
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("acquireCreateLock for different names must not block")
+	}
+}
+
+// TestCreateShed_ConcurrentSameName_BlocksOnLock verifies the per-name
+// lock is actually wired into CreateShed. With the per-name mutex held
+// externally, a concurrent CreateShed for that name must block rather
+// than racing past the metadata existence check.
+func TestCreateShed_ConcurrentSameName_BlocksOnLock(t *testing.T) {
+	dir := mustTempDir(t, "concurrent-create")
+	cfg := testFirecrackerConfig(dir)
+
+	c := &Client{
+		cfg:         cfg,
+		vms:         make(map[string]*VM),
+		usedCIDs:    make(map[uint32]string),
+		usedIPs:     make(map[string]string),
+		p9Servers:   make(map[string][]*P9Server),
+		createLocks: make(map[string]*sync.Mutex),
+	}
+
+	release := c.acquireCreateLock("race-demo")
+	defer release()
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = c.CreateShed(t.Context(), config.CreateShedRequest{Name: "race-demo"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("CreateShed must block on the per-name create lock while it is held")
+	case <-time.After(200 * time.Millisecond):
+		// expected
+	}
+}
 
 func TestAllocateCID(t *testing.T) {
 	dir := mustTempDir(t, "client-test")

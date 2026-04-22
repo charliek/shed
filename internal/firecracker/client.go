@@ -34,6 +34,15 @@ type Client struct {
 	usedIPs   map[string]string      // IP -> name
 	p9Servers map[string][]*P9Server // name -> active 9P servers for this VM
 
+	// createLocks serializes CreateShed calls by shed name to close the
+	// TOCTOU between the already-exists check and the final meta.Save.
+	// Two racing `shed create` calls for the same name would otherwise
+	// both pass the existence check and the second caller's CopyRootfs
+	// would os.Remove the first caller's just-cloned rootfs. createMu
+	// guards the map; each value is locked across a single CreateShed.
+	createMu    sync.Mutex
+	createLocks map[string]*sync.Mutex
+
 	// Credential sync
 	credMgr *vmutil.CredentialManager
 }
@@ -46,14 +55,15 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, br
 	}
 
 	client := &Client{
-		cfg:       cfg,
-		serverCfg: serverCfg,
-		netMgr:    netMgr,
-		vms:       make(map[string]*VM),
-		usedCIDs:  make(map[uint32]string),
-		usedIPs:   make(map[string]string),
-		p9Servers: make(map[string][]*P9Server),
-		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
+		cfg:         cfg,
+		serverCfg:   serverCfg,
+		netMgr:      netMgr,
+		vms:         make(map[string]*VM),
+		usedCIDs:    make(map[uint32]string),
+		usedIPs:     make(map[string]string),
+		p9Servers:   make(map[string][]*P9Server),
+		createLocks: make(map[string]*sync.Mutex),
+		credMgr:     vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -83,6 +93,25 @@ func (c *Client) loadExistingInstances() error {
 	}
 
 	return nil
+}
+
+// acquireCreateLock returns an unlock closure after taking the per-name
+// create mutex. Callers MUST defer the returned closure. The per-name
+// mutex is leaked on first use — bounded by the number of distinct shed
+// names ever created in this process, which is effectively negligible.
+func (c *Client) acquireCreateLock(name string) func() {
+	c.createMu.Lock()
+	if c.createLocks == nil {
+		c.createLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := c.createLocks[name]
+	if !ok {
+		mu = &sync.Mutex{}
+		c.createLocks[name] = mu
+	}
+	c.createMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // Close closes the client and releases resources.
@@ -345,6 +374,11 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
 	}
+
+	// Serialize CreateShed calls for the same name so the existence check
+	// below and CopyRootfs's os.Remove(dst) can't race two concurrent
+	// creates into corrupting the first caller's rootfs.
+	defer c.acquireCreateLock(req.Name)()
 
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)

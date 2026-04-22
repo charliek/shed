@@ -25,8 +25,10 @@ func RootfsPath(instanceDir, name string) string {
 // Both FICLONE and copy_file_range require dst to not already exist;
 // pre-clean any stale dst before invoking the chain.
 //
-// CONCURRENCY: single-writer-per-shed-name is assumed. See the matching
-// comment in internal/vz/rootfs.go for details on the TOCTOU window.
+// CONCURRENCY: single-writer-per-shed-name is enforced upstream by
+// Client.acquireCreateLock, which wraps the whole CreateShed flow. The
+// unconditional os.Remove(dst) below is therefore safe against racing
+// `shed create` calls for the same name.
 func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 	dst := RootfsPath(instanceDir, name)
 

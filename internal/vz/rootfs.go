@@ -26,16 +26,10 @@ func RootfsPath(instanceDir, name string) string {
 // both require dst to not exist. A prior failed create may have left
 // rootfs.ext4 behind; remove it first (ignoring "already gone").
 //
-// CONCURRENCY: this function assumes a single-writer-per-shed-name
-// contract. Higher-level code in CreateShed performs a LoadMetadata
-// existence check before calling in, but that check has a TOCTOU window
-// with the metadata Save. Two concurrent `shed create` calls for the
-// same name could both pass the existence check; the unconditional
-// os.Remove(dst) here would let the second caller delete the first
-// caller's newly-cloned rootfs. In practice the window is narrow
-// (microseconds to a few seconds) and shed names are user-supplied and
-// rarely raced. A per-name mutex would close the race at the cost of
-// serializing creates; out of scope for this change.
+// CONCURRENCY: single-writer-per-shed-name is enforced upstream by
+// Client.acquireCreateLock, which wraps the whole CreateShed flow. The
+// unconditional os.Remove(dst) below is therefore safe against racing
+// `shed create` calls for the same name.
 func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 	dst := RootfsPath(instanceDir, name)
 
