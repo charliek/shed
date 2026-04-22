@@ -286,60 +286,57 @@ func TestBuildCredentialShares(t *testing.T) {
 	}
 }
 
-// TestAcquireCreateLock_SerializesSameName verifies that two acquireCreateLock
-// calls for the same shed name serialize — the second blocks until the
-// first releases. This is the lock that closes the CreateShed / CopyRootfs
-// TOCTOU race described in rootfs.go.
-func TestAcquireCreateLock_SerializesSameName(t *testing.T) {
-	c := &Client{}
-
-	release1 := c.acquireCreateLock("same")
-
-	acquired := make(chan struct{})
-	go func() {
-		release2 := c.acquireCreateLock("same")
-		close(acquired)
-		release2()
-	}()
-
-	select {
-	case <-acquired:
-		release1()
-		t.Fatal("second acquireCreateLock for same name should have blocked")
-	case <-time.After(100 * time.Millisecond):
-		// expected: still blocked on the first holder
+// TestAcquireCreateLock covers the lock that closes the CreateShed /
+// CopyRootfs TOCTOU race described in rootfs.go: same-name acquires must
+// serialize; different-name acquires must run in parallel.
+func TestAcquireCreateLock(t *testing.T) {
+	tests := []struct {
+		name        string
+		firstName   string
+		secondName  string
+		shouldBlock bool
+	}{
+		{"same name serializes", "same", "same", true},
+		{"different names do not block", "a", "b", false},
 	}
 
-	release1()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{}
+			release1 := c.acquireCreateLock(tt.firstName)
 
-	select {
-	case <-acquired:
-		// expected: unblocked once the first released
-	case <-time.After(time.Second):
-		t.Fatal("second acquireCreateLock did not proceed after release")
-	}
-}
+			acquired := make(chan struct{})
+			go func() {
+				release2 := c.acquireCreateLock(tt.secondName)
+				close(acquired)
+				release2()
+			}()
 
-// TestAcquireCreateLock_DifferentNamesDontBlock verifies that concurrent
-// creates for distinct names still run in parallel.
-func TestAcquireCreateLock_DifferentNamesDontBlock(t *testing.T) {
-	c := &Client{}
-
-	release1 := c.acquireCreateLock("a")
-	defer release1()
-
-	acquired := make(chan struct{})
-	go func() {
-		release2 := c.acquireCreateLock("b")
-		close(acquired)
-		release2()
-	}()
-
-	select {
-	case <-acquired:
-		// expected
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("acquireCreateLock for different names must not block")
+			if tt.shouldBlock {
+				select {
+				case <-acquired:
+					release1()
+					t.Fatal("second acquireCreateLock should have blocked")
+				case <-time.After(100 * time.Millisecond):
+					// expected: still blocked on the first holder
+				}
+				release1()
+				select {
+				case <-acquired:
+					// expected: unblocked after release
+				case <-time.After(time.Second):
+					t.Fatal("second acquireCreateLock did not proceed after release")
+				}
+			} else {
+				defer release1()
+				select {
+				case <-acquired:
+					// expected: different names run in parallel
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("acquireCreateLock for different names must not block")
+				}
+			}
+		})
 	}
 }
 
