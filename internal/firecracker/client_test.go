@@ -71,7 +71,6 @@ func TestAcquireCreateLock_DifferentNamesDontBlock(t *testing.T) {
 	}
 }
 
-
 func TestAllocateCID(t *testing.T) {
 	dir := mustTempDir(t, "client-test")
 	cfg := testFirecrackerConfig(dir)
