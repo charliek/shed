@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.4.2
+
+- **Snapshots — machine-id regeneration:** Every shed (fresh-create AND snapshot-spawn) now gets a unique `/etc/machine-id` at every VM boot. Pre-fix, `dbus`'s postinst baked a single UUID into the rootfs at Docker build time, so all sheds inherited it; spawning multiple sheds from one snapshot collided on identity. Fixed in both rootfs Dockerfiles via systemd's "transient machine-id" pattern: `/etc/machine-id` is a symlink to `/run/machine-id` (tmpfs), `/var/lib/dbus/machine-id` symlinks to `/etc/machine-id`, and `systemd-machine-id-commit.service` is masked so systemd doesn't replace the symlink with a regular file. PID 1 generates a fresh UUID per boot; nothing persists to disk. **Behavior change:** machine-id regenerates on every boot of the same shed, not just first boot. For applications that key persistent state on machine-id and expect it stable across reboots, recreate the shed instead of stop+starting it. Documented in `docs/reference/snapshots.md`.
+- **Snapshots — SSH host key comment:** `shed-firstboot` now sets `/etc/hostname` BEFORE running `ssh-keygen -A`, so cloned sheds' SSH host keys carry the spawn's hostname (e.g. `root@my-spawn`) in the comment field rather than the source's.
+- **Snapshots — internal cleanup:** `shed-firstboot` no longer touches machine-id (the previous `truncate + systemd-machine-id-setup` flow was broken — it pulled the source's value back from `/var/lib/dbus/machine-id`). With the rootfs symlink in place, machine-id is handled cleanly by systemd alone.
+
 ## v0.4.1
 
 - **Snapshots:** Drop `ConditionVirtualization=vm` from `shed-firstboot.service`. In v0.4.0 the unit was loaded and enabled but never ran on snapshot-spawned sheds because `systemd-detect-virt` returns `docker` inside the Docker-built rootfs (container-y artifacts in `/` confuse detection), and the condition blocked the boot. The shed-firstboot binary already short-circuits when `/proc/cmdline` has no `shed.name=`, so the systemd-side gate was redundant. After this fix, snapshot-spawned sheds get fresh SSH host keys and the correct hostname on first boot. (The machine-id PID 1 caching caveat from `docs/reference/snapshots.md` still applies — fix is queued for a follow-up.)
