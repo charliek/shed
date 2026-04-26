@@ -128,3 +128,25 @@ func (b *FirecrackerBackend) DiskUsage(_ context.Context) (config.DiskUsage, err
 func (b *FirecrackerBackend) Prune(_ context.Context, _ backend.PruneOptions) (config.PruneReport, error) {
 	return config.PruneReport{}, fmt.Errorf("prune: %w", config.ErrNotSupportedSentinel)
 }
+
+// CreateSnapshot returns an error on non-linux platforms. Uses the
+// not-supported sentinel so the API layer can map it consistently with the
+// other unsupported snapshot methods (e.g., to 501 Not Implemented).
+func (b *FirecrackerBackend) CreateSnapshot(_ context.Context, _ config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	return nil, fmt.Errorf("create snapshot: %w", config.ErrNotSupportedSentinel)
+}
+
+// ListSnapshots returns an empty list on non-linux platforms.
+func (b *FirecrackerBackend) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
+	return nil, nil
+}
+
+// GetSnapshot returns an error on non-linux platforms.
+func (b *FirecrackerBackend) GetSnapshot(_ context.Context, _ string) (*config.Snapshot, error) {
+	return nil, fmt.Errorf("get snapshot: %w", config.ErrNotSupportedSentinel)
+}
+
+// DeleteSnapshot returns an error on non-linux platforms.
+func (b *FirecrackerBackend) DeleteSnapshot(_ context.Context, _ string) error {
+	return fmt.Errorf("delete snapshot: %w", config.ErrNotSupportedSentinel)
+}

@@ -39,6 +39,18 @@ var (
 
 	// ErrNotSupportedSentinel is returned when an operation is not supported by a backend.
 	ErrNotSupportedSentinel = errors.New("not supported by this backend")
+
+	// ErrSnapshotNotFoundSentinel is returned when a snapshot does not exist.
+	ErrSnapshotNotFoundSentinel = errors.New("snapshot not found")
+
+	// ErrSnapshotAlreadyExistsSentinel is returned when creating a snapshot that already exists.
+	ErrSnapshotAlreadyExistsSentinel = errors.New("snapshot already exists")
+
+	// ErrSnapshotSourceRunningSentinel is returned when snapshotting a running shed.
+	ErrSnapshotSourceRunningSentinel = errors.New("source shed is running; stop it before snapshotting")
+
+	// ErrSnapshotBackendMismatchSentinel is returned when spawning a snapshot on the wrong backend.
+	ErrSnapshotBackendMismatchSentinel = errors.New("snapshot backend does not match target")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -69,24 +81,44 @@ func ValidateShedName(name string) error {
 	return nil
 }
 
+// ValidateSnapshotName validates that a snapshot name is valid.
+// Snapshot names follow the same rules as shed names.
+func ValidateSnapshotName(name string) error {
+	if name == "" {
+		return fmt.Errorf("snapshot name cannot be empty")
+	}
+
+	if len(name) > MaxShedNameLength {
+		return fmt.Errorf("snapshot name cannot exceed %d characters", MaxShedNameLength)
+	}
+
+	if !shedNameRegex.MatchString(name) {
+		return fmt.Errorf("snapshot name must be lowercase alphanumeric with hyphens (not at start/end), starting with a letter")
+	}
+
+	return nil
+}
+
 // Shed represents a development environment container.
 type Shed struct {
-	Name        string                         `json:"name" yaml:"name"`
-	Status      string                         `json:"status" yaml:"status"`
-	CreatedAt   time.Time                      `json:"created_at" yaml:"created_at"`
-	Repo        string                         `json:"repo,omitempty" yaml:"repo,omitempty"`
-	ContainerID string                         `json:"container_id" yaml:"container_id"`
-	Backend     string                         `json:"backend,omitempty" yaml:"backend,omitempty"`
-	IPAddress   string                         `json:"ip_address,omitempty" yaml:"ip_address,omitempty"`
-	CPUs        int                            `json:"cpus,omitempty" yaml:"cpus,omitempty"`
-	MemoryMB    int                            `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
-	PID         int                            `json:"pid,omitempty" yaml:"pid,omitempty"`
-	RootfsPath  string                         `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
-	LocalDir    string                         `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
-	Image       string                         `json:"image,omitempty" yaml:"image,omitempty"`
-	LastHealthy *time.Time                     `json:"last_healthy,omitempty" yaml:"last_healthy,omitempty"` // last heartbeat from agent (VM backends only)
-	StartedAt   *time.Time                     `json:"started_at,omitempty" yaml:"started_at,omitempty"`     // agent boot time from heartbeat (VM backends only)
-	Extensions  map[string]ExtensionHealthInfo `json:"extensions,omitempty" yaml:"extensions,omitempty"`     // per-extension health (VM backends only)
+	Name        string    `json:"name" yaml:"name"`
+	Status      string    `json:"status" yaml:"status"`
+	CreatedAt   time.Time `json:"created_at" yaml:"created_at"`
+	Repo        string    `json:"repo,omitempty" yaml:"repo,omitempty"`
+	ContainerID string    `json:"container_id" yaml:"container_id"`
+	Backend     string    `json:"backend,omitempty" yaml:"backend,omitempty"`
+	IPAddress   string    `json:"ip_address,omitempty" yaml:"ip_address,omitempty"`
+	CPUs        int       `json:"cpus,omitempty" yaml:"cpus,omitempty"`
+	MemoryMB    int       `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
+	PID         int       `json:"pid,omitempty" yaml:"pid,omitempty"`
+	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
+	LocalDir    string    `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
+	Image       string    `json:"image,omitempty" yaml:"image,omitempty"`
+	// FromSnapshot records the snapshot name this shed was spawned from (immediate parent only).
+	FromSnapshot string                         `json:"from_snapshot,omitempty" yaml:"from_snapshot,omitempty"`
+	LastHealthy  *time.Time                     `json:"last_healthy,omitempty" yaml:"last_healthy,omitempty"` // last heartbeat from agent (VM backends only)
+	StartedAt    *time.Time                     `json:"started_at,omitempty" yaml:"started_at,omitempty"`     // agent boot time from heartbeat (VM backends only)
+	Extensions   map[string]ExtensionHealthInfo `json:"extensions,omitempty" yaml:"extensions,omitempty"`     // per-extension health (VM backends only)
 }
 
 // ExtensionHealthInfo is the API-facing extension health for a shed.
@@ -231,10 +263,11 @@ type ShedDiskEntry struct {
 
 // DiskUsageTotals aggregates bytes across df sections.
 type DiskUsageTotals struct {
-	Images  DiskSize `json:"images"` // includes kernel + initrd
-	Sheds   DiskSize `json:"sheds"`
-	Orphans DiskSize `json:"orphans"`
-	All     DiskSize `json:"all"`
+	Images    DiskSize `json:"images"` // includes kernel + initrd
+	Sheds     DiskSize `json:"sheds"`
+	Snapshots DiskSize `json:"snapshots"`
+	Orphans   DiskSize `json:"orphans"`
+	All       DiskSize `json:"all"`
 }
 
 // DiskUsage is the payload returned by GET /api/system/df.
@@ -247,8 +280,9 @@ type DiskUsage struct {
 	Kernel *FileEntry       `json:"kernel,omitempty"`
 	Initrd *FileEntry       `json:"initrd,omitempty"` // VZ only
 
-	Sheds   []ShedDiskEntry `json:"sheds"`
-	Orphans []FileEntry     `json:"orphans"`
+	Sheds     []ShedDiskEntry     `json:"sheds"`
+	Snapshots []SnapshotDiskEntry `json:"snapshots,omitempty"`
+	Orphans   []FileEntry         `json:"orphans"`
 
 	Totals DiskUsageTotals `json:"totals"`
 
@@ -350,6 +384,71 @@ type CreateShedRequest struct {
 	// LocalDir mounts a host directory as the workspace instead of creating
 	// a volume. Mutually exclusive with Repo.
 	LocalDir string `json:"local_dir,omitempty"`
+
+	// FromSnapshot spawns the shed from a snapshot's rootfs instead of a base image.
+	// Mutually exclusive with Image and Repo. Provisioning steps (repo clone, install
+	// hook, first-time auto-sync) are skipped because the snapshot is already provisioned.
+	FromSnapshot string `json:"from_snapshot,omitempty"`
+}
+
+// Snapshot represents a captured rootfs that can be used to spawn new sheds.
+type Snapshot struct {
+	// Version is the snapshot schema version (current: 1).
+	Version int `json:"version"`
+
+	// Name is the unique snapshot identifier within a server.
+	Name string `json:"name"`
+
+	// Backend is "vz" or "firecracker"; only matching backends can spawn from this snapshot.
+	Backend string `json:"backend"`
+
+	// SourceShed is the shed this snapshot was created from. May reference a deleted shed.
+	SourceShed string `json:"source_shed,omitempty"`
+
+	// SourceImage is the image variant the source shed was created from (provenance hint).
+	SourceImage string `json:"source_image,omitempty"`
+
+	// SourceLocalDir is the host directory the source shed was using (hint only; not bound at spawn).
+	SourceLocalDir string `json:"source_local_dir,omitempty"`
+
+	// Comment is an optional user-supplied note attached at create time.
+	Comment string `json:"comment,omitempty"`
+
+	// CreatedAt is when the snapshot was captured.
+	CreatedAt time.Time `json:"created_at"`
+
+	// SizeBytes is the apparent (logical) size of the snapshot rootfs.
+	SizeBytes int64 `json:"size_bytes,omitempty"`
+}
+
+// SnapshotCreateRequest is the request body for POST /api/snapshots.
+type SnapshotCreateRequest struct {
+	Name       string `json:"name"`
+	SourceShed string `json:"source_shed"`
+	Comment    string `json:"comment,omitempty"`
+}
+
+// SnapshotsResponse is returned by GET /api/snapshots.
+type SnapshotsResponse struct {
+	Snapshots []Snapshot `json:"snapshots"`
+}
+
+// SnapshotCreateResponse is returned by POST /api/snapshots. It wraps the
+// created snapshot together with any non-fatal warnings emitted during the
+// operation (e.g., source shed used --local-dir so workspace contents are
+// not captured). Wire format is intentionally distinct from the Snapshot
+// type so warnings can grow without disturbing snapshot.json on disk.
+type SnapshotCreateResponse struct {
+	Snapshot *Snapshot `json:"snapshot"`
+	Warnings []string  `json:"warnings,omitempty"`
+}
+
+// SnapshotDiskEntry describes one snapshot's disk footprint for `shed system df`.
+type SnapshotDiskEntry struct {
+	Name       string    `json:"name"`
+	SourceShed string    `json:"source_shed,omitempty"`
+	Rootfs     FileEntry `json:"rootfs"`
+	Total      DiskSize  `json:"total"`
 }
 
 // APIError represents an error response from the API.
@@ -393,6 +492,12 @@ const (
 	ErrTmuxNotAvailable   = "TMUX_NOT_AVAILABLE"
 	ErrInvalidLocalDir    = "INVALID_LOCAL_DIR"
 	ErrInvalidRequest     = "INVALID_REQUEST"
+
+	ErrSnapshotNotFound        = "SNAPSHOT_NOT_FOUND"
+	ErrSnapshotAlreadyExists   = "SNAPSHOT_ALREADY_EXISTS"
+	ErrSnapshotSourceRunning   = "SNAPSHOT_SOURCE_RUNNING"
+	ErrSnapshotBackendMismatch = "SNAPSHOT_BACKEND_MISMATCH"
+	ErrInvalidSnapshotName     = "INVALID_SNAPSHOT_NAME"
 )
 
 // Backend type constants for Shed.Backend field.

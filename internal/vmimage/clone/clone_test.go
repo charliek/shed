@@ -145,6 +145,62 @@ func TestStrategy_String(t *testing.T) {
 	}
 }
 
+// TestCloneFile_ChmodAfterClone_From0o444Source asserts the contract relied
+// on by the spawn-from-snapshot path in vz/firecracker client.go: a snapshot
+// rootfs is stored at mode 0o444 (immutable artifact); when a new shed is
+// spawned from it, the cloned dst is explicitly chmod'd to 0o644 so the VM
+// can write to its rootfs. This test verifies the chmod actually flips the
+// mode regardless of the clone strategy that produced dst (the darwin
+// Clonefile path preserves source mode; the linux O_CREAT paths force 0o644
+// at creation, so the chmod is defense in depth there).
+//
+// If a future regression removes the chmod, the darwin run will fail because
+// dst would still be 0o444 and the VM would refuse to mount rw.
+func TestCloneFile_ChmodAfterClone_From0o444Source(t *testing.T) {
+	tests := []struct {
+		name          string
+		forceFallback bool
+	}{
+		{"native_strategy", false},
+		{"io_copy_fallback", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.forceFallback {
+				restore := ForceFallback(true)
+				defer restore()
+			}
+
+			dir := t.TempDir()
+			src := filepath.Join(dir, "src")
+			dst := filepath.Join(dir, "dst")
+
+			data := randomBytes(t, 4096)
+			if err := os.WriteFile(src, data, 0o444); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := CloneFile(src, dst); err != nil {
+				t.Fatalf("CloneFile: %v", err)
+			}
+
+			// Mirror the spawn-from-snapshot fix: explicit chmod 0o644.
+			if err := os.Chmod(dst, 0o644); err != nil {
+				t.Fatalf("chmod dst: %v", err)
+			}
+
+			fi, err := os.Stat(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode := fi.Mode().Perm(); mode != 0o644 {
+				t.Errorf("dst mode = %o; want 0644", mode)
+			}
+		})
+	}
+}
+
 // TestCloneFile_ConcurrentSameDst verifies that two concurrent goroutines
 // calling CloneFile on the same dst don't both claim success. Exactly
 // one should win; the loser must see an EEXIST-class error and leave the

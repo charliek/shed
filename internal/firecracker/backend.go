@@ -209,3 +209,23 @@ func (b *FirecrackerBackend) DiskUsage(ctx context.Context) (config.DiskUsage, e
 func (b *FirecrackerBackend) Prune(ctx context.Context, opts backend.PruneOptions) (config.PruneReport, error) {
 	return b.client.Prune(ctx, opts)
 }
+
+// CreateSnapshot captures a stopped shed's rootfs as a named, immutable artifact.
+func (b *FirecrackerBackend) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	return b.client.CreateSnapshot(ctx, req)
+}
+
+// ListSnapshots returns all snapshots stored on this server.
+func (b *FirecrackerBackend) ListSnapshots(ctx context.Context) ([]config.Snapshot, error) {
+	return b.client.ListSnapshots(ctx)
+}
+
+// GetSnapshot returns a snapshot by name.
+func (b *FirecrackerBackend) GetSnapshot(ctx context.Context, name string) (*config.Snapshot, error) {
+	return b.client.GetSnapshot(ctx, name)
+}
+
+// DeleteSnapshot removes a snapshot.
+func (b *FirecrackerBackend) DeleteSnapshot(ctx context.Context, name string) error {
+	return b.client.DeleteSnapshot(ctx, name)
+}

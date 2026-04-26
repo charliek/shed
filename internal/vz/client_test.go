@@ -286,9 +286,143 @@ func TestBuildCredentialShares(t *testing.T) {
 	}
 }
 
+// TestAcquireSnapshotLock mirrors TestAcquireCreateLock for the snapshot-name
+// keyspace. Same-name acquires must serialize CreateSnapshot vs DeleteSnapshot
+// vs CreateShed-from-snapshot; different-name acquires must run in parallel.
+func TestAcquireSnapshotLock(t *testing.T) {
+	tests := []struct {
+		name        string
+		firstName   string
+		secondName  string
+		shouldBlock bool
+	}{
+		{"same name serializes", "snap", "snap", true},
+		{"different names do not block", "a", "b", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{}
+			release1 := c.acquireSnapshotLock(tt.firstName)
+
+			acquired := make(chan struct{})
+			go func() {
+				release2 := c.acquireSnapshotLock(tt.secondName)
+				close(acquired)
+				release2()
+			}()
+
+			if tt.shouldBlock {
+				select {
+				case <-acquired:
+					release1()
+					t.Fatal("second acquireSnapshotLock should have blocked")
+				case <-time.After(100 * time.Millisecond):
+				}
+				release1()
+				select {
+				case <-acquired:
+				case <-time.After(time.Second):
+					t.Fatal("second acquireSnapshotLock did not proceed after release")
+				}
+			} else {
+				defer release1()
+				select {
+				case <-acquired:
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("acquireSnapshotLock for different names must not block")
+				}
+			}
+		})
+	}
+}
+
+// TestSnapshotAndCreateLockOrderNoDeadlock asserts the documented lock-order
+// rule (snapshotLock -> createLock) holds under real contention. Two
+// goroutines acquire the SAME snapshot and shed names so the locks actually
+// contend; if either took them in the wrong order this would AB-BA deadlock.
+//
+// A start gate ensures both goroutines start the acquire dance simultaneously
+// rather than one finishing before the other begins.
+func TestSnapshotAndCreateLockOrderNoDeadlock(t *testing.T) {
+	c := &Client{}
+	const snapName = "shared-snap"
+	const shedName = "shared-shed"
+	start := make(chan struct{})
+
+	doneA := make(chan struct{})
+	go func() {
+		<-start
+		releaseSnap := c.acquireSnapshotLock(snapName)
+		time.Sleep(10 * time.Millisecond)
+		releaseCreate := c.acquireCreateLock(shedName)
+		releaseCreate()
+		releaseSnap()
+		close(doneA)
+	}()
+
+	doneB := make(chan struct{})
+	go func() {
+		<-start
+		releaseSnap := c.acquireSnapshotLock(snapName)
+		releaseCreate := c.acquireCreateLock(shedName)
+		releaseCreate()
+		releaseSnap()
+		close(doneB)
+	}()
+	close(start)
+
+	select {
+	case <-doneA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine A deadlocked")
+	}
+	select {
+	case <-doneB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine B deadlocked")
+	}
+}
+
+// TestStopShedLockedDoesNotReacquireLock guards against a regression where
+// DeleteShed (which holds the lifecycle lock) calls into the stop path and
+// the stop path re-takes the same non-reentrant mutex — a deadlock that
+// CodeRabbit flagged on PR #81 and that wasn't caught by the live test
+// because cleanup stopped sheds before deleting them.
+//
+// The check: with the lifecycle lock held, calling stopShedLocked must not
+// itself try to acquire the same lock. We verify by holding the lock in the
+// test goroutine and calling stopShedLocked with a stopped-state metadata
+// (which short-circuits inside) and asserting it returns within a deadline.
+func TestStopShedLockedDoesNotReacquireLock(t *testing.T) {
+	c := &Client{}
+	defer c.acquireCreateLock("test-shed")()
+
+	done := make(chan struct{})
+	go func() {
+		// stopShedLocked on a stopped meta returns ErrShedNotRunningSentinel
+		// without doing any work — but it must not block trying to take the
+		// lifecycle lock the caller already holds.
+		_, _ = c.stopShedLocked(context.Background(), &Metadata{
+			Name:   "test-shed",
+			Status: config.StatusStopped,
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stopShedLocked deadlocked while caller held createLock")
+	}
+}
+
 // TestAcquireCreateLock covers the lock that closes the CreateShed /
 // CopyRootfs TOCTOU race described in rootfs.go: same-name acquires must
 // serialize; different-name acquires must run in parallel.
+//
+// As of the snapshot feature, this is also the per-shed-name lifecycle lock
+// taken by Start/Stop/Delete and by CreateSnapshot of this shed as source.
 func TestAcquireCreateLock(t *testing.T) {
 	tests := []struct {
 		name        string

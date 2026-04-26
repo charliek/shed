@@ -261,6 +261,9 @@ func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 	if !strings.Contains(argsStr, "init=/sbin/init") {
 		t.Error("expected init=/sbin/init in kernel cmdline")
 	}
+	if !strings.Contains(argsStr, "shed.name=test-vm") {
+		t.Errorf("expected shed.name=test-vm in kernel cmdline (read by shed-firstboot for identity regen), got: %s", argsStr)
+	}
 }
 
 func TestCleanupSockets(t *testing.T) {

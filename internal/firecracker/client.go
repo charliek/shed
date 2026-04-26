@@ -43,6 +43,11 @@ type Client struct {
 	createMu    sync.Mutex
 	createLocks map[string]*sync.Mutex
 
+	// snapshotLocks serializes CreateSnapshot/DeleteSnapshot calls by
+	// snapshot name. Distinct keyspace from createLocks.
+	snapshotMu    sync.Mutex
+	snapshotLocks map[string]*sync.Mutex
+
 	// Credential sync
 	credMgr *vmutil.CredentialManager
 }
@@ -55,15 +60,16 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, br
 	}
 
 	client := &Client{
-		cfg:         cfg,
-		serverCfg:   serverCfg,
-		netMgr:      netMgr,
-		vms:         make(map[string]*VM),
-		usedCIDs:    make(map[uint32]string),
-		usedIPs:     make(map[string]string),
-		p9Servers:   make(map[string][]*P9Server),
-		createLocks: make(map[string]*sync.Mutex),
-		credMgr:     vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
+		cfg:           cfg,
+		serverCfg:     serverCfg,
+		netMgr:        netMgr,
+		vms:           make(map[string]*VM),
+		usedCIDs:      make(map[uint32]string),
+		usedIPs:       make(map[string]string),
+		p9Servers:     make(map[string][]*P9Server),
+		createLocks:   make(map[string]*sync.Mutex),
+		snapshotLocks: make(map[string]*sync.Mutex),
+		credMgr:       vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -95,10 +101,21 @@ func (c *Client) loadExistingInstances() error {
 	return nil
 }
 
-// acquireCreateLock returns an unlock closure after taking the per-name
-// create mutex. Callers MUST defer the returned closure. The per-name
-// mutex is leaked on first use — bounded by the number of distinct shed
-// names ever created in this process, which is effectively negligible.
+// acquireCreateLock returns an unlock closure after taking the per-shed-name
+// lifecycle mutex. Callers MUST defer the returned closure.
+//
+// Originally added to serialize CreateShed-vs-CreateShed for the same name,
+// the lock has since broadened to cover any operation that mutates a shed's
+// on-disk state (Create, Start, Stop, Delete, and CreateSnapshot of this
+// shed as source). This closes TOCTOU races between, e.g., a snapshot of a
+// stopped shed and a concurrent Start of the same shed.
+//
+// Lock-order rule: when both locks are needed (snapshot create or
+// from-snapshot spawn), acquire snapshotLock BEFORE createLock to avoid
+// AB-BA deadlock with other code paths.
+//
+// The per-name mutex is leaked on first use — bounded by the number of
+// distinct shed names ever created in this process, which is negligible.
 func (c *Client) acquireCreateLock(name string) func() {
 	c.createMu.Lock()
 	if c.createLocks == nil {
@@ -353,19 +370,20 @@ func (c *Client) mount9PCredentialFunc(shedName string) vmutil.DirMountFunc {
 
 func metadataToShed(meta *Metadata) *config.Shed {
 	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   meta.IPAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-		LocalDir:    meta.LocalDir,
-		Image:       meta.Image,
+		Name:         meta.Name,
+		Status:       meta.Status,
+		CreatedAt:    meta.CreatedAt,
+		Repo:         meta.Repo,
+		ContainerID:  fmt.Sprintf("fc-%s", meta.Name),
+		Backend:      meta.Backend,
+		IPAddress:    meta.IPAddress,
+		CPUs:         meta.CPUs,
+		MemoryMB:     meta.MemoryMB,
+		PID:          meta.PID,
+		RootfsPath:   meta.RootfsPath,
+		LocalDir:     meta.LocalDir,
+		Image:        meta.Image,
+		FromSnapshot: meta.FromSnapshot,
 	}
 }
 
@@ -373,6 +391,19 @@ func metadataToShed(meta *Metadata) *config.Shed {
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
+	}
+
+	if req.FromSnapshot != "" {
+		if req.Image != "" || req.Repo != "" {
+			return nil, fmt.Errorf("--from-snapshot is mutually exclusive with --image and --repo")
+		}
+	}
+
+	// Lock-order: snapshotLock(source) BEFORE createLock(new shed). This
+	// blocks DeleteSnapshot of the source between loadSnapshot and the
+	// reflink read, and matches CreateSnapshot's order so no AB-BA cycle.
+	if req.FromSnapshot != "" {
+		defer c.acquireSnapshotLock(req.FromSnapshot)()
 	}
 
 	// Serialize CreateShed calls for the same name so the existence check
@@ -384,31 +415,44 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
-	// Resolve and ensure image before allocating network resources.
-	// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
-	// pull from Docker which can take minutes. Doing this first avoids holding
-	// scarce network resources (TAP devices, IPs) during slow operations.
-	var resolved config.ResolvedImage
-	var err error
-	if req.Image != "" {
-		resolved, err = c.cfg.ResolveImage(req.Image)
+	var rootfsSource string
+	if req.FromSnapshot != "" {
+		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
 		if err != nil {
 			return nil, err
 		}
+		if snap.Backend != config.BackendFirecracker {
+			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
+				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendFirecracker)
+		}
+		rootfsSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
 	} else {
-		resolved = c.cfg.ResolveBaseRootfs()
-	}
+		// Resolve and ensure image before allocating network resources.
+		// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
+		// pull from Docker which can take minutes. Doing this first avoids holding
+		// scarce network resources (TAP devices, IPs) during slow operations.
+		var resolved config.ResolvedImage
+		var err error
+		if req.Image != "" {
+			resolved, err = c.cfg.ResolveImage(req.Image)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			resolved = c.cfg.ResolveBaseRootfs()
+		}
 
-	mgr := vmimage.NewManager(c.cfg)
-	rootfsSource, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
-		Path:      resolved.Path,
-		DockerRef: resolved.DockerRef,
-		Name:      resolved.Name,
-	}, func(stage, msg string) {
-		backend.Progress(ctx, stage, msg)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to ensure image: %w", err)
+		mgr := vmimage.NewManager(c.cfg)
+		rootfsSource, err = mgr.EnsureImage(ctx, vmimage.ResolvedRef{
+			Path:      resolved.Path,
+			DockerRef: resolved.DockerRef,
+			Name:      resolved.Name,
+		}, func(stage, msg string) {
+			backend.Progress(ctx, stage, msg)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to ensure image: %w", err)
+		}
 	}
 
 	backend.Progress(ctx, "network", "Allocating network resources...")
@@ -438,6 +482,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
+	// CopyRootfs forces 0o644 internally so spawning from a 0o444
+	// snapshot rootfs produces a writable instance rootfs.
 
 	cpus := req.CPUs
 	if cpus == 0 {
@@ -449,19 +495,20 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	meta := &Metadata{
-		Name:       req.Name,
-		Status:     config.StatusStopped,
-		CreatedAt:  time.Now(),
-		Backend:    config.BackendFirecracker,
-		CID:        cid,
-		IPAddress:  ipAddress,
-		TAPDevice:  tapDevice,
-		CPUs:       cpus,
-		MemoryMB:   memoryMB,
-		RootfsPath: rootfsPath,
-		Repo:       req.Repo,
-		LocalDir:   req.LocalDir,
-		Image:      req.Image,
+		Name:         req.Name,
+		Status:       config.StatusStopped,
+		CreatedAt:    time.Now(),
+		Backend:      config.BackendFirecracker,
+		CID:          cid,
+		IPAddress:    ipAddress,
+		TAPDevice:    tapDevice,
+		CPUs:         cpus,
+		MemoryMB:     memoryMB,
+		RootfsPath:   rootfsPath,
+		Repo:         req.Repo,
+		LocalDir:     req.LocalDir,
+		Image:        req.Image,
+		FromSnapshot: req.FromSnapshot,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -567,15 +614,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mount9PCredentialFunc(req.Name))
 	}
 
-	// Clone repo if specified (skip when using local dir -- directory already has content)
-	if req.Repo != "" && req.LocalDir == "" {
+	// Clone repo if specified (skip when using local dir or spawning from snapshot;
+	// snapshot rootfs is already provisioned).
+	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
 		}
 	}
 
-	// Run provisioning
+	// Run provisioning. When spawning from a snapshot the rootfs is already
+	// provisioned, so we skip the one-shot install hook but still run the
+	// startup hook on every boot — matching StartShed's behavior.
 	if !req.NoProvision {
 		provisioner := vmutil.NewProvisioner(agent, req.Name)
 		provisioner.SetOutput(os.Stdout, os.Stderr)
@@ -583,7 +633,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if err != nil {
 			log.Printf("Warning: failed to load provisioning config: %v", err)
 		} else {
-			if err := provisioner.RunProvisioning(ctx, cfg, true); err != nil {
+			runInstall := req.FromSnapshot == ""
+			if err := provisioner.RunProvisioning(ctx, cfg, runInstall); err != nil {
 				log.Printf("Warning: provisioning failed: %v", err)
 			}
 		}
@@ -663,6 +714,8 @@ func (c *Client) ListSheds(ctx context.Context) ([]config.Shed, error) {
 
 // DeleteShed removes a shed.
 func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+	defer c.acquireCreateLock(name)()
+
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -672,9 +725,11 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 	}
 
 	if meta.Status == config.StatusRunning {
-		if _, err := c.StopShed(ctx, name); err != nil {
+		// Use the lock-aware variant so we don't deadlock on the per-shed
+		// mutex we already hold (sync.Mutex is non-reentrant).
+		if _, err := c.stopShedLocked(ctx, meta); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
-			// StopShed failed — clean up resources it would have released
+			// stopShedLocked failed — clean up resources it would have released
 			c.credMgr.StopListener(name)
 			c.stopP9Servers(name)
 			c.mu.Lock()
@@ -708,6 +763,8 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 
 // StartShed starts a stopped shed.
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
+	defer c.acquireCreateLock(name)()
+
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -797,6 +854,8 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 
 // StopShed stops a running shed.
 func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error) {
+	defer c.acquireCreateLock(name)()
+
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -805,22 +864,30 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		return nil, err
 	}
 
+	return c.stopShedLocked(ctx, meta)
+}
+
+// stopShedLocked performs the stop logic assuming the caller already holds
+// acquireCreateLock(meta.Name). This split exists so DeleteShed can stop a
+// running shed without re-entering the non-reentrant per-shed mutex it is
+// already holding. The public StopShed acquires the lock and delegates here.
+func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Shed, error) {
 	if meta.Status != config.StatusRunning {
-		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, meta.Name)
 	}
 
 	// Stop notification listener before shutting down
-	c.credMgr.StopListener(name)
+	c.credMgr.StopListener(meta.Name)
 
 	// Stop P9 servers before shutting down
-	c.stopP9Servers(name)
+	c.stopP9Servers(meta.Name)
 
 	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
 
 	// Get or create VM handle
 	c.mu.Lock()
-	vm := c.vms[name]
+	vm := c.vms[meta.Name]
 	c.mu.Unlock()
 
 	if vm == nil {
@@ -838,7 +905,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	}
 
 	c.mu.Lock()
-	delete(c.vms, name)
+	delete(c.vms, meta.Name)
 	c.mu.Unlock()
 
 	return metadataToShed(meta), nil

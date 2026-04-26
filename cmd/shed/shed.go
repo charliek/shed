@@ -64,20 +64,21 @@ var stopCmd = &cobra.Command{
 }
 
 var (
-	createRepo        string
-	createImage       string
-	createNoProvision bool
-	createNoSync      bool
-	createSyncProfile string
-	createTimeout     time.Duration
-	createBackend     string
-	createCPUs        int
-	createMemory      int
-	createLocalDir    string
-	startTimeout      time.Duration
-	listAll           bool
-	deleteKeep        bool
-	deleteForce       bool
+	createRepo         string
+	createImage        string
+	createNoProvision  bool
+	createNoSync       bool
+	createSyncProfile  string
+	createTimeout      time.Duration
+	createBackend      string
+	createCPUs         int
+	createMemory       int
+	createLocalDir     string
+	createFromSnapshot string
+	startTimeout       time.Duration
+	listAll            bool
+	deleteKeep         bool
+	deleteForce        bool
 )
 
 func init() {
@@ -91,6 +92,7 @@ func init() {
 	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker/vz only)")
 	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
 	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a local directory as the workspace (mutually exclusive with --repo)")
+	createCmd.Flags().StringVar(&createFromSnapshot, "from-snapshot", "", "Spawn from a snapshot's rootfs (mutually exclusive with --image and --repo)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
@@ -127,6 +129,19 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// Validate --local-dir flag
 	if createLocalDir != "" && createRepo != "" {
 		return fmt.Errorf("--local-dir and --repo are mutually exclusive")
+	}
+
+	// Validate --from-snapshot flag
+	if createFromSnapshot != "" {
+		if createImage != "" {
+			return fmt.Errorf("--from-snapshot and --image are mutually exclusive (snapshot rootfs is the source of truth)")
+		}
+		if createRepo != "" {
+			return fmt.Errorf("--from-snapshot and --repo are mutually exclusive (snapshot is already provisioned)")
+		}
+		if err := config.ValidateSnapshotName(createFromSnapshot); err != nil {
+			return fmt.Errorf("invalid --from-snapshot name: %w", err)
+		}
 	}
 	if createLocalDir != "" {
 		absDir, err := filepath.Abs(createLocalDir)
@@ -180,14 +195,15 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	req := &config.CreateShedRequest{
-		Name:        name,
-		Repo:        createRepo,
-		Image:       createImage,
-		NoProvision: createNoProvision,
-		Backend:     resolvedBackend,
-		CPUs:        createCPUs,
-		MemoryMB:    createMemory,
-		LocalDir:    createLocalDir,
+		Name:         name,
+		Repo:         createRepo,
+		Image:        createImage,
+		NoProvision:  createNoProvision,
+		Backend:      resolvedBackend,
+		CPUs:         createCPUs,
+		MemoryMB:     createMemory,
+		LocalDir:     createLocalDir,
+		FromSnapshot: createFromSnapshot,
 	}
 
 	shed, err := client.CreateShedWithProgress(req, func(event backend.ProgressEvent) {

@@ -59,6 +59,9 @@ type Metadata struct {
 
 	// Image is the image variant name used to create this instance
 	Image string `json:"image,omitempty"`
+
+	// FromSnapshot records the snapshot this instance was spawned from (if any).
+	FromSnapshot string `json:"from_snapshot,omitempty"`
 }
 
 const metadataFilename = "metadata.json"

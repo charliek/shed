@@ -174,6 +174,8 @@ func runSystemDFAll() error {
 		totals.Images.PhysicalBytes += r.Value.Totals.Images.PhysicalBytes
 		totals.Sheds.LogicalBytes += r.Value.Totals.Sheds.LogicalBytes
 		totals.Sheds.PhysicalBytes += r.Value.Totals.Sheds.PhysicalBytes
+		totals.Snapshots.LogicalBytes += r.Value.Totals.Snapshots.LogicalBytes
+		totals.Snapshots.PhysicalBytes += r.Value.Totals.Snapshots.PhysicalBytes
 		totals.Orphans.LogicalBytes += r.Value.Totals.Orphans.LogicalBytes
 		totals.Orphans.PhysicalBytes += r.Value.Totals.Orphans.PhysicalBytes
 		totals.All.LogicalBytes += r.Value.Totals.All.LogicalBytes
@@ -220,6 +222,9 @@ func renderDF(w io.Writer, du config.DiskUsage, verbose bool) {
 		}
 	}
 
+	// Per-snapshot FILES count is one rootfs + one snapshot.json per snapshot.
+	snapshotFiles := len(du.Snapshots) * 2
+
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "CATEGORY\tFILES\tLOGICAL\tPHYSICAL")
 	fmt.Fprintf(tw, "images\t%d\t%s\t%s\n",
@@ -228,10 +233,13 @@ func renderDF(w io.Writer, du config.DiskUsage, verbose bool) {
 	fmt.Fprintf(tw, "%s\t%d\t%s\t%s\n",
 		shedLabel, shedFiles,
 		formatSize(du.Totals.Sheds.LogicalBytes), formatSize(du.Totals.Sheds.PhysicalBytes))
+	fmt.Fprintf(tw, "snapshots\t%d\t%s\t%s\n",
+		snapshotFiles,
+		formatSize(du.Totals.Snapshots.LogicalBytes), formatSize(du.Totals.Snapshots.PhysicalBytes))
 	fmt.Fprintf(tw, "orphans\t%d\t%s\t%s\n",
 		len(du.Orphans), formatSize(du.Totals.Orphans.LogicalBytes), formatSize(du.Totals.Orphans.PhysicalBytes))
 	fmt.Fprintf(tw, "TOTAL\t%d\t%s\t%s\n",
-		imageFiles+shedFiles+len(du.Orphans),
+		imageFiles+shedFiles+snapshotFiles+len(du.Orphans),
 		formatSize(du.Totals.All.LogicalBytes), formatSize(du.Totals.All.PhysicalBytes))
 	tw.Flush()
 
@@ -307,6 +315,24 @@ func renderDFVerbose(w io.Writer, du config.DiskUsage) {
 		tw.Flush()
 	}
 
+	if len(du.Snapshots) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "SNAPSHOTS (%d)\n", len(du.Snapshots))
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAME\tSOURCE\tROOTFS\tTOTAL")
+		for _, s := range du.Snapshots {
+			source := s.SourceShed
+			if source == "" {
+				source = "-"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+				s.Name, source,
+				formatSize(s.Rootfs.Size.LogicalBytes),
+				formatSize(s.Total.LogicalBytes))
+		}
+		tw.Flush()
+	}
+
 	if len(du.Orphans) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintf(w, "ORPHANS (%d)\n", len(du.Orphans))
@@ -339,6 +365,8 @@ func countFiles(du *config.DiskUsage) int {
 		}
 		n += len(s.OtherFiles)
 	}
+	// Each snapshot is rootfs.ext4 + snapshot.json.
+	n += len(du.Snapshots) * 2
 	return n
 }
 

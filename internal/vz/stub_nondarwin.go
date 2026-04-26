@@ -129,3 +129,25 @@ func (b *VZBackend) DiskUsage(_ context.Context) (config.DiskUsage, error) {
 func (b *VZBackend) Prune(_ context.Context, _ backend.PruneOptions) (config.PruneReport, error) {
 	return config.PruneReport{}, fmt.Errorf("prune: %w", config.ErrNotSupportedSentinel)
 }
+
+// CreateSnapshot returns an error on non-darwin platforms. Uses the
+// not-supported sentinel so the API layer can map it consistently with the
+// other unsupported snapshot methods (e.g., to 501 Not Implemented).
+func (b *VZBackend) CreateSnapshot(_ context.Context, _ config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	return nil, fmt.Errorf("create snapshot: %w", config.ErrNotSupportedSentinel)
+}
+
+// ListSnapshots returns an empty list on non-darwin platforms.
+func (b *VZBackend) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
+	return nil, nil
+}
+
+// GetSnapshot returns an error on non-darwin platforms.
+func (b *VZBackend) GetSnapshot(_ context.Context, _ string) (*config.Snapshot, error) {
+	return nil, fmt.Errorf("get snapshot: %w", config.ErrNotSupportedSentinel)
+}
+
+// DeleteSnapshot returns an error on non-darwin platforms.
+func (b *VZBackend) DeleteSnapshot(_ context.Context, _ string) error {
+	return fmt.Errorf("delete snapshot: %w", config.ErrNotSupportedSentinel)
+}

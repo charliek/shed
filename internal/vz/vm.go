@@ -112,7 +112,11 @@ func (vm *VM) Start(ctx context.Context) error {
 
 // buildVfkitArgs constructs the vfkit command-line arguments.
 func (vm *VM) buildVfkitArgs() []string {
-	kernelArgs := "console=hvc0 root=/dev/vda rw init=/sbin/init"
+	// shed.name= is read by the in-guest shed-firstboot service to set the
+	// hostname and detect rootfs clones (snapshot spawns). Shed names are
+	// validated to a kernel-cmdline-safe regex in config.ValidateShedName,
+	// so direct concatenation here is safe.
+	kernelArgs := fmt.Sprintf("console=hvc0 root=/dev/vda rw init=/sbin/init shed.name=%s", vm.meta.Name)
 
 	bootloader := fmt.Sprintf("linux,kernel=%s,cmdline=%s", vm.cfg.KernelPath, kernelArgs)
 	if vm.cfg.InitrdPath != "" {

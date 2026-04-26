@@ -55,6 +55,17 @@ func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 		return "", fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
+	// Force dst to 0o644 immediately. darwin Clonefile preserves the
+	// source's mode, so a 0o444 source (e.g., a snapshot rootfs cloned
+	// during shed create --from-snapshot) would otherwise leave dst
+	// read-only and break both the fsync below and the VM's first
+	// write. FICLONE / copy_file_range / io.Copy already create dst at
+	// 0o644 on linux; this chmod is a no-op there, defense in depth.
+	if err := os.Chmod(dst, 0o644); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to chmod rootfs: %w", err)
+	}
+
 	// Stable log line for operators: "rootfs strategy=clonefile src=... dst=... logical_bytes=..."
 	var logical int64
 	if fi, statErr := os.Stat(dst); statErr == nil {

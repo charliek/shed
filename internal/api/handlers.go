@@ -83,6 +83,22 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// from_snapshot is mutually exclusive with image and repo (snapshot rootfs is the source of truth).
+	if req.FromSnapshot != "" {
+		if req.Image != "" {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "from_snapshot and image are mutually exclusive")
+			return
+		}
+		if req.Repo != "" {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "from_snapshot and repo are mutually exclusive")
+			return
+		}
+		if err := config.ValidateSnapshotName(req.FromSnapshot); err != nil {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidSnapshotName, err.Error())
+			return
+		}
+	}
+
 	// Validate local_dir exists on the server
 	if req.LocalDir != "" {
 		if !filepath.IsAbs(req.LocalDir) {
@@ -394,6 +410,18 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrNotSupportedSentinel) {
 		return http.StatusNotImplemented, config.ErrBackendError, err.Error()
+	}
+	if errors.Is(err, config.ErrSnapshotNotFoundSentinel) {
+		return http.StatusNotFound, config.ErrSnapshotNotFound, err.Error()
+	}
+	if errors.Is(err, config.ErrSnapshotAlreadyExistsSentinel) {
+		return http.StatusConflict, config.ErrSnapshotAlreadyExists, err.Error()
+	}
+	if errors.Is(err, config.ErrSnapshotSourceRunningSentinel) {
+		return http.StatusConflict, config.ErrSnapshotSourceRunning, err.Error()
+	}
+	if errors.Is(err, config.ErrSnapshotBackendMismatchSentinel) {
+		return http.StatusBadRequest, config.ErrSnapshotBackendMismatch, err.Error()
 	}
 
 	// Fallback to string matching for errors without sentinels

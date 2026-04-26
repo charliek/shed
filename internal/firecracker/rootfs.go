@@ -50,6 +50,16 @@ func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
 		return "", fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
+	// Force dst to 0o644. FICLONE / copy_file_range / io.Copy on linux
+	// already create dst at 0o644, so this is normally a no-op — but a
+	// future strategy that preserves source mode would silently leave a
+	// 0o444 instance rootfs after spawn-from-snapshot, breaking the VM.
+	// Mirrors the same chmod in vz/rootfs.go for cross-backend symmetry.
+	if err := os.Chmod(dst, 0o644); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("failed to chmod rootfs: %w", err)
+	}
+
 	var logical int64
 	if fi, statErr := os.Stat(dst); statErr == nil {
 		logical = fi.Size()
