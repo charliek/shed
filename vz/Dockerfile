@@ -202,6 +202,22 @@ RUN mkdir -p /etc/systemd/network && \
 # the VM's enp0s1 interface to the VZ NAT gateway.
 RUN printf "net.ipv4.ip_forward=1\n" > /etc/sysctl.d/99-docker-forward.conf
 
+# Make machine-id transient (lives in /run, never persists to disk).
+# Without this, dbus's postinst writes a value into /etc/machine-id at image
+# build time, baking a single UUID into the image — every shed (fresh or
+# snapshot-spawned) would inherit it. Symlinking /etc/machine-id to /run
+# makes systemd treat it as transient: PID 1 generates a fresh value into
+# /run/machine-id at every VM boot. /var/lib/dbus/machine-id is symlinked
+# to /etc/machine-id (the modern systemd convention) so dbus sees the same
+# value. systemd-machine-id-commit.service is masked so systemd doesn't try
+# to convert the symlink back to a real file when root is writable. Net
+# effect: every VM boot of every shed yields a unique machine-id, with
+# nothing persisted to disk and no host-side ext4 manipulation required.
+RUN rm -f /etc/machine-id /var/lib/dbus/machine-id && \
+    ln -sf /run/machine-id /etc/machine-id && \
+    ln -sf /etc/machine-id /var/lib/dbus/machine-id && \
+    ln -sf /dev/null /etc/systemd/system/systemd-machine-id-commit.service
+
 # Shell customization - colored prompt showing shed name, path, and git branch
 USER shed
 RUN cat >> /home/shed/.bashrc << 'PROMPT_EOF'

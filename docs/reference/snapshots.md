@@ -47,11 +47,24 @@ shed create <new-name> --from-snapshot <snapshot-name> [--local-dir ...]
 ## Identity regeneration
 
 Each spawned shed gets a fresh `/etc/machine-id`, fresh SSH host keys, and the
-correct hostname. This is handled by a one-shot `shed-firstboot` service that
-runs early in boot — before D-Bus, journald, sshd, or `shed-agent` cache the
-old identity. The service is idempotent: it re-runs only when the recorded
-shed name in `/var/lib/shed/identity.json` does not match the
-`shed.name=<name>` value passed on the kernel cmdline.
+correct hostname.
+
+- **machine-id** is handled by the rootfs itself: `/etc/machine-id` is a
+  symlink to `/run/machine-id` (tmpfs), and `systemd-machine-id-commit.service`
+  is masked. PID 1 generates a fresh UUID into `/run/machine-id` at every VM
+  boot; nothing persists to disk. Each shed (fresh-create OR snapshot-spawn)
+  gets a unique machine-id, with no host-side ext4 manipulation required.
+  *Note:* this means `/etc/machine-id` regenerates on every boot of the same
+  shed, not just the first boot. For shed's ephemeral test-environment workflow
+  this is fine, but applications that key persistent state on machine-id and
+  expect it to be stable across reboots will see a regression.
+- **Hostname and SSH host keys** are handled by a one-shot `shed-firstboot`
+  service that runs early in boot — before D-Bus, journald, sshd, or
+  `shed-agent` cache identity. firstboot writes `/etc/hostname` from the
+  kernel cmdline `shed.name=<name>` value, then runs `ssh-keygen -A` so the
+  new keys' comment field carries the spawn's hostname. It records the name
+  in `/var/lib/shed/identity.json` and is idempotent — re-runs only when the
+  recorded name doesn't match the cmdline value.
 
 This makes `ssh known_hosts` and machine-id-based services work correctly
 across snapshot-spawned sheds.
@@ -112,14 +125,12 @@ overcount on-disk usage.
 
 ## Known caveats
 
-- **Early-boot journal may briefly show source's machine-id.** systemd PID 1
-  reads `/etc/machine-id` very early. On a cloned rootfs the file is
-  non-empty with the source shed's UUID until `shed-firstboot` regenerates
-  it. By the time firstboot runs, PID 1 has latched onto the source's value
-  in memory, so journald entries from the very first sysinit phase carry
-  the wrong machine-id. The persistent `/etc/machine-id` and
-  `/var/lib/dbus/machine-id` are correct after firstboot completes; this is
-  only an early-journal-staleness artifact, not a steady-state issue.
+- **machine-id is not stable across reboots of the same shed.** Because
+  `/etc/machine-id` is a tmpfs symlink (see "Identity regeneration"), every
+  VM boot generates a fresh value. This is the trade-off for unique-per-VM
+  identity without host-side ext4 manipulation. For applications that expect
+  a stable machine-id across reboots, recreate the shed instead of
+  stop+starting it.
 - **A snapshot create that crashes mid-write may leave an "invisible"
   directory.** If the host crashes between writing `rootfs.ext4` and the
   atomic rename of `snapshot.json`, the directory under `snapshots_dir`

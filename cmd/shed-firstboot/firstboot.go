@@ -2,8 +2,16 @@
 
 // Package main implements shed-firstboot, an early-boot oneshot that ensures
 // the guest's identity matches the shed name passed via kernel cmdline.
-// It runs before D-Bus, journald, sshd, and shed-agent so that machine-id
-// and SSH host keys are correct before any service caches them.
+// It runs before D-Bus, journald, sshd, and shed-agent so SSH host keys
+// and the hostname are correct before any service caches them.
+//
+// machine-id is intentionally NOT touched here: the rootfs Dockerfile
+// symlinks /etc/machine-id to /run/machine-id (transient tmpfs), so PID 1
+// generates a fresh value at every VM boot and nothing persists to disk.
+// Doing the regen at the firstboot layer would fight that mechanism (the
+// `systemd-machine-id-setup` command pulls from /var/lib/dbus/machine-id
+// when /etc/machine-id is empty, and the symlink chain handles the same
+// concern more cleanly via systemd's transient machine-id machinery).
 package main
 
 import (
@@ -19,23 +27,21 @@ import (
 
 // firstbootCfg lets tests override paths and the command runner.
 type firstbootCfg struct {
-	cmdlinePath   string
-	machineIDPath string
-	sshKeyGlob    string
-	hostnamePath  string
-	identityPath  string
-	runCommand    func(name string, args ...string) error
+	cmdlinePath  string
+	sshKeyGlob   string
+	hostnamePath string
+	identityPath string
+	runCommand   func(name string, args ...string) error
 }
 
 // defaultCfg is the production filesystem layout.
 func defaultCfg() firstbootCfg {
 	return firstbootCfg{
-		cmdlinePath:   "/proc/cmdline",
-		machineIDPath: "/etc/machine-id",
-		sshKeyGlob:    "/etc/ssh/ssh_host_*",
-		hostnamePath:  "/etc/hostname",
-		identityPath:  "/var/lib/shed/identity.json",
-		runCommand:    runRealCommand,
+		cmdlinePath:  "/proc/cmdline",
+		sshKeyGlob:   "/etc/ssh/ssh_host_*",
+		hostnamePath: "/etc/hostname",
+		identityPath: "/var/lib/shed/identity.json",
+		runCommand:   runRealCommand,
 	}
 }
 
@@ -105,22 +111,28 @@ func saveIdentity(path string, id *identity) error {
 	return nil
 }
 
-// regenerateIdentity wipes machine-id, removes existing SSH host keys, sets
-// the hostname, and re-derives the regenerated artifacts via systemd helpers.
-// Failures are returned per step; callers decide whether to abort or log.
+// regenerateIdentity sets the hostname, then removes and re-derives SSH host
+// keys. Hostname must be set BEFORE `ssh-keygen -A` so the new keys' comment
+// field reflects the spawned shed's name; otherwise `ssh-keygen` records the
+// source's hostname (still in /etc/hostname at this point) into every cloned
+// shed's keys. Failures are returned per step; callers decide whether to
+// abort or log.
+//
+// machine-id is intentionally NOT touched — the Dockerfile makes it transient
+// via a symlink to /run/machine-id, so PID 1 generates a fresh value per boot.
 func regenerateIdentity(cfg firstbootCfg, name string) error {
-	// machine-id: empty file makes systemd-machine-id-setup generate a fresh one.
-	if err := os.WriteFile(cfg.machineIDPath, nil, 0o444); err != nil {
-		return fmt.Errorf("clear machine-id: %w", err)
+	// Hostname BEFORE SSH key generation so the keys' comment matches.
+	// Avoid hostnamectl (requires running D-Bus, which is not yet up).
+	if err := os.WriteFile(cfg.hostnamePath, []byte(name+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write hostname: %w", err)
 	}
-	if err := cfg.runCommand("systemd-machine-id-setup"); err != nil {
-		// Fall back to dbus-uuidgen if the systemd helper is unavailable.
-		if err2 := cfg.runCommand("dbus-uuidgen", "--ensure="+cfg.machineIDPath); err2 != nil {
-			return fmt.Errorf("regen machine-id (systemd-machine-id-setup: %v; dbus-uuidgen: %w)", err, err2)
-		}
+	if err := cfg.runCommand("hostname", "-F", cfg.hostnamePath); err != nil {
+		return fmt.Errorf("apply hostname: %w", err)
 	}
 
-	// SSH host keys: remove existing, regenerate via ssh-keygen -A.
+	// SSH host keys: remove existing, regenerate via ssh-keygen -A. The
+	// hostname call above ensures the new keys' comment field carries the
+	// spawned shed's name rather than the source's.
 	matches, _ := filepath.Glob(cfg.sshKeyGlob)
 	for _, p := range matches {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -129,14 +141,6 @@ func regenerateIdentity(cfg firstbootCfg, name string) error {
 	}
 	if err := cfg.runCommand("ssh-keygen", "-A"); err != nil {
 		return fmt.Errorf("regen ssh host keys: %w", err)
-	}
-
-	// Hostname: avoid hostnamectl (requires running D-Bus, which is not yet up).
-	if err := os.WriteFile(cfg.hostnamePath, []byte(name+"\n"), 0o644); err != nil {
-		return fmt.Errorf("write hostname: %w", err)
-	}
-	if err := cfg.runCommand("hostname", "-F", cfg.hostnamePath); err != nil {
-		return fmt.Errorf("apply hostname: %w", err)
 	}
 
 	return nil

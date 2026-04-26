@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -172,11 +174,6 @@ func TestRunFirstboot(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			machineIDPath := filepath.Join(tmp, "machine-id")
-			if err := os.WriteFile(machineIDPath, []byte("oldid"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-
 			sshDir := filepath.Join(tmp, "ssh")
 			if err := os.MkdirAll(sshDir, 0o755); err != nil {
 				t.Fatal(err)
@@ -198,11 +195,10 @@ func TestRunFirstboot(t *testing.T) {
 			}
 
 			cfg := firstbootCfg{
-				cmdlinePath:   cmdlinePath,
-				machineIDPath: machineIDPath,
-				sshKeyGlob:    filepath.Join(sshDir, "ssh_host_*"),
-				hostnamePath:  hostnamePath,
-				identityPath:  identityPath,
+				cmdlinePath:  cmdlinePath,
+				sshKeyGlob:   filepath.Join(sshDir, "ssh_host_*"),
+				hostnamePath: hostnamePath,
+				identityPath: identityPath,
 				runCommand: func(name string, args ...string) error {
 					f.ranCommands = append(f.ranCommands, name)
 					return nil
@@ -233,16 +229,88 @@ func TestRunFirstboot(t *testing.T) {
 	}
 }
 
+// TestRegenerateIdentity_Calls asserts the exact argv and order of external
+// commands run during identity regeneration. Hostname must be set BEFORE
+// `ssh-keygen -A` so the new SSH host keys' comment field captures the spawn's
+// hostname rather than the source's (caught during v0.4.1 live test — keys on
+// cloned sheds said `root@v041-base` instead of `root@v041-spawnN`). Recording
+// full argv as []string preserves token boundaries so e.g. a switch from
+// `hostname -F /etc/hostname` to `hostname -F/etc/hostname` would still fail.
+func TestRegenerateIdentity_Calls(t *testing.T) {
+	tests := []struct {
+		name      string
+		shedName  string
+		wantCalls [][]string // exact argv tokens, in order
+	}{
+		{
+			name:     "hostname_then_ssh_keygen_with_correct_argv",
+			shedName: "newshed",
+			wantCalls: [][]string{
+				{"hostname", "-F", "%hostnamePath%"},
+				{"ssh-keygen", "-A"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(tmp, "ssh"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			hostnamePath := filepath.Join(tmp, "hostname")
+			if err := os.WriteFile(hostnamePath, []byte("oldhost\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var calls [][]string
+			cfg := firstbootCfg{
+				sshKeyGlob:   filepath.Join(tmp, "ssh", "ssh_host_*"),
+				hostnamePath: hostnamePath,
+				identityPath: filepath.Join(tmp, "identity.json"),
+				runCommand: func(name string, args ...string) error {
+					argv := append([]string{name}, args...)
+					calls = append(calls, argv)
+					return nil
+				},
+			}
+
+			if err := regenerateIdentity(cfg, tt.shedName); err != nil {
+				t.Fatalf("regenerateIdentity: %v", err)
+			}
+
+			// Substitute %hostnamePath% in expected argv so the test stays
+			// portable across t.TempDir's per-run paths.
+			want := make([][]string, len(tt.wantCalls))
+			for i, c := range tt.wantCalls {
+				argv := make([]string, len(c))
+				for j, tok := range c {
+					argv[j] = strings.ReplaceAll(tok, "%hostnamePath%", hostnamePath)
+				}
+				want[i] = argv
+			}
+
+			if len(calls) != len(want) {
+				t.Fatalf("call count = %d; want %d (got: %v)", len(calls), len(want), calls)
+			}
+			for i, w := range want {
+				if !reflect.DeepEqual(calls[i], w) {
+					t.Errorf("call[%d] = %v; want %v (full sequence: %v)", i, calls[i], w, calls)
+				}
+			}
+		})
+	}
+}
+
 func TestRunFirstboot_ErrorPaths(t *testing.T) {
 	t.Run("missing_cmdline_errors", func(t *testing.T) {
 		tmp := t.TempDir()
 		cfg := firstbootCfg{
-			cmdlinePath:   filepath.Join(tmp, "no-such-file"),
-			machineIDPath: filepath.Join(tmp, "machine-id"),
-			sshKeyGlob:    filepath.Join(tmp, "ssh_host_*"),
-			hostnamePath:  filepath.Join(tmp, "hostname"),
-			identityPath:  filepath.Join(tmp, "identity.json"),
-			runCommand:    func(string, ...string) error { return nil },
+			cmdlinePath:  filepath.Join(tmp, "no-such-file"),
+			sshKeyGlob:   filepath.Join(tmp, "ssh_host_*"),
+			hostnamePath: filepath.Join(tmp, "hostname"),
+			identityPath: filepath.Join(tmp, "identity.json"),
+			runCommand:   func(string, ...string) error { return nil },
 		}
 		err := runFirstboot(cfg)
 		if err == nil {
@@ -253,14 +321,12 @@ func TestRunFirstboot_ErrorPaths(t *testing.T) {
 	t.Run("regen_command_failure_propagates", func(t *testing.T) {
 		tmp := t.TempDir()
 		os.WriteFile(filepath.Join(tmp, "cmdline"), []byte("shed.name=err"), 0o644)
-		os.WriteFile(filepath.Join(tmp, "machine-id"), []byte(""), 0o644)
 		os.WriteFile(filepath.Join(tmp, "hostname"), []byte(""), 0o644)
 		cfg := firstbootCfg{
-			cmdlinePath:   filepath.Join(tmp, "cmdline"),
-			machineIDPath: filepath.Join(tmp, "machine-id"),
-			sshKeyGlob:    filepath.Join(tmp, "ssh_host_*"),
-			hostnamePath:  filepath.Join(tmp, "hostname"),
-			identityPath:  filepath.Join(tmp, "identity.json"),
+			cmdlinePath:  filepath.Join(tmp, "cmdline"),
+			sshKeyGlob:   filepath.Join(tmp, "ssh_host_*"),
+			hostnamePath: filepath.Join(tmp, "hostname"),
+			identityPath: filepath.Join(tmp, "identity.json"),
 			runCommand: func(name string, args ...string) error {
 				if name == "ssh-keygen" {
 					return errors.New("simulated failure")
