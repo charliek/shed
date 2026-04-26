@@ -66,10 +66,21 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plu
 	return client, nil
 }
 
-// acquireCreateLock returns an unlock closure after taking the per-name
-// create mutex. Callers MUST defer the returned closure. The per-name
-// mutex is leaked on first use — bounded by the number of distinct shed
-// names ever created in this process, which is effectively negligible.
+// acquireCreateLock returns an unlock closure after taking the per-shed-name
+// lifecycle mutex. Callers MUST defer the returned closure.
+//
+// Originally added to serialize CreateShed-vs-CreateShed for the same name,
+// the lock has since broadened to cover any operation that mutates a shed's
+// on-disk state (Create, Start, Stop, Delete, and CreateSnapshot of this
+// shed as source). This closes TOCTOU races between, e.g., a snapshot of a
+// stopped shed and a concurrent Start of the same shed.
+//
+// Lock-order rule: when both locks are needed (snapshot create or
+// from-snapshot spawn), acquire snapshotLock BEFORE createLock to avoid
+// AB-BA deadlock with other code paths.
+//
+// The per-name mutex is leaked on first use — bounded by the number of
+// distinct shed names ever created in this process, which is negligible.
 func (c *Client) acquireCreateLock(name string) func() {
 	c.createMu.Lock()
 	if c.createLocks == nil {
@@ -107,6 +118,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if req.Image != "" || req.Repo != "" {
 			return nil, fmt.Errorf("--from-snapshot is mutually exclusive with --image and --repo")
 		}
+	}
+
+	// Lock-order: snapshotLock(source) BEFORE createLock(new shed). This
+	// blocks DeleteSnapshot of the source between loadSnapshot and the
+	// reflink read, and matches CreateSnapshot's order so no AB-BA cycle.
+	if req.FromSnapshot != "" {
+		defer c.acquireSnapshotLock(req.FromSnapshot)()
 	}
 
 	// Serialize CreateShed calls for the same name so the existence check
@@ -351,6 +369,8 @@ func (c *Client) ListSheds(ctx context.Context) ([]config.Shed, error) {
 
 // DeleteShed removes a shed.
 func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+	defer c.acquireCreateLock(name)()
+
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -389,6 +409,8 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 
 // StartShed starts a stopped shed.
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
+	defer c.acquireCreateLock(name)()
+
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -461,6 +483,8 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 
 // StopShed stops a running shed.
 func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error) {
+	defer c.acquireCreateLock(name)()
+
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {

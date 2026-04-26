@@ -200,6 +200,25 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
+	// fsync ladder mirroring CopyRootfs in rootfs.go: clonefile/FICLONE
+	// don't guarantee metadata durability until the next FS commit, and
+	// delayed-writeback errors (ENOSPC, EIO) only surface on fsync. Run
+	// fsync BEFORE the chmod-to-0444 since fsync requires write fd.
+	f, err := os.OpenFile(dstRootfs, os.O_RDWR, 0)
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to reopen snapshot rootfs for sync: %w", err)
+	}
+	if syncErr := f.Sync(); syncErr != nil {
+		f.Close()
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to sync snapshot rootfs: %w", syncErr)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to close snapshot rootfs after sync: %w", closeErr)
+	}
+
 	if err := os.Chmod(dstRootfs, snapshotRootfsMode); err != nil {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("failed to set snapshot rootfs mode: %w", err)
@@ -227,6 +246,14 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	if err := saveSnapshot(c.cfg.SnapshotsDir, snap); err != nil {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("failed to save snapshot metadata: %w", err)
+	}
+
+	// Final dir fsync so the rename of snapshot.json and the rootfs link
+	// are durable before we report success — same crash-safety bar as
+	// CopyRootfs's syncDir at the end of its happy path.
+	if err := syncDir(dir); err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to sync snapshot directory: %w", err)
 	}
 
 	return snap, nil
