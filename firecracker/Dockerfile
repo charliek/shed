@@ -80,6 +80,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     unzip \
     ca-certificates \
+    # Required by shed-firstboot to apply the hostname read from kernel cmdline
+    hostname \
     # Development tools
     tmux \
     git \

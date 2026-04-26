@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/go-chi/chi/v5"
 )
@@ -24,6 +25,11 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 
 // handleCreateSnapshot creates a new snapshot from a stopped shed.
 // POST /api/snapshots
+//
+// Non-fatal warnings emitted by the backend via backend.ProgressWarning
+// are collected and returned in the response body alongside the snapshot,
+// so the operator can see e.g. the "--local-dir not captured" warning
+// without needing SSE plumbing on this endpoint.
 func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 	var req config.SnapshotCreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -40,13 +46,24 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := s.backend.CreateSnapshot(r.Context(), req)
+	var warnings []string
+	collect := func(event backend.ProgressEvent) {
+		if event.Warning {
+			warnings = append(warnings, event.Message)
+		}
+	}
+	ctx := backend.ContextWithProgress(r.Context(), collect)
+
+	snap, err := s.backend.CreateSnapshot(ctx, req)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
-	writeJSON(w, http.StatusCreated, snap)
+	writeJSON(w, http.StatusCreated, config.SnapshotCreateResponse{
+		Snapshot: snap,
+		Warnings: warnings,
+	})
 }
 
 // handleGetSnapshot returns a single snapshot by name.

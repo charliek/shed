@@ -433,6 +433,16 @@ type SnapshotsResponse struct {
 	Snapshots []Snapshot `json:"snapshots"`
 }
 
+// SnapshotCreateResponse is returned by POST /api/snapshots. It wraps the
+// created snapshot together with any non-fatal warnings emitted during the
+// operation (e.g., source shed used --local-dir so workspace contents are
+// not captured). Wire format is intentionally distinct from the Snapshot
+// type so warnings can grow without disturbing snapshot.json on disk.
+type SnapshotCreateResponse struct {
+	Snapshot *Snapshot `json:"snapshot"`
+	Warnings []string  `json:"warnings,omitempty"`
+}
+
 // SnapshotDiskEntry describes one snapshot's disk footprint for `shed system df`.
 type SnapshotDiskEntry struct {
 	Name       string    `json:"name"`

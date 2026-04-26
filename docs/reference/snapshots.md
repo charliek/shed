@@ -63,7 +63,24 @@ across snapshot-spawned sheds.
 | Source shed must be stopped | `shed snapshot create` errors with a `stop the shed first` message otherwise. |
 | Same backend only | A VZ snapshot can only spawn VZ sheds; a Firecracker snapshot only Firecracker. The CLI surfaces this as a clear error. |
 | `--from-snapshot` is mutually exclusive with `--image` and `--repo` | The snapshot rootfs is the source of truth. `--local-dir` and credential mounts are still allowed because they are runtime mounts. |
-| Snapshot rootfs is immutable | Stored mode `0444`. Spawned sheds get a writable copy via reflink. |
+| Snapshot rootfs is immutable | Stored mode `0444`. Spawned sheds get a writable (`0644`) copy via reflink. |
+
+## `--from-snapshot` combined with `--local-dir`
+
+These compose. `--from-snapshot` selects the rootfs; `--local-dir` is a
+runtime VirtioFS / 9P mount that overlays the workspace path inside the VM.
+Both can be set at the same time:
+
+```bash
+shed create work --from-snapshot baseline-v1 --local-dir /Users/me/proj
+```
+
+In that example the rootfs is the snapshot's (so installed tools / dotfiles
+are present) but `/workspace` inside the VM is the host's `/Users/me/proj`,
+not whatever the snapshot's rootfs had at `/workspace`. If the source shed
+also used `--local-dir`, the snapshot's `/workspace` is whatever the rootfs
+held *before* the local dir was first mounted — typically empty — so the
+overlay behavior matches what you'd intuitively expect.
 
 ## Storage layout
 
@@ -92,6 +109,24 @@ overcount on-disk usage.
 - Live (memory state) snapshots — Tier 1 captures rootfs only.
 - Snapshot export/import / multi-host transfer.
 - Snapshot lineage chains — only the immediate `source_shed` is recorded.
+
+## Known caveats
+
+- **Early-boot journal may briefly show source's machine-id.** systemd PID 1
+  reads `/etc/machine-id` very early. On a cloned rootfs the file is
+  non-empty with the source shed's UUID until `shed-firstboot` regenerates
+  it. By the time firstboot runs, PID 1 has latched onto the source's value
+  in memory, so journald entries from the very first sysinit phase carry
+  the wrong machine-id. The persistent `/etc/machine-id` and
+  `/var/lib/dbus/machine-id` are correct after firstboot completes; this is
+  only an early-journal-staleness artifact, not a steady-state issue.
+- **A snapshot create that crashes mid-write may leave an "invisible"
+  directory.** If the host crashes between writing `rootfs.ext4` and the
+  atomic rename of `snapshot.json`, the directory under `snapshots_dir`
+  will contain only `rootfs.ext4` and be filtered out of `shed snapshot
+  list` (which requires `snapshot.json` to be present). Cleanup is manual
+  for v1: remove the directory directly. `shed system prune` does not
+  currently scan `snapshots_dir`.
 
 ## Example: bootstrap, snapshot, experiment
 

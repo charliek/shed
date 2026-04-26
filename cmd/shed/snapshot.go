@@ -98,21 +98,27 @@ func runSnapshotCreate(cmd *cobra.Command, args []string) error {
 		SourceShed: shedName,
 		Comment:    snapshotCreateComment,
 	}
-	snap, err := client.CreateSnapshot(req)
+	snap, warnings, err := client.CreateSnapshot(req)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
 
 	if jsonFlag {
 		return outputJSON(ActionResult{
-			Status:  "ok",
-			Action:  "created",
-			Name:    snap.Name,
-			Server:  serverName,
-			Details: snap,
+			Status: "ok",
+			Action: "created",
+			Name:   snap.Name,
+			Server: serverName,
+			Details: struct {
+				Snapshot *config.Snapshot `json:"snapshot"`
+				Warnings []string         `json:"warnings,omitempty"`
+			}{Snapshot: snap, Warnings: warnings},
 		})
 	}
 
+	for _, msg := range warnings {
+		fmt.Fprintf(os.Stderr, "  Warning: %s\n", msg)
+	}
 	printSuccess("Created snapshot %s (%s) from %s on %s",
 		snap.Name, formatSize(snap.SizeBytes), shedName, serverName)
 	return nil

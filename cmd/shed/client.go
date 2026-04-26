@@ -436,12 +436,14 @@ func (c *APIClient) GetSnapshot(name string) (*config.Snapshot, error) {
 }
 
 // CreateSnapshot creates a new snapshot from a stopped shed.
-func (c *APIClient) CreateSnapshot(req *config.SnapshotCreateRequest) (*config.Snapshot, error) {
-	var snap config.Snapshot
-	if err := c.doRequestWithTimeout(http.MethodPost, "/api/snapshots", req, &snap, c.createTimeout, http.StatusCreated, http.StatusOK); err != nil {
-		return nil, err
+// Returns the created snapshot and any non-fatal warnings the backend emitted
+// during the operation (e.g., "--local-dir not captured").
+func (c *APIClient) CreateSnapshot(req *config.SnapshotCreateRequest) (*config.Snapshot, []string, error) {
+	var resp config.SnapshotCreateResponse
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/snapshots", req, &resp, c.createTimeout, http.StatusCreated, http.StatusOK); err != nil {
+		return nil, nil, err
 	}
-	return &snap, nil
+	return resp.Snapshot, resp.Warnings, nil
 }
 
 // DeleteSnapshot removes a snapshot from the server.

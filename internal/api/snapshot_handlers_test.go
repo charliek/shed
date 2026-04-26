@@ -87,6 +87,23 @@ func (f *snapshotFakeBackend) DeleteSnapshot(_ context.Context, _ string) error 
 	return f.deleteErr
 }
 
+// snapshotFakeBackendWarner embeds snapshotFakeBackend and overrides
+// CreateSnapshot to emit warnings via backend.ProgressWarning so the test
+// exercises the warning-collection path through the handler.
+type snapshotFakeBackendWarner struct {
+	snapshotFakeBackend
+	createResp *config.Snapshot
+	createErr  error
+	warnings   []string
+}
+
+func (f *snapshotFakeBackendWarner) CreateSnapshot(ctx context.Context, _ config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	for _, msg := range f.warnings {
+		backend.ProgressWarning(ctx, "test", msg)
+	}
+	return f.createResp, f.createErr
+}
+
 func newSnapshotTestServer(be backend.Backend) *Server {
 	return NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
 }
@@ -153,12 +170,41 @@ func TestHandleCreateSnapshot_Success(t *testing.T) {
 	if be.createCalled.Comment != "hi" {
 		t.Errorf("comment forwarded = %q; want %q", be.createCalled.Comment, "hi")
 	}
-	var got config.Snapshot
+	var got config.SnapshotCreateResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Name != want.Name {
-		t.Errorf("name = %q; want %q", got.Name, want.Name)
+	if got.Snapshot == nil || got.Snapshot.Name != want.Name {
+		t.Errorf("snapshot = %+v; want name=%q", got.Snapshot, want.Name)
+	}
+	if len(got.Warnings) != 0 {
+		t.Errorf("warnings = %v; want empty", got.Warnings)
+	}
+}
+
+// TestHandleCreateSnapshot_Warnings verifies that backend.ProgressWarning
+// emitted during CreateSnapshot is surfaced in the response payload.
+func TestHandleCreateSnapshot_Warnings(t *testing.T) {
+	be := &snapshotFakeBackendWarner{
+		createResp: &config.Snapshot{Version: 1, Name: "snap1", Backend: "vz", SourceShed: "src"},
+		warnings:   []string{"workspace not captured: /tmp/proj"},
+	}
+	srv := newSnapshotTestServer(be)
+
+	body := `{"name":"snap1","source_shed":"src"}`
+	r := httptest.NewRequest(http.MethodPost, "/api/snapshots", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d; want 201 (body: %s)", w.Code, w.Body.String())
+	}
+	var got config.SnapshotCreateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Warnings) != 1 || got.Warnings[0] != "workspace not captured: /tmp/proj" {
+		t.Errorf("warnings = %v; want [workspace not captured: /tmp/proj]", got.Warnings)
 	}
 }
 
