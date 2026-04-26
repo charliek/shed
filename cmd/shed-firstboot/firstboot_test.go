@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -233,20 +234,20 @@ func TestRunFirstboot(t *testing.T) {
 // `ssh-keygen -A` so the new SSH host keys' comment field captures the spawn's
 // hostname rather than the source's (caught during v0.4.1 live test — keys on
 // cloned sheds said `root@v041-base` instead of `root@v041-spawnN`). Recording
-// full argv (not just the command name) prevents a regression where the
-// implementation switches to a different flag/path silently.
+// full argv as []string preserves token boundaries so e.g. a switch from
+// `hostname -F /etc/hostname` to `hostname -F/etc/hostname` would still fail.
 func TestRegenerateIdentity_Calls(t *testing.T) {
 	tests := []struct {
 		name      string
 		shedName  string
-		wantCalls []string // exact argv strings, in order
+		wantCalls [][]string // exact argv tokens, in order
 	}{
 		{
 			name:     "hostname_then_ssh_keygen_with_correct_argv",
 			shedName: "newshed",
-			wantCalls: []string{
-				"hostname -F %hostnamePath%",
-				"ssh-keygen -A",
+			wantCalls: [][]string{
+				{"hostname", "-F", "%hostnamePath%"},
+				{"ssh-keygen", "-A"},
 			},
 		},
 	}
@@ -262,17 +263,14 @@ func TestRegenerateIdentity_Calls(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			var calls []string
+			var calls [][]string
 			cfg := firstbootCfg{
 				sshKeyGlob:   filepath.Join(tmp, "ssh", "ssh_host_*"),
 				hostnamePath: hostnamePath,
 				identityPath: filepath.Join(tmp, "identity.json"),
 				runCommand: func(name string, args ...string) error {
-					if len(args) == 0 {
-						calls = append(calls, name)
-					} else {
-						calls = append(calls, name+" "+strings.Join(args, " "))
-					}
+					argv := append([]string{name}, args...)
+					calls = append(calls, argv)
 					return nil
 				},
 			}
@@ -281,19 +279,23 @@ func TestRegenerateIdentity_Calls(t *testing.T) {
 				t.Fatalf("regenerateIdentity: %v", err)
 			}
 
-			// Substitute %hostnamePath% in the expected argv so the test
-			// stays portable across t.TempDir's per-run paths.
-			want := make([]string, len(tt.wantCalls))
+			// Substitute %hostnamePath% in expected argv so the test stays
+			// portable across t.TempDir's per-run paths.
+			want := make([][]string, len(tt.wantCalls))
 			for i, c := range tt.wantCalls {
-				want[i] = strings.ReplaceAll(c, "%hostnamePath%", hostnamePath)
+				argv := make([]string, len(c))
+				for j, tok := range c {
+					argv[j] = strings.ReplaceAll(tok, "%hostnamePath%", hostnamePath)
+				}
+				want[i] = argv
 			}
 
 			if len(calls) != len(want) {
 				t.Fatalf("call count = %d; want %d (got: %v)", len(calls), len(want), calls)
 			}
 			for i, w := range want {
-				if calls[i] != w {
-					t.Errorf("call[%d] = %q; want %q (full sequence: %v)", i, calls[i], w, calls)
+				if !reflect.DeepEqual(calls[i], w) {
+					t.Errorf("call[%d] = %v; want %v (full sequence: %v)", i, calls[i], w, calls)
 				}
 			}
 		})
