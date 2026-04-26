@@ -122,6 +122,10 @@ build_agent() {
     cd "$PROJECT_ROOT"
     GOOS=linux GOARCH=amd64 go build -o "$FIRECRACKER_DIR/shed-agent" ./cmd/shed-agent
     echo "Built shed-agent binary"
+
+    echo "=== Building shed-firstboot binary (linux/amd64) ==="
+    GOOS=linux GOARCH=amd64 go build -o "$FIRECRACKER_DIR/shed-firstboot" ./cmd/shed-firstboot
+    echo "Built shed-firstboot binary"
 }
 
 # Build a single variant
@@ -212,8 +216,8 @@ else
     build_variant "$VARIANT"
 fi
 
-# Clean up the shed-agent binary from the build directory
-rm -f "$FIRECRACKER_DIR/shed-agent"
+# Clean up the shed-agent and shed-firstboot binaries from the build directory
+rm -f "$FIRECRACKER_DIR/shed-agent" "$FIRECRACKER_DIR/shed-firstboot"
 
 echo ""
 echo "=== Build Complete ==="

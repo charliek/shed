@@ -67,9 +67,12 @@ func (vm *VM) Start(ctx context.Context) error {
 		return fmt.Errorf("invalid bridge CIDR %q: %w", vm.cfg.BridgeCIDR, err)
 	}
 	netmask := fmt.Sprintf("%d.%d.%d.%d", ipNet.Mask[0], ipNet.Mask[1], ipNet.Mask[2], ipNet.Mask[3])
+	// shed.name= is read by the in-guest shed-firstboot service to set the
+	// hostname and detect rootfs clones (snapshot spawns). Shed names are
+	// validated by config.ValidateShedName so direct concatenation is safe.
 	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1",
-		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask,
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s",
+		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
 	)
 
 	fcCfg := firecracker.Config{

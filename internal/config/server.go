@@ -120,6 +120,9 @@ type FirecrackerConfig struct {
 	// InstanceDir is the directory for instance data
 	InstanceDir string `yaml:"instance_dir"`
 
+	// SnapshotsDir is the directory where shed snapshots are stored.
+	SnapshotsDir string `yaml:"snapshots_dir,omitempty"`
+
 	// SocketDir is the directory for Firecracker API sockets
 	SocketDir string `yaml:"socket_dir"`
 
@@ -183,6 +186,9 @@ type VZConfig struct {
 	// InstanceDir is the directory for instance data
 	InstanceDir string `yaml:"instance_dir"`
 
+	// SnapshotsDir is the directory where shed snapshots are stored.
+	SnapshotsDir string `yaml:"snapshots_dir,omitempty"`
+
 	// SocketDir is the directory for vsock Unix sockets.
 	// NOTE: This path must not contain spaces. vfkit URL-encodes socket paths,
 	// turning spaces into %20, which causes connection failures.
@@ -240,6 +246,7 @@ func DefaultVZConfig() *VZConfig {
 		BaseRootfs:      ExpandPath(DefaultVZImagesDir + "/default-rootfs.ext4"),
 		ImagesDir:       ExpandPath(DefaultVZImagesDir),
 		InstanceDir:     ExpandPath(DefaultVZImagesDir + "/instances"),
+		SnapshotsDir:    ExpandPath(DefaultVZImagesDir + "/snapshots"),
 		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
 		DefaultCPUs:     2,
 		DefaultMemoryMB: 4096,
@@ -267,11 +274,17 @@ func (c *VZConfig) applyDefaults() {
 	c.BaseRootfs = ExpandPath(c.BaseRootfs)
 	c.ImagesDir = ExpandPath(c.ImagesDir)
 	c.InstanceDir = ExpandPath(c.InstanceDir)
+	c.SnapshotsDir = ExpandPath(c.SnapshotsDir)
 	c.SocketDir = ExpandPath(c.SocketDir)
 
 	// Default ImagesDir if not set
 	if c.ImagesDir == "" {
 		c.ImagesDir = ExpandPath(DefaultVZImagesDir)
+	}
+
+	// Default SnapshotsDir to ImagesDir/snapshots if unset
+	if c.SnapshotsDir == "" {
+		c.SnapshotsDir = filepath.Join(c.ImagesDir, "snapshots")
 	}
 
 	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
@@ -295,6 +308,9 @@ func (c *VZConfig) Validate() error {
 	}
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
+	}
+	if c.SnapshotsDir == "" {
+		return fmt.Errorf("snapshots_dir is required")
 	}
 	if c.SocketDir == "" {
 		return fmt.Errorf("socket_dir is required")
@@ -590,6 +606,7 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 		BaseRootfs:      "/var/lib/shed/firecracker/base-rootfs.ext4",
 		ImagesDir:       DefaultFirecrackerImagesDir,
 		InstanceDir:     "/var/lib/shed/firecracker/instances",
+		SnapshotsDir:    "/var/lib/shed/firecracker/snapshots",
 		SocketDir:       "/var/run/shed/firecracker",
 		DefaultCPUs:     2,
 		DefaultMemoryMB: 4096,
@@ -894,6 +911,11 @@ func (c *FirecrackerConfig) applyDefaults() {
 		c.ImagesDir = DefaultFirecrackerImagesDir
 	}
 
+	// Default SnapshotsDir if not set (sibling of InstanceDir)
+	if c.SnapshotsDir == "" {
+		c.SnapshotsDir = "/var/lib/shed/firecracker/snapshots"
+	}
+
 	// Default KernelPath to ImagesDir/vmlinux (extracted from published images)
 	if c.KernelPath == "" {
 		c.KernelPath = c.ImagesDir + "/vmlinux"
@@ -918,6 +940,9 @@ func (c *FirecrackerConfig) Validate() error {
 	}
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
+	}
+	if c.SnapshotsDir == "" {
+		return fmt.Errorf("snapshots_dir is required")
 	}
 	if c.SocketDir == "" {
 		return fmt.Errorf("socket_dir is required")

@@ -95,6 +95,7 @@ nav:
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
+      - Snapshots: reference/snapshots.md
       - Disk Management: reference/disk-management.md
       - Tunnels: reference/tunnels.md
       - File Sync: reference/sync.md

@@ -417,6 +417,38 @@ func (c *APIClient) PruneImages(dryRun bool) (*config.PruneImagesResponse, error
 	return &resp, nil
 }
 
+// ListSnapshots returns all snapshots managed by the server.
+func (c *APIClient) ListSnapshots() (*config.SnapshotsResponse, error) {
+	var resp config.SnapshotsResponse
+	if err := c.doRequest(http.MethodGet, "/api/snapshots", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetSnapshot retrieves a snapshot by name.
+func (c *APIClient) GetSnapshot(name string) (*config.Snapshot, error) {
+	var snap config.Snapshot
+	if err := c.doRequest(http.MethodGet, "/api/snapshots/"+name, nil, &snap); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+// CreateSnapshot creates a new snapshot from a stopped shed.
+func (c *APIClient) CreateSnapshot(req *config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	var snap config.Snapshot
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/snapshots", req, &snap, c.createTimeout, http.StatusCreated, http.StatusOK); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+// DeleteSnapshot removes a snapshot from the server.
+func (c *APIClient) DeleteSnapshot(name string) error {
+	return c.doRequest(http.MethodDelete, "/api/snapshots/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
+}
+
 // GetSystemDF retrieves disk usage information for the server.
 func (c *APIClient) GetSystemDF() (*config.DiskUsage, error) {
 	var du config.DiskUsage

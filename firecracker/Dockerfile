@@ -194,9 +194,18 @@ RUN mkdir -p /home/shed/.ssh && chown shed:shed /home/shed/.ssh && chmod 700 /ho
 COPY shed-agent /usr/local/bin/shed-agent
 RUN chmod +x /usr/local/bin/shed-agent
 
+# Copy shed-firstboot binary (handles identity regen on first/cloned boot)
+COPY shed-firstboot /usr/local/bin/shed-firstboot
+RUN chmod +x /usr/local/bin/shed-firstboot
+
 # Copy shed-agent systemd service
 COPY shed-agent.service /etc/systemd/system/shed-agent.service
 RUN SYSTEMD_OFFLINE=1 systemctl enable shed-agent
+
+# Copy shed-firstboot systemd service (runs at sysinit.target, before journald/sshd/shed-agent
+# cache identity, so cloned rootfs gets fresh machine-id and SSH host keys)
+COPY shed-firstboot.service /etc/systemd/system/shed-firstboot.service
+RUN SYSTEMD_OFFLINE=1 systemctl enable shed-firstboot
 
 # Copy network setup script
 COPY network-setup.sh /usr/local/bin/network-setup.sh

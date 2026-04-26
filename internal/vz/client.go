@@ -39,6 +39,12 @@ type Client struct {
 	createMu    sync.Mutex
 	createLocks map[string]*sync.Mutex
 
+	// snapshotLocks serializes CreateSnapshot/DeleteSnapshot calls by
+	// snapshot name. Distinct keyspace from createLocks (snapshot names
+	// vs shed names). Same mutex-map-leak tradeoff documented above.
+	snapshotMu    sync.Mutex
+	snapshotLocks map[string]*sync.Mutex
+
 	credMgr *vmutil.CredentialManager
 }
 
@@ -49,11 +55,12 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plu
 	}
 
 	client := &Client{
-		cfg:         cfg,
-		serverCfg:   serverCfg,
-		vms:         make(map[string]*VM),
-		createLocks: make(map[string]*sync.Mutex),
-		credMgr:     vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendVZ), vmutil.NewHealthTracker()),
+		cfg:           cfg,
+		serverCfg:     serverCfg,
+		vms:           make(map[string]*VM),
+		createLocks:   make(map[string]*sync.Mutex),
+		snapshotLocks: make(map[string]*sync.Mutex),
+		credMgr:       vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendVZ), vmutil.NewHealthTracker()),
 	}
 
 	return client, nil
@@ -96,6 +103,12 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, err
 	}
 
+	if req.FromSnapshot != "" {
+		if req.Image != "" || req.Repo != "" {
+			return nil, fmt.Errorf("--from-snapshot is mutually exclusive with --image and --repo")
+		}
+	}
+
 	// Serialize CreateShed calls for the same name so the existence check
 	// below and CopyRootfs's os.Remove(dst) can't race two concurrent
 	// creates into corrupting the first caller's rootfs.
@@ -120,21 +133,35 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
 	}
 
-	var resolved config.ResolvedImage
-	if req.Image != "" {
-		var err error
-		resolved, err = c.cfg.ResolveImage(req.Image)
+	var rootfsSource string
+	if req.FromSnapshot != "" {
+		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
 		if err != nil {
 			return nil, err
 		}
+		if snap.Backend != config.BackendVZ {
+			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
+				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendVZ)
+		}
+		rootfsSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
 	} else {
-		resolved = c.cfg.ResolveBaseRootfs()
-	}
+		var resolved config.ResolvedImage
+		if req.Image != "" {
+			var err error
+			resolved, err = c.cfg.ResolveImage(req.Image)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			resolved = c.cfg.ResolveBaseRootfs()
+		}
 
-	// Ensure image is available locally (pulls + converts Docker refs if needed)
-	rootfsSource, err := EnsureImage(ctx, resolved, c.cfg)
-	if err != nil {
-		return nil, err
+		// Ensure image is available locally (pulls + converts Docker refs if needed)
+		var err error
+		rootfsSource, err = EnsureImage(ctx, resolved, c.cfg)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
@@ -143,17 +170,27 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
+	// Snapshot rootfs is 0444 immutable; the cloned instance copy must be writable.
+	// Clonefile preserves source mode on darwin, so chmod after the clone unconditionally.
+	if req.FromSnapshot != "" {
+		if err := os.Chmod(rootfsPath, 0o644); err != nil {
+			_ = os.Remove(rootfsPath)
+			return nil, fmt.Errorf("failed to chmod cloned rootfs: %w", err)
+		}
+	}
+
 	meta := &Metadata{
-		Name:       req.Name,
-		Status:     config.StatusStopped,
-		CreatedAt:  time.Now(),
-		Backend:    config.BackendVZ,
-		CPUs:       cpus,
-		MemoryMB:   memoryMB,
-		RootfsPath: rootfsPath,
-		Repo:       req.Repo,
-		LocalDir:   req.LocalDir,
-		Image:      req.Image,
+		Name:         req.Name,
+		Status:       config.StatusStopped,
+		CreatedAt:    time.Now(),
+		Backend:      config.BackendVZ,
+		CPUs:         cpus,
+		MemoryMB:     memoryMB,
+		RootfsPath:   rootfsPath,
+		Repo:         req.Repo,
+		LocalDir:     req.LocalDir,
+		Image:        req.Image,
+		FromSnapshot: req.FromSnapshot,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -211,16 +248,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// Mount credentials
 	c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mountVirtioFSCredential)
 
-	// Clone repo if specified (skip when using local dir)
-	if req.Repo != "" && req.LocalDir == "" {
+	// Clone repo if specified (skip when using local dir or spawning from snapshot;
+	// snapshot rootfs is already provisioned).
+	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
 		}
 	}
 
-	// Run provisioning
-	if !req.NoProvision {
+	// Run provisioning (skipped when spawning from a snapshot; snapshot rootfs
+	// is already provisioned and the install hook should not re-run).
+	if !req.NoProvision && req.FromSnapshot == "" {
 		provisioner := vmutil.NewProvisioner(agent, req.Name)
 		provisioner.SetOutput(os.Stdout, os.Stderr)
 		cfg, err := provisioner.LoadConfig(ctx)
@@ -501,19 +540,20 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 // metadataToShed converts VZ metadata to a config.Shed response.
 func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("vz-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   ipAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-		LocalDir:    meta.LocalDir,
-		Image:       meta.Image,
+		Name:         meta.Name,
+		Status:       meta.Status,
+		CreatedAt:    meta.CreatedAt,
+		Repo:         meta.Repo,
+		ContainerID:  fmt.Sprintf("vz-%s", meta.Name),
+		Backend:      meta.Backend,
+		IPAddress:    ipAddress,
+		CPUs:         meta.CPUs,
+		MemoryMB:     meta.MemoryMB,
+		PID:          meta.PID,
+		RootfsPath:   meta.RootfsPath,
+		LocalDir:     meta.LocalDir,
+		Image:        meta.Image,
+		FromSnapshot: meta.FromSnapshot,
 	}
 }
 

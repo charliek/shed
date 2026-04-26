@@ -173,6 +173,58 @@ shed delete <name> [flags]
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
 
+## Snapshots
+
+A snapshot captures a stopped shed's rootfs as a named, immutable artifact.
+New sheds spawned from a snapshot get a fresh identity (machine-id, SSH host
+keys, hostname) and their own runtime mounts. See [Snapshots](snapshots.md)
+for the full overview.
+
+### shed snapshot create
+
+```bash
+shed snapshot create <shed-name> <snapshot-name> [--comment "..."]
+```
+
+Captures the source shed's rootfs into a new immutable snapshot. The source
+shed must be stopped.
+
+### shed snapshot list
+
+```bash
+shed snapshot list
+```
+
+Lists snapshots on the current server.
+
+### shed snapshot info
+
+```bash
+shed snapshot info <snapshot-name>
+```
+
+Shows snapshot metadata, including provenance and size.
+
+### shed snapshot delete
+
+```bash
+shed snapshot delete <snapshot-name> [-f]
+```
+
+Removes a snapshot. Spawned sheds remain independent (each has its own
+rootfs copy).
+
+### shed create --from-snapshot
+
+```bash
+shed create <new-name> --from-snapshot <snapshot-name> [--local-dir ...]
+```
+
+Spawns a new shed from a snapshot. `--from-snapshot` is mutually exclusive
+with `--image` and `--repo` (the snapshot rootfs is the source of truth).
+`--local-dir`, `--cpus`, and `--memory` remain valid since they describe
+runtime configuration, not rootfs source.
+
 ## Image Management
 
 ### shed image build

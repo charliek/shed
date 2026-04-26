@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent test test-integration release clean dev-server dev-cli check coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent build-firstboot test test-integration release clean dev-server dev-cli check coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -8,7 +8,7 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X github.com/charliek/shed/internal/version.Version=$(VERSION) -X github.com/charliek/shed/internal/version.GitCommit=$(GIT_COMMIT) -X github.com/charliek/shed/internal/version.BuildDate=$(BUILD_DATE)"
 
 # Build all binaries
-build: build-cli build-server build-agent
+build: build-cli build-server build-agent build-firstboot
 
 # Build CLI only
 build-cli:
@@ -21,6 +21,10 @@ build-server:
 # Build shed-agent only (for Firecracker VMs)
 build-agent:
 	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-agent ./cmd/shed-agent
+
+# Build shed-firstboot only (in-VM oneshot for identity regen)
+build-firstboot:
+	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-firstboot ./cmd/shed-firstboot
 
 # Run all unit tests (including SDK submodule)
 test:
@@ -41,6 +45,8 @@ release:
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-server-linux-arm64 ./cmd/shed-server
 	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/shed-agent-linux-amd64 ./cmd/shed-agent
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-agent-linux-arm64 ./cmd/shed-agent
+	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o dist/shed-firstboot-linux-amd64 ./cmd/shed-firstboot
+	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/shed-firstboot-linux-arm64 ./cmd/shed-firstboot
 
 # Clean build artifacts
 clean:
@@ -95,7 +101,7 @@ docs-serve:
 # Firecracker targets
 
 # Build Firecracker rootfs image
-firecracker-rootfs: build-agent
+firecracker-rootfs: build-agent build-firstboot
 	./scripts/build-firecracker-rootfs.sh
 
 # Download Firecracker binary and kernel
@@ -105,13 +111,13 @@ download-firecracker:
 # VZ rootfs targets
 
 # Build default VZ rootfs image
-vz-rootfs: build-agent
+vz-rootfs: build-agent build-firstboot
 	./scripts/build-vz-rootfs.sh
 
 # Build base VZ rootfs image (minimal)
-vz-rootfs-base: build-agent
+vz-rootfs-base: build-agent build-firstboot
 	./scripts/build-vz-rootfs.sh --variant base
 
 # Build all VZ rootfs image variants
-vz-rootfs-all: build-agent
+vz-rootfs-all: build-agent build-firstboot
 	./scripts/build-vz-rootfs.sh --all

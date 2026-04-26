@@ -100,4 +100,24 @@ type Backend interface {
 	// without mutating. Age-based instance pruning uses mtime(metadata.json)
 	// as the "last touched" proxy — see opts.Until.
 	Prune(ctx context.Context, opts PruneOptions) (config.PruneReport, error)
+
+	// Snapshots
+
+	// CreateSnapshot captures a stopped shed's rootfs as a named, immutable artifact.
+	// Returns ErrSnapshotSourceRunningSentinel if the source is running,
+	// ErrSnapshotAlreadyExistsSentinel if the name is taken, or ErrShedNotFoundSentinel
+	// if the source shed does not exist. Backends emit progress via backend.Progress.
+	CreateSnapshot(ctx context.Context, req config.SnapshotCreateRequest) (*config.Snapshot, error)
+
+	// ListSnapshots returns all snapshots managed by this backend.
+	ListSnapshots(ctx context.Context) ([]config.Snapshot, error)
+
+	// GetSnapshot returns a snapshot by name.
+	// Returns ErrSnapshotNotFoundSentinel if the snapshot does not exist.
+	GetSnapshot(ctx context.Context, name string) (*config.Snapshot, error)
+
+	// DeleteSnapshot removes a snapshot. Spawned sheds remain independent
+	// (each holds its own rootfs copy at create-from-snapshot time).
+	// Returns ErrSnapshotNotFoundSentinel if the snapshot does not exist.
+	DeleteSnapshot(ctx context.Context, name string) error
 }

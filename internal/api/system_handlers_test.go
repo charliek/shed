@@ -76,6 +76,17 @@ func (f *fakeBackend) Prune(ctx context.Context, opts backend.PruneOptions) (con
 	return f.pruneReport, f.pruneErr
 }
 
+func (f *fakeBackend) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *fakeBackend) ListSnapshots(ctx context.Context) ([]config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *fakeBackend) GetSnapshot(ctx context.Context, name string) (*config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *fakeBackend) DeleteSnapshot(ctx context.Context, name string) error { panic("unexpected") }
+
 func newSystemTestServer(be backend.Backend) *Server {
 	return NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
 }

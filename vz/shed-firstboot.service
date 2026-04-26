@@ -1,0 +1,17 @@
+[Unit]
+Description=Shed first-boot identity setup
+DefaultDependencies=no
+After=systemd-remount-fs.service local-fs.target
+Before=sysinit.target systemd-machine-id-commit.service systemd-journald.service ssh.service shed-agent.service network-setup.service
+Requires=local-fs.target
+ConditionVirtualization=vm
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/shed-firstboot
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

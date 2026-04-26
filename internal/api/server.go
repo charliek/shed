@@ -70,6 +70,14 @@ func (s *Server) Router() chi.Router {
 			r.Get("/sheds", s.handleListPluginSheds)
 		})
 
+		// Snapshots
+		r.Route("/snapshots", func(r chi.Router) {
+			r.Get("/", s.handleListSnapshots)
+			r.Post("/", s.handleCreateSnapshot)
+			r.Get("/{name}", s.handleGetSnapshot)
+			r.Delete("/{name}", s.handleDeleteSnapshot)
+		})
+
 		// Sheds
 		r.Route("/sheds", func(r chi.Router) {
 			r.Get("/", s.handleListSheds)

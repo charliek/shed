@@ -43,6 +43,11 @@ type Client struct {
 	createMu    sync.Mutex
 	createLocks map[string]*sync.Mutex
 
+	// snapshotLocks serializes CreateSnapshot/DeleteSnapshot calls by
+	// snapshot name. Distinct keyspace from createLocks.
+	snapshotMu    sync.Mutex
+	snapshotLocks map[string]*sync.Mutex
+
 	// Credential sync
 	credMgr *vmutil.CredentialManager
 }
@@ -55,15 +60,16 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, br
 	}
 
 	client := &Client{
-		cfg:         cfg,
-		serverCfg:   serverCfg,
-		netMgr:      netMgr,
-		vms:         make(map[string]*VM),
-		usedCIDs:    make(map[uint32]string),
-		usedIPs:     make(map[string]string),
-		p9Servers:   make(map[string][]*P9Server),
-		createLocks: make(map[string]*sync.Mutex),
-		credMgr:     vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
+		cfg:           cfg,
+		serverCfg:     serverCfg,
+		netMgr:        netMgr,
+		vms:           make(map[string]*VM),
+		usedCIDs:      make(map[uint32]string),
+		usedIPs:       make(map[string]string),
+		p9Servers:     make(map[string][]*P9Server),
+		createLocks:   make(map[string]*sync.Mutex),
+		snapshotLocks: make(map[string]*sync.Mutex),
+		credMgr:       vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -353,19 +359,20 @@ func (c *Client) mount9PCredentialFunc(shedName string) vmutil.DirMountFunc {
 
 func metadataToShed(meta *Metadata) *config.Shed {
 	return &config.Shed{
-		Name:        meta.Name,
-		Status:      meta.Status,
-		CreatedAt:   meta.CreatedAt,
-		Repo:        meta.Repo,
-		ContainerID: fmt.Sprintf("fc-%s", meta.Name),
-		Backend:     meta.Backend,
-		IPAddress:   meta.IPAddress,
-		CPUs:        meta.CPUs,
-		MemoryMB:    meta.MemoryMB,
-		PID:         meta.PID,
-		RootfsPath:  meta.RootfsPath,
-		LocalDir:    meta.LocalDir,
-		Image:       meta.Image,
+		Name:         meta.Name,
+		Status:       meta.Status,
+		CreatedAt:    meta.CreatedAt,
+		Repo:         meta.Repo,
+		ContainerID:  fmt.Sprintf("fc-%s", meta.Name),
+		Backend:      meta.Backend,
+		IPAddress:    meta.IPAddress,
+		CPUs:         meta.CPUs,
+		MemoryMB:     meta.MemoryMB,
+		PID:          meta.PID,
+		RootfsPath:   meta.RootfsPath,
+		LocalDir:     meta.LocalDir,
+		Image:        meta.Image,
+		FromSnapshot: meta.FromSnapshot,
 	}
 }
 
@@ -373,6 +380,12 @@ func metadataToShed(meta *Metadata) *config.Shed {
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
+	}
+
+	if req.FromSnapshot != "" {
+		if req.Image != "" || req.Repo != "" {
+			return nil, fmt.Errorf("--from-snapshot is mutually exclusive with --image and --repo")
+		}
 	}
 
 	// Serialize CreateShed calls for the same name so the existence check
@@ -384,31 +397,44 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
-	// Resolve and ensure image before allocating network resources.
-	// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
-	// pull from Docker which can take minutes. Doing this first avoids holding
-	// scarce network resources (TAP devices, IPs) during slow operations.
-	var resolved config.ResolvedImage
-	var err error
-	if req.Image != "" {
-		resolved, err = c.cfg.ResolveImage(req.Image)
+	var rootfsSource string
+	if req.FromSnapshot != "" {
+		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
 		if err != nil {
 			return nil, err
 		}
+		if snap.Backend != config.BackendFirecracker {
+			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
+				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendFirecracker)
+		}
+		rootfsSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
 	} else {
-		resolved = c.cfg.ResolveBaseRootfs()
-	}
+		// Resolve and ensure image before allocating network resources.
+		// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
+		// pull from Docker which can take minutes. Doing this first avoids holding
+		// scarce network resources (TAP devices, IPs) during slow operations.
+		var resolved config.ResolvedImage
+		var err error
+		if req.Image != "" {
+			resolved, err = c.cfg.ResolveImage(req.Image)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			resolved = c.cfg.ResolveBaseRootfs()
+		}
 
-	mgr := vmimage.NewManager(c.cfg)
-	rootfsSource, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
-		Path:      resolved.Path,
-		DockerRef: resolved.DockerRef,
-		Name:      resolved.Name,
-	}, func(stage, msg string) {
-		backend.Progress(ctx, stage, msg)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to ensure image: %w", err)
+		mgr := vmimage.NewManager(c.cfg)
+		rootfsSource, err = mgr.EnsureImage(ctx, vmimage.ResolvedRef{
+			Path:      resolved.Path,
+			DockerRef: resolved.DockerRef,
+			Name:      resolved.Name,
+		}, func(stage, msg string) {
+			backend.Progress(ctx, stage, msg)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to ensure image: %w", err)
+		}
 	}
 
 	backend.Progress(ctx, "network", "Allocating network resources...")
@@ -439,6 +465,21 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
 
+	// Snapshot rootfs is 0444 immutable; ensure the cloned instance copy is writable.
+	// FICLONE/copy_file_range explicitly create dst at 0644 so this is usually a no-op,
+	// but keep it for defense across all clone strategies (and to mirror VZ behavior).
+	if req.FromSnapshot != "" {
+		if err := os.Chmod(rootfsPath, 0o644); err != nil {
+			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+			}
+			_ = os.Remove(rootfsPath)
+			c.ReleaseIP(ipAddress)
+			c.ReleaseCID(cid)
+			return nil, fmt.Errorf("failed to chmod cloned rootfs: %w", err)
+		}
+	}
+
 	cpus := req.CPUs
 	if cpus == 0 {
 		cpus = c.cfg.DefaultCPUs
@@ -449,19 +490,20 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	meta := &Metadata{
-		Name:       req.Name,
-		Status:     config.StatusStopped,
-		CreatedAt:  time.Now(),
-		Backend:    config.BackendFirecracker,
-		CID:        cid,
-		IPAddress:  ipAddress,
-		TAPDevice:  tapDevice,
-		CPUs:       cpus,
-		MemoryMB:   memoryMB,
-		RootfsPath: rootfsPath,
-		Repo:       req.Repo,
-		LocalDir:   req.LocalDir,
-		Image:      req.Image,
+		Name:         req.Name,
+		Status:       config.StatusStopped,
+		CreatedAt:    time.Now(),
+		Backend:      config.BackendFirecracker,
+		CID:          cid,
+		IPAddress:    ipAddress,
+		TAPDevice:    tapDevice,
+		CPUs:         cpus,
+		MemoryMB:     memoryMB,
+		RootfsPath:   rootfsPath,
+		Repo:         req.Repo,
+		LocalDir:     req.LocalDir,
+		Image:        req.Image,
+		FromSnapshot: req.FromSnapshot,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -567,16 +609,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mount9PCredentialFunc(req.Name))
 	}
 
-	// Clone repo if specified (skip when using local dir -- directory already has content)
-	if req.Repo != "" && req.LocalDir == "" {
+	// Clone repo if specified (skip when using local dir or spawning from snapshot;
+	// snapshot rootfs is already provisioned).
+	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
 		}
 	}
 
-	// Run provisioning
-	if !req.NoProvision {
+	// Run provisioning (skipped when spawning from a snapshot; snapshot rootfs
+	// is already provisioned and the install hook should not re-run).
+	if !req.NoProvision && req.FromSnapshot == "" {
 		provisioner := vmutil.NewProvisioner(agent, req.Name)
 		provisioner.SetOutput(os.Stdout, os.Stderr)
 		cfg, err := provisioner.LoadConfig(ctx)

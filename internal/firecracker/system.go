@@ -29,6 +29,7 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		GeneratedAt: time.Now().UTC(),
 		Images:      []config.ImageDiskEntry{},
 		Sheds:       []config.ShedDiskEntry{},
+		Snapshots:   []config.SnapshotDiskEntry{},
 		Orphans:     []config.FileEntry{},
 	}
 
@@ -100,6 +101,33 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		}
 	}
 
+	// Snapshots
+	if c.cfg.SnapshotsDir != "" {
+		names, err := listSnapshotNames(c.cfg.SnapshotsDir)
+		if err != nil {
+			return du, fmt.Errorf("listing snapshots: %w", err)
+		}
+		for _, name := range names {
+			snap, err := loadSnapshot(c.cfg.SnapshotsDir, name)
+			if err != nil {
+				continue
+			}
+			rootfs := SnapshotRootfsPath(c.cfg.SnapshotsDir, name)
+			logical, physical, _ := diskstat.Stat(rootfs)
+			entry := config.SnapshotDiskEntry{
+				Name:       snap.Name,
+				SourceShed: snap.SourceShed,
+				Rootfs: config.FileEntry{
+					Path: rootfs,
+					Size: config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
+					Kind: "rootfs",
+				},
+				Total: config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
+			}
+			du.Snapshots = append(du.Snapshots, entry)
+		}
+	}
+
 	for _, img := range du.Images {
 		du.Totals.Images.LogicalBytes += img.Size.LogicalBytes
 		du.Totals.Images.PhysicalBytes += img.Size.PhysicalBytes
@@ -112,16 +140,25 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		du.Totals.Sheds.LogicalBytes += shed.Total.LogicalBytes
 		du.Totals.Sheds.PhysicalBytes += shed.Total.PhysicalBytes
 	}
+	for _, snap := range du.Snapshots {
+		du.Totals.Snapshots.LogicalBytes += snap.Total.LogicalBytes
+		du.Totals.Snapshots.PhysicalBytes += snap.Total.PhysicalBytes
+	}
 	for _, orph := range du.Orphans {
 		du.Totals.Orphans.LogicalBytes += orph.Size.LogicalBytes
 		du.Totals.Orphans.PhysicalBytes += orph.Size.PhysicalBytes
 	}
-	du.Totals.All.LogicalBytes = du.Totals.Images.LogicalBytes + du.Totals.Sheds.LogicalBytes + du.Totals.Orphans.LogicalBytes
-	du.Totals.All.PhysicalBytes = du.Totals.Images.PhysicalBytes + du.Totals.Sheds.PhysicalBytes + du.Totals.Orphans.PhysicalBytes
+	du.Totals.All.LogicalBytes = du.Totals.Images.LogicalBytes + du.Totals.Sheds.LogicalBytes + du.Totals.Snapshots.LogicalBytes + du.Totals.Orphans.LogicalBytes
+	du.Totals.All.PhysicalBytes = du.Totals.Images.PhysicalBytes + du.Totals.Sheds.PhysicalBytes + du.Totals.Snapshots.PhysicalBytes + du.Totals.Orphans.PhysicalBytes
 
 	du.Notes = append(du.Notes,
 		"physical bytes may overcount shared extents (reflink clones, hardlinks)",
 	)
+	if len(du.Snapshots) > 0 {
+		du.Notes = append(du.Notes,
+			"snapshots and sheds spawned from them share extents via reflink — physical bytes count those extents under both",
+		)
+	}
 
 	return du, nil
 }
