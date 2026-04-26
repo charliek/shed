@@ -269,16 +269,20 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	// Run provisioning (skipped when spawning from a snapshot; snapshot rootfs
-	// is already provisioned and the install hook should not re-run).
-	if !req.NoProvision && req.FromSnapshot == "" {
+	// Run provisioning. When spawning from a snapshot the rootfs is already
+	// provisioned, so we skip the one-shot install hook but still run the
+	// startup hook on every boot — matching StartShed's behavior. This means
+	// a snapshot-spawned shed gets the same first-boot startup hook as if
+	// the operator had started it manually.
+	if !req.NoProvision {
 		provisioner := vmutil.NewProvisioner(agent, req.Name)
 		provisioner.SetOutput(os.Stdout, os.Stderr)
 		cfg, err := provisioner.LoadConfig(ctx)
 		if err != nil {
 			log.Printf("Warning: failed to load provisioning config: %v", err)
 		} else {
-			if err := provisioner.RunProvisioning(ctx, cfg, true); err != nil {
+			runInstall := req.FromSnapshot == ""
+			if err := provisioner.RunProvisioning(ctx, cfg, runInstall); err != nil {
 				log.Printf("Warning: provisioning failed: %v", err)
 			}
 		}
@@ -374,9 +378,11 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 	}
 
 	if meta.Status == config.StatusRunning {
-		if _, err := c.StopShed(ctx, name); err != nil {
+		// Use the lock-aware variant so we don't deadlock on the per-shed
+		// mutex we already hold (sync.Mutex is non-reentrant).
+		if _, err := c.stopShedLocked(ctx, meta); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
-			// StopShed failed — clean up resources it would have released
+			// stopShedLocked failed — clean up resources it would have released
 			c.credMgr.StopListener(name)
 			c.mu.Lock()
 			delete(c.vms, name)
@@ -487,19 +493,27 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		return nil, err
 	}
 
+	return c.stopShedLocked(ctx, meta)
+}
+
+// stopShedLocked performs the stop logic assuming the caller already holds
+// acquireCreateLock(meta.Name). This split exists so DeleteShed can stop a
+// running shed without re-entering the non-reentrant per-shed mutex it is
+// already holding. The public StopShed acquires the lock and delegates here.
+func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Shed, error) {
 	if meta.Status != config.StatusRunning {
-		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, meta.Name)
 	}
 
 	// Stop notification listener before shutting down
-	c.credMgr.StopListener(name)
+	c.credMgr.StopListener(meta.Name)
 
 	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
 
 	// Get or create VM handle
 	c.mu.Lock()
-	vm := c.vms[name]
+	vm := c.vms[meta.Name]
 	c.mu.Unlock()
 
 	if vm == nil {
@@ -517,7 +531,7 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 	}
 
 	c.mu.Lock()
-	delete(c.vms, name)
+	delete(c.vms, meta.Name)
 	c.mu.Unlock()
 
 	return metadataToShed(meta, ""), nil

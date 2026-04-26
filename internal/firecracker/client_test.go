@@ -4,6 +4,7 @@
 package firecracker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -66,15 +67,21 @@ func TestAcquireSnapshotLock(t *testing.T) {
 }
 
 // TestSnapshotAndCreateLockOrderNoDeadlock asserts the documented lock-order
-// rule (snapshotLock -> createLock) is consistent across goroutines.
+// rule (snapshotLock -> createLock) holds under real contention. Two
+// goroutines acquire the SAME snapshot and shed names so the locks actually
+// contend; if either took them in the wrong order this would AB-BA deadlock.
 func TestSnapshotAndCreateLockOrderNoDeadlock(t *testing.T) {
 	c := &Client{}
+	const snapName = "shared-snap"
+	const shedName = "shared-shed"
+	start := make(chan struct{})
 
 	doneA := make(chan struct{})
 	go func() {
-		releaseSnap := c.acquireSnapshotLock("snap-a")
+		<-start
+		releaseSnap := c.acquireSnapshotLock(snapName)
 		time.Sleep(10 * time.Millisecond)
-		releaseCreate := c.acquireCreateLock("shed-a")
+		releaseCreate := c.acquireCreateLock(shedName)
 		releaseCreate()
 		releaseSnap()
 		close(doneA)
@@ -82,12 +89,14 @@ func TestSnapshotAndCreateLockOrderNoDeadlock(t *testing.T) {
 
 	doneB := make(chan struct{})
 	go func() {
-		releaseSnap := c.acquireSnapshotLock("snap-b")
-		releaseCreate := c.acquireCreateLock("shed-b")
+		<-start
+		releaseSnap := c.acquireSnapshotLock(snapName)
+		releaseCreate := c.acquireCreateLock(shedName)
 		releaseCreate()
 		releaseSnap()
 		close(doneB)
 	}()
+	close(start)
 
 	select {
 	case <-doneA:
@@ -98,6 +107,30 @@ func TestSnapshotAndCreateLockOrderNoDeadlock(t *testing.T) {
 	case <-doneB:
 	case <-time.After(2 * time.Second):
 		t.Fatal("goroutine B deadlocked")
+	}
+}
+
+// TestStopShedLockedDoesNotReacquireLock guards against a regression where
+// DeleteShed (which holds the lifecycle lock) calls into the stop path and
+// the stop path re-takes the same non-reentrant mutex — a deadlock that
+// CodeRabbit flagged on PR #81.
+func TestStopShedLockedDoesNotReacquireLock(t *testing.T) {
+	c := &Client{}
+	defer c.acquireCreateLock("test-shed")()
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = c.stopShedLocked(context.Background(), &Metadata{
+			Name:   "test-shed",
+			Status: config.StatusStopped,
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stopShedLocked deadlocked while caller held createLock")
 	}
 }
 

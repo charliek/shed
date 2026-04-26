@@ -130,9 +130,11 @@ func (b *VZBackend) Prune(_ context.Context, _ backend.PruneOptions) (config.Pru
 	return config.PruneReport{}, fmt.Errorf("prune: %w", config.ErrNotSupportedSentinel)
 }
 
-// CreateSnapshot returns an error on non-darwin platforms.
+// CreateSnapshot returns an error on non-darwin platforms. Uses the
+// not-supported sentinel so the API layer can map it consistently with the
+// other unsupported snapshot methods (e.g., to 501 Not Implemented).
 func (b *VZBackend) CreateSnapshot(_ context.Context, _ config.SnapshotCreateRequest) (*config.Snapshot, error) {
-	return nil, errNonDarwin
+	return nil, fmt.Errorf("create snapshot: %w", config.ErrNotSupportedSentinel)
 }
 
 // ListSnapshots returns an empty list on non-darwin platforms.

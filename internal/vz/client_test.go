@@ -338,34 +338,39 @@ func TestAcquireSnapshotLock(t *testing.T) {
 }
 
 // TestSnapshotAndCreateLockOrderNoDeadlock asserts the documented lock-order
-// rule (snapshotLock -> createLock) is consistent: a holder taking both locks
-// in that order does not deadlock against a peer taking either lock alone.
-// The actual cross-product is enforced at all callers (CreateShed-from-snapshot
-// and CreateSnapshot both acquire snapshot first); this test guards the
-// invariant by exercising both halves of a paired acquire under timeout.
+// rule (snapshotLock -> createLock) holds under real contention. Two
+// goroutines acquire the SAME snapshot and shed names so the locks actually
+// contend; if either took them in the wrong order this would AB-BA deadlock.
+//
+// A start gate ensures both goroutines start the acquire dance simultaneously
+// rather than one finishing before the other begins.
 func TestSnapshotAndCreateLockOrderNoDeadlock(t *testing.T) {
 	c := &Client{}
+	const snapName = "shared-snap"
+	const shedName = "shared-shed"
+	start := make(chan struct{})
 
-	// Goroutine A: takes snapshot, then create. Holds briefly.
 	doneA := make(chan struct{})
 	go func() {
-		releaseSnap := c.acquireSnapshotLock("snap-a")
+		<-start
+		releaseSnap := c.acquireSnapshotLock(snapName)
 		time.Sleep(10 * time.Millisecond)
-		releaseCreate := c.acquireCreateLock("shed-a")
+		releaseCreate := c.acquireCreateLock(shedName)
 		releaseCreate()
 		releaseSnap()
 		close(doneA)
 	}()
 
-	// Goroutine B: same lock order, different names. Must run in parallel.
 	doneB := make(chan struct{})
 	go func() {
-		releaseSnap := c.acquireSnapshotLock("snap-b")
-		releaseCreate := c.acquireCreateLock("shed-b")
+		<-start
+		releaseSnap := c.acquireSnapshotLock(snapName)
+		releaseCreate := c.acquireCreateLock(shedName)
 		releaseCreate()
 		releaseSnap()
 		close(doneB)
 	}()
+	close(start)
 
 	select {
 	case <-doneA:
@@ -376,6 +381,39 @@ func TestSnapshotAndCreateLockOrderNoDeadlock(t *testing.T) {
 	case <-doneB:
 	case <-time.After(2 * time.Second):
 		t.Fatal("goroutine B deadlocked")
+	}
+}
+
+// TestStopShedLockedDoesNotReacquireLock guards against a regression where
+// DeleteShed (which holds the lifecycle lock) calls into the stop path and
+// the stop path re-takes the same non-reentrant mutex — a deadlock that
+// CodeRabbit flagged on PR #81 and that wasn't caught by the live test
+// because cleanup stopped sheds before deleting them.
+//
+// The check: with the lifecycle lock held, calling stopShedLocked must not
+// itself try to acquire the same lock. We verify by holding the lock in the
+// test goroutine and calling stopShedLocked with a stopped-state metadata
+// (which short-circuits inside) and asserting it returns within a deadline.
+func TestStopShedLockedDoesNotReacquireLock(t *testing.T) {
+	c := &Client{}
+	defer c.acquireCreateLock("test-shed")()
+
+	done := make(chan struct{})
+	go func() {
+		// stopShedLocked on a stopped meta returns ErrShedNotRunningSentinel
+		// without doing any work — but it must not block trying to take the
+		// lifecycle lock the caller already holds.
+		_, _ = c.stopShedLocked(context.Background(), &Metadata{
+			Name:   "test-shed",
+			Status: config.StatusStopped,
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stopShedLocked deadlocked while caller held createLock")
 	}
 }
 

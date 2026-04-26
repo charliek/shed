@@ -129,9 +129,11 @@ func (b *FirecrackerBackend) Prune(_ context.Context, _ backend.PruneOptions) (c
 	return config.PruneReport{}, fmt.Errorf("prune: %w", config.ErrNotSupportedSentinel)
 }
 
-// CreateSnapshot returns an error on non-linux platforms.
+// CreateSnapshot returns an error on non-linux platforms. Uses the
+// not-supported sentinel so the API layer can map it consistently with the
+// other unsupported snapshot methods (e.g., to 501 Not Implemented).
 func (b *FirecrackerBackend) CreateSnapshot(_ context.Context, _ config.SnapshotCreateRequest) (*config.Snapshot, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, fmt.Errorf("create snapshot: %w", config.ErrNotSupportedSentinel)
 }
 
 // ListSnapshots returns an empty list on non-linux platforms.
