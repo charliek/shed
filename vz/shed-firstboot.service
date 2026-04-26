@@ -4,7 +4,10 @@ DefaultDependencies=no
 After=systemd-remount-fs.service local-fs.target
 Before=sysinit.target systemd-machine-id-commit.service systemd-journald.service ssh.service shed-agent.service network-setup.service
 Requires=local-fs.target
-ConditionVirtualization=vm
+# No ConditionVirtualization=vm: Docker-built rootfs makes systemd-detect-virt
+# return "docker" even when booted as a VM via vfkit. The shed-firstboot binary
+# itself short-circuits when /proc/cmdline has no shed.name= (e.g., rootfs run
+# outside of shed for debugging), so the systemd-side gate is redundant.
 
 [Service]
 Type=oneshot
