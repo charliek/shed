@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -227,54 +228,75 @@ func TestRunFirstboot(t *testing.T) {
 	}
 }
 
-// TestRegenerateIdentity_HostnameBeforeSSHKeygen asserts the order:
-// hostname must be set before `ssh-keygen -A` runs, otherwise the new SSH
-// host keys' comment field captures the source shed's hostname (which is
-// still in /etc/hostname at that point) instead of the spawn's. Caught
-// during the v0.4.1 live test on both backends — keys on cloned sheds
-// said `root@v041-base` instead of `root@v041-spawnN`.
-func TestRegenerateIdentity_HostnameBeforeSSHKeygen(t *testing.T) {
-	tmp := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(tmp, "ssh"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(tmp, "hostname"), []byte("oldhost\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	var order []string
-	cfg := firstbootCfg{
-		sshKeyGlob:   filepath.Join(tmp, "ssh", "ssh_host_*"),
-		hostnamePath: filepath.Join(tmp, "hostname"),
-		identityPath: filepath.Join(tmp, "identity.json"),
-		runCommand: func(name string, args ...string) error {
-			order = append(order, name)
-			return nil
+// TestRegenerateIdentity_Calls asserts the exact argv and order of external
+// commands run during identity regeneration. Hostname must be set BEFORE
+// `ssh-keygen -A` so the new SSH host keys' comment field captures the spawn's
+// hostname rather than the source's (caught during v0.4.1 live test — keys on
+// cloned sheds said `root@v041-base` instead of `root@v041-spawnN`). Recording
+// full argv (not just the command name) prevents a regression where the
+// implementation switches to a different flag/path silently.
+func TestRegenerateIdentity_Calls(t *testing.T) {
+	tests := []struct {
+		name      string
+		shedName  string
+		wantCalls []string // exact argv strings, in order
+	}{
+		{
+			name:     "hostname_then_ssh_keygen_with_correct_argv",
+			shedName: "newshed",
+			wantCalls: []string{
+				"hostname -F %hostnamePath%",
+				"ssh-keygen -A",
+			},
 		},
 	}
 
-	if err := regenerateIdentity(cfg, "newshed"); err != nil {
-		t.Fatalf("regenerateIdentity: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(tmp, "ssh"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			hostnamePath := filepath.Join(tmp, "hostname")
+			if err := os.WriteFile(hostnamePath, []byte("oldhost\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
 
-	hostnameIdx, sshKeygenIdx := -1, -1
-	for i, c := range order {
-		if c == "hostname" && hostnameIdx == -1 {
-			hostnameIdx = i
-		}
-		if c == "ssh-keygen" && sshKeygenIdx == -1 {
-			sshKeygenIdx = i
-		}
-	}
-	if hostnameIdx < 0 {
-		t.Fatalf("hostname command never ran (order: %v)", order)
-	}
-	if sshKeygenIdx < 0 {
-		t.Fatalf("ssh-keygen never ran (order: %v)", order)
-	}
-	if hostnameIdx >= sshKeygenIdx {
-		t.Errorf("hostname (idx %d) must run before ssh-keygen (idx %d); order: %v",
-			hostnameIdx, sshKeygenIdx, order)
+			var calls []string
+			cfg := firstbootCfg{
+				sshKeyGlob:   filepath.Join(tmp, "ssh", "ssh_host_*"),
+				hostnamePath: hostnamePath,
+				identityPath: filepath.Join(tmp, "identity.json"),
+				runCommand: func(name string, args ...string) error {
+					if len(args) == 0 {
+						calls = append(calls, name)
+					} else {
+						calls = append(calls, name+" "+strings.Join(args, " "))
+					}
+					return nil
+				},
+			}
+
+			if err := regenerateIdentity(cfg, tt.shedName); err != nil {
+				t.Fatalf("regenerateIdentity: %v", err)
+			}
+
+			// Substitute %hostnamePath% in the expected argv so the test
+			// stays portable across t.TempDir's per-run paths.
+			want := make([]string, len(tt.wantCalls))
+			for i, c := range tt.wantCalls {
+				want[i] = strings.ReplaceAll(c, "%hostnamePath%", hostnamePath)
+			}
+
+			if len(calls) != len(want) {
+				t.Fatalf("call count = %d; want %d (got: %v)", len(calls), len(want), calls)
+			}
+			for i, w := range want {
+				if calls[i] != w {
+					t.Errorf("call[%d] = %q; want %q (full sequence: %v)", i, calls[i], w, calls)
+				}
+			}
+		})
 	}
 }
 
