@@ -172,11 +172,6 @@ func TestRunFirstboot(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			machineIDPath := filepath.Join(tmp, "machine-id")
-			if err := os.WriteFile(machineIDPath, []byte("oldid"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-
 			sshDir := filepath.Join(tmp, "ssh")
 			if err := os.MkdirAll(sshDir, 0o755); err != nil {
 				t.Fatal(err)
@@ -198,11 +193,10 @@ func TestRunFirstboot(t *testing.T) {
 			}
 
 			cfg := firstbootCfg{
-				cmdlinePath:   cmdlinePath,
-				machineIDPath: machineIDPath,
-				sshKeyGlob:    filepath.Join(sshDir, "ssh_host_*"),
-				hostnamePath:  hostnamePath,
-				identityPath:  identityPath,
+				cmdlinePath:  cmdlinePath,
+				sshKeyGlob:   filepath.Join(sshDir, "ssh_host_*"),
+				hostnamePath: hostnamePath,
+				identityPath: identityPath,
 				runCommand: func(name string, args ...string) error {
 					f.ranCommands = append(f.ranCommands, name)
 					return nil
@@ -233,16 +227,66 @@ func TestRunFirstboot(t *testing.T) {
 	}
 }
 
+// TestRegenerateIdentity_HostnameBeforeSSHKeygen asserts the order:
+// hostname must be set before `ssh-keygen -A` runs, otherwise the new SSH
+// host keys' comment field captures the source shed's hostname (which is
+// still in /etc/hostname at that point) instead of the spawn's. Caught
+// during the v0.4.1 live test on both backends — keys on cloned sheds
+// said `root@v041-base` instead of `root@v041-spawnN`.
+func TestRegenerateIdentity_HostnameBeforeSSHKeygen(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "ssh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "hostname"), []byte("oldhost\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var order []string
+	cfg := firstbootCfg{
+		sshKeyGlob:   filepath.Join(tmp, "ssh", "ssh_host_*"),
+		hostnamePath: filepath.Join(tmp, "hostname"),
+		identityPath: filepath.Join(tmp, "identity.json"),
+		runCommand: func(name string, args ...string) error {
+			order = append(order, name)
+			return nil
+		},
+	}
+
+	if err := regenerateIdentity(cfg, "newshed"); err != nil {
+		t.Fatalf("regenerateIdentity: %v", err)
+	}
+
+	hostnameIdx, sshKeygenIdx := -1, -1
+	for i, c := range order {
+		if c == "hostname" && hostnameIdx == -1 {
+			hostnameIdx = i
+		}
+		if c == "ssh-keygen" && sshKeygenIdx == -1 {
+			sshKeygenIdx = i
+		}
+	}
+	if hostnameIdx < 0 {
+		t.Fatalf("hostname command never ran (order: %v)", order)
+	}
+	if sshKeygenIdx < 0 {
+		t.Fatalf("ssh-keygen never ran (order: %v)", order)
+	}
+	if hostnameIdx >= sshKeygenIdx {
+		t.Errorf("hostname (idx %d) must run before ssh-keygen (idx %d); order: %v",
+			hostnameIdx, sshKeygenIdx, order)
+	}
+}
+
 func TestRunFirstboot_ErrorPaths(t *testing.T) {
 	t.Run("missing_cmdline_errors", func(t *testing.T) {
 		tmp := t.TempDir()
 		cfg := firstbootCfg{
-			cmdlinePath:   filepath.Join(tmp, "no-such-file"),
-			machineIDPath: filepath.Join(tmp, "machine-id"),
-			sshKeyGlob:    filepath.Join(tmp, "ssh_host_*"),
-			hostnamePath:  filepath.Join(tmp, "hostname"),
-			identityPath:  filepath.Join(tmp, "identity.json"),
-			runCommand:    func(string, ...string) error { return nil },
+			cmdlinePath:  filepath.Join(tmp, "no-such-file"),
+			sshKeyGlob:   filepath.Join(tmp, "ssh_host_*"),
+			hostnamePath: filepath.Join(tmp, "hostname"),
+			identityPath: filepath.Join(tmp, "identity.json"),
+			runCommand:   func(string, ...string) error { return nil },
 		}
 		err := runFirstboot(cfg)
 		if err == nil {
@@ -253,14 +297,12 @@ func TestRunFirstboot_ErrorPaths(t *testing.T) {
 	t.Run("regen_command_failure_propagates", func(t *testing.T) {
 		tmp := t.TempDir()
 		os.WriteFile(filepath.Join(tmp, "cmdline"), []byte("shed.name=err"), 0o644)
-		os.WriteFile(filepath.Join(tmp, "machine-id"), []byte(""), 0o644)
 		os.WriteFile(filepath.Join(tmp, "hostname"), []byte(""), 0o644)
 		cfg := firstbootCfg{
-			cmdlinePath:   filepath.Join(tmp, "cmdline"),
-			machineIDPath: filepath.Join(tmp, "machine-id"),
-			sshKeyGlob:    filepath.Join(tmp, "ssh_host_*"),
-			hostnamePath:  filepath.Join(tmp, "hostname"),
-			identityPath:  filepath.Join(tmp, "identity.json"),
+			cmdlinePath:  filepath.Join(tmp, "cmdline"),
+			sshKeyGlob:   filepath.Join(tmp, "ssh_host_*"),
+			hostnamePath: filepath.Join(tmp, "hostname"),
+			identityPath: filepath.Join(tmp, "identity.json"),
 			runCommand: func(name string, args ...string) error {
 				if name == "ssh-keygen" {
 					return errors.New("simulated failure")
