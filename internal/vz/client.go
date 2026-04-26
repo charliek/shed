@@ -187,15 +187,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
-
-	// Snapshot rootfs is 0444 immutable; the cloned instance copy must be writable.
-	// Clonefile preserves source mode on darwin, so chmod after the clone unconditionally.
-	if req.FromSnapshot != "" {
-		if err := os.Chmod(rootfsPath, 0o644); err != nil {
-			_ = os.Remove(rootfsPath)
-			return nil, fmt.Errorf("failed to chmod cloned rootfs: %w", err)
-		}
-	}
+	// CopyRootfs now forces 0o644 internally so spawning from a 0o444
+	// snapshot rootfs produces a writable instance rootfs without an
+	// extra chmod here.
 
 	meta := &Metadata{
 		Name:         req.Name,

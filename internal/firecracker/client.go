@@ -482,21 +482,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
 	}
-
-	// Snapshot rootfs is 0444 immutable; ensure the cloned instance copy is writable.
-	// FICLONE/copy_file_range explicitly create dst at 0644 so this is usually a no-op,
-	// but keep it for defense across all clone strategies (and to mirror VZ behavior).
-	if req.FromSnapshot != "" {
-		if err := os.Chmod(rootfsPath, 0o644); err != nil {
-			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-			}
-			_ = os.Remove(rootfsPath)
-			c.ReleaseIP(ipAddress)
-			c.ReleaseCID(cid)
-			return nil, fmt.Errorf("failed to chmod cloned rootfs: %w", err)
-		}
-	}
+	// CopyRootfs forces 0o644 internally so spawning from a 0o444
+	// snapshot rootfs produces a writable instance rootfs.
 
 	cpus := req.CPUs
 	if cpus == 0 {
