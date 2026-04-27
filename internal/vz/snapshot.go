@@ -11,11 +11,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/systemprune"
 	"github.com/charliek/shed/internal/vmimage/clone"
 )
 
@@ -131,20 +131,12 @@ func listSnapshotNames(snapshotsDir string) ([]string, error) {
 
 // acquireSnapshotLock returns an unlock closure after taking the per-name
 // snapshot mutex. Mirrors acquireCreateLock for the snapshot keyspace.
-// Per-name mutex bound by number of distinct snapshot names ever used.
+//
+// Lock-order rule: when both locks are needed (snapshot create or
+// from-snapshot spawn), acquire snapshotLock BEFORE the source shed's
+// createLock to avoid AB-BA deadlock.
 func (c *Client) acquireSnapshotLock(name string) func() {
-	c.snapshotMu.Lock()
-	if c.snapshotLocks == nil {
-		c.snapshotLocks = make(map[string]*sync.Mutex)
-	}
-	mu, ok := c.snapshotLocks[name]
-	if !ok {
-		mu = &sync.Mutex{}
-		c.snapshotLocks[name] = mu
-	}
-	c.snapshotMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return c.snapshotLocks.Acquire(name)
 }
 
 // CreateSnapshot captures a stopped shed's rootfs as a named, immutable artifact.
@@ -187,6 +179,23 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create snapshot directory: %w", err)
 	}
+
+	// Drop a `.creating` marker so `shed system prune --orphans` won't sweep
+	// this dir if the host crashes mid-create. Fail-closed: if we can't make
+	// the marker durable before the long-running clone, abort rather than
+	// proceed with no crash protection. fsync the parent dir so the marker
+	// dentry is on stable storage before returning from the write.
+	markerPath := filepath.Join(dir, systemprune.SnapshotCreatingMarker)
+	if err := os.WriteFile(markerPath, nil, 0o600); err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to create snapshot marker: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		_ = os.Remove(markerPath)
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to sync snapshot marker: %w", err)
+	}
+	defer os.Remove(markerPath)
 
 	dstRootfs := SnapshotRootfsPath(c.cfg.SnapshotsDir, req.Name)
 	if err := os.Remove(dstRootfs); err != nil && !os.IsNotExist(err) {

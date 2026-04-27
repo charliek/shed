@@ -180,6 +180,31 @@ func TestCountFiles(t *testing.T) {
 	}
 }
 
+func TestCountFiles_SnapshotOtherFiles(t *testing.T) {
+	du := sampleDiskUsage()
+	du.Snapshots = []config.SnapshotDiskEntry{
+		{
+			Name:   "snap-no-meta",
+			Rootfs: config.FileEntry{Path: "/tmp/r1", Size: config.DiskSize{LogicalBytes: 1024}, Kind: "rootfs"},
+			Total:  config.DiskSize{LogicalBytes: 1024},
+		},
+		{
+			Name:   "snap-with-meta",
+			Rootfs: config.FileEntry{Path: "/tmp/r2", Size: config.DiskSize{LogicalBytes: 2048}, Kind: "rootfs"},
+			OtherFiles: []config.FileEntry{
+				{Path: "/tmp/r2/snapshot.json", Size: config.DiskSize{LogicalBytes: 256, PhysicalBytes: 4096}, Kind: "metadata"},
+			},
+			Total: config.DiskSize{LogicalBytes: 2048 + 256, PhysicalBytes: 4096},
+		},
+	}
+	// Base from the existing fixture is 8 (see TestCountFiles); plus 2 snapshot
+	// rootfs + 1 metadata sidecar = 11.
+	got := countFiles(&du)
+	if got != 11 {
+		t.Errorf("countFiles = %d, want 11", got)
+	}
+}
+
 func samplePruneReport(dry bool) config.PruneReport {
 	return config.PruneReport{
 		DryRun:     dry,

@@ -163,6 +163,7 @@ func TestMapBackendError_SentinelErrors(t *testing.T) {
 		{"not running", fmt.Errorf("%w: mydev", config.ErrShedNotRunningSentinel), http.StatusConflict, config.ErrShedAlreadyStopped},
 		{"image not found", fmt.Errorf("%w", config.ErrImageNotFoundSentinel), http.StatusNotFound, config.ErrImageNotFound},
 		{"image in use", fmt.Errorf("%w", config.ErrImageInUseSentinel), http.StatusConflict, config.ErrImageInUse},
+		{"invalid shed request", fmt.Errorf("%w: --from-snapshot cannot be combined with --image or --repo", config.ErrInvalidShedRequestSentinel), http.StatusBadRequest, config.ErrInvalidRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

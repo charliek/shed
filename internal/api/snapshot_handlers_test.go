@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,10 @@ import (
 
 // snapshotFakeBackend is a minimal backend.Backend that exercises only the
 // snapshot-related routes. Other methods panic so accidental coupling shows up.
+//
+// CreateShed is overridable via createShedFn for tests that need to exercise
+// the API handler's create path (e.g., the from-snapshot mutual-exclusion case
+// after the API-layer mutex check moved to the backend sentinel).
 type snapshotFakeBackend struct {
 	listResp     []config.Snapshot
 	listErr      error
@@ -25,11 +30,15 @@ type snapshotFakeBackend struct {
 	getErr       error
 	deleteErr    error
 	createCalled config.SnapshotCreateRequest
+	createShedFn func(context.Context, config.CreateShedRequest) (*config.Shed, error)
 }
 
 func (f *snapshotFakeBackend) Type() backend.Type { return backend.TypeVZ }
 func (f *snapshotFakeBackend) Close() error       { return nil }
-func (f *snapshotFakeBackend) CreateShed(_ context.Context, _ config.CreateShedRequest) (*config.Shed, error) {
+func (f *snapshotFakeBackend) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+	if f.createShedFn != nil {
+		return f.createShedFn(ctx, req)
+	}
 	panic("unexpected")
 }
 func (f *snapshotFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, error) {
@@ -277,7 +286,11 @@ func TestHandleCreateShed_FromSnapshotMutualExclusion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			be := &snapshotFakeBackend{}
+			be := &snapshotFakeBackend{
+				createShedFn: func(_ context.Context, _ config.CreateShedRequest) (*config.Shed, error) {
+					return nil, fmt.Errorf("%w: --from-snapshot cannot be combined with --image or --repo", config.ErrInvalidShedRequestSentinel)
+				},
+			}
 			srv := NewServer(be, &config.ServerConfig{Name: "t", DefaultBackend: config.BackendVZ}, "", nil, nil)
 			r := httptest.NewRequest(http.MethodPost, "/api/sheds", bytes.NewBufferString(tt.body))
 			w := httptest.NewRecorder()

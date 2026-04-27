@@ -5,6 +5,7 @@ package vz
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -516,5 +517,32 @@ func TestCreateShedValidatesResources(t *testing.T) {
 	}
 	if _, statErr := os.Stat(InstanceDir(tmpDir, "too-little-memory")); !os.IsNotExist(statErr) {
 		t.Fatalf("instance dir should not exist for invalid memory request, stat err: %v", statErr)
+	}
+}
+
+func TestCreateShedFromSnapshotMutualExclusionWrapsSentinel(t *testing.T) {
+	client := &Client{
+		cfg:     &config.VZConfig{InstanceDir: t.TempDir()},
+		vms:     make(map[string]*VM),
+		credMgr: newTestCredMgr(),
+	}
+
+	tests := []struct {
+		name string
+		req  config.CreateShedRequest
+	}{
+		{"with_image", config.CreateShedRequest{Name: "n", FromSnapshot: "snap1", Image: "default"}},
+		{"with_repo", config.CreateShedRequest{Name: "n", FromSnapshot: "snap1", Repo: "git@github.com:o/r.git"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CreateShed(context.Background(), tt.req)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !errors.Is(err, config.ErrInvalidShedRequestSentinel) {
+				t.Fatalf("error %v does not wrap ErrInvalidShedRequestSentinel", err)
+			}
+		})
 	}
 }

@@ -6,6 +6,7 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -583,5 +584,28 @@ func TestMetadataLocalDir_RoundTrip(t *testing.T) {
 
 	if localDir != "/tmp/test-project" {
 		t.Errorf("local_dir in JSON = %q, want %q", localDir, "/tmp/test-project")
+	}
+}
+
+func TestCreateShedFromSnapshotMutualExclusionWrapsSentinel(t *testing.T) {
+	c := &Client{}
+
+	tests := []struct {
+		name string
+		req  config.CreateShedRequest
+	}{
+		{"with_image", config.CreateShedRequest{Name: "n", FromSnapshot: "snap1", Image: "default"}},
+		{"with_repo", config.CreateShedRequest{Name: "n", FromSnapshot: "snap1", Repo: "git@github.com:o/r.git"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := c.CreateShed(context.Background(), tt.req)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !errors.Is(err, config.ErrInvalidShedRequestSentinel) {
+				t.Fatalf("error %v does not wrap ErrInvalidShedRequestSentinel", err)
+			}
+		})
 	}
 }

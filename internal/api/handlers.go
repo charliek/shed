@@ -83,18 +83,18 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// from_snapshot is mutually exclusive with image and repo (snapshot rootfs is the source of truth).
+	// from_snapshot validation runs BEFORE either the SSE branch or the
+	// backend call: handleCreateShedSSE writes "200 OK" before the backend
+	// runs, so a backend-only sentinel would surface as a streamed error
+	// instead of the 400 INVALID_REQUEST clients expect.
 	if req.FromSnapshot != "" {
-		if req.Image != "" {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "from_snapshot and image are mutually exclusive")
-			return
-		}
-		if req.Repo != "" {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "from_snapshot and repo are mutually exclusive")
-			return
-		}
 		if err := config.ValidateSnapshotName(req.FromSnapshot); err != nil {
 			writeError(w, http.StatusBadRequest, config.ErrInvalidSnapshotName, err.Error())
+			return
+		}
+		if req.Image != "" || req.Repo != "" {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest,
+				"invalid create-shed request: --from-snapshot cannot be combined with --image or --repo")
 			return
 		}
 	}
@@ -422,6 +422,9 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrSnapshotBackendMismatchSentinel) {
 		return http.StatusBadRequest, config.ErrSnapshotBackendMismatch, err.Error()
+	}
+	if errors.Is(err, config.ErrInvalidShedRequestSentinel) {
+		return http.StatusBadRequest, config.ErrInvalidRequest, err.Error()
 	}
 
 	// Fallback to string matching for errors without sentinels

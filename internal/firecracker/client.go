@@ -17,6 +17,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
@@ -34,19 +35,17 @@ type Client struct {
 	usedIPs   map[string]string      // IP -> name
 	p9Servers map[string][]*P9Server // name -> active 9P servers for this VM
 
-	// createLocks serializes CreateShed calls by shed name to close the
-	// TOCTOU between the already-exists check and the final meta.Save.
-	// Two racing `shed create` calls for the same name would otherwise
-	// both pass the existence check and the second caller's CopyRootfs
-	// would os.Remove the first caller's just-cloned rootfs. createMu
-	// guards the map; each value is locked across a single CreateShed.
-	createMu    sync.Mutex
-	createLocks map[string]*sync.Mutex
+	// shedLocks serializes per-shed-name lifecycle operations. Originally
+	// added for CreateShed-vs-CreateShed TOCTOU but the lock has broadened
+	// to cover any operation that mutates a shed's on-disk state (Create,
+	// Start, Stop, Delete, and CreateSnapshot of this shed as source).
+	// Value type so the zero-value Client{} works in tests.
+	shedLocks lockmap.NamedMutexMap
 
-	// snapshotLocks serializes CreateSnapshot/DeleteSnapshot calls by
-	// snapshot name. Distinct keyspace from createLocks.
-	snapshotMu    sync.Mutex
-	snapshotLocks map[string]*sync.Mutex
+	// snapshotLocks serializes CreateSnapshot/DeleteSnapshot/CreateShed-
+	// from-snapshot calls by snapshot name. Distinct keyspace from
+	// shedLocks (snapshot names vs shed names).
+	snapshotLocks lockmap.NamedMutexMap
 
 	// Credential sync
 	credMgr *vmutil.CredentialManager
@@ -60,16 +59,14 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, br
 	}
 
 	client := &Client{
-		cfg:           cfg,
-		serverCfg:     serverCfg,
-		netMgr:        netMgr,
-		vms:           make(map[string]*VM),
-		usedCIDs:      make(map[uint32]string),
-		usedIPs:       make(map[string]string),
-		p9Servers:     make(map[string][]*P9Server),
-		createLocks:   make(map[string]*sync.Mutex),
-		snapshotLocks: make(map[string]*sync.Mutex),
-		credMgr:       vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
+		cfg:       cfg,
+		serverCfg: serverCfg,
+		netMgr:    netMgr,
+		vms:       make(map[string]*VM),
+		usedCIDs:  make(map[uint32]string),
+		usedIPs:   make(map[string]string),
+		p9Servers: make(map[string][]*P9Server),
+		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -113,22 +110,8 @@ func (c *Client) loadExistingInstances() error {
 // Lock-order rule: when both locks are needed (snapshot create or
 // from-snapshot spawn), acquire snapshotLock BEFORE createLock to avoid
 // AB-BA deadlock with other code paths.
-//
-// The per-name mutex is leaked on first use — bounded by the number of
-// distinct shed names ever created in this process, which is negligible.
 func (c *Client) acquireCreateLock(name string) func() {
-	c.createMu.Lock()
-	if c.createLocks == nil {
-		c.createLocks = make(map[string]*sync.Mutex)
-	}
-	mu, ok := c.createLocks[name]
-	if !ok {
-		mu = &sync.Mutex{}
-		c.createLocks[name] = mu
-	}
-	c.createMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return c.shedLocks.Acquire(name)
 }
 
 // Close closes the client and releases resources.
@@ -395,7 +378,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	if req.FromSnapshot != "" {
 		if req.Image != "" || req.Repo != "" {
-			return nil, fmt.Errorf("--from-snapshot is mutually exclusive with --image and --repo")
+			return nil, fmt.Errorf("%w: --from-snapshot cannot be combined with --image or --repo", config.ErrInvalidShedRequestSentinel)
 		}
 	}
 

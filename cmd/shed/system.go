@@ -222,8 +222,13 @@ func renderDF(w io.Writer, du config.DiskUsage, verbose bool) {
 		}
 	}
 
-	// Per-snapshot FILES count is one rootfs + one snapshot.json per snapshot.
-	snapshotFiles := len(du.Snapshots) * 2
+	// Per-snapshot FILES count is one rootfs plus any sidecar files (typically
+	// snapshot.json). Mirrors the per-shed shedFiles accumulation above.
+	snapshotFiles := 0
+	for _, s := range du.Snapshots {
+		snapshotFiles++ // rootfs
+		snapshotFiles += len(s.OtherFiles)
+	}
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "CATEGORY\tFILES\tLOGICAL\tPHYSICAL")
@@ -365,8 +370,10 @@ func countFiles(du *config.DiskUsage) int {
 		}
 		n += len(s.OtherFiles)
 	}
-	// Each snapshot is rootfs.ext4 + snapshot.json.
-	n += len(du.Snapshots) * 2
+	for _, s := range du.Snapshots {
+		n++ // rootfs
+		n += len(s.OtherFiles)
+	}
 	return n
 }
 

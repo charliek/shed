@@ -51,6 +51,12 @@ var (
 
 	// ErrSnapshotBackendMismatchSentinel is returned when spawning a snapshot on the wrong backend.
 	ErrSnapshotBackendMismatchSentinel = errors.New("snapshot backend does not match target")
+
+	// ErrInvalidShedRequestSentinel is the catch-all sentinel for CreateShedRequest
+	// field-level validation that maps to HTTP 400 INVALID_REQUEST. Add new
+	// field-conflict cases (e.g., --from-snapshot combined with --image or --repo)
+	// under this sentinel rather than minting per-conflict sentinels.
+	ErrInvalidShedRequestSentinel = errors.New("invalid create-shed request")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
@@ -234,7 +240,7 @@ type FileEntry struct {
 	Path string   `json:"path"`
 	Size DiskSize `json:"size"`
 	// Kind is one of: "rootfs" | "console_log" | "kernel" | "initrd" |
-	// "lock" | "tmp" | "source" | "metadata".
+	// "lock" | "tmp" | "source" | "metadata" | "snapshot_orphan".
 	Kind string `json:"kind,omitempty"`
 }
 
@@ -308,7 +314,7 @@ type SystemDFResponse struct {
 // by `shed system prune`.
 type PrunedItem struct {
 	// Kind is one of: "image" | "rootfs" | "console_log" | "metadata" |
-	// "instance" | "lock" | "tmp" | "source".
+	// "instance" | "lock" | "tmp" | "source" | "snapshot_orphan".
 	Kind string `json:"kind"`
 	Path string `json:"path,omitempty"`
 	// Name is the shed or image name when applicable.
@@ -444,11 +450,14 @@ type SnapshotCreateResponse struct {
 }
 
 // SnapshotDiskEntry describes one snapshot's disk footprint for `shed system df`.
+// OtherFiles holds metadata sidecars (snapshot.json) so callers can sum the
+// total footprint without hardcoding a per-snapshot file count.
 type SnapshotDiskEntry struct {
-	Name       string    `json:"name"`
-	SourceShed string    `json:"source_shed,omitempty"`
-	Rootfs     FileEntry `json:"rootfs"`
-	Total      DiskSize  `json:"total"`
+	Name       string      `json:"name"`
+	SourceShed string      `json:"source_shed,omitempty"`
+	Rootfs     FileEntry   `json:"rootfs"`
+	OtherFiles []FileEntry `json:"other_files,omitempty"`
+	Total      DiskSize    `json:"total"`
 }
 
 // APIError represents an error response from the API.
