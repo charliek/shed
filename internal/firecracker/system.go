@@ -75,6 +75,14 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		du.Orphans = orphans
 	}
 
+	if c.cfg.SnapshotsDir != "" {
+		snapOrphans, err := systemprune.FindSnapshotOrphans(c.cfg.SnapshotsDir)
+		if err != nil {
+			return du, fmt.Errorf("scanning snapshot orphans: %w", err)
+		}
+		du.Orphans = append(du.Orphans, snapOrphans...)
+	}
+
 	// Kernel only — Firecracker has no initrd.
 	if c.cfg.KernelPath != "" {
 		if logical, physical, err := diskstat.Stat(c.cfg.KernelPath); err == nil {
@@ -247,6 +255,13 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		report.Skipped = append(report.Skipped, skipped...)
 	}
 
+	var snapshotOrphanCandidates []systemprune.SnapshotOrphanCandidate
+	if opts.Orphans && c.cfg.SnapshotsDir != "" {
+		cands, skipped := systemprune.CollectSnapshotOrphanCandidates(c.cfg.SnapshotsDir)
+		snapshotOrphanCandidates = cands
+		report.Skipped = append(report.Skipped, skipped...)
+	}
+
 	var imageCandidates []vmimage.ImageInfo
 	if opts.Images && c.cfg.ImagesDir != "" {
 		skipSet := make(map[string]bool, len(instanceCandidates))
@@ -281,6 +296,9 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	}
 	for _, oc := range orphanCandidates {
 		report.Items = append(report.Items, oc.ToPrunedItem(opts.DryRun))
+	}
+	for _, sc := range snapshotOrphanCandidates {
+		report.Items = append(report.Items, sc.ToPrunedItems(opts.DryRun)...)
 	}
 	for _, img := range imageCandidates {
 		report.Items = append(report.Items, systemprune.ImageToPrunedItem(img, opts.DryRun))
@@ -327,6 +345,16 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 				continue
 			}
 			report.Items = append(report.Items, oc.ToPrunedItem(false))
+		}
+		for _, sc := range snapshotOrphanCandidates {
+			if ok := systemprune.SweepSnapshotOrphan(sc); !ok {
+				report.Skipped = append(report.Skipped, config.SkippedItem{
+					Kind: "snapshot_orphan", Path: sc.Dir,
+					Reason: "removal failed",
+				})
+				continue
+			}
+			report.Items = append(report.Items, sc.ToPrunedItems(false)...)
 		}
 	}
 

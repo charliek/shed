@@ -40,6 +40,15 @@ func newPruneTestClient(t *testing.T) (*Client, string, string) {
 	return c, imagesDir, instanceDir
 }
 
+// newPruneTestClientWithSnapshots is like newPruneTestClient but also seeds a
+// SnapshotsDir on the config so the snapshot-orphan path is exercised.
+func newPruneTestClientWithSnapshots(t *testing.T) (*Client, string) {
+	t.Helper()
+	c, _, _ := newPruneTestClient(t)
+	c.cfg.SnapshotsDir = t.TempDir()
+	return c, c.cfg.SnapshotsDir
+}
+
 // seedStoppedShed creates a stopped-instance fixture with a rootfs and
 // (optionally) a console.log. Backdate sets metadata.json mtime so the age
 // filter sees it as "old enough."
@@ -616,5 +625,110 @@ func TestTryAcquireFileLock_NoCreate(t *testing.T) {
 	// The probe must not have created the file.
 	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
 		t.Errorf("TryAcquireFileLock created the lock file; it should be a no-op for missing locks")
+	}
+}
+
+func TestPrune_SnapshotOrphans_PartialDirRemoved(t *testing.T) {
+	c, snapshotsDir := newPruneTestClientWithSnapshots(t)
+
+	// Partial snapshot: rootfs.ext4 present, snapshot.json missing, no marker.
+	dir := filepath.Join(snapshotsDir, "halfwritten")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(rootfs, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := c.Prune(context.Background(), backend.PruneOptions{Orphans: true})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+
+	hasRootfs, hasDir := false, false
+	for _, it := range report.Items {
+		if it.Path == rootfs && it.Kind == "snapshot_orphan" {
+			hasRootfs = true
+		}
+		if it.Path == dir && it.Kind == "snapshot_orphan" {
+			hasDir = true
+		}
+	}
+	if !hasRootfs {
+		t.Errorf("expected snapshot rootfs reported as snapshot_orphan, got %+v", report.Items)
+	}
+	if !hasDir {
+		t.Errorf("expected snapshot dir reported as snapshot_orphan, got %+v", report.Items)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("snapshot orphan dir still exists after prune (err=%v)", err)
+	}
+}
+
+func TestPrune_SnapshotOrphans_FreshCreatingMarkerSkipped(t *testing.T) {
+	c, snapshotsDir := newPruneTestClientWithSnapshots(t)
+
+	dir := filepath.Join(snapshotsDir, "inflight")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rootfs.ext4"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".creating"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := c.Prune(context.Background(), backend.PruneOptions{Orphans: true})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+
+	for _, it := range report.Items {
+		if strings.HasPrefix(it.Path, dir) {
+			t.Fatalf("inflight snapshot dir was touched: %+v", it)
+		}
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("inflight dir was deleted: %v", err)
+	}
+
+	// And the skipped list should mention the dir.
+	hasSkip := false
+	for _, sk := range report.Skipped {
+		if sk.Path == dir && sk.Kind == "snapshot_orphan" {
+			hasSkip = true
+		}
+	}
+	if !hasSkip {
+		t.Errorf("expected SkippedItem for inflight snapshot, got %+v", report.Skipped)
+	}
+}
+
+func TestPrune_SnapshotOrphans_DryRunNoMutation(t *testing.T) {
+	c, snapshotsDir := newPruneTestClientWithSnapshots(t)
+
+	dir := filepath.Join(snapshotsDir, "halfwritten")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(rootfs, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := c.Prune(context.Background(), backend.PruneOptions{Orphans: true, DryRun: true})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if !report.DryRun {
+		t.Errorf("expected DryRun=true")
+	}
+	if _, err := os.Stat(rootfs); err != nil {
+		t.Errorf("dry run deleted rootfs: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("dry run deleted dir: %v", err)
 	}
 }

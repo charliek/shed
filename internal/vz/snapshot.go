@@ -15,6 +15,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/systemprune"
 	"github.com/charliek/shed/internal/vmimage/clone"
 )
 
@@ -177,6 +178,14 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	dir := SnapshotDir(c.cfg.SnapshotsDir, req.Name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create snapshot directory: %w", err)
+	}
+
+	// Drop a `.creating` marker so `shed system prune --orphans` won't sweep
+	// this dir if the host crashes mid-create. Removed on every exit path.
+	markerPath := filepath.Join(dir, systemprune.SnapshotCreatingMarker)
+	if mf, err := os.Create(markerPath); err == nil {
+		_ = mf.Close()
+		defer os.Remove(markerPath)
 	}
 
 	dstRootfs := SnapshotRootfsPath(c.cfg.SnapshotsDir, req.Name)

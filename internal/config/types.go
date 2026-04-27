@@ -240,7 +240,7 @@ type FileEntry struct {
 	Path string   `json:"path"`
 	Size DiskSize `json:"size"`
 	// Kind is one of: "rootfs" | "console_log" | "kernel" | "initrd" |
-	// "lock" | "tmp" | "source" | "metadata".
+	// "lock" | "tmp" | "source" | "metadata" | "snapshot_orphan".
 	Kind string `json:"kind,omitempty"`
 }
 
@@ -314,7 +314,7 @@ type SystemDFResponse struct {
 // by `shed system prune`.
 type PrunedItem struct {
 	// Kind is one of: "image" | "rootfs" | "console_log" | "metadata" |
-	// "instance" | "lock" | "tmp" | "source".
+	// "instance" | "lock" | "tmp" | "source" | "snapshot_orphan".
 	Kind string `json:"kind"`
 	Path string `json:"path,omitempty"`
 	// Name is the shed or image name when applicable.
