@@ -51,6 +51,12 @@ var (
 
 	// ErrSnapshotBackendMismatchSentinel is returned when spawning a snapshot on the wrong backend.
 	ErrSnapshotBackendMismatchSentinel = errors.New("snapshot backend does not match target")
+
+	// ErrInvalidShedRequestSentinel is the catch-all sentinel for CreateShedRequest
+	// field-level validation that maps to HTTP 400 INVALID_REQUEST. Add new
+	// field-conflict cases (e.g., --from-snapshot combined with --image or --repo)
+	// under this sentinel rather than minting per-conflict sentinels.
+	ErrInvalidShedRequestSentinel = errors.New("invalid create-shed request")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.

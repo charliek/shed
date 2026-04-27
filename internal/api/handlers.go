@@ -83,16 +83,11 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// from_snapshot is mutually exclusive with image and repo (snapshot rootfs is the source of truth).
+	// from_snapshot name validation. The mutual-exclusion check (vs image/repo) is enforced
+	// in the backend via ErrInvalidShedRequestSentinel, which mapBackendError translates to
+	// 400 INVALID_REQUEST. Name validation stays here because backends only catch a bad name
+	// later (in loadSnapshot) without surfacing a 400.
 	if req.FromSnapshot != "" {
-		if req.Image != "" {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "from_snapshot and image are mutually exclusive")
-			return
-		}
-		if req.Repo != "" {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "from_snapshot and repo are mutually exclusive")
-			return
-		}
 		if err := config.ValidateSnapshotName(req.FromSnapshot); err != nil {
 			writeError(w, http.StatusBadRequest, config.ErrInvalidSnapshotName, err.Error())
 			return
@@ -422,6 +417,9 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrSnapshotBackendMismatchSentinel) {
 		return http.StatusBadRequest, config.ErrSnapshotBackendMismatch, err.Error()
+	}
+	if errors.Is(err, config.ErrInvalidShedRequestSentinel) {
+		return http.StatusBadRequest, config.ErrInvalidRequest, err.Error()
 	}
 
 	// Fallback to string matching for errors without sentinels

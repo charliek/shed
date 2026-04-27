@@ -395,7 +395,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	if req.FromSnapshot != "" {
 		if req.Image != "" || req.Repo != "" {
-			return nil, fmt.Errorf("--from-snapshot is mutually exclusive with --image and --repo")
+			return nil, fmt.Errorf("%w: --from-snapshot cannot be combined with --image or --repo", config.ErrInvalidShedRequestSentinel)
 		}
 	}
 
