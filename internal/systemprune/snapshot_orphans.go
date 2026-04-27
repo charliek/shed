@@ -88,7 +88,14 @@ func FindSnapshotOrphans(snapshotsDir string) ([]config.FileEntry, error) {
 			continue
 		}
 		dir := filepath.Join(snapshotsDir, e.Name())
-		if _, err := os.Stat(filepath.Join(dir, snapshotMetadataFilename)); err == nil {
+		_, statErr := os.Stat(filepath.Join(dir, snapshotMetadataFilename))
+		if statErr == nil {
+			continue
+		}
+		// Only IsNotExist means "metadata is genuinely missing." A permission
+		// or transient I/O error must NOT misclassify a healthy snapshot as
+		// orphan — skip and let the next scan retry.
+		if !os.IsNotExist(statErr) {
 			continue
 		}
 		files, err := walkSnapshotDir(dir)
@@ -121,7 +128,19 @@ func CollectSnapshotOrphanCandidates(snapshotsDir string) ([]SnapshotOrphanCandi
 			continue
 		}
 		dir := filepath.Join(snapshotsDir, e.Name())
-		if _, err := os.Stat(filepath.Join(dir, snapshotMetadataFilename)); err == nil {
+		_, statErr := os.Stat(filepath.Join(dir, snapshotMetadataFilename))
+		if statErr == nil {
+			continue
+		}
+		// Permission or transient I/O failure must NOT be treated as "missing
+		// metadata" — that path leads to deletion of healthy snapshots. Surface
+		// it as a SkippedItem instead.
+		if !os.IsNotExist(statErr) {
+			skipped = append(skipped, config.SkippedItem{
+				Kind:   "snapshot_orphan",
+				Path:   dir,
+				Reason: fmt.Sprintf("stat snapshot.json failed: %v", statErr),
+			})
 			continue
 		}
 

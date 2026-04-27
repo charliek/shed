@@ -628,107 +628,98 @@ func TestTryAcquireFileLock_NoCreate(t *testing.T) {
 	}
 }
 
-func TestPrune_SnapshotOrphans_PartialDirRemoved(t *testing.T) {
-	c, snapshotsDir := newPruneTestClientWithSnapshots(t)
-
-	// Partial snapshot: rootfs.ext4 present, snapshot.json missing, no marker.
-	dir := filepath.Join(snapshotsDir, "halfwritten")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	rootfs := filepath.Join(dir, "rootfs.ext4")
-	if err := os.WriteFile(rootfs, []byte("data"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	report, err := c.Prune(context.Background(), backend.PruneOptions{Orphans: true})
-	if err != nil {
-		t.Fatalf("Prune: %v", err)
-	}
-
-	hasRootfs, hasDir := false, false
-	for _, it := range report.Items {
-		if it.Path == rootfs && it.Kind == "snapshot_orphan" {
-			hasRootfs = true
-		}
-		if it.Path == dir && it.Kind == "snapshot_orphan" {
-			hasDir = true
-		}
-	}
-	if !hasRootfs {
-		t.Errorf("expected snapshot rootfs reported as snapshot_orphan, got %+v", report.Items)
-	}
-	if !hasDir {
-		t.Errorf("expected snapshot dir reported as snapshot_orphan, got %+v", report.Items)
-	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("snapshot orphan dir still exists after prune (err=%v)", err)
-	}
-}
-
-func TestPrune_SnapshotOrphans_FreshCreatingMarkerSkipped(t *testing.T) {
-	c, snapshotsDir := newPruneTestClientWithSnapshots(t)
-
-	dir := filepath.Join(snapshotsDir, "inflight")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "rootfs.ext4"), []byte("data"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".creating"), nil, 0o600); err != nil {
-		t.Fatal(err)
+// TestPrune_SnapshotOrphans covers all three snapshot-orphan paths in one
+// table-driven harness. Setup writes a partial snapshot dir; flags toggle
+// the `.creating` marker and DryRun. Assertions cover both the
+// PruneReport shape and the on-disk state after Prune returns.
+func TestPrune_SnapshotOrphans(t *testing.T) {
+	tests := []struct {
+		name              string
+		writeMarker       bool
+		dryRun            bool
+		wantItems         bool // expect snapshot_orphan entries in report.Items
+		wantSkipped       bool // expect snapshot_orphan SkippedItem
+		wantDirRemoved    bool // expect the partial dir to be gone after Prune
+		wantRootfsRemoved bool // expect the rootfs file to be gone after Prune
+	}{
+		{
+			name:              "partial dir removed",
+			wantItems:         true,
+			wantDirRemoved:    true,
+			wantRootfsRemoved: true,
+		},
+		{
+			name:        "fresh creating marker is skipped",
+			writeMarker: true,
+			wantSkipped: true,
+		},
+		{
+			name:      "dry-run does not mutate disk",
+			dryRun:    true,
+			wantItems: true,
+		},
 	}
 
-	report, err := c.Prune(context.Background(), backend.PruneOptions{Orphans: true})
-	if err != nil {
-		t.Fatalf("Prune: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, snapshotsDir := newPruneTestClientWithSnapshots(t)
 
-	for _, it := range report.Items {
-		if strings.HasPrefix(it.Path, dir) {
-			t.Fatalf("inflight snapshot dir was touched: %+v", it)
-		}
-	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("inflight dir was deleted: %v", err)
-	}
+			dir := filepath.Join(snapshotsDir, "halfwritten")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			rootfs := filepath.Join(dir, "rootfs.ext4")
+			if err := os.WriteFile(rootfs, []byte("data"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tt.writeMarker {
+				if err := os.WriteFile(filepath.Join(dir, ".creating"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-	// And the skipped list should mention the dir.
-	hasSkip := false
-	for _, sk := range report.Skipped {
-		if sk.Path == dir && sk.Kind == "snapshot_orphan" {
-			hasSkip = true
-		}
-	}
-	if !hasSkip {
-		t.Errorf("expected SkippedItem for inflight snapshot, got %+v", report.Skipped)
-	}
-}
+			report, err := c.Prune(context.Background(), backend.PruneOptions{
+				Orphans: true,
+				DryRun:  tt.dryRun,
+			})
+			if err != nil {
+				t.Fatalf("Prune: %v", err)
+			}
+			if report.DryRun != tt.dryRun {
+				t.Errorf("report.DryRun = %v; want %v", report.DryRun, tt.dryRun)
+			}
 
-func TestPrune_SnapshotOrphans_DryRunNoMutation(t *testing.T) {
-	c, snapshotsDir := newPruneTestClientWithSnapshots(t)
+			hasItems := false
+			for _, it := range report.Items {
+				if strings.HasPrefix(it.Path, dir) && it.Kind == "snapshot_orphan" {
+					hasItems = true
+				}
+			}
+			if hasItems != tt.wantItems {
+				t.Errorf("snapshot_orphan items present = %v; want %v (items=%+v)", hasItems, tt.wantItems, report.Items)
+			}
 
-	dir := filepath.Join(snapshotsDir, "halfwritten")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	rootfs := filepath.Join(dir, "rootfs.ext4")
-	if err := os.WriteFile(rootfs, []byte("data"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+			hasSkipped := false
+			for _, sk := range report.Skipped {
+				if sk.Path == dir && sk.Kind == "snapshot_orphan" {
+					hasSkipped = true
+				}
+			}
+			if hasSkipped != tt.wantSkipped {
+				t.Errorf("snapshot_orphan skipped present = %v; want %v (skipped=%+v)", hasSkipped, tt.wantSkipped, report.Skipped)
+			}
 
-	report, err := c.Prune(context.Background(), backend.PruneOptions{Orphans: true, DryRun: true})
-	if err != nil {
-		t.Fatalf("Prune: %v", err)
-	}
-	if !report.DryRun {
-		t.Errorf("expected DryRun=true")
-	}
-	if _, err := os.Stat(rootfs); err != nil {
-		t.Errorf("dry run deleted rootfs: %v", err)
-	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("dry run deleted dir: %v", err)
+			_, dirStatErr := os.Stat(dir)
+			dirGone := os.IsNotExist(dirStatErr)
+			if dirGone != tt.wantDirRemoved {
+				t.Errorf("dir removed = %v; want %v (stat err=%v)", dirGone, tt.wantDirRemoved, dirStatErr)
+			}
+
+			_, rootfsStatErr := os.Stat(rootfs)
+			rootfsGone := os.IsNotExist(rootfsStatErr)
+			if rootfsGone != tt.wantRootfsRemoved {
+				t.Errorf("rootfs removed = %v; want %v (stat err=%v)", rootfsGone, tt.wantRootfsRemoved, rootfsStatErr)
+			}
+		})
 	}
 }

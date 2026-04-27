@@ -83,13 +83,18 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// from_snapshot name validation. The mutual-exclusion check (vs image/repo) is enforced
-	// in the backend via ErrInvalidShedRequestSentinel, which mapBackendError translates to
-	// 400 INVALID_REQUEST. Name validation stays here because backends only catch a bad name
-	// later (in loadSnapshot) without surfacing a 400.
+	// from_snapshot validation runs BEFORE either the SSE branch or the
+	// backend call: handleCreateShedSSE writes "200 OK" before the backend
+	// runs, so a backend-only sentinel would surface as a streamed error
+	// instead of the 400 INVALID_REQUEST clients expect.
 	if req.FromSnapshot != "" {
 		if err := config.ValidateSnapshotName(req.FromSnapshot); err != nil {
 			writeError(w, http.StatusBadRequest, config.ErrInvalidSnapshotName, err.Error())
+			return
+		}
+		if req.Image != "" || req.Repo != "" {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidRequest,
+				"invalid create-shed request: --from-snapshot cannot be combined with --image or --repo")
 			return
 		}
 	}

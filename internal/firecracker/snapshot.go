@@ -175,12 +175,21 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	}
 
 	// Drop a `.creating` marker so `shed system prune --orphans` won't sweep
-	// this dir if the host crashes mid-create. Removed on every exit path.
+	// this dir if the host crashes mid-create. Fail-closed: if we can't make
+	// the marker durable before the long-running clone, abort rather than
+	// proceed with no crash protection. fsync the parent dir so the marker
+	// dentry is on stable storage before returning from the write.
 	markerPath := filepath.Join(dir, systemprune.SnapshotCreatingMarker)
-	if mf, err := os.Create(markerPath); err == nil {
-		_ = mf.Close()
-		defer os.Remove(markerPath)
+	if err := os.WriteFile(markerPath, nil, 0o600); err != nil {
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to create snapshot marker: %w", err)
 	}
+	if err := syncDir(dir); err != nil {
+		_ = os.Remove(markerPath)
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("failed to sync snapshot marker: %w", err)
+	}
+	defer os.Remove(markerPath)
 
 	dstRootfs := SnapshotRootfsPath(c.cfg.SnapshotsDir, req.Name)
 	if err := os.Remove(dstRootfs); err != nil && !os.IsNotExist(err) {
