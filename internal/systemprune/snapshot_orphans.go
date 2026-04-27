@@ -145,7 +145,8 @@ func CollectSnapshotOrphanCandidates(snapshotsDir string) ([]SnapshotOrphanCandi
 		}
 
 		markerPath := filepath.Join(dir, SnapshotCreatingMarker)
-		if fi, err := os.Stat(markerPath); err == nil {
+		fi, markerErr := os.Stat(markerPath)
+		if markerErr == nil {
 			age := now.Sub(fi.ModTime())
 			if age < SnapshotCreatingMaxAge {
 				skipped = append(skipped, config.SkippedItem{
@@ -155,6 +156,16 @@ func CollectSnapshotOrphanCandidates(snapshotsDir string) ([]SnapshotOrphanCandi
 				})
 				continue
 			}
+		} else if !os.IsNotExist(markerErr) {
+			// Permission/transient I/O error stat'ing the marker: fail closed.
+			// Treating "stat failed" as "marker absent" would let an in-flight
+			// create be enqueued for deletion.
+			skipped = append(skipped, config.SkippedItem{
+				Kind:   "snapshot_orphan",
+				Path:   dir,
+				Reason: fmt.Sprintf("stat %s failed: %v", SnapshotCreatingMarker, markerErr),
+			})
+			continue
 		}
 
 		files, err := walkSnapshotDir(dir)
