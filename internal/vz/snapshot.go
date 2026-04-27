@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
@@ -131,20 +130,12 @@ func listSnapshotNames(snapshotsDir string) ([]string, error) {
 
 // acquireSnapshotLock returns an unlock closure after taking the per-name
 // snapshot mutex. Mirrors acquireCreateLock for the snapshot keyspace.
-// Per-name mutex bound by number of distinct snapshot names ever used.
+//
+// Lock-order rule: when both locks are needed (snapshot create or
+// from-snapshot spawn), acquire snapshotLock BEFORE the source shed's
+// createLock to avoid AB-BA deadlock.
 func (c *Client) acquireSnapshotLock(name string) func() {
-	c.snapshotMu.Lock()
-	if c.snapshotLocks == nil {
-		c.snapshotLocks = make(map[string]*sync.Mutex)
-	}
-	mu, ok := c.snapshotLocks[name]
-	if !ok {
-		mu = &sync.Mutex{}
-		c.snapshotLocks[name] = mu
-	}
-	c.snapshotMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return c.snapshotLocks.Acquire(name)
 }
 
 // CreateSnapshot captures a stopped shed's rootfs as a named, immutable artifact.
