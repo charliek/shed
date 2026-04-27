@@ -450,11 +450,14 @@ type SnapshotCreateResponse struct {
 }
 
 // SnapshotDiskEntry describes one snapshot's disk footprint for `shed system df`.
+// OtherFiles holds metadata sidecars (snapshot.json) so callers can sum the
+// total footprint without hardcoding a per-snapshot file count.
 type SnapshotDiskEntry struct {
-	Name       string    `json:"name"`
-	SourceShed string    `json:"source_shed,omitempty"`
-	Rootfs     FileEntry `json:"rootfs"`
-	Total      DiskSize  `json:"total"`
+	Name       string      `json:"name"`
+	SourceShed string      `json:"source_shed,omitempty"`
+	Rootfs     FileEntry   `json:"rootfs"`
+	OtherFiles []FileEntry `json:"other_files,omitempty"`
+	Total      DiskSize    `json:"total"`
 }
 
 // APIError represents an error response from the API.

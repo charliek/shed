@@ -141,6 +141,16 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 				},
 				Total: config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
 			}
+			meta := SnapshotMetadataPath(c.cfg.SnapshotsDir, name)
+			if metaLogical, metaPhysical, err := diskstat.Stat(meta); err == nil {
+				entry.OtherFiles = append(entry.OtherFiles, config.FileEntry{
+					Path: meta,
+					Size: config.DiskSize{LogicalBytes: metaLogical, PhysicalBytes: metaPhysical},
+					Kind: "metadata",
+				})
+				entry.Total.LogicalBytes += metaLogical
+				entry.Total.PhysicalBytes += metaPhysical
+			}
 			du.Snapshots = append(du.Snapshots, entry)
 		}
 	}
@@ -178,7 +188,7 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 	)
 	if len(du.Snapshots) > 0 {
 		du.Notes = append(du.Notes,
-			"snapshots and sheds spawned from them share extents via reflink — physical bytes count those extents under both",
+			"rootfs extents are shared via reflink between a snapshot and sheds spawned from it — physical bytes count those extents under both; metadata files are unique per snapshot",
 		)
 	}
 
