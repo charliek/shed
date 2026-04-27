@@ -56,7 +56,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Upgrade", "shed-tcp")
 	w.WriteHeader(http.StatusSwitchingProtocols)
 
-	clientConn, _, err := hj.Hijack()
+	clientConn, bufrw, err := hj.Hijack()
 	if err != nil {
 		vmConn.Close()
 		log.Printf("Connect API: hijack failed for %s:%d: %v", shedName, port, err)
@@ -65,8 +65,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Connect API: tunnel %s:%d established", shedName, port)
 
+	// The HTTP server's bufio.Reader may have read past the request headers
+	// into the body before Hijack returned. Wrap clientConn with BufferedConn
+	// so BidirectionalCopy reads those buffered bytes first; otherwise they
+	// are stranded in bufrw and lost. Mirrors internal/tunnels/connect.go.
+	bufferedClient := &vmutil.BufferedConn{Conn: clientConn, Reader: bufrw.Reader}
+
 	// Bidirectional proxy.
-	vmutil.BidirectionalCopy(clientConn, vmConn)
+	vmutil.BidirectionalCopy(bufferedClient, vmConn)
 	clientConn.Close()
 	vmConn.Close()
 
