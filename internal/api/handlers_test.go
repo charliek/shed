@@ -283,7 +283,9 @@ func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 	be := &createShedFakeBackend{
 		createFn: func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 			backend.Progress(ctx, "repo", "Cloning repository...")
-			backend.ProgressWarning(ctx, "repo", "Failed to clone repository: boom")
+			// Match the production sanitized message from vz/firecracker
+			// client.go — no URL, no wrapped err.
+			backend.ProgressWarning(ctx, "repo", "Failed to clone repository (see server logs for details)")
 			return &config.Shed{Name: req.Name, Status: config.StatusRunning, Repo: req.Repo}, nil
 		},
 	}

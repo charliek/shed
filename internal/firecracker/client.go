@@ -603,10 +603,11 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
-			// Don't include req.Repo in the SSE message — it can contain
-			// credentials (e.g., https://user:pw@host/...). Detail stays in
-			// the server log.
-			backend.ProgressWarning(ctx, "repo", fmt.Sprintf("Failed to clone repository: %v", err))
+			// Generic SSE message by design: req.Repo can carry credentials
+			// (e.g., https://user:pw@host/...) and the wrapped err from
+			// git/ssh may include the URL too. Full detail is in the server
+			// log above; SSE consumers get a stable, sanitized signal.
+			backend.ProgressWarning(ctx, "repo", "Failed to clone repository (see server logs for details)")
 		} else {
 			backend.Progress(ctx, "repo", "Repository cloned")
 		}
