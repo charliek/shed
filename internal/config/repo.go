@@ -34,6 +34,22 @@ func ExpandRepoShorthand(repo string) string {
 	return repo
 }
 
+// IsSSHRepoURL reports whether a repo URL uses SSH transport.
+// Matches both `git@host:path` (SCP-like) and `ssh://...` schemes.
+// HTTPS, git://, http://, and empty strings return false.
+func IsSSHRepoURL(repo string) bool {
+	if repo == "" {
+		return false
+	}
+	if strings.HasPrefix(repo, "ssh://") {
+		return true
+	}
+	if strings.HasPrefix(repo, "git@") {
+		return gitSSHRegex.MatchString(repo)
+	}
+	return false
+}
+
 // ValidateGitRepoURL validates that a git repository URL is well-formed.
 // Accepts https://, git://, ssh://, and git@host:path formats.
 func ValidateGitRepoURL(repoURL string) error {

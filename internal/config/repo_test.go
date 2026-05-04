@@ -31,6 +31,35 @@ func TestExpandRepoShorthand(t *testing.T) {
 	}
 }
 
+func TestIsSSHRepoURL(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{name: "empty", input: "", want: false},
+		{name: "git@ form", input: "git@github.com:charliek/prox.git", want: true},
+		{name: "git@ no .git", input: "git@github.com:charliek/prox", want: true},
+		{name: "ssh:// scheme", input: "ssh://git@github.com/charliek/prox.git", want: true},
+		{name: "ssh:// no user", input: "ssh://example.com/repo", want: true},
+		{name: "https rejected", input: "https://github.com/charliek/prox.git", want: false},
+		{name: "http rejected", input: "http://github.com/charliek/prox.git", want: false},
+		{name: "git:// rejected", input: "git://github.com/charliek/prox.git", want: false},
+		{name: "shorthand rejected", input: "charliek/prox", want: false},
+		{name: "garbage rejected", input: "not a url", want: false},
+		{name: "malformed git@ rejected", input: "git@:bad", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsSSHRepoURL(tt.input)
+			if got != tt.want {
+				t.Errorf("IsSSHRepoURL(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidateGitRepoURL(t *testing.T) {
 	tests := []struct {
 		name    string
