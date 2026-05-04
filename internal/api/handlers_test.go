@@ -283,7 +283,7 @@ func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 	be := &createShedFakeBackend{
 		createFn: func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 			backend.Progress(ctx, "repo", "Cloning repository...")
-			backend.ProgressWarning(ctx, "repo", "Failed to clone git@example.com:x/y.git: boom")
+			backend.ProgressWarning(ctx, "repo", "Failed to clone repository: boom")
 			return &config.Shed{Name: req.Name, Status: config.StatusRunning, Repo: req.Repo}, nil
 		},
 	}
@@ -310,8 +310,14 @@ func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 			if !strings.Contains(e.Data, `"phase":"repo"`) {
 				t.Errorf("warning event missing repo phase: %s", e.Data)
 			}
-			if !strings.Contains(e.Data, "Failed to clone") {
+			if !strings.Contains(e.Data, "Failed to clone repository") {
 				t.Errorf("warning event missing failure message: %s", e.Data)
+			}
+			// SSE warning must NOT leak the repo URL — backends sanitize
+			// it because URLs can carry credentials. (See vz/firecracker
+			// client.go for the production message.)
+			if strings.Contains(e.Data, "git@") || strings.Contains(e.Data, "://") {
+				t.Errorf("warning event must not include repo URL: %s", e.Data)
 			}
 		}
 		if e.Event == "complete" {

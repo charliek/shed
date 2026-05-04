@@ -603,7 +603,10 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
-			backend.ProgressWarning(ctx, "repo", fmt.Sprintf("Failed to clone %s: %v", req.Repo, err))
+			// Don't include req.Repo in the SSE message — it can contain
+			// credentials (e.g., https://user:pw@host/...). Detail stays in
+			// the server log.
+			backend.ProgressWarning(ctx, "repo", fmt.Sprintf("Failed to clone repository: %v", err))
 		} else {
 			backend.Progress(ctx, "repo", "Repository cloned")
 		}
