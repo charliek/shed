@@ -34,6 +34,26 @@ func ExpandRepoShorthand(repo string) string {
 	return repo
 }
 
+// SanitizeRepoURL returns repo with the password component removed from the
+// URL's userinfo, if any. The username is preserved (it's informational, not
+// a secret). SSH-form URLs (git@host:path) and shorthand pass through
+// unchanged. Use this when logging URLs to avoid leaking embedded credentials
+// from forms like `https://user:password@host/repo.git`.
+func SanitizeRepoURL(repo string) string {
+	if repo == "" || strings.HasPrefix(repo, "git@") {
+		return repo
+	}
+	u, err := url.Parse(repo)
+	if err != nil || u.User == nil {
+		return repo
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword {
+		return repo
+	}
+	u.User = url.User(u.User.Username())
+	return u.String()
+}
+
 // IsSSHRepoURL reports whether a repo URL uses SSH transport.
 // Matches both `git@host:path` (SCP-like) and `ssh://...` schemes.
 // HTTPS, git://, http://, and empty strings return false.

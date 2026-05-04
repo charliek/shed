@@ -602,7 +602,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
-			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
+			log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 			// Generic SSE message by design: req.Repo can carry credentials
 			// (e.g., https://user:pw@host/...) and the wrapped err from
 			// git/ssh may include the URL too. Full detail is in the server

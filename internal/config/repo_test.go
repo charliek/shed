@@ -31,6 +31,31 @@ func TestExpandRepoShorthand(t *testing.T) {
 	}
 }
 
+func TestSanitizeRepoURL(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "empty", input: "", want: ""},
+		{name: "git@ unchanged", input: "git@github.com:charliek/prox.git", want: "git@github.com:charliek/prox.git"},
+		{name: "ssh:// with username unchanged", input: "ssh://git@host/path", want: "ssh://git@host/path"},
+		{name: "https no userinfo unchanged", input: "https://github.com/charliek/prox.git", want: "https://github.com/charliek/prox.git"},
+		{name: "https with username only unchanged", input: "https://user@host/repo.git", want: "https://user@host/repo.git"},
+		{name: "https with password stripped", input: "https://user:pw@host/repo.git", want: "https://user@host/repo.git"},
+		{name: "https with empty password stripped", input: "https://user:@host/repo.git", want: "https://user@host/repo.git"},
+		{name: "malformed url passes through", input: "not a url", want: "not a url"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SanitizeRepoURL(tt.input)
+			if got != tt.want {
+				t.Errorf("SanitizeRepoURL(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsSSHRepoURL(t *testing.T) {
 	tests := []struct {
 		name  string
