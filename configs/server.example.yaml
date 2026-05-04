@@ -62,6 +62,14 @@ log_level: info
 #     - ssh-agent
 #     - aws-credentials
 
+# Git behaviour for in-VM clones
+# extra_known_hosts: lines appended to ~/.ssh/known_hosts before `git clone`
+# runs over SSH. GitHub's published host keys are always included; this list
+# extends them. Generate entries with `ssh-keyscan <host>` on a trusted machine.
+# git:
+#   extra_known_hosts:
+#     - "gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf"
+
 # --- VZ Backend (macOS Apple Silicon) ---
 # vz:
 #   vfkit_path: vfkit

@@ -83,6 +83,7 @@ log_level: info
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `extensions` | object | `{}` | Extensions to activate in VMs (see [Extensions](extensions.md)) |
+| `git` | object | - | Git behaviour for in-VM clones (see [Git](#git)) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
 
@@ -169,6 +170,31 @@ extensions:
 ```
 
 See [Extensions](extensions.md) for the full guide on the message bus, manifests, SDK, and health reporting.
+
+## Git
+
+When a shed is created with a `repo` over SSH (e.g., `charliek/sltstodo` or `git@github.com:org/repo.git`), the server seeds the in-VM `~/.ssh/known_hosts` before invoking `git clone`. Without this, OpenSSH defaults to `StrictHostKeyChecking=yes` and rejects the connection with `Host key verification failed`.
+
+GitHub's published host keys (ED25519, ECDSA, RSA) are baked into the server binary and are always included. To trust additional hosts (GitLab, GitHub Enterprise, self-hosted Gitea, etc.), add their `known_hosts` lines to `git.extra_known_hosts`:
+
+```yaml
+git:
+  extra_known_hosts:
+    - "gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf"
+    - "my-gitea.internal ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+```
+
+Each entry must be a syntactically valid `known_hosts` line: `<host> <key-type> <base64-key>`. The server validates this at startup and refuses to start if any entry is malformed.
+
+**Generating entries:** Run `ssh-keyscan <host>` on a trusted machine and paste the output. For example:
+
+```bash
+ssh-keyscan gitlab.com 2>/dev/null
+```
+
+The `git.extra_known_hosts` list is *additive* — it extends the built-in defaults, never replaces them. Only SSH-form clone URLs (`git@host:path`, `ssh://...`) consult `known_hosts`; HTTPS clones skip this step entirely.
+
+**Key rotation:** If GitHub or another host rotates its keys, you can extend the trust list via `extra_known_hosts` immediately without waiting for a shed release. The default GitHub keys ship with the server binary and are updated in releases.
 
 ## Firecracker Configuration
 
