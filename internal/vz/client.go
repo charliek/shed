@@ -248,6 +248,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		backend.Progress(ctx, "repo", "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", req.Repo, err)
+			backend.ProgressWarning(ctx, "repo", fmt.Sprintf("Failed to clone %s: %v", req.Repo, err))
+		} else {
+			backend.Progress(ctx, "repo", "Repository cloned")
 		}
 	}
 

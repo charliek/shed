@@ -2,8 +2,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -175,5 +178,150 @@ func TestMapBackendError_SentinelErrors(t *testing.T) {
 				t.Errorf("errCode = %q, want %q", errCode, tt.wantErr)
 			}
 		})
+	}
+}
+
+// createShedFakeBackend stubs only what handleCreateShedSSE touches.
+// CreateShed runs the configured fn so tests can emit progress/warning events
+// before returning a result.
+type createShedFakeBackend struct {
+	createFn func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error)
+}
+
+func (f *createShedFakeBackend) Type() backend.Type { return backend.TypeVZ }
+func (f *createShedFakeBackend) Close() error       { return nil }
+func (f *createShedFakeBackend) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+	return f.createFn(ctx, req)
+}
+func (f *createShedFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) DeleteShed(_ context.Context, _ string, _ bool) error {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) StartShed(_ context.Context, _ string) (*config.Shed, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) StopShed(_ context.Context, _ string) (*config.Shed, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) ListSessions(_ context.Context, _ string) ([]config.Session, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) KillSession(_ context.Context, _, _ string) error {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) Exec(_ context.Context, _ string, _ backend.ExecOptions) error {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) GetNetworkEndpoint(_ context.Context, _ string) (string, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) DialService(_ context.Context, _ string, _ uint16) (net.Conn, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) DeleteImage(_ context.Context, _ string) error {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) DiskUsage(_ context.Context) (config.DiskUsage, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) Prune(_ context.Context, _ backend.PruneOptions) (config.PruneReport, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) CreateSnapshot(_ context.Context, _ config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) GetSnapshot(_ context.Context, _ string) (*config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) DeleteSnapshot(_ context.Context, _ string) error {
+	panic("unexpected")
+}
+
+// parseSSEEvents parses an SSE stream body into a list of (event, data) pairs.
+// Handles only the simple "event:\ndata:\n\n" framing used by the API.
+func parseSSEEvents(t *testing.T, body string) []struct{ Event, Data string } {
+	t.Helper()
+	var events []struct{ Event, Data string }
+	for _, block := range strings.Split(body, "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var evt, data string
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				evt = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		events = append(events, struct{ Event, Data string }{evt, data})
+	}
+	return events
+}
+
+// TestCreateShed_SSE_SurfacesProgressAndWarning verifies that ProgressWarning
+// events emitted by the backend during CreateShed reach the SSE stream as
+// progress events with warning=true. Regression test for issue #84 — clone
+// failures used to be journald-only.
+func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
+	be := &createShedFakeBackend{
+		createFn: func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+			backend.Progress(ctx, "repo", "Cloning repository...")
+			backend.ProgressWarning(ctx, "repo", "Failed to clone git@example.com:x/y.git: boom")
+			return &config.Shed{Name: req.Name, Status: config.StatusRunning, Repo: req.Repo}, nil
+		},
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	body, _ := json.Marshal(config.CreateShedRequest{Name: "myshed", Repo: "git@example.com:x/y.git"})
+	r := httptest.NewRequest(http.MethodPost, "/api/sheds", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", w.Code, w.Body.String())
+	}
+
+	events := parseSSEEvents(t, w.Body.String())
+
+	// Find the warning event and assert its payload carries warning=true.
+	var sawWarning, sawComplete bool
+	for _, e := range events {
+		if e.Event == "progress" && strings.Contains(e.Data, `"warning":true`) {
+			sawWarning = true
+			if !strings.Contains(e.Data, `"phase":"repo"`) {
+				t.Errorf("warning event missing repo phase: %s", e.Data)
+			}
+			if !strings.Contains(e.Data, "Failed to clone") {
+				t.Errorf("warning event missing failure message: %s", e.Data)
+			}
+		}
+		if e.Event == "complete" {
+			sawComplete = true
+		}
+	}
+	if !sawWarning {
+		t.Errorf("no progress event with warning=true found in stream:\n%s", w.Body.String())
+	}
+	if !sawComplete {
+		t.Errorf("no complete event found in stream:\n%s", w.Body.String())
 	}
 }
