@@ -48,6 +48,10 @@ type ServerConfig struct {
 	// Extensions configures which extensions the agent should enable in VMs.
 	Extensions *ExtensionsConfig `yaml:"extensions,omitempty"`
 
+	// Git configures git-related behaviour for in-VM clones, including
+	// the SSH known_hosts content seeded before `git clone` runs.
+	Git *GitConfig `yaml:"git,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
 }
@@ -74,6 +78,49 @@ func (e *ExtensionsConfig) Validate() error {
 		// max 128 chars, rejects "system:" prefix).
 		if err := validateExtensionNamespace(ns); err != nil {
 			return fmt.Errorf("invalid extension namespace %q: %w", ns, err)
+		}
+	}
+	return nil
+}
+
+// GitConfig configures git behaviour for in-VM clones.
+type GitConfig struct {
+	// ExtraKnownHosts contains additional lines to append to the in-VM
+	// ~/.ssh/known_hosts before `git clone` runs over SSH. Each entry must be
+	// a valid known_hosts line (e.g., "github.com ssh-ed25519 AAAAC3..."),
+	// typically obtained by running `ssh-keyscan <host>` on a trusted machine.
+	// Built-in defaults (currently GitHub's published host keys) are always
+	// included; this list extends them.
+	ExtraKnownHosts []string `yaml:"extra_known_hosts,omitempty"`
+}
+
+// knownHostsKeyTypes lists the SSH key-type tokens accepted in known_hosts
+// lines. Used by GitConfig.Validate to reject obviously-malformed entries
+// at server startup rather than silently shipping garbage to the VM.
+var knownHostsKeyTypes = map[string]bool{
+	"ssh-rsa":             true,
+	"ssh-ed25519":         true,
+	"ssh-dss":             true,
+	"ecdsa-sha2-nistp256": true,
+	"ecdsa-sha2-nistp384": true,
+	"ecdsa-sha2-nistp521": true,
+}
+
+// Validate checks that each extra_known_hosts entry is a syntactically valid
+// known_hosts line. The check is deliberately simple — it catches typos and
+// obvious garbage but does not try to parse the base64 key material.
+func (g *GitConfig) Validate() error {
+	for i, line := range g.ExtraKnownHosts {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			return fmt.Errorf("extra_known_hosts[%d]: line must not be empty", i)
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 3 {
+			return fmt.Errorf("extra_known_hosts[%d]: expected at least 3 fields (host, key-type, base64-key), got %d", i, len(fields))
+		}
+		if !knownHostsKeyTypes[fields[1]] {
+			return fmt.Errorf("extra_known_hosts[%d]: unrecognized key type %q (expected one of ssh-rsa, ssh-ed25519, ssh-dss, ecdsa-sha2-nistp256/384/521)", i, fields[1])
 		}
 	}
 	return nil
@@ -866,6 +913,13 @@ func (c *ServerConfig) Validate() error {
 	if c.Extensions != nil {
 		if err := c.Extensions.Validate(); err != nil {
 			return fmt.Errorf("extensions config: %w", err)
+		}
+	}
+
+	// Validate git config if present
+	if c.Git != nil {
+		if err := c.Git.Validate(); err != nil {
+			return fmt.Errorf("git config: %w", err)
 		}
 	}
 
