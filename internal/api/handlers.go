@@ -291,6 +291,23 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, shed)
 }
 
+// handleResetShed resets a stopped shed by deleting and recreating its
+// per-shed writable upper layer. Workspace contents (mounted post-boot
+// from outside the overlay) are not affected.
+// POST /api/sheds/{name}/reset
+func (s *Server) handleResetShed(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+
+	shed, err := s.backend.ResetShed(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, shed)
+}
+
 // handleListSessions returns all tmux sessions in a shed.
 // GET /api/sheds/{name}/sessions
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -398,6 +415,9 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrShedNotRunningSentinel) {
 		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
+	}
+	if errors.Is(err, config.ErrShedNotStoppedSentinel) {
+		return http.StatusConflict, config.ErrShedNotStopped, err.Error()
 	}
 	if errors.Is(err, config.ErrUnknownImageSentinel) {
 		return http.StatusBadRequest, config.ErrUnknownImage, err.Error()

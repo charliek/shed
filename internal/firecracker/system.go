@@ -170,12 +170,9 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 	du.Totals.All.LogicalBytes = du.Totals.Images.LogicalBytes + du.Totals.Sheds.LogicalBytes + du.Totals.Snapshots.LogicalBytes + du.Totals.Orphans.LogicalBytes
 	du.Totals.All.PhysicalBytes = du.Totals.Images.PhysicalBytes + du.Totals.Sheds.PhysicalBytes + du.Totals.Snapshots.PhysicalBytes + du.Totals.Orphans.PhysicalBytes
 
-	du.Notes = append(du.Notes,
-		"physical bytes may overcount shared extents (reflink clones, hardlinks)",
-	)
 	if len(du.Snapshots) > 0 {
 		du.Notes = append(du.Notes,
-			"rootfs extents are shared via reflink between a snapshot and sheds spawned from it — physical bytes count those extents under both; metadata files are unique per snapshot",
+			"snapshot upper extents are shared via reflink with sheds spawned from the snapshot; physical bytes count those extents under both",
 		)
 	}
 
@@ -184,6 +181,12 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 
 // shedDiskEntryForFC builds a ShedDiskEntry for a single Firecracker instance.
 // No ConsoleLog (FC writes to stderr, not a per-instance file).
+//
+// Per-shed accounting reflects only the writable upper layer. The
+// (much larger) read-only lower image is shared across every shed
+// pinning the same digest and is reported once in du.Images, so
+// summing per-shed bytes against image bytes gives an honest picture
+// of total disk consumed.
 func shedDiskEntryForFC(instanceDir string, meta *Metadata) config.ShedDiskEntry {
 	entry := config.ShedDiskEntry{
 		Name:   meta.Name,
@@ -191,12 +194,18 @@ func shedDiskEntryForFC(instanceDir string, meta *Metadata) config.ShedDiskEntry
 		Image:  meta.Image,
 	}
 
-	rootfsPath := RootfsPath(instanceDir, meta.Name)
-	rootfsLogical, rootfsPhysical, _ := diskstat.Stat(rootfsPath)
+	upperPath := meta.UpperPath
+	if upperPath == "" {
+		upperPath = meta.RootfsPath
+	}
+	if upperPath == "" {
+		upperPath = RootfsPath(instanceDir, meta.Name)
+	}
+	rootfsLogical, rootfsPhysical, _ := diskstat.Stat(upperPath)
 	entry.Rootfs = config.FileEntry{
-		Path: rootfsPath,
+		Path: upperPath,
 		Size: config.DiskSize{LogicalBytes: rootfsLogical, PhysicalBytes: rootfsPhysical},
-		Kind: "rootfs",
+		Kind: "upper",
 	}
 
 	metaPath := MetadataPath(instanceDir, meta.Name)

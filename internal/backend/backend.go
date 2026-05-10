@@ -48,6 +48,12 @@ type Backend interface {
 	// StopShed stops a running shed.
 	StopShed(ctx context.Context, name string) (*config.Shed, error)
 
+	// ResetShed deletes the per-shed writable upper layer and recreates
+	// it as a fresh empty sparse file. The shed must be stopped. The
+	// workspace (mounted post-boot via 9P/VirtioFS from outside the
+	// overlay) is not touched. Returns the updated shed metadata.
+	ResetShed(ctx context.Context, name string) (*config.Shed, error)
+
 	// Session operations
 
 	// ListSessions returns all sessions in a shed.

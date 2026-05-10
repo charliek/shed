@@ -69,6 +69,11 @@ func (b *FirecrackerBackend) StopShed(ctx context.Context, name string) (*config
 	return b.client.StopShed(ctx, name)
 }
 
+// ResetShed wipes and recreates a stopped shed's writable upper layer.
+func (b *FirecrackerBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return b.client.ResetShed(ctx, name)
+}
+
 // ListSessions returns all tmux sessions in a shed.
 func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
 	meta, err := LoadMetadata(b.client.cfg.InstanceDir, shedName)

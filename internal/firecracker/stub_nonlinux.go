@@ -77,6 +77,11 @@ func (b *FirecrackerBackend) StopShed(ctx context.Context, name string) (*config
 	return nil, errors.New(nonLinuxErr)
 }
 
+// ResetShed returns an error on non-linux platforms.
+func (b *FirecrackerBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return nil, errors.New(nonLinuxErr)
+}
+
 // ListSessions returns an error on non-linux platforms.
 func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
 	return nil, errors.New(nonLinuxErr)

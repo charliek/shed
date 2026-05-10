@@ -77,6 +77,11 @@ func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, er
 	return nil, errNonDarwin
 }
 
+// ResetShed returns an error on non-darwin platforms.
+func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return nil, errNonDarwin
+}
+
 // ListSessions returns an error on non-darwin platforms.
 func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
 	return nil, errNonDarwin

@@ -68,6 +68,11 @@ func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, er
 	return b.client.StopShed(ctx, name)
 }
 
+// ResetShed wipes and recreates a stopped shed's writable upper layer.
+func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return b.client.ResetShed(ctx, name)
+}
+
 // newAgentClient creates a vmutil.AgentClient for the given instance name.
 func (b *VZBackend) newAgentClient(name string) *vmutil.AgentClient {
 	dialer := NewVZDialer(b.client.cfg.SocketDir, name)

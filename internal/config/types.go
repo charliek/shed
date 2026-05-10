@@ -28,6 +28,10 @@ var (
 	// ErrShedNotRunningSentinel is returned when an operation requires a running shed.
 	ErrShedNotRunningSentinel = errors.New("shed is not running")
 
+	// ErrShedNotStoppedSentinel is returned when an operation requires a
+	// stopped shed (e.g. shed reset, shed snapshot create).
+	ErrShedNotStoppedSentinel = errors.New("shed must be stopped first")
+
 	// ErrUnknownImageSentinel is returned when a requested image variant does not exist.
 	ErrUnknownImageSentinel = errors.New("unknown image")
 
@@ -486,6 +490,13 @@ type Snapshot struct {
 	// the lower's refcount: pruning a digest pinned by a snapshot is
 	// refused. Empty for snapshots created before schema v2.
 	LowerDigest string `json:"lower_digest,omitempty"`
+
+	// LowerCached reports whether the lower digest's blob is currently
+	// installed in the local image store. Computed at read time, never
+	// persisted (the on-disk value is recomputed on each load). When
+	// false, `shed create --from-snapshot` will fail until the lower
+	// image is pulled or rebuilt; surfaced by `shed snapshot info`.
+	LowerCached bool `json:"lower_cached,omitempty"`
 }
 
 // SnapshotCreateRequest is the request body for POST /api/snapshots.
@@ -548,6 +559,7 @@ const (
 	ErrShedAlreadyExists  = "SHED_ALREADY_EXISTS"
 	ErrShedAlreadyRunning = "SHED_ALREADY_RUNNING"
 	ErrShedAlreadyStopped = "SHED_ALREADY_STOPPED"
+	ErrShedNotStopped     = "SHED_NOT_STOPPED"
 	ErrInvalidShedName    = "INVALID_SHED_NAME"
 	ErrInvalidRepoURL     = "INVALID_REPO_URL"
 	ErrCloneFailed        = "CLONE_FAILED"

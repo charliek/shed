@@ -12,18 +12,43 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmimage"
 )
 
+// setupBlobForTest creates a fake content-addressed blob (rootfs.ext4 +
+// initrd) under a temp imagesDir and returns (imagesDir, digest).
+// buildVfkitArgs needs the blob to exist and contain a rootfs + initrd
+// before it will produce a usable arg list.
+func setupBlobForTest(t *testing.T) (imagesDir, digest string) {
+	t.Helper()
+	imagesDir = t.TempDir()
+	digestHex := strings.Repeat("a", 64)
+	digest = vmimage.DigestPrefix + digestHex
+	blobDir := filepath.Join(imagesDir, "blobs", "sha256", digestHex)
+	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	for _, name := range []string{vmimage.BlobRootfsFilename, vmimage.BlobInitrdFilename} {
+		if err := os.WriteFile(filepath.Join(blobDir, name), []byte("stub"), 0o444); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+	}
+	return imagesDir, digest
+}
+
 func TestBuildVfkitArgs(t *testing.T) {
+	imagesDir, digest := setupBlobForTest(t)
 	meta := &Metadata{
-		Name:       "test-vm",
-		CPUs:       4,
-		MemoryMB:   8192,
-		RootfsPath: "/tmp/test-rootfs.ext4",
+		Name:        "test-vm",
+		CPUs:        4,
+		MemoryMB:    8192,
+		RootfsPath:  "/tmp/test-rootfs.ext4",
+		LowerDigest: digest,
 	}
 	cfg := &config.VZConfig{
 		VfkitPath:    "vfkit",
 		KernelPath:   "/tmp/vmlinux",
+		ImagesDir:    imagesDir,
 		InstanceDir:  "",
 		SocketDir:    "/tmp/sockets",
 		ConsolePort:  1024,
@@ -32,7 +57,10 @@ func TestBuildVfkitArgs(t *testing.T) {
 	}
 
 	vm := &VM{meta: meta, cfg: cfg}
-	args := vm.buildVfkitArgs()
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		t.Fatalf("buildVfkitArgs: %v", err)
+	}
 
 	// Check that key args are present
 	argsStr := strings.Join(args, " ")
@@ -69,10 +97,16 @@ func TestBuildVfkitArgs(t *testing.T) {
 		}
 	}
 
-	// Should have exactly 6 --device flags (1 block + 1 net + 1 serial + 3 vsock)
+	// Should have exactly 7 --device flags
+	// (2 block: upper+lower, 1 net, 1 serial, 3 vsock).
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 6 {
-		t.Errorf("expected 6 --device flags (1 block + 1 net + 1 serial + 3 vsock), got %d", deviceCount)
+	if deviceCount != 7 {
+		t.Errorf("expected 7 --device flags (2 block + 1 net + 1 serial + 3 vsock), got %d", deviceCount)
+	}
+
+	// Lower (read-only) virtio-blk should be present.
+	if !strings.Contains(argsStr, ",readOnly=true") {
+		t.Errorf("expected lower virtio-blk with readOnly=true, got: %s", argsStr)
 	}
 
 	// No VirtioFS device when LocalDir is empty
@@ -82,15 +116,18 @@ func TestBuildVfkitArgs(t *testing.T) {
 }
 
 func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
+	imagesDir, digest := setupBlobForTest(t)
 	meta := &Metadata{
-		Name:       "test-vm",
-		CPUs:       2,
-		MemoryMB:   4096,
-		RootfsPath: "/tmp/rootfs.ext4",
-		LocalDir:   "/Users/charlie/projects/myapp",
+		Name:        "test-vm",
+		CPUs:        2,
+		MemoryMB:    4096,
+		RootfsPath:  "/tmp/rootfs.ext4",
+		LocalDir:    "/Users/charlie/projects/myapp",
+		LowerDigest: digest,
 	}
 	cfg := &config.VZConfig{
 		KernelPath:   "/tmp/vmlinux",
+		ImagesDir:    imagesDir,
 		InstanceDir:  "",
 		SocketDir:    "/tmp/sockets",
 		ConsolePort:  1024,
@@ -99,7 +136,10 @@ func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
 	}
 
 	vm := &VM{meta: meta, cfg: cfg}
-	args := vm.buildVfkitArgs()
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		t.Fatalf("buildVfkitArgs: %v", err)
+	}
 	argsStr := strings.Join(args, " ")
 
 	// Should have VirtioFS device
@@ -108,22 +148,25 @@ func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
 		t.Errorf("expected VirtioFS device %q in args, got: %s", expected, argsStr)
 	}
 
-	// Should have 7 --device flags (1 block + 1 net + 1 serial + 1 virtio-fs + 3 vsock)
+	// Should have 8 --device flags (2 block + 1 net + 1 serial + 1 virtio-fs + 3 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 7 {
-		t.Errorf("expected 7 --device flags, got %d", deviceCount)
+	if deviceCount != 8 {
+		t.Errorf("expected 8 --device flags, got %d", deviceCount)
 	}
 }
 
 func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
+	imagesDir, digest := setupBlobForTest(t)
 	meta := &Metadata{
-		Name:       "test-vm",
-		CPUs:       2,
-		MemoryMB:   4096,
-		RootfsPath: "/tmp/rootfs.ext4",
+		Name:        "test-vm",
+		CPUs:        2,
+		MemoryMB:    4096,
+		RootfsPath:  "/tmp/rootfs.ext4",
+		LowerDigest: digest,
 	}
 	cfg := &config.VZConfig{
 		KernelPath:   "/tmp/vmlinux",
+		ImagesDir:    imagesDir,
 		InstanceDir:  "",
 		SocketDir:    "/tmp/sockets",
 		ConsolePort:  1024,
@@ -139,7 +182,10 @@ func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
 			{SourceDir: "/Users/charlie/.config/gh", MountTag: "cred-gh"},
 		},
 	}
-	args := vm.buildVfkitArgs()
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		t.Fatalf("buildVfkitArgs: %v", err)
+	}
 	argsStr := strings.Join(args, " ")
 
 	// Check credential VirtioFS devices
@@ -150,10 +196,10 @@ func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
 		t.Error("expected VirtioFS device for gh credential")
 	}
 
-	// Should have 8 --device flags (1 block + 1 net + 1 serial + 2 virtio-fs creds + 3 vsock)
+	// Should have 9 --device flags (2 block + 1 net + 1 serial + 2 virtio-fs creds + 3 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 8 {
-		t.Errorf("expected 8 --device flags, got %d", deviceCount)
+	if deviceCount != 9 {
+		t.Errorf("expected 9 --device flags, got %d", deviceCount)
 	}
 
 	// No workspace VirtioFS device (LocalDir is empty)
@@ -163,15 +209,18 @@ func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
 }
 
 func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
+	imagesDir, digest := setupBlobForTest(t)
 	meta := &Metadata{
-		Name:       "test-vm",
-		CPUs:       2,
-		MemoryMB:   4096,
-		RootfsPath: "/tmp/rootfs.ext4",
-		LocalDir:   "/Users/charlie/projects/myapp",
+		Name:        "test-vm",
+		CPUs:        2,
+		MemoryMB:    4096,
+		RootfsPath:  "/tmp/rootfs.ext4",
+		LocalDir:    "/Users/charlie/projects/myapp",
+		LowerDigest: digest,
 	}
 	cfg := &config.VZConfig{
 		KernelPath:   "/tmp/vmlinux",
+		ImagesDir:    imagesDir,
 		InstanceDir:  "",
 		SocketDir:    "/tmp/sockets",
 		ConsolePort:  1024,
@@ -186,7 +235,10 @@ func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
 			{SourceDir: "/Users/charlie/.claude", MountTag: "cred-claude"},
 		},
 	}
-	args := vm.buildVfkitArgs()
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		t.Fatalf("buildVfkitArgs: %v", err)
+	}
 	argsStr := strings.Join(args, " ")
 
 	// Should have workspace VirtioFS
@@ -199,22 +251,25 @@ func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
 		t.Error("expected VirtioFS device for claude credential")
 	}
 
-	// Should have 8 --device flags (1 block + 1 net + 1 serial + 1 workspace virtio-fs + 1 cred virtio-fs + 3 vsock)
+	// Should have 9 --device flags (2 block + 1 net + 1 serial + 1 workspace virtio-fs + 1 cred virtio-fs + 3 vsock)
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 8 {
-		t.Errorf("expected 8 --device flags, got %d", deviceCount)
+	if deviceCount != 9 {
+		t.Errorf("expected 9 --device flags, got %d", deviceCount)
 	}
 }
 
 func TestBuildVfkitArgsNoCredentialShares(t *testing.T) {
+	imagesDir, digest := setupBlobForTest(t)
 	meta := &Metadata{
-		Name:       "test-vm",
-		CPUs:       2,
-		MemoryMB:   4096,
-		RootfsPath: "/tmp/rootfs.ext4",
+		Name:        "test-vm",
+		CPUs:        2,
+		MemoryMB:    4096,
+		RootfsPath:  "/tmp/rootfs.ext4",
+		LowerDigest: digest,
 	}
 	cfg := &config.VZConfig{
 		KernelPath:   "/tmp/vmlinux",
+		ImagesDir:    imagesDir,
 		InstanceDir:  "",
 		SocketDir:    "/tmp/sockets",
 		ConsolePort:  1024,
@@ -223,13 +278,16 @@ func TestBuildVfkitArgsNoCredentialShares(t *testing.T) {
 	}
 
 	vm := &VM{meta: meta, cfg: cfg, credentialShares: nil}
-	args := vm.buildVfkitArgs()
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		t.Fatalf("buildVfkitArgs: %v", err)
+	}
 	argsStr := strings.Join(args, " ")
 
-	// Should have 6 --device flags (1 block + 1 net + 1 serial + 3 vsock) — no virtio-fs
+	// Should have 7 --device flags (2 block + 1 net + 1 serial + 3 vsock) — no virtio-fs
 	deviceCount := strings.Count(argsStr, "--device")
-	if deviceCount != 6 {
-		t.Errorf("expected 6 --device flags with no credential shares, got %d", deviceCount)
+	if deviceCount != 7 {
+		t.Errorf("expected 7 --device flags with no credential shares, got %d", deviceCount)
 	}
 
 	if strings.Contains(argsStr, "virtio-fs") {
@@ -238,9 +296,11 @@ func TestBuildVfkitArgsNoCredentialShares(t *testing.T) {
 }
 
 func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
-	meta := &Metadata{Name: "test-vm", CPUs: 2, MemoryMB: 4096, RootfsPath: "/tmp/rootfs.ext4"}
+	imagesDir, digest := setupBlobForTest(t)
+	meta := &Metadata{Name: "test-vm", CPUs: 2, MemoryMB: 4096, RootfsPath: "/tmp/rootfs.ext4", LowerDigest: digest}
 	cfg := &config.VZConfig{
 		KernelPath:   "/tmp/vmlinux",
+		ImagesDir:    imagesDir,
 		InstanceDir:  "",
 		SocketDir:    "/tmp/sockets",
 		ConsolePort:  1024,
@@ -249,14 +309,26 @@ func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 	}
 
 	vm := &VM{meta: meta, cfg: cfg}
-	args := vm.buildVfkitArgs()
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		t.Fatalf("buildVfkitArgs: %v", err)
+	}
 	argsStr := strings.Join(args, " ")
 
 	if !strings.Contains(argsStr, "console=hvc0") {
 		t.Error("expected console=hvc0 in kernel cmdline")
 	}
-	if !strings.Contains(argsStr, "root=/dev/vda") {
-		t.Error("expected root=/dev/vda in kernel cmdline")
+	// The shed initramfs builds the overlay itself, so the legacy
+	// `root=/dev/vda rw` cmdline is replaced with shed.upper / shed.lower
+	// pointing at the writable upper and the read-only lower.
+	if strings.Contains(argsStr, "root=/dev/vda") {
+		t.Errorf("expected no root=/dev/vda in kernel cmdline (initramfs builds overlay): %s", argsStr)
+	}
+	if !strings.Contains(argsStr, "shed.upper=/dev/vda") {
+		t.Errorf("expected shed.upper=/dev/vda in kernel cmdline, got: %s", argsStr)
+	}
+	if !strings.Contains(argsStr, "shed.lower=/dev/vdb") {
+		t.Errorf("expected shed.lower=/dev/vdb in kernel cmdline, got: %s", argsStr)
 	}
 	if !strings.Contains(argsStr, "init=/sbin/init") {
 		t.Error("expected init=/sbin/init in kernel cmdline")

@@ -16,6 +16,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/systemprune"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmimage/clone"
 )
 
@@ -203,11 +204,18 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		return nil, fmt.Errorf("failed to clean stale snapshot rootfs: %w", err)
 	}
 
-	backend.Progress(ctx, "snapshot", "Copying rootfs to snapshot...")
-	strategy, err := clone.CloneFile(srcMeta.RootfsPath, dstRootfs)
+	// Snapshot the per-shed upper only. The lower image is shared via
+	// LowerDigest, so capturing it here would balloon the snapshot to a
+	// full image clone for no gain.
+	src := srcMeta.UpperPath
+	if src == "" {
+		src = srcMeta.RootfsPath
+	}
+	backend.Progress(ctx, "snapshot", "Copying upper layer to snapshot...")
+	strategy, err := clone.CloneFile(src, dstRootfs)
 	if err != nil {
 		os.RemoveAll(dir)
-		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
+		return nil, fmt.Errorf("failed to copy upper: %w", err)
 	}
 
 	// fsync ladder mirroring CopyRootfs in rootfs.go: clonefile/FICLONE
@@ -238,7 +246,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	if fi, statErr := os.Stat(dstRootfs); statErr == nil {
 		sizeBytes = fi.Size()
 	}
-	log.Printf("snapshot strategy=%s src=%s dst=%s logical_bytes=%d", strategy, srcMeta.RootfsPath, dstRootfs, sizeBytes)
+	log.Printf("snapshot strategy=%s src=%s dst=%s logical_bytes=%d", strategy, src, dstRootfs, sizeBytes)
 
 	snap := &config.Snapshot{
 		Version:        config.SnapshotSchemaVersion,
@@ -283,6 +291,7 @@ func (c *Client) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
 			log.Printf("Warning: skipping invalid snapshot %q: %v", name, err)
 			continue
 		}
+		c.augmentSnapshot(snap)
 		out = append(out, *snap)
 	}
 	return out, nil
@@ -290,7 +299,21 @@ func (c *Client) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
 
 // GetSnapshot returns a single snapshot by name.
 func (c *Client) GetSnapshot(_ context.Context, name string) (*config.Snapshot, error) {
-	return loadSnapshot(c.cfg.SnapshotsDir, name)
+	snap, err := loadSnapshot(c.cfg.SnapshotsDir, name)
+	if err != nil {
+		return nil, err
+	}
+	c.augmentSnapshot(snap)
+	return snap, nil
+}
+
+// augmentSnapshot fills in transient fields (LowerCached) that are
+// recomputed on every read rather than persisted.
+func (c *Client) augmentSnapshot(snap *config.Snapshot) {
+	if snap.LowerDigest == "" || c.cfg.ImagesDir == "" {
+		return
+	}
+	snap.LowerCached = vmimage.BlobExists(c.cfg.ImagesDir, snap.LowerDigest)
 }
 
 // DeleteSnapshot removes a snapshot from disk.

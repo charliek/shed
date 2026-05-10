@@ -90,6 +90,7 @@ func (s *Server) Router() chi.Router {
 				r.Delete("/", s.handleDeleteShed)
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
+				r.Post("/reset", s.handleResetShed)
 
 				// Sessions within a shed
 				r.Get("/sessions", s.handleListSessions)

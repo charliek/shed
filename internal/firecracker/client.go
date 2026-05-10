@@ -1024,3 +1024,53 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 	var d net.Dialer
 	return d.DialContext(ctx, "tcp", addr)
 }
+
+// ResetShed nukes the per-shed upper and recreates it as a fresh
+// sparse, unformatted ext4-sized file. The shed must be stopped.
+// /workspace is mounted post-boot via 9P from outside the overlay so
+// it is not affected by this operation.
+func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	if meta.Status != config.StatusStopped {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotStoppedSentinel, name)
+	}
+
+	size := meta.UpperSizeBytes
+	if size <= 0 {
+		sz := c.cfg.UpperSizeDefault
+		if sz == "" {
+			sz = config.DefaultUpperSize
+		}
+		parsed, perr := config.ParseUpperSize(sz)
+		if perr != nil {
+			return nil, fmt.Errorf("invalid upper_size_default during reset: %w", perr)
+		}
+		size = parsed
+	}
+
+	if err := DeleteUpper(c.cfg.UppersDir, name); err != nil {
+		return nil, fmt.Errorf("failed to delete upper during reset: %w", err)
+	}
+	upperPath, err := EnsureUpper(c.cfg.UppersDir, name, size)
+	if err != nil {
+		return nil, fmt.Errorf("failed to recreate upper during reset: %w", err)
+	}
+
+	meta.UpperPath = upperPath
+	meta.RootfsPath = upperPath
+	meta.UpperSizeBytes = size
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("failed to persist metadata after reset: %w", err)
+	}
+
+	log.Printf("reset shed %s: upper recreated at %s (%d bytes)", name, upperPath, size)
+	return metadataToShed(meta), nil
+}

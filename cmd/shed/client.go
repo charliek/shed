@@ -373,6 +373,15 @@ func (c *APIClient) StopShed(name string) (*config.Shed, error) {
 	return &shed, nil
 }
 
+// ResetShed resets the per-shed writable upper layer.
+func (c *APIClient) ResetShed(name string) (*config.Shed, error) {
+	var shed config.Shed
+	if err := c.doRequest(http.MethodPost, "/api/sheds/"+name+"/reset", nil, &shed); err != nil {
+		return nil, err
+	}
+	return &shed, nil
+}
+
 // ListSessions retrieves all tmux sessions in a shed.
 func (c *APIClient) ListSessions(shedName string) ([]config.Session, error) {
 	var resp config.SessionsResponse

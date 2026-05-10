@@ -44,6 +44,9 @@ func (f *fakeBackend) StartShed(ctx context.Context, name string) (*config.Shed,
 func (f *fakeBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	panic("unexpected")
 }
+func (f *fakeBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	panic("unexpected")
+}
 func (f *fakeBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
 	panic("unexpected")
 }

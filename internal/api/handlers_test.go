@@ -208,6 +208,9 @@ func (f *createShedFakeBackend) StartShed(_ context.Context, _ string) (*config.
 func (f *createShedFakeBackend) StopShed(_ context.Context, _ string) (*config.Shed, error) {
 	panic("unexpected")
 }
+func (f *createShedFakeBackend) ResetShed(_ context.Context, _ string) (*config.Shed, error) {
+	panic("unexpected")
+}
 func (f *createShedFakeBackend) ListSessions(_ context.Context, _ string) ([]config.Session, error) {
 	panic("unexpected")
 }
