@@ -20,6 +20,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -70,21 +71,56 @@ func (vm *VM) Start(ctx context.Context) error {
 	// shed.name= is read by the in-guest shed-firstboot service to set the
 	// hostname and detect rootfs clones (snapshot spawns). Shed names are
 	// validated by config.ValidateShedName so direct concatenation is safe.
+	//
+	// The kernel cmdline drops `root=` because the shed initramfs builds an
+	// overlayfs and pivot_roots into the merged tree itself. shed.upper /
+	// shed.lower are read by the initramfs to locate the writable upper
+	// (vda) and read-only lower (vdb) block devices.
 	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s",
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
 		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
 	)
+
+	if vm.meta.LowerDigest == "" {
+		return fmt.Errorf("vm %s has no lower_digest in metadata; recreate via `shed delete && shed create`", vm.meta.Name)
+	}
+	lowerRootfs, err := vmimage.BlobRootfsPath(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	if err != nil {
+		return fmt.Errorf("resolving lower rootfs path: %w", err)
+	}
+	if !vmimage.BlobExists(vm.cfg.ImagesDir, vm.meta.LowerDigest) {
+		return fmt.Errorf("lower image blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
+	}
+	blobDir, err := vmimage.BlobDir(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	if err != nil {
+		return fmt.Errorf("resolving blob dir: %w", err)
+	}
+	initrdPath := filepath.Join(blobDir, vmimage.BlobInitrdFilename)
+	if _, err := os.Stat(initrdPath); err != nil {
+		return fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, err)
+	}
 
 	fcCfg := firecracker.Config{
 		SocketPath:      socketPath,
 		KernelImagePath: vm.cfg.KernelPath,
+		InitrdPath:      initrdPath,
 		KernelArgs:      kernelArgs,
 		Drives: []models.Drive{
+			// Upper (writable). The initramfs runs mkfs.ext4 on first
+			// boot when no FS signature is present.
 			{
 				DriveID:      firecracker.String("rootfs"),
 				PathOnHost:   firecracker.String(vm.meta.RootfsPath),
 				IsRootDevice: firecracker.Bool(true),
 				IsReadOnly:   firecracker.Bool(false),
+			},
+			// Lower (read-only). Shared across all sheds that pin this
+			// digest — both disk and host page cache.
+			{
+				DriveID:      firecracker.String("lower"),
+				PathOnHost:   firecracker.String(lowerRootfs),
+				IsRootDevice: firecracker.Bool(false),
+				IsReadOnly:   firecracker.Bool(true),
 			},
 		},
 		MachineCfg: models.MachineConfiguration{

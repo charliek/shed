@@ -20,6 +20,8 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/vmimage"
+	"github.com/charliek/shed/internal/vmimage/clone"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -133,7 +135,25 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
 	}
 
-	var rootfsSource, lowerDigest, lowerImageTag string
+	upperSizeBytes := req.UpperSizeBytes
+	if upperSizeBytes == 0 {
+		sz := c.cfg.UpperSizeDefault
+		if sz == "" {
+			sz = config.DefaultUpperSize
+		}
+		parsed, perr := config.ParseUpperSize(sz)
+		if perr != nil {
+			return nil, fmt.Errorf("invalid upper_size_default: %w", perr)
+		}
+		upperSizeBytes = parsed
+	} else {
+		if upperSizeBytes < config.MinUpperSizeBytes || upperSizeBytes > config.MaxUpperSizeBytes {
+			return nil, fmt.Errorf("upper size out of range: must be between %dG and %dG",
+				config.MinUpperSizeBytes/(1024*1024*1024), config.MaxUpperSizeBytes/(1024*1024*1024))
+		}
+	}
+
+	var snapshotUpperSource, lowerDigest, lowerImageTag string
 	if req.FromSnapshot != "" {
 		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
 		if err != nil {
@@ -143,7 +163,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
 				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendVZ)
 		}
-		rootfsSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
+		if snap.LowerDigest == "" {
+			return nil, fmt.Errorf("snapshot %q is missing lower_digest; recreate the snapshot from a current shed", req.FromSnapshot)
+		}
+		if !vmimage.BlobExists(c.cfg.ImagesDir, snap.LowerDigest) {
+			ref := snap.SourceImage
+			if ref == "" {
+				ref = "(unknown)"
+			}
+			return nil, fmt.Errorf("snapshot %q references lower digest %s which is no longer cached; pull the original image (%s) first",
+				req.FromSnapshot, vmimage.ShortDigest(snap.LowerDigest), ref)
+		}
+		snapshotUpperSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
 		lowerDigest = snap.LowerDigest
 		lowerImageTag = snap.SourceImage
 	} else {
@@ -158,43 +189,67 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			resolved = c.cfg.ResolveBaseRootfs()
 		}
 
-		// Ensure image is available locally (pulls + converts Docker refs if needed)
-		var err error
-		rootfsSource, lowerDigest, err = EnsureImage(ctx, resolved, c.cfg)
+		// Ensure image is available locally (pulls + converts Docker refs if needed).
+		// We only need the digest — the rootfs path is rederived per-boot inside vm.go.
+		_, ldigest, err := EnsureImage(ctx, resolved, c.cfg)
 		if err != nil {
 			return nil, err
 		}
+		if ldigest == "" {
+			return nil, fmt.Errorf("image %q resolved to a path outside the blob store; the overlay model requires content-addressed images", resolved.Name)
+		}
+		lowerDigest = ldigest
 		lowerImageTag = resolved.Name
 	}
 
-	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
-	rootfsPath, err := CopyRootfs(rootfsSource, c.cfg.InstanceDir, req.Name)
+	backend.Progress(ctx, "rootfs", "Allocating writable upper layer...")
+	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
+		return nil, fmt.Errorf("failed to create upper: %w", err)
 	}
-	// CopyRootfs now forces 0o644 internally so spawning from a 0o444
-	// snapshot rootfs produces a writable instance rootfs without an
-	// extra chmod here.
+	if snapshotUpperSource != "" {
+		// Replace the freshly allocated empty upper with a clone of the
+		// snapshot's stored upper so the new shed inherits its parent's
+		// writable contents.
+		if err := os.Remove(upperPath); err != nil && !os.IsNotExist(err) {
+			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+			return nil, fmt.Errorf("failed to clear upper for snapshot clone: %w", err)
+		}
+		if _, err := clone.CloneFile(snapshotUpperSource, upperPath); err != nil {
+			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+			return nil, fmt.Errorf("failed to clone snapshot upper: %w", err)
+		}
+		if err := os.Chmod(upperPath, 0o644); err != nil {
+			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
+		}
+	}
+	rootfsPath := upperPath
 
 	meta := &Metadata{
-		Name:          req.Name,
-		Status:        config.StatusStopped,
-		CreatedAt:     time.Now(),
-		Backend:       config.BackendVZ,
-		CPUs:          cpus,
-		MemoryMB:      memoryMB,
-		RootfsPath:    rootfsPath,
-		Repo:          req.Repo,
-		LocalDir:      req.LocalDir,
-		Image:         req.Image,
-		LowerDigest:   lowerDigest,
-		LowerImageTag: lowerImageTag,
-		FromSnapshot:  req.FromSnapshot,
+		Name:           req.Name,
+		Status:         config.StatusStopped,
+		CreatedAt:      time.Now(),
+		Backend:        config.BackendVZ,
+		CPUs:           cpus,
+		MemoryMB:       memoryMB,
+		RootfsPath:     rootfsPath,
+		UpperPath:      upperPath,
+		UpperSizeBytes: upperSizeBytes,
+		Repo:           req.Repo,
+		LocalDir:       req.LocalDir,
+		Image:          req.Image,
+		LowerDigest:    lowerDigest,
+		LowerImageTag:  lowerImageTag,
+		FromSnapshot:   req.FromSnapshot,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+		}
+		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
 		}
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
@@ -211,6 +266,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
+		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
+		}
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
 
@@ -222,6 +280,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+		}
+		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
 		}
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
@@ -396,6 +457,10 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
+	}
+
+	if err := DeleteUpper(c.cfg.UppersDir, name); err != nil {
+		log.Printf("Warning: failed to delete upper layer for %s: %v", name, err)
 	}
 
 	return nil

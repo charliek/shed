@@ -13,8 +13,75 @@ import (
 )
 
 // RootfsPath returns the path to the rootfs image for an instance.
+//
+// In the overlay-in-guest model this is a symlink-style alias for the
+// upper layer file path: per-shed bookkeeping keeps using "rootfs"
+// terminology so existing `shed system df` accounting and prune flows
+// don't have to grow a parallel "upper" walker.
 func RootfsPath(instanceDir, name string) string {
 	return filepath.Join(instanceDir, name, "rootfs.ext4")
+}
+
+// UpperPath returns the absolute path of the per-shed writable upper
+// layer file under {uppersDir}/{name}/upper.ext4.
+func UpperPath(uppersDir, name string) string {
+	return filepath.Join(uppersDir, name, "upper.ext4")
+}
+
+// UpperDir returns the per-shed upper directory.
+func UpperDir(uppersDir, name string) string {
+	return filepath.Join(uppersDir, name)
+}
+
+// EnsureUpper creates the per-shed writable upper layer as a sparse
+// ext4-sized file at {uppersDir}/<name>/upper.ext4. The file is left
+// unformatted; the in-guest initramfs runs mkfs.ext4 on first boot.
+//
+// If the file already exists it is left in place (idempotent — useful
+// for `shed reset`-style flows that need to recreate the upper after
+// a previous create completed). Returns the absolute path on success.
+func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
+	if sizeBytes <= 0 {
+		return "", fmt.Errorf("upper size must be positive (got %d)", sizeBytes)
+	}
+	dir := UpperDir(uppersDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create upper directory: %w", err)
+	}
+	path := UpperPath(uppersDir, name)
+
+	// O_CREATE|O_EXCL keeps a stale upper from a previous create from
+	// being silently reused. ResetUpper handles the recreate case.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return path, nil
+		}
+		return "", fmt.Errorf("failed to create upper file: %w", err)
+	}
+	if err := f.Truncate(sizeBytes); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("failed to size upper file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("failed to close upper file: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return "", fmt.Errorf("failed to sync upper directory: %w", err)
+	}
+	log.Printf("upper created path=%s size_bytes=%d", path, sizeBytes)
+	return path, nil
+}
+
+// DeleteUpper removes the per-shed upper directory and its contents.
+// Used by `shed delete` and `shed reset`.
+func DeleteUpper(uppersDir, name string) error {
+	if err := os.RemoveAll(UpperDir(uppersDir, name)); err != nil {
+		return fmt.Errorf("failed to remove upper dir: %w", err)
+	}
+	return nil
 }
 
 // CopyRootfs copies the base rootfs image to the instance directory,

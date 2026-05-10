@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -170,6 +171,14 @@ type FirecrackerConfig struct {
 	// SnapshotsDir is the directory where shed snapshots are stored.
 	SnapshotsDir string `yaml:"snapshots_dir,omitempty"`
 
+	// UppersDir is the directory where per-shed writable upper layers
+	// (sparse ext4 files) are stored.
+	UppersDir string `yaml:"uppers_dir,omitempty"`
+
+	// UpperSizeDefault is the default logical size of the per-shed
+	// writable upper. Accepted units: G (GB) and M (MB). Range 1G-100G.
+	UpperSizeDefault string `yaml:"upper_size_default,omitempty"`
+
 	// SocketDir is the directory for Firecracker API sockets
 	SocketDir string `yaml:"socket_dir"`
 
@@ -236,6 +245,14 @@ type VZConfig struct {
 	// SnapshotsDir is the directory where shed snapshots are stored.
 	SnapshotsDir string `yaml:"snapshots_dir,omitempty"`
 
+	// UppersDir is the directory where per-shed writable upper layers
+	// (sparse ext4 files) are stored.
+	UppersDir string `yaml:"uppers_dir,omitempty"`
+
+	// UpperSizeDefault is the default logical size of the per-shed
+	// writable upper. Accepted units: G (GB) and M (MB). Range 1G-100G.
+	UpperSizeDefault string `yaml:"upper_size_default,omitempty"`
+
 	// SocketDir is the directory for vsock Unix sockets.
 	// NOTE: This path must not contain spaces. vfkit URL-encodes socket paths,
 	// turning spaces into %20, which causes connection failures.
@@ -291,10 +308,12 @@ func DefaultVZConfig() *VZConfig {
 		KernelPath:      ExpandPath(DefaultVZImagesDir + "/vmlinux"),
 		InitrdPath:      ExpandPath(DefaultVZImagesDir + "/initrd.img"),
 		BaseRootfs:      ExpandPath(DefaultVZImagesDir + "/default-rootfs.ext4"),
-		ImagesDir:       ExpandPath(DefaultVZImagesDir),
-		InstanceDir:     ExpandPath(DefaultVZImagesDir + "/instances"),
-		SnapshotsDir:    ExpandPath(DefaultVZImagesDir + "/snapshots"),
-		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
+		ImagesDir:        ExpandPath(DefaultVZImagesDir),
+		InstanceDir:      ExpandPath(DefaultVZImagesDir + "/instances"),
+		SnapshotsDir:     ExpandPath(DefaultVZImagesDir + "/snapshots"),
+		UppersDir:        ExpandPath(DefaultVZImagesDir + "/uppers"),
+		UpperSizeDefault: DefaultUpperSize,
+		SocketDir:        ExpandPath("~/.shed/vz/sockets"),
 		DefaultCPUs:     2,
 		DefaultMemoryMB: 4096,
 		DefaultDiskGB:   20,
@@ -332,6 +351,16 @@ func (c *VZConfig) applyDefaults() {
 	// Default SnapshotsDir to ImagesDir/snapshots if unset
 	if c.SnapshotsDir == "" {
 		c.SnapshotsDir = filepath.Join(c.ImagesDir, "snapshots")
+	}
+
+	// Default UppersDir to ImagesDir/uppers if unset.
+	c.UppersDir = ExpandPath(c.UppersDir)
+	if c.UppersDir == "" {
+		c.UppersDir = filepath.Join(c.ImagesDir, "uppers")
+	}
+
+	if c.UpperSizeDefault == "" {
+		c.UpperSizeDefault = DefaultUpperSize
 	}
 
 	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
@@ -423,6 +452,12 @@ func (c *VZConfig) Validate() error {
 		}
 		if stopTimeout > MaxTimeout {
 			return fmt.Errorf("vz: stop_timeout must be at most %s", MaxTimeout)
+		}
+	}
+
+	if c.UpperSizeDefault != "" {
+		if _, err := ParseUpperSize(c.UpperSizeDefault); err != nil {
+			return fmt.Errorf("vz: upper_size_default: %w", err)
 		}
 	}
 
@@ -650,10 +685,12 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 	return &FirecrackerConfig{
 		KernelPath:      DefaultFirecrackerImagesDir + "/vmlinux",
 		BaseRootfs:      "/var/lib/shed/firecracker/base-rootfs.ext4",
-		ImagesDir:       DefaultFirecrackerImagesDir,
-		InstanceDir:     "/var/lib/shed/firecracker/instances",
-		SnapshotsDir:    "/var/lib/shed/firecracker/snapshots",
-		SocketDir:       "/var/run/shed/firecracker",
+		ImagesDir:        DefaultFirecrackerImagesDir,
+		InstanceDir:      "/var/lib/shed/firecracker/instances",
+		SnapshotsDir:     "/var/lib/shed/firecracker/snapshots",
+		UppersDir:        "/var/lib/shed/firecracker/uppers",
+		UpperSizeDefault: DefaultUpperSize,
+		SocketDir:        "/var/run/shed/firecracker",
 		DefaultCPUs:     2,
 		DefaultMemoryMB: 4096,
 		DefaultDiskGB:   20,
@@ -969,6 +1006,14 @@ func (c *FirecrackerConfig) applyDefaults() {
 		c.SnapshotsDir = "/var/lib/shed/firecracker/snapshots"
 	}
 
+	if c.UppersDir == "" {
+		c.UppersDir = "/var/lib/shed/firecracker/uppers"
+	}
+
+	if c.UpperSizeDefault == "" {
+		c.UpperSizeDefault = DefaultUpperSize
+	}
+
 	// Default KernelPath to ImagesDir/vmlinux (extracted from published images)
 	if c.KernelPath == "" {
 		c.KernelPath = c.ImagesDir + "/vmlinux"
@@ -1107,7 +1152,60 @@ func (c *FirecrackerConfig) Validate() error {
 		return fmt.Errorf("tap_prefix is required")
 	}
 
+	if c.UpperSizeDefault != "" {
+		if _, err := ParseUpperSize(c.UpperSizeDefault); err != nil {
+			return fmt.Errorf("firecracker: upper_size_default: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// UpperSize bounds. The plan caps configurable upper size at
+// 1G-100G; values outside this range almost always indicate a config
+// typo and should fail-fast at validation time.
+const (
+	MinUpperSizeBytes int64 = 1 * 1024 * 1024 * 1024
+	MaxUpperSizeBytes int64 = 100 * 1024 * 1024 * 1024
+)
+
+// DefaultUpperSize is the fallback upper-layer size when the config
+// omits upper_size_default. Plan-aligned at 5 GB sparse — a working
+// guess for typical "build a project" workloads.
+const DefaultUpperSize = "5G"
+
+// ParseUpperSize accepts a human-friendly suffix (G, M, or bare bytes)
+// and returns the size in bytes. Validates the range against
+// MinUpperSizeBytes/MaxUpperSizeBytes.
+func ParseUpperSize(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("upper size is empty")
+	}
+	mul := int64(1)
+	digits := s
+	switch unit := s[len(s)-1]; unit {
+	case 'G', 'g':
+		mul = 1024 * 1024 * 1024
+		digits = s[:len(s)-1]
+	case 'M', 'm':
+		mul = 1024 * 1024
+		digits = s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid upper size %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("upper size must be positive: %q", s)
+	}
+	bytes := n * mul
+	if bytes < MinUpperSizeBytes {
+		return 0, fmt.Errorf("upper size must be at least %dG, got %q", MinUpperSizeBytes/(1024*1024*1024), s)
+	}
+	if bytes > MaxUpperSizeBytes {
+		return 0, fmt.Errorf("upper size must be at most %dG, got %q", MaxUpperSizeBytes/(1024*1024*1024), s)
+	}
+	return bytes, nil
 }
 
 // ExpandPath expands ~ to the user's home directory.

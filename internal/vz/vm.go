@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -56,7 +57,10 @@ func (vm *VM) Start(ctx context.Context) error {
 	vm.cleanupSockets()
 
 	// Build vfkit command-line arguments
-	args := vm.buildVfkitArgs()
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		return fmt.Errorf("failed to build vfkit args: %w", err)
+	}
 
 	// Bail out early if the caller already cancelled
 	if err := ctx.Err(); err != nil {
@@ -111,26 +115,59 @@ func (vm *VM) Start(ctx context.Context) error {
 }
 
 // buildVfkitArgs constructs the vfkit command-line arguments.
-func (vm *VM) buildVfkitArgs() []string {
+//
+// The shed initramfs (per-image, pulled from the blob dir) builds the
+// in-guest overlay (writable upper on /dev/vda + read-only lower on
+// /dev/vdb) and pivot_roots into the merged tree, so the kernel cmdline
+// drops the legacy `root=/dev/vda rw` and instead names the two layers
+// via `shed.upper=` / `shed.lower=`.
+func (vm *VM) buildVfkitArgs() (args []string, err error) {
+	if vm.meta.LowerDigest == "" {
+		return nil, fmt.Errorf("vm %s has no lower_digest in metadata; recreate via `shed delete && shed create`", vm.meta.Name)
+	}
+	if !vmimage.BlobExists(vm.cfg.ImagesDir, vm.meta.LowerDigest) {
+		return nil, fmt.Errorf("lower image blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
+	}
+	lowerRootfs, err := vmimage.BlobRootfsPath(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	if err != nil {
+		return nil, fmt.Errorf("resolving lower rootfs: %w", err)
+	}
+	blobDir, err := vmimage.BlobDir(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	if err != nil {
+		return nil, fmt.Errorf("resolving blob dir: %w", err)
+	}
+	initrdPath := filepath.Join(blobDir, vmimage.BlobInitrdFilename)
+	if _, statErr := os.Stat(initrdPath); statErr != nil {
+		return nil, fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, statErr)
+	}
+
 	// shed.name= is read by the in-guest shed-firstboot service to set the
 	// hostname and detect rootfs clones (snapshot spawns). Shed names are
 	// validated to a kernel-cmdline-safe regex in config.ValidateShedName,
 	// so direct concatenation here is safe.
-	kernelArgs := fmt.Sprintf("console=hvc0 root=/dev/vda rw init=/sbin/init shed.name=%s", vm.meta.Name)
+	kernelArgs := fmt.Sprintf(
+		"console=hvc0 init=/sbin/init shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
+		vm.meta.Name,
+	)
 
-	bootloader := fmt.Sprintf("linux,kernel=%s,cmdline=%s", vm.cfg.KernelPath, kernelArgs)
-	if vm.cfg.InitrdPath != "" {
-		bootloader = fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", vm.cfg.KernelPath, vm.cfg.InitrdPath, kernelArgs)
-	}
+	bootloader := fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", vm.cfg.KernelPath, initrdPath, kernelArgs)
 
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
 
-	args := []string{
+	// vfkit's virtio-blk read-only flag has historically been spelled
+	// `,readOnly=true`. If a future vfkit release changes the spelling,
+	// boot will fail with a clear error from vfkit and we can update
+	// here without wider blast radius.
+	args = []string{
 		"--cpus", fmt.Sprintf("%d", vm.meta.CPUs),
 		"--memory", fmt.Sprintf("%d", vm.meta.MemoryMB),
 		"--bootloader", bootloader,
+		// Upper: writable, /dev/vda inside the guest.
 		"--device", fmt.Sprintf("virtio-blk,path=%s", vm.meta.RootfsPath),
+		// Lower: read-only, /dev/vdb. Shared across all sheds pinning
+		// this digest so disk + host page cache are reused.
+		"--device", fmt.Sprintf("virtio-blk,path=%s,readOnly=true", lowerRootfs),
 		"--device", "virtio-net,nat",
 		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLogPath),
 	}
@@ -154,7 +191,7 @@ func (vm *VM) buildVfkitArgs() []string {
 		args = append(args, "--device", fmt.Sprintf("virtio-vsock,port=%d,socketURL=%s,connect", port, socketPath))
 	}
 
-	return args
+	return args, nil
 }
 
 // Stop stops the VM gracefully via SIGTERM, falling back to SIGKILL.

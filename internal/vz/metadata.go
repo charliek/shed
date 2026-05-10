@@ -55,8 +55,18 @@ type Metadata struct {
 	// MemoryMB is the memory in MB
 	MemoryMB int `json:"memory_mb"`
 
-	// RootfsPath is the path to the instance's rootfs image
+	// RootfsPath is the path to the instance's rootfs image. With the
+	// overlay-in-guest model this is the per-shed writable upper; the
+	// read-only lower is the blob's rootfs.ext4, resolved through
+	// LowerDigest at boot time.
 	RootfsPath string `json:"rootfs_path"`
+
+	// UpperPath is the absolute path to the per-shed writable upper
+	// (an ext4-formatted sparse file mounted as /dev/vda in the guest).
+	UpperPath string `json:"upper_path,omitempty"`
+
+	// UpperSizeBytes is the logical size of the upper sparse file.
+	UpperSizeBytes int64 `json:"upper_size_bytes,omitempty"`
 
 	// Repo is the optional git repository URL
 	Repo string `json:"repo,omitempty"`

@@ -442,6 +442,10 @@ type CreateShedRequest struct {
 	// Mutually exclusive with Image and Repo. Provisioning steps (repo clone, install
 	// hook, first-time auto-sync) are skipped because the snapshot is already provisioned.
 	FromSnapshot string `json:"from_snapshot,omitempty"`
+
+	// UpperSizeBytes is the logical size of the per-shed writable upper.
+	// Zero falls back to the backend's upper_size_default config value.
+	UpperSizeBytes int64 `json:"upper_size_bytes,omitempty"`
 }
 
 // SnapshotSchemaVersion is the current snapshot schema version. Bumped
