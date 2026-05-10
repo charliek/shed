@@ -198,8 +198,14 @@ build_variant() {
 
     echo "Created rootfs image: $rootfs_path"
 
-    # Build the shed-overlay initramfs.
-    local shed_initrd="$OUTPUT_DIR/shed-initrd-fc.img"
+    # Build the shed-overlay initramfs into a tempfile rather than
+    # OUTPUT_DIR. OUTPUT_DIR is root-owned by default (`sudo mkdir -p`
+    # at script start), so writing the intermediate as the current
+    # user would fail with EPERM before install-blob.sh ever runs.
+    # install-blob.sh moves the file into the blob layout, so no
+    # explicit cleanup is needed on the happy path.
+    local shed_initrd
+    shed_initrd="$(mktemp "${TMPDIR:-/tmp}/shed-initrd-fc.XXXXXX.img")"
     echo ""
     echo "=== Building shed-overlay initramfs ==="
     "$SCRIPT_DIR/build-initramfs.sh" \

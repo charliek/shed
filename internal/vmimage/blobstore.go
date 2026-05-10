@@ -314,7 +314,29 @@ func InstallBlob(imagesDir string, spec BlobInstallSpec) (blobDir string, alread
 // fall apart if a caller passed a stale or wrong digest. Hashing here
 // is one extra read per install; that's an acceptable cost for the
 // "core invariant always holds" property.
+//
+// Also rejects any spec.Files map key that's not a bare blob filename:
+// the keys flow straight into filepath.Join under the staging dir,
+// and a key like `../tags/x.json` would otherwise let a bad caller
+// overwrite sibling state. All callers in-tree use the BlobRootfs/
+// Kernel/Initrd constants — this is a defense-in-depth check.
 func validateInstallSpec(spec BlobInstallSpec) error {
+	allowedFiles := map[string]struct{}{
+		BlobRootfsFilename: {},
+		BlobKernelFilename: {},
+		BlobInitrdFilename: {},
+	}
+	for name := range spec.Files {
+		if name == "" {
+			return fmt.Errorf("install spec contains empty file key")
+		}
+		if filepath.Base(name) != name || name == "." || name == ".." {
+			return fmt.Errorf("install spec file key must be a bare filename: %q", name)
+		}
+		if _, ok := allowedFiles[name]; !ok {
+			return fmt.Errorf("install spec contains unsupported file %q (allowed: rootfs.ext4, kernel, initrd)", name)
+		}
+	}
 	if _, err := digestHex(spec.Manifest.Digest); err != nil {
 		return err
 	}

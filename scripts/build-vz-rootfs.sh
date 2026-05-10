@@ -286,8 +286,11 @@ build_variant() {
     extract_kernel "$docker_tag"
 
     # Build the shed-overlay initramfs (one initrd is fine across all
-    # variants — it's image-content-independent).
-    local shed_initrd="$OUTPUT_DIR/shed-initrd-vz.img"
+    # variants — it's image-content-independent). Stage into a tempfile
+    # rather than OUTPUT_DIR for symmetry with the FC script and to
+    # avoid leaking intermediates if install-blob.sh is interrupted.
+    local shed_initrd
+    shed_initrd="$(mktemp "${TMPDIR:-/tmp}/shed-initrd-vz.XXXXXX.img")"
     echo ""
     echo "=== Building shed-overlay initramfs ==="
     "$SCRIPT_DIR/build-initramfs.sh" \

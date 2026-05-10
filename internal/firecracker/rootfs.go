@@ -67,6 +67,15 @@ func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
 		os.Remove(path)
 		return "", fmt.Errorf("failed to size upper file: %w", err)
 	}
+	// syncDir alone only persists the directory entry; the truncate
+	// metadata still needs a file-level sync, or a crash right after
+	// EnsureUpper can leave a zero-length upper.ext4 with a tag-good
+	// metadata pointer at it.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("failed to sync upper file: %w", err)
+	}
 	if err := f.Close(); err != nil {
 		os.Remove(path)
 		return "", fmt.Errorf("failed to close upper file: %w", err)

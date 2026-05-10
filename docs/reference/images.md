@@ -288,7 +288,12 @@ any blob with no protective references (no shed and no snapshot).
     | `blobs/sha256/.<digest>.lock` | Empty flock file used to serialize install/prune. |
     | `tags/<tag>.json` | Tag → digest pointer (`{"digest": "sha256:...", "updated_at": "..."}`). |
 
-    Per running shed, the server creates a copy at `/var/lib/shed/firecracker/instances/{shed-name}/rootfs.ext4` plus a v2 `metadata.json` recording `lower_digest`. Deleting the shed removes the whole directory.
+    Per shed, the server creates:
+
+    - `/var/lib/shed/firecracker/uppers/{shed-name}/upper.ext4` — the per-shed writable overlay (sparse, default 5 GB). `mkfs.ext4` runs on first boot inside the guest.
+    - `/var/lib/shed/firecracker/instances/{shed-name}/metadata.json` — v2 schema; records `lower_digest` (the shared blob's content address, which protects it from prune) and `upper_path`.
+
+    The lower image is NOT copied per shed — it's shared via the blob store. `shed delete <name>` removes both the upper directory and the instance directory, but never touches the shared lower.
 
     Control sockets live in `/var/run/shed/firecracker/` (tiny files).
 
@@ -304,7 +309,12 @@ any blob with no protective references (no shed and no snapshot).
     | `blobs/sha256/<digest>/initrd` | Extracted initrd (VZ requires this). |
     | `tags/<tag>.json` | Tag → digest pointer. |
 
-    Per running shed, the server creates a copy at `~/Library/Application Support/shed/vz/instances/{shed-name}/rootfs.ext4` plus `metadata.json`. Deleting the shed removes this directory.
+    Per shed, the server creates:
+
+    - `~/Library/Application Support/shed/vz/uppers/{shed-name}/upper.ext4` — the per-shed writable overlay (sparse, default 5 GB).
+    - `~/Library/Application Support/shed/vz/instances/{shed-name}/metadata.json` — records `lower_digest` and `upper_path`.
+
+    The lower image is NOT copied per shed — it's shared via the blob store. `shed delete <name>` removes both the upper and instance directories.
 
     Vsock sockets live in `~/.shed/vz/sockets/` (tiny files).
 
@@ -339,10 +349,13 @@ Tags do NOT protect a digest. After
 `shed image rm experimental` you typically also want
 `shed image prune` to actually free the blob.
 
-Deleting a cached image does not affect running sheds — each shed
-holds its own copy of the rootfs and pins the lower digest in its
-metadata. You'll need to re-pull or rebuild the image before creating
-new sheds from it.
+Deleting a cached image does not affect running sheds — every shed
+pins its lower digest in `metadata.json`, and that digest is what
+boots the VM (via the shared `blobs/sha256/<digest>/rootfs.ext4`).
+Pruning a digest that's still pinned is refused; only after the last
+shed and snapshot referencing it are gone does `shed image prune`
+reclaim the blob. To create *new* sheds from a deleted image, re-pull
+or rebuild it first.
 
 ### Cookbook: upgrading image versions and reclaiming disk
 

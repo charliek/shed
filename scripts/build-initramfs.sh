@@ -41,7 +41,14 @@ while [[ $# -gt 0 ]]; do
             require_value "--output" "${2:-}"
             OUTPUT="$2"; shift 2 ;;
         --help|-h)
-            sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            # Print the comment block at the top of this script. awk
+            # stops at the first non-comment line so the help output
+            # doesn't leak `set -euo pipefail`.
+            awk '
+                NR == 1 { next }
+                /^#/ { sub(/^# ?/, ""); print; next }
+                { exit }
+            ' "${BASH_SOURCE[0]}"
             exit 0 ;;
         *)
             echo "ERROR: unknown argument: $1" >&2
