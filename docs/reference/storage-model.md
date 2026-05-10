@@ -91,6 +91,19 @@ prune reclaims it.
 Stopped sheds count as references, so a digest stays cached as long as
 any shed (running or stopped) was created from it.
 
+## Tag updates don't propagate to existing sheds
+
+A shed's metadata pins the **digest** its lower was resolved from at
+create time, not the tag string. After a `shed image pull <ref> -t
+experimental` that advances the `experimental` tag to a new digest,
+existing sheds keep booting from the old digest until they're deleted
+and recreated — `shed stop && shed start` (and a future `shed restart`)
+re-read the metadata, they do not re-resolve the tag. This is
+intentional: live re-resolution would change the read-only lower out
+from under a running guest. To roll a shed onto a new tag's content,
+`shed delete <name>` and `shed create <name> --image experimental`.
+Workspace contents under `--local-dir` are unaffected by that cycle.
+
 ## Lifecycle commands
 
 | Command | What it does |

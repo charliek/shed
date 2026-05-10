@@ -120,6 +120,20 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
+	// Sweep an orphan upper from a previously crashed create. We're
+	// guaranteed at this point that no metadata.json claims this name
+	// (the LoadMetadata check above returned NotFound) and we hold the
+	// per-name create lock, so anything still sitting at
+	// uppers/<name>/ is leftover state from a half-completed run.
+	// Without this, EnsureUpper's strict-rejection would force the
+	// operator to manually `rm -rf` to recover.
+	if _, err := os.Stat(UpperPath(c.cfg.UppersDir, req.Name)); err == nil {
+		log.Printf("CreateShed %s: sweeping orphan upper from a prior crashed create", req.Name)
+		if err := DeleteUpper(c.cfg.UppersDir, req.Name); err != nil {
+			return nil, fmt.Errorf("failed to sweep orphan upper for %s: %w", req.Name, err)
+		}
+	}
+
 	cpus := req.CPUs
 	if cpus == 0 {
 		cpus = c.cfg.DefaultCPUs
@@ -191,7 +205,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 		// Ensure image is available locally (pulls + converts Docker refs if needed).
 		// We only need the digest — the rootfs path is rederived per-boot inside vm.go.
-		_, ldigest, err := EnsureImage(ctx, resolved, c.cfg)
+		_, ldigest, err := c.EnsureImage(ctx, resolved)
 		if err != nil {
 			return nil, err
 		}

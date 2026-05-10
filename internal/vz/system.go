@@ -62,6 +62,10 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		// Skip when its path matches an existing entry — under content-
 		// addressing, _base often resolves to the same blob as a tagged
 		// variant, and double-counting would inflate `df` totals.
+		// Path comparison is digest-equivalent here: both go through
+		// BlobRootfsPath(imagesDir, digest), which is deterministic
+		// from the digest, and Resolve is called with no expectedRef so
+		// it never short-circuits on a mismatched manifest.SourceRef.
 		if basePath := vmimage.Resolve(imagesDir, "_base", ""); basePath != "" && !imagesContainPath(du.Images, basePath) {
 			if logical, physical, err := diskstat.Stat(basePath); err == nil {
 				baseRef := ""

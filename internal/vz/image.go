@@ -16,8 +16,12 @@ import (
 // EnsureImage ensures a resolved image is available as a local ext4 file.
 // Returns the path and the digest of the underlying blob (empty when the
 // resolved image is a local-path escape hatch rather than a tagged blob).
-func EnsureImage(ctx context.Context, resolved config.ResolvedImage, cfg *config.VZConfig) (path, digest string, err error) {
-	mgr := vmimage.NewManager(cfg, nil)
+//
+// Method on Client (not a free function) so the manager carries a real
+// RefScanner — matches the Firecracker create path and keeps EnsureImage
+// behavior symmetric across backends.
+func (c *Client) EnsureImage(ctx context.Context, resolved config.ResolvedImage) (path, digest string, err error) {
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
 	res, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 		Path:      resolved.Path,
 		DockerRef: resolved.DockerRef,
