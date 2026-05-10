@@ -185,17 +185,33 @@ func (b *FirecrackerBackend) DialService(ctx context.Context, shedName string, p
 	return b.client.DialService(ctx, shedName, port)
 }
 
-// ListImages returns available Firecracker image variants from config and auto-discovery.
+// ListImages returns available Firecracker image variants from config
+// and the blob store.
 func (b *FirecrackerBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	return b.client.ListImages()
 }
 
-// DeleteImage removes a cached image by name.
+// InspectImage returns full details for a tag or digest.
+func (b *FirecrackerBackend) InspectImage(_ context.Context, tagOrDigest string) (config.ImageInspectResponse, error) {
+	return b.client.InspectImage(tagOrDigest)
+}
+
+// TagImage points newTag at the digest currently held by srcTagOrDigest.
+func (b *FirecrackerBackend) TagImage(_ context.Context, src, dst string) error {
+	return b.client.TagImage(src, dst)
+}
+
+// PullImage pulls a Docker reference into the blob store under the named tag.
+func (b *FirecrackerBackend) PullImage(ctx context.Context, dockerRef, tag string) (string, error) {
+	return b.client.PullImage(ctx, dockerRef, tag)
+}
+
+// DeleteImage removes a tag.
 func (b *FirecrackerBackend) DeleteImage(_ context.Context, name string) error {
 	return b.client.DeleteImage(name)
 }
 
-// PruneImages removes cached images not referenced by config or existing sheds.
+// PruneImages removes blobs not protected by any shed/snapshot.
 func (b *FirecrackerBackend) PruneImages(_ context.Context, dryRun bool) ([]config.ImageInfo, error) {
 	return b.client.PruneImages(dryRun)
 }

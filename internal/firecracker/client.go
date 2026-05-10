@@ -398,7 +398,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
-	var rootfsSource string
+	var rootfsSource, lowerDigest, lowerImageTag string
 	if req.FromSnapshot != "" {
 		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
 		if err != nil {
@@ -409,6 +409,10 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendFirecracker)
 		}
 		rootfsSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
+		// Inherit the lower-digest pin from the snapshot so this new
+		// shed continues to protect the underlying blob from prune.
+		lowerDigest = snap.LowerDigest
+		lowerImageTag = snap.SourceImage
 	} else {
 		// Resolve and ensure image before allocating network resources.
 		// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
@@ -425,8 +429,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			resolved = c.cfg.ResolveBaseRootfs()
 		}
 
-		mgr := vmimage.NewManager(c.cfg)
-		rootfsSource, err = mgr.EnsureImage(ctx, vmimage.ResolvedRef{
+		mgr := vmimage.NewManager(c.cfg, c.refScanner())
+		ensureRes, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 			Path:      resolved.Path,
 			DockerRef: resolved.DockerRef,
 			Name:      resolved.Name,
@@ -436,6 +440,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure image: %w", err)
 		}
+		rootfsSource = ensureRes.Path
+		lowerDigest = ensureRes.Digest
+		lowerImageTag = resolved.Name
 	}
 
 	backend.Progress(ctx, "network", "Allocating network resources...")
@@ -478,20 +485,22 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	meta := &Metadata{
-		Name:         req.Name,
-		Status:       config.StatusStopped,
-		CreatedAt:    time.Now(),
-		Backend:      config.BackendFirecracker,
-		CID:          cid,
-		IPAddress:    ipAddress,
-		TAPDevice:    tapDevice,
-		CPUs:         cpus,
-		MemoryMB:     memoryMB,
-		RootfsPath:   rootfsPath,
-		Repo:         req.Repo,
-		LocalDir:     req.LocalDir,
-		Image:        req.Image,
-		FromSnapshot: req.FromSnapshot,
+		Name:          req.Name,
+		Status:        config.StatusStopped,
+		CreatedAt:     time.Now(),
+		Backend:       config.BackendFirecracker,
+		CID:           cid,
+		IPAddress:     ipAddress,
+		TAPDevice:     tapDevice,
+		CPUs:          cpus,
+		MemoryMB:      memoryMB,
+		RootfsPath:    rootfsPath,
+		Repo:          req.Repo,
+		LocalDir:      req.LocalDir,
+		Image:         req.Image,
+		LowerDigest:   lowerDigest,
+		LowerImageTag: lowerImageTag,
+		FromSnapshot:  req.FromSnapshot,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {

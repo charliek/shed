@@ -310,28 +310,23 @@ func TestMetadataVersion(t *testing.T) {
 		}
 	})
 
-	t.Run("load missing version as 1", func(t *testing.T) {
+	t.Run("refuse pre-v2 metadata", func(t *testing.T) {
 		dir := mustTempDir(t, "metadata-version")
 
-		// Write raw JSON without version field
-		instanceDir := filepath.Join(dir, "no-version")
+		// Write raw v1 JSON.
+		instanceDir := filepath.Join(dir, "old-shed")
 		if err := os.MkdirAll(instanceDir, 0755); err != nil {
 			t.Fatalf("failed to create instance dir: %v", err)
 		}
-
-		raw := `{"name":"no-version","status":"stopped","created_at":"2024-01-01T00:00:00Z","backend":"firecracker","cid":100}`
+		raw := `{"version":1,"name":"old-shed","status":"stopped","created_at":"2024-01-01T00:00:00Z","backend":"firecracker","cid":100}`
 		metaPath := filepath.Join(instanceDir, "metadata.json")
 		if err := os.WriteFile(metaPath, []byte(raw), 0644); err != nil {
 			t.Fatalf("failed to write metadata: %v", err)
 		}
 
-		loaded, err := LoadMetadata(dir, "no-version")
-		if err != nil {
-			t.Fatalf("LoadMetadata() error = %v", err)
-		}
-
-		if loaded.Version != 1 {
-			t.Errorf("Version = %d, want 1", loaded.Version)
+		_, err := LoadMetadata(dir, "old-shed")
+		if !errors.Is(err, ErrLegacyMetadata) {
+			t.Fatalf("LoadMetadata(v1) err = %v, want ErrLegacyMetadata", err)
 		}
 	})
 

@@ -133,7 +133,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
 	}
 
-	var rootfsSource string
+	var rootfsSource, lowerDigest, lowerImageTag string
 	if req.FromSnapshot != "" {
 		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
 		if err != nil {
@@ -144,6 +144,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendVZ)
 		}
 		rootfsSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
+		lowerDigest = snap.LowerDigest
+		lowerImageTag = snap.SourceImage
 	} else {
 		var resolved config.ResolvedImage
 		if req.Image != "" {
@@ -158,10 +160,11 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 		// Ensure image is available locally (pulls + converts Docker refs if needed)
 		var err error
-		rootfsSource, err = EnsureImage(ctx, resolved, c.cfg)
+		rootfsSource, lowerDigest, err = EnsureImage(ctx, resolved, c.cfg)
 		if err != nil {
 			return nil, err
 		}
+		lowerImageTag = resolved.Name
 	}
 
 	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
@@ -174,17 +177,19 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// extra chmod here.
 
 	meta := &Metadata{
-		Name:         req.Name,
-		Status:       config.StatusStopped,
-		CreatedAt:    time.Now(),
-		Backend:      config.BackendVZ,
-		CPUs:         cpus,
-		MemoryMB:     memoryMB,
-		RootfsPath:   rootfsPath,
-		Repo:         req.Repo,
-		LocalDir:     req.LocalDir,
-		Image:        req.Image,
-		FromSnapshot: req.FromSnapshot,
+		Name:          req.Name,
+		Status:        config.StatusStopped,
+		CreatedAt:     time.Now(),
+		Backend:       config.BackendVZ,
+		CPUs:          cpus,
+		MemoryMB:      memoryMB,
+		RootfsPath:    rootfsPath,
+		Repo:          req.Repo,
+		LocalDir:      req.LocalDir,
+		Image:         req.Image,
+		LowerDigest:   lowerDigest,
+		LowerImageTag: lowerImageTag,
+		FromSnapshot:  req.FromSnapshot,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {

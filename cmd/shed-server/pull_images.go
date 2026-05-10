@@ -72,7 +72,7 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	mgr := vmimage.NewManager(imgCfg)
+	mgr := vmimage.NewManager(imgCfg, nil)
 	pulled := 0
 
 	// Sort variant names for deterministic output
@@ -103,50 +103,50 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 		pulled++
 	}
 
-	// Hydrate _base from base_rootfs. If base_rootfs shares a Docker ref
-	// with any cached variant in the full config, hardlink _base to that
-	// variant (zero extra disk). Otherwise pull a fresh copy. This makes
-	// `shed create` (no --image) immediate after `pull-images`, which
-	// previously skipped _base whenever the ref matched a variant.
+	// Hydrate _base from base_rootfs. With the content-addressed blob
+	// store, two tags (_base and a variant) sharing the same Docker ref
+	// converge on the same digest after first conversion — so all we
+	// need to do is pull/ensure for _base. If a sibling tag already has
+	// a matching blob installed, EnsureImage's cache hit makes this an
+	// O(stat) operation; otherwise it falls through to a full convert.
 	baseRootfs := imgCfg.GetBaseRootfs()
 	if vmimage.IsDockerRef(baseRootfs) {
 		imagesDir := imgCfg.GetImagesDir()
-		var linkFrom string
+		// Fast path: another tag in this run already installed the
+		// matching digest. Point _base at it directly.
+		var sourceTag string
 		for name, ref := range imgCfg.GetImages() {
 			if ref != baseRootfs || !vmimage.IsDockerRef(ref) {
 				continue
 			}
-			if vmimage.CheckCache(imagesDir, name, ref) != "" {
-				linkFrom = name
+			if vmimage.Resolve(imagesDir, name, ref) != "" {
+				sourceTag = name
 				break
 			}
 		}
 
-		linked := false
-		if linkFrom != "" {
-			if err := vmimage.LinkCachedImage(imagesDir, linkFrom, "_base", baseRootfs); err != nil {
-				fmt.Printf("  [warn] hardlink of _base to %s failed (%v); falling back to full pull\n", linkFrom, err)
+		if sourceTag != "" {
+			if err := mgr.TagImage(sourceTag, "_base"); err != nil {
+				fmt.Printf("  [warn] tagging _base from %s failed (%v); falling back to full pull\n", sourceTag, err)
 			} else {
-				fmt.Printf("Done: _base (linked to %s)\n", linkFrom)
+				fmt.Printf("Done: _base (tagged from %s)\n", sourceTag)
 				pulled++
-				linked = true
+				goto baseDone
 			}
 		}
 
-		if !linked {
-			fmt.Printf("Pulling _base (%s)...\n", baseRootfs)
-			_, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
-				DockerRef: baseRootfs,
-				Name:      "_base",
-			}, func(stage, msg string) {
-				fmt.Printf("  [%s] %s\n", stage, msg)
-			})
-			if err != nil {
-				return fmt.Errorf("failed to pull base rootfs: %w", err)
-			}
-			fmt.Println("Done: _base")
-			pulled++
+		fmt.Printf("Pulling _base (%s)...\n", baseRootfs)
+		if _, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
+			DockerRef: baseRootfs,
+			Name:      "_base",
+		}, func(stage, msg string) {
+			fmt.Printf("  [%s] %s\n", stage, msg)
+		}); err != nil {
+			return fmt.Errorf("failed to pull base rootfs: %w", err)
 		}
+		fmt.Println("Done: _base")
+		pulled++
+	baseDone:
 	}
 
 	if pulled == 0 {

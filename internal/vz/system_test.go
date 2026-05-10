@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
-	"github.com/charliek/shed/internal/vmimage"
 )
 
 func newSystemTestClient(t *testing.T) (*Client, string, string) {
@@ -53,15 +52,9 @@ func TestDiskUsage_Empty(t *testing.T) {
 func TestDiskUsage_Populated(t *testing.T) {
 	client, imagesDir, instanceDir := newSystemTestClient(t)
 
-	// _base (discovered directly) + one variant (auto-discovered via ListImages).
-	basePath := filepath.Join(imagesDir, vmimage.RootfsFilename("_base"))
-	if err := os.WriteFile(basePath, make([]byte, 4096), 0644); err != nil {
-		t.Fatal(err)
-	}
-	variantPath := filepath.Join(imagesDir, vmimage.RootfsFilename("experimental"))
-	if err := os.WriteFile(variantPath, make([]byte, 8192), 0644); err != nil {
-		t.Fatal(err)
-	}
+	// _base (discovered via tag indirection) + one variant (auto-discovered via ListImages).
+	createFakeImage(t, imagesDir, "_base")
+	createFakeImage(t, imagesDir, "experimental")
 
 	// One stopped shed with a rootfs copy and a console.log.
 	dir := filepath.Join(instanceDir, "api-dev")

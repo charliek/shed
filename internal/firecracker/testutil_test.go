@@ -4,12 +4,15 @@
 package firecracker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmimage"
 )
 
 // testMetadata returns a valid test metadata instance.
@@ -59,6 +62,36 @@ func createTestInstance(t *testing.T, dir, name string) *Metadata {
 		t.Fatalf("failed to create test instance: %v", err)
 	}
 	return meta
+}
+
+// installTestBlob installs a fake blob into imagesDir and tags it with
+// `tag`. Returns the digest.
+func installTestBlob(t *testing.T, imagesDir, tag string, body []byte) string {
+	t.Helper()
+	stagingDir := t.TempDir()
+	src := filepath.Join(stagingDir, "rootfs.ext4")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
+	if _, _, err := vmimage.InstallBlob(imagesDir, vmimage.BlobInstallSpec{
+		Files: map[string]string{vmimage.BlobRootfsFilename: src},
+		Manifest: vmimage.Manifest{
+			SchemaVersion:     vmimage.ManifestSchemaVersion,
+			Digest:            digest,
+			SourceRef:         "ghcr.io/test/" + tag + ":v1",
+			RootfsLogicalSize: int64(len(body)),
+		},
+	}); err != nil {
+		t.Fatalf("InstallBlob: %v", err)
+	}
+	if tag != "" {
+		if err := vmimage.SetTag(imagesDir, tag, digest); err != nil {
+			t.Fatalf("SetTag: %v", err)
+		}
+	}
+	return digest
 }
 
 // mustTempDir creates a temporary directory for testing.

@@ -6,7 +6,6 @@ package firecracker
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
@@ -52,20 +51,22 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 			du.Images = append(du.Images, entry)
 		}
 
-		// _base is skipped by ListImages by design; stat it directly.
-		basePath := filepath.Join(imagesDir, vmimage.RootfsFilename("_base"))
-		if logical, physical, err := diskstat.Stat(basePath); err == nil {
-			baseRef := ""
-			if vmimage.IsDockerRef(c.cfg.BaseRootfs) {
-				baseRef = c.cfg.BaseRootfs
+		// _base is skipped by ListImages by design; resolve via the
+		// content-addressed blob store and stat the underlying rootfs.
+		if basePath := vmimage.Resolve(imagesDir, "_base", ""); basePath != "" {
+			if logical, physical, err := diskstat.Stat(basePath); err == nil {
+				baseRef := ""
+				if vmimage.IsDockerRef(c.cfg.BaseRootfs) {
+					baseRef = c.cfg.BaseRootfs
+				}
+				du.Images = append(du.Images, config.ImageDiskEntry{
+					Name:      "_base",
+					Path:      basePath,
+					DockerRef: baseRef,
+					Size:      config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
+					IsBase:    true,
+				})
 			}
-			du.Images = append(du.Images, config.ImageDiskEntry{
-				Name:      "_base",
-				Path:      basePath,
-				DockerRef: baseRef,
-				Size:      config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
-				IsBase:    true,
-			})
 		}
 
 		orphans, err := systemprune.FindOrphans(imagesDir)
@@ -268,10 +269,8 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		for _, ic := range instanceCandidates {
 			skipSet[ic.Name] = true
 		}
-		mgr := vmimage.NewManager(c.cfg)
-		cands, err := mgr.PruneImages(true, func() ([]string, error) {
-			return c.inUseImageNamesExcept(skipSet)
-		})
+		mgr := vmimage.NewManager(c.cfg, c.refScannerExcept(skipSet))
+		cands, err := mgr.PruneImages(true)
 		if err != nil {
 			return report, fmt.Errorf("dry-run image prune: %w", err)
 		}
@@ -324,8 +323,8 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	}
 
 	if opts.Images && c.cfg.ImagesDir != "" {
-		mgr := vmimage.NewManager(c.cfg)
-		deleted, err := mgr.PruneImages(false, c.inUseImageNames)
+		mgr := vmimage.NewManager(c.cfg, c.refScanner())
+		deleted, err := mgr.PruneImages(false)
 		if err != nil {
 			systemprune.FinalizeReport(&report)
 			return report, fmt.Errorf("image prune: %w", err)

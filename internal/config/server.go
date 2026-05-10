@@ -474,14 +474,15 @@ type ResolvedImage struct {
 // configKey is used in error messages (e.g., "vz.images" or "firecracker.images").
 //
 // Resolution order:
-//  1. Look up in images map — if value is a Docker ref, check imagesDir cache first
-//  2. Auto-discover {name}-rootfs.ext4 in imagesDir
+//  1. Look up in images map — if value is a Docker ref, check the
+//     blob-store tag cache first
+//  2. Auto-discover existing tag in {imagesDir}/tags/
 //  3. Absolute path escape hatch
 //  4. Error with available variants
 func resolveImage(images map[string]string, imagesDir, image, configKey string) (ResolvedImage, error) {
 	if val, ok := images[image]; ok {
 		if vmimage.IsDockerRef(val) {
-			if cached := vmimage.CheckCache(imagesDir, image, val); cached != "" {
+			if cached := vmimage.Resolve(imagesDir, image, val); cached != "" {
 				return ResolvedImage{Path: cached, Name: image}, nil
 			}
 			return ResolvedImage{DockerRef: val, Name: image}, nil
@@ -489,10 +490,9 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 		return ResolvedImage{Path: val, Name: image}, nil
 	}
 
-	// Auto-discover in ImagesDir
+	// Auto-discover by tag in the blob store.
 	if imagesDir != "" {
-		discovered := filepath.Join(imagesDir, vmimage.RootfsFilename(image))
-		if _, err := os.Stat(discovered); err == nil {
+		if discovered := vmimage.Resolve(imagesDir, image, ""); discovered != "" {
 			return ResolvedImage{Path: discovered, Name: image}, nil
 		}
 	}
@@ -520,7 +520,7 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 // resolveBaseRootfs is the shared implementation for base rootfs resolution.
 func resolveBaseRootfs(baseRootfs, imagesDir string) ResolvedImage {
 	if vmimage.IsDockerRef(baseRootfs) {
-		if cached := vmimage.CheckCache(imagesDir, "_base", baseRootfs); cached != "" {
+		if cached := vmimage.Resolve(imagesDir, "_base", baseRootfs); cached != "" {
 			return ResolvedImage{Path: cached, Name: "_base"}
 		}
 		return ResolvedImage{DockerRef: baseRootfs, Name: "_base"}
@@ -528,21 +528,20 @@ func resolveBaseRootfs(baseRootfs, imagesDir string) ResolvedImage {
 	return ResolvedImage{Path: baseRootfs, Name: "_base"}
 }
 
-// availableImageVariants returns sorted list of available image names from config and imagesDir.
+// availableImageVariants returns a sorted list of image names known to
+// the system: every key in the Images config map plus every tag present
+// in the blob store. The synthetic "_base" tag is excluded.
 func availableImageVariants(images map[string]string, imagesDir string) []string {
 	seen := make(map[string]bool)
 	for name := range images {
 		seen[name] = true
 	}
 	if imagesDir != "" {
-		entries, err := os.ReadDir(imagesDir)
+		tags, err := vmimage.ListTags(imagesDir)
 		if err == nil {
-			for _, e := range entries {
-				if strings.HasSuffix(e.Name(), "-rootfs.ext4") && !e.IsDir() {
-					name := strings.TrimSuffix(e.Name(), "-rootfs.ext4")
-					if name != "" && name != "_base" {
-						seen[name] = true
-					}
+			for _, name := range tags {
+				if name != "" && name != "_base" {
+					seen[name] = true
 				}
 			}
 		}

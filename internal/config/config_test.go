@@ -1,13 +1,48 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charliek/shed/internal/vmimage"
 )
+
+// installCachedBlob installs a fake blob into imagesDir under the given
+// tag, with the given source ref recorded in its manifest. Returns the
+// path to the cached blob's rootfs.ext4. Test helper.
+func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
+	t.Helper()
+	stagingDir := t.TempDir()
+	src := filepath.Join(stagingDir, "rootfs.ext4")
+	body := []byte("fake-" + tag)
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
+	if _, _, err := vmimage.InstallBlob(imagesDir, vmimage.BlobInstallSpec{
+		Files: map[string]string{vmimage.BlobRootfsFilename: src},
+		Manifest: vmimage.Manifest{
+			SchemaVersion:     vmimage.ManifestSchemaVersion,
+			Digest:            digest,
+			SourceRef:         sourceRef,
+			RootfsLogicalSize: int64(len(body)),
+		},
+	}); err != nil {
+		t.Fatalf("InstallBlob: %v", err)
+	}
+	if err := vmimage.SetTag(imagesDir, tag, digest); err != nil {
+		t.Fatalf("SetTag: %v", err)
+	}
+	path, _ := vmimage.BlobRootfsPath(imagesDir, digest)
+	return path
+}
 
 func TestNewAPIError(t *testing.T) {
 	err := NewAPIError(ErrShedNotFound, "Shed 'test' not found")
@@ -1097,11 +1132,7 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("cached docker ref returns Path", func(t *testing.T) {
 		dir := t.TempDir()
-		// Create cached rootfs and source sidecar
-		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
-		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
-		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-vz-default:v1.0.0\n"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "default", "ghcr.io/charliek/shed-vz-default:v1.0.0")
 
 		cfg := &VZConfig{
 			Images:    map[string]string{"default": "ghcr.io/charliek/shed-vz-default:v1.0.0"},
@@ -1121,10 +1152,7 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("stale cache triggers re-pull", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
-		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
-		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-vz-default:v1.0.0\n"), 0644)
+		installCachedBlob(t, dir, "default", "ghcr.io/charliek/shed-vz-default:v1.0.0")
 
 		cfg := &VZConfig{
 			Images:    map[string]string{"default": "ghcr.io/charliek/shed-vz-default:v2.0.0"},
@@ -1141,8 +1169,7 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("auto-discover from ImagesDir", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "custom-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "custom", "ghcr.io/example/custom:v1")
 
 		cfg := &VZConfig{
 			Images:    map[string]string{},
@@ -1253,10 +1280,7 @@ func TestFirecrackerConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("cached docker ref returns Path", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
-		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
-		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-fc-default:v1.0.0\n"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "default", "ghcr.io/charliek/shed-fc-default:v1.0.0")
 
 		cfg := &FirecrackerConfig{
 			Images:    map[string]string{"default": "ghcr.io/charliek/shed-fc-default:v1.0.0"},
@@ -1273,8 +1297,7 @@ func TestFirecrackerConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("auto-discover from ImagesDir", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "custom-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "custom", "ghcr.io/example/custom:v1")
 
 		cfg := &FirecrackerConfig{
 			Images:    map[string]string{},

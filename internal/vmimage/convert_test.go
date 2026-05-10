@@ -1,6 +1,8 @@
 package vmimage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,97 +42,89 @@ func TestIsDockerRef(t *testing.T) {
 	}
 }
 
-func TestRootfsFilename(t *testing.T) {
-	tests := []struct {
-		name string
-		want string
-	}{
-		{name: "default", want: "default-rootfs.ext4"},
-		{name: "base", want: "base-rootfs.ext4"},
-		{name: "my-custom", want: "my-custom-rootfs.ext4"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := RootfsFilename(tt.name)
-			if got != tt.want {
-				t.Errorf("RootfsFilename(%q) = %q, want %q", tt.name, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestSourceFilename(t *testing.T) {
-	tests := []struct {
-		name string
-		want string
-	}{
-		{name: "default", want: "default-rootfs.ext4.source"},
-		{name: "base", want: "base-rootfs.ext4.source"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := SourceFilename(tt.name)
-			if got != tt.want {
-				t.Errorf("SourceFilename(%q) = %q, want %q", tt.name, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCheckCache(t *testing.T) {
-	t.Run("hit", func(t *testing.T) {
-		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4"), []byte("data"), 0644)
-		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4.source"), []byte("ghcr.io/test:v1\n"), 0644)
-
-		got := CheckCache(dir, "default", "ghcr.io/test:v1")
-		want := filepath.Join(dir, "default-rootfs.ext4")
-		if got != want {
-			t.Errorf("CheckCache() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("miss no file", func(t *testing.T) {
-		dir := t.TempDir()
-		if got := CheckCache(dir, "default", "ghcr.io/test:v1"); got != "" {
-			t.Errorf("CheckCache() = %q, want empty", got)
-		}
-	})
-
-	t.Run("stale source", func(t *testing.T) {
-		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4"), []byte("data"), 0644)
-		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4.source"), []byte("ghcr.io/test:v1\n"), 0644)
-
-		if got := CheckCache(dir, "default", "ghcr.io/test:v2"); got != "" {
-			t.Errorf("CheckCache() = %q, want empty (stale source)", got)
-		}
-	})
-
-	t.Run("no sidecar file", func(t *testing.T) {
-		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, "default-rootfs.ext4"), []byte("data"), 0644)
-
-		if got := CheckCache(dir, "default", "ghcr.io/test:v1"); got != "" {
-			t.Errorf("CheckCache() = %q, want empty (no sidecar)", got)
-		}
-	})
-}
-
-func TestWriteSource(t *testing.T) {
+// TestHashFileDeterminism verifies that the digest of a fixture file is
+// stable across calls — the foundation of the content-addressed store.
+func TestHashFileDeterminism(t *testing.T) {
 	dir := t.TempDir()
-	err := WriteSource(dir, "default", "ghcr.io/test:v1")
-	if err != nil {
-		t.Fatalf("WriteSource() error = %v", err)
+	path := filepath.Join(dir, "rootfs.ext4")
+	body := []byte("the-quick-brown-fox-jumps-over-the-lazy-dog")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(dir, "default-rootfs.ext4.source"))
+	d1, err := HashFile(path)
 	if err != nil {
-		t.Fatalf("ReadFile error = %v", err)
+		t.Fatalf("HashFile: %v", err)
 	}
-	if string(data) != "ghcr.io/test:v1\n" {
-		t.Errorf("source file content = %q, want %q", string(data), "ghcr.io/test:v1\n")
+	d2, err := HashFile(path)
+	if err != nil {
+		t.Fatalf("HashFile: %v", err)
 	}
+	if d1 != d2 {
+		t.Fatalf("HashFile not deterministic: %s vs %s", d1, d2)
+	}
+
+	want := DigestPrefix + hex.EncodeToString(sumBytes(body))
+	if d1 != want {
+		t.Fatalf("HashFile = %s, want %s", d1, want)
+	}
+}
+
+func TestResolveTagAndBlob(t *testing.T) {
+	dir := t.TempDir()
+
+	// Install a blob.
+	body := []byte("rootfs-bytes")
+	src := filepath.Join(dir, "src-rootfs.ext4")
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := DigestPrefix + hex.EncodeToString(sumBytes(body))
+	if _, _, err := InstallBlob(dir, BlobInstallSpec{
+		Files: map[string]string{BlobRootfsFilename: src},
+		Manifest: Manifest{
+			SchemaVersion:     ManifestSchemaVersion,
+			Digest:            digest,
+			SourceRef:         "ghcr.io/test:v1",
+			RootfsLogicalSize: int64(len(body)),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tag it.
+	if err := SetTag(dir, "default", digest); err != nil {
+		t.Fatalf("SetTag: %v", err)
+	}
+
+	// Resolve hits when expectedRef matches.
+	if got := Resolve(dir, "default", "ghcr.io/test:v1"); got == "" {
+		t.Fatalf("Resolve: cache miss after install")
+	}
+
+	// Resolve misses on stale ref.
+	if got := Resolve(dir, "default", "ghcr.io/test:v2"); got != "" {
+		t.Fatalf("Resolve: stale ref should miss, got %q", got)
+	}
+
+	// Resolve hits when expectedRef is empty (skip check).
+	if got := Resolve(dir, "default", ""); got == "" {
+		t.Fatalf("Resolve(empty ref): expected hit")
+	}
+
+	gotDigest, gotPath, err := ResolveTag(dir, "default")
+	if err != nil {
+		t.Fatalf("ResolveTag: %v", err)
+	}
+	if gotDigest != digest {
+		t.Fatalf("ResolveTag digest = %s, want %s", gotDigest, digest)
+	}
+	if gotPath == "" {
+		t.Fatalf("ResolveTag path empty")
+	}
+}
+
+func sumBytes(b []byte) []byte {
+	s := sha256.Sum256(b)
+	return s[:]
 }

@@ -13,14 +13,21 @@ import (
 	"time"
 )
 
-// MetadataVersion is the current metadata schema version.
-const MetadataVersion = 1
+// MetadataVersion is the current metadata schema version. Bumped from
+// 1 to 2 with the introduction of content-addressed image lower digests
+// in the storage rewrite. Pre-v2 metadata is rejected on load — operators
+// must `shed delete <name>` and recreate.
+const MetadataVersion = 2
 
 // ErrInstanceNotFound is returned when a requested instance does not exist.
 var ErrInstanceNotFound = errors.New("instance not found")
 
 // ErrInvalidInstanceName is returned when a requested instance name is unsafe.
 var ErrInvalidInstanceName = errors.New("invalid instance name")
+
+// ErrLegacyMetadata is returned when loading metadata written by a
+// pre-v2 build. Surfaced as a clear operator-facing error in handlers.
+var ErrLegacyMetadata = errors.New("metadata is from a pre-overlay version of shed; please run `shed delete <name>` and recreate")
 
 // Metadata represents the persistent state of a VM instance.
 type Metadata struct {
@@ -66,8 +73,18 @@ type Metadata struct {
 	// LocalDir is the host directory mounted via 9P as the workspace (if set)
 	LocalDir string `json:"local_dir,omitempty"`
 
-	// Image is the image variant name used to create this instance
+	// Image is the image variant name (tag) used to create this instance.
+	// Display-only; identity lives in LowerDigest.
 	Image string `json:"image,omitempty"`
+
+	// LowerDigest is the digest of the lower (base) image this shed was
+	// cloned from, in the form "sha256:...". This pins the underlying
+	// blob against prune for as long as the shed exists.
+	LowerDigest string `json:"lower_digest,omitempty"`
+
+	// LowerImageTag is the image variant name at create time (mirrors
+	// Image; kept for naming symmetry with the future overlay model).
+	LowerImageTag string `json:"lower_image_tag,omitempty"`
 
 	// FromSnapshot records the snapshot this instance was spawned from (if any).
 	FromSnapshot string `json:"from_snapshot,omitempty"`
@@ -105,9 +122,11 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
-	// Backward compat: files written before version field existed
-	if meta.Version == 0 {
-		meta.Version = 1
+	// Refuse pre-v2 metadata — the storage layout changed in an
+	// incompatible way (introduction of content-addressed lowers and
+	// LowerDigest tracking). Operators must wipe and recreate.
+	if meta.Version < MetadataVersion {
+		return nil, fmt.Errorf("%w (shed=%q, version=%d)", ErrLegacyMetadata, name, meta.Version)
 	}
 
 	return &meta, nil

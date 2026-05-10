@@ -72,6 +72,13 @@ func (f *snapshotFakeBackend) DialService(_ context.Context, _ string, _ uint16)
 func (f *snapshotFakeBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	panic("unexpected")
 }
+func (f *snapshotFakeBackend) InspectImage(_ context.Context, _ string) (config.ImageInspectResponse, error) {
+	panic("unexpected")
+}
+func (f *snapshotFakeBackend) TagImage(_ context.Context, _, _ string) error { panic("unexpected") }
+func (f *snapshotFakeBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+	panic("unexpected")
+}
 func (f *snapshotFakeBackend) DeleteImage(_ context.Context, _ string) error { panic("unexpected") }
 func (f *snapshotFakeBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
 	panic("unexpected")

@@ -205,13 +205,60 @@ type SessionsResponse struct {
 }
 
 // ImageInfo describes an available image variant.
+//
+// Storage model is content-addressed: Digest pins the underlying blob,
+// Tag is the optional human-readable name (matches Name for tagged
+// images, empty for dangling blobs).
 type ImageInfo struct {
 	Name      string `json:"name"`
 	Path      string `json:"path,omitempty"`
 	DockerRef string `json:"docker_ref,omitempty"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
-	Source    string `json:"source"` // "config" or "discovered"
+	Source    string `json:"source"` // "config", "discovered", or "dangling"
 	Cached    bool   `json:"cached"`
+	Digest    string `json:"digest,omitempty"` // "sha256:..." digest of the blob
+	Tag       string `json:"tag,omitempty"`    // tag name pointing at this blob
+	InUse     bool   `json:"in_use,omitempty"` // protected by a shed/snapshot reference
+}
+
+// ImageInspectResponse is returned by GET /api/images/{tag-or-digest}.
+type ImageInspectResponse struct {
+	Image    ImageInfo     `json:"image"`
+	Manifest ImageManifest `json:"manifest"`
+}
+
+// ImageManifest mirrors vmimage.Manifest for the wire format.
+type ImageManifest struct {
+	SchemaVersion      int       `json:"schema_version"`
+	Digest             string    `json:"digest"`
+	Backend            string    `json:"backend,omitempty"`
+	Arch               string    `json:"arch,omitempty"`
+	SourceRef          string    `json:"source_ref,omitempty"`
+	SourceRefDigest    string    `json:"source_ref_digest,omitempty"`
+	ShedExtVersion     string    `json:"shed_ext_version,omitempty"`
+	KernelSize         int64     `json:"kernel_size,omitempty"`
+	InitrdSize         int64     `json:"initrd_size,omitempty"`
+	RootfsLogicalSize  int64     `json:"rootfs_logical_size"`
+	RootfsPhysicalSize int64     `json:"rootfs_physical_size,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// ImageTagRequest is the body of POST /api/images/tag.
+type ImageTagRequest struct {
+	Source string `json:"source"` // tag name or digest
+	Target string `json:"target"` // new tag name
+}
+
+// ImagePullRequest is the body of POST /api/images/pull.
+type ImagePullRequest struct {
+	DockerRef string `json:"docker_ref"`
+	Tag       string `json:"tag"`
+}
+
+// ImagePullResponse is the response of POST /api/images/pull.
+type ImagePullResponse struct {
+	Tag    string `json:"tag"`
+	Digest string `json:"digest"`
 }
 
 // ImagesResponse is returned by GET /api/images.
@@ -397,9 +444,13 @@ type CreateShedRequest struct {
 	FromSnapshot string `json:"from_snapshot,omitempty"`
 }
 
+// SnapshotSchemaVersion is the current snapshot schema version. Bumped
+// from 1 to 2 with the introduction of LowerDigest tracking.
+const SnapshotSchemaVersion = 2
+
 // Snapshot represents a captured rootfs that can be used to spawn new sheds.
 type Snapshot struct {
-	// Version is the snapshot schema version (current: 1).
+	// Version is the snapshot schema version (current: SnapshotSchemaVersion).
 	Version int `json:"version"`
 
 	// Name is the unique snapshot identifier within a server.
@@ -425,6 +476,12 @@ type Snapshot struct {
 
 	// SizeBytes is the apparent (logical) size of the snapshot rootfs.
 	SizeBytes int64 `json:"size_bytes,omitempty"`
+
+	// LowerDigest is the digest of the lower (base) image the source shed
+	// was created from, in the form "sha256:...". Snapshots count toward
+	// the lower's refcount: pruning a digest pinned by a snapshot is
+	// refused. Empty for snapshots created before schema v2.
+	LowerDigest string `json:"lower_digest,omitempty"`
 }
 
 // SnapshotCreateRequest is the request body for POST /api/snapshots.

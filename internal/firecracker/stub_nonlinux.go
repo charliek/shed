@@ -107,6 +107,21 @@ func (b *FirecrackerBackend) ListImages(_ context.Context) ([]config.ImageInfo, 
 	return nil, nil
 }
 
+// InspectImage returns an error on non-linux platforms.
+func (b *FirecrackerBackend) InspectImage(_ context.Context, _ string) (config.ImageInspectResponse, error) {
+	return config.ImageInspectResponse{}, fmt.Errorf("inspect image: %w", config.ErrNotSupportedSentinel)
+}
+
+// TagImage returns an error on non-linux platforms.
+func (b *FirecrackerBackend) TagImage(_ context.Context, _, _ string) error {
+	return fmt.Errorf("tag image: %w", config.ErrNotSupportedSentinel)
+}
+
+// PullImage returns an error on non-linux platforms.
+func (b *FirecrackerBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+	return "", fmt.Errorf("pull image: %w", config.ErrNotSupportedSentinel)
+}
+
 // DeleteImage returns an error on non-linux platforms.
 func (b *FirecrackerBackend) DeleteImage(_ context.Context, _ string) error {
 	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)

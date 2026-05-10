@@ -53,13 +53,20 @@ func newPruneTestClientWithSnapshots(t *testing.T) (*Client, string) {
 // (optionally) a console.log. Backdate sets metadata.json mtime so the age
 // filter sees it as "old enough."
 func seedStoppedShed(t *testing.T, instanceDir, name, image string, rootfsSize int, consoleSize int, age time.Duration) {
+	seedStoppedShedWithDigest(t, instanceDir, name, image, "", rootfsSize, consoleSize, age)
+}
+
+// seedStoppedShedWithDigest is like seedStoppedShed but also records a
+// LowerDigest so the refScanner sees a protective ref.
+func seedStoppedShedWithDigest(t *testing.T, instanceDir, name, image, lowerDigest string, rootfsSize int, consoleSize int, age time.Duration) {
 	t.Helper()
 	meta := &Metadata{
-		Version: MetadataVersion,
-		Name:    name,
-		Status:  config.StatusStopped,
-		Backend: "vz",
-		Image:   image,
+		Version:     MetadataVersion,
+		Name:        name,
+		Status:      config.StatusStopped,
+		Backend:     "vz",
+		Image:       image,
+		LowerDigest: lowerDigest,
 	}
 	if err := meta.Save(instanceDir); err != nil {
 		t.Fatalf("save metadata: %v", err)
@@ -385,11 +392,10 @@ func TestPrune_LogTruncation_PreservesTail(t *testing.T) {
 func TestPrune_InstancesBeforeImages_ReleasesImageRef(t *testing.T) {
 	c, imagesDir, instanceDir := newPruneTestClient(t)
 
-	// Create a cached image and a stopped shed that references it.
-	if err := os.WriteFile(filepath.Join(imagesDir, vmimage.RootfsFilename("tobereclaimed")), make([]byte, 8192), 0644); err != nil {
-		t.Fatal(err)
-	}
-	seedStoppedShed(t, instanceDir, "old-shed", "tobereclaimed", 4096, 0, 5*24*time.Hour)
+	// Install a blob tagged "tobereclaimed" and a stopped shed that
+	// pins its digest via LowerDigest.
+	digest := createFakeImage(t, imagesDir, "tobereclaimed")
+	seedStoppedShedWithDigest(t, instanceDir, "old-shed", "tobereclaimed", digest, 4096, 0, 5*24*time.Hour)
 
 	report, err := c.Prune(context.Background(), backend.PruneOptions{
 		Images:    true,
@@ -415,9 +421,9 @@ func TestPrune_InstancesBeforeImages_ReleasesImageRef(t *testing.T) {
 	if !contains(imagesDeleted, "tobereclaimed") {
 		t.Errorf("expected tobereclaimed image deleted after shed ref released, got %v", imagesDeleted)
 	}
-	// The image file should actually be gone.
-	if _, err := os.Stat(filepath.Join(imagesDir, vmimage.RootfsFilename("tobereclaimed"))); !os.IsNotExist(err) {
-		t.Errorf("image rootfs still exists after prune (err=%v)", err)
+	// The blob should actually be gone.
+	if vmimage.BlobExists(imagesDir, digest) {
+		t.Errorf("blob still present after prune")
 	}
 }
 

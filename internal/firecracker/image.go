@@ -3,17 +3,20 @@
 package firecracker
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/vmimage"
 )
 
 // ListImages returns available image variants from config and auto-discovery.
 func (c *Client) ListImages() ([]config.ImageInfo, error) {
-	mgr := vmimage.NewManager(c.cfg)
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
 	images, err := mgr.ListImages()
 	if err != nil {
 		return nil, err
@@ -21,79 +24,161 @@ func (c *Client) ListImages() ([]config.ImageInfo, error) {
 	return toConfigImageInfos(images), nil
 }
 
-// DeleteImage removes a cached image by name.
-func (c *Client) DeleteImage(name string) error {
-	mgr := vmimage.NewManager(c.cfg)
-	err := mgr.DeleteImage(name, c.inUseImageNames)
-	return mapSentinelErrors(err)
+// InspectImage returns full details for a tag or digest.
+func (c *Client) InspectImage(tagOrDigest string) (config.ImageInspectResponse, error) {
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
+	info, manifest, err := mgr.InspectImage(tagOrDigest)
+	if err != nil {
+		return config.ImageInspectResponse{}, mapSentinelErrors(err)
+	}
+	return config.ImageInspectResponse{
+		Image:    toConfigImageInfo(*info),
+		Manifest: toConfigManifest(*manifest),
+	}, nil
 }
 
-// PruneImages removes cached images not referenced by config or existing sheds.
+// TagImage points newTag at the digest currently held by srcTagOrDigest.
+func (c *Client) TagImage(srcTagOrDigest, newTag string) error {
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
+	return mapSentinelErrors(mgr.TagImage(srcTagOrDigest, newTag))
+}
+
+// PullImage pulls a Docker ref, installs into the blob store, and tags.
+func (c *Client) PullImage(ctx context.Context, dockerRef, tag string) (string, error) {
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
+	return mgr.PullImage(ctx, dockerRef, tag, func(stage, msg string) {
+		backend.Progress(ctx, stage, msg)
+	})
+}
+
+// DeleteImage removes a tag (Docker model). The underlying blob is GC'd
+// by PruneImages once nothing references it.
+func (c *Client) DeleteImage(name string) error {
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
+	return mapSentinelErrors(mgr.DeleteImage(name))
+}
+
+// PruneImages removes blobs not protected by any shed/snapshot ref.
 func (c *Client) PruneImages(dryRun bool) ([]config.ImageInfo, error) {
-	mgr := vmimage.NewManager(c.cfg)
-	images, err := mgr.PruneImages(dryRun, c.inUseImageNames)
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
+	images, err := mgr.PruneImages(dryRun)
 	if err != nil {
 		return nil, err
 	}
 	return toConfigImageInfos(images), nil
 }
 
-// inUseImageNames returns image names referenced by existing Firecracker instances.
-func (c *Client) inUseImageNames() ([]string, error) {
-	return c.inUseImageNamesExcept(nil)
+// refScanner returns a RefScanner that walks instances and snapshots and
+// emits the LowerDigest references that protect blobs from prune.
+func (c *Client) refScanner() vmimage.RefScanner {
+	return &fcRefScanner{cfg: c.cfg}
 }
 
-// inUseImageNamesExcept returns image names referenced by existing
-// Firecracker instances whose names are NOT in skipSheds. Used by Prune's
-// dry-run path to simulate the post-instance-delete state.
-//
-// Malformed metadata on a single instance is skip-and-warn rather than a
-// hard failure — matches ListSheds and keeps the prune path operable when
-// one shed's metadata got corrupted. The closure still returns only the
-// image references we could verify, so Manager.PruneImages' fail-closed
-// protection on the names it receives is intact.
-func (c *Client) inUseImageNamesExcept(skipSheds map[string]bool) ([]string, error) {
-	instances, err := ListInstances(c.cfg.InstanceDir)
+// refScannerExcept is like refScanner but skips sheds named in the
+// provided set. Used by `shed system prune` dry-run to simulate the
+// post-instance-delete state for image GC.
+func (c *Client) refScannerExcept(skipSheds map[string]bool) vmimage.RefScanner {
+	return &fcRefScanner{cfg: c.cfg, skipSheds: skipSheds}
+}
+
+type fcRefScanner struct {
+	cfg       *config.FirecrackerConfig
+	skipSheds map[string]bool
+}
+
+func (s *fcRefScanner) ScanRefs() ([]vmimage.Reference, error) {
+	var refs []vmimage.Reference
+
+	// Sheds.
+	instances, err := ListInstances(s.cfg.InstanceDir)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("listing instances: %w", err)
 	}
-	var names []string
 	for _, inst := range instances {
-		if skipSheds[inst] {
+		if s.skipSheds[inst] {
 			continue
 		}
-		meta, err := LoadMetadata(c.cfg.InstanceDir, inst)
+		meta, err := LoadMetadata(s.cfg.InstanceDir, inst)
 		if err != nil {
-			// Only tolerate the list-then-load race; all other errors
-			// (malformed JSON, I/O failure) must fail closed so we don't
-			// accidentally mark a still-referenced image as unused.
-			if errors.Is(err, ErrInstanceNotFound) {
+			if errors.Is(err, ErrInstanceNotFound) || errors.Is(err, ErrLegacyMetadata) {
 				continue
 			}
 			return nil, fmt.Errorf("reading metadata for %s: %w", inst, err)
 		}
-		if meta.Image != "" {
-			names = append(names, meta.Image)
+		if meta.LowerDigest != "" {
+			refs = append(refs, vmimage.Reference{
+				Digest: meta.LowerDigest,
+				Kind:   vmimage.RefKindShed,
+				Name:   meta.Name,
+			})
 		}
 	}
-	return names, nil
+
+	// Snapshots.
+	if s.cfg.SnapshotsDir != "" {
+		names, err := listSnapshotNames(s.cfg.SnapshotsDir)
+		if err != nil {
+			return nil, fmt.Errorf("listing snapshots: %w", err)
+		}
+		for _, name := range names {
+			snap, err := loadSnapshot(s.cfg.SnapshotsDir, name)
+			if err != nil {
+				log.Printf("Warning: skipping snapshot %q during ref scan: %v", name, err)
+				continue
+			}
+			if snap.LowerDigest != "" {
+				refs = append(refs, vmimage.Reference{
+					Digest: snap.LowerDigest,
+					Kind:   vmimage.RefKindSnapshot,
+					Name:   snap.Name,
+				})
+			}
+		}
+	}
+
+	return refs, nil
+}
+
+// toConfigImageInfo copies a single vmimage.ImageInfo into the wire shape.
+func toConfigImageInfo(img vmimage.ImageInfo) config.ImageInfo {
+	return config.ImageInfo{
+		Name:      img.Name,
+		Path:      img.Path,
+		DockerRef: img.DockerRef,
+		SizeBytes: img.SizeBytes,
+		Source:    img.Source,
+		Cached:    img.Cached,
+		Digest:    img.Digest,
+		Tag:       img.Tag,
+		InUse:     img.InUse,
+	}
 }
 
 // toConfigImageInfos converts vmimage.ImageInfo slice to config.ImageInfo slice.
-// These types must stay in sync — see vmimage.ImageInfo.
 func toConfigImageInfos(images []vmimage.ImageInfo) []config.ImageInfo {
 	result := make([]config.ImageInfo, len(images))
 	for i, img := range images {
-		result[i] = config.ImageInfo{
-			Name:      img.Name,
-			Path:      img.Path,
-			DockerRef: img.DockerRef,
-			SizeBytes: img.SizeBytes,
-			Source:    img.Source,
-			Cached:    img.Cached,
-		}
+		result[i] = toConfigImageInfo(img)
 	}
 	return result
+}
+
+// toConfigManifest copies a vmimage.Manifest into the wire shape.
+func toConfigManifest(m vmimage.Manifest) config.ImageManifest {
+	return config.ImageManifest{
+		SchemaVersion:      m.SchemaVersion,
+		Digest:             m.Digest,
+		Backend:            m.Backend,
+		Arch:               m.Arch,
+		SourceRef:          m.SourceRef,
+		SourceRefDigest:    m.SourceRefDigest,
+		ShedExtVersion:     m.ShedExtVersion,
+		KernelSize:         m.KernelSize,
+		InitrdSize:         m.InitrdSize,
+		RootfsLogicalSize:  m.RootfsLogicalSize,
+		RootfsPhysicalSize: m.RootfsPhysicalSize,
+		CreatedAt:          m.CreatedAt,
+	}
 }
 
 // mapSentinelErrors maps vmimage sentinel errors to config sentinel errors.
@@ -101,7 +186,7 @@ func mapSentinelErrors(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, vmimage.ErrImageNotFound) {
+	if errors.Is(err, vmimage.ErrImageNotFound) || errors.Is(err, vmimage.ErrTagNotFound) || errors.Is(err, vmimage.ErrBlobNotFound) {
 		return config.ErrImageNotFoundSentinel
 	}
 	if errors.Is(err, vmimage.ErrImageInUse) {

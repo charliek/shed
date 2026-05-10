@@ -226,6 +226,15 @@ func (f *createShedFakeBackend) DialService(_ context.Context, _ string, _ uint1
 func (f *createShedFakeBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	panic("unexpected")
 }
+func (f *createShedFakeBackend) InspectImage(_ context.Context, _ string) (config.ImageInspectResponse, error) {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) TagImage(_ context.Context, _, _ string) error {
+	panic("unexpected")
+}
+func (f *createShedFakeBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+	panic("unexpected")
+}
 func (f *createShedFakeBackend) DeleteImage(_ context.Context, _ string) error {
 	panic("unexpected")
 }

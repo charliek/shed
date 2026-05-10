@@ -398,9 +398,34 @@ func (c *APIClient) KillSession(shedName, sessionName string) error {
 	return c.doRequest(http.MethodDelete, path, nil, nil, http.StatusNoContent, http.StatusOK)
 }
 
-// DeleteImage removes a cached image by name.
+// DeleteImage removes a tag (Docker model). The blob is GC'd by PruneImages.
 func (c *APIClient) DeleteImage(name string) error {
 	return c.doRequest(http.MethodDelete, "/api/images/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
+}
+
+// InspectImage returns full details for a tag or digest.
+func (c *APIClient) InspectImage(name string) (*config.ImageInspectResponse, error) {
+	var resp config.ImageInspectResponse
+	if err := c.doRequest(http.MethodGet, "/api/images/inspect/"+name, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// TagImage points newTag at the digest currently held by srcTagOrDigest.
+func (c *APIClient) TagImage(src, dst string) error {
+	body := config.ImageTagRequest{Source: src, Target: dst}
+	return c.doRequest(http.MethodPost, "/api/images/tag", body, nil, http.StatusNoContent, http.StatusOK)
+}
+
+// PullImage pulls a Docker reference into the blob store under the named tag.
+func (c *APIClient) PullImage(dockerRef, tag string) (*config.ImagePullResponse, error) {
+	body := config.ImagePullRequest{DockerRef: dockerRef, Tag: tag}
+	var resp config.ImagePullResponse
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/images/pull", body, &resp, 30*time.Minute); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // PruneImages removes unused cached images.

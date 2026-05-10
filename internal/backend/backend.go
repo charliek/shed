@@ -79,13 +79,26 @@ type Backend interface {
 	// Returns an empty list for backends that don't support image variants.
 	ListImages(ctx context.Context) ([]config.ImageInfo, error)
 
-	// DeleteImage removes a cached image by name.
-	// Returns ErrImageNotFoundSentinel if the image doesn't exist,
-	// or ErrImageInUseSentinel if the image is referenced by config.
+	// InspectImage returns full details (info + manifest) for a tag or
+	// digest. Returns ErrImageNotFoundSentinel if neither resolves.
+	InspectImage(ctx context.Context, tagOrDigest string) (config.ImageInspectResponse, error)
+
+	// TagImage points newTag at the digest currently held by srcTagOrDigest.
+	// Equivalent to `docker tag`.
+	TagImage(ctx context.Context, srcTagOrDigest, newTag string) error
+
+	// PullImage pulls a Docker reference, converts it to ext4, installs
+	// into the blob store, and advances the named tag. Returns the digest.
+	PullImage(ctx context.Context, dockerRef, tag string) (string, error)
+
+	// DeleteImage removes a tag (Docker model). The underlying blob is
+	// GC'd by PruneImages once nothing references it. Returns
+	// ErrImageNotFoundSentinel if the tag doesn't exist, or
+	// ErrImageInUseSentinel if the tag is referenced by config.
 	DeleteImage(ctx context.Context, name string) error
 
-	// PruneImages removes cached images not referenced by config or existing sheds.
-	// If dryRun is true, returns candidates without deleting.
+	// PruneImages removes blobs that have no protective shed/snapshot
+	// references. If dryRun is true, returns candidates without deleting.
 	PruneImages(ctx context.Context, dryRun bool) ([]config.ImageInfo, error)
 
 	// System

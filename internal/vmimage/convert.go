@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,6 +49,10 @@ type ConvertOptions struct {
 }
 
 // ConvertResult holds the output paths from a successful conversion.
+//
+// Convert leaves all output files in OutputDir. Callers that want to
+// install the result into the content-addressed blob store should pass
+// the result to InstallBlob.
 type ConvertResult struct {
 	// RootfsPath is the path to the created ext4 image.
 	RootfsPath string
@@ -59,6 +62,10 @@ type ConvertResult struct {
 
 	// InitrdPath is the path to the extracted initrd (empty if not extracted).
 	InitrdPath string
+
+	// Digest is the sha256 digest of the rootfs.ext4 file produced by
+	// the conversion, formatted as "sha256:<hex>".
+	Digest string
 }
 
 // IsDockerRef returns true if s is a Docker image reference rather than a filesystem path.
@@ -76,159 +83,64 @@ func IsDockerRef(s string) bool {
 	return err == nil
 }
 
-// RootfsFilename returns the ext4 filename for a given variant name.
-func RootfsFilename(name string) string {
-	return name + "-rootfs.ext4"
-}
-
-// SourceFilename returns the source sidecar filename for cache invalidation.
-func SourceFilename(name string) string {
-	return name + "-rootfs.ext4.source"
-}
-
-// CheckCache returns the cached rootfs path if it exists and its source sidecar
-// matches expectedRef. Returns "" if not cached or stale.
-func CheckCache(imagesDir, name, expectedRef string) string {
-	rootfsPath := filepath.Join(imagesDir, RootfsFilename(name))
-	if _, err := os.Stat(rootfsPath); err != nil {
+// Resolve looks up a tag and returns the path to its blob's rootfs.ext4
+// if the tag exists, the blob is installed, and (when expectedRef is
+// non-empty) the blob's manifest.SourceRef matches expectedRef. Returns
+// "" if any of these conditions fail (i.e. cache miss).
+//
+// expectedRef may be left empty to skip the source-ref check (callers
+// that don't track cache freshness by Docker ref).
+func Resolve(imagesDir, tag, expectedRef string) string {
+	t, err := GetTag(imagesDir, tag)
+	if err != nil {
 		return ""
 	}
-	sourceFile := filepath.Join(imagesDir, SourceFilename(name))
-	source, err := os.ReadFile(sourceFile)
-	if err != nil || strings.TrimSpace(string(source)) != expectedRef {
+	if !BlobExists(imagesDir, t.Digest) {
 		return ""
 	}
-	return rootfsPath
-}
-
-// WriteSource writes the Docker ref to a sidecar file for cache invalidation tracking.
-func WriteSource(imagesDir, name, ref string) error {
-	sourceFile := filepath.Join(imagesDir, SourceFilename(name))
-	return os.WriteFile(sourceFile, []byte(ref+"\n"), 0644)
-}
-
-// sweepStaleTmp removes orphan tmp files for a single target produced by
-// a prior crashed LinkCachedImage call. It matches only:
-//   - {base}.tmp              — the current fixed tmp name.
-//   - {base}.tmp.<digits>     — the legacy PID-suffixed tmp name from
-//     pre-v0.3.6 builds (fmt.Sprintf("%s.tmp.%d", ...)).
-//
-// Any other suffix (e.g. .keep, .bak, .tmp.tmp) is left alone so operator
-// scratch files in the images directory are never collected.
-//
-// Caller MUST hold {targetPath}.lock — the sweep and the subsequent
-// os.Link must run under the same flock, otherwise a concurrent writer
-// could have an in-flight {base}.tmp that this sweep would destroy.
-//
-// os.Remove failures other than os.IsNotExist are logged but non-fatal:
-// if the stale file is the fixed {base}.tmp, the subsequent os.Link
-// will surface the problem via EEXIST; legacy PID-suffixed orphans that
-// resist removal become visible to the operator via the log line rather
-// than turning into silent long-lived leaks.
-func sweepStaleTmp(targetPath string) error {
-	dir := filepath.Dir(targetPath)
-	base := filepath.Base(targetPath)
-	prefix := base + ".tmp"
-
-	entries, err := os.ReadDir(dir)
+	if expectedRef != "" {
+		manifest, err := LoadManifest(imagesDir, t.Digest)
+		if err != nil {
+			return ""
+		}
+		if manifest.SourceRef != expectedRef {
+			return ""
+		}
+	}
+	rootfs, err := BlobRootfsPath(imagesDir, t.Digest)
 	if err != nil {
-		return fmt.Errorf("reading %s: %w", dir, err)
+		return ""
 	}
-
-	for _, e := range entries {
-		n := e.Name()
-		if !strings.HasPrefix(n, prefix) {
-			continue
-		}
-		suffix := n[len(prefix):]
-		if suffix != "" && !isLegacyPIDSuffix(suffix) {
-			continue
-		}
-		p := filepath.Join(dir, n)
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			log.Printf("warning: failed to remove stale tmp %s: %v", p, err)
-		}
-	}
-	return nil
+	return rootfs
 }
 
-// isLegacyPIDSuffix reports whether s is "." followed by one or more
-// decimal digits, matching the pre-v0.3.6 tmp-file naming convention
-// fmt.Sprintf("%s.tmp.%d", targetPath, os.Getpid()).
-func isLegacyPIDSuffix(s string) bool {
-	if len(s) < 2 || s[0] != '.' {
-		return false
-	}
-	for _, r := range s[1:] {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// LinkCachedImage hardlinks an existing cached ext4 under sourceName to
-// targetName in the same imagesDir and writes targetName's .source sidecar
-// so callers see a matching cache entry.
-//
-// It acquires targetName's .lock flock for the duration of the rename and
-// sidecar write, serializing against EnsureImage / DeleteImage / PruneImages.
-// The replace uses link-to-tmp + rename to stay atomic and preserve any open
-// FDs an in-flight CopyRootfs holds against the old target inode.
-//
-// Returns an error if os.Link fails (e.g. cross-device, missing source, or
-// permission issue). Callers should treat this as a signal to fall back to
-// a full pull. No partial state is left on error.
-func LinkCachedImage(imagesDir, sourceName, targetName, ref string) error {
-	sourcePath := filepath.Join(imagesDir, RootfsFilename(sourceName))
-	targetPath := filepath.Join(imagesDir, RootfsFilename(targetName))
-
-	if _, err := os.Stat(sourcePath); err != nil {
-		return fmt.Errorf("source image %q: %w", sourceName, err)
-	}
-
-	unlock, err := acquireFileLock(targetPath + ".lock")
+// ResolveTag looks up a tag and returns its digest plus the path to the
+// blob's rootfs.ext4. Returns ErrTagNotFound or ErrBlobNotFound if the
+// tag/blob is missing.
+func ResolveTag(imagesDir, tag string) (digest, rootfsPath string, err error) {
+	t, err := GetTag(imagesDir, tag)
 	if err != nil {
-		return fmt.Errorf("acquiring lock for %q: %w", targetName, err)
+		return "", "", err
 	}
-	defer unlock()
-
-	// Sweep stale tmp orphans for this exact target only — must not
-	// match siblings (other variants) or operator scratch files.
-	// Matches "{base}.tmp" (the fixed tmp name used below) and the
-	// legacy "{base}.tmp.<digits>" name produced by pre-v0.3.6 builds
-	// that crashed between os.Link and os.Rename.
-	if err := sweepStaleTmp(targetPath); err != nil {
-		return fmt.Errorf("scanning for stale tmp files: %w", err)
+	if !BlobExists(imagesDir, t.Digest) {
+		return t.Digest, "", fmt.Errorf("%w: %s (tag %q)", ErrBlobNotFound, t.Digest, tag)
 	}
-
-	// Fixed tmp name: the target's .lock flock already serializes all
-	// writers, so a PID suffix adds nothing. A stable name is what lets
-	// the sweep above self-heal across crashes.
-	tmpPath := targetPath + ".tmp"
-	if err := os.Link(sourcePath, tmpPath); err != nil {
-		return fmt.Errorf("linking %s -> %s: %w", sourcePath, tmpPath, err)
+	rootfs, err := BlobRootfsPath(imagesDir, t.Digest)
+	if err != nil {
+		return t.Digest, "", err
 	}
-
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("renaming %s -> %s: %w", tmpPath, targetPath, err)
-	}
-
-	if err := WriteSource(imagesDir, targetName, ref); err != nil {
-		// Keep the "no partial state on error" contract: a successful
-		// rename already replaced targetPath, so tearing it down here
-		// avoids leaving a rootfs with a missing/stale sidecar behind.
-		_ = os.Remove(targetPath)
-		_ = os.Remove(filepath.Join(imagesDir, SourceFilename(targetName)))
-		return fmt.Errorf("writing source sidecar for %q: %w", targetName, err)
-	}
-
-	return nil
+	return t.Digest, rootfs, nil
 }
 
-// Convert pulls a Docker image and converts it to an ext4 rootfs.
-// The conversion uses a privileged Docker container for ext4 creation (loop mount).
+// Convert pulls a Docker image and converts it to an ext4 rootfs in a
+// staging directory under OutputDir. The conversion uses a privileged
+// Docker container for ext4 creation (loop mount).
+//
+// The caller is responsible for installing the result into the
+// content-addressed blob store (see InstallBlob). On success, all files
+// referenced by the returned ConvertResult live in a per-call staging
+// dir; if the caller does not InstallBlob the files, it should remove
+// the staging dir to avoid leaks.
 func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 	if opts.RootfsSize == "" {
 		opts.RootfsSize = "20G"
@@ -237,12 +149,23 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 		opts.Platform = DefaultPlatform
 	}
 
-	rootfsFile := RootfsFilename(opts.Name)
-	rootfsPath := filepath.Join(opts.OutputDir, rootfsFile)
-
-	if err := os.MkdirAll(opts.OutputDir, 0755); err != nil {
+	if err := os.MkdirAll(opts.OutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
 	}
+
+	stagingDir, err := os.MkdirTemp(opts.OutputDir, ".convert-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create staging directory: %w", err)
+	}
+	cleanupStaging := true
+	defer func() {
+		if cleanupStaging {
+			os.RemoveAll(stagingDir)
+		}
+	}()
+
+	rootfsFile := BlobRootfsFilename
+	rootfsPath := filepath.Join(stagingDir, rootfsFile)
 
 	containerID, err := dockerCreate(ctx, opts.Platform, opts.DockerRef)
 	if err != nil {
@@ -262,32 +185,58 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 		return nil, fmt.Errorf("failed to export container: %w", err)
 	}
 
-	if err := createExt4(ctx, opts.Platform, tarPath, rootfsFile, opts.OutputDir, opts.RootfsSize); err != nil {
-		// Clean up partial rootfs on failure
-		os.Remove(rootfsPath)
+	if err := createExt4(ctx, opts.Platform, tarPath, rootfsFile, stagingDir, opts.RootfsSize); err != nil {
 		return nil, fmt.Errorf("failed to create ext4 image: %w", err)
 	}
 
-	result := &ConvertResult{RootfsPath: rootfsPath}
+	digest, err := HashFile(rootfsPath)
+	if err != nil {
+		return nil, fmt.Errorf("hashing rootfs: %w", err)
+	}
+
+	result := &ConvertResult{
+		RootfsPath: rootfsPath,
+		Digest:     digest,
+	}
 
 	if opts.ExtractKernel {
-		kernelPath := filepath.Join(opts.OutputDir, "vmlinux")
-
-		if err := extractKernel(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
+		if err := extractKernel(ctx, opts.Platform, opts.DockerRef, stagingDir); err != nil {
 			return nil, fmt.Errorf("failed to extract kernel: %w", err)
 		}
-		result.KernelPath = kernelPath
+		// extractKernel writes to stagingDir/vmlinux; rename to the
+		// blob-store filename so InstallBlob can pick it up by name.
+		oldKernel := filepath.Join(stagingDir, "vmlinux")
+		newKernel := filepath.Join(stagingDir, BlobKernelFilename)
+		if err := os.Rename(oldKernel, newKernel); err != nil {
+			return nil, fmt.Errorf("renaming kernel into staging: %w", err)
+		}
+		result.KernelPath = newKernel
 
 		if opts.NeedsInitrd {
-			initrdPath := filepath.Join(opts.OutputDir, "initrd.img")
-			if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, opts.OutputDir); err != nil {
+			if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, stagingDir); err != nil {
 				return nil, fmt.Errorf("failed to extract initrd: %w", err)
 			}
-			result.InitrdPath = initrdPath
+			oldInitrd := filepath.Join(stagingDir, "initrd.img")
+			newInitrd := filepath.Join(stagingDir, BlobInitrdFilename)
+			if err := os.Rename(oldInitrd, newInitrd); err != nil {
+				return nil, fmt.Errorf("renaming initrd into staging: %w", err)
+			}
+			result.InitrdPath = newInitrd
 		}
 	}
 
+	cleanupStaging = false
 	return result, nil
+}
+
+// CleanupConvert removes the staging directory associated with a
+// ConvertResult. Safe to call after a successful InstallBlob to clear
+// the now-empty staging dir.
+func CleanupConvert(r *ConvertResult) {
+	if r == nil || r.RootfsPath == "" {
+		return
+	}
+	os.RemoveAll(filepath.Dir(r.RootfsPath))
 }
 
 func dockerCreate(ctx context.Context, platform, imageRef string) (string, error) {

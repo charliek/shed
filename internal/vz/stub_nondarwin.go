@@ -107,6 +107,21 @@ func (b *VZBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	return nil, nil
 }
 
+// InspectImage returns an error on non-darwin platforms.
+func (b *VZBackend) InspectImage(_ context.Context, _ string) (config.ImageInspectResponse, error) {
+	return config.ImageInspectResponse{}, fmt.Errorf("inspect image: %w", config.ErrNotSupportedSentinel)
+}
+
+// TagImage returns an error on non-darwin platforms.
+func (b *VZBackend) TagImage(_ context.Context, _, _ string) error {
+	return fmt.Errorf("tag image: %w", config.ErrNotSupportedSentinel)
+}
+
+// PullImage returns an error on non-darwin platforms.
+func (b *VZBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+	return "", fmt.Errorf("pull image: %w", config.ErrNotSupportedSentinel)
+}
+
 // DeleteImage returns an error on non-darwin platforms.
 func (b *VZBackend) DeleteImage(_ context.Context, _ string) error {
 	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)
