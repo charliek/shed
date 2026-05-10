@@ -141,3 +141,46 @@ func TestRootfsExists(t *testing.T) {
 		t.Error("RootfsExists() = true for nonexistent, want false")
 	}
 }
+
+func TestEnsureUpper(t *testing.T) {
+	dir := t.TempDir()
+
+	// First call creates a sparse file at the requested size.
+	const size int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+	path, err := EnsureUpper(dir, "alpha", size)
+	if err != nil {
+		t.Fatalf("EnsureUpper: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Size() != size {
+		t.Errorf("upper size = %d, want %d", fi.Size(), size)
+	}
+
+	// Idempotent: second call returns the existing file unchanged.
+	path2, err := EnsureUpper(dir, "alpha", size)
+	if err != nil {
+		t.Fatalf("EnsureUpper second call: %v", err)
+	}
+	if path2 != path {
+		t.Errorf("path differs across calls: %q vs %q", path, path2)
+	}
+
+	// Negative or zero size is rejected.
+	if _, err := EnsureUpper(dir, "beta", 0); err == nil {
+		t.Errorf("EnsureUpper with size=0 succeeded; want error")
+	}
+	if _, err := EnsureUpper(dir, "beta", -1); err == nil {
+		t.Errorf("EnsureUpper with size=-1 succeeded; want error")
+	}
+
+	// DeleteUpper wipes the per-shed dir.
+	if err := DeleteUpper(dir, "alpha"); err != nil {
+		t.Fatalf("DeleteUpper: %v", err)
+	}
+	if _, err := os.Stat(UpperDir(dir, "alpha")); !os.IsNotExist(err) {
+		t.Errorf("upper dir should be gone, got err=%v", err)
+	}
+}

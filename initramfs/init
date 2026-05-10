@@ -77,7 +77,12 @@ if [ "$need_mkfs" = "1" ]; then
 fi
 
 mount -t ext4 "$UPPER_DEV" /upper || panic "failed to mount $UPPER_DEV at /upper"
-mkdir -p /upper/data /upper/work
+mkdir -p /upper/data
+# overlayfs requires workdir to be empty at mount time; bookkeeping
+# files left behind from a prior unclean shutdown will make the next
+# mount fail. Wipe and recreate to be safe.
+rm -rf /upper/work
+mkdir -p /upper/work
 
 mount -t ext4 -o ro "$LOWER_DEV" /lower \
     || panic "failed to mount $LOWER_DEV ro at /lower"

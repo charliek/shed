@@ -137,7 +137,7 @@ The `base_rootfs` field is used when no `--image` flag is specified. The `images
 The two fields play different roles:
 
 - `images:` is a map of named variants. Each entry is cacheable, pre-pullable via `shed-server pull-images`, visible in `shed image ls`, and selectable with `shed create --image <name>`.
-- `base_rootfs` is a single top-level fallback used when `shed create` is invoked without `--image`. It is stored on disk as `_base-rootfs.ext4` (underscore prefix).
+- `base_rootfs` is a single top-level fallback used when `shed create` is invoked without `--image`. Under the content-addressed layout it is just another tag — `_base` — pointing at a digest under `blobs/sha256/<digest>/`, not a flat `_base-rootfs.ext4` file. The underscore-prefixed name keeps it distinct from user-visible variants in `shed image ls`.
 
 When `base_rootfs` equals one of the `images:` refs (a common pattern where `base_rootfs` and `images.experimental` both point at the same Docker ref), `shed-server pull-images` points the `_base` and `experimental` tags at the same content-addressed blob — zero extra disk cost. Because both tags share a digest, removing one (`shed image rm experimental`) leaves the blob in place; only `shed image prune` reclaims it once nothing pins the digest.
 

@@ -14,6 +14,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -566,11 +567,15 @@ func (s *Server) handleInspectImage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTagImage(w http.ResponseWriter, r *http.Request) {
 	var req config.ImageTagRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, config.ErrBackendError, "invalid request body: "+err.Error())
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body: "+err.Error())
 		return
 	}
 	if req.Source == "" || req.Target == "" {
-		writeError(w, http.StatusBadRequest, config.ErrBackendError, "source and target are required")
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "source and target are required")
+		return
+	}
+	if err := vmimage.ValidateImageName(req.Target); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "target: "+err.Error())
 		return
 	}
 	if err := s.backend.TagImage(r.Context(), req.Source, req.Target); err != nil {
@@ -587,11 +592,15 @@ func (s *Server) handleTagImage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 	var req config.ImagePullRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, config.ErrBackendError, "invalid request body: "+err.Error())
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body: "+err.Error())
 		return
 	}
 	if req.DockerRef == "" || req.Tag == "" {
-		writeError(w, http.StatusBadRequest, config.ErrBackendError, "docker_ref and tag are required")
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "docker_ref and tag are required")
+		return
+	}
+	if err := vmimage.ValidateImageName(req.Tag); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "tag: "+err.Error())
 		return
 	}
 	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag)

@@ -160,7 +160,7 @@ shed exec <name> <cmd>           # Run command in shed
 # Image Management
 shed image build                 # Build a custom rootfs image
 shed image ls                    # List cached images (alias: list)
-shed image inspect <tag>         # Show manifest + digest for an image
+shed image inspect <tag-or-digest>  # Show manifest + digest for an image
 shed image pull <docker-ref>     # Pull a Docker image into the blob store
 shed image tag <src> <new>       # Point a new tag at an existing digest
 shed image rm <name>             # Remove a tag (alias: delete)

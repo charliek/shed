@@ -307,6 +307,13 @@ func InstallBlob(imagesDir string, spec BlobInstallSpec) (blobDir string, alread
 }
 
 // validateInstallSpec checks an InstallBlob input.
+//
+// Critically, it re-hashes the rootfs file and confirms the result
+// matches spec.Manifest.Digest. The blob store's whole guarantee — that
+// `blobs/sha256/<digest>/rootfs.ext4` actually has that sha256 — would
+// fall apart if a caller passed a stale or wrong digest. Hashing here
+// is one extra read per install; that's an acceptable cost for the
+// "core invariant always holds" property.
 func validateInstallSpec(spec BlobInstallSpec) error {
 	if _, err := digestHex(spec.Manifest.Digest); err != nil {
 		return err
@@ -314,8 +321,17 @@ func validateInstallSpec(spec BlobInstallSpec) error {
 	if spec.Manifest.SchemaVersion == 0 {
 		return fmt.Errorf("manifest schema_version must be set")
 	}
-	if _, ok := spec.Files[BlobRootfsFilename]; !ok {
+	rootfsPath, ok := spec.Files[BlobRootfsFilename]
+	if !ok {
 		return fmt.Errorf("install spec missing required %q file", BlobRootfsFilename)
+	}
+	actualDigest, err := HashFile(rootfsPath)
+	if err != nil {
+		return fmt.Errorf("hashing rootfs %q: %w", rootfsPath, err)
+	}
+	if actualDigest != spec.Manifest.Digest {
+		return fmt.Errorf("%w: manifest says %s but rootfs hashes to %s",
+			ErrInvalidDigest, spec.Manifest.Digest, actualDigest)
 	}
 	return nil
 }
@@ -447,9 +463,23 @@ func SetTag(imagesDir, tag, digest string) error {
 		return fmt.Errorf("marshalling tag: %w", err)
 	}
 
-	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// Use os.CreateTemp so concurrent SetTag callers each get their own
+	// scratch file. A shared `final + ".tmp"` would let two writers
+	// truncate and rename the same file, defeating the atomic-update
+	// guarantee.
+	tmpFile, err := os.CreateTemp(dir, "."+tag+".*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("creating tag tmp: %w", err)
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmp)
 		return fmt.Errorf("writing tag tmp: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("closing tag tmp: %w", err)
 	}
 	if err := fsyncFile(tmp); err != nil {
 		os.Remove(tmp)

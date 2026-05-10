@@ -121,17 +121,16 @@ stays cached for as long as the snapshot exists. Spawning a shed from
 a snapshot inherits that pin: the new shed's metadata also records
 `lower_digest`, keeping the blob alive for the new shed's lifetime.
 
-Snapshots created before this storage rewrite (schema v1) carry an
-empty `lower_digest`. They still spawn correctly, but they do not pin
-any image blob; if the original image is pruned and a new one is
-pulled under the same tag, the digest the snapshot was originally
-built on may be gone. Re-create the snapshot from a fresh source shed
-to restore the pin.
+Snapshots and sheds created before this storage rewrite (schema v1)
+are not loadable: pre-v2 metadata is rejected at runtime with an
+explicit "delete and recreate" error. There is no in-place migration —
+delete the old snapshot/shed and recapture from a freshly created
+shed on the new layout.
 
 When the host filesystem supports reflink (APFS clonefile, XFS/Btrfs/ext4
-FICLONE), the snapshot's `rootfs.ext4` and any spawned shed's `rootfs.ext4`
-share extents until they diverge. `shed system df` notes this so you don't
-overcount on-disk usage.
+FICLONE), the snapshot's stored upper and any spawned shed's upper
+share extents until they diverge. `shed system df` notes this so you
+don't overcount on-disk usage.
 
 ## Out of scope
 

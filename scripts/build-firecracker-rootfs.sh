@@ -143,23 +143,17 @@ build_variant() {
     echo "  Output: $rootfs_file"
     echo "========================================"
 
-    # Build Docker image. Build context is the project root so the
-    # shed-initramfs-builder stage can COPY initramfs/init.
+    # Build Docker image. Context is the firecracker/ directory so the
+    # Dockerfile's relative COPY paths resolve correctly. The shed
+    # initramfs is built separately by build-initramfs.sh.
     echo ""
     echo "=== Building Docker image ($docker_tag) ==="
-    cd "$PROJECT_ROOT"
+    cd "$FIRECRACKER_DIR"
     local build_args=()
     if [ -n "$SHED_EXT_VERSION" ]; then
         build_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
     fi
-    if ! docker buildx build \
-            --platform linux/amd64 \
-            --file "$FIRECRACKER_DIR/Dockerfile" \
-            --target "$docker_target" \
-            -t "$docker_tag" \
-            "${build_args[@]}" \
-            --load \
-            "$PROJECT_ROOT"; then
+    if ! docker buildx build --platform linux/amd64 --target "$docker_target" -t "$docker_tag" "${build_args[@]}" --load .; then
         echo "ERROR: Docker build failed for variant '$variant'"
         exit 1
     fi

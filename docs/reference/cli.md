@@ -269,7 +269,7 @@ shed image ls
 
 **Output:**
 
-```
+```text
 NAME          DIGEST          SOURCE      SIZE      IN USE   REF
 base          sha256:abc123…  config      2.1 GB    yes      ghcr.io/charliek/shed-vz-base:{version}
 experimental  sha256:def456…  config      3.8 GB    no       ghcr.io/charliek/shed-vz-experimental:{version}

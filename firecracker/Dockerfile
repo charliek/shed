@@ -19,55 +19,10 @@
 ARG SHED_EXT_VERSION=v0.3.1
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
-# =============================================================================
-# Stage: shed-initramfs-builder
-# Produces a minimal busybox-based initrd whose only job is to mount the
-# overlay (writable upper on /dev/vda + read-only lower on /dev/vdb) and
-# pivot_root into the merged image. Output: /initrd.img (cpio.gz).
-#
-# Build context must be the project root so `COPY initramfs/init` resolves.
-# Extract with:
-#   docker buildx build --platform linux/amd64 -f firecracker/Dockerfile \
-#     --target shed-initramfs --output type=local,dest=./out .
-# =============================================================================
-FROM debian:bookworm-slim AS shed-initramfs-builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        busybox-static \
-        e2fsprogs \
-        cpio \
-        gzip \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p /irfs/bin /irfs/sbin /irfs/dev /irfs/proc /irfs/sys \
-             /irfs/run /irfs/etc /irfs/newroot /irfs/upper /irfs/lower /irfs/mnt
-
-RUN cp /bin/busybox /irfs/bin/busybox \
-    && for cmd in sh mount umount mkdir mknod cat echo sleep chmod chown \
-                  ls cp mv rm ln dd od tr grep cut head tail sed find \
-                  switch_root pivot_root reboot poweroff blkid; do \
-        ln -sf busybox /irfs/bin/$cmd; \
-    done
-
-RUN ln -sf /bin/busybox /irfs/sbin/pivot_root \
-    && cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
-    && for lib in $(ldd /usr/sbin/mkfs.ext4 \
-            | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
-            | grep -v '^$'); do \
-        mkdir -p "/irfs$(dirname "$lib")"; \
-        cp "$lib" "/irfs$lib"; \
-    done
-
-COPY initramfs/init /irfs/init
-RUN chmod 0755 /irfs/init
-
-RUN cd /irfs \
-    && find . -print0 \
-    | cpio --null --create --format=newc --quiet \
-    | gzip -9 > /initrd.img
-
-FROM scratch AS shed-initramfs
-COPY --from=shed-initramfs-builder /initrd.img /initrd.img
+# Note: the shed initramfs (overlay-on-the-guest init) is built from
+# initramfs/Dockerfile via scripts/build-initramfs.sh. It lives in its
+# own Dockerfile so this file's COPY paths can keep resolving relative
+# to the firecracker/ build context.
 
 # =============================================================================
 # Stage: kernel-builder (temporary)

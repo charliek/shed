@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 
 	"github.com/charliek/shed/internal/backend"
@@ -123,8 +122,11 @@ func (s *fcRefScanner) ScanRefs() ([]vmimage.Reference, error) {
 		for _, name := range names {
 			snap, err := loadSnapshot(s.cfg.SnapshotsDir, name)
 			if err != nil {
-				log.Printf("Warning: skipping snapshot %q during ref scan: %v", name, err)
-				continue
+				// Fail-closed: if we can't read a snapshot, we don't
+				// know which lower digest it pins, and silently
+				// skipping would let prune delete a blob the
+				// snapshot still references.
+				return nil, fmt.Errorf("reading snapshot %s during ref scan: %w", name, err)
 			}
 			if snap.LowerDigest != "" {
 				refs = append(refs, vmimage.Reference{

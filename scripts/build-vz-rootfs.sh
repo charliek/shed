@@ -227,24 +227,18 @@ build_variant() {
     echo "  Output: $rootfs_file"
     echo "========================================"
 
-    # Build Docker image. Build context is the project root so the
-    # shed-initramfs-builder stage can COPY initramfs/init from outside
-    # the vz/ subdirectory.
+    # Build Docker image. Context is the vz/ directory so the
+    # Dockerfile's relative COPY paths (daemon.json, shed-agent, etc.)
+    # resolve correctly. The shed initramfs is built separately by
+    # build-initramfs.sh from initramfs/Dockerfile.
     echo ""
     echo "=== Building Docker image ($docker_tag) ==="
-    cd "$PROJECT_ROOT"
+    cd "$VZ_DIR"
     local build_args=()
     if [ -n "$SHED_EXT_VERSION" ]; then
         build_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
     fi
-    if ! docker buildx build \
-            --platform linux/arm64 \
-            --file "$VZ_DIR/Dockerfile" \
-            --target "$docker_target" \
-            -t "$docker_tag" \
-            "${build_args[@]}" \
-            --load \
-            "$PROJECT_ROOT"; then
+    if ! docker buildx build --platform linux/arm64 --target "$docker_target" -t "$docker_tag" "${build_args[@]}" --load .; then
         echo "ERROR: Docker build failed for variant '$variant'"
         echo "Hint: Ensure Docker Desktop has buildx enabled for linux/arm64"
         exit 1

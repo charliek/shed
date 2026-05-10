@@ -165,3 +165,35 @@ func TestGitConfigValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestParseUpperSize(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    int64
+		wantErr bool
+	}{
+		{"5G is the default-ish", "5G", 5 * 1024 * 1024 * 1024, false},
+		{"100G upper bound", "100G", 100 * 1024 * 1024 * 1024, false},
+		{"1G lower bound", "1G", 1024 * 1024 * 1024, false},
+		{"1024M = 1G accepted", "1024M", 1024 * 1024 * 1024, false},
+		{"lowercase g", "5g", 5 * 1024 * 1024 * 1024, false},
+		{"500M below 1G floor rejected", "500M", 0, true},
+		{"101G above 100G ceiling rejected", "101G", 0, true},
+		{"empty rejected", "", 0, true},
+		{"non-numeric rejected", "fiveG", 0, true},
+		{"negative rejected", "-1G", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseUpperSize(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseUpperSize(%q) error = %v, wantErr = %v", tt.input, err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("ParseUpperSize(%q) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}

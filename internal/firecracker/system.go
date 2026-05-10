@@ -53,7 +53,10 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 
 		// _base is skipped by ListImages by design; resolve via the
 		// content-addressed blob store and stat the underlying rootfs.
-		if basePath := vmimage.Resolve(imagesDir, "_base", ""); basePath != "" {
+		// Skip when its path matches an existing entry — under content-
+		// addressing, _base often resolves to the same blob as a tagged
+		// variant, and double-counting would inflate `df` totals.
+		if basePath := vmimage.Resolve(imagesDir, "_base", ""); basePath != "" && !imagesContainPath(du.Images, basePath) {
 			if logical, physical, err := diskstat.Stat(basePath); err == nil {
 				baseRef := ""
 				if vmimage.IsDockerRef(c.cfg.BaseRootfs) {
@@ -406,4 +409,16 @@ func (c *Client) collectInstanceCandidates(ctx context.Context, mtimes map[strin
 		})
 	}
 	return cands, skipped, nil
+}
+
+// imagesContainPath reports whether any entry's Path equals path.
+// Used to dedupe `_base` when it resolves to the same blob as a
+// tagged variant under the content-addressed image layout.
+func imagesContainPath(entries []config.ImageDiskEntry, path string) bool {
+	for _, e := range entries {
+		if e.Path == path {
+			return true
+		}
+	}
+	return false
 }

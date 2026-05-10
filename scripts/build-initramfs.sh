@@ -1,16 +1,15 @@
 #!/bin/bash
-# Build the shed initramfs by invoking the `shed-initramfs` stage of one
-# of the backend Dockerfiles. The output is a single gzipped cpio archive
-# (/initrd.img) extracted to the path passed in --output.
+# Build the shed initramfs by invoking the `shed-initramfs` stage of
+# initramfs/Dockerfile. The output is a single gzipped cpio archive
+# extracted to the path passed in --output.
 #
 # Usage:
 #   ./scripts/build-initramfs.sh \
-#       --backend <vz|firecracker> \
 #       --platform <linux/arm64|linux/amd64> \
 #       --output <path>
 #
-# The Dockerfile stage is the canonical source for the initramfs build;
-# this script is a thin wrapper around `docker buildx build --output`.
+# `--backend` is accepted for symmetry with caller scripts but is
+# informational only — the same initramfs serves both backends.
 
 set -euo pipefail
 
@@ -21,13 +20,25 @@ BACKEND=""
 PLATFORM=""
 OUTPUT=""
 
+require_value() {
+    local flag="$1"
+    local val="${2:-}"
+    if [ -z "$val" ] || [[ "$val" == --* ]]; then
+        echo "ERROR: $flag requires a value" >&2
+        exit 2
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend)
+            require_value "--backend" "${2:-}"
             BACKEND="$2"; shift 2 ;;
         --platform)
+            require_value "--platform" "${2:-}"
             PLATFORM="$2"; shift 2 ;;
         --output)
+            require_value "--output" "${2:-}"
             OUTPUT="$2"; shift 2 ;;
         --help|-h)
             sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -38,16 +49,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$BACKEND" ] || [ -z "$PLATFORM" ] || [ -z "$OUTPUT" ]; then
-    echo "ERROR: --backend, --platform, and --output are required" >&2
+if [ -z "$PLATFORM" ] || [ -z "$OUTPUT" ]; then
+    echo "ERROR: --platform and --output are required" >&2
     exit 2
 fi
 
-case "$BACKEND" in
-    vz)          DOCKERFILE="$PROJECT_ROOT/vz/Dockerfile" ;;
-    firecracker) DOCKERFILE="$PROJECT_ROOT/firecracker/Dockerfile" ;;
-    *) echo "ERROR: unknown backend $BACKEND (want vz|firecracker)" >&2; exit 2 ;;
-esac
+DOCKERFILE="$PROJECT_ROOT/initramfs/Dockerfile"
+if [ ! -f "$DOCKERFILE" ]; then
+    echo "ERROR: $DOCKERFILE not found" >&2
+    exit 2
+fi
 
 OUTPUT_DIR="$(dirname "$OUTPUT")"
 mkdir -p "$OUTPUT_DIR"
@@ -58,7 +69,7 @@ mkdir -p "$OUTPUT_DIR"
 TMP_OUT="$(mktemp -d)"
 trap 'rm -rf "$TMP_OUT"' EXIT
 
-echo "shed-initramfs: building from $DOCKERFILE (backend=$BACKEND platform=$PLATFORM)" >&2
+echo "shed-initramfs: building from $DOCKERFILE (backend=${BACKEND:-any} platform=$PLATFORM)" >&2
 docker buildx build \
     --platform "$PLATFORM" \
     --file "$DOCKERFILE" \

@@ -174,6 +174,12 @@ func TestPruneImagesRespectsRefs(t *testing.T) {
 	if len(deleted) != 1 || deleted[0].Digest != danglingDigest {
 		t.Fatalf("unexpected deletions: %#v", deleted)
 	}
+	// PruneImages reports what it intended to delete; assert the blob
+	// is actually gone from disk so a regression that drops the
+	// DeleteBlob call is caught.
+	if vmimage.BlobExists(imagesDir, danglingDigest) {
+		t.Fatalf("dangling blob still exists after prune")
+	}
 	if !vmimage.BlobExists(imagesDir, pinnedDigest) {
 		t.Fatalf("pinned blob removed by prune")
 	}

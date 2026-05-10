@@ -72,14 +72,33 @@ TMP_DIR="$BLOB_DIR.tmp"
 
 mkdir -p "$BLOB_PARENT"
 
+# move_into copies src to dst when cross-device or when the source must
+# be preserved; otherwise rename moves it. We rename to consume source
+# files so the caller is not left with stray top-level artifacts (which
+# the blob store's prune/df flows would never reclaim).
+move_into() {
+    local src="$1" dst="$2"
+    if mv "$src" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    # Cross-device fallback: copy then unlink the source.
+    cp "$src" "$dst" || return 1
+    rm -f "$src"
+}
+
 # If the blob already exists at this digest, the install is a no-op.
+# We still consume the source files so the caller doesn't leak them.
 if [ -f "$BLOB_DIR/rootfs.ext4" ]; then
     echo "shed-blob: $DIGEST already installed at $BLOB_DIR" >&2
+    rm -f "$ROOTFS"
+    [ -n "$KERNEL" ] && rm -f "$KERNEL" || true
+    [ -n "$INITRD" ] && rm -f "$INITRD" || true
 else
     rm -rf "$TMP_DIR"
     mkdir -p "$TMP_DIR"
 
-    cp "$ROOTFS" "$TMP_DIR/rootfs.ext4"
+    move_into "$ROOTFS" "$TMP_DIR/rootfs.ext4" \
+        || { echo "ERROR: failed to stage rootfs" >&2; rm -rf "$TMP_DIR"; exit 1; }
     chmod 0444 "$TMP_DIR/rootfs.ext4"
 
     if [ -n "$KERNEL" ]; then
@@ -87,7 +106,8 @@ else
             echo "ERROR: kernel file not found: $KERNEL" >&2
             rm -rf "$TMP_DIR"; exit 2
         fi
-        cp "$KERNEL" "$TMP_DIR/kernel"
+        move_into "$KERNEL" "$TMP_DIR/kernel" \
+            || { echo "ERROR: failed to stage kernel" >&2; rm -rf "$TMP_DIR"; exit 1; }
         chmod 0444 "$TMP_DIR/kernel"
     fi
 
@@ -96,16 +116,18 @@ else
             echo "ERROR: initrd file not found: $INITRD" >&2
             rm -rf "$TMP_DIR"; exit 2
         fi
-        cp "$INITRD" "$TMP_DIR/initrd"
+        move_into "$INITRD" "$TMP_DIR/initrd" \
+            || { echo "ERROR: failed to stage initrd" >&2; rm -rf "$TMP_DIR"; exit 1; }
         chmod 0444 "$TMP_DIR/initrd"
     fi
 
-    # Manifest. Sizes are computed via stat; format differs by platform.
-    rootfs_logical="$(wc -c < "$ROOTFS" | tr -d ' ')"
+    # Manifest. Read sizes from the staged copies — the source files
+    # have already been moved into $TMP_DIR.
+    rootfs_logical="$(wc -c < "$TMP_DIR/rootfs.ext4" | tr -d ' ')"
     kernel_size="0"
-    [ -n "$KERNEL" ] && kernel_size="$(wc -c < "$KERNEL" | tr -d ' ')"
+    [ -n "$KERNEL" ] && kernel_size="$(wc -c < "$TMP_DIR/kernel" | tr -d ' ')"
     initrd_size="0"
-    [ -n "$INITRD" ] && initrd_size="$(wc -c < "$INITRD" | tr -d ' ')"
+    [ -n "$INITRD" ] && initrd_size="$(wc -c < "$TMP_DIR/initrd" | tr -d ' ')"
     created_at="$(date -u +"%Y-%m-%dT%H:%M:%S.000000000Z")"
 
     cat > "$TMP_DIR/manifest.json" <<EOF

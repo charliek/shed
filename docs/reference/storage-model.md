@@ -8,16 +8,22 @@ it's structured this way, and how it interacts with sheds and snapshots.
 
 For each VM backend, all on-disk state lives under a single `images_dir`:
 
-```
+```text
 {images_dir}/
   blobs/sha256/<digest>/
     rootfs.ext4         mode 0444   read-only image content
     kernel              mode 0444   extracted boot kernel (when present)
-    initrd              mode 0444   extracted initrd (VZ; future Firecracker)
+    initrd              mode 0444   extracted initrd (the shed-built initramfs)
     manifest.json       mode 0444   image metadata
   tags/
     <tag>.json                      {"digest": "sha256:...", "updated_at": "..."}
-  ...
+  uppers/
+    <shed-name>/upper.ext4          per-shed writable upper (sparse)
+  instances/
+    <shed-name>/metadata.json       per-shed bookkeeping
+  snapshots/
+    <snap-name>/{rootfs.ext4,snapshot.json}    # rootfs.ext4 holds the captured upper
+
 ```
 
 For Firecracker the default is `/var/lib/shed/firecracker/images/`; for
