@@ -227,15 +227,24 @@ build_variant() {
     echo "  Output: $rootfs_file"
     echo "========================================"
 
-    # Build Docker image
+    # Build Docker image. Build context is the project root so the
+    # shed-initramfs-builder stage can COPY initramfs/init from outside
+    # the vz/ subdirectory.
     echo ""
     echo "=== Building Docker image ($docker_tag) ==="
-    cd "$VZ_DIR"
+    cd "$PROJECT_ROOT"
     local build_args=()
     if [ -n "$SHED_EXT_VERSION" ]; then
         build_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
     fi
-    if ! docker buildx build --platform linux/arm64 --target "$docker_target" -t "$docker_tag" "${build_args[@]}" --load .; then
+    if ! docker buildx build \
+            --platform linux/arm64 \
+            --file "$VZ_DIR/Dockerfile" \
+            --target "$docker_target" \
+            -t "$docker_tag" \
+            "${build_args[@]}" \
+            --load \
+            "$PROJECT_ROOT"; then
         echo "ERROR: Docker build failed for variant '$variant'"
         echo "Hint: Ensure Docker Desktop has buildx enabled for linux/arm64"
         exit 1
@@ -281,6 +290,29 @@ build_variant() {
 
     # Extract kernel/initrd from the base image (all variants share the same kernel)
     extract_kernel "$docker_tag"
+
+    # Build the shed-overlay initramfs (one initrd is fine across all
+    # variants — it's image-content-independent).
+    local shed_initrd="$OUTPUT_DIR/shed-initrd-vz.img"
+    echo ""
+    echo "=== Building shed-overlay initramfs ==="
+    "$SCRIPT_DIR/build-initramfs.sh" \
+        --backend vz \
+        --platform linux/arm64 \
+        --output "$shed_initrd"
+
+    # Install rootfs+kernel+initrd as a content-addressed blob and
+    # update the variant tag.
+    echo ""
+    echo "=== Installing blob ==="
+    "$SCRIPT_DIR/install-blob.sh" \
+        --images-dir "$OUTPUT_DIR" \
+        --rootfs "$rootfs_path" \
+        --kernel "$KERNEL_PATH" \
+        --initrd "$shed_initrd" \
+        --tag "$variant" \
+        --backend vz \
+        --arch arm64
 }
 
 # Main execution

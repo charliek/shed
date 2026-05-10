@@ -1,0 +1,105 @@
+#!/bin/sh
+# shed initramfs init: mount overlayfs (writable upper + read-only lower),
+# pivot_root, and hand off to /sbin/init in the merged rootfs.
+#
+# Disk layout (set by the backend at VM-create time):
+#   /dev/vda  per-shed writable upper   (ext4, formatted on first boot)
+#   /dev/vdb  read-only lower image     (ext4, the immutable image blob)
+#
+# Kernel cmdline overrides (optional):
+#   shed.upper=/dev/vda  shed.lower=/dev/vdb
+#
+# This script intentionally avoids fancy busybox-only constructs so it
+# works equally well with full busybox and the static binaries shipped
+# in the shed-initramfs-builder image.
+
+set -e
+
+UPPER_DEV=/dev/vda
+LOWER_DEV=/dev/vdb
+
+# Honor cmdline overrides (rudimentary parser; quoting not supported).
+for arg in $(cat /proc/cmdline 2>/dev/null || true); do
+    case "$arg" in
+        shed.upper=*) UPPER_DEV="${arg#shed.upper=}" ;;
+        shed.lower=*) LOWER_DEV="${arg#shed.lower=}" ;;
+    esac
+done
+
+panic() {
+    echo ""
+    echo "shed-initramfs PANIC: $*"
+    echo "Dropping to shell. Press Enter to continue, or 'reboot -f' to bail."
+    exec /bin/sh
+}
+
+mkdir -p /proc /sys /dev /run /newroot /upper /lower
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev || mount -t tmpfs tmpfs /dev
+# /dev/pts is not strictly needed pre-pivot but cheap to set up so any
+# console fallback works when init drops to a shell.
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+echo "shed-initramfs: upper=${UPPER_DEV} lower=${LOWER_DEV}"
+
+# Wait briefly for virtio-blk devices to appear. Firecracker exposes
+# them quickly; vfkit/VZ can take a few hundred ms on cold boot.
+i=0
+while [ $i -lt 50 ]; do
+    if [ -b "$UPPER_DEV" ] && [ -b "$LOWER_DEV" ]; then
+        break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+
+[ -b "$UPPER_DEV" ] || panic "upper block device $UPPER_DEV not present"
+[ -b "$LOWER_DEV" ] || panic "lower block device $LOWER_DEV not present"
+
+# Format the upper on first boot. We detect "no FS yet" by reading the
+# ext4 magic at offset 1080 (0x438): the two-byte signature is 0x53 0xEF.
+# If anything else is there — including all zeroes — we mkfs. We avoid
+# blkid here because the busybox initramfs doesn't ship libblkid.
+need_mkfs=1
+if dd if="$UPPER_DEV" bs=1 count=2 skip=1080 2>/dev/null \
+        | od -An -tx1 \
+        | tr -d ' \n' \
+        | grep -qx "53ef"; then
+    need_mkfs=0
+fi
+
+if [ "$need_mkfs" = "1" ]; then
+    echo "shed-initramfs: formatting ${UPPER_DEV} (first boot)"
+    mkfs.ext4 -F -L shed-upper "$UPPER_DEV" >/dev/null 2>&1 \
+        || panic "mkfs.ext4 on $UPPER_DEV failed"
+fi
+
+mount -t ext4 "$UPPER_DEV" /upper || panic "failed to mount $UPPER_DEV at /upper"
+mkdir -p /upper/data /upper/work
+
+mount -t ext4 -o ro "$LOWER_DEV" /lower \
+    || panic "failed to mount $LOWER_DEV ro at /lower"
+
+mount -t overlay overlay \
+    -o "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work" \
+    /newroot \
+    || panic "overlay mount failed"
+
+# Move the API filesystems into the new root rather than re-mounting,
+# so kernel state and open fds keep working through the pivot.
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run
+mount --move /proc /newroot/proc
+mount --move /sys  /newroot/sys
+mount --move /dev  /newroot/dev
+
+# pivot_root needs an existing oldroot dir inside newroot to receive the
+# old / mountpoint. /mnt is always present in our images.
+mkdir -p /newroot/mnt
+cd /newroot
+pivot_root . mnt || panic "pivot_root failed"
+# Detach the old root; it's still pinned by our cwd otherwise.
+umount -l /mnt || true
+
+exec /sbin/init "$@"

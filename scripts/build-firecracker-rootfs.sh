@@ -143,15 +143,23 @@ build_variant() {
     echo "  Output: $rootfs_file"
     echo "========================================"
 
-    # Build Docker image
+    # Build Docker image. Build context is the project root so the
+    # shed-initramfs-builder stage can COPY initramfs/init.
     echo ""
     echo "=== Building Docker image ($docker_tag) ==="
-    cd "$FIRECRACKER_DIR"
+    cd "$PROJECT_ROOT"
     local build_args=()
     if [ -n "$SHED_EXT_VERSION" ]; then
         build_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
     fi
-    if ! docker buildx build --platform linux/amd64 --target "$docker_target" -t "$docker_tag" "${build_args[@]}" --load .; then
+    if ! docker buildx build \
+            --platform linux/amd64 \
+            --file "$FIRECRACKER_DIR/Dockerfile" \
+            --target "$docker_target" \
+            -t "$docker_tag" \
+            "${build_args[@]}" \
+            --load \
+            "$PROJECT_ROOT"; then
         echo "ERROR: Docker build failed for variant '$variant'"
         exit 1
     fi
@@ -195,6 +203,34 @@ build_variant() {
     EXPORT_TAR=""
 
     echo "Created rootfs image: $rootfs_path"
+
+    # Build the shed-overlay initramfs.
+    local shed_initrd="$OUTPUT_DIR/shed-initrd-fc.img"
+    echo ""
+    echo "=== Building shed-overlay initramfs ==="
+    "$SCRIPT_DIR/build-initramfs.sh" \
+        --backend firecracker \
+        --platform linux/amd64 \
+        --output "$shed_initrd"
+
+    # Firecracker's compiled kernel lives at ${OUTPUT_DIR}/vmlinux after
+    # download-firecracker.sh runs. Use it as the blob's kernel when
+    # present so the runtime never has to look outside the blob dir.
+    local kernel_arg=()
+    if [ -f "$OUTPUT_DIR/vmlinux" ]; then
+        kernel_arg=(--kernel "$OUTPUT_DIR/vmlinux")
+    fi
+
+    echo ""
+    echo "=== Installing blob ==="
+    "$SCRIPT_DIR/install-blob.sh" \
+        --images-dir "$OUTPUT_DIR" \
+        --rootfs "$rootfs_path" \
+        "${kernel_arg[@]}" \
+        --initrd "$shed_initrd" \
+        --tag "$variant" \
+        --backend firecracker \
+        --arch amd64
 }
 
 # Main execution
