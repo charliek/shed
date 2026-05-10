@@ -183,6 +183,8 @@ func TestParseUpperSize(t *testing.T) {
 		{"empty rejected", "", 0, true},
 		{"non-numeric rejected", "fiveG", 0, true},
 		{"negative rejected", "-1G", 0, true},
+		{"overflow on G suffix rejected", "10000000000G", 0, true},
+		{"raw int64-max rejected", "9223372036854775807", 0, true},
 	}
 
 	for _, tt := range tests {

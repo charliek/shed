@@ -5,7 +5,6 @@ package firecracker
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 
@@ -14,14 +13,19 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 )
 
-const nonLinuxErr = "firecracker backend is only supported on linux"
+// errNonLinux returns a fresh sentinel-wrapped error for every call so
+// errors.Is(err, ErrNotSupportedSentinel) catches it and the API layer
+// maps it to HTTP 501 (Not Implemented).
+func errNonLinux() error {
+	return fmt.Errorf("%w: firecracker backend is only supported on linux", config.ErrNotSupportedSentinel)
+}
 
 // Client is a stub for non-linux builds.
 type Client struct{}
 
 // NewClient returns an error on non-linux platforms.
 func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, _ *plugin.Bridge) (*Client, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // Close is a no-op for the stub client.
@@ -49,62 +53,62 @@ func (b *FirecrackerBackend) Close() error {
 
 // CreateShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // GetShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) GetShed(ctx context.Context, name string) (*config.Shed, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // ListSheds returns an error on non-linux platforms.
 func (b *FirecrackerBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // DeleteShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
-	return errors.New(nonLinuxErr)
+	return errNonLinux()
 }
 
 // StartShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) StartShed(ctx context.Context, name string) (*config.Shed, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // StopShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // ResetShed returns an error on non-linux platforms.
 func (b *FirecrackerBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // ListSessions returns an error on non-linux platforms.
 func (b *FirecrackerBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // KillSession returns an error on non-linux platforms.
 func (b *FirecrackerBackend) KillSession(ctx context.Context, shedName, sessionName string) error {
-	return errors.New(nonLinuxErr)
+	return errNonLinux()
 }
 
 // Exec returns an error on non-linux platforms.
 func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts backend.ExecOptions) error {
-	return errors.New(nonLinuxErr)
+	return errNonLinux()
 }
 
 // GetNetworkEndpoint returns an error on non-linux platforms.
 func (b *FirecrackerBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
-	return "", errors.New(nonLinuxErr)
+	return "", errNonLinux()
 }
 
 // DialService returns an error on non-linux platforms.
 func (b *FirecrackerBackend) DialService(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
-	return nil, errors.New(nonLinuxErr)
+	return nil, errNonLinux()
 }
 
 // ListImages returns an empty list on non-linux platforms.

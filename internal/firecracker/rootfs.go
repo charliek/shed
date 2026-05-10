@@ -37,9 +37,12 @@ func UpperDir(uppersDir, name string) string {
 // ext4-sized file at {uppersDir}/<name>/upper.ext4. The file is left
 // unformatted; the in-guest initramfs runs mkfs.ext4 on first boot.
 //
-// If the file already exists it is left in place (idempotent — useful
-// for `shed reset`-style flows that need to recreate the upper after
-// a previous create completed). Returns the absolute path on success.
+// Fails with an explicit error when the upper file already exists
+// rather than silently reusing it: a stale upper from a previously
+// crashed `shed create` (or from manual operator intervention) almost
+// always reflects state the next caller doesn't intend to inherit.
+// Callers that want fresh-state semantics (e.g. `shed reset`) call
+// DeleteUpper first.
 func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
 	if sizeBytes <= 0 {
 		return "", fmt.Errorf("upper size must be positive (got %d)", sizeBytes)
@@ -50,12 +53,12 @@ func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
 	}
 	path := UpperPath(uppersDir, name)
 
-	// O_CREATE|O_EXCL keeps a stale upper from a previous create from
-	// being silently reused. ResetUpper handles the recreate case.
+	// O_CREATE|O_EXCL guarantees we never silently reuse a stale upper
+	// from a previously failed create.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
-			return path, nil
+			return "", fmt.Errorf("upper already exists at %s; remove it (or run `shed reset <name>`) before recreating", path)
 		}
 		return "", fmt.Errorf("failed to create upper file: %w", err)
 	}

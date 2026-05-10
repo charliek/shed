@@ -5,7 +5,6 @@ package vz
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 
@@ -14,7 +13,10 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 )
 
-var errNonDarwin = errors.New("vz backend is only supported on macOS")
+// errNonDarwin wraps ErrNotSupportedSentinel so the API layer maps
+// every VZ-on-Linux call to HTTP 501 (Not Implemented) rather than a
+// generic 500 backend error.
+var errNonDarwin = fmt.Errorf("%w: vz backend is only supported on macOS", config.ErrNotSupportedSentinel)
 
 // Client is a stub for non-darwin builds.
 type Client struct{}

@@ -1006,6 +1006,7 @@ func (c *FirecrackerConfig) applyDefaults() {
 		c.SnapshotsDir = "/var/lib/shed/firecracker/snapshots"
 	}
 
+	c.UppersDir = ExpandPath(c.UppersDir)
 	if c.UppersDir == "" {
 		c.UppersDir = "/var/lib/shed/firecracker/uppers"
 	}
@@ -1177,6 +1178,10 @@ const DefaultUpperSize = "5G"
 // ParseUpperSize accepts a human-friendly suffix (G, M, or bare bytes)
 // and returns the size in bytes. Validates the range against
 // MinUpperSizeBytes/MaxUpperSizeBytes.
+//
+// Pre-checks that n*mul won't overflow int64 — otherwise a value like
+// "10000000000G" would silently wrap to a tiny positive number and
+// slip past the range bounds.
 func ParseUpperSize(s string) (int64, error) {
 	if s == "" {
 		return 0, fmt.Errorf("upper size is empty")
@@ -1197,6 +1202,12 @@ func ParseUpperSize(s string) (int64, error) {
 	}
 	if n <= 0 {
 		return 0, fmt.Errorf("upper size must be positive: %q", s)
+	}
+	// Reject inputs that would overflow before the bound checks see
+	// them. Anything > MaxUpperSizeBytes/mul is already out of range,
+	// so we can fail with the same range error.
+	if n > MaxUpperSizeBytes/mul {
+		return 0, fmt.Errorf("upper size must be at most %dG, got %q", MaxUpperSizeBytes/(1024*1024*1024), s)
 	}
 	bytes := n * mul
 	if bytes < MinUpperSizeBytes {

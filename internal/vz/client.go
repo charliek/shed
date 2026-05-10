@@ -223,6 +223,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
 			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
 		}
+		// The metadata's UpperSizeBytes must reflect the *cloned* file's
+		// actual size, not the freshly-allocated sparse size — otherwise
+		// `shed system df` and reset/snapshot bookkeeping report the
+		// pre-snapshot size for what is now a different file.
+		if fi, statErr := os.Stat(upperPath); statErr == nil {
+			upperSizeBytes = fi.Size()
+		}
 	}
 	rootfsPath := upperPath
 

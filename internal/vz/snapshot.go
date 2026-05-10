@@ -253,7 +253,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		Name:           req.Name,
 		Backend:        config.BackendVZ,
 		SourceShed:     req.SourceShed,
-		SourceImage:    srcMeta.Image,
+		SourceImage:    snapshotSourceImage(srcMeta),
 		SourceLocalDir: srcMeta.LocalDir,
 		Comment:        req.Comment,
 		CreatedAt:      time.Now(),
@@ -333,4 +333,17 @@ func (c *Client) DeleteSnapshot(_ context.Context, name string) error {
 		return fmt.Errorf("failed to remove snapshot directory: %w", err)
 	}
 	return nil
+}
+
+// snapshotSourceImage picks the most actionable display value for the
+// snapshot's SourceImage field. LowerImageTag is the tag the source
+// shed pinned its lower digest to; Image is the variant the operator
+// requested and may be empty (default base) or stale after a retag.
+// Prefer the pinned tag because that's what `shed snapshot info` and
+// the "lower missing" recovery message refer to.
+func snapshotSourceImage(meta *Metadata) string {
+	if meta.LowerImageTag != "" {
+		return meta.LowerImageTag
+	}
+	return meta.Image
 }

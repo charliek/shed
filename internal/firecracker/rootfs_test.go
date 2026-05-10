@@ -159,13 +159,11 @@ func TestEnsureUpper(t *testing.T) {
 		t.Errorf("upper size = %d, want %d", fi.Size(), size)
 	}
 
-	// Idempotent: second call returns the existing file unchanged.
-	path2, err := EnsureUpper(dir, "alpha", size)
-	if err != nil {
-		t.Fatalf("EnsureUpper second call: %v", err)
-	}
-	if path2 != path {
-		t.Errorf("path differs across calls: %q vs %q", path, path2)
+	// Strict: second call refuses to silently reuse the existing
+	// upper. Callers that want fresh state (e.g. shed reset) must
+	// DeleteUpper first.
+	if _, err := EnsureUpper(dir, "alpha", size); err == nil {
+		t.Errorf("EnsureUpper accepted a pre-existing upper; want error")
 	}
 
 	// Negative or zero size is rejected.

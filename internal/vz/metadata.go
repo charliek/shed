@@ -26,8 +26,11 @@ var ErrInstanceNotFound = errors.New("instance not found")
 var ErrInvalidInstanceName = errors.New("invalid instance name")
 
 // ErrLegacyMetadata is returned when loading metadata written by a
-// pre-v2 build.
-var ErrLegacyMetadata = errors.New("metadata is from a pre-overlay version of shed; please run `shed delete <name>` and recreate")
+// pre-v2 build. The pre-overlay storage layout cannot be migrated
+// in place — the operator has to remove the on-disk state manually
+// (since `shed delete` itself goes through LoadMetadata and would
+// hit this same error).
+var ErrLegacyMetadata = errors.New("metadata is from a pre-overlay version of shed; remove the instance directory under {vz.instance_dir}/<name>/ (and its uppers/<name>/ entry, if any) and recreate the shed")
 
 // Metadata represents the persistent state of a VZ VM instance.
 type Metadata struct {

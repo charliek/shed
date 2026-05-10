@@ -250,6 +250,13 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 // store at the computed digest, and advances the imageBuildName tag.
 // Returns the digest installed.
 func convertAndInstall(ctx context.Context, sourceRef, outputDir, platform string, extractKernel, needsInitrd bool) (string, error) {
+	// Validate the tag up front: SetTag would also catch this, but only
+	// after Convert + InstallBlob have done minutes of work and left a
+	// dangling untagged blob in the store.
+	if err := vmimage.ValidateImageName(imageBuildName); err != nil {
+		return "", fmt.Errorf("invalid image name %q: %w", imageBuildName, err)
+	}
+
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
 		DockerRef:     sourceRef,
 		Name:          imageBuildName,
@@ -418,11 +425,11 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 		return outputJSON(result)
 	}
 
-	msg := fmt.Sprintf("Deleted image %s", name)
-	if targetImage != nil && targetImage.SizeBytes > 0 {
-		msg += fmt.Sprintf(" (freed %s)", formatSize(targetImage.SizeBytes))
-	}
-	printSuccess(msg)
+	// `shed image rm` removes only the tag; the underlying blob persists
+	// until `shed image prune` reclaims it (Docker model). Reporting
+	// "freed X" here would mislead operators about real disk recovery.
+	printSuccess("Removed image tag %s (run `shed image prune` to reclaim disk)", name)
+	_ = targetImage
 	return nil
 }
 

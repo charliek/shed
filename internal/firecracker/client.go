@@ -537,6 +537,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			c.ReleaseCID(cid)
 			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
 		}
+		// The metadata's UpperSizeBytes must reflect the *cloned* file's
+		// actual size, not the freshly-allocated sparse size — otherwise
+		// `shed system df` and reset/snapshot bookkeeping report the
+		// pre-snapshot size for what is now a different file.
+		if fi, statErr := os.Stat(upperPath); statErr == nil {
+			upperSizeBytes = fi.Size()
+		}
 	}
 	rootfsPath := upperPath
 
@@ -657,6 +664,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 			}
+			if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+				log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
+			}
 			c.UnregisterInstance(req.Name, cid, ipAddress)
 			return nil, fmt.Errorf("failed to start 9P server for local dir: %w", err)
 		}
@@ -670,6 +680,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			}
 			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+			}
+			if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+				log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
 			}
 			c.UnregisterInstance(req.Name, cid, ipAddress)
 			return nil, fmt.Errorf("failed to mount 9P in guest: %w", err)

@@ -36,6 +36,12 @@ func UpperDir(uppersDir, name string) string {
 // EnsureUpper creates the per-shed writable upper as a sparse, unformatted
 // file at {uppersDir}/<name>/upper.ext4. mkfs.ext4 happens in the guest
 // initramfs on first boot.
+//
+// Fails with an explicit error when the upper file already exists rather
+// than silently reusing it: a stale upper from a previously crashed
+// `shed create` almost always reflects state the next caller doesn't
+// intend to inherit. Callers that want fresh-state semantics (e.g.
+// `shed reset`) call DeleteUpper first.
 func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
 	if sizeBytes <= 0 {
 		return "", fmt.Errorf("upper size must be positive (got %d)", sizeBytes)
@@ -49,7 +55,7 @@ func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
-			return path, nil
+			return "", fmt.Errorf("upper already exists at %s; remove it (or run `shed reset <name>`) before recreating", path)
 		}
 		return "", fmt.Errorf("failed to create upper file: %w", err)
 	}
