@@ -105,8 +105,8 @@ func TestBuildVfkitArgs(t *testing.T) {
 	}
 
 	// Lower (read-only) virtio-blk should be present.
-	if !strings.Contains(argsStr, ",readOnly=true") {
-		t.Errorf("expected lower virtio-blk with readOnly=true, got: %s", argsStr)
+	if !strings.Contains(argsStr, ",readonly") {
+		t.Errorf("expected lower virtio-blk with vfkit `readonly` flag, got: %s", argsStr)
 	}
 
 	// No VirtioFS device when LocalDir is empty

@@ -155,10 +155,10 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
 
-	// vfkit's virtio-blk read-only flag has historically been spelled
-	// `,readOnly=true`. If a future vfkit release changes the spelling,
-	// boot will fail with a clear error from vfkit and we can update
-	// here without wider blast radius.
+	// vfkit's virtio-blk read-only flag is the bare token `readonly`
+	// (lowercase, no `=value`). Verified against crc-org/vfkit
+	// pkg/config/virtio.go: DiskStorageConfig.FromOptions errors out
+	// on any `readonly=...` form.
 	args = []string{
 		"--cpus", fmt.Sprintf("%d", vm.meta.CPUs),
 		"--memory", fmt.Sprintf("%d", vm.meta.MemoryMB),
@@ -167,7 +167,7 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		"--device", fmt.Sprintf("virtio-blk,path=%s", vm.meta.RootfsPath),
 		// Lower: read-only, /dev/vdb. Shared across all sheds pinning
 		// this digest so disk + host page cache are reused.
-		"--device", fmt.Sprintf("virtio-blk,path=%s,readOnly=true", lowerRootfs),
+		"--device", fmt.Sprintf("virtio-blk,path=%s,readonly", lowerRootfs),
 		"--device", "virtio-net,nat",
 		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLogPath),
 	}
