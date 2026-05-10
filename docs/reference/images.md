@@ -130,16 +130,16 @@ If you build images locally, point to ext4 file paths:
 
 You can mix Docker refs and local paths in the same config.
 
-The `base_rootfs` field is used when no `--image` flag is specified. The `images` map enables per-shed variant selection via `--image`. The `images_dir` directory is scanned for auto-discovered images matching `{name}-rootfs.ext4`.
+The `base_rootfs` field is used when no `--image` flag is specified. The `images` map enables per-shed variant selection via `--image`. The `images_dir` directory is scanned for auto-discovered tags under `tags/<name>.json`.
 
 ### `base_rootfs` vs `images:` — how they interact
 
 The two fields play different roles:
 
-- `images:` is a map of named variants. Each entry is cacheable, pre-pullable via `shed-server pull-images`, visible in `shed image list`, and selectable with `shed create --image <name>`.
+- `images:` is a map of named variants. Each entry is cacheable, pre-pullable via `shed-server pull-images`, visible in `shed image ls`, and selectable with `shed create --image <name>`.
 - `base_rootfs` is a single top-level fallback used when `shed create` is invoked without `--image`. It is stored on disk as `_base-rootfs.ext4` (underscore prefix).
 
-When `base_rootfs` equals one of the `images:` refs (a common pattern where `base_rootfs` and `images.experimental` both point at the same Docker ref), `shed-server pull-images` stores `_base-rootfs.ext4` as a **hardlink** to the matching variant file — zero extra disk cost. Because the two names share the same inode, running `shed image delete experimental` will not reclaim disk until the other name (`_base`) is also removed; `shed image prune` after a config-ref bump handles this cleanly.
+When `base_rootfs` equals one of the `images:` refs (a common pattern where `base_rootfs` and `images.experimental` both point at the same Docker ref), `shed-server pull-images` points the `_base` and `experimental` tags at the same content-addressed blob — zero extra disk cost. Because both tags share a digest, removing one (`shed image rm experimental`) leaves the blob in place; only `shed image prune` reclaims it once nothing pins the digest.
 
 ## Using Variants
 
@@ -159,8 +159,10 @@ shed create myproject
 List available images:
 
 ```bash
-shed image list
+shed image ls
 ```
+
+(`shed image list` is kept as a deprecated alias for one release.)
 
 ## Creating Custom Images
 
@@ -260,9 +262,17 @@ shed image build -f Dockerfile.shed -n acmeco
 
 ## Image Caching
 
-Converted ext4 images are cached in `images_dir`. A `.source` sidecar file tracks which Docker ref produced each image, and a `.lock` sidecar coordinates concurrent pulls.
+Converted ext4 images are cached in `images_dir` as **content-addressed
+blobs** with **tag indirection**. Each ext4 image is identified by the
+sha256 digest of its bytes; tags are pointers from human-readable names
+to digests. See [Storage Model](storage-model.md) for the full layout
+and rationale.
 
-When the Docker ref in your config changes (for example after a version bump), shed compares each cached `.ext4`'s `.source` against the current config ref. On mismatch, the cache is considered stale — `shed-server pull-images` re-pulls it, and `shed image prune` treats it as a candidate for deletion.
+When the Docker ref in your config changes (for example after a
+version bump), shed compares the manifest's recorded `source_ref`
+against the configured ref. On mismatch, the cache is considered stale
+— `shed-server pull-images` re-pulls it. `shed image prune` removes
+any blob with no protective references (no shed and no snapshot).
 
 ## On-Disk Layout
 
@@ -270,16 +280,15 @@ When the Docker ref in your config changes (for example after a version bump), s
 
     Default `images_dir`: `/var/lib/shed/firecracker/images/`
 
-    | File | Description |
+    | Path | Description |
     |------|-------------|
-    | `{name}-rootfs.ext4` | Cached variant rootfs (20GB sparse, 2–5GB actual). One per entry in `firecracker.images:`. |
-    | `{name}-rootfs.ext4.source` | Docker ref this cache was built from. Used by `shed image prune` to detect stale caches. |
-    | `{name}-rootfs.ext4.lock` | Empty flock file. Preserved across deletes to avoid a lock-inode race — safe to ignore. |
-    | `{name}-rootfs.ext4.tmp` | Transient file that may briefly exist while a cached variant is being hardlinked into `_base` (or any other cache slot). Swept on the next invocation of the hydration path if left behind by a crash — no manual cleanup needed. |
-    | `_base-rootfs.ext4` (+ `.source`, `.lock`) | Backing cache for `firecracker.base_rootfs` (the fallback used when `shed create` is invoked without `--image`). Stored as a hardlink to a matching variant when refs align, otherwise a full copy. |
-    | `vmlinux` | Extracted kernel (~40MB). |
+    | `blobs/sha256/<digest>/rootfs.ext4` | Read-only blob content (mode 0444). |
+    | `blobs/sha256/<digest>/manifest.json` | Image metadata: digest, source_ref, sizes, timestamps. |
+    | `blobs/sha256/<digest>/kernel` | Extracted kernel for this image. |
+    | `blobs/sha256/.<digest>.lock` | Empty flock file used to serialize install/prune. |
+    | `tags/<tag>.json` | Tag → digest pointer (`{"digest": "sha256:...", "updated_at": "..."}`). |
 
-    Per running shed, the server creates a full copy of the base image at `/var/lib/shed/firecracker/instances/{shed-name}/rootfs.ext4` (another 20GB sparse, 2–5GB actual) plus `metadata.json`. Deleting the shed removes this whole directory.
+    Per running shed, the server creates a copy at `/var/lib/shed/firecracker/instances/{shed-name}/rootfs.ext4` plus a v2 `metadata.json` recording `lower_digest`. Deleting the shed removes the whole directory.
 
     Control sockets live in `/var/run/shed/firecracker/` (tiny files).
 
@@ -287,48 +296,53 @@ When the Docker ref in your config changes (for example after a version bump), s
 
     Default `images_dir`: `~/Library/Application Support/shed/vz/`
 
-    | File | Description |
+    | Path | Description |
     |------|-------------|
-    | `{name}-rootfs.ext4` | Cached variant rootfs (20GB sparse, 2–5GB actual). One per entry in `vz.images:`. |
-    | `{name}-rootfs.ext4.source` | Docker ref this cache was built from. Used by `shed image prune` to detect stale caches. |
-    | `{name}-rootfs.ext4.lock` | Empty flock file. Preserved across deletes — safe to ignore. |
-    | `{name}-rootfs.ext4.tmp` | Transient file that may briefly exist while a cached variant is being hardlinked into `_base` (or any other cache slot). Swept on the next invocation of the hydration path if left behind by a crash — no manual cleanup needed. |
-    | `_base-rootfs.ext4` (+ `.source`, `.lock`) | Backing cache for `vz.base_rootfs`. Stored as a hardlink to a matching variant when refs align, otherwise a full copy. |
-    | `vmlinux` | Extracted kernel. |
-    | `initrd.img` | Extracted initial RAM disk (VZ requires this; Firecracker boots directly from `vmlinux`). |
+    | `blobs/sha256/<digest>/rootfs.ext4` | Read-only blob content. |
+    | `blobs/sha256/<digest>/manifest.json` | Image metadata. |
+    | `blobs/sha256/<digest>/kernel` | Extracted kernel. |
+    | `blobs/sha256/<digest>/initrd` | Extracted initrd (VZ requires this). |
+    | `tags/<tag>.json` | Tag → digest pointer. |
 
-    Per running shed, the server creates a full copy at `~/Library/Application Support/shed/vz/instances/{shed-name}/rootfs.ext4` plus `metadata.json`. Deleting the shed removes this directory.
+    Per running shed, the server creates a copy at `~/Library/Application Support/shed/vz/instances/{shed-name}/rootfs.ext4` plus `metadata.json`. Deleting the shed removes this directory.
 
     Vsock sockets live in `~/.shed/vz/sockets/` (tiny files).
 
 ## Cleaning Up Images
 
-Cached images can be 2–5 GB each, and every running shed adds another 2–5 GB for its instance rootfs. Use these commands to reclaim disk space:
+Shed follows the Docker model: `shed image rm` removes a tag,
+`shed image prune` garbage-collects unreferenced blobs.
 
 ```bash
-# Delete a specific cached image (refused if it is currently referenced
-# by the config images: map, or if it is _base while base_rootfs is a
-# Docker ref, or if an existing shed still depends on it)
-shed image delete myimage
+# Remove a tag. The underlying blob is NOT deleted by this command;
+# any other tag pointing at the same digest still resolves, and any
+# shed/snapshot pinning the digest is unaffected.
+shed image rm myimage
 
-# Preview which images would be pruned
+# Preview which blobs would be reclaimed (those with no protective
+# shed or snapshot reference)
 shed image prune --dry-run
 
-# Remove all unused or stale cached images
+# Reclaim them
 shed image prune
 ```
 
-When `_base` shares an inode with a variant (because `base_rootfs` and an `images:` entry point at the same Docker ref), `shed image delete _base` is refused — `_base` is still backing the configured `base_rootfs`. Freeing that shared storage requires bumping the `base_rootfs` ref in config (or removing the `base_rootfs` field entirely) and then running `shed image prune`. The [cookbook](#cookbook-upgrading-image-versions-and-reclaiming-disk) below walks through the version-bump case.
+`shed image rm` is refused when the tag is in the `images:` config map
+(or `_base` while `base_rootfs` is a Docker ref) — those are
+system-managed tags. To bump them, edit the server config and let
+`shed-server pull-images` advance the tag to the new digest; the
+previous digest becomes dangling and `shed image prune` reclaims it.
 
-`shed image prune` preserves an image only when it matches the current config. Specifically, a cached `.ext4` is preserved when:
+`shed image prune` protects a digest only when it has at least one
+**shed** or **snapshot** reference recorded in its on-disk metadata.
+Tags do NOT protect a digest. After
+`shed image rm experimental` you typically also want
+`shed image prune` to actually free the blob.
 
-- It is referenced in the `images:` map **and** its `.source` sidecar matches the configured Docker ref (or the config entry is a local path, in which case it is always preserved).
-- Or it is `_base` **and** its `.source` sidecar matches the configured `base_rootfs`.
-- Or it is referenced by an existing shed's metadata.
-
-Anything else — stale caches after a config ref bump, leftover variants from a renamed image, and the underscore-prefixed `_base` when it no longer matches — is a candidate for deletion. Prune removes the `.ext4` and `.source` files; `.lock` files are intentionally left behind (removing them creates a race where concurrent processes can hold locks on different inodes).
-
-Deleting a cached image does not affect running sheds — each shed uses its own copy of the rootfs. You'll need to re-pull or rebuild the image before creating new sheds from it.
+Deleting a cached image does not affect running sheds — each shed
+holds its own copy of the rootfs and pins the lower digest in its
+metadata. You'll need to re-pull or rebuild the image before creating
+new sheds from it.
 
 ### Cookbook: upgrading image versions and reclaiming disk
 
@@ -357,15 +371,17 @@ The common end-to-end flow when bumping image refs (for example, moving config f
    ```bash
    sudo shed-server pull-images
    ```
-5. Reclaim stale caches. The `--dry-run` preview shows which stale files would go; `--force` actually deletes them.
+5. Reclaim stale blobs. After the new pull advances each tag to a new
+   digest, the previous digests are dangling — protected only if a
+   shed/snapshot still pins them.
    ```bash
    shed image prune --dry-run
    shed image prune --force
    ```
 6. Verify.
    ```bash
-   shed image list
-   du -sh <images_dir>      # cached variants + _base + kernel
+   shed image ls
+   du -sh <images_dir>      # blobs + tags + kernel
    du -sh <instances_dir>   # running shed rootfs copies
    ```
 

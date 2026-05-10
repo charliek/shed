@@ -100,7 +100,7 @@ overlay behavior matches what you'd intuitively expect.
 ```
 {snapshots_dir}/
   {snapshot-name}/
-    snapshot.json    # metadata
+    snapshot.json    # metadata (records lower_digest)
     rootfs.ext4      # rootfs (mode 0444)
 ```
 
@@ -111,6 +111,22 @@ overlay behavior matches what you'd intuitively expect.
 Snapshots show up in `shed system df` under their own section. They are
 **not** removed by `shed system prune` — deletion is always explicit via
 `shed snapshot delete`.
+
+### Lower-digest pinning
+
+Each snapshot records the `lower_digest` of the underlying image its
+source shed was created from. This counts as a protective reference
+against `shed image prune`, so a snapshot guarantees its source image
+stays cached for as long as the snapshot exists. Spawning a shed from
+a snapshot inherits that pin: the new shed's metadata also records
+`lower_digest`, keeping the blob alive for the new shed's lifetime.
+
+Snapshots created before this storage rewrite (schema v1) carry an
+empty `lower_digest`. They still spawn correctly, but they do not pin
+any image blob; if the original image is pruned and a new one is
+pulled under the same tag, the digest the snapshot was originally
+built on may be gone. Re-create the snapshot from a fresh source shed
+to restore the pin.
 
 When the host filesystem supports reflink (APFS clonefile, XFS/Btrfs/ext4
 FICLONE), the snapshot's `rootfs.ext4` and any spawned shed's `rootfs.ext4`

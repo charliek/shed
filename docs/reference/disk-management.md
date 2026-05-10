@@ -8,7 +8,7 @@ The three tools involved:
 - `shed system prune` — scoped cleanup with a dry-run-first UX.
 - Reflink / clonefile on `shed create` — new sheds share extents with the base image on reflink-capable filesystems, so per-shed disk cost starts at near-zero.
 
-Full flag references live in the [CLI reference](cli.md#system-disk-usage); full API schemas live in the [HTTP API reference](api.md#system). This page focuses on workflows and the reflink behavior that affects every `shed create`.
+Full flag references live in the [CLI reference](cli.md#system-disk-usage); full API schemas live in the [HTTP API reference](api.md#system). This page focuses on workflows and the reflink behavior that affects every `shed create`. The on-disk layout itself is covered in [Storage Model](storage-model.md).
 
 ## What lives on disk
 
@@ -16,14 +16,15 @@ Each server stores four kinds of data in its backend directory:
 
 | Kind | VZ path (macOS) | Firecracker path (Linux) | Created by | Removed by |
 |------|-----------------|---------------------------|------------|------------|
-| `_base` rootfs cache | `~/Library/Application Support/shed/vz/_base-rootfs.ext4` | `/var/lib/shed/firecracker/images/_base-rootfs.ext4` | First `shed create` pulling the configured `base_rootfs` Docker ref | `shed image delete _base` or config change + `shed image prune` |
-| Image variants | `~/Library/Application Support/shed/vz/{name}-rootfs.ext4` | `/var/lib/shed/firecracker/images/{name}-rootfs.ext4` | `shed image build` or `shed-server pull-images` | `shed image delete <name>` or `shed system prune --images` |
-| Kernel / initrd | `~/Library/Application Support/shed/vz/vmlinux`, `initrd.img` | `/var/lib/shed/firecracker/images/vmlinux` (no initrd on FC) | `shed-server setup` or first image pull | Manual |
-| Per-shed rootfs | `~/Library/Application Support/shed/vz/instances/{name}/rootfs.ext4` | `/var/lib/shed/firecracker/instances/{name}/rootfs.ext4` | `shed create` (shares extents with `_base` when possible) | `shed delete` or `shed system prune --instances` |
+| Image blobs | `~/Library/Application Support/shed/vz/blobs/sha256/<digest>/` | `/var/lib/shed/firecracker/images/blobs/sha256/<digest>/` | `shed image build`, `shed image pull`, or `shed-server pull-images` | `shed image prune` (when no shed/snapshot pins the digest) |
+| Tags | `~/Library/Application Support/shed/vz/tags/<tag>.json` | `/var/lib/shed/firecracker/images/tags/<tag>.json` | Same as above | `shed image rm <tag>` |
+| Kernel / initrd (per blob) | Stored alongside `rootfs.ext4` inside each blob directory | Same | First conversion of an image | Removed with the blob |
+| Per-shed rootfs | `~/Library/Application Support/shed/vz/instances/{name}/rootfs.ext4` | `/var/lib/shed/firecracker/instances/{name}/rootfs.ext4` | `shed create` (shares extents with the blob's rootfs when possible) | `shed delete` or `shed system prune --instances` |
 | VZ console log | `~/Library/Application Support/shed/vz/instances/{name}/console.log` | _(Firecracker has none — SDK writes to stderr)_ | VM boot | `shed system prune --logs` (truncates to last N bytes) |
-| Orphan sidecars | `*.tmp`, `*.source` whose matching `-rootfs.ext4` is absent | Same | Partial or crashed image conversions | `shed system prune --orphans` |
+| Orphan sidecars | `*.tmp` from a crashed install staging dir | Same | Partial or crashed image conversions | `shed system prune --orphans` |
 
-See [Image Variants](images.md) for how `_base`, variants, and the Docker-ref cache work together.
+See [Storage Model](storage-model.md) for the content-addressed layout
+and [Image Variants](images.md) for how named tags resolve to digests.
 
 ## Measuring usage with `shed system df`
 
