@@ -598,8 +598,16 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	// Stop notification listener before shutting down
 	c.credMgr.StopListener(meta.Name)
 
+	agent := c.newAgentClient(meta.Name)
+
 	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+	vmutil.RunShutdownSequence(ctx, agent, meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+
+	// Ask the guest to flush its dirty buffers to the virtio-blk
+	// devices before vfkit terminates. Without this, post-stop
+	// snapshots and any host-side read of upper.ext4 see a stale
+	// pre-sync state — vfkit does not synchronously flush on SIGTERM.
+	vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
 
 	// Get or create VM handle
 	c.mu.Lock()

@@ -295,6 +295,37 @@ func RunShutdownSequence(ctx context.Context, agent *AgentClient, name string, s
 	}
 }
 
+// SyncFilesystems asks the guest to flush its dirty page cache via `sync(1)`
+// before the VM is signaled to stop. Without this, vfkit / firecracker
+// terminate while there are still dirty pages buffered in the VM kernel
+// and/or the host-side mmap of the upper image, and the on-disk
+// upper.ext4 the host sees is an older state than what the guest had
+// just observed. That diverges:
+//   - `shed snapshot create` clones the on-disk file, so freshly written
+//     guest data is missing from the snapshot;
+//   - host-side debug / df / orphan-detection logic that opens the file
+//     out-of-band sees a stale view.
+//
+// Failures here are logged but never fail the stop sequence — the agent
+// may be unreachable on a sick VM, but we still need to stop it.
+func SyncFilesystems(ctx context.Context, agent *AgentClient, stopTimeout time.Duration) {
+	if agent == nil {
+		return
+	}
+	budget := stopTimeout / 2
+	if budget <= 0 || budget > 15*time.Second {
+		budget = 15 * time.Second
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	if err := agent.Exec(syncCtx, backend.ExecOptions{
+		Cmd:        []string{"sync"},
+		WorkingDir: "/",
+	}); err != nil {
+		log.Printf("Warning: in-guest sync before stop failed: %v", err)
+	}
+}
+
 // ProvisionState tracks provisioning state in VMs via files.
 type ProvisionState struct {
 	agent *AgentClient

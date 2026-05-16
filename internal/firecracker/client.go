@@ -1007,8 +1007,15 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	// Stop P9 servers before shutting down
 	c.stopP9Servers(meta.Name)
 
+	agent := c.newAgentClient(meta.Name)
+
 	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+	vmutil.RunShutdownSequence(ctx, agent, meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+
+	// Ask the guest to flush dirty buffers to the virtio-blk devices
+	// before firecracker terminates. Without this, post-stop snapshots
+	// and any host-side read of upper.ext4 see a stale pre-sync state.
+	vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
 
 	// Get or create VM handle
 	c.mu.Lock()
