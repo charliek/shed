@@ -7,10 +7,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/systemprune"
 	"github.com/charliek/shed/internal/vmimage"
 )
 
@@ -259,5 +262,76 @@ func TestStartShedMissingUpperFailsClearly(t *testing.T) {
 	msg := err.Error()
 	if !strings.Contains(msg, "shed reset missing-upper") {
 		t.Errorf("error %q does not point operator at `shed reset`", msg)
+	}
+}
+
+// TestPruneRespectsCreatingMarker confirms the prune-vs-create race
+// window flagged in the second deep review is closed: a `.creating`
+// marker recording the lower digest keeps an in-flight create's
+// blob from being swept, even when no shed/snapshot ref exists yet.
+//
+// Mirrors the snapshot-pin test but for the in-flight path.
+func TestPruneRespectsCreatingMarker(t *testing.T) {
+	imagesDir := t.TempDir()
+	instanceDir := t.TempDir()
+	snapshotsDir := t.TempDir()
+
+	c := &Client{
+		cfg: &config.FirecrackerConfig{
+			ImagesDir:    imagesDir,
+			InstanceDir:  instanceDir,
+			SnapshotsDir: snapshotsDir,
+		},
+		serverCfg: &config.ServerConfig{Name: "test"},
+	}
+
+	// Install two blobs. Only the first is "claimed" by an
+	// in-flight create marker — no shed pins either.
+	inFlight := installTestBlob(t, imagesDir, "", []byte("in-flight-rootfs"))
+	dangling := installTestBlob(t, imagesDir, "", []byte("dangling-rootfs"))
+
+	shedDir := filepath.Join(instanceDir, "creating-now")
+	if err := os.MkdirAll(shedDir, 0o755); err != nil {
+		t.Fatalf("mkdir shedDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shedDir, systemprune.InstanceCreatingMarker), []byte(inFlight), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// Fresh marker -> dangling is the only prune candidate.
+	deleted, err := c.PruneImages(false)
+	if err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0].Digest != dangling {
+		t.Fatalf("unexpected deletions: %#v (want only dangling=%s)", deleted, dangling)
+	}
+	if !vmimage.BlobExists(imagesDir, inFlight) {
+		t.Fatalf("in-flight blob was pruned despite fresh .creating marker")
+	}
+
+	// Re-install the dangling blob and expire the marker by
+	// rewinding its mtime past InstanceCreatingMaxAge.
+	dangling = installTestBlob(t, imagesDir, "", []byte("dangling-rootfs-v2"))
+	stale := time.Now().Add(-2 * systemprune.InstanceCreatingMaxAge)
+	if err := os.Chtimes(filepath.Join(shedDir, systemprune.InstanceCreatingMarker), stale, stale); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	// Stale marker -> in-flight blob is no longer protected and the
+	// fresh dangling-v2 is also sweepable.
+	deleted, err = c.PruneImages(false)
+	if err != nil {
+		t.Fatalf("PruneImages (2nd): %v", err)
+	}
+	gotDigests := map[string]bool{}
+	for _, d := range deleted {
+		gotDigests[d.Digest] = true
+	}
+	if !gotDigests[inFlight] {
+		t.Errorf("stale marker should have stopped protecting; in-flight blob still present")
+	}
+	if !gotDigests[dangling] {
+		t.Errorf("expected dangling-v2 blob to be swept too")
 	}
 }

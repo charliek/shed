@@ -91,6 +91,16 @@ prune reclaims it.
 Stopped sheds count as references, so a digest stays cached as long as
 any shed (running or stopped) was created from it.
 
+In-flight `shed create` calls also protect their target digest. The
+server writes a `.creating` marker into `instances/<name>/` recording
+the lower digest between resolving the image and saving the shed's
+metadata, and a concurrent `shed image prune` treats every fresh
+marker as a protective reference for up to **1 hour**. After that the
+marker is considered crash residue and stops protecting — at which
+point the blob becomes reclaimable on the next prune. A successful
+create removes its marker on the spot, so the gate only matters for
+crashed creates.
+
 ## Tag updates don't propagate to existing sheds
 
 A shed's metadata pins the **digest** its lower was resolved from at

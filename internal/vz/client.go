@@ -216,6 +216,16 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		lowerImageTag = resolved.Name
 	}
 
+	// Drop a `.creating` marker so a concurrent `shed image prune`
+	// can't sweep the blob between here and meta.Save. See the
+	// matching block in firecracker/client.go for rationale.
+	if lowerDigest != "" && req.FromSnapshot == "" {
+		if err := writeCreatingMarker(c.cfg.InstanceDir, req.Name, lowerDigest); err != nil {
+			return nil, fmt.Errorf("failed to write creating marker: %w", err)
+		}
+		defer removeCreatingMarker(c.cfg.InstanceDir, req.Name)
+	}
+
 	backend.Progress(ctx, "rootfs", "Allocating writable upper layer...")
 	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
 	if err != nil {

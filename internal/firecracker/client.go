@@ -493,6 +493,22 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		lowerImageTag = resolved.Name
 	}
 
+	// Drop a `.creating` marker recording the lower digest so a
+	// concurrent `shed image prune` can't sweep the blob between
+	// here and meta.Save. The marker counts as a Pending protective
+	// ref in the refscanner (systemprune.ScanInstanceCreatingMarkers)
+	// for up to InstanceCreatingMaxAge (1h); stale markers from
+	// crashed creates expire and stop protecting on their own.
+	//
+	// Skip for from-snapshot: the snapshot already pins the digest
+	// via its own LowerDigest field.
+	if lowerDigest != "" && req.FromSnapshot == "" {
+		if err := writeCreatingMarker(c.cfg.InstanceDir, req.Name, lowerDigest); err != nil {
+			return nil, fmt.Errorf("failed to write creating marker: %w", err)
+		}
+		defer removeCreatingMarker(c.cfg.InstanceDir, req.Name)
+	}
+
 	backend.Progress(ctx, "network", "Allocating network resources...")
 	cid, err := c.AllocateCID(req.Name)
 	if err != nil {

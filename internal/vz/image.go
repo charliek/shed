@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/systemprune"
 	"github.com/charliek/shed/internal/vmimage"
 )
 
@@ -156,6 +157,25 @@ func (s *vzRefScanner) ScanRefs() ([]vmimage.Reference, error) {
 				})
 			}
 		}
+	}
+
+	// In-flight creates. The .creating marker carries the lower
+	// digest the create is about to use; treat as protective for up
+	// to InstanceCreatingMaxAge so a concurrent `image prune`
+	// can't delete the blob between EnsureImage and meta.Save.
+	pending, err := systemprune.ScanInstanceCreatingMarkers(s.cfg.InstanceDir)
+	if err != nil {
+		return nil, fmt.Errorf("scanning in-flight create markers: %w", err)
+	}
+	for _, p := range pending {
+		if s.skipSheds[p.ShedName] {
+			continue
+		}
+		refs = append(refs, vmimage.Reference{
+			Digest: p.LowerDigest,
+			Kind:   vmimage.RefKindPending,
+			Name:   p.ShedName,
+		})
 	}
 
 	return refs, nil

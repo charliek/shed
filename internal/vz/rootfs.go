@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+
+	"github.com/charliek/shed/internal/systemprune"
 )
 
 // RootfsPath returns the path to the rootfs image for an instance.
@@ -116,4 +118,39 @@ func RootfsExists(instanceDir, name string) bool {
 	path := RootfsPath(instanceDir, name)
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// writeCreatingMarker drops a `.creating` marker into the instance
+// directory containing the lower digest the in-flight create is
+// about to use. The refscanner (systemprune.ScanInstanceCreatingMarkers)
+// reads this body as a protective reference so a racing prune can't
+// delete the blob between EnsureImage and meta.Save.
+//
+// The marker is fsync'd along with its parent dir so a crash right
+// after this returns cannot lose the protection. removeCreatingMarker
+// is called via defer on every CreateShed exit path.
+func writeCreatingMarker(instanceDir, name, lowerDigest string) error {
+	dir := InstanceDir(instanceDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating instance dir for marker: %w", err)
+	}
+	path := filepath.Join(dir, systemprune.InstanceCreatingMarker)
+	if err := os.WriteFile(path, []byte(lowerDigest), 0o600); err != nil {
+		return fmt.Errorf("writing creating marker: %w", err)
+	}
+	if f, err := os.Open(path); err == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("syncing instance dir after marker write: %w", err)
+	}
+	return nil
+}
+
+// removeCreatingMarker deletes the `.creating` marker (if present).
+// Safe to call when no marker exists — used as a defer in CreateShed.
+func removeCreatingMarker(instanceDir, name string) {
+	path := filepath.Join(InstanceDir(instanceDir, name), systemprune.InstanceCreatingMarker)
+	_ = os.Remove(path)
 }

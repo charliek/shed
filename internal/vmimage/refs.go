@@ -13,6 +13,15 @@ const (
 	// RefKindTag indicates a reference held by a tag. Tags are
 	// informational and DO NOT protect a digest from prune (Docker model).
 	RefKindTag RefKind = "tag"
+
+	// RefKindPending indicates a reference held by an in-flight
+	// `shed create`. The backend writes a `.creating` marker into the
+	// instance directory between EnsureImage and meta.Save; the
+	// refscanner emits a Pending ref for each fresh marker so prune
+	// can't delete the blob the create is about to depend on. Fresh
+	// for 1 h (see systemprune.InstanceCreatingMaxAge); stale markers
+	// produce no reference and the underlying blob becomes prunable.
+	RefKindPending RefKind = "pending-create"
 )
 
 // Reference describes one thing that points at a blob digest.
@@ -39,8 +48,8 @@ type RefScanner interface {
 	ScanRefs() ([]Reference, error)
 }
 
-// ProtectiveRefs reports whether a digest has any shed or snapshot
-// references — i.e. is the digest pinned by something prune must protect.
+// ProtectiveRefs reports whether a digest has any protective
+// reference — Shed, Snapshot, or Pending (in-flight create).
 //
 // Tag references are NOT protective and are excluded from this check.
 func ProtectiveRefs(refs []Reference, digest string) []Reference {
