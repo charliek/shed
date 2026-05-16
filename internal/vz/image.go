@@ -28,6 +28,7 @@ func (c *Client) EnsureImage(ctx context.Context, resolved config.ResolvedImage)
 		Path:      resolved.Path,
 		DockerRef: resolved.DockerRef,
 		Name:      resolved.Name,
+		Digest:    resolved.Digest,
 	}, func(stage, msg string) {
 		backend.Progress(ctx, stage, msg)
 	})

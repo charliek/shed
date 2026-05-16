@@ -513,6 +513,14 @@ type ResolvedImage struct {
 
 	// Name is the variant name, used for caching (e.g., "default" → "default-rootfs.ext4").
 	Name string
+
+	// Digest is set when Path came from a tag in the content-addressed
+	// blob store. Empty for the legacy hardcoded-path escape hatch
+	// (where the caller can't tell us a digest). Carries the digest
+	// forward so EnsureImage doesn't have to re-do tag lookup — that
+	// second lookup was both awkward and racey (tag could advance
+	// between resolve and ensure).
+	Digest string
 }
 
 // resolveImage is the shared implementation for image name resolution.
@@ -527,8 +535,13 @@ type ResolvedImage struct {
 func resolveImage(images map[string]string, imagesDir, image, configKey string) (ResolvedImage, error) {
 	if val, ok := images[image]; ok {
 		if vmimage.IsDockerRef(val) {
-			if cached := vmimage.Resolve(imagesDir, image, val); cached != "" {
-				return ResolvedImage{Path: cached, Name: image}, nil
+			// ResolveTag returns the digest too — carry it through
+			// so EnsureImage doesn't have to re-do tag lookup
+			// (which races against concurrent `shed image pull`).
+			if digest, cached, err := vmimage.ResolveTag(imagesDir, image); err == nil {
+				if manifest, mErr := vmimage.LoadManifest(imagesDir, digest); mErr == nil && manifest.SourceRef == val {
+					return ResolvedImage{Path: cached, Name: image, Digest: digest}, nil
+				}
 			}
 			return ResolvedImage{DockerRef: val, Name: image}, nil
 		}
@@ -537,8 +550,8 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 
 	// Auto-discover by tag in the blob store.
 	if imagesDir != "" {
-		if discovered := vmimage.Resolve(imagesDir, image, ""); discovered != "" {
-			return ResolvedImage{Path: discovered, Name: image}, nil
+		if digest, discovered, err := vmimage.ResolveTag(imagesDir, image); err == nil {
+			return ResolvedImage{Path: discovered, Name: image, Digest: digest}, nil
 		}
 	}
 

@@ -85,6 +85,7 @@ type ResolvedRef struct {
 	Path      string // set when the ext4 image already exists on disk
 	DockerRef string // set when the image needs to be pulled and converted
 	Name      string // variant name, used as a tag in the blob store
+	Digest    string // set when Path came from a tag in the blob store; preserved through to EnsureResult.Digest
 }
 
 // EnsureResult is what EnsureImage returns: the path to the cached
@@ -97,29 +98,17 @@ type EnsureResult struct {
 
 // EnsureImage ensures an image is available as a local ext4 file.
 //
-//   - If ref.Path is set, returns it directly. When ref.Name is also set
-//     (the common case — config's resolveImage discovered the path via
-//     tag indirection), the tag is looked up so the result carries a
-//     digest. A path-only ref (no Name) is the legacy local-path escape
-//     hatch and returns with no digest.
+//   - If ref.Path is set, returns it directly. ref.Digest carries the
+//     blob-store digest forward when the path was discovered via tag
+//     resolution; a path without a digest is the legacy local-path
+//     escape hatch and returns digest-less.
 //   - Else: looks up the tag named ref.Name. If cached and the blob's
 //     manifest.SourceRef matches ref.DockerRef, returns the cached blob.
 //     Otherwise pulls + converts ref.DockerRef, installs into the blob
 //     store, and advances the tag.
 func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress ProgressFunc) (EnsureResult, error) {
 	if ref.Path != "" {
-		// Recover the digest via tag lookup when possible — the overlay
-		// boot path requires a digest to pin the lower in instance
-		// metadata. Only the legacy hardcoded-path escape hatch
-		// (Name == "" or no matching tag) returns digest-less.
-		if ref.Name != "" {
-			if imagesDir := m.cfg.GetImagesDir(); imagesDir != "" {
-				if digest, rootfs, err := ResolveTag(imagesDir, ref.Name); err == nil && rootfs == ref.Path {
-					return EnsureResult{Path: ref.Path, Digest: digest}, nil
-				}
-			}
-		}
-		return EnsureResult{Path: ref.Path}, nil
+		return EnsureResult{Path: ref.Path, Digest: ref.Digest}, nil
 	}
 
 	if ref.DockerRef == "" {

@@ -483,6 +483,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			Path:      resolved.Path,
 			DockerRef: resolved.DockerRef,
 			Name:      resolved.Name,
+			Digest:    resolved.Digest,
 		}, func(stage, msg string) {
 			backend.Progress(ctx, stage, msg)
 		})

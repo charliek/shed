@@ -1060,6 +1060,49 @@ func TestVZConfigResolveImage(t *testing.T) {
 			t.Errorf("error = %q, want 'no image variants configured'", err.Error())
 		}
 	})
+
+	t.Run("tag-auto-discovery carries digest", func(t *testing.T) {
+		// Plant a fake blob under a tag in a temp ImagesDir and confirm
+		// resolveImage's "not in images map → auto-discover by tag"
+		// branch returns the digest in the ResolvedImage. Closes the
+		// race window where EnsureImage previously had to re-do the
+		// tag lookup based on Path alone.
+		dir := t.TempDir()
+		body := []byte("fake-rootfs-for-digest-carry-test")
+		src := filepath.Join(dir, "stage.ext4")
+		if err := os.WriteFile(src, body, 0o644); err != nil {
+			t.Fatalf("write staging rootfs: %v", err)
+		}
+		sum := sha256.Sum256(body)
+		digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
+		if _, _, err := vmimage.InstallBlob(dir, vmimage.BlobInstallSpec{
+			Files: map[string]string{vmimage.BlobRootfsFilename: src},
+			Manifest: vmimage.Manifest{
+				SchemaVersion:     vmimage.ManifestSchemaVersion,
+				Digest:            digest,
+				RootfsLogicalSize: int64(len(body)),
+			},
+		}); err != nil {
+			t.Fatalf("InstallBlob: %v", err)
+		}
+		if err := vmimage.SetTag(dir, "carry", digest); err != nil {
+			t.Fatalf("SetTag: %v", err)
+		}
+
+		// images map is empty; auto-discovery path is the one we want
+		// to exercise.
+		cfg := &VZConfig{ImagesDir: dir, Images: map[string]string{}}
+		resolved, err := cfg.ResolveImage("carry")
+		if err != nil {
+			t.Fatalf("ResolveImage(carry) error = %v", err)
+		}
+		if resolved.Digest != digest {
+			t.Errorf("Digest = %q, want %q", resolved.Digest, digest)
+		}
+		if resolved.Path == "" {
+			t.Error("Path should be populated for tag-discovered image")
+		}
+	})
 }
 
 func TestVZConfigValidateImages(t *testing.T) {
