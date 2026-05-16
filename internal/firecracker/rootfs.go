@@ -157,10 +157,19 @@ func writeCreatingMarker(instanceDir, name, lowerDigest string) error {
 		return fmt.Errorf("writing creating marker: %w", err)
 	}
 	// fsync the marker file and the parent dir so the protective ref
-	// survives a host crash between here and meta.Save.
-	if f, err := os.Open(path); err == nil {
-		_ = f.Sync()
+	// survives a host crash between here and meta.Save. Surface
+	// errors: if we can't durably persist the marker, prune protection
+	// is silently lost and the caller deserves to know.
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening creating marker for sync: %w", err)
+	}
+	if err := f.Sync(); err != nil {
 		_ = f.Close()
+		return fmt.Errorf("syncing creating marker: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing creating marker: %w", err)
 	}
 	if err := syncDir(dir); err != nil {
 		return fmt.Errorf("syncing instance dir after marker write: %w", err)

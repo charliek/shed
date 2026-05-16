@@ -185,16 +185,17 @@ func CollectUpperOrphanCandidates(uppersDir, instanceDir string) ([]UpperOrphanC
 	return candidates, skipped
 }
 
-// SweepUpperOrphan removes every file in the candidate directory
-// and then rmdirs the directory itself. Returns false if any step
-// fails — caller records a SkippedItem and surfaces the failure.
+// SweepUpperOrphan removes the candidate directory and everything
+// under it. Returns false if removal fails — caller records a
+// SkippedItem and surfaces the failure.
+//
+// Uses RemoveAll rather than walking c.Files and rmdir'ing the
+// parent because walkUpperDir skips directories: a per-shed upper
+// dir that crashed mid-operation can contain subdirectories
+// (e.g. clonefile staging dirs), and the prior file-by-file +
+// os.Remove(c.Dir) path would fail with "directory not empty".
 func SweepUpperOrphan(c UpperOrphanCandidate) bool {
-	for _, f := range c.Files {
-		if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
-			return false
-		}
-	}
-	if err := os.Remove(c.Dir); err != nil && !os.IsNotExist(err) {
+	if err := os.RemoveAll(c.Dir); err != nil && !os.IsNotExist(err) {
 		return false
 	}
 	return true

@@ -6,6 +6,7 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,8 +176,16 @@ func TestResetShedRecreatesUpper(t *testing.T) {
 	if fi.Size() != meta.UpperSizeBytes {
 		t.Errorf("upper size after reset = %d, want %d", fi.Size(), meta.UpperSizeBytes)
 	}
-	first5, _ := os.ReadFile(upperPath)
-	if len(first5) >= 5 && string(first5[:5]) == "STALE" {
+	// Read only the first 5 bytes; the upper is a 1 GiB sparse file
+	// and os.ReadFile would spike memory in CI.
+	upperFile, openErr := os.Open(upperPath)
+	if openErr != nil {
+		t.Fatalf("open upper: %v", openErr)
+	}
+	prefix := make([]byte, 5)
+	n, _ := io.ReadFull(upperFile, prefix)
+	_ = upperFile.Close()
+	if n >= 5 && string(prefix[:5]) == "STALE" {
 		t.Errorf("reset did not wipe stale upper contents")
 	}
 
