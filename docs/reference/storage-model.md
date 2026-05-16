@@ -132,10 +132,12 @@ Workspace contents under `--local-dir` are unaffected by that cycle.
   the same lower image months later as long as the digest is still
   cached. If the digest has been evicted, the operator gets a clear
   error pointing at the original Docker ref.
-- **Future overlay.** Phase B of this storage rewrite will use the
-  digest-keyed blob as the read-only lower of an in-guest overlay,
-  with a small per-VM writable upper. The blob layout already supports
-  this; the tag/refcount semantics don't change.
+- **Overlay-in-guest, not host-side reflinks.** The digest-keyed blob
+  is the read-only lower of an in-guest overlayfs, layered with a
+  per-shed writable upper at `uppers/<shed>/upper.ext4`. This means
+  per-shed disk cost is the upper alone (sparse, default 5 GB) and
+  host filesystem reflink support is no longer load-bearing — the
+  cost model is the same on APFS, ext4-reflink, and plain ext4.
 
 See also: [Image Variants](images.md), [Disk Management](disk-management.md),
 [Snapshots](snapshots.md).

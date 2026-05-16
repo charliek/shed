@@ -101,7 +101,8 @@ type Metadata struct {
 	LowerDigest string `json:"lower_digest,omitempty"`
 
 	// LowerImageTag is the image variant name at create time (mirrors
-	// Image; kept for naming symmetry with the future overlay model).
+	// Image; the underlying digest in LowerDigest is the source of
+	// truth — tags can be retagged later without invalidating sheds).
 	LowerImageTag string `json:"lower_image_tag,omitempty"`
 
 	// FromSnapshot records the snapshot this instance was spawned from (if any).

@@ -130,13 +130,35 @@ else
     [ -n "$INITRD" ] && initrd_size="$(wc -c < "$TMP_DIR/initrd" | tr -d ' ')"
     created_at="$(date -u +"%Y-%m-%dT%H:%M:%S.000000000Z")"
 
+    # JSON-escape the string fields. Docker refs are usually plain ASCII
+    # but a stray `"` or `\` from a future caller would otherwise produce
+    # syntactically invalid manifest.json. Backend/arch/digest/created_at
+    # are constrained enough at the call sites that they don't need it;
+    # source-ref is the loose one. Pipe through Python if available
+    # (handles Unicode + control chars correctly) and fall back to a
+    # minimal sed escape (good enough for the characters Docker refs
+    # actually contain).
+    json_escape() {
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1"
+        elif command -v python >/dev/null 2>&1; then
+            python -c 'import json, sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1"
+        else
+            local s="$1"
+            s="${s//\\/\\\\}"
+            s="${s//\"/\\\"}"
+            printf '"%s"' "$s"
+        fi
+    }
+    source_ref_json="$(json_escape "$SOURCE_REF")"
+
     cat > "$TMP_DIR/manifest.json" <<EOF
 {
   "schema_version": 1,
   "digest": "$DIGEST",
   "backend": "$BACKEND",
   "arch": "$ARCH",
-  "source_ref": "$SOURCE_REF",
+  "source_ref": $source_ref_json,
   "kernel_size": $kernel_size,
   "initrd_size": $initrd_size,
   "rootfs_logical_size": $rootfs_logical,

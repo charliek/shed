@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmimage"
 )
 
 // TestGetSnapshotPopulatesLowerCached confirms augmentSnapshot fills
@@ -185,5 +186,52 @@ func TestResetShedRecreatesUpper(t *testing.T) {
 	}
 	if got.RootfsPath != upperPath {
 		t.Errorf("meta.RootfsPath = %q, want %q", got.RootfsPath, upperPath)
+	}
+}
+
+// TestPruneImagesProtectsSnapshotPin (FC) confirms a snapshot's
+// LowerDigest keeps its source blob alive even when no shed pins it.
+// Without this guarantee, `shed image prune` could delete the only
+// blob a `shed create --from-snapshot` would spawn from. Mirrors the
+// VZ test of the same name.
+func TestPruneImagesProtectsSnapshotPin(t *testing.T) {
+	imagesDir := t.TempDir()
+	instanceDir := t.TempDir()
+	snapshotsDir := t.TempDir()
+
+	c := &Client{
+		cfg: &config.FirecrackerConfig{
+			ImagesDir:    imagesDir,
+			InstanceDir:  instanceDir,
+			SnapshotsDir: snapshotsDir,
+		},
+		serverCfg: &config.ServerConfig{Name: "test"},
+	}
+
+	// Install two blobs; only the first is referenced by a snapshot.
+	snapshotPinned := installTestBlob(t, imagesDir, "", []byte("snap-pinned-rootfs"))
+	dangling := installTestBlob(t, imagesDir, "", []byte("dangling-rootfs"))
+
+	snap := &config.Snapshot{
+		Name:        "preserved",
+		Backend:     config.BackendFirecracker,
+		LowerDigest: snapshotPinned,
+	}
+	if err := saveSnapshot(snapshotsDir, snap); err != nil {
+		t.Fatalf("saveSnapshot: %v", err)
+	}
+
+	deleted, err := c.PruneImages(false)
+	if err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0].Digest != dangling {
+		t.Fatalf("unexpected deletions: %#v (want only dangling=%s)", deleted, dangling)
+	}
+	if vmimage.BlobExists(imagesDir, dangling) {
+		t.Fatalf("dangling blob still exists after prune")
+	}
+	if !vmimage.BlobExists(imagesDir, snapshotPinned) {
+		t.Fatalf("snapshot-pinned blob removed by prune; shed create --from-snapshot would now fail")
 	}
 }

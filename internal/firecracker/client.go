@@ -1070,6 +1070,20 @@ func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, erro
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotStoppedSentinel, name)
 	}
 
+	// Refuse to wipe the upper if the lower blob is gone — the shed
+	// is unbootable either way, but `shed reset` succeeding without
+	// the lower would silently destroy uncommitted in-VM work for a
+	// shed that can't be started afterwards. Operators want a clear
+	// "pull the image first" signal.
+	if meta.LowerDigest != "" && !vmimage.BlobExists(c.cfg.ImagesDir, meta.LowerDigest) {
+		ref := meta.LowerImageTag
+		if ref == "" {
+			ref = "(unknown)"
+		}
+		return nil, fmt.Errorf("cannot reset %s: lower image blob %s is no longer cached; pull or rebuild %s before resetting",
+			name, vmimage.ShortDigest(meta.LowerDigest), ref)
+	}
+
 	size := meta.UpperSizeBytes
 	if size <= 0 {
 		sz := c.cfg.UpperSizeDefault

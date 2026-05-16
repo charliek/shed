@@ -19,10 +19,12 @@ func newTestClient(t *testing.T) (*Client, string) {
 	t.Helper()
 	imagesDir := t.TempDir()
 	instanceDir := t.TempDir()
+	snapshotsDir := t.TempDir()
 
 	cfg := &config.VZConfig{
-		ImagesDir:   imagesDir,
-		InstanceDir: instanceDir,
+		ImagesDir:    imagesDir,
+		InstanceDir:  instanceDir,
+		SnapshotsDir: snapshotsDir,
 		Images: map[string]string{
 			"managed": "ghcr.io/example/managed:v1",
 		},
@@ -31,6 +33,30 @@ func newTestClient(t *testing.T) (*Client, string) {
 
 	client := &Client{cfg: cfg}
 	return client, imagesDir
+}
+
+// createFakeSnapshot writes a minimal snapshot.json with the given
+// LowerDigest so the refScanner sees a snapshot-kind protective ref.
+// Used by TestPruneImagesProtectsSnapshotPin to confirm snapshots can
+// keep a blob alive after every shed that referenced it has been
+// deleted — the exact "lower digest stays cached for snapshot restore"
+// guarantee the storage rewrite committed to.
+func createFakeSnapshot(t *testing.T, snapshotsDir, name, lowerDigest string) {
+	t.Helper()
+	dir := filepath.Join(snapshotsDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("failed to create snapshot dir: %v", err)
+	}
+	snap := config.Snapshot{
+		Version:     config.SnapshotSchemaVersion,
+		Name:        name,
+		Backend:     config.BackendVZ,
+		LowerDigest: lowerDigest,
+	}
+	data, _ := json.MarshalIndent(snap, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0o644); err != nil {
+		t.Fatalf("failed to write snapshot.json: %v", err)
+	}
 }
 
 // createFakeImage installs a fake blob into imagesDir tagged as `name`.
@@ -182,5 +208,51 @@ func TestPruneImagesRespectsRefs(t *testing.T) {
 	}
 	if !vmimage.BlobExists(imagesDir, pinnedDigest) {
 		t.Fatalf("pinned blob removed by prune")
+	}
+}
+
+// TestPruneImagesProtectsSnapshotPin confirms that a snapshot's
+// LowerDigest counts as a protective reference even when no shed
+// pins it — the snapshot is supposed to keep its source blob
+// reclaimable for `shed create --from-snapshot` later. Without
+// this guarantee, the snapshot rewrite (Phase C) is meaningless:
+// pruning would delete the only blob a snapshot could spawn from.
+func TestPruneImagesProtectsSnapshotPin(t *testing.T) {
+	client, imagesDir := newTestClient(t)
+
+	// Set up two blobs: one referenced only by a snapshot, one truly
+	// dangling. NO shed pins either one — this is the
+	// "all shed refs removed, snapshot remains" scenario.
+	snapshotPinned := createFakeImage(t, imagesDir, "snap-pinned")
+	dangling := createFakeImage(t, imagesDir, "dangling")
+	createFakeSnapshot(t, client.cfg.SnapshotsDir, "preserved-snap", snapshotPinned)
+
+	// Drop the tags so the only protection on snapshotPinned is the
+	// snapshot reference (tags don't protect in Docker model).
+	if err := vmimage.DeleteTag(imagesDir, "snap-pinned"); err != nil {
+		t.Fatalf("DeleteTag: %v", err)
+	}
+	if err := vmimage.DeleteTag(imagesDir, "dangling"); err != nil {
+		t.Fatalf("DeleteTag: %v", err)
+	}
+
+	// Dry-run: snapshotPinned is NOT a candidate; dangling is.
+	cands, err := client.PruneImages(true)
+	if err != nil {
+		t.Fatalf("PruneImages(dryRun): %v", err)
+	}
+	if len(cands) != 1 || cands[0].Digest != dangling {
+		t.Fatalf("expected only dangling blob as candidate; got %#v (snapshot-pinned digest %s should not appear)", cands, snapshotPinned)
+	}
+
+	// Real prune: dangling removed, snapshot-pinned blob still present.
+	if _, err := client.PruneImages(false); err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+	if vmimage.BlobExists(imagesDir, dangling) {
+		t.Fatalf("dangling blob still exists after prune")
+	}
+	if !vmimage.BlobExists(imagesDir, snapshotPinned) {
+		t.Fatalf("snapshot-pinned blob removed by prune; shed create --from-snapshot would now fail")
 	}
 }
