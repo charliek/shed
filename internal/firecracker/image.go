@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/charliek/shed/internal/backend"
@@ -103,7 +104,15 @@ func (s *fcRefScanner) ScanRefs() ([]vmimage.Reference, error) {
 			if errors.Is(err, ErrInstanceNotFound) || errors.Is(err, ErrLegacyMetadata) {
 				continue
 			}
-			return nil, fmt.Errorf("reading metadata for %s: %w", inst, err)
+			// A broken instance metadata can't be started, deleted
+			// cleanly, or reasoned about — so it can't meaningfully
+			// protect a blob from prune. Skip with a warning, matching
+			// the behavior of ListSheds and the prune path. The blob
+			// it pinned (if any) will be reclaimable on the next
+			// prune; the operator must `rm -rf` the broken instance
+			// directory to restore consistency.
+			log.Printf("Warning: skipping shed %q with invalid metadata during ref scan: %v", inst, err)
+			continue
 		}
 		if meta.LowerDigest != "" {
 			refs = append(refs, vmimage.Reference{

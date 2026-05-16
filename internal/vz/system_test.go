@@ -115,9 +115,13 @@ func TestDiskUsage_Populated(t *testing.T) {
 	if du.Totals.All.LogicalBytes <= 0 {
 		t.Errorf("expected non-zero total, got %d", du.Totals.All.LogicalBytes)
 	}
-	// Images total should include at least _base + experimental (12288 bytes).
-	if du.Totals.Images.LogicalBytes < 12288 {
-		t.Errorf("images total = %d, want >= 12288", du.Totals.Images.LogicalBytes)
+	// Images total should be non-zero. createFakeImage writes ~20-byte
+	// fake rootfs bodies; the old 12288-byte threshold predated that
+	// helper (when tests wrote 4 KiB + 8 KiB raw files). Use a lower
+	// bound that just verifies the bytes flow through — the exact size
+	// is asserted on per-image entries elsewhere.
+	if du.Totals.Images.LogicalBytes == 0 {
+		t.Errorf("images total = %d, want > 0", du.Totals.Images.LogicalBytes)
 	}
 	// Sheds total should include rootfs (4096) + console.log (256) at minimum.
 	if du.Totals.Sheds.LogicalBytes < 4096+256 {
