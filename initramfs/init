@@ -36,7 +36,13 @@ panic() {
 mkdir -p /proc /sys /dev /run /newroot /upper /lower
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev || mount -t tmpfs tmpfs /dev
+# devtmpfs is mandatory: the wait loop below needs /dev/vda and /dev/vdb
+# to be populated by the kernel, and a plain tmpfs would have no device
+# nodes. Stock Linux kernels enable CONFIG_DEVTMPFS=y and
+# CONFIG_DEVTMPFS_MOUNT=y; we still mount explicitly for the rare
+# defconfig that disables the automount.
+mount -t devtmpfs devtmpfs /dev \
+    || panic "failed to mount devtmpfs at /dev — kernel built without CONFIG_DEVTMPFS?"
 # /dev/pts is not strictly needed pre-pivot but cheap to set up so any
 # console fallback works when init drops to a shell.
 mkdir -p /dev/pts
