@@ -95,10 +95,15 @@ mount -t ext4 -o ro "$LOWER_DEV" /lower \
 # kernel already has overlayfs built in the mount below will succeed
 # regardless; if the load also fails, the overlay mount panic message
 # will surface the real cause.
+#
+# Both clauses are inside the `if` so the failure paths don't trip
+# `set -e`; a missing module file or a failed insmod just leaves the
+# fallback to the kernel's built-in overlay (if any), and the overlay
+# mount below is what ultimately surfaces an unrecoverable failure.
 ov_dir="/lower/lib/modules/$(uname -r 2>/dev/null)/kernel/fs/overlayfs"
 for ov in "$ov_dir/overlay.ko.zst" "$ov_dir/overlay.ko.xz" "$ov_dir/overlay.ko.gz" "$ov_dir/overlay.ko"; do
-    if [ -f "$ov" ]; then
-        /sbin/insmod "$ov" 2>/dev/null && break
+    if [ -f "$ov" ] && /sbin/insmod "$ov" 2>/dev/null; then
+        break
     fi
 done
 
