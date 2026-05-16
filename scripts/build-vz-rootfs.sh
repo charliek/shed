@@ -139,7 +139,11 @@ fi
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Build shed-agent binary for linux/arm64 (shared across all variants)
+# Build shed-agent binary for linux/arm64 (shared across all variants),
+# the in-VM shed-firstboot, and the host-side shed CLI used below by
+# `shed image install`. The CLI build is mandatory: a clean checkout
+# has no bin/shed, and the install step below would fail with
+# "command not found".
 build_agent() {
     echo ""
     echo "=== Building shed-agent binary (linux/arm64) ==="
@@ -150,6 +154,11 @@ build_agent() {
     echo "=== Building shed-firstboot binary (linux/arm64) ==="
     GOOS=linux GOARCH=arm64 go build -o "$VZ_DIR/shed-firstboot" ./cmd/shed-firstboot
     echo "Built shed-firstboot binary"
+
+    echo "=== Building host shed CLI ==="
+    mkdir -p "$PROJECT_ROOT/bin"
+    go build -o "$PROJECT_ROOT/bin/shed" ./cmd/shed
+    echo "Built $PROJECT_ROOT/bin/shed"
 }
 
 # Extract kernel and initrd from the base image

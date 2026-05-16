@@ -304,10 +304,15 @@ func (c *VZConfig) GetNeedsInitrd() bool { return true }
 // DefaultVZConfig returns a VZConfig with default values.
 func DefaultVZConfig() *VZConfig {
 	return &VZConfig{
-		VfkitPath:        "vfkit",
-		KernelPath:       ExpandPath(DefaultVZImagesDir + "/vmlinux"),
-		InitrdPath:       ExpandPath(DefaultVZImagesDir + "/initrd.img"),
-		BaseRootfs:       ExpandPath(DefaultVZImagesDir + "/default-rootfs.ext4"),
+		VfkitPath: "vfkit",
+		// KernelPath / InitrdPath / BaseRootfs are intentionally left
+		// empty by default. Phase A retired the flat-file layout (e.g.
+		// {ImagesDir}/default-rootfs.ext4) in favor of the content-
+		// addressed blob store at {ImagesDir}/blobs/sha256/<digest>/
+		// with tag indirection at {ImagesDir}/tags/<tag>.json. vm.Start
+		// reads the kernel from the blob; ResolveBaseRootfs is only
+		// consulted when `shed create` runs without --image, in which
+		// case the operator must set BaseRootfs explicitly.
 		ImagesDir:        ExpandPath(DefaultVZImagesDir),
 		InstanceDir:      ExpandPath(DefaultVZImagesDir + "/instances"),
 		SnapshotsDir:     ExpandPath(DefaultVZImagesDir + "/snapshots"),
@@ -460,10 +465,13 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	// Defer kernel/initrd/rootfs path validation when Docker refs are present
-	// (files are extracted during first image conversion) or when kernel_path
-	// is empty (Phase B: vm.Start reads the kernel from the blob).
-	if c.KernelPath != "" && !hasAnyDockerRef(c.BaseRootfs, c.Images) {
+	// Defer kernel/initrd/rootfs path validation when every configured
+	// source is a Docker ref (files are extracted during first image
+	// conversion) or when kernel_path is empty (Phase B: vm.Start
+	// reads the kernel from the blob). The previous hasAnyDockerRef
+	// gate was too loose — a mix of local + remote sources still
+	// needs the legacy kernel/initrd for the local-spawn path.
+	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.BaseRootfs, c.Images) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
 		}
@@ -685,8 +693,13 @@ func (c *FirecrackerConfig) ResolveBaseRootfs() ResolvedImage {
 // DefaultFirecrackerConfig returns a FirecrackerConfig with default values.
 func DefaultFirecrackerConfig() *FirecrackerConfig {
 	return &FirecrackerConfig{
-		KernelPath:       DefaultFirecrackerImagesDir + "/vmlinux",
-		BaseRootfs:       "/var/lib/shed/firecracker/base-rootfs.ext4",
+		// KernelPath and BaseRootfs are intentionally left empty by
+		// default — Phase A retired the flat-file layout (the previous
+		// /var/lib/shed/firecracker/base-rootfs.ext4 default) in favor
+		// of the content-addressed blob store under
+		// {ImagesDir}/blobs/sha256/<digest>/, and Phase B made the
+		// in-blob kernel the canonical source. Operators who want the
+		// legacy fallbacks set them explicitly in server.yaml.
 		ImagesDir:        DefaultFirecrackerImagesDir,
 		InstanceDir:      "/var/lib/shed/firecracker/instances",
 		SnapshotsDir:     "/var/lib/shed/firecracker/snapshots",
@@ -1112,11 +1125,13 @@ func (c *FirecrackerConfig) Validate() error {
 		}
 	}
 
-	// Defer kernel/rootfs path validation when Docker refs are present
-	// (files are extracted during first image conversion) or when
-	// kernel_path is empty (Phase B: vm.Start reads the kernel from
-	// the blob).
-	if c.KernelPath != "" && !hasAnyDockerRef(c.BaseRootfs, c.Images) {
+	// Defer kernel/rootfs path validation when every configured source
+	// is a Docker ref (files are extracted during first image
+	// conversion) or when kernel_path is empty (Phase B: vm.Start
+	// reads the kernel from the blob). The previous hasAnyDockerRef
+	// gate was too loose — a mix of local + remote sources still
+	// needs the legacy kernel/initrd for the local-spawn path.
+	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.BaseRootfs, c.Images) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
 		}
@@ -1276,15 +1291,19 @@ func loadEnvFile(path string) (map[string]string, error) {
 	return envVars, nil
 }
 
-// hasAnyDockerRef returns true if baseRootfs or any image in the map is a Docker reference.
-func hasAnyDockerRef(baseRootfs string, images map[string]string) bool {
-	if vmimage.IsDockerRef(baseRootfs) {
-		return true
+// allSourcesAreDockerRefs returns true when the kernel/initrd validation
+// can be safely skipped: either base_rootfs is empty (the optional-Phase-B
+// case) or it's a Docker ref, AND every entry in images is either a Docker
+// ref or empty. A single local-path source means the legacy kernel/initrd
+// files must still exist to support spawning from it.
+func allSourcesAreDockerRefs(baseRootfs string, images map[string]string) bool {
+	if baseRootfs != "" && !vmimage.IsDockerRef(baseRootfs) {
+		return false
 	}
 	for _, val := range images {
-		if vmimage.IsDockerRef(val) {
-			return true
+		if val != "" && !vmimage.IsDockerRef(val) {
+			return false
 		}
 	}
-	return false
+	return true
 }

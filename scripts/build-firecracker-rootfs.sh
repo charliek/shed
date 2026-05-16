@@ -115,7 +115,11 @@ trap cleanup EXIT
 # Create output directory
 sudo mkdir -p "$OUTPUT_DIR"
 
-# Build shed-agent binary for linux/amd64 (shared across all variants)
+# Build shed-agent binary for linux/amd64 (shared across all variants),
+# the in-VM shed-firstboot, and the host-side shed CLI used below by
+# `shed image install`. The CLI build is mandatory: a clean checkout
+# has no bin/shed, and the install step below would fail with
+# "command not found".
 build_agent() {
     echo ""
     echo "=== Building shed-agent binary (linux/amd64) ==="
@@ -126,6 +130,11 @@ build_agent() {
     echo "=== Building shed-firstboot binary (linux/amd64) ==="
     GOOS=linux GOARCH=amd64 go build -o "$FIRECRACKER_DIR/shed-firstboot" ./cmd/shed-firstboot
     echo "Built shed-firstboot binary"
+
+    echo "=== Building host shed CLI ==="
+    mkdir -p "$PROJECT_ROOT/bin"
+    go build -o "$PROJECT_ROOT/bin/shed" ./cmd/shed
+    echo "Built $PROJECT_ROOT/bin/shed"
 }
 
 # Build a single variant
