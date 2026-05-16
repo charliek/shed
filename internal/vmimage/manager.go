@@ -277,10 +277,11 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		return nil, err
 	}
 
-	// Collect protective refs once for the InUse column.
+	// Collect protective refs once for the InUse column. Read-only
+	// path: lenient — one broken instance shouldn't break `image ls`.
 	var refs []Reference
 	if m.scanner != nil {
-		refs, err = m.scanner.ScanRefs()
+		refs, err = m.scanner.ScanRefs(false)
 		if err != nil {
 			return nil, fmt.Errorf("scanning refs: %w", err)
 		}
@@ -397,7 +398,8 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *Manifest, error
 		info.SizeBytes, _ = fileSize(path)
 	}
 	if m.scanner != nil {
-		refs, err := m.scanner.ScanRefs()
+		// Read-only inspect: lenient scan.
+		refs, err := m.scanner.ScanRefs(false)
 		if err == nil && len(ProtectiveRefs(refs, digest)) > 0 {
 			info.InUse = true
 		}
@@ -523,9 +525,12 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		return nil, err
 	}
 
+	// PruneImages is destructive: a partial ref set risks deleting a
+	// blob the broken-but-recoverable shed pinned. Strict scan fails
+	// closed with a clear "remove the broken dir first" error.
 	var refs []Reference
 	if m.scanner != nil {
-		refs, err = m.scanner.ScanRefs()
+		refs, err = m.scanner.ScanRefs(true)
 		if err != nil {
 			return nil, fmt.Errorf("scanning refs: %w", err)
 		}

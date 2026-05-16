@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
@@ -148,5 +149,40 @@ func TestDiskUsage_MalformedMetadataSkipped(t *testing.T) {
 	}
 	if len(du.Sheds) != 0 {
 		t.Errorf("expected 0 sheds after skipping broken, got %d", len(du.Sheds))
+	}
+}
+
+// TestRefScanner_StrictModeFailsOnMalformedMetadata locks in the policy
+// split Codex flagged: image prune (which scans refs in strict mode)
+// must refuse to run when an instance has malformed metadata, because
+// returning a partial protective-ref set from a destructive caller
+// risks deleting a blob the broken-but-recoverable shed pinned. The
+// lenient (read-only) path still warn-and-skips.
+func TestRefScanner_StrictModeFailsOnMalformedMetadata(t *testing.T) {
+	_, _, instanceDir := newSystemTestClient(t)
+
+	dir := filepath.Join(instanceDir, "broken")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "metadata.json"), []byte("{not-json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := &vzRefScanner{cfg: &config.VZConfig{InstanceDir: instanceDir}}
+
+	if _, err := scanner.ScanRefs(false); err != nil {
+		t.Fatalf("lenient ScanRefs should not fail on malformed metadata: %v", err)
+	}
+
+	_, err := scanner.ScanRefs(true)
+	if err == nil {
+		t.Fatal("strict ScanRefs should fail on malformed metadata")
+	}
+	if !strings.Contains(err.Error(), "broken") {
+		t.Errorf("error should name the broken instance, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "remove the directory") {
+		t.Errorf("error should hint at fix, got: %v", err)
 	}
 }

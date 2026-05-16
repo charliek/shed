@@ -110,7 +110,7 @@ type vzRefScanner struct {
 	skipSheds map[string]bool
 }
 
-func (s *vzRefScanner) ScanRefs() ([]vmimage.Reference, error) {
+func (s *vzRefScanner) ScanRefs(strict bool) ([]vmimage.Reference, error) {
 	var refs []vmimage.Reference
 
 	instances, err := ListInstances(s.cfg.InstanceDir)
@@ -126,13 +126,16 @@ func (s *vzRefScanner) ScanRefs() ([]vmimage.Reference, error) {
 			if errors.Is(err, ErrInstanceNotFound) || errors.Is(err, ErrLegacyMetadata) {
 				continue
 			}
-			// A broken instance metadata can't be started, deleted
-			// cleanly, or reasoned about — so it can't meaningfully
-			// protect a blob from prune. Skip with a warning, matching
-			// the behavior of ListSheds and the prune path. The blob
-			// it pinned (if any) will be reclaimable on the next
-			// prune; the operator must `rm -rf` the broken instance
-			// directory to restore consistency.
+			// strict=true (prune): fail closed. A broken metadata could
+			// be pinning the only protective reference to a blob the
+			// operator might want to recover; let prune refuse and
+			// point the operator at the broken dir.
+			if strict {
+				return nil, fmt.Errorf("invalid metadata on shed %q: %w (remove the directory at %s/%s/ before retrying)", inst, err, s.cfg.InstanceDir, inst)
+			}
+			// strict=false (read paths): warn-and-skip. Matches ListSheds
+			// and DiskUsage so one corrupt instance doesn't break the
+			// whole listing.
 			log.Printf("Warning: skipping shed %q with invalid metadata during ref scan: %v", inst, err)
 			continue
 		}

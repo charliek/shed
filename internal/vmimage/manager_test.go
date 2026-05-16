@@ -32,7 +32,7 @@ type fakeScanner struct {
 	err  error
 }
 
-func (s *fakeScanner) ScanRefs() ([]Reference, error) { return s.refs, s.err }
+func (s *fakeScanner) ScanRefs(strict bool) ([]Reference, error) { return s.refs, s.err }
 
 // installFakeBlob installs a deterministic fake blob with the given
 // SourceRef and tag. Returns the digest.

@@ -43,9 +43,26 @@ type Reference struct {
 //
 // Implementations MUST return shed and snapshot references (the protective
 // refs that block prune). Tag refs are scanned by the Manager itself.
+//
+// The `strict` parameter selects how malformed instance metadata is
+// handled:
+//
+//   - strict=false (read paths — ListImages, InspectImage, DiskUsage):
+//     skip the broken instance with a warning, return the rest. A
+//     `shed list` or `shed system df` shouldn't fail because one
+//     instance has a corrupt JSON file somewhere.
+//   - strict=true (PruneImages): fail closed. Returning a partial
+//     ref set from a destructive caller risks deleting a blob the
+//     broken-but-recoverable shed still pinned. The caller surfaces
+//     the error to the operator and tells them to fix or `rm -rf`
+//     the broken instance before pruning.
+//
+// Sentinels for "the listing itself succeeded but a known-broken
+// instance was skipped" are intentionally not part of the interface
+// — implementations log a warning. Callers that want to inspect
+// the skipped set should walk instances/* themselves.
 type RefScanner interface {
-	// ScanRefs returns shed + snapshot refs.
-	ScanRefs() ([]Reference, error)
+	ScanRefs(strict bool) ([]Reference, error)
 }
 
 // ProtectiveRefs reports whether a digest has any protective
