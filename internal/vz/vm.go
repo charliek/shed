@@ -153,6 +153,19 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		return nil, fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, statErr)
 	}
 
+	// Prefer the kernel from inside the blob (set by `shed image install
+	// --kernel ... --consume`) over the legacy cfg.KernelPath. The build
+	// scripts consume the host-side kernel into the blob, so the legacy
+	// path is usually absent after a fresh build. cfg.KernelPath remains
+	// the fallback for images installed without a kernel.
+	kernelPath := filepath.Join(blobDir, vmimage.BlobKernelFilename)
+	if _, statErr := os.Stat(kernelPath); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("stat blob kernel at %s: %w", kernelPath, statErr)
+		}
+		kernelPath = vm.cfg.KernelPath
+	}
+
 	// shed.name= is read by the in-guest shed-firstboot service to set the
 	// hostname and detect rootfs clones (snapshot spawns). Shed names are
 	// validated to a kernel-cmdline-safe regex in config.ValidateShedName,
@@ -162,7 +175,7 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		vm.meta.Name,
 	)
 
-	bootloader := fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", vm.cfg.KernelPath, initrdPath, kernelArgs)
+	bootloader := fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", kernelPath, initrdPath, kernelArgs)
 
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")

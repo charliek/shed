@@ -97,14 +97,28 @@ type EnsureResult struct {
 
 // EnsureImage ensures an image is available as a local ext4 file.
 //
-//   - If ref.Path is set, returns it directly with no digest. (Local-path
-//     escape hatch; not content-addressed.)
+//   - If ref.Path is set, returns it directly. When ref.Name is also set
+//     (the common case — config's resolveImage discovered the path via
+//     tag indirection), the tag is looked up so the result carries a
+//     digest. A path-only ref (no Name) is the legacy local-path escape
+//     hatch and returns with no digest.
 //   - Else: looks up the tag named ref.Name. If cached and the blob's
 //     manifest.SourceRef matches ref.DockerRef, returns the cached blob.
 //     Otherwise pulls + converts ref.DockerRef, installs into the blob
 //     store, and advances the tag.
 func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress ProgressFunc) (EnsureResult, error) {
 	if ref.Path != "" {
+		// Recover the digest via tag lookup when possible — the overlay
+		// boot path requires a digest to pin the lower in instance
+		// metadata. Only the legacy hardcoded-path escape hatch
+		// (Name == "" or no matching tag) returns digest-less.
+		if ref.Name != "" {
+			if imagesDir := m.cfg.GetImagesDir(); imagesDir != "" {
+				if digest, rootfs, err := ResolveTag(imagesDir, ref.Name); err == nil && rootfs == ref.Path {
+					return EnsureResult{Path: ref.Path, Digest: digest}, nil
+				}
+			}
+		}
 		return EnsureResult{Path: ref.Path}, nil
 	}
 

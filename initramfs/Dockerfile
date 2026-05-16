@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         e2fsprogs \
         cpio \
         gzip \
+        kmod \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /irfs/bin /irfs/sbin /irfs/dev /irfs/proc /irfs/sys \
@@ -28,7 +29,7 @@ RUN mkdir -p /irfs/bin /irfs/sbin /irfs/dev /irfs/proc /irfs/sys \
 # we rely on so the initrd stays small.
 RUN cp /bin/busybox /irfs/bin/busybox \
     && for cmd in sh mount umount mkdir mknod cat echo sleep chmod chown \
-                  ls cp mv rm ln dd od tr grep cut head tail sed find \
+                  ls cp mv rm ln dd od tr grep cut head tail sed find uname \
                   switch_root pivot_root reboot poweroff blkid; do \
         ln -sf busybox /irfs/bin/$cmd; \
     done
@@ -38,6 +39,19 @@ RUN cp /bin/busybox /irfs/bin/busybox \
 RUN ln -sf /bin/busybox /irfs/sbin/pivot_root \
     && cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
     && for lib in $(ldd /usr/sbin/mkfs.ext4 \
+            | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
+            | grep -v '^$'); do \
+        mkdir -p "/irfs$(dirname "$lib")"; \
+        cp "$lib" "/irfs$lib"; \
+    done
+
+# kmod's insmod uses finit_module(2) via libkmod, which decompresses
+# .ko.gz / .ko.xz / .ko.zst transparently (busybox's insmod doesn't).
+# Ubuntu 24.04 ships overlayfs as a zstd-compressed module under the
+# lower's /lib/modules; we need libkmod-aware insmod to load it before
+# the overlay mount in init.
+RUN cp /usr/sbin/insmod /irfs/sbin/insmod \
+    && for lib in $(ldd /usr/sbin/insmod \
             | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
             | grep -v '^$'); do \
         mkdir -p "/irfs$(dirname "$lib")"; \

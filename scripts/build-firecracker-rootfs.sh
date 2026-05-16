@@ -227,7 +227,13 @@ build_variant() {
     # bash re-implementation of the atomic-install protocol — same
     # blob-layout output, but the Go path adds digest verification, a
     # per-digest flock, fsync ladder, and JSON-safe manifest encoding.
-    "$PROJECT_ROOT/bin/shed" image install \
+    #
+    # OUTPUT_DIR (default /var/lib/shed/firecracker/images) is
+    # root-owned (sudo mkdir -p at script start), so the install needs
+    # sudo to write the blob layout. Everything else in this script
+    # that touches OUTPUT_DIR (truncate/mkfs.ext4/mount/tar) already
+    # runs under sudo; this mirrors that.
+    sudo "$PROJECT_ROOT/bin/shed" image install \
         --images-dir "$OUTPUT_DIR" \
         --rootfs "$rootfs_path" \
         "${kernel_arg[@]}" \

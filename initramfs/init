@@ -88,10 +88,24 @@ mkdir -p /upper/work
 mount -t ext4 -o ro "$LOWER_DEV" /lower \
     || panic "failed to mount $LOWER_DEV ro at /lower"
 
+# Load overlayfs from the lower's /lib/modules if it isn't built into
+# the kernel. Stock Ubuntu kernels ship overlayfs as a zstd-compressed
+# module (`overlay.ko.zst`); kmod's insmod (linked against libkmod) uses
+# finit_module(2) which lets the kernel decompress on the fly. If the
+# kernel already has overlayfs built in the mount below will succeed
+# regardless; if the load also fails, the overlay mount panic message
+# will surface the real cause.
+ov_dir="/lower/lib/modules/$(uname -r 2>/dev/null)/kernel/fs/overlayfs"
+for ov in "$ov_dir/overlay.ko.zst" "$ov_dir/overlay.ko.xz" "$ov_dir/overlay.ko.gz" "$ov_dir/overlay.ko"; do
+    if [ -f "$ov" ]; then
+        /sbin/insmod "$ov" 2>/dev/null && break
+    fi
+done
+
 mount -t overlay overlay \
     -o "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work" \
     /newroot \
-    || panic "overlay mount failed"
+    || panic "overlay mount failed (overlay kernel module not loaded?)"
 
 # Move the API filesystems into the new root rather than re-mounting,
 # so kernel state and open fds keep working through the pivot.

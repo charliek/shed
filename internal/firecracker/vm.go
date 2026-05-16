@@ -112,9 +112,22 @@ func (vm *VM) Start(ctx context.Context) error {
 		return fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, err)
 	}
 
+	// Prefer the kernel from inside the blob (set by `shed image install
+	// --kernel ... --consume`) over the legacy cfg.KernelPath. The build
+	// scripts consume the host-side kernel into the blob, so the legacy
+	// path is usually absent after a fresh build. cfg.KernelPath remains
+	// the fallback for images installed without a kernel.
+	kernelPath := filepath.Join(blobDir, vmimage.BlobKernelFilename)
+	if _, err := os.Stat(kernelPath); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat blob kernel at %s: %w", kernelPath, err)
+		}
+		kernelPath = vm.cfg.KernelPath
+	}
+
 	fcCfg := firecracker.Config{
 		SocketPath:      socketPath,
-		KernelImagePath: vm.cfg.KernelPath,
+		KernelImagePath: kernelPath,
 		InitrdPath:      initrdPath,
 		KernelArgs:      kernelArgs,
 		Drives: []models.Drive{
