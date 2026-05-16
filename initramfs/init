@@ -119,12 +119,10 @@ mount --move /proc /newroot/proc
 mount --move /sys  /newroot/sys
 mount --move /dev  /newroot/dev
 
-# pivot_root needs an existing oldroot dir inside newroot to receive the
-# old / mountpoint. /mnt is always present in our images.
-mkdir -p /newroot/mnt
-cd /newroot
-pivot_root . mnt || panic "pivot_root failed"
-# Detach the old root; it's still pinned by our cwd otherwise.
-umount -l /mnt || true
-
-exec /sbin/init "$@"
+# Leave the initramfs and switch to the merged overlay. We use
+# `switch_root` rather than `pivot_root` because the initial root is
+# a kernel rootfs (initramfs), which doesn't support pivot_root —
+# `pivot_root` returns EINVAL on that root type. busybox's
+# `switch_root` does the canonical initramfs-exit dance: frees the
+# initramfs pages, chroots into /newroot, and execs /sbin/init.
+exec switch_root /newroot /sbin/init "$@"
