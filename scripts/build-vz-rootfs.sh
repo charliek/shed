@@ -299,17 +299,22 @@ build_variant() {
         --output "$shed_initrd"
 
     # Install rootfs+kernel+initrd as a content-addressed blob and
-    # update the variant tag.
+    # update the variant tag. Calls into the `shed image install`
+    # Go subcommand rather than a bash re-implementation of the
+    # atomic-install protocol — same blob-layout output, but the Go
+    # path adds digest verification, a per-digest flock, fsync
+    # ladder, and JSON-safe manifest encoding.
     echo ""
     echo "=== Installing blob ==="
-    "$SCRIPT_DIR/install-blob.sh" \
+    "$PROJECT_ROOT/bin/shed" image install \
         --images-dir "$OUTPUT_DIR" \
         --rootfs "$rootfs_path" \
         --kernel "$KERNEL_PATH" \
         --initrd "$shed_initrd" \
         --tag "$variant" \
         --backend vz \
-        --arch arm64
+        --arch arm64 \
+        --consume
 }
 
 # Main execution

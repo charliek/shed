@@ -306,6 +306,49 @@ shed image pull <docker-ref> [-t <tag>]
 
 If `--tag` is omitted, the tag is derived from the last path segment of the Docker ref minus the version suffix (e.g. `ghcr.io/charliek/shed-vz-experimental:v0.4.0` → `experimental`).
 
+### shed image install
+
+Installs a pre-built rootfs (plus optional kernel and initrd) directly into the content-addressed blob store and optionally advances a tag. The structural replacement for the legacy `scripts/install-blob.sh` — same on-disk layout, but the Go path adds digest verification, per-digest flock, fsync ladder, and JSON-safe manifest encoding.
+
+```bash
+shed image install --rootfs <path> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rootfs` | (required) | Path to `rootfs.ext4` |
+| `--kernel` |  | Path to the boot kernel |
+| `--initrd` |  | Path to the boot initrd |
+| `--tag` |  | Tag to advance to the resulting digest |
+| `--backend` |  | Backend recorded in the manifest (`vz` or `firecracker`) |
+| `--arch` |  | Architecture recorded in the manifest (`arm64` or `amd64`) |
+| `--source-ref` |  | Docker source reference recorded in the manifest |
+| `--images-dir` | from server config | Override the `images_dir` from server config |
+| `--consume` | `false` | Move source files into the blob (don't leave intermediates) |
+
+Operates **locally** — no shed-server interaction. The invoking user needs write access to `images_dir`. The build pipeline (`make vz-rootfs`, `make firecracker-rootfs`) calls this with `--consume` so intermediates from `mkfs.ext4` and the initramfs build don't accumulate.
+
+The digest is `sha256(rootfs.ext4)`. `InstallBlob` verifies the hash before publishing the blob, so a wrong `--rootfs` can't end up addressed under the wrong digest.
+
+```bash
+# Typical build pipeline invocation
+shed image install \
+  --rootfs ./default-rootfs.ext4 \
+  --kernel ./vmlinux \
+  --initrd ./initrd.img \
+  --tag default \
+  --backend firecracker --arch amd64 \
+  --source-ref ghcr.io/charliek/shed-fc-default:v1.0.0 \
+  --consume
+
+# Output:
+# Digest: sha256:abc123...
+# Blob:   /var/lib/shed/firecracker/images/blobs/sha256/abc123... (installed)
+# Tag:    default -> sha256:abc123...
+```
+
+When the blob with this digest already exists, the install is a no-op and reports `(already-installed)`; the tag is still advanced (idempotent).
+
 ### shed image rm
 
 Removes a tag from the image store. `shed image delete` is a deprecated alias.

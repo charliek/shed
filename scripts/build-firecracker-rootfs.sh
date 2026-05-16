@@ -223,14 +223,19 @@ build_variant() {
 
     echo ""
     echo "=== Installing blob ==="
-    "$SCRIPT_DIR/install-blob.sh" \
+    # Calls into the `shed image install` Go subcommand rather than a
+    # bash re-implementation of the atomic-install protocol — same
+    # blob-layout output, but the Go path adds digest verification, a
+    # per-digest flock, fsync ladder, and JSON-safe manifest encoding.
+    "$PROJECT_ROOT/bin/shed" image install \
         --images-dir "$OUTPUT_DIR" \
         --rootfs "$rootfs_path" \
         "${kernel_arg[@]}" \
         --initrd "$shed_initrd" \
         --tag "$variant" \
         --backend firecracker \
-        --arch amd64
+        --arch amd64 \
+        --consume
 }
 
 # Main execution

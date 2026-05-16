@@ -100,8 +100,9 @@ docs-serve:
 
 # Firecracker targets
 
-# Build Firecracker rootfs image
-firecracker-rootfs: build-agent build-firstboot
+# Build Firecracker rootfs image. Requires bin/shed for the
+# `shed image install` step that lands the blob into images_dir.
+firecracker-rootfs: build-cli build-agent build-firstboot
 	./scripts/build-firecracker-rootfs.sh
 
 # Download Firecracker binary and kernel
@@ -110,14 +111,15 @@ download-firecracker:
 
 # VZ rootfs targets
 
-# Build default VZ rootfs image
-vz-rootfs: build-agent build-firstboot
+# Build default VZ rootfs image. Requires bin/shed for the
+# `shed image install` step that lands the blob into images_dir.
+vz-rootfs: build-cli build-agent build-firstboot
 	./scripts/build-vz-rootfs.sh
 
 # Build base VZ rootfs image (minimal)
-vz-rootfs-base: build-agent build-firstboot
+vz-rootfs-base: build-cli build-agent build-firstboot
 	./scripts/build-vz-rootfs.sh --variant base
 
 # Build all VZ rootfs image variants
-vz-rootfs-all: build-agent build-firstboot
+vz-rootfs-all: build-cli build-agent build-firstboot
 	./scripts/build-vz-rootfs.sh --all
