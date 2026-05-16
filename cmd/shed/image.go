@@ -543,8 +543,11 @@ func deriveTagFromRef(ref string) string {
 }
 
 func runImagePrune(_ *cobra.Command, _ []string) error {
-	if jsonFlag && !imagePruneForce {
-		return fmt.Errorf("--force is required when using --json")
+	// --json + --dry-run is always safe (read-only). Only require
+	// --force when --json is combined with an execute pass, matching
+	// the system-prune ergonomics.
+	if jsonFlag && !imagePruneForce && !imagePruneDryRun {
+		return fmt.Errorf("--force is required when combining --json with an execute pass (add --dry-run to preview)")
 	}
 
 	entry, _, err := getServerEntry()
