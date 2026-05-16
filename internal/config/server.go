@@ -376,14 +376,11 @@ func (c *VZConfig) Validate() error {
 	if c.VfkitPath == "" {
 		return fmt.Errorf("vfkit_path is required")
 	}
-	if c.KernelPath == "" {
-		return fmt.Errorf("kernel_path is required")
-	}
-	// base_rootfs is optional under the content-addressed model: it's
-	// only consulted by ResolveBaseRootfs (called when `shed create`
-	// runs without --image). If empty, `shed create` without --image
-	// fails with a clear message; with --image <tag>, resolution goes
-	// through the blob-store tags and base_rootfs is never read.
+	// kernel_path is optional under Phase B: vm.Start prefers the
+	// kernel inside the blob (blobs/<digest>/kernel, written by
+	// `shed image install --kernel ...`), so the legacy fallback path
+	// is only consulted when a blob arrives without a kernel.
+	// base_rootfs is similarly optional — see below.
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
 	}
@@ -463,9 +460,10 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	// Defer kernel/initrd/rootfs path validation when Docker refs are present —
-	// files are extracted during first image conversion.
-	if !hasAnyDockerRef(c.BaseRootfs, c.Images) {
+	// Defer kernel/initrd/rootfs path validation when Docker refs are present
+	// (files are extracted during first image conversion) or when kernel_path
+	// is empty (Phase B: vm.Start reads the kernel from the blob).
+	if c.KernelPath != "" && !hasAnyDockerRef(c.BaseRootfs, c.Images) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
 		}
@@ -1034,15 +1032,12 @@ func (c *FirecrackerConfig) applyDefaults() {
 
 // Validate checks that the Firecracker configuration is valid.
 func (c *FirecrackerConfig) Validate() error {
-	// Validate paths exist
-	if c.KernelPath == "" {
-		return fmt.Errorf("kernel_path is required")
-	}
-	// base_rootfs is optional under the content-addressed model: it's
-	// only consulted by ResolveBaseRootfs (called when `shed create`
-	// runs without --image). If empty, `shed create` without --image
-	// fails with a clear message; with --image <tag>, resolution goes
-	// through the blob-store tags and base_rootfs is never read.
+	// kernel_path and base_rootfs are both optional under the Phase B
+	// content-addressed model: vm.Start reads the kernel from the
+	// blob, and ResolveBaseRootfs is only called when `shed create`
+	// runs without --image (handled separately by CreateShed). The
+	// legacy path-based fields remain as fallbacks; an empty value
+	// means "rely on the blob."
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
 	}
@@ -1117,9 +1112,11 @@ func (c *FirecrackerConfig) Validate() error {
 		}
 	}
 
-	// Defer kernel/rootfs path validation when Docker refs are present —
-	// files are extracted during first image conversion.
-	if !hasAnyDockerRef(c.BaseRootfs, c.Images) {
+	// Defer kernel/rootfs path validation when Docker refs are present
+	// (files are extracted during first image conversion) or when
+	// kernel_path is empty (Phase B: vm.Start reads the kernel from
+	// the blob).
+	if c.KernelPath != "" && !hasAnyDockerRef(c.BaseRootfs, c.Images) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
 		}

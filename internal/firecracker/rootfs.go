@@ -34,8 +34,10 @@ func UpperDir(uppersDir, name string) string {
 }
 
 // EnsureUpper creates the per-shed writable upper layer as a sparse
-// ext4-sized file at {uppersDir}/<name>/upper.ext4. The file is left
-// unformatted; the in-guest initramfs runs mkfs.ext4 on first boot.
+// ext4-sized file at {uppersDir}/<name>/upper.ext4. The in-guest
+// initramfs runs mkfs.ext4 on first boot — see the VZ EnsureUpper
+// doc for the FreshUpperSignature contract that lets the initramfs
+// distinguish "needs mkfs" from "corrupted, panic with shed reset".
 //
 // Fails with an explicit error when the upper file already exists
 // rather than silently reusing it: a stale upper from a previously
@@ -67,6 +69,11 @@ func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
 		os.Remove(path)
 		return "", fmt.Errorf("failed to size upper file: %w", err)
 	}
+	if _, err := f.WriteAt([]byte(FreshUpperSignature), FreshUpperSignatureOffset); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("failed to write fresh-upper signature: %w", err)
+	}
 	// syncDir alone only persists the directory entry; the truncate
 	// metadata still needs a file-level sync, or a crash right after
 	// EnsureUpper can leave a zero-length upper.ext4 with a tag-good
@@ -86,6 +93,14 @@ func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
 	log.Printf("upper created path=%s size_bytes=%d", path, sizeBytes)
 	return path, nil
 }
+
+// FreshUpperSignature: see internal/vz/rootfs.go for the contract.
+// Duplicated here to keep the firecracker package buildable on Linux
+// without a build-tag dance through the VZ package.
+const (
+	FreshUpperSignature       = "SHED-FRESH-UPPER"
+	FreshUpperSignatureOffset = 1024
+)
 
 // DeleteUpper removes the per-shed upper directory and its contents.
 // Used by `shed delete` and `shed reset`.

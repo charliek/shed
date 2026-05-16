@@ -27,6 +27,11 @@ RUN mkdir -p /irfs/bin /irfs/sbin /irfs/dev /irfs/proc /irfs/sys \
 
 # busybox provides sh, mount, mkdir, dd, od, etc. Symlink the applets
 # we rely on so the initrd stays small.
+#
+# `switch_root` is the canonical initramfs exit; `pivot_root` was
+# tried first but EINVAL'd on the kernel rootfs (see initramfs/init
+# and commit ceafa1e). Kept in the applet list defensively in case
+# a future init variant needs it; `switch_root` is what runs today.
 RUN cp /bin/busybox /irfs/bin/busybox \
     && for cmd in sh mount umount mkdir mknod cat echo sleep chmod chown \
                   ls cp mv rm ln dd od tr grep cut head tail sed find uname \
@@ -34,10 +39,8 @@ RUN cp /bin/busybox /irfs/bin/busybox \
         ln -sf busybox /irfs/bin/$cmd; \
     done
 
-# pivot_root applet exists in busybox; symlink in /sbin too for tools
-# that look there. mkfs.ext4 ships outside busybox.
-RUN ln -sf /bin/busybox /irfs/sbin/pivot_root \
-    && cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
+# mkfs.ext4 ships outside busybox.
+RUN cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
     && for lib in $(ldd /usr/sbin/mkfs.ext4 \
             | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
             | grep -v '^$'); do \

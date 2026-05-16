@@ -122,6 +122,9 @@ func (vm *VM) Start(ctx context.Context) error {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("stat blob kernel at %s: %w", kernelPath, err)
 		}
+		if vm.cfg.KernelPath == "" {
+			return fmt.Errorf("no kernel for %s: blob %s has no kernel and firecracker.kernel_path is unset; rebuild the image with `shed image install --kernel ...` or set firecracker.kernel_path in server.yaml", vm.meta.Name, vmimage.ShortDigest(vm.meta.LowerDigest))
+		}
 		kernelPath = vm.cfg.KernelPath
 	}
 

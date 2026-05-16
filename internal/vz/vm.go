@@ -163,6 +163,9 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		if !os.IsNotExist(statErr) {
 			return nil, fmt.Errorf("stat blob kernel at %s: %w", kernelPath, statErr)
 		}
+		if vm.cfg.KernelPath == "" {
+			return nil, fmt.Errorf("no kernel for %s: blob %s has no kernel and vz.kernel_path is unset; rebuild the image with `shed image install --kernel ...` or set vz.kernel_path in server.yaml", vm.meta.Name, vmimage.ShortDigest(vm.meta.LowerDigest))
+		}
 		kernelPath = vm.cfg.KernelPath
 	}
 

@@ -620,9 +620,11 @@ func TestVZConfigValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "missing kernel_path",
+			// kernel_path is optional under Phase B — vm.Start prefers
+			// the kernel inside the blob.
+			name:    "missing kernel_path is allowed",
 			modify:  func(c *VZConfig) { c.KernelPath = "" },
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			// base_rootfs is now optional under the content-addressed

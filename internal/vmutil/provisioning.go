@@ -308,13 +308,22 @@ func RunShutdownSequence(ctx context.Context, agent *AgentClient, name string, s
 //
 // Failures here are logged but never fail the stop sequence — the agent
 // may be unreachable on a sick VM, but we still need to stop it.
+//
+// Budget: tight, capped well below the shutdown-hook budget so the
+// total pre-stop guest work stays within roughly stopTimeout/2 +
+// stopTimeout/8 instead of unbounded. `sync(1)` on a healthy guest
+// returns in milliseconds; the only reason it would hit the timeout
+// is a hung agent, in which case stalling here doesn't help anyone.
 func SyncFilesystems(ctx context.Context, agent *AgentClient, stopTimeout time.Duration) {
 	if agent == nil {
 		return
 	}
-	budget := stopTimeout / 2
-	if budget <= 0 || budget > 15*time.Second {
-		budget = 15 * time.Second
+	budget := stopTimeout / 8
+	if budget < 2*time.Second {
+		budget = 2 * time.Second
+	}
+	if budget > 5*time.Second {
+		budget = 5 * time.Second
 	}
 	syncCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
