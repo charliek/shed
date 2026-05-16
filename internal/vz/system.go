@@ -97,6 +97,17 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		du.Orphans = append(du.Orphans, snapOrphans...)
 	}
 
+	// Uppers left behind by crashed creates that the operator never
+	// retried (the CreateShed-time sweep handles the retry case, but
+	// not "operator gave up").
+	if c.cfg.UppersDir != "" {
+		upperOrphans, err := systemprune.FindUpperOrphans(c.cfg.UppersDir, c.cfg.InstanceDir)
+		if err != nil {
+			return du, fmt.Errorf("scanning upper orphans: %w", err)
+		}
+		du.Orphans = append(du.Orphans, upperOrphans...)
+	}
+
 	// Kernel + initrd
 	if c.cfg.KernelPath != "" {
 		if logical, physical, err := diskstat.Stat(c.cfg.KernelPath); err == nil {
@@ -326,6 +337,15 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		report.Skipped = append(report.Skipped, skipped...)
 	}
 
+	// Step 2b'': upper orphan candidates (crashed creates that never
+	// reached meta.Save and that no operator-retry has cleaned up).
+	var upperOrphanCandidates []systemprune.UpperOrphanCandidate
+	if opts.Orphans && c.cfg.UppersDir != "" {
+		cands, skipped := systemprune.CollectUpperOrphanCandidates(c.cfg.UppersDir, c.cfg.InstanceDir)
+		upperOrphanCandidates = cands
+		report.Skipped = append(report.Skipped, skipped...)
+	}
+
 	// Step 2c: image candidates (dry-run, respects candidate deletions).
 	// Same empty-ImagesDir guard for safety.
 	var imageCandidates []vmimage.ImageInfo
@@ -362,6 +382,9 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	}
 	for _, sc := range snapshotOrphanCandidates {
 		report.Items = append(report.Items, sc.ToPrunedItems(opts.DryRun)...)
+	}
+	for _, uc := range upperOrphanCandidates {
+		report.Items = append(report.Items, uc.ToPrunedItems(opts.DryRun)...)
 	}
 	for _, img := range imageCandidates {
 		report.Items = append(report.Items, systemprune.ImageToPrunedItem(img, opts.DryRun))
@@ -428,6 +451,16 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 				continue
 			}
 			report.Items = append(report.Items, sc.ToPrunedItems(false)...)
+		}
+		for _, uc := range upperOrphanCandidates {
+			if ok := systemprune.SweepUpperOrphan(uc); !ok {
+				report.Skipped = append(report.Skipped, config.SkippedItem{
+					Kind: "upper_orphan", Path: uc.Dir,
+					Reason: "removal failed",
+				})
+				continue
+			}
+			report.Items = append(report.Items, uc.ToPrunedItems(false)...)
 		}
 	}
 

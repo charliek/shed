@@ -65,7 +65,7 @@ The full flag table is in the [CLI reference](cli.md#system-disk-usage). The raw
 - `--images` — remove cached image variants that aren't referenced by config or any existing shed.
 - `--instances` — delete stopped sheds older than `--until` (default 72 h).
 - `--logs` — truncate VZ console logs to the last `--log-tail-bytes` (default 5 MiB). No-op on Firecracker.
-- `--orphans` — remove `*.tmp` staging directories left behind by a crashed image install. Lock files are preserved to avoid an inode-reuse race.
+- `--orphans` — remove leftover state from crashed operations: `*.tmp` staging directories from interrupted image installs, partial snapshot directories whose `snapshot.json` never landed, and per-shed `uppers/<name>/` directories whose `metadata.json` was never written. Lock files are preserved to avoid an inode-reuse race, and any `.creating` marker fresher than 1 h keeps its directory in skipped status so in-flight operations aren't swept.
 
 When no scope flags are set, the command applies the default scope: `--images --instances --orphans` (not `--logs`, which is always opt-in).
 
