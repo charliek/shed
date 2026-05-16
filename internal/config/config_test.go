@@ -544,6 +544,13 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 			modify:  func(c *FirecrackerConfig) { c.BaseRootfs = "/nonexistent/rootfs.ext4" },
 			wantErr: true,
 		},
+		{
+			// Empty base_rootfs is allowed under the content-addressed
+			// model — see Validate header.
+			name:    "empty base_rootfs is allowed",
+			modify:  func(c *FirecrackerConfig) { c.BaseRootfs = "" },
+			wantErr: false,
+		},
 		// Lower bounds still work
 		{
 			name:    "cpus below min",
@@ -618,9 +625,12 @@ func TestVZConfigValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "missing base_rootfs",
+			// base_rootfs is now optional under the content-addressed
+			// model — empty is valid; create-without-image errors later
+			// in the CreateShed path with a clear message.
+			name:    "missing base_rootfs is allowed",
 			modify:  func(c *VZConfig) { c.BaseRootfs = "" },
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "missing instance_dir",

@@ -60,17 +60,36 @@ done
 
 # Format the upper on first boot. We detect "no FS yet" by reading the
 # ext4 magic at offset 1080 (0x438): the two-byte signature is 0x53 0xEF.
-# If anything else is there — including all zeroes — we mkfs. We avoid
-# blkid here because the busybox initramfs doesn't ship libblkid.
-need_mkfs=1
+# We avoid blkid here because the busybox initramfs doesn't ship
+# libblkid.
+#
+# When the magic isn't found, we *also* check whether the first 64
+# KiB is all zero. A genuinely fresh sparse upper reads back as
+# zeros; reformatting is safe. A magic-byte-corrupted ext4 still
+# carries data elsewhere in the first 64 KiB (superblock backups,
+# group descriptor table, journal); reformatting that path would
+# silently destroy the user's writes. In that case we panic with
+# the `shed reset` hint instead.
+has_magic=0
 if dd if="$UPPER_DEV" bs=1 count=2 skip=1080 2>/dev/null \
         | od -An -tx1 \
         | tr -d ' \n' \
         | grep -qx "53ef"; then
-    need_mkfs=0
+    has_magic=1
 fi
 
-if [ "$need_mkfs" = "1" ]; then
+if [ "$has_magic" = "0" ]; then
+    # Sample the first 64 KiB and look for any non-zero byte.
+    # Reading more than the superblock catches the group descriptor
+    # table and journal superblock, which an ext4 fs always has
+    # populated but a freshly-truncated sparse file does not.
+    head_hex=$(dd if="$UPPER_DEV" bs=1024 count=64 2>/dev/null \
+                   | od -An -tx1 \
+                   | tr -d ' \n')
+    case "$head_hex" in
+        *[!0]*)
+            panic "upper ${UPPER_DEV} contains data but no ext4 magic at offset 1080 — the writable upper appears corrupted. From the host, run 'shed reset <name>' to wipe and recreate it." ;;
+    esac
     echo "shed-initramfs: formatting ${UPPER_DEV} (first boot)"
     mkfs.ext4 -F -L shed-upper "$UPPER_DEV" >/dev/null 2>&1 \
         || panic "mkfs.ext4 on $UPPER_DEV failed"

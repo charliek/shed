@@ -200,6 +200,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 				return nil, err
 			}
 		} else {
+			if c.cfg.BaseRootfs == "" {
+				return nil, fmt.Errorf("%w: no --image specified and no base_rootfs configured in vz.base_rootfs; pass --image <tag> or set base_rootfs in server.yaml", config.ErrInvalidShedRequestSentinel)
+			}
 			resolved = c.cfg.ResolveBaseRootfs()
 		}
 

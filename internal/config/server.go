@@ -379,9 +379,11 @@ func (c *VZConfig) Validate() error {
 	if c.KernelPath == "" {
 		return fmt.Errorf("kernel_path is required")
 	}
-	if c.BaseRootfs == "" {
-		return fmt.Errorf("base_rootfs is required")
-	}
+	// base_rootfs is optional under the content-addressed model: it's
+	// only consulted by ResolveBaseRootfs (called when `shed create`
+	// runs without --image). If empty, `shed create` without --image
+	// fails with a clear message; with --image <tag>, resolution goes
+	// through the blob-store tags and base_rootfs is never read.
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
 	}
@@ -474,7 +476,9 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	if !vmimage.IsDockerRef(c.BaseRootfs) {
+	// base_rootfs path-existence check only applies when configured as
+	// a local path. An empty value is allowed (see Validate header).
+	if c.BaseRootfs != "" && !vmimage.IsDockerRef(c.BaseRootfs) {
 		if _, err := os.Stat(c.BaseRootfs); err != nil {
 			return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)
 		}
@@ -1034,9 +1038,11 @@ func (c *FirecrackerConfig) Validate() error {
 	if c.KernelPath == "" {
 		return fmt.Errorf("kernel_path is required")
 	}
-	if c.BaseRootfs == "" {
-		return fmt.Errorf("base_rootfs is required")
-	}
+	// base_rootfs is optional under the content-addressed model: it's
+	// only consulted by ResolveBaseRootfs (called when `shed create`
+	// runs without --image). If empty, `shed create` without --image
+	// fails with a clear message; with --image <tag>, resolution goes
+	// through the blob-store tags and base_rootfs is never read.
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
 	}
@@ -1119,8 +1125,9 @@ func (c *FirecrackerConfig) Validate() error {
 		}
 	}
 
-	// Validate base rootfs path exists (skip for Docker refs — deferred validation)
-	if !vmimage.IsDockerRef(c.BaseRootfs) {
+	// Validate base rootfs path exists when configured as a local
+	// path. An empty value is allowed (see Validate header).
+	if c.BaseRootfs != "" && !vmimage.IsDockerRef(c.BaseRootfs) {
 		if _, err := os.Stat(c.BaseRootfs); err != nil {
 			return fmt.Errorf("base_rootfs does not exist: %s", c.BaseRootfs)
 		}
