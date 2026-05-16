@@ -48,6 +48,18 @@ func CreateVM(meta *Metadata, cfg *config.VZConfig) *VM {
 
 // Start starts the VM by launching vfkit as a subprocess.
 func (vm *VM) Start(ctx context.Context) error {
+	// Guard against a previously interrupted ResetShed (DeleteUpper
+	// succeeded, EnsureUpper then failed): without this, vfkit would
+	// fail with an opaque "open failed" on the virtio-blk device.
+	// Surfacing a clean recovery hint here saves the operator from
+	// digging through vfkit logs.
+	if _, err := os.Stat(vm.meta.RootfsPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("shed %s has no writable upper at %s; run `shed reset %s` to recreate it (or `shed delete %s` to abandon)", vm.meta.Name, vm.meta.RootfsPath, vm.meta.Name, vm.meta.Name)
+		}
+		return fmt.Errorf("stat upper at %s: %w", vm.meta.RootfsPath, err)
+	}
+
 	// Ensure socket directory exists
 	if err := os.MkdirAll(vm.cfg.SocketDir, 0755); err != nil {
 		return fmt.Errorf("failed to create socket directory: %w", err)

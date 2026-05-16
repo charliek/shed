@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
@@ -233,5 +234,30 @@ func TestPruneImagesProtectsSnapshotPin(t *testing.T) {
 	}
 	if !vmimage.BlobExists(imagesDir, snapshotPinned) {
 		t.Fatalf("snapshot-pinned blob removed by prune; shed create --from-snapshot would now fail")
+	}
+}
+
+// TestStartShedMissingUpperFailsClearly confirms vm.Start surfaces
+// a clean recovery hint when the upper file is gone (e.g. after a
+// ResetShed interrupted between DeleteUpper and EnsureUpper).
+// Without this guard, the operator sees an opaque firecracker SDK
+// "drive open failed" error and has to dig through logs.
+func TestStartShedMissingUpperFailsClearly(t *testing.T) {
+	vm := &VM{
+		meta: &Metadata{
+			Name:       "missing-upper",
+			RootfsPath: "/nonexistent/uppers/missing-upper/upper.ext4",
+		},
+		cfg: &config.FirecrackerConfig{
+			SocketDir: t.TempDir(),
+		},
+	}
+	err := vm.Start(context.Background())
+	if err == nil {
+		t.Fatalf("vm.Start with missing upper succeeded; want error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "shed reset missing-upper") {
+		t.Errorf("error %q does not point operator at `shed reset`", msg)
 	}
 }
