@@ -76,7 +76,8 @@ if [ "$need_mkfs" = "1" ]; then
         || panic "mkfs.ext4 on $UPPER_DEV failed"
 fi
 
-mount -t ext4 "$UPPER_DEV" /upper || panic "failed to mount $UPPER_DEV at /upper"
+mount -t ext4 "$UPPER_DEV" /upper \
+    || panic "failed to mount $UPPER_DEV at /upper; the writable upper may be corrupt. From the host, run 'shed reset <name>' to wipe and recreate it."
 mkdir -p /upper/data
 # overlayfs requires workdir to be empty at mount time; bookkeeping
 # files left behind from a prior unclean shutdown will make the next
