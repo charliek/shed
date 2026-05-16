@@ -216,10 +216,36 @@ build_variant() {
     # Firecracker's compiled kernel lives at ${OUTPUT_DIR}/vmlinux after
     # download-firecracker.sh runs. Use it as the blob's kernel when
     # present so the runtime never has to look outside the blob dir.
-    local kernel_arg=()
-    if [ -f "$OUTPUT_DIR/vmlinux" ]; then
-        kernel_arg=(--kernel "$OUTPUT_DIR/vmlinux")
+    #
+    # The first install with --consume moves vmlinux into the blob,
+    # which means a second rebuild has no kernel to pass and produces
+    # a "kernelless" blob — vm.Start then errors with "failed to stat
+    # kernel image path" because cfg.KernelPath (the legacy path) is
+    # now empty. Pre-flight: if vmlinux is missing but some other
+    # blob in the store has one, copy it back out so this build can
+    # use it. If no kernel is available anywhere, abort with a clear
+    # message pointing at download-firecracker.sh.
+    if [ ! -f "$OUTPUT_DIR/vmlinux" ]; then
+        echo "$OUTPUT_DIR/vmlinux missing; looking for one in an existing blob..."
+        # Find the first blob that has a 'kernel' file.
+        local found_kernel=""
+        for blob in "$OUTPUT_DIR"/blobs/sha256/*/kernel; do
+            if [ -f "$blob" ]; then
+                found_kernel="$blob"
+                break
+            fi
+        done
+        if [ -n "$found_kernel" ]; then
+            echo "  recovering kernel from $found_kernel"
+            sudo cp "$found_kernel" "$OUTPUT_DIR/vmlinux"
+            sudo chmod 0755 "$OUTPUT_DIR/vmlinux"
+        else
+            echo "ERROR: $OUTPUT_DIR/vmlinux missing and no existing blob has a kernel."
+            echo "Run ./scripts/download-firecracker.sh (or restore from backup) first."
+            exit 1
+        fi
     fi
+    local kernel_arg=(--kernel "$OUTPUT_DIR/vmlinux")
 
     echo ""
     echo "=== Installing blob ==="
