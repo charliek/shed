@@ -52,6 +52,9 @@ shed create my-project --repo git@github.com:user/repo.git
 
 # Or mount a local directory as the workspace
 shed create my-project --local-dir ~/projects/my-project
+
+# With a larger writable upper (default 5G; range 1G–100G)
+shed create big-project --image experimental --upper-size 20G
 ```
 
 ### 4. Connect
@@ -149,6 +152,7 @@ shed create <name> [--repo URL]  # Create a new shed (or --local-dir PATH)
 shed list                        # List all sheds on the current server
 shed start <name>                # Start a stopped shed
 shed stop <name>                 # Stop a running shed
+shed reset <name>                # Wipe and recreate the per-shed writable upper
 shed delete <name> [--force]     # Delete a shed
 
 # Connection & Execution
