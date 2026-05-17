@@ -56,16 +56,17 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  # base_rootfs: ~/Library/Application Support/shed/vz/default-rootfs.ext4
+  # base_rootfs: ~/Library/Application Support/shed/vz/full-rootfs.ext4
   # images:
   #   base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
-  #   default: ~/Library/Application Support/shed/vz/default-rootfs.ext4
-  #   experimental: ~/Library/Application Support/shed/vz/experimental-rootfs.ext4
+  #   extensions: ~/Library/Application Support/shed/vz/extensions-rootfs.ext4
+  #   full: ~/Library/Application Support/shed/vz/full-rootfs.ext4
 
-  base_rootfs: ghcr.io/charliek/shed-vz-experimental:v0.4.3
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.0-dev
   images:
-    base: ghcr.io/charliek/shed-vz-base:v0.4.3
-    experimental: ghcr.io/charliek/shed-vz-experimental:v0.4.3
+    base: ghcr.io/charliek/shed-vz-base:v0.5.0-dev
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.0-dev
+    full: ghcr.io/charliek/shed-vz-full:v0.5.0-dev
   
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets

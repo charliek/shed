@@ -8,9 +8,10 @@
 # Prerequisites: Docker, Go
 #
 # Usage:
-#   ./scripts/build-firecracker-rootfs.sh                      # Build default variant
+#   ./scripts/build-firecracker-rootfs.sh                      # Build full variant
 #   ./scripts/build-firecracker-rootfs.sh --variant base        # Build base variant
-#   ./scripts/build-firecracker-rootfs.sh --variant experimental  # Build experimental variant
+#   ./scripts/build-firecracker-rootfs.sh --variant extensions  # Build extensions variant
+#   ./scripts/build-firecracker-rootfs.sh --variant full        # Build full variant
 #   ./scripts/build-firecracker-rootfs.sh --all                  # Build all variants
 
 set -e
@@ -25,10 +26,10 @@ ROOTFS_SIZE="${ROOTFS_SIZE:-20G}"  # 20GB default
 
 # Built-in variants surfaced by --all and --help. Explicit --variant values
 # are forwarded to Docker so custom shed-fc-<name> stages can be built too.
-KNOWN_VARIANTS="base default experimental"
+KNOWN_VARIANTS="base extensions full"
 
 # Defaults
-VARIANT="default"
+VARIANT="full"
 BUILD_ALL=false
 SHED_EXT_VERSION=""
 
@@ -63,10 +64,10 @@ while [[ $# -gt 0 ]]; do
             echo "Build Firecracker rootfs images for shed."
             echo ""
             echo "Options:"
-            echo "  --variant <name>   Build a specific variant (default: default)"
+            echo "  --variant <name>   Build a specific variant (default: full)"
             echo "                     Available variants: $KNOWN_VARIANTS"
             echo "  --all              Build all variants"
-            echo "  --shed-ext-version Override shed-extensions image version for experimental variant"
+            echo "  --shed-ext-version Override shed-extensions image version for extensions/full variants"
             echo "                     (e.g., 'dev' to use a locally-built image)"
             echo "  --help, -h         Show this help message"
             echo ""
@@ -116,10 +117,10 @@ trap cleanup EXIT
 sudo mkdir -p "$OUTPUT_DIR"
 
 # Build shed-agent binary for linux/amd64 (shared across all variants),
-# the in-VM shed-firstboot, and the host-side shed CLI used below by
-# `shed image install`. The CLI build is mandatory: a clean checkout
-# has no bin/shed, and the install step below would fail with
-# "command not found".
+# the in-VM shed-firstboot, and the host-side shed CLI. The CLI build
+# was previously required by the `shed image install` step (removed in
+# Phase 1); it is still produced here so a clean checkout has a usable
+# bin/shed for the follow-up shed image build path.
 build_agent() {
     echo ""
     echo "=== Building shed-agent binary (linux/amd64) ==="
@@ -241,27 +242,19 @@ build_variant() {
     fi
     local kernel_arg=(--kernel "$OUTPUT_DIR/vmlinux")
 
-    echo ""
-    echo "=== Installing blob ==="
-    # Calls into the `shed image install` Go subcommand rather than a
-    # bash re-implementation of the atomic-install protocol — same
-    # blob-layout output, but the Go path adds digest verification, a
-    # per-digest flock, fsync ladder, and JSON-safe manifest encoding.
-    #
-    # OUTPUT_DIR (default /var/lib/shed/firecracker/images) is
-    # root-owned (sudo mkdir -p at script start), so the install needs
-    # sudo to write the blob layout. Everything else in this script
-    # that touches OUTPUT_DIR (truncate/mkfs.ext4/mount/tar) already
-    # runs under sudo; this mirrors that.
-    sudo "$PROJECT_ROOT/bin/shed" image install \
-        --images-dir "$OUTPUT_DIR" \
-        --rootfs "$rootfs_path" \
-        "${kernel_arg[@]}" \
-        --initrd "$shed_initrd" \
-        --tag "$variant" \
-        --backend firecracker \
-        --arch amd64 \
-        --consume
+    # shed image install removed in Phase 1; build scripts will be updated
+    # to use shed image build in a follow-up.
+    # echo ""
+    # echo "=== Installing blob ==="
+    # sudo "$PROJECT_ROOT/bin/shed" image install \
+    #     --images-dir "$OUTPUT_DIR" \
+    #     --rootfs "$rootfs_path" \
+    #     "${kernel_arg[@]}" \
+    #     --initrd "$shed_initrd" \
+    #     --tag "$variant" \
+    #     --backend firecracker \
+    #     --arch amd64 \
+    #     --consume
 }
 
 # Main execution

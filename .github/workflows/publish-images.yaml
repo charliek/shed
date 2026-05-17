@@ -95,12 +95,23 @@ jobs:
             --push \
             vz/
 
-      - name: Build and push shed-vz-experimental
+      - name: Build and push shed-vz-extensions
         run: |
           docker buildx build \
             --platform linux/arm64 \
-            --target shed-vz-experimental \
-            -t ghcr.io/charliek/shed-vz-experimental:${{ steps.version.outputs.tag }} \
+            --target shed-vz-extensions \
+            -t ghcr.io/charliek/shed-vz-extensions:${{ steps.version.outputs.tag }} \
+            --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
+            --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
+            --push \
+            vz/
+
+      - name: Build and push shed-vz-full
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --target shed-vz-full \
+            -t ghcr.io/charliek/shed-vz-full:${{ steps.version.outputs.tag }} \
             --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
             --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
             --push \
@@ -182,12 +193,23 @@ jobs:
             --push \
             firecracker/
 
-      - name: Build and push shed-fc-experimental
+      - name: Build and push shed-fc-extensions
         run: |
           docker buildx build \
             --platform linux/amd64 \
-            --target shed-fc-experimental \
-            -t ghcr.io/charliek/shed-fc-experimental:${{ steps.version.outputs.tag }} \
+            --target shed-fc-extensions \
+            -t ghcr.io/charliek/shed-fc-extensions:${{ steps.version.outputs.tag }} \
+            --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
+            --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
+            --push \
+            firecracker/
+
+      - name: Build and push shed-fc-full
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --target shed-fc-full \
+            -t ghcr.io/charliek/shed-fc-full:${{ steps.version.outputs.tag }} \
             --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
             --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
             --push \

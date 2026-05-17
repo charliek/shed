@@ -10,9 +10,10 @@
 # Note: VZ support is currently Apple Silicon-only.
 #
 # Usage:
-#   ./scripts/build-vz-rootfs.sh                      # Build default variant
+#   ./scripts/build-vz-rootfs.sh                      # Build full variant
 #   ./scripts/build-vz-rootfs.sh --variant base        # Build base variant
-#   ./scripts/build-vz-rootfs.sh --variant experimental  # Build experimental variant
+#   ./scripts/build-vz-rootfs.sh --variant extensions  # Build extensions variant
+#   ./scripts/build-vz-rootfs.sh --variant full        # Build full variant
 #   ./scripts/build-vz-rootfs.sh --all                  # Build all variants
 #   ./scripts/build-vz-rootfs.sh --force-kernel         # Force kernel re-extraction
 
@@ -28,10 +29,10 @@ ROOTFS_SIZE="${ROOTFS_SIZE:-20G}"  # 20GB default
 
 # Built-in variants surfaced by --all and --help. Explicit --variant values
 # are forwarded to Docker so custom shed-vz-<name> stages can be built too.
-KNOWN_VARIANTS="base default experimental"
+KNOWN_VARIANTS="base extensions full"
 
 # Defaults
-VARIANT="default"
+VARIANT="full"
 BUILD_ALL=false
 FORCE_KERNEL=false
 SHED_EXT_VERSION=""
@@ -71,11 +72,11 @@ while [[ $# -gt 0 ]]; do
             echo "Build VZ rootfs images for shed."
             echo ""
             echo "Options:"
-            echo "  --variant <name>   Build a specific variant (default: default)"
+            echo "  --variant <name>   Build a specific variant (default: full)"
             echo "                     Available variants: $KNOWN_VARIANTS"
             echo "  --all              Build all variants"
             echo "  --force-kernel     Force kernel/initrd re-extraction even if files exist"
-            echo "  --shed-ext-version Override shed-extensions image version for experimental variant"
+            echo "  --shed-ext-version Override shed-extensions image version for extensions/full variants"
             echo "                     (e.g., 'dev' to use a locally-built image)"
             echo "  --help, -h         Show this help message"
             echo ""
@@ -140,10 +141,10 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 # Build shed-agent binary for linux/arm64 (shared across all variants),
-# the in-VM shed-firstboot, and the host-side shed CLI used below by
-# `shed image install`. The CLI build is mandatory: a clean checkout
-# has no bin/shed, and the install step below would fail with
-# "command not found".
+# the in-VM shed-firstboot, and the host-side shed CLI. The CLI build
+# was previously required by the `shed image install` step (removed in
+# Phase 1); it is still produced here so a clean checkout has a usable
+# bin/shed for the follow-up shed image build path.
 build_agent() {
     echo ""
     echo "=== Building shed-agent binary (linux/arm64) ==="
@@ -307,23 +308,19 @@ build_variant() {
         --platform linux/arm64 \
         --output "$shed_initrd"
 
-    # Install rootfs+kernel+initrd as a content-addressed blob and
-    # update the variant tag. Calls into the `shed image install`
-    # Go subcommand rather than a bash re-implementation of the
-    # atomic-install protocol — same blob-layout output, but the Go
-    # path adds digest verification, a per-digest flock, fsync
-    # ladder, and JSON-safe manifest encoding.
-    echo ""
-    echo "=== Installing blob ==="
-    "$PROJECT_ROOT/bin/shed" image install \
-        --images-dir "$OUTPUT_DIR" \
-        --rootfs "$rootfs_path" \
-        --kernel "$KERNEL_PATH" \
-        --initrd "$shed_initrd" \
-        --tag "$variant" \
-        --backend vz \
-        --arch arm64 \
-        --consume
+    # shed image install removed in Phase 1; build scripts will be updated
+    # to use shed image build in a follow-up.
+    # echo ""
+    # echo "=== Installing blob ==="
+    # "$PROJECT_ROOT/bin/shed" image install \
+    #     --images-dir "$OUTPUT_DIR" \
+    #     --rootfs "$rootfs_path" \
+    #     --kernel "$KERNEL_PATH" \
+    #     --initrd "$shed_initrd" \
+    #     --tag "$variant" \
+    #     --backend vz \
+    #     --arch arm64 \
+    #     --consume
 }
 
 # Main execution

@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 FIRECRACKER_DIR="$PROJECT_ROOT/firecracker"
 REGISTRY="${REGISTRY:-ghcr.io/charliek}"
-KNOWN_VARIANTS="base devtools default experimental"
+KNOWN_VARIANTS="base extensions full"
 
 # Defaults
 VERSION=""
