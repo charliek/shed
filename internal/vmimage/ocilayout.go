@@ -54,15 +54,24 @@ func EnsureOCILayout(imagesDir string) error {
 	}
 
 	markerPath := filepath.Join(imagesDir, ociLayoutFile)
-	if _, err := os.Stat(markerPath); errors.Is(err, os.ErrNotExist) {
+	switch _, err := os.Stat(markerPath); {
+	case err == nil:
+		// Marker already present; leave it alone.
+	case errors.Is(err, os.ErrNotExist):
 		marker, _ := json.Marshal(OCILayoutMarker{ImageLayoutVersion: CurrentOCILayoutVersion})
 		if err := atomicWriteFile(markerPath, marker, 0o644); err != nil {
 			return fmt.Errorf("writing oci-layout: %w", err)
 		}
+	default:
+		// Permission, I/O, or another unexpected stat error.
+		return fmt.Errorf("stat oci-layout: %w", err)
 	}
 
 	indexPath := filepath.Join(imagesDir, ociIndexFile)
-	if _, err := os.Stat(indexPath); errors.Is(err, os.ErrNotExist) {
+	switch _, err := os.Stat(indexPath); {
+	case err == nil:
+		// Index already present; leave it alone.
+	case errors.Is(err, os.ErrNotExist):
 		idx := &OCIIndex{}
 		data, err := idx.MarshalIndent()
 		if err != nil {
@@ -71,6 +80,8 @@ func EnsureOCILayout(imagesDir string) error {
 		if err := atomicWriteFile(indexPath, data, 0o644); err != nil {
 			return fmt.Errorf("writing index.json: %w", err)
 		}
+	default:
+		return fmt.Errorf("stat index.json: %w", err)
 	}
 
 	return nil

@@ -116,9 +116,9 @@ shed image history shed-vz-full
 
 ```text
 LAYER  DIGEST                                                                   SIZE      CREATED         CREATED BY
-3      sha256:9a1c4f3b8e2d7a05c1e0a3f81b9c6d2e74a8b5c3f9e2d7a1c4f3b8e2d7a05c1   612.4 MB  2 hours ago     LABEL io.shed.variant=full
-2      sha256:7c2e5d0f4a8b9c1e3f6a8d2b5c9e1f4a7b0d3c6f9e2d5b8a1c4f7e0d3b6a9c   148.2 MB  2 hours ago     LABEL io.shed.variant=extensions
-1      sha256:3f6a8d2b5c9e1f4a7b0d3c6f9e2d5b8a1c4f7e0d3b6a9c2e5d0f4a8b9c1e3f6   1.84 GB   2 hours ago     LABEL io.shed.variant=base
+3      sha256:9a1c4f3b8e2d7a05c1e0a3f81b9c6d2e74a8b5c3f9e2d7a1c4f3b8e2d7aaa05   612.4 MB  2 hours ago     LABEL io.shed.variant=full
+2      sha256:7c2e5d0f4a8b9c1e3f6a8d2b5c9e1f4a7b0d3c6f9e2d5b8a1c4f7e0d3b6a9ccc   148.2 MB  2 hours ago     LABEL io.shed.variant=extensions
+1      sha256:3f6a8d2b5c9e1f4a7b0d3c6f9e2d5b8a1c4f7e0d3b6a9c2e5d0f4a8b9c1e3fff   1.84 GB   2 hours ago     LABEL io.shed.variant=base
 ```
 
 The `CREATED BY` column is the corresponding history entry from the OCI

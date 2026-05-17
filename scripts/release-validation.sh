@@ -277,10 +277,20 @@ if [[ "${SKIP_REMOTE}" != "1" ]]; then
             || fail "remote delete ${test_name}"
     done
 
-    # Cross-arch sanity: pulling an arm64-only image on amd64 mini2
-    # must refuse with a platform mismatch.
+    # Cross-arch sanity: pulling an arm64 image on amd64 mini2 must
+    # refuse with a platform mismatch. We push the Mac-built arm64
+    # image directly to mini2's registry (the Mac flow above only
+    # pushes to the Mac's registry) so the pull resolves to bytes that
+    # actually exist, surfacing the real architecture error rather
+    # than a generic "manifest unknown".
     step "Cross-arch refusal test (arm64 image on mini2)"
-    if run_remote "/tmp/shed-validation/bin/shed image pull ${LOCAL_REGISTRY}/shed-vz-base:test -t crossarch 2>&1 | grep -qi 'platform\\|arm64\\|architecture'"; then
+    if crane copy \
+        "${LOCAL_REGISTRY}/shed-vz-base:test" \
+        "${MINI2_USER}@${MINI2_HOST}/shed-vz-base:test" \
+        --insecure 2>/dev/null; then
+        : # rare; only used to seed the mini2 registry for this test
+    fi
+    if run_remote "/tmp/shed-validation/bin/shed image pull ${LOCAL_REGISTRY}/shed-vz-base:test -t crossarch --platform linux/arm64 2>&1 | grep -qi 'platform\\|arm64\\|architecture'"; then
         ok "cross-arch pull refused with clear platform error"
     else
         fail "cross-arch pull did not surface a platform mismatch"
