@@ -16,6 +16,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/systemprune"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmimage/clone"
 )
 
@@ -60,6 +61,7 @@ func loadSnapshot(snapshotsDir, name string) (*config.Snapshot, error) {
 		return nil, fmt.Errorf("failed to parse snapshot metadata: %w", err)
 	}
 	if snap.Version == 0 {
+		// Older builds wrote no version; treat as v1.
 		snap.Version = 1
 	}
 	return &snap, nil
@@ -76,7 +78,7 @@ func saveSnapshot(snapshotsDir string, snap *config.Snapshot) error {
 		return fmt.Errorf("failed to create snapshot directory: %w", err)
 	}
 
-	snap.Version = 1
+	snap.Version = config.SnapshotSchemaVersion
 
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -202,11 +204,18 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		return nil, fmt.Errorf("failed to clean stale snapshot rootfs: %w", err)
 	}
 
-	backend.Progress(ctx, "snapshot", "Copying rootfs to snapshot...")
-	strategy, err := clone.CloneFile(srcMeta.RootfsPath, dstRootfs)
+	// Snapshot the per-shed upper only. The lower image is shared via
+	// LowerDigest, so capturing it here would balloon the snapshot to a
+	// full image clone for no gain.
+	src := srcMeta.UpperPath
+	if src == "" {
+		src = srcMeta.RootfsPath
+	}
+	backend.Progress(ctx, "snapshot", "Copying upper layer to snapshot...")
+	strategy, err := clone.CloneFile(src, dstRootfs)
 	if err != nil {
 		os.RemoveAll(dir)
-		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
+		return nil, fmt.Errorf("failed to copy upper: %w", err)
 	}
 
 	// fsync ladder mirroring CopyRootfs in rootfs.go: clonefile/FICLONE
@@ -237,18 +246,19 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	if fi, statErr := os.Stat(dstRootfs); statErr == nil {
 		sizeBytes = fi.Size()
 	}
-	log.Printf("snapshot strategy=%s src=%s dst=%s logical_bytes=%d", strategy, srcMeta.RootfsPath, dstRootfs, sizeBytes)
+	log.Printf("snapshot strategy=%s src=%s dst=%s logical_bytes=%d", strategy, src, dstRootfs, sizeBytes)
 
 	snap := &config.Snapshot{
-		Version:        1,
+		Version:        config.SnapshotSchemaVersion,
 		Name:           req.Name,
 		Backend:        config.BackendVZ,
 		SourceShed:     req.SourceShed,
-		SourceImage:    srcMeta.Image,
+		SourceImage:    snapshotSourceImage(srcMeta),
 		SourceLocalDir: srcMeta.LocalDir,
 		Comment:        req.Comment,
 		CreatedAt:      time.Now(),
 		SizeBytes:      sizeBytes,
+		LowerDigest:    srcMeta.LowerDigest,
 	}
 
 	backend.Progress(ctx, "snapshot", "Writing snapshot metadata...")
@@ -281,6 +291,7 @@ func (c *Client) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
 			log.Printf("Warning: skipping invalid snapshot %q: %v", name, err)
 			continue
 		}
+		c.augmentSnapshot(snap)
 		out = append(out, *snap)
 	}
 	return out, nil
@@ -288,7 +299,21 @@ func (c *Client) ListSnapshots(_ context.Context) ([]config.Snapshot, error) {
 
 // GetSnapshot returns a single snapshot by name.
 func (c *Client) GetSnapshot(_ context.Context, name string) (*config.Snapshot, error) {
-	return loadSnapshot(c.cfg.SnapshotsDir, name)
+	snap, err := loadSnapshot(c.cfg.SnapshotsDir, name)
+	if err != nil {
+		return nil, err
+	}
+	c.augmentSnapshot(snap)
+	return snap, nil
+}
+
+// augmentSnapshot fills in transient fields (LowerCached) that are
+// recomputed on every read rather than persisted.
+func (c *Client) augmentSnapshot(snap *config.Snapshot) {
+	if snap.LowerDigest == "" || c.cfg.ImagesDir == "" {
+		return
+	}
+	snap.LowerCached = vmimage.BlobExists(c.cfg.ImagesDir, snap.LowerDigest)
 }
 
 // DeleteSnapshot removes a snapshot from disk.
@@ -308,4 +333,17 @@ func (c *Client) DeleteSnapshot(_ context.Context, name string) error {
 		return fmt.Errorf("failed to remove snapshot directory: %w", err)
 	}
 	return nil
+}
+
+// snapshotSourceImage picks the most actionable display value for the
+// snapshot's SourceImage field. LowerImageTag is the tag the source
+// shed pinned its lower digest to; Image is the variant the operator
+// requested and may be empty (default base) or stale after a retag.
+// Prefer the pinned tag because that's what `shed snapshot info` and
+// the "lower missing" recovery message refer to.
+func snapshotSourceImage(meta *Metadata) string {
+	if meta.LowerImageTag != "" {
+		return meta.LowerImageTag
+	}
+	return meta.Image
 }

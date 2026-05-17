@@ -6,10 +6,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
-	"github.com/charliek/shed/internal/vmimage"
 )
 
 func newSystemTestClient(t *testing.T) (*Client, string, string) {
@@ -53,15 +53,9 @@ func TestDiskUsage_Empty(t *testing.T) {
 func TestDiskUsage_Populated(t *testing.T) {
 	client, imagesDir, instanceDir := newSystemTestClient(t)
 
-	// _base (discovered directly) + one variant (auto-discovered via ListImages).
-	basePath := filepath.Join(imagesDir, vmimage.RootfsFilename("_base"))
-	if err := os.WriteFile(basePath, make([]byte, 4096), 0644); err != nil {
-		t.Fatal(err)
-	}
-	variantPath := filepath.Join(imagesDir, vmimage.RootfsFilename("experimental"))
-	if err := os.WriteFile(variantPath, make([]byte, 8192), 0644); err != nil {
-		t.Fatal(err)
-	}
+	// _base (discovered via tag indirection) + one variant (auto-discovered via ListImages).
+	createFakeImage(t, imagesDir, "_base")
+	createFakeImage(t, imagesDir, "experimental")
 
 	// One stopped shed with a rootfs copy and a console.log.
 	dir := filepath.Join(instanceDir, "api-dev")
@@ -122,9 +116,13 @@ func TestDiskUsage_Populated(t *testing.T) {
 	if du.Totals.All.LogicalBytes <= 0 {
 		t.Errorf("expected non-zero total, got %d", du.Totals.All.LogicalBytes)
 	}
-	// Images total should include at least _base + experimental (12288 bytes).
-	if du.Totals.Images.LogicalBytes < 12288 {
-		t.Errorf("images total = %d, want >= 12288", du.Totals.Images.LogicalBytes)
+	// Images total should be non-zero. createFakeImage writes ~20-byte
+	// fake rootfs bodies; the old 12288-byte threshold predated that
+	// helper (when tests wrote 4 KiB + 8 KiB raw files). Use a lower
+	// bound that just verifies the bytes flow through — the exact size
+	// is asserted on per-image entries elsewhere.
+	if du.Totals.Images.LogicalBytes == 0 {
+		t.Errorf("images total = %d, want > 0", du.Totals.Images.LogicalBytes)
 	}
 	// Sheds total should include rootfs (4096) + console.log (256) at minimum.
 	if du.Totals.Sheds.LogicalBytes < 4096+256 {
@@ -151,5 +149,40 @@ func TestDiskUsage_MalformedMetadataSkipped(t *testing.T) {
 	}
 	if len(du.Sheds) != 0 {
 		t.Errorf("expected 0 sheds after skipping broken, got %d", len(du.Sheds))
+	}
+}
+
+// TestRefScanner_StrictModeFailsOnMalformedMetadata locks in the policy
+// split Codex flagged: image prune (which scans refs in strict mode)
+// must refuse to run when an instance has malformed metadata, because
+// returning a partial protective-ref set from a destructive caller
+// risks deleting a blob the broken-but-recoverable shed pinned. The
+// lenient (read-only) path still warn-and-skips.
+func TestRefScanner_StrictModeFailsOnMalformedMetadata(t *testing.T) {
+	_, _, instanceDir := newSystemTestClient(t)
+
+	dir := filepath.Join(instanceDir, "broken")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "metadata.json"), []byte("{not-json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := &vzRefScanner{cfg: &config.VZConfig{InstanceDir: instanceDir}}
+
+	if _, err := scanner.ScanRefs(false); err != nil {
+		t.Fatalf("lenient ScanRefs should not fail on malformed metadata: %v", err)
+	}
+
+	_, err := scanner.ScanRefs(true)
+	if err == nil {
+		t.Fatal("strict ScanRefs should fail on malformed metadata")
+	}
+	if !strings.Contains(err.Error(), "broken") {
+		t.Errorf("error should name the broken instance, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "remove the directory") {
+		t.Errorf("error should hint at fix, got: %v", err)
 	}
 }

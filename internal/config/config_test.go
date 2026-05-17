@@ -1,13 +1,48 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charliek/shed/internal/vmimage"
 )
+
+// installCachedBlob installs a fake blob into imagesDir under the given
+// tag, with the given source ref recorded in its manifest. Returns the
+// path to the cached blob's rootfs.ext4. Test helper.
+func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
+	t.Helper()
+	stagingDir := t.TempDir()
+	src := filepath.Join(stagingDir, "rootfs.ext4")
+	body := []byte("fake-" + tag)
+	if err := os.WriteFile(src, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
+	if _, _, err := vmimage.InstallBlob(imagesDir, vmimage.BlobInstallSpec{
+		Files: map[string]string{vmimage.BlobRootfsFilename: src},
+		Manifest: vmimage.Manifest{
+			SchemaVersion:     vmimage.ManifestSchemaVersion,
+			Digest:            digest,
+			SourceRef:         sourceRef,
+			RootfsLogicalSize: int64(len(body)),
+		},
+	}); err != nil {
+		t.Fatalf("InstallBlob: %v", err)
+	}
+	if err := vmimage.SetTag(imagesDir, tag, digest); err != nil {
+		t.Fatalf("SetTag: %v", err)
+	}
+	path, _ := vmimage.BlobRootfsPath(imagesDir, digest)
+	return path
+}
 
 func TestNewAPIError(t *testing.T) {
 	err := NewAPIError(ErrShedNotFound, "Shed 'test' not found")
@@ -509,6 +544,13 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 			modify:  func(c *FirecrackerConfig) { c.BaseRootfs = "/nonexistent/rootfs.ext4" },
 			wantErr: true,
 		},
+		{
+			// Empty base_rootfs is allowed under the content-addressed
+			// model — see Validate header.
+			name:    "empty base_rootfs is allowed",
+			modify:  func(c *FirecrackerConfig) { c.BaseRootfs = "" },
+			wantErr: false,
+		},
 		// Lower bounds still work
 		{
 			name:    "cpus below min",
@@ -578,14 +620,19 @@ func TestVZConfigValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "missing kernel_path",
+			// kernel_path is optional under Phase B — vm.Start prefers
+			// the kernel inside the blob.
+			name:    "missing kernel_path is allowed",
 			modify:  func(c *VZConfig) { c.KernelPath = "" },
-			wantErr: true,
+			wantErr: false,
 		},
 		{
-			name:    "missing base_rootfs",
+			// base_rootfs is now optional under the content-addressed
+			// model — empty is valid; create-without-image errors later
+			// in the CreateShed path with a clear message.
+			name:    "missing base_rootfs is allowed",
 			modify:  func(c *VZConfig) { c.BaseRootfs = "" },
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "missing instance_dir",
@@ -1013,6 +1060,49 @@ func TestVZConfigResolveImage(t *testing.T) {
 			t.Errorf("error = %q, want 'no image variants configured'", err.Error())
 		}
 	})
+
+	t.Run("tag-auto-discovery carries digest", func(t *testing.T) {
+		// Plant a fake blob under a tag in a temp ImagesDir and confirm
+		// resolveImage's "not in images map → auto-discover by tag"
+		// branch returns the digest in the ResolvedImage. Closes the
+		// race window where EnsureImage previously had to re-do the
+		// tag lookup based on Path alone.
+		dir := t.TempDir()
+		body := []byte("fake-rootfs-for-digest-carry-test")
+		src := filepath.Join(dir, "stage.ext4")
+		if err := os.WriteFile(src, body, 0o644); err != nil {
+			t.Fatalf("write staging rootfs: %v", err)
+		}
+		sum := sha256.Sum256(body)
+		digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
+		if _, _, err := vmimage.InstallBlob(dir, vmimage.BlobInstallSpec{
+			Files: map[string]string{vmimage.BlobRootfsFilename: src},
+			Manifest: vmimage.Manifest{
+				SchemaVersion:     vmimage.ManifestSchemaVersion,
+				Digest:            digest,
+				RootfsLogicalSize: int64(len(body)),
+			},
+		}); err != nil {
+			t.Fatalf("InstallBlob: %v", err)
+		}
+		if err := vmimage.SetTag(dir, "carry", digest); err != nil {
+			t.Fatalf("SetTag: %v", err)
+		}
+
+		// images map is empty; auto-discovery path is the one we want
+		// to exercise.
+		cfg := &VZConfig{ImagesDir: dir, Images: map[string]string{}}
+		resolved, err := cfg.ResolveImage("carry")
+		if err != nil {
+			t.Fatalf("ResolveImage(carry) error = %v", err)
+		}
+		if resolved.Digest != digest {
+			t.Errorf("Digest = %q, want %q", resolved.Digest, digest)
+		}
+		if resolved.Path == "" {
+			t.Error("Path should be populated for tag-discovered image")
+		}
+	})
 }
 
 func TestVZConfigValidateImages(t *testing.T) {
@@ -1097,11 +1187,7 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("cached docker ref returns Path", func(t *testing.T) {
 		dir := t.TempDir()
-		// Create cached rootfs and source sidecar
-		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
-		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
-		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-vz-default:v1.0.0\n"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "default", "ghcr.io/charliek/shed-vz-default:v1.0.0")
 
 		cfg := &VZConfig{
 			Images:    map[string]string{"default": "ghcr.io/charliek/shed-vz-default:v1.0.0"},
@@ -1121,10 +1207,7 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("stale cache triggers re-pull", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
-		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
-		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-vz-default:v1.0.0\n"), 0644)
+		installCachedBlob(t, dir, "default", "ghcr.io/charliek/shed-vz-default:v1.0.0")
 
 		cfg := &VZConfig{
 			Images:    map[string]string{"default": "ghcr.io/charliek/shed-vz-default:v2.0.0"},
@@ -1141,8 +1224,7 @@ func TestVZConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("auto-discover from ImagesDir", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "custom-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "custom", "ghcr.io/example/custom:v1")
 
 		cfg := &VZConfig{
 			Images:    map[string]string{},
@@ -1253,10 +1335,7 @@ func TestFirecrackerConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("cached docker ref returns Path", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "default-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
-		sourceFile := filepath.Join(dir, "default-rootfs.ext4.source")
-		os.WriteFile(sourceFile, []byte("ghcr.io/charliek/shed-fc-default:v1.0.0\n"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "default", "ghcr.io/charliek/shed-fc-default:v1.0.0")
 
 		cfg := &FirecrackerConfig{
 			Images:    map[string]string{"default": "ghcr.io/charliek/shed-fc-default:v1.0.0"},
@@ -1273,8 +1352,7 @@ func TestFirecrackerConfigResolveImageDockerRef(t *testing.T) {
 
 	t.Run("auto-discover from ImagesDir", func(t *testing.T) {
 		dir := t.TempDir()
-		rootfsPath := filepath.Join(dir, "custom-rootfs.ext4")
-		os.WriteFile(rootfsPath, []byte("fake"), 0644)
+		rootfsPath := installCachedBlob(t, dir, "custom", "ghcr.io/example/custom:v1")
 
 		cfg := &FirecrackerConfig{
 			Images:    map[string]string{},

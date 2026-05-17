@@ -139,7 +139,11 @@ fi
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Build shed-agent binary for linux/arm64 (shared across all variants)
+# Build shed-agent binary for linux/arm64 (shared across all variants),
+# the in-VM shed-firstboot, and the host-side shed CLI used below by
+# `shed image install`. The CLI build is mandatory: a clean checkout
+# has no bin/shed, and the install step below would fail with
+# "command not found".
 build_agent() {
     echo ""
     echo "=== Building shed-agent binary (linux/arm64) ==="
@@ -150,6 +154,11 @@ build_agent() {
     echo "=== Building shed-firstboot binary (linux/arm64) ==="
     GOOS=linux GOARCH=arm64 go build -o "$VZ_DIR/shed-firstboot" ./cmd/shed-firstboot
     echo "Built shed-firstboot binary"
+
+    echo "=== Building host shed CLI ==="
+    mkdir -p "$PROJECT_ROOT/bin"
+    go build -o "$PROJECT_ROOT/bin/shed" ./cmd/shed
+    echo "Built $PROJECT_ROOT/bin/shed"
 }
 
 # Extract kernel and initrd from the base image
@@ -227,7 +236,10 @@ build_variant() {
     echo "  Output: $rootfs_file"
     echo "========================================"
 
-    # Build Docker image
+    # Build Docker image. Context is the vz/ directory so the
+    # Dockerfile's relative COPY paths (daemon.json, shed-agent, etc.)
+    # resolve correctly. The shed initramfs is built separately by
+    # build-initramfs.sh from initramfs/Dockerfile.
     echo ""
     echo "=== Building Docker image ($docker_tag) ==="
     cd "$VZ_DIR"
@@ -281,6 +293,37 @@ build_variant() {
 
     # Extract kernel/initrd from the base image (all variants share the same kernel)
     extract_kernel "$docker_tag"
+
+    # Build the shed-overlay initramfs (one initrd is fine across all
+    # variants — it's image-content-independent). Stage into a tempfile
+    # rather than OUTPUT_DIR for symmetry with the FC script and to
+    # avoid leaking intermediates if install-blob.sh is interrupted.
+    local shed_initrd
+    shed_initrd="$(mktemp "${TMPDIR:-/tmp}/shed-initrd-vz.XXXXXX.img")"
+    echo ""
+    echo "=== Building shed-overlay initramfs ==="
+    "$SCRIPT_DIR/build-initramfs.sh" \
+        --backend vz \
+        --platform linux/arm64 \
+        --output "$shed_initrd"
+
+    # Install rootfs+kernel+initrd as a content-addressed blob and
+    # update the variant tag. Calls into the `shed image install`
+    # Go subcommand rather than a bash re-implementation of the
+    # atomic-install protocol — same blob-layout output, but the Go
+    # path adds digest verification, a per-digest flock, fsync
+    # ladder, and JSON-safe manifest encoding.
+    echo ""
+    echo "=== Installing blob ==="
+    "$PROJECT_ROOT/bin/shed" image install \
+        --images-dir "$OUTPUT_DIR" \
+        --rootfs "$rootfs_path" \
+        --kernel "$KERNEL_PATH" \
+        --initrd "$shed_initrd" \
+        --tag "$variant" \
+        --backend vz \
+        --arch arm64 \
+        --consume
 }
 
 # Main execution

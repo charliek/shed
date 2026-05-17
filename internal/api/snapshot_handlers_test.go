@@ -56,6 +56,9 @@ func (f *snapshotFakeBackend) StartShed(_ context.Context, _ string) (*config.Sh
 func (f *snapshotFakeBackend) StopShed(_ context.Context, _ string) (*config.Shed, error) {
 	panic("unexpected")
 }
+func (f *snapshotFakeBackend) ResetShed(_ context.Context, _ string) (*config.Shed, error) {
+	panic("unexpected")
+}
 func (f *snapshotFakeBackend) ListSessions(_ context.Context, _ string) ([]config.Session, error) {
 	panic("unexpected")
 }
@@ -70,6 +73,13 @@ func (f *snapshotFakeBackend) DialService(_ context.Context, _ string, _ uint16)
 	panic("unexpected")
 }
 func (f *snapshotFakeBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
+	panic("unexpected")
+}
+func (f *snapshotFakeBackend) InspectImage(_ context.Context, _ string) (config.ImageInspectResponse, error) {
+	panic("unexpected")
+}
+func (f *snapshotFakeBackend) TagImage(_ context.Context, _, _ string) error { panic("unexpected") }
+func (f *snapshotFakeBackend) PullImage(_ context.Context, _, _ string) (string, error) {
 	panic("unexpected")
 }
 func (f *snapshotFakeBackend) DeleteImage(_ context.Context, _ string) error { panic("unexpected") }

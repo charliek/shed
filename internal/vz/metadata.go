@@ -13,14 +13,24 @@ import (
 	"time"
 )
 
-// MetadataVersion is the current metadata schema version.
-const MetadataVersion = 1
+// MetadataVersion is the current metadata schema version. Bumped from
+// 1 to 2 with the introduction of content-addressed image lower digests.
+// Pre-v2 metadata is rejected on load — operators must
+// `shed delete <name>` and recreate.
+const MetadataVersion = 2
 
 // ErrInstanceNotFound is returned when a requested instance does not exist.
 var ErrInstanceNotFound = errors.New("instance not found")
 
 // ErrInvalidInstanceName is returned when a requested instance name is unsafe.
 var ErrInvalidInstanceName = errors.New("invalid instance name")
+
+// ErrLegacyMetadata is returned when loading metadata written by a
+// pre-v2 build. The pre-overlay storage layout cannot be migrated
+// in place — the operator has to remove the on-disk state manually
+// (since `shed delete` itself goes through LoadMetadata and would
+// hit this same error).
+var ErrLegacyMetadata = errors.New("metadata is from a pre-overlay version of shed; remove the instance directory under {vz.instance_dir}/<name>/ (and its uppers/<name>/ entry, if any) and recreate the shed")
 
 // Metadata represents the persistent state of a VZ VM instance.
 type Metadata struct {
@@ -48,8 +58,18 @@ type Metadata struct {
 	// MemoryMB is the memory in MB
 	MemoryMB int `json:"memory_mb"`
 
-	// RootfsPath is the path to the instance's rootfs image
+	// RootfsPath is the path to the instance's rootfs image. With the
+	// overlay-in-guest model this is the per-shed writable upper; the
+	// read-only lower is the blob's rootfs.ext4, resolved through
+	// LowerDigest at boot time.
 	RootfsPath string `json:"rootfs_path"`
+
+	// UpperPath is the absolute path to the per-shed writable upper
+	// (an ext4-formatted sparse file mounted as /dev/vda in the guest).
+	UpperPath string `json:"upper_path,omitempty"`
+
+	// UpperSizeBytes is the logical size of the upper sparse file.
+	UpperSizeBytes int64 `json:"upper_size_bytes,omitempty"`
 
 	// Repo is the optional git repository URL
 	Repo string `json:"repo,omitempty"`
@@ -57,8 +77,18 @@ type Metadata struct {
 	// LocalDir is the host directory mounted via VirtioFS (if set)
 	LocalDir string `json:"local_dir,omitempty"`
 
-	// Image is the image variant name used to create this instance
+	// Image is the image variant name (tag) used to create this instance.
+	// Display-only; identity lives in LowerDigest.
 	Image string `json:"image,omitempty"`
+
+	// LowerDigest is the digest of the lower (base) image this shed was
+	// cloned from, in the form "sha256:...".
+	LowerDigest string `json:"lower_digest,omitempty"`
+
+	// LowerImageTag is the image variant name at create time (mirrors
+	// Image; the underlying digest in LowerDigest is the source of
+	// truth — tags can be retagged later without invalidating sheds).
+	LowerImageTag string `json:"lower_image_tag,omitempty"`
 
 	// FromSnapshot records the snapshot this instance was spawned from (if any).
 	FromSnapshot string `json:"from_snapshot,omitempty"`
@@ -96,8 +126,8 @@ func LoadMetadata(instanceDir, name string) (*Metadata, error) {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
-	if meta.Version == 0 {
-		meta.Version = 1
+	if meta.Version < MetadataVersion {
+		return nil, fmt.Errorf("%w (shed=%q, version=%d)", ErrLegacyMetadata, name, meta.Version)
 	}
 
 	return &meta, nil

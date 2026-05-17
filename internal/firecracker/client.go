@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmimage"
+	"github.com/charliek/shed/internal/vmimage/clone"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -398,7 +399,39 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
 
-	var rootfsSource string
+	// Sweep an orphan upper from a previously crashed create. We're
+	// guaranteed at this point that no metadata.json claims this name
+	// (the LoadMetadata check above returned NotFound) and we hold the
+	// per-name create lock, so anything still sitting at
+	// uppers/<name>/ is leftover state from a half-completed run.
+	// Without this, EnsureUpper's strict-rejection would force the
+	// operator to manually `rm -rf` to recover.
+	if _, err := os.Stat(UpperPath(c.cfg.UppersDir, req.Name)); err == nil {
+		log.Printf("CreateShed %s: sweeping orphan upper from a prior crashed create", req.Name)
+		if err := DeleteUpper(c.cfg.UppersDir, req.Name); err != nil {
+			return nil, fmt.Errorf("failed to sweep orphan upper for %s: %w", req.Name, err)
+		}
+	}
+
+	upperSizeBytes := req.UpperSizeBytes
+	if upperSizeBytes == 0 {
+		sz := c.cfg.UpperSizeDefault
+		if sz == "" {
+			sz = config.DefaultUpperSize
+		}
+		parsed, err := config.ParseUpperSize(sz)
+		if err != nil {
+			return nil, fmt.Errorf("invalid upper_size_default: %w", err)
+		}
+		upperSizeBytes = parsed
+	} else {
+		if upperSizeBytes < config.MinUpperSizeBytes || upperSizeBytes > config.MaxUpperSizeBytes {
+			return nil, fmt.Errorf("upper size out of range: must be between %dG and %dG",
+				config.MinUpperSizeBytes/(1024*1024*1024), config.MaxUpperSizeBytes/(1024*1024*1024))
+		}
+	}
+
+	var snapshotUpperSource, lowerDigest, lowerImageTag string
 	if req.FromSnapshot != "" {
 		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
 		if err != nil {
@@ -408,7 +441,24 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
 				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendFirecracker)
 		}
-		rootfsSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
+		// The lower-digest pin must still be cached or the new shed
+		// can't boot — overlay needs both layers present.
+		if snap.LowerDigest == "" {
+			return nil, fmt.Errorf("snapshot %q is missing lower_digest; recreate the snapshot from a current shed", req.FromSnapshot)
+		}
+		if !vmimage.BlobExists(c.cfg.ImagesDir, snap.LowerDigest) {
+			ref := snap.SourceImage
+			if ref == "" {
+				ref = "(unknown)"
+			}
+			return nil, fmt.Errorf("snapshot %q references lower digest %s which is no longer cached; pull the original image (%s) first",
+				req.FromSnapshot, vmimage.ShortDigest(snap.LowerDigest), ref)
+		}
+		snapshotUpperSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
+		// Inherit the lower-digest pin from the snapshot so this new
+		// shed continues to protect the underlying blob from prune.
+		lowerDigest = snap.LowerDigest
+		lowerImageTag = snap.SourceImage
 	} else {
 		// Resolve and ensure image before allocating network resources.
 		// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
@@ -422,20 +472,45 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 				return nil, err
 			}
 		} else {
+			if c.cfg.BaseRootfs == "" {
+				return nil, fmt.Errorf("%w: no --image specified and no base_rootfs configured in firecracker.base_rootfs; pass --image <tag> or set base_rootfs in server.yaml", config.ErrInvalidShedRequestSentinel)
+			}
 			resolved = c.cfg.ResolveBaseRootfs()
 		}
 
-		mgr := vmimage.NewManager(c.cfg)
-		rootfsSource, err = mgr.EnsureImage(ctx, vmimage.ResolvedRef{
+		mgr := vmimage.NewManager(c.cfg, c.refScanner())
+		ensureRes, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 			Path:      resolved.Path,
 			DockerRef: resolved.DockerRef,
 			Name:      resolved.Name,
+			Digest:    resolved.Digest,
 		}, func(stage, msg string) {
 			backend.Progress(ctx, stage, msg)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure image: %w", err)
 		}
+		if ensureRes.Digest == "" {
+			return nil, fmt.Errorf("image %q resolved to a path outside the blob store; the overlay model requires content-addressed images", resolved.Name)
+		}
+		lowerDigest = ensureRes.Digest
+		lowerImageTag = resolved.Name
+	}
+
+	// Drop a `.creating` marker recording the lower digest so a
+	// concurrent `shed image prune` can't sweep the blob between
+	// here and meta.Save. The marker counts as a Pending protective
+	// ref in the refscanner (systemprune.ScanInstanceCreatingMarkers)
+	// for up to InstanceCreatingMaxAge (1h); stale markers from
+	// crashed creates expire and stop protecting on their own.
+	//
+	// Skip for from-snapshot: the snapshot already pins the digest
+	// via its own LowerDigest field.
+	if lowerDigest != "" && req.FromSnapshot == "" {
+		if err := writeCreatingMarker(c.cfg.InstanceDir, req.Name, lowerDigest); err != nil {
+			return nil, fmt.Errorf("failed to write creating marker: %w", err)
+		}
+		defer removeCreatingMarker(c.cfg.InstanceDir, req.Name)
 	}
 
 	backend.Progress(ctx, "network", "Allocating network resources...")
@@ -455,18 +530,56 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to create TAP device: %w", err)
 	}
 
-	backend.Progress(ctx, "rootfs", "Copying root filesystem...")
-	rootfsPath, err := CopyRootfs(rootfsSource, c.cfg.InstanceDir, req.Name)
+	backend.Progress(ctx, "rootfs", "Allocating writable upper layer...")
+	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
 	if err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
 		}
 		c.ReleaseIP(ipAddress)
 		c.ReleaseCID(cid)
-		return nil, fmt.Errorf("failed to copy rootfs: %w", err)
+		return nil, fmt.Errorf("failed to create upper: %w", err)
 	}
-	// CopyRootfs forces 0o644 internally so spawning from a 0o444
-	// snapshot rootfs produces a writable instance rootfs.
+	// from-snapshot: replace the freshly allocated empty upper with a
+	// reflink clone of the snapshot's stored upper so the new shed
+	// inherits its parent's writable contents.
+	if snapshotUpperSource != "" {
+		if err := os.Remove(upperPath); err != nil && !os.IsNotExist(err) {
+			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+			}
+			c.ReleaseIP(ipAddress)
+			c.ReleaseCID(cid)
+			return nil, fmt.Errorf("failed to clear upper for snapshot clone: %w", err)
+		}
+		if _, err := clone.CloneFile(snapshotUpperSource, upperPath); err != nil {
+			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+			}
+			c.ReleaseIP(ipAddress)
+			c.ReleaseCID(cid)
+			return nil, fmt.Errorf("failed to clone snapshot upper: %w", err)
+		}
+		if err := os.Chmod(upperPath, 0o644); err != nil {
+			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
+				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
+			}
+			c.ReleaseIP(ipAddress)
+			c.ReleaseCID(cid)
+			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
+		}
+		// The metadata's UpperSizeBytes must reflect the *cloned* file's
+		// actual size, not the freshly-allocated sparse size — otherwise
+		// `shed system df` and reset/snapshot bookkeeping report the
+		// pre-snapshot size for what is now a different file.
+		if fi, statErr := os.Stat(upperPath); statErr == nil {
+			upperSizeBytes = fi.Size()
+		}
+	}
+	rootfsPath := upperPath
 
 	cpus := req.CPUs
 	if cpus == 0 {
@@ -478,20 +591,24 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	meta := &Metadata{
-		Name:         req.Name,
-		Status:       config.StatusStopped,
-		CreatedAt:    time.Now(),
-		Backend:      config.BackendFirecracker,
-		CID:          cid,
-		IPAddress:    ipAddress,
-		TAPDevice:    tapDevice,
-		CPUs:         cpus,
-		MemoryMB:     memoryMB,
-		RootfsPath:   rootfsPath,
-		Repo:         req.Repo,
-		LocalDir:     req.LocalDir,
-		Image:        req.Image,
-		FromSnapshot: req.FromSnapshot,
+		Name:           req.Name,
+		Status:         config.StatusStopped,
+		CreatedAt:      time.Now(),
+		Backend:        config.BackendFirecracker,
+		CID:            cid,
+		IPAddress:      ipAddress,
+		TAPDevice:      tapDevice,
+		CPUs:           cpus,
+		MemoryMB:       memoryMB,
+		RootfsPath:     rootfsPath,
+		UpperPath:      upperPath,
+		UpperSizeBytes: upperSizeBytes,
+		Repo:           req.Repo,
+		LocalDir:       req.LocalDir,
+		Image:          req.Image,
+		LowerDigest:    lowerDigest,
+		LowerImageTag:  lowerImageTag,
+		FromSnapshot:   req.FromSnapshot,
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -500,6 +617,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+		}
+		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
 		}
 		c.ReleaseIP(ipAddress)
 		c.ReleaseCID(cid)
@@ -516,6 +636,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
+		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
+		}
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
@@ -527,6 +650,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+		}
+		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
 		}
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to start VM: %w", err)
@@ -542,6 +668,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+		}
+		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
 		}
 		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
@@ -569,6 +698,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 			}
+			if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+				log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
+			}
 			c.UnregisterInstance(req.Name, cid, ipAddress)
 			return nil, fmt.Errorf("failed to start 9P server for local dir: %w", err)
 		}
@@ -582,6 +714,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			}
 			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
+			}
+			if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
+				log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
 			}
 			c.UnregisterInstance(req.Name, cid, ipAddress)
 			return nil, fmt.Errorf("failed to mount 9P in guest: %w", err)
@@ -748,6 +883,10 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		return fmt.Errorf("failed to delete instance: %w", err)
 	}
 
+	if err := DeleteUpper(c.cfg.UppersDir, name); err != nil {
+		log.Printf("Warning: failed to delete upper layer for %s: %v", name, err)
+	}
+
 	return nil
 }
 
@@ -872,8 +1011,15 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	// Stop P9 servers before shutting down
 	c.stopP9Servers(meta.Name)
 
+	agent := c.newAgentClient(meta.Name)
+
 	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, c.newAgentClient(meta.Name), meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+	vmutil.RunShutdownSequence(ctx, agent, meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+
+	// Ask the guest to flush dirty buffers to the virtio-blk devices
+	// before firecracker terminates. Without this, post-stop snapshots
+	// and any host-side read of upper.ext4 see a stale pre-sync state.
+	vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
 
 	// Get or create VM handle
 	c.mu.Lock()
@@ -931,4 +1077,68 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 	addr := net.JoinHostPort(meta.IPAddress, strconv.FormatUint(uint64(port), 10))
 	var d net.Dialer
 	return d.DialContext(ctx, "tcp", addr)
+}
+
+// ResetShed nukes the per-shed upper and recreates it as a fresh
+// sparse, unformatted ext4-sized file. The shed must be stopped.
+// /workspace is mounted post-boot via 9P from outside the overlay so
+// it is not affected by this operation.
+func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	if meta.Status != config.StatusStopped {
+		return nil, fmt.Errorf("%w: %s", config.ErrShedNotStoppedSentinel, name)
+	}
+
+	// Refuse to wipe the upper if the lower blob is gone — the shed
+	// is unbootable either way, but `shed reset` succeeding without
+	// the lower would silently destroy uncommitted in-VM work for a
+	// shed that can't be started afterwards. Operators want a clear
+	// "pull the image first" signal.
+	if meta.LowerDigest != "" && !vmimage.BlobExists(c.cfg.ImagesDir, meta.LowerDigest) {
+		ref := meta.LowerImageTag
+		if ref == "" {
+			ref = "(unknown)"
+		}
+		return nil, fmt.Errorf("cannot reset %s: lower image blob %s is no longer cached; pull or rebuild %s before resetting",
+			name, vmimage.ShortDigest(meta.LowerDigest), ref)
+	}
+
+	size := meta.UpperSizeBytes
+	if size <= 0 {
+		sz := c.cfg.UpperSizeDefault
+		if sz == "" {
+			sz = config.DefaultUpperSize
+		}
+		parsed, perr := config.ParseUpperSize(sz)
+		if perr != nil {
+			return nil, fmt.Errorf("invalid upper_size_default during reset: %w", perr)
+		}
+		size = parsed
+	}
+
+	if err := DeleteUpper(c.cfg.UppersDir, name); err != nil {
+		return nil, fmt.Errorf("failed to delete upper during reset: %w", err)
+	}
+	upperPath, err := EnsureUpper(c.cfg.UppersDir, name, size)
+	if err != nil {
+		return nil, fmt.Errorf("failed to recreate upper during reset: %w", err)
+	}
+
+	meta.UpperPath = upperPath
+	meta.RootfsPath = upperPath
+	meta.UpperSizeBytes = size
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("failed to persist metadata after reset: %w", err)
+	}
+
+	log.Printf("reset shed %s: upper recreated at %s (%d bytes)", name, upperPath, size)
+	return metadataToShed(meta), nil
 }

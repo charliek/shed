@@ -199,8 +199,25 @@ func runSnapshotInfo(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("Size:           %s\n", formatSize(snap.SizeBytes))
 	fmt.Printf("Created:        %s\n", snap.CreatedAt.Format("2006-01-02 15:04:05"))
+	if snap.LowerDigest != "" {
+		status := "cached"
+		if !snap.LowerCached {
+			status = "MISSING — pull or rebuild the image before spawning"
+		}
+		fmt.Printf("Lower digest:   %s (%s)\n", snap.LowerDigest, status)
+	}
 	if snap.Comment != "" {
 		fmt.Printf("Comment:        %s\n", snap.Comment)
+	}
+	if snap.LowerDigest != "" && !snap.LowerCached {
+		ref := snap.SourceImage
+		if ref == "" {
+			ref = "<unknown>"
+		}
+		fmt.Fprintf(os.Stderr,
+			"\nWarning: this snapshot's lower image is no longer cached.\n"+
+				"  shed create --from-snapshot %s will fail until you pull/rebuild %s.\n",
+			snap.Name, ref)
 	}
 	return nil
 }

@@ -5,7 +5,6 @@ package vz
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 
@@ -14,7 +13,10 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 )
 
-var errNonDarwin = errors.New("vz backend is only supported on macOS")
+// errNonDarwin wraps ErrNotSupportedSentinel so the API layer maps
+// every VZ-on-Linux call to HTTP 501 (Not Implemented) rather than a
+// generic 500 backend error.
+var errNonDarwin = fmt.Errorf("%w: vz backend is only supported on macOS", config.ErrNotSupportedSentinel)
 
 // Client is a stub for non-darwin builds.
 type Client struct{}
@@ -77,6 +79,11 @@ func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, er
 	return nil, errNonDarwin
 }
 
+// ResetShed returns an error on non-darwin platforms.
+func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return nil, errNonDarwin
+}
+
 // ListSessions returns an error on non-darwin platforms.
 func (b *VZBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
 	return nil, errNonDarwin
@@ -105,6 +112,21 @@ func (b *VZBackend) DialService(ctx context.Context, shedName string, port uint1
 // ListImages returns an empty list on non-darwin platforms.
 func (b *VZBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	return nil, nil
+}
+
+// InspectImage returns an error on non-darwin platforms.
+func (b *VZBackend) InspectImage(_ context.Context, _ string) (config.ImageInspectResponse, error) {
+	return config.ImageInspectResponse{}, fmt.Errorf("inspect image: %w", config.ErrNotSupportedSentinel)
+}
+
+// TagImage returns an error on non-darwin platforms.
+func (b *VZBackend) TagImage(_ context.Context, _, _ string) error {
+	return fmt.Errorf("tag image: %w", config.ErrNotSupportedSentinel)
+}
+
+// PullImage returns an error on non-darwin platforms.
+func (b *VZBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+	return "", fmt.Errorf("pull image: %w", config.ErrNotSupportedSentinel)
 }
 
 // DeleteImage returns an error on non-darwin platforms.

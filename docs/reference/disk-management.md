@@ -8,7 +8,7 @@ The three tools involved:
 - `shed system prune` — scoped cleanup with a dry-run-first UX.
 - Reflink / clonefile on `shed create` — new sheds share extents with the base image on reflink-capable filesystems, so per-shed disk cost starts at near-zero.
 
-Full flag references live in the [CLI reference](cli.md#system-disk-usage); full API schemas live in the [HTTP API reference](api.md#system). This page focuses on workflows and the reflink behavior that affects every `shed create`.
+Full flag references live in the [CLI reference](cli.md#system-disk-usage); full API schemas live in the [HTTP API reference](api.md#system). This page focuses on workflows and the reflink behavior that affects every `shed create`. The on-disk layout itself is covered in [Storage Model](storage-model.md).
 
 ## What lives on disk
 
@@ -16,14 +16,15 @@ Each server stores four kinds of data in its backend directory:
 
 | Kind | VZ path (macOS) | Firecracker path (Linux) | Created by | Removed by |
 |------|-----------------|---------------------------|------------|------------|
-| `_base` rootfs cache | `~/Library/Application Support/shed/vz/_base-rootfs.ext4` | `/var/lib/shed/firecracker/images/_base-rootfs.ext4` | First `shed create` pulling the configured `base_rootfs` Docker ref | `shed image delete _base` or config change + `shed image prune` |
-| Image variants | `~/Library/Application Support/shed/vz/{name}-rootfs.ext4` | `/var/lib/shed/firecracker/images/{name}-rootfs.ext4` | `shed image build` or `shed-server pull-images` | `shed image delete <name>` or `shed system prune --images` |
-| Kernel / initrd | `~/Library/Application Support/shed/vz/vmlinux`, `initrd.img` | `/var/lib/shed/firecracker/images/vmlinux` (no initrd on FC) | `shed-server setup` or first image pull | Manual |
-| Per-shed rootfs | `~/Library/Application Support/shed/vz/instances/{name}/rootfs.ext4` | `/var/lib/shed/firecracker/instances/{name}/rootfs.ext4` | `shed create` (shares extents with `_base` when possible) | `shed delete` or `shed system prune --instances` |
+| Image blobs | `~/Library/Application Support/shed/vz/blobs/sha256/<digest>/` | `/var/lib/shed/firecracker/images/blobs/sha256/<digest>/` | `shed image build`, `shed image pull`, or `shed-server pull-images` | `shed image prune` (when no shed/snapshot pins the digest) |
+| Tags | `~/Library/Application Support/shed/vz/tags/<tag>.json` | `/var/lib/shed/firecracker/images/tags/<tag>.json` | Same as above | `shed image rm <tag>` |
+| Kernel / initrd (per blob) | Stored alongside `rootfs.ext4` inside each blob directory | Same | First conversion of an image | Removed with the blob |
+| Per-shed rootfs | `~/Library/Application Support/shed/vz/instances/{name}/rootfs.ext4` | `/var/lib/shed/firecracker/instances/{name}/rootfs.ext4` | `shed create` (shares extents with the blob's rootfs when possible) | `shed delete` or `shed system prune --instances` |
 | VZ console log | `~/Library/Application Support/shed/vz/instances/{name}/console.log` | _(Firecracker has none — SDK writes to stderr)_ | VM boot | `shed system prune --logs` (truncates to last N bytes) |
-| Orphan sidecars | `*.tmp`, `*.source` whose matching `-rootfs.ext4` is absent | Same | Partial or crashed image conversions | `shed system prune --orphans` |
+| Orphan sidecars | `*.tmp` from a crashed install staging dir | Same | Partial or crashed image conversions | `shed system prune --orphans` |
 
-See [Image Variants](images.md) for how `_base`, variants, and the Docker-ref cache work together.
+See [Storage Model](storage-model.md) for the content-addressed layout
+and [Image Variants](images.md) for how named tags resolve to digests.
 
 ## Measuring usage with `shed system df`
 
@@ -35,17 +36,15 @@ GENERATED: 2026-04-21T13:36:15Z
 
 CATEGORY                  FILES  LOGICAL  PHYSICAL
 images                    3      20.1 GB  3.3 GB
-sheds (0 stopped, 2 run)  5      40.0 GB  6.3 GB
+sheds (0 stopped, 2 run)  5      8.1 GB   712 MB
 orphans                   1      0 B      0 B
-TOTAL                     9      60.1 GB  9.6 GB
-
-Note: physical bytes may overcount shared extents on APFS (clonefile) or hardlinks
+TOTAL                     9      28.2 GB  4.0 GB
 ```
 
 Two columns matter:
 
-- **LOGICAL** (`stat.Size`) — what tools like `du -k --apparent-size` see. For a 20 GB sparse ext4 rootfs, this is 20 GB regardless of how much data is actually in it.
-- **PHYSICAL** (`stat.Blocks * 512`) — how much the filesystem reports as allocated. On non-reflink filesystems this is the real on-disk cost. On APFS, ext4-reflink, btrfs, and xfs, extents shared via clonefile or FICLONE are counted against **every** file that references them, so summed physical bytes can exceed the actual disk consumption.
+- **LOGICAL** (`stat.Size`) — what tools like `du -k --apparent-size` see. For a 5 GB sparse upper layer, this is 5 GB regardless of how much data has actually been written into it.
+- **PHYSICAL** (`stat.Blocks * 512`) — how much the filesystem reports as allocated. With the overlay-in-guest model, per-shed rows now report only the per-shed writable upper (typically hundreds of MB), and the read-only lower image is reported once under `images` rather than under every shed pinning it.
 
 Add `-v` for per-image and per-shed rows, `--json` for machine-readable output, and `--all` to fan out across every configured server:
 
@@ -66,7 +65,7 @@ The full flag table is in the [CLI reference](cli.md#system-disk-usage). The raw
 - `--images` — remove cached image variants that aren't referenced by config or any existing shed.
 - `--instances` — delete stopped sheds older than `--until` (default 72 h).
 - `--logs` — truncate VZ console logs to the last `--log-tail-bytes` (default 5 MiB). No-op on Firecracker.
-- `--orphans` — remove `.tmp` / `.source` sidecars whose matching rootfs is absent. Lock files are preserved to avoid an inode-reuse race.
+- `--orphans` — remove leftover state from crashed operations: `*.tmp` staging directories from interrupted image installs, partial snapshot directories whose `snapshot.json` never landed, and per-shed `uppers/<name>/` directories whose `metadata.json` was never written. Lock files are preserved to avoid an inode-reuse race, and any `.creating` marker fresher than 1 h keeps its directory in skipped status so in-flight operations aren't swept.
 
 When no scope flags are set, the command applies the default scope: `--images --instances --orphans` (not `--logs`, which is always opt-in).
 
@@ -100,33 +99,13 @@ Full flag table, scope semantics, and the internal deletion ordering are in the 
 
 The `PHYSICAL` freed total is attributed per file from `stat.Blocks * 512`. When the file being removed shares extents with another file (clonefile, FICLONE, or hardlinks), the bytes the filesystem actually reclaims may be lower than what the report attributes. Compare `shed system df` before and after to measure true reclamation.
 
-## Reflink and copy-on-write on `shed create`
+## Per-shed cost: writable upper layer
 
-`shed create` produces a per-shed rootfs under `instances/{name}/rootfs.ext4`. On reflink-capable filesystems the rootfs starts out sharing all its extents with `_base`, so the create adds near-zero physical bytes and completes in under a second on a warm cache. Writes diverge on a copy-on-write basis from that point, so long-lived sheds grow gradually with the changes the VM makes.
+`shed create` allocates a per-shed sparse upper file under `uppers/{name}/upper.ext4` (5 GB by default; configurable via `--upper-size <N>G` or the server's `upper_size_default`). The read-only lower (the cached image blob) is shared across every shed pinning the same digest, so multiple sheds on the same image share both disk and the host page cache.
 
-The server picks a strategy per create from this chain:
+The shed's in-guest initramfs `mkfs.ext4`-formats the upper on first boot, then mounts it as the writable layer of an overlayfs stack on top of the lower. Writes inside the VM grow the upper; reads from the lower are zero-cost beyond the host's first page-cache miss.
 
-| Host | Filesystem | Strategy | Initial physical cost per shed |
-|------|------------|----------|--------------------------------|
-| macOS | APFS | `clonefile(2)` | ~0 bytes (extents shared with `_base`) |
-| Linux | btrfs, xfs-reflink, or ext4 with `reflink=1` | `FICLONE` ioctl | ~0 bytes (extents shared with `_base`) |
-| Linux | ext4 without reflink, other filesystems | `copy_file_range(2)` | Full image size (~2–5 GB) |
-| Any | Remaining fallback | `io.Copy` | Full image size |
-
-Each `shed create` logs one line to the server journal so operators can confirm which strategy fired:
-
-```text
-rootfs strategy=<clonefile|ficlone|copy_file_range|io_copy> src=<base path> dst=<instance rootfs path> logical_bytes=<size>
-```
-
-On Linux, check whether the images directory supports reflink:
-
-```bash
-sudo tune2fs -l $(findmnt -T /var/lib/shed/firecracker/images -o SOURCE --noheadings) \
-  | grep -i 'features' | grep shared_blocks
-```
-
-If `shared_blocks` is not in the feature list, `shed create` falls back to `copy_file_range` and each shed will cost the full rootfs size. To enable reflink on ext4 you need kernel 6.7+ and the filesystem must have been created with `mkfs.ext4 -O reflink`.
+Per-shed disk cost stays small (typically a few hundred MB to a couple GB after a busy session), independent of host filesystem reflink support — the cost is borne inside the guest's overlay rather than via reflink between two host files.
 
 ## Workflows
 
@@ -136,7 +115,7 @@ If `shared_blocks` is not in the feature list, `shed create` falls back to `copy
 shed system df -v
 ```
 
-The verbose view shows per-image and per-shed rows so you can identify the largest consumers. On APFS the PHYSICAL column overcounts shared extents — cross-check against `du -k -s ~/Library/Application\ Support/shed/vz` if the sum looks higher than the actual disk.
+The verbose view shows per-image and per-shed rows so you can identify the largest consumers. The shared lower image is reported once under `images`, not duplicated under every shed pinning it.
 
 ### Clean up before a deploy
 

@@ -9,86 +9,106 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/charliek/shed/internal/vmimage/clone"
+	"github.com/charliek/shed/internal/systemprune"
 )
 
 // RootfsPath returns the path to the rootfs image for an instance.
+//
+// In the overlay-in-guest model this is a symlink-style alias for the
+// upper layer file path: per-shed bookkeeping keeps using "rootfs"
+// terminology so existing `shed system df` accounting and prune flows
+// don't have to grow a parallel "upper" walker.
 func RootfsPath(instanceDir, name string) string {
 	return filepath.Join(instanceDir, name, "rootfs.ext4")
 }
 
-// CopyRootfs copies the base rootfs image to the instance directory,
-// preferring FICLONE (reflink) then copy_file_range and falling back to
-// io.Copy on older kernels or non-reflink filesystems. See the clone
-// package for strategy precedence.
+// UpperPath returns the absolute path of the per-shed writable upper
+// layer file under {uppersDir}/{name}/upper.ext4.
+func UpperPath(uppersDir, name string) string {
+	return filepath.Join(uppersDir, name, "upper.ext4")
+}
+
+// UpperDir returns the per-shed upper directory.
+func UpperDir(uppersDir, name string) string {
+	return filepath.Join(uppersDir, name)
+}
+
+// EnsureUpper creates the per-shed writable upper layer as a sparse
+// ext4-sized file at {uppersDir}/<name>/upper.ext4. The in-guest
+// initramfs runs mkfs.ext4 on first boot — see the VZ EnsureUpper
+// doc for the FreshUpperSignature contract that lets the initramfs
+// distinguish "needs mkfs" from "corrupted, panic with shed reset".
 //
-// Both FICLONE and copy_file_range require dst to not already exist;
-// pre-clean any stale dst before invoking the chain.
-//
-// CONCURRENCY: single-writer-per-shed-name is enforced upstream by
-// Client.acquireCreateLock, which wraps the whole CreateShed flow. The
-// unconditional os.Remove(dst) below is therefore safe against racing
-// `shed create` calls for the same name.
-func CopyRootfs(baseRootfs, instanceDir, name string) (string, error) {
-	dst := RootfsPath(instanceDir, name)
-
-	dir := InstanceDir(instanceDir, name)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create instance directory: %w", err)
+// Fails with an explicit error when the upper file already exists
+// rather than silently reusing it: a stale upper from a previously
+// crashed `shed create` (or from manual operator intervention) almost
+// always reflects state the next caller doesn't intend to inherit.
+// Callers that want fresh-state semantics (e.g. `shed reset`) call
+// DeleteUpper first.
+func EnsureUpper(uppersDir, name string, sizeBytes int64) (string, error) {
+	if sizeBytes <= 0 {
+		return "", fmt.Errorf("upper size must be positive (got %d)", sizeBytes)
 	}
-
-	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("failed to clean stale rootfs: %w", err)
+	dir := UpperDir(uppersDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create upper directory: %w", err)
 	}
-	if err := syncDir(dir); err != nil {
-		return "", fmt.Errorf("failed to sync instance directory after cleanup: %w", err)
-	}
+	path := UpperPath(uppersDir, name)
 
-	strategy, err := clone.CloneFile(baseRootfs, dst)
+	// O_CREATE|O_EXCL guarantees we never silently reuse a stale upper
+	// from a previously failed create.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("failed to copy rootfs: %w", err)
+		if os.IsExist(err) {
+			return "", fmt.Errorf("upper already exists at %s; remove it (or run `shed reset <name>`) before recreating", path)
+		}
+		return "", fmt.Errorf("failed to create upper file: %w", err)
 	}
-
-	// Force dst to 0o644. FICLONE / copy_file_range / io.Copy on linux
-	// already create dst at 0o644, so this is normally a no-op — but a
-	// future strategy that preserves source mode would silently leave a
-	// 0o444 instance rootfs after spawn-from-snapshot, breaking the VM.
-	// Mirrors the same chmod in vz/rootfs.go for cross-backend symmetry.
-	if err := os.Chmod(dst, 0o644); err != nil {
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("failed to chmod rootfs: %w", err)
-	}
-
-	var logical int64
-	if fi, statErr := os.Stat(dst); statErr == nil {
-		logical = fi.Size()
-	}
-	log.Printf("rootfs strategy=%s src=%s dst=%s logical_bytes=%d", strategy, baseRootfs, dst, logical)
-
-	// Sync on every path so crash recovery semantics stay uniform, and
-	// surface delayed-writeback errors (ENOSPC, EIO) rather than silently
-	// booting a VM on broken storage.
-	f, err := os.OpenFile(dst, os.O_RDWR, 0)
-	if err != nil {
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("failed to reopen rootfs for sync: %w", err)
-	}
-	if syncErr := f.Sync(); syncErr != nil {
+	if err := f.Truncate(sizeBytes); err != nil {
 		f.Close()
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("failed to sync rootfs: %w", syncErr)
+		os.Remove(path)
+		return "", fmt.Errorf("failed to size upper file: %w", err)
 	}
-	if closeErr := f.Close(); closeErr != nil {
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("failed to close rootfs after sync: %w", closeErr)
+	if _, err := f.WriteAt([]byte(FreshUpperSignature), FreshUpperSignatureOffset); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("failed to write fresh-upper signature: %w", err)
+	}
+	// syncDir alone only persists the directory entry; the truncate
+	// metadata still needs a file-level sync, or a crash right after
+	// EnsureUpper can leave a zero-length upper.ext4 with a tag-good
+	// metadata pointer at it.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("failed to sync upper file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("failed to close upper file: %w", err)
 	}
 	if err := syncDir(dir); err != nil {
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("failed to sync instance directory: %w", err)
+		return "", fmt.Errorf("failed to sync upper directory: %w", err)
 	}
+	log.Printf("upper created path=%s size_bytes=%d", path, sizeBytes)
+	return path, nil
+}
 
-	return dst, nil
+// FreshUpperSignature: see internal/vz/rootfs.go for the contract.
+// Duplicated here to keep the firecracker package buildable on Linux
+// without a build-tag dance through the VZ package.
+const (
+	FreshUpperSignature       = "SHED-FRESH-UPPER"
+	FreshUpperSignatureOffset = 1024
+)
+
+// DeleteUpper removes the per-shed upper directory and its contents.
+// Used by `shed delete` and `shed reset`.
+func DeleteUpper(uppersDir, name string) error {
+	if err := os.RemoveAll(UpperDir(uppersDir, name)); err != nil {
+		return fmt.Errorf("failed to remove upper dir: %w", err)
+	}
+	return nil
 }
 
 // syncDir fsyncs a directory so pending create/unlink metadata is on
@@ -116,4 +136,50 @@ func RootfsExists(instanceDir, name string) bool {
 	path := RootfsPath(instanceDir, name)
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// writeCreatingMarker drops a `.creating` marker into the instance
+// directory containing the lower digest the in-flight create is
+// about to use. The refscanner (systemprune.ScanInstanceCreatingMarkers)
+// reads this body as a protective reference so a racing prune can't
+// delete the blob between EnsureImage and meta.Save.
+//
+// The marker is fsync'd along with its parent dir so a crash right
+// after this returns cannot lose the protection. removeCreatingMarker
+// is called via defer on every CreateShed exit path.
+func writeCreatingMarker(instanceDir, name, lowerDigest string) error {
+	dir := InstanceDir(instanceDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating instance dir for marker: %w", err)
+	}
+	path := filepath.Join(dir, systemprune.InstanceCreatingMarker)
+	if err := os.WriteFile(path, []byte(lowerDigest), 0o600); err != nil {
+		return fmt.Errorf("writing creating marker: %w", err)
+	}
+	// fsync the marker file and the parent dir so the protective ref
+	// survives a host crash between here and meta.Save. Surface
+	// errors: if we can't durably persist the marker, prune protection
+	// is silently lost and the caller deserves to know.
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening creating marker for sync: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("syncing creating marker: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing creating marker: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("syncing instance dir after marker write: %w", err)
+	}
+	return nil
+}
+
+// removeCreatingMarker deletes the `.creating` marker (if present).
+// Safe to call when no marker exists — used as a defer in CreateShed.
+func removeCreatingMarker(instanceDir, name string) {
+	path := filepath.Join(InstanceDir(instanceDir, name), systemprune.InstanceCreatingMarker)
+	_ = os.Remove(path)
 }

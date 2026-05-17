@@ -259,49 +259,122 @@ shed image build --from ghcr.io/charliek/shed-fc-base:{version} -n myimage
 
 Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
 
-### shed image list
+### shed image ls
 
-Lists available image variants from server config and auto-discovered images.
+Lists available image variants from server config plus any tags discovered in the blob store. `shed image list` is a deprecated alias.
 
 ```bash
-shed image list
+shed image ls
 ```
 
 **Output:**
 
-```
-NAME         SOURCE       SIZE      CACHED   REF
-base         config       2.1 GB    yes      -
-default      config       -         no       ghcr.io/charliek/shed-vz-default:{version}
-experimental discovered   3.8 GB    yes      -
+```text
+NAME          DIGEST          SOURCE      SIZE      IN USE   REF
+base          sha256:abc123…  config      2.1 GB    yes      ghcr.io/charliek/shed-vz-base:{version}
+experimental  sha256:def456…  config      3.8 GB    no       ghcr.io/charliek/shed-vz-experimental:{version}
+sha256:ff…    sha256:ff8800…  dangling    2.0 GB    yes      ghcr.io/test/legacy:v1
 ```
 
-### shed image delete
+### shed image inspect
 
-Deletes a cached rootfs image from the images directory.
+Shows full details (manifest + blob path + in-use status) for a tag or a digest. Accepts either a tag name (`experimental`) or a `sha256:...` digest (full or truncated).
 
 ```bash
-shed image delete <name> [flags]
+shed image inspect <tag-or-digest>
+```
+
+### shed image tag
+
+Points a new tag at the digest currently held by another tag (or by a specified digest). Equivalent to `docker tag`.
+
+```bash
+shed image tag <src-tag-or-digest> <new-tag>
+```
+
+### shed image pull
+
+Pulls a Docker reference, converts it to ext4, installs it into the content-addressed blob store, and advances a tag. Equivalent to `docker pull` + storing the result locally.
+
+```bash
+shed image pull <docker-ref> [-t <tag>]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--tag` | `-t` | derived from the ref | Tag name to advance |
+
+If `--tag` is omitted, the tag is derived from the last path segment of the Docker ref minus the version suffix (e.g. `ghcr.io/charliek/shed-vz-experimental:v0.4.0` → `experimental`).
+
+### shed image install
+
+Installs a pre-built rootfs (plus optional kernel and initrd) directly into the content-addressed blob store and optionally advances a tag. The structural replacement for the legacy `scripts/install-blob.sh` — same on-disk layout, but the Go path adds digest verification, per-digest flock, fsync ladder, and JSON-safe manifest encoding.
+
+```bash
+shed image install --rootfs <path> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rootfs` | (required) | Path to `rootfs.ext4` |
+| `--kernel` |  | Path to the boot kernel |
+| `--initrd` |  | Path to the boot initrd |
+| `--tag` |  | Tag to advance to the resulting digest |
+| `--backend` |  | Backend recorded in the manifest (`vz` or `firecracker`) |
+| `--arch` |  | Architecture recorded in the manifest (`arm64` or `amd64`) |
+| `--source-ref` |  | Docker source reference recorded in the manifest |
+| `--images-dir` | from server config | Override the `images_dir` from server config |
+| `--consume` | `false` | Move source files into the blob (don't leave intermediates) |
+
+Operates **locally** — no shed-server interaction. The invoking user needs write access to `images_dir`. The build pipeline (`make vz-rootfs`, `make firecracker-rootfs`) calls this with `--consume` so intermediates from `mkfs.ext4` and the initramfs build don't accumulate.
+
+The digest is `sha256(rootfs.ext4)`. `InstallBlob` verifies the hash before publishing the blob, so a wrong `--rootfs` can't end up addressed under the wrong digest.
+
+```bash
+# Typical build pipeline invocation
+shed image install \
+  --rootfs ./default-rootfs.ext4 \
+  --kernel ./vmlinux \
+  --initrd ./initrd.img \
+  --tag default \
+  --backend firecracker --arch amd64 \
+  --source-ref ghcr.io/charliek/shed-fc-default:v1.0.0 \
+  --consume
+
+# Output:
+# Digest: sha256:abc123...
+# Blob:   /var/lib/shed/firecracker/images/blobs/sha256/abc123... (installed)
+# Tag:    default -> sha256:abc123...
+```
+
+When the blob with this digest already exists, the install is a no-op and reports `(already-installed)`; the tag is still advanced (idempotent).
+
+### shed image rm
+
+Removes a tag from the image store. `shed image delete` is a deprecated alias.
+
+```bash
+shed image rm <name> [flags]
 ```
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--force` | | `false` | Skip confirmation prompt |
 
-Removes the cached ext4 rootfs and source sidecar files. Does not affect running sheds (they use copies of the image). Config-managed images cannot be deleted — remove them from the server config first.
+Following the Docker model, this removes the **tag** only — the underlying blob persists for `shed image prune` to garbage-collect once nothing references it. Config-managed tags (those listed in `images:` in server config, plus `_base` while `base_rootfs` is a Docker ref) cannot be removed by `image rm` — bump them via config instead.
 
 **Note:** When using `--json`, the `--force` flag is required.
 
 **Examples:**
 
 ```bash
-shed image delete myimage
-shed image delete myimage --force
+shed image rm myimage
+shed image rm myimage --force
 ```
 
 ### shed image prune
 
-Removes cached images that are not referenced by config or any existing shed.
+Removes blobs that have no protective shed/snapshot reference. Tags do **not** protect a digest from prune.
 
 ```bash
 shed image prune [flags]
@@ -312,7 +385,7 @@ shed image prune [flags]
 | `--force` | | `false` | Skip confirmation prompt |
 | `--dry-run` | | `false` | List candidates without deleting |
 
-A cached `.ext4` is preserved only if it is referenced by the current server config **and** its `.source` sidecar matches the current Docker ref (or the entry is a local path), or if it is referenced by an existing shed's metadata. Stale caches left behind after a config ref bump are reclaimed; see the [upgrade-and-reclaim cookbook](images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) for the full flow.
+A blob is preserved only if its digest is referenced by an existing shed's `metadata.json` (`lower_digest`) or a snapshot's `snapshot.json` (`lower_digest`). Tags are informational and do not protect blobs. After bumping image refs in server config and re-running `shed-server pull-images`, the previous digests typically become dangling and `shed image prune` reclaims them.
 
 **Note:** When using `--json`, the `--force` flag is required.
 

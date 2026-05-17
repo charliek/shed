@@ -1,0 +1,162 @@
+#!/bin/sh
+# shed initramfs init: mount overlayfs (writable upper + read-only lower),
+# pivot_root, and hand off to /sbin/init in the merged rootfs.
+#
+# Disk layout (set by the backend at VM-create time):
+#   /dev/vda  per-shed writable upper   (ext4, formatted on first boot)
+#   /dev/vdb  read-only lower image     (ext4, the immutable image blob)
+#
+# Kernel cmdline overrides (optional):
+#   shed.upper=/dev/vda  shed.lower=/dev/vdb
+#
+# This script intentionally avoids fancy busybox-only constructs so it
+# works equally well with full busybox and the static binaries shipped
+# in the shed-initramfs-builder image.
+
+set -e
+
+UPPER_DEV=/dev/vda
+LOWER_DEV=/dev/vdb
+
+# Honor cmdline overrides (rudimentary parser; quoting not supported).
+for arg in $(cat /proc/cmdline 2>/dev/null || true); do
+    case "$arg" in
+        shed.upper=*) UPPER_DEV="${arg#shed.upper=}" ;;
+        shed.lower=*) LOWER_DEV="${arg#shed.lower=}" ;;
+    esac
+done
+
+panic() {
+    echo ""
+    echo "shed-initramfs PANIC: $*"
+    echo "Dropping to shell. Press Enter to continue, or 'reboot -f' to bail."
+    exec /bin/sh
+}
+
+mkdir -p /proc /sys /dev /run /newroot /upper /lower
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+# devtmpfs is mandatory: the wait loop below needs /dev/vda and /dev/vdb
+# to be populated by the kernel, and a plain tmpfs would have no device
+# nodes. Stock Linux kernels enable CONFIG_DEVTMPFS=y and
+# CONFIG_DEVTMPFS_MOUNT=y; we still mount explicitly for the rare
+# defconfig that disables the automount.
+mount -t devtmpfs devtmpfs /dev \
+    || panic "failed to mount devtmpfs at /dev — kernel built without CONFIG_DEVTMPFS?"
+# /dev/pts is not strictly needed pre-pivot but cheap to set up so any
+# console fallback works when init drops to a shell.
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+echo "shed-initramfs: upper=${UPPER_DEV} lower=${LOWER_DEV}"
+
+# Wait briefly for virtio-blk devices to appear. Firecracker exposes
+# them quickly; vfkit/VZ can take a few hundred ms on cold boot.
+i=0
+while [ $i -lt 50 ]; do
+    if [ -b "$UPPER_DEV" ] && [ -b "$LOWER_DEV" ]; then
+        break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+
+[ -b "$UPPER_DEV" ] || panic "upper block device $UPPER_DEV not present"
+[ -b "$LOWER_DEV" ] || panic "lower block device $LOWER_DEV not present"
+
+# Format the upper on first boot, panic on corruption. The detection
+# triangulates between two markers:
+#
+#   - ext4 superblock magic at offset 1080 (0x53 0xEF). Present iff
+#     mkfs.ext4 has run successfully at least once.
+#   - FreshUpperSignature ("SHED-FRESH-UPPER") at offset 1024. Written
+#     by the host's EnsureUpper at create-time, and overwritten by
+#     mkfs.ext4 when it lays down a real superblock.
+#
+# Decision matrix:
+#   ext4 magic present                 → mount; signature is don't-care
+#   ext4 magic absent + signature here → fresh upper; mkfs.ext4
+#   ext4 magic absent + signature gone → corruption; panic with shed reset
+#
+# A zeroed first MiB (the Phase 3.6 corruption case) loses both
+# markers, so the corruption arm fires instead of silently reformatting
+# and destroying the user's writes. A subtler corruption that wipes
+# only the ext4 magic but leaves the signature intact would
+# spuriously fall into the fresh arm; that path is narrow and the
+# trade-off is acceptable since corruption that surgical is rare.
+has_magic=0
+if dd if="$UPPER_DEV" bs=1 count=2 skip=1080 2>/dev/null \
+        | od -An -tx1 \
+        | tr -d ' \n' \
+        | grep -qx "53ef"; then
+    has_magic=1
+fi
+
+if [ "$has_magic" = "0" ]; then
+    # Read 16 bytes at offset 1024 and hex-encode. Must match host's
+    # FreshUpperSignature ("SHED-FRESH-UPPER") at FreshUpperSignatureOffset.
+    # Byte sequence: S=53 H=48 E=45 D=44 -=2d F=46 R=52 E=45 S=53 H=48
+    #                -=2d U=55 P=50 P=50 E=45 R=52
+    sig_hex=$(dd if="$UPPER_DEV" bs=1 count=16 skip=1024 2>/dev/null \
+                  | od -An -tx1 \
+                  | tr -d ' \n')
+    fresh_hex="534845442d46524553482d5550504552"
+    if [ "$sig_hex" = "$fresh_hex" ]; then
+        echo "shed-initramfs: formatting ${UPPER_DEV} (first boot, fresh signature)"
+        mkfs.ext4 -F -L shed-upper "$UPPER_DEV" >/dev/null 2>&1 \
+            || panic "mkfs.ext4 on $UPPER_DEV failed"
+    else
+        panic "upper ${UPPER_DEV} has no ext4 magic at offset 1080 and no fresh-upper signature at offset 1024 — the writable upper appears corrupted. From the host, run 'shed reset <name>' to wipe and recreate it."
+    fi
+fi
+
+mount -t ext4 "$UPPER_DEV" /upper \
+    || panic "failed to mount $UPPER_DEV at /upper; the writable upper may be corrupt. From the host, run 'shed reset <name>' to wipe and recreate it."
+mkdir -p /upper/data
+# overlayfs requires workdir to be empty at mount time; bookkeeping
+# files left behind from a prior unclean shutdown will make the next
+# mount fail. Wipe and recreate to be safe.
+rm -rf /upper/work
+mkdir -p /upper/work
+
+mount -t ext4 -o ro "$LOWER_DEV" /lower \
+    || panic "failed to mount $LOWER_DEV ro at /lower"
+
+# Load overlayfs from the lower's /lib/modules if it isn't built into
+# the kernel. Stock Ubuntu kernels ship overlayfs as a zstd-compressed
+# module (`overlay.ko.zst`); kmod's insmod (linked against libkmod) uses
+# finit_module(2) which lets the kernel decompress on the fly. If the
+# kernel already has overlayfs built in the mount below will succeed
+# regardless; if the load also fails, the overlay mount panic message
+# will surface the real cause.
+#
+# Both clauses are inside the `if` so the failure paths don't trip
+# `set -e`; a missing module file or a failed insmod just leaves the
+# fallback to the kernel's built-in overlay (if any), and the overlay
+# mount below is what ultimately surfaces an unrecoverable failure.
+ov_dir="/lower/lib/modules/$(uname -r 2>/dev/null)/kernel/fs/overlayfs"
+for ov in "$ov_dir/overlay.ko.zst" "$ov_dir/overlay.ko.xz" "$ov_dir/overlay.ko.gz" "$ov_dir/overlay.ko"; do
+    if [ -f "$ov" ] && /sbin/insmod "$ov" 2>/dev/null; then
+        break
+    fi
+done
+
+mount -t overlay overlay \
+    -o "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work" \
+    /newroot \
+    || panic "overlay mount failed (overlay kernel module not loaded?)"
+
+# Move the API filesystems into the new root rather than re-mounting,
+# so kernel state and open fds keep working through the pivot.
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run
+mount --move /proc /newroot/proc
+mount --move /sys  /newroot/sys
+mount --move /dev  /newroot/dev
+
+# Leave the initramfs and switch to the merged overlay. We use
+# `switch_root` rather than `pivot_root` because the initial root is
+# a kernel rootfs (initramfs), which doesn't support pivot_root —
+# `pivot_root` returns EINVAL on that root type. busybox's
+# `switch_root` does the canonical initramfs-exit dance: frees the
+# initramfs pages, chroots into /newroot, and execs /sbin/init.
+exec switch_root /newroot /sbin/init "$@"

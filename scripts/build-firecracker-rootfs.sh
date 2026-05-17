@@ -115,7 +115,11 @@ trap cleanup EXIT
 # Create output directory
 sudo mkdir -p "$OUTPUT_DIR"
 
-# Build shed-agent binary for linux/amd64 (shared across all variants)
+# Build shed-agent binary for linux/amd64 (shared across all variants),
+# the in-VM shed-firstboot, and the host-side shed CLI used below by
+# `shed image install`. The CLI build is mandatory: a clean checkout
+# has no bin/shed, and the install step below would fail with
+# "command not found".
 build_agent() {
     echo ""
     echo "=== Building shed-agent binary (linux/amd64) ==="
@@ -126,6 +130,11 @@ build_agent() {
     echo "=== Building shed-firstboot binary (linux/amd64) ==="
     GOOS=linux GOARCH=amd64 go build -o "$FIRECRACKER_DIR/shed-firstboot" ./cmd/shed-firstboot
     echo "Built shed-firstboot binary"
+
+    echo "=== Building host shed CLI ==="
+    mkdir -p "$PROJECT_ROOT/bin"
+    go build -o "$PROJECT_ROOT/bin/shed" ./cmd/shed
+    echo "Built $PROJECT_ROOT/bin/shed"
 }
 
 # Build a single variant
@@ -143,7 +152,9 @@ build_variant() {
     echo "  Output: $rootfs_file"
     echo "========================================"
 
-    # Build Docker image
+    # Build Docker image. Context is the firecracker/ directory so the
+    # Dockerfile's relative COPY paths resolve correctly. The shed
+    # initramfs is built separately by build-initramfs.sh.
     echo ""
     echo "=== Building Docker image ($docker_tag) ==="
     cd "$FIRECRACKER_DIR"
@@ -195,6 +206,62 @@ build_variant() {
     EXPORT_TAR=""
 
     echo "Created rootfs image: $rootfs_path"
+
+    # Build the shed-overlay initramfs into a tempfile rather than
+    # OUTPUT_DIR. OUTPUT_DIR is root-owned by default (`sudo mkdir -p`
+    # at script start), so writing the intermediate as the current
+    # user would fail with EPERM before install-blob.sh ever runs.
+    # install-blob.sh moves the file into the blob layout, so no
+    # explicit cleanup is needed on the happy path.
+    local shed_initrd
+    shed_initrd="$(mktemp "${TMPDIR:-/tmp}/shed-initrd-fc.XXXXXX.img")"
+    echo ""
+    echo "=== Building shed-overlay initramfs ==="
+    "$SCRIPT_DIR/build-initramfs.sh" \
+        --backend firecracker \
+        --platform linux/amd64 \
+        --output "$shed_initrd"
+
+    # Firecracker's compiled kernel lives at ${OUTPUT_DIR}/vmlinux after
+    # download-firecracker.sh runs. Use it as the blob's kernel when
+    # present so the runtime never has to look outside the blob dir.
+    #
+    # The first install with --consume moves vmlinux into the blob.
+    # A subsequent rebuild needs a fresh vmlinux at the legacy path;
+    # download-firecracker.sh is the canonical source (pins to a
+    # specific Firecracker-compatible kernel version that has to
+    # match what's in the rootfs's modules dir). Fail fast and
+    # point at the right command — don't try to scavenge a kernel
+    # from another blob, because nothing here guarantees that
+    # kernel matches the new rootfs's modules.
+    if [ ! -f "$OUTPUT_DIR/vmlinux" ]; then
+        echo "ERROR: $OUTPUT_DIR/vmlinux is missing." >&2
+        echo "Run ./scripts/download-firecracker.sh to fetch a Firecracker-compatible kernel, then re-run this script." >&2
+        exit 1
+    fi
+    local kernel_arg=(--kernel "$OUTPUT_DIR/vmlinux")
+
+    echo ""
+    echo "=== Installing blob ==="
+    # Calls into the `shed image install` Go subcommand rather than a
+    # bash re-implementation of the atomic-install protocol — same
+    # blob-layout output, but the Go path adds digest verification, a
+    # per-digest flock, fsync ladder, and JSON-safe manifest encoding.
+    #
+    # OUTPUT_DIR (default /var/lib/shed/firecracker/images) is
+    # root-owned (sudo mkdir -p at script start), so the install needs
+    # sudo to write the blob layout. Everything else in this script
+    # that touches OUTPUT_DIR (truncate/mkfs.ext4/mount/tar) already
+    # runs under sudo; this mirrors that.
+    sudo "$PROJECT_ROOT/bin/shed" image install \
+        --images-dir "$OUTPUT_DIR" \
+        --rootfs "$rootfs_path" \
+        "${kernel_arg[@]}" \
+        --initrd "$shed_initrd" \
+        --tag "$variant" \
+        --backend firecracker \
+        --arch amd64 \
+        --consume
 }
 
 # Main execution

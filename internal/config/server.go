@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -170,6 +171,14 @@ type FirecrackerConfig struct {
 	// SnapshotsDir is the directory where shed snapshots are stored.
 	SnapshotsDir string `yaml:"snapshots_dir,omitempty"`
 
+	// UppersDir is the directory where per-shed writable upper layers
+	// (sparse ext4 files) are stored.
+	UppersDir string `yaml:"uppers_dir,omitempty"`
+
+	// UpperSizeDefault is the default logical size of the per-shed
+	// writable upper. Accepted units: G (GB) and M (MB). Range 1G-100G.
+	UpperSizeDefault string `yaml:"upper_size_default,omitempty"`
+
 	// SocketDir is the directory for Firecracker API sockets
 	SocketDir string `yaml:"socket_dir"`
 
@@ -236,6 +245,14 @@ type VZConfig struct {
 	// SnapshotsDir is the directory where shed snapshots are stored.
 	SnapshotsDir string `yaml:"snapshots_dir,omitempty"`
 
+	// UppersDir is the directory where per-shed writable upper layers
+	// (sparse ext4 files) are stored.
+	UppersDir string `yaml:"uppers_dir,omitempty"`
+
+	// UpperSizeDefault is the default logical size of the per-shed
+	// writable upper. Accepted units: G (GB) and M (MB). Range 1G-100G.
+	UpperSizeDefault string `yaml:"upper_size_default,omitempty"`
+
 	// SocketDir is the directory for vsock Unix sockets.
 	// NOTE: This path must not contain spaces. vfkit URL-encodes socket paths,
 	// turning spaces into %20, which causes connection failures.
@@ -287,22 +304,29 @@ func (c *VZConfig) GetNeedsInitrd() bool { return true }
 // DefaultVZConfig returns a VZConfig with default values.
 func DefaultVZConfig() *VZConfig {
 	return &VZConfig{
-		VfkitPath:       "vfkit",
-		KernelPath:      ExpandPath(DefaultVZImagesDir + "/vmlinux"),
-		InitrdPath:      ExpandPath(DefaultVZImagesDir + "/initrd.img"),
-		BaseRootfs:      ExpandPath(DefaultVZImagesDir + "/default-rootfs.ext4"),
-		ImagesDir:       ExpandPath(DefaultVZImagesDir),
-		InstanceDir:     ExpandPath(DefaultVZImagesDir + "/instances"),
-		SnapshotsDir:    ExpandPath(DefaultVZImagesDir + "/snapshots"),
-		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
-		DefaultCPUs:     2,
-		DefaultMemoryMB: 4096,
-		DefaultDiskGB:   20,
-		ConsolePort:     1024,
-		NotifyPort:      1026,
-		TCPProxyPort:    1028,
-		StartTimeout:    Duration(60 * time.Second),
-		StopTimeout:     Duration(10 * time.Second),
+		VfkitPath: "vfkit",
+		// KernelPath / InitrdPath / BaseRootfs are intentionally left
+		// empty by default. Phase A retired the flat-file layout (e.g.
+		// {ImagesDir}/default-rootfs.ext4) in favor of the content-
+		// addressed blob store at {ImagesDir}/blobs/sha256/<digest>/
+		// with tag indirection at {ImagesDir}/tags/<tag>.json. vm.Start
+		// reads the kernel from the blob; ResolveBaseRootfs is only
+		// consulted when `shed create` runs without --image, in which
+		// case the operator must set BaseRootfs explicitly.
+		ImagesDir:        ExpandPath(DefaultVZImagesDir),
+		InstanceDir:      ExpandPath(DefaultVZImagesDir + "/instances"),
+		SnapshotsDir:     ExpandPath(DefaultVZImagesDir + "/snapshots"),
+		UppersDir:        ExpandPath(DefaultVZImagesDir + "/uppers"),
+		UpperSizeDefault: DefaultUpperSize,
+		SocketDir:        ExpandPath("~/.shed/vz/sockets"),
+		DefaultCPUs:      2,
+		DefaultMemoryMB:  4096,
+		DefaultDiskGB:    20,
+		ConsolePort:      1024,
+		NotifyPort:       1026,
+		TCPProxyPort:     1028,
+		StartTimeout:     Duration(60 * time.Second),
+		StopTimeout:      Duration(10 * time.Second),
 	}
 }
 
@@ -334,6 +358,16 @@ func (c *VZConfig) applyDefaults() {
 		c.SnapshotsDir = filepath.Join(c.ImagesDir, "snapshots")
 	}
 
+	// Default UppersDir to ImagesDir/uppers if unset.
+	c.UppersDir = ExpandPath(c.UppersDir)
+	if c.UppersDir == "" {
+		c.UppersDir = filepath.Join(c.ImagesDir, "uppers")
+	}
+
+	if c.UpperSizeDefault == "" {
+		c.UpperSizeDefault = DefaultUpperSize
+	}
+
 	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
 	for name, val := range c.Images {
 		if !vmimage.IsDockerRef(val) {
@@ -347,12 +381,11 @@ func (c *VZConfig) Validate() error {
 	if c.VfkitPath == "" {
 		return fmt.Errorf("vfkit_path is required")
 	}
-	if c.KernelPath == "" {
-		return fmt.Errorf("kernel_path is required")
-	}
-	if c.BaseRootfs == "" {
-		return fmt.Errorf("base_rootfs is required")
-	}
+	// kernel_path is optional under Phase B: vm.Start prefers the
+	// kernel inside the blob (blobs/<digest>/kernel, written by
+	// `shed image install --kernel ...`), so the legacy fallback path
+	// is only consulted when a blob arrives without a kernel.
+	// base_rootfs is similarly optional — see below.
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
 	}
@@ -426,9 +459,19 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	// Defer kernel/initrd/rootfs path validation when Docker refs are present —
-	// files are extracted during first image conversion.
-	if !hasAnyDockerRef(c.BaseRootfs, c.Images) {
+	if c.UpperSizeDefault != "" {
+		if _, err := ParseUpperSize(c.UpperSizeDefault); err != nil {
+			return fmt.Errorf("vz: upper_size_default: %w", err)
+		}
+	}
+
+	// Defer kernel/initrd/rootfs path validation when every configured
+	// source is a Docker ref (files are extracted during first image
+	// conversion) or when kernel_path is empty (Phase B: vm.Start
+	// reads the kernel from the blob). The previous hasAnyDockerRef
+	// gate was too loose — a mix of local + remote sources still
+	// needs the legacy kernel/initrd for the local-spawn path.
+	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.BaseRootfs, c.Images) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
 		}
@@ -439,7 +482,9 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	if !vmimage.IsDockerRef(c.BaseRootfs) {
+	// base_rootfs path-existence check only applies when configured as
+	// a local path. An empty value is allowed (see Validate header).
+	if c.BaseRootfs != "" && !vmimage.IsDockerRef(c.BaseRootfs) {
 		if _, err := os.Stat(c.BaseRootfs); err != nil {
 			return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)
 		}
@@ -468,32 +513,45 @@ type ResolvedImage struct {
 
 	// Name is the variant name, used for caching (e.g., "default" → "default-rootfs.ext4").
 	Name string
+
+	// Digest is set when Path came from a tag in the content-addressed
+	// blob store. Empty for the legacy hardcoded-path escape hatch
+	// (where the caller can't tell us a digest). Carries the digest
+	// forward so EnsureImage doesn't have to re-do tag lookup — that
+	// second lookup was both awkward and racey (tag could advance
+	// between resolve and ensure).
+	Digest string
 }
 
 // resolveImage is the shared implementation for image name resolution.
 // configKey is used in error messages (e.g., "vz.images" or "firecracker.images").
 //
 // Resolution order:
-//  1. Look up in images map — if value is a Docker ref, check imagesDir cache first
-//  2. Auto-discover {name}-rootfs.ext4 in imagesDir
+//  1. Look up in images map — if value is a Docker ref, check the
+//     blob-store tag cache first
+//  2. Auto-discover existing tag in {imagesDir}/tags/
 //  3. Absolute path escape hatch
 //  4. Error with available variants
 func resolveImage(images map[string]string, imagesDir, image, configKey string) (ResolvedImage, error) {
 	if val, ok := images[image]; ok {
 		if vmimage.IsDockerRef(val) {
-			if cached := vmimage.CheckCache(imagesDir, image, val); cached != "" {
-				return ResolvedImage{Path: cached, Name: image}, nil
+			// ResolveTag returns the digest too — carry it through
+			// so EnsureImage doesn't have to re-do tag lookup
+			// (which races against concurrent `shed image pull`).
+			if digest, cached, err := vmimage.ResolveTag(imagesDir, image); err == nil {
+				if manifest, mErr := vmimage.LoadManifest(imagesDir, digest); mErr == nil && manifest.SourceRef == val {
+					return ResolvedImage{Path: cached, Name: image, Digest: digest}, nil
+				}
 			}
 			return ResolvedImage{DockerRef: val, Name: image}, nil
 		}
 		return ResolvedImage{Path: val, Name: image}, nil
 	}
 
-	// Auto-discover in ImagesDir
+	// Auto-discover by tag in the blob store.
 	if imagesDir != "" {
-		discovered := filepath.Join(imagesDir, vmimage.RootfsFilename(image))
-		if _, err := os.Stat(discovered); err == nil {
-			return ResolvedImage{Path: discovered, Name: image}, nil
+		if digest, discovered, err := vmimage.ResolveTag(imagesDir, image); err == nil {
+			return ResolvedImage{Path: discovered, Name: image, Digest: digest}, nil
 		}
 	}
 
@@ -520,7 +578,7 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 // resolveBaseRootfs is the shared implementation for base rootfs resolution.
 func resolveBaseRootfs(baseRootfs, imagesDir string) ResolvedImage {
 	if vmimage.IsDockerRef(baseRootfs) {
-		if cached := vmimage.CheckCache(imagesDir, "_base", baseRootfs); cached != "" {
+		if cached := vmimage.Resolve(imagesDir, "_base", baseRootfs); cached != "" {
 			return ResolvedImage{Path: cached, Name: "_base"}
 		}
 		return ResolvedImage{DockerRef: baseRootfs, Name: "_base"}
@@ -528,21 +586,20 @@ func resolveBaseRootfs(baseRootfs, imagesDir string) ResolvedImage {
 	return ResolvedImage{Path: baseRootfs, Name: "_base"}
 }
 
-// availableImageVariants returns sorted list of available image names from config and imagesDir.
+// availableImageVariants returns a sorted list of image names known to
+// the system: every key in the Images config map plus every tag present
+// in the blob store. The synthetic "_base" tag is excluded.
 func availableImageVariants(images map[string]string, imagesDir string) []string {
 	seen := make(map[string]bool)
 	for name := range images {
 		seen[name] = true
 	}
 	if imagesDir != "" {
-		entries, err := os.ReadDir(imagesDir)
+		tags, err := vmimage.ListTags(imagesDir)
 		if err == nil {
-			for _, e := range entries {
-				if strings.HasSuffix(e.Name(), "-rootfs.ext4") && !e.IsDir() {
-					name := strings.TrimSuffix(e.Name(), "-rootfs.ext4")
-					if name != "" && name != "_base" {
-						seen[name] = true
-					}
+			for _, name := range tags {
+				if name != "" && name != "_base" {
+					seen[name] = true
 				}
 			}
 		}
@@ -649,23 +706,30 @@ func (c *FirecrackerConfig) ResolveBaseRootfs() ResolvedImage {
 // DefaultFirecrackerConfig returns a FirecrackerConfig with default values.
 func DefaultFirecrackerConfig() *FirecrackerConfig {
 	return &FirecrackerConfig{
-		KernelPath:      DefaultFirecrackerImagesDir + "/vmlinux",
-		BaseRootfs:      "/var/lib/shed/firecracker/base-rootfs.ext4",
-		ImagesDir:       DefaultFirecrackerImagesDir,
-		InstanceDir:     "/var/lib/shed/firecracker/instances",
-		SnapshotsDir:    "/var/lib/shed/firecracker/snapshots",
-		SocketDir:       "/var/run/shed/firecracker",
-		DefaultCPUs:     2,
-		DefaultMemoryMB: 4096,
-		DefaultDiskGB:   20,
-		VsockBaseCID:    100,
-		ConsolePort:     1024,
-		NotifyPort:      1026,
-		StartTimeout:    Duration(30 * time.Second),
-		StopTimeout:     Duration(10 * time.Second),
-		BridgeName:      "shed-br0",
-		BridgeCIDR:      "172.30.0.1/24",
-		TAPPrefix:       "shed-tap",
+		// KernelPath and BaseRootfs are intentionally left empty by
+		// default — Phase A retired the flat-file layout (the previous
+		// /var/lib/shed/firecracker/base-rootfs.ext4 default) in favor
+		// of the content-addressed blob store under
+		// {ImagesDir}/blobs/sha256/<digest>/, and Phase B made the
+		// in-blob kernel the canonical source. Operators who want the
+		// legacy fallbacks set them explicitly in server.yaml.
+		ImagesDir:        DefaultFirecrackerImagesDir,
+		InstanceDir:      "/var/lib/shed/firecracker/instances",
+		SnapshotsDir:     "/var/lib/shed/firecracker/snapshots",
+		UppersDir:        "/var/lib/shed/firecracker/uppers",
+		UpperSizeDefault: DefaultUpperSize,
+		SocketDir:        "/var/run/shed/firecracker",
+		DefaultCPUs:      2,
+		DefaultMemoryMB:  4096,
+		DefaultDiskGB:    20,
+		VsockBaseCID:     100,
+		ConsolePort:      1024,
+		NotifyPort:       1026,
+		StartTimeout:     Duration(30 * time.Second),
+		StopTimeout:      Duration(10 * time.Second),
+		BridgeName:       "shed-br0",
+		BridgeCIDR:       "172.30.0.1/24",
+		TAPPrefix:        "shed-tap",
 	}
 }
 
@@ -970,6 +1034,15 @@ func (c *FirecrackerConfig) applyDefaults() {
 		c.SnapshotsDir = "/var/lib/shed/firecracker/snapshots"
 	}
 
+	c.UppersDir = ExpandPath(c.UppersDir)
+	if c.UppersDir == "" {
+		c.UppersDir = "/var/lib/shed/firecracker/uppers"
+	}
+
+	if c.UpperSizeDefault == "" {
+		c.UpperSizeDefault = DefaultUpperSize
+	}
+
 	// Default KernelPath to ImagesDir/vmlinux (extracted from published images)
 	if c.KernelPath == "" {
 		c.KernelPath = c.ImagesDir + "/vmlinux"
@@ -985,13 +1058,12 @@ func (c *FirecrackerConfig) applyDefaults() {
 
 // Validate checks that the Firecracker configuration is valid.
 func (c *FirecrackerConfig) Validate() error {
-	// Validate paths exist
-	if c.KernelPath == "" {
-		return fmt.Errorf("kernel_path is required")
-	}
-	if c.BaseRootfs == "" {
-		return fmt.Errorf("base_rootfs is required")
-	}
+	// kernel_path and base_rootfs are both optional under the Phase B
+	// content-addressed model: vm.Start reads the kernel from the
+	// blob, and ResolveBaseRootfs is only called when `shed create`
+	// runs without --image (handled separately by CreateShed). The
+	// legacy path-based fields remain as fallbacks; an empty value
+	// means "rely on the blob."
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
 	}
@@ -1066,16 +1138,21 @@ func (c *FirecrackerConfig) Validate() error {
 		}
 	}
 
-	// Defer kernel/rootfs path validation when Docker refs are present —
-	// files are extracted during first image conversion.
-	if !hasAnyDockerRef(c.BaseRootfs, c.Images) {
+	// Defer kernel/rootfs path validation when every configured source
+	// is a Docker ref (files are extracted during first image
+	// conversion) or when kernel_path is empty (Phase B: vm.Start
+	// reads the kernel from the blob). The previous hasAnyDockerRef
+	// gate was too loose — a mix of local + remote sources still
+	// needs the legacy kernel/initrd for the local-spawn path.
+	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.BaseRootfs, c.Images) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
 		}
 	}
 
-	// Validate base rootfs path exists (skip for Docker refs — deferred validation)
-	if !vmimage.IsDockerRef(c.BaseRootfs) {
+	// Validate base rootfs path exists when configured as a local
+	// path. An empty value is allowed (see Validate header).
+	if c.BaseRootfs != "" && !vmimage.IsDockerRef(c.BaseRootfs) {
 		if _, err := os.Stat(c.BaseRootfs); err != nil {
 			return fmt.Errorf("base_rootfs does not exist: %s", c.BaseRootfs)
 		}
@@ -1108,7 +1185,70 @@ func (c *FirecrackerConfig) Validate() error {
 		return fmt.Errorf("tap_prefix is required")
 	}
 
+	if c.UpperSizeDefault != "" {
+		if _, err := ParseUpperSize(c.UpperSizeDefault); err != nil {
+			return fmt.Errorf("firecracker: upper_size_default: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// UpperSize bounds. The plan caps configurable upper size at
+// 1G-100G; values outside this range almost always indicate a config
+// typo and should fail-fast at validation time.
+const (
+	MinUpperSizeBytes int64 = 1 * 1024 * 1024 * 1024
+	MaxUpperSizeBytes int64 = 100 * 1024 * 1024 * 1024
+)
+
+// DefaultUpperSize is the fallback upper-layer size when the config
+// omits upper_size_default. Plan-aligned at 5 GB sparse — a working
+// guess for typical "build a project" workloads.
+const DefaultUpperSize = "5G"
+
+// ParseUpperSize accepts a human-friendly suffix (G, M, or bare bytes)
+// and returns the size in bytes. Validates the range against
+// MinUpperSizeBytes/MaxUpperSizeBytes.
+//
+// Pre-checks that n*mul won't overflow int64 — otherwise a value like
+// "10000000000G" would silently wrap to a tiny positive number and
+// slip past the range bounds.
+func ParseUpperSize(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("upper size is empty")
+	}
+	mul := int64(1)
+	digits := s
+	switch unit := s[len(s)-1]; unit {
+	case 'G', 'g':
+		mul = 1024 * 1024 * 1024
+		digits = s[:len(s)-1]
+	case 'M', 'm':
+		mul = 1024 * 1024
+		digits = s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid upper size %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("upper size must be positive: %q", s)
+	}
+	// Reject inputs that would overflow before the bound checks see
+	// them. Anything > MaxUpperSizeBytes/mul is already out of range,
+	// so we can fail with the same range error.
+	if n > MaxUpperSizeBytes/mul {
+		return 0, fmt.Errorf("upper size must be at most %dG, got %q", MaxUpperSizeBytes/(1024*1024*1024), s)
+	}
+	bytes := n * mul
+	if bytes < MinUpperSizeBytes {
+		return 0, fmt.Errorf("upper size must be at least %dG, got %q", MinUpperSizeBytes/(1024*1024*1024), s)
+	}
+	if bytes > MaxUpperSizeBytes {
+		return 0, fmt.Errorf("upper size must be at most %dG, got %q", MaxUpperSizeBytes/(1024*1024*1024), s)
+	}
+	return bytes, nil
 }
 
 // ExpandPath expands ~ to the user's home directory.
@@ -1164,15 +1304,19 @@ func loadEnvFile(path string) (map[string]string, error) {
 	return envVars, nil
 }
 
-// hasAnyDockerRef returns true if baseRootfs or any image in the map is a Docker reference.
-func hasAnyDockerRef(baseRootfs string, images map[string]string) bool {
-	if vmimage.IsDockerRef(baseRootfs) {
-		return true
+// allSourcesAreDockerRefs returns true when the kernel/initrd validation
+// can be safely skipped: either base_rootfs is empty (the optional-Phase-B
+// case) or it's a Docker ref, AND every entry in images is either a Docker
+// ref or empty. A single local-path source means the legacy kernel/initrd
+// files must still exist to support spawning from it.
+func allSourcesAreDockerRefs(baseRootfs string, images map[string]string) bool {
+	if baseRootfs != "" && !vmimage.IsDockerRef(baseRootfs) {
+		return false
 	}
 	for _, val := range images {
-		if vmimage.IsDockerRef(val) {
-			return true
+		if val != "" && !vmimage.IsDockerRef(val) {
+			return false
 		}
 	}
-	return false
+	return true
 }

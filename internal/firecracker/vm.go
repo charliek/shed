@@ -20,6 +20,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -42,6 +43,18 @@ func CreateVM(ctx context.Context, meta *Metadata, cfg *config.FirecrackerConfig
 
 // Start starts the VM.
 func (vm *VM) Start(ctx context.Context) error {
+	// Guard against a previously interrupted ResetShed (DeleteUpper
+	// succeeded, EnsureUpper then failed): without this, vm.Start
+	// would fail deep inside the firecracker SDK with a generic
+	// "open failed" on the rootfs drive. Surfacing a clean recovery
+	// hint here saves the operator from digging through SDK logs.
+	if _, err := os.Stat(vm.meta.RootfsPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("shed %s has no writable upper at %s; run `shed reset %s` to recreate it (or `shed delete %s` to abandon)", vm.meta.Name, vm.meta.RootfsPath, vm.meta.Name, vm.meta.Name)
+		}
+		return fmt.Errorf("stat upper at %s: %w", vm.meta.RootfsPath, err)
+	}
+
 	// Ensure socket directory exists
 	socketDir := vm.cfg.SocketDir
 	if err := os.MkdirAll(socketDir, 0755); err != nil {
@@ -70,21 +83,72 @@ func (vm *VM) Start(ctx context.Context) error {
 	// shed.name= is read by the in-guest shed-firstboot service to set the
 	// hostname and detect rootfs clones (snapshot spawns). Shed names are
 	// validated by config.ValidateShedName so direct concatenation is safe.
+	//
+	// The kernel cmdline drops `root=` because the shed initramfs builds an
+	// overlayfs and pivot_roots into the merged tree itself. shed.upper /
+	// shed.lower are read by the initramfs to locate the writable upper
+	// (vda) and read-only lower (vdb) block devices.
 	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s",
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
 		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
 	)
 
+	if vm.meta.LowerDigest == "" {
+		return fmt.Errorf("vm %s has no lower_digest in metadata; recreate via `shed delete && shed create`", vm.meta.Name)
+	}
+	lowerRootfs, err := vmimage.BlobRootfsPath(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	if err != nil {
+		return fmt.Errorf("resolving lower rootfs path: %w", err)
+	}
+	if !vmimage.BlobExists(vm.cfg.ImagesDir, vm.meta.LowerDigest) {
+		return fmt.Errorf("lower image blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
+	}
+	blobDir, err := vmimage.BlobDir(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	if err != nil {
+		return fmt.Errorf("resolving blob dir: %w", err)
+	}
+	initrdPath := filepath.Join(blobDir, vmimage.BlobInitrdFilename)
+	if _, err := os.Stat(initrdPath); err != nil {
+		return fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, err)
+	}
+
+	// Prefer the kernel from inside the blob (set by `shed image install
+	// --kernel ... --consume`) over the legacy cfg.KernelPath. The build
+	// scripts consume the host-side kernel into the blob, so the legacy
+	// path is usually absent after a fresh build. cfg.KernelPath remains
+	// the fallback for images installed without a kernel.
+	kernelPath := filepath.Join(blobDir, vmimage.BlobKernelFilename)
+	if _, err := os.Stat(kernelPath); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat blob kernel at %s: %w", kernelPath, err)
+		}
+		if vm.cfg.KernelPath == "" {
+			return fmt.Errorf("no kernel for %s: blob %s has no kernel and firecracker.kernel_path is unset; rebuild the image with `shed image install --kernel ...` or set firecracker.kernel_path in server.yaml", vm.meta.Name, vmimage.ShortDigest(vm.meta.LowerDigest))
+		}
+		kernelPath = vm.cfg.KernelPath
+	}
+
 	fcCfg := firecracker.Config{
 		SocketPath:      socketPath,
-		KernelImagePath: vm.cfg.KernelPath,
+		KernelImagePath: kernelPath,
+		InitrdPath:      initrdPath,
 		KernelArgs:      kernelArgs,
 		Drives: []models.Drive{
+			// Upper (writable). The initramfs runs mkfs.ext4 on first
+			// boot when no FS signature is present.
 			{
 				DriveID:      firecracker.String("rootfs"),
 				PathOnHost:   firecracker.String(vm.meta.RootfsPath),
 				IsRootDevice: firecracker.Bool(true),
 				IsReadOnly:   firecracker.Bool(false),
+			},
+			// Lower (read-only). Shared across all sheds that pin this
+			// digest — both disk and host page cache.
+			{
+				DriveID:      firecracker.String("lower"),
+				PathOnHost:   firecracker.String(lowerRootfs),
+				IsRootDevice: firecracker.Bool(false),
+				IsReadOnly:   firecracker.Bool(true),
 			},
 		},
 		MachineCfg: models.MachineConfiguration{

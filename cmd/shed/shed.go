@@ -75,6 +75,7 @@ var (
 	createMemory       int
 	createLocalDir     string
 	createFromSnapshot string
+	createUpperSize    string
 	startTimeout       time.Duration
 	listAll            bool
 	deleteKeep         bool
@@ -93,6 +94,7 @@ func init() {
 	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
 	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a local directory as the workspace (mutually exclusive with --repo)")
 	createCmd.Flags().StringVar(&createFromSnapshot, "from-snapshot", "", "Spawn from a snapshot's rootfs (mutually exclusive with --image and --repo)")
+	createCmd.Flags().StringVar(&createUpperSize, "upper-size", "", "Logical size of the per-shed writable upper layer (e.g. 5G, 20G; default: server config)")
 
 	startCmd.Flags().DurationVar(&startTimeout, "timeout", 0, "Timeout for start operation (default: from config or 10m)")
 
@@ -194,16 +196,26 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 
+	var upperSizeBytes int64
+	if createUpperSize != "" {
+		parsed, err := config.ParseUpperSize(createUpperSize)
+		if err != nil {
+			return fmt.Errorf("invalid --upper-size: %w", err)
+		}
+		upperSizeBytes = parsed
+	}
+
 	req := &config.CreateShedRequest{
-		Name:         name,
-		Repo:         createRepo,
-		Image:        createImage,
-		NoProvision:  createNoProvision,
-		Backend:      resolvedBackend,
-		CPUs:         createCPUs,
-		MemoryMB:     createMemory,
-		LocalDir:     createLocalDir,
-		FromSnapshot: createFromSnapshot,
+		Name:           name,
+		Repo:           createRepo,
+		Image:          createImage,
+		NoProvision:    createNoProvision,
+		Backend:        resolvedBackend,
+		CPUs:           createCPUs,
+		MemoryMB:       createMemory,
+		LocalDir:       createLocalDir,
+		FromSnapshot:   createFromSnapshot,
+		UpperSizeBytes: upperSizeBytes,
 	}
 
 	shed, err := client.CreateShedWithProgress(req, func(event backend.ProgressEvent) {

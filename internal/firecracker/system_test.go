@@ -10,7 +10,6 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
-	"github.com/charliek/shed/internal/vmimage"
 )
 
 func newSystemTestClient(t *testing.T) (*Client, string, string) {
@@ -79,13 +78,10 @@ func TestPrune_FC_LogsSkippedWithReason(t *testing.T) {
 func TestDiskUsage_Populated_FC(t *testing.T) {
 	client, imagesDir, instanceDir := newSystemTestClient(t)
 
-	// _base and a variant.
-	if err := os.WriteFile(filepath.Join(imagesDir, vmimage.RootfsFilename("_base")), make([]byte, 4096), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(imagesDir, vmimage.RootfsFilename("default")), make([]byte, 8192), 0644); err != nil {
-		t.Fatal(err)
-	}
+	// _base and a variant — install via the content-addressed blob
+	// store so DiskUsage can resolve them through the tag layer.
+	installTestBlob(t, imagesDir, "_base", make([]byte, 4096))
+	installTestBlob(t, imagesDir, "default", make([]byte, 8192))
 
 	// One stopped shed with rootfs — but NO console.log (FC has no console log file).
 	meta := testMetadata("api-dev")

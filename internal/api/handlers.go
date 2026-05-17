@@ -14,6 +14,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -291,6 +292,23 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, shed)
 }
 
+// handleResetShed resets a stopped shed by deleting and recreating its
+// per-shed writable upper layer. Workspace contents (mounted post-boot
+// from outside the overlay) are not affected.
+// POST /api/sheds/{name}/reset
+func (s *Server) handleResetShed(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+
+	shed, err := s.backend.ResetShed(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, shed)
+}
+
 // handleListSessions returns all tmux sessions in a shed.
 // GET /api/sheds/{name}/sessions
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -398,6 +416,9 @@ func mapBackendError(err error) (int, string, string) {
 	}
 	if errors.Is(err, config.ErrShedNotRunningSentinel) {
 		return http.StatusConflict, config.ErrShedAlreadyStopped, err.Error()
+	}
+	if errors.Is(err, config.ErrShedNotStoppedSentinel) {
+		return http.StatusConflict, config.ErrShedNotStopped, err.Error()
 	}
 	if errors.Is(err, config.ErrUnknownImageSentinel) {
 		return http.StatusBadRequest, config.ErrUnknownImage, err.Error()
@@ -525,4 +546,68 @@ func (s *Server) handlePruneImages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, config.PruneImagesResponse{Deleted: deleted})
+}
+
+// handleInspectImage returns the manifest + info for a tag or digest.
+// GET /api/images/inspect/{name}
+func (s *Server) handleInspectImage(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	resp, err := s.backend.InspectImage(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleTagImage points a new tag at the digest currently held by another
+// tag (or a digest passed directly).
+// POST /api/images/tag
+func (s *Server) handleTagImage(w http.ResponseWriter, r *http.Request) {
+	var req config.ImageTagRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.Source == "" || req.Target == "" {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "source and target are required")
+		return
+	}
+	if err := vmimage.ValidateImageName(req.Target); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "target: "+err.Error())
+		return
+	}
+	if err := s.backend.TagImage(r.Context(), req.Source, req.Target); err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handlePullImage pulls a Docker reference into the blob store under the
+// named tag. Returns the resulting digest.
+// POST /api/images/pull
+func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
+	var req config.ImagePullRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.DockerRef == "" || req.Tag == "" {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "docker_ref and tag are required")
+		return
+	}
+	if err := vmimage.ValidateImageName(req.Tag); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "tag: "+err.Error())
+		return
+	}
+	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, config.ImagePullResponse{Tag: req.Tag, Digest: digest})
 }

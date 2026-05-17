@@ -52,8 +52,11 @@ func (s *Server) Router() chi.Router {
 		// Images
 		r.Route("/images", func(r chi.Router) {
 			r.Get("/", s.handleListImages)
-			r.Delete("/{name}", s.handleDeleteImage)
 			r.Post("/prune", s.handlePruneImages)
+			r.Post("/tag", s.handleTagImage)
+			r.Post("/pull", s.handlePullImage)
+			r.Get("/inspect/{name}", s.handleInspectImage)
+			r.Delete("/{name}", s.handleDeleteImage)
 		})
 
 		// System (disk reporting + prune)
@@ -87,6 +90,7 @@ func (s *Server) Router() chi.Router {
 				r.Delete("/", s.handleDeleteShed)
 				r.Post("/start", s.handleStartShed)
 				r.Post("/stop", s.handleStopShed)
+				r.Post("/reset", s.handleResetShed)
 
 				// Sessions within a shed
 				r.Get("/sessions", s.handleListSessions)

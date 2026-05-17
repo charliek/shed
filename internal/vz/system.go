@@ -57,20 +57,29 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		}
 
 		// _base is produced by the runtime when base_rootfs is a Docker ref,
-		// and is intentionally omitted from ListImages(). Stat it here.
-		basePath := filepath.Join(imagesDir, vmimage.RootfsFilename("_base"))
-		if logical, physical, err := diskstat.Stat(basePath); err == nil {
-			baseRef := ""
-			if vmimage.IsDockerRef(c.cfg.BaseRootfs) {
-				baseRef = c.cfg.BaseRootfs
+		// and is intentionally omitted from ListImages(). Resolve via the
+		// content-addressed blob store and stat the underlying rootfs.
+		// Skip when its path matches an existing entry — under content-
+		// addressing, _base often resolves to the same blob as a tagged
+		// variant, and double-counting would inflate `df` totals.
+		// Path comparison is digest-equivalent here: both go through
+		// BlobRootfsPath(imagesDir, digest), which is deterministic
+		// from the digest, and Resolve is called with no expectedRef so
+		// it never short-circuits on a mismatched manifest.SourceRef.
+		if basePath := vmimage.Resolve(imagesDir, "_base", ""); basePath != "" && !imagesContainPath(du.Images, basePath) {
+			if logical, physical, err := diskstat.Stat(basePath); err == nil {
+				baseRef := ""
+				if vmimage.IsDockerRef(c.cfg.BaseRootfs) {
+					baseRef = c.cfg.BaseRootfs
+				}
+				du.Images = append(du.Images, config.ImageDiskEntry{
+					Name:      "_base",
+					Path:      basePath,
+					DockerRef: baseRef,
+					Size:      config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
+					IsBase:    true,
+				})
 			}
-			du.Images = append(du.Images, config.ImageDiskEntry{
-				Name:      "_base",
-				Path:      basePath,
-				DockerRef: baseRef,
-				Size:      config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
-				IsBase:    true,
-			})
 		}
 
 		orphans, err := systemprune.FindOrphans(imagesDir)
@@ -86,6 +95,17 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 			return du, fmt.Errorf("scanning snapshot orphans: %w", err)
 		}
 		du.Orphans = append(du.Orphans, snapOrphans...)
+	}
+
+	// Uppers left behind by crashed creates that the operator never
+	// retried (the CreateShed-time sweep handles the retry case, but
+	// not "operator gave up").
+	if c.cfg.UppersDir != "" {
+		upperOrphans, err := systemprune.FindUpperOrphans(c.cfg.UppersDir, c.cfg.InstanceDir)
+		if err != nil {
+			return du, fmt.Errorf("scanning upper orphans: %w", err)
+		}
+		du.Orphans = append(du.Orphans, upperOrphans...)
 	}
 
 	// Kernel + initrd
@@ -191,12 +211,9 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 	du.Totals.All.LogicalBytes = du.Totals.Images.LogicalBytes + du.Totals.Sheds.LogicalBytes + du.Totals.Snapshots.LogicalBytes + du.Totals.Orphans.LogicalBytes
 	du.Totals.All.PhysicalBytes = du.Totals.Images.PhysicalBytes + du.Totals.Sheds.PhysicalBytes + du.Totals.Snapshots.PhysicalBytes + du.Totals.Orphans.PhysicalBytes
 
-	du.Notes = append(du.Notes,
-		"physical bytes may overcount shared extents on APFS (clonefile) or hardlinks",
-	)
 	if len(du.Snapshots) > 0 {
 		du.Notes = append(du.Notes,
-			"rootfs extents are shared via reflink between a snapshot and sheds spawned from it — physical bytes count those extents under both; metadata files are unique per snapshot",
+			"snapshot upper extents are shared via reflink with sheds spawned from the snapshot; physical bytes count those extents under both",
 		)
 	}
 
@@ -204,6 +221,10 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 }
 
 // shedDiskEntryForVZ builds a ShedDiskEntry for a single VZ instance.
+//
+// Per-shed accounting reflects only the writable upper layer. The
+// (much larger) read-only lower image is shared across every shed
+// pinning the same digest and is reported once in du.Images.
 func shedDiskEntryForVZ(instanceDir string, meta *Metadata) config.ShedDiskEntry {
 	entry := config.ShedDiskEntry{
 		Name:   meta.Name,
@@ -211,12 +232,18 @@ func shedDiskEntryForVZ(instanceDir string, meta *Metadata) config.ShedDiskEntry
 		Image:  meta.Image,
 	}
 
-	rootfsPath := RootfsPath(instanceDir, meta.Name)
-	rootfsLogical, rootfsPhysical, _ := diskstat.Stat(rootfsPath)
+	upperPath := meta.UpperPath
+	if upperPath == "" {
+		upperPath = meta.RootfsPath
+	}
+	if upperPath == "" {
+		upperPath = RootfsPath(instanceDir, meta.Name)
+	}
+	rootfsLogical, rootfsPhysical, _ := diskstat.Stat(upperPath)
 	entry.Rootfs = config.FileEntry{
-		Path: rootfsPath,
+		Path: upperPath,
 		Size: config.DiskSize{LogicalBytes: rootfsLogical, PhysicalBytes: rootfsPhysical},
-		Kind: "rootfs",
+		Kind: "upper",
 	}
 
 	consolePath := filepath.Join(InstanceDir(instanceDir, meta.Name), consoleLogFilename)
@@ -310,6 +337,15 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		report.Skipped = append(report.Skipped, skipped...)
 	}
 
+	// Step 2b'': upper orphan candidates (crashed creates that never
+	// reached meta.Save and that no operator-retry has cleaned up).
+	var upperOrphanCandidates []systemprune.UpperOrphanCandidate
+	if opts.Orphans && c.cfg.UppersDir != "" {
+		cands, skipped := systemprune.CollectUpperOrphanCandidates(c.cfg.UppersDir, c.cfg.InstanceDir)
+		upperOrphanCandidates = cands
+		report.Skipped = append(report.Skipped, skipped...)
+	}
+
 	// Step 2c: image candidates (dry-run, respects candidate deletions).
 	// Same empty-ImagesDir guard for safety.
 	var imageCandidates []vmimage.ImageInfo
@@ -318,10 +354,8 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 		for _, ic := range instanceCandidates {
 			skipSet[ic.Name] = true
 		}
-		mgr := vmimage.NewManager(c.cfg)
-		cands, err := mgr.PruneImages(true, func() ([]string, error) {
-			return c.inUseImageNamesExcept(skipSet)
-		})
+		mgr := vmimage.NewManager(c.cfg, c.refScannerExcept(skipSet))
+		cands, err := mgr.PruneImages(true)
 		if err != nil {
 			return report, fmt.Errorf("dry-run image prune: %w", err)
 		}
@@ -348,6 +382,9 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	}
 	for _, sc := range snapshotOrphanCandidates {
 		report.Items = append(report.Items, sc.ToPrunedItems(opts.DryRun)...)
+	}
+	for _, uc := range upperOrphanCandidates {
+		report.Items = append(report.Items, uc.ToPrunedItems(opts.DryRun)...)
 	}
 	for _, img := range imageCandidates {
 		report.Items = append(report.Items, systemprune.ImageToPrunedItem(img, opts.DryRun))
@@ -382,8 +419,8 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	// On error we still return the report (with Items populated from 3a)
 	// so the client sees partial progress rather than a bare 500.
 	if opts.Images && c.cfg.ImagesDir != "" {
-		mgr := vmimage.NewManager(c.cfg)
-		deleted, err := mgr.PruneImages(false, c.inUseImageNames)
+		mgr := vmimage.NewManager(c.cfg, c.refScanner())
+		deleted, err := mgr.PruneImages(false)
 		if err != nil {
 			systemprune.FinalizeReport(&report)
 			return report, fmt.Errorf("image prune: %w", err)
@@ -414,6 +451,16 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 				continue
 			}
 			report.Items = append(report.Items, sc.ToPrunedItems(false)...)
+		}
+		for _, uc := range upperOrphanCandidates {
+			if ok := systemprune.SweepUpperOrphan(uc); !ok {
+				report.Skipped = append(report.Skipped, config.SkippedItem{
+					Kind: "upper_orphan", Path: uc.Dir,
+					Reason: "removal failed",
+				})
+				continue
+			}
+			report.Items = append(report.Items, uc.ToPrunedItems(false)...)
 		}
 	}
 
@@ -570,4 +617,16 @@ func truncateConsoleLogInPlace(path string, origSize, tailBytes int64) error {
 		return fmt.Errorf("write tail: %w", err)
 	}
 	return nil
+}
+
+// imagesContainPath reports whether any entry's Path equals path.
+// Used to dedupe `_base` when it resolves to the same blob as a
+// tagged variant under the content-addressed image layout.
+func imagesContainPath(entries []config.ImageDiskEntry, path string) bool {
+	for _, e := range entries {
+		if e.Path == path {
+			return true
+		}
+	}
+	return false
 }

@@ -97,6 +97,7 @@ nav:
       - Configuration: reference/configuration.md
       - Snapshots: reference/snapshots.md
       - Disk Management: reference/disk-management.md
+      - Storage Model: reference/storage-model.md
       - Tunnels: reference/tunnels.md
       - File Sync: reference/sync.md
       - Provisioning: reference/provisioning.md

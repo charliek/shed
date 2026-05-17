@@ -62,6 +62,10 @@ VZ and Firecracker use multi-stage Dockerfiles (`vz/Dockerfile`, `firecracker/Do
 - Local dev with shed-extensions changes: `--shed-ext-version dev` (after building the shed-extensions Docker image locally)
 - See `docs/reference/images.md` for full variant docs and build instructions
 
+## Storage Model
+
+Images are stored content-addressed under `{images_dir}/blobs/sha256/<digest>/` with tag indirection at `{images_dir}/tags/<tag>.json`. Each shed and snapshot pins the digest of its lower image in metadata so `shed image prune` can refcount-GC unreferenced blobs. Tags do NOT protect blobs from prune (Docker model). See `docs/reference/storage-model.md` for the full layout and the lifecycle commands (`shed image ls/inspect/tag/pull/rm/prune`).
+
 ## Documentation
 
 Docs use MkDocs Material. See `mkdocs.yml` for style guidelines (top comment block). Key rules:

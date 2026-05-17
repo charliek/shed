@@ -44,6 +44,9 @@ func (f *fakeBackend) StartShed(ctx context.Context, name string) (*config.Shed,
 func (f *fakeBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	panic("unexpected")
 }
+func (f *fakeBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	panic("unexpected")
+}
 func (f *fakeBackend) ListSessions(ctx context.Context, shedName string) ([]config.Session, error) {
 	panic("unexpected")
 }
@@ -60,6 +63,13 @@ func (f *fakeBackend) DialService(ctx context.Context, shedName string, port uin
 	panic("unexpected")
 }
 func (f *fakeBackend) ListImages(ctx context.Context) ([]config.ImageInfo, error) {
+	panic("unexpected")
+}
+func (f *fakeBackend) InspectImage(ctx context.Context, _ string) (config.ImageInspectResponse, error) {
+	panic("unexpected")
+}
+func (f *fakeBackend) TagImage(ctx context.Context, _, _ string) error { panic("unexpected") }
+func (f *fakeBackend) PullImage(ctx context.Context, _, _ string) (string, error) {
 	panic("unexpected")
 }
 func (f *fakeBackend) DeleteImage(ctx context.Context, name string) error { panic("unexpected") }

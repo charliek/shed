@@ -40,49 +40,6 @@ func TestRootfsPath(t *testing.T) {
 	}
 }
 
-func TestCopyRootfs_Success(t *testing.T) {
-	dir := mustTempDir(t, "rootfs-test")
-
-	// Create a source rootfs file
-	srcContent := []byte("test rootfs content for testing")
-	srcPath := filepath.Join(dir, "base-rootfs.ext4")
-	if err := os.WriteFile(srcPath, srcContent, 0644); err != nil {
-		t.Fatalf("failed to create source rootfs: %v", err)
-	}
-
-	// Copy rootfs
-	instanceDir := filepath.Join(dir, "instances")
-	dstPath, err := CopyRootfs(srcPath, instanceDir, "test-vm")
-	if err != nil {
-		t.Fatalf("CopyRootfs() error = %v", err)
-	}
-
-	// Verify destination path
-	expectedPath := filepath.Join(instanceDir, "test-vm", "rootfs.ext4")
-	if dstPath != expectedPath {
-		t.Errorf("CopyRootfs() returned %v, want %v", dstPath, expectedPath)
-	}
-
-	// Verify content was copied
-	dstContent, err := os.ReadFile(dstPath)
-	if err != nil {
-		t.Fatalf("failed to read destination rootfs: %v", err)
-	}
-
-	if string(dstContent) != string(srcContent) {
-		t.Error("destination content does not match source")
-	}
-}
-
-func TestCopyRootfs_MissingSource(t *testing.T) {
-	dir := mustTempDir(t, "rootfs-test")
-
-	_, err := CopyRootfs("/nonexistent/rootfs.ext4", dir, "test-vm")
-	if err == nil {
-		t.Error("CopyRootfs() expected error for missing source")
-	}
-}
-
 func TestDeleteRootfs_Exists(t *testing.T) {
 	dir := mustTempDir(t, "rootfs-test")
 
@@ -139,5 +96,46 @@ func TestRootfsExists(t *testing.T) {
 	// Test not exists
 	if RootfsExists(dir, "nonexistent-vm") {
 		t.Error("RootfsExists() = true for nonexistent, want false")
+	}
+}
+
+func TestEnsureUpper(t *testing.T) {
+	dir := t.TempDir()
+
+	// First call creates a sparse file at the requested size.
+	const size int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+	path, err := EnsureUpper(dir, "alpha", size)
+	if err != nil {
+		t.Fatalf("EnsureUpper: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Size() != size {
+		t.Errorf("upper size = %d, want %d", fi.Size(), size)
+	}
+
+	// Strict: second call refuses to silently reuse the existing
+	// upper. Callers that want fresh state (e.g. shed reset) must
+	// DeleteUpper first.
+	if _, err := EnsureUpper(dir, "alpha", size); err == nil {
+		t.Errorf("EnsureUpper accepted a pre-existing upper; want error")
+	}
+
+	// Negative or zero size is rejected.
+	if _, err := EnsureUpper(dir, "beta", 0); err == nil {
+		t.Errorf("EnsureUpper with size=0 succeeded; want error")
+	}
+	if _, err := EnsureUpper(dir, "beta", -1); err == nil {
+		t.Errorf("EnsureUpper with size=-1 succeeded; want error")
+	}
+
+	// DeleteUpper wipes the per-shed dir.
+	if err := DeleteUpper(dir, "alpha"); err != nil {
+		t.Fatalf("DeleteUpper: %v", err)
+	}
+	if _, err := os.Stat(UpperDir(dir, "alpha")); !os.IsNotExist(err) {
+		t.Errorf("upper dir should be gone, got err=%v", err)
 	}
 }

@@ -19,6 +19,11 @@
 ARG SHED_EXT_VERSION=v0.3.1
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
+# Note: the shed initramfs (overlay-on-the-guest init) is built from
+# initramfs/Dockerfile via scripts/build-initramfs.sh. It lives in its
+# own Dockerfile so this file's COPY paths can keep resolving relative
+# to the firecracker/ build context.
+
 # =============================================================================
 # Stage: kernel-builder (temporary)
 # Compiles a custom Firecracker kernel with Docker, 9P, and BPF support.

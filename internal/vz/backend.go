@@ -68,6 +68,11 @@ func (b *VZBackend) StopShed(ctx context.Context, name string) (*config.Shed, er
 	return b.client.StopShed(ctx, name)
 }
 
+// ResetShed wipes and recreates a stopped shed's writable upper layer.
+func (b *VZBackend) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
+	return b.client.ResetShed(ctx, name)
+}
+
 // newAgentClient creates a vmutil.AgentClient for the given instance name.
 func (b *VZBackend) newAgentClient(name string) *vmutil.AgentClient {
 	dialer := NewVZDialer(b.client.cfg.SocketDir, name)
@@ -190,17 +195,32 @@ func (b *VZBackend) DialService(ctx context.Context, shedName string, port uint1
 	return b.client.DialService(ctx, shedName, port)
 }
 
-// ListImages returns available VZ image variants from config and auto-discovery.
+// ListImages returns available VZ image variants from config and the blob store.
 func (b *VZBackend) ListImages(_ context.Context) ([]config.ImageInfo, error) {
 	return b.client.ListImages()
 }
 
-// DeleteImage removes a cached image by name.
+// InspectImage returns full details for a tag or digest.
+func (b *VZBackend) InspectImage(_ context.Context, tagOrDigest string) (config.ImageInspectResponse, error) {
+	return b.client.InspectImage(tagOrDigest)
+}
+
+// TagImage points newTag at the digest currently held by srcTagOrDigest.
+func (b *VZBackend) TagImage(_ context.Context, src, dst string) error {
+	return b.client.TagImage(src, dst)
+}
+
+// PullImage pulls a Docker reference into the blob store under the named tag.
+func (b *VZBackend) PullImage(ctx context.Context, dockerRef, tag string) (string, error) {
+	return b.client.PullImage(ctx, dockerRef, tag)
+}
+
+// DeleteImage removes a tag.
 func (b *VZBackend) DeleteImage(_ context.Context, name string) error {
 	return b.client.DeleteImage(name)
 }
 
-// PruneImages removes cached images not referenced by config or existing sheds.
+// PruneImages removes blobs not protected by any shed/snapshot.
 func (b *VZBackend) PruneImages(_ context.Context, dryRun bool) ([]config.ImageInfo, error) {
 	return b.client.PruneImages(dryRun)
 }
