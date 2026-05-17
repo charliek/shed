@@ -22,7 +22,10 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
 // PullOptions configures a registry-direct image pull.
@@ -72,6 +75,194 @@ type PullResult struct {
 	LayerDigests   []string
 	KernelDigest   string
 	InitrdDigest   string
+}
+
+// PushOptions configures a registry-direct image push.
+type PushOptions struct {
+	// Ref is the destination registry reference.
+	Ref string
+
+	// ImagesDir is the source OCI layout.
+	ImagesDir string
+
+	// ManifestDigest is the source manifest digest to push (typically
+	// resolved from a tag by the caller).
+	ManifestDigest string
+
+	// Insecure permits plain-HTTP transport. Auto-detected for
+	// loopback hosts when left at its zero value (caller can also
+	// set explicitly).
+	Insecure bool
+
+	// AuthKeychain controls credential lookup. nil → DefaultKeychain.
+	AuthKeychain authn.Keychain
+
+	// Progress is invoked with stage updates.
+	Progress ProgressFunc
+}
+
+// PushFromOCILayout uploads the on-disk manifest + config + layers to
+// the destination registry. Layer bytes are streamed straight from the
+// OCI store so the registry digests are preserved end-to-end (the
+// byte-perfect push guarantee). Shed-specific kernel/initrd blobs are
+// also uploaded when the manifest carries the corresponding
+// annotations, so other shed instances can pull them back without
+// re-extracting from rootfs.
+func PushFromOCILayout(ctx context.Context, opts PushOptions) error {
+	if opts.Ref == "" {
+		return errors.New("PushOptions.Ref is required")
+	}
+	if opts.ImagesDir == "" {
+		return errors.New("PushOptions.ImagesDir is required")
+	}
+	if opts.ManifestDigest == "" {
+		return errors.New("PushOptions.ManifestDigest is required")
+	}
+
+	manifestBytes, err := ReadBlob(opts.ImagesDir, opts.ManifestDigest)
+	if err != nil {
+		return fmt.Errorf("reading manifest blob: %w", err)
+	}
+	manifest, err := ParseManifest(manifestBytes)
+	if err != nil {
+		return fmt.Errorf("parsing manifest: %w", err)
+	}
+
+	keychain := opts.AuthKeychain
+	if keychain == nil {
+		keychain = authn.DefaultKeychain
+	}
+
+	insecure := opts.Insecure || isLoopbackHost(opts.Ref)
+	var nameOpts []name.Option
+	if insecure {
+		nameOpts = append(nameOpts, name.Insecure)
+	}
+	dst, err := name.ParseReference(opts.Ref, nameOpts...)
+	if err != nil {
+		return fmt.Errorf("parsing destination ref %q: %w", opts.Ref, err)
+	}
+
+	remoteOpts := []remote.Option{
+		remote.WithAuthFromKeychain(keychain),
+		remote.WithContext(ctx),
+	}
+
+	// Upload kernel / initrd loose blobs first so the manifest's
+	// annotation references resolve when other clients fetch.
+	for _, ann := range []string{AnnotationKernelDigest, AnnotationInitrdDigest} {
+		d := manifest.Annotations[ann]
+		if d == "" {
+			continue
+		}
+		if opts.Progress != nil {
+			opts.Progress("image", fmt.Sprintf("Pushing %s %s", ann, ShortDigest(d)))
+		}
+		if err := pushLooseBlob(ctx, dst, d, opts.ImagesDir, remoteOpts, nameOpts); err != nil {
+			return fmt.Errorf("pushing %s blob: %w", ann, err)
+		}
+	}
+
+	// Open the OCI image-layout we already wrote on disk and let
+	// go-containerregistry resolve the v1.Image for our manifest
+	// digest. remote.Write then streams the layer + config blobs
+	// straight from disk byte-for-byte.
+	lp, err := layout.FromPath(opts.ImagesDir)
+	if err != nil {
+		return fmt.Errorf("opening OCI layout: %w", err)
+	}
+	hash, err := v1.NewHash(opts.ManifestDigest)
+	if err != nil {
+		return fmt.Errorf("parsing manifest digest %q: %w", opts.ManifestDigest, err)
+	}
+	img, err := lp.Image(hash)
+	if err != nil {
+		return fmt.Errorf("loading image from layout: %w", err)
+	}
+	if opts.Progress != nil {
+		opts.Progress("image", fmt.Sprintf("Pushing manifest %s → %s", ShortDigest(opts.ManifestDigest), opts.Ref))
+	}
+	if err := remote.Write(dst, img, remoteOpts...); err != nil {
+		return fmt.Errorf("uploading image: %w", err)
+	}
+	return nil
+}
+
+// pushLooseBlob uploads a single shed-specific blob (kernel/initrd)
+// to the registry by digest. Used because go-containerregistry's
+// remote.Write only handles layers + config; sibling blobs need a
+// direct upload. The blob's bytes flow straight from the on-disk OCI
+// store.
+func pushLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir string, remoteOpts []remote.Option, nameOpts []name.Option) error {
+	blobRef, err := name.NewDigest(ref.Context().Name()+"@"+digest, nameOpts...)
+	if err != nil {
+		return fmt.Errorf("forming digest ref: %w", err)
+	}
+	if _, err := remote.Head(blobRef, remoteOpts...); err == nil {
+		return nil // already uploaded
+	}
+	layer, err := newLooseLayer(imagesDir, digest)
+	if err != nil {
+		return err
+	}
+	return remote.WriteLayer(ref.Context(), layer, remoteOpts...)
+}
+
+// looseLayer adapts a blob in the OCI store to v1.Layer for upload.
+// We mark it as the shed-specific kernel/initrd media type; foreign
+// tools see an unknown blob and skip it, while shed re-pulling the
+// image fetches the same bytes back by digest.
+type looseLayer struct {
+	imagesDir string
+	digest    v1.Hash
+	size      int64
+}
+
+func newLooseLayer(imagesDir, digest string) (*looseLayer, error) {
+	h, err := v1.NewHash(digest)
+	if err != nil {
+		return nil, fmt.Errorf("parsing digest %q: %w", digest, err)
+	}
+	path, err := BlobPath(imagesDir, digest)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat loose blob: %w", err)
+	}
+	return &looseLayer{imagesDir: imagesDir, digest: h, size: fi.Size()}, nil
+}
+
+func (l *looseLayer) Digest() (v1.Hash, error)     { return l.digest, nil }
+func (l *looseLayer) DiffID() (v1.Hash, error)     { return l.digest, nil }
+func (l *looseLayer) Size() (int64, error)         { return l.size, nil }
+func (l *looseLayer) MediaType() (types.MediaType, error) {
+	return types.MediaType("application/vnd.shed.blob"), nil
+}
+func (l *looseLayer) Compressed() (io.ReadCloser, error) {
+	return OpenBlob(l.imagesDir, l.digest.String())
+}
+func (l *looseLayer) Uncompressed() (io.ReadCloser, error) {
+	return l.Compressed()
+}
+
+// Compile-time check: looseLayer satisfies partial.UncompressedLayer.
+var _ partial.UncompressedLayer = (*looseLayer)(nil)
+
+// isLoopbackHost is the no-scheme analog of isLoopbackRef (which
+// inspects the full ref). True if the ref's host segment is loopback.
+func isLoopbackHost(ref string) bool {
+	host := ref
+	if i := strings.Index(host, "/"); i > 0 {
+		host = host[:i]
+	}
+	for _, p := range []string{"localhost", "127.0.0.1", "[::1]"} {
+		if strings.HasPrefix(host, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // PullToOCILayout fetches an image from a registry into the OCI image

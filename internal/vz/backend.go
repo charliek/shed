@@ -215,6 +215,11 @@ func (b *VZBackend) PullImage(ctx context.Context, dockerRef, tag, platform stri
 	return b.client.PullImage(ctx, dockerRef, tag, platform)
 }
 
+// PushImage uploads the manifest held by tagOrDigest to dstRef.
+func (b *VZBackend) PushImage(ctx context.Context, tagOrDigest, dstRef string) error {
+	return b.client.PushImage(ctx, tagOrDigest, dstRef)
+}
+
 // DeleteImage removes a tag.
 func (b *VZBackend) DeleteImage(_ context.Context, name string) error {
 	return b.client.DeleteImage(name)

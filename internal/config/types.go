@@ -274,6 +274,20 @@ type ImagePullRequest struct {
 	Platform string `json:"platform,omitempty"`
 }
 
+// ImagePushRequest is the body of POST /api/images/push.
+type ImagePushRequest struct {
+	// Source is the local tag or digest to push.
+	Source string `json:"source"`
+	// Destination is the registry reference (e.g. "ghcr.io/org/repo:v1").
+	Destination string `json:"destination"`
+}
+
+// ImagePushResponse is the response of POST /api/images/push.
+type ImagePushResponse struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+}
+
 // ImagePullResponse is the response of POST /api/images/pull.
 type ImagePullResponse struct {
 	Tag    string `json:"tag"`

@@ -92,6 +92,17 @@ var imageTagCmd = &cobra.Command{
 	RunE:  runImageTag,
 }
 
+var imagePushCmd = &cobra.Command{
+	Use:   "push <tag-or-digest> <destination-ref>",
+	Short: "Push an image to a registry",
+	Long: `Push the manifest currently held by a tag (or digest) to a
+destination registry reference, byte-perfect: the on-disk layer blobs
+are streamed unchanged so any signatures attached to the original
+remain valid.`,
+	Args: cobra.ExactArgs(2),
+	RunE: runImagePush,
+}
+
 var imagePullCmd = &cobra.Command{
 	Use:   "pull <docker-ref>",
 	Short: "Pull a Docker image into the blob store",
@@ -140,6 +151,7 @@ func init() {
 	imageCmd.AddCommand(imageInspectCmd)
 	imageCmd.AddCommand(imageTagCmd)
 	imageCmd.AddCommand(imagePullCmd)
+	imageCmd.AddCommand(imagePushCmd)
 	rootCmd.AddCommand(imageCmd)
 }
 
@@ -483,6 +495,25 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 		return outputJSON(resp)
 	}
 	printSuccess("Pulled %s as tag %q (%s)", dockerRef, resp.Tag, vmimage.ShortDigest(resp.Digest))
+	return nil
+}
+
+func runImagePush(_ *cobra.Command, args []string) error {
+	source := args[0]
+	dest := args[1]
+	entry, _, err := getServerEntry()
+	if err != nil {
+		return err
+	}
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	resp, err := client.PushImage(source, dest)
+	if err != nil {
+		return fmt.Errorf("failed to push image: %w", err)
+	}
+	if jsonFlag {
+		return outputJSON(resp)
+	}
+	printSuccess("Pushed %s → %s", resp.Source, resp.Destination)
 	return nil
 }
 

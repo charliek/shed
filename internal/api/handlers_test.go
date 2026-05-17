@@ -238,6 +238,9 @@ func (f *createShedFakeBackend) TagImage(_ context.Context, _, _ string) error {
 func (f *createShedFakeBackend) PullImage(_ context.Context, _, _, _ string) (string, error) {
 	panic("unexpected")
 }
+func (f *createShedFakeBackend) PushImage(_ context.Context, _, _ string) error {
+	panic("unexpected")
+}
 func (f *createShedFakeBackend) DeleteImage(_ context.Context, _ string) error {
 	panic("unexpected")
 }

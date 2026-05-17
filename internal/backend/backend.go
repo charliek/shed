@@ -99,6 +99,11 @@ type Backend interface {
 	// Returns the manifest digest.
 	PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error)
 
+	// PushImage uploads the manifest currently held by tagOrDigest to
+	// the destination registry ref. Byte-perfect — original layer
+	// digests are preserved.
+	PushImage(ctx context.Context, tagOrDigest, dstRef string) error
+
 	// DeleteImage removes a tag (Docker model). The underlying blob is
 	// GC'd by PruneImages once nothing references it. Returns
 	// ErrImageNotFoundSentinel if the tag doesn't exist, or

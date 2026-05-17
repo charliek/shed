@@ -206,6 +206,26 @@ func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string
 	return result.ManifestDigest, nil
 }
 
+// PushImage uploads the manifest currently held by tagOrDigest to a
+// destination registry ref. Byte-perfect: the on-disk tar.gz layer
+// blobs are streamed straight from the OCI store.
+func (m *Manager) PushImage(ctx context.Context, tagOrDigest, dstRef string, progress ProgressFunc) error {
+	imagesDir := m.cfg.GetImagesDir()
+	if imagesDir == "" {
+		return fmt.Errorf("images_dir is not configured")
+	}
+	digest, _, err := m.resolveTagOrDigest(tagOrDigest)
+	if err != nil {
+		return err
+	}
+	return PushFromOCILayout(ctx, PushOptions{
+		Ref:            dstRef,
+		ImagesDir:      imagesDir,
+		ManifestDigest: digest,
+		Progress:       progress,
+	})
+}
+
 // isLoopbackRef returns true for registry refs that target localhost.
 // Such endpoints typically don't have TLS, so go-containerregistry needs
 // the Insecure name.Option to talk to them.

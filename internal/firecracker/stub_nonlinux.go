@@ -131,6 +131,11 @@ func (b *FirecrackerBackend) PullImage(_ context.Context, _, _, _ string) (strin
 	return "", fmt.Errorf("pull image: %w", config.ErrNotSupportedSentinel)
 }
 
+// PushImage returns an error on non-linux platforms.
+func (b *FirecrackerBackend) PushImage(_ context.Context, _, _ string) error {
+	return fmt.Errorf("push image: %w", config.ErrNotSupportedSentinel)
+}
+
 // DeleteImage returns an error on non-linux platforms.
 func (b *FirecrackerBackend) DeleteImage(_ context.Context, _ string) error {
 	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)

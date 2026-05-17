@@ -77,6 +77,16 @@ func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string)
 	})
 }
 
+// PushImage uploads the manifest currently held by tagOrDigest to the
+// destination registry ref. Byte-perfect: layer bytes flow from the
+// on-disk OCI store.
+func (c *Client) PushImage(ctx context.Context, tagOrDigest, dstRef string) error {
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
+	return mapSentinelErrors(mgr.PushImage(ctx, tagOrDigest, dstRef, func(stage, msg string) {
+		backend.Progress(ctx, stage, msg)
+	}))
+}
+
 // DeleteImage removes a tag (Docker model). The underlying blob is GC'd
 // by PruneImages once nothing references it.
 func (c *Client) DeleteImage(name string) error {

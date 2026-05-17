@@ -211,6 +211,11 @@ func (b *FirecrackerBackend) PullImage(ctx context.Context, dockerRef, tag, plat
 	return b.client.PullImage(ctx, dockerRef, tag, platform)
 }
 
+// PushImage uploads the manifest held by tagOrDigest to dstRef.
+func (b *FirecrackerBackend) PushImage(ctx context.Context, tagOrDigest, dstRef string) error {
+	return b.client.PushImage(ctx, tagOrDigest, dstRef)
+}
+
 // DeleteImage removes a tag.
 func (b *FirecrackerBackend) DeleteImage(_ context.Context, name string) error {
 	return b.client.DeleteImage(name)

@@ -82,6 +82,9 @@ func (f *snapshotFakeBackend) TagImage(_ context.Context, _, _ string) error { p
 func (f *snapshotFakeBackend) PullImage(_ context.Context, _, _, _ string) (string, error) {
 	panic("unexpected")
 }
+func (f *snapshotFakeBackend) PushImage(_ context.Context, _, _ string) error {
+	panic("unexpected")
+}
 func (f *snapshotFakeBackend) DeleteImage(_ context.Context, _ string) error { panic("unexpected") }
 func (f *snapshotFakeBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
 	panic("unexpected")

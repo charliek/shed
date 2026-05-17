@@ -55,6 +55,7 @@ func (s *Server) Router() chi.Router {
 			r.Post("/prune", s.handlePruneImages)
 			r.Post("/tag", s.handleTagImage)
 			r.Post("/pull", s.handlePullImage)
+			r.Post("/push", s.handlePushImage)
 			r.Get("/inspect/{name}", s.handleInspectImage)
 			r.Delete("/{name}", s.handleDeleteImage)
 		})

@@ -438,6 +438,17 @@ func (c *APIClient) PullImage(dockerRef, tag, platform string) (*config.ImagePul
 	return &resp, nil
 }
 
+// PushImage uploads the manifest held by source (tag or digest) to a
+// destination registry ref. Byte-perfect.
+func (c *APIClient) PushImage(source, destination string) (*config.ImagePushResponse, error) {
+	body := config.ImagePushRequest{Source: source, Destination: destination}
+	var resp config.ImagePushResponse
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/images/push", body, &resp, 30*time.Minute); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // PruneImages removes unused cached images.
 // If dryRun is true, returns candidates without deleting.
 func (c *APIClient) PruneImages(dryRun bool) (*config.PruneImagesResponse, error) {

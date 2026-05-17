@@ -129,6 +129,11 @@ func (b *VZBackend) PullImage(_ context.Context, _, _, _ string) (string, error)
 	return "", fmt.Errorf("pull image: %w", config.ErrNotSupportedSentinel)
 }
 
+// PushImage returns an error on non-darwin platforms.
+func (b *VZBackend) PushImage(_ context.Context, _, _ string) error {
+	return fmt.Errorf("push image: %w", config.ErrNotSupportedSentinel)
+}
+
 // DeleteImage returns an error on non-darwin platforms.
 func (b *VZBackend) DeleteImage(_ context.Context, _ string) error {
 	return fmt.Errorf("image management: %w", config.ErrNotSupportedSentinel)
