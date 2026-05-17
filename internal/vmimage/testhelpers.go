@@ -48,8 +48,13 @@ func InstallSyntheticImage(imagesDir, tagName, sourceRef string, rootfsContent, 
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(cachePath, rootfsContent, 0o444); err != nil {
-		return "", fmt.Errorf("writing synthetic ext4 cache: %w", err)
+	// Layer cache is content-addressed; if the file is already in
+	// place from an earlier synthetic install with the same content,
+	// leave it alone (it's 0o444 and would otherwise refuse a rewrite).
+	if _, statErr := os.Stat(cachePath); statErr != nil {
+		if err := os.WriteFile(cachePath, rootfsContent, 0o444); err != nil {
+			return "", fmt.Errorf("writing synthetic ext4 cache: %w", err)
+		}
 	}
 
 	annotations := map[string]string{
