@@ -115,6 +115,20 @@ func InstallSyntheticImage(imagesDir, tagName, sourceRef string, rootfsContent, 
 		return "", fmt.Errorf("writing manifest blob: %w", err)
 	}
 
+	// Record the manifest in index.json so ListImages / PruneImages
+	// can enumerate it without probe-reading every blob (matches the
+	// behavior of the production Convert / PullToOCILayout paths).
+	if err := indexUpsert(imagesDir, Descriptor{
+		MediaType: MediaTypeOCIManifest,
+		Digest:    manifestDigest,
+		Size:      int64(len(manData)),
+		Annotations: map[string]string{
+			"org.opencontainers.image.ref.name": tagName,
+		},
+	}); err != nil {
+		return "", fmt.Errorf("updating index for synthetic image: %w", err)
+	}
+
 	if tagName != "" {
 		if err := SetTag(imagesDir, tagName, manifestDigest); err != nil {
 			return "", fmt.Errorf("setting tag: %w", err)

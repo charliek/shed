@@ -331,6 +331,54 @@ func ReadIndex(imagesDir string) (*OCIIndex, error) {
 	return ParseIndex(data)
 }
 
+// IndexManifestDigests reads index.json and returns the set of
+// manifest digests recorded there. This is the cheap way to discover
+// which blobs are manifests without probe-reading every blob.
+//
+// Returns an empty set if index.json is missing or unreadable —
+// callers should treat that as "no known manifests" and may fall back
+// to a more expensive scan if they require completeness.
+func IndexManifestDigests(imagesDir string) (map[string]bool, error) {
+	idx, err := ReadIndex(imagesDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(idx.Manifests))
+	for _, m := range idx.Manifests {
+		if m.Digest == "" {
+			continue
+		}
+		out[m.Digest] = true
+	}
+	return out, nil
+}
+
+// IndexRemoveByDigest drops a manifest entry from index.json. Called by
+// PruneImages after deleting a manifest blob so foreign tools don't see
+// a stale descriptor pointing at a missing blob.
+func IndexRemoveByDigest(imagesDir, digest string) error {
+	lockPath := filepath.Join(imagesDir, ".index.lock")
+	unlock, err := acquireFileLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("locking index: %w", err)
+	}
+	defer unlock()
+
+	idx, err := ReadIndex(imagesDir)
+	if err != nil {
+		return err
+	}
+	out := idx.Manifests[:0]
+	for _, m := range idx.Manifests {
+		if m.Digest == digest {
+			continue
+		}
+		out = append(out, m)
+	}
+	idx.Manifests = out
+	return WriteIndex(imagesDir, idx)
+}
+
 // WriteIndex atomically writes the top-level OCI index.
 func WriteIndex(imagesDir string, idx *OCIIndex) error {
 	if err := EnsureOCILayout(imagesDir); err != nil {

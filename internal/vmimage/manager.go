@@ -418,28 +418,27 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		manifests = append(manifests, manifestInfo{digest: t.Digest, tag: tag, manifest: m})
 	}
 
-	// Find dangling manifests: any manifest blob not tagged.
-	blobs, err := ListBlobs(imagesDir)
+	// Find dangling manifests by consulting index.json — which lists
+	// every installed manifest by digest. This avoids the older O(N)
+	// probe-read of every blob (a layer tar.gz can be GBs and would
+	// otherwise be loaded into memory just to fail ParseManifest).
+	indexed, err := IndexManifestDigests(imagesDir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading OCI index: %w", err)
 	}
-	for _, b := range blobs {
-		if taggedDigests[b] {
+	for digest := range indexed {
+		if taggedDigests[digest] {
 			continue
 		}
-		data, err := ReadBlob(imagesDir, b)
+		if !BlobExists(imagesDir, digest) {
+			continue
+		}
+		mf, err := LoadManifestByDigest(imagesDir, digest)
 		if err != nil {
+			log.Printf("Warning: index entry %s unreadable: %v", digest, err)
 			continue
 		}
-		m, err := ParseManifest(data)
-		if err != nil {
-			// Not a manifest — likely a config or layer blob. Skip.
-			continue
-		}
-		if m.MediaType != "" && m.MediaType != MediaTypeOCIManifest {
-			continue
-		}
-		manifests = append(manifests, manifestInfo{digest: b, manifest: m})
+		manifests = append(manifests, manifestInfo{digest: digest, manifest: mf})
 	}
 
 	// Compute per-layer reference counts across DISTINCT manifests
@@ -722,7 +721,19 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		return nil, err
 	}
 
-	// Identify manifests (for human-readable ImageInfo display).
+	// index.json is the cheap source of truth for "which blobs are
+	// manifests". The old prune walker read every blob to probe-parse
+	// it as a manifest; that's O(total store bytes) for what amounts
+	// to a directory listing.
+	indexed, err := IndexManifestDigests(imagesDir)
+	if err != nil {
+		return nil, fmt.Errorf("reading OCI index: %w", err)
+	}
+
+	// Manifest candidates are unreachable blobs the index identifies
+	// as manifests; non-manifest candidates (configs/layers/kernels
+	// that nobody references anymore) come from the remaining
+	// unreachable blobs.
 	manifestCandidates := make(map[string]*OCIManifest)
 	var candidateBlobs []string
 	for _, b := range allBlobs {
@@ -730,12 +741,11 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 			continue
 		}
 		candidateBlobs = append(candidateBlobs, b)
-		data, err := ReadBlob(imagesDir, b)
-		if err != nil {
+		if !indexed[b] {
 			continue
 		}
-		if m, err := ParseManifest(data); err == nil && (m.MediaType == "" || m.MediaType == MediaTypeOCIManifest) {
-			manifestCandidates[b] = m
+		if mf, err := LoadManifestByDigest(imagesDir, b); err == nil {
+			manifestCandidates[b] = mf
 		}
 	}
 
@@ -798,6 +808,11 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		}
 		if c.Tag != "" {
 			_ = DeleteTag(imagesDir, c.Tag)
+		}
+		// Drop the index.json entry too so foreign OCI tools don't
+		// see a descriptor pointing at a now-missing blob.
+		if indexed[c.Digest] {
+			_ = IndexRemoveByDigest(imagesDir, c.Digest)
 		}
 		deleted = append(deleted, c)
 	}
