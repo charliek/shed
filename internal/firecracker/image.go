@@ -34,7 +34,7 @@ func (c *Client) InspectImage(tagOrDigest string) (config.ImageInspectResponse, 
 	}
 	return config.ImageInspectResponse{
 		Image:    toConfigImageInfo(*info),
-		Manifest: toConfigManifest(*manifest),
+		Manifest: toConfigManifest(info.Digest, *manifest),
 	}, nil
 }
 
@@ -210,8 +210,11 @@ func toConfigImageInfos(images []vmimage.ImageInfo) []config.ImageInfo {
 }
 
 // toConfigManifest copies a vmimage.OCIManifest into the wire shape.
-func toConfigManifest(m vmimage.OCIManifest) config.ImageManifest {
+// digest is the manifest's content digest (the same value that's
+// recorded in tags/<name>.json).
+func toConfigManifest(digest string, m vmimage.OCIManifest) config.ImageManifest {
 	out := config.ImageManifest{
+		Digest:        digest,
 		SchemaVersion: m.SchemaVersion,
 		MediaType:     m.MediaType,
 		Config: config.ImageDescriptor{

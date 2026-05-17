@@ -234,9 +234,9 @@ func newLooseLayer(imagesDir, digest string) (*looseLayer, error) {
 	return &looseLayer{imagesDir: imagesDir, digest: h, size: fi.Size()}, nil
 }
 
-func (l *looseLayer) Digest() (v1.Hash, error)     { return l.digest, nil }
-func (l *looseLayer) DiffID() (v1.Hash, error)     { return l.digest, nil }
-func (l *looseLayer) Size() (int64, error)         { return l.size, nil }
+func (l *looseLayer) Digest() (v1.Hash, error) { return l.digest, nil }
+func (l *looseLayer) DiffID() (v1.Hash, error) { return l.digest, nil }
+func (l *looseLayer) Size() (int64, error)     { return l.size, nil }
 func (l *looseLayer) MediaType() (types.MediaType, error) {
 	return types.MediaType("application/vnd.shed.blob"), nil
 }
@@ -398,7 +398,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		// Kernel is a sibling blob in the registry — fetch it as a
 		// loose blob (the registry doesn't surface it via Image()
 		// because it isn't a layer).
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, remoteOpts); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts); err != nil {
 			return nil, fmt.Errorf("pulling kernel blob %s: %w", d, err)
 		}
 		kernelDigest = d
@@ -410,7 +410,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		kernelDigest = d
 	}
 	if d := annotationFromManifest(manifestDesc, AnnotationInitrdDigest); d != "" {
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, remoteOpts); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts); err != nil {
 			return nil, fmt.Errorf("pulling initrd blob %s: %w", d, err)
 		}
 		initrdDigest = d
@@ -532,11 +532,13 @@ func streamHashCopy(dst io.Writer, src io.Reader) (string, int64, error) {
 
 // pullLooseBlob fetches a sibling blob (kernel, initrd, etc.) by digest
 // from the same repo as `ref`, writing it under blobs/sha256/<hex>.
-func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir string, remoteOpts []remote.Option) error {
+// The caller passes the same insecure flag they set on the originating
+// pull so the sibling-blob request honors the same TLS policy.
+func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir string, insecure bool, remoteOpts []remote.Option) error {
 	if BlobExists(imagesDir, digest) {
 		return nil
 	}
-	blobRef, err := name.NewDigest(ref.Context().Name()+"@"+digest, nameOptsFromRef(ref)...)
+	blobRef, err := name.NewDigest(ref.Context().Name()+"@"+digest, nameOptsForInsecure(insecure)...)
 	if err != nil {
 		return fmt.Errorf("forming digest ref: %w", err)
 	}
@@ -552,11 +554,13 @@ func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir st
 	return writeBlobFromReader(imagesDir, digest, rc)
 }
 
-// nameOptsFromRef preserves the original ref's name parsing options
-// (e.g. Insecure) when forming sibling-blob refs.
-func nameOptsFromRef(ref name.Reference) []name.Option {
-	if strings.HasPrefix(ref.Context().RegistryStr(), "localhost") ||
-		strings.HasPrefix(ref.Context().RegistryStr(), "127.0.0.1") {
+// nameOptsForInsecure returns the name parsing options needed for a
+// sibling-blob fetch on the same registry. Callers pass the insecure
+// flag through from the originating PullOptions rather than guessing
+// from the registry string — that way a private HTTP registry that
+// the caller explicitly marked insecure stays insecure.
+func nameOptsForInsecure(insecure bool) []name.Option {
+	if insecure {
 		return []name.Option{name.Insecure}
 	}
 	return nil
@@ -609,6 +613,12 @@ func extractInitrdFromLayers(imagesDir string, layerDigests []string) (string, e
 	}
 	return "", errors.New("no initrd found in layer rootfs")
 }
+
+// maxBootFileSize caps the in-memory buffer used to extract kernel /
+// initrd entries from a layer tar. Defense-in-depth: hdr.Size is
+// attacker-controlled if a malicious or corrupted registry serves a
+// crafted tar; the cap keeps a hostile blob from triggering OOM.
+const maxBootFileSize = 256 << 20 // 256 MiB — comfortably above any real kernel/initrd
 
 // extractBootFile streams the layer tar.gz at layerDigest and returns
 // the bytes of the highest-versioned /boot/<basenamePattern>* entry.
@@ -663,8 +673,11 @@ func extractBootFile(imagesDir, layerDigest, basenamePattern string) ([]byte, er
 		if !matches {
 			continue
 		}
+		if hdr.Size > maxBootFileSize {
+			return nil, fmt.Errorf("boot file %s exceeds %d-byte limit", hdr.Name, maxBootFileSize)
+		}
 		buf := bytes.NewBuffer(make([]byte, 0, hdr.Size))
-		if _, err := io.Copy(buf, tr); err != nil {
+		if _, err := io.Copy(buf, io.LimitReader(tr, maxBootFileSize)); err != nil {
 			return nil, fmt.Errorf("reading %s: %w", hdr.Name, err)
 		}
 		found = append(found, candidate{name: name, buf: buf})
@@ -695,4 +708,3 @@ func extractBootFile(imagesDir, layerDigest, basenamePattern string) ([]byte, er
 func isGzip(b []byte) bool {
 	return len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b
 }
-

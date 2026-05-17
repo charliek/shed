@@ -212,6 +212,9 @@ func ParseIndex(data []byte) (*OCIIndex, error) {
 	if err := json.Unmarshal(data, &i); err != nil {
 		return nil, fmt.Errorf("parsing index: %w", err)
 	}
+	if i.SchemaVersion != 0 && i.SchemaVersion != 2 {
+		return nil, fmt.Errorf("unsupported index schemaVersion %d (want 2)", i.SchemaVersion)
+	}
 	return &i, nil
 }
 

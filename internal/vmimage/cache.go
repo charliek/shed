@@ -16,8 +16,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+// validExt4Size constrains the size string passed to truncate(1) /
+// mkfs.ext4. The value is interpolated into a shell script inside a
+// privileged container; restricting to a digits-with-optional-suffix
+// pattern keeps that path injection-free even if a future caller plumbs
+// untrusted input down.
+var validExt4Size = regexp.MustCompile(`^[1-9][0-9]*[KMGTP]?$`)
 
 const cacheDir = "cache"
 
@@ -161,6 +169,9 @@ func EnsureExt4FromLayer(ctx context.Context, imagesDir, layerDigest, platform, 
 // blobPath must be a gzipped tar produced by `Convert`'s layer writer.
 // outputPath is where the resulting ext4 file should be written.
 func createExt4FromTarGz(ctx context.Context, platform, blobPath, outputPath, size string) error {
+	if !validExt4Size.MatchString(size) {
+		return fmt.Errorf("invalid ext4 size %q (want NNN[KMGTP])", size)
+	}
 	outDir := filepath.Dir(outputPath)
 	outName := filepath.Base(outputPath)
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--privileged",

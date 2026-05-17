@@ -14,9 +14,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Sentinel errors for image operations. Backend wrappers map these to
@@ -226,14 +228,20 @@ func (m *Manager) PushImage(ctx context.Context, tagOrDigest, dstRef string, pro
 	})
 }
 
-// isLoopbackRef returns true for registry refs that target localhost.
-// Such endpoints typically don't have TLS, so go-containerregistry needs
-// the Insecure name.Option to talk to them.
+// isLoopbackRef returns true for registry refs whose registry host is
+// loopback. Parses the host out of the ref first so refs like
+// `localhost.example.com/repo` are NOT misclassified — only the actual
+// localhost / 127.0.0.0/8 / ::1 hosts get the Insecure name.Option.
 func isLoopbackRef(ref string) bool {
-	for _, prefix := range []string{"localhost", "127.0.0.1", "[::1]"} {
-		if len(ref) >= len(prefix) && ref[:len(prefix)] == prefix {
-			return true
-		}
+	host, _, _ := strings.Cut(ref, "/")
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
 	}
 	return false
 }
@@ -434,14 +442,20 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		manifests = append(manifests, manifestInfo{digest: b, manifest: m})
 	}
 
-	// Compute per-layer reference counts across all known manifests
-	// (tagged + dangling). UniqueBytes/SharedBytes attribute each
-	// layer's bytes back to manifests by the per-layer refcount.
+	// Compute per-layer reference counts across DISTINCT manifests
+	// (tagged + dangling). Multiple tags pointing at the same manifest
+	// would otherwise count its layers twice and flip every entry from
+	// unique to shared.
 	layerRefs := make(map[string]int)
+	seenManifests := make(map[string]bool)
 	for _, mi := range manifests {
 		if mi.manifest == nil {
 			continue
 		}
+		if seenManifests[mi.digest] {
+			continue
+		}
+		seenManifests[mi.digest] = true
 		for _, layer := range mi.manifest.Layers {
 			layerRefs[layer.Digest]++
 		}

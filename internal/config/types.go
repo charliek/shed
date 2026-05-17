@@ -236,12 +236,12 @@ type ImageInspectResponse struct {
 // oras, skopeo) inspecting shed's store see this same JSON on disk
 // at blobs/sha256/<manifest-digest>.
 type ImageManifest struct {
-	Digest        string             `json:"digest"`
-	SchemaVersion int                `json:"schema_version"`
-	MediaType     string             `json:"media_type,omitempty"`
-	Config        ImageDescriptor    `json:"config"`
-	Layers        []ImageDescriptor  `json:"layers,omitempty"`
-	Annotations   map[string]string  `json:"annotations,omitempty"`
+	Digest        string            `json:"digest"`
+	SchemaVersion int               `json:"schema_version"`
+	MediaType     string            `json:"media_type,omitempty"`
+	Config        ImageDescriptor   `json:"config"`
+	Layers        []ImageDescriptor `json:"layers,omitempty"`
+	Annotations   map[string]string `json:"annotations,omitempty"`
 	// Convenience fields lifted from annotations for backwards
 	// compatibility with consumers that read SourceRef directly.
 	SourceRef         string `json:"source_ref,omitempty"`

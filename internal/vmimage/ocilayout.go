@@ -148,67 +148,76 @@ func WriteBlob(imagesDir, expectedDigest string, data []byte) (string, error) {
 }
 
 // WriteBlobFromFile installs the contents of srcPath as a blob in the
-// store. The file is hashed before install; the resulting digest is
-// returned. If consume is true, srcPath is renamed into place (saving
-// a copy); otherwise it is copied and srcPath is preserved.
+// store. The STAGED bytes are hashed (not the source) so a concurrent
+// writer to srcPath can't end up with the staged content stored under
+// a stale digest. If consume is true, srcPath is renamed into the
+// staging path (saving a copy); otherwise it is copied and srcPath is
+// preserved.
 func WriteBlobFromFile(imagesDir, srcPath string, consume bool) (digest, blobPath string, err error) {
 	if err := EnsureOCILayout(imagesDir); err != nil {
 		return "", "", err
 	}
-	digest, err = HashFile(srcPath)
+
+	// Stage first under a non-content-addressed temp name.
+	algoDir := filepath.Join(imagesDir, blobsDir, algorithmDir)
+	if err := os.MkdirAll(algoDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("creating blobs dir: %w", err)
+	}
+	tmpFile, err := os.CreateTemp(algoDir, ".staging-*.tmp")
 	if err != nil {
-		return "", "", fmt.Errorf("hashing %s: %w", srcPath, err)
+		return "", "", fmt.Errorf("creating tmp blob: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if consume {
+		if err := moveOrCopyFile(srcPath, tmpPath); err != nil {
+			return "", "", fmt.Errorf("staging blob: %w", err)
+		}
+	} else {
+		if err := copyFile(srcPath, tmpPath); err != nil {
+			return "", "", fmt.Errorf("staging blob: %w", err)
+		}
+	}
+
+	// Hash the staged bytes (not srcPath) — that's what's actually
+	// going to live under blobs/sha256/<hex>.
+	digest, err = HashFile(tmpPath)
+	if err != nil {
+		return "", "", fmt.Errorf("hashing staged blob: %w", err)
 	}
 	hex, _ := digestHex(digest)
-	final := filepath.Join(imagesDir, blobsDir, algorithmDir, hex)
+	final := filepath.Join(algoDir, hex)
 	if _, err := os.Stat(final); err == nil {
-		if consume {
-			_ = os.Remove(srcPath)
-		}
+		// Already installed; staged copy is redundant.
 		return digest, final, nil
 	}
-	lockPath := filepath.Join(imagesDir, blobsDir, algorithmDir, "."+hex+".lock")
+	lockPath := filepath.Join(algoDir, "."+hex+".lock")
 	unlock, err := acquireFileLock(lockPath)
 	if err != nil {
 		return "", "", fmt.Errorf("locking blob %s: %w", digest, err)
 	}
 	defer unlock()
 	if _, err := os.Stat(final); err == nil {
-		if consume {
-			_ = os.Remove(srcPath)
-		}
 		return digest, final, nil
 	}
-	tmpFile, err := os.CreateTemp(filepath.Dir(final), "."+hex+".*.tmp")
-	if err != nil {
-		return "", "", fmt.Errorf("creating tmp blob: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	tmpFile.Close()
-	if consume {
-		if err := moveOrCopyFile(srcPath, tmpPath); err != nil {
-			os.Remove(tmpPath)
-			return "", "", fmt.Errorf("staging blob: %w", err)
-		}
-	} else {
-		if err := copyFile(srcPath, tmpPath); err != nil {
-			os.Remove(tmpPath)
-			return "", "", fmt.Errorf("staging blob: %w", err)
-		}
-	}
 	if err := os.Chmod(tmpPath, 0o444); err != nil {
-		os.Remove(tmpPath)
 		return "", "", fmt.Errorf("chmod tmp blob: %w", err)
 	}
 	if err := fsyncFile(tmpPath); err != nil {
-		os.Remove(tmpPath)
 		return "", "", fmt.Errorf("fsync tmp blob: %w", err)
 	}
 	if err := os.Rename(tmpPath, final); err != nil {
-		os.Remove(tmpPath)
 		return "", "", fmt.Errorf("renaming blob into place: %w", err)
 	}
-	if err := fsyncDir(filepath.Dir(final)); err != nil {
+	cleanupTmp = false
+	if err := fsyncDir(algoDir); err != nil {
 		return "", "", fmt.Errorf("fsync blobs dir: %w", err)
 	}
 	return digest, final, nil
@@ -270,7 +279,11 @@ func DeleteBlob(imagesDir, digest string) error {
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("removing blob: %w", err)
 	}
-	_ = os.Remove(lockPath)
+	// Intentionally NOT unlinking lockPath here — doing so before the
+	// deferred unlock() runs would let a concurrent caller create a
+	// fresh lock file on a different inode and acquire it while we
+	// still hold flock() on the old inode, allowing overlapping
+	// delete/write operations.
 	return nil
 }
 

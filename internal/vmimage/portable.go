@@ -40,7 +40,7 @@ func (m *Manager) SaveImage(tagOrDigest string, out io.Writer) error {
 
 	// Collect the set of blob digests reachable from the manifest.
 	reachable := map[string]bool{
-		digest:                true,
+		digest:                 true,
 		manifest.Config.Digest: true,
 	}
 	for _, layer := range manifest.Layers {

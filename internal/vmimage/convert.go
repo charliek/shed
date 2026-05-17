@@ -426,7 +426,18 @@ func mustBlobPath(imagesDir, digest string) string {
 
 // indexUpsert adds or replaces a descriptor in index.json by ref-name
 // annotation. Descriptors without ref names are deduplicated by digest.
+//
+// Serialized via a per-images-dir flock so two concurrent pulls/builds
+// can't both read the same index, modify in memory, and clobber each
+// other's writes.
 func indexUpsert(imagesDir string, d Descriptor) error {
+	lockPath := filepath.Join(imagesDir, ".index.lock")
+	unlock, err := acquireFileLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("locking index: %w", err)
+	}
+	defer unlock()
+
 	idx, err := ReadIndex(imagesDir)
 	if err != nil {
 		return err
