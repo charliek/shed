@@ -1,21 +1,23 @@
 # Multi-stage Dockerfile for Firecracker rootfs images
 #
 # Stages:
-#   kernel-builder       - Temporary: compiles custom Firecracker kernel
-#   shed-fc-base         - Minimal: shed infrastructure + basic dev tools + kernel
-#   shed-fc-devtools     - Internal: adds mise, Node.js, Claude Code, UV, Python
-#   shed-fc-default      - Full: all coding agents and language runtimes
-#   shed-fc-experimental - Default + shed-extensions credential brokering
+#   kernel-builder      - Temporary: compiles custom Firecracker kernel
+#   shed-fc-base        - Minimal: shed infrastructure + basic dev tools + kernel
+#   shed-fc-extensions  - Base + shed-extensions credential brokering (no coding agents).
+#                         Recommended starting point for users who customize their own image.
+#   shed-fc-full        - Extensions + mise/Node/Python/UV + all coding agents
+#                         (Claude Code, OpenCode, Cursor CLI, Codex CLI)
 #
 # Build a specific variant:
 #   docker buildx build --platform linux/amd64 --target shed-fc-base -t shed-fc-base:latest --load .
-#   docker buildx build --platform linux/amd64 --target shed-fc-default -t shed-fc-default:latest --load .
+#   docker buildx build --platform linux/amd64 --target shed-fc-extensions -t shed-fc-extensions:latest --load .
+#   docker buildx build --platform linux/amd64 --target shed-fc-full -t shed-fc-full:latest --load .
 #
 # Or use the build script:
 #   ./scripts/build-firecracker-rootfs.sh --variant base
 
 # Bump this when shed-extensions releases a new version.
-# The experimental variant pulls binaries from this tag.
+# The extensions and full variants pull binaries from this tag.
 ARG SHED_EXT_VERSION=v0.3.1
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
@@ -263,11 +265,42 @@ ENTRYPOINT ["/sbin/init"]
 
 
 # =============================================================================
-# Stage: shed-fc-devtools (internal)
-# Shared tooling layer: mise, Node.js, Claude Code, UV, Python.
-# Not intended for direct use — serves as base for default and experimental.
+# Stage: shed-fc-extensions
+# Base + shed-extensions credential brokering (SSH agent, AWS proxy, Docker
+# credentials). No coding agents or language runtimes — recommended starting
+# point for users who customize their own image.
+# See https://github.com/charliek/shed-extensions for details.
 # =============================================================================
-FROM shed-fc-base AS shed-fc-devtools
+FROM shed-fc-base AS shed-fc-extensions
+
+COPY --from=shed-extensions /usr/local/bin/shed-ext-ssh-agent /usr/local/bin/shed-ext-ssh-agent
+COPY --from=shed-extensions /usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials
+COPY --from=shed-extensions /usr/local/bin/docker-credential-shed /usr/local/bin/docker-credential-shed
+COPY --from=shed-extensions /etc/systemd/system/shed-ext-ssh-agent.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
+COPY --from=shed-extensions /etc/shed-extensions.d/ /etc/shed-extensions.d/
+# Units ship disabled — shed-agent enables them from server config
+
+# Configure Docker inside the guest to use shed credential helper
+RUN mkdir -p /home/shed/.docker && \
+    echo '{"credsStore": "shed"}' > /home/shed/.docker/config.json && \
+    chown -R shed:shed /home/shed/.docker
+
+USER root
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/sbin/init"]
+
+
+# =============================================================================
+# Stage: shed-fc-full
+# Extensions + mise, Node.js, Python (via UV), and all coding agents
+# (Claude Code, OpenCode, Cursor CLI, Codex CLI). The full development
+# experience built on top of the credential-brokering base.
+# =============================================================================
+FROM shed-fc-extensions AS shed-fc-full
 
 USER shed
 
@@ -302,13 +335,6 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN /home/shed/.local/bin/uv python install 3.13
 
-
-# =============================================================================
-# Stage: shed-fc-default
-# Full development experience with all coding agents and language runtimes.
-# =============================================================================
-FROM shed-fc-devtools AS shed-fc-default
-
 # Additional mise tools
 RUN mise use -g \
     github:charliek/prox \
@@ -317,36 +343,11 @@ RUN mise use -g \
 # OpenCode
 RUN curl -fsSL https://opencode.ai/install | bash
 
+# Cursor CLI (agent)
+RUN curl https://cursor.com/install -fsS | bash
+
 # Codex cli
 RUN npm i -g @openai/codex
-
-USER root
-
-WORKDIR /workspace
-
-ENTRYPOINT ["/sbin/init"]
-
-
-# =============================================================================
-# Stage: shed-fc-experimental
-# Default tools + shed-extensions credential brokering (SSH agent, AWS proxy, Docker credentials).
-# See https://github.com/charliek/shed-extensions for details.
-# =============================================================================
-FROM shed-fc-default AS shed-fc-experimental
-
-COPY --from=shed-extensions /usr/local/bin/shed-ext-ssh-agent /usr/local/bin/shed-ext-ssh-agent
-COPY --from=shed-extensions /usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials
-COPY --from=shed-extensions /usr/local/bin/docker-credential-shed /usr/local/bin/docker-credential-shed
-COPY --from=shed-extensions /etc/systemd/system/shed-ext-ssh-agent.service /etc/systemd/system/
-COPY --from=shed-extensions /etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/
-COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
-COPY --from=shed-extensions /etc/shed-extensions.d/ /etc/shed-extensions.d/
-# Units ship disabled — shed-agent enables them from server config
-
-# Configure Docker inside the guest to use shed credential helper
-RUN mkdir -p /home/shed/.docker && \
-    echo '{"credsStore": "shed"}' > /home/shed/.docker/config.json && \
-    chown -R shed:shed /home/shed/.docker
 
 USER root
 

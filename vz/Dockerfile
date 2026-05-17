@@ -1,20 +1,22 @@
 # Multi-stage Dockerfile for VZ (Apple Virtualization.framework) rootfs images
 #
 # Stages:
-#   shed-vz-base         - Minimal: shed infrastructure + basic dev tools
-#   shed-vz-devtools     - Internal: adds mise, Node.js, Claude Code, UV, Python
-#   shed-vz-default      - Full: all coding agents and language runtimes
-#   shed-vz-experimental - Default + shed-extensions credential brokering
+#   shed-vz-base        - Minimal: shed infrastructure + basic dev tools
+#   shed-vz-extensions  - Base + shed-extensions credential brokering (no coding agents).
+#                         Recommended starting point for users who customize their own image.
+#   shed-vz-full        - Extensions + mise/Node/Python/UV + all coding agents
+#                         (Claude Code, OpenCode, Cursor CLI, Codex CLI)
 #
 # Build a specific variant:
 #   docker buildx build --platform linux/arm64 --target shed-vz-base -t shed-vz-base:latest --load .
-#   docker buildx build --platform linux/arm64 --target shed-vz-default -t shed-vz-default:latest --load .
+#   docker buildx build --platform linux/arm64 --target shed-vz-extensions -t shed-vz-extensions:latest --load .
+#   docker buildx build --platform linux/arm64 --target shed-vz-full -t shed-vz-full:latest --load .
 #
 # Or use the build script:
 #   ./scripts/build-vz-rootfs.sh --variant base
 
 # Bump this when shed-extensions releases a new version.
-# The experimental variant pulls binaries from this tag.
+# The extensions and full variants pull binaries from this tag.
 ARG SHED_EXT_VERSION=v0.3.1
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
@@ -245,11 +247,42 @@ ENTRYPOINT ["/sbin/init"]
 
 
 # =============================================================================
-# Stage: shed-vz-devtools (internal)
-# Shared tooling layer: mise, Node.js, Claude Code, UV, Python.
-# Not intended for direct use — serves as base for default and experimental.
+# Stage: shed-vz-extensions
+# Base + shed-extensions credential brokering (SSH agent, AWS proxy, Docker
+# credentials). No coding agents or language runtimes — recommended starting
+# point for users who customize their own image.
+# See https://github.com/charliek/shed-extensions for details.
 # =============================================================================
-FROM shed-vz-base AS shed-vz-devtools
+FROM shed-vz-base AS shed-vz-extensions
+
+COPY --from=shed-extensions /usr/local/bin/shed-ext-ssh-agent /usr/local/bin/shed-ext-ssh-agent
+COPY --from=shed-extensions /usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials
+COPY --from=shed-extensions /usr/local/bin/docker-credential-shed /usr/local/bin/docker-credential-shed
+COPY --from=shed-extensions /etc/systemd/system/shed-ext-ssh-agent.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/
+COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
+COPY --from=shed-extensions /etc/shed-extensions.d/ /etc/shed-extensions.d/
+# Units ship disabled — shed-agent enables them from server config
+
+# Configure Docker inside the guest to use shed credential helper
+RUN mkdir -p /home/shed/.docker && \
+    echo '{"credsStore": "shed"}' > /home/shed/.docker/config.json && \
+    chown -R shed:shed /home/shed/.docker
+
+USER root
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/sbin/init"]
+
+
+# =============================================================================
+# Stage: shed-vz-full
+# Extensions + mise, Node.js, Python (via UV), and all coding agents
+# (Claude Code, OpenCode, Cursor CLI, Codex CLI). The full development
+# experience built on top of the credential-brokering base.
+# =============================================================================
+FROM shed-vz-extensions AS shed-vz-full
 
 USER shed
 
@@ -285,13 +318,6 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN /home/shed/.local/bin/uv python install 3.13
 
-
-# =============================================================================
-# Stage: shed-vz-default
-# Full development experience with all coding agents and language runtimes.
-# =============================================================================
-FROM shed-vz-devtools AS shed-vz-default
-
 # Additional mise tools
 RUN mise use -g \
     github:charliek/prox \
@@ -305,34 +331,6 @@ RUN curl https://cursor.com/install -fsS | bash
 
 # Codex cli
 RUN npm i -g @openai/codex
-
-USER root
-
-WORKDIR /workspace
-
-ENTRYPOINT ["/sbin/init"]
-
-
-# =============================================================================
-# Stage: shed-vz-experimental
-# Default tools + shed-extensions credential brokering (SSH agent, AWS proxy, Docker credentials).
-# See https://github.com/charliek/shed-extensions for details.
-# =============================================================================
-FROM shed-vz-default AS shed-vz-experimental
-
-COPY --from=shed-extensions /usr/local/bin/shed-ext-ssh-agent /usr/local/bin/shed-ext-ssh-agent
-COPY --from=shed-extensions /usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials
-COPY --from=shed-extensions /usr/local/bin/docker-credential-shed /usr/local/bin/docker-credential-shed
-COPY --from=shed-extensions /etc/systemd/system/shed-ext-ssh-agent.service /etc/systemd/system/
-COPY --from=shed-extensions /etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/
-COPY --from=shed-extensions /etc/environment.d/shed-extensions.conf /etc/environment.d/
-COPY --from=shed-extensions /etc/shed-extensions.d/ /etc/shed-extensions.d/
-# Units ship disabled — shed-agent enables them from server config
-
-# Configure Docker inside the guest to use shed credential helper
-RUN mkdir -p /home/shed/.docker && \
-    echo '{"credsStore": "shed"}' > /home/shed/.docker/config.json && \
-    chown -R shed:shed /home/shed/.docker
 
 USER root
 
