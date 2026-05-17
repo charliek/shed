@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -246,13 +245,12 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 	return nil
 }
 
-// convertAndInstall runs Convert, installs the result into the blob
-// store at the computed digest, and advances the imageBuildName tag.
-// Returns the digest installed.
-func convertAndInstall(ctx context.Context, sourceRef, outputDir, platform string, extractKernel, needsInitrd bool) (string, error) {
-	// Validate the tag up front: SetTag would also catch this, but only
-	// after Convert + InstallBlob have done minutes of work and left a
-	// dangling untagged blob in the store.
+// convertAndInstall runs the OCI Convert flow against `imagesDir`,
+// which writes the manifest+config+layer+kernel+initrd blobs into the
+// OCI layout and materializes a derived ext4 in the cache, then
+// advances the imageBuildName tag to the new manifest digest.
+// Returns the manifest digest.
+func convertAndInstall(ctx context.Context, sourceRef, imagesDir, platform string, extractKernel, needsInitrd bool) (string, error) {
 	if err := vmimage.ValidateImageName(imageBuildName); err != nil {
 		return "", fmt.Errorf("invalid image name %q: %w", imageBuildName, err)
 	}
@@ -260,7 +258,7 @@ func convertAndInstall(ctx context.Context, sourceRef, outputDir, platform strin
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
 		DockerRef:     sourceRef,
 		Name:          imageBuildName,
-		OutputDir:     outputDir,
+		ImagesDir:     imagesDir,
 		RootfsSize:    imageBuildSize,
 		Platform:      platform,
 		ExtractKernel: extractKernel,
@@ -269,45 +267,10 @@ func convertAndInstall(ctx context.Context, sourceRef, outputDir, platform strin
 	if err != nil {
 		return "", fmt.Errorf("conversion failed: %w", err)
 	}
-	defer vmimage.CleanupConvert(result)
-
-	rootfsLogical := int64(0)
-	if fi, err := os.Stat(result.RootfsPath); err == nil {
-		rootfsLogical = fi.Size()
-	}
-	manifest := vmimage.Manifest{
-		SchemaVersion:     vmimage.ManifestSchemaVersion,
-		Digest:            result.Digest,
-		SourceRef:         sourceRef,
-		RootfsLogicalSize: rootfsLogical,
-		CreatedAt:         time.Now().UTC(),
-	}
-	files := map[string]string{vmimage.BlobRootfsFilename: result.RootfsPath}
-	if result.KernelPath != "" {
-		files[vmimage.BlobKernelFilename] = result.KernelPath
-		if fi, err := os.Stat(result.KernelPath); err == nil {
-			manifest.KernelSize = fi.Size()
-		}
-	}
-	if result.InitrdPath != "" {
-		files[vmimage.BlobInitrdFilename] = result.InitrdPath
-		if fi, err := os.Stat(result.InitrdPath); err == nil {
-			manifest.InitrdSize = fi.Size()
-		}
-	}
-
-	if _, _, err := vmimage.InstallBlob(outputDir, vmimage.BlobInstallSpec{
-		Files:    files,
-		Manifest: manifest,
-	}); err != nil {
-		return "", fmt.Errorf("installing blob: %w", err)
-	}
-
-	if err := vmimage.SetTag(outputDir, imageBuildName, result.Digest); err != nil {
+	if err := vmimage.SetTag(imagesDir, imageBuildName, result.ManifestDigest); err != nil {
 		return "", fmt.Errorf("advancing tag %q: %w", imageBuildName, err)
 	}
-
-	return result.Digest, nil
+	return result.ManifestDigest, nil
 }
 
 // finishImageBuild prints success output. Tag advancement happens inside
@@ -464,8 +427,14 @@ func runImageInspect(_ *cobra.Command, args []string) error {
 		fmt.Fprintf(w, "Size:\t%s\n", formatSize(resp.Image.SizeBytes))
 	}
 	fmt.Fprintf(w, "In use:\t%v\n", resp.Image.InUse)
-	if !resp.Manifest.CreatedAt.IsZero() {
-		fmt.Fprintf(w, "Created:\t%s\n", resp.Manifest.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+	if resp.Manifest.Variant != "" {
+		fmt.Fprintf(w, "Variant:\t%s\n", resp.Manifest.Variant)
+	}
+	if resp.Manifest.SourceRef != "" {
+		fmt.Fprintf(w, "Source ref:\t%s\n", resp.Manifest.SourceRef)
+	}
+	if len(resp.Manifest.Layers) > 0 {
+		fmt.Fprintf(w, "Layers:\t%d\n", len(resp.Manifest.Layers))
 	}
 	w.Flush()
 	return nil

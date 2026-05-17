@@ -238,8 +238,11 @@ func TestPruneImagesProtectsSnapshotPin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PruneImages: %v", err)
 	}
-	if len(deleted) != 1 || deleted[0].Digest != dangling {
-		t.Fatalf("unexpected deletions: %#v (want only dangling=%s)", deleted, dangling)
+	if !fcInfoHasDigest(deleted, dangling) {
+		t.Fatalf("dangling manifest not deleted: %#v", deleted)
+	}
+	if fcInfoHasDigest(deleted, snapshotPinned) {
+		t.Fatalf("snapshot-pinned manifest %s appears in deletions: %#v", snapshotPinned, deleted)
 	}
 	if vmimage.BlobExists(imagesDir, dangling) {
 		t.Fatalf("dangling blob still exists after prune")
@@ -247,6 +250,17 @@ func TestPruneImagesProtectsSnapshotPin(t *testing.T) {
 	if !vmimage.BlobExists(imagesDir, snapshotPinned) {
 		t.Fatalf("snapshot-pinned blob removed by prune; shed create --from-snapshot would now fail")
 	}
+}
+
+// fcInfoHasDigest reports whether digest appears in a list of
+// config.ImageInfo entries returned by PruneImages.
+func fcInfoHasDigest(infos []config.ImageInfo, digest string) bool {
+	for _, i := range infos {
+		if i.Digest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 // TestStartShedMissingUpperFailsClearly confirms vm.Start surfaces
@@ -307,13 +321,16 @@ func TestPruneRespectsCreatingMarker(t *testing.T) {
 		t.Fatalf("write marker: %v", err)
 	}
 
-	// Fresh marker -> dangling is the only prune candidate.
+	// Fresh marker -> only the dangling manifest (and its chain) is pruned.
 	deleted, err := c.PruneImages(false)
 	if err != nil {
 		t.Fatalf("PruneImages: %v", err)
 	}
-	if len(deleted) != 1 || deleted[0].Digest != dangling {
-		t.Fatalf("unexpected deletions: %#v (want only dangling=%s)", deleted, dangling)
+	if !fcInfoHasDigest(deleted, dangling) {
+		t.Fatalf("dangling manifest not deleted: %#v", deleted)
+	}
+	if fcInfoHasDigest(deleted, inFlight) {
+		t.Fatalf("in-flight manifest %s appears in deletions despite fresh marker: %#v", inFlight, deleted)
 	}
 	if !vmimage.BlobExists(imagesDir, inFlight) {
 		t.Fatalf("in-flight blob was pruned despite fresh .creating marker")

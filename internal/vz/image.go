@@ -218,22 +218,31 @@ func toConfigImageInfos(images []vmimage.ImageInfo) []config.ImageInfo {
 	return result
 }
 
-// toConfigManifest copies a vmimage.Manifest into the wire shape.
-func toConfigManifest(m vmimage.Manifest) config.ImageManifest {
-	return config.ImageManifest{
-		SchemaVersion:      m.SchemaVersion,
-		Digest:             m.Digest,
-		Backend:            m.Backend,
-		Arch:               m.Arch,
-		SourceRef:          m.SourceRef,
-		SourceRefDigest:    m.SourceRefDigest,
-		ShedExtVersion:     m.ShedExtVersion,
-		KernelSize:         m.KernelSize,
-		InitrdSize:         m.InitrdSize,
-		RootfsLogicalSize:  m.RootfsLogicalSize,
-		RootfsPhysicalSize: m.RootfsPhysicalSize,
-		CreatedAt:          m.CreatedAt,
+// toConfigManifest copies a vmimage.OCIManifest into the wire shape.
+func toConfigManifest(m vmimage.OCIManifest) config.ImageManifest {
+	out := config.ImageManifest{
+		SchemaVersion: m.SchemaVersion,
+		MediaType:     m.MediaType,
+		Config: config.ImageDescriptor{
+			MediaType: m.Config.MediaType,
+			Digest:    m.Config.Digest,
+			Size:      m.Config.Size,
+		},
+		Annotations:  m.Annotations,
+		SourceRef:    m.ShedSourceRef(),
+		Variant:      m.ShedVariant(),
+		KernelDigest: m.ShedKernelDigest(),
+		InitrdDigest: m.ShedInitrdDigest(),
 	}
+	for _, layer := range m.Layers {
+		out.Layers = append(out.Layers, config.ImageDescriptor{
+			MediaType:   layer.MediaType,
+			Digest:      layer.Digest,
+			Size:        layer.Size,
+			Annotations: layer.Annotations,
+		})
+	}
+	return out
 }
 
 // mapSentinelErrors maps vmimage sentinel errors to config sentinel errors.

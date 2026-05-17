@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -71,31 +70,18 @@ func TestHashFileDeterminism(t *testing.T) {
 	}
 }
 
+// TestResolveTagAndBlob exercises the tag → manifest → cached-ext4
+// resolution path used by VM start. Installs a synthetic OCI image
+// (manifest + config + layer + cached ext4) under a tag, then verifies
+// Resolve / ResolveTag honor the source-ref check and surface the path
+// to the first layer's cached ext4.
 func TestResolveTagAndBlob(t *testing.T) {
 	dir := t.TempDir()
 
-	// Install a blob.
-	body := []byte("rootfs-bytes")
-	src := filepath.Join(dir, "src-rootfs.ext4")
-	if err := os.WriteFile(src, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	digest := DigestPrefix + hex.EncodeToString(sumBytes(body))
-	if _, _, err := InstallBlob(dir, BlobInstallSpec{
-		Files: map[string]string{BlobRootfsFilename: src},
-		Manifest: Manifest{
-			SchemaVersion:     ManifestSchemaVersion,
-			Digest:            digest,
-			SourceRef:         "ghcr.io/test:v1",
-			RootfsLogicalSize: int64(len(body)),
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Tag it.
-	if err := SetTag(dir, "default", digest); err != nil {
-		t.Fatalf("SetTag: %v", err)
+	rootfsContent := []byte("rootfs-bytes-for-resolve-test")
+	digest, err := InstallSyntheticImage(dir, "default", "ghcr.io/test:v1", rootfsContent, nil, nil)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
 
 	// Resolve hits when expectedRef matches.
@@ -128,34 +114,4 @@ func TestResolveTagAndBlob(t *testing.T) {
 func sumBytes(b []byte) []byte {
 	s := sha256.Sum256(b)
 	return s[:]
-}
-
-// TestInstallBlobRejectsDigestMismatch confirms the install-time guard:
-// if the manifest's claimed digest doesn't match sha256(rootfs.ext4),
-// install fails before anything is written into the blob store. This
-// preserves the "blobs/sha256/<digest>/rootfs.ext4 always hashes to
-// <digest>" invariant the rest of the system depends on.
-func TestInstallBlobRejectsDigestMismatch(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "src.ext4")
-	if err := os.WriteFile(src, []byte("real-bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Wrong digest: pretend this is a 64-zero-hex blob. InstallBlob
-	// must hash the actual file and reject the mismatch.
-	wrongDigest := DigestPrefix + "0000000000000000000000000000000000000000000000000000000000000000"
-	_, _, err := InstallBlob(dir, BlobInstallSpec{
-		Files: map[string]string{BlobRootfsFilename: src},
-		Manifest: Manifest{
-			SchemaVersion: ManifestSchemaVersion,
-			Digest:        wrongDigest,
-			SourceRef:     "ghcr.io/test:wrong",
-		},
-	})
-	if err == nil {
-		t.Fatalf("InstallBlob accepted mismatched digest; want error")
-	}
-	if !strings.Contains(err.Error(), "manifest says") {
-		t.Errorf("error %q does not mention digest mismatch", err.Error())
-	}
 }

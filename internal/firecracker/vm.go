@@ -96,37 +96,46 @@ func (vm *VM) Start(ctx context.Context) error {
 	if vm.meta.LowerDigest == "" {
 		return fmt.Errorf("vm %s has no lower_digest in metadata; recreate via `shed delete && shed create`", vm.meta.Name)
 	}
-	lowerRootfs, err := vmimage.BlobRootfsPath(vm.cfg.ImagesDir, vm.meta.LowerDigest)
-	if err != nil {
-		return fmt.Errorf("resolving lower rootfs path: %w", err)
-	}
 	if !vmimage.BlobExists(vm.cfg.ImagesDir, vm.meta.LowerDigest) {
-		return fmt.Errorf("lower image blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
+		return fmt.Errorf("manifest blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
 	}
-	blobDir, err := vmimage.BlobDir(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	imageMgr := vmimage.NewManager(vm.cfg, nil)
+	_, kernelBlob, initrdBlob, err := imageMgr.ResolveImageBlobs(vm.meta.LowerDigest)
 	if err != nil {
-		return fmt.Errorf("resolving blob dir: %w", err)
+		return fmt.Errorf("resolving image blobs: %w", err)
 	}
-	initrdPath := filepath.Join(blobDir, vmimage.BlobInitrdFilename)
-	if _, err := os.Stat(initrdPath); err != nil {
-		return fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, err)
+	if initrdBlob == "" {
+		return fmt.Errorf("image %s has no initrd annotation; rebuild the image", vmimage.ShortDigest(vm.meta.LowerDigest))
 	}
+	if _, err := os.Stat(initrdBlob); err != nil {
+		return fmt.Errorf("initrd blob missing at %s: %w", initrdBlob, err)
+	}
+	initrdPath := initrdBlob
 
-	// Prefer the kernel from inside the blob (set by `shed image install
-	// --kernel ... --consume`) over the legacy cfg.KernelPath. The build
-	// scripts consume the host-side kernel into the blob, so the legacy
-	// path is usually absent after a fresh build. cfg.KernelPath remains
-	// the fallback for images installed without a kernel.
-	kernelPath := filepath.Join(blobDir, vmimage.BlobKernelFilename)
-	if _, err := os.Stat(kernelPath); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat blob kernel at %s: %w", kernelPath, err)
-		}
+	// Prefer the kernel blob from the manifest annotation. Fall back to
+	// the configured `firecracker.kernel_path` only when the manifest
+	// lacks an io.shed.kernel.digest annotation.
+	kernelPath := kernelBlob
+	if kernelPath == "" {
 		if vm.cfg.KernelPath == "" {
-			return fmt.Errorf("no kernel for %s: blob %s has no kernel and firecracker.kernel_path is unset; rebuild the image with `shed image install --kernel ...` or set firecracker.kernel_path in server.yaml", vm.meta.Name, vmimage.ShortDigest(vm.meta.LowerDigest))
+			return fmt.Errorf("no kernel for %s: manifest has no kernel annotation and firecracker.kernel_path is unset", vm.meta.Name)
 		}
 		kernelPath = vm.cfg.KernelPath
+	} else if _, err := os.Stat(kernelPath); err != nil {
+		return fmt.Errorf("kernel blob missing at %s: %w", kernelPath, err)
 	}
+
+	// Resolve every layer's cached ext4 (Phase 1: exactly one layer;
+	// Phase 3 expands this to N readonly drives + N-layer overlay
+	// assembly in the initramfs).
+	layerPaths, err := imageMgr.ResolveLayerExt4Paths(ctx, vm.meta.LowerDigest)
+	if err != nil {
+		return fmt.Errorf("resolving layer ext4s: %w", err)
+	}
+	if len(layerPaths) == 0 {
+		return fmt.Errorf("manifest %s has no layers", vmimage.ShortDigest(vm.meta.LowerDigest))
+	}
+	lowerRootfs := layerPaths[0]
 
 	fcCfg := firecracker.Config{
 		SocketPath:      socketPath,

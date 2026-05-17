@@ -539,7 +539,7 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 			// so EnsureImage doesn't have to re-do tag lookup
 			// (which races against concurrent `shed image pull`).
 			if digest, cached, err := vmimage.ResolveTag(imagesDir, image); err == nil {
-				if manifest, mErr := vmimage.LoadManifest(imagesDir, digest); mErr == nil && manifest.SourceRef == val {
+				if manifest, mErr := vmimage.LoadManifestByDigest(imagesDir, digest); mErr == nil && manifest.ShedSourceRef() == val {
 					return ResolvedImage{Path: cached, Name: image, Digest: digest}, nil
 				}
 			}

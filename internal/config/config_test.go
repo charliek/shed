@@ -1,8 +1,6 @@
 package config
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,34 +11,28 @@ import (
 	"github.com/charliek/shed/internal/vmimage"
 )
 
-// installCachedBlob installs a fake blob into imagesDir under the given
-// tag, with the given source ref recorded in its manifest. Returns the
-// path to the cached blob's rootfs.ext4. Test helper.
+// installCachedBlob installs a synthetic OCI image into imagesDir under
+// the given tag with the given source-ref annotation. Returns the path
+// to the first layer's cached ext4 — the path that config resolution
+// surfaces to callers as ResolvedImage.Path.
 func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
 	t.Helper()
-	stagingDir := t.TempDir()
-	src := filepath.Join(stagingDir, "rootfs.ext4")
 	body := []byte("fake-" + tag)
-	if err := os.WriteFile(src, body, 0o644); err != nil {
-		t.Fatal(err)
+	digest, err := vmimage.InstallSyntheticImage(imagesDir, tag, sourceRef, body, nil, nil)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
-	sum := sha256.Sum256(body)
-	digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
-	if _, _, err := vmimage.InstallBlob(imagesDir, vmimage.BlobInstallSpec{
-		Files: map[string]string{vmimage.BlobRootfsFilename: src},
-		Manifest: vmimage.Manifest{
-			SchemaVersion:     vmimage.ManifestSchemaVersion,
-			Digest:            digest,
-			SourceRef:         sourceRef,
-			RootfsLogicalSize: int64(len(body)),
-		},
-	}); err != nil {
-		t.Fatalf("InstallBlob: %v", err)
+	manifest, err := vmimage.LoadManifestByDigest(imagesDir, digest)
+	if err != nil {
+		t.Fatalf("LoadManifestByDigest: %v", err)
 	}
-	if err := vmimage.SetTag(imagesDir, tag, digest); err != nil {
-		t.Fatalf("SetTag: %v", err)
+	if len(manifest.Layers) == 0 {
+		t.Fatalf("synthetic manifest has no layers")
 	}
-	path, _ := vmimage.BlobRootfsPath(imagesDir, digest)
+	path, err := vmimage.CacheExt4Path(imagesDir, manifest.Layers[0].Digest)
+	if err != nil {
+		t.Fatalf("CacheExt4Path: %v", err)
+	}
 	return path
 }
 
@@ -1062,31 +1054,16 @@ func TestVZConfigResolveImage(t *testing.T) {
 	})
 
 	t.Run("tag-auto-discovery carries digest", func(t *testing.T) {
-		// Plant a fake blob under a tag in a temp ImagesDir and confirm
-		// resolveImage's "not in images map → auto-discover by tag"
-		// branch returns the digest in the ResolvedImage. Closes the
-		// race window where EnsureImage previously had to re-do the
-		// tag lookup based on Path alone.
+		// Plant a synthetic OCI image under a tag in a temp ImagesDir and
+		// confirm resolveImage's "not in images map → auto-discover by
+		// tag" branch returns the manifest digest in the ResolvedImage.
+		// Closes the race window where EnsureImage previously had to
+		// re-do the tag lookup based on Path alone.
 		dir := t.TempDir()
 		body := []byte("fake-rootfs-for-digest-carry-test")
-		src := filepath.Join(dir, "stage.ext4")
-		if err := os.WriteFile(src, body, 0o644); err != nil {
-			t.Fatalf("write staging rootfs: %v", err)
-		}
-		sum := sha256.Sum256(body)
-		digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
-		if _, _, err := vmimage.InstallBlob(dir, vmimage.BlobInstallSpec{
-			Files: map[string]string{vmimage.BlobRootfsFilename: src},
-			Manifest: vmimage.Manifest{
-				SchemaVersion:     vmimage.ManifestSchemaVersion,
-				Digest:            digest,
-				RootfsLogicalSize: int64(len(body)),
-			},
-		}); err != nil {
-			t.Fatalf("InstallBlob: %v", err)
-		}
-		if err := vmimage.SetTag(dir, "carry", digest); err != nil {
-			t.Fatalf("SetTag: %v", err)
+		digest, err := vmimage.InstallSyntheticImage(dir, "carry", "", body, nil, nil)
+		if err != nil {
+			t.Fatalf("InstallSyntheticImage: %v", err)
 		}
 
 		// images map is empty; auto-discovery path is the one we want
