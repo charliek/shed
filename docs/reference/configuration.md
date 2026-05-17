@@ -58,7 +58,7 @@ sheds:
 name: mini-desktop
 http_port: 8080
 ssh_port: 2222
-default_image: shed-base:latest
+default_image: full
 
 credentials:
   claude:
@@ -78,7 +78,7 @@ log_level: info
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
-| `default_image` | string | `shed-base:latest` | Default image for sheds |
+| `default_image` | string | `full` | Default image variant for sheds (one of `base`, `extensions`, `full`, or a tag in the `images:` map) |
 | `credentials` | map | `{}` | Credential directories to mount into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
@@ -204,9 +204,11 @@ When enabling Firecracker, configure the Firecracker-specific settings:
 default_backend: firecracker
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
   images:
-    base: ghcr.io/charliek/shed-fc-base:{version}
+    base: ghcr.io/charliek/shed-fc-base:v{version}
+    extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
+    full: ghcr.io/charliek/shed-fc-full:v{version}
   images_dir: /var/lib/shed/firecracker/images
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
@@ -269,9 +271,11 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
   images:
-    base: ghcr.io/charliek/shed-vz-base:{version}
+    base: ghcr.io/charliek/shed-vz-base:v{version}
+    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
+    full: ghcr.io/charliek/shed-vz-full:v{version}
   images_dir: ~/Library/Application Support/shed/vz/
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets

@@ -53,8 +53,8 @@ shed create my-project --repo git@github.com:user/repo.git
 # Or mount a local directory as the workspace
 shed create my-project --local-dir ~/projects/my-project
 
-# With a larger writable upper (default 5G; range 1G–100G)
-shed create big-project --image experimental --upper-size 20G
+# Pick a specific image variant (base / extensions / full — full is the default)
+shed create big-project --image full --upper-size 20G
 ```
 
 ### 4. Connect
@@ -69,6 +69,13 @@ shed ssh-config >> ~/.ssh/config
 ```
 
 ## Backends
+
+Both backends boot from **layered OCI images**. Each shed's rootfs is a
+stack of read-only ext4 layers (pulled registry-direct from `ghcr.io`,
+no Docker daemon needed) plus a per-shed writable upper layer, mounted
+together via overlayfs inside the guest. Three variants ship per
+backend: `base`, `extensions`, and `full`. See
+[Image Variants](docs/reference/images.md).
 
 ### VZ (macOS)
 
@@ -162,13 +169,17 @@ shed attach <name> -S <session>  # Attach to named session
 shed exec <name> <cmd>           # Run command in shed
 
 # Image Management
-shed image build                 # Build a custom rootfs image
+shed image build                 # Build an OCI image from a Dockerfile
 shed image ls                    # List cached images (alias: list)
-shed image inspect <tag-or-digest>  # Show manifest + digest for an image
-shed image pull <docker-ref>     # Pull a Docker image into the blob store
+shed image history <tag>         # Show the layer stack for an image
+shed image inspect <tag-or-digest>  # Show manifest + annotations + digest
+shed image pull <ref>            # Pull an OCI image registry-direct
+shed image push <src> <dst>      # Push a tag/digest to a registry (byte-perfect)
+shed image save <tag> -o <file>  # Save an image to an OCI archive
+shed image load -i <file>        # Load an OCI archive into the local store
 shed image tag <src> <new>       # Point a new tag at an existing digest
 shed image rm <name>             # Remove a tag (alias: delete)
-shed image prune                 # Remove unused cached images
+shed image prune                 # Reclaim unreferenced layer blobs
 
 # Session Management
 shed sessions                    # List all sessions on default server
@@ -266,18 +277,22 @@ env_file: ~/.shed/env
 
 # VZ backend (macOS Apple Silicon)
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-base:{version}
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
   images:
-    base: ghcr.io/charliek/shed-vz-base:{version}
+    base: ghcr.io/charliek/shed-vz-base:v{version}
+    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
+    full: ghcr.io/charliek/shed-vz-full:v{version}
   images_dir: ~/Library/Application Support/shed/vz/
   default_cpus: 2
   default_memory_mb: 4096
 
 # Firecracker backend (Linux with KVM)
 # firecracker:
-#   base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
+#   base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
 #   images:
-#     base: ghcr.io/charliek/shed-fc-base:{version}
+#     base: ghcr.io/charliek/shed-fc-base:v{version}
+#     extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
+#     full: ghcr.io/charliek/shed-fc-full:v{version}
 #   images_dir: /var/lib/shed/firecracker/images
 #   default_cpus: 2
 #   default_memory_mb: 4096
