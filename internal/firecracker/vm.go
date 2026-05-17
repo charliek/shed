@@ -84,15 +84,6 @@ func (vm *VM) Start(ctx context.Context) error {
 	// hostname and detect rootfs clones (snapshot spawns). Shed names are
 	// validated by config.ValidateShedName so direct concatenation is safe.
 	//
-	// The kernel cmdline drops `root=` because the shed initramfs builds an
-	// overlayfs and pivot_roots into the merged tree itself. shed.upper /
-	// shed.lower are read by the initramfs to locate the writable upper
-	// (vda) and read-only lower (vdb) block devices.
-	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
-		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
-	)
-
 	if vm.meta.LowerDigest == "" {
 		return fmt.Errorf("vm %s has no lower_digest in metadata; recreate via `shed delete && shed create`", vm.meta.Name)
 	}
@@ -125,9 +116,10 @@ func (vm *VM) Start(ctx context.Context) error {
 		return fmt.Errorf("kernel blob missing at %s: %w", kernelPath, err)
 	}
 
-	// Resolve every layer's cached ext4 (Phase 1: exactly one layer;
-	// Phase 3 expands this to N readonly drives + N-layer overlay
-	// assembly in the initramfs).
+	// Resolve every layer's cached ext4. Upper is /dev/vda; lowers
+	// occupy /dev/vdb..vd{1+N} in manifest order (layer[0] = base).
+	// The in-guest initramfs stacks them in reverse manifest order so
+	// the base sits at the bottom of the overlay.
 	layerPaths, err := imageMgr.ResolveLayerExt4Paths(ctx, vm.meta.LowerDigest)
 	if err != nil {
 		return fmt.Errorf("resolving layer ext4s: %w", err)
@@ -135,31 +127,46 @@ func (vm *VM) Start(ctx context.Context) error {
 	if len(layerPaths) == 0 {
 		return fmt.Errorf("manifest %s has no layers", vmimage.ShortDigest(vm.meta.LowerDigest))
 	}
-	lowerRootfs := layerPaths[0]
+	if len(layerPaths) > vmimage.MaxLayers {
+		return fmt.Errorf("image has %d layers (max %d)", len(layerPaths), vmimage.MaxLayers)
+	}
+
+	lowerDevs := make([]string, len(layerPaths))
+	for i := range layerPaths {
+		lowerDevs[i] = fmt.Sprintf("/dev/vd%c", 'b'+byte(i))
+	}
+
+	kernelArgs := fmt.Sprintf(
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lowers=%s",
+		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
+		strings.Join(lowerDevs, ","),
+	)
+
+	drives := []models.Drive{
+		// Upper (writable). The initramfs runs mkfs.ext4 on first
+		// boot when no FS signature is present.
+		{
+			DriveID:      firecracker.String("rootfs"),
+			PathOnHost:   firecracker.String(vm.meta.RootfsPath),
+			IsRootDevice: firecracker.Bool(true),
+			IsReadOnly:   firecracker.Bool(false),
+		},
+	}
+	for i, p := range layerPaths {
+		drives = append(drives, models.Drive{
+			DriveID:      firecracker.String(fmt.Sprintf("lower-%d", i+1)),
+			PathOnHost:   firecracker.String(p),
+			IsRootDevice: firecracker.Bool(false),
+			IsReadOnly:   firecracker.Bool(true),
+		})
+	}
 
 	fcCfg := firecracker.Config{
 		SocketPath:      socketPath,
 		KernelImagePath: kernelPath,
 		InitrdPath:      initrdPath,
 		KernelArgs:      kernelArgs,
-		Drives: []models.Drive{
-			// Upper (writable). The initramfs runs mkfs.ext4 on first
-			// boot when no FS signature is present.
-			{
-				DriveID:      firecracker.String("rootfs"),
-				PathOnHost:   firecracker.String(vm.meta.RootfsPath),
-				IsRootDevice: firecracker.Bool(true),
-				IsReadOnly:   firecracker.Bool(false),
-			},
-			// Lower (read-only). Shared across all sheds that pin this
-			// digest — both disk and host page cache.
-			{
-				DriveID:      firecracker.String("lower"),
-				PathOnHost:   firecracker.String(lowerRootfs),
-				IsRootDevice: firecracker.Bool(false),
-				IsReadOnly:   firecracker.Bool(true),
-			},
-		},
+		Drives:          drives,
 		MachineCfg: models.MachineConfiguration{
 			VcpuCount:  firecracker.Int64(int64(vm.meta.CPUs)),
 			MemSizeMib: firecracker.Int64(int64(vm.meta.MemoryMB)),

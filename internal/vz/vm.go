@@ -20,6 +20,19 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
+// guestLowerDevices returns the names of the N readonly virtio-blk
+// devices the guest sees, ordered to match manifest layer order
+// (layer[0] = /dev/vdb, layer[1] = /dev/vdc, ...). vfkit / firecracker
+// assign device names by attach order, so the host's drive order
+// determines the guest's vdX letters.
+func guestLowerDevices(n int) []string {
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		out[i] = fmt.Sprintf("/dev/vd%c", 'b'+i)
+	}
+	return out
+}
+
 // credentialVirtioFS describes a VirtioFS share for a credential directory.
 type credentialVirtioFS struct {
 	SourceDir string
@@ -164,9 +177,11 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		return nil, fmt.Errorf("kernel blob missing at %s: %w", kernelPath, statErr)
 	}
 
-	// Resolve every layer's cached ext4 (Phase 1: exactly one layer;
-	// Phase 3 expands this to N readonly drives + N-layer overlay
-	// assembly in the initramfs).
+	// Resolve every layer's cached ext4. Upper is /dev/vda; lowers
+	// occupy /dev/vdb..vd{1+N} in manifest order (layer[0] = base,
+	// pinned to the leftmost lower devices). The in-guest initramfs
+	// stacks them in reverse manifest order so the base sits at the
+	// bottom of the overlay.
 	layerPaths, err := vmimage.NewManager(vm.cfg, nil).ResolveLayerExt4Paths(context.Background(), vm.meta.LowerDigest)
 	if err != nil {
 		return nil, fmt.Errorf("resolving layer ext4s: %w", err)
@@ -174,13 +189,18 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 	if len(layerPaths) == 0 {
 		return nil, fmt.Errorf("manifest %s has no layers", vmimage.ShortDigest(vm.meta.LowerDigest))
 	}
-	_ = manifest // reserved for future multi-layer use
+	if len(layerPaths) > vmimage.MaxLayers {
+		return nil, fmt.Errorf("image has %d layers (max %d)", len(layerPaths), vmimage.MaxLayers)
+	}
+	_ = manifest // reserved for future per-layer annotation use
 
-	// shed.name= is read by the in-guest shed-firstboot service to set the
-	// hostname and detect rootfs clones (snapshot spawns).
+	// shed.lowers= names every lower device in manifest order. The
+	// initramfs builds the overlayfs lowerdir from this list.
+	lowerDevs := guestLowerDevices(len(layerPaths))
 	kernelArgs := fmt.Sprintf(
-		"console=hvc0 init=/sbin/init shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
+		"console=hvc0 init=/sbin/init shed.name=%s shed.upper=/dev/vda shed.lowers=%s",
 		vm.meta.Name,
+		strings.Join(lowerDevs, ","),
 	)
 
 	bootloader := fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", kernelPath, initrdBlobPath, kernelArgs)
@@ -194,12 +214,14 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		"--bootloader", bootloader,
 		// Upper: writable, /dev/vda inside the guest.
 		"--device", fmt.Sprintf("virtio-blk,path=%s", vm.meta.RootfsPath),
-		// Lower(s): read-only. Phase 1 has exactly one; later phases
-		// add additional readonly drives per layer.
-		"--device", fmt.Sprintf("virtio-blk,path=%s,readonly", layerPaths[0]),
+	}
+	for _, p := range layerPaths {
+		args = append(args, "--device", fmt.Sprintf("virtio-blk,path=%s,readonly", p))
+	}
+	args = append(args,
 		"--device", "virtio-net,nat",
 		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLogPath),
-	}
+	)
 
 	// Add VirtioFS shared directory if a local dir is configured
 	if vm.meta.LocalDir != "" {
