@@ -263,36 +263,6 @@ func ValidateImageName(name string) error {
 	return nil
 }
 
-// moveOrCopyFile moves src to dst, falling back to copy when rename fails
-// (e.g. cross-device). On a successful copy, the source is removed.
-func moveOrCopyFile(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(dst)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(dst)
-		return err
-	}
-	_ = os.Remove(src)
-	return nil
-}
-
 func fsyncFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
