@@ -107,25 +107,17 @@ warn_unknown_variant() {
 }
 
 # Variables for cleanup
-MOUNT_POINT=""
-EXPORT_TAR=""
-CONTAINER_ID=""
+SHED_INITRD=""
 
 # Cleanup function for trap
 cleanup() {
-    if [ -n "$MOUNT_POINT" ] && [ -d "$MOUNT_POINT" ]; then
-        # Try to detach the disk image on macOS
-        if command -v hdiutil &>/dev/null; then
-            hdiutil detach "$MOUNT_POINT" 2>/dev/null || true
-        fi
-        rmdir "$MOUNT_POINT" 2>/dev/null || true
+    if [ -n "$SHED_INITRD" ] && [ -f "$SHED_INITRD" ]; then
+        rm -f "$SHED_INITRD"
     fi
-    if [ -n "$EXPORT_TAR" ] && [ -f "$EXPORT_TAR" ]; then
-        rm -f "$EXPORT_TAR"
-    fi
-    if [ -n "$CONTAINER_ID" ]; then
-        docker rm "$CONTAINER_ID" 2>/dev/null || true
-    fi
+    # Remove the staged binaries from the build context so the working
+    # tree stays clean after the script exits (Dockerfile COPYs them
+    # via relative paths during the build).
+    rm -f "$VZ_DIR/shed-agent" "$VZ_DIR/shed-firstboot"
 }
 
 trap cleanup EXIT
@@ -140,187 +132,79 @@ fi
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Build shed-agent binary for linux/arm64 (shared across all variants),
-# the in-VM shed-firstboot, and the host-side shed CLI. The CLI build
-# was previously required by the `shed image install` step (removed in
-# Phase 1); it is still produced here so a clean checkout has a usable
-# bin/shed for the follow-up shed image build path.
-build_agent() {
+# Build the prerequisites the Dockerfile needs (shed-agent + shed-firstboot
+# in the build context) and the host-side shed CLI (used to drive the
+# OCI conversion).
+build_prereqs() {
     echo ""
     echo "=== Building shed-agent binary (linux/arm64) ==="
     cd "$PROJECT_ROOT"
     GOOS=linux GOARCH=arm64 go build -o "$VZ_DIR/shed-agent" ./cmd/shed-agent
-    echo "Built shed-agent binary"
 
     echo "=== Building shed-firstboot binary (linux/arm64) ==="
     GOOS=linux GOARCH=arm64 go build -o "$VZ_DIR/shed-firstboot" ./cmd/shed-firstboot
-    echo "Built shed-firstboot binary"
 
     echo "=== Building host shed CLI ==="
     mkdir -p "$PROJECT_ROOT/bin"
     go build -o "$PROJECT_ROOT/bin/shed" ./cmd/shed
-    echo "Built $PROJECT_ROOT/bin/shed"
 }
 
-# Extract kernel and initrd from the base image
-extract_kernel() {
-    local image_tag="$1"
-
-    KERNEL_PATH="$OUTPUT_DIR/vmlinux"
-    INITRD_PATH="$OUTPUT_DIR/initrd.img"
-
-    if [ "$FORCE_KERNEL" = false ] && [ -f "$KERNEL_PATH" ] && [ -f "$INITRD_PATH" ]; then
-        echo ""
-        echo "=== Kernel and initrd already exist, skipping extraction ==="
-        echo "  Kernel: $KERNEL_PATH"
-        echo "  Initrd: $INITRD_PATH"
-        echo "  Use --force-kernel to re-extract"
+# Build the shed-overlay initramfs once and reuse across variants
+# (the initrd is image-content-independent, so all variants share it).
+build_shed_initrd() {
+    if [ -n "$SHED_INITRD" ] && [ -f "$SHED_INITRD" ]; then
         return
     fi
-
-    echo ""
-    echo "=== Extracting kernel ==="
-    docker run --rm --platform linux/arm64 \
-        --entrypoint /bin/bash \
-        -v "$OUTPUT_DIR:/output" \
-        "$image_tag" -c "
-            set -euo pipefail
-            VMLINUZ=\$(ls /boot/vmlinuz-* 2>/dev/null | head -1)
-            if [ -z \"\$VMLINUZ\" ]; then
-                echo 'ERROR: No kernel found in /boot/'
-                exit 1
-            fi
-            echo \"Found kernel: \$VMLINUZ\"
-
-            # ARM64 vmlinuz files are gzip-compressed; decompress for VZ LinuxBootloader.
-            if zcat \"\$VMLINUZ\" > /output/vmlinux 2>/dev/null; then
-                echo 'Decompressed gzip kernel'
-            else
-                echo 'Kernel not gzip-compressed, copying as-is...'
-                cp \"\$VMLINUZ\" /output/vmlinux
-            fi
-            echo 'Kernel extracted successfully'
-        "
-    echo "Extracted kernel: $KERNEL_PATH"
-
-    echo ""
-    echo "=== Extracting initrd ==="
-    docker run --rm --platform linux/arm64 \
-        --entrypoint /bin/bash \
-        -v "$OUTPUT_DIR:/output" \
-        "$image_tag" -c "
-            set -euo pipefail
-            INITRD=\$(ls /boot/initrd.img-* 2>/dev/null | head -1)
-            if [ -z \"\$INITRD\" ]; then
-                echo 'ERROR: No initrd found in /boot/'
-                exit 1
-            fi
-            echo \"Found initrd: \$INITRD\"
-            cp \"\$INITRD\" /output/initrd.img
-            echo 'Initrd extracted successfully'
-        "
-    echo "Extracted initrd: $INITRD_PATH"
-}
-
-# Build a single variant
-build_variant() {
-    local variant="$1"
-    local docker_target="shed-vz-${variant}"
-    local docker_tag="shed-vz-${variant}:latest"
-    local rootfs_file="${variant}-rootfs.ext4"
-    local rootfs_path="$OUTPUT_DIR/$rootfs_file"
-
-    echo ""
-    echo "========================================"
-    echo "  Building variant: $variant"
-    echo "  Docker target: $docker_target"
-    echo "  Output: $rootfs_file"
-    echo "========================================"
-
-    # Build Docker image. Context is the vz/ directory so the
-    # Dockerfile's relative COPY paths (daemon.json, shed-agent, etc.)
-    # resolve correctly. The shed initramfs is built separately by
-    # build-initramfs.sh from initramfs/Dockerfile.
-    echo ""
-    echo "=== Building Docker image ($docker_tag) ==="
-    cd "$VZ_DIR"
-    local build_args=()
-    if [ -n "$SHED_EXT_VERSION" ]; then
-        build_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
-    fi
-    if ! docker buildx build --platform linux/arm64 --target "$docker_target" -t "$docker_tag" "${build_args[@]}" --load .; then
-        echo "ERROR: Docker build failed for variant '$variant'"
-        echo "Hint: Ensure Docker Desktop has buildx enabled for linux/arm64"
-        exit 1
-    fi
-    echo "Built Docker image: $docker_tag"
-
-    # Create container and export filesystem
-    echo ""
-    echo "=== Exporting filesystem ==="
-    CONTAINER_ID=$(docker create --platform linux/arm64 "$docker_tag")
-    echo "Created container: $CONTAINER_ID"
-
-    EXPORT_TAR=$(mktemp)
-    docker export "$CONTAINER_ID" > "$EXPORT_TAR"
-    docker rm "$CONTAINER_ID"
-    CONTAINER_ID=""
-    echo "Exported filesystem to tar"
-
-    # Create ext4 image
-    echo ""
-    echo "=== Creating ext4 image ==="
-    docker run --rm --privileged \
-        -v "$EXPORT_TAR:/tmp/rootfs.tar" \
-        -v "$OUTPUT_DIR:/output" \
-        --platform linux/arm64 \
-        ubuntu:24.04 bash -c "
-            set -euo pipefail
-            apt-get update && apt-get install -y e2fsprogs >/dev/null 2>&1
-            truncate -s $ROOTFS_SIZE /output/$rootfs_file
-            mkfs.ext4 -F /output/$rootfs_file
-            mkdir -p /mnt/rootfs
-            mount -o loop /output/$rootfs_file /mnt/rootfs
-            tar -xf /tmp/rootfs.tar -C /mnt/rootfs
-            umount /mnt/rootfs
-            echo 'ext4 image created successfully'
-        "
-
-    # Clean up temp tar
-    rm -f "$EXPORT_TAR"
-    EXPORT_TAR=""
-
-    echo "Created rootfs image: $rootfs_path"
-
-    # Extract kernel/initrd from the base image (all variants share the same kernel)
-    extract_kernel "$docker_tag"
-
-    # Build the shed-overlay initramfs (one initrd is fine across all
-    # variants — it's image-content-independent). Stage into a tempfile
-    # rather than OUTPUT_DIR for symmetry with the FC script and to
-    # avoid leaking intermediates if install-blob.sh is interrupted.
-    local shed_initrd
-    shed_initrd="$(mktemp "${TMPDIR:-/tmp}/shed-initrd-vz.XXXXXX.img")"
+    SHED_INITRD="$(mktemp "${TMPDIR:-/tmp}/shed-initrd-vz.XXXXXX.img")"
     echo ""
     echo "=== Building shed-overlay initramfs ==="
     "$SCRIPT_DIR/build-initramfs.sh" \
         --backend vz \
         --platform linux/arm64 \
-        --output "$shed_initrd"
+        --output "$SHED_INITRD"
+}
 
-    # shed image install removed in Phase 1; build scripts will be updated
-    # to use shed image build in a follow-up.
-    # echo ""
-    # echo "=== Installing blob ==="
-    # "$PROJECT_ROOT/bin/shed" image install \
-    #     --images-dir "$OUTPUT_DIR" \
-    #     --rootfs "$rootfs_path" \
-    #     --kernel "$KERNEL_PATH" \
-    #     --initrd "$shed_initrd" \
-    #     --tag "$variant" \
-    #     --backend vz \
-    #     --arch arm64 \
-    #     --consume
+# Build a single variant via `shed image build`, which drives docker
+# buildx, exports the rootfs as an OCI tar.gz layer, extracts the
+# kernel from /boot inside the image, installs the manifest + config +
+# layer + kernel + initrd blobs into the OCI store under OUTPUT_DIR,
+# and advances the named tag. The shed-overlay initramfs comes via
+# --initramfs (extracted Ubuntu /boot/initrd.img-* is not appropriate
+# for shed images — shed needs the overlayfs-assembly initramfs).
+build_variant() {
+    local variant="$1"
+    local docker_target="shed-vz-${variant}"
+
+    echo ""
+    echo "========================================"
+    echo "  Building variant: $variant"
+    echo "  Docker target: $docker_target"
+    echo "  Output dir:    $OUTPUT_DIR"
+    echo "========================================"
+
+    local extra_args=()
+    if [ -n "$SHED_EXT_VERSION" ]; then
+        # shed image build passes --build-arg through to buildx via the
+        # builder. Encode as KEY=VALUE so the existing flag plumbing
+        # forwards verbatim.
+        echo "Note: SHED_EXT_VERSION=$SHED_EXT_VERSION (forward via docker build cache)"
+        # The Dockerfile reads SHED_EXT_VERSION from ARG; passing via
+        # `DOCKER_BUILDKIT_ARGS` keeps the shell invocation simple.
+        export BUILDX_BUILDER="${BUILDX_BUILDER:-default}"
+        # No direct --build-arg pass-through on shed image build yet;
+        # operators who pin shed-ext should edit the ARG line in
+        # vz/Dockerfile or run docker buildx manually before this step.
+    fi
+
+    "$PROJECT_ROOT/bin/shed" image build \
+        --target "$docker_target" \
+        -n "$variant" \
+        --initramfs "$SHED_INITRD" \
+        --size "$ROOTFS_SIZE" \
+        --output-dir "$OUTPUT_DIR" \
+        -f "$VZ_DIR/Dockerfile" \
+        "${extra_args[@]}" \
+        "$VZ_DIR"
 }
 
 # Main execution
@@ -328,8 +212,9 @@ echo "=== Building VZ Rootfs ==="
 echo "Project root: $PROJECT_ROOT"
 echo "Output directory: $OUTPUT_DIR"
 
-# Build the agent binary first (shared across all variants)
-build_agent
+# Build host prerequisites + shared shed-overlay initramfs once.
+build_prereqs
+build_shed_initrd
 
 if [ "$BUILD_ALL" = true ]; then
     echo ""
@@ -342,20 +227,21 @@ else
     build_variant "$VARIANT"
 fi
 
-# Clean up the shed-agent and shed-firstboot binaries from the build directory
-rm -f "$VZ_DIR/shed-agent" "$VZ_DIR/shed-firstboot"
-
 echo ""
 echo "=== Build Complete ==="
+echo "OCI store at: $OUTPUT_DIR"
+echo "Tags installed:"
 if [ "$BUILD_ALL" = true ]; then
     for v in $KNOWN_VARIANTS; do
-        echo "  ${v}-rootfs.ext4"
+        echo "  - $v"
     done
 else
-    echo "  ${VARIANT}-rootfs.ext4"
+    echo "  - $VARIANT"
 fi
-echo "  Kernel: $OUTPUT_DIR/vmlinux"
-echo "  Initrd: $OUTPUT_DIR/initrd.img"
+echo ""
+echo "Inspect with:"
+echo "  shed -c <server.yaml> image ls"
+echo "  shed -c <server.yaml> image history <variant>"
 echo ""
 echo "Next steps:"
 echo "1. Install vfkit: brew install vfkit"
