@@ -79,7 +79,7 @@ SERVER: prod-mac (dry-run) --until 72h0m0s scope=images+instances+orphans
 IMAGES (2, 40.0 GB)
 NAME          PATH                                                                                       LOGICAL  PHYSICAL
 base          /Users/alice/Library/Application Support/shed/vz/blobs/sha256/abc123.../rootfs.ext4        20.0 GB  1.9 GB
-experimental  /Users/alice/Library/Application Support/shed/vz/blobs/sha256/def456.../rootfs.ext4        20.0 GB  3.2 GB
+full          /Users/alice/Library/Application Support/shed/vz/blobs/sha256/def456.../rootfs.ext4        20.0 GB  3.2 GB
 
 SKIPPED (3)
 KIND      NAME/PATH                                                                            REASON
