@@ -37,20 +37,19 @@ var (
 var imageBuildCmd = &cobra.Command{
 	Use:   "build [context]",
 	Short: "Build a rootfs image",
-	Long: `Build a rootfs image from a Dockerfile or Docker registry image.
+	Long: `Build a rootfs image from a Dockerfile.
 
-There are two modes:
-
-  Dockerfile mode (default):
-    shed image build -f Dockerfile.shed -n myimage .
-
-  Registry mode (--from):
-    shed image build --from ghcr.io/org/image:v1.0.0 -n myimage
+Example:
+  shed image build -f Dockerfile.shed -n myimage .
 
 The target platform is auto-detected from the host OS (linux/amd64 for
-Firecracker, linux/arm64 for VZ). The resulting ext4 image is stored in
+Firecracker, linux/arm64 for VZ). The resulting OCI image is stored in
 the images directory and is immediately available for use with:
-  shed create mydev --image myimage`,
+  shed create mydev --image myimage
+
+To consume an image from a registry instead of building locally, use
+'shed image pull <ref>' — the old 'shed image build --from <ref>' mode
+was removed in this release.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runImageBuild,
 }
