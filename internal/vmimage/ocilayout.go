@@ -176,14 +176,18 @@ func WriteBlobFromFile(imagesDir, srcPath string, consume bool) (digest, blobPat
 		}
 	}()
 
+	// Always copy (not rename) when sourcing from outside the blob
+	// store. Rename would carry the source file's ownership over —
+	// kernel/initrd files extracted from a privileged-docker container
+	// land as root on Linux, and a subsequent chmod from a non-root
+	// caller would fail with EPERM. The copy path creates tmpPath
+	// with our ownership; the source is removed on success when the
+	// caller asked to consume it.
+	if err := copyFile(srcPath, tmpPath); err != nil {
+		return "", "", fmt.Errorf("staging blob: %w", err)
+	}
 	if consume {
-		if err := moveOrCopyFile(srcPath, tmpPath); err != nil {
-			return "", "", fmt.Errorf("staging blob: %w", err)
-		}
-	} else {
-		if err := copyFile(srcPath, tmpPath); err != nil {
-			return "", "", fmt.Errorf("staging blob: %w", err)
-		}
+		_ = os.Remove(srcPath)
 	}
 
 	// Hash the staged bytes (not srcPath) — that's what's actually

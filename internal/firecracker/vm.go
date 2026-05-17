@@ -153,8 +153,11 @@ func (vm *VM) Start(ctx context.Context) error {
 		},
 	}
 	for i, p := range layerPaths {
+		// Firecracker rejects drive IDs containing characters outside
+		// [A-Za-z0-9_]; hyphens specifically fail with "API Resource
+		// IDs can only contain alphanumeric characters and underscores".
 		drives = append(drives, models.Drive{
-			DriveID:      firecracker.String(fmt.Sprintf("lower-%d", i+1)),
+			DriveID:      firecracker.String(fmt.Sprintf("lower_%d", i+1)),
 			PathOnHost:   firecracker.String(p),
 			IsRootDevice: firecracker.Bool(false),
 			IsReadOnly:   firecracker.Bool(true),

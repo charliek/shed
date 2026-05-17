@@ -268,11 +268,13 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 		}
 		kernelDigest = d
 
-		if opts.NeedsInitrd {
-			// Prefer a caller-provided initrd (the shed-overlay
-			// initramfs from build-initramfs.sh). Fall back to
-			// extracting Ubuntu's stock initrd from /boot for
-			// non-shed Dockerfiles.
+		// Install an initrd blob whenever the caller provided one
+		// explicitly OR the backend asks for an Ubuntu-style initrd
+		// extracted from /boot. Both VZ and Firecracker need the
+		// shed-overlay initramfs to assemble overlayfs at boot, so
+		// the build CLI passes --initramfs <path> regardless of
+		// backend.
+		if opts.InitrdSourcePath != "" || opts.NeedsInitrd {
 			var initrdSrc string
 			if opts.InitrdSourcePath != "" {
 				if _, err := os.Stat(opts.InitrdSourcePath); err != nil {

@@ -691,7 +691,11 @@ func (c *FirecrackerConfig) GetPlatform() string { return "linux/amd64" }
 func (c *FirecrackerConfig) GetExtractKernel() bool { return true }
 
 // GetNeedsInitrd implements vmimage.ImageConfig.
-func (c *FirecrackerConfig) GetNeedsInitrd() bool { return false }
+//
+// Both VZ and Firecracker boot through the shed-overlay initramfs
+// (it owns overlayfs assembly + pivot_root), so an initrd blob must
+// be installed alongside every shed image regardless of backend.
+func (c *FirecrackerConfig) GetNeedsInitrd() bool { return true }
 
 // ResolveImage resolves an image name to a local ext4 path or Docker reference.
 func (c *FirecrackerConfig) ResolveImage(image string) (ResolvedImage, error) {
