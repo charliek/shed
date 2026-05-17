@@ -10,6 +10,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"text/tabwriter"
 	"time"
 
@@ -72,13 +73,33 @@ func init() {
 }
 
 // loadLocalManager reads the active server config and returns a
-// vmimage.Manager bound to the backend's image store.
+// vmimage.Manager bound to the backend's image store. Honors the
+// global --config flag so users can point at an alternate server
+// config (matching the rest of the CLI).
+//
+// "detect" backend resolves to the host's native backend so the
+// installed default homebrew config works on Mac without manual
+// edits.
 func loadLocalManager() (*vmimage.Manager, error) {
-	cfg, err := config.LoadServerConfig()
+	var cfg *config.ServerConfig
+	var err error
+	if configFlag != "" {
+		cfg, err = config.LoadServerConfigFromPath(configFlag)
+	} else {
+		cfg, err = config.LoadServerConfig()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("loading server config: %w", err)
 	}
-	switch cfg.DefaultBackend {
+	backend := cfg.DefaultBackend
+	if backend == "detect" {
+		if runtime.GOOS == "linux" {
+			backend = "firecracker"
+		} else {
+			backend = "vz"
+		}
+	}
+	switch backend {
 	case "vz":
 		if cfg.VZ == nil {
 			return nil, fmt.Errorf("server config has default_backend=vz but no vz: block")

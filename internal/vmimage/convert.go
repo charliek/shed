@@ -60,8 +60,20 @@ type ConvertOptions struct {
 	ExtractKernel bool
 
 	// NeedsInitrd controls whether an initrd should be extracted alongside
-	// the kernel. Only consulted when ExtractKernel is true.
+	// the kernel. Only consulted when ExtractKernel is true. When set,
+	// either InitrdSourcePath must be provided OR the Ubuntu-style
+	// /boot/initrd.img-* will be extracted from the image (a fallback
+	// useful for ad-hoc Dockerfiles; not appropriate for shed images
+	// that need the shed-overlay initramfs to assemble overlayfs at boot).
 	NeedsInitrd bool
+
+	// InitrdSourcePath, when set, points at a pre-built initrd file (on
+	// the host) that shed should install as the image's boot initrd
+	// instead of extracting one from the rootfs. The shed build flow
+	// builds the shed-overlay initramfs separately via build-initramfs.sh
+	// and passes the path here so the resulting image boots through
+	// shed's overlay assembly path rather than Ubuntu's regular initrd.
+	InitrdSourcePath string
 }
 
 // ConvertResult holds the digests produced by a successful conversion.
@@ -257,11 +269,23 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 		kernelDigest = d
 
 		if opts.NeedsInitrd {
-			iPath := filepath.Join(stagingDir, "initrd.img")
-			if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, stagingDir); err != nil {
-				return nil, fmt.Errorf("extracting initrd: %w", err)
+			// Prefer a caller-provided initrd (the shed-overlay
+			// initramfs from build-initramfs.sh). Fall back to
+			// extracting Ubuntu's stock initrd from /boot for
+			// non-shed Dockerfiles.
+			var initrdSrc string
+			if opts.InitrdSourcePath != "" {
+				if _, err := os.Stat(opts.InitrdSourcePath); err != nil {
+					return nil, fmt.Errorf("initrd source %q: %w", opts.InitrdSourcePath, err)
+				}
+				initrdSrc = opts.InitrdSourcePath
+			} else {
+				initrdSrc = filepath.Join(stagingDir, "initrd.img")
+				if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, stagingDir); err != nil {
+					return nil, fmt.Errorf("extracting initrd: %w", err)
+				}
 			}
-			d, _, err := WriteBlobFromFile(opts.ImagesDir, iPath, true)
+			d, _, err := WriteBlobFromFile(opts.ImagesDir, initrdSrc, opts.InitrdSourcePath == "")
 			if err != nil {
 				return nil, fmt.Errorf("installing initrd blob: %w", err)
 			}

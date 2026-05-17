@@ -23,6 +23,7 @@ var imageCmd = &cobra.Command{
 
 var (
 	imageBuildFile      string
+	imageBuildInitrd    string
 	imageBuildName      string
 	imageBuildTarget    string
 	imageBuildSize      string
@@ -129,6 +130,7 @@ var imagePruneCmd = &cobra.Command{
 func init() {
 	imageBuildCmd.Flags().StringVarP(&imageBuildFile, "file", "f", "", "Dockerfile path (default: ./Dockerfile.shed or ./Dockerfile)")
 	imageBuildCmd.Flags().StringVarP(&imageBuildName, "name", "n", "", "Image variant name (required)")
+	imageBuildCmd.Flags().StringVar(&imageBuildInitrd, "initramfs", "", "Path to a pre-built shed-overlay initramfs (built via scripts/build-initramfs.sh). Required for images that need to boot through shed's overlayfs assembly.")
 	imageBuildCmd.Flags().StringVar(&imageBuildTarget, "target", "", "Docker build target stage (Dockerfile mode only)")
 	imageBuildCmd.Flags().StringVar(&imageBuildSize, "size", "20G", "Rootfs image size")
 	imageBuildCmd.Flags().StringVar(&imageBuildOutputDir, "output-dir", "", "Output directory (auto-detected based on backend)")
@@ -255,13 +257,14 @@ func convertAndInstall(ctx context.Context, sourceRef, imagesDir, platform strin
 	}
 
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
-		DockerRef:     sourceRef,
-		Name:          imageBuildName,
-		ImagesDir:     imagesDir,
-		RootfsSize:    imageBuildSize,
-		Platform:      platform,
-		ExtractKernel: extractKernel,
-		NeedsInitrd:   needsInitrd,
+		DockerRef:        sourceRef,
+		Name:             imageBuildName,
+		ImagesDir:        imagesDir,
+		RootfsSize:       imageBuildSize,
+		Platform:         platform,
+		ExtractKernel:    extractKernel,
+		NeedsInitrd:      needsInitrd,
+		InitrdSourcePath: imageBuildInitrd,
 	})
 	if err != nil {
 		return "", fmt.Errorf("conversion failed: %w", err)
