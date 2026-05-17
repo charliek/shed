@@ -1,6 +1,6 @@
 # Disk Management
 
-Shed stores cached VM images, per-shed rootfs copies, and (on VZ) console logs on each server. This page explains what lives on disk, how to measure it, and how to reclaim space safely.
+Shed stores cached VM image blobs (the shared lower layers), per-shed writable upper layers, instance metadata, and (on VZ) console logs on each server. This page explains what lives on disk, how to measure it, and how to reclaim space safely.
 
 The three tools involved:
 
