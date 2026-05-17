@@ -269,6 +269,9 @@ type ImageTagRequest struct {
 type ImagePullRequest struct {
 	DockerRef string `json:"docker_ref"`
 	Tag       string `json:"tag"`
+	// Platform is an optional override (e.g. "linux/arm64"). Empty
+	// means the server-side backend's native platform.
+	Platform string `json:"platform,omitempty"`
 }
 
 // ImagePullResponse is the response of POST /api/images/pull.

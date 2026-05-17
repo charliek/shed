@@ -211,8 +211,8 @@ func (b *VZBackend) TagImage(_ context.Context, src, dst string) error {
 }
 
 // PullImage pulls a Docker reference into the blob store under the named tag.
-func (b *VZBackend) PullImage(ctx context.Context, dockerRef, tag string) (string, error) {
-	return b.client.PullImage(ctx, dockerRef, tag)
+func (b *VZBackend) PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error) {
+	return b.client.PullImage(ctx, dockerRef, tag, platform)
 }
 
 // DeleteImage removes a tag.

@@ -45,9 +45,11 @@ func (c *Client) TagImage(srcTagOrDigest, newTag string) error {
 }
 
 // PullImage pulls a Docker ref, installs into the blob store, and tags.
-func (c *Client) PullImage(ctx context.Context, dockerRef, tag string) (string, error) {
+// platform is an optional override (e.g. "linux/arm64"); empty means
+// the backend's native platform.
+func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error) {
 	mgr := vmimage.NewManager(c.cfg, c.refScanner())
-	return mgr.PullImage(ctx, dockerRef, tag, func(stage, msg string) {
+	return mgr.PullImage(ctx, dockerRef, tag, platform, func(stage, msg string) {
 		backend.Progress(ctx, stage, msg)
 	})
 }

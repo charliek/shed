@@ -104,7 +104,10 @@ suffix (e.g. ghcr.io/charliek/shed-vz-experimental:v0.4.0 → 'experimental').`,
 	RunE: runImagePull,
 }
 
-var imagePullTag string
+var (
+	imagePullTag      string
+	imagePullPlatform string
+)
 
 var imagePruneCmd = &cobra.Command{
 	Use:   "prune",
@@ -128,6 +131,7 @@ func init() {
 	imagePruneCmd.Flags().BoolVar(&imagePruneForce, "force", false, "Skip confirmation prompt")
 	imagePruneCmd.Flags().BoolVar(&imagePruneDryRun, "dry-run", false, "List candidates without deleting")
 	imagePullCmd.Flags().StringVarP(&imagePullTag, "tag", "t", "", "Tag name (default: derived from docker ref)")
+	imagePullCmd.Flags().StringVar(&imagePullPlatform, "platform", "", "Platform override for multi-arch images (e.g. linux/arm64). Empty means the backend's native platform.")
 
 	imageCmd.AddCommand(imageBuildCmd)
 	imageCmd.AddCommand(imageListCmd)
@@ -471,7 +475,7 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	client := NewAPIClientFromEntry(entry, DefaultTimeout)
-	resp, err := client.PullImage(dockerRef, tag)
+	resp, err := client.PullImage(dockerRef, tag, imagePullPlatform)
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}

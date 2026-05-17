@@ -603,7 +603,7 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "tag: "+err.Error())
 		return
 	}
-	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag)
+	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag, req.Platform)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)

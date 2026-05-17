@@ -150,9 +150,10 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 	return m.layerExt4Paths(ctx, imagesDir, result.ManifestDigest)
 }
 
-// PullImage pulls a Docker reference, converts it, installs into the blob
-// store, and advances the named tag to the new manifest digest.
-func (m *Manager) PullImage(ctx context.Context, dockerRef, tag string, progress ProgressFunc) (string, error) {
+// PullImage pulls a registry reference straight to the OCI layout (no
+// Docker daemon required) and advances the named tag. Defaults to the
+// backend's native platform when platform is empty.
+func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string, progress ProgressFunc) (string, error) {
 	if err := ValidateImageName(tag); err != nil {
 		return "", err
 	}
@@ -171,14 +172,50 @@ func (m *Manager) PullImage(ctx context.Context, dockerRef, tag string, progress
 	}
 	defer unlock()
 
-	result, err := m.convertAndInstall(ctx, dockerRef, tag, progress)
-	if err != nil {
-		return "", err
+	if platform == "" {
+		platform = m.cfg.GetPlatform()
 	}
-	if err := SetTag(imagesDir, tag, result.ManifestDigest); err != nil {
-		return "", fmt.Errorf("advancing tag %q: %w", tag, err)
+
+	result, err := PullToOCILayout(ctx, PullOptions{
+		Ref:           dockerRef,
+		ImagesDir:     imagesDir,
+		TagName:       tag,
+		Platform:      platform,
+		Insecure:      isLoopbackRef(dockerRef),
+		ExtractKernel: m.cfg.GetExtractKernel(),
+		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
+		Progress:      progress,
+	})
+	if err != nil {
+		// Fall back to the legacy Docker-daemon flow for refs the
+		// registry path cannot satisfy (e.g. images pinned in a local
+		// Docker daemon). This keeps `shed image build --from` and
+		// hand-loaded images working during the transition.
+		if progress != nil {
+			progress("image", fmt.Sprintf("Registry pull failed (%v); falling back to docker", err))
+		}
+		convertResult, cErr := m.convertAndInstall(ctx, dockerRef, tag, progress)
+		if cErr != nil {
+			return "", fmt.Errorf("registry pull and docker fallback both failed: registry=%v docker=%w", err, cErr)
+		}
+		if err := SetTag(imagesDir, tag, convertResult.ManifestDigest); err != nil {
+			return "", fmt.Errorf("advancing tag %q: %w", tag, err)
+		}
+		return convertResult.ManifestDigest, nil
 	}
 	return result.ManifestDigest, nil
+}
+
+// isLoopbackRef returns true for registry refs that target localhost.
+// Such endpoints typically don't have TLS, so go-containerregistry needs
+// the Insecure name.Option to talk to them.
+func isLoopbackRef(ref string) bool {
+	for _, prefix := range []string{"localhost", "127.0.0.1", "[::1]"} {
+		if len(ref) >= len(prefix) && ref[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveLayerExt4Paths returns the ordered ext4 cache paths for every

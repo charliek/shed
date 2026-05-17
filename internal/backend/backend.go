@@ -93,9 +93,11 @@ type Backend interface {
 	// Equivalent to `docker tag`.
 	TagImage(ctx context.Context, srcTagOrDigest, newTag string) error
 
-	// PullImage pulls a Docker reference, converts it to ext4, installs
-	// into the blob store, and advances the named tag. Returns the digest.
-	PullImage(ctx context.Context, dockerRef, tag string) (string, error)
+	// PullImage pulls a registry reference into the blob store and
+	// advances the named tag. platform is an optional override
+	// (e.g. "linux/arm64"); empty means the backend's native platform.
+	// Returns the manifest digest.
+	PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error)
 
 	// DeleteImage removes a tag (Docker model). The underlying blob is
 	// GC'd by PruneImages once nothing references it. Returns

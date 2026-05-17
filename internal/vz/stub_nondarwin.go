@@ -125,7 +125,7 @@ func (b *VZBackend) TagImage(_ context.Context, _, _ string) error {
 }
 
 // PullImage returns an error on non-darwin platforms.
-func (b *VZBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+func (b *VZBackend) PullImage(_ context.Context, _, _, _ string) (string, error) {
 	return "", fmt.Errorf("pull image: %w", config.ErrNotSupportedSentinel)
 }
 
