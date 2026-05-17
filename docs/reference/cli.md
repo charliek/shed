@@ -84,6 +84,7 @@ shed create <name> [flags]
 | `--backend` | | Server default | Backend to use: `firecracker` or `vz` |
 | `--cpus` | | Server default | Number of vCPUs |
 | `--memory` | | Server default | Memory in MB |
+| `--upper-size` | | Server default (`5G`) | Logical size of the per-shed writable overlay upper layer (e.g. `1G`, `5G`, `10G`, `100G`). Validated range: 1–100 GiB. The overlay grows copy-on-write, so this is the maximum, not the on-disk physical bytes. |
 | `--local-dir` | | None | Mount a local host directory as the workspace (mutually exclusive with `--repo`) |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
@@ -203,7 +204,12 @@ Lists snapshots on the current server.
 shed snapshot info <snapshot-name>
 ```
 
-Shows snapshot metadata, including provenance and size.
+Shows snapshot metadata, including provenance and size. The output includes a
+`Lower digest: sha256:... (cached)` line — the digest of the lower image the
+snapshot was captured against. If that blob is no longer in the local image
+store, the status reads `(MISSING — pull or rebuild the image before
+spawning)` and a warning block points at the original image tag. See
+[Snapshots → Missing lower digest](snapshots.md#missing-lower-digest).
 
 ### shed snapshot delete
 
@@ -224,6 +230,45 @@ Spawns a new shed from a snapshot. `--from-snapshot` is mutually exclusive
 with `--image` and `--repo` (the snapshot rootfs is the source of truth).
 `--local-dir`, `--cpus`, and `--memory` remain valid since they describe
 runtime configuration, not rootfs source.
+
+If the snapshot's pinned `lower_digest` is no longer cached, the command
+fails fast with `BACKEND_ERROR: snapshot ... references lower digest
+sha256:... which is no longer cached; pull the original image (<tag>)
+first`. See [Snapshots → Missing lower digest](snapshots.md#missing-lower-digest).
+
+## Reset
+
+### shed reset
+
+Wipes and recreates a stopped shed's per-shed writable upper layer.
+
+```bash
+shed reset <name> [flags]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--force` | `-f` | `false` | Skip confirmation prompt |
+
+The lower image (shared, read-only) and `/workspace` (mounted post-boot from
+outside the overlay) are unaffected — only the writable upper is deleted and
+re-created empty. This is the equivalent of "throw away anything I wrote
+inside the VM and start fresh from the same image."
+
+The shed must be stopped. Otherwise the API returns `SHED_NOT_STOPPED` (HTTP
+409). When using `--json`, `--force` is required.
+
+Common uses:
+
+- Recovering from the upper-corruption panic (`shed-initramfs PANIC: ... no
+  ext4 magic at offset 1080 ...`) emitted by the in-guest initramfs.
+- Throwing away accumulated experiment state without losing `/workspace`.
+
+**Example:**
+
+```bash
+shed reset my-broken-shed --force
+```
 
 ## Image Management
 
@@ -386,6 +431,8 @@ shed image prune [flags]
 | `--dry-run` | | `false` | List candidates without deleting |
 
 A blob is preserved only if its digest is referenced by an existing shed's `metadata.json` (`lower_digest`) or a snapshot's `snapshot.json` (`lower_digest`). Tags are informational and do not protect blobs. After bumping image refs in server config and re-running `shed-server pull-images`, the previous digests typically become dangling and `shed image prune` reclaims them.
+
+**Fail-closed on malformed metadata:** `image prune` aborts (returns an error naming the broken shed and its directory) if any instance's `metadata.json` cannot be parsed for `lower_digest` — pruning while a refcount source is unreadable could orphan a digest still in use. Fix or `rm -rf` the broken instance directory before re-running. Lenient read paths (`shed list`, `shed image ls`, `shed system df`) warn-and-skip on the same fault.
 
 **Note:** When using `--json`, the `--force` flag is required.
 

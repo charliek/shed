@@ -132,6 +132,33 @@ FICLONE), the snapshot's stored upper and any spawned shed's upper
 share extents until they diverge. `shed system df` notes this so you
 don't overcount on-disk usage.
 
+### Missing lower digest
+
+A snapshot only **pins** its source's `lower_digest` — it doesn't carry a
+copy of the lower bytes. `shed image prune` refuses to delete a digest a
+snapshot pins, so in normal operation the lower stays available. If an
+operator removes a blob directory by hand (or moves the image store between
+hosts), the pin's protection is bypassed and the lower may go missing.
+
+`shed snapshot info` warns when this happens:
+
+```text
+Lower digest:   sha256:abc123... (MISSING — pull or rebuild the image before spawning)
+
+Warning: this snapshot's lower image is no longer cached.
+  shed create --from-snapshot <snap> will fail until you pull/rebuild <tag>.
+```
+
+`shed create --from-snapshot` then fails fast with
+`BACKEND_ERROR: snapshot ... references lower digest sha256:... which is no
+longer cached; pull the original image (<tag>) first`. Recover by pulling
+the original image:
+
+```bash
+shed image pull <docker-ref> -t <tag>
+shed create my-new-shed --from-snapshot <snap>
+```
+
 ## Out of scope
 
 - Live (memory state) snapshots — Tier 1 captures rootfs only.

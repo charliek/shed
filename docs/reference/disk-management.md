@@ -1,14 +1,14 @@
 # Disk Management
 
-Shed stores cached VM images, per-shed rootfs copies, and (on VZ) console logs on each server. This page explains what lives on disk, how to measure it, and how to reclaim space safely.
+Shed stores cached VM image blobs (the shared lower layers), per-shed writable upper layers, instance metadata, and (on VZ) console logs on each server. This page explains what lives on disk, how to measure it, and how to reclaim space safely.
 
 The three tools involved:
 
 - `shed system df` — read-only disk usage report.
 - `shed system prune` — scoped cleanup with a dry-run-first UX.
-- Reflink / clonefile on `shed create` — new sheds share extents with the base image on reflink-capable filesystems, so per-shed disk cost starts at near-zero.
+- The overlay-in-guest storage model — each shed allocates only a sparse writable upper (default 5 GB), while the read-only lower image is shared across every shed pinning the same digest.
 
-Full flag references live in the [CLI reference](cli.md#system-disk-usage); full API schemas live in the [HTTP API reference](api.md#system). This page focuses on workflows and the reflink behavior that affects every `shed create`. The on-disk layout itself is covered in [Storage Model](storage-model.md).
+Full flag references live in the [CLI reference](cli.md#system-disk-usage); full API schemas live in the [HTTP API reference](api.md#system). This page focuses on workflows. The on-disk layout itself is covered in [Storage Model](storage-model.md).
 
 ## What lives on disk
 
@@ -19,7 +19,8 @@ Each server stores four kinds of data in its backend directory:
 | Image blobs | `~/Library/Application Support/shed/vz/blobs/sha256/<digest>/` | `/var/lib/shed/firecracker/images/blobs/sha256/<digest>/` | `shed image build`, `shed image pull`, or `shed-server pull-images` | `shed image prune` (when no shed/snapshot pins the digest) |
 | Tags | `~/Library/Application Support/shed/vz/tags/<tag>.json` | `/var/lib/shed/firecracker/images/tags/<tag>.json` | Same as above | `shed image rm <tag>` |
 | Kernel / initrd (per blob) | Stored alongside `rootfs.ext4` inside each blob directory | Same | First conversion of an image | Removed with the blob |
-| Per-shed rootfs | `~/Library/Application Support/shed/vz/instances/{name}/rootfs.ext4` | `/var/lib/shed/firecracker/instances/{name}/rootfs.ext4` | `shed create` (shares extents with the blob's rootfs when possible) | `shed delete` or `shed system prune --instances` |
+| Per-shed writable upper | `~/Library/Application Support/shed/vz/uppers/{name}/upper.ext4` | `/var/lib/shed/firecracker/uppers/{name}/upper.ext4` | `shed create` (sparse, default 5 GB; lower image is shared read-only via overlayfs inside the guest) | `shed delete`, `shed reset`, or `shed system prune --instances` |
+| Per-shed metadata | `~/Library/Application Support/shed/vz/instances/{name}/metadata.json` | `/var/lib/shed/firecracker/instances/{name}/metadata.json` | `shed create` | `shed delete` or `shed system prune --instances` |
 | VZ console log | `~/Library/Application Support/shed/vz/instances/{name}/console.log` | _(Firecracker has none — SDK writes to stderr)_ | VM boot | `shed system prune --logs` (truncates to last N bytes) |
 | Orphan sidecars | `*.tmp` from a crashed install staging dir | Same | Partial or crashed image conversions | `shed system prune --orphans` |
 
@@ -76,15 +77,15 @@ $ shed system prune
 SERVER: prod-mac (dry-run) --until 72h0m0s scope=images+instances+orphans
 
 IMAGES (2, 40.0 GB)
-NAME          PATH                                                                          LOGICAL  PHYSICAL
-base          /Users/alice/Library/Application Support/shed/vz/base-rootfs.ext4             20.0 GB  1.9 GB
-experimental  /Users/alice/Library/Application Support/shed/vz/experimental-rootfs.ext4     20.0 GB  3.2 GB
+NAME          PATH                                                                                       LOGICAL  PHYSICAL
+base          /Users/alice/Library/Application Support/shed/vz/blobs/sha256/abc123.../rootfs.ext4        20.0 GB  1.9 GB
+experimental  /Users/alice/Library/Application Support/shed/vz/blobs/sha256/def456.../rootfs.ext4        20.0 GB  3.2 GB
 
 SKIPPED (3)
-KIND      NAME/PATH                                                                 REASON
-instance  api-dev                                                                   cannot prune running shed
-instance  api-test                                                                  too recent (3h < 72h)
-lock      /Users/alice/Library/Application Support/shed/vz/foo-rootfs.ext4.lock     lock file retained (inode-reuse race safety)
+KIND      NAME/PATH                                                                            REASON
+instance  api-dev                                                                              cannot prune running shed
+instance  api-test                                                                             too recent (3h < 72h)
+lock      /Users/alice/Library/Application Support/shed/vz/blobs/sha256/abc123.../rootfs.ext4.lock  lock file retained (inode-reuse race safety)
 
 TOTAL TO FREE: 40.0 GB logical / 5.1 GB physical (2 items)
 
