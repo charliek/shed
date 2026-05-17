@@ -23,7 +23,6 @@ var imageCmd = &cobra.Command{
 
 var (
 	imageBuildFile      string
-	imageBuildFrom      string
 	imageBuildName      string
 	imageBuildTarget    string
 	imageBuildSize      string
@@ -130,7 +129,6 @@ var imagePruneCmd = &cobra.Command{
 
 func init() {
 	imageBuildCmd.Flags().StringVarP(&imageBuildFile, "file", "f", "", "Dockerfile path (default: ./Dockerfile.shed or ./Dockerfile)")
-	imageBuildCmd.Flags().StringVar(&imageBuildFrom, "from", "", "Docker image reference to convert directly (skips build)")
 	imageBuildCmd.Flags().StringVarP(&imageBuildName, "name", "n", "", "Image variant name (required)")
 	imageBuildCmd.Flags().StringVar(&imageBuildTarget, "target", "", "Docker build target stage (Dockerfile mode only)")
 	imageBuildCmd.Flags().StringVar(&imageBuildSize, "size", "20G", "Rootfs image size")
@@ -194,21 +192,7 @@ func runImageBuild(cmd *cobra.Command, args []string) error {
 		outputDir = bc.OutputDir
 	}
 
-	if imageBuildFrom != "" {
-		return runImageBuildFromRef(cmd.Context(), outputDir, bc.Platform, bc.ExtractKernel, bc.NeedsInitrd)
-	}
 	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, bc.Platform, bc.ExtractKernel, bc.NeedsInitrd)
-}
-
-func runImageBuildFromRef(ctx context.Context, outputDir, platform string, extractKernel, needsInitrd bool) error {
-	fmt.Printf("Converting %s to ext4 rootfs...\n", imageBuildFrom)
-
-	digest, err := convertAndInstall(ctx, imageBuildFrom, outputDir, platform, extractKernel, needsInitrd)
-	if err != nil {
-		return err
-	}
-	finishImageBuild(outputDir, imageBuildFrom, digest)
-	return nil
 }
 
 func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, prefix, platform string, extractKernel, needsInitrd bool) error {
