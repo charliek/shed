@@ -295,13 +295,26 @@ shed image build [flags] [context]
 | `--file` | `-f` | `./Dockerfile.shed` or `./Dockerfile` | Dockerfile path |
 | `--name` | `-n` | *required* | Tag to advance after install |
 | `--target` | | | Build target stage |
-| `--builder` | | `docker` | Builder backend (`docker` works today; `podman` / `buildah` are planned, see [Docker-free builds](../discovery/docker-free-builds.md)) |
+| `--initramfs` | | | Pre-built shed-overlay initramfs (produced by `scripts/build-initramfs.sh`). Required for images that need shed's overlayfs assembly at boot — i.e. anything you intend to `shed create` against. |
+| `--size` | | `20G` | Sparse size of the derived ext4 cache |
 | `--output-dir` | | `images_dir` from server config | Override the OCI store root |
 | `--force` | | `false` | Skip base-image validation warning |
 
 ```bash
-shed image build -f Dockerfile.shed -n myimage .
+# Build the shed-overlay initramfs once.
+./scripts/build-initramfs.sh --backend vz --platform linux/arm64 --output /tmp/shed-initrd.img
+
+# Then drive the OCI conversion.
+shed image build \
+    --target shed-vz-full \
+    -n my-image \
+    --initramfs /tmp/shed-initrd.img \
+    -f vz/Dockerfile vz/
 ```
+
+The `scripts/build-{vz,firecracker}-rootfs.sh` helpers wrap this flow
+for the standard variants — use them if you don't need a custom
+target.
 
 To convert an existing registry image into the local store, use
 [`shed image pull`](#shed-image-pull) — `shed image build --from` was
@@ -408,13 +421,22 @@ shed image push <src> <dst>
 | `<src>` | Local tag (`full`) or `sha256:...` manifest digest |
 | `<dst>` | Destination OCI reference (e.g. `ghcr.io/myorg/my-shed-image:v1`) |
 
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--local` | `false` | Read the OCI store directly instead of routing through a running shed-server's HTTP API. Implied when `-c <config>` is passed without `-s <server>`. Useful for CI publish flows. |
+
 ```bash
+# Push against a running shed-server:
 shed image push full ghcr.io/myorg/shed-vz-full:v0.5.0
-shed image push sha256:9a1c... ghcr.io/myorg/shed-vz-full@sha256:9a1c...
+
+# Local mode (no shed-server needed):
+shed image push --local --output-dir ./store full ghcr.io/myorg/shed-vz-full:v0.5.0
+shed -c ./publish-server.yaml image push full ghcr.io/myorg/shed-vz-full:v0.5.0
 ```
 
 Authentication uses the standard Docker credential resolution chain
-(`~/.docker/config.json` and any installed credential helpers).
+(`~/.docker/config.json` and any installed credential helpers — `docker
+login ghcr.io` works).
 
 ### shed image save
 

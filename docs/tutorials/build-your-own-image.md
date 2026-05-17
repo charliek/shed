@@ -122,17 +122,28 @@ docker push ghcr.io/myorg/my-shed-image:v1
 **Option B — `shed image push`** (registry-direct, byte-perfect):
 
 ```bash
-# First import the just-built image into shed's local store.
-shed image build -f Dockerfile.shed -n my-shed-image .
+# Build the shed-overlay initramfs (shared across variants — once
+# per machine is enough, the artifact is image-content-independent).
+./scripts/build-initramfs.sh --backend vz --platform linux/arm64 --output /tmp/shed-initrd.img
 
-# Then push from there.
-shed image push my-shed-image ghcr.io/myorg/my-shed-image:v1
+# Import the just-built rootfs into shed's local OCI store.
+shed image build \
+    -f Dockerfile.shed \
+    -n my-shed-image \
+    --initramfs /tmp/shed-initrd.img \
+    .
+
+# Then push from there. --local skips the HTTP API hop to a running
+# shed-server, which is handy from a build host without one running.
+shed image push --local my-shed-image ghcr.io/myorg/my-shed-image:v1
 ```
 
 `shed image push` is byte-perfect: the manifest digest at the
 destination equals the local manifest digest, so any host that later
 pulls `ghcr.io/myorg/my-shed-image:v1` resolves to the same digest you
-just pushed.
+just pushed. The shed-overlay initramfs is uploaded as a sibling blob
+referenced by an `io.shed.initrd.digest` annotation, so the receiving
+host doesn't need to rebuild it locally.
 
 ## 4. Pull on the shed server
 
