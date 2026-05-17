@@ -97,10 +97,16 @@ var imagePushCmd = &cobra.Command{
 	Long: `Push the manifest currently held by a tag (or digest) to a
 destination registry reference, byte-perfect: the on-disk layer blobs
 are streamed unchanged so any signatures attached to the original
-remain valid.`,
+remain valid.
+
+By default this talks to a running shed-server via the HTTP API.
+Pass --local (or -c <config>) to read the OCI store directly without
+needing a server — useful for CI publish flows and standalone hosts.`,
 	Args: cobra.ExactArgs(2),
 	RunE: runImagePush,
 }
+
+var imagePushLocal bool
 
 var imagePullCmd = &cobra.Command{
 	Use:   "pull <docker-ref>",
@@ -142,6 +148,7 @@ func init() {
 	imagePruneCmd.Flags().BoolVar(&imagePruneDryRun, "dry-run", false, "List candidates without deleting")
 	imagePullCmd.Flags().StringVarP(&imagePullTag, "tag", "t", "", "Tag name (default: derived from docker ref)")
 	imagePullCmd.Flags().StringVar(&imagePullPlatform, "platform", "", "Platform override for multi-arch images (e.g. linux/arm64). Empty means the backend's native platform.")
+	imagePushCmd.Flags().BoolVar(&imagePushLocal, "local", false, "Push from the local OCI store (no shed-server required). Implied when -c is set without -s.")
 
 	imageCmd.AddCommand(imageBuildCmd)
 	imageCmd.AddCommand(imageListCmd)
@@ -487,6 +494,24 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 func runImagePush(_ *cobra.Command, args []string) error {
 	source := args[0]
 	dest := args[1]
+
+	// Local mode: --local explicit, or -c <config> passed without
+	// -s <server>. Otherwise talk to a running shed-server.
+	useLocal := imagePushLocal || (configFlag != "" && serverFlag == "")
+	if useLocal {
+		mgr, err := loadLocalManager()
+		if err != nil {
+			return err
+		}
+		if err := mgr.PushImage(context.Background(), source, dest, func(stage, msg string) {
+			fmt.Printf("  %s: %s\n", stage, msg)
+		}); err != nil {
+			return fmt.Errorf("failed to push image: %w", err)
+		}
+		printSuccess("Pushed %s → %s", source, dest)
+		return nil
+	}
+
 	entry, _, err := getServerEntry()
 	if err != nil {
 		return err
