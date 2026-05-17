@@ -158,7 +158,10 @@ Example output:
   "tap_device": "shed-tap-0",
   "cpus": 2,
   "memory_mb": 4096,
-  "rootfs_path": "/var/lib/shed/firecracker/instances/myproject/rootfs.ext4"
+  "rootfs_path": "/var/lib/shed/firecracker/uppers/myproject/upper.ext4",
+  "upper_path": "/var/lib/shed/firecracker/uppers/myproject/upper.ext4",
+  "upper_size_bytes": 5368709120,
+  "lower_digest": "sha256:abc123..."
 }
 ```
 
@@ -222,47 +225,65 @@ shed exec myproject -- curl -I https://google.com
 
 ### VM Disk Layout
 
-Each VM has its own rootfs derived from the base image:
+Each VM mounts an overlayfs stack in-guest: the shared, read-only lower
+image (the content-addressed blob) plus a per-shed writable upper.
 
 ```text
-/var/lib/shed/firecracker/instances/myproject/
-├── metadata.json    # VM configuration and state
-└── rootfs.ext4      # VM's root filesystem (reflink of base when supported)
+/var/lib/shed/firecracker/
+├── images/blobs/sha256/<digest>/   # Shared lower images (read-only)
+│   ├── rootfs.ext4                 # The lower layer mounted in every shed pinning this digest
+│   ├── kernel                      # Kernel (preferred by Phase B initramfs)
+│   ├── initrd                      # Initial RAM disk
+│   └── manifest.json
+├── uppers/myproject/upper.ext4     # Per-shed sparse writable layer (default 5 GB)
+└── instances/myproject/
+    └── metadata.json               # VM configuration and pinned lower_digest
 
-/var/run/shed/firecracker/  # Runtime sockets (when VM is running)
-├── myproject.sock   # Firecracker API socket
-└── myproject.vsock  # vsock UDS for guest communication
+/var/run/shed/firecracker/          # Runtime sockets (when VM is running)
+├── myproject.sock                  # Firecracker API socket
+└── myproject.vsock                 # vsock UDS for guest communication
 ```
 
-On reflink-capable filesystems (btrfs, xfs with reflink, ext4 with `reflink=1` on kernel 6.7+), the per-shed rootfs shares extents with `_base` and adds near-zero physical bytes at create time; writes diverge copy-on-write. On non-reflink ext4 the rootfs is materialized as a full copy (~2–5 GB). See [Disk Management](disk-management.md) for the strategy chain, how to check reflink support, and how to measure per-shed cost.
+Per-shed disk cost is the writable upper alone — a sparse file (default 5 GB,
+configurable via `shed create --upper-size`). The lower image is shared across
+every shed pinning the same digest, both on disk and in the host page cache,
+so host filesystem reflink support is no longer load-bearing for per-shed
+cost. See [Storage Model](storage-model.md) for the overlay-in-guest design
+and [Disk Management](disk-management.md) for measurement and reclamation.
 
 ### Expanding Disk Space
 
-To resize a VM's rootfs:
+To give a shed more writable headroom, recreate it with a larger upper. The
+writable upper is sized at create time and cannot be resized in place — the
+lower image is read-only and shared:
 
 ```bash
-# Stop the VM first
+# Stop, snapshot if you need to keep state, then recreate with a bigger upper
 shed stop myproject
-
-# Resize the image
-sudo truncate -s 40G /var/lib/shed/firecracker/instances/myproject/rootfs.ext4
-sudo e2fsck -f /var/lib/shed/firecracker/instances/myproject/rootfs.ext4
-sudo resize2fs /var/lib/shed/firecracker/instances/myproject/rootfs.ext4
-
-# Start the VM
-shed start myproject
+shed snapshot create myproject pre-resize
+shed delete myproject --keep-volume
+shed create myproject --from-snapshot pre-resize --upper-size 20G
 ```
+
+To wipe accumulated upper-layer writes without resizing, use `shed reset` —
+it deletes and re-creates the upper at its current size while leaving
+`/workspace` and the lower untouched.
 
 ### Backing Up a VM
 
+The writable upper plus `metadata.json` is what's per-shed. `/workspace`
+lives outside the overlay (volume- or virtiofs-backed) and is the typical
+backup target.
+
 ```bash
-# Stop the VM
+# Snapshot the upper as a named snapshot
 shed stop myproject
+shed snapshot create myproject backup-2026-05-17
 
-# Copy the instance directory
-cp -r /var/lib/shed/firecracker/instances/myproject /backup/myproject-backup
-
-# Restart
+# Or copy the raw upper + metadata
+shed stop myproject
+sudo cp -r /var/lib/shed/firecracker/uppers/myproject /backup/upper-myproject
+sudo cp /var/lib/shed/firecracker/instances/myproject/metadata.json /backup/myproject.json
 shed start myproject
 ```
 

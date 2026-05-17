@@ -229,10 +229,11 @@ Replace `{version}` with the version matching your `shed` binary — run `shed v
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `kernel_path` | string | `{images_dir}/vmlinux` | Path to Linux kernel image (auto-populated from published images) |
-| `base_rootfs` | string | - | Path or Docker ref for base rootfs (used when no `--image` specified) |
+| `kernel_path` | string | `""` | Optional. Path to a Linux kernel image (auto-populated by published-image pulls). The Phase B initramfs prefers the kernel embedded in the image blob (`{images_dir}/blobs/sha256/<digest>/kernel`); this path is the fallback for legacy blobs that lack an embedded kernel. |
+| `base_rootfs` | string | `""` | Optional. Path or Docker ref for the default rootfs. Only consulted when `shed create` runs without `--image`. Empty is fine if every create passes `--image` explicitly; otherwise `shed create` errors with `INVALID_REQUEST: no --image specified and no base_rootfs configured`. |
 | `images` | map | - | Named image variants (ext4 paths or Docker refs) |
-| `images_dir` | string | `/var/lib/shed/firecracker/images` | Directory for converted/discovered ext4 images |
+| `images_dir` | string | `/var/lib/shed/firecracker/images` | Directory for converted/discovered ext4 images and the content-addressed blob store |
+| `upper_size_default` | string | `5G` | Default logical size of the per-shed writable overlay upper layer when `shed create --upper-size` is omitted. Validated to the range 1–100 GiB. |
 | `instance_dir` | string | - | Directory for VM instances |
 | `socket_dir` | string | - | Directory for API/vsock sockets |
 | `default_cpus` | int | `2` | Default vCPUs per VM |
@@ -246,6 +247,12 @@ Replace `{version}` with the version matching your `shed` binary — run `shed v
 | `bridge_name` | string | `shed-br0` | Linux bridge name |
 | `bridge_cidr` | string | `172.30.0.1/24` | Bridge network CIDR |
 | `tap_prefix` | string | `shed-tap` | TAP device name prefix |
+
+Path-existence validation only fires when **all** configured image sources
+are local paths. When `base_rootfs` (or any `images:` entry) is a Docker
+ref, the path-existence check is skipped because the file is created on
+first pull. `kernel_path` is still required to point at a real file when
+set non-empty.
 
 See [Firecracker Setup](../getting-started/fc-setup.md) for setup details.
 
@@ -283,11 +290,12 @@ vz:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `vfkit_path` | string | `vfkit` | Path to vfkit binary |
-| `kernel_path` | string | - | Path to decompressed Linux kernel |
-| `initrd_path` | string | - | Path to initial RAM disk image |
-| `base_rootfs` | string | - | Default rootfs ext4 path or Docker image reference (used when `--image` is not specified) |
+| `kernel_path` | string | `""` | Optional. Path to a decompressed Linux kernel (auto-populated by published-image pulls). Phase B prefers the kernel embedded in the image blob; this is the fallback for legacy blobs that lack an embedded kernel. |
+| `initrd_path` | string | `""` | Optional. Path to an initial RAM disk image. The shed-overlay initramfs lives inside the image blob, so this field is only consulted for legacy blobs. |
+| `base_rootfs` | string | `""` | Optional. Path or Docker ref for the default rootfs. Only consulted when `shed create` runs without `--image`. Empty is fine if every create passes `--image` explicitly; otherwise `shed create` errors with `INVALID_REQUEST: no --image specified and no base_rootfs configured`. |
 | `images` | map | - | Named image variants mapping variant name to rootfs path or Docker image reference (see [Image Variants](images.md)) |
-| `images_dir` | string | `~/Library/Application Support/shed/vz/` | Directory for converted/auto-discovered ext4 images |
+| `images_dir` | string | `~/Library/Application Support/shed/vz/` | Directory for converted/auto-discovered ext4 images and the content-addressed blob store |
+| `upper_size_default` | string | `5G` | Default logical size of the per-shed writable overlay upper layer when `shed create --upper-size` is omitted. Validated to the range 1–100 GiB. |
 | `instance_dir` | string | - | Directory for VM instances |
 | `socket_dir` | string | - | Directory for vsock Unix sockets (must not contain spaces) |
 | `default_cpus` | int | `2` | Default vCPUs per VM |

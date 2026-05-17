@@ -380,7 +380,11 @@ The common end-to-end flow when bumping image refs (for example, moving config f
         brew services restart shed
         ```
 
-4. Pull the new images. If `base_rootfs` shares a ref with a variant, `_base-rootfs.ext4` is hardlinked to the variant (no extra disk, no extra pull).
+4. Pull the new images. Each pull lands a new blob under
+   `blobs/sha256/<digest>/` and advances the tag (`tags/<tag>.json`) to
+   the new digest. When `base_rootfs` shares a Docker ref with a variant,
+   the same blob backs both `_base` and the variant tag — no duplicate
+   blob, no second pull.
    ```bash
    sudo shed-server pull-images
    ```
@@ -395,12 +399,19 @@ The common end-to-end flow when bumping image refs (for example, moving config f
    ```bash
    shed image ls
    du -sh <images_dir>      # blobs + tags + kernel
-   du -sh <instances_dir>   # running shed rootfs copies
+   du -sh <instances_dir>   # per-shed metadata + (VZ) console.log
+   du -sh <uppers_dir>      # per-shed writable upper layers
    ```
 
 ## Disk Space
 
-Each variant is a 20 GB sparse ext4 image; actual usage is typically 2–5 GB depending on what the variant installed. Per-shed rootfs copies start out sharing extents with `_base` on reflink-capable filesystems (APFS, btrfs, xfs-reflink, ext4 with `reflink=1`) and grow copy-on-write as the VM writes. On non-reflink filesystems the rootfs is materialized as a full copy.
+Each variant is a 20 GB sparse ext4 image; actual physical usage is
+typically 2–5 GB depending on what the variant installed. Per-shed cost is
+the writable upper layer alone (sparse, default 5 GB, configurable via
+`shed create --upper-size`) — not a copy of the rootfs. The lower image
+(the cached blob) is shared read-only across every shed pinning the same
+digest, both on disk and in the host page cache. See
+[Storage Model](storage-model.md) for the overlay-in-guest design.
 
 To measure usage, use `shed system df`:
 
@@ -409,13 +420,21 @@ shed system df
 shed system df -v
 ```
 
-See [Disk Management](disk-management.md) for the full reflink strategy chain, the APFS extent-sharing caveat, how to check reflink support on Linux, and how to reclaim space with `shed system prune`.
+See [Disk Management](disk-management.md) for how to measure and reclaim
+space with `shed system df` / `shed system prune`, plus the APFS
+extent-sharing caveat that affects physical-byte reporting.
 
 ## Requirements
 
 Image conversion requires Docker with privileged container support. The ext4 creation step uses a privileged Docker container for loop mounting.
 
-For VZ images, the kernel and initrd are automatically extracted alongside the rootfs during conversion. Both `shed image build --from` and the auto-pull on `shed create` handle this — no manual kernel extraction is needed.
+For VZ images, the kernel and initrd are extracted from the source image
+and written into the blob directory alongside the rootfs
+(`{images_dir}/blobs/sha256/<digest>/{kernel,initrd}`). Phase B's
+in-guest initramfs prefers these embedded files over the legacy
+`kernel_path`/`initrd_path` config values. Both `shed image build --from`
+and the auto-pull on `shed create` handle this — no manual extraction is
+needed.
 
 ## Building from Source
 

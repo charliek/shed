@@ -19,12 +19,20 @@ The `shed-server` exposes a REST API for managing sheds.
 | DELETE | `/api/sheds/{name}` | Delete a shed |
 | POST | `/api/sheds/{name}/start` | Start a shed |
 | POST | `/api/sheds/{name}/stop` | Stop a shed |
+| POST | `/api/sheds/{name}/reset` | Wipe and recreate the shed's writable upper layer |
 | GET | `/api/sheds/{name}/sessions` | List tmux sessions in shed |
 | DELETE | `/api/sheds/{name}/sessions/{session}` | Kill a tmux session |
 | GET | `/api/sessions` | List all sessions across sheds |
+| GET | `/api/snapshots` | List snapshots |
+| POST | `/api/snapshots` | Create a snapshot from a stopped shed |
+| GET | `/api/snapshots/{name}` | Get snapshot details |
+| DELETE | `/api/snapshots/{name}` | Delete a snapshot |
 | GET | `/api/images` | List available image variants |
-| DELETE | `/api/images/{name}` | Delete a cached image |
-| POST | `/api/images/prune` | Prune unused cached images |
+| GET | `/api/images/inspect/{name}` | Inspect a tag or digest (manifest + info) |
+| POST | `/api/images/tag` | Point a new tag at an existing digest |
+| POST | `/api/images/pull` | Pull a Docker reference into the blob store |
+| DELETE | `/api/images/{name}` | Delete a tag (blob preserved for `prune`) |
+| POST | `/api/images/prune` | Reclaim unreferenced blobs |
 | GET | `/api/system/df` | Disk usage report (image cache, sheds, orphans) |
 | POST | `/api/system/prune` | Scoped disk cleanup (dry-run, images/instances/logs/orphans) |
 | GET | `/api/sheds/{name}/connect/{port}` | TCP tunnel via HTTP upgrade |
@@ -117,6 +125,9 @@ Creates a new shed.
 | `local_dir` | No | null | Absolute path to host directory to mount as workspace (mutually exclusive with `repo`) |
 | `cpus` | No | Backend default | Number of vCPUs |
 | `memory_mb` | No | Backend default | Memory in MB |
+| `from_snapshot` | No | null | Snapshot name to spawn from (mutually exclusive with `image` and `repo`). Provisioning is skipped because the snapshot is already provisioned. |
+| `upper_size_bytes` | No | Server default | Per-shed overlay upper size in bytes. Range-validated 1 GiB – 100 GiB. When omitted, the per-backend `upper_size_default` config value applies. |
+| `no_provision` | No | `false` | Skip provisioning hooks (repo clone, install hook, first-time auto-sync). |
 
 **Response (201 Created):**
 
@@ -164,13 +175,14 @@ Without the `Accept: text/event-stream` header, the endpoint behaves synchronous
 
 **Errors:**
 
-| Code | Description |
-|------|-------------|
-| 400 | Invalid name format |
-| 400 | Invalid repository URL |
-| 400 | Invalid local directory path |
-| 409 | Shed already exists |
-| 500 | Backend or clone failure |
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_SHED_NAME` | Invalid name format |
+| 400 | `INVALID_REPO_URL` | Invalid repository URL |
+| 400 | `INVALID_LOCAL_DIR` | Invalid local directory path |
+| 400 | `INVALID_REQUEST` | No `image` specified and `base_rootfs` is not configured on the chosen backend, or `upper_size_bytes` is outside the 1–100 GiB range, or `from_snapshot` was passed together with `image`/`repo`. |
+| 409 | `SHED_ALREADY_EXISTS` | Shed already exists |
+| 500 | `CLONE_FAILED` / `BACKEND_ERROR` | Backend or clone failure |
 
 ### GET /api/sheds/{name}
 
@@ -248,6 +260,127 @@ Stops a running shed.
 | 404 | Shed not found |
 | 409 | Shed already stopped |
 
+### POST /api/sheds/{name}/reset
+
+Wipes and recreates the shed's per-shed writable overlay upper. The shared
+lower image is untouched; `/workspace` (mounted outside the overlay) is
+unaffected. The shed must be stopped first.
+
+**Response (200 OK):** the (still-stopped) Shed object, same shape as
+`GET /api/sheds/{name}`.
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 404 | `SHED_NOT_FOUND` | Shed does not exist |
+| 409 | `SHED_NOT_STOPPED` | Shed must be stopped before reset |
+
+## Snapshots
+
+### GET /api/snapshots
+
+Lists all snapshots managed by this server. Each snapshot's `lower_cached`
+field is recomputed at read time from the local blob store; it is never
+persisted to `snapshot.json`.
+
+**Response (200 OK):**
+
+```json
+{
+  "snapshots": [
+    {
+      "version": 2,
+      "name": "post-migration",
+      "backend": "vz",
+      "source_shed": "api-dev",
+      "source_image": "experimental",
+      "size_bytes": 5368709120,
+      "created_at": "2026-05-10T12:00:00Z",
+      "lower_digest": "sha256:abc123...",
+      "lower_cached": true
+    }
+  ]
+}
+```
+
+### POST /api/snapshots
+
+Creates a snapshot from a stopped shed. Backend-emitted warnings (e.g., the
+source used `--local-dir`, so workspace contents are not captured) are
+returned alongside the snapshot rather than failing the request.
+
+**Request:**
+
+```json
+{
+  "name": "post-migration",
+  "source_shed": "api-dev",
+  "comment": "after the schema bump"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Snapshot name (alphanumeric + hyphens) |
+| `source_shed` | Yes | Source shed name. Must be stopped. |
+| `comment` | No | Free-form note attached to the snapshot |
+
+**Response (201 Created):**
+
+```json
+{
+  "snapshot": {
+    "version": 2,
+    "name": "post-migration",
+    "backend": "vz",
+    "source_shed": "api-dev",
+    "lower_digest": "sha256:abc123...",
+    "lower_cached": true,
+    "size_bytes": 5368709120,
+    "created_at": "2026-05-10T12:00:00Z"
+  },
+  "warnings": [
+    "source shed used --local-dir; workspace contents are not captured in the snapshot"
+  ]
+}
+```
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_SNAPSHOT_NAME` / `INVALID_SHED_NAME` | Name validation failed |
+| 404 | `SHED_NOT_FOUND` | Source shed does not exist |
+| 409 | `SNAPSHOT_ALREADY_EXISTS` | A snapshot with that name already exists |
+| 409 | `SNAPSHOT_SOURCE_RUNNING` | Source shed is running; stop it before snapshotting |
+
+### GET /api/snapshots/{name}
+
+Returns a single snapshot. Shape matches the list entries above (with
+`lower_cached` recomputed at read time).
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 404 | `SNAPSHOT_NOT_FOUND` | Snapshot does not exist |
+
+### DELETE /api/snapshots/{name}
+
+Removes a snapshot. Sheds spawned from this snapshot remain independent —
+each has its own writable upper and metadata. Deleting a snapshot whose
+`lower_digest` is no longer referenced by any other shed or snapshot makes
+that digest a candidate for `shed image prune`.
+
+**Response (204 No Content)**
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 404 | `SNAPSHOT_NOT_FOUND` | Snapshot does not exist |
+
 ## Session Management
 
 ### GET /api/sheds/{name}/sessions
@@ -321,7 +454,8 @@ Lists all tmux sessions across all running sheds.
 
 ### GET /api/images
 
-Returns available image variants across all backends.
+Returns available image variants across all backends. Each entry is an
+`ImageInfo`: tag-or-dangling-digest plus content-addressed metadata.
 
 **Response:**
 
@@ -330,18 +464,22 @@ Returns available image variants across all backends.
   "images": [
     {
       "name": "base",
-      "path": "/Users/user/Library/Application Support/shed/vz/base-rootfs.ext4",
-      "docker_ref": "ghcr.io/charliek/shed-vz-base:{version}",
+      "path": "/var/lib/shed/vz/blobs/sha256/abc123.../rootfs.ext4",
+      "docker_ref": "ghcr.io/charliek/shed-vz-base:v0.5.0",
       "size_bytes": 2147483648,
       "source": "config",
-      "cached": true
+      "cached": true,
+      "digest": "sha256:abc123...",
+      "tag": "base",
+      "in_use": true
     },
     {
-      "name": "custom",
-      "path": "/Users/user/Library/Application Support/shed/vz/custom-rootfs.ext4",
-      "size_bytes": 3221225472,
-      "source": "discovered",
-      "cached": true
+      "name": "sha256:ff8800...",
+      "path": "/var/lib/shed/vz/blobs/sha256/ff8800.../rootfs.ext4",
+      "size_bytes": 2147483648,
+      "source": "dangling",
+      "cached": true,
+      "digest": "sha256:ff8800..."
     }
   ]
 }
@@ -349,29 +487,144 @@ Returns available image variants across all backends.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | string | Image variant name |
-| `path` | string | Local ext4 file path (empty if not cached) |
+| `name` | string | Tag name, or `sha256:...` for dangling blobs |
+| `path` | string | Blob rootfs path (empty if not cached) |
 | `docker_ref` | string | Docker image reference (empty for local-only images) |
 | `size_bytes` | int | File size in bytes (0 if not cached) |
-| `source` | string | `config` (from server config) or `discovered` (found in images_dir) |
-| `cached` | bool | Whether the ext4 file exists locally |
+| `source` | string | `config` (from server config), `discovered` (in blob store), or `dangling` (blob with no tag) |
+| `cached` | bool | Whether the underlying blob exists locally |
+| `digest` | string | Content digest (`sha256:...`) of the blob; empty when the image is uncached |
+| `tag` | string | Tag name pointing at this blob; empty for dangling entries |
+| `in_use` | bool | True when any existing shed or snapshot pins this digest |
 
-### DELETE /api/images/{name}
+### GET /api/images/inspect/{name}
 
-Deletes a cached image by name. Removes the ext4 rootfs and source sidecar files but preserves the lock file.
+Returns the full manifest plus `ImageInfo` for a tag or digest. `{name}`
+accepts either a tag (`experimental`) or a `sha256:...` digest (full or
+truncated).
+
+**Response (200 OK):**
+
+```json
+{
+  "image": {
+    "name": "experimental",
+    "path": "/var/lib/shed/vz/blobs/sha256/abc123.../rootfs.ext4",
+    "docker_ref": "ghcr.io/charliek/shed-vz-experimental:v0.5.0",
+    "size_bytes": 3700000000,
+    "source": "config",
+    "cached": true,
+    "digest": "sha256:abc123...",
+    "tag": "experimental",
+    "in_use": false
+  },
+  "manifest": {
+    "schema_version": 1,
+    "digest": "sha256:abc123...",
+    "backend": "vz",
+    "arch": "arm64",
+    "source_ref": "ghcr.io/charliek/shed-vz-experimental:v0.5.0",
+    "source_ref_digest": "sha256:def456...",
+    "shed_ext_version": "v0.3.1",
+    "kernel_size": 8388608,
+    "initrd_size": 102400,
+    "rootfs_logical_size": 21474836480,
+    "rootfs_physical_size": 3700000000,
+    "created_at": "2026-05-01T08:00:00Z"
+  }
+}
+```
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 404 | `IMAGE_NOT_FOUND` | Tag/digest does not resolve to a cached blob |
+
+### POST /api/images/tag
+
+Points a new tag at the digest held by another tag (or a digest passed
+directly). Equivalent to `docker tag`.
+
+**Request:**
+
+```json
+{
+  "source": "experimental",
+  "target": "stable"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `source` | Yes | Tag name or `sha256:...` digest of an existing blob |
+| `target` | Yes | New tag name (must be a valid image name) |
 
 **Response (204 No Content)**
 
 **Errors:**
 
-| Code | Description |
-|------|-------------|
-| 404 | Image not found |
-| 409 | Image is referenced by config |
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | Missing fields or invalid target name |
+| 404 | `IMAGE_NOT_FOUND` | Source tag/digest not found |
+
+### POST /api/images/pull
+
+Pulls a Docker reference, converts it to ext4, installs it under the blob
+store, and advances a tag. Returns the resulting digest.
+
+**Request:**
+
+```json
+{
+  "docker_ref": "ghcr.io/charliek/shed-vz-experimental:v0.5.0",
+  "tag": "experimental"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `docker_ref` | Yes | Docker registry reference to pull |
+| `tag` | Yes | Tag to advance to the resulting digest |
+
+**Response (200 OK):**
+
+```json
+{
+  "tag": "experimental",
+  "digest": "sha256:abc123..."
+}
+```
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 400 | `INVALID_REQUEST` | Missing `docker_ref`/`tag` or invalid tag name |
+| 500 | `BACKEND_ERROR` | Pull or ext4 conversion failed |
+
+### DELETE /api/images/{name}
+
+Removes the tag (Docker model). The underlying blob is preserved and is
+reclaimed only by `POST /api/images/prune` once it has zero protective
+references. Config-managed tags cannot be removed via this endpoint —
+adjust server config instead.
+
+**Response (204 No Content)**
+
+**Errors:**
+
+| Code | Error | Description |
+|------|-------|-------------|
+| 404 | `IMAGE_NOT_FOUND` | Tag does not exist |
+| 409 | `IMAGE_IN_USE` | Tag is config-managed |
 
 ### POST /api/images/prune
 
-Removes cached images not referenced by config or any existing shed.
+Reclaims blobs that no shed or snapshot pins by digest. Tags do **not**
+protect blobs — only `lower_digest` references on instance `metadata.json`
+and snapshot `snapshot.json` do.
 
 **Query Parameters:**
 
@@ -385,17 +638,26 @@ Removes cached images not referenced by config or any existing shed.
 {
   "deleted": [
     {
-      "name": "old-variant",
-      "path": "/Users/user/Library/Application Support/shed/vz/old-variant-rootfs.ext4",
-      "docker_ref": "ghcr.io/example/old:v1",
+      "name": "sha256:ff8800...",
+      "path": "/var/lib/shed/vz/blobs/sha256/ff8800.../rootfs.ext4",
       "size_bytes": 2147483648,
-      "cached": true
+      "source": "dangling",
+      "cached": true,
+      "digest": "sha256:ff8800...",
+      "in_use": false
     }
   ]
 }
 ```
 
-The `deleted` array contains the images that were removed (or would be removed if `dry_run=true`).
+The `deleted` array contains the blobs that were removed (or would be removed
+if `dry_run=true`).
+
+**Fail-closed on malformed metadata:** prune aborts when any instance's
+`metadata.json` cannot be parsed for `lower_digest`. The error names the
+broken shed and its directory — fix or remove the broken instance before
+retrying. Lenient read paths (`GET /api/sheds`, `GET /api/images`,
+`GET /api/system/df`) warn-and-skip on the same fault.
 
 ## System
 
