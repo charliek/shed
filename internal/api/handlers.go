@@ -630,5 +630,5 @@ func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
-	writeJSON(w, http.StatusOK, config.ImagePushResponse{Source: req.Source, Destination: req.Destination})
+	writeJSON(w, http.StatusOK, config.ImagePushResponse(req))
 }

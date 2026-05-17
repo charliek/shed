@@ -655,7 +655,7 @@ func extractBootFile(imagesDir, layerDigest, basenamePattern string) ([]byte, er
 		if err != nil {
 			return nil, fmt.Errorf("tar next: %w", err)
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
 		name := filepath.Base(hdr.Name)

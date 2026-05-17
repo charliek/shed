@@ -127,7 +127,7 @@ func (m *Manager) LoadImage(in io.Reader) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tar next: %w", err)
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
 		buf := new(bytes.Buffer)
