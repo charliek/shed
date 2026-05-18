@@ -57,7 +57,13 @@ func (s *Server) Router() chi.Router {
 			r.Post("/pull", s.handlePullImage)
 			r.Post("/push", s.handlePushImage)
 			r.Get("/inspect/{name}", s.handleInspectImage)
-			r.Delete("/{name}", s.handleDeleteImage)
+			// Wrap parametric /{name} in a sub-router so it doesn't shadow
+			// literal sibling routes like /pull, /push, /prune, /tag at the
+			// chi trie level (which would return 405 Method Not Allowed
+			// instead of dispatching to the literal POST handler).
+			r.Route("/{name}", func(r chi.Router) {
+				r.Delete("/", s.handleDeleteImage)
+			})
 		})
 
 		// System (disk reporting + prune)
@@ -78,8 +84,12 @@ func (s *Server) Router() chi.Router {
 		r.Route("/snapshots", func(r chi.Router) {
 			r.Get("/", s.handleListSnapshots)
 			r.Post("/", s.handleCreateSnapshot)
-			r.Get("/{name}", s.handleGetSnapshot)
-			r.Delete("/{name}", s.handleDeleteSnapshot)
+			// Same defensive wrap as /images — drift insurance if we ever
+			// add literal sibling routes (e.g. /snapshots/prune).
+			r.Route("/{name}", func(r chi.Router) {
+				r.Get("/", s.handleGetSnapshot)
+				r.Delete("/", s.handleDeleteSnapshot)
+			})
 		})
 
 		// Sheds

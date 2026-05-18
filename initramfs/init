@@ -186,7 +186,7 @@ done
 mount -t overlay overlay \
     -o "lowerdir=${lower_dirs},upperdir=/upper/data,workdir=/upper/work" \
     /newroot \
-    || panic SHED-INIT-04 "overlay mount failed (kernel module not loaded or lowerdir too long?)"
+    || panic SHED-INIT-04 "overlay mount failed. If this is a freshly-built image, the cached initramfs may be stale: re-run ./scripts/build-{vz,firecracker}-rootfs.sh. See docs/reference/images.md#shed-init-panic-codes."
 
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run
 mount --move /proc /newroot/proc

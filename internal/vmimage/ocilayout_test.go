@@ -2,8 +2,10 @@ package vmimage
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -121,5 +123,83 @@ func TestSyntheticImageInstall(t *testing.T) {
 	}
 	if len(manifest.Layers) != 1 {
 		t.Fatalf("expected one layer, got %d", len(manifest.Layers))
+	}
+}
+
+// TestReadBlobDetectsLegacyBundledDirectory exercises the v0.4.x → v0.5.0
+// upgrade path: a blob slot is a directory (containing manifest.json /
+// kernel / initrd / rootfs.ext4) instead of the flat OCI blob file. The
+// reader must return a typed sentinel error so the CLI can point at the
+// migration docs instead of the misleading "unreadable manifest …: is a
+// directory" + "unknown image" fallback.
+func TestReadBlobDetectsLegacyBundledDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := EnsureOCILayout(dir); err != nil {
+		t.Fatalf("EnsureOCILayout: %v", err)
+	}
+	hex := strings.Repeat("a", 64)
+	digest := DigestPrefix + hex
+	bundle := filepath.Join(dir, blobsDir, algorithmDir, hex)
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatalf("mkdir bundle: %v", err)
+	}
+	for _, name := range []string{"manifest.json", "kernel", "initrd", "rootfs.ext4"} {
+		if err := os.WriteFile(filepath.Join(bundle, name), []byte("legacy"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	_, err := ReadBlob(dir, digest)
+	if err == nil {
+		t.Fatalf("expected error from ReadBlob on bundled directory, got nil")
+	}
+	if !errors.Is(err, ErrLegacyBundledBlob) {
+		t.Fatalf("expected ErrLegacyBundledBlob, got %v", err)
+	}
+	for _, want := range []string{
+		"v0.4.x bundled directory layout",
+		"docs/UPGRADE.md",
+		"wipe legacy store",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing expected substring %q", err.Error(), want)
+		}
+	}
+
+	// LoadManifestByDigest goes through ReadBlob and should surface the
+	// same sentinel so manager / config callers can branch on it.
+	if _, mErr := LoadManifestByDigest(dir, digest); !errors.Is(mErr, ErrLegacyBundledBlob) {
+		t.Fatalf("LoadManifestByDigest: expected ErrLegacyBundledBlob, got %v", mErr)
+	}
+
+	// OpenBlob takes a different code path; verify it too.
+	if _, oErr := OpenBlob(dir, digest); !errors.Is(oErr, ErrLegacyBundledBlob) {
+		t.Fatalf("OpenBlob: expected ErrLegacyBundledBlob, got %v", oErr)
+	}
+}
+
+// TestDetectLegacyBundledBlobNonDirectory confirms we don't accidentally
+// flag a real blob file or a missing path as legacy.
+func TestDetectLegacyBundledBlobNonDirectory(t *testing.T) {
+	dir := t.TempDir()
+	// Missing path: not legacy.
+	if err := detectLegacyBundledBlob(filepath.Join(dir, "absent")); err != nil {
+		t.Fatalf("missing path flagged as legacy: %v", err)
+	}
+	// Regular file: not legacy.
+	regular := filepath.Join(dir, "blob")
+	if err := os.WriteFile(regular, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write regular: %v", err)
+	}
+	if err := detectLegacyBundledBlob(regular); err != nil {
+		t.Fatalf("regular file flagged as legacy: %v", err)
+	}
+	// Directory without manifest.json: not legacy.
+	emptyDir := filepath.Join(dir, "empty-dir")
+	if err := os.MkdirAll(emptyDir, 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	if err := detectLegacyBundledBlob(emptyDir); err != nil {
+		t.Fatalf("empty dir flagged as legacy: %v", err)
 	}
 }

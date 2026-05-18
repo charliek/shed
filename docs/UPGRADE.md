@@ -1,0 +1,167 @@
+# Upgrade Guide: v0.4.x to v0.5.0
+
+v0.5.0 rewrites how shed stores images. The legacy flat-file image cache
+is gone; the new store is content-addressed (Docker-style), images are
+layered, and per-shed disk usage drops from a full rootfs clone to a
+small writable upper. The schema is not backwards-compatible: existing
+sheds, snapshots, and cached blobs cannot be migrated and must be
+wiped on upgrade.
+
+This page is a top-level walkthrough. Backend-specific commands live in
+the existing setup guides, which this page links into.
+
+## What's new at a glance
+
+- **Content-addressed OCI image store.** Image identity is now the
+  sha256 of the produced ext4 bytes. Blobs live at
+  `{images_dir}/blobs/sha256/<digest>/`; tags at
+  `{images_dir}/tags/<tag>.json`. Multiple tags can point at one digest
+  with zero extra disk cost. See
+  [Storage Model](reference/storage-model.md) for the full layout.
+- **Layer-preserving builds.** `shed image build` now writes one blob
+  per Docker layer rather than flattening each variant. `base`,
+  `extensions`, and `full` share their common parent layers byte-for-byte.
+  Three locally built VZ variants land in roughly 5 GB rather than the
+  ~12 GB the old flattened model required.
+- **Overlay-in-guest boot.** Each shed boots from a shared read-only
+  lower stack and a per-shed writable upper (sparse `upper.ext4`,
+  default 5 GB). A new busybox-based initramfs assembles the overlay and
+  `pivot_root`s into the merged tree.
+- **New per-shed commands.** `shed reset <name>` wipes and recreates a
+  shed's upper while leaving the workspace and shared lower untouched.
+  `shed create --upper-size <N>G` overrides the default upper size.
+- **New image commands.** `shed image inspect`, `shed image tag`,
+  `shed image pull`, and refcount-protected `shed image prune`. See
+  [`shed image`](reference/cli.md) and the
+  [upgrade-and-reclaim cookbook](reference/images.md#cookbook-upgrading-image-versions).
+- **Metadata schema v3.** Instance and snapshot metadata gain
+  `lower_digest`, `lower_image_tag`, `upper_path`, and `upper_size_bytes`.
+  Pre-v3 metadata is rejected at load time with an actionable message.
+
+## What you keep, what you lose
+
+| Keep | Lose |
+|------|------|
+| `~/.shed/` client config and SSH config entries | All image blobs under `images_dir` |
+| Server `server.yaml` (the schema is backwards-compatible) | All sheds and their writable uppers |
+| Host SSH keys and any custom systemd / launchd units | All snapshots |
+| Workspace data stored in `--local-dir` mounts | Workspace data that lived only inside the upper of a deleted shed |
+| Published images on `ghcr.io` (once v0.5.0 tags ship) | Pre-v3 v1/v2 metadata under `instances/` and `snapshots/` |
+
+Workspace data that you care about belongs under a `--local-dir` mount.
+Anything that only ever lived inside a shed's writable layer is lost by
+design during the upgrade wipe.
+
+## Backend migration
+
+Follow the canonical wipe steps in the backend setup guides; they live
+alongside the rest of the install instructions and are kept in sync with
+the install path you use.
+
+- **macOS (VZ):**
+  [Upgrading from v0.4.x](getting-started/vz-setup.md#upgrading-from-v04x)
+- **Linux (Firecracker):**
+  [Upgrading from v0.4.x](getting-started/fc-setup.md#upgrading-from-v04x)
+
+At a high level, both flows are: stop the server, `rm -rf` the legacy
+blob / instance / snapshot / upper directories, install the new binary
+or rebuild from source, restart the server, and re-pull or rebuild
+images.
+
+## Recovery scenarios
+
+If you see one of the following errors, the most likely cause is a
+partial upgrade — a v0.5.0 binary running against a v0.4.x on-disk
+layout, or vice versa.
+
+### `... is a directory` when starting a shed
+
+The runtime tried to open a v0.4.x flat-file rootfs cache
+(`<variant>-rootfs.ext4`) and found a v0.5.0 blob directory instead, or
+vice versa. The blob store and the legacy cache cannot coexist on the
+same `images_dir`.
+
+Fix: follow the wipe steps in
+[VZ Setup](getting-started/vz-setup.md#upgrading-from-v04x) or
+[Firecracker Setup](getting-started/fc-setup.md#upgrading-from-v04x)
+to drop the legacy `blobs/`, `instances/`, `snapshots/`, and
+`uppers/` directories, then re-pull or rebuild images.
+
+### `image has N layers (max 16)` when pulling
+
+The image you're pulling has more than 16 ext4 layers. v0.5.0 caps
+manifests at 16 layers to keep boot-time overlay assembly bounded.
+
+Fix:
+
+- If you're pulling a published `ghcr.io/charliek/shed-*` image
+  produced before v0.5.0, that image is incompatible — wait for a
+  v0.5.0+ tag (see "Published images" below) or rebuild locally with
+  `./scripts/build-vz-rootfs.sh` / `./scripts/build-firecracker-rootfs.sh`.
+- If you're pulling a custom image, rebuild with fewer / squashed
+  Docker layers.
+
+### `SHED-INIT-04` panic during VM boot
+
+```
+SHED-INIT-04 overlay mount failed (kernel module not loaded or lowerdir too long?)
+```
+
+The in-guest initramfs failed to assemble the overlay. Most often the
+cached initramfs is stale (built before the overlay-mount fix or the
+`/proc`-mount-order fix landed).
+
+Fix: re-run the build script for your backend
+(`./scripts/build-vz-rootfs.sh` or
+`./scripts/build-firecracker-rootfs.sh`) to refresh the cached
+initramfs. The build pipeline installs the rootfs, kernel, and initrd
+atomically into the blob store. If you're using published images,
+re-pull with `shed image pull <ref> -t <tag>` once v0.5.0 images ship.
+
+If the initramfs is fresh, see [Storage Model](reference/storage-model.md)
+for overlay layout. The panic codes are stable — `SHED-INIT-04` is
+specifically the overlay mount; `SHED-INIT-02` / `-03` are missing or
+unmountable lower blocks; `SHED-INIT-06` / `-08` are corrupt uppers
+(recover with `shed reset <name>`).
+
+### `405 Method Not Allowed, Allow: DELETE` on `POST /api/images/pull`
+
+A v0.4.x router precedence bug routed `POST /api/images/pull` to the
+parametric `/api/images/{name}` DELETE handler.
+
+This is fixed in v0.5.0. If you still see it, you're talking to an old
+`shed-server`; upgrade the server binary.
+
+## Published images
+
+The published `ghcr.io/charliek/shed-*` v0.4.x images use the old
+flattened layout and are not v0.5.0-compatible. v0.5.0-compatible
+published images become available once the `v0.5.0` tag is cut and CI
+republishes the variants.
+
+Until then, the supported path is a local rebuild:
+
+```bash
+# macOS / VZ
+./scripts/build-vz-rootfs.sh --variant full
+
+# Linux / Firecracker
+./scripts/build-firecracker-rootfs.sh --variant full
+```
+
+Local builds write directly into the blob store and advance the
+`base` / `extensions` / `full` tags. Check available tags at
+<https://github.com/charliek/shed/pkgs/container/shed-vz-full> (and the
+parallel `shed-fc-*` packages) once they ship.
+
+## Verifying the upgrade
+
+```bash
+shed image ls            # should list the rebuilt or re-pulled tags
+shed create test --image full
+shed console test        # boots into the overlay-merged rootfs
+shed delete test
+```
+
+If `shed create` succeeds and `shed console` lands you in a shell, the
+upgrade is complete.

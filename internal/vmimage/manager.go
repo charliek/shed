@@ -411,7 +411,11 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		}
 		m, err := LoadManifestByDigest(imagesDir, t.Digest)
 		if err != nil {
-			log.Printf("Warning: tag %q points at unreadable manifest %s: %v", tag, t.Digest, err)
+			if errors.Is(err, ErrLegacyBundledBlob) {
+				log.Printf("Warning: tag %q references legacy bundled blob: %v", tag, err)
+			} else {
+				log.Printf("Warning: tag %q points at unreadable manifest %s: %v", tag, t.Digest, err)
+			}
 			manifests = append(manifests, manifestInfo{digest: t.Digest, tag: tag})
 			continue
 		}
@@ -435,7 +439,11 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		}
 		mf, err := LoadManifestByDigest(imagesDir, digest)
 		if err != nil {
-			log.Printf("Warning: index entry %s unreadable: %v", digest, err)
+			if errors.Is(err, ErrLegacyBundledBlob) {
+				log.Printf("Warning: index entry %s references legacy bundled blob: %v", digest, err)
+			} else {
+				log.Printf("Warning: index entry %s unreadable: %v", digest, err)
+			}
 			continue
 		}
 		manifests = append(manifests, manifestInfo{digest: digest, manifest: mf})

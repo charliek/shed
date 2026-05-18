@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -538,10 +539,17 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 			// ResolveTag returns the digest too — carry it through
 			// so EnsureImage doesn't have to re-do tag lookup
 			// (which races against concurrent `shed image pull`).
-			if digest, cached, err := vmimage.ResolveTag(imagesDir, image); err == nil {
-				if manifest, mErr := vmimage.LoadManifestByDigest(imagesDir, digest); mErr == nil && manifest.ShedSourceRef() == val {
+			digest, cached, err := vmimage.ResolveTag(imagesDir, image)
+			if err == nil {
+				manifest, mErr := vmimage.LoadManifestByDigest(imagesDir, digest)
+				if mErr != nil && errors.Is(mErr, vmimage.ErrLegacyBundledBlob) {
+					return ResolvedImage{}, mErr
+				}
+				if mErr == nil && manifest.ShedSourceRef() == val {
 					return ResolvedImage{Path: cached, Name: image, Digest: digest}, nil
 				}
+			} else if errors.Is(err, vmimage.ErrLegacyBundledBlob) {
+				return ResolvedImage{}, err
 			}
 			return ResolvedImage{DockerRef: val, Name: image}, nil
 		}
@@ -550,8 +558,12 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 
 	// Auto-discover by tag in the blob store.
 	if imagesDir != "" {
-		if digest, discovered, err := vmimage.ResolveTag(imagesDir, image); err == nil {
+		digest, discovered, err := vmimage.ResolveTag(imagesDir, image)
+		if err == nil {
 			return ResolvedImage{Path: discovered, Name: image, Digest: digest}, nil
+		}
+		if errors.Is(err, vmimage.ErrLegacyBundledBlob) {
+			return ResolvedImage{}, err
 		}
 	}
 
