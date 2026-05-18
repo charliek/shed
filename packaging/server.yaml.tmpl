@@ -36,11 +36,33 @@ log_level: info
 #     - aws-credentials
 #     - docker-credentials
 
+vz:
+  vfkit_path: vfkit
+  kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+  initrd_path: ~/Library/Application Support/shed/vz/initrd.img
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v{{VERSION}}
+  images:
+    base: ghcr.io/charliek/shed-vz-base:v{{VERSION}}
+    extensions: ghcr.io/charliek/shed-vz-extensions:v{{VERSION}}
+    full: ghcr.io/charliek/shed-vz-full:v{{VERSION}}
+  instance_dir: ~/Library/Application Support/shed/vz/instances
+  socket_dir: ~/.shed/vz/sockets
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  console_port: 1024
+  notify_port: 1026
+  tcp_proxy_port: 1028
+  start_timeout: 60s
+  stop_timeout: 10s
+
 firecracker:
   kernel_path: /var/lib/shed/firecracker/images/vmlinux
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v{{VERSION}}
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v{{VERSION}}
   images:
     base: ghcr.io/charliek/shed-fc-base:v{{VERSION}}
+    extensions: ghcr.io/charliek/shed-fc-extensions:v{{VERSION}}
+    full: ghcr.io/charliek/shed-fc-full:v{{VERSION}}
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2

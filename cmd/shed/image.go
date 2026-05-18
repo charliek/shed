@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -24,7 +23,7 @@ var imageCmd = &cobra.Command{
 
 var (
 	imageBuildFile      string
-	imageBuildFrom      string
+	imageBuildInitrd    string
 	imageBuildName      string
 	imageBuildTarget    string
 	imageBuildSize      string
@@ -39,20 +38,19 @@ var (
 var imageBuildCmd = &cobra.Command{
 	Use:   "build [context]",
 	Short: "Build a rootfs image",
-	Long: `Build a rootfs image from a Dockerfile or Docker registry image.
+	Long: `Build a rootfs image from a Dockerfile.
 
-There are two modes:
-
-  Dockerfile mode (default):
-    shed image build -f Dockerfile.shed -n myimage .
-
-  Registry mode (--from):
-    shed image build --from ghcr.io/org/image:v1.0.0 -n myimage
+Example:
+  shed image build -f Dockerfile.shed -n myimage .
 
 The target platform is auto-detected from the host OS (linux/amd64 for
-Firecracker, linux/arm64 for VZ). The resulting ext4 image is stored in
+Firecracker, linux/arm64 for VZ). The resulting OCI image is stored in
 the images directory and is immediately available for use with:
-  shed create mydev --image myimage`,
+  shed create mydev --image myimage
+
+To consume an image from a registry instead of building locally, use
+'shed image pull <ref>' — the old 'shed image build --from <ref>' mode
+was removed in this release.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runImageBuild,
 }
@@ -93,6 +91,23 @@ var imageTagCmd = &cobra.Command{
 	RunE:  runImageTag,
 }
 
+var imagePushCmd = &cobra.Command{
+	Use:   "push <tag-or-digest> <destination-ref>",
+	Short: "Push an image to a registry",
+	Long: `Push the manifest currently held by a tag (or digest) to a
+destination registry reference, byte-perfect: the on-disk layer blobs
+are streamed unchanged so any signatures attached to the original
+remain valid.
+
+By default this talks to a running shed-server via the HTTP API.
+Pass --local (or -c <config>) to read the OCI store directly without
+needing a server — useful for CI publish flows and standalone hosts.`,
+	Args: cobra.ExactArgs(2),
+	RunE: runImagePush,
+}
+
+var imagePushLocal bool
+
 var imagePullCmd = &cobra.Command{
 	Use:   "pull <docker-ref>",
 	Short: "Pull a Docker image into the blob store",
@@ -105,7 +120,10 @@ suffix (e.g. ghcr.io/charliek/shed-vz-experimental:v0.4.0 → 'experimental').`,
 	RunE: runImagePull,
 }
 
-var imagePullTag string
+var (
+	imagePullTag      string
+	imagePullPlatform string
+)
 
 var imagePruneCmd = &cobra.Command{
 	Use:   "prune",
@@ -117,8 +135,8 @@ var imagePruneCmd = &cobra.Command{
 
 func init() {
 	imageBuildCmd.Flags().StringVarP(&imageBuildFile, "file", "f", "", "Dockerfile path (default: ./Dockerfile.shed or ./Dockerfile)")
-	imageBuildCmd.Flags().StringVar(&imageBuildFrom, "from", "", "Docker image reference to convert directly (skips build)")
 	imageBuildCmd.Flags().StringVarP(&imageBuildName, "name", "n", "", "Image variant name (required)")
+	imageBuildCmd.Flags().StringVar(&imageBuildInitrd, "initramfs", "", "Path to a pre-built shed-overlay initramfs (built via scripts/build-initramfs.sh). Required for images that need to boot through shed's overlayfs assembly.")
 	imageBuildCmd.Flags().StringVar(&imageBuildTarget, "target", "", "Docker build target stage (Dockerfile mode only)")
 	imageBuildCmd.Flags().StringVar(&imageBuildSize, "size", "20G", "Rootfs image size")
 	imageBuildCmd.Flags().StringVar(&imageBuildOutputDir, "output-dir", "", "Output directory (auto-detected based on backend)")
@@ -129,6 +147,8 @@ func init() {
 	imagePruneCmd.Flags().BoolVar(&imagePruneForce, "force", false, "Skip confirmation prompt")
 	imagePruneCmd.Flags().BoolVar(&imagePruneDryRun, "dry-run", false, "List candidates without deleting")
 	imagePullCmd.Flags().StringVarP(&imagePullTag, "tag", "t", "", "Tag name (default: derived from docker ref)")
+	imagePullCmd.Flags().StringVar(&imagePullPlatform, "platform", "", "Platform override for multi-arch images (e.g. linux/arm64). Empty means the backend's native platform.")
+	imagePushCmd.Flags().BoolVar(&imagePushLocal, "local", false, "Push from the local OCI store (no shed-server required). Implied when -c is set without -s.")
 
 	imageCmd.AddCommand(imageBuildCmd)
 	imageCmd.AddCommand(imageListCmd)
@@ -137,6 +157,7 @@ func init() {
 	imageCmd.AddCommand(imageInspectCmd)
 	imageCmd.AddCommand(imageTagCmd)
 	imageCmd.AddCommand(imagePullCmd)
+	imageCmd.AddCommand(imagePushCmd)
 	rootCmd.AddCommand(imageCmd)
 }
 
@@ -179,21 +200,7 @@ func runImageBuild(cmd *cobra.Command, args []string) error {
 		outputDir = bc.OutputDir
 	}
 
-	if imageBuildFrom != "" {
-		return runImageBuildFromRef(cmd.Context(), outputDir, bc.Platform, bc.ExtractKernel, bc.NeedsInitrd)
-	}
 	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, bc.Platform, bc.ExtractKernel, bc.NeedsInitrd)
-}
-
-func runImageBuildFromRef(ctx context.Context, outputDir, platform string, extractKernel, needsInitrd bool) error {
-	fmt.Printf("Converting %s to ext4 rootfs...\n", imageBuildFrom)
-
-	digest, err := convertAndInstall(ctx, imageBuildFrom, outputDir, platform, extractKernel, needsInitrd)
-	if err != nil {
-		return err
-	}
-	finishImageBuild(outputDir, imageBuildFrom, digest)
-	return nil
 }
 
 func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, prefix, platform string, extractKernel, needsInitrd bool) error {
@@ -222,9 +229,25 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 
 	dockerTag := fmt.Sprintf("%s%s:latest", prefix, imageBuildName)
 
-	fmt.Printf("Building Docker image %s...\n", dockerTag)
-	buildArgs := []string{"buildx", "build", "--platform", platform,
-		"-t", dockerTag, "--load", "-f", dockerfile}
+	// Emit buildx output as an OCI image-layout tar so shed's Convert
+	// ingests the full layer structure (Dockerfile stages that `FROM`
+	// each other share layers in the OCI store, which lights up the
+	// SHARED column in `shed image ls`). The legacy --load + docker
+	// create/export flatten path collapsed everything to one layer.
+	ociTar, err := os.CreateTemp("", "shed-build-*.tar")
+	if err != nil {
+		return fmt.Errorf("creating build output tempfile: %w", err)
+	}
+	ociTarPath := ociTar.Name()
+	ociTar.Close()
+	defer os.Remove(ociTarPath)
+
+	fmt.Printf("Building Docker image %s (OCI output → %s)...\n", dockerTag, ociTarPath)
+	buildArgs := []string{
+		"buildx", "build", "--platform", platform,
+		"--output", "type=oci,dest=" + ociTarPath,
+		"-f", dockerfile,
+	}
 	if imageBuildTarget != "" {
 		buildArgs = append(buildArgs, "--target", imageBuildTarget)
 	}
@@ -237,8 +260,8 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 		return fmt.Errorf("docker build failed: %w", err)
 	}
 
-	fmt.Printf("\nConverting to ext4 rootfs...\n")
-	digest, err := convertAndInstall(ctx, dockerTag, outputDir, platform, extractKernel, needsInitrd)
+	fmt.Printf("\nIngesting OCI layers into shed store...\n")
+	digest, err := convertAndInstall(ctx, dockerTag, ociTarPath, outputDir, platform, extractKernel, needsInitrd)
 	if err != nil {
 		return err
 	}
@@ -246,68 +269,34 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 	return nil
 }
 
-// convertAndInstall runs Convert, installs the result into the blob
-// store at the computed digest, and advances the imageBuildName tag.
-// Returns the digest installed.
-func convertAndInstall(ctx context.Context, sourceRef, outputDir, platform string, extractKernel, needsInitrd bool) (string, error) {
-	// Validate the tag up front: SetTag would also catch this, but only
-	// after Convert + InstallBlob have done minutes of work and left a
-	// dangling untagged blob in the store.
+// convertAndInstall runs the OCI Convert flow against `imagesDir`,
+// which writes the manifest+config+layer+kernel+initrd blobs into the
+// OCI layout and materializes a derived ext4 in the cache, then
+// advances the imageBuildName tag to the new manifest digest.
+// Returns the manifest digest.
+func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir, platform string, extractKernel, needsInitrd bool) (string, error) {
 	if err := vmimage.ValidateImageName(imageBuildName); err != nil {
 		return "", fmt.Errorf("invalid image name %q: %w", imageBuildName, err)
 	}
 
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
-		DockerRef:     sourceRef,
-		Name:          imageBuildName,
-		OutputDir:     outputDir,
-		RootfsSize:    imageBuildSize,
-		Platform:      platform,
-		ExtractKernel: extractKernel,
-		NeedsInitrd:   needsInitrd,
+		OCIArchivePath:   ociArchivePath,
+		DockerRef:        sourceRef,
+		Name:             imageBuildName,
+		ImagesDir:        imagesDir,
+		RootfsSize:       imageBuildSize,
+		Platform:         platform,
+		ExtractKernel:    extractKernel,
+		NeedsInitrd:      needsInitrd,
+		InitrdSourcePath: imageBuildInitrd,
 	})
 	if err != nil {
 		return "", fmt.Errorf("conversion failed: %w", err)
 	}
-	defer vmimage.CleanupConvert(result)
-
-	rootfsLogical := int64(0)
-	if fi, err := os.Stat(result.RootfsPath); err == nil {
-		rootfsLogical = fi.Size()
-	}
-	manifest := vmimage.Manifest{
-		SchemaVersion:     vmimage.ManifestSchemaVersion,
-		Digest:            result.Digest,
-		SourceRef:         sourceRef,
-		RootfsLogicalSize: rootfsLogical,
-		CreatedAt:         time.Now().UTC(),
-	}
-	files := map[string]string{vmimage.BlobRootfsFilename: result.RootfsPath}
-	if result.KernelPath != "" {
-		files[vmimage.BlobKernelFilename] = result.KernelPath
-		if fi, err := os.Stat(result.KernelPath); err == nil {
-			manifest.KernelSize = fi.Size()
-		}
-	}
-	if result.InitrdPath != "" {
-		files[vmimage.BlobInitrdFilename] = result.InitrdPath
-		if fi, err := os.Stat(result.InitrdPath); err == nil {
-			manifest.InitrdSize = fi.Size()
-		}
-	}
-
-	if _, _, err := vmimage.InstallBlob(outputDir, vmimage.BlobInstallSpec{
-		Files:    files,
-		Manifest: manifest,
-	}); err != nil {
-		return "", fmt.Errorf("installing blob: %w", err)
-	}
-
-	if err := vmimage.SetTag(outputDir, imageBuildName, result.Digest); err != nil {
+	if err := vmimage.SetTag(imagesDir, imageBuildName, result.ManifestDigest); err != nil {
 		return "", fmt.Errorf("advancing tag %q: %w", imageBuildName, err)
 	}
-
-	return result.Digest, nil
+	return result.ManifestDigest, nil
 }
 
 // finishImageBuild prints success output. Tag advancement happens inside
@@ -464,8 +453,14 @@ func runImageInspect(_ *cobra.Command, args []string) error {
 		fmt.Fprintf(w, "Size:\t%s\n", formatSize(resp.Image.SizeBytes))
 	}
 	fmt.Fprintf(w, "In use:\t%v\n", resp.Image.InUse)
-	if !resp.Manifest.CreatedAt.IsZero() {
-		fmt.Fprintf(w, "Created:\t%s\n", resp.Manifest.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+	if resp.Manifest.Variant != "" {
+		fmt.Fprintf(w, "Variant:\t%s\n", resp.Manifest.Variant)
+	}
+	if resp.Manifest.SourceRef != "" {
+		fmt.Fprintf(w, "Source ref:\t%s\n", resp.Manifest.SourceRef)
+	}
+	if len(resp.Manifest.Layers) > 0 {
+		fmt.Fprintf(w, "Layers:\t%d\n", len(resp.Manifest.Layers))
 	}
 	w.Flush()
 	return nil
@@ -502,7 +497,7 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	client := NewAPIClientFromEntry(entry, DefaultTimeout)
-	resp, err := client.PullImage(dockerRef, tag)
+	resp, err := client.PullImage(dockerRef, tag, imagePullPlatform)
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}
@@ -510,6 +505,43 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 		return outputJSON(resp)
 	}
 	printSuccess("Pulled %s as tag %q (%s)", dockerRef, resp.Tag, vmimage.ShortDigest(resp.Digest))
+	return nil
+}
+
+func runImagePush(_ *cobra.Command, args []string) error {
+	source := args[0]
+	dest := args[1]
+
+	// Local mode: --local explicit, or -c <config> passed without
+	// -s <server>. Otherwise talk to a running shed-server.
+	useLocal := imagePushLocal || (configFlag != "" && serverFlag == "")
+	if useLocal {
+		mgr, err := loadLocalManager()
+		if err != nil {
+			return err
+		}
+		if err := mgr.PushImage(context.Background(), source, dest, func(stage, msg string) {
+			fmt.Printf("  %s: %s\n", stage, msg)
+		}); err != nil {
+			return fmt.Errorf("failed to push image: %w", err)
+		}
+		printSuccess("Pushed %s → %s", source, dest)
+		return nil
+	}
+
+	entry, _, err := getServerEntry()
+	if err != nil {
+		return err
+	}
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	resp, err := client.PushImage(source, dest)
+	if err != nil {
+		return fmt.Errorf("failed to push image: %w", err)
+	}
+	if jsonFlag {
+		return outputJSON(resp)
+	}
+	printSuccess("Pushed %s → %s", resp.Source, resp.Destination)
 	return nil
 }
 

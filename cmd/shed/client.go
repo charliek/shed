@@ -428,10 +428,22 @@ func (c *APIClient) TagImage(src, dst string) error {
 }
 
 // PullImage pulls a Docker reference into the blob store under the named tag.
-func (c *APIClient) PullImage(dockerRef, tag string) (*config.ImagePullResponse, error) {
-	body := config.ImagePullRequest{DockerRef: dockerRef, Tag: tag}
+// platform is an optional override (e.g. "linux/arm64").
+func (c *APIClient) PullImage(dockerRef, tag, platform string) (*config.ImagePullResponse, error) {
+	body := config.ImagePullRequest{DockerRef: dockerRef, Tag: tag, Platform: platform}
 	var resp config.ImagePullResponse
 	if err := c.doRequestWithTimeout(http.MethodPost, "/api/images/pull", body, &resp, 30*time.Minute); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// PushImage uploads the manifest held by source (tag or digest) to a
+// destination registry ref. Byte-perfect.
+func (c *APIClient) PushImage(source, destination string) (*config.ImagePushResponse, error) {
+	body := config.ImagePushRequest{Source: source, Destination: destination}
+	var resp config.ImagePushResponse
+	if err := c.doRequestWithTimeout(http.MethodPost, "/api/images/push", body, &resp, 30*time.Minute); err != nil {
 		return nil, err
 	}
 	return &resp, nil

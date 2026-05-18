@@ -4,8 +4,6 @@
 package firecracker
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,32 +62,19 @@ func createTestInstance(t *testing.T, dir, name string) *Metadata {
 	return meta
 }
 
-// installTestBlob installs a fake blob into imagesDir and tags it with
-// `tag`. Returns the digest.
+// installTestBlob installs a synthetic OCI image into imagesDir with
+// the given body bytes as the layer content, tagged at `tag` (or no
+// tag if empty). Returns the OCI manifest digest, which is what
+// metadata records under LowerDigest.
 func installTestBlob(t *testing.T, imagesDir, tag string, body []byte) string {
 	t.Helper()
-	stagingDir := t.TempDir()
-	src := filepath.Join(stagingDir, "rootfs.ext4")
-	if err := os.WriteFile(src, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(body)
-	digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
-	if _, _, err := vmimage.InstallBlob(imagesDir, vmimage.BlobInstallSpec{
-		Files: map[string]string{vmimage.BlobRootfsFilename: src},
-		Manifest: vmimage.Manifest{
-			SchemaVersion:     vmimage.ManifestSchemaVersion,
-			Digest:            digest,
-			SourceRef:         "ghcr.io/test/" + tag + ":v1",
-			RootfsLogicalSize: int64(len(body)),
-		},
-	}); err != nil {
-		t.Fatalf("InstallBlob: %v", err)
-	}
+	srcRef := ""
 	if tag != "" {
-		if err := vmimage.SetTag(imagesDir, tag, digest); err != nil {
-			t.Fatalf("SetTag: %v", err)
-		}
+		srcRef = "ghcr.io/test/" + tag + ":v1"
+	}
+	digest, err := vmimage.InstallSyntheticImage(imagesDir, tag, srcRef, body, nil, nil)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
 	return digest
 }

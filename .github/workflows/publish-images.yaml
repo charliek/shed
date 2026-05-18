@@ -54,25 +54,18 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build shed-agent (linux/arm64)
+      - name: Build shed binaries
         run: |
-          GOOS=linux GOARCH=arm64 go build \
-            -ldflags "-s -w \
-              -X github.com/charliek/shed/internal/version.Version=${{ steps.version.outputs.bare }} \
-              -X github.com/charliek/shed/internal/version.GitCommit=${{ steps.version.outputs.sha }} \
-              -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}" \
-            -o vz/shed-agent \
-            ./cmd/shed-agent
-
-      - name: Build shed-firstboot (linux/arm64)
-        run: |
-          GOOS=linux GOARCH=arm64 go build \
-            -ldflags "-s -w \
-              -X github.com/charliek/shed/internal/version.Version=${{ steps.version.outputs.bare }} \
-              -X github.com/charliek/shed/internal/version.GitCommit=${{ steps.version.outputs.sha }} \
-              -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}" \
-            -o vz/shed-firstboot \
-            ./cmd/shed-firstboot
+          LDFLAGS="-s -w \
+            -X github.com/charliek/shed/internal/version.Version=${{ steps.version.outputs.bare }} \
+            -X github.com/charliek/shed/internal/version.GitCommit=${{ steps.version.outputs.sha }} \
+            -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}"
+          # In-VM binaries staged into the Dockerfile build context.
+          GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-agent ./cmd/shed-agent
+          GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-firstboot ./cmd/shed-firstboot
+          # Host-side CLI used to drive OCI conversion + push.
+          mkdir -p bin
+          go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -84,27 +77,58 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push shed-vz-base
+      - name: Build shed-overlay initramfs
         run: |
-          docker buildx build \
+          ./scripts/build-initramfs.sh \
+            --backend vz \
             --platform linux/arm64 \
-            --target shed-vz-base \
-            -t ghcr.io/charliek/shed-vz-base:${{ steps.version.outputs.tag }} \
-            --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
-            --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
-            --push \
-            vz/
+            --output /tmp/shed-initrd-vz.img
 
-      - name: Build and push shed-vz-experimental
+      - name: Build OCI images (base, extensions, full)
         run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            --target shed-vz-experimental \
-            -t ghcr.io/charliek/shed-vz-experimental:${{ steps.version.outputs.tag }} \
-            --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
-            --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
-            --push \
-            vz/
+          # Local OCI store; shed image build writes here, shed image
+          # push streams from here to ghcr.io.
+          mkdir -p /tmp/oci-store-vz
+          for variant in base extensions full; do
+            echo "=== building shed-vz-${variant} ==="
+            ./bin/shed image build \
+              --target "shed-vz-${variant}" \
+              -n "${variant}" \
+              --initramfs /tmp/shed-initrd-vz.img \
+              --output-dir /tmp/oci-store-vz \
+              -f vz/Dockerfile \
+              vz/
+          done
+
+      - name: Push OCI images to ghcr.io
+        run: |
+          # Server config is needed by shed image push to locate the
+          # OCI store; minimal stub pointing at the build output.
+          cat > /tmp/publish-server.yaml <<YAML
+          name: publish
+          http_port: 0
+          ssh_port: 0
+          default_backend: vz
+          vz:
+            vfkit_path: vfkit
+            images_dir: /tmp/oci-store-vz
+            instance_dir: /tmp/oci-store-vz/instances
+            socket_dir: /tmp/oci-store-vz/sockets
+            default_cpus: 2
+            default_memory_mb: 1024
+            default_disk_gb: 1
+            console_port: 1024
+            notify_port: 1026
+            tcp_proxy_port: 1028
+            start_timeout: 60s
+            stop_timeout: 10s
+          YAML
+          for variant in base extensions full; do
+            echo "=== pushing shed-vz-${variant}:${{ steps.version.outputs.tag }} ==="
+            ./bin/shed -c /tmp/publish-server.yaml image push \
+              "${variant}" \
+              "ghcr.io/charliek/shed-vz-${variant}:${{ steps.version.outputs.tag }}"
+          done
 
   publish-fc:
     name: Publish FC Images
@@ -141,25 +165,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build shed-agent (linux/amd64)
+      - name: Build shed binaries
         run: |
-          GOOS=linux GOARCH=amd64 go build \
-            -ldflags "-s -w \
-              -X github.com/charliek/shed/internal/version.Version=${{ steps.version.outputs.bare }} \
-              -X github.com/charliek/shed/internal/version.GitCommit=${{ steps.version.outputs.sha }} \
-              -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}" \
-            -o firecracker/shed-agent \
-            ./cmd/shed-agent
-
-      - name: Build shed-firstboot (linux/amd64)
-        run: |
-          GOOS=linux GOARCH=amd64 go build \
-            -ldflags "-s -w \
-              -X github.com/charliek/shed/internal/version.Version=${{ steps.version.outputs.bare }} \
-              -X github.com/charliek/shed/internal/version.GitCommit=${{ steps.version.outputs.sha }} \
-              -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}" \
-            -o firecracker/shed-firstboot \
-            ./cmd/shed-firstboot
+          LDFLAGS="-s -w \
+            -X github.com/charliek/shed/internal/version.Version=${{ steps.version.outputs.bare }} \
+            -X github.com/charliek/shed/internal/version.GitCommit=${{ steps.version.outputs.sha }} \
+            -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}"
+          GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-agent ./cmd/shed-agent
+          GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-firstboot ./cmd/shed-firstboot
+          mkdir -p bin
+          go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -171,24 +186,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push shed-fc-base
+      - name: Build shed-overlay initramfs
         run: |
-          docker buildx build \
+          ./scripts/build-initramfs.sh \
+            --backend firecracker \
             --platform linux/amd64 \
-            --target shed-fc-base \
-            -t ghcr.io/charliek/shed-fc-base:${{ steps.version.outputs.tag }} \
-            --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
-            --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
-            --push \
-            firecracker/
+            --output /tmp/shed-initrd-fc.img
 
-      - name: Build and push shed-fc-experimental
+      - name: Build OCI images (base, extensions, full)
         run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            --target shed-fc-experimental \
-            -t ghcr.io/charliek/shed-fc-experimental:${{ steps.version.outputs.tag }} \
-            --label "org.opencontainers.image.version=${{ steps.version.outputs.bare }}" \
-            --label "org.opencontainers.image.revision=${{ steps.version.outputs.sha }}" \
-            --push \
-            firecracker/
+          mkdir -p /tmp/oci-store-fc
+          for variant in base extensions full; do
+            echo "=== building shed-fc-${variant} ==="
+            ./bin/shed image build \
+              --target "shed-fc-${variant}" \
+              -n "${variant}" \
+              --initramfs /tmp/shed-initrd-fc.img \
+              --output-dir /tmp/oci-store-fc \
+              -f firecracker/Dockerfile \
+              firecracker/
+          done
+
+      - name: Push OCI images to ghcr.io
+        run: |
+          cat > /tmp/publish-server.yaml <<YAML
+          name: publish
+          http_port: 0
+          ssh_port: 0
+          default_backend: firecracker
+          firecracker:
+            images_dir: /tmp/oci-store-fc
+            instance_dir: /tmp/oci-store-fc/instances
+            socket_dir: /tmp/oci-store-fc/sockets
+            default_cpus: 2
+            default_memory_mb: 1024
+            default_disk_gb: 1
+            console_port: 1024
+            notify_port: 1026
+            vsock_base_cid: 100
+            bridge_name: shed-br0
+            bridge_cidr: 172.30.0.1/24
+            tap_prefix: shed-tap
+            start_timeout: 60s
+            stop_timeout: 10s
+          YAML
+          for variant in base extensions full; do
+            echo "=== pushing shed-fc-${variant}:${{ steps.version.outputs.tag }} ==="
+            ./bin/shed -c /tmp/publish-server.yaml image push \
+              "${variant}" \
+              "ghcr.io/charliek/shed-fc-${variant}:${{ steps.version.outputs.tag }}"
+          done

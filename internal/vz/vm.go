@@ -20,6 +20,19 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
+// guestLowerDevices returns the names of the N readonly virtio-blk
+// devices the guest sees, ordered to match manifest layer order
+// (layer[0] = /dev/vdb, layer[1] = /dev/vdc, ...). vfkit / firecracker
+// assign device names by attach order, so the host's drive order
+// determines the guest's vdX letters.
+func guestLowerDevices(n int) []string {
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		out[i] = fmt.Sprintf("/dev/vd%c", 'b'+i)
+	}
+	return out
+}
+
 // credentialVirtioFS describes a VirtioFS share for a credential directory.
 type credentialVirtioFS struct {
 	SourceDir string
@@ -138,67 +151,83 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		return nil, fmt.Errorf("vm %s has no lower_digest in metadata; recreate via `shed delete && shed create`", vm.meta.Name)
 	}
 	if !vmimage.BlobExists(vm.cfg.ImagesDir, vm.meta.LowerDigest) {
-		return nil, fmt.Errorf("lower image blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
+		return nil, fmt.Errorf("manifest blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
 	}
-	lowerRootfs, err := vmimage.BlobRootfsPath(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	manifest, kernelBlobPath, initrdBlobPath, err := vmimage.NewManager(vm.cfg, nil).ResolveImageBlobs(vm.meta.LowerDigest)
 	if err != nil {
-		return nil, fmt.Errorf("resolving lower rootfs: %w", err)
+		return nil, fmt.Errorf("resolving image blobs: %w", err)
 	}
-	blobDir, err := vmimage.BlobDir(vm.cfg.ImagesDir, vm.meta.LowerDigest)
-	if err != nil {
-		return nil, fmt.Errorf("resolving blob dir: %w", err)
+	if initrdBlobPath == "" {
+		return nil, fmt.Errorf("image %s has no initrd annotation; rebuild the image", vmimage.ShortDigest(vm.meta.LowerDigest))
 	}
-	initrdPath := filepath.Join(blobDir, vmimage.BlobInitrdFilename)
-	if _, statErr := os.Stat(initrdPath); statErr != nil {
-		return nil, fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, statErr)
+	if _, statErr := os.Stat(initrdBlobPath); statErr != nil {
+		return nil, fmt.Errorf("initrd blob missing at %s: %w", initrdBlobPath, statErr)
 	}
 
-	// Prefer the kernel from inside the blob (set by `shed image install
-	// --kernel ... --consume`) over the legacy cfg.KernelPath. The build
-	// scripts consume the host-side kernel into the blob, so the legacy
-	// path is usually absent after a fresh build. cfg.KernelPath remains
-	// the fallback for images installed without a kernel.
-	kernelPath := filepath.Join(blobDir, vmimage.BlobKernelFilename)
-	if _, statErr := os.Stat(kernelPath); statErr != nil {
-		if !os.IsNotExist(statErr) {
-			return nil, fmt.Errorf("stat blob kernel at %s: %w", kernelPath, statErr)
-		}
+	// Prefer the kernel blob from the manifest annotation. Fall back to
+	// the configured `vz.kernel_path` only when the manifest lacks an
+	// io.shed.kernel.digest annotation (legacy / hand-built images).
+	kernelPath := kernelBlobPath
+	if kernelPath == "" {
 		if vm.cfg.KernelPath == "" {
-			return nil, fmt.Errorf("no kernel for %s: blob %s has no kernel and vz.kernel_path is unset; rebuild the image with `shed image install --kernel ...` or set vz.kernel_path in server.yaml", vm.meta.Name, vmimage.ShortDigest(vm.meta.LowerDigest))
+			return nil, fmt.Errorf("no kernel for %s: manifest has no kernel annotation and vz.kernel_path is unset", vm.meta.Name)
 		}
 		kernelPath = vm.cfg.KernelPath
+	} else if _, statErr := os.Stat(kernelPath); statErr != nil {
+		return nil, fmt.Errorf("kernel blob missing at %s: %w", kernelPath, statErr)
 	}
 
-	// shed.name= is read by the in-guest shed-firstboot service to set the
-	// hostname and detect rootfs clones (snapshot spawns). Shed names are
-	// validated to a kernel-cmdline-safe regex in config.ValidateShedName,
-	// so direct concatenation here is safe.
+	// Resolve every layer's cached ext4. Upper is /dev/vda; lowers
+	// occupy /dev/vdb..vd{1+N} in manifest order (layer[0] = base,
+	// pinned to the leftmost lower devices). The in-guest initramfs
+	// stacks them in reverse manifest order so the base sits at the
+	// bottom of the overlay.
+	layerPaths, err := vmimage.NewManager(vm.cfg, nil).ResolveLayerExt4Paths(context.Background(), vm.meta.LowerDigest)
+	if err != nil {
+		return nil, fmt.Errorf("resolving layer ext4s: %w", err)
+	}
+	if len(layerPaths) == 0 {
+		return nil, fmt.Errorf("manifest %s has no layers", vmimage.ShortDigest(vm.meta.LowerDigest))
+	}
+	if len(layerPaths) > vmimage.MaxLayers {
+		return nil, fmt.Errorf("image has %d layers (max %d)", len(layerPaths), vmimage.MaxLayers)
+	}
+	_ = manifest // reserved for future per-layer annotation use
+
+	// shed.lowers= names every lower device in manifest order. The
+	// initramfs builds the overlayfs lowerdir from this list.
+	lowerDevs := guestLowerDevices(len(layerPaths))
 	kernelArgs := fmt.Sprintf(
-		"console=hvc0 init=/sbin/init shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
+		"console=hvc0 init=/sbin/init shed.name=%s shed.upper=/dev/vda shed.lowers=%s",
 		vm.meta.Name,
+		strings.Join(lowerDevs, ","),
 	)
 
-	bootloader := fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", kernelPath, initrdPath, kernelArgs)
+	// Use the dedicated --kernel / --initrd / --kernel-cmdline flags
+	// instead of inlining cmdline= into --bootloader. The bootloader spec
+	// is comma-separated key=value pairs, and the kernel cmdline contains
+	// commas (e.g. shed.lowers=/dev/vdb,/dev/vdc,…) which vfkit's
+	// bootloader parser would misinterpret as extra bootloader options.
 
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
 
-	// vfkit's virtio-blk read-only flag is the bare token `readonly`
-	// (lowercase, no `=value`). Verified against crc-org/vfkit
-	// pkg/config/virtio.go: DiskStorageConfig.FromOptions errors out
-	// on any `readonly=...` form.
 	args = []string{
 		"--cpus", fmt.Sprintf("%d", vm.meta.CPUs),
 		"--memory", fmt.Sprintf("%d", vm.meta.MemoryMB),
-		"--bootloader", bootloader,
+		"--kernel", kernelPath,
+		"--initrd", initrdBlobPath,
+		"--kernel-cmdline", kernelArgs,
 		// Upper: writable, /dev/vda inside the guest.
 		"--device", fmt.Sprintf("virtio-blk,path=%s", vm.meta.RootfsPath),
-		// Lower: read-only, /dev/vdb. Shared across all sheds pinning
-		// this digest so disk + host page cache are reused.
-		"--device", fmt.Sprintf("virtio-blk,path=%s,readonly", lowerRootfs),
+	}
+	for _, p := range layerPaths {
+		args = append(args, "--device", fmt.Sprintf("virtio-blk,path=%s,readonly", p))
+	}
+	args = append(args,
 		"--device", "virtio-net,nat",
 		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLogPath),
-	}
+	)
 
 	// Add VirtioFS shared directory if a local dir is configured
 	if vm.meta.LocalDir != "" {

@@ -603,11 +603,32 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "tag: "+err.Error())
 		return
 	}
-	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag)
+	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag, req.Platform)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
 	writeJSON(w, http.StatusOK, config.ImagePullResponse{Tag: req.Tag, Digest: digest})
+}
+
+// handlePushImage uploads the manifest held by the named tag (or by a
+// digest) to a destination registry ref, byte-perfect.
+// POST /api/images/push
+func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
+	var req config.ImagePushRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.Source == "" || req.Destination == "" {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "source and destination are required")
+		return
+	}
+	if err := s.backend.PushImage(r.Context(), req.Source, req.Destination); err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, config.ImagePushResponse(req))
 }

@@ -79,7 +79,10 @@ func (f *snapshotFakeBackend) InspectImage(_ context.Context, _ string) (config.
 	panic("unexpected")
 }
 func (f *snapshotFakeBackend) TagImage(_ context.Context, _, _ string) error { panic("unexpected") }
-func (f *snapshotFakeBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+func (f *snapshotFakeBackend) PullImage(_ context.Context, _, _, _ string) (string, error) {
+	panic("unexpected")
+}
+func (f *snapshotFakeBackend) PushImage(_ context.Context, _, _ string) error {
 	panic("unexpected")
 }
 func (f *snapshotFakeBackend) DeleteImage(_ context.Context, _ string) error { panic("unexpected") }

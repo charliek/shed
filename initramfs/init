@@ -1,68 +1,99 @@
 #!/bin/sh
-# shed initramfs init: mount overlayfs (writable upper + read-only lower),
-# pivot_root, and hand off to /sbin/init in the merged rootfs.
+# shed initramfs init: mount overlayfs (writable upper + N read-only
+# lowers), pivot_root, and hand off to /sbin/init in the merged rootfs.
 #
 # Disk layout (set by the backend at VM-create time):
 #   /dev/vda  per-shed writable upper   (ext4, formatted on first boot)
-#   /dev/vdb  read-only lower image     (ext4, the immutable image blob)
+#   /dev/vdb, /dev/vdc, ...  read-only lower images, one per OCI layer.
 #
-# Kernel cmdline overrides (optional):
-#   shed.upper=/dev/vda  shed.lower=/dev/vdb
+# Kernel cmdline overrides:
+#   shed.upper=/dev/vda
+#   shed.lowers=/dev/vdb,/dev/vdc,/dev/vdd   (N-layer form, in manifest order)
+#   shed.lower=/dev/vdb                       (legacy single-layer form)
 #
 # This script intentionally avoids fancy busybox-only constructs so it
 # works equally well with full busybox and the static binaries shipped
 # in the shed-initramfs-builder image.
+#
+# Panic codes (SHED-INIT-NN) are stable so docs can link to them:
+#   SHED-INIT-02  missing lower block device
+#   SHED-INIT-03  ext4 mount failed on a lower
+#   SHED-INIT-04  overlay mount failed (kernel module / lowerdir issue)
+#   SHED-INIT-05  upper block device missing
+#   SHED-INIT-06  upper appears corrupted (no ext4 magic + no fresh sig)
+#   SHED-INIT-07  mkfs.ext4 on upper failed
+#   SHED-INIT-08  upper ext4 mount failed
+#   SHED-INIT-09  switch_root failed (caller should never see this)
 
 set -e
 
 UPPER_DEV=/dev/vda
-LOWER_DEV=/dev/vdb
-
-# Honor cmdline overrides (rudimentary parser; quoting not supported).
-for arg in $(cat /proc/cmdline 2>/dev/null || true); do
-    case "$arg" in
-        shed.upper=*) UPPER_DEV="${arg#shed.upper=}" ;;
-        shed.lower=*) LOWER_DEV="${arg#shed.lower=}" ;;
-    esac
-done
+LOWER_DEVS=""   # space-separated list of /dev/vdX paths, manifest order
 
 panic() {
+    code="$1"
+    shift
     echo ""
-    echo "shed-initramfs PANIC: $*"
+    echo "shed-initramfs PANIC [${code}]: $*"
     echo "Dropping to shell. Press Enter to continue, or 'reboot -f' to bail."
     exec /bin/sh
 }
 
-mkdir -p /proc /sys /dev /run /newroot /upper /lower
+# Mount /proc, /sys, /dev *before* parsing /proc/cmdline. The previous
+# ordering tried to read /proc/cmdline before /proc existed, which
+# silently degraded into the LOWER_DEVS=/dev/vdb legacy fallback — fine
+# for single-layer images, wrong for multi-layer.
+mkdir -p /proc /sys /dev /run /newroot /upper
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-# devtmpfs is mandatory: the wait loop below needs /dev/vda and /dev/vdb
-# to be populated by the kernel, and a plain tmpfs would have no device
-# nodes. Stock Linux kernels enable CONFIG_DEVTMPFS=y and
-# CONFIG_DEVTMPFS_MOUNT=y; we still mount explicitly for the rare
-# defconfig that disables the automount.
 mount -t devtmpfs devtmpfs /dev \
-    || panic "failed to mount devtmpfs at /dev — kernel built without CONFIG_DEVTMPFS?"
-# /dev/pts is not strictly needed pre-pivot but cheap to set up so any
-# console fallback works when init drops to a shell.
+    || panic SHED-INIT-04 "failed to mount devtmpfs at /dev — kernel built without CONFIG_DEVTMPFS?"
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts 2>/dev/null || true
 
-echo "shed-initramfs: upper=${UPPER_DEV} lower=${LOWER_DEV}"
-
-# Wait briefly for virtio-blk devices to appear. Firecracker exposes
-# them quickly; vfkit/VZ can take a few hundred ms on cold boot.
-i=0
-while [ $i -lt 50 ]; do
-    if [ -b "$UPPER_DEV" ] && [ -b "$LOWER_DEV" ]; then
-        break
-    fi
-    sleep 0.1
-    i=$((i + 1))
+# Parse kernel cmdline. shed.lowers= must come before shed.lower= in the
+# case statement (more-specific pattern first) — but the two prefixes
+# differ enough that POSIX glob doesn't actually cross-match; the order
+# is just defensive.
+for arg in $(cat /proc/cmdline 2>/dev/null || true); do
+    case "$arg" in
+        shed.upper=*) UPPER_DEV="${arg#shed.upper=}" ;;
+        shed.lowers=*)
+            list="${arg#shed.lowers=}"
+            LOWER_DEVS=$(echo "$list" | tr ',' ' ')
+            ;;
+        shed.lower=*) LOWER_DEVS="${arg#shed.lower=}" ;;
+    esac
 done
 
-[ -b "$UPPER_DEV" ] || panic "upper block device $UPPER_DEV not present"
-[ -b "$LOWER_DEV" ] || panic "lower block device $LOWER_DEV not present"
+# Legacy single-lower compatibility: if nothing parsed, default to vdb.
+if [ -z "$LOWER_DEVS" ]; then
+    LOWER_DEVS=/dev/vdb
+fi
+
+echo "shed-initramfs: upper=${UPPER_DEV} lowers=${LOWER_DEVS}"
+
+# Wait briefly for all virtio-blk devices to appear. Firecracker exposes
+# them quickly; vfkit/VZ can take a few hundred ms on cold boot.
+wait_block_device() {
+    dev="$1"
+    j=0
+    while [ $j -lt 50 ]; do
+        if [ -b "$dev" ]; then
+            return 0
+        fi
+        sleep 0.1
+        j=$((j + 1))
+    done
+    return 1
+}
+
+wait_block_device "$UPPER_DEV" \
+    || panic SHED-INIT-05 "upper block device $UPPER_DEV not present"
+for d in $LOWER_DEVS; do
+    wait_block_device "$d" \
+        || panic SHED-INIT-02 "lower block device $d not present"
+done
 
 # Format the upper on first boot, panic on corruption. The detection
 # triangulates between two markers:
@@ -77,13 +108,6 @@ done
 #   ext4 magic present                 → mount; signature is don't-care
 #   ext4 magic absent + signature here → fresh upper; mkfs.ext4
 #   ext4 magic absent + signature gone → corruption; panic with shed reset
-#
-# A zeroed first MiB (the Phase 3.6 corruption case) loses both
-# markers, so the corruption arm fires instead of silently reformatting
-# and destroying the user's writes. A subtler corruption that wipes
-# only the ext4 magic but leaves the signature intact would
-# spuriously fall into the fresh arm; that path is narrow and the
-# trade-off is acceptable since corruption that surgical is rare.
 has_magic=0
 if dd if="$UPPER_DEV" bs=1 count=2 skip=1080 2>/dev/null \
         | od -An -tx1 \
@@ -93,10 +117,6 @@ if dd if="$UPPER_DEV" bs=1 count=2 skip=1080 2>/dev/null \
 fi
 
 if [ "$has_magic" = "0" ]; then
-    # Read 16 bytes at offset 1024 and hex-encode. Must match host's
-    # FreshUpperSignature ("SHED-FRESH-UPPER") at FreshUpperSignatureOffset.
-    # Byte sequence: S=53 H=48 E=45 D=44 -=2d F=46 R=52 E=45 S=53 H=48
-    #                -=2d U=55 P=50 P=50 E=45 R=52
     sig_hex=$(dd if="$UPPER_DEV" bs=1 count=16 skip=1024 2>/dev/null \
                   | od -An -tx1 \
                   | tr -d ' \n')
@@ -104,59 +124,74 @@ if [ "$has_magic" = "0" ]; then
     if [ "$sig_hex" = "$fresh_hex" ]; then
         echo "shed-initramfs: formatting ${UPPER_DEV} (first boot, fresh signature)"
         mkfs.ext4 -F -L shed-upper "$UPPER_DEV" >/dev/null 2>&1 \
-            || panic "mkfs.ext4 on $UPPER_DEV failed"
+            || panic SHED-INIT-07 "mkfs.ext4 on $UPPER_DEV failed"
     else
-        panic "upper ${UPPER_DEV} has no ext4 magic at offset 1080 and no fresh-upper signature at offset 1024 — the writable upper appears corrupted. From the host, run 'shed reset <name>' to wipe and recreate it."
+        panic SHED-INIT-06 "upper ${UPPER_DEV} has no ext4 magic at offset 1080 and no fresh-upper signature at offset 1024 — the writable upper appears corrupted. From the host, run 'shed reset <name>' to wipe and recreate it."
     fi
 fi
 
 mount -t ext4 "$UPPER_DEV" /upper \
-    || panic "failed to mount $UPPER_DEV at /upper; the writable upper may be corrupt. From the host, run 'shed reset <name>' to wipe and recreate it."
+    || panic SHED-INIT-08 "failed to mount $UPPER_DEV at /upper; the writable upper may be corrupt. From the host, run 'shed reset <name>' to wipe and recreate it."
 mkdir -p /upper/data
-# overlayfs requires workdir to be empty at mount time; bookkeeping
-# files left behind from a prior unclean shutdown will make the next
-# mount fail. Wipe and recreate to be safe.
 rm -rf /upper/work
 mkdir -p /upper/work
 
-mount -t ext4 -o ro "$LOWER_DEV" /lower \
-    || panic "failed to mount $LOWER_DEV ro at /lower"
-
-# Load overlayfs from the lower's /lib/modules if it isn't built into
-# the kernel. Stock Ubuntu kernels ship overlayfs as a zstd-compressed
-# module (`overlay.ko.zst`); kmod's insmod (linked against libkmod) uses
-# finit_module(2) which lets the kernel decompress on the fly. If the
-# kernel already has overlayfs built in the mount below will succeed
-# regardless; if the load also fails, the overlay mount panic message
-# will surface the real cause.
-#
-# Both clauses are inside the `if` so the failure paths don't trip
-# `set -e`; a missing module file or a failed insmod just leaves the
-# fallback to the kernel's built-in overlay (if any), and the overlay
-# mount below is what ultimately surfaces an unrecoverable failure.
-ov_dir="/lower/lib/modules/$(uname -r 2>/dev/null)/kernel/fs/overlayfs"
-for ov in "$ov_dir/overlay.ko.zst" "$ov_dir/overlay.ko.xz" "$ov_dir/overlay.ko.gz" "$ov_dir/overlay.ko"; do
-    if [ -f "$ov" ] && /sbin/insmod "$ov" 2>/dev/null; then
-        break
+# Mount every lower in turn at /lower-N (1-indexed for human-readable
+# panics). Build a colon-separated overlayfs lowerdir as we go.
+# overlayfs convention: leftmost lowerdir is highest priority (top of
+# stack). Manifest layers are listed bottom-first (layer[0] = base),
+# so we build the lowerdir string in REVERSE order: last lower seen
+# goes leftmost.
+idx=0
+lower_dirs=""
+for d in $LOWER_DEVS; do
+    idx=$((idx + 1))
+    mnt="/lower-${idx}"
+    mkdir -p "$mnt"
+    mount -t ext4 -o ro "$d" "$mnt" \
+        || panic SHED-INIT-03 "failed to mount $d ro at $mnt"
+    if [ -z "$lower_dirs" ]; then
+        lower_dirs="$mnt"
+    else
+        lower_dirs="${mnt}:${lower_dirs}"
     fi
 done
 
-mount -t overlay overlay \
-    -o "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work" \
-    /newroot \
-    || panic "overlay mount failed (overlay kernel module not loaded?)"
+# Load overlayfs if not built into the kernel. /lib/modules may live in
+# any lower layer (it's part of the APT install in our images, which
+# sits a few layers above the bare distro base), so walk every lower
+# and try the first overlay.ko we find.
+kver="$(uname -r 2>/dev/null)"
+# Modern Ubuntu/Debian put kernel modules under /usr/lib/modules/; older
+# layouts use /lib/modules/. In a merged rootfs /lib is a symlink to
+# /usr/lib so both paths resolve, but layer ext4s contain only the diff
+# of their stage — the symlink may live in a different layer than the
+# modules. Probe both paths in every lower so we find overlay.ko
+# regardless of which layer happens to carry it.
+overlay_loaded=0
+i=1
+while [ $i -le $idx ]; do
+    for base in /usr/lib /lib; do
+        ov_dir="/lower-${i}${base}/modules/${kver}/kernel/fs/overlayfs"
+        for ov in "$ov_dir/overlay.ko.zst" "$ov_dir/overlay.ko.xz" "$ov_dir/overlay.ko.gz" "$ov_dir/overlay.ko"; do
+            if [ -f "$ov" ] && /sbin/insmod "$ov" 2>/dev/null; then
+                overlay_loaded=1
+                break 2
+            fi
+        done
+    done
+    i=$((i + 1))
+done
 
-# Move the API filesystems into the new root rather than re-mounting,
-# so kernel state and open fds keep working through the pivot.
+mount -t overlay overlay \
+    -o "lowerdir=${lower_dirs},upperdir=/upper/data,workdir=/upper/work" \
+    /newroot \
+    || panic SHED-INIT-04 "overlay mount failed (kernel module not loaded or lowerdir too long?)"
+
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run
 mount --move /proc /newroot/proc
 mount --move /sys  /newroot/sys
 mount --move /dev  /newroot/dev
 
-# Leave the initramfs and switch to the merged overlay. We use
-# `switch_root` rather than `pivot_root` because the initial root is
-# a kernel rootfs (initramfs), which doesn't support pivot_root —
-# `pivot_root` returns EINVAL on that root type. busybox's
-# `switch_root` does the canonical initramfs-exit dance: frees the
-# initramfs pages, chroots into /newroot, and execs /sbin/init.
-exec switch_root /newroot /sbin/init "$@"
+exec switch_root /newroot /sbin/init "$@" \
+    || panic SHED-INIT-09 "switch_root failed"

@@ -127,8 +127,13 @@ func (b *FirecrackerBackend) TagImage(_ context.Context, _, _ string) error {
 }
 
 // PullImage returns an error on non-linux platforms.
-func (b *FirecrackerBackend) PullImage(_ context.Context, _, _ string) (string, error) {
+func (b *FirecrackerBackend) PullImage(_ context.Context, _, _, _ string) (string, error) {
 	return "", fmt.Errorf("pull image: %w", config.ErrNotSupportedSentinel)
+}
+
+// PushImage returns an error on non-linux platforms.
+func (b *FirecrackerBackend) PushImage(_ context.Context, _, _ string) error {
+	return fmt.Errorf("push image: %w", config.ErrNotSupportedSentinel)
 }
 
 // DeleteImage returns an error on non-linux platforms.

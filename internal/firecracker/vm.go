@@ -84,48 +84,84 @@ func (vm *VM) Start(ctx context.Context) error {
 	// hostname and detect rootfs clones (snapshot spawns). Shed names are
 	// validated by config.ValidateShedName so direct concatenation is safe.
 	//
-	// The kernel cmdline drops `root=` because the shed initramfs builds an
-	// overlayfs and pivot_roots into the merged tree itself. shed.upper /
-	// shed.lower are read by the initramfs to locate the writable upper
-	// (vda) and read-only lower (vdb) block devices.
-	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
-		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
-	)
-
 	if vm.meta.LowerDigest == "" {
 		return fmt.Errorf("vm %s has no lower_digest in metadata; recreate via `shed delete && shed create`", vm.meta.Name)
 	}
-	lowerRootfs, err := vmimage.BlobRootfsPath(vm.cfg.ImagesDir, vm.meta.LowerDigest)
-	if err != nil {
-		return fmt.Errorf("resolving lower rootfs path: %w", err)
-	}
 	if !vmimage.BlobExists(vm.cfg.ImagesDir, vm.meta.LowerDigest) {
-		return fmt.Errorf("lower image blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
+		return fmt.Errorf("manifest blob %s is not cached; pull the image (%s) before starting", vmimage.ShortDigest(vm.meta.LowerDigest), vm.meta.LowerImageTag)
 	}
-	blobDir, err := vmimage.BlobDir(vm.cfg.ImagesDir, vm.meta.LowerDigest)
+	imageMgr := vmimage.NewManager(vm.cfg, nil)
+	_, kernelBlob, initrdBlob, err := imageMgr.ResolveImageBlobs(vm.meta.LowerDigest)
 	if err != nil {
-		return fmt.Errorf("resolving blob dir: %w", err)
+		return fmt.Errorf("resolving image blobs: %w", err)
 	}
-	initrdPath := filepath.Join(blobDir, vmimage.BlobInitrdFilename)
-	if _, err := os.Stat(initrdPath); err != nil {
-		return fmt.Errorf("lower image blob is missing initrd at %s: %w", initrdPath, err)
+	if initrdBlob == "" {
+		return fmt.Errorf("image %s has no initrd annotation; rebuild the image", vmimage.ShortDigest(vm.meta.LowerDigest))
 	}
+	if _, err := os.Stat(initrdBlob); err != nil {
+		return fmt.Errorf("initrd blob missing at %s: %w", initrdBlob, err)
+	}
+	initrdPath := initrdBlob
 
-	// Prefer the kernel from inside the blob (set by `shed image install
-	// --kernel ... --consume`) over the legacy cfg.KernelPath. The build
-	// scripts consume the host-side kernel into the blob, so the legacy
-	// path is usually absent after a fresh build. cfg.KernelPath remains
-	// the fallback for images installed without a kernel.
-	kernelPath := filepath.Join(blobDir, vmimage.BlobKernelFilename)
-	if _, err := os.Stat(kernelPath); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat blob kernel at %s: %w", kernelPath, err)
-		}
+	// Prefer the kernel blob from the manifest annotation. Fall back to
+	// the configured `firecracker.kernel_path` only when the manifest
+	// lacks an io.shed.kernel.digest annotation.
+	kernelPath := kernelBlob
+	if kernelPath == "" {
 		if vm.cfg.KernelPath == "" {
-			return fmt.Errorf("no kernel for %s: blob %s has no kernel and firecracker.kernel_path is unset; rebuild the image with `shed image install --kernel ...` or set firecracker.kernel_path in server.yaml", vm.meta.Name, vmimage.ShortDigest(vm.meta.LowerDigest))
+			return fmt.Errorf("no kernel for %s: manifest has no kernel annotation and firecracker.kernel_path is unset", vm.meta.Name)
 		}
 		kernelPath = vm.cfg.KernelPath
+	} else if _, err := os.Stat(kernelPath); err != nil {
+		return fmt.Errorf("kernel blob missing at %s: %w", kernelPath, err)
+	}
+
+	// Resolve every layer's cached ext4. Upper is /dev/vda; lowers
+	// occupy /dev/vdb..vd{1+N} in manifest order (layer[0] = base).
+	// The in-guest initramfs stacks them in reverse manifest order so
+	// the base sits at the bottom of the overlay.
+	layerPaths, err := imageMgr.ResolveLayerExt4Paths(ctx, vm.meta.LowerDigest)
+	if err != nil {
+		return fmt.Errorf("resolving layer ext4s: %w", err)
+	}
+	if len(layerPaths) == 0 {
+		return fmt.Errorf("manifest %s has no layers", vmimage.ShortDigest(vm.meta.LowerDigest))
+	}
+	if len(layerPaths) > vmimage.MaxLayers {
+		return fmt.Errorf("image has %d layers (max %d)", len(layerPaths), vmimage.MaxLayers)
+	}
+
+	lowerDevs := make([]string, len(layerPaths))
+	for i := range layerPaths {
+		lowerDevs[i] = fmt.Sprintf("/dev/vd%c", 'b'+byte(i))
+	}
+
+	kernelArgs := fmt.Sprintf(
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lowers=%s",
+		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
+		strings.Join(lowerDevs, ","),
+	)
+
+	drives := []models.Drive{
+		// Upper (writable). The initramfs runs mkfs.ext4 on first
+		// boot when no FS signature is present.
+		{
+			DriveID:      firecracker.String("rootfs"),
+			PathOnHost:   firecracker.String(vm.meta.RootfsPath),
+			IsRootDevice: firecracker.Bool(true),
+			IsReadOnly:   firecracker.Bool(false),
+		},
+	}
+	for i, p := range layerPaths {
+		// Firecracker rejects drive IDs containing characters outside
+		// [A-Za-z0-9_]; hyphens specifically fail with "API Resource
+		// IDs can only contain alphanumeric characters and underscores".
+		drives = append(drives, models.Drive{
+			DriveID:      firecracker.String(fmt.Sprintf("lower_%d", i+1)),
+			PathOnHost:   firecracker.String(p),
+			IsRootDevice: firecracker.Bool(false),
+			IsReadOnly:   firecracker.Bool(true),
+		})
 	}
 
 	fcCfg := firecracker.Config{
@@ -133,24 +169,7 @@ func (vm *VM) Start(ctx context.Context) error {
 		KernelImagePath: kernelPath,
 		InitrdPath:      initrdPath,
 		KernelArgs:      kernelArgs,
-		Drives: []models.Drive{
-			// Upper (writable). The initramfs runs mkfs.ext4 on first
-			// boot when no FS signature is present.
-			{
-				DriveID:      firecracker.String("rootfs"),
-				PathOnHost:   firecracker.String(vm.meta.RootfsPath),
-				IsRootDevice: firecracker.Bool(true),
-				IsReadOnly:   firecracker.Bool(false),
-			},
-			// Lower (read-only). Shared across all sheds that pin this
-			// digest — both disk and host page cache.
-			{
-				DriveID:      firecracker.String("lower"),
-				PathOnHost:   firecracker.String(lowerRootfs),
-				IsRootDevice: firecracker.Bool(false),
-				IsReadOnly:   firecracker.Bool(true),
-			},
-		},
+		Drives:          drives,
 		MachineCfg: models.MachineConfiguration{
 			VcpuCount:  firecracker.Int64(int64(vm.meta.CPUs)),
 			MemSizeMib: firecracker.Int64(int64(vm.meta.MemoryMB)),

@@ -185,7 +185,7 @@ shed create my-new-shed --from-snapshot <snap>
 
 ```bash
 # Set up a baseline shed
-shed create base --image experimental
+shed create base --image full
 shed ssh base
 # ...install your tools, customize the rootfs...
 exit

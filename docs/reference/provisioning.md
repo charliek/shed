@@ -245,7 +245,7 @@ The shed agent loads environment variables from `/etc/environment.d/*.conf` file
 
 Files are read in alphabetical order — later files can override values from earlier ones. Each file contains one `KEY=VALUE` pair per line. Blank lines and lines starting with `#` are ignored.
 
-The `experimental` image variant uses this mechanism to configure shed-extensions:
+The `full` image variant uses this mechanism to configure shed-extensions:
 
 ```dotenv
 # /etc/environment.d/shed-extensions.conf

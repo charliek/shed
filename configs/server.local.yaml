@@ -85,7 +85,11 @@ log_level: debug
 default_backend: firecracker
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v0.1.0
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.0-dev
+  images:
+    base: ghcr.io/charliek/shed-fc-base:v0.5.0-dev
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.0-dev
+    full: ghcr.io/charliek/shed-fc-full:v0.5.0-dev
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2

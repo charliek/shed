@@ -92,6 +92,8 @@ nav:
       - Quick Start: getting-started/quick-start.md
       - VZ Setup (macOS): getting-started/vz-setup.md
       - Firecracker Setup: getting-started/fc-setup.md
+  - Tutorials:
+      - Build Your Own Image: tutorials/build-your-own-image.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
@@ -106,6 +108,11 @@ nav:
       - Image Variants: reference/images.md
       - Extensions: reference/extensions.md
       - HTTP API: reference/api.md
+  - Discovery:
+      - Docker-Free Builds: discovery/docker-free-builds.md
+      - Layer Storage Optimization: discovery/layer-storage-optimization.md
+      - Proxy Integration: discovery/proxy_integration_design.md
+      - Web Proxy: discovery/web_proxy_discovery.md
   - Development:
       - Setup: development/setup.md
       - Testing: development/testing.md

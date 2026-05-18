@@ -3,8 +3,6 @@
 package vz
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -59,31 +57,15 @@ func createFakeSnapshot(t *testing.T, snapshotsDir, name, lowerDigest string) {
 	}
 }
 
-// createFakeImage installs a fake blob into imagesDir tagged as `name`.
-// Returns the digest.
+// createFakeImage installs a synthetic OCI image into imagesDir tagged
+// as `name`. Returns the manifest digest, which is what metadata
+// records under LowerDigest.
 func createFakeImage(t *testing.T, imagesDir, name string) string {
 	t.Helper()
-	stagingDir := t.TempDir()
-	src := filepath.Join(stagingDir, "rootfs.ext4")
 	body := []byte("fake-rootfs-" + name)
-	if err := os.WriteFile(src, body, 0o644); err != nil {
-		t.Fatalf("failed to write staging rootfs: %v", err)
-	}
-	sum := sha256.Sum256(body)
-	digest := vmimage.DigestPrefix + hex.EncodeToString(sum[:])
-	if _, _, err := vmimage.InstallBlob(imagesDir, vmimage.BlobInstallSpec{
-		Files: map[string]string{vmimage.BlobRootfsFilename: src},
-		Manifest: vmimage.Manifest{
-			SchemaVersion:     vmimage.ManifestSchemaVersion,
-			Digest:            digest,
-			SourceRef:         "ghcr.io/example/" + name + ":v1",
-			RootfsLogicalSize: int64(len(body)),
-		},
-	}); err != nil {
-		t.Fatalf("InstallBlob: %v", err)
-	}
-	if err := vmimage.SetTag(imagesDir, name, digest); err != nil {
-		t.Fatalf("SetTag: %v", err)
+	digest, err := vmimage.InstallSyntheticImage(imagesDir, name, "ghcr.io/example/"+name+":v1", body, nil, nil)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
 	return digest
 }
@@ -183,32 +165,44 @@ func TestPruneImagesRespectsRefs(t *testing.T) {
 	danglingDigest := createFakeImage(t, imagesDir, "dangling")
 	createFakeInstance(t, client.cfg.InstanceDir, "live-shed", "pinned", pinnedDigest)
 
-	// Dry-run reports the dangling blob only.
+	// Dry-run reports the dangling manifest (and its config/layer); the
+	// pinned manifest and its chain are protected.
 	cands, err := client.PruneImages(true)
 	if err != nil {
 		t.Fatalf("PruneImages(dryRun): %v", err)
 	}
-	if len(cands) != 1 || cands[0].Digest != danglingDigest {
-		t.Fatalf("expected only dangling blob as candidate, got %#v", cands)
+	if !infoHasDigest(cands, danglingDigest) {
+		t.Errorf("dangling manifest %s missing from candidates: %#v", danglingDigest, cands)
+	}
+	if infoHasDigest(cands, pinnedDigest) {
+		t.Errorf("pinned manifest %s appears in candidates: %#v", pinnedDigest, cands)
 	}
 
-	// Real prune removes the dangling blob; pinned remains.
+	// Real prune removes the dangling chain; pinned remains.
 	deleted, err := client.PruneImages(false)
 	if err != nil {
 		t.Fatalf("PruneImages: %v", err)
 	}
-	if len(deleted) != 1 || deleted[0].Digest != danglingDigest {
-		t.Fatalf("unexpected deletions: %#v", deleted)
+	if !infoHasDigest(deleted, danglingDigest) {
+		t.Fatalf("dangling manifest not deleted: %#v", deleted)
 	}
-	// PruneImages reports what it intended to delete; assert the blob
-	// is actually gone from disk so a regression that drops the
-	// DeleteBlob call is caught.
 	if vmimage.BlobExists(imagesDir, danglingDigest) {
 		t.Fatalf("dangling blob still exists after prune")
 	}
 	if !vmimage.BlobExists(imagesDir, pinnedDigest) {
 		t.Fatalf("pinned blob removed by prune")
 	}
+}
+
+// infoHasDigest reports whether digest appears in a list of
+// config.ImageInfo entries returned by PruneImages.
+func infoHasDigest(infos []config.ImageInfo, digest string) bool {
+	for _, i := range infos {
+		if i.Digest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 // TestPruneImagesProtectsSnapshotPin confirms that a snapshot's
@@ -236,13 +230,16 @@ func TestPruneImagesProtectsSnapshotPin(t *testing.T) {
 		t.Fatalf("DeleteTag: %v", err)
 	}
 
-	// Dry-run: snapshotPinned is NOT a candidate; dangling is.
+	// Dry-run: snapshotPinned's manifest is NOT a candidate; dangling's is.
 	cands, err := client.PruneImages(true)
 	if err != nil {
 		t.Fatalf("PruneImages(dryRun): %v", err)
 	}
-	if len(cands) != 1 || cands[0].Digest != dangling {
-		t.Fatalf("expected only dangling blob as candidate; got %#v (snapshot-pinned digest %s should not appear)", cands, snapshotPinned)
+	if !infoHasDigest(cands, dangling) {
+		t.Errorf("dangling manifest %s missing from candidates: %#v", dangling, cands)
+	}
+	if infoHasDigest(cands, snapshotPinned) {
+		t.Errorf("snapshot-pinned manifest %s appears in candidates: %#v", snapshotPinned, cands)
 	}
 
 	// Real prune: dangling removed, snapshot-pinned blob still present.

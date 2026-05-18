@@ -67,9 +67,13 @@ Pull and convert VM images before creating your first shed:
 sudo shed-server pull-images
 ```
 
-This downloads the configured Docker image, converts it to ext4, and extracts the kernel. Without this step, the first `shed create` performs the conversion automatically (which takes a few minutes).
+This pulls each configured image registry-direct, lands the OCI blobs
+under `images_dir/blobs/sha256/`, and materializes the per-layer ext4
+cache lazily on first boot.
 
-Cached images live under `/var/lib/shed/firecracker/images/`. See the [image storage reference](../reference/images.md#on-disk-layout) for the full layout and the [upgrade-and-reclaim cookbook](../reference/images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) for how to bump image versions and free disk space.
+The OCI image store lives under `/var/lib/shed/firecracker/images/`. See
+[Storage Model](../reference/storage-model.md) for the full layout and
+the [upgrade cookbook](../reference/images.md#cookbook-upgrading-image-versions) for how to bump image versions and free disk space.
 
 ## 4. Configure
 
@@ -103,9 +107,11 @@ env_file: /root/.shed/env
 #     - docker-credentials
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:v{version}
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
   images:
     base: ghcr.io/charliek/shed-fc-base:v{version}
+    extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
+    full: ghcr.io/charliek/shed-fc-full:v{version}
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2
@@ -150,12 +156,45 @@ The service starts automatically on reboot since the deb package enables it duri
 ## 6. Create a Firecracker Shed
 
 ```bash
-# Create a shed with the Firecracker backend
+# Create a shed with the Firecracker backend (default `full` variant)
 shed create myproject --backend=firecracker
 
 # Or with custom resources
 shed create myproject --backend=firecracker --cpus=4 --memory=8192
+
+# Or with a specific variant
+shed create myproject --backend=firecracker --image extensions
 ```
+
+## Upgrading from v0.4.x
+
+The image store schema changed from v2 to v3 with the OCI image
+rollout. Pre-v3 sheds, snapshots, and cached blobs are not migrated
+automatically — the in-guest initramfs rejects them.
+
+To upgrade:
+
+```bash
+sudo systemctl stop shed-server
+
+# Wipe the legacy store. Backup first if anything in there is precious.
+sudo rm -rf /var/lib/shed/firecracker/images/blobs
+sudo rm -rf /var/lib/shed/firecracker/images/instances
+sudo rm -rf /var/lib/shed/firecracker/images/snapshots
+sudo rm -rf /var/lib/shed/firecracker/images/uppers
+sudo rm -rf /var/lib/shed/firecracker/instances
+
+# Install the new release.
+VERSION=0.5.0
+wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
+sudo dpkg -i shed-server_${VERSION}_amd64.deb
+
+sudo systemctl start shed-server
+sudo shed-server pull-images
+```
+
+Workspace data under `--local-dir` mounts is unaffected. Workspace data
+that lived only inside the deleted upper layers is lost, by design.
 
 ## Manual Setup Reference
 
@@ -186,13 +225,19 @@ This installs `/usr/local/bin/firecracker` (v1.14.1). When using published image
 
 #### Option A: Use published images (recommended)
 
-Configure your server to use published Docker image references. Shed auto-pulls and converts them to ext4 on first use. Published images include a custom Firecracker kernel with Docker, 9P, and BPF support — no separate kernel build needed.
+Configure your server to use published OCI references. Shed pulls them
+registry-direct (no Docker daemon needed) and stacks the layers as
+overlayfs lowers on first boot. Published images include a custom
+Firecracker kernel with Docker, 9P, and BPF support — no separate kernel
+build needed.
 
 ```yaml
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-base:{version}
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
   images:
-    base: ghcr.io/charliek/shed-fc-base:{version}
+    base: ghcr.io/charliek/shed-fc-base:v{version}
+    extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
+    full: ghcr.io/charliek/shed-fc-full:v{version}
   images_dir: /var/lib/shed/firecracker/images
 ```
 
@@ -205,13 +250,14 @@ See [Image Variants](../reference/images.md) for available images and configurat
 Build rootfs images locally. Requires Go 1.24+ for compiling `shed-agent`.
 
 ```bash
-# Build the default variant
+# Build the default variant (full)
 ./scripts/build-firecracker-rootfs.sh
 
 # Build a specific variant
 ./scripts/build-firecracker-rootfs.sh --variant base
+./scripts/build-firecracker-rootfs.sh --variant extensions
 
-# Build all variants (base, default, experimental)
+# Build all variants (base, extensions, full)
 ./scripts/build-firecracker-rootfs.sh --all
 ```
 

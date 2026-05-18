@@ -294,7 +294,7 @@ persisted to `snapshot.json`.
       "name": "post-migration",
       "backend": "vz",
       "source_shed": "api-dev",
-      "source_image": "experimental",
+      "source_image": "full",
       "size_bytes": 5368709120,
       "created_at": "2026-05-10T12:00:00Z",
       "lower_digest": "sha256:abc123...",
@@ -500,7 +500,7 @@ Returns available image variants across all backends. Each entry is an
 ### GET /api/images/inspect/{name}
 
 Returns the full manifest plus `ImageInfo` for a tag or digest. `{name}`
-accepts either a tag (`experimental`) or a `sha256:...` digest (full or
+accepts either a tag (`full`) or a `sha256:...` digest (full or
 truncated).
 
 **Response (200 OK):**
@@ -508,14 +508,14 @@ truncated).
 ```json
 {
   "image": {
-    "name": "experimental",
+    "name": "full",
     "path": "/var/lib/shed/vz/blobs/sha256/abc123.../rootfs.ext4",
-    "docker_ref": "ghcr.io/charliek/shed-vz-experimental:v0.5.0",
+    "docker_ref": "ghcr.io/charliek/shed-vz-full:v0.5.0",
     "size_bytes": 3700000000,
     "source": "config",
     "cached": true,
     "digest": "sha256:abc123...",
-    "tag": "experimental",
+    "tag": "full",
     "in_use": false
   },
   "manifest": {
@@ -523,7 +523,7 @@ truncated).
     "digest": "sha256:abc123...",
     "backend": "vz",
     "arch": "arm64",
-    "source_ref": "ghcr.io/charliek/shed-vz-experimental:v0.5.0",
+    "source_ref": "ghcr.io/charliek/shed-vz-full:v0.5.0",
     "source_ref_digest": "sha256:def456...",
     "shed_ext_version": "v0.3.1",
     "kernel_size": 8388608,
@@ -550,7 +550,7 @@ directly). Equivalent to `docker tag`.
 
 ```json
 {
-  "source": "experimental",
+  "source": "full",
   "target": "stable"
 }
 ```
@@ -578,8 +578,8 @@ store, and advances a tag. Returns the resulting digest.
 
 ```json
 {
-  "docker_ref": "ghcr.io/charliek/shed-vz-experimental:v0.5.0",
-  "tag": "experimental"
+  "docker_ref": "ghcr.io/charliek/shed-vz-full:v0.5.0",
+  "tag": "full"
 }
 ```
 
@@ -592,7 +592,7 @@ store, and advances a tag. Returns the resulting digest.
 
 ```json
 {
-  "tag": "experimental",
+  "tag": "full",
   "digest": "sha256:abc123..."
 }
 ```

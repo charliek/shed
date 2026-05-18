@@ -15,25 +15,23 @@ import (
 	"github.com/charliek/shed/internal/vmimage"
 )
 
-// setupBlobForTest creates a fake content-addressed blob (rootfs.ext4 +
-// initrd) under a temp imagesDir and returns (imagesDir, digest).
-// buildVfkitArgs needs the blob to exist and contain a rootfs + initrd
-// before it will produce a usable arg list.
+// setupBlobForTest installs a synthetic OCI image (rootfs layer + kernel +
+// initrd blobs) under a temp imagesDir and returns (imagesDir, manifestDigest).
+// buildVfkitArgs needs the manifest blob to exist along with an initrd
+// annotation before it will produce a usable arg list.
 func setupBlobForTest(t *testing.T) (imagesDir, digest string) {
 	t.Helper()
 	imagesDir = t.TempDir()
-	digestHex := strings.Repeat("a", 64)
-	digest = vmimage.DigestPrefix + digestHex
-	blobDir := filepath.Join(imagesDir, "blobs", "sha256", digestHex)
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
+	rootfs := []byte("stub-rootfs-content")
+	// Distinct kernel/initrd content so the synthetic helper writes
+	// separate blobs and annotates the manifest with both digests.
+	kernel := []byte("stub-kernel-content")
+	initrd := []byte("stub-initrd-content")
+	d, err := vmimage.InstallSyntheticImage(imagesDir, "stubimg", "ghcr.io/test/stub:v1", rootfs, kernel, initrd)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
-	for _, name := range []string{vmimage.BlobRootfsFilename, vmimage.BlobInitrdFilename} {
-		if err := os.WriteFile(filepath.Join(blobDir, name), []byte("stub"), 0o444); err != nil {
-			t.Fatalf("WriteFile %s: %v", name, err)
-		}
-	}
-	return imagesDir, digest
+	return imagesDir, d
 }
 
 func TestBuildVfkitArgs(t *testing.T) {
@@ -71,8 +69,12 @@ func TestBuildVfkitArgs(t *testing.T) {
 	if !strings.Contains(argsStr, "--memory 8192") {
 		t.Errorf("expected --memory 8192 in args, got: %s", argsStr)
 	}
-	if !strings.Contains(argsStr, fmt.Sprintf("kernel=%s", cfg.KernelPath)) {
-		t.Errorf("expected kernel path in args, got: %s", argsStr)
+	// The manifest carries an io.shed.kernel.digest annotation, so the
+	// production code prefers the kernel blob over cfg.KernelPath.
+	// Kernel is passed via dedicated --kernel flag (not folded into
+	// --bootloader cmdline=) so the kernel cmdline can contain commas.
+	if !strings.Contains(argsStr, "--kernel "+filepath.Join(cfg.ImagesDir, "blobs", "sha256")) {
+		t.Errorf("expected --kernel <blob path> in args, got: %s", argsStr)
 	}
 	if !strings.Contains(argsStr, fmt.Sprintf("path=%s", meta.RootfsPath)) {
 		t.Errorf("expected rootfs path in args, got: %s", argsStr)
@@ -319,16 +321,17 @@ func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 		t.Error("expected console=hvc0 in kernel cmdline")
 	}
 	// The shed initramfs builds the overlay itself, so the legacy
-	// `root=/dev/vda rw` cmdline is replaced with shed.upper / shed.lower
-	// pointing at the writable upper and the read-only lower.
+	// `root=/dev/vda rw` cmdline is replaced with shed.upper /
+	// shed.lowers naming the writable upper and the N read-only
+	// lowers.
 	if strings.Contains(argsStr, "root=/dev/vda") {
 		t.Errorf("expected no root=/dev/vda in kernel cmdline (initramfs builds overlay): %s", argsStr)
 	}
 	if !strings.Contains(argsStr, "shed.upper=/dev/vda") {
 		t.Errorf("expected shed.upper=/dev/vda in kernel cmdline, got: %s", argsStr)
 	}
-	if !strings.Contains(argsStr, "shed.lower=/dev/vdb") {
-		t.Errorf("expected shed.lower=/dev/vdb in kernel cmdline, got: %s", argsStr)
+	if !strings.Contains(argsStr, "shed.lowers=/dev/vdb") {
+		t.Errorf("expected shed.lowers=/dev/vdb in kernel cmdline, got: %s", argsStr)
 	}
 	if !strings.Contains(argsStr, "init=/sbin/init") {
 		t.Error("expected init=/sbin/init in kernel cmdline")

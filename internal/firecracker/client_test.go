@@ -459,7 +459,7 @@ func TestMetadataBackwardCompat(t *testing.T) {
 
 	// Write metadata JSON without local_dir field (pre-9P format)
 	raw := `{
-  "version": 2,
+  "version": 3,
   "name": "old-vm",
   "status": "stopped",
   "created_at": "2024-06-15T10:00:00Z",
@@ -512,7 +512,7 @@ func TestMetadataBackwardCompat_WithLocalDir(t *testing.T) {
 	}
 
 	raw := `{
-  "version": 2,
+  "version": 3,
   "name": "new-vm",
   "status": "running",
   "created_at": "2024-06-15T10:00:00Z",

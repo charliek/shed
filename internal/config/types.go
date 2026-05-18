@@ -231,20 +231,32 @@ type ImageInspectResponse struct {
 	Manifest ImageManifest `json:"manifest"`
 }
 
-// ImageManifest mirrors vmimage.Manifest for the wire format.
+// ImageManifest mirrors vmimage.OCIManifest for the wire format.
+// Shape parallels the OCI image manifest spec; foreign tools (crane,
+// oras, skopeo) inspecting shed's store see this same JSON on disk
+// at blobs/sha256/<manifest-digest>.
 type ImageManifest struct {
-	SchemaVersion      int       `json:"schema_version"`
-	Digest             string    `json:"digest"`
-	Backend            string    `json:"backend,omitempty"`
-	Arch               string    `json:"arch,omitempty"`
-	SourceRef          string    `json:"source_ref,omitempty"`
-	SourceRefDigest    string    `json:"source_ref_digest,omitempty"`
-	ShedExtVersion     string    `json:"shed_ext_version,omitempty"`
-	KernelSize         int64     `json:"kernel_size,omitempty"`
-	InitrdSize         int64     `json:"initrd_size,omitempty"`
-	RootfsLogicalSize  int64     `json:"rootfs_logical_size"`
-	RootfsPhysicalSize int64     `json:"rootfs_physical_size,omitempty"`
-	CreatedAt          time.Time `json:"created_at"`
+	Digest        string            `json:"digest"`
+	SchemaVersion int               `json:"schema_version"`
+	MediaType     string            `json:"media_type,omitempty"`
+	Config        ImageDescriptor   `json:"config"`
+	Layers        []ImageDescriptor `json:"layers,omitempty"`
+	Annotations   map[string]string `json:"annotations,omitempty"`
+	// Convenience fields lifted from annotations for backwards
+	// compatibility with consumers that read SourceRef directly.
+	SourceRef         string `json:"source_ref,omitempty"`
+	Variant           string `json:"variant,omitempty"`
+	KernelDigest      string `json:"kernel_digest,omitempty"`
+	InitrdDigest      string `json:"initrd_digest,omitempty"`
+	RootfsLogicalSize int64  `json:"rootfs_logical_size,omitempty"`
+}
+
+// ImageDescriptor is the wire-format counterpart of vmimage.Descriptor.
+type ImageDescriptor struct {
+	MediaType   string            `json:"media_type"`
+	Digest      string            `json:"digest"`
+	Size        int64             `json:"size"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // ImageTagRequest is the body of POST /api/images/tag.
@@ -257,6 +269,23 @@ type ImageTagRequest struct {
 type ImagePullRequest struct {
 	DockerRef string `json:"docker_ref"`
 	Tag       string `json:"tag"`
+	// Platform is an optional override (e.g. "linux/arm64"). Empty
+	// means the server-side backend's native platform.
+	Platform string `json:"platform,omitempty"`
+}
+
+// ImagePushRequest is the body of POST /api/images/push.
+type ImagePushRequest struct {
+	// Source is the local tag or digest to push.
+	Source string `json:"source"`
+	// Destination is the registry reference (e.g. "ghcr.io/org/repo:v1").
+	Destination string `json:"destination"`
+}
+
+// ImagePushResponse is the response of POST /api/images/push.
+type ImagePushResponse struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
 }
 
 // ImagePullResponse is the response of POST /api/images/pull.

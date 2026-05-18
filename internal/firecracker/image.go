@@ -34,7 +34,7 @@ func (c *Client) InspectImage(tagOrDigest string) (config.ImageInspectResponse, 
 	}
 	return config.ImageInspectResponse{
 		Image:    toConfigImageInfo(*info),
-		Manifest: toConfigManifest(*manifest),
+		Manifest: toConfigManifest(info.Digest, *manifest),
 	}, nil
 }
 
@@ -45,11 +45,23 @@ func (c *Client) TagImage(srcTagOrDigest, newTag string) error {
 }
 
 // PullImage pulls a Docker ref, installs into the blob store, and tags.
-func (c *Client) PullImage(ctx context.Context, dockerRef, tag string) (string, error) {
+// platform is an optional override (e.g. "linux/arm64"); empty means
+// the backend's native platform.
+func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error) {
 	mgr := vmimage.NewManager(c.cfg, c.refScanner())
-	return mgr.PullImage(ctx, dockerRef, tag, func(stage, msg string) {
+	return mgr.PullImage(ctx, dockerRef, tag, platform, func(stage, msg string) {
 		backend.Progress(ctx, stage, msg)
 	})
+}
+
+// PushImage uploads the manifest currently held by tagOrDigest to the
+// destination registry ref. Byte-perfect: layer bytes flow from the
+// on-disk OCI store.
+func (c *Client) PushImage(ctx context.Context, tagOrDigest, dstRef string) error {
+	mgr := vmimage.NewManager(c.cfg, c.refScanner())
+	return mapSentinelErrors(mgr.PushImage(ctx, tagOrDigest, dstRef, func(stage, msg string) {
+		backend.Progress(ctx, stage, msg)
+	}))
 }
 
 // DeleteImage removes a tag (Docker model). The underlying blob is GC'd
@@ -197,22 +209,34 @@ func toConfigImageInfos(images []vmimage.ImageInfo) []config.ImageInfo {
 	return result
 }
 
-// toConfigManifest copies a vmimage.Manifest into the wire shape.
-func toConfigManifest(m vmimage.Manifest) config.ImageManifest {
-	return config.ImageManifest{
-		SchemaVersion:      m.SchemaVersion,
-		Digest:             m.Digest,
-		Backend:            m.Backend,
-		Arch:               m.Arch,
-		SourceRef:          m.SourceRef,
-		SourceRefDigest:    m.SourceRefDigest,
-		ShedExtVersion:     m.ShedExtVersion,
-		KernelSize:         m.KernelSize,
-		InitrdSize:         m.InitrdSize,
-		RootfsLogicalSize:  m.RootfsLogicalSize,
-		RootfsPhysicalSize: m.RootfsPhysicalSize,
-		CreatedAt:          m.CreatedAt,
+// toConfigManifest copies a vmimage.OCIManifest into the wire shape.
+// digest is the manifest's content digest (the same value that's
+// recorded in tags/<name>.json).
+func toConfigManifest(digest string, m vmimage.OCIManifest) config.ImageManifest {
+	out := config.ImageManifest{
+		Digest:        digest,
+		SchemaVersion: m.SchemaVersion,
+		MediaType:     m.MediaType,
+		Config: config.ImageDescriptor{
+			MediaType: m.Config.MediaType,
+			Digest:    m.Config.Digest,
+			Size:      m.Config.Size,
+		},
+		Annotations:  m.Annotations,
+		SourceRef:    m.ShedSourceRef(),
+		Variant:      m.ShedVariant(),
+		KernelDigest: m.ShedKernelDigest(),
+		InitrdDigest: m.ShedInitrdDigest(),
 	}
+	for _, layer := range m.Layers {
+		out.Layers = append(out.Layers, config.ImageDescriptor{
+			MediaType:   layer.MediaType,
+			Digest:      layer.Digest,
+			Size:        layer.Size,
+			Annotations: layer.Annotations,
+		})
+	}
+	return out
 }
 
 // mapSentinelErrors maps vmimage sentinel errors to config sentinel errors.

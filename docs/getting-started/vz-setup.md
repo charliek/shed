@@ -53,7 +53,10 @@ shed create test
 shed console test
 ```
 
-The first `shed create` pulls the VM image from the container registry and converts it to ext4. This takes a minute on the first run.
+The first `shed create` pulls the OCI image registry-direct from
+`ghcr.io` and materializes each layer's ext4 cache. This takes a
+minute on the first run; subsequent creates that share layers are
+fast.
 
 ### Service management
 
@@ -63,6 +66,31 @@ brew services restart shed          # restart after config changes
 ```
 
 Logs are at `$(brew --prefix)/var/log/shed-server.log` and `$(brew --prefix)/var/log/shed-host-agent.log`.
+
+## Upgrading from v0.4.x
+
+The image store schema changed from v2 to v3 with the OCI image
+rollout. Pre-v3 sheds, snapshots, and cached blobs are not migrated
+automatically — the in-guest initramfs rejects them.
+
+To upgrade:
+
+```bash
+brew services stop shed
+
+# Wipe the legacy store. Backup first if anything in there is precious.
+rm -rf ~/Library/Application\ Support/shed/vz/blobs
+rm -rf ~/Library/Application\ Support/shed/vz/instances
+rm -rf ~/Library/Application\ Support/shed/vz/snapshots
+rm -rf ~/Library/Application\ Support/shed/vz/uppers
+
+brew upgrade charliek/tap/shed
+brew services start shed
+sudo shed-server pull-images
+```
+
+Workspace data under `--local-dir` mounts is unaffected. Workspace data
+that lived only inside the deleted upper layers is lost, by design.
 
 ## Build from Source (Alternative)
 
@@ -86,19 +114,23 @@ make build
 
 #### Published images (recommended)
 
-Configure your server to use published Docker image references. Shed auto-pulls and converts them to ext4 on first use:
+Configure your server to use published OCI references. Shed pulls them
+registry-direct (no Docker daemon needed) and stacks the layers as
+overlayfs lowers on first boot.
 
 ```yaml
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-experimental:{version}
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
   images:
-    base: ghcr.io/charliek/shed-vz-base:{version}
-    experimental: ghcr.io/charliek/shed-vz-experimental:{version}
+    base: ghcr.io/charliek/shed-vz-base:v{version}
+    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
+    full: ghcr.io/charliek/shed-vz-full:v{version}
 ```
 
 Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
 
-The first `shed create` will pull the image, convert it to ext4, and extract the kernel and initrd automatically.
+The first `shed create` pulls each layer blob, materializes the layer
+ext4 cache, and boots. Subsequent variants reuse the shared layers.
 
 #### Build images from source
 
@@ -106,15 +138,18 @@ The first `shed create` will pull the image, convert it to ext4, and extract the
 ./scripts/build-vz-rootfs.sh
 ```
 
-This builds the `default` variant. Build other variants with `--variant`:
+This builds the `full` variant. Build other variants with `--variant`:
 
 ```bash
-./scripts/build-vz-rootfs.sh --variant base           # Minimal image
-./scripts/build-vz-rootfs.sh --variant experimental   # Default + credential brokering
-./scripts/build-vz-rootfs.sh --all                    # All variants
+./scripts/build-vz-rootfs.sh --variant base         # Minimal image
+./scripts/build-vz-rootfs.sh --variant extensions   # Base + credential brokering
+./scripts/build-vz-rootfs.sh --all                  # All variants
 ```
 
-See [Image Variants](../reference/images.md) for details. Cached images and per-shed rootfs copies live under `~/Library/Application Support/shed/vz/` — see the [on-disk layout reference](../reference/images.md#on-disk-layout) and the [upgrade-and-reclaim cookbook](../reference/images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) for how to manage disk space.
+See [Image Variants](../reference/images.md) for details. The OCI image
+store lives under `~/Library/Application Support/shed/vz/` — see
+[Storage Model](../reference/storage-model.md) and the
+[upgrade-and-reclaim cookbook](../reference/images.md#cookbook-upgrading-image-versions) for how to manage disk space.
 
 ### 4. Create directories
 
@@ -137,10 +172,11 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-experimental:{version}
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
   images:
-    base: ghcr.io/charliek/shed-vz-base:{version}
-    experimental: ghcr.io/charliek/shed-vz-experimental:{version}
+    base: ghcr.io/charliek/shed-vz-base:v{version}
+    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
+    full: ghcr.io/charliek/shed-vz-full:v{version}
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2

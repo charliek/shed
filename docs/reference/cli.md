@@ -2,6 +2,14 @@
 
 Complete reference for the `shed` command-line interface.
 
+!!! warning "Migration from v0.4.x"
+    Two image commands were removed in the OCI image rollout:
+
+    - `shed image build --from <ref>` — use [`shed image pull`](#shed-image-pull) instead. Pulls are now registry-direct via `go-containerregistry` and don't require a Docker daemon.
+    - `shed image install` — host-side blob install. The same effect is now produced by `shed image build`, `shed image pull`, or `shed image load`.
+
+    The variant lineup also changed. The old `default`, `devtools`, and `experimental` variants are replaced by `base`, `extensions`, and `full`. See [Image Variants](images.md) for the new lineup.
+
 ## Global Flags
 
 | Flag | Short | Description |
@@ -274,7 +282,9 @@ shed reset my-broken-shed --force
 
 ### shed image build
 
-Builds a rootfs image from a Dockerfile or Docker registry image. The target platform is auto-detected from the host OS (linux/amd64 for Firecracker, linux/arm64 for VZ).
+Builds an OCI image from a Dockerfile and installs it into the local
+image store. The target platform is auto-detected from the host OS
+(`linux/amd64` for Firecracker, `linux/arm64` for VZ).
 
 ```bash
 shed image build [flags] [context]
@@ -283,26 +293,32 @@ shed image build [flags] [context]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--file` | `-f` | `./Dockerfile.shed` or `./Dockerfile` | Dockerfile path |
-| `--from` | | | Docker image reference to convert directly (skips build) |
-| `--name` | `-n` | *required* | Image variant name |
-| `--target` | | | Docker build target stage (Dockerfile mode only) |
-| `--size` | | `20G` | Rootfs image size |
-| `--output-dir` | | auto-detected | Output directory |
-| `--force` | | `false` | Skip base image validation warning |
-
-**Dockerfile mode:**
+| `--name` | `-n` | *required* | Tag to advance after install |
+| `--target` | | | Build target stage |
+| `--initramfs` | | | Pre-built shed-overlay initramfs (produced by `scripts/build-initramfs.sh`). Required for images that need shed's overlayfs assembly at boot — i.e. anything you intend to `shed create` against. |
+| `--size` | | `20G` | Sparse size of the derived ext4 cache |
+| `--output-dir` | | `images_dir` from server config | Override the OCI store root |
+| `--force` | | `false` | Skip base-image validation warning |
 
 ```bash
-shed image build -f Dockerfile.shed -n myimage .
+# Build the shed-overlay initramfs once.
+./scripts/build-initramfs.sh --backend vz --platform linux/arm64 --output /tmp/shed-initrd.img
+
+# Then drive the OCI conversion.
+shed image build \
+    --target shed-vz-full \
+    -n my-image \
+    --initramfs /tmp/shed-initrd.img \
+    -f vz/Dockerfile vz/
 ```
 
-**Registry mode:**
+The `scripts/build-{vz,firecracker}-rootfs.sh` helpers wrap this flow
+for the standard variants — use them if you don't need a custom
+target.
 
-```bash
-shed image build --from ghcr.io/charliek/shed-fc-base:{version} -n myimage
-```
-
-Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
+To convert an existing registry image into the local store, use
+[`shed image pull`](#shed-image-pull) — `shed image build --from` was
+removed in the OCI rollout.
 
 ### shed image ls
 
@@ -315,15 +331,54 @@ shed image ls
 **Output:**
 
 ```text
-NAME          DIGEST          SOURCE      SIZE      IN USE   REF
-base          sha256:abc123…  config      2.1 GB    yes      ghcr.io/charliek/shed-vz-base:{version}
-experimental  sha256:def456…  config      3.8 GB    no       ghcr.io/charliek/shed-vz-experimental:{version}
-sha256:ff…    sha256:ff8800…  dangling    2.0 GB    yes      ghcr.io/test/legacy:v1
+NAME          DIGEST          SOURCE      SIZE      LAYERS   IN USE   REF
+base          sha256:abc123…  config      2.1 GB    1        yes      ghcr.io/charliek/shed-vz-base:v0.5.0
+extensions    sha256:7c2e5d…  config      2.3 GB    2        no       ghcr.io/charliek/shed-vz-extensions:v0.5.0
+full          sha256:def456…  config      3.8 GB    3        no       ghcr.io/charliek/shed-vz-full:v0.5.0
+sha256:ff…    sha256:ff8800…  dangling    2.0 GB    1        yes      ghcr.io/test/legacy:v1
 ```
+
+### shed image history
+
+Lists the layers of an image, top-down (latest layer first).
+
+```bash
+shed image history <tag-or-digest>
+```
+
+| Column | Description |
+|------|---------|
+| `LAYER` | Layer ordinal — `1` is the bottom-most overlay lower, `N` is just below the writable upper |
+| `DIGEST` | Layer blob digest |
+| `SIZE` | Layer size in the OCI manifest |
+| `CREATED` | Relative timestamp from the image config history |
+| `CREATED BY` | Matching history entry (typically the Dockerfile line that produced the layer) |
+
+**Example:**
+
+```bash
+shed image history shed-vz-full
+```
+
+```text
+LAYER  DIGEST                                                                   SIZE      CREATED         CREATED BY
+9      sha256:6214c050b2d46d711a9878da53f2ae1f1c2cc2644d1d30f9116d346c59d06ab2   493.4 MB  2 hours ago     RUN runuser -l shed -c '… mise use -g node@lts; uv python install 3.13; …'
+8      sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1     32 B    2 hours ago     ENV CLAUDE_CONFIG_DIR=/home/shed/.claude
+7      sha256:5c61939d1edf11daa570fcfe8ea24b56a60a89403f5ce91c4354cd400cad2591   6.92 MB   2 hours ago     RUN --mount=type=bind,from=shed-extensions … (extensions binaries)
+…
+2      sha256:a3e89a578b079f684c28e09084737b3ff22914ab234c60ae0064c6f4d218be54   1.18 GB   2 hours ago     RUN apt-get install systemd docker-ce …
+1      sha256:818154cda96df8bbb276b4f4339124da55756620a1037af15570bc95312850fa     28 MB   2 hours ago     ubuntu:24.04 base
+```
+
+The big shared layers — `ubuntu:24.04` (ordinal 1) and `apt-get install`
+(ordinal 2) — appear with the same digest in `base`, `extensions`, and
+`full`, so on disk they cost once across all three variants.
 
 ### shed image inspect
 
-Shows full details (manifest + blob path + in-use status) for a tag or a digest. Accepts either a tag name (`experimental`) or a `sha256:...` digest (full or truncated).
+Shows full details (manifest + annotations + cached path + in-use status)
+for a tag or a digest. Accepts either a tag name (`full`) or a
+`sha256:...` digest (full or truncated).
 
 ```bash
 shed image inspect <tag-or-digest>
@@ -339,60 +394,97 @@ shed image tag <src-tag-or-digest> <new-tag>
 
 ### shed image pull
 
-Pulls a Docker reference, converts it to ext4, installs it into the content-addressed blob store, and advances a tag. Equivalent to `docker pull` + storing the result locally.
+Pulls an OCI reference registry-direct (no Docker daemon needed),
+installs every blob into the local store, and advances a tag.
 
 ```bash
-shed image pull <docker-ref> [-t <tag>]
+shed image pull <ref> [-t <tag>] [--platform <os/arch>]
 ```
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--tag` | `-t` | derived from the ref | Tag name to advance |
+| `--tag` | `-t` | derived from the ref | Tag to advance |
+| `--platform` | | host (`linux/arm64` on VZ, `linux/amd64` on Firecracker) | Override the manifest selection for multi-arch indexes (e.g. `linux/amd64`, `linux/arm64`) |
 
-If `--tag` is omitted, the tag is derived from the last path segment of the Docker ref minus the version suffix (e.g. `ghcr.io/charliek/shed-vz-experimental:v0.4.0` → `experimental`).
+If `--tag` is omitted, the tag is derived from the last path segment of
+the ref minus the `shed-{vz,fc}-` prefix and the version suffix (e.g.
+`ghcr.io/charliek/shed-vz-extensions:v0.5.0` → `extensions`).
 
-### shed image install
+The layer ext4 caches are materialized lazily on first boot — `pull`
+itself only writes blobs into `blobs/sha256/`.
 
-Installs a pre-built rootfs (plus optional kernel and initrd) directly into the content-addressed blob store and optionally advances a tag. The structural replacement for the legacy `scripts/install-blob.sh` — same on-disk layout, but the Go path adds digest verification, per-digest flock, fsync ladder, and JSON-safe manifest encoding.
+### shed image push
+
+Pushes a local tag or manifest digest to an OCI registry. The upload is
+byte-perfect — the manifest digest at the destination equals the local
+manifest digest.
 
 ```bash
-shed image install --rootfs <path> [flags]
+shed image push <src> <dst>
 ```
+
+| Argument | Description |
+|------|---------|
+| `<src>` | Local tag (`full`) or `sha256:...` manifest digest |
+| `<dst>` | Destination OCI reference (e.g. `ghcr.io/myorg/my-shed-image:v1`) |
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--rootfs` | (required) | Path to `rootfs.ext4` |
-| `--kernel` |  | Path to the boot kernel |
-| `--initrd` |  | Path to the boot initrd |
-| `--tag` |  | Tag to advance to the resulting digest |
-| `--backend` |  | Backend recorded in the manifest (`vz` or `firecracker`) |
-| `--arch` |  | Architecture recorded in the manifest (`arm64` or `amd64`) |
-| `--source-ref` |  | Docker source reference recorded in the manifest |
-| `--images-dir` | from server config | Override the `images_dir` from server config |
-| `--consume` | `false` | Move source files into the blob (don't leave intermediates) |
-
-Operates **locally** — no shed-server interaction. The invoking user needs write access to `images_dir`. The build pipeline (`make vz-rootfs`, `make firecracker-rootfs`) calls this with `--consume` so intermediates from `mkfs.ext4` and the initramfs build don't accumulate.
-
-The digest is `sha256(rootfs.ext4)`. `InstallBlob` verifies the hash before publishing the blob, so a wrong `--rootfs` can't end up addressed under the wrong digest.
+| `--local` | `false` | Read the OCI store directly instead of routing through a running shed-server's HTTP API. Implied when `-c <config>` is passed without `-s <server>`. Useful for CI publish flows. |
 
 ```bash
-# Typical build pipeline invocation
-shed image install \
-  --rootfs ./default-rootfs.ext4 \
-  --kernel ./vmlinux \
-  --initrd ./initrd.img \
-  --tag default \
-  --backend firecracker --arch amd64 \
-  --source-ref ghcr.io/charliek/shed-fc-default:v1.0.0 \
-  --consume
+# Push against a running shed-server:
+shed image push full ghcr.io/myorg/shed-vz-full:v0.5.0
 
-# Output:
-# Digest: sha256:abc123...
-# Blob:   /var/lib/shed/firecracker/images/blobs/sha256/abc123... (installed)
-# Tag:    default -> sha256:abc123...
+# Local mode (no shed-server needed):
+shed image push --local --output-dir ./store full ghcr.io/myorg/shed-vz-full:v0.5.0
+shed -c ./publish-server.yaml image push full ghcr.io/myorg/shed-vz-full:v0.5.0
 ```
 
-When the blob with this digest already exists, the install is a no-op and reports `(already-installed)`; the tag is still advanced (idempotent).
+Authentication uses the standard Docker credential resolution chain
+(`~/.docker/config.json` and any installed credential helpers — `docker
+login ghcr.io` works).
+
+### shed image save
+
+Writes a tag and every layer it references to a single OCI archive,
+suitable for air-gap transport or backups.
+
+```bash
+shed image save <tag-or-digest> -o <file>
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--output` | `-o` | *required* | Output archive path |
+
+The archive is a standard OCI image layout — `crane manifest
+--from-archive`, `skopeo copy oci-archive:`, and similar tools work on
+it unmodified.
+
+```bash
+shed image save shed-vz-full -o shed-vz-full.tar
+crane manifest --from-archive shed-vz-full.tar
+```
+
+### shed image load
+
+Loads an OCI archive into the local store. Inverse of `shed image save`.
+
+```bash
+shed image load -i <file>
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--input` | `-i` | *required* | OCI archive path |
+
+```bash
+shed image load -i shed-vz-full.tar
+```
+
+Layers already present locally are skipped (deduplicated by blob
+digest). Tag pointers in the archive are advanced on the local side.
 
 ### shed image rm
 
@@ -777,7 +869,7 @@ sudo shed-server pull-images                  # Pull all configured variants
 sudo shed-server pull-images --variant base   # Pull only the base variant
 ```
 
-Works on both macOS (VZ) and Linux (Firecracker). Uses the images configured in `server.yaml` for the active backend. When `base_rootfs` shares a Docker ref with any `images:` entry, the `_base` cache is hardlinked to the matching variant rather than being re-pulled — `shed create` without `--image` is then immediate. See the [on-disk layout](images.md#on-disk-layout) and [upgrade cookbook](images.md#cookbook-upgrading-image-versions-and-reclaiming-disk) in the images reference.
+Works on both macOS (VZ) and Linux (Firecracker). Uses the images configured in `server.yaml` for the active backend. When `base_rootfs` shares an OCI ref with any `images:` entry, the underlying manifest is deduplicated — `_base` and the variant tag point at the same digest without a second pull. See [Storage Model](storage-model.md) for the on-disk layout and the [upgrade cookbook](images.md#cookbook-upgrading-image-versions) in the images reference.
 
 ### shed-server install
 

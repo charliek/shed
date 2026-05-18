@@ -1,11 +1,7 @@
 package vmimage
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -34,37 +30,15 @@ type fakeScanner struct {
 
 func (s *fakeScanner) ScanRefs(strict bool) ([]Reference, error) { return s.refs, s.err }
 
-// installFakeBlob installs a deterministic fake blob with the given
-// SourceRef and tag. Returns the digest.
+// installFakeBlob installs a synthetic OCI image with the given source
+// ref, tagged at `tag`, into imagesDir. Returns the manifest digest.
 func installFakeBlob(t *testing.T, imagesDir, tag, sourceRef string, body []byte) string {
 	t.Helper()
-	src := filepath.Join(t.TempDir(), "rootfs.ext4")
-	if err := os.WriteFile(src, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	digest := DigestPrefix + hex.EncodeToString(sumSha(body))
-	if _, _, err := InstallBlob(imagesDir, BlobInstallSpec{
-		Files: map[string]string{BlobRootfsFilename: src},
-		Manifest: Manifest{
-			SchemaVersion:     ManifestSchemaVersion,
-			Digest:            digest,
-			SourceRef:         sourceRef,
-			RootfsLogicalSize: int64(len(body)),
-		},
-	}); err != nil {
-		t.Fatalf("InstallBlob: %v", err)
-	}
-	if tag != "" {
-		if err := SetTag(imagesDir, tag, digest); err != nil {
-			t.Fatalf("SetTag: %v", err)
-		}
+	digest, err := InstallSyntheticImage(imagesDir, tag, sourceRef, body, nil, nil)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
 	return digest
-}
-
-func sumSha(b []byte) []byte {
-	s := sha256.Sum256(b)
-	return s[:]
 }
 
 func TestManagerListImages(t *testing.T) {
@@ -86,7 +60,7 @@ func TestManagerListImages(t *testing.T) {
 
 	// Install one tagged config-managed image.
 	installFakeBlob(t, imagesDir, "default", "ghcr.io/example/default:v1", []byte("default-body"))
-	// Install one dangling blob.
+	// Install one dangling image (no tag).
 	installFakeBlob(t, imagesDir, "", "ghcr.io/example/dangling:v1", []byte("dangling-body"))
 
 	got, err = mgr.ListImages()
@@ -135,8 +109,8 @@ func TestManagerInspectAndTag(t *testing.T) {
 	if info.Digest != digest {
 		t.Errorf("inspect digest = %q, want %q", info.Digest, digest)
 	}
-	if manifest.SourceRef != "ghcr.io/test:v1" {
-		t.Errorf("manifest source ref = %q", manifest.SourceRef)
+	if manifest.ShedSourceRef() != "ghcr.io/test:v1" {
+		t.Errorf("manifest source ref = %q", manifest.ShedSourceRef())
 	}
 
 	// Inspect by full digest.
@@ -201,25 +175,28 @@ func TestManagerPruneRefcount(t *testing.T) {
 	}}
 	mgr := NewManager(cfg, scanner)
 
-	// Dry run: dangling is a candidate; pinned is not.
+	// Dry run: every blob reachable from the dangling manifest
+	// (manifest + config + layer) is a candidate; nothing reachable
+	// from the pinned manifest is.
 	cands, err := mgr.PruneImages(true)
 	if err != nil {
 		t.Fatalf("PruneImages(dryRun): %v", err)
 	}
-	if len(cands) != 1 {
-		t.Fatalf("expected 1 prune candidate, got %d (%#v)", len(cands), cands)
+	if !hasCandidate(cands, danglingDigest) {
+		t.Errorf("dangling manifest %s missing from prune candidates: %#v", danglingDigest, cands)
 	}
-	if cands[0].Digest != danglingDigest {
-		t.Errorf("candidate digest = %s, want %s", cands[0].Digest, danglingDigest)
+	if hasCandidate(cands, pinnedDigest) {
+		t.Errorf("pinned manifest %s appears in prune candidates: %#v", pinnedDigest, cands)
 	}
 
-	// Real prune: dangling is removed, pinned remains.
+	// Real prune: every dangling-reachable blob is removed, every
+	// pinned-reachable blob remains.
 	deleted, err := mgr.PruneImages(false)
 	if err != nil {
 		t.Fatalf("PruneImages: %v", err)
 	}
-	if len(deleted) != 1 || deleted[0].Digest != danglingDigest {
-		t.Fatalf("unexpected deletions: %#v", deleted)
+	if !hasDeleted(deleted, danglingDigest) {
+		t.Fatalf("dangling manifest not deleted: %#v", deleted)
 	}
 	if !BlobExists(imagesDir, pinnedDigest) {
 		t.Fatalf("pinned blob removed by prune")
@@ -227,6 +204,28 @@ func TestManagerPruneRefcount(t *testing.T) {
 	if BlobExists(imagesDir, danglingDigest) {
 		t.Fatalf("dangling blob not removed")
 	}
+}
+
+// hasCandidate reports whether digest appears in the list of prune
+// candidates returned by PruneImages.
+func hasCandidate(cands []ImageInfo, digest string) bool {
+	for _, c := range cands {
+		if c.Digest == digest {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDeleted reports whether digest appears in the list of deleted
+// entries returned by PruneImages.
+func hasDeleted(deleted []ImageInfo, digest string) bool {
+	for _, d := range deleted {
+		if d.Digest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 func TestManagerPruneRespectsSnapshotRefs(t *testing.T) {
