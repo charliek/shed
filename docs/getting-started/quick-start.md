@@ -11,6 +11,21 @@ Get up and running with Shed in a few minutes.
 
 ## Install
 
+Shed has two install paths:
+
+- **Published packages (Homebrew on macOS, deb on Linux)** are the
+  easiest path. They install pre-built binaries and pull pre-built VM
+  images from `ghcr.io`. Pick this if you want shed running quickly and
+  don't need to modify the rootfs / kernel / initramfs.
+- **Build from source** is for contributors and bleeding-edge use. It
+  builds binaries locally from the repo and (optionally) builds the VM
+  rootfs images from the local `vz/` and `firecracker/` Dockerfiles.
+  Pick this if you're hacking on shed itself or want to run an unreleased
+  commit.
+
+Upgrading from v0.4.x? See the [Upgrade Guide](../UPGRADE.md) — the
+v0.5.0 image store is not backwards-compatible.
+
 ### Homebrew (macOS, Recommended)
 
 ```bash
@@ -39,7 +54,10 @@ See [VZ Setup](vz-setup.md) for the full macOS setup guide.
 Download and install the `.deb` from the [latest release](https://github.com/charliek/shed/releases):
 
 ```bash
-VERSION=0.3.3  # replace with desired version
+# Find the latest version at https://github.com/charliek/shed/releases
+# or, with the gh CLI:
+VERSION=$(gh release view --repo charliek/shed --json tagName -q .tagName | sed 's/^v//')
+
 wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
 sudo dpkg -i shed-server_${VERSION}_amd64.deb
 ```
@@ -67,7 +85,15 @@ make build
 go install github.com/charliek/shed/cmd/shed@latest
 ```
 
-See [VZ Setup](vz-setup.md) or [Firecracker Setup](fc-setup.md) for server setup instructions when building from source.
+`make build` produces `bin/shed`, `bin/shed-server`, and `bin/shed-agent`.
+That's only step one of a source install — `shed-server` still needs a
+server config, VM images, and (on Linux) bridge networking before it can
+launch a VM.
+
+Continue with the backend-specific setup guide:
+
+- macOS Apple Silicon: [VZ Setup — Build from Source](vz-setup.md#build-from-source-alternative)
+- Linux with KVM: [Firecracker Setup — Build from Source](fc-setup.md#build-from-source-alternative)
 
 ## Add a Server
 

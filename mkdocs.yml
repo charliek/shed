@@ -92,6 +92,7 @@ nav:
       - Quick Start: getting-started/quick-start.md
       - VZ Setup (macOS): getting-started/vz-setup.md
       - Firecracker Setup: getting-started/fc-setup.md
+      - Upgrade Guide: UPGRADE.md
   - Tutorials:
       - Build Your Own Image: tutorials/build-your-own-image.md
   - Reference:

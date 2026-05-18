@@ -120,14 +120,19 @@ overlayfs lowers on first boot.
 
 ```yaml
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.0
   images:
-    base: ghcr.io/charliek/shed-vz-base:v{version}
-    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
-    full: ghcr.io/charliek/shed-vz-full:v{version}
+    base: ghcr.io/charliek/shed-vz-base:v0.5.0
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.0
+    full: ghcr.io/charliek/shed-vz-full:v0.5.0
 ```
 
-Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
+Pin a concrete version that matches the `shed-server` you built. Once
+the `v0.5.0` tag is cut, the v0.5.0-compatible published images become
+available — check
+<https://github.com/charliek/shed/pkgs/container/shed-vz-full> for tags.
+Pre-v0.5.0 published images use the legacy flattened layout and will not
+work with v0.5.0 `shed-server`.
 
 The first `shed create` pulls each layer blob, materializes the layer
 ext4 cache, and boots. Subsequent variants reuse the shared layers.
@@ -146,10 +151,39 @@ This builds the `full` variant. Build other variants with `--variant`:
 ./scripts/build-vz-rootfs.sh --all                  # All variants
 ```
 
+The script writes directly into the local blob store and advances the
+`base`, `extensions`, and `full` tags. Confirm with `shed image ls`.
+
 See [Image Variants](../reference/images.md) for details. The OCI image
 store lives under `~/Library/Application Support/shed/vz/` — see
 [Storage Model](../reference/storage-model.md) and the
 [upgrade-and-reclaim cookbook](../reference/images.md#cookbook-upgrading-image-versions) for how to manage disk space.
+
+#### Configure server for local builds
+
+When you build images locally, the source `server.yaml` should **omit**
+`base_rootfs` and the `images:` map entirely. The runtime falls back to
+tag auto-discovery, and you pass the tag explicitly on `shed create`:
+
+```yaml
+vz:
+  vfkit_path: vfkit
+  instance_dir: ~/Library/Application Support/shed/vz/instances
+  socket_dir: ~/.shed/vz/sockets
+  # no base_rootfs, no images: — tags resolved from the local blob store
+```
+
+Then pass `--image <tag>` on every create:
+
+```bash
+shed create test --image full
+shed create dev  --image base
+```
+
+`base_rootfs` is treated as a literal path when it doesn't look like a
+Docker reference, so the bare tag form (`base_rootfs: full`) does not
+work today. Use either a fully-qualified `ghcr.io/...:vX` ref or omit
+the field and pass `--image`.
 
 ### 4. Create directories
 
@@ -170,13 +204,17 @@ default_backend: vz
 
 vz:
   vfkit_path: vfkit
-  kernel_path: ~/Library/Application Support/shed/vz/vmlinux
-  initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
+  # kernel_path and initrd_path are optional fallbacks for OCI images.
+  # The published / locally-built image blobs include their own kernel
+  # and initramfs via manifest annotations; these fields only apply if
+  # you're booting a legacy raw-rootfs image (rare).
+  # kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+  # initrd_path: ~/Library/Application Support/shed/vz/initrd.img
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.0
   images:
-    base: ghcr.io/charliek/shed-vz-base:v{version}
-    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
-    full: ghcr.io/charliek/shed-vz-full:v{version}
+    base: ghcr.io/charliek/shed-vz-base:v0.5.0
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.0
+    full: ghcr.io/charliek/shed-vz-full:v0.5.0
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2
@@ -207,15 +245,24 @@ codesign --entitlements internal/vz/entitlements.plist -s - ./bin/shed-server
 
 ### 7. Start the server
 
+Pass `--config` explicitly when your config lives outside the current
+working directory. `shed-server` without `--config` only looks at
+`./server.yaml` (CWD), **not** `~/.config/shed/server.yaml`.
+
 ```bash
-./bin/shed-server serve
+./bin/shed-server serve --config ~/.config/shed/server.yaml
 ```
 
 ### 8. Create a test shed
 
+`shed server add` registers the server under the `name:` field from
+`server.yaml`, not literally as `localhost`. Confirm with
+`shed server list` before creating a shed.
+
 ```bash
 shed server add localhost
-shed create test
+shed server list                  # shows the registered name (e.g. "my-mac")
+shed create test --image full     # required when base_rootfs is omitted
 shed console test
 ```
 

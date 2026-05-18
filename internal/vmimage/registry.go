@@ -359,7 +359,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		return nil, fmt.Errorf("listing layers: %w", err)
 	}
 	if len(layers) > MaxLayers {
-		return nil, fmt.Errorf("image has %d layers (max %d); rebuild flatter or raise MaxLayers", len(layers), MaxLayers)
+		return nil, fmt.Errorf("image has %d layers (max %d). This image was probably built with the pre-v0.5.0 build pipeline. Pull a v0.5.0 or later tag from ghcr.io, or build locally with the consolidated Dockerfile under {vz,firecracker}/Dockerfile", len(layers), MaxLayers)
 	}
 
 	layerDigests := make([]string, 0, len(layers))

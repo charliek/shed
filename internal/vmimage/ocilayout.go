@@ -238,6 +238,26 @@ func WriteBlobFromFile(imagesDir, srcPath string, consume bool) (digest, blobPat
 	return digest, final, nil
 }
 
+// detectLegacyBundledBlob returns a wrapped ErrLegacyBundledBlob if
+// path is a directory containing the v0.4.x bundled layout
+// (manifest.json sibling of kernel/initrd/rootfs.ext4). Returns nil
+// otherwise so the caller can surface the original error.
+func detectLegacyBundledBlob(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.IsDir() {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(path, "manifest.json")); err != nil {
+		return nil
+	}
+	return fmt.Errorf("%w: blob at %s is a v0.4.x bundled directory layout. "+
+		"This format is no longer supported. See "+
+		"https://github.com/charliek/shed/blob/main/docs/UPGRADE.md or "+
+		"docs/getting-started/{fc,vz}-setup.md#upgrading-from-v04x for the "+
+		"migration steps (stop server, wipe legacy store, re-pull or rebuild)",
+		ErrLegacyBundledBlob, path)
+}
+
 // ReadBlob reads a blob's bytes. Returns ErrBlobNotFound if missing.
 func ReadBlob(imagesDir, digest string) ([]byte, error) {
 	path, err := BlobPath(imagesDir, digest)
@@ -249,6 +269,9 @@ func ReadBlob(imagesDir, digest string) ([]byte, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("%w: %s", ErrBlobNotFound, digest)
 		}
+		if legacyErr := detectLegacyBundledBlob(path); legacyErr != nil {
+			return nil, legacyErr
+		}
 		return nil, fmt.Errorf("reading blob %s: %w", digest, err)
 	}
 	return data, nil
@@ -259,6 +282,12 @@ func OpenBlob(imagesDir, digest string) (*os.File, error) {
 	path, err := BlobPath(imagesDir, digest)
 	if err != nil {
 		return nil, err
+	}
+	// os.Open succeeds on directories on Linux/macOS, so a v0.4.x
+	// bundled-directory blob would otherwise return a usable but
+	// useless *os.File. Probe with Stat first.
+	if legacyErr := detectLegacyBundledBlob(path); legacyErr != nil {
+		return nil, legacyErr
 	}
 	f, err := os.Open(path)
 	if err != nil {

@@ -59,6 +59,14 @@ var (
 
 	// ErrInvalidTag is returned when a tag name is unsafe.
 	ErrInvalidTag = errors.New("invalid tag name")
+
+	// ErrLegacyBundledBlob is returned when a blob path is occupied by a
+	// v0.4.x bundled directory layout (a directory holding manifest.json,
+	// kernel, initrd, rootfs.ext4) instead of the v0.5.0+ flat-file OCI
+	// blob. The caller should surface the wrapped message so the user
+	// knows to wipe the legacy store. See ocilayout.go ReadBlob for the
+	// detection step.
+	ErrLegacyBundledBlob = errors.New("legacy v0.4.x bundled blob layout")
 )
 
 // BlobsRoot returns {imagesDir}/blobs.

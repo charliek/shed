@@ -4,6 +4,58 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Release-readiness fixes
+
+- **`POST /api/images/pull` no longer 405s.** A chi router precedence
+  bug routed `POST /api/images/pull` to the parametric
+  `DELETE /api/images/{name}` handler, returning `405 Method Not Allowed,
+  Allow: DELETE`. Fixed in `internal/api/server.go` by mounting the
+  static `/pull` route before the parametric `/{name}` sibling.
+- **Legacy bundled-blob layout now surfaces an actionable error.**
+  v0.4.x users upgrading without wiping `images_dir` previously hit a
+  cryptic `... is a directory` error. `internal/vmimage/ocilayout.go`
+  now detects this case and wraps it as `ErrLegacyBundledBlob`; the CLI
+  surfaces a message pointing the user at [`docs/UPGRADE.md`](docs/UPGRADE.md).
+- **`image has N layers (max 16)` rejection now includes a recovery
+  hint.** `internal/vmimage/registry.go` extends the pull-time
+  `MaxLayers` error with concrete next steps (wait for the v0.5.0+
+  published image, or rebuild locally with the backend's build script).
+- **`SHED-INIT-04` panic cross-references the upgrade guide.** The
+  initramfs overlay-mount panic in `initramfs/init` now points at
+  [`docs/UPGRADE.md#shed-init-04-panic-during-vm-boot`](docs/UPGRADE.md#shed-init-04-panic-during-vm-boot)
+  so operators know to refresh the cached initramfs by re-running the
+  build script.
+- **New top-level [`docs/UPGRADE.md`](docs/UPGRADE.md).** Walks v0.4.x →
+  v0.5.0 with a "what's new", a keep/lose table, links into the
+  backend-specific wipe steps in `vz-setup.md` / `fc-setup.md`, and a
+  recovery-scenarios index keyed off the error strings users actually
+  see (cryptic "is a directory", `>MaxLayers`, `SHED-INIT-04`, the
+  now-fixed 405 on `/api/images/pull`). Added to the MkDocs nav under
+  "Getting Started".
+- **Getting-started doc gap repairs.**
+  [`quick-start.md`](docs/getting-started/quick-start.md) now frames the
+  published-vs-source install paths explicitly, routes source builders
+  into the backend setup guides instead of dead-ending at `make build`,
+  and drops the stale `VERSION=0.3.3` pin in favor of a
+  `gh release view`-driven lookup.
+  [`vz-setup.md`](docs/getting-started/vz-setup.md) and
+  [`fc-setup.md`](docs/getting-started/fc-setup.md) gain a working
+  local-build `server.yaml` example (omit `base_rootfs` + `images:`,
+  rely on tag auto-discovery, pass `--image <tag>`), demote
+  `kernel_path` / `initrd_path` to optional fallbacks for OCI images,
+  spell out `shed-server serve --config <path>` (the binary doesn't
+  read `~/.config/shed/server.yaml` by default), document `uppers_dir`
+  as an optional FC config field that should track non-default
+  `instance_dir`, restructure the FC manual-setup section so source
+  builders see it as required rather than optional reference material,
+  call out the Go-on-host requirement for the FC rootfs build script,
+  and reframe `shed server add localhost` so users know it registers
+  under the server's `name:` field (with `shed server list` to confirm).
+  Concrete `:v0.5.0` placeholders replace the unresolvable `:v{version}`
+  pseudo-syntax.
+
+### Storage rewrite (Phase A / B / C)
+
 - **`shed image build` preserves the docker layer structure (multi-layer per variant).** The previous flow flattened every variant to a single layer via `docker create` + `docker export`, defeating cross-variant sharing on disk. The new flow uses `docker buildx --output type=oci,dest=<tar>` and ingests each layer blob into the local store, so `base`, `extensions`, and `full` share their common parent layers byte-for-byte. The `vz/` and `firecracker/` Dockerfiles are consolidated (BuildKit 1.7 `--mount=type=bind` for context staging) to keep each variant under the 16-layer `MaxLayers` cap: VZ ships 5 / 7 / 9 layers and FC ships 6 / 8 / 10. Measured on an arm64 Mac with all three VZ variants built locally: **~5.0 GB total** (1.7 GB blobs + 3.3 GB cache) versus **~12 GB** for the same three under the old flattened model — about **60% less disk** for users who keep multiple variants installed. Single-variant footprint is roughly unchanged; the gain is from cross-variant blob dedup.
 - **Multi-layer boot fixes surfaced during validation.** Three latent bugs only triggered once a variant carried more than one lower:
   - **vfkit bootloader cmdline:** `--bootloader linux,kernel=,initrd=,cmdline=…` is comma-separated key=value, and `shed.lowers=/dev/vdb,/dev/vdc,…` embeds commas vfkit interprets as bogus options (`unknown option /dev/vdc`). Switched to the dedicated `--kernel` / `--initrd` / `--kernel-cmdline` flags.

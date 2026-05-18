@@ -1,12 +1,21 @@
 # Firecracker Setup
 
-This guide covers the installation and setup of the Firecracker backend for shed. Firecracker is Linux-only and requires KVM.
+This guide covers the installation and setup of the Firecracker backend
+for shed. Firecracker is Linux-only and requires KVM. The remote-Linux-host
+workflow is the common case: you run `shed` on your laptop and `shed-server`
+on a separate Linux box you SSH into (e.g.,
+`ssh charliek@your.linux.host.example.com`).
 
 ## Prerequisites
 
 - Linux host with KVM support (`/dev/kvm`)
 - Root access (for network and capability setup)
 - Docker CE (for pulling and converting images). Install from [Docker's official repository](https://docs.docker.com/engine/install/ubuntu/), not the `docker.io` package in Ubuntu's default repositories.
+- **For source builds:** Go 1.24+ on the host where you run
+  `scripts/build-firecracker-rootfs.sh` (the script unconditionally
+  builds `shed-agent` and `shed-firstboot` with Go). If you don't want
+  Go on the remote Linux host, cross-compile the binaries on another
+  machine and copy them in, or use the deb package.
 
 ## 1. Install shed
 
@@ -15,7 +24,10 @@ This guide covers the installation and setup of the Firecracker backend for shed
 Download and install the `.deb` from the [latest release](https://github.com/charliek/shed/releases):
 
 ```bash
-VERSION=0.3.3  # replace with desired version
+# Find the latest version at https://github.com/charliek/shed/releases
+# or, with the gh CLI:
+VERSION=$(gh release view --repo charliek/shed --json tagName -q .tagName | sed 's/^v//')
+
 wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
 sudo dpkg -i shed-server_${VERSION}_amd64.deb
 ```
@@ -28,13 +40,25 @@ This installs:
 
 ### Build from Source (Alternative)
 
+On the remote Linux host (or wherever you'll run `shed-server`):
+
 ```bash
+ssh charliek@your.linux.host.example.com
 git clone https://github.com/charliek/shed.git
 cd shed
 make build
 ```
 
-If building from source, use `shed-server install` to create the systemd service, or run `shed-server serve` directly.
+When building from source you must also do the steps that
+`shed-server setup` automates for the deb install:
+
+- [Set up the bridge network](#set-up-bridge-network)
+- [Check and join the KVM group](#check-kvm-support)
+- [Set CAP_NET_ADMIN on the binaries](#set-capabilities-alternative-to-running-as-root) (or run as root)
+- Build or pull VM images — see [Set Up Images](#set-up-images)
+
+Use `shed-server install` to create the systemd service, or run
+`./bin/shed-server serve --config <path>` directly.
 
 ## 2. Run Automated Setup
 
@@ -107,13 +131,18 @@ env_file: /root/.shed/env
 #     - docker-credentials
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.0
   images:
-    base: ghcr.io/charliek/shed-fc-base:v{version}
-    extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
-    full: ghcr.io/charliek/shed-fc-full:v{version}
+    base: ghcr.io/charliek/shed-fc-base:v0.5.0
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.0
+    full: ghcr.io/charliek/shed-fc-full:v0.5.0
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
+  # uppers_dir is optional. Defaults to <images_dir>/uppers. If you set
+  # a non-default instance_dir (e.g. for testing under /tmp), set
+  # uppers_dir to a matching location so per-shed writable layers live
+  # alongside their sheds.
+  # uppers_dir: /var/lib/shed/firecracker/uppers
   default_cpus: 2
   default_memory_mb: 4096
   default_disk_gb: 20
@@ -127,7 +156,15 @@ firecracker:
   tap_prefix: shed-tap
 ```
 
-Replace `{version}` with the version matching your `shed` binary — run `shed version` to check. The deb package generates this config with the correct version automatically.
+Pin a concrete version that matches your `shed-server`. Once the
+`v0.5.0` tag is cut, the v0.5.0-compatible published images become
+available — check
+<https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
+Pre-v0.5.0 published images use the legacy flattened layout and will not
+work with v0.5.0 `shed-server`.
+
+The deb package generates this config with a matching version
+automatically.
 
 ### Private Repo Access
 
@@ -184,8 +221,9 @@ sudo rm -rf /var/lib/shed/firecracker/images/snapshots
 sudo rm -rf /var/lib/shed/firecracker/images/uppers
 sudo rm -rf /var/lib/shed/firecracker/instances
 
-# Install the new release.
-VERSION=0.5.0
+# Install the new release. Pick the latest v0.5.x deb from the releases page
+# (https://github.com/charliek/shed/releases), or with the gh CLI:
+VERSION=$(gh release view --repo charliek/shed --json tagName -q .tagName | sed 's/^v//')
 wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
 sudo dpkg -i shed-server_${VERSION}_amd64.deb
 
@@ -193,12 +231,29 @@ sudo systemctl start shed-server
 sudo shed-server pull-images
 ```
 
+See the [Upgrade Guide](../UPGRADE.md) for what's new in v0.5.0,
+what carries over, and recovery scenarios.
+
 Workspace data under `--local-dir` mounts is unaffected. Workspace data
 that lived only inside the deleted upper layers is lost, by design.
 
 ## Manual Setup Reference
 
-The sections below document the individual steps that `shed-server setup` automates. Use these if you need to customize the setup or are building from source without the deb package.
+The sections below document the individual steps that
+`shed-server setup` automates. **If you built from source (no deb), you
+need to walk through these manually** — the deb install path is the
+only one where `sudo shed-server setup` does it all for you.
+
+Source-build users should at minimum do:
+
+1. [Check KVM Support](#check-kvm-support) (add user to `kvm` group)
+2. [Set Up Bridge Network](#set-up-bridge-network) (bridge + NAT + IP
+   forwarding)
+3. [Set Capabilities](#set-capabilities-alternative-to-running-as-root)
+   so `shed-server` can create TAP devices without sudo
+4. [Create Required Directories](#create-required-directories)
+
+Then continue with [Set Up Images](#set-up-images) and the main flow.
 
 ### Check KVM Support
 
@@ -233,21 +288,25 @@ build needed.
 
 ```yaml
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.0
   images:
-    base: ghcr.io/charliek/shed-fc-base:v{version}
-    extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
-    full: ghcr.io/charliek/shed-fc-full:v{version}
+    base: ghcr.io/charliek/shed-fc-base:v0.5.0
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.0
+    full: ghcr.io/charliek/shed-fc-full:v0.5.0
   images_dir: /var/lib/shed/firecracker/images
 ```
 
-Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
+Pin a concrete version. Once `v0.5.0` is tagged the corresponding
+images become available — check
+<https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
 
-See [Image Variants](../reference/images.md) for available images and configuration details.
+See [Image Variants](../reference/images.md) for available images and
+configuration details.
 
 #### Option B: Build from source
 
-Build rootfs images locally. Requires Go 1.24+ for compiling `shed-agent`.
+Build rootfs images locally. Requires Go 1.24+ on the host where the
+script runs (the script compiles `shed-agent` and `shed-firstboot`).
 
 ```bash
 # Build the default variant (full)
@@ -261,7 +320,35 @@ Build rootfs images locally. Requires Go 1.24+ for compiling `shed-agent`.
 ./scripts/build-firecracker-rootfs.sh --all
 ```
 
-This creates ext4 images in `/var/lib/shed/firecracker/images/`.
+The script writes directly into the local blob store at
+`/var/lib/shed/firecracker/images/blobs/` and advances the `base`,
+`extensions`, and `full` tags. Confirm with `shed image ls`.
+
+##### Configure server for local builds
+
+When you build images locally, the source `server.yaml` should **omit**
+`base_rootfs` and the `images:` map entirely. The runtime falls back to
+tag auto-discovery, and you pass the tag explicitly on `shed create`:
+
+```yaml
+firecracker:
+  instance_dir: /var/lib/shed/firecracker/instances
+  socket_dir: /var/run/shed/firecracker
+  images_dir: /var/lib/shed/firecracker/images
+  # no base_rootfs, no images: — tags resolved from the local blob store
+```
+
+Then pass `--image <tag>` on every create:
+
+```bash
+shed create test --image full
+shed create dev  --image base
+```
+
+`base_rootfs` is treated as a literal path when it doesn't look like a
+Docker reference, so the bare tag form (`base_rootfs: full`) does not
+work today. Use either a fully-qualified `ghcr.io/...:vX` ref or omit
+the field and pass `--image`.
 
 ### Set Up Bridge Network
 
