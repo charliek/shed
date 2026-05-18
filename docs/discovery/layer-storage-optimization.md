@@ -168,7 +168,105 @@ quarterly typically don't notice the overhead.
 Nothing in this sketch is committed. Treat it as "if we don't get
 distracted by something more important."
 
-## 7. Open Questions
+## 7. Whiteout Translation for Foreign Multi-Layer Images
+
+OCI middle-layer tarballs encode file deletions as `.wh.<name>` marker
+files. `EnsureExt4FromLayer` in `internal/vmimage/cache.go` does a
+plain `tar -xzf` into a fresh ext4, so a `.wh.foo` arrives as a regular
+file rather than the character-device-zero (`mknod foo c 0 0`) that
+overlayfs honors. The result: **deletions in middle layers are
+silently ignored at boot** for any image that uses them.
+
+For shed's own variants (`base` ⊂ `extensions` ⊂ `full`) this is a
+non-issue — each stage only ADDS files on top of its parent, never
+deletes. But it's a real bug for arbitrary foreign images:
+`shed image pull` of a random image whose Dockerfile uses
+`RUN rm /something/from/parent` will produce a guest where
+`/something/from/parent` *still exists*.
+
+**Fix sketch.** During tar extraction in `EnsureExt4FromLayer`, before
+writing each tar entry to the staging ext4:
+
+1. If `entry.Name` matches `*/\.wh\.<name>` (an opaque whiteout marker)
+   — convert to `mknod <dir>/<name> c 0 0` and skip writing the marker
+   itself.
+2. If `entry.Name` matches `*/\.wh\.\.wh\..wh\.\.opq` (opaque-directory
+   marker — "ignore everything below this dir in lower layers") — set
+   the `trusted.overlay.opaque="y"` xattr on the parent directory.
+
+Both forms are defined in the [OCI image-spec layer changesets][oci-wh].
+Implementations to look at: [containerd's diff/walking package][containerd-diff],
+[crane's mutate.Extract][crane-extract], [moby's archive package][moby-archive].
+
+[oci-wh]: https://github.com/opencontainers/image-spec/blob/main/layer.md#whiteouts
+[containerd-diff]: https://github.com/containerd/containerd/blob/main/pkg/archive/tar.go
+[crane-extract]: https://github.com/google/go-containerregistry/blob/main/pkg/v1/mutate/mutate.go
+[moby-archive]: https://github.com/moby/moby/blob/master/pkg/archive/diff.go
+
+**Acceptance test once implemented:**
+
+```dockerfile
+FROM ghcr.io/charliek/shed-vz-extensions:latest
+RUN echo placeholder > /tmp/marker
+RUN rm /tmp/marker
+```
+
+Build with `shed image build`, boot, exec `ls /tmp/marker` — should
+report "No such file or directory". Today it incorrectly reports the
+file as present.
+
+## 8. Build-Time Layer Non-Determinism
+
+Buildkit's tar.gz emission isn't byte-stable: rebuilding the same
+Dockerfile from a hot cache can yield layer digests that differ by a
+handful of bytes (observed 6 B and 32 B differences between `base` and
+`extensions` for what should be identical bind-mount staging layers).
+The root cause is some combination of gzip implementation, mtime
+preservation, and tar header field ordering.
+
+Consequences:
+
+- Cross-variant sharing for the *intended-identical* staging layers
+  doesn't quite happen — two ~7 MB layers diverge between `base` and
+  `extensions` instead of being shared.
+- Local builds vs the published `ghcr.io/charliek/shed-*` tags have
+  different layer digests, so `shed image pull` after a local build of
+  the same content re-downloads identical content.
+
+Workarounds to investigate:
+
+- `BUILDKIT_INLINE_CACHE=1` + cache import/export to make the staging
+  layer hashes reproducible across builds.
+- `--source-date-epoch` (buildkit 0.13+) to pin mtimes.
+- Reproducible gzip via `--build-arg SOURCE_DATE_EPOCH=...` once
+  buildkit normalizes its compression.
+
+Loss from current state: ~14 MB across `base`+`extensions`+`full`
+(two small layers × ~7 MB unshared). Small enough that this is a
+"nice to have" not a "must fix".
+
+## 9. Spurious 32-Byte Empty Layers
+
+Each variant's manifest carries one or more 32-byte tar.gz layers
+(digest `sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1`
+— gzipped empty tar). They come from buildkit's handling of `ENV`,
+`LABEL`, and `WORKDIR` instructions when they're the *only* thing in
+a stage's diff.
+
+These layers cost almost nothing on disk (1 mkfs.ext4 prelude ≈ 1.5 MiB
+each — about 4–6 MiB across the three variants), but they pollute
+`shed image history` and bump the `MaxLayers=16` budget unnecessarily.
+
+Workarounds:
+
+- Fold the `ENV`/`LABEL` into the surrounding `RUN` via a `&&` chain.
+- Use buildkit's `--metadata-only-cache-prune` mode (if it ever lands)
+  to drop empty diff layers.
+
+This is fully cosmetic — the layer cap (16) gives plenty of headroom
+for the 9–10 we ship today.
+
+## 10. Open Questions
 
 - **Cache key for `-O ^has_journal`:** if we ever change the
   materialize parameters, the digest of `cache/sha256/<hex>.ext4` is
@@ -185,3 +283,7 @@ distracted by something more important."
   *another* shed pinning the same layer would fail to mount until the
   layer is re-materialized. Probably safer to refuse eviction while a
   shed is running on it; clarify before implementing Option B.
+- **Whiteout translation testing path:** the acceptance test above
+  needs a guest-side comparison harness — a way to walk a layer's tar
+  pre-extract and a `find /` post-boot diff. Worth building once;
+  reusable for any future layer-semantics work.
