@@ -101,9 +101,9 @@ registry round-trips and fast boot. See
 for design notes on shrinking this in the future.
 
 **Layer cap.** `MaxLayers = 16`. Manifests with more than 16 layers are
-rejected at pull/load time. Shed's own variants ship 2–4 layers; the cap
-exists to keep overlayfs and boot-time mount overhead bounded for custom
-images.
+rejected at pull/load time. Shed's own variants ship 5–10 layers (`base`
+sits near the low end, `full` near the high end); the cap keeps
+overlayfs and boot-time mount overhead bounded for custom images.
 
 ### Inspecting layers with `shed image history`
 
@@ -116,15 +116,21 @@ shed image history shed-vz-full
 
 ```text
 LAYER  DIGEST                                                                   SIZE      CREATED         CREATED BY
-3      sha256:9a1c4f3b8e2d7a05c1e0a3f81b9c6d2e74a8b5c3f9e2d7a1c4f3b8e2d7aaa05   612.4 MB  2 hours ago     LABEL io.shed.variant=full
-2      sha256:7c2e5d0f4a8b9c1e3f6a8d2b5c9e1f4a7b0d3c6f9e2d5b8a1c4f7e0d3b6a9ccc   148.2 MB  2 hours ago     LABEL io.shed.variant=extensions
-1      sha256:3f6a8d2b5c9e1f4a7b0d3c6f9e2d5b8a1c4f7e0d3b6a9c2e5d0f4a8b9c1e3fff   1.84 GB   2 hours ago     LABEL io.shed.variant=base
+9      sha256:6214c050b2d46d711a9878da53f2ae1f1c2cc2644d1d30f9116d346c59d06ab2   493.4 MB  2 hours ago     RUN runuser -l shed -c '… mise use -g node@lts; uv python install 3.13; …'
+8      sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1     32 B    2 hours ago     ENV CLAUDE_CONFIG_DIR=/home/shed/.claude
+7      sha256:5c61939d1edf11daa570fcfe8ea24b56a60a89403f5ce91c4354cd400cad2591   6.92 MB   2 hours ago     RUN --mount=type=bind,from=shed-extensions … (extensions binaries)
+…
+2      sha256:a3e89a578b079f684c28e09084737b3ff22914ab234c60ae0064c6f4d218be54   1.18 GB   2 hours ago     RUN apt-get install systemd docker-ce …
+1      sha256:818154cda96df8bbb276b4f4339124da55756620a1037af15570bc95312850fa     28 MB   2 hours ago     ubuntu:24.04 base
 ```
 
 The `CREATED BY` column is the corresponding history entry from the OCI
 config — most often the `Dockerfile` line that produced the layer. Layer
 ordinals match the order the in-guest initramfs stacks them: ordinal 1 is
 the bottom-most overlay lower, ordinal N is just below the writable upper.
+The big shared layers — `ubuntu:24.04` (ordinal 1) and the APT install
+(ordinal 2) — appear with the same digest in `base`, `extensions`, and
+`full`, so on-disk they cost once across all three variants.
 
 ### Air-gap transport with `shed image save` / `shed image load`
 

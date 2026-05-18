@@ -165,9 +165,13 @@ Verify the layer stack:
 shed image history my-image
 ```
 
-You should see three layers (or four if the Python install was split):
-your top layer, then the `extensions` and `base` layers from the
-parent.
+You should see roughly 9–11 layers: your `RUN curl … uv …`,
+`RUN curl … opencode …`, the `LABEL` and any other top-of-Dockerfile
+instructions you added, then the 7-or-so layers from the parent
+`extensions` variant. The big shared layers (`ubuntu:24.04`,
+`apt-get install …`) appear with the same digest the parent uses, so on
+disk you only pay for the bytes your top-of-Dockerfile additions
+brought in.
 
 ## 5. Boot a shed from it
 

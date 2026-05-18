@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // validExt4Size constrains the size string passed to truncate(1) /
@@ -57,7 +58,9 @@ func CacheExt4Exists(imagesDir, layerDigest string) bool {
 }
 
 // CacheExt4Size returns the on-disk size of a cached ext4 file, or 0
-// if absent.
+// if absent. Reports actual allocated blocks (st_blocks × 512), not the
+// 20 GB sparse-file logical length — otherwise `shed image ls`'s SIZE
+// column reads 100+ GB for a manifest with a handful of layers.
 func CacheExt4Size(imagesDir, layerDigest string) int64 {
 	path, err := CacheExt4Path(imagesDir, layerDigest)
 	if err != nil {
@@ -66,6 +69,9 @@ func CacheExt4Size(imagesDir, layerDigest string) int64 {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Blocks * 512
 	}
 	return fi.Size()
 }
