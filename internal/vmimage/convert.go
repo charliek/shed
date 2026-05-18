@@ -14,11 +14,13 @@
 package vmimage
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,8 +40,26 @@ const DefaultPlatform = "linux/arm64"
 const FirecrackerPlatform = "linux/amd64"
 
 // ConvertOptions configures a Docker-to-OCI conversion.
+//
+// Two input modes are supported:
+//
+//   - OCIArchivePath set: ingest a buildx-produced OCI image-layout
+//     tar (the path-of-least-surprise for shed image build). The
+//     docker image's layer structure is preserved — extensions and
+//     full variants share base's layers in the on-disk store.
+//   - DockerRef set (and OCIArchivePath empty): flatten the named
+//     local-docker-daemon image via docker create + docker export
+//     into a single OCI layer. Kept for the pull-fallback path that
+//     can't reach a registry but does have the image loaded locally.
 type ConvertOptions struct {
+	// OCIArchivePath is the path to an OCI image-layout tar produced
+	// by `docker buildx build --output type=oci,dest=...`. When set,
+	// Convert preserves the buildx layer structure.
+	OCIArchivePath string
+
 	// DockerRef is the image reference to convert (e.g. ghcr.io/.../shed-vz-full:v1.0.0).
+	// Used only when OCIArchivePath is empty — flattens via docker
+	// create/export into a single layer.
 	DockerRef string
 
 	// Name is the variant name (e.g. "full"); recorded as io.shed.variant.
@@ -192,10 +212,16 @@ func LoadConfigByDigest(imagesDir, configDigest string) (*OCIConfig, error) {
 	return ParseConfig(data)
 }
 
-// Convert pulls a Docker image, gzips its filesystem as an OCI layer,
-// writes the OCI manifest+config+layer blobs into the store, extracts
-// kernel/initrd as shed-typed blobs, and materializes the derived ext4
-// in the cache. Returns the manifest digest.
+// Convert dispatches between two input modes:
+//
+//   - OCIArchivePath: ingest a buildx OCI tar, preserving its layer
+//     structure. Shared layers (extensions FROM base) end up referenced
+//     by both manifests with identical digests in the store, so disk
+//     usage scales with unique-deltas rather than full-rootfs-per-tag.
+//   - DockerRef: flatten the named local docker daemon image to a
+//     single layer via docker create + docker export. Kept for the
+//     pull-fallback case where a ref is in the daemon but not on
+//     a registry.
 //
 // The caller advances the tag (SetTag) after Convert returns; this
 // keeps Convert pure with respect to tag indirection.
@@ -212,6 +238,307 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 	if err := EnsureOCILayout(opts.ImagesDir); err != nil {
 		return nil, err
 	}
+	if opts.OCIArchivePath != "" {
+		return convertFromOCIArchive(ctx, opts)
+	}
+	if opts.DockerRef == "" {
+		return nil, errors.New("ConvertOptions requires OCIArchivePath or DockerRef")
+	}
+	return convertFromDockerExport(ctx, opts)
+}
+
+// convertFromOCIArchive ingests a docker buildx-produced OCI image-layout
+// tar, preserving the Dockerfile's stage-to-stage layer structure. Each
+// layer blob is content-addressed; layers shared with previously-built
+// variants (extensions FROM base, full FROM extensions) collide on the
+// existing blobs in our store and dedupe automatically.
+func convertFromOCIArchive(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
+	stagingDir, err := os.MkdirTemp("", "shed-buildx-ingest-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating ingest staging dir: %w", err)
+	}
+	defer os.RemoveAll(stagingDir)
+
+	// Untar the buildx output into stagingDir. Result is an OCI image
+	// layout (oci-layout + index.json + blobs/sha256/*).
+	if err := untarOCIArchive(opts.OCIArchivePath, stagingDir); err != nil {
+		return nil, fmt.Errorf("extracting OCI archive: %w", err)
+	}
+
+	// Resolve to the platform-specific image manifest. buildx may emit
+	// an index with both the image and an attestation manifest;
+	// resolveBuildxImage filters attestations out.
+	srcManifestDigest, srcManifestBytes, err := resolveBuildxImage(stagingDir, opts.Platform)
+	if err != nil {
+		return nil, fmt.Errorf("resolving buildx image manifest: %w", err)
+	}
+	srcManifest, err := ParseManifest(srcManifestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing buildx manifest: %w", err)
+	}
+	if len(srcManifest.Layers) == 0 {
+		return nil, errors.New("buildx manifest has no layers")
+	}
+	if len(srcManifest.Layers) > MaxLayers {
+		return nil, fmt.Errorf("buildx manifest has %d layers (max %d)", len(srcManifest.Layers), MaxLayers)
+	}
+
+	// Stream each layer blob from the staging layout into our local
+	// store. Existing blobs (shared base layers between variants) are
+	// no-ops thanks to content addressing.
+	layerDigests := make([]string, 0, len(srcManifest.Layers))
+	for _, layer := range srcManifest.Layers {
+		layerDigests = append(layerDigests, layer.Digest)
+		stagingBlobPath := filepath.Join(stagingDir, "blobs", "sha256", strings.TrimPrefix(layer.Digest, DigestPrefix))
+		if BlobExists(opts.ImagesDir, layer.Digest) {
+			continue
+		}
+		data, err := os.ReadFile(stagingBlobPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading staged layer %s: %w", layer.Digest, err)
+		}
+		if _, err := WriteBlob(opts.ImagesDir, layer.Digest, data); err != nil {
+			return nil, fmt.Errorf("installing layer %s: %w", layer.Digest, err)
+		}
+	}
+
+	// Install the OCI config blob verbatim from the buildx layout.
+	srcConfigPath := filepath.Join(stagingDir, "blobs", "sha256", strings.TrimPrefix(srcManifest.Config.Digest, DigestPrefix))
+	cfgBytes, err := os.ReadFile(srcConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading staged config: %w", err)
+	}
+	configDigest := srcManifest.Config.Digest
+	if _, err := WriteBlob(opts.ImagesDir, configDigest, cfgBytes); err != nil {
+		return nil, fmt.Errorf("installing config blob: %w", err)
+	}
+	srcConfig, _ := ParseConfig(cfgBytes) // best-effort; we only use rootfs.diff_ids for logging
+
+	// Extract kernel from the freshly-installed layers (top layer first
+	// since later RUNs override earlier ones).
+	var kernelDigest string
+	if opts.ExtractKernel {
+		kd, err := extractKernelFromLayers(opts.ImagesDir, layerDigests)
+		if err != nil {
+			return nil, fmt.Errorf("extracting kernel from buildx layers: %w", err)
+		}
+		kernelDigest = kd
+	}
+
+	// Initrd: prefer caller-supplied path (the shed-overlay initramfs);
+	// fall back to extracting from layers for non-shed Dockerfiles.
+	var initrdDigest string
+	if opts.InitrdSourcePath != "" {
+		if _, err := os.Stat(opts.InitrdSourcePath); err != nil {
+			return nil, fmt.Errorf("initrd source %q: %w", opts.InitrdSourcePath, err)
+		}
+		d, _, err := WriteBlobFromFile(opts.ImagesDir, opts.InitrdSourcePath, false)
+		if err != nil {
+			return nil, fmt.Errorf("installing initrd blob: %w", err)
+		}
+		initrdDigest = d
+	} else if opts.NeedsInitrd {
+		d, err := extractInitrdFromLayers(opts.ImagesDir, layerDigests)
+		if err != nil {
+			return nil, fmt.Errorf("extracting initrd from buildx layers: %w", err)
+		}
+		initrdDigest = d
+	}
+
+	// Materialize ext4 for each layer. EnsureExt4FromLayer is
+	// content-addressed: shared base layers between variants reuse the
+	// existing cache file without rebuilding.
+	for _, ld := range layerDigests {
+		if _, err := EnsureExt4FromLayer(ctx, opts.ImagesDir, ld, opts.Platform, opts.RootfsSize); err != nil {
+			return nil, fmt.Errorf("materializing ext4 for layer %s: %w", ShortDigest(ld), err)
+		}
+	}
+
+	// Build our shed-annotated manifest referencing the same layer +
+	// config digests as buildx emitted. Adding annotations changes the
+	// manifest digest (it's our digest now, not the buildx digest) —
+	// that's fine because our annotations are the source of truth for
+	// shed runtime behavior.
+	manifest := &OCIManifest{
+		SchemaVersion: 2,
+		MediaType:     MediaTypeOCIManifest,
+		Config: Descriptor{
+			MediaType: MediaTypeOCIConfig,
+			Digest:    configDigest,
+			Size:      int64(len(cfgBytes)),
+		},
+		Layers: append([]Descriptor{}, srcManifest.Layers...),
+		Annotations: map[string]string{
+			AnnotationSchemaVersion: ShedSchemaVersion,
+			AnnotationVariant:       opts.Name,
+			AnnotationSourceRef:     opts.DockerRef,
+		},
+	}
+	if kernelDigest != "" {
+		manifest.Annotations[AnnotationKernelDigest] = kernelDigest
+	}
+	if initrdDigest != "" {
+		manifest.Annotations[AnnotationInitrdDigest] = initrdDigest
+	}
+	manData, err := manifest.MarshalIndent()
+	if err != nil {
+		return nil, fmt.Errorf("marshalling manifest: %w", err)
+	}
+	manifestDigest := DigestBytes(manData)
+	if _, err := WriteBlob(opts.ImagesDir, manifestDigest, manData); err != nil {
+		return nil, fmt.Errorf("installing manifest blob: %w", err)
+	}
+
+	if err := indexUpsert(opts.ImagesDir, Descriptor{
+		MediaType: MediaTypeOCIManifest,
+		Digest:    manifestDigest,
+		Size:      int64(len(manData)),
+		Annotations: map[string]string{
+			"org.opencontainers.image.ref.name": opts.Name,
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("updating index.json: %w", err)
+	}
+
+	rootfsLogical := int64(0)
+	if srcConfig != nil {
+		// Sum uncompressed layer sizes as an approximation. We don't
+		// have the per-diff_id sizes from the OCI config, so this is
+		// best-effort display data only.
+		_ = srcConfig // kept for future use
+	}
+	_ = srcManifestDigest // unused; we mint our own manifest digest with annotations
+
+	return &ConvertResult{
+		ManifestDigest:    manifestDigest,
+		ConfigDigest:      configDigest,
+		LayerDigests:      layerDigests,
+		KernelDigest:      kernelDigest,
+		InitrdDigest:      initrdDigest,
+		RootfsLogicalSize: rootfsLogical,
+	}, nil
+}
+
+// resolveBuildxImage walks the OCI index in stagingDir and returns the
+// digest + raw bytes of the image manifest for the given platform.
+// Filters out attestation manifests (which buildx >= 0.11 emits as a
+// sibling descriptor).
+func resolveBuildxImage(stagingDir, platform string) (digest string, manifestBytes []byte, err error) {
+	idxBytes, err := os.ReadFile(filepath.Join(stagingDir, "index.json"))
+	if err != nil {
+		return "", nil, fmt.Errorf("reading staged index.json: %w", err)
+	}
+	var idx OCIIndex
+	if err := jsonUnmarshal(idxBytes, &idx); err != nil {
+		return "", nil, fmt.Errorf("parsing staged index: %w", err)
+	}
+
+	// Strategy: prefer descriptors whose Platform fields match. Skip
+	// descriptors annotated as attestation manifests. For single-
+	// platform buildx output we usually find one non-attestation
+	// descriptor.
+	wantArch := platformArch(platform)
+	for _, m := range idx.Manifests {
+		if m.Annotations != nil {
+			if t := m.Annotations["vnd.docker.reference.type"]; t == "attestation-manifest" {
+				continue
+			}
+		}
+		// Read the manifest blob bytes from staging.
+		hex := strings.TrimPrefix(m.Digest, DigestPrefix)
+		path := filepath.Join(stagingDir, "blobs", "sha256", hex)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", nil, fmt.Errorf("reading staged manifest %s: %w", m.Digest, err)
+		}
+		// If the manifest is itself an index, recurse to its platform-matching child.
+		if m.MediaType == MediaTypeOCIIndex || strings.HasSuffix(m.MediaType, "manifest.list.v2+json") {
+			var inner OCIIndex
+			if err := jsonUnmarshal(data, &inner); err != nil {
+				return "", nil, fmt.Errorf("parsing nested index %s: %w", m.Digest, err)
+			}
+			for _, im := range inner.Manifests {
+				if im.Annotations != nil && im.Annotations["vnd.docker.reference.type"] == "attestation-manifest" {
+					continue
+				}
+				innerHex := strings.TrimPrefix(im.Digest, DigestPrefix)
+				innerPath := filepath.Join(stagingDir, "blobs", "sha256", innerHex)
+				innerBytes, err := os.ReadFile(innerPath)
+				if err != nil {
+					return "", nil, fmt.Errorf("reading nested manifest %s: %w", im.Digest, err)
+				}
+				return im.Digest, innerBytes, nil
+			}
+		}
+		_ = wantArch // Phase 1: single-platform buildx output — first non-attestation wins.
+		return m.Digest, data, nil
+	}
+	return "", nil, errors.New("no image manifest in OCI archive")
+}
+
+// untarOCIArchive extracts a tarball (typically docker buildx --output
+// type=oci output) into dst. Safe-by-construction path validation
+// rejects any entry that would escape dst.
+func untarOCIArchive(archivePath, dst string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("tar next: %w", err)
+		}
+		// Clean and validate the entry path.
+		cleaned := filepath.Clean(hdr.Name)
+		if strings.HasPrefix(cleaned, "..") || strings.HasPrefix(cleaned, "/") {
+			return fmt.Errorf("unsafe tar entry %q", hdr.Name)
+		}
+		out := filepath.Join(dst, cleaned)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(out, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+				return err
+			}
+			w, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(w, tr); err != nil {
+				w.Close()
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		default:
+			// Skip symlinks, char devices, etc. — buildx OCI output
+			// doesn't include them at the top level.
+		}
+	}
+	return nil
+}
+
+// jsonUnmarshal is a tiny indirection so we can wrap parse errors with
+// uniform context strings. encoding/json is the only impl.
+func jsonUnmarshal(data []byte, v interface{}) error {
+	return json.Unmarshal(data, v)
+}
+
+// convertFromDockerExport implements the single-layer flatten path used
+// when ingesting a docker-daemon-resident image without a buildx OCI
+// tar. Splits out from the original Convert body — see convertFromOCIArchive
+// for the layer-preserving path.
+func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 
 	stagingDir, err := os.MkdirTemp(opts.ImagesDir, ".convert-*")
 	if err != nil {

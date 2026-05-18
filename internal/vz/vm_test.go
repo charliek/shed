@@ -71,8 +71,10 @@ func TestBuildVfkitArgs(t *testing.T) {
 	}
 	// The manifest carries an io.shed.kernel.digest annotation, so the
 	// production code prefers the kernel blob over cfg.KernelPath.
-	if !strings.Contains(argsStr, "kernel="+filepath.Join(cfg.ImagesDir, "blobs", "sha256")) {
-		t.Errorf("expected kernel blob path in args, got: %s", argsStr)
+	// Kernel is passed via dedicated --kernel flag (not folded into
+	// --bootloader cmdline=) so the kernel cmdline can contain commas.
+	if !strings.Contains(argsStr, "--kernel "+filepath.Join(cfg.ImagesDir, "blobs", "sha256")) {
+		t.Errorf("expected --kernel <blob path> in args, got: %s", argsStr)
 	}
 	if !strings.Contains(argsStr, fmt.Sprintf("path=%s", meta.RootfsPath)) {
 		t.Errorf("expected rootfs path in args, got: %s", argsStr)

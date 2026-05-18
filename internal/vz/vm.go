@@ -203,7 +203,11 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		strings.Join(lowerDevs, ","),
 	)
 
-	bootloader := fmt.Sprintf("linux,kernel=%s,initrd=%s,cmdline=%s", kernelPath, initrdBlobPath, kernelArgs)
+	// Use the dedicated --kernel / --initrd / --kernel-cmdline flags
+	// instead of inlining cmdline= into --bootloader. The bootloader spec
+	// is comma-separated key=value pairs, and the kernel cmdline contains
+	// commas (e.g. shed.lowers=/dev/vdb,/dev/vdc,…) which vfkit's
+	// bootloader parser would misinterpret as extra bootloader options.
 
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
@@ -211,7 +215,9 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 	args = []string{
 		"--cpus", fmt.Sprintf("%d", vm.meta.CPUs),
 		"--memory", fmt.Sprintf("%d", vm.meta.MemoryMB),
-		"--bootloader", bootloader,
+		"--kernel", kernelPath,
+		"--initrd", initrdBlobPath,
+		"--kernel-cmdline", kernelArgs,
 		// Upper: writable, /dev/vda inside the guest.
 		"--device", fmt.Sprintf("virtio-blk,path=%s", vm.meta.RootfsPath),
 	}

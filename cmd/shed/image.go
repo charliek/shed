@@ -229,9 +229,25 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 
 	dockerTag := fmt.Sprintf("%s%s:latest", prefix, imageBuildName)
 
-	fmt.Printf("Building Docker image %s...\n", dockerTag)
-	buildArgs := []string{"buildx", "build", "--platform", platform,
-		"-t", dockerTag, "--load", "-f", dockerfile}
+	// Emit buildx output as an OCI image-layout tar so shed's Convert
+	// ingests the full layer structure (Dockerfile stages that `FROM`
+	// each other share layers in the OCI store, which lights up the
+	// SHARED column in `shed image ls`). The legacy --load + docker
+	// create/export flatten path collapsed everything to one layer.
+	ociTar, err := os.CreateTemp("", "shed-build-*.tar")
+	if err != nil {
+		return fmt.Errorf("creating build output tempfile: %w", err)
+	}
+	ociTarPath := ociTar.Name()
+	ociTar.Close()
+	defer os.Remove(ociTarPath)
+
+	fmt.Printf("Building Docker image %s (OCI output → %s)...\n", dockerTag, ociTarPath)
+	buildArgs := []string{
+		"buildx", "build", "--platform", platform,
+		"--output", "type=oci,dest=" + ociTarPath,
+		"-f", dockerfile,
+	}
 	if imageBuildTarget != "" {
 		buildArgs = append(buildArgs, "--target", imageBuildTarget)
 	}
@@ -244,8 +260,8 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 		return fmt.Errorf("docker build failed: %w", err)
 	}
 
-	fmt.Printf("\nConverting to ext4 rootfs...\n")
-	digest, err := convertAndInstall(ctx, dockerTag, outputDir, platform, extractKernel, needsInitrd)
+	fmt.Printf("\nIngesting OCI layers into shed store...\n")
+	digest, err := convertAndInstall(ctx, dockerTag, ociTarPath, outputDir, platform, extractKernel, needsInitrd)
 	if err != nil {
 		return err
 	}
@@ -258,12 +274,13 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 // OCI layout and materializes a derived ext4 in the cache, then
 // advances the imageBuildName tag to the new manifest digest.
 // Returns the manifest digest.
-func convertAndInstall(ctx context.Context, sourceRef, imagesDir, platform string, extractKernel, needsInitrd bool) (string, error) {
+func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir, platform string, extractKernel, needsInitrd bool) (string, error) {
 	if err := vmimage.ValidateImageName(imageBuildName); err != nil {
 		return "", fmt.Errorf("invalid image name %q: %w", imageBuildName, err)
 	}
 
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
+		OCIArchivePath:   ociArchivePath,
 		DockerRef:        sourceRef,
 		Name:             imageBuildName,
 		ImagesDir:        imagesDir,
