@@ -924,6 +924,148 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	return cfg, nil
 }
 
+// LoadServerConfigForCLI loads server config the same way as
+// LoadServerConfigFromPath but skips the host/backend OS coupling
+// validation. Used by CLI commands like `shed image push --local`
+// and `shed image build` that read the OCI store via the backend's
+// config block but never actually start a VM. For example, the
+// publish-images.yaml workflow runs on a Linux runner, builds VZ
+// images via `--target shed-vz-*`, and pushes them via `shed image
+// push --local -c <config-with-vz-block>`. The strict validator
+// rejects that combination ("vz backend is only supported on
+// macOS") even though we're never going to boot a VM there.
+//
+// CALLERS THAT START A VM (or accept arbitrary HTTP traffic that
+// will start a VM) MUST use LoadServerConfigFromPath instead — the
+// OS coupling check matters for them.
+func LoadServerConfigForCLI(path string) (*ServerConfig, error) {
+	cfg, err := loadServerConfigForCLI(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.ValidateNoHostCoupling(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// loadServerConfigForCLI replicates the YAML-read + defaults path of
+// LoadServerConfigFromPath without invoking the strict Validate at
+// the end. Kept private; callers go through LoadServerConfigForCLI
+// (which adds ValidateNoHostCoupling).
+func loadServerConfigForCLI(path string) (*ServerConfig, error) {
+	cfg := DefaultServerConfig()
+
+	var configPath string
+	if path != "" {
+		configPath = ExpandPath(path)
+	} else {
+		locations := []string{
+			"./server.yaml",
+			ExpandPath("~/.config/shed/server.yaml"),
+			"/etc/shed/server.yaml",
+		}
+		for _, loc := range locations {
+			if _, err := os.Stat(loc); err == nil {
+				configPath = loc
+				break
+			}
+		}
+		if configPath == "" {
+			return cfg, nil
+		}
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file %s: %w", configPath, err)
+	}
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
+	}
+
+	if cfg.HTTPPort == 0 {
+		cfg.HTTPPort = 8080
+	}
+	if cfg.SSHPort == 0 {
+		cfg.SSHPort = 2222
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	if cfg.Terminal == nil {
+		cfg.Terminal = terminal.DefaultConfig()
+	}
+
+	cfg.normalizeBackends()
+
+	if cfg.Firecracker != nil {
+		cfg.Firecracker.applyDefaults()
+	}
+	if cfg.VZ != nil {
+		cfg.VZ.applyDefaults()
+	}
+
+	return cfg, nil
+}
+
+// ValidateNoHostCoupling runs the parts of Validate that aren't tied to
+// the host OS/arch. Used by CLI commands that only need to read the
+// OCI store (image build, image push --local), where the strict
+// "vz backend only on macOS" / "firecracker backend only on linux"
+// checks would block cross-platform image operations from CI runners
+// or developers cross-publishing images. Callers that actually start
+// a VM MUST call Validate instead.
+func (c *ServerConfig) ValidateNoHostCoupling() error {
+	if c.Name == "" {
+		return fmt.Errorf("server name is required")
+	}
+	if c.HTTPPort < 0 || c.HTTPPort > 65535 {
+		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	}
+	if c.SSHPort < 0 || c.SSHPort > 65535 {
+		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
+	}
+
+	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	if !validLogLevels[c.LogLevel] {
+		return fmt.Errorf("invalid log_level: %s (must be debug, info, warn, or error)", c.LogLevel)
+	}
+
+	if c.DefaultBackend == "" {
+		return fmt.Errorf("default_backend is required")
+	}
+
+	if !isValidBackend(c.DefaultBackend) {
+		return fmt.Errorf("invalid default_backend: %s (must be firecracker, vz, or detect)", c.DefaultBackend)
+	}
+
+	// Resolve detect to the actual backend (no OS coupling check below).
+	if c.DefaultBackend == BackendDetect {
+		resolved, err := ResolveBackend(BackendDetect, runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			return fmt.Errorf("default_backend: %w", err)
+		}
+		c.DefaultBackend = resolved
+	}
+
+	// Per-backend config block presence is still validated (you can't
+	// point at a vz: store if the block is absent), but the full per-
+	// backend Validate is skipped — it asserts things like 'firecracker
+	// requires this kernel path' that don't apply to image-only flows.
+	switch c.DefaultBackend {
+	case BackendFirecracker:
+		if c.Firecracker == nil {
+			return fmt.Errorf("firecracker configuration is required when backend is firecracker")
+		}
+	case BackendVZ:
+		if c.VZ == nil {
+			return fmt.Errorf("vz configuration is required when backend is vz")
+		}
+	}
+	return nil
+}
+
 // Validate checks that the configuration is valid.
 func (c *ServerConfig) Validate() error {
 	if c.Name == "" {

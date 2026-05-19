@@ -81,12 +81,17 @@ func init() {
 // installed default homebrew config works on Mac without manual
 // edits.
 func loadLocalManager() (*vmimage.Manager, error) {
+	// CLI image operations (build, push --local) don't start a VM —
+	// they only need the OCI store config. Use the lenient loader so
+	// `shed image build --target shed-vz-*` and `shed image push
+	// --local` work from a Linux runner pointing at a `default_backend:
+	// vz` config (publish-images.yaml does exactly that).
 	var cfg *config.ServerConfig
 	var err error
 	if configFlag != "" {
-		cfg, err = config.LoadServerConfigFromPath(configFlag)
+		cfg, err = config.LoadServerConfigForCLI(configFlag)
 	} else {
-		cfg, err = config.LoadServerConfig()
+		cfg, err = config.LoadServerConfigForCLI("")
 	}
 	if err != nil {
 		return nil, fmt.Errorf("loading server config: %w", err)

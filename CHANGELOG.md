@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Release-readiness fixes
 
+- **`shed image push --local` works from a Linux runner pointing at a
+  `default_backend: vz` config.** The publish workflow stages a small
+  config file with the relevant backend block; on the `ubuntu-24.04-arm`
+  runner that meant `vz:`, which the strict validator rejected
+  (`vz backend is only supported on macOS`). Added
+  `config.LoadServerConfigForCLI` + `ServerConfig.ValidateNoHostCoupling`
+  for the image-only flows that never start a VM. Callers that *do* start
+  a VM (shed-server serve) still use the strict path.
 - **`shed image build` picks the right `--platform` for the target backend.**
   Previously the CLI inferred the platform purely from `runtime.GOOS`, so
   invoking `shed image build --target shed-vz-*` from a Linux runner (e.g.,
