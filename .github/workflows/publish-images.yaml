@@ -88,12 +88,23 @@ jobs:
         run: |
           # Local OCI store; shed image build writes here, shed image
           # push streams from here to ghcr.io.
+          #
+          # --platform is set explicitly (belt-and-suspenders): even if
+          # CLI inference regresses, the runner is arm64 and these
+          # images must boot on Apple Silicon.
+          #
+          # --source-ref pins the manifest's io.shed.source-ref
+          # annotation to the registry ref we're about to push to, so
+          # the remote server's resolveImage cache-hit check matches
+          # on subsequent `shed create` pulls.
           mkdir -p /tmp/oci-store-vz
           for variant in base extensions full; do
             echo "=== building shed-vz-${variant} ==="
             ./bin/shed image build \
               --target "shed-vz-${variant}" \
               -n "${variant}" \
+              --platform linux/arm64 \
+              --source-ref "ghcr.io/charliek/shed-vz-${variant}:${{ steps.version.outputs.tag }}" \
               --initramfs /tmp/shed-initrd-vz.img \
               --output-dir /tmp/oci-store-vz \
               -f vz/Dockerfile \
@@ -195,12 +206,15 @@ jobs:
 
       - name: Build OCI images (base, extensions, full)
         run: |
+          # See VZ job for rationale on --platform and --source-ref.
           mkdir -p /tmp/oci-store-fc
           for variant in base extensions full; do
             echo "=== building shed-fc-${variant} ==="
             ./bin/shed image build \
               --target "shed-fc-${variant}" \
               -n "${variant}" \
+              --platform linux/amd64 \
+              --source-ref "ghcr.io/charliek/shed-fc-${variant}:${{ steps.version.outputs.tag }}" \
               --initramfs /tmp/shed-initrd-fc.img \
               --output-dir /tmp/oci-store-fc \
               -f firecracker/Dockerfile \

@@ -14,6 +14,20 @@ All notable changes to this project will be documented in this file.
   `config.LoadServerConfigForCLI` + `ServerConfig.ValidateNoHostCoupling`
   for the image-only flows that never start a VM. Callers that *do* start
   a VM (shed-server serve) still use the strict path.
+- **`shed image build` picks the right tag prefix AND `io.shed.source-ref`
+  for cross-builds.** The PR #92 fix corrected `--platform` for
+  `--target shed-vz-*` invocations from a Linux runner, but the tag
+  prefix (`shed-fc-` vs `shed-vz-`), kernel-extraction flag, and initrd
+  flag were still derived from `runtime.GOOS` — so a Linux-built
+  `shed-vz-full` image landed on disk tagged `shed-fc-full:latest` and
+  its manifest's `io.shed.source-ref` annotation lied accordingly. The
+  per-target table is now centralized and driven off `--target`
+  uniformly. Added `--source-ref <ref>` so CI publish workflows can pin
+  the annotation to the final `ghcr.io/charliek/shed-*-*:<version>` ref
+  the image will be pushed to; without this, the server's
+  `resolveImage` cache-hit check (which compares the manifest annotation
+  against the configured `ref:`) missed on every subsequent `shed create`
+  and forced a re-pull.
 - **`shed image build` picks the right `--platform` for the target backend.**
   Previously the CLI inferred the platform purely from `runtime.GOOS`, so
   invoking `shed image build --target shed-vz-*` from a Linux runner (e.g.,
