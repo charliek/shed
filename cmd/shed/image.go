@@ -29,6 +29,7 @@ var (
 	imageBuildSize      string
 	imageBuildOutputDir string
 	imageBuildPlatform  string
+	imageBuildSourceRef string
 	imageBuildForce     bool
 
 	imageDeleteForce bool
@@ -142,6 +143,15 @@ func init() {
 	imageBuildCmd.Flags().StringVar(&imageBuildSize, "size", "20G", "Rootfs image size")
 	imageBuildCmd.Flags().StringVar(&imageBuildOutputDir, "output-dir", "", "Output directory (auto-detected based on backend)")
 	imageBuildCmd.Flags().StringVar(&imageBuildPlatform, "platform", "", "Target docker platform (linux/arm64 or linux/amd64). Default: linux/arm64 for shed-vz-* targets, linux/amd64 for shed-fc-* targets, else host arch.")
+	// --source-ref controls the `io.shed.source-ref` manifest annotation
+	// that the server's resolveImage cache lookup compares against. CI
+	// publish workflows should pass the final registry ref here (e.g.,
+	// `ghcr.io/charliek/shed-vz-full:v0.5.0`) so subsequent `shed create`
+	// pulls on a remote host hit the cache instead of re-pulling. When
+	// empty, defaults to the local buildx tag (`<prefix><name>:latest`),
+	// which is fine for purely-local builds but does NOT match the
+	// registry ref the image is later pushed to.
+	imageBuildCmd.Flags().StringVar(&imageBuildSourceRef, "source-ref", "", "Override the io.shed.source-ref annotation baked into the manifest (default: <prefix><name>:latest). Pass the final registry ref in CI publish flows so server-side cache lookups match.")
 	imageBuildCmd.Flags().BoolVar(&imageBuildForce, "force", false, "Skip base image validation warning")
 	_ = imageBuildCmd.MarkFlagRequired("name")
 
@@ -164,6 +174,19 @@ func init() {
 }
 
 // buildContext holds backend-specific settings for image building.
+//
+// All four behavior-shaping fields (Prefix, Platform, ExtractKernel,
+// NeedsInitrd) MUST stay in lockstep with each other: VZ is arm64 +
+// needs-initrd, FC is amd64 + no-initrd. Splitting their resolution
+// (one source for Prefix, another for Platform) is what caused the
+// pre-PR #92/#94 bugs where a Linux-runner cross-build of `shed-vz-*`
+// got the right --platform but the wrong `shed-fc-` prefix in the
+// manifest's source-ref annotation. Keep the per-target table here
+// as the single source of truth.
+//
+// OutputDir is the one field that legitimately follows the host OS:
+// it's the on-disk path of the local OCI store, and the user's
+// explicit --output-dir always wins anyway.
 type buildContext struct {
 	Prefix        string // Docker tag prefix ("shed-vz-" or "shed-fc-")
 	Platform      string // Docker platform ("linux/arm64" or "linux/amd64")
@@ -172,48 +195,88 @@ type buildContext struct {
 	NeedsInitrd   bool   // Whether to extract initrd (VZ only)
 }
 
-// imageBackendContext returns build settings for the current host OS.
-// shed image build is a host-local operation — the platform is determined
-// by the host, not by server backend selection.
-func imageBackendContext() buildContext {
-	if runtime.GOOS == "linux" {
-		return buildContext{
-			Prefix:        "shed-fc-",
-			Platform:      vmimage.FirecrackerPlatform,
-			OutputDir:     config.DefaultFirecrackerImagesDir,
-			ExtractKernel: true,
-			NeedsInitrd:   false,
-		}
-	}
+// vzBuildContext returns the VZ-shaped per-target settings. OutputDir is
+// filled in by the caller (it follows host OS, not target).
+func vzBuildContext() buildContext {
 	return buildContext{
 		Prefix:        "shed-vz-",
 		Platform:      vmimage.DefaultPlatform,
-		OutputDir:     config.ExpandPath(config.DefaultVZImagesDir),
 		ExtractKernel: true,
 		NeedsInitrd:   true,
 	}
 }
 
-func runImageBuild(cmd *cobra.Command, args []string) error {
-	bc := imageBackendContext()
+// fcBuildContext returns the Firecracker-shaped per-target settings.
+// OutputDir is filled in by the caller (it follows host OS, not target).
+func fcBuildContext() buildContext {
+	return buildContext{
+		Prefix:        "shed-fc-",
+		Platform:      vmimage.FirecrackerPlatform,
+		ExtractKernel: true,
+		NeedsInitrd:   false,
+	}
+}
 
-	// Platform resolution order:
-	//   1. --platform CLI flag (explicit override; used by CI publish workflow
-	//      where the runner arch doesn't match the target backend).
-	//   2. --target prefix (shed-vz-* → linux/arm64, shed-fc-* → linux/amd64).
-	//      Picked before the host-OS fallback so a cross-build (e.g., building
-	//      a VZ variant from a Linux runner) does not silently flip platforms.
-	//   3. Host OS default from imageBackendContext().
+// hostDefaultOutputDir returns the local-OCI-store path appropriate for
+// goos. Extracted as a helper so imageBackendContext stays unit-testable
+// without mocking runtime.GOOS.
+func hostDefaultOutputDir(goos string) string {
+	if goos == "linux" {
+		return config.DefaultFirecrackerImagesDir
+	}
+	return config.ExpandPath(config.DefaultVZImagesDir)
+}
+
+// imageBackendContext returns build settings for the requested target.
+//
+// Resolution order:
+//  1. If target has a `shed-vz-` / `shed-fc-` prefix, return that
+//     backend's context. This covers the CI cross-build case (e.g.,
+//     building shed-vz-* from a Linux runner) where the host OS and
+//     the target backend disagree — without this fork, every
+//     non-OutputDir field would silently flip to the host's default.
+//  2. Otherwise fall back to the host OS default (vz on macOS, fc on
+//     linux). This is the day-to-day local-developer case where
+//     `shed image build -n myimg` should infer the backend from the
+//     machine running the build.
+//
+// OutputDir always follows the host OS: it's the location of the
+// on-disk OCI store, which has nothing to do with the image's target
+// architecture. Callers may override with --output-dir.
+func imageBackendContext(target string) buildContext {
+	return imageBackendContextForHost(target, runtime.GOOS)
+}
+
+// imageBackendContextForHost is the unit-testable inner of
+// imageBackendContext. goos is the host operating system identifier
+// (matches runtime.GOOS values: "linux", "darwin", ...).
+func imageBackendContextForHost(target, goos string) buildContext {
+	var bc buildContext
+	switch {
+	case strings.HasPrefix(target, "shed-vz-"):
+		bc = vzBuildContext()
+	case strings.HasPrefix(target, "shed-fc-"):
+		bc = fcBuildContext()
+	default:
+		if goos == "linux" {
+			bc = fcBuildContext()
+		} else {
+			bc = vzBuildContext()
+		}
+	}
+	bc.OutputDir = hostDefaultOutputDir(goos)
+	return bc
+}
+
+func runImageBuild(cmd *cobra.Command, args []string) error {
+	bc := imageBackendContext(imageBuildTarget)
+
+	// --platform CLI flag remains an explicit override on top of the
+	// target-driven default in bc.Platform (e.g., for non-shed-* targets
+	// where the user wants an arch that disagrees with the host).
 	platform := imageBuildPlatform
 	if platform == "" {
-		switch {
-		case strings.HasPrefix(imageBuildTarget, "shed-vz-"):
-			platform = vmimage.DefaultPlatform
-		case strings.HasPrefix(imageBuildTarget, "shed-fc-"):
-			platform = vmimage.FirecrackerPlatform
-		default:
-			platform = bc.Platform
-		}
+		platform = bc.Platform
 	}
 
 	outputDir := imageBuildOutputDir
@@ -250,6 +313,18 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 
 	dockerTag := fmt.Sprintf("%s%s:latest", prefix, imageBuildName)
 
+	// sourceRef is what gets baked into the manifest's
+	// io.shed.source-ref annotation, which the server's resolveImage
+	// cache-hit check (internal/config/server.go) compares against
+	// the configured `ref:` to decide whether a re-pull is needed.
+	// Default to the local buildx tag for ad-hoc developer builds;
+	// publish workflows override with the final registry ref so
+	// remote `shed create` pulls hit the cache.
+	sourceRef := imageBuildSourceRef
+	if sourceRef == "" {
+		sourceRef = dockerTag
+	}
+
 	// Emit buildx output as an OCI image-layout tar so shed's Convert
 	// ingests the full layer structure (Dockerfile stages that `FROM`
 	// each other share layers in the OCI store, which lights up the
@@ -282,11 +357,11 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 	}
 
 	fmt.Printf("\nIngesting OCI layers into shed store...\n")
-	digest, err := convertAndInstall(ctx, dockerTag, ociTarPath, outputDir, platform, extractKernel, needsInitrd)
+	digest, err := convertAndInstall(ctx, sourceRef, ociTarPath, outputDir, platform, extractKernel, needsInitrd)
 	if err != nil {
 		return err
 	}
-	finishImageBuild(outputDir, dockerTag, digest)
+	finishImageBuild(outputDir, sourceRef, digest)
 	return nil
 }
 
@@ -294,7 +369,12 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 // which writes the manifest+config+layer+kernel+initrd blobs into the
 // OCI layout and materializes a derived ext4 in the cache, then
 // advances the imageBuildName tag to the new manifest digest.
-// Returns the manifest digest.
+//
+// sourceRef is recorded verbatim in the manifest's io.shed.source-ref
+// annotation; pass the final registry ref here when this image will be
+// pushed, otherwise the server's resolveImage cache check (which
+// compares `manifest.ShedSourceRef() == cfg.ref`) will miss on every
+// subsequent pull. Returns the manifest digest.
 func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir, platform string, extractKernel, needsInitrd bool) (string, error) {
 	if err := vmimage.ValidateImageName(imageBuildName); err != nil {
 		return "", fmt.Errorf("invalid image name %q: %w", imageBuildName, err)

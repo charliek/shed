@@ -115,3 +115,78 @@ func sumBytes(b []byte) []byte {
 	s := sha256.Sum256(b)
 	return s[:]
 }
+
+// TestBuildShedAnnotationsSourceRef pins down the contract that the
+// io.shed.source-ref annotation reads back EXACTLY the DockerRef the
+// caller passed in. The server's resolveImage cache lookup compares
+// `manifest.ShedSourceRef() == cfg.ref`, so any transformation here
+// (prefixing, lowercasing, dropping the registry) would silently
+// break post-publish cache hits and force a re-pull on every
+// `shed create`. Locking the round-trip here catches that class of
+// regression before it reaches a live shed.
+func TestBuildShedAnnotationsSourceRef(t *testing.T) {
+	tests := []struct {
+		name      string
+		sourceRef string
+	}{
+		{name: "registry ref with version tag", sourceRef: "ghcr.io/foo/bar:v1"},
+		{name: "registry ref with full version", sourceRef: "ghcr.io/charliek/shed-vz-full:v0.5.0"},
+		{name: "local buildx tag", sourceRef: "shed-vz-full:latest"},
+		{name: "digest ref", sourceRef: "ghcr.io/foo/bar@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ann := buildShedAnnotations("full", tt.sourceRef, "", "", "")
+			if got := ann[AnnotationSourceRef]; got != tt.sourceRef {
+				t.Errorf("AnnotationSourceRef = %q, want %q", got, tt.sourceRef)
+			}
+			// Round-trip through the parser to mirror the runtime path
+			// (Convert writes the manifest blob; the server later reads
+			// it back via ParseManifest before calling ShedSourceRef).
+			m := &OCIManifest{
+				SchemaVersion: 2,
+				MediaType:     MediaTypeOCIManifest,
+				Layers:        []Descriptor{{MediaType: MediaTypeOCILayer, Digest: "sha256:deadbeef", Size: 1}},
+				Annotations:   ann,
+			}
+			data, err := m.MarshalIndent()
+			if err != nil {
+				t.Fatalf("MarshalIndent: %v", err)
+			}
+			parsed, err := ParseManifest(data)
+			if err != nil {
+				t.Fatalf("ParseManifest: %v", err)
+			}
+			if got := parsed.ShedSourceRef(); got != tt.sourceRef {
+				t.Errorf("parsed ShedSourceRef() = %q, want %q", got, tt.sourceRef)
+			}
+		})
+	}
+}
+
+// TestBuildShedAnnotationsOptionalFields verifies that empty optional
+// values are omitted from the annotation map (so the on-disk manifest
+// JSON doesn't carry confusing empty-string entries).
+func TestBuildShedAnnotationsOptionalFields(t *testing.T) {
+	ann := buildShedAnnotations("base", "ghcr.io/x/y:v1", "", "", "")
+	if _, ok := ann[AnnotationKernelDigest]; ok {
+		t.Errorf("empty kernel digest should be omitted, got %q", ann[AnnotationKernelDigest])
+	}
+	if _, ok := ann[AnnotationInitrdDigest]; ok {
+		t.Errorf("empty initrd digest should be omitted, got %q", ann[AnnotationInitrdDigest])
+	}
+	if _, ok := ann[AnnotationRootfsLogicalSize]; ok {
+		t.Errorf("empty rootfs logical size should be omitted, got %q", ann[AnnotationRootfsLogicalSize])
+	}
+
+	ann2 := buildShedAnnotations("base", "ghcr.io/x/y:v1", "sha256:k", "sha256:i", "12345")
+	if ann2[AnnotationKernelDigest] != "sha256:k" {
+		t.Errorf("kernel digest = %q, want sha256:k", ann2[AnnotationKernelDigest])
+	}
+	if ann2[AnnotationInitrdDigest] != "sha256:i" {
+		t.Errorf("initrd digest = %q, want sha256:i", ann2[AnnotationInitrdDigest])
+	}
+	if ann2[AnnotationRootfsLogicalSize] != "12345" {
+		t.Errorf("rootfs logical size = %q, want 12345", ann2[AnnotationRootfsLogicalSize])
+	}
+}

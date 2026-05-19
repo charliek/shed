@@ -120,6 +120,34 @@ type ConvertResult struct {
 	RootfsLogicalSize int64
 }
 
+// buildShedAnnotations returns the manifest annotation map shed writes
+// to every image it ingests. Centralizing the construction here keeps
+// the OCI-archive and docker-export convert paths in lockstep — they
+// previously each open-coded the map, which let one drift while the
+// other was updated. Empty digest / size strings are omitted so the
+// emitted JSON matches the pre-helper byte shape.
+//
+// sourceRef is recorded verbatim in io.shed.source-ref; the server's
+// resolveImage cache-hit check compares this against the configured
+// `ref:`, so publish flows MUST pass the final registry ref here.
+func buildShedAnnotations(variant, sourceRef, kernelDigest, initrdDigest, rootfsLogicalSize string) map[string]string {
+	ann := map[string]string{
+		AnnotationSchemaVersion: ShedSchemaVersion,
+		AnnotationVariant:       variant,
+		AnnotationSourceRef:     sourceRef,
+	}
+	if kernelDigest != "" {
+		ann[AnnotationKernelDigest] = kernelDigest
+	}
+	if initrdDigest != "" {
+		ann[AnnotationInitrdDigest] = initrdDigest
+	}
+	if rootfsLogicalSize != "" {
+		ann[AnnotationRootfsLogicalSize] = rootfsLogicalSize
+	}
+	return ann
+}
+
 // IsDockerRef returns true if s is a Docker image reference rather than a filesystem path.
 func IsDockerRef(s string) bool {
 	if s == "" {
@@ -367,18 +395,8 @@ func convertFromOCIArchive(ctx context.Context, opts ConvertOptions) (*ConvertRe
 			Digest:    configDigest,
 			Size:      int64(len(cfgBytes)),
 		},
-		Layers: append([]Descriptor{}, srcManifest.Layers...),
-		Annotations: map[string]string{
-			AnnotationSchemaVersion: ShedSchemaVersion,
-			AnnotationVariant:       opts.Name,
-			AnnotationSourceRef:     opts.DockerRef,
-		},
-	}
-	if kernelDigest != "" {
-		manifest.Annotations[AnnotationKernelDigest] = kernelDigest
-	}
-	if initrdDigest != "" {
-		manifest.Annotations[AnnotationInitrdDigest] = initrdDigest
+		Layers:      append([]Descriptor{}, srcManifest.Layers...),
+		Annotations: buildShedAnnotations(opts.Name, opts.DockerRef, kernelDigest, initrdDigest, ""),
 	}
 	manData, err := manifest.MarshalIndent()
 	if err != nil {
@@ -661,18 +679,7 @@ func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*Convert
 			Digest:    layerDigest,
 			Size:      gzSize,
 		}},
-		Annotations: map[string]string{
-			AnnotationSchemaVersion:     ShedSchemaVersion,
-			AnnotationVariant:           opts.Name,
-			AnnotationSourceRef:         opts.DockerRef,
-			AnnotationRootfsLogicalSize: fmt.Sprintf("%d", tarStat.Size()),
-		},
-	}
-	if kernelDigest != "" {
-		manifest.Annotations[AnnotationKernelDigest] = kernelDigest
-	}
-	if initrdDigest != "" {
-		manifest.Annotations[AnnotationInitrdDigest] = initrdDigest
+		Annotations: buildShedAnnotations(opts.Name, opts.DockerRef, kernelDigest, initrdDigest, fmt.Sprintf("%d", tarStat.Size())),
 	}
 	manData, err := manifest.MarshalIndent()
 	if err != nil {
