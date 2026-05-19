@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Release-readiness fixes
 
+- **`shed image build` picks the right `--platform` for the target backend.**
+  Previously the CLI inferred the platform purely from `runtime.GOOS`, so
+  invoking `shed image build --target shed-vz-*` from a Linux runner (e.g.,
+  the `ubuntu-24.04-arm` GitHub Actions runner used by the publish workflow)
+  silently flipped to `linux/amd64`, which then crashed the per-layer ext4
+  materialization step with `exec format error`. The CLI now inspects
+  `--target shed-vz-*` / `shed-fc-*` and picks `linux/arm64` / `linux/amd64`
+  accordingly; an explicit `--platform <plat>` flag is available as an
+  override.
 - **`POST /api/images/pull` no longer 405s.** A chi router precedence
   bug routed `POST /api/images/pull` to the parametric
   `DELETE /api/images/{name}` handler, returning `405 Method Not Allowed,

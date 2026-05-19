@@ -28,6 +28,7 @@ var (
 	imageBuildTarget    string
 	imageBuildSize      string
 	imageBuildOutputDir string
+	imageBuildPlatform  string
 	imageBuildForce     bool
 
 	imageDeleteForce bool
@@ -140,6 +141,7 @@ func init() {
 	imageBuildCmd.Flags().StringVar(&imageBuildTarget, "target", "", "Docker build target stage (Dockerfile mode only)")
 	imageBuildCmd.Flags().StringVar(&imageBuildSize, "size", "20G", "Rootfs image size")
 	imageBuildCmd.Flags().StringVar(&imageBuildOutputDir, "output-dir", "", "Output directory (auto-detected based on backend)")
+	imageBuildCmd.Flags().StringVar(&imageBuildPlatform, "platform", "", "Target docker platform (linux/arm64 or linux/amd64). Default: linux/arm64 for shed-vz-* targets, linux/amd64 for shed-fc-* targets, else host arch.")
 	imageBuildCmd.Flags().BoolVar(&imageBuildForce, "force", false, "Skip base image validation warning")
 	_ = imageBuildCmd.MarkFlagRequired("name")
 
@@ -195,12 +197,31 @@ func imageBackendContext() buildContext {
 func runImageBuild(cmd *cobra.Command, args []string) error {
 	bc := imageBackendContext()
 
+	// Platform resolution order:
+	//   1. --platform CLI flag (explicit override; used by CI publish workflow
+	//      where the runner arch doesn't match the target backend).
+	//   2. --target prefix (shed-vz-* → linux/arm64, shed-fc-* → linux/amd64).
+	//      Picked before the host-OS fallback so a cross-build (e.g., building
+	//      a VZ variant from a Linux runner) does not silently flip platforms.
+	//   3. Host OS default from imageBackendContext().
+	platform := imageBuildPlatform
+	if platform == "" {
+		switch {
+		case strings.HasPrefix(imageBuildTarget, "shed-vz-"):
+			platform = vmimage.DefaultPlatform
+		case strings.HasPrefix(imageBuildTarget, "shed-fc-"):
+			platform = vmimage.FirecrackerPlatform
+		default:
+			platform = bc.Platform
+		}
+	}
+
 	outputDir := imageBuildOutputDir
 	if outputDir == "" {
 		outputDir = bc.OutputDir
 	}
 
-	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, bc.Platform, bc.ExtractKernel, bc.NeedsInitrd)
+	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, platform, bc.ExtractKernel, bc.NeedsInitrd)
 }
 
 func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, prefix, platform string, extractKernel, needsInitrd bool) error {
