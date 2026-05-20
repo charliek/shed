@@ -1,7 +1,9 @@
 package vmimage
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -244,6 +246,47 @@ func TestManagerPruneRespectsSnapshotRefs(t *testing.T) {
 	}
 	if len(cands) != 0 {
 		t.Fatalf("snapshot-pinned blob should NOT be a prune candidate, got %#v", cands)
+	}
+}
+
+// TestEnsureImageTriesRegistryBeforeDocker is the regression for #98.
+// EnsureImage must call PullToOCILayout (registry-direct) before falling
+// back to convertAndInstall (docker-export). Before the fix, only the
+// docker path was tried, which produced a single-layer flatten with
+// Ubuntu's stock initramfs — boot would fail with "No root device".
+//
+// Test strategy: with a bogus registry ref + no docker daemon reachable
+// in the test env, BOTH paths fail. The combined error message
+// "registry pull and docker fallback both failed: registry=... docker=..."
+// only appears in the new code path. The old code would have returned
+// only the docker error.
+func TestEnsureImageTriesRegistryBeforeDocker(t *testing.T) {
+	imagesDir := t.TempDir()
+	cfg := &testConfig{
+		imagesDir:     imagesDir,
+		platform:      "linux/arm64",
+		extractKernel: true,
+		needsInitrd:   true,
+	}
+	mgr := NewManager(cfg, nil)
+
+	if err := EnsureOCILayout(imagesDir); err != nil {
+		t.Fatalf("EnsureOCILayout: %v", err)
+	}
+
+	// A ref that doesn't exist anywhere. Both registry pull AND docker
+	// daemon pull will fail. We don't care which specific errors fire;
+	// only that the combined error message proves both paths were
+	// attempted in the right order.
+	_, err := mgr.EnsureImage(context.Background(), ResolvedRef{
+		Name:      "test-prefers-registry",
+		DockerRef: "ghcr.io/charliek/this-image-deliberately-does-not-exist:v0.0.0",
+	}, nil)
+	if err == nil {
+		t.Fatal("expected error from EnsureImage against a bogus ref, got nil")
+	}
+	if !strings.Contains(err.Error(), "registry pull and docker fallback both failed") {
+		t.Fatalf("error should indicate both paths were tried (#98 regression).\n  got: %v", err)
 	}
 }
 

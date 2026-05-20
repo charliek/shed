@@ -138,11 +138,38 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 	if progress != nil {
 		progress("image", fmt.Sprintf("Pulling %s...", ref.DockerRef))
 	}
-	log.Printf("Converting Docker image %s (tag %q)", ref.DockerRef, ref.Name)
+
+	// Registry-direct pull is preferred. It produces a multi-layer
+	// manifest with the correct shed-overlay initrd annotation, so the
+	// resulting shed can boot via the overlay-assembly init path.
+	// `convertAndInstall` (the docker-daemon-driven fallback) flattens
+	// to a single layer and extracts Ubuntu's stock /boot/initrd.img,
+	// which doesn't understand shed.upper / shed.lowers and panics at
+	// boot. Only fall back when registry pull truly can't satisfy the
+	// ref (e.g., images pinned in a local Docker daemon, non-OCI refs).
+	platform := m.cfg.GetPlatform()
+	pullResult, pullErr := PullToOCILayout(ctx, PullOptions{
+		Ref:           ref.DockerRef,
+		ImagesDir:     imagesDir,
+		TagName:       ref.Name,
+		Platform:      platform,
+		Insecure:      isLoopbackRef(ref.DockerRef),
+		ExtractKernel: m.cfg.GetExtractKernel(),
+		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
+		Progress:      progress,
+	})
+	if pullErr == nil {
+		return m.layerExt4Paths(ctx, imagesDir, pullResult.ManifestDigest)
+	}
+
+	if progress != nil {
+		progress("image", fmt.Sprintf("Registry pull failed (%v); falling back to docker", pullErr))
+	}
+	log.Printf("Registry pull of %s failed (%v); falling back to docker daemon", ref.DockerRef, pullErr)
 
 	result, err := m.convertAndInstall(ctx, ref.DockerRef, ref.Name, progress)
 	if err != nil {
-		return EnsureResult{}, err
+		return EnsureResult{}, fmt.Errorf("registry pull and docker fallback both failed: registry=%v docker=%w", pullErr, err)
 	}
 
 	if err := SetTag(imagesDir, ref.Name, result.ManifestDigest); err != nil {
