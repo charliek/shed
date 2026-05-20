@@ -81,12 +81,27 @@ LABEL org.opencontainers.image.source="https://github.com/charliek/shed"
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Strip man pages, docs, and non-English locales from every subsequent
+# dpkg/apt operation. Must come BEFORE the first apt-get install so the
+# excludes apply to all packages. Keep en/en_US locales — many tools
+# (less, perl, bash completion) misbehave without at least one locale.
+RUN printf '%s\n' \
+    'path-exclude=/usr/share/man/*' \
+    'path-exclude=/usr/share/doc/*' \
+    'path-exclude=/usr/share/locale/*' \
+    'path-include=/usr/share/locale/en/*' \
+    'path-include=/usr/share/locale/en_US/*' \
+    > /etc/dpkg/dpkg.cfg.d/01-shed-strip
+
 # Layer 1: APT-installed system + dev tools + Docker CE + GitHub CLI in one go.
+# Editor lineup: neovim only (vim/nano/htop dropped to save ~80 MB and
+# align with the VZ side; users who need vi-style or other editors can
+# `apt install` inside a shed).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        systemd systemd-sysv dbus \
        sudo unzip ca-certificates hostname \
-       tmux git curl wget vim nano htop jq ncurses-term ripgrep tree \
+       tmux git curl wget neovim jq ncurses-term ripgrep tree \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \
        build-essential bubblewrap \

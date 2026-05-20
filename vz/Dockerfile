@@ -44,14 +44,28 @@ LABEL org.opencontainers.image.source="https://github.com/charliek/shed"
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Strip man pages, docs, and non-English locales from every subsequent
+# dpkg/apt operation. Must come BEFORE the first apt-get install so the
+# excludes apply to all packages. Keep en/en_US locales — many tools
+# (less, perl, bash completion) misbehave without at least one locale.
+RUN printf '%s\n' \
+    'path-exclude=/usr/share/man/*' \
+    'path-exclude=/usr/share/doc/*' \
+    'path-exclude=/usr/share/locale/*' \
+    'path-include=/usr/share/locale/en/*' \
+    'path-include=/usr/share/locale/en_US/*' \
+    > /etc/dpkg/dpkg.cfg.d/01-shed-strip
+
 # Layer 1: APT-installed system + dev tools + Docker CE in one go.
 # linux-image-generic + initramfs-tools provide the in-VM kernel
 # (extracted at image-build time by shed image build for VZ booting).
+# Editor lineup: neovim only. vim/nano/jed/htop dropped to save ~80 MB;
+# users who need them can `apt install` inside a shed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        systemd systemd-sysv systemd-resolved dbus \
        sudo unzip ca-certificates hostname \
-       tmux git gh curl wget vim neovim jed nano htop jq ncurses-term ripgrep tree \
+       tmux git gh curl wget neovim jq ncurses-term ripgrep tree \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \
        build-essential bubblewrap \
