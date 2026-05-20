@@ -57,8 +57,12 @@ RUN printf '%s\n' \
     > /etc/dpkg/dpkg.cfg.d/01-shed-strip
 
 # Layer 1: APT-installed system + dev tools + Docker CE in one go.
-# linux-image-generic + initramfs-tools provide the in-VM kernel
+# linux-image-virtual + initramfs-tools provide the in-VM kernel
 # (extracted at image-build time by shed image build for VZ booting).
+# linux-image-virtual ships the same kernel as linux-image-generic but
+# trims the recommended-modules tree to virtualization-relevant only:
+# virtio_blk, virtio_net, virtio_pci, vmw_vsock_virtio_transport, 9p,
+# 9pnet_virtio, loop, overlay, erofs. ~100 MB smaller than -generic.
 # Editor lineup: neovim only. vim/nano/jed/htop dropped to save ~80 MB;
 # users who need them can `apt install` inside a shed.
 RUN apt-get update \
@@ -69,7 +73,7 @@ RUN apt-get update \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \
        build-essential bubblewrap \
-       linux-image-generic initramfs-tools \
+       linux-image-virtual initramfs-tools \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
