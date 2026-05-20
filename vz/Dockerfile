@@ -122,11 +122,12 @@ RUN set -euo pipefail && \
     # Non-root shed user (UID 1000) with passwordless sudo (devcontainer
     # pattern). Ubuntu 24.04 ships its own 'ubuntu' at UID 1000 — drop
     # it first so files created in the VM are owned by shed.
-    # docker group is pre-created (gid matches docker-ce postinst) so
-    # the `-G docker` line works regardless of whether the `full`
-    # stage layers docker on top.
+    # docker group is pre-created so `-G docker` works regardless of
+    # whether the `full` stage layers docker-ce on top. Use --system so
+    # GID is allocated from the system range (docker-ce postinst
+    # matches by group NAME, not GID, so any free GID is fine).
     userdel -r ubuntu 2>/dev/null || true && \
-    groupadd -g 999 docker && \
+    (getent group docker >/dev/null 2>&1 || groupadd --system docker) && \
     useradd -m -s /bin/bash -u 1000 -G docker shed && \
     echo 'shed ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/shed && \
     chmod 0440 /etc/sudoers.d/shed && \

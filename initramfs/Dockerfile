@@ -36,7 +36,8 @@ RUN mkdir -p /irfs/bin /irfs/sbin /irfs/dev /irfs/proc /irfs/sys \
 RUN cp /bin/busybox /irfs/bin/busybox \
     && for cmd in sh mount umount mkdir mknod cat echo sleep chmod chown \
                   ls cp mv rm ln dd od tr grep cut head tail sed find uname \
-                  switch_root pivot_root reboot poweroff blkid; do \
+                  switch_root pivot_root reboot poweroff blkid \
+                  tar gunzip gzip sync; do \
         ln -sf busybox /irfs/bin/$cmd; \
     done
 
@@ -54,8 +55,8 @@ RUN cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
 # read-only lower images without launching a Docker container on the
 # host. lz4 compression is supported by Linux 5.4+; the shed kernels
 # already include CONFIG_EROFS_FS=y plus CONFIG_EROFS_FS_ZIP=y.
-RUN cp /usr/sbin/mkfs.erofs /irfs/sbin/mkfs.erofs \
-    && for lib in $(ldd /usr/sbin/mkfs.erofs \
+RUN cp /usr/bin/mkfs.erofs /irfs/sbin/mkfs.erofs \
+    && for lib in $(ldd /usr/bin/mkfs.erofs \
             | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
             | grep -v '^$'); do \
         mkdir -p "/irfs$(dirname "$lib")"; \

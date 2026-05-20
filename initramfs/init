@@ -14,7 +14,7 @@
 #   shed.lower=/dev/vdb                       (legacy single-layer form)
 #
 # In materialize mode the additional cmdline args are:
-#   shed.input=sha256:<hex>                   layer digest to materialize
+#   shed.input-device=/dev/vdb                block device backing the layer tar.gz (read-only)
 #   shed.output=/dev/vda                      target block device
 #   shed.output-format=erofs                  output filesystem (only erofs supported)
 # and the input blob bytes are accessed through a VirtioFS share with
@@ -45,6 +45,7 @@ UPPER_DEV=/dev/vda
 LOWER_DEVS=""   # space-separated list of /dev/vdX paths, manifest order
 SHED_MODE=""
 SHED_INPUT=""
+SHED_INPUT_DEVICE=""
 SHED_OUTPUT=""
 SHED_OUTPUT_FORMAT=""
 
@@ -61,7 +62,7 @@ panic() {
 # ordering tried to read /proc/cmdline before /proc existed, which
 # silently degraded into the LOWER_DEVS=/dev/vdb legacy fallback — fine
 # for single-layer images, wrong for multi-layer.
-mkdir -p /proc /sys /dev /run /newroot /upper
+mkdir -p /proc /sys /dev /run /newroot /upper /tmp
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev \
@@ -73,9 +74,11 @@ mount -t devpts devpts /dev/pts 2>/dev/null || true
 # case statement (more-specific pattern first) — but the two prefixes
 # differ enough that POSIX glob doesn't actually cross-match; the order
 # is just defensive.
+echo "shed-initramfs: /proc/cmdline=[$(cat /proc/cmdline 2>/dev/null)]"
 for arg in $(cat /proc/cmdline 2>/dev/null || true); do
     case "$arg" in
         shed.mode=*) SHED_MODE="${arg#shed.mode=}" ;;
+        shed.input-device=*) SHED_INPUT_DEVICE="${arg#shed.input-device=}" ;;
         shed.input=*) SHED_INPUT="${arg#shed.input=}" ;;
         shed.output=*) SHED_OUTPUT="${arg#shed.output=}" ;;
         shed.output-format=*) SHED_OUTPUT_FORMAT="${arg#shed.output-format=}" ;;
@@ -93,9 +96,9 @@ done
 # VirtioFS, then powers off. shed-server reaps the process and reads
 # the resulting .erofs from the host filesystem.
 if [ "$SHED_MODE" = "materialize" ]; then
-    echo "shed-initramfs: mode=materialize input=${SHED_INPUT} output=${SHED_OUTPUT} format=${SHED_OUTPUT_FORMAT}"
-    if [ -z "$SHED_INPUT" ] || [ -z "$SHED_OUTPUT" ]; then
-        panic SHED-INIT-24 "materialize mode requires shed.input= and shed.output= on cmdline"
+    echo "shed-initramfs: mode=materialize input-device=${SHED_INPUT_DEVICE} output=${SHED_OUTPUT} format=${SHED_OUTPUT_FORMAT}"
+    if [ -z "$SHED_OUTPUT" ]; then
+        panic SHED-INIT-24 "materialize mode requires shed.output= on cmdline"
     fi
     if [ "$SHED_OUTPUT_FORMAT" != "erofs" ] && [ -n "$SHED_OUTPUT_FORMAT" ]; then
         panic SHED-INIT-24 "materialize mode: only shed.output-format=erofs is supported (got $SHED_OUTPUT_FORMAT)"
@@ -114,38 +117,53 @@ if [ "$SHED_MODE" = "materialize" ]; then
         panic SHED-INIT-24 "materialize mode: output device $SHED_OUTPUT not present"
     fi
 
-    mkdir -p /input /work/extracted
-
-    # Mount the host blobs directory read-only via VirtioFS.
-    if ! mount -t virtiofs -o ro blobs /input 2>/dev/null; then
-        # Fall back to 9P share (used by Firecracker, which lacks VirtioFS).
-        if ! mount -t 9p -o trans=virtio,version=9p2000.L,ro blobs /input 2>/dev/null; then
-            panic SHED-INIT-20 "materialize mode: failed to mount input share (tried virtiofs + 9p, tag=blobs)"
-        fi
-    fi
-
-    # Translate sha256:<hex> -> sha256/<hex>; the host shares the parent
-    # of sha256/ so the in-guest path mirrors blobs/sha256/<hex>.
-    case "$SHED_INPUT" in
-        sha256:*) hex="${SHED_INPUT#sha256:}"; blob_path="/input/sha256/${hex}" ;;
-        *) panic SHED-INIT-24 "materialize mode: shed.input must be sha256:<hex> (got $SHED_INPUT)" ;;
-    esac
-    if [ ! -f "$blob_path" ]; then
-        panic SHED-INIT-21 "materialize mode: input blob missing at $blob_path"
-    fi
-
-    # Extract the layer tar.gz into a tmpfs work area. Layer blobs in
-    # the OCI store can be gzipped, zstd, or raw — busybox tar's -z
-    # handles gzip, the most common case for shed-emitted layers.
-    mount -t tmpfs tmpfs /work
     mkdir -p /work/extracted
-    if ! tar -xzf "$blob_path" -C /work/extracted 2>/tmp/tar.err; then
-        # Try without -z (raw tar) before giving up.
-        if ! tar -xf "$blob_path" -C /work/extracted 2>>/tmp/tar.err; then
-            echo "tar extract stderr:"
-            cat /tmp/tar.err 2>/dev/null || true
-            panic SHED-INIT-22 "materialize mode: failed to extract $blob_path"
+
+    # Wait briefly for the input block device to appear.
+    if [ -z "$SHED_INPUT_DEVICE" ]; then
+        panic SHED-INIT-24 "materialize mode requires shed.input-device= on cmdline (block device backing the layer tar.gz)"
+    fi
+    j=0
+    while [ $j -lt 50 ]; do
+        if [ -b "$SHED_INPUT_DEVICE" ]; then
+            break
         fi
+        sleep 0.1
+        j=$((j + 1))
+    done
+    if [ ! -b "$SHED_INPUT_DEVICE" ]; then
+        panic SHED-INIT-20 "materialize mode: input device $SHED_INPUT_DEVICE not present"
+    fi
+
+    # Extract the layer tar.gz directly from the read-only virtio-blk
+    # device. busybox tar's -z reads the file by seek/stat which
+    # doesn't always work on a block device — pipe through dd|gunzip
+    # so we read the underlying bytes sequentially. dd's bs=1M is plenty
+    # large; the trailing zero padding from the host stager is ignored
+    # by gunzip (it stops at the end of the gzip stream).
+    # Size the tmpfs explicitly so it can hold a fully-uncompressed
+    # Ubuntu base layer (~3-4 GiB). Default tmpfs is 50% of RAM, but
+    # we want a generous explicit upper bound — the materializer VM
+    # is sized to comfortably hold this.
+    mount -t tmpfs -o size=5G tmpfs /work
+    mkdir -p /work/extracted
+    echo "shed-initramfs: ls /dev/vd*:"
+    ls -la /dev/vd* 2>&1 || true
+    echo "shed-initramfs: first 16 bytes of $SHED_INPUT_DEVICE:"
+    dd if="$SHED_INPUT_DEVICE" bs=16 count=1 2>/dev/null | od -An -c -N 16 2>&1 || true
+    echo "shed-initramfs: which tar gunzip dd:"
+    which tar gunzip dd 2>&1 || true
+    echo "shed-initramfs: starting dd|gunzip|tar extract..."
+    set +e
+    dd if="$SHED_INPUT_DEVICE" bs=1M 2>/tmp/dd.err | gunzip -c 2>/tmp/gunzip.err | tar -xf - -C /work/extracted 2>/tmp/tar.err
+    extract_rc=$?
+    set -e
+    echo "shed-initramfs: pipeline rc=$extract_rc"
+    echo "dd stderr:"; cat /tmp/dd.err 2>/dev/null || true
+    echo "gunzip stderr:"; cat /tmp/gunzip.err 2>/dev/null || true
+    echo "tar stderr:"; cat /tmp/tar.err 2>/dev/null || true
+    if [ "$extract_rc" -ne 0 ]; then
+        panic SHED-INIT-22 "materialize mode: failed to extract $SHED_INPUT_DEVICE (rc=$extract_rc)"
     fi
 
     echo "shed-initramfs: running mkfs.erofs -> $SHED_OUTPUT"
@@ -242,8 +260,13 @@ for d in $LOWER_DEVS; do
     idx=$((idx + 1))
     mnt="/lower-${idx}"
     mkdir -p "$mnt"
-    mount -t ext4 -o ro "$d" "$mnt" \
-        || panic SHED-INIT-03 "failed to mount $d ro at $mnt"
+    # Lowers are now erofs (since the materializer cutover in v0.5.1);
+    # try erofs first, then fall back to ext4 for backward compat
+    # with caches materialized before the cutover.
+    if ! mount -t erofs -o ro "$d" "$mnt" 2>/dev/null; then
+        mount -t ext4 -o ro "$d" "$mnt" \
+            || panic SHED-INIT-03 "failed to mount $d ro at $mnt (tried erofs and ext4)"
+    fi
     if [ -z "$lower_dirs" ]; then
         lower_dirs="$mnt"
     else

@@ -51,15 +51,13 @@ type MaterializerOpts struct {
 	KernelPath string
 	InitrdPath string
 
-	// InputBlobsDir is the host path shared into the VM read-only via
-	// VirtioFS. Inside the VM the materializer mounts it at /input;
-	// the layer tar.gz lives at /input/sha256/<hex>. Typical value:
-	// "{imagesDir}/blobs".
-	InputBlobsDir string
+	// InputBlobPath is the host path to the layer tar.gz blob. Passed
+	// as a read-only virtio-blk device; the in-guest initramfs runs
+	// `tar -xzf <device>` directly (no filesystem layer in between).
+	// This avoids needing virtio-fs / 9p modules in the initramfs.
+	InputBlobPath string
 
-	// InputDigest is the layer digest to materialize ("sha256:..."). The
-	// initramfs reads this from shed.input= on the cmdline and locates
-	// the blob inside the shared dir.
+	// InputDigest is the layer digest being materialized (for logging).
 	InputDigest string
 
 	// OutputPath is the host path where the resulting erofs image
@@ -96,8 +94,8 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 	if opts.KernelPath == "" || opts.InitrdPath == "" {
 		return fmt.Errorf("%w: kernel and initrd paths are required", vmimage.ErrMaterializerUnavailable)
 	}
-	if opts.InputBlobsDir == "" || opts.InputDigest == "" || opts.OutputPath == "" {
-		return fmt.Errorf("RunMaterializer: input dir, input digest, and output path are required")
+	if opts.InputBlobPath == "" || opts.OutputPath == "" {
+		return fmt.Errorf("RunMaterializer: input blob path and output path are required")
 	}
 	if opts.VfkitPath == "" {
 		opts.VfkitPath = "vfkit"
@@ -106,7 +104,11 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 		opts.CPUs = 2
 	}
 	if opts.MemoryMiB <= 0 {
-		opts.MemoryMiB = 2048
+		// Generous default — the in-guest tmpfs holds the uncompressed
+		// layer tree before mkfs.erofs. Ubuntu base images can decompress
+		// to 3-4 GiB. APFS doesn't actually commit unused guest memory,
+		// so this is a paper allocation.
+		opts.MemoryMiB = 6144
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = 5 * time.Minute
@@ -124,8 +126,8 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 			return fmt.Errorf("materializer prerequisite missing (%s): %w", p, err)
 		}
 	}
-	if _, err := os.Stat(opts.InputBlobsDir); err != nil {
-		return fmt.Errorf("materializer input dir missing: %w", err)
+	if _, err := os.Stat(opts.InputBlobPath); err != nil {
+		return fmt.Errorf("materializer input blob missing: %w", err)
 	}
 	// The output path must exist as a regular file backing virtio-blk.
 	// vfkit will not create it. Caller (EnsureLowerFromLayer) creates a
@@ -135,17 +137,47 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 	}
 
 	// Pre-allocate the output file. erofs needs enough space to land
-	// its output; truncating to a generous size + sparse holes is
-	// cheap on APFS / ext4. Skip if the file is already non-empty
-	// (caller may have sized it).
-	if err := ensureSparseSize(opts.OutputPath, 2*1024*1024*1024); err != nil {
+	// its output. Use 1.5× the input blob's compressed size as a
+	// safe upper bound (lz4 typically beats gzip's ratio so the
+	// erofs result is usually 70-100% of the tar.gz size). Cap at
+	// 4 GiB which is way bigger than any reasonable single layer.
+	// Sparse-allocated — APFS only physically commits the bytes
+	// mkfs.erofs actually writes.
+	inputInfo, ierr := os.Stat(opts.InputBlobPath)
+	if ierr != nil {
+		return fmt.Errorf("statting materializer input: %w", ierr)
+	}
+	outputSize := int64(float64(inputInfo.Size()) * 1.5)
+	if outputSize < 64*1024*1024 {
+		outputSize = 64 * 1024 * 1024 // floor at 64 MiB for tiny layers
+	}
+	if outputSize > 4*1024*1024*1024 {
+		outputSize = 4 * 1024 * 1024 * 1024
+	}
+	// Round up to 512-byte block boundary (VZ requirement).
+	outputSize = ((outputSize + 511) / 512) * 512
+	if err := ensureSparseSize(opts.OutputPath, outputSize); err != nil {
 		return fmt.Errorf("sizing materializer output: %w", err)
 	}
+
+	// VZ rejects virtio-blk image files whose size isn't a multiple of
+	// 512 bytes ("Invalid disk image. The disk image format is not
+	// recognized."). The OCI blob is an immutable content-addressed
+	// file we can't pad in place, and we don't want to mutate it
+	// anyway. Stage a padded copy in the same dir as the output (same
+	// volume — APFS clonefile is O(1) sparse on most paths). The
+	// in-guest `tar -xzf` reads the gzip stream and stops at end-of-
+	// stream; trailing zero padding is ignored by gzip.
+	stagedInput, stagedErr := stagePaddedBlob(opts.InputBlobPath, opts.OutputPath+".input")
+	if stagedErr != nil {
+		return fmt.Errorf("staging padded input blob: %w", stagedErr)
+	}
+	defer os.Remove(stagedInput)
 
 	cmdline := strings.Join([]string{
 		"console=hvc0",
 		"shed.mode=materialize",
-		"shed.input=" + opts.InputDigest,
+		"shed.input-device=/dev/vdb",
 		"shed.output=/dev/vda",
 		"shed.output-format=erofs",
 	}, " ")
@@ -156,16 +188,25 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 		"--kernel", opts.KernelPath,
 		"--initrd", opts.InitrdPath,
 		"--kernel-cmdline", cmdline,
-		// Output device: virtio-blk-backed by the staging file. Guest
-		// writes mkfs.erofs output here.
+		// /dev/vda: the staging output file. Guest writes mkfs.erofs
+		// output here.
 		"--device", "virtio-blk,path=" + opts.OutputPath,
-		// Read-only VirtioFS share of the blobs directory. The guest
-		// reads the layer tar.gz directly from the host store.
-		"--device", fmt.Sprintf("virtio-fs,sharedDir=%s,mountTag=blobs", opts.InputBlobsDir),
-		// Console serial — gives us boot logs if the materializer
-		// panics in the initramfs.
-		"--device", "virtio-serial,stdio",
+		// /dev/vdb: the input layer tar.gz blob (read-only, staged copy
+		// padded to 512-byte alignment for VZ). Guest's initramfs does
+		// `tar -xzf /dev/vdb` directly — no filesystem mount in
+		// between, so we don't depend on virtio-fs or 9p kernel
+		// modules being loadable from the initramfs.
+		"--device", "virtio-blk,path=" + stagedInput + ",readonly",
 	}
+	// Console serial — gives us boot logs if the materializer panics in
+	// the initramfs. vfkit's virtio-serial device wants logFilePath=
+	// (NOT a bare "stdio" subkey, which vfkit rejects as
+	// "operation not supported by device").
+	consoleLog := opts.ConsoleLogPath
+	if consoleLog == "" {
+		consoleLog = opts.OutputPath + ".console.log"
+	}
+	args = append(args, "--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLog))
 
 	runCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
@@ -173,20 +214,9 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 	cmd := exec.CommandContext(runCtx, opts.VfkitPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-
-	if opts.ConsoleLogPath != "" {
-		// Use the log file as stdout so the guest serial console gets
-		// captured. Stderr stays buffered so we can include it in the
-		// error message.
-		f, err := os.OpenFile(opts.ConsoleLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return fmt.Errorf("opening materializer console log: %w", err)
-		}
-		defer f.Close()
-		cmd.Stdout = f
-	} else {
-		cmd.Stdout = io.Discard
-	}
+	cmd.Stdout = io.Discard
+	// Note: guest console output is captured via virtio-serial's
+	// logFilePath= above, not via vfkit's stdout.
 
 	start := time.Now()
 	if err := cmd.Run(); err != nil {
@@ -209,13 +239,18 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 // locally-cached shed image with the relevant annotations. Returns
 // vmimage.ErrMaterializerUnavailable if no candidate image is cached
 // yet (caller falls back to the docker pipeline).
+//
+// Limitation: this only resolves through tagged images, which means
+// the very first pull on a fresh cache falls back to docker because
+// the new image's tag hasn't been committed yet. Subsequent pulls
+// (other variants, re-pulls of the same tag) take the materializer-VM
+// path. See docs/discovery/layer-storage-optimization.md §12 — first-
+// pull bootstrap is a known follow-up.
 func ResolveMaterializerBootBlobs(imagesDir string) (kernelPath, initrdPath string, err error) {
 	tags, terr := vmimage.ListTags(imagesDir)
 	if terr != nil {
 		return "", "", fmt.Errorf("listing tags: %w", terr)
 	}
-	// Try every tag — pick the first that has both kernel + initrd
-	// annotations and where both blobs are on disk.
 	for _, tag := range tags {
 		t, err := vmimage.GetTag(imagesDir, tag)
 		if err != nil {
@@ -259,23 +294,60 @@ func MaterializerHook(imagesDir, vfkitPath, consoleLogPath string) vmimage.Mater
 		if rerr != nil {
 			return rerr
 		}
-		// blobPath is {imagesDir}/blobs/sha256/<hex>. We pass the
-		// parent of sha256/ as the share root so the guest sees a
-		// stable directory layout regardless of which shed image we
-		// picked for boot.
-		blobsDir := filepath.Dir(filepath.Dir(blobPath))
+		// blobPath is {imagesDir}/blobs/sha256/<hex>. We pass it
+		// directly as the read-only input virtio-blk device — the
+		// guest reads `tar -xzf /dev/vdb` from the blob.
 		hex := filepath.Base(blobPath)
 		digest := "sha256:" + hex
 		return RunMaterializer(ctx, MaterializerOpts{
 			VfkitPath:      vfkitPath,
 			KernelPath:     kernel,
 			InitrdPath:     initrd,
-			InputBlobsDir:  blobsDir,
+			InputBlobPath:  blobPath,
 			InputDigest:    digest,
 			OutputPath:     outputPath,
 			ConsoleLogPath: consoleLogPath,
 		})
 	}
+}
+
+// stagePaddedBlob copies srcPath to a new file at dstPath padded to the
+// next 512-byte block boundary. VZ requires virtio-blk image files to
+// be exact multiples of 512 bytes — content-addressed OCI tar.gz blobs
+// almost never are. Returns the staged path on success; caller is
+// responsible for removing it. Uses APFS clonefile when available
+// (instantaneous + sparse) and falls back to a regular copy otherwise.
+func stagePaddedBlob(srcPath, dstPath string) (string, error) {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return "", err
+	}
+	dst, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = os.Remove(dstPath)
+		return "", fmt.Errorf("copy: %w", err)
+	}
+	// Pad up to the next 512-byte boundary.
+	const blockSize = 512
+	size := srcInfo.Size()
+	padded := ((size + blockSize - 1) / blockSize) * blockSize
+	if padded == size {
+		padded = size + blockSize // ensure at least one trailing block; harmless
+	}
+	if err := dst.Truncate(padded); err != nil {
+		_ = os.Remove(dstPath)
+		return "", fmt.Errorf("truncate: %w", err)
+	}
+	return dstPath, nil
 }
 
 // ensureSparseSize grows path to at least sizeBytes via truncate.
