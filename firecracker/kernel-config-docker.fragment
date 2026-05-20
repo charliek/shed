@@ -29,3 +29,9 @@ CONFIG_NET_9P=y
 CONFIG_NET_9P_FD=y
 CONFIG_9P_FS=y
 CONFIG_9P_FS_POSIX_ACL=y
+
+# erofs read-only filesystem for per-layer cache files (v0.5.1+).
+# Replaces ext4 lowers with a compressed format (lz4) materialized
+# either natively on Linux hosts or by a shed-launched materializer
+# VM on Mac. See docs/discovery/layer-storage-optimization.md.
+CONFIG_EROFS_FS=y
