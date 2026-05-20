@@ -4,18 +4,24 @@ Design notes for reducing the per-layer disk overhead in the OCI image
 store. Background context for operators running many cached tags or
 disk-bound CI runners.
 
-## 1. Current State: 1.4× Overhead
+## 1. Current State: ~1.0–1.1× Overhead
 
-Shed's v1 OCI store keeps two copies of every layer:
+Shed's OCI store keeps two copies of every layer:
 
 | Form | Where | Purpose |
 |---|---|---|
 | Layer tar.gz | `blobs/sha256/<hex>` | Canonical OCI blob; byte-perfect for `shed image push` and registry round-trips |
-| Derived ext4 | `cache/sha256/<hex>.ext4` | Mounted directly as an overlayfs lower at boot time |
+| Derived erofs | `cache/sha256/<hex>.erofs` | Mounted directly as an overlayfs lower at boot time (lz4-compressed) |
 
 For typical content (rootfs of an Ubuntu-based shed image), the tar.gz
-is roughly **0.4× the size of the ext4**. Total cost is ~1.4× the ext4
-alone.
+is roughly the same size as the erofs cache file — both are compressed
+representations of the same content. erofs+lz4 typically lands around
+**0.5–0.7× the equivalent uncompressed ext4 size**, with gzipped tar.gz
+in the same ballpark. Total cost is now ~1.0–1.1× the equivalent ext4
+alone, down from ~1.4× when the cache was uncompressed ext4.
+
+Legacy `.ext4` cache files from v0.5.0 and earlier are still mounted at
+boot; new materializes produce `.erofs`.
 
 The trade-off is intentional:
 
@@ -27,9 +33,11 @@ The trade-off is intentional:
   `docker manifest inspect` and `crane manifest --from-archive` for the
   same tag.
 
-For a default `full` install with 3 layers totaling ~3 GB, the
-overhead is ~1.2 GB. Acceptable for single-developer macOS hosts;
-worth optimizing on multi-tenant or disk-bound hosts.
+For a default `full` install with 3 layers totaling ~3 GB of
+uncompressed rootfs, the on-disk cost is now in the ~3.2 GB range
+rather than ~4.2 GB. The two-forms model is still an intentional
+trade — fast boot and byte-perfect push in exchange for a compressed
+cache copy alongside the canonical blob.
 
 ## 2. mkfs.ext4 Floor
 
@@ -54,6 +62,14 @@ read-write — which is fine, lowers are mounted read-only.
 **Status:** not yet wired up in `materializeLayer`. Tracked as a
 follow-up; expected to land as `mkfs.ext4 -O ^has_journal -m 0 -N
 <computed>` for any layer under N MB.
+
+**Note (v0.5.1).** The optimizations in this section are now moot for
+freshly-materialized images. Materialize uses `mkfs.erofs`, which has
+no journal and no group-descriptor / reserved-block overhead — the
+floor is a few KiB rather than 1.5 MiB. The section is kept because
+(a) legacy `.ext4` cache files from earlier versions still exist and
+mount, and (b) it documents the design space we explored before
+switching.
 
 ## 3. Cache Eviction Designs
 
@@ -134,9 +150,21 @@ easy. For VZ we inherit whatever Ubuntu ships, which is erofs-capable.
 
 ### Decision
 
-**Stay on ext4 for v1.** Both squashfs and erofs are worth a
-prototype, but neither is a free swap — initramfs changes, kernel
-config audit, performance benchmarking on real boot paths. Park for v2.
+**Switched to erofs in v0.5.1.** erofs+lz4 was preferred over squashfs
+because:
+
+- `mkfs.erofs` is roughly 2–3× faster than `mksquashfs` at equivalent
+  compression ratios — matters when materialize runs once per layer
+  and a typical image has 5–10 layers.
+- Random reads are faster, which shows up during `shed start` storms
+  and systemd boot from the layer.
+- Android ships erofs on system partitions at fleet scale, so the
+  format is battle-tested under real workloads.
+
+Kernel support landed alongside the format switch: the Firecracker
+kernel was rebuilt with `CONFIG_EROFS_FS=y`. On the VZ side, Ubuntu's
+`linux-image-virtual` already enables erofs, so no kernel work was
+needed there.
 
 ## 5. When This Matters
 
@@ -160,10 +188,10 @@ quarterly typically don't notice the overhead.
 
 | Version | Change |
 |---|---|
-| v1.0 | Current — 1.4× overhead, no eviction. |
-| v1.5 | `mkfs.ext4 -O ^has_journal -m 0 -N <auto>` for layers under 256 MB. Manual `shed image prune --layer-cache`. |
-| v2.0 | Squashfs or erofs lower option behind a feature flag, with benchmarks. |
-| v2.5 | Auto LRU eviction with configurable budget. |
+| v0.5.0 | Multi-layer OCI store; 1.4× overhead with uncompressed ext4 cache; no eviction. |
+| v0.5.1 | erofs+lz4 cache replaces ext4; overhead drops to ~1.0–1.1×. Materialize moved off Docker (native `mkfs.erofs` on Linux, materializer VM on macOS). |
+| Next | Manual `shed image prune --layer-cache`. Whiteout translation for foreign multi-layer images. |
+| Later | VirtioFS lowers (eliminates the materialize step entirely). Auto LRU eviction with configurable budget. |
 
 Nothing in this sketch is committed. Treat it as "if we don't get
 distracted by something more important."
@@ -287,3 +315,86 @@ for the 9–10 we ship today.
   needs a guest-side comparison harness — a way to walk a layer's tar
   pre-extract and a `find /` post-boot diff. Worth building once;
   reusable for any future layer-semantics work.
+
+## 11. The Materialize-via-Docker History
+
+The path from "single ext4 per image" to "per-layer erofs via a
+materializer VM" took three releases and one production incident.
+
+**v0.4.x: single flat ext4 per image.** Each pulled image was
+materialized once into a single ext4 file via
+`docker run ubuntu:24.04 mkfs.ext4`. Slow per invocation, but it ran
+once per image and the cost was amortized across every `shed start`
+from that image. Tolerable.
+
+**v0.5.0: multi-layer rollout amplified the cost N×.** Switching to
+the OCI multi-layer store meant one materialize per layer rather than
+one per image — typically 5–10 layers for a default image. The
+per-materialize cost also included `apt-get install e2fsprogs` inside a
+fresh Ubuntu container every time, since the materialize container was
+ephemeral.
+
+**#99: Docker Desktop hung under load.** Once 5–10 materialize
+containers ran back-to-back during a fresh `shed image pull`, Docker
+Desktop on macOS would intermittently lock up — not a shed bug per se,
+but shed's usage pattern reliably triggered it. What had been a
+tolerable annoyance in v0.4 became a production blocker in v0.5.
+
+### Options Considered for v0.5.1
+
+| Option | Pros | Cons |
+|---|---|---|
+| Published helper image (`ghcr.io/charliek/shed-cache-builder`) | Cleanest tooling-wise; single thin container | Introduces a separate publish workflow; still depends on Docker at runtime |
+| Locally-built Dockerfile shipped with shed | No external dependency | ~30 s one-time build per host; couples `shed-server` to repo files; awkward with brew/deb installs |
+| Native `mkfs` on the host (no Docker) | Zero indirection on Linux | macOS has no native ext4/erofs userland — needs *something* Linux-flavored |
+| VirtioFS lowers (no cache filesystem images at all) | Architecturally cleanest — eliminates materialize entirely | Largest scope; separate quarter of work |
+| **Materializer VM** (chosen) | Zero Docker dependency; reuses shed's existing kernel + initrd; smallest blast radius; aligns with "we already run Linux VMs" | One extra build artifact (the materializer-mode initramfs) |
+
+### Why the Materializer VM Was the Right Size for v0.5.1
+
+The materializer VM is a tactical fix: shed-server launches a one-shot
+vfkit VM with shed's own kernel and a materializer-mode initramfs that
+runs `mkfs.erofs` inside the VM, then exits. On Linux hosts the same
+work is done natively via the `erofs-utils` package — no VM.
+
+It addresses #99 today without committing to the larger VirtioFS-lowers
+redesign, and it leaves that door open as a future "even simpler"
+follow-up. The change is contained to `internal/vmimage/` and the
+materializer initramfs build; nothing in the rest of the system needs
+to know that materialize used to involve Docker.
+
+### Reflection
+
+The v0.5.0 multi-layer rollout was net-positive — ~60% disk savings
+across the variant set and byte-perfect interop with arbitrary OCI
+registries — but the materialize complexity was higher than
+anticipated going in. The Docker-based materialize path worked in
+isolation and worked in v0.4 at one-per-image rates; it didn't survive
+the N× multiplier of multi-layer at production load. The materializer
+VM closes the specific gap that #99 surfaced and leaves the
+architecture in a better place to take the next step (VirtioFS lowers)
+when scope allows.
+
+## 12. Remaining Roadmap
+
+What's still open after v0.5.1:
+
+- **Cache eviction policy** (LRU / refcount / manual). Still parked.
+  Section 3 covers the design options; no implementation yet.
+- **`shed image build` without a Docker daemon.** `shed image build`
+  still shells out to `docker buildx`. Tracked separately in
+  `docs/discovery/docker-free-builds.md`.
+- **VirtioFS lowers.** The "even cleaner" architectural follow-up:
+  lower layers stay as directory trees on the host (no filesystem
+  image at all), mounted into VMs via VirtioFS (macOS) or 9P (Linux).
+  Eliminates the materialize step entirely. Big change; parked here
+  for future scope.
+- **Whiteout translation for foreign multi-layer images**
+  (`.wh.foo` → `mknod c 0 0`). Section 7 covers the fix sketch.
+  Affects only foreign images that delete files in middle layers;
+  shed's own variants only add.
+- **32-byte empty layers in published manifests** (from ENV/LABEL
+  diffs in buildkit). Section 9. Cosmetic; polish for later.
+
+See [issue #90](https://github.com/charliek/shed/issues/90) which
+tracks several of these.
