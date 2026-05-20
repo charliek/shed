@@ -241,13 +241,14 @@ ENTRYPOINT ["/sbin/init"]
 
 # =============================================================================
 # Stage: shed-fc-full
-# Extensions + mise, Node.js, Python (via UV), and all coding agents
-# (Claude Code, OpenCode, Cursor CLI, Codex CLI). The full development
-# experience built on top of the credential-brokering base.
+# Extensions + Bun + coding agents (Claude Code, OpenCode, Codex CLI).
+# mise stays for Go-binary tools (prox, envsecrets). Node/Python/uv
+# dropped — Bun is the JS runtime + package manager, and users who
+# need Python can `uv python install 3.13` inside a shed.
 # =============================================================================
 FROM shed-fc-extensions AS shed-fc-full
 
-ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:${PATH}"
+ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.bun/bin:/home/shed/.local/bin:${PATH}"
 # CLAUDE_CONFIG_DIR tells Claude Code to read/write .claude.json inside
 # ~/.claude/ instead of at ~/.claude.json. This lets a credential mount
 # of ~/.claude/ cover all Claude state.
@@ -257,10 +258,11 @@ ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
 # folded into a single runuser-driven RUN.
 RUN set -euo pipefail && \
     # profile.d shim so login shells see the shed user's PATH.
+    # Bun installs to ~/.bun/bin and is the runtime for OpenCode + Codex.
     printf '%s\n' \
         '# Only add shed user paths for the shed user (not root)' \
         'if [ "$(id -u)" = "1000" ]; then' \
-        '  export PATH="/home/shed/.local/share/mise/shims:/home/shed/.local/bin:$PATH"' \
+        '  export PATH="/home/shed/.local/share/mise/shims:/home/shed/.bun/bin:/home/shed/.local/bin:$PATH"' \
         'fi' \
         > /etc/profile.d/shed-path.sh && \
     # CLAUDE_CONFIG_DIR for login shells (matches the ENV above).
@@ -268,21 +270,19 @@ RUN set -euo pipefail && \
     # All shed-user installations happen via `runuser -l shed -c` so the
     # umasks, HOMEs, and downloaders behave as if `shed` ran them.
     runuser -l shed -c 'set -euo pipefail; \
-        # mise (version manager) + Node LTS.
+        # mise (kept for prox + envsecrets Go binaries; no Node/Python). \
         curl https://mise.run | sh && \
         echo "eval \"\$(mise activate bash)\"" >> /home/shed/.bashrc && \
-        mise use -g node@lts && \
-        # Claude Code.
+        # Bun (single-binary runtime + package manager for opencode + codex). \
+        curl -fsSL https://bun.com/install | bash && \
+        # Claude Code (ships its own bundled runtime; not Node-dependent). \
         curl -fsSL https://claude.ai/install.sh | bash && \
-        # UV + Python.
-        curl -LsSf https://astral.sh/uv/install.sh | sh && \
-        /home/shed/.local/bin/uv python install 3.13 && \
-        # Additional mise-managed tools.
+        # Additional mise-managed tools. \
         mise use -g github:charliek/prox github:charliek/envsecrets && \
-        # OpenCode.
-        curl -fsSL https://opencode.ai/install | bash && \
-        # Codex CLI (Node-based; lands in mise-managed npm bin).
-        npm i -g @openai/codex \
+        # OpenCode via Bun. \
+        /home/shed/.bun/bin/bun add -g opencode-ai && \
+        # Codex CLI via Bun (npm-compatible). \
+        /home/shed/.bun/bin/bun install -g @openai/codex \
     '
 
 WORKDIR /workspace
