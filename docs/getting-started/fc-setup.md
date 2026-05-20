@@ -231,8 +231,8 @@ sudo systemctl start shed-server
 sudo shed-server pull-images
 ```
 
-See the [Upgrade Guide](../UPGRADE.md) for what's new in v0.5.0,
-what carries over, and recovery scenarios.
+See the [v0.4 → v0.5 Upgrade Guide](../upgrades/v0.4-to-v0.5.md) for
+what's new in v0.5.0, what carries over, and recovery scenarios.
 
 Workspace data under `--local-dir` mounts is unaffected. Workspace data
 that lived only inside the deleted upper layers is lost, by design.

@@ -92,7 +92,8 @@ nav:
       - Quick Start: getting-started/quick-start.md
       - VZ Setup (macOS): getting-started/vz-setup.md
       - Firecracker Setup: getting-started/fc-setup.md
-      - Upgrade Guide: UPGRADE.md
+      - Upgrades:
+          - v0.4 → v0.5: upgrades/v0.4-to-v0.5.md
   - Tutorials:
       - Build Your Own Image: tutorials/build-your-own-image.md
   - Reference:
@@ -118,6 +119,7 @@ nav:
       - Setup: development/setup.md
       - Testing: development/testing.md
       - Architecture: development/architecture.md
+      - In-shed Build Debugging: development/in-shed-build-debugging.md
   - Roadmap: ROADMAP.md
 
 extra:

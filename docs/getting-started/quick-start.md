@@ -23,8 +23,8 @@ Shed has two install paths:
   Pick this if you're hacking on shed itself or want to run an unreleased
   commit.
 
-Upgrading from v0.4.x? See the [Upgrade Guide](../UPGRADE.md) — the
-v0.5.0 image store is not backwards-compatible.
+Upgrading from v0.4.x? See the [v0.4 → v0.5 Upgrade Guide](../upgrades/v0.4-to-v0.5.md) —
+the v0.5.0 image store is not backwards-compatible.
 
 ### Homebrew (macOS, Recommended)
 
