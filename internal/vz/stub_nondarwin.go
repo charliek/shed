@@ -11,7 +11,15 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/vmimage"
 )
+
+// MaterializerHook returns nil on non-darwin builds. The VZ
+// materializer VM only runs on Mac; on Linux the firecracker backend
+// uses the host-native mkfs.erofs path instead.
+func MaterializerHook(imagesDir, vfkitPath, consoleLogPath string) vmimage.MaterializerFunc {
+	return nil
+}
 
 // errNonDarwin wraps ErrNotSupportedSentinel so the API layer maps
 // every VZ-on-Linux call to HTTP 501 (Not Implemented) rather than a

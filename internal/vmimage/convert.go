@@ -187,12 +187,21 @@ func Resolve(imagesDir, tag, expectedRef string) string {
 		return ""
 	}
 	layer := manifest.Layers[0]
-	cachePath, err := CacheExt4Path(imagesDir, layer.Digest)
+	cachePath, err := CacheLowerPath(imagesDir, layer.Digest)
 	if err != nil {
 		return ""
 	}
 	if _, err := os.Stat(cachePath); err != nil {
-		return ""
+		// Fall back to the legacy .ext4 path for layers cached by
+		// v0.5.0 before the erofs cutover.
+		legacyPath, lerr := CacheLowerPathLegacy(imagesDir, layer.Digest)
+		if lerr != nil {
+			return ""
+		}
+		if _, err := os.Stat(legacyPath); err != nil {
+			return ""
+		}
+		return legacyPath
 	}
 	return cachePath
 }
@@ -215,9 +224,18 @@ func ResolveTag(imagesDir, tag string) (digest, rootfsPath string, err error) {
 	if len(manifest.Layers) == 0 {
 		return t.Digest, "", fmt.Errorf("manifest %s has no layers", t.Digest)
 	}
-	cachePath, err := CacheExt4Path(imagesDir, manifest.Layers[0].Digest)
+	cachePath, err := CacheLowerPath(imagesDir, manifest.Layers[0].Digest)
 	if err != nil {
 		return t.Digest, "", err
+	}
+	if _, statErr := os.Stat(cachePath); statErr != nil {
+		// Prefer the legacy .ext4 path when present so a partial
+		// upgrade (v0.5.0 cache + v0.5.1 binary) keeps booting.
+		if legacy, lerr := CacheLowerPathLegacy(imagesDir, manifest.Layers[0].Digest); lerr == nil {
+			if _, lstat := os.Stat(legacy); lstat == nil {
+				cachePath = legacy
+			}
+		}
 	}
 	return t.Digest, cachePath, nil
 }
@@ -255,7 +273,7 @@ func LoadConfigByDigest(imagesDir, configDigest string) (*OCIConfig, error) {
 // keeps Convert pure with respect to tag indirection.
 func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 	if opts.RootfsSize == "" {
-		opts.RootfsSize = DefaultLayerExt4Size
+		opts.RootfsSize = DefaultLayerSize
 	}
 	if opts.Platform == "" {
 		opts.Platform = DefaultPlatform
@@ -373,12 +391,12 @@ func convertFromOCIArchive(ctx context.Context, opts ConvertOptions) (*ConvertRe
 		initrdDigest = d
 	}
 
-	// Materialize ext4 for each layer. EnsureExt4FromLayer is
-	// content-addressed: shared base layers between variants reuse the
-	// existing cache file without rebuilding.
+	// Materialize the read-only lower for each layer.
+	// EnsureLowerFromLayer is content-addressed: shared base layers
+	// between variants reuse the existing cache file without rebuilding.
 	for _, ld := range layerDigests {
-		if _, err := EnsureExt4FromLayer(ctx, opts.ImagesDir, ld, opts.Platform, opts.RootfsSize); err != nil {
-			return nil, fmt.Errorf("materializing ext4 for layer %s: %w", ShortDigest(ld), err)
+		if _, err := EnsureLowerFromLayer(ctx, opts.ImagesDir, ld, opts.Platform, opts.RootfsSize); err != nil {
+			return nil, fmt.Errorf("materializing lower for layer %s: %w", ShortDigest(ld), err)
 		}
 	}
 
@@ -703,9 +721,9 @@ func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*Convert
 		return nil, fmt.Errorf("updating index.json: %w", err)
 	}
 
-	// Materialize the derived ext4 in the cache (Phase 1: single layer).
-	if _, err := EnsureExt4FromLayer(ctx, opts.ImagesDir, layerDigest, opts.Platform, opts.RootfsSize); err != nil {
-		return nil, fmt.Errorf("materializing ext4 cache: %w", err)
+	// Materialize the derived lower in the cache (Phase 1: single layer).
+	if _, err := EnsureLowerFromLayer(ctx, opts.ImagesDir, layerDigest, opts.Platform, opts.RootfsSize); err != nil {
+		return nil, fmt.Errorf("materializing lower cache: %w", err)
 	}
 
 	return &ConvertResult{

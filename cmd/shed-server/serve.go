@@ -18,6 +18,7 @@ import (
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/sshd"
+	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vz"
 )
 
@@ -70,6 +71,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create firecracker client: %w", err)
 		}
+		// Linux hosts always materialize natively (mkfs.erofs from
+		// erofs-utils). The hook is a no-op on this path.
+		vmimage.RegisterMaterializer(firecracker.MaterializerHook(fcCfg.ImagesDir))
 		log.Printf("Initialized Firecracker backend")
 		be = firecracker.NewBackend(fcClient)
 
@@ -82,6 +86,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create vz client: %w", err)
 		}
+		// On Mac the materializer launches a one-shot vfkit VM running
+		// mkfs.erofs in the initramfs. Falls back to the legacy docker
+		// pipeline when no shed image is cached yet (first-pull case).
+		materializerLog := ""
+		if vzCfg.InstanceDir != "" {
+			materializerLog = vzCfg.InstanceDir + "/materializer.log"
+		}
+		vmimage.RegisterMaterializer(vz.MaterializerHook(vzCfg.ImagesDir, vzCfg.VfkitPath, materializerLog))
 		log.Printf("Initialized VZ backend")
 		be = vz.NewBackend(vzClient)
 

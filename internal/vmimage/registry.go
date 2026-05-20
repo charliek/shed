@@ -434,10 +434,10 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		return nil, fmt.Errorf("updating index.json: %w", err)
 	}
 
-	// Materialize the derived ext4 for every layer.
+	// Materialize the derived lower image for every layer.
 	for _, ld := range layerDigests {
-		if _, err := EnsureExt4FromLayer(ctx, opts.ImagesDir, ld, opts.Platform, ""); err != nil {
-			return nil, fmt.Errorf("materializing ext4 for layer %s: %w", ShortDigest(ld), err)
+		if _, err := EnsureLowerFromLayer(ctx, opts.ImagesDir, ld, opts.Platform, ""); err != nil {
+			return nil, fmt.Errorf("materializing lower for layer %s: %w", ShortDigest(ld), err)
 		}
 	}
 

@@ -310,6 +310,12 @@ nfpms:
     ids:
       - shed
       - shed-server
+    # erofs-utils provides mkfs.erofs, used by the host-native layer
+    # materializer on Linux hosts (v0.5.1+). Without it the deb is
+    # functional but every `shed image pull` falls back to the docker
+    # pipeline — fine for parity with macOS but kills the speedup.
+    dependencies:
+      - erofs-utils
     conflicts:
       - shed
     contents:

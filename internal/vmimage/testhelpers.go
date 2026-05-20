@@ -39,9 +39,10 @@ func InstallSyntheticImage(imagesDir, tagName, sourceRef string, rootfsContent, 
 		return "", fmt.Errorf("writing layer blob: %w", err)
 	}
 
-	// Materialize a fake ext4 in the cache so callers that expect a
-	// ready-to-boot image see CacheExt4Exists() returning true.
-	cachePath, err := CacheExt4Path(imagesDir, layerDigest)
+	// Materialize a fake lower-image in the cache so callers that
+	// expect a ready-to-boot image see CacheLowerExists() returning
+	// true.
+	cachePath, err := CacheLowerPath(imagesDir, layerDigest)
 	if err != nil {
 		return "", err
 	}
@@ -53,7 +54,7 @@ func InstallSyntheticImage(imagesDir, tagName, sourceRef string, rootfsContent, 
 	// leave it alone (it's 0o444 and would otherwise refuse a rewrite).
 	if _, statErr := os.Stat(cachePath); statErr != nil {
 		if err := os.WriteFile(cachePath, rootfsContent, 0o444); err != nil {
-			return "", fmt.Errorf("writing synthetic ext4 cache: %w", err)
+			return "", fmt.Errorf("writing synthetic lower cache: %w", err)
 		}
 	}
 

@@ -17,6 +17,7 @@ FROM debian:bookworm-slim AS shed-initramfs-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         busybox-static \
         e2fsprogs \
+        erofs-utils \
         cpio \
         gzip \
         kmod \
@@ -42,6 +43,19 @@ RUN cp /bin/busybox /irfs/bin/busybox \
 # mkfs.ext4 ships outside busybox.
 RUN cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
     && for lib in $(ldd /usr/sbin/mkfs.ext4 \
+            | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
+            | grep -v '^$'); do \
+        mkdir -p "/irfs$(dirname "$lib")"; \
+        cp "$lib" "/irfs$lib"; \
+    done
+
+# mkfs.erofs: used by the materializer-mode boot path
+# (shed.mode=materialize) to convert OCI layer tar.gz blobs into
+# read-only lower images without launching a Docker container on the
+# host. lz4 compression is supported by Linux 5.4+; the shed kernels
+# already include CONFIG_EROFS_FS=y plus CONFIG_EROFS_FS_ZIP=y.
+RUN cp /usr/sbin/mkfs.erofs /irfs/sbin/mkfs.erofs \
+    && for lib in $(ldd /usr/sbin/mkfs.erofs \
             | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
             | grep -v '^$'); do \
         mkdir -p "/irfs$(dirname "$lib")"; \

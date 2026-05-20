@@ -11,7 +11,15 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/vmimage"
 )
+
+// MaterializerHook returns nil on non-linux builds. The firecracker
+// backend is linux-only, and even there the host-native mkfs.erofs
+// path runs without a VM, so the registered hook is a no-op.
+func MaterializerHook(imagesDir string) vmimage.MaterializerFunc {
+	return nil
+}
 
 // errNonLinux returns a fresh sentinel-wrapped error for every call so
 // errors.Is(err, ErrNotSupportedSentinel) catches it and the API layer

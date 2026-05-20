@@ -29,9 +29,9 @@ func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
 	if len(manifest.Layers) == 0 {
 		t.Fatalf("synthetic manifest has no layers")
 	}
-	path, err := vmimage.CacheExt4Path(imagesDir, manifest.Layers[0].Digest)
+	path, err := vmimage.CacheLowerPath(imagesDir, manifest.Layers[0].Digest)
 	if err != nil {
-		t.Fatalf("CacheExt4Path: %v", err)
+		t.Fatalf("CacheLowerPath: %v", err)
 	}
 	return path
 }

@@ -273,9 +273,11 @@ func isLoopbackRef(ref string) bool {
 	return false
 }
 
-// ResolveLayerExt4Paths returns the ordered ext4 cache paths for every
-// layer of the manifest, materializing any missing layers from their
-// tar.gz blobs. Used by VM start to attach N read-only block devices.
+// ResolveLayerExt4Paths returns the ordered lower-image cache paths for
+// every layer of the manifest, materializing any missing layers from
+// their tar.gz blobs. Used by VM start to attach N read-only block
+// devices. Despite the name, the paths may end in .erofs or .ext4
+// depending on which materializer produced each layer's cache file.
 func (m *Manager) ResolveLayerExt4Paths(ctx context.Context, manifestDigest string) ([]string, error) {
 	imagesDir := m.cfg.GetImagesDir()
 	if imagesDir == "" {
@@ -339,7 +341,7 @@ func (m *Manager) resolveCachedTag(ctx context.Context, imagesDir, name, expecte
 }
 
 // layerExt4Paths resolves every layer of a manifest into an ordered
-// list of cached ext4 paths, materializing any that are missing.
+// list of cached lower-image paths, materializing any that are missing.
 func (m *Manager) layerExt4Paths(ctx context.Context, imagesDir, manifestDigest string) (EnsureResult, error) {
 	manifest, err := LoadManifestByDigest(imagesDir, manifestDigest)
 	if err != nil {
@@ -350,9 +352,9 @@ func (m *Manager) layerExt4Paths(ctx context.Context, imagesDir, manifestDigest 
 	}
 	paths := make([]string, 0, len(manifest.Layers))
 	for _, layer := range manifest.Layers {
-		path, err := EnsureExt4FromLayer(ctx, imagesDir, layer.Digest, m.cfg.GetPlatform(), "")
+		path, err := EnsureLowerFromLayer(ctx, imagesDir, layer.Digest, m.cfg.GetPlatform(), "")
 		if err != nil {
-			return EnsureResult{}, fmt.Errorf("materializing ext4 for layer %s: %w", ShortDigest(layer.Digest), err)
+			return EnsureResult{}, fmt.Errorf("materializing lower for layer %s: %w", ShortDigest(layer.Digest), err)
 		}
 		paths = append(paths, path)
 	}
@@ -520,8 +522,8 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 			}
 			for _, layer := range mi.manifest.Layers {
 				info.SizeBytes += layer.Size
-				info.SizeBytes += CacheExt4Size(imagesDir, layer.Digest)
-				layerCost := layer.Size + CacheExt4Size(imagesDir, layer.Digest)
+				info.SizeBytes += CacheLowerSize(imagesDir, layer.Digest)
+				layerCost := layer.Size + CacheLowerSize(imagesDir, layer.Digest)
 				if layerRefs[layer.Digest] <= 1 {
 					info.UniqueBytes += layerCost
 				} else {
@@ -529,7 +531,7 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 				}
 			}
 			if len(mi.manifest.Layers) > 0 {
-				if path, err := CacheExt4Path(imagesDir, mi.manifest.Layers[0].Digest); err == nil {
+				if path, err := CacheLowerPath(imagesDir, mi.manifest.Layers[0].Digest); err == nil {
 					info.Path = path
 				}
 			}
@@ -579,10 +581,10 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 		info.Source = "dangling"
 	}
 	for _, layer := range manifest.Layers {
-		info.SizeBytes += layer.Size + CacheExt4Size(imagesDir, layer.Digest)
+		info.SizeBytes += layer.Size + CacheLowerSize(imagesDir, layer.Digest)
 	}
 	if len(manifest.Layers) > 0 {
-		if path, err := CacheExt4Path(imagesDir, manifest.Layers[0].Digest); err == nil {
+		if path, err := CacheLowerPath(imagesDir, manifest.Layers[0].Digest); err == nil {
 			info.Path = path
 		}
 	}
@@ -801,7 +803,7 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		if m, ok := manifestCandidates[b]; ok {
 			info.DockerRef = m.ShedSourceRef()
 			for _, layer := range m.Layers {
-				info.SizeBytes += layer.Size + CacheExt4Size(imagesDir, layer.Digest)
+				info.SizeBytes += layer.Size + CacheLowerSize(imagesDir, layer.Digest)
 			}
 		}
 		candidates = append(candidates, info)
@@ -815,8 +817,10 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		return candidates, nil
 	}
 
-	// Cached ext4 files for orphaned layers: evict any cache file
-	// whose layer digest is not in `reachable`.
+	// Cached lower-image files for orphaned layers: evict any cache
+	// file whose layer digest is not in `reachable`. Walks both the
+	// current (.erofs) and legacy (.ext4) extensions so the upgrade
+	// from v0.5.0 doesn't strand legacy cache files.
 	cacheDirPath := filepath.Join(imagesDir, cacheDir, algorithmDir)
 	if entries, err := os.ReadDir(cacheDirPath); err == nil {
 		for _, e := range entries {
@@ -824,10 +828,15 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 				continue
 			}
 			name := e.Name()
-			if len(name) < 64 || name[len(name)-5:] != ".ext4" {
+			ext := filepath.Ext(name)
+			if ext != CacheLowerExt && ext != LegacyCacheLowerExt {
 				continue
 			}
-			digest := DigestPrefix + name[:len(name)-5]
+			hex := strings.TrimSuffix(name, ext)
+			if len(hex) != 64 {
+				continue
+			}
+			digest := DigestPrefix + hex
 			if reachable[digest] {
 				continue
 			}

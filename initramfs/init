@@ -7,9 +7,18 @@
 #   /dev/vdb, /dev/vdc, ...  read-only lower images, one per OCI layer.
 #
 # Kernel cmdline overrides:
+#   shed.mode=boot                            (default; overlay assembly + switch_root)
+#   shed.mode=materialize                     (one-shot: mkfs.erofs into output device)
 #   shed.upper=/dev/vda
 #   shed.lowers=/dev/vdb,/dev/vdc,/dev/vdd   (N-layer form, in manifest order)
 #   shed.lower=/dev/vdb                       (legacy single-layer form)
+#
+# In materialize mode the additional cmdline args are:
+#   shed.input=sha256:<hex>                   layer digest to materialize
+#   shed.output=/dev/vda                      target block device
+#   shed.output-format=erofs                  output filesystem (only erofs supported)
+# and the input blob bytes are accessed through a VirtioFS share with
+# tag "blobs", mounted read-only at /input.
 #
 # This script intentionally avoids fancy busybox-only constructs so it
 # works equally well with full busybox and the static binaries shipped
@@ -24,11 +33,20 @@
 #   SHED-INIT-07  mkfs.ext4 on upper failed
 #   SHED-INIT-08  upper ext4 mount failed
 #   SHED-INIT-09  switch_root failed (caller should never see this)
+#   SHED-INIT-20  materialize mode: input share mount failed
+#   SHED-INIT-21  materialize mode: input blob missing
+#   SHED-INIT-22  materialize mode: tar extract failed
+#   SHED-INIT-23  materialize mode: mkfs.erofs failed
+#   SHED-INIT-24  materialize mode: invalid arguments
 
 set -e
 
 UPPER_DEV=/dev/vda
 LOWER_DEVS=""   # space-separated list of /dev/vdX paths, manifest order
+SHED_MODE=""
+SHED_INPUT=""
+SHED_OUTPUT=""
+SHED_OUTPUT_FORMAT=""
 
 panic() {
     code="$1"
@@ -57,6 +75,10 @@ mount -t devpts devpts /dev/pts 2>/dev/null || true
 # is just defensive.
 for arg in $(cat /proc/cmdline 2>/dev/null || true); do
     case "$arg" in
+        shed.mode=*) SHED_MODE="${arg#shed.mode=}" ;;
+        shed.input=*) SHED_INPUT="${arg#shed.input=}" ;;
+        shed.output=*) SHED_OUTPUT="${arg#shed.output=}" ;;
+        shed.output-format=*) SHED_OUTPUT_FORMAT="${arg#shed.output-format=}" ;;
         shed.upper=*) UPPER_DEV="${arg#shed.upper=}" ;;
         shed.lowers=*)
             list="${arg#shed.lowers=}"
@@ -65,6 +87,78 @@ for arg in $(cat /proc/cmdline 2>/dev/null || true); do
         shed.lower=*) LOWER_DEVS="${arg#shed.lower=}" ;;
     esac
 done
+
+# Materialize mode: skip the overlay-assembly path entirely. The VM was
+# booted just to run mkfs.erofs against a layer tar.gz mounted via
+# VirtioFS, then powers off. shed-server reaps the process and reads
+# the resulting .erofs from the host filesystem.
+if [ "$SHED_MODE" = "materialize" ]; then
+    echo "shed-initramfs: mode=materialize input=${SHED_INPUT} output=${SHED_OUTPUT} format=${SHED_OUTPUT_FORMAT}"
+    if [ -z "$SHED_INPUT" ] || [ -z "$SHED_OUTPUT" ]; then
+        panic SHED-INIT-24 "materialize mode requires shed.input= and shed.output= on cmdline"
+    fi
+    if [ "$SHED_OUTPUT_FORMAT" != "erofs" ] && [ -n "$SHED_OUTPUT_FORMAT" ]; then
+        panic SHED-INIT-24 "materialize mode: only shed.output-format=erofs is supported (got $SHED_OUTPUT_FORMAT)"
+    fi
+
+    # Wait briefly for the output block device to appear.
+    j=0
+    while [ $j -lt 50 ]; do
+        if [ -b "$SHED_OUTPUT" ]; then
+            break
+        fi
+        sleep 0.1
+        j=$((j + 1))
+    done
+    if [ ! -b "$SHED_OUTPUT" ]; then
+        panic SHED-INIT-24 "materialize mode: output device $SHED_OUTPUT not present"
+    fi
+
+    mkdir -p /input /work/extracted
+
+    # Mount the host blobs directory read-only via VirtioFS.
+    if ! mount -t virtiofs -o ro blobs /input 2>/dev/null; then
+        # Fall back to 9P share (used by Firecracker, which lacks VirtioFS).
+        if ! mount -t 9p -o trans=virtio,version=9p2000.L,ro blobs /input 2>/dev/null; then
+            panic SHED-INIT-20 "materialize mode: failed to mount input share (tried virtiofs + 9p, tag=blobs)"
+        fi
+    fi
+
+    # Translate sha256:<hex> -> sha256/<hex>; the host shares the parent
+    # of sha256/ so the in-guest path mirrors blobs/sha256/<hex>.
+    case "$SHED_INPUT" in
+        sha256:*) hex="${SHED_INPUT#sha256:}"; blob_path="/input/sha256/${hex}" ;;
+        *) panic SHED-INIT-24 "materialize mode: shed.input must be sha256:<hex> (got $SHED_INPUT)" ;;
+    esac
+    if [ ! -f "$blob_path" ]; then
+        panic SHED-INIT-21 "materialize mode: input blob missing at $blob_path"
+    fi
+
+    # Extract the layer tar.gz into a tmpfs work area. Layer blobs in
+    # the OCI store can be gzipped, zstd, or raw — busybox tar's -z
+    # handles gzip, the most common case for shed-emitted layers.
+    mount -t tmpfs tmpfs /work
+    mkdir -p /work/extracted
+    if ! tar -xzf "$blob_path" -C /work/extracted 2>/tmp/tar.err; then
+        # Try without -z (raw tar) before giving up.
+        if ! tar -xf "$blob_path" -C /work/extracted 2>>/tmp/tar.err; then
+            echo "tar extract stderr:"
+            cat /tmp/tar.err 2>/dev/null || true
+            panic SHED-INIT-22 "materialize mode: failed to extract $blob_path"
+        fi
+    fi
+
+    echo "shed-initramfs: running mkfs.erofs -> $SHED_OUTPUT"
+    if ! /sbin/mkfs.erofs -z lz4 "$SHED_OUTPUT" /work/extracted; then
+        panic SHED-INIT-23 "materialize mode: mkfs.erofs failed"
+    fi
+
+    sync
+    echo "shed-initramfs: materialize complete; powering off"
+    poweroff -f
+    # Should never reach here.
+    exec /bin/sh
+fi
 
 # Legacy single-lower compatibility: if nothing parsed, default to vdb.
 if [ -z "$LOWER_DEVS" ]; then
