@@ -253,8 +253,6 @@ RUN set -euo pipefail && \
         mise use -g github:charliek/prox github:charliek/envsecrets && \
         # OpenCode.
         curl -fsSL https://opencode.ai/install | bash && \
-        # Cursor CLI agent.
-        curl https://cursor.com/install -fsS | bash && \
         # Codex CLI (Node-based; lands in mise-managed npm bin).
         npm i -g @openai/codex \
     '
