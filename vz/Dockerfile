@@ -74,20 +74,13 @@ RUN apt-get update \
        iproute2 iputils-ping dnsutils netcat-openbsd \
        build-essential bubblewrap \
        linux-image-virtual initramfs-tools \
-    && install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
-    && chmod a+r /etc/apt/keyrings/docker.asc \
-    && printf "Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nSigned-By: /etc/apt/keyrings/docker.asc\n" \
-       "$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")" \
-       > /etc/apt/sources.list.d/docker.sources \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-       docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
-# Layer 2: stage shed-built binaries + service files + config from the
-# build context via a bind mount so we get a single layer for the
-# placements + chmods + configs (instead of 1 layer per COPY).
+# Layer 2: stage shed-built binaries + service files from the build
+# context via a bind mount so we get a single layer for the placements
+# + chmods + configs (instead of 1 layer per COPY). daemon.json is
+# staged but placed by the `full` stage where docker is actually
+# installed.
 RUN --mount=type=bind,source=.,target=/ctx \
     install -m 0755 /ctx/shed-agent       /usr/local/bin/shed-agent && \
     install -m 0755 /ctx/shed-firstboot   /usr/local/bin/shed-firstboot && \
@@ -95,7 +88,7 @@ RUN --mount=type=bind,source=.,target=/ctx \
     install -m 0644 /ctx/shed-agent.service     /etc/systemd/system/shed-agent.service && \
     install -m 0644 /ctx/shed-firstboot.service /etc/systemd/system/shed-firstboot.service && \
     install -m 0644 /ctx/network-setup.service  /etc/systemd/system/network-setup.service && \
-    install -m 0644 /ctx/daemon.json            /etc/docker/daemon.json
+    install -m 0644 /ctx/daemon.json            /usr/local/share/shed-docker-daemon.json
 
 # Layer 3: systemd cleanup + service enablement + user + filesystem +
 # machine-id transient setup + networking + bashrc — all in one RUN so
@@ -109,8 +102,9 @@ RUN set -euo pipefail && \
           /lib/systemd/system/sockets.target.wants/*initctl* \
           /lib/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup* \
           /lib/systemd/system/systemd-update-utmp* && \
-    # Enable services shipped by base.
-    SYSTEMD_OFFLINE=1 systemctl enable docker ssh shed-agent shed-firstboot \
+    # Enable services shipped by base. docker is enabled in the `full`
+    # stage where it's actually installed.
+    SYSTEMD_OFFLINE=1 systemctl enable ssh shed-agent shed-firstboot \
         network-setup systemd-networkd systemd-resolved && \
     # SSH server policy.
     mkdir -p /run/sshd /etc/ssh/sshd_config.d && \
@@ -128,7 +122,11 @@ RUN set -euo pipefail && \
     # Non-root shed user (UID 1000) with passwordless sudo (devcontainer
     # pattern). Ubuntu 24.04 ships its own 'ubuntu' at UID 1000 — drop
     # it first so files created in the VM are owned by shed.
+    # docker group is pre-created (gid matches docker-ce postinst) so
+    # the `-G docker` line works regardless of whether the `full`
+    # stage layers docker on top.
     userdel -r ubuntu 2>/dev/null || true && \
+    groupadd -g 999 docker && \
     useradd -m -s /bin/bash -u 1000 -G docker shed && \
     echo 'shed ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/shed && \
     chmod 0440 /etc/sudoers.d/shed && \
@@ -229,6 +227,23 @@ ENV PATH="/home/shed/.local/share/mise/shims:/home/shed/.bun/bin:/home/shed/.loc
 # ~/.claude/ instead of at ~/.claude.json. This lets a VirtioFS
 # credential mount of ~/.claude/ cover all Claude state.
 ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
+
+# Docker (only in `full`). base + extensions ship without docker; users
+# who want nested containers pull `full`. docker-buildx-plugin is NOT
+# installed (rarely used by coding agents; users can `apt install` on
+# demand). docker-compose-plugin is kept for `docker compose`.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && printf "Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nSigned-By: /etc/apt/keyrings/docker.asc\n" \
+       "$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")" \
+       > /etc/apt/sources.list.d/docker.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       docker-ce docker-ce-cli containerd.io docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -m 0644 /usr/local/share/shed-docker-daemon.json /etc/docker/daemon.json \
+    && SYSTEMD_OFFLINE=1 systemctl enable docker
 
 # Layer: install all language runtimes + coding agents as the shed user,
 # folded into a single sudo-driven RUN.
