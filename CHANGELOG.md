@@ -46,17 +46,17 @@ All notable changes to this project will be documented in this file.
   v0.4.x users upgrading without wiping `images_dir` previously hit a
   cryptic `... is a directory` error. `internal/vmimage/ocilayout.go`
   now detects this case and wraps it as `ErrLegacyBundledBlob`; the CLI
-  surfaces a message pointing the user at [`docs/UPGRADE.md`](docs/UPGRADE.md).
+  surfaces a message pointing the user at [`docs/upgrades/v0.4-to-v0.5.md`](docs/upgrades/v0.4-to-v0.5.md).
 - **`image has N layers (max 16)` rejection now includes a recovery
   hint.** `internal/vmimage/registry.go` extends the pull-time
   `MaxLayers` error with concrete next steps (wait for the v0.5.0+
   published image, or rebuild locally with the backend's build script).
 - **`SHED-INIT-04` panic cross-references the upgrade guide.** The
   initramfs overlay-mount panic in `initramfs/init` now points at
-  [`docs/UPGRADE.md#shed-init-04-panic-during-vm-boot`](docs/UPGRADE.md#shed-init-04-panic-during-vm-boot)
+  [`docs/upgrades/v0.4-to-v0.5.md#shed-init-04-panic-during-vm-boot`](docs/upgrades/v0.4-to-v0.5.md#shed-init-04-panic-during-vm-boot)
   so operators know to refresh the cached initramfs by re-running the
   build script.
-- **New top-level [`docs/UPGRADE.md`](docs/UPGRADE.md).** Walks v0.4.x →
+- **New top-level [`docs/upgrades/v0.4-to-v0.5.md`](docs/upgrades/v0.4-to-v0.5.md).** Walks v0.4.x →
   v0.5.0 with a "what's new", a keep/lose table, links into the
   backend-specific wipe steps in `vz-setup.md` / `fc-setup.md`, and a
   recovery-scenarios index keyed off the error strings users actually

@@ -252,7 +252,7 @@ func detectLegacyBundledBlob(path string) error {
 	}
 	return fmt.Errorf("%w: blob at %s is a v0.4.x bundled directory layout. "+
 		"This format is no longer supported. See "+
-		"https://github.com/charliek/shed/blob/main/docs/UPGRADE.md or "+
+		"https://github.com/charliek/shed/blob/main/docs/upgrades/v0.4-to-v0.5.md or "+
 		"docs/getting-started/{fc,vz}-setup.md#upgrading-from-v04x for the "+
 		"migration steps (stop server, wipe legacy store, re-pull or rebuild)",
 		ErrLegacyBundledBlob, path)
