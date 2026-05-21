@@ -58,13 +58,26 @@ RUN cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
 # read-only lower images without launching a Docker container on the
 # host. lz4 compression is supported by Linux 5.4+; the shed kernels
 # already include CONFIG_EROFS_FS=y plus CONFIG_EROFS_FS_ZIP=y.
+#
+# libgcc_s.so.1 is dlopen'd at runtime for pthread_exit cleanup —
+# `ldd` doesn't see it because it's not linked at build time. Without
+# it mkfs.erofs aborts with "libgcc_s.so.1 must be installed for
+# pthread_exit to work" when shutting down its worker pool. Copy it
+# explicitly.
 RUN cp /usr/bin/mkfs.erofs /irfs/sbin/mkfs.erofs \
     && for lib in $(ldd /usr/bin/mkfs.erofs \
             | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
             | grep -v '^$'); do \
         mkdir -p "/irfs$(dirname "$lib")"; \
         cp "$lib" "/irfs$lib"; \
-    done
+    done \
+    && libgcc=$(find /usr/lib /lib -name 'libgcc_s.so.1' 2>/dev/null | head -1) \
+    && if [ -n "$libgcc" ]; then \
+         mkdir -p "/irfs$(dirname "$libgcc")"; \
+         cp "$libgcc" "/irfs$libgcc"; \
+       else \
+         echo "WARNING: libgcc_s.so.1 not found — mkfs.erofs may abort on shutdown" >&2; \
+       fi
 
 # kmod's insmod uses finit_module(2) via libkmod, which decompresses
 # .ko.gz / .ko.xz / .ko.zst transparently (busybox's insmod doesn't).
