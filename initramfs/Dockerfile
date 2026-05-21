@@ -12,7 +12,10 @@
 #     --target shed-initramfs \
 #     --output type=local,dest=./out .
 
-FROM debian:bookworm-slim AS shed-initramfs-builder
+# Trixie (Debian 13) for erofs-utils 1.8.6: needed for `mkfs.erofs
+# --tar=f`, which the materialize-mode init pipeline streams the layer
+# tar.gz through. Bookworm ships erofs-utils 1.5 which predates --tar.
+FROM debian:trixie-slim AS shed-initramfs-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         busybox-static \
@@ -37,7 +40,7 @@ RUN cp /bin/busybox /irfs/bin/busybox \
     && for cmd in sh mount umount mkdir mknod cat echo sleep chmod chown \
                   ls cp mv rm ln dd od tr grep cut head tail sed find uname \
                   switch_root pivot_root reboot poweroff blkid \
-                  tar gunzip gzip sync; do \
+                  gunzip gzip sync; do \
         ln -sf busybox /irfs/bin/$cmd; \
     done
 

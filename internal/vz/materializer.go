@@ -4,10 +4,18 @@
 // Materializer VM: a one-shot vfkit invocation that converts an OCI
 // layer tar.gz blob into a read-only erofs image. The VM boots a shed
 // kernel + initramfs whose `shed.mode=materialize` cmdline branch
-// (initramfs/init) extracts the layer and runs mkfs.erofs natively,
-// then powers off. shed-server reaps the process and reads the
-// resulting .erofs back from the host filesystem (the output device is
-// a virtio-blk-backed file).
+// (initramfs/init) streams the gzipped tar through
+// `mkfs.erofs --tar=f` in a single pass and powers off. shed-server
+// reaps the process and reads the resulting .erofs back from the host
+// filesystem (the output device is a virtio-blk-backed file).
+//
+// Why streaming: the v0.5.1 first cut extracted the tar into a tmpfs
+// inside the VM, then walked the tree with mkfs.erofs. For 1+ GiB
+// compressed Ubuntu base layers that overran the 5-min per-VM timeout
+// and forced a docker fallback. Streaming collapses the two passes
+// into one and drops the in-guest working set from ~3-4 GiB to a few
+// hundred MiB. Requires erofs-utils 1.7+; the initramfs base
+// (initramfs/Dockerfile) bumps to debian:trixie-slim for 1.8.6.
 //
 // This replaces the legacy `docker run ubuntu:24.04 mkfs.ext4`
 // pipeline on Mac. The docker pipeline ran apt-get inside the
@@ -16,11 +24,11 @@
 // reuses the same kernel + initrd that shed-server boots regular VMs
 // with, so the only new artifact in the cache is the .erofs output.
 //
-// Falls back via ErrMaterializerUnavailable when no shed kernel is
-// cached locally — that's the first-pull case, where the dispatcher in
-// internal/vmimage/cache.go drops back to the docker pipeline. Once
-// any shed image is cached the materializer VM takes over for
-// subsequent layers.
+// Returns ErrMaterializerUnavailable when no cached shed image
+// provides a kernel + initrd to boot the materializer VM. The
+// dispatcher in internal/vmimage/cache.go falls back to docker in
+// that case. See ResolveMaterializerBootBlobs for the scan that
+// makes the first-pull case docker-free (commit 12 of v0.5.1).
 
 package vz
 
@@ -104,11 +112,11 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 		opts.CPUs = 2
 	}
 	if opts.MemoryMiB <= 0 {
-		// Generous default — the in-guest tmpfs holds the uncompressed
-		// layer tree before mkfs.erofs. Ubuntu base images can decompress
-		// to 3-4 GiB. APFS doesn't actually commit unused guest memory,
-		// so this is a paper allocation.
-		opts.MemoryMiB = 6144
+		// Streaming `mkfs.erofs --tar=f` keeps a working set of a few
+		// hundred MiB regardless of layer size; the in-guest pipeline
+		// doesn't materialize the uncompressed tree anywhere. 2 GiB is
+		// comfortable headroom.
+		opts.MemoryMiB = 2048
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = 5 * time.Minute
@@ -136,23 +144,24 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 		return fmt.Errorf("materializer output file missing: %w", err)
 	}
 
-	// Pre-allocate the output file. erofs needs enough space to land
-	// its output. Use 1.5× the input blob's compressed size as a
-	// safe upper bound (lz4 typically beats gzip's ratio so the
-	// erofs result is usually 70-100% of the tar.gz size). Cap at
-	// 4 GiB which is way bigger than any reasonable single layer.
+	// Pre-allocate the output file. mkfs.erofs writes the erofs
+	// image into the device but never grows it; the file must be at
+	// least as large as the final image. Use 2× the input blob's
+	// compressed size as a safe upper bound — lz4's compression
+	// ratio is typically worse than gzip's, so the erofs result can
+	// exceed the tar.gz size for low-entropy layers. Cap at 8 GiB.
 	// Sparse-allocated — APFS only physically commits the bytes
 	// mkfs.erofs actually writes.
 	inputInfo, ierr := os.Stat(opts.InputBlobPath)
 	if ierr != nil {
 		return fmt.Errorf("statting materializer input: %w", ierr)
 	}
-	outputSize := int64(float64(inputInfo.Size()) * 1.5)
+	outputSize := int64(float64(inputInfo.Size()) * 2.0)
 	if outputSize < 64*1024*1024 {
 		outputSize = 64 * 1024 * 1024 // floor at 64 MiB for tiny layers
 	}
-	if outputSize > 4*1024*1024*1024 {
-		outputSize = 4 * 1024 * 1024 * 1024
+	if outputSize > 8*1024*1024*1024 {
+		outputSize = 8 * 1024 * 1024 * 1024
 	}
 	// Round up to 512-byte block boundary (VZ requirement).
 	outputSize = ((outputSize + 511) / 512) * 512
@@ -236,52 +245,71 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 }
 
 // ResolveMaterializerBootBlobs picks a kernel + initrd from any
-// locally-cached shed image with the relevant annotations. Returns
-// vmimage.ErrMaterializerUnavailable if no candidate image is cached
-// yet (caller falls back to the docker pipeline).
+// locally-cached shed image with the relevant annotations. Two-pass:
 //
-// Limitation: this only resolves through tagged images, which means
-// the very first pull on a fresh cache falls back to docker because
-// the new image's tag hasn't been committed yet. Subsequent pulls
-// (other variants, re-pulls of the same tag) take the materializer-VM
-// path. See docs/discovery/layer-storage-optimization.md §12 — first-
-// pull bootstrap is a known follow-up.
+//  1. Tagged images (fast path on second+ pull).
+//  2. Every manifest descriptor in index.json (catches the
+//     just-pulled but not-yet-tagged manifest mid-EnsureLowerFromLayer
+//     loop — see registry.go:391-435 for the pull order proof).
+//
+// Returns vmimage.ErrMaterializerUnavailable if neither pass finds a
+// candidate; the caller falls back to docker. Until the first shed
+// image's manifest blob and kernel/initrd blobs land on disk, no
+// materializer VM is possible.
 func ResolveMaterializerBootBlobs(imagesDir string) (kernelPath, initrdPath string, err error) {
-	tags, terr := vmimage.ListTags(imagesDir)
-	if terr != nil {
-		return "", "", fmt.Errorf("listing tags: %w", terr)
+	// Pass 1: tagged images.
+	if tags, terr := vmimage.ListTags(imagesDir); terr == nil {
+		for _, tag := range tags {
+			t, err := vmimage.GetTag(imagesDir, tag)
+			if err != nil {
+				continue
+			}
+			if kp, ip, ok := tryManifestForBootBlobs(imagesDir, t.Digest); ok {
+				return kp, ip, nil
+			}
+		}
 	}
-	for _, tag := range tags {
-		t, err := vmimage.GetTag(imagesDir, tag)
-		if err != nil {
-			continue
+	// Pass 2: every manifest descriptor in index.json. Catches the
+	// just-pulled manifest before its tag is committed (first-pull case).
+	if digests, ierr := vmimage.IndexManifestDigests(imagesDir); ierr == nil {
+		for dgst := range digests {
+			if kp, ip, ok := tryManifestForBootBlobs(imagesDir, dgst); ok {
+				return kp, ip, nil
+			}
 		}
-		m, err := vmimage.LoadManifestByDigest(imagesDir, t.Digest)
-		if err != nil {
-			continue
-		}
-		kd := m.ShedKernelDigest()
-		id := m.ShedInitrdDigest()
-		if kd == "" || id == "" {
-			continue
-		}
-		kp, kerr := vmimage.BlobPath(imagesDir, kd)
-		if kerr != nil {
-			continue
-		}
-		ip, ierr := vmimage.BlobPath(imagesDir, id)
-		if ierr != nil {
-			continue
-		}
-		if _, err := os.Stat(kp); err != nil {
-			continue
-		}
-		if _, err := os.Stat(ip); err != nil {
-			continue
-		}
-		return kp, ip, nil
 	}
 	return "", "", fmt.Errorf("%w: no cached shed image provides a kernel + initrd", vmimage.ErrMaterializerUnavailable)
+}
+
+// tryManifestForBootBlobs returns paths to the kernel + initrd blobs
+// annotated on the given manifest digest, if both blobs exist on disk.
+// Returns ok=false for non-manifest blobs, manifests without shed
+// annotations, or manifests whose blobs aren't fully cached.
+func tryManifestForBootBlobs(imagesDir, manifestDigest string) (kernelPath, initrdPath string, ok bool) {
+	m, err := vmimage.LoadManifestByDigest(imagesDir, manifestDigest)
+	if err != nil {
+		return "", "", false
+	}
+	kd := m.ShedKernelDigest()
+	id := m.ShedInitrdDigest()
+	if kd == "" || id == "" {
+		return "", "", false
+	}
+	kp, kerr := vmimage.BlobPath(imagesDir, kd)
+	if kerr != nil {
+		return "", "", false
+	}
+	ip, ierr := vmimage.BlobPath(imagesDir, id)
+	if ierr != nil {
+		return "", "", false
+	}
+	if _, err := os.Stat(kp); err != nil {
+		return "", "", false
+	}
+	if _, err := os.Stat(ip); err != nil {
+		return "", "", false
+	}
+	return kp, ip, true
 }
 
 // MaterializerHook returns a vmimage.MaterializerFunc closure suitable

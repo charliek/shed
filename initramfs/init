@@ -117,8 +117,6 @@ if [ "$SHED_MODE" = "materialize" ]; then
         panic SHED-INIT-24 "materialize mode: output device $SHED_OUTPUT not present"
     fi
 
-    mkdir -p /work/extracted
-
     # Wait briefly for the input block device to appear.
     if [ -z "$SHED_INPUT_DEVICE" ]; then
         panic SHED-INIT-24 "materialize mode requires shed.input-device= on cmdline (block device backing the layer tar.gz)"
@@ -135,40 +133,41 @@ if [ "$SHED_MODE" = "materialize" ]; then
         panic SHED-INIT-20 "materialize mode: input device $SHED_INPUT_DEVICE not present"
     fi
 
-    # Extract the layer tar.gz directly from the read-only virtio-blk
-    # device. busybox tar's -z reads the file by seek/stat which
-    # doesn't always work on a block device — pipe through dd|gunzip
-    # so we read the underlying bytes sequentially. dd's bs=1M is plenty
-    # large; the trailing zero padding from the host stager is ignored
-    # by gunzip (it stops at the end of the gzip stream).
-    # Size the tmpfs explicitly so it can hold a fully-uncompressed
-    # Ubuntu base layer (~3-4 GiB). Default tmpfs is 50% of RAM, but
-    # we want a generous explicit upper bound — the materializer VM
-    # is sized to comfortably hold this.
-    mount -t tmpfs -o size=5G tmpfs /work
-    mkdir -p /work/extracted
-    echo "shed-initramfs: ls /dev/vd*:"
-    ls -la /dev/vd* 2>&1 || true
-    echo "shed-initramfs: first 16 bytes of $SHED_INPUT_DEVICE:"
-    dd if="$SHED_INPUT_DEVICE" bs=16 count=1 2>/dev/null | od -An -c -N 16 2>&1 || true
-    echo "shed-initramfs: which tar gunzip dd:"
-    which tar gunzip dd 2>&1 || true
-    echo "shed-initramfs: starting dd|gunzip|tar extract..."
+    # Stream the layer tar.gz straight from the read-only virtio-blk
+    # device into mkfs.erofs's --tar=f mode (erofs-utils 1.7+; the
+    # initramfs is built from debian:trixie-slim which ships 1.8+).
+    # Single pass, no tmpfs intermediate: dd reads sequentially from
+    # the block device, gunzip decompresses on the fly, mkfs.erofs
+    # consumes the tar stream and writes the erofs image directly to
+    # the output device. Trailing 512-byte VZ padding past the gzip
+    # EOF is harmless — gunzip stops at the gzip stream end and dd
+    # exits with SIGPIPE (st_dd=141, expected).
+    echo "shed-initramfs: mkfs.erofs version:"
+    /sbin/mkfs.erofs --version 2>&1 | head -1 || true
     set +e
-    dd if="$SHED_INPUT_DEVICE" bs=1M 2>/tmp/dd.err | gunzip -c 2>/tmp/gunzip.err | tar -xf - -C /work/extracted 2>/tmp/tar.err
-    extract_rc=$?
+    dd if="$SHED_INPUT_DEVICE" bs=1M 2>/tmp/dd.err \
+        | gunzip -c 2>/tmp/gunzip.err \
+        | /sbin/mkfs.erofs -z lz4 --tar=f "$SHED_OUTPUT" - 2>/tmp/mkfs.err
+    # busybox ash exposes $PIPESTATUS as an array (1.34+; trixie ships 1.36).
+    st_dd=${PIPESTATUS[0]}
+    st_gz=${PIPESTATUS[1]}
+    st_mk=${PIPESTATUS[2]}
     set -e
-    echo "shed-initramfs: pipeline rc=$extract_rc"
-    echo "dd stderr:"; cat /tmp/dd.err 2>/dev/null || true
+    echo "shed-initramfs: pipeline status: dd=${st_dd} gunzip=${st_gz} mkfs=${st_mk}"
+    echo "dd stderr:";     cat /tmp/dd.err     2>/dev/null || true
     echo "gunzip stderr:"; cat /tmp/gunzip.err 2>/dev/null || true
-    echo "tar stderr:"; cat /tmp/tar.err 2>/dev/null || true
-    if [ "$extract_rc" -ne 0 ]; then
-        panic SHED-INIT-22 "materialize mode: failed to extract $SHED_INPUT_DEVICE (rc=$extract_rc)"
+    echo "mkfs stderr:";   cat /tmp/mkfs.err   2>/dev/null || true
+    if [ "$st_mk" -ne 0 ]; then
+        panic SHED-INIT-23 "materialize mode: mkfs.erofs failed (rc=$st_mk)"
     fi
-
-    echo "shed-initramfs: running mkfs.erofs -> $SHED_OUTPUT"
-    if ! /sbin/mkfs.erofs -z lz4 "$SHED_OUTPUT" /work/extracted; then
-        panic SHED-INIT-23 "materialize mode: mkfs.erofs failed"
+    if [ "$st_gz" -ne 0 ]; then
+        panic SHED-INIT-22 "materialize mode: gunzip failed (rc=$st_gz)"
+    fi
+    # dd typically exits 141 (SIGPIPE) when mkfs closes after seeing
+    # the gzip EOF; the trailing VZ padding is left unread. Treat
+    # 0 and 141 as success; anything else is a real read error.
+    if [ "$st_dd" -ne 0 ] && [ "$st_dd" -ne 141 ]; then
+        panic SHED-INIT-22 "materialize mode: dd failed (rc=$st_dd)"
     fi
 
     sync
