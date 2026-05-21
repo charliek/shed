@@ -121,7 +121,11 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 		opts.MemoryMiB = 6144
 	}
 	if opts.Timeout <= 0 {
-		opts.Timeout = 5 * time.Minute
+		// Big Ubuntu-base layers extract to ~3-4 GiB and mkfs.erofs
+		// walks 50k+ files; 5 minutes overran on a 2.4-GHz M1.
+		// 15-min cap leaves headroom but caps blast radius if mkfs
+		// gets stuck.
+		opts.Timeout = 15 * time.Minute
 	}
 
 	// Sanity-check the kernel + initrd before we shell out — vfkit's

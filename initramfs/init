@@ -166,7 +166,11 @@ if [ "$SHED_MODE" = "materialize" ]; then
     fi
     echo "shed-initramfs: running mkfs.erofs -> $SHED_OUTPUT"
     set +e
-    /sbin/mkfs.erofs -z lz4 "$SHED_OUTPUT" /work/extracted 2>/tmp/mkfs.err
+    # --quiet suppresses the per-file "Processing X ..." output.
+    # Each Processing line is a virtio-serial console write which
+    # is expensive in a vfkit-hosted VM: Ubuntu base has 50k+ files
+    # and the I/O dominates wallclock. Errors still print.
+    /sbin/mkfs.erofs --quiet -z lz4 "$SHED_OUTPUT" /work/extracted 2>/tmp/mkfs.err
     rc=$?
     set -e
     echo "shed-initramfs: mkfs.erofs rc=$rc"
