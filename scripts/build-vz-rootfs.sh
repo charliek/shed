@@ -196,15 +196,45 @@ build_variant() {
         # vz/Dockerfile or run docker buildx manually before this step.
     fi
 
+    # Bake the source-ref to match the server config's `images.<variant>`
+    # entry so server-side resolveCachedTag finds our locally-built
+    # manifest instead of pulling from the registry. Without this,
+    # local builds get OVERWRITTEN by `shed create --image <variant>`
+    # because the source-ref check fails. We derive the version from
+    # the `shed` binary itself (`shed version` → `shed vX.Y.Z`) so this
+    # tracks releases automatically. For pre-release dev binaries
+    # (`shed dev`), we annotate with `:dev` and the caller is
+    # responsible for ensuring server.yaml's images map matches.
+    # Override the whole ref via $SHED_SOURCE_REF.
+    local source_ref
+    if [ -n "${SHED_SOURCE_REF:-}" ]; then
+        source_ref="$SHED_SOURCE_REF"
+    else
+        local version
+        version="$("$PROJECT_ROOT/bin/shed" version 2>/dev/null | awk '{print $2}')"
+        if [ -z "$version" ] || [ "$version" = "dev" ]; then
+            version="dev"
+        fi
+        source_ref="ghcr.io/charliek/shed-vz-${variant}:${version}"
+    fi
+    echo "Source-ref: $source_ref"
+
     "$PROJECT_ROOT/bin/shed" image build \
         --target "$docker_target" \
         -n "$variant" \
         --initramfs "$SHED_INITRD" \
         --size "$ROOTFS_SIZE" \
         --output-dir "$OUTPUT_DIR" \
+        --source-ref "$source_ref" \
         -f "$VZ_DIR/Dockerfile" \
         "${extra_args[@]}" \
-        "$VZ_DIR"
+        "$VZ_DIR" || return $?
+
+    # Helpful pointer so server config can be aligned. Important: if
+    # server.yaml's images.<variant> doesn't match this source-ref,
+    # `shed create --image <variant>` will fall through to a registry
+    # pull and OVERWRITE this manifest.
+    echo "Tip: ensure ~/.config/shed/server.yaml has 'images.${variant}: $source_ref'"
 }
 
 # Main execution

@@ -318,6 +318,20 @@ func (m *Manager) ResolveImageBlobs(manifestDigest string) (manifest *OCIManifes
 
 // resolveCachedTag returns an EnsureResult derived from a cached tag
 // when one is available and every layer is materialized.
+//
+// Local tags always win over the configured registry ref: if a tag
+// named `name` exists locally and its layers are fully materialized,
+// we use it regardless of whether the manifest's io.shed.source-ref
+// matches the configured Docker ref. The previous strict equality
+// check forced a registry re-pull every time the server config or a
+// local build set a different source-ref — that overwrote
+// locally-built manifests with whatever was published, which is
+// exactly backwards for development workflows. To force a refresh
+// from the registry, run `shed image pull <ref> -t <name>` (or
+// `shed image rm <name>` first).
+//
+// `expectedRef` is still accepted for the signature compat but only
+// logged for debugging when there's a mismatch.
 func (m *Manager) resolveCachedTag(ctx context.Context, imagesDir, name, expectedRef string) (EnsureResult, bool) {
 	t, err := GetTag(imagesDir, name)
 	if err != nil {
@@ -331,7 +345,8 @@ func (m *Manager) resolveCachedTag(ctx context.Context, imagesDir, name, expecte
 		return EnsureResult{}, false
 	}
 	if expectedRef != "" && manifest.ShedSourceRef() != expectedRef {
-		return EnsureResult{}, false
+		log.Printf("vmimage: tag %q points at manifest with source-ref %q which differs from configured ref %q — using local tag anyway (run `shed image rm %s` then re-pull to refresh from registry)",
+			name, manifest.ShedSourceRef(), expectedRef, name)
 	}
 	res, err := m.layerExt4Paths(ctx, imagesDir, t.Digest)
 	if err != nil {
