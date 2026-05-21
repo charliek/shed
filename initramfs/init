@@ -62,7 +62,7 @@ panic() {
 # ordering tried to read /proc/cmdline before /proc existed, which
 # silently degraded into the LOWER_DEVS=/dev/vdb legacy fallback — fine
 # for single-layer images, wrong for multi-layer.
-mkdir -p /proc /sys /dev /run /newroot /upper /tmp
+mkdir -p /proc /sys /dev /run /newroot /upper /tmp /work
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev \
