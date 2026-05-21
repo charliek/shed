@@ -20,12 +20,17 @@ type ClientConfig struct {
 	path string `yaml:"-"`
 }
 
-// GetCreateTimeout returns the configured create timeout or the default (10 minutes).
+// GetCreateTimeout returns the configured create timeout or the default
+// (30 minutes). First-pull scenarios materialize every OCI layer in
+// series, and a single big Ubuntu base layer can take 8-12 minutes in
+// the materializer VM on Mac (extract + mkfs.erofs of ~50k files). With
+// 5+ layers this trivially exceeds a 10-minute budget. Cache hits on
+// subsequent creates are sub-second.
 func (c *ClientConfig) GetCreateTimeout() time.Duration {
 	if c.CreateTimeout > 0 {
 		return c.CreateTimeout
 	}
-	return 10 * time.Minute
+	return 30 * time.Minute
 }
 
 // ServerEntry represents a configured server.
