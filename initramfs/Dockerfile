@@ -12,6 +12,37 @@
 #     --target shed-initramfs \
 #     --output type=local,dest=./out .
 
+# Stage: pull Ubuntu's linux-image-virtual kernel modules so the
+# initramfs can insmod erofs.ko before mounting the per-layer erofs
+# lowers. Ubuntu ships erofs as a *module* (=m) in linux-image-virtual,
+# not built-in, and overlay.ko alone isn't enough — without erofs
+# loaded, the lower mounts fail with EINVAL.
+FROM ubuntu:24.04 AS ubuntu-modules
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        linux-image-virtual \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stage erofs.ko AND its dependency libcrc32c.ko (erofs uses crc32c for
+# block-level checksums). insmod doesn't auto-resolve module deps
+# (unlike modprobe), so we have to load libcrc32c first. Naming
+# matters: the init script loads libcrc32c BEFORE erofs.
+#
+# Filenames in /stage/ get a numeric prefix so the init script can
+# load them in sorted order (libcrc32c=10, erofs=20). Without this,
+# erofs.ko's "Unknown symbol crc32c" fails the load and erofs mounts
+# return EINVAL.
+RUN mkdir -p /stage \
+    && erofs_ko=$(find /lib/modules -name 'erofs.ko*' 2>/dev/null | tail -1) \
+    && crc32c_ko=$(find /lib/modules -name 'libcrc32c.ko*' 2>/dev/null | tail -1) \
+    && if [ -z "$erofs_ko" ]; then echo "ERROR: erofs.ko not found in linux-image-virtual" >&2; exit 1; fi \
+    && if [ -z "$crc32c_ko" ]; then echo "ERROR: libcrc32c.ko not found" >&2; exit 1; fi \
+    && cp "$crc32c_ko" "/stage/10-$(basename "$crc32c_ko")" \
+    && cp "$erofs_ko"  "/stage/20-$(basename "$erofs_ko")" \
+    && kver=$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$erofs_ko")")")")") \
+    && echo "$kver" > /stage/kver.txt \
+    && echo "Staged: 10-$(basename "$crc32c_ko"), 20-$(basename "$erofs_ko") for kver $kver"
+
 # Trixie (Debian 13) for erofs-utils 1.8.6: needed for `mkfs.erofs
 # --tar=f`, which the materialize-mode init pipeline streams the layer
 # tar.gz through. Bookworm ships erofs-utils 1.5 which predates --tar.
@@ -91,6 +122,14 @@ RUN cp /usr/sbin/insmod /irfs/sbin/insmod \
         mkdir -p "/irfs$(dirname "$lib")"; \
         cp "$lib" "/irfs$lib"; \
     done
+
+# Copy the Ubuntu kernel modules needed for early-boot lower mounts.
+# Files are prefixed 10-/20- so the init script can load them in
+# sorted order (libcrc32c first, erofs second — erofs has a hard
+# dependency on libcrc32c that insmod can't auto-resolve).
+COPY --from=ubuntu-modules /stage/10-libcrc32c.ko* /irfs/lib/modules-extra/
+COPY --from=ubuntu-modules /stage/20-erofs.ko*     /irfs/lib/modules-extra/
+COPY --from=ubuntu-modules /stage/kver.txt         /irfs/lib/modules-extra/kver.txt
 
 COPY initramfs/init /irfs/init
 RUN chmod 0755 /irfs/init

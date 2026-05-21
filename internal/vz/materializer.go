@@ -264,26 +264,37 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 // materializer VM is possible.
 func ResolveMaterializerBootBlobs(imagesDir string) (kernelPath, initrdPath string, err error) {
 	// Pass 1: tagged images.
-	if tags, terr := vmimage.ListTags(imagesDir); terr == nil {
-		for _, tag := range tags {
-			t, err := vmimage.GetTag(imagesDir, tag)
-			if err != nil {
-				continue
-			}
-			if kp, ip, ok := tryManifestForBootBlobs(imagesDir, t.Digest); ok {
-				return kp, ip, nil
-			}
+	tags, terr := vmimage.ListTags(imagesDir)
+	if terr != nil {
+		log.Printf("ResolveMaterializerBootBlobs: ListTags error: %v", terr)
+	}
+	for _, tag := range tags {
+		t, err := vmimage.GetTag(imagesDir, tag)
+		if err != nil {
+			log.Printf("ResolveMaterializerBootBlobs: GetTag(%s) error: %v", tag, err)
+			continue
 		}
+		if kp, ip, ok := tryManifestForBootBlobs(imagesDir, t.Digest); ok {
+			return kp, ip, nil
+		}
+		log.Printf("ResolveMaterializerBootBlobs: tag %s manifest %s did not yield boot blobs",
+			tag, vmimage.ShortDigest(t.Digest))
 	}
 	// Pass 2: every manifest descriptor in index.json. Catches the
 	// just-pulled manifest before its tag is committed (first-pull case).
-	if digests, ierr := vmimage.IndexManifestDigests(imagesDir); ierr == nil {
-		for dgst := range digests {
-			if kp, ip, ok := tryManifestForBootBlobs(imagesDir, dgst); ok {
-				return kp, ip, nil
-			}
-		}
+	digests, ierr := vmimage.IndexManifestDigests(imagesDir)
+	if ierr != nil {
+		log.Printf("ResolveMaterializerBootBlobs: IndexManifestDigests error: %v", ierr)
 	}
+	for dgst := range digests {
+		if kp, ip, ok := tryManifestForBootBlobs(imagesDir, dgst); ok {
+			return kp, ip, nil
+		}
+		log.Printf("ResolveMaterializerBootBlobs: index manifest %s did not yield boot blobs",
+			vmimage.ShortDigest(dgst))
+	}
+	log.Printf("ResolveMaterializerBootBlobs: %d tags + %d index manifests scanned, none valid",
+		len(tags), len(digests))
 	return "", "", fmt.Errorf("%w: no cached shed image provides a kernel + initrd", vmimage.ErrMaterializerUnavailable)
 }
 
