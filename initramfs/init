@@ -133,50 +133,49 @@ if [ "$SHED_MODE" = "materialize" ]; then
         panic SHED-INIT-20 "materialize mode: input device $SHED_INPUT_DEVICE not present"
     fi
 
-    # Stream the layer tar.gz straight from the read-only virtio-blk
-    # device into mkfs.erofs's --tar=f mode (erofs-utils 1.7+; the
-    # initramfs is built from debian:trixie-slim which ships 1.8+).
-    # Single pass, no tmpfs intermediate: dd reads sequentially from
-    # the block device, gunzip decompresses on the fly, mkfs.erofs
-    # consumes the tar stream and writes the erofs image directly to
-    # the output device. Trailing 512-byte VZ padding past the gzip
-    # EOF is harmless — gunzip stops at the gzip stream end and dd
-    # exits with SIGPIPE (st_dd=141, expected).
+    # Extract the gzipped tar to a tmpfs and then run mkfs.erofs over
+    # the resulting tree. We tried `mkfs.erofs --tar=f --ungzip` (one-
+    # shot streaming) but trixie's erofs-utils 1.8.6 fails with
+    # "[Error 74] Bad message" on real Ubuntu base layers — likely the
+    # custom tar parser in erofs-utils doesn't handle PAX/@LongLink
+    # extensions GNU tar emits for paths >100 chars (Ubuntu layers have
+    # them). busybox tar handles every variant of tar we've seen in
+    # OCI layers, so we extract via busybox first.
+    #
+    # The tmpfs holds the uncompressed layer tree — Ubuntu base
+    # decompresses to ~3-4 GiB. The materializer VM is sized to fit
+    # this (materializer.go opts.MemoryMiB).
     echo "shed-initramfs: mkfs.erofs version:"
     /sbin/mkfs.erofs --version 2>&1 | head -1 || true
-    # busybox ash doesn't support ${PIPESTATUS[N]} array access (that's
-    # a bash-ism). Use `set -o pipefail` so $? reflects any failing
-    # stage. We can't distinguish dd/gunzip/mkfs failures this way, but
-    # all of them are real errors that warrant SHED-INIT-22. The
-    # post-pipeline erofs-magic check below catches mkfs producing a
-    # bogus image even if it exits 0.
+    mount -t tmpfs -o size=5G tmpfs /work
+    mkdir -p /work/extracted
+    echo "shed-initramfs: extracting tar from $SHED_INPUT_DEVICE..."
     set +e
     set -o pipefail
     dd if="$SHED_INPUT_DEVICE" bs=1M 2>/tmp/dd.err \
         | gunzip -c 2>/tmp/gunzip.err \
-        | /sbin/mkfs.erofs -z lz4 --tar=f "$SHED_OUTPUT" - 2>/tmp/mkfs.err
-    rc=$?
+        | tar -xf - -C /work/extracted 2>/tmp/tar.err
+    extract_rc=$?
     set +o pipefail
     set -e
-    echo "shed-initramfs: pipeline rc=$rc"
-    echo "dd stderr:";     cat /tmp/dd.err     2>/dev/null || true
-    echo "gunzip stderr:"; cat /tmp/gunzip.err 2>/dev/null || true
-    echo "mkfs stderr:";   cat /tmp/mkfs.err   2>/dev/null || true
+    if [ "$extract_rc" -ne 0 ] && [ "$extract_rc" -ne 141 ]; then
+        echo "dd stderr:";     cat /tmp/dd.err     2>/dev/null || true
+        echo "gunzip stderr:"; cat /tmp/gunzip.err 2>/dev/null || true
+        echo "tar stderr:";    cat /tmp/tar.err    2>/dev/null || true
+        panic SHED-INIT-22 "materialize mode: failed to extract $SHED_INPUT_DEVICE (rc=$extract_rc)"
+    fi
+    echo "shed-initramfs: running mkfs.erofs -> $SHED_OUTPUT"
+    set +e
+    /sbin/mkfs.erofs -z lz4 "$SHED_OUTPUT" /work/extracted 2>/tmp/mkfs.err
+    rc=$?
+    set -e
+    echo "shed-initramfs: mkfs.erofs rc=$rc"
+    echo "mkfs stderr:"; cat /tmp/mkfs.err 2>/dev/null || true
     if [ "$rc" -ne 0 ]; then
-        # dd typically exits 141 (SIGPIPE) when mkfs.erofs closes the
-        # pipe after seeing the gzip EOF, leaving trailing VZ padding
-        # unread. With pipefail this surfaces as rc=141 IFF mkfs and
-        # gunzip both succeeded. Tolerate that specific case.
-        if [ "$rc" -eq 141 ]; then
-            echo "shed-initramfs: ignoring rc=141 (dd SIGPIPE after mkfs closed pipe)"
-        else
-            panic SHED-INIT-23 "materialize mode: streaming pipeline failed (rc=$rc)"
-        fi
+        panic SHED-INIT-23 "materialize mode: mkfs.erofs failed (rc=$rc)"
     fi
     # Defense in depth: confirm the output really is erofs (magic at
-    # offset 1024 is 0xE2 0xE1 0xF5 0xE0). Catches mkfs.erofs exit-0
-    # corner cases — e.g., short input where mkfs writes a header but
-    # not a complete image.
+    # offset 1024 is 0xE2 0xE1 0xF5 0xE0).
     magic=$(dd if="$SHED_OUTPUT" bs=1 count=4 skip=1024 2>/dev/null | od -An -tx1 | tr -d ' ')
     if [ "$magic" != "e2e1f5e0" ]; then
         panic SHED-INIT-23 "materialize mode: $SHED_OUTPUT lacks erofs magic (got $magic at offset 1024)"

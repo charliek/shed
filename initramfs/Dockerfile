@@ -40,7 +40,7 @@ RUN cp /bin/busybox /irfs/bin/busybox \
     && for cmd in sh mount umount mkdir mknod cat echo sleep chmod chown \
                   ls cp mv rm ln dd od tr grep cut head tail sed find uname \
                   switch_root pivot_root reboot poweroff blkid \
-                  gunzip gzip sync; do \
+                  tar gunzip gzip sync; do \
         ln -sf busybox /irfs/bin/$cmd; \
     done
 

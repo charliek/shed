@@ -112,11 +112,13 @@ func RunMaterializer(ctx context.Context, opts MaterializerOpts) error {
 		opts.CPUs = 2
 	}
 	if opts.MemoryMiB <= 0 {
-		// Streaming `mkfs.erofs --tar=f` keeps a working set of a few
-		// hundred MiB regardless of layer size; the in-guest pipeline
-		// doesn't materialize the uncompressed tree anywhere. 2 GiB is
-		// comfortable headroom.
-		opts.MemoryMiB = 2048
+		// The in-guest pipeline extracts the uncompressed tar tree to
+		// tmpfs (busybox tar parses the GNU PAX/LongLink extensions
+		// that erofs-utils 1.8.6's tar parser chokes on). Ubuntu base
+		// images decompress to 3-4 GiB; 6 GiB covers it with room for
+		// mkfs.erofs's working buffers. APFS doesn't actually commit
+		// unused guest memory so this is a paper allocation.
+		opts.MemoryMiB = 6144
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = 5 * time.Minute
