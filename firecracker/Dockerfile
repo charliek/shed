@@ -192,6 +192,15 @@ RUN set -euo pipefail && \
     ln -sf /run/machine-id /etc/machine-id && \
     ln -sf /etc/machine-id /var/lib/dbus/machine-id && \
     ln -sf /dev/null /etc/systemd/system/systemd-machine-id-commit.service && \
+    # Mask systemd-firstboot.service. It runs interactively (--prompt-
+    # locale, --prompt-hostname, --prompt-root-password) via /dev/console
+    # and gets gated on by sysinit.target (which multi-user.target needs,
+    # which shed-agent.service is WantedBy). The transient machine-id
+    # symlink above makes ConditionFirstBoot=yes trigger on every boot;
+    # masking it skips the interactive prompt and lets boot reach
+    # multi-user.target so shed-agent can start. systemd-firstboot is
+    # for human-driven OS setup, irrelevant for an automated shed VM.
+    ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service && \
     # Colored shell prompt with shed name + cwd + git branch + dirty marker.
     cat >> /home/shed/.bashrc <<'PROMPT_EOF'
 __git_prompt() {
