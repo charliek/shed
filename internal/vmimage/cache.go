@@ -202,4 +202,3 @@ func EnsureLowerFromManifest(ctx context.Context, imagesDir, manifestDigest stri
 	}
 	return finalPath, nil
 }
-

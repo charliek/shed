@@ -69,7 +69,6 @@ type ConvertOptions struct {
 	// {ImagesDir}/blobs/sha256/.
 	ImagesDir string
 
-
 	// Platform is the Docker platform (e.g., "linux/arm64"). Defaults to DefaultPlatform.
 	Platform string
 

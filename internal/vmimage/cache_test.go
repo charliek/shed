@@ -24,4 +24,3 @@ func TestCacheLowerExists(t *testing.T) {
 		t.Error("CacheLowerExists should accept .erofs")
 	}
 }
-
