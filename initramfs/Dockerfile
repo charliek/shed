@@ -13,10 +13,10 @@
 #     --output type=local,dest=./out .
 
 # Stage: pull Ubuntu's linux-image-virtual kernel modules so the
-# initramfs can insmod erofs.ko before mounting the per-layer erofs
-# lowers. Ubuntu ships erofs as a *module* (=m) in linux-image-virtual,
-# not built-in, and overlay.ko alone isn't enough — without erofs
-# loaded, the lower mounts fail with EINVAL.
+# initramfs can insmod erofs.ko before mounting the single read-only
+# erofs lower. Ubuntu ships erofs as a *module* (=m) in
+# linux-image-virtual, not built-in, and overlay.ko alone isn't enough
+# — without erofs loaded, the lower mount fails with EINVAL.
 FROM ubuntu:24.04 AS ubuntu-modules
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -43,15 +43,14 @@ RUN mkdir -p /stage \
     && echo "$kver" > /stage/kver.txt \
     && echo "Staged: 10-$(basename "$crc32c_ko"), 20-$(basename "$erofs_ko") for kver $kver"
 
-# Trixie (Debian 13) for erofs-utils 1.8.6: needed for `mkfs.erofs
-# --tar=f`, which the materialize-mode init pipeline streams the layer
-# tar.gz through. Bookworm ships erofs-utils 1.5 which predates --tar.
-FROM debian:trixie-slim AS shed-initramfs-builder
+# Bookworm-slim is sufficient now: we no longer build erofs in the
+# initramfs (host-side mkfs.erofs --tar=f handles materialize), so the
+# trixie / erofs-utils 1.8.6 dependency is gone.
+FROM debian:bookworm-slim AS shed-initramfs-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         busybox-static \
         e2fsprogs \
-        erofs-utils \
         cpio \
         gzip \
         kmod \
@@ -70,12 +69,12 @@ RUN mkdir -p /irfs/bin /irfs/sbin /irfs/dev /irfs/proc /irfs/sys \
 RUN cp /bin/busybox /irfs/bin/busybox \
     && for cmd in sh mount umount mkdir mknod cat echo sleep chmod chown \
                   ls cp mv rm ln dd od tr grep cut head tail sed find uname \
-                  switch_root pivot_root reboot poweroff blkid \
-                  tar gunzip gzip sync; do \
+                  switch_root pivot_root reboot poweroff blkid sync; do \
         ln -sf busybox /irfs/bin/$cmd; \
     done
 
-# mkfs.ext4 ships outside busybox.
+# mkfs.ext4 ships outside busybox. The initramfs runs it on the
+# per-shed upper on first boot.
 RUN cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
     && for lib in $(ldd /usr/sbin/mkfs.ext4 \
             | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
@@ -83,32 +82,6 @@ RUN cp /usr/sbin/mkfs.ext4 /irfs/sbin/mkfs.ext4 \
         mkdir -p "/irfs$(dirname "$lib")"; \
         cp "$lib" "/irfs$lib"; \
     done
-
-# mkfs.erofs: used by the materializer-mode boot path
-# (shed.mode=materialize) to convert OCI layer tar.gz blobs into
-# read-only lower images without launching a Docker container on the
-# host. lz4 compression is supported by Linux 5.4+; the shed kernels
-# already include CONFIG_EROFS_FS=y plus CONFIG_EROFS_FS_ZIP=y.
-#
-# libgcc_s.so.1 is dlopen'd at runtime for pthread_exit cleanup —
-# `ldd` doesn't see it because it's not linked at build time. Without
-# it mkfs.erofs aborts with "libgcc_s.so.1 must be installed for
-# pthread_exit to work" when shutting down its worker pool. Copy it
-# explicitly.
-RUN cp /usr/bin/mkfs.erofs /irfs/sbin/mkfs.erofs \
-    && for lib in $(ldd /usr/bin/mkfs.erofs \
-            | awk '/=>/ {print $3} /ld-linux/ {print $1}' \
-            | grep -v '^$'); do \
-        mkdir -p "/irfs$(dirname "$lib")"; \
-        cp "$lib" "/irfs$lib"; \
-    done \
-    && libgcc=$(find /usr/lib /lib -name 'libgcc_s.so.1' 2>/dev/null | head -1) \
-    && if [ -n "$libgcc" ]; then \
-         mkdir -p "/irfs$(dirname "$libgcc")"; \
-         cp "$libgcc" "/irfs$libgcc"; \
-       else \
-         echo "WARNING: libgcc_s.so.1 not found — mkfs.erofs may abort on shutdown" >&2; \
-       fi
 
 # kmod's insmod uses finit_module(2) via libkmod, which decompresses
 # .ko.gz / .ko.xz / .ko.zst transparently (busybox's insmod doesn't).

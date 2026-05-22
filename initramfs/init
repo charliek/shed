@@ -1,24 +1,15 @@
 #!/bin/sh
-# shed initramfs init: mount overlayfs (writable upper + N read-only
-# lowers), pivot_root, and hand off to /sbin/init in the merged rootfs.
+# shed initramfs init: mount overlayfs (writable upper + single read-only
+# lower), pivot_root, and hand off to /sbin/init in the merged rootfs.
 #
 # Disk layout (set by the backend at VM-create time):
 #   /dev/vda  per-shed writable upper   (ext4, formatted on first boot)
-#   /dev/vdb, /dev/vdc, ...  read-only lower images, one per OCI layer.
+#   /dev/vdb  read-only flattened lower (erofs, content-addressed by
+#             OCI manifest digest, shared across every shed of this image)
 #
 # Kernel cmdline overrides:
-#   shed.mode=boot                            (default; overlay assembly + switch_root)
-#   shed.mode=materialize                     (one-shot: mkfs.erofs into output device)
 #   shed.upper=/dev/vda
-#   shed.lowers=/dev/vdb,/dev/vdc,/dev/vdd   (N-layer form, in manifest order)
-#   shed.lower=/dev/vdb                       (legacy single-layer form)
-#
-# In materialize mode the additional cmdline args are:
-#   shed.input-device=/dev/vdb                block device backing the layer tar.gz (read-only)
-#   shed.output=/dev/vda                      target block device
-#   shed.output-format=erofs                  output filesystem (only erofs supported)
-# and the input blob bytes are accessed through a VirtioFS share with
-# tag "blobs", mounted read-only at /input.
+#   shed.lower=/dev/vdb
 #
 # This script intentionally avoids fancy busybox-only constructs so it
 # works equally well with full busybox and the static binaries shipped
@@ -26,28 +17,18 @@
 #
 # Panic codes (SHED-INIT-NN) are stable so docs can link to them:
 #   SHED-INIT-02  missing lower block device
-#   SHED-INIT-03  ext4 mount failed on a lower
+#   SHED-INIT-03  erofs mount failed on the lower
 #   SHED-INIT-04  overlay mount failed (kernel module / lowerdir issue)
 #   SHED-INIT-05  upper block device missing
 #   SHED-INIT-06  upper appears corrupted (no ext4 magic + no fresh sig)
 #   SHED-INIT-07  mkfs.ext4 on upper failed
 #   SHED-INIT-08  upper ext4 mount failed
 #   SHED-INIT-09  switch_root failed (caller should never see this)
-#   SHED-INIT-20  materialize mode: input share mount failed
-#   SHED-INIT-21  materialize mode: input blob missing
-#   SHED-INIT-22  materialize mode: tar extract failed
-#   SHED-INIT-23  materialize mode: mkfs.erofs failed
-#   SHED-INIT-24  materialize mode: invalid arguments
 
 set -e
 
 UPPER_DEV=/dev/vda
-LOWER_DEVS=""   # space-separated list of /dev/vdX paths, manifest order
-SHED_MODE=""
-SHED_INPUT=""
-SHED_INPUT_DEVICE=""
-SHED_OUTPUT=""
-SHED_OUTPUT_FORMAT=""
+LOWER_DEV=/dev/vdb
 
 panic() {
     code="$1"
@@ -60,9 +41,8 @@ panic() {
 
 # Mount /proc, /sys, /dev *before* parsing /proc/cmdline. The previous
 # ordering tried to read /proc/cmdline before /proc existed, which
-# silently degraded into the LOWER_DEVS=/dev/vdb legacy fallback — fine
-# for single-layer images, wrong for multi-layer.
-mkdir -p /proc /sys /dev /run /newroot /upper /tmp /work
+# silently degraded into the LOWER_DEV=/dev/vdb default.
+mkdir -p /proc /sys /dev /run /newroot /upper /tmp /lower
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev \
@@ -70,136 +50,18 @@ mount -t devtmpfs devtmpfs /dev \
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts 2>/dev/null || true
 
-# Parse kernel cmdline. shed.lowers= must come before shed.lower= in the
-# case statement (more-specific pattern first) — but the two prefixes
-# differ enough that POSIX glob doesn't actually cross-match; the order
-# is just defensive.
+# Parse kernel cmdline.
 echo "shed-initramfs: /proc/cmdline=[$(cat /proc/cmdline 2>/dev/null)]"
 for arg in $(cat /proc/cmdline 2>/dev/null || true); do
     case "$arg" in
-        shed.mode=*) SHED_MODE="${arg#shed.mode=}" ;;
-        shed.input-device=*) SHED_INPUT_DEVICE="${arg#shed.input-device=}" ;;
-        shed.input=*) SHED_INPUT="${arg#shed.input=}" ;;
-        shed.output=*) SHED_OUTPUT="${arg#shed.output=}" ;;
-        shed.output-format=*) SHED_OUTPUT_FORMAT="${arg#shed.output-format=}" ;;
         shed.upper=*) UPPER_DEV="${arg#shed.upper=}" ;;
-        shed.lowers=*)
-            list="${arg#shed.lowers=}"
-            LOWER_DEVS=$(echo "$list" | tr ',' ' ')
-            ;;
-        shed.lower=*) LOWER_DEVS="${arg#shed.lower=}" ;;
+        shed.lower=*) LOWER_DEV="${arg#shed.lower=}" ;;
     esac
 done
 
-# Materialize mode: skip the overlay-assembly path entirely. The VM was
-# booted just to run mkfs.erofs against a layer tar.gz mounted via
-# VirtioFS, then powers off. shed-server reaps the process and reads
-# the resulting .erofs from the host filesystem.
-if [ "$SHED_MODE" = "materialize" ]; then
-    echo "shed-initramfs: mode=materialize input-device=${SHED_INPUT_DEVICE} output=${SHED_OUTPUT} format=${SHED_OUTPUT_FORMAT}"
-    if [ -z "$SHED_OUTPUT" ]; then
-        panic SHED-INIT-24 "materialize mode requires shed.output= on cmdline"
-    fi
-    if [ "$SHED_OUTPUT_FORMAT" != "erofs" ] && [ -n "$SHED_OUTPUT_FORMAT" ]; then
-        panic SHED-INIT-24 "materialize mode: only shed.output-format=erofs is supported (got $SHED_OUTPUT_FORMAT)"
-    fi
+echo "shed-initramfs: upper=${UPPER_DEV} lower=${LOWER_DEV}"
 
-    # Wait briefly for the output block device to appear.
-    j=0
-    while [ $j -lt 50 ]; do
-        if [ -b "$SHED_OUTPUT" ]; then
-            break
-        fi
-        sleep 0.1
-        j=$((j + 1))
-    done
-    if [ ! -b "$SHED_OUTPUT" ]; then
-        panic SHED-INIT-24 "materialize mode: output device $SHED_OUTPUT not present"
-    fi
-
-    # Wait briefly for the input block device to appear.
-    if [ -z "$SHED_INPUT_DEVICE" ]; then
-        panic SHED-INIT-24 "materialize mode requires shed.input-device= on cmdline (block device backing the layer tar.gz)"
-    fi
-    j=0
-    while [ $j -lt 50 ]; do
-        if [ -b "$SHED_INPUT_DEVICE" ]; then
-            break
-        fi
-        sleep 0.1
-        j=$((j + 1))
-    done
-    if [ ! -b "$SHED_INPUT_DEVICE" ]; then
-        panic SHED-INIT-20 "materialize mode: input device $SHED_INPUT_DEVICE not present"
-    fi
-
-    # Extract the gzipped tar to a tmpfs and then run mkfs.erofs over
-    # the resulting tree. We tried `mkfs.erofs --tar=f --ungzip` (one-
-    # shot streaming) but trixie's erofs-utils 1.8.6 fails with
-    # "[Error 74] Bad message" on real Ubuntu base layers — likely the
-    # custom tar parser in erofs-utils doesn't handle PAX/@LongLink
-    # extensions GNU tar emits for paths >100 chars (Ubuntu layers have
-    # them). busybox tar handles every variant of tar we've seen in
-    # OCI layers, so we extract via busybox first.
-    #
-    # The tmpfs holds the uncompressed layer tree — Ubuntu base
-    # decompresses to ~3-4 GiB. The materializer VM is sized to fit
-    # this (materializer.go opts.MemoryMiB).
-    echo "shed-initramfs: mkfs.erofs version:"
-    /sbin/mkfs.erofs --version 2>&1 | head -1 || true
-    mount -t tmpfs -o size=5G tmpfs /work
-    mkdir -p /work/extracted
-    echo "shed-initramfs: extracting tar from $SHED_INPUT_DEVICE..."
-    set +e
-    set -o pipefail
-    dd if="$SHED_INPUT_DEVICE" bs=1M 2>/tmp/dd.err \
-        | gunzip -c 2>/tmp/gunzip.err \
-        | tar -xf - -C /work/extracted 2>/tmp/tar.err
-    extract_rc=$?
-    set +o pipefail
-    set -e
-    if [ "$extract_rc" -ne 0 ] && [ "$extract_rc" -ne 141 ]; then
-        echo "dd stderr:";     cat /tmp/dd.err     2>/dev/null || true
-        echo "gunzip stderr:"; cat /tmp/gunzip.err 2>/dev/null || true
-        echo "tar stderr:";    cat /tmp/tar.err    2>/dev/null || true
-        panic SHED-INIT-22 "materialize mode: failed to extract $SHED_INPUT_DEVICE (rc=$extract_rc)"
-    fi
-    echo "shed-initramfs: running mkfs.erofs -> $SHED_OUTPUT"
-    set +e
-    # --quiet suppresses the per-file "Processing X ..." output.
-    # Each Processing line is a virtio-serial console write which
-    # is expensive in a vfkit-hosted VM: Ubuntu base has 50k+ files
-    # and the I/O dominates wallclock. Errors still print.
-    /sbin/mkfs.erofs --quiet -z lz4 "$SHED_OUTPUT" /work/extracted 2>/tmp/mkfs.err
-    rc=$?
-    set -e
-    echo "shed-initramfs: mkfs.erofs rc=$rc"
-    echo "mkfs stderr:"; cat /tmp/mkfs.err 2>/dev/null || true
-    if [ "$rc" -ne 0 ]; then
-        panic SHED-INIT-23 "materialize mode: mkfs.erofs failed (rc=$rc)"
-    fi
-    # Defense in depth: confirm the output really is erofs (magic at
-    # offset 1024 is 0xE2 0xE1 0xF5 0xE0).
-    magic=$(dd if="$SHED_OUTPUT" bs=1 count=4 skip=1024 2>/dev/null | od -An -tx1 | tr -d ' ')
-    if [ "$magic" != "e2e1f5e0" ]; then
-        panic SHED-INIT-23 "materialize mode: $SHED_OUTPUT lacks erofs magic (got $magic at offset 1024)"
-    fi
-
-    sync
-    echo "shed-initramfs: materialize complete; powering off"
-    poweroff -f
-    # Should never reach here.
-    exec /bin/sh
-fi
-
-# Legacy single-lower compatibility: if nothing parsed, default to vdb.
-if [ -z "$LOWER_DEVS" ]; then
-    LOWER_DEVS=/dev/vdb
-fi
-
-echo "shed-initramfs: upper=${UPPER_DEV} lowers=${LOWER_DEVS}"
-
-# Wait briefly for all virtio-blk devices to appear. Firecracker exposes
+# Wait briefly for virtio-blk devices to appear. Firecracker exposes
 # them quickly; vfkit/VZ can take a few hundred ms on cold boot.
 wait_block_device() {
     dev="$1"
@@ -216,10 +78,8 @@ wait_block_device() {
 
 wait_block_device "$UPPER_DEV" \
     || panic SHED-INIT-05 "upper block device $UPPER_DEV not present"
-for d in $LOWER_DEVS; do
-    wait_block_device "$d" \
-        || panic SHED-INIT-02 "lower block device $d not present"
-done
+wait_block_device "$LOWER_DEV" \
+    || panic SHED-INIT-02 "lower block device $LOWER_DEV not present"
 
 # Format the upper on first boot, panic on corruption. The detection
 # triangulates between two markers:
@@ -262,22 +122,15 @@ mkdir -p /upper/data
 rm -rf /upper/work
 mkdir -p /upper/work
 
-# Mount every lower in turn at /lower-N (1-indexed for human-readable
-# panics). Build a colon-separated overlayfs lowerdir as we go.
-# overlayfs convention: leftmost lowerdir is highest priority (top of
-# stack). Manifest layers are listed bottom-first (layer[0] = base),
-# so we build the lowerdir string in REVERSE order: last lower seen
-# goes leftmost.
-# Pre-load the erofs kernel module (and its libcrc32c dependency)
-# before mounting the lowers. Ubuntu's linux-image-virtual ships these
-# as modules, not built-in, so the kernel can't mount erofs
-# filesystems until we insmod them. Modules are baked into the
-# initramfs at /lib/modules-extra/ by the build (see
-# initramfs/Dockerfile's ubuntu-modules stage). Files are prefixed
-# with NN- so shell globbing loads them in dependency order
-# (10-libcrc32c, then 20-erofs). Soft-fail any individual insmod
-# since the kernel might already have one built-in (FC's custom
-# kernel has CONFIG_EROFS_FS=y).
+# Pre-load the erofs kernel module (and its libcrc32c dependency) before
+# mounting the lower. Ubuntu's linux-image-virtual ships these as
+# modules, not built-in, so the kernel can't mount erofs filesystems
+# until we insmod them. Modules are baked into the initramfs at
+# /lib/modules-extra/ by the build (see initramfs/Dockerfile's
+# ubuntu-modules stage). Files are prefixed with NN- so shell globbing
+# loads them in dependency order (10-libcrc32c, then 20-erofs). Soft-
+# fail any individual insmod since the kernel might already have one
+# built-in (FC's custom kernel has CONFIG_EROFS_FS=y).
 for ko in /lib/modules-extra/[0-9]*-*.ko*; do
     [ -f "$ko" ] || continue
     if /sbin/insmod "$ko" 2>/tmp/insmod.err; then
@@ -287,54 +140,24 @@ for ko in /lib/modules-extra/[0-9]*-*.ko*; do
     fi
 done
 
-idx=0
-lower_dirs=""
-for d in $LOWER_DEVS; do
-    idx=$((idx + 1))
-    mnt="/lower-${idx}"
-    mkdir -p "$mnt"
-    # Lowers are now erofs (since the materializer cutover in v0.5.1);
-    # try erofs first, then fall back to ext4 for backward compat
-    # with caches materialized before the cutover.
-    if ! mount -t erofs -o ro "$d" "$mnt" 2>/dev/null; then
-        mount -t ext4 -o ro "$d" "$mnt" \
-            || panic SHED-INIT-03 "failed to mount $d ro at $mnt (tried erofs and ext4)"
-    fi
-    if [ -z "$lower_dirs" ]; then
-        lower_dirs="$mnt"
-    else
-        lower_dirs="${mnt}:${lower_dirs}"
-    fi
-done
+mount -t erofs -o ro "$LOWER_DEV" /lower \
+    || panic SHED-INIT-03 "failed to mount $LOWER_DEV at /lower (erofs)"
 
-# Load overlayfs if not built into the kernel. /lib/modules may live in
-# any lower layer (it's part of the APT install in our images, which
-# sits a few layers above the bare distro base), so walk every lower
-# and try the first overlay.ko we find.
+# Load overlayfs if not built into the kernel.
 kver="$(uname -r 2>/dev/null)"
-# Modern Ubuntu/Debian put kernel modules under /usr/lib/modules/; older
-# layouts use /lib/modules/. In a merged rootfs /lib is a symlink to
-# /usr/lib so both paths resolve, but layer ext4s contain only the diff
-# of their stage — the symlink may live in a different layer than the
-# modules. Probe both paths in every lower so we find overlay.ko
-# regardless of which layer happens to carry it.
 overlay_loaded=0
-i=1
-while [ $i -le $idx ]; do
-    for base in /usr/lib /lib; do
-        ov_dir="/lower-${i}${base}/modules/${kver}/kernel/fs/overlayfs"
-        for ov in "$ov_dir/overlay.ko.zst" "$ov_dir/overlay.ko.xz" "$ov_dir/overlay.ko.gz" "$ov_dir/overlay.ko"; do
-            if [ -f "$ov" ] && /sbin/insmod "$ov" 2>/dev/null; then
-                overlay_loaded=1
-                break 2
-            fi
-        done
+for base in /usr/lib /lib; do
+    ov_dir="/lower${base}/modules/${kver}/kernel/fs/overlayfs"
+    for ov in "$ov_dir/overlay.ko.zst" "$ov_dir/overlay.ko.xz" "$ov_dir/overlay.ko.gz" "$ov_dir/overlay.ko"; do
+        if [ -f "$ov" ] && /sbin/insmod "$ov" 2>/dev/null; then
+            overlay_loaded=1
+            break 2
+        fi
     done
-    i=$((i + 1))
 done
 
 mount -t overlay overlay \
-    -o "lowerdir=${lower_dirs},upperdir=/upper/data,workdir=/upper/work" \
+    -o "lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work" \
     /newroot \
     || panic SHED-INIT-04 "overlay mount failed. If this is a freshly-built image, the cached initramfs may be stale: re-run ./scripts/build-{vz,firecracker}-rootfs.sh. See docs/reference/images.md#shed-init-panic-codes."
 
