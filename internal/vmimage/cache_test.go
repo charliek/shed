@@ -25,24 +25,3 @@ func TestCacheLowerExists(t *testing.T) {
 	}
 }
 
-func TestValidLowerSize(t *testing.T) {
-	cases := map[string]bool{
-		"20G":   true,
-		"500M":  true,
-		"1K":    true,
-		"0":     false,
-		"":      false,
-		"20":    true,
-		"abc":   false,
-		"20Gb":  false,
-		"-1G":   false,
-		"20.5G": false,
-	}
-	for in, want := range cases {
-		got := validLowerSize.MatchString(in)
-		if got != want {
-			t.Errorf("validLowerSize(%q) = %v, want %v", in, got, want)
-		}
-	}
-}
-

@@ -21,16 +21,16 @@ type ClientConfig struct {
 }
 
 // GetCreateTimeout returns the configured create timeout or the default
-// (30 minutes). First-pull scenarios materialize every OCI layer in
-// series, and a single big Ubuntu base layer can take 8-12 minutes in
-// the materializer VM on Mac (extract + mkfs.erofs of ~50k files). With
-// 5+ layers this trivially exceeds a 10-minute budget. Cache hits on
+// (10 minutes). One per-manifest mkfs.erofs over a merged tree is
+// single-digit seconds even on cold cache; only the first-pull from
+// the registry adds notable wallclock, and 10 min is enough headroom
+// even for a slow network on a multi-GB image. Cache hits on
 // subsequent creates are sub-second.
 func (c *ClientConfig) GetCreateTimeout() time.Duration {
 	if c.CreateTimeout > 0 {
 		return c.CreateTimeout
 	}
-	return 30 * time.Minute
+	return 10 * time.Minute
 }
 
 // ServerEntry represents a configured server.

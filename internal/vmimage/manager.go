@@ -525,18 +525,19 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 			}
 			for _, layer := range mi.manifest.Layers {
 				info.SizeBytes += layer.Size
-				info.SizeBytes += CacheLowerSize(imagesDir, layer.Digest)
-				layerCost := layer.Size + CacheLowerSize(imagesDir, layer.Digest)
 				if layerRefs[layer.Digest] <= 1 {
-					info.UniqueBytes += layerCost
+					info.UniqueBytes += layer.Size
 				} else {
-					info.SharedBytes += layerCost
+					info.SharedBytes += layer.Size
 				}
 			}
-			if len(mi.manifest.Layers) > 0 {
-				if path, err := CacheLowerPath(imagesDir, mi.manifest.Layers[0].Digest); err == nil {
-					info.Path = path
-				}
+			// The flattened lower is keyed by manifest digest and
+			// unique-per-manifest (no cross-manifest sharing for the
+			// erofs file, only for layer blobs above).
+			info.SizeBytes += CacheLowerSize(imagesDir, mi.digest)
+			info.UniqueBytes += CacheLowerSize(imagesDir, mi.digest)
+			if path, err := CacheLowerPath(imagesDir, mi.digest); err == nil {
+				info.Path = path
 			}
 		}
 		if len(ProtectiveRefs(refs, mi.digest)) > 0 {
@@ -584,12 +585,11 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 		info.Source = "dangling"
 	}
 	for _, layer := range manifest.Layers {
-		info.SizeBytes += layer.Size + CacheLowerSize(imagesDir, layer.Digest)
+		info.SizeBytes += layer.Size
 	}
-	if len(manifest.Layers) > 0 {
-		if path, err := CacheLowerPath(imagesDir, manifest.Layers[0].Digest); err == nil {
-			info.Path = path
-		}
+	info.SizeBytes += CacheLowerSize(imagesDir, digest)
+	if path, err := CacheLowerPath(imagesDir, digest); err == nil {
+		info.Path = path
 	}
 	if m.scanner != nil {
 		refs, err := m.scanner.ScanRefs(false)
@@ -806,8 +806,9 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		if m, ok := manifestCandidates[b]; ok {
 			info.DockerRef = m.ShedSourceRef()
 			for _, layer := range m.Layers {
-				info.SizeBytes += layer.Size + CacheLowerSize(imagesDir, layer.Digest)
+				info.SizeBytes += layer.Size
 			}
+			info.SizeBytes += CacheLowerSize(imagesDir, b)
 		}
 		candidates = append(candidates, info)
 	}
@@ -820,10 +821,8 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		return candidates, nil
 	}
 
-	// Cached lower-image files for orphaned layers: evict any cache
-	// file whose layer digest is not in `reachable`. Walks both the
-	// current (.erofs) and legacy (.ext4) extensions so the upgrade
-	// from v0.5.0 doesn't strand legacy cache files.
+	// Cached lower-image files are keyed by manifest digest. Evict any
+	// cache file whose digest is not in `reachable`.
 	cacheDirPath := filepath.Join(imagesDir, cacheDir, algorithmDir)
 	if entries, err := os.ReadDir(cacheDirPath); err == nil {
 		for _, e := range entries {
@@ -831,11 +830,10 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 				continue
 			}
 			name := e.Name()
-			ext := filepath.Ext(name)
-			if ext != CacheLowerExt && ext != LegacyCacheLowerExt {
+			if filepath.Ext(name) != CacheLowerExt {
 				continue
 			}
-			hex := strings.TrimSuffix(name, ext)
+			hex := strings.TrimSuffix(name, CacheLowerExt)
 			if len(hex) != 64 {
 				continue
 			}

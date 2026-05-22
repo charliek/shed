@@ -13,7 +13,7 @@ import (
 
 // installCachedBlob installs a synthetic OCI image into imagesDir under
 // the given tag with the given source-ref annotation. Returns the path
-// to the first layer's cached ext4 — the path that config resolution
+// to the manifest's cached lower image — the path that config resolution
 // surfaces to callers as ResolvedImage.Path.
 func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
 	t.Helper()
@@ -22,14 +22,7 @@ func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
 	if err != nil {
 		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
-	manifest, err := vmimage.LoadManifestByDigest(imagesDir, digest)
-	if err != nil {
-		t.Fatalf("LoadManifestByDigest: %v", err)
-	}
-	if len(manifest.Layers) == 0 {
-		t.Fatalf("synthetic manifest has no layers")
-	}
-	path, err := vmimage.CacheLowerPath(imagesDir, manifest.Layers[0].Digest)
+	path, err := vmimage.CacheLowerPath(imagesDir, digest)
 	if err != nil {
 		t.Fatalf("CacheLowerPath: %v", err)
 	}

@@ -184,28 +184,18 @@ func Resolve(imagesDir, tag, expectedRef string) string {
 	if len(manifest.Layers) == 0 {
 		return ""
 	}
-	layer := manifest.Layers[0]
-	cachePath, err := CacheLowerPath(imagesDir, layer.Digest)
+	cachePath, err := CacheLowerPath(imagesDir, t.Digest)
 	if err != nil {
 		return ""
 	}
 	if _, err := os.Stat(cachePath); err != nil {
-		// Fall back to the legacy .ext4 path for layers cached by
-		// v0.5.0 before the erofs cutover.
-		legacyPath, lerr := CacheLowerPathLegacy(imagesDir, layer.Digest)
-		if lerr != nil {
-			return ""
-		}
-		if _, err := os.Stat(legacyPath); err != nil {
-			return ""
-		}
-		return legacyPath
+		return ""
 	}
 	return cachePath
 }
 
 // ResolveTag looks up a tag and returns its manifest digest plus the
-// path to the first layer's cached ext4. Returns ErrTagNotFound or
+// path to the manifest's cached lower image. Returns ErrTagNotFound or
 // ErrBlobNotFound on miss.
 func ResolveTag(imagesDir, tag string) (digest, rootfsPath string, err error) {
 	t, err := GetTag(imagesDir, tag)
@@ -222,18 +212,9 @@ func ResolveTag(imagesDir, tag string) (digest, rootfsPath string, err error) {
 	if len(manifest.Layers) == 0 {
 		return t.Digest, "", fmt.Errorf("manifest %s has no layers", t.Digest)
 	}
-	cachePath, err := CacheLowerPath(imagesDir, manifest.Layers[0].Digest)
+	cachePath, err := CacheLowerPath(imagesDir, t.Digest)
 	if err != nil {
 		return t.Digest, "", err
-	}
-	if _, statErr := os.Stat(cachePath); statErr != nil {
-		// Prefer the legacy .ext4 path when present so a partial
-		// upgrade (v0.5.0 cache + v0.5.1 binary) keeps booting.
-		if legacy, lerr := CacheLowerPathLegacy(imagesDir, manifest.Layers[0].Digest); lerr == nil {
-			if _, lstat := os.Stat(legacy); lstat == nil {
-				cachePath = legacy
-			}
-		}
 	}
 	return t.Digest, cachePath, nil
 }

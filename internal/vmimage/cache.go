@@ -21,16 +21,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 )
-
-// validLowerSize is retained for input validation against the size
-// hint accepted by legacy callers. The new materialize pipeline ignores
-// size (erofs is tightly-packed), but config validation still uses this
-// regex to catch typos in user-supplied size strings.
-var validLowerSize = regexp.MustCompile(`^[1-9][0-9]*[KMGTP]?$`)
 
 const cacheDir = "cache"
 
@@ -41,124 +34,56 @@ const cacheDir = "cache"
 // by CacheLowerPath as an opaque value.
 const CacheLowerExt = ".erofs"
 
-// LegacyCacheLowerExt is the previous extension (pre-v0.5.1). Kept as
-// a constant so PruneImages's GC scan can recognize and evict legacy
-// .ext4 files left over from a v0.5.0 cache (B.5 deletes this entirely).
-const LegacyCacheLowerExt = ".ext4"
-
 // CacheLowerPath returns the on-disk path of the derived lower image
-// for a layer. layerDigest must be of the form "sha256:<hex>".
-func CacheLowerPath(imagesDir, layerDigest string) (string, error) {
-	hex, err := digestHex(layerDigest)
+// for a manifest. manifestDigest must be of the form "sha256:<hex>".
+func CacheLowerPath(imagesDir, manifestDigest string) (string, error) {
+	hex, err := digestHex(manifestDigest)
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(imagesDir, cacheDir, algorithmDir, hex+CacheLowerExt), nil
 }
 
-// CacheLowerPathLegacy returns the legacy .ext4 path for a layer. Used
-// by the docker fallback materializer (which still writes .ext4) and by
-// PruneImages's GC scan. Returns the same hex prefix as CacheLowerPath
-// but with the legacy extension.
-func CacheLowerPathLegacy(imagesDir, layerDigest string) (string, error) {
-	hex, err := digestHex(layerDigest)
+// CacheLowerExists reports whether the derived lower image is present.
+func CacheLowerExists(imagesDir, manifestDigest string) bool {
+	path, err := CacheLowerPath(imagesDir, manifestDigest)
 	if err != nil {
-		return "", err
+		return false
 	}
-	return filepath.Join(imagesDir, cacheDir, algorithmDir, hex+LegacyCacheLowerExt), nil
-}
-
-// CacheExt4Path is the legacy accessor name preserved for backward
-// compatibility with internal tests. New code should call
-// CacheLowerPath. The returned path uses the current cache extension
-// (.erofs from v0.5.1 onward).
-//
-// Deprecated: use CacheLowerPath.
-func CacheExt4Path(imagesDir, layerDigest string) (string, error) {
-	return CacheLowerPath(imagesDir, layerDigest)
-}
-
-// CacheLowerExists reports whether the derived lower image for a layer
-// is present, in either the current (.erofs) or legacy (.ext4) format.
-func CacheLowerExists(imagesDir, layerDigest string) bool {
-	if path, err := CacheLowerPath(imagesDir, layerDigest); err == nil {
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-	}
-	if path, err := CacheLowerPathLegacy(imagesDir, layerDigest); err == nil {
-		if _, err := os.Stat(path); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
-// CacheExt4Exists is preserved for compatibility with existing tests
-// and call sites. Returns true if any cached lower image exists for the
-// layer, regardless of format.
-//
-// Deprecated: use CacheLowerExists.
-func CacheExt4Exists(imagesDir, layerDigest string) bool {
-	return CacheLowerExists(imagesDir, layerDigest)
+	_, err = os.Stat(path)
+	return err == nil
 }
 
 // CacheLowerSize returns the on-disk size of the cached lower image
-// for a layer, or 0 if absent. Reports actual allocated blocks
-// (st_blocks × 512), not the sparse-file logical length — otherwise
-// `shed image ls`'s SIZE column reads 100+ GB for a manifest with a
-// handful of layers. If both .erofs and .ext4 exist for the same
-// digest (shouldn't happen but is possible during a partial migration),
-// returns the sum so disk-usage reporting stays honest.
-func CacheLowerSize(imagesDir, layerDigest string) int64 {
-	var total int64
-	for _, fn := range []func(string, string) (string, error){CacheLowerPath, CacheLowerPathLegacy} {
-		path, err := fn(imagesDir, layerDigest)
-		if err != nil {
-			continue
-		}
-		fi, err := os.Stat(path)
-		if err != nil {
-			continue
-		}
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			total += st.Blocks * 512
-		} else {
-			total += fi.Size()
-		}
+// for a manifest, or 0 if absent. Reports actual allocated blocks
+// (st_blocks × 512), not the sparse-file logical length, so the
+// `shed image ls` SIZE column reads true on-disk usage.
+func CacheLowerSize(imagesDir, manifestDigest string) int64 {
+	path, err := CacheLowerPath(imagesDir, manifestDigest)
+	if err != nil {
+		return 0
 	}
-	return total
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Blocks * 512
+	}
+	return fi.Size()
 }
 
-// CacheExt4Size is preserved for compatibility with existing call sites.
-//
-// Deprecated: use CacheLowerSize.
-func CacheExt4Size(imagesDir, layerDigest string) int64 {
-	return CacheLowerSize(imagesDir, layerDigest)
-}
-
-// RemoveCachedLower evicts derived lower images for a layer in both the
-// current and legacy formats. Idempotent: missing files are not an
-// error.
-func RemoveCachedLower(imagesDir, layerDigest string) error {
-	for _, fn := range []func(string, string) (string, error){CacheLowerPath, CacheLowerPathLegacy} {
-		path, err := fn(imagesDir, layerDigest)
-		if err != nil {
-			return err
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("removing cached lower: %w", err)
-		}
+// RemoveCachedLower evicts the derived lower image for a manifest.
+// Idempotent: a missing file is not an error.
+func RemoveCachedLower(imagesDir, manifestDigest string) error {
+	path, err := CacheLowerPath(imagesDir, manifestDigest)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing cached lower: %w", err)
 	}
 	return nil
-}
-
-// RemoveCachedExt4 is preserved for compatibility with existing call
-// sites. Same semantics as RemoveCachedLower.
-//
-// Deprecated: use RemoveCachedLower.
-func RemoveCachedExt4(imagesDir, layerDigest string) error {
-	return RemoveCachedLower(imagesDir, layerDigest)
 }
 
 // EnsureLowerFromManifest materializes (or re-materializes) the
