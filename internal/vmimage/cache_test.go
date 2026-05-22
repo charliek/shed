@@ -162,82 +162,7 @@ func TestMaterializeNativeLinuxOnLinux(t *testing.T) {
 	}
 }
 
-// TestEnsureLowerFromLayerLegacyCacheHit verifies that an existing
-// legacy .ext4 cache file is honored without rebuilding (upgrade-in-
-// place from v0.5.0 must not force re-materialization of every layer).
-func TestEnsureLowerFromLayerLegacyCacheHit(t *testing.T) {
-	tmp := t.TempDir()
-	if err := EnsureOCILayout(tmp); err != nil {
-		t.Fatalf("EnsureOCILayout: %v", err)
-	}
-
-	// Write a fake layer blob.
-	content := []byte("fake-layer-content")
-	digest := DigestBytes(content)
-	if _, err := WriteBlob(tmp, digest, content); err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
-
-	// Pre-seed the legacy .ext4 cache path.
-	legacyPath, err := CacheLowerPathLegacy(tmp, digest)
-	if err != nil {
-		t.Fatalf("CacheLowerPathLegacy: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(legacyPath, []byte("legacy-ext4-fake"), 0o444); err != nil {
-		t.Fatalf("write legacy cache: %v", err)
-	}
-
-	got, err := EnsureLowerFromLayer(context.Background(), tmp, digest, "linux/arm64", "")
-	if err != nil {
-		t.Fatalf("EnsureLowerFromLayer: %v", err)
-	}
-	if got != legacyPath {
-		t.Errorf("EnsureLowerFromLayer returned %s, want legacy path %s", got, legacyPath)
-	}
-	// And the new .erofs path should NOT have been written.
-	newPath, _ := CacheLowerPath(tmp, digest)
-	if _, err := os.Stat(newPath); err == nil {
-		t.Errorf("EnsureLowerFromLayer wrote %s even though %s already existed", newPath, legacyPath)
-	}
-}
-
-func TestEnsureLowerFromLayerErofsCacheHit(t *testing.T) {
-	tmp := t.TempDir()
-	if err := EnsureOCILayout(tmp); err != nil {
-		t.Fatalf("EnsureOCILayout: %v", err)
-	}
-
-	content := []byte("fake-erofs-content")
-	digest := DigestBytes(content)
-	if _, err := WriteBlob(tmp, digest, content); err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
-
-	// Pre-seed the new .erofs cache path.
-	erofsPath, err := CacheLowerPath(tmp, digest)
-	if err != nil {
-		t.Fatalf("CacheLowerPath: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(erofsPath), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(erofsPath, []byte("erofs-pre-seeded"), 0o444); err != nil {
-		t.Fatalf("write cache: %v", err)
-	}
-
-	got, err := EnsureLowerFromLayer(context.Background(), tmp, digest, "linux/arm64", "")
-	if err != nil {
-		t.Fatalf("EnsureLowerFromLayer: %v", err)
-	}
-	if got != erofsPath {
-		t.Errorf("returned %s, want %s", got, erofsPath)
-	}
-}
-
-func TestCacheLowerExistsBothFormats(t *testing.T) {
+func TestCacheLowerExists(t *testing.T) {
 	tmp := t.TempDir()
 	if err := EnsureOCILayout(tmp); err != nil {
 		t.Fatalf("EnsureOCILayout: %v", err)
@@ -248,42 +173,11 @@ func TestCacheLowerExistsBothFormats(t *testing.T) {
 		t.Error("CacheLowerExists with no files should return false")
 	}
 
-	// Seed legacy .ext4 only.
-	legacy, _ := CacheLowerPathLegacy(tmp, digest)
-	_ = os.MkdirAll(filepath.Dir(legacy), 0o755)
-	_ = os.WriteFile(legacy, []byte("x"), 0o444)
-	if !CacheLowerExists(tmp, digest) {
-		t.Error("CacheLowerExists should accept legacy .ext4")
-	}
-	_ = os.Remove(legacy)
-
-	// Seed only .erofs.
 	erofs, _ := CacheLowerPath(tmp, digest)
+	_ = os.MkdirAll(filepath.Dir(erofs), 0o755)
 	_ = os.WriteFile(erofs, []byte("x"), 0o444)
 	if !CacheLowerExists(tmp, digest) {
-		t.Error("CacheLowerExists should accept new .erofs")
-	}
-}
-
-func TestRegisterMaterializerHook(t *testing.T) {
-	// Capture and restore so other tests don't see our injected hook.
-	prev := materializerHook
-	defer RegisterMaterializer(prev)
-
-	called := false
-	RegisterMaterializer(func(ctx context.Context, blobPath, outputPath, platform string) error {
-		called = true
-		return nil
-	})
-
-	if materializerHook == nil {
-		t.Fatal("RegisterMaterializer did not install the hook")
-	}
-	if err := materializerHook(context.Background(), "/tmp/x", "/tmp/y", "linux/arm64"); err != nil {
-		t.Fatalf("hook: %v", err)
-	}
-	if !called {
-		t.Error("hook closure never ran")
+		t.Error("CacheLowerExists should accept .erofs")
 	}
 }
 

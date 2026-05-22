@@ -121,6 +121,22 @@ func InstallSyntheticImage(imagesDir, tagName, sourceRef string, rootfsContent, 
 		return "", fmt.Errorf("writing manifest blob: %w", err)
 	}
 
+	// Pre-populate the manifest-digest-keyed cache lower so tests that
+	// expect a ready-to-boot image skip the EnsureLowerFromManifest path
+	// (which would try to flatten the synthetic non-tar layer content).
+	mfCachePath, err := CacheLowerPath(imagesDir, manifestDigest)
+	if err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(mfCachePath); statErr != nil {
+		if err := os.MkdirAll(filepath.Dir(mfCachePath), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(mfCachePath, rootfsContent, 0o444); err != nil {
+			return "", fmt.Errorf("writing synthetic manifest cache: %w", err)
+		}
+	}
+
 	// Record the manifest in index.json so ListImages / PruneImages
 	// can enumerate it without probe-reading every blob (matches the
 	// behavior of the production Convert / PullToOCILayout paths).

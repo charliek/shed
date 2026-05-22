@@ -116,30 +116,17 @@ func (vm *VM) Start(ctx context.Context) error {
 		return fmt.Errorf("kernel blob missing at %s: %w", kernelPath, err)
 	}
 
-	// Resolve every layer's cached ext4. Upper is /dev/vda; lowers
-	// occupy /dev/vdb..vd{1+N} in manifest order (layer[0] = base).
-	// The in-guest initramfs stacks them in reverse manifest order so
-	// the base sits at the bottom of the overlay.
-	layerPaths, err := imageMgr.ResolveLayerExt4Paths(ctx, vm.meta.LowerDigest)
+	// Resolve the single flattened lower for the manifest. Upper is
+	// /dev/vda (per-shed writable); lower is /dev/vdb (read-only erofs
+	// shared across every shed booting from this manifest).
+	lowerPath, err := imageMgr.ResolveManifestLower(ctx, vm.meta.LowerDigest)
 	if err != nil {
-		return fmt.Errorf("resolving layer ext4s: %w", err)
-	}
-	if len(layerPaths) == 0 {
-		return fmt.Errorf("manifest %s has no layers", vmimage.ShortDigest(vm.meta.LowerDigest))
-	}
-	if len(layerPaths) > vmimage.MaxLayers {
-		return fmt.Errorf("image has %d layers (max %d)", len(layerPaths), vmimage.MaxLayers)
-	}
-
-	lowerDevs := make([]string, len(layerPaths))
-	for i := range layerPaths {
-		lowerDevs[i] = fmt.Sprintf("/dev/vd%c", 'b'+byte(i))
+		return fmt.Errorf("resolving manifest lower: %w", err)
 	}
 
 	kernelArgs := fmt.Sprintf(
-		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lowers=%s",
+		"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init ip=%s::%s:%s::eth0:off cgroup_enable=memory cgroup_memory=1 shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
 		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
-		strings.Join(lowerDevs, ","),
 	)
 
 	drives := []models.Drive{
@@ -151,17 +138,13 @@ func (vm *VM) Start(ctx context.Context) error {
 			IsRootDevice: firecracker.Bool(true),
 			IsReadOnly:   firecracker.Bool(false),
 		},
-	}
-	for i, p := range layerPaths {
-		// Firecracker rejects drive IDs containing characters outside
-		// [A-Za-z0-9_]; hyphens specifically fail with "API Resource
-		// IDs can only contain alphanumeric characters and underscores".
-		drives = append(drives, models.Drive{
-			DriveID:      firecracker.String(fmt.Sprintf("lower_%d", i+1)),
-			PathOnHost:   firecracker.String(p),
+		// Lower: read-only flattened manifest erofs, /dev/vdb.
+		{
+			DriveID:      firecracker.String("lower"),
+			PathOnHost:   firecracker.String(lowerPath),
 			IsRootDevice: firecracker.Bool(false),
 			IsReadOnly:   firecracker.Bool(true),
-		})
+		},
 	}
 
 	fcCfg := firecracker.Config{

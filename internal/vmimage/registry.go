@@ -434,12 +434,9 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		return nil, fmt.Errorf("updating index.json: %w", err)
 	}
 
-	// Materialize the derived lower image for every layer.
-	for _, ld := range layerDigests {
-		if _, err := EnsureLowerFromLayer(ctx, opts.ImagesDir, ld, opts.Platform, ""); err != nil {
-			return nil, fmt.Errorf("materializing lower for layer %s: %w", ShortDigest(ld), err)
-		}
-	}
+	// The flattened manifest lower is materialized lazily on the next
+	// EnsureImage call so a registry pull stays fast on its own; the
+	// erofs gets built when the next shed actually needs to boot.
 
 	if opts.TagName != "" {
 		if err := SetTag(opts.ImagesDir, opts.TagName, manifestDigest.String()); err != nil {

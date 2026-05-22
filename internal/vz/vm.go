@@ -20,19 +20,6 @@ import (
 	"github.com/charliek/shed/internal/vmutil"
 )
 
-// guestLowerDevices returns the names of the N readonly virtio-blk
-// devices the guest sees, ordered to match manifest layer order
-// (layer[0] = /dev/vdb, layer[1] = /dev/vdc, ...). vfkit / firecracker
-// assign device names by attach order, so the host's drive order
-// determines the guest's vdX letters.
-func guestLowerDevices(n int) []string {
-	out := make([]string, n)
-	for i := 0; i < n; i++ {
-		out[i] = fmt.Sprintf("/dev/vd%c", 'b'+i)
-	}
-	return out
-}
-
 // credentialVirtioFS describes a VirtioFS share for a credential directory.
 type credentialVirtioFS struct {
 	SourceDir string
@@ -177,37 +164,19 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		return nil, fmt.Errorf("kernel blob missing at %s: %w", kernelPath, statErr)
 	}
 
-	// Resolve every layer's cached ext4. Upper is /dev/vda; lowers
-	// occupy /dev/vdb..vd{1+N} in manifest order (layer[0] = base,
-	// pinned to the leftmost lower devices). The in-guest initramfs
-	// stacks them in reverse manifest order so the base sits at the
-	// bottom of the overlay.
-	layerPaths, err := vmimage.NewManager(vm.cfg, nil).ResolveLayerExt4Paths(context.Background(), vm.meta.LowerDigest)
+	// Resolve the single flattened lower for the manifest. Upper is
+	// /dev/vda (per-shed writable); lower is /dev/vdb (read-only erofs
+	// shared across every shed booting from this manifest).
+	lowerPath, err := vmimage.NewManager(vm.cfg, nil).ResolveManifestLower(context.Background(), vm.meta.LowerDigest)
 	if err != nil {
-		return nil, fmt.Errorf("resolving layer ext4s: %w", err)
-	}
-	if len(layerPaths) == 0 {
-		return nil, fmt.Errorf("manifest %s has no layers", vmimage.ShortDigest(vm.meta.LowerDigest))
-	}
-	if len(layerPaths) > vmimage.MaxLayers {
-		return nil, fmt.Errorf("image has %d layers (max %d)", len(layerPaths), vmimage.MaxLayers)
+		return nil, fmt.Errorf("resolving manifest lower: %w", err)
 	}
 	_ = manifest // reserved for future per-layer annotation use
 
-	// shed.lowers= names every lower device in manifest order. The
-	// initramfs builds the overlayfs lowerdir from this list.
-	lowerDevs := guestLowerDevices(len(layerPaths))
 	kernelArgs := fmt.Sprintf(
-		"console=hvc0 init=/sbin/init shed.name=%s shed.upper=/dev/vda shed.lowers=%s",
+		"console=hvc0 init=/sbin/init shed.name=%s shed.upper=/dev/vda shed.lower=/dev/vdb",
 		vm.meta.Name,
-		strings.Join(lowerDevs, ","),
 	)
-
-	// Use the dedicated --kernel / --initrd / --kernel-cmdline flags
-	// instead of inlining cmdline= into --bootloader. The bootloader spec
-	// is comma-separated key=value pairs, and the kernel cmdline contains
-	// commas (e.g. shed.lowers=/dev/vdb,/dev/vdc,…) which vfkit's
-	// bootloader parser would misinterpret as extra bootloader options.
 
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
@@ -220,9 +189,8 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		"--kernel-cmdline", kernelArgs,
 		// Upper: writable, /dev/vda inside the guest.
 		"--device", fmt.Sprintf("virtio-blk,path=%s", vm.meta.RootfsPath),
-	}
-	for _, p := range layerPaths {
-		args = append(args, "--device", fmt.Sprintf("virtio-blk,path=%s,readonly", p))
+		// Lower: read-only flattened manifest erofs, /dev/vdb.
+		"--device", fmt.Sprintf("virtio-blk,path=%s,readonly", lowerPath),
 	}
 	args = append(args,
 		"--device", "virtio-net,nat",

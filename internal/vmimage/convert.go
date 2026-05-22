@@ -391,14 +391,10 @@ func convertFromOCIArchive(ctx context.Context, opts ConvertOptions) (*ConvertRe
 		initrdDigest = d
 	}
 
-	// Materialize the read-only lower for each layer.
-	// EnsureLowerFromLayer is content-addressed: shared base layers
-	// between variants reuse the existing cache file without rebuilding.
-	for _, ld := range layerDigests {
-		if _, err := EnsureLowerFromLayer(ctx, opts.ImagesDir, ld, opts.Platform, opts.RootfsSize); err != nil {
-			return nil, fmt.Errorf("materializing lower for layer %s: %w", ShortDigest(ld), err)
-		}
-	}
+	// The flattened manifest lower is materialized lazily on the next
+	// EnsureImage call (via resolveManifestLower) — no need to pre-bake
+	// the erofs here. Keeping image-build snappy when iterating on a
+	// rootfs that may not even be booted.
 
 	// Build our shed-annotated manifest referencing the same layer +
 	// config digests as buildx emitted. Adding annotations changes the
@@ -721,10 +717,9 @@ func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*Convert
 		return nil, fmt.Errorf("updating index.json: %w", err)
 	}
 
-	// Materialize the derived lower in the cache (Phase 1: single layer).
-	if _, err := EnsureLowerFromLayer(ctx, opts.ImagesDir, layerDigest, opts.Platform, opts.RootfsSize); err != nil {
-		return nil, fmt.Errorf("materializing lower cache: %w", err)
-	}
+	// Lower is materialized lazily on the next EnsureImage (via
+	// resolveManifestLower) so docker-fallback conversions don't
+	// block waiting on mkfs.erofs.
 
 	return &ConvertResult{
 		ManifestDigest:    manifestDigest,

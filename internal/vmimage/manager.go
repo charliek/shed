@@ -82,13 +82,12 @@ type ResolvedRef struct {
 	Digest    string // set when Path came from a tag in the blob store; preserved through to EnsureResult.Digest
 }
 
-// EnsureResult is what EnsureImage returns: the path to the first layer's
-// ext4 (for single-layer compat), the OCI manifest digest, and the full
-// ordered list of layer ext4 paths that the VM needs to mount.
+// EnsureResult is what EnsureImage returns: the path to the
+// content-addressed lower image for the resolved manifest, and the
+// manifest digest itself.
 type EnsureResult struct {
-	Path           string   // path to the first layer's cached ext4
-	Digest         string   // OCI manifest digest
-	LayerExt4Paths []string // ordered cached ext4 paths for every layer (lowest index = bottom of stack)
+	Path   string // path to the cached lower image (manifest-digest-keyed erofs)
+	Digest string // OCI manifest digest
 }
 
 // EnsureImage ensures an image is available locally. For Docker refs,
@@ -159,7 +158,7 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		Progress:      progress,
 	})
 	if pullErr == nil {
-		return m.layerExt4Paths(ctx, imagesDir, pullResult.ManifestDigest)
+		return m.resolveManifestLower(ctx, imagesDir, pullResult.ManifestDigest)
 	}
 
 	if progress != nil {
@@ -176,7 +175,7 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		return EnsureResult{}, fmt.Errorf("advancing tag %q: %w", ref.Name, err)
 	}
 
-	return m.layerExt4Paths(ctx, imagesDir, result.ManifestDigest)
+	return m.resolveManifestLower(ctx, imagesDir, result.ManifestDigest)
 }
 
 // PullImage pulls a registry reference straight to the OCI layout (no
@@ -273,21 +272,20 @@ func isLoopbackRef(ref string) bool {
 	return false
 }
 
-// ResolveLayerExt4Paths returns the ordered lower-image cache paths for
-// every layer of the manifest, materializing any missing layers from
-// their tar.gz blobs. Used by VM start to attach N read-only block
-// devices. Despite the name, the paths may end in .erofs or .ext4
-// depending on which materializer produced each layer's cache file.
-func (m *Manager) ResolveLayerExt4Paths(ctx context.Context, manifestDigest string) ([]string, error) {
+// ResolveManifestLower returns the path of the single content-addressed
+// lower-image (flattened, all-layers-merged erofs) for the manifest,
+// materializing it from the layer blobs if it isn't already cached.
+// Used by VM start to attach one read-only block device.
+func (m *Manager) ResolveManifestLower(ctx context.Context, manifestDigest string) (string, error) {
 	imagesDir := m.cfg.GetImagesDir()
 	if imagesDir == "" {
-		return nil, fmt.Errorf("images_dir is not configured")
+		return "", fmt.Errorf("images_dir is not configured")
 	}
-	res, err := m.layerExt4Paths(ctx, imagesDir, manifestDigest)
+	res, err := m.resolveManifestLower(ctx, imagesDir, manifestDigest)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return res.LayerExt4Paths, nil
+	return res.Path, nil
 }
 
 // ResolveImageBlobs returns the manifest and config for an installed
@@ -348,35 +346,25 @@ func (m *Manager) resolveCachedTag(ctx context.Context, imagesDir, name, expecte
 		log.Printf("vmimage: tag %q points at manifest with source-ref %q which differs from configured ref %q — using local tag anyway (run `shed image rm %s` then re-pull to refresh from registry)",
 			name, manifest.ShedSourceRef(), expectedRef, name)
 	}
-	res, err := m.layerExt4Paths(ctx, imagesDir, t.Digest)
+	res, err := m.resolveManifestLower(ctx, imagesDir, t.Digest)
 	if err != nil {
 		return EnsureResult{}, false
 	}
 	return res, true
 }
 
-// layerExt4Paths resolves every layer of a manifest into an ordered
-// list of cached lower-image paths, materializing any that are missing.
-func (m *Manager) layerExt4Paths(ctx context.Context, imagesDir, manifestDigest string) (EnsureResult, error) {
-	manifest, err := LoadManifestByDigest(imagesDir, manifestDigest)
+// resolveManifestLower materializes (if needed) the single flattened
+// lower image for the manifest and returns its path. The cache file is
+// content-addressed by the manifest digest, so all sheds booting from
+// the same image share one erofs file on disk.
+func (m *Manager) resolveManifestLower(ctx context.Context, imagesDir, manifestDigest string) (EnsureResult, error) {
+	path, err := EnsureLowerFromManifest(ctx, imagesDir, manifestDigest)
 	if err != nil {
-		return EnsureResult{}, err
-	}
-	if len(manifest.Layers) == 0 {
-		return EnsureResult{}, fmt.Errorf("manifest %s has no layers", manifestDigest)
-	}
-	paths := make([]string, 0, len(manifest.Layers))
-	for _, layer := range manifest.Layers {
-		path, err := EnsureLowerFromLayer(ctx, imagesDir, layer.Digest, m.cfg.GetPlatform(), "")
-		if err != nil {
-			return EnsureResult{}, fmt.Errorf("materializing lower for layer %s: %w", ShortDigest(layer.Digest), err)
-		}
-		paths = append(paths, path)
+		return EnsureResult{}, fmt.Errorf("materializing lower for manifest %s: %w", ShortDigest(manifestDigest), err)
 	}
 	return EnsureResult{
-		Path:           paths[0],
-		Digest:         manifestDigest,
-		LayerExt4Paths: paths,
+		Path:   path,
+		Digest: manifestDigest,
 	}, nil
 }
 

@@ -202,52 +202,46 @@ func RemoveCachedExt4(imagesDir, layerDigest string) error {
 	return RemoveCachedLower(imagesDir, layerDigest)
 }
 
-// EnsureLowerFromLayer materializes (or re-materializes) the read-only
-// lower image for a layer blob. If a cache file already exists (in
-// either the current or legacy format), returns its path without
-// rebuilding. Otherwise reads the layer blob (a tar.gz) and runs the
-// backend-specific materializer (host-native mkfs.erofs on Linux, a
-// one-shot vfkit VM on Mac), installing the result atomically into the
-// cache.
+// EnsureLowerFromManifest materializes (or re-materializes) the
+// flattened read-only lower image for an OCI manifest. The cache file
+// is keyed by manifest digest at
+// {imagesDir}/cache/sha256/<manifest-digest>.erofs, shared across every
+// shed that boots from this manifest.
 //
-// platform should be the Docker platform string ("linux/arm64" or
-// "linux/amd64") matching the layer; sizeBytes is a hint passed to the
-// legacy docker fallback only (the erofs materializer ignores it).
-func EnsureLowerFromLayer(ctx context.Context, imagesDir, layerDigest, platform, sizeBytes string) (string, error) {
+// If the cache file already exists, returns its path without rebuilding.
+// Otherwise: flatten every layer with whiteout handling into a temp
+// tarball, run `mkfs.erofs --tar=f -z lz4 -E force-inode-compact` to
+// produce the erofs image, then atomically rename into the cache. A
+// file lock around the cache path keeps concurrent EnsureImage calls
+// from racing each other.
+//
+// Requires `mkfs.erofs` on PATH (apt install erofs-utils on
+// Debian/Ubuntu, brew install erofs-utils on macOS).
+func EnsureLowerFromManifest(ctx context.Context, imagesDir, manifestDigest string) (string, error) {
 	if err := EnsureOCILayout(imagesDir); err != nil {
 		return "", err
 	}
-	if sizeBytes == "" {
-		sizeBytes = DefaultLayerSize
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		return "", fmt.Errorf("mkfs.erofs not found on PATH (install erofs-utils): %w", err)
 	}
 
-	// Already cached? Prefer the new format; fall back to legacy so
-	// upgrade-in-place doesn't force re-materialization of layers
-	// cached by v0.5.0.
-	if path, err := CacheLowerPath(imagesDir, layerDigest); err == nil {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
-		}
-	}
-	if path, err := CacheLowerPathLegacy(imagesDir, layerDigest); err == nil {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
-		}
-	}
-
-	if !BlobExists(imagesDir, layerDigest) {
-		return "", fmt.Errorf("%w: layer %s", ErrBlobNotFound, layerDigest)
-	}
-
-	finalPath, err := CacheLowerPath(imagesDir, layerDigest)
+	finalPath, err := CacheLowerPath(imagesDir, manifestDigest)
 	if err != nil {
 		return "", err
 	}
-	hex, _ := digestHex(layerDigest)
+	if _, err := os.Stat(finalPath); err == nil {
+		return finalPath, nil
+	}
+
+	if !BlobExists(imagesDir, manifestDigest) {
+		return "", fmt.Errorf("%w: manifest %s", ErrBlobNotFound, manifestDigest)
+	}
+
+	hex, _ := digestHex(manifestDigest)
 	lockPath := filepath.Join(imagesDir, cacheDir, algorithmDir, "."+hex+CacheLowerExt+".lock")
 	unlock, err := acquireFileLock(lockPath)
 	if err != nil {
-		return "", fmt.Errorf("locking cache lower %s: %w", layerDigest, err)
+		return "", fmt.Errorf("locking cache lower %s: %w", manifestDigest, err)
 	}
 	defer unlock()
 
@@ -255,23 +249,13 @@ func EnsureLowerFromLayer(ctx context.Context, imagesDir, layerDigest, platform,
 	if _, err := os.Stat(finalPath); err == nil {
 		return finalPath, nil
 	}
-	if legacyPath, err := CacheLowerPathLegacy(imagesDir, layerDigest); err == nil {
-		if _, err := os.Stat(legacyPath); err == nil {
-			return legacyPath, nil
-		}
-	}
 
-	blobPath, err := BlobPath(imagesDir, layerDigest)
+	stagingErofs, err := os.CreateTemp(filepath.Dir(finalPath), "."+hex+".*"+CacheLowerExt+".tmp")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("creating staging erofs: %w", err)
 	}
-
-	stagingFile, err := os.CreateTemp(filepath.Dir(finalPath), "."+hex+".*"+CacheLowerExt+".tmp")
-	if err != nil {
-		return "", fmt.Errorf("creating staging lower: %w", err)
-	}
-	stagingPath := stagingFile.Name()
-	stagingFile.Close()
+	stagingPath := stagingErofs.Name()
+	stagingErofs.Close()
 	cleanupStaging := true
 	defer func() {
 		if cleanupStaging {
@@ -279,9 +263,39 @@ func EnsureLowerFromLayer(ctx context.Context, imagesDir, layerDigest, platform,
 		}
 	}()
 
-	if err := materializeLayer(ctx, blobPath, stagingPath, platform, sizeBytes); err != nil {
-		return "", fmt.Errorf("creating lower from layer: %w", err)
+	mergedTar, err := os.CreateTemp("", "shed-merged-*.tar")
+	if err != nil {
+		return "", fmt.Errorf("creating merged tar: %w", err)
 	}
+	mergedTarPath := mergedTar.Name()
+	mergedTar.Close()
+	defer os.Remove(mergedTarPath)
+
+	if err := MergeLayersFromManifest(ctx, imagesDir, manifestDigest, mergedTarPath); err != nil {
+		return "", fmt.Errorf("flattening layers: %w", err)
+	}
+
+	// mkfs.erofs refuses to overwrite an existing target. Unlink the
+	// empty staging file before running it (CreateTemp leaves it empty).
+	if err := os.Remove(stagingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("removing empty staging file: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx,
+		"mkfs.erofs",
+		"--quiet",
+		"--tar=f",
+		"-z", "lz4",
+		"-E", "force-inode-compact",
+		stagingPath,
+		mergedTarPath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("mkfs.erofs: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+
 	if err := os.Chmod(stagingPath, 0o444); err != nil {
 		return "", fmt.Errorf("chmod staging lower: %w", err)
 	}
@@ -296,14 +310,6 @@ func EnsureLowerFromLayer(ctx context.Context, imagesDir, layerDigest, platform,
 		return "", fmt.Errorf("fsync cache dir: %w", err)
 	}
 	return finalPath, nil
-}
-
-// EnsureExt4FromLayer is preserved for compatibility with existing call
-// sites. Semantically identical to EnsureLowerFromLayer.
-//
-// Deprecated: use EnsureLowerFromLayer.
-func EnsureExt4FromLayer(ctx context.Context, imagesDir, layerDigest, platform, sizeBytes string) (string, error) {
-	return EnsureLowerFromLayer(ctx, imagesDir, layerDigest, platform, sizeBytes)
 }
 
 // materializeLayer dispatches between the host-native and VM-based

@@ -322,16 +322,16 @@ func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 	}
 	// The shed initramfs builds the overlay itself, so the legacy
 	// `root=/dev/vda rw` cmdline is replaced with shed.upper /
-	// shed.lowers naming the writable upper and the N read-only
-	// lowers.
+	// shed.lower naming the writable upper and the single
+	// content-addressed lower.
 	if strings.Contains(argsStr, "root=/dev/vda") {
 		t.Errorf("expected no root=/dev/vda in kernel cmdline (initramfs builds overlay): %s", argsStr)
 	}
 	if !strings.Contains(argsStr, "shed.upper=/dev/vda") {
 		t.Errorf("expected shed.upper=/dev/vda in kernel cmdline, got: %s", argsStr)
 	}
-	if !strings.Contains(argsStr, "shed.lowers=/dev/vdb") {
-		t.Errorf("expected shed.lowers=/dev/vdb in kernel cmdline, got: %s", argsStr)
+	if !strings.Contains(argsStr, "shed.lower=/dev/vdb") {
+		t.Errorf("expected shed.lower=/dev/vdb in kernel cmdline, got: %s", argsStr)
 	}
 	if !strings.Contains(argsStr, "init=/sbin/init") {
 		t.Error("expected init=/sbin/init in kernel cmdline")

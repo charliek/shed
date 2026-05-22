@@ -157,16 +157,14 @@ func walkLayerTarReader(ctx context.Context, r io.Reader, layerIdx int, st *flat
 		}
 
 		// Emit with canonicalized name (no leading "./"). Directories keep
-		// the trailing slash that the tar format prefers.
+		// the trailing slash that the tar format prefers. Let tar.Writer
+		// pick the format (USTAR for short paths, PAX only when forced
+		// by length); mkfs.erofs's tar parser is happier with USTAR.
 		newHdr := *hdr
 		newHdr.Name = name
 		if hdr.Typeflag == tar.TypeDir {
 			newHdr.Name = name + "/"
 		}
-		// Don't carry forward PAX xattrs that mkfs.erofs may choke on;
-		// keep the few fields that matter for fidelity (uid/gid/mode/
-		// mtime, linkname, devmajor/minor).
-		newHdr.Format = tar.FormatPAX
 
 		if err := tw.WriteHeader(&newHdr); err != nil {
 			return fmt.Errorf("writing tar header for %s: %w", name, err)
