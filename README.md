@@ -22,7 +22,21 @@ brew install charliek/tap/shed
 brew install charliek/tap/shed-host-agent  # optional: credential brokering
 ```
 
-This installs `shed` (CLI) and `shed-server`, generates a default server config, codesigns the server binary, and sets up launchd services. See [VZ Setup](docs/getting-started/vz-setup.md) for the full macOS setup guide.
+This installs `shed` (CLI) and `shed-server`, generates a default server config, codesigns the server binary, and sets up launchd services. Pulls `vfkit` and `erofs-utils` as dependencies. See [VZ Setup](docs/getting-started/vz-setup.md) for the full macOS setup guide.
+
+#### Debian / Ubuntu (apt)
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.stridelabs.ai/pubkey.gpg | \
+  sudo tee /etc/apt/keyrings/apt-charliek.gpg > /dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/apt-charliek.gpg] https://apt.stridelabs.ai noble main' | \
+  sudo tee /etc/apt/sources.list.d/apt-charliek.list
+sudo apt update
+sudo apt install shed-server
+```
+
+Installs the `shed-server` binary, default config at `/etc/shed/server.yaml`, and the systemd unit. Pulls `erofs-utils` as a dependency. The `shed` CLI is built from source on Linux today (see below).
 
 #### Build from Source
 
