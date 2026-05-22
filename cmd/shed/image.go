@@ -26,7 +26,6 @@ var (
 	imageBuildInitrd    string
 	imageBuildName      string
 	imageBuildTarget    string
-	imageBuildSize      string
 	imageBuildOutputDir string
 	imageBuildPlatform  string
 	imageBuildSourceRef string
@@ -140,7 +139,6 @@ func init() {
 	imageBuildCmd.Flags().StringVarP(&imageBuildName, "name", "n", "", "Image variant name (required)")
 	imageBuildCmd.Flags().StringVar(&imageBuildInitrd, "initramfs", "", "Path to a pre-built shed-overlay initramfs (built via scripts/build-initramfs.sh). Required for images that need to boot through shed's overlayfs assembly.")
 	imageBuildCmd.Flags().StringVar(&imageBuildTarget, "target", "", "Docker build target stage (Dockerfile mode only)")
-	imageBuildCmd.Flags().StringVar(&imageBuildSize, "size", "20G", "Rootfs image size")
 	imageBuildCmd.Flags().StringVar(&imageBuildOutputDir, "output-dir", "", "Output directory (auto-detected based on backend)")
 	imageBuildCmd.Flags().StringVar(&imageBuildPlatform, "platform", "", "Target docker platform (linux/arm64 or linux/amd64). Default: linux/arm64 for shed-vz-* targets, linux/amd64 for shed-fc-* targets, else host arch.")
 	// --source-ref controls the `io.shed.source-ref` manifest annotation
@@ -385,7 +383,6 @@ func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir
 		DockerRef:        sourceRef,
 		Name:             imageBuildName,
 		ImagesDir:        imagesDir,
-		RootfsSize:       imageBuildSize,
 		Platform:         platform,
 		ExtractKernel:    extractKernel,
 		NeedsInitrd:      needsInitrd,

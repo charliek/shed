@@ -69,8 +69,6 @@ type ConvertOptions struct {
 	// {ImagesDir}/blobs/sha256/.
 	ImagesDir string
 
-	// RootfsSize is the sparse ext4 image size (e.g., "20G"). Defaults to "20G".
-	RootfsSize string
 
 	// Platform is the Docker platform (e.g., "linux/arm64"). Defaults to DefaultPlatform.
 	Platform string
@@ -272,9 +270,6 @@ func LoadConfigByDigest(imagesDir, configDigest string) (*OCIConfig, error) {
 // The caller advances the tag (SetTag) after Convert returns; this
 // keeps Convert pure with respect to tag indirection.
 func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
-	if opts.RootfsSize == "" {
-		opts.RootfsSize = DefaultLayerSize
-	}
 	if opts.Platform == "" {
 		opts.Platform = DefaultPlatform
 	}
