@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"syscall"
@@ -90,6 +91,21 @@ func (c *Client) Close() error {
 func (c *Client) newAgentClient(name string) *vmutil.AgentClient {
 	dialer := NewVZDialer(c.cfg.SocketDir, name)
 	return vmutil.NewAgentClient(dialer, c.cfg.ConsolePort, c.cfg.NotifyPort)
+}
+
+// preserveConsoleLog copies the failing shed's console.log into a sibling
+// `logs/` directory before the caller wipes the instance dir. Safe to
+// call on a failure path that doesn't yet know if vfkit ever started:
+// missing logs are logged at debug-level and ignored.
+func (c *Client) preserveConsoleLog(meta *Metadata) {
+	dest, err := meta.PreserveConsoleLog(c.cfg.InstanceDir, filepath.Join(filepath.Dir(c.cfg.InstanceDir), "logs"))
+	if err != nil {
+		log.Printf("Warning: failed to preserve console log for %s: %v", meta.Name, err)
+		return
+	}
+	if dest != "" {
+		log.Printf("Preserved console log for failed shed %s at %s", meta.Name, dest)
+	}
 }
 
 // CreateShed creates a new VZ-based shed.
@@ -279,6 +295,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		c.preserveConsoleLog(meta)
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
@@ -297,6 +314,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	backend.Progress(ctx, "vm", "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
+		c.preserveConsoleLog(meta)
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}
@@ -312,6 +330,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if stopErr := vm.Stop(context.Background()); stopErr != nil {
 			log.Printf("Warning: failed to stop VM: %v", stopErr)
 		}
+		c.preserveConsoleLog(meta)
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
 			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
 		}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -197,6 +198,50 @@ func (m *Metadata) Delete(instanceDir string) error {
 		return fmt.Errorf("failed to remove instance directory: %w", err)
 	}
 	return nil
+}
+
+// PreserveConsoleLog copies the instance's console.log to destDir before
+// the caller tears down the instance directory. The destination filename
+// includes the shed name and a timestamp so multiple failed creates of
+// the same name don't clobber each other. Returns the absolute path of
+// the preserved copy, or empty string if there was nothing to preserve.
+// A missing console.log is not an error — the VM may have failed before
+// vfkit ever opened the file.
+//
+// Called from failure cleanup paths so the boot log survives the
+// os.RemoveAll(InstanceDir/<name>) that follows a failed CreateShed or
+// Start. Without preservation, postmortems on boot regressions reduce to
+// "rerun and hope the failure repeats" since vfkit's stderr/stdout are
+// only ever written into the about-to-be-deleted instance dir.
+func (m *Metadata) PreserveConsoleLog(instanceDir, destDir string) (string, error) {
+	if err := validateInstanceName(m.Name); err != nil {
+		return "", err
+	}
+
+	src := filepath.Join(InstanceDir(instanceDir, m.Name), consoleLogFilename)
+	srcFile, err := os.Open(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("opening console log: %w", err)
+	}
+	defer srcFile.Close()
+
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return "", fmt.Errorf("creating logs dir: %w", err)
+	}
+	ts := time.Now().UTC().Format("20060102T150405Z")
+	dest := filepath.Join(destDir, fmt.Sprintf("%s-%s.log", m.Name, ts))
+	destFile, err := os.Create(dest)
+	if err != nil {
+		return "", fmt.Errorf("creating preserved log: %w", err)
+	}
+	defer destFile.Close()
+	if _, err := io.Copy(destFile, srcFile); err != nil {
+		return "", fmt.Errorf("copying console log: %w", err)
+	}
+	return dest, nil
 }
 
 func validateInstanceName(name string) error {
