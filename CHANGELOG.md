@@ -43,17 +43,20 @@ All notable changes to this project will be documented in this file.
 ### Required cleanup on upgrade
 
 The cache layout changed from `<layer-digest>.{erofs,ext4}` to
-`<manifest-digest>.erofs`. v0.5.0 cache files are not migrated — wipe
-the cache dir once on upgrade:
+`<manifest-digest>.erofs`, and the new prune walker only recognizes
+`.erofs`. v0.5.0 `.ext4` cache files become orphans — wipe the cache
+dir once on upgrade. The cache lives under `{images_dir}/cache/`, so
+the exact path depends on backend config:
 
 ```bash
-# Mac (VZ)
+# Mac (VZ default)
 rm -rf ~/Library/Application\ Support/shed/vz/cache
-# Linux (Firecracker) — adjust to your images_dir
-rm -rf /var/lib/shed/firecracker/cache
+# Linux (Firecracker default — uses images_dir/cache)
+rm -rf /var/lib/shed/firecracker/images/cache
 ```
 
-`shed image prune` will GC any orphaned blobs on the next run.
+`shed image prune` will GC any orphaned `.erofs` files automatically
+on subsequent runs.
 
 ### New runtime dependency
 
