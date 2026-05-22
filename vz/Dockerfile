@@ -59,10 +59,14 @@ RUN printf '%s\n' \
 # Layer 1: APT-installed system + dev tools + Docker CE in one go.
 # linux-image-virtual + initramfs-tools provide the in-VM kernel
 # (extracted at image-build time by shed image build for VZ booting).
-# linux-image-virtual ships the same kernel as linux-image-generic but
-# trims the recommended-modules tree to virtualization-relevant only:
-# virtio_blk, virtio_net, virtio_pci, vmw_vsock_virtio_transport, 9p,
-# 9pnet_virtio, loop, overlay, erofs. ~100 MB smaller than -generic.
+# linux-image-virtual is ~100 MB smaller than linux-image-generic because
+# it ships a minimal recommended-modules set: virtio_blk, virtio_net,
+# virtio_pci, 9p, 9pnet_virtio, loop, overlay. It does NOT ship the
+# vsock guest-transport modules (vmw_vsock_virtio_transport*); those
+# live in linux-modules-extra-virtual, which is a tiny metapackage that
+# pulls in linux-modules-extra-$(uname -r)-generic. Without -extra,
+# shed-agent.service can't open its vsock listener and host health
+# checks time out.
 # Editor lineup: neovim only. vim/nano/jed/htop dropped to save ~80 MB;
 # users who need them can `apt install` inside a shed.
 RUN apt-get update \
@@ -73,7 +77,7 @@ RUN apt-get update \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \
        build-essential bubblewrap \
-       linux-image-virtual initramfs-tools \
+       linux-image-virtual linux-modules-extra-virtual initramfs-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 2: stage shed-built binaries + service files from the build
