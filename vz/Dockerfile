@@ -62,11 +62,14 @@ RUN printf '%s\n' \
 # linux-image-virtual is ~100 MB smaller than linux-image-generic because
 # it ships a minimal recommended-modules set: virtio_blk, virtio_net,
 # virtio_pci, 9p, 9pnet_virtio, loop, overlay. It does NOT ship the
-# vsock guest-transport modules (vmw_vsock_virtio_transport*); those
-# live in linux-modules-extra-virtual, which is a tiny metapackage that
-# pulls in linux-modules-extra-$(uname -r)-generic. Without -extra,
-# shed-agent.service can't open its vsock listener and host health
-# checks time out.
+# vsock guest-transport modules (vmw_vsock_virtio_transport[_common]);
+# those live in linux-modules-extra-$KVERS-generic, which Noble does
+# NOT expose as a -virtual metapackage (only kernel-flavor-specific
+# aliases like -extra-aws/-azure/-gcp exist). We derive the exact
+# kernel version from the linux-image-*-generic package the
+# linux-image-virtual metapackage pulled in and install the matching
+# -extra package by name. Without it, shed-agent.service can't open
+# its vsock listener and host health checks time out.
 # Editor lineup: neovim only. vim/nano/jed/htop dropped to save ~80 MB;
 # users who need them can `apt install` inside a shed.
 RUN apt-get update \
@@ -77,7 +80,10 @@ RUN apt-get update \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \
        build-essential bubblewrap \
-       linux-image-virtual linux-modules-extra-virtual initramfs-tools \
+       linux-image-virtual initramfs-tools \
+    && KVERS=$(dpkg-query -W -f='${Package}\n' 'linux-image-*-generic' | head -1 | sed 's/linux-image-//') \
+    && [ -n "$KVERS" ] || { echo "ERROR: could not derive kernel version from linux-image-*-generic"; exit 1; } \
+    && apt-get install -y --no-install-recommends "linux-modules-extra-$KVERS" \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 2: stage shed-built binaries + service files from the build
