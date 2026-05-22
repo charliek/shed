@@ -22,7 +22,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 FIRECRACKER_DIR="$PROJECT_ROOT/firecracker"
 OUTPUT_DIR="${OUTPUT_DIR:-/var/lib/shed/firecracker/images}"
-ROOTFS_SIZE="${ROOTFS_SIZE:-20G}"  # 20GB default
 
 # Built-in variants surfaced by --all and --help. Explicit --variant values
 # are forwarded to Docker so custom shed-fc-<name> stages can be built too.
@@ -73,7 +72,6 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Environment variables:"
             echo "  OUTPUT_DIR         Output directory (default: /var/lib/shed/firecracker/images)"
-            echo "  ROOTFS_SIZE        Rootfs image size (default: 20G)"
             exit 0
             ;;
         *)
@@ -165,7 +163,6 @@ build_variant() {
         --target "$docker_target" \
         -n "$variant" \
         --initramfs "$SHED_INITRD" \
-        --size "$ROOTFS_SIZE" \
         --output-dir "$OUTPUT_DIR" \
         -f "$FIRECRACKER_DIR/Dockerfile" \
         "$FIRECRACKER_DIR"
