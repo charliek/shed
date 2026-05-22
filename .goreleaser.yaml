@@ -111,6 +111,10 @@ brews:
     dependencies:
       - name: vfkit
         os: mac
+      # erofs-utils provides mkfs.erofs, used by the host-native layer
+      # materializer added in v0.5.1. Same dep is also declared by the
+      # nfpms (deb) block below.
+      - name: erofs-utils
     install: |
       bin.install "shed"
       bin.install "shed-server"
