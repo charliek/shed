@@ -2,6 +2,88 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.1 — 2026-05-22
+
+### Flatten + host-native materialize
+
+- **One flattened erofs lower per OCI manifest** replaces the
+  multi-layer overlay + per-layer materialize VM. On both Linux and
+  macOS, shed now reads every layer of an OCI manifest in order,
+  applies OCI whiteouts (`.wh.foo`, `.wh..wh..opq`), and feeds the
+  merged tree to `mkfs.erofs --tar=f` to produce one content-addressed
+  erofs file at `{imagesDir}/cache/sha256/<manifest-digest>.erofs`.
+  Boot becomes "mount one read-only lower + per-shed writable upper +
+  overlay." This is the same pattern Lima / Colima / OrbStack /
+  Podman Machine v5+ use.
+
+- **Image sizes** stayed at the v0.5.1 plan numbers from earlier
+  pre-release commits (drop nano/vim/jed/htop + locale strip, drop
+  Cursor CLI from full, Bun replaces Node+Python+uv,
+  linux-image-virtual instead of -generic, Docker moved to full). VZ
+  full is ~50% smaller compressed than v0.5.0.
+
+- **Vsock fix on VZ:** `linux-image-virtual` ships a minimal recommended
+  modules tree without `vmw_vsock_virtio_transport[_common]`. The VZ
+  rootfs Dockerfile now derives the matching
+  `linux-modules-extra-<kvers>-generic` package name from the
+  installed kernel and installs it alongside, so shed-agent can open
+  its vsock listener.
+
+- **systemd-firstboot.service is now masked** in the VZ rootfs. With
+  the transient `/etc/machine-id → /run/machine-id` symlink, systemd
+  evaluates `ConditionFirstBoot=yes` on every boot and the interactive
+  wizard would block `sysinit.target` → `multi-user.target` →
+  `shed-agent.service` indefinitely on `/dev/console`.
+
+- **Boot-log preservation:** failed `CreateShed` paths now copy
+  `console.log` to `{imagesDir}/../logs/<name>-<timestamp>.log` before
+  the instance dir is removed. No more "rerun and hope it repeats"
+  debugging.
+
+### Required cleanup on upgrade
+
+The cache layout changed from `<layer-digest>.{erofs,ext4}` to
+`<manifest-digest>.erofs`. v0.5.0 cache files are not migrated — wipe
+the cache dir once on upgrade:
+
+```bash
+# Mac (VZ)
+rm -rf ~/Library/Application\ Support/shed/vz/cache
+# Linux (Firecracker) — adjust to your images_dir
+rm -rf /var/lib/shed/firecracker/cache
+```
+
+`shed image prune` will GC any orphaned blobs on the next run.
+
+### New runtime dependency
+
+`mkfs.erofs` (from `erofs-utils`) must be on PATH on the host running
+`shed-server`:
+
+- macOS: `brew install erofs-utils`
+- Debian/Ubuntu: `apt install erofs-utils`
+
+Shed errors at first materialize attempt with an install hint if
+absent.
+
+### Other
+
+- `EnsureImage` prefers registry-direct pull over docker-export
+  (closes #98). Cuts cold-start materialize wallclock on first pull,
+  and produces multi-layer manifests with the shed-overlay initrd
+  annotation rather than single flattened blobs.
+- Local tags always win over the configured registry ref. Previously
+  the server config's `ref:` had to match the manifest's
+  `io.shed.source-ref` exactly, which broke local rebuild workflows.
+- `shed image build` derives `--source-ref` from `shed version` so
+  the published annotation tracks releases automatically.
+- Initramfs no longer ships `mkfs.erofs` + `libgcc_s.so.1` + busybox
+  tar/gunzip — materialize happens host-side, the initrd just mounts.
+  Initramfs shrinks ~5-10 MB.
+- `internal/firecracker/kernel-config-docker.fragment` keeps
+  `CONFIG_EROFS_FS=y` so the Firecracker kernel can mount erofs
+  without the host insmod choreography.
+
 ## v0.5.0 — 2026-05-18
 
 ### Release-readiness fixes

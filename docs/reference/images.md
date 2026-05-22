@@ -5,10 +5,25 @@ Shed images are OCI-compliant container images. The on-disk store is an
 directory, layers are shared across tags, and pulls/pushes go directly to any
 OCI registry — no Docker daemon required for transport.
 
-Each image carries one or more read-only ext4 layers and a few annotations
-(kernel digest, initrd digest, source ref, variant name, schema version). At
-boot the in-guest initramfs stacks those layers as overlayfs lowers with a
-per-shed writable upper on top.
+Each image carries one or more read-only gzipped tar layers and a few
+annotations (kernel digest, initrd digest, source ref, variant name, schema
+version). At materialize time on the host, every layer is read in OCI order,
+OCI whiteouts are applied, and the merged tree is fed to `mkfs.erofs --tar=f`
+to produce a single content-addressed erofs file (one per manifest digest,
+shared across every shed that boots from this image). At boot the in-guest
+initramfs assembles a single-lower overlayfs with the per-shed writable
+upper on top.
+
+## Prerequisites
+
+The host running `shed-server` needs `mkfs.erofs` on PATH so the materialize
+step can build the flattened lower:
+
+- **macOS:** `brew install erofs-utils` (1.9.1+ via Homebrew bottle).
+- **Debian/Ubuntu:** `apt install erofs-utils`.
+
+If absent, shed errors at first `shed create` (or `shed image pull` followed
+by boot) with a clear install hint.
 
 ## Available Variants
 
