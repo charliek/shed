@@ -169,6 +169,13 @@ func EnsureLowerFromManifest(ctx context.Context, imagesDir, manifestDigest stri
 		"mkfs.erofs",
 		"--quiet",
 		"--tar=f",
+		// -b 4096 pins the erofs block size to 4 KiB regardless of the
+		// host's page size. mkfs.erofs defaults to host page size, which
+		// on Apple Silicon Macs is 16 KiB; mounting that image inside the
+		// Linux guest (4-KiB page size) panics with
+		// "erofs_read_superblock: blkszbits 14 isn't supported". 4 KiB
+		// matches what the guest kernel expects on both Linux and macOS.
+		"-b", "4096",
 		"-z", "lz4",
 		"-E", "force-inode-compact",
 		stagingPath,
