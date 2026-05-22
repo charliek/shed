@@ -45,7 +45,7 @@ Save the following as `Dockerfile.shed` in an empty directory:
 # Pick the variant matching your backend platform.
 # VZ (macOS arm64): shed-vz-extensions
 # Firecracker (Linux amd64): shed-fc-extensions
-ARG SHED_VERSION=v0.5.0
+ARG SHED_VERSION=v0.5.1
 FROM ghcr.io/charliek/shed-vz-extensions:${SHED_VERSION}
 
 USER root
@@ -197,9 +197,9 @@ default, edit your server config:
 vz:
   base_rootfs: my-image          # or the full ghcr.io ref
   images:
-    base: ghcr.io/charliek/shed-vz-base:v0.5.0
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.0
-    full: ghcr.io/charliek/shed-vz-full:v0.5.0
+    base: ghcr.io/charliek/shed-vz-base:v0.5.1
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
+    full: ghcr.io/charliek/shed-vz-full:v0.5.1
     my-image: ghcr.io/myorg/my-shed-image:v1
 ```
 

@@ -93,37 +93,52 @@ The on-disk store under `{images_dir}/` is OCI image-layout-v1:
   oci-layout                                   # {"imageLayoutVersion":"1.0.0"}
   index.json                                   # OCI image index
   blobs/sha256/<hex>                           # OCI blobs (manifests, configs, layer tar.gz)
-  cache/sha256/<hex>.ext4                      # derived per-layer ext4, materialized lazily
+  cache/sha256/<manifest-digest>.erofs         # flattened lower for the whole manifest, materialized lazily
   tags/<name>.json                             # tag → manifest digest pointers
   uppers/<shed>/upper.ext4                     # per-shed writable overlay upper
   instances/<shed>/metadata.json               # per-shed bookkeeping (pins manifest digest)
   snapshots/<snap>/snapshot.json               # per-snapshot bookkeeping
 ```
 
-Each layer is a tar.gz blob in `blobs/sha256/`. The first time a layer is
-needed for boot, shed materializes it into `cache/sha256/<hex>.ext4`. Both
-forms stay on disk: the tar.gz so `shed image push` can byte-perfectly
-round-trip the manifest to a registry, the ext4 so boot is fast.
+**Two storage roles.** Layer blobs live in `blobs/sha256/` as gzipped
+tarballs and are deduplicated across manifests (the `apt-get install`
+layer is one blob no matter how many variants reference it). The
+materialized boot artifact is a separate object: a single erofs file
+under `cache/sha256/<manifest-digest>.erofs` that represents the entire
+manifest's layers flattened (with OCI whiteouts applied) into one
+read-only filesystem. Both forms stay on disk: the tar.gz so
+`shed image push` can byte-perfectly round-trip the manifest to a
+registry, the erofs so boot is fast and the same artifact is shared
+across every shed booting from that manifest.
 
-**Layer sharing.** Two tags that share a base layer share the underlying
-blob and the derived ext4 cache — pulling `shed-vz-full:v0.5.0` after
-`shed-vz-extensions:v0.5.0` only fetches the top layer.
+**Layer sharing happens at the blob layer.** Two tags that share a base
+layer share the underlying blob — pulling `shed-vz-full:v0.5.1` after
+`shed-vz-extensions:v0.5.1` only fetches the top layers from the
+registry. The flattened erofs is per-manifest, so each variant has its
+own erofs file (no cross-variant sharing for the boot artifact), but the
+big shared layers underneath cost once across all variants.
 
-**Disk overhead.** Keeping both forms costs roughly 1.4× per layer (tar.gz
-≈ 0.4× the ext4 size for typical content). The trade-off buys byte-perfect
-registry round-trips and fast boot. See
+**Disk overhead.** Each manifest's flattened erofs file is roughly
+0.5–0.7× the equivalent uncompressed ext4 (lz4 compression). Total cost
+for an image is the sum of its layer tar.gz blobs (deduplicated across
+manifests) plus its flattened erofs (per-manifest). See
 [Layer storage optimization](../discovery/layer-storage-optimization.md)
-for design notes on shrinking this in the future.
+for design notes.
 
 **Layer cap.** `MaxLayers = 16`. Manifests with more than 16 layers are
 rejected at pull/load time. Shed's own variants ship 5–10 layers (`base`
-sits near the low end, `full` near the high end); the cap keeps
-overlayfs and boot-time mount overhead bounded for custom images.
+sits near the low end, `full` near the high end). With the flatten model
+the cap is a soft hint — only the blob deduplication math cares about
+layer count at boot time, not overlayfs assembly.
 
 ### Inspecting layers with `shed image history`
 
 `shed image history <tag>` walks the manifest top-down (latest layer first)
-and prints one row per layer:
+and prints one row per layer. The output describes the manifest's layer
+chain — useful for understanding what blobs the image references and how
+much each Dockerfile instruction contributes to the size — but does NOT
+correspond to a guest-side overlay stack. The guest sees a single
+flattened lower regardless of the number of layers.
 
 ```bash
 shed image history shed-vz-full
@@ -140,12 +155,11 @@ LAYER  DIGEST                                                                   
 ```
 
 The `CREATED BY` column is the corresponding history entry from the OCI
-config — most often the `Dockerfile` line that produced the layer. Layer
-ordinals match the order the in-guest initramfs stacks them: ordinal 1 is
-the bottom-most overlay lower, ordinal N is just below the writable upper.
-The big shared layers — `ubuntu:24.04` (ordinal 1) and the APT install
+config — most often the `Dockerfile` line that produced the layer. The
+big shared layers — `ubuntu:24.04` (ordinal 1) and the APT install
 (ordinal 2) — appear with the same digest in `base`, `extensions`, and
-`full`, so on-disk they cost once across all three variants.
+`full`, so the underlying tar.gz blobs cost once across all three
+variants.
 
 ### Air-gap transport with `shed image save` / `shed image load`
 
@@ -172,15 +186,15 @@ shed image load -i shed-vz-full.tar
 ```
 
 It unpacks each blob into the local store, advances the tag(s), and
-materializes the ext4 cache lazily on first boot. Layers already present
-locally are skipped.
+materializes the flattened erofs cache lazily on first boot. Layers
+already present locally are skipped.
 
 ### Push to a registry
 
 `shed image push` uploads a tag or digest to any OCI registry:
 
 ```bash
-shed image push shed-vz-full ghcr.io/myorg/shed-vz-full:v0.5.0
+shed image push shed-vz-full ghcr.io/myorg/shed-vz-full:v0.5.1
 shed image push sha256:9a1c... ghcr.io/myorg/shed-vz-full@sha256:9a1c...
 ```
 

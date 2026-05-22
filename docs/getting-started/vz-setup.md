@@ -54,9 +54,10 @@ shed console test
 ```
 
 The first `shed create` pulls the OCI image registry-direct from
-`ghcr.io` and materializes each layer's ext4 cache. This takes a
-minute on the first run; subsequent creates that share layers are
-fast.
+`ghcr.io` and materializes the flattened erofs lower via host-native
+`mkfs.erofs --tar=f`. The pull step dominates wallclock on the first
+run (registry I/O); subsequent creates from the same manifest mount
+the cached erofs in under a second.
 
 ### Service management
 
@@ -120,22 +121,26 @@ overlayfs lowers on first boot.
 
 ```yaml
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.0
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.1
   images:
-    base: ghcr.io/charliek/shed-vz-base:v0.5.0
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.0
-    full: ghcr.io/charliek/shed-vz-full:v0.5.0
+    base: ghcr.io/charliek/shed-vz-base:v0.5.1
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
+    full: ghcr.io/charliek/shed-vz-full:v0.5.1
 ```
 
-Pin a concrete version that matches the `shed-server` you built. Once
-the `v0.5.0` tag is cut, the v0.5.0-compatible published images become
-available — check
+Pin a concrete version that matches the `shed-server` you built.
+v0.5.1 published images are live now — check
 <https://github.com/charliek/shed/pkgs/container/shed-vz-full> for tags.
-Pre-v0.5.0 published images use the legacy flattened layout and will not
-work with v0.5.0 `shed-server`.
+Pre-v0.5.0 published images use the legacy flattened layout and will
+not work with v0.5.0+ `shed-server`; v0.5.0 cached images use the
+per-layer cache layout and need a one-time
+`rm -rf {images_dir}/cache` on upgrade to v0.5.1.
 
-The first `shed create` pulls each layer blob, materializes the layer
-ext4 cache, and boots. Subsequent variants reuse the shared layers.
+The first `shed create` pulls each layer blob, flattens them into a
+single erofs lower at `cache/sha256/<manifest-digest>.erofs`, and
+boots. Subsequent sheds from the same manifest reuse the cached erofs
+directly; other variants that share layer blobs skip the registry pull
+but build their own flattened erofs the first time they're used.
 
 #### Build images from source
 
@@ -210,11 +215,11 @@ vz:
   # you're booting a legacy raw-rootfs image (rare).
   # kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   # initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.0
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.1
   images:
-    base: ghcr.io/charliek/shed-vz-base:v0.5.0
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.0
-    full: ghcr.io/charliek/shed-vz-full:v0.5.0
+    base: ghcr.io/charliek/shed-vz-base:v0.5.1
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
+    full: ghcr.io/charliek/shed-vz-full:v0.5.1
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2

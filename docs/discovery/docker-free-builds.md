@@ -32,13 +32,15 @@ This is mildly annoying for:
 - **CI workers** running shed images through `shed image build` in
   pipelines that try to avoid pulling Docker.
 - **`shed-server` setup scripts** that today install Docker CE
-  primarily for `shed image build` and the legacy host-side
-  rootfs conversion.
+  primarily for `shed image build`. (The v0.5.1 materialize step no
+  longer needs Docker — it shells out to host-native `mkfs.erofs` from
+  `erofs-utils`.)
 
-The `--builder` flag was added to `shed image build` in v0.5 as
-scaffolding: it accepts `docker`, `podman`, and `buildah`, but only
-`docker` is wired up. The other two are placeholders for the work
-described here.
+`shed image build` currently runs `docker buildx` under the hood and
+ingests the resulting OCI archive into shed's blob store via the same
+`InstallBlobs` path that daemon-free `pull` uses. The `--builder` flag
+that existed briefly in v0.5 scaffolding was removed; replacing the
+underlying builder is now a code-level swap.
 
 ## 2. Approach 1: Pluggable Builder (Recommended)
 
@@ -101,7 +103,7 @@ Auto-detection order: `docker` → `podman` → `buildah` → `nerdctl`.
 
 | Milestone | Scope |
 |---|---|
-| M1 | `--builder` flag accepted, only `docker` works (shipped in v0.5). |
+| M1 | `--builder` flag accepted, only `docker` wired (shipped in v0.5, removed in a later v0.5.x cleanup — replacing the underlying builder is now a code-level swap, not a CLI choice). |
 | M2 | `podman` backend. Linux first; macOS via Podman Machine. |
 | M3 | `buildah` backend. |
 | M4 | Auto-detection. Drop the daemon-CE requirement from `shed-server setup`. |
@@ -151,11 +153,14 @@ viable rootless path on macOS.
 
 ## 5. Recommended Path
 
-1. **Today:** `--builder docker` works; `podman` / `buildah` are
-   placeholders (M1, shipped in v0.5).
-2. **Next release:** Implement `--builder podman`. This gets the
-   daemon-free build story on Linux with one well-tested adapter.
-3. **Release after:** `--builder buildah` for sites that prefer it.
+1. **Today (post-v0.5.1):** `shed image build` always uses
+   `docker buildx`. The `--builder` CLI scaffolding was removed —
+   plugging in a second builder is now a code-level decision.
+2. **Next:** Add a `podman` builder behind a small internal interface.
+   This gets the daemon-free build story on Linux with one well-tested
+   adapter and lets us drop Docker CE from `shed-server setup` on
+   Linux hosts.
+3. **Release after:** `buildah` for sites that prefer it.
 4. **Stretch:** auto-detect, then remove the Docker CE install step
    from `shed-server setup`.
 5. **Defer:** in-process BuildKit. Only revisit if the adapter path

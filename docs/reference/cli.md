@@ -296,7 +296,6 @@ shed image build [flags] [context]
 | `--name` | `-n` | *required* | Tag to advance after install |
 | `--target` | | | Build target stage |
 | `--initramfs` | | | Pre-built shed-overlay initramfs (produced by `scripts/build-initramfs.sh`). Required for images that need shed's overlayfs assembly at boot — i.e. anything you intend to `shed create` against. |
-| `--size` | | `20G` | Sparse size of the derived ext4 cache |
 | `--output-dir` | | `images_dir` from server config | Override the OCI store root |
 | `--force` | | `false` | Skip base-image validation warning |
 
@@ -332,9 +331,9 @@ shed image ls
 
 ```text
 NAME          DIGEST          SOURCE      SIZE      LAYERS   IN USE   REF
-base          sha256:abc123…  config      2.1 GB    1        yes      ghcr.io/charliek/shed-vz-base:v0.5.0
-extensions    sha256:7c2e5d…  config      2.3 GB    2        no       ghcr.io/charliek/shed-vz-extensions:v0.5.0
-full          sha256:def456…  config      3.8 GB    3        no       ghcr.io/charliek/shed-vz-full:v0.5.0
+base          sha256:abc123…  config      2.1 GB    1        yes      ghcr.io/charliek/shed-vz-base:v0.5.1
+extensions    sha256:7c2e5d…  config      2.3 GB    2        no       ghcr.io/charliek/shed-vz-extensions:v0.5.1
+full          sha256:def456…  config      3.8 GB    3        no       ghcr.io/charliek/shed-vz-full:v0.5.1
 sha256:ff…    sha256:ff8800…  dangling    2.0 GB    1        yes      ghcr.io/test/legacy:v1
 ```
 
@@ -408,10 +407,12 @@ shed image pull <ref> [-t <tag>] [--platform <os/arch>]
 
 If `--tag` is omitted, the tag is derived from the last path segment of
 the ref minus the `shed-{vz,fc}-` prefix and the version suffix (e.g.
-`ghcr.io/charliek/shed-vz-extensions:v0.5.0` → `extensions`).
+`ghcr.io/charliek/shed-vz-extensions:v0.5.1` → `extensions`).
 
-The layer ext4 caches are materialized lazily on first boot — `pull`
-itself only writes blobs into `blobs/sha256/`.
+The flattened erofs lower at
+`cache/sha256/<manifest-digest>.erofs` is materialized lazily on first
+boot via host-native `mkfs.erofs --tar=f` — `pull` itself only writes
+blobs into `blobs/sha256/`.
 
 ### shed image push
 
@@ -434,11 +435,11 @@ shed image push <src> <dst>
 
 ```bash
 # Push against a running shed-server:
-shed image push full ghcr.io/myorg/shed-vz-full:v0.5.0
+shed image push full ghcr.io/myorg/shed-vz-full:v0.5.1
 
 # Local mode (no shed-server needed):
-shed image push --local --output-dir ./store full ghcr.io/myorg/shed-vz-full:v0.5.0
-shed -c ./publish-server.yaml image push full ghcr.io/myorg/shed-vz-full:v0.5.0
+shed image push --local --output-dir ./store full ghcr.io/myorg/shed-vz-full:v0.5.1
+shed -c ./publish-server.yaml image push full ghcr.io/myorg/shed-vz-full:v0.5.1
 ```
 
 Authentication uses the standard Docker credential resolution chain

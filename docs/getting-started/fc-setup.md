@@ -91,9 +91,10 @@ Pull and convert VM images before creating your first shed:
 sudo shed-server pull-images
 ```
 
-This pulls each configured image registry-direct, lands the OCI blobs
-under `images_dir/blobs/sha256/`, and materializes the per-layer ext4
-cache lazily on first boot.
+This pulls each configured image registry-direct and lands the OCI
+blobs under `images_dir/blobs/sha256/`. The flattened erofs lower at
+`images_dir/cache/sha256/<manifest-digest>.erofs` is materialized
+lazily on first boot via host-native `mkfs.erofs --tar=f`.
 
 The OCI image store lives under `/var/lib/shed/firecracker/images/`. See
 [Storage Model](../reference/storage-model.md) for the full layout and
@@ -131,11 +132,11 @@ env_file: /root/.shed/env
 #     - docker-credentials
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.0
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.1
   images:
-    base: ghcr.io/charliek/shed-fc-base:v0.5.0
-    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.0
-    full: ghcr.io/charliek/shed-fc-full:v0.5.0
+    base: ghcr.io/charliek/shed-fc-base:v0.5.1
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.1
+    full: ghcr.io/charliek/shed-fc-full:v0.5.1
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   # uppers_dir is optional. Defaults to <images_dir>/uppers. If you set
@@ -156,12 +157,14 @@ firecracker:
   tap_prefix: shed-tap
 ```
 
-Pin a concrete version that matches your `shed-server`. Once the
-`v0.5.0` tag is cut, the v0.5.0-compatible published images become
-available — check
+Pin a concrete version that matches your `shed-server`. v0.5.1
+published images are live now — check
 <https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
-Pre-v0.5.0 published images use the legacy flattened layout and will not
-work with v0.5.0 `shed-server`.
+Pre-v0.5.0 published images use the legacy flattened layout and will
+not work with v0.5.0+ `shed-server`; v0.5.0 cached images use the
+per-layer cache layout and need a one-time
+`rm -rf {images_dir}/cache` on upgrade to v0.5.1 (see the
+[changelog](../CHANGELOG.md)).
 
 The deb package generates this config with a matching version
 automatically.
@@ -288,15 +291,15 @@ build needed.
 
 ```yaml
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.0
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.1
   images:
-    base: ghcr.io/charliek/shed-fc-base:v0.5.0
-    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.0
-    full: ghcr.io/charliek/shed-fc-full:v0.5.0
+    base: ghcr.io/charliek/shed-fc-base:v0.5.1
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.1
+    full: ghcr.io/charliek/shed-fc-full:v0.5.1
   images_dir: /var/lib/shed/firecracker/images
 ```
 
-Pin a concrete version. Once `v0.5.0` is tagged the corresponding
+Pin a concrete version. Once `v0.5.1` is tagged the corresponding
 images become available — check
 <https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
 

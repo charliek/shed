@@ -465,7 +465,7 @@ Returns available image variants across all backends. Each entry is an
     {
       "name": "base",
       "path": "/var/lib/shed/vz/blobs/sha256/abc123.../rootfs.ext4",
-      "docker_ref": "ghcr.io/charliek/shed-vz-base:v0.5.0",
+      "docker_ref": "ghcr.io/charliek/shed-vz-base:v0.5.1",
       "size_bytes": 2147483648,
       "source": "config",
       "cached": true,
@@ -510,7 +510,7 @@ truncated).
   "image": {
     "name": "full",
     "path": "/var/lib/shed/vz/blobs/sha256/abc123.../rootfs.ext4",
-    "docker_ref": "ghcr.io/charliek/shed-vz-full:v0.5.0",
+    "docker_ref": "ghcr.io/charliek/shed-vz-full:v0.5.1",
     "size_bytes": 3700000000,
     "source": "config",
     "cached": true,
@@ -523,7 +523,7 @@ truncated).
     "digest": "sha256:abc123...",
     "backend": "vz",
     "arch": "arm64",
-    "source_ref": "ghcr.io/charliek/shed-vz-full:v0.5.0",
+    "source_ref": "ghcr.io/charliek/shed-vz-full:v0.5.1",
     "source_ref_digest": "sha256:def456...",
     "shed_ext_version": "v0.3.1",
     "kernel_size": 8388608,
@@ -578,7 +578,7 @@ store, and advances a tag. Returns the resulting digest.
 
 ```json
 {
-  "docker_ref": "ghcr.io/charliek/shed-vz-full:v0.5.0",
+  "docker_ref": "ghcr.io/charliek/shed-vz-full:v0.5.1",
   "tag": "full"
 }
 ```

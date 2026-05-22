@@ -1,63 +1,71 @@
 # Layer Storage Optimization
 
-Design notes for reducing the per-layer disk overhead in the OCI image
-store. Background context for operators running many cached tags or
+Design notes for reducing disk overhead in the OCI image store.
+Background context for operators running many cached tags or
 disk-bound CI runners.
 
-## 1. Current State: ~1.0–1.1× Overhead
+> **Status note (v0.5.1+):** the materialize model changed in v0.5.1
+> from per-layer cache files to a single flattened erofs per manifest.
+> Sections 1 and 2 below describe the current state; subsequent
+> sections (composefs, blob-sharing, cache eviction) are still-open
+> exploration that applies on top of the v0.5.1 design.
 
-Shed's OCI store keeps two copies of every layer:
+## 1. Current State: per-manifest flattened erofs
+
+Shed's OCI store keeps two distinct artifacts:
 
 | Form | Where | Purpose |
 |---|---|---|
-| Layer tar.gz | `blobs/sha256/<hex>` | Canonical OCI blob; byte-perfect for `shed image push` and registry round-trips |
-| Derived erofs | `cache/sha256/<hex>.erofs` | Mounted directly as an overlayfs lower at boot time (lz4-compressed) |
+| Layer tar.gz blobs | `blobs/sha256/<hex>` | Canonical OCI blobs; byte-perfect for `shed image push` and registry round-trips. Deduplicated across manifests. |
+| Flattened manifest lower | `cache/sha256/<manifest-digest>.erofs` | Single read-only erofs representing all of a manifest's layers merged with OCI whiteouts applied. Mounted at boot. Shared across every shed using that manifest. |
 
-For typical content (rootfs of an Ubuntu-based shed image), the tar.gz
-is roughly the same size as the erofs cache file — both are compressed
-representations of the same content. erofs+lz4 typically lands around
-**0.5–0.7× the equivalent uncompressed ext4 size**, with gzipped tar.gz
-in the same ballpark. Total cost is now ~1.0–1.1× the equivalent ext4
-alone, down from ~1.4× when the cache was uncompressed ext4.
+For typical Ubuntu-rootfs content, erofs+lz4 lands around **0.5–0.7×
+the equivalent uncompressed ext4 size**, comparable to the gzipped
+tar.gz blobs. Total cost for a manifest is:
 
-Legacy `.ext4` cache files from v0.5.0 and earlier are still mounted at
-boot; new materializes produce `.erofs`.
+- Sum of layer blob sizes (deduplicated across manifests — `apt-get
+  install` is one blob shared by `base`, `extensions`, and `full`).
+- Plus the per-manifest erofs (one file per variant; the flattened form
+  is not deduplicated across manifests because OCI-whiteout application
+  + ordering is manifest-specific).
 
-The trade-off is intentional:
+In aggregate this is ~1.0–1.3× the equivalent ext4 alone for a typical
+shed deployment. The trade-off is intentional:
 
-- **Boot is fast.** No on-demand tar extraction in the hot path.
+- **Boot is fast.** Mount-and-go; no on-demand tar extraction.
 - **Push is byte-perfect.** The manifest digest at the destination
-  equals the local manifest digest, which means
-  `shed image push --byte-perfect` is real, not approximate.
+  equals the local manifest digest.
 - **Inspectability.** `shed image inspect <tag>` matches
   `docker manifest inspect` and `crane manifest --from-archive` for the
   same tag.
 
-For a default `full` install with 3 layers totaling ~3 GB of
-uncompressed rootfs, the on-disk cost is now in the ~3.2 GB range
-rather than ~4.2 GB. The two-forms model is still an intentional
-trade — fast boot and byte-perfect push in exchange for a compressed
-cache copy alongside the canonical blob.
+For a default `full` install with ~3 GB of uncompressed rootfs across
+7-ish layers, the on-disk cost is now ~3.2 GB for `full` alone, then
+roughly +0.5 GB to also keep `extensions` and `base` resident (their
+flattened erofs files are per-manifest, but the underlying layer blobs
+that make up `base` and `extensions` are already on disk because `full`
+references them).
 
-## 2. mkfs.ext4 Floor
+## 2. Tradeoffs in the flatten design
 
-Every derived ext4 carries a fixed-cost prelude — journal, group
-descriptors, inode tables, root directory entry — that's about 1.5 MiB
-even for an empty filesystem.
+The per-manifest flatten is simpler to boot but loses one optimization
+the older per-layer model had: the per-layer erofs files were shared
+across manifests that referenced the same layer blob. With flatten,
+each manifest gets its own erofs. For a user who keeps base +
+extensions + full all cached, that's three full-rootfs erofs files,
+not one + two thin diff layers.
 
-For tiny custom layers (think a 5 MB layer that just drops a config
-file into `/etc`), the floor is 30% of the layer cost. Default
-`mkfs.ext4` flags overshoot for read-only lowers:
+In practice this matters less than it sounds:
 
-| Flag | Default | Recommended for read-only lowers |
-|---|---|---|
-| `-O has_journal` | on | **off** (`-O ^has_journal`) — no writes happen to a lower, journal is dead weight |
-| `-m <pct>` | 5% reserved | **0** (`-m 0`) |
-| `-N <inodes>` | auto | size to actual content, not the formula |
+- The layer blobs themselves still dedupe across manifests (the big
+  APT layer is one blob, no matter how many flat erofs files
+  reference its content).
+- Most users care about one variant at a time.
+- mkfs.erofs over a 3 GB merged tree is single-digit seconds — fast
+  enough that lazy-materialize-on-first-create is a non-event.
 
-These three together cut the prelude from ~1.5 MiB to ~256 KiB for a
-small layer. The trade-off is that the ext4 cannot be remounted
-read-write — which is fine, lowers are mounted read-only.
+The dual-format question (do you keep the layer blobs alongside the
+flattened erofs, or evict one of them?) is open work. See section 4.
 
 **Status:** not yet wired up in `materializeLayer`. Tracked as a
 follow-up; expected to land as `mkfs.ext4 -O ^has_journal -m 0 -N
@@ -168,18 +176,20 @@ needed there.
 
 ## 5. When This Matters
 
-The 1.4× overhead is the dominant disk cost on hosts that:
+Disk pressure shows up on hosts that:
 
 - **Cache many pulled-but-idle tags.** A CI runner that pulls every
-  release tag for regression testing keeps every layer's tar.gz and
-  every layer's ext4. Ten releases at 3 GB each = 42 GB instead of
-  30 GB.
+  release tag for regression testing keeps each manifest's blobs +
+  flattened erofs. Ten releases at ~3 GB each = ~32 GB instead of
+  ~30 GB (blob deduplication absorbs most of the multi-tag cost; the
+  per-manifest erofs is what scales linearly with manifest count).
 - **Run a single tag with frequent rebuilds.** Every `shed image
-  build` of a derived image lands a new layer ext4. The old layer is
-  still referenced by the old tag (or the manifest you just pruned),
-  so disk grows monotonically until prune runs.
+  build` of a derived image lands new layer blobs and a new manifest
+  erofs. Old manifests stay referenced by their tags (or by sheds
+  pinning them) until prune runs.
 - **Use multi-arch indexes.** Pulling `--platform linux/arm64` AND
-  `--platform linux/amd64` doubles every layer.
+  `--platform linux/amd64` doubles every layer blob AND produces a
+  separate flattened erofs per platform.
 
 Single-developer hosts that pull one tag per release and prune
 quarterly typically don't notice the overhead.
@@ -188,60 +198,42 @@ quarterly typically don't notice the overhead.
 
 | Version | Change |
 |---|---|
-| v0.5.0 | Multi-layer OCI store; 1.4× overhead with uncompressed ext4 cache; no eviction. |
-| v0.5.1 | erofs+lz4 cache replaces ext4; overhead drops to ~1.0–1.1×. Materialize moved off Docker (native `mkfs.erofs` on Linux, materializer VM on macOS). |
-| Next | Manual `shed image prune --layer-cache`. Whiteout translation for foreign multi-layer images. |
-| Later | VirtioFS lowers (eliminates the materialize step entirely). Auto LRU eviction with configurable budget. |
+| v0.5.0 | Multi-layer OCI store; per-layer ext4 cache (~1.4× ext4 overhead); no eviction. |
+| v0.5.1 | **Flatten + host-native materialize.** Per-manifest erofs cache replaces per-layer cache. mkfs.erofs runs on the host (no Docker, no materializer VM). OCI whiteouts applied at flatten time. Boot path drops from N-lower overlay to single-lower. |
+| Next | `shed image prune --cache-only` to evict orphaned flattened erofs without touching layer blobs. Auto LRU eviction with configurable cache budget. |
+| Later | composefs: keep the layer blobs as the canonical artifact, generate composefs metadata that maps onto them at boot, eliminating the flat erofs entirely and getting blob-level sharing across manifests at boot. Needs `mkcomposefs` on the host (today Linux-only — would re-introduce a VM step on Mac). |
 
 Nothing in this sketch is committed. Treat it as "if we don't get
 distracted by something more important."
 
-## 7. Whiteout Translation for Foreign Multi-Layer Images
+## 7. Whiteout Translation — RESOLVED in v0.5.1
 
-OCI middle-layer tarballs encode file deletions as `.wh.<name>` marker
-files. `EnsureExt4FromLayer` in `internal/vmimage/cache.go` does a
-plain `tar -xzf` into a fresh ext4, so a `.wh.foo` arrives as a regular
-file rather than the character-device-zero (`mknod foo c 0 0`) that
-overlayfs honors. The result: **deletions in middle layers are
-silently ignored at boot** for any image that uses them.
+OCI middle-layer tarballs encode file deletions as `.wh.<name>` and
+opaque-directory markers as `.wh..wh..opq`. Pre-v0.5.1, shed's
+per-layer materializer did a plain tar extract into a fresh ext4 and
+passed whiteouts through verbatim, so middle-layer deletions in
+arbitrary foreign images were silently ignored.
 
-For shed's own variants (`base` ⊂ `extensions` ⊂ `full`) this is a
-non-issue — each stage only ADDS files on top of its parent, never
-deletes. But it's a real bug for arbitrary foreign images:
-`shed image pull` of a random image whose Dockerfile uses
-`RUN rm /something/from/parent` will produce a guest where
-`/something/from/parent` *still exists*.
+The flatten pipeline added in v0.5.1
+(`internal/vmimage/flatten.go:MergeLayersFromManifest`) handles
+whiteouts correctly:
 
-**Fix sketch.** During tar extraction in `EnsureExt4FromLayer`, before
-writing each tar entry to the staging ext4:
+- A `path/.wh.name` marker at layer N suppresses any entry whose path
+  is `path/name` or a descendant of `path/name` from layers below N.
+  The marker itself is never emitted into the merged tar.
+- A `path/.wh..wh..opq` marker at layer N suppresses any entry
+  strictly under `path/` from layers below N (but keeps same-layer
+  siblings).
 
-1. If `entry.Name` matches `*/\.wh\.<name>` (an opaque whiteout marker)
-   — convert to `mknod <dir>/<name> c 0 0` and skip writing the marker
-   itself.
-2. If `entry.Name` matches `*/\.wh\.\.wh\..wh\.\.opq` (opaque-directory
-   marker — "ignore everything below this dir in lower layers") — set
-   the `trusted.overlay.opaque="y"` xattr on the parent directory.
+Implementation walks layers in REVERSE OCI order, emitting the first
+entry seen for each path. See `flatten_test.go` for the test cases
+covering simple flatten, file whiteouts (recursive on directories),
+opaque-dir whiteouts with same-layer re-adds, re-add-after-whiteout
+across layers, and symlink passthrough.
 
-Both forms are defined in the [OCI image-spec layer changesets][oci-wh].
-Implementations to look at: [containerd's diff/walking package][containerd-diff],
-[crane's mutate.Extract][crane-extract], [moby's archive package][moby-archive].
-
-[oci-wh]: https://github.com/opencontainers/image-spec/blob/main/layer.md#whiteouts
-[containerd-diff]: https://github.com/containerd/containerd/blob/main/pkg/archive/tar.go
-[crane-extract]: https://github.com/google/go-containerregistry/blob/main/pkg/v1/mutate/mutate.go
-[moby-archive]: https://github.com/moby/moby/blob/master/pkg/archive/diff.go
-
-**Acceptance test once implemented:**
-
-```dockerfile
-FROM ghcr.io/charliek/shed-vz-extensions:latest
-RUN echo placeholder > /tmp/marker
-RUN rm /tmp/marker
-```
-
-Build with `shed image build`, boot, exec `ls /tmp/marker` — should
-report "No such file or directory". Today it incorrectly reports the
-file as present.
+For shed's own variants (`base` ⊂ `extensions` ⊂ `full`) whiteouts
+don't appear — each stage only adds files. But foreign images with
+`RUN rm /something/from/parent` now flatten correctly.
 
 ## 8. Build-Time Layer Non-Determinism
 
