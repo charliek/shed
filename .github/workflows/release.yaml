@@ -41,3 +41,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      # Tell apt-charliek to pick up the new shed-server.deb attached to
+      # this release. The dispatch is fire-and-forget — apt-charliek's
+      # publish workflow re-scans every tracked package on every run, so
+      # a missed dispatch self-heals on the next one. Requires
+      # APT_DISPATCH_TOKEN (fine-grained PAT scoped to charliek/apt-charliek
+      # with Contents: write) to be set on this repo; skipped silently if
+      # the secret isn't present so the release still ships.
+      - name: Trigger apt-charliek publish
+        if: success() && env.APT_DISPATCH_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+          APT_DISPATCH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/charliek/apt-charliek/dispatches \
+            --method POST \
+            -f event_type=publish \
+            -F "client_payload[package]=shed-server" \
+            -F "client_payload[tag]=${{ github.ref_name }}"
+          echo "::notice::Watch publish at https://github.com/charliek/apt-charliek/actions"
