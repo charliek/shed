@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- **BREAKING — `shed exec` now executes argv directly (Docker-style); login-shell sourcing removed (#44, #48).** Previously the backend wrapped every non-empty command in `bash --login -c "<joined argv>"`, which collided with the SSH wire protocol (argv joined with spaces, server-side `shlex.Split` re-parses) to silently mangle pipes, redirects, semicolons, and nested quotes — e.g. `shed exec myvm -- bash -c 'echo hello | wc -c'` returned `1` instead of `6`, and `shed exec myvm -- bash -c 'bun -e "console.log(1+1)"'` syntax-errored on stripped parentheses. The fix has two coordinated parts: the CLI (`sshToShed`) now shell-quotes each command arg before invoking `ssh` so argv survives the SSH server's `shlex.Split` round-trip intact, and both backends (`VZBackend.Exec`, `FirecrackerBackend.Exec`) now pass non-empty `opts.Cmd` through to the agent verbatim — the agent execs `argv[0]` with `argv[1:]` directly, no implicit shell layer. `shed console` (empty argv → interactive `bash --login`) is unaffected. **Behavior change for users:** `shed exec myvm -- mytool` no longer sources `/etc/profile` or `~/.profile`, so tools installed via rustup / mise / nvm / `~/.profile` PATH additions are not on PATH by default. Workaround (same idiom Docker users use daily): `shed exec myvm -- bash -lc 'mytool'` runs an explicit login shell. The agent's existing env setup (`/etc/environment.d`, plus HOME/USER/PATH/SHELL/LANG defaults) still applies in both modes. **No agent or rootfs changes** — host-only fix; existing image blobs continue to boot unchanged.
+
 ## v0.5.1 — 2026-05-22
 
 ### Flatten + host-native materialize

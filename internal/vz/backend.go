@@ -173,13 +173,16 @@ func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.Exec
 		return config.ErrShedNotRunningSentinel
 	}
 
-	cmd := opts.Cmd
-	if len(cmd) == 0 {
-		cmd = []string{"/bin/bash", "--login"}
-	} else {
-		cmd = []string{"/bin/bash", "--login", "-c", strings.Join(cmd, " ")}
+	// Non-empty argv is passed through verbatim: the agent execs argv[0] with
+	// argv[1:] directly (matching docker exec / kubectl exec semantics). This
+	// avoids a second layer of shell parsing that previously mangled pipes,
+	// redirects, and nested quotes (issues #44 and #48). Users wanting
+	// login-shell sourcing of /etc/profile or ~/.profile invoke
+	// `bash -lc 'cmd'` explicitly. Empty argv still defaults to an
+	// interactive login shell for `shed console`.
+	if len(opts.Cmd) == 0 {
+		opts.Cmd = []string{"/bin/bash", "--login"}
 	}
-	opts.Cmd = cmd
 
 	agent := b.newAgentClient(meta.Name)
 	return agent.Exec(ctx, opts)
