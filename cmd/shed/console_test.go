@@ -87,3 +87,54 @@ func TestShellQuoteArgFormat(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateAndQuoteArgs verifies that validateAndQuoteArgs single-quotes
+// non-empty argv but rejects empty elements (which posix shlex drops, silently
+// shifting argv on the server side).
+func TestValidateAndQuoteArgs(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		got, err := validateAndQuoteArgs([]string{"bash", "-c", "echo hi"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{`'bash'`, `'-c'`, `'echo hi'`}
+		if len(got) != len(want) {
+			t.Fatalf("length = %d, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("rejects empty at index 0", func(t *testing.T) {
+		_, err := validateAndQuoteArgs([]string{"", "hello"})
+		if err == nil {
+			t.Fatal("expected error for empty argv[0], got nil")
+		}
+		if !strings.Contains(err.Error(), "argv[0] is empty") {
+			t.Errorf("error = %q, want it to mention argv[0]", err.Error())
+		}
+	})
+
+	t.Run("rejects empty in middle", func(t *testing.T) {
+		_, err := validateAndQuoteArgs([]string{"echo", "", "hello"})
+		if err == nil {
+			t.Fatal("expected error for empty argv[1], got nil")
+		}
+		if !strings.Contains(err.Error(), "argv[1] is empty") {
+			t.Errorf("error = %q, want it to mention argv[1]", err.Error())
+		}
+	})
+
+	t.Run("empty slice is fine (caller's len check guards entry)", func(t *testing.T) {
+		got, err := validateAndQuoteArgs(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %d args, want 0", len(got))
+		}
+	})
+}

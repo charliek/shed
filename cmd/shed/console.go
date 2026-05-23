@@ -100,6 +100,20 @@ func shellQuoteArgs(args []string) []string {
 	return out
 }
 
+// validateAndQuoteArgs single-quotes each argv element (so shell metacharacters
+// survive the SSH wire) and rejects empty elements. The gliderlabs/ssh server
+// uses anmitsu/go-shlex in posix mode, which drops empty quoted tokens — so
+// without this guard, an empty argv element would silently shift the rest of
+// argv on the server side.
+func validateAndQuoteArgs(args []string) ([]string, error) {
+	for i, a := range args {
+		if a == "" {
+			return nil, fmt.Errorf("argv[%d] is empty; the SSH transport cannot represent empty arguments (posix shlex drops '' tokens)", i)
+		}
+	}
+	return shellQuoteArgs(args), nil
+}
+
 // sshToShed establishes an SSH connection to a shed.
 // If command is nil, an interactive shell is opened.
 // If command is provided, it is executed on the shed.
@@ -132,13 +146,16 @@ func sshToShed(name string, command []string) error {
 		name + "@" + entry.Host,
 	}
 
-	// Add command if provided. Each argv element is wrapped in single quotes
-	// so it survives the SSH client joining remaining args with spaces and the
-	// server-side shlex.Split (gliderlabs/ssh sess.Command()) recovering argv.
-	// Without this, args containing pipes, redirects, semicolons, spaces, or
-	// nested quotes fragment on the wire. See issues #44 and #48.
+	// Add command if provided. validateAndQuoteArgs single-quotes each argv
+	// element so pipes, redirects, semicolons, spaces, and nested quotes
+	// survive the SSH wire (issues #44 and #48) and rejects empty elements
+	// the posix-mode server-side shlex would silently drop.
 	if len(command) > 0 {
-		sshArgs = append(sshArgs, shellQuoteArgs(command)...)
+		quoted, err := validateAndQuoteArgs(command)
+		if err != nil {
+			return err
+		}
+		sshArgs = append(sshArgs, quoted...)
 	}
 
 	// Find ssh binary
