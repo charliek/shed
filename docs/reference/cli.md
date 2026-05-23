@@ -295,6 +295,7 @@ shed image build [flags] [context]
 | `--file` | `-f` | `./Dockerfile.shed` or `./Dockerfile` | Dockerfile path |
 | `--name` | `-n` | *required* | Tag to advance after install |
 | `--target` | | | Build target stage |
+| `--from-oci-archive` | | | Skip `docker buildx` and ingest a pre-built OCI image-layout tar (e.g. produced by `podman build --output type=oci,dest=...` or `buildah bud --output oci-archive,...`). Mutually exclusive with `--file`/`--target`/`--platform`/`--force`. |
 | `--initramfs` | | | Pre-built shed-overlay initramfs (produced by `scripts/build-initramfs.sh`). Required for images that need shed's overlayfs assembly at boot — i.e. anything you intend to `shed create` against. |
 | `--output-dir` | | `images_dir` from server config | Override the OCI store root |
 | `--force` | | `false` | Skip base-image validation warning |
@@ -303,17 +304,27 @@ shed image build [flags] [context]
 # Build the shed-overlay initramfs once.
 ./scripts/build-initramfs.sh --backend vz --platform linux/arm64 --output /tmp/shed-initrd.img
 
-# Then drive the OCI conversion.
+# Then drive the OCI conversion (Dockerfile path; runs docker buildx).
 shed image build \
     --target shed-vz-full \
     -n my-image \
     --initramfs /tmp/shed-initrd.img \
     -f vz/Dockerfile vz/
+
+# Or, ingest an OCI archive built externally (no Docker required):
+podman build --platform linux/arm64 \
+    --output type=oci,dest=my-image.tar \
+    -f Dockerfile.shed .
+shed image build \
+    --from-oci-archive my-image.tar \
+    -n my-image \
+    --initramfs /tmp/shed-initrd.img
 ```
 
-The `scripts/build-{vz,firecracker}-rootfs.sh` helpers wrap this flow
-for the standard variants — use them if you don't need a custom
-target.
+The `scripts/build-{vz,firecracker}-rootfs.sh` helpers wrap the
+Dockerfile flow for the standard variants — use them if you don't
+need a custom target. See [Build your own image § 2a](../tutorials/build-your-own-image.md#2a-alternative-building-without-docker)
+for the daemon-free workflow.
 
 To convert an existing registry image into the local store, use
 [`shed image pull`](#shed-image-pull) — `shed image build --from` was

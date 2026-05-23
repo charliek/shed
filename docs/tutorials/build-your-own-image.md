@@ -108,6 +108,76 @@ docker buildx build \
 `--load` makes the image available to the local Docker daemon so the
 next step can push it.
 
+## 2a. Alternative: building without Docker
+
+`shed image build` drives `docker buildx` under the hood. If you don't
+want a Docker daemon on your build host, any tool that emits an OCI
+image-layout tar will work — shed ingests it via
+`shed image build --from-oci-archive`. The downstream pipeline
+(layer ingestion into the blob store, initramfs annotation, source-ref
+annotation) is pure Go and runs identically regardless of which tool
+produced the archive.
+
+**Build with podman** (rootless on Linux, no daemon):
+
+```bash
+# Linux/amd64 → Firecracker; macOS/arm64 → VZ
+podman build \
+  --platform linux/arm64 \
+  --output type=oci,dest=my-shed-image.tar \
+  -f Dockerfile.shed \
+  .
+```
+
+**Build with buildah** (rootless on Linux, no daemon, no Podman):
+
+```bash
+buildah bud \
+  --platform linux/arm64 \
+  --output type=oci-archive,dest=my-shed-image.tar \
+  -f Dockerfile.shed \
+  .
+```
+
+**Anything else that emits an OCI archive** works too — nix-build
+piped through skopeo, a custom Go binary using
+`github.com/google/go-containerregistry`, even hand-assembled tarballs
+that conform to OCI image-layout-v1.
+
+Then ingest into shed's local store:
+
+```bash
+# Build the shed-overlay initramfs (image-content-independent — one per
+# machine suffices, the same artifact works for every derived image).
+./scripts/build-initramfs.sh --backend vz --platform linux/arm64 --output /tmp/shed-initrd.img
+
+# Ingest the OCI archive. shed handles the initramfs blob injection,
+# manifest annotations, source-ref, kernel extraction, and tag
+# advancement — same as the docker path, just without docker.
+shed image build \
+    --from-oci-archive my-shed-image.tar \
+    -n my-shed-image \
+    --initramfs /tmp/shed-initrd.img \
+    --source-ref ghcr.io/myorg/my-shed-image:v1
+```
+
+`--from-oci-archive` is mutually exclusive with `--file`, `--target`,
+`--platform`, and `--force` (those are Dockerfile-mode options;
+ingesting a pre-built archive has nothing to drive). `--initramfs`,
+`--name`, `--source-ref`, and `--output-dir` apply to both modes.
+
+From here the rest of the flow (push, pull, boot) is identical to the
+Docker path below.
+
+**What still needs Docker.** Today shed-server itself doesn't need
+Docker for anything in the boot/image lifecycle: `pull`, `push`,
+`save`, `load`, `inspect`, `history`, `ls`, `prune`, the
+materialize step on `shed create`, snapshots, and all VM ops are
+Docker-free. The remaining Docker dep is only `shed image build`
+when invoked without `--from-oci-archive`. With this flag, a
+cloud-VPS or rootless-Linux host can run shed-server end-to-end
+without installing Docker CE.
+
 ## 3. Push to a private registry
 
 You have two options.

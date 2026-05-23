@@ -22,14 +22,15 @@ var imageCmd = &cobra.Command{
 }
 
 var (
-	imageBuildFile      string
-	imageBuildInitrd    string
-	imageBuildName      string
-	imageBuildTarget    string
-	imageBuildOutputDir string
-	imageBuildPlatform  string
-	imageBuildSourceRef string
-	imageBuildForce     bool
+	imageBuildFile       string
+	imageBuildInitrd     string
+	imageBuildName       string
+	imageBuildTarget     string
+	imageBuildOutputDir  string
+	imageBuildPlatform   string
+	imageBuildSourceRef  string
+	imageBuildForce      bool
+	imageBuildOCIArchive string
 
 	imageDeleteForce bool
 	imagePruneForce  bool
@@ -151,6 +152,7 @@ func init() {
 	// registry ref the image is later pushed to.
 	imageBuildCmd.Flags().StringVar(&imageBuildSourceRef, "source-ref", "", "Override the io.shed.source-ref annotation baked into the manifest (default: <prefix><name>:latest). Pass the final registry ref in CI publish flows so server-side cache lookups match.")
 	imageBuildCmd.Flags().BoolVar(&imageBuildForce, "force", false, "Skip base image validation warning")
+	imageBuildCmd.Flags().StringVar(&imageBuildOCIArchive, "from-oci-archive", "", "Skip docker buildx and ingest a pre-built OCI image-layout tar (e.g. produced by `podman build --output type=oci,dest=...` or `buildah bud --output oci-archive,...`). Mutually exclusive with --file/--target/--platform/--force.")
 	_ = imageBuildCmd.MarkFlagRequired("name")
 
 	imageDeleteCmd.Flags().BoolVar(&imageDeleteForce, "force", false, "Skip confirmation prompt")
@@ -282,7 +284,47 @@ func runImageBuild(cmd *cobra.Command, args []string) error {
 		outputDir = bc.OutputDir
 	}
 
+	if imageBuildOCIArchive != "" {
+		return runImageBuildFromOCIArchive(cmd.Context(), outputDir, bc.Prefix, platform, bc.ExtractKernel, bc.NeedsInitrd)
+	}
 	return runImageBuildFromDockerfile(cmd.Context(), args, outputDir, bc.Prefix, platform, bc.ExtractKernel, bc.NeedsInitrd)
+}
+
+// runImageBuildFromOCIArchive ingests a pre-built OCI image-layout tar
+// (produced by podman / buildah / nix-build / any tool that emits the
+// OCI format) into the local shed store without ever invoking Docker.
+// The flag exists so users on hosts without a Docker daemon can still
+// produce derived shed images — `Convert()` itself has always
+// supported this code path, only the CLI surface was missing.
+func runImageBuildFromOCIArchive(ctx context.Context, outputDir, prefix, platform string, extractKernel, needsInitrd bool) error {
+	for flag, val := range map[string]string{"--file": imageBuildFile, "--target": imageBuildTarget} {
+		if val != "" {
+			return fmt.Errorf("%s is incompatible with --from-oci-archive (the OCI archive is already built; shed only ingests it)", flag)
+		}
+	}
+	if imageBuildForce {
+		return fmt.Errorf("--force is incompatible with --from-oci-archive (no base-image validation runs without a Dockerfile)")
+	}
+	if _, err := os.Stat(imageBuildOCIArchive); err != nil {
+		return fmt.Errorf("--from-oci-archive %s: %w", imageBuildOCIArchive, err)
+	}
+
+	// Default the source-ref the same way the Dockerfile path does so
+	// the resulting manifest annotation matches what a `shed create
+	// --image <name>` would otherwise resolve to.
+	dockerTag := fmt.Sprintf("%s%s:latest", prefix, imageBuildName)
+	sourceRef := imageBuildSourceRef
+	if sourceRef == "" {
+		sourceRef = dockerTag
+	}
+
+	fmt.Printf("Ingesting OCI archive %s into shed store...\n", imageBuildOCIArchive)
+	digest, err := convertAndInstall(ctx, sourceRef, imageBuildOCIArchive, outputDir, platform, extractKernel, needsInitrd)
+	if err != nil {
+		return err
+	}
+	finishImageBuild(outputDir, sourceRef, digest)
+	return nil
 }
 
 func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, prefix, platform string, extractKernel, needsInitrd bool) error {

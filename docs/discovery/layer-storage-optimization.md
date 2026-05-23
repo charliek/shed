@@ -374,8 +374,12 @@ What's still open after v0.5.1:
 - **Cache eviction policy** (LRU / refcount / manual). Still parked.
   Section 3 covers the design options; no implementation yet.
 - **`shed image build` without a Docker daemon.** `shed image build`
-  still shells out to `docker buildx`. Tracked separately in
-  `docs/discovery/docker-free-builds.md`.
+  still shells out to `docker buildx` for the Dockerfile path. The
+  `--from-oci-archive` flag (added in v0.5.x) lets users build with
+  podman / buildah / nix-build / etc. and ingest the resulting OCI
+  archive without invoking Docker. See
+  [build-your-own-image.md § 2a](../tutorials/build-your-own-image.md#2a-alternative-building-without-docker)
+  for the workflow.
 - **VirtioFS lowers.** The "even cleaner" architectural follow-up:
   lower layers stay as directory trees on the host (no filesystem
   image at all), mounted into VMs via VirtioFS (macOS) or 9P (Linux).

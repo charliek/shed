@@ -378,10 +378,15 @@ see [Build your own image](../tutorials/build-your-own-image.md).
 
 ### Builder backend
 
-`shed image build` currently shells out to `docker buildx`. The
-`--builder` flag accepts `docker` (the only working option today);
-`podman` and `buildah` are placeholders for a future docker-free build
-path (see [Docker-free builds](../discovery/docker-free-builds.md)).
+`shed image build`'s default Dockerfile path shells out to
+`docker buildx`. To build without a Docker daemon, produce an OCI
+image-layout tar with any tool (podman, buildah, nix-build, etc.) and
+pass it to `shed image build --from-oci-archive <path>` — the
+downstream ingestion (layer install, manifest annotations, initramfs
+injection, tag advancement) is pure Go. See
+[Build your own image § 2a](../tutorials/build-your-own-image.md#2a-alternative-building-without-docker)
+for the workflow.
+
 `shed image pull` is already docker-free — it uses
 [`go-containerregistry`](https://github.com/google/go-containerregistry)
 directly.
