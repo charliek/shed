@@ -161,7 +161,7 @@ profiles:
 Verify the CA was added:
 
 ```bash
-shed exec myproj "cat /etc/ssl/certs/ca-certificates.crt | grep -c mkcert"
+shed exec myproj -- bash -c 'cat /etc/ssl/certs/ca-certificates.crt | grep -c mkcert'
 ```
 
 ## Direct File Transfer

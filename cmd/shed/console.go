@@ -82,6 +82,24 @@ func escapeForShellSingleQuote(s string) string {
 	return strings.ReplaceAll(s, "'", `'\''`)
 }
 
+// shellQuoteArg wraps a single argv element in single quotes so it survives
+// one round-trip through a shell-style command-line parser (e.g. the SSH
+// server's shlex.Split). Used when handing argv to ssh, which joins remaining
+// arguments with spaces into a single command string before transmission.
+func shellQuoteArg(s string) string {
+	return "'" + escapeForShellSingleQuote(s) + "'"
+}
+
+// shellQuoteArgs applies shellQuoteArg to each element, returning a new slice
+// of the same length.
+func shellQuoteArgs(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = shellQuoteArg(a)
+	}
+	return out
+}
+
 // sshToShed establishes an SSH connection to a shed.
 // If command is nil, an interactive shell is opened.
 // If command is provided, it is executed on the shed.
@@ -114,9 +132,13 @@ func sshToShed(name string, command []string) error {
 		name + "@" + entry.Host,
 	}
 
-	// Add command if provided
+	// Add command if provided. Each argv element is wrapped in single quotes
+	// so it survives the SSH client joining remaining args with spaces and the
+	// server-side shlex.Split (gliderlabs/ssh sess.Command()) recovering argv.
+	// Without this, args containing pipes, redirects, semicolons, spaces, or
+	// nested quotes fragment on the wire. See issues #44 and #48.
 	if len(command) > 0 {
-		sshArgs = append(sshArgs, command...)
+		sshArgs = append(sshArgs, shellQuoteArgs(command)...)
 	}
 
 	// Find ssh binary

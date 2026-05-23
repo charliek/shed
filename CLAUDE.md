@@ -45,6 +45,20 @@ Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to se
 - **Workspace path**: `/workspace` inside VMs (see `config.WorkspacePath`)
 - **VM user**: `shed` (UID 1000) with passwordless sudo
 
+## `shed exec` semantics
+
+`shed exec` runs `argv[0]` with `argv[1:]` directly inside the shed — like `docker exec` / `kubectl exec`. There is **no implicit shell wrapping**, so pipes, redirects, semicolons, `$VAR`, command substitution, etc. only fire when the user explicitly invokes a shell. The CLI single-quotes each argv element before handing to `ssh` so the SSH server's `shlex.Split` recovers the original argv intact.
+
+Implications when writing code or docs:
+
+- `shed exec <name> -- mytool` is direct-exec; tools must already be on the agent's `PATH` (`/etc/environment.d/` defaults).
+- Anything needing shell features goes through `bash -c '…'`: `shed exec <name> -- bash -c 'a | b > c'`.
+- Login-shell init (`/etc/profile.d`, `~/.profile`) is opt-in via `bash -lc '…'`.
+- Provisioning hooks are a separate path (`internal/vmutil/provisioning.go`) — they still run as `bash --login -c` and source profile scripts.
+- The legacy idiom `shed exec name "cmd | with | pipes"` no longer works; rewrite as `shed exec name -- bash -c 'cmd | with | pipes'`.
+
+This convention is documented end-user-style in `docs/reference/cli.md` under `shed exec`.
+
 ## Backends
 
 | Backend | Platform | Isolation | Workspace |
