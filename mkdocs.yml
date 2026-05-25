@@ -94,6 +94,7 @@ nav:
       - Firecracker Setup: getting-started/fc-setup.md
       - Upgrades:
           - v0.4 → v0.5: upgrades/v0.4-to-v0.5.md
+          - v0.5.1 → v0.5.2: upgrades/v0.5.1-to-v0.5.2.md
   - Tutorials:
       - Build Your Own Image: tutorials/build-your-own-image.md
   - Reference:

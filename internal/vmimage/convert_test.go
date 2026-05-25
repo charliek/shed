@@ -136,7 +136,7 @@ func TestBuildShedAnnotationsSourceRef(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ann := buildShedAnnotations("full", tt.sourceRef, "", "", "")
+			ann := buildShedAnnotations("full", tt.sourceRef, "", "", "", "")
 			if got := ann[AnnotationSourceRef]; got != tt.sourceRef {
 				t.Errorf("AnnotationSourceRef = %q, want %q", got, tt.sourceRef)
 			}
@@ -168,23 +168,29 @@ func TestBuildShedAnnotationsSourceRef(t *testing.T) {
 // values are omitted from the annotation map (so the on-disk manifest
 // JSON doesn't carry confusing empty-string entries).
 func TestBuildShedAnnotationsOptionalFields(t *testing.T) {
-	ann := buildShedAnnotations("base", "ghcr.io/x/y:v1", "", "", "")
+	ann := buildShedAnnotations("base", "ghcr.io/x/y:v1", "", "", "", "")
 	if _, ok := ann[AnnotationKernelDigest]; ok {
 		t.Errorf("empty kernel digest should be omitted, got %q", ann[AnnotationKernelDigest])
 	}
 	if _, ok := ann[AnnotationInitrdDigest]; ok {
 		t.Errorf("empty initrd digest should be omitted, got %q", ann[AnnotationInitrdDigest])
 	}
+	if _, ok := ann[AnnotationRootfsErofsDigest]; ok {
+		t.Errorf("empty rootfs erofs digest should be omitted, got %q", ann[AnnotationRootfsErofsDigest])
+	}
 	if _, ok := ann[AnnotationRootfsLogicalSize]; ok {
 		t.Errorf("empty rootfs logical size should be omitted, got %q", ann[AnnotationRootfsLogicalSize])
 	}
 
-	ann2 := buildShedAnnotations("base", "ghcr.io/x/y:v1", "sha256:k", "sha256:i", "12345")
+	ann2 := buildShedAnnotations("base", "ghcr.io/x/y:v1", "sha256:k", "sha256:i", "sha256:e", "12345")
 	if ann2[AnnotationKernelDigest] != "sha256:k" {
 		t.Errorf("kernel digest = %q, want sha256:k", ann2[AnnotationKernelDigest])
 	}
 	if ann2[AnnotationInitrdDigest] != "sha256:i" {
 		t.Errorf("initrd digest = %q, want sha256:i", ann2[AnnotationInitrdDigest])
+	}
+	if ann2[AnnotationRootfsErofsDigest] != "sha256:e" {
+		t.Errorf("rootfs erofs digest = %q, want sha256:e", ann2[AnnotationRootfsErofsDigest])
 	}
 	if ann2[AnnotationRootfsLogicalSize] != "12345" {
 		t.Errorf("rootfs logical size = %q, want 12345", ann2[AnnotationRootfsLogicalSize])

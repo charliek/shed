@@ -5,25 +5,36 @@ Shed images are OCI-compliant container images. The on-disk store is an
 directory, layers are shared across tags, and pulls/pushes go directly to any
 OCI registry — no Docker daemon required for transport.
 
-Each image carries one or more read-only gzipped tar layers and a few
-annotations (kernel digest, initrd digest, source ref, variant name, schema
-version). At materialize time on the host, every layer is read in OCI order,
-OCI whiteouts are applied, and the merged tree is fed to `mkfs.erofs --tar=f`
-to produce a single content-addressed erofs file (one per manifest digest,
-shared across every shed that boots from this image). At boot the in-guest
-initramfs assembles a single-lower overlayfs with the per-shed writable
-upper on top.
+Each image carries:
+
+- one or more read-only gzipped tar layers (Dockerfile-stage shape preserved),
+- a prebuilt rootfs erofs blob (`io.shed.rootfs.erofs.digest` annotation; this
+  is what the VM mounts read-only at `/dev/vdb`),
+- a kernel blob (`io.shed.kernel.digest`),
+- an initrd blob (`io.shed.initrd.digest`),
+- standard annotations (source ref, variant name, shed schema version).
+
+The rootfs erofs is minted at image-publish time by `mkfs.erofs` running
+inside the [shed-build-tools](build-tools.md) container — a known-good
+`erofs-utils` version is pinned there so every consumer sees byte-identical
+filesystem layout regardless of where the image was published or where
+it'll be mounted. Hosts do not invoke `mkfs.erofs` themselves; they
+download the blob and mount it directly. At boot the in-guest initramfs
+assembles a single-lower overlayfs with the per-shed writable upper on
+top.
 
 ## Prerequisites
 
-The host running `shed-server` needs `mkfs.erofs` on PATH so the materialize
-step can build the flattened lower:
+No host-side erofs tooling is required. The shed-server package does
+not depend on `erofs-utils`; the OCI manifests ship the prebuilt erofs
+as a content-addressed blob. (Hosts that *publish* images — i.e., run
+`shed image build` — need Docker so the build-tools container can run,
+but not `erofs-utils` directly on the host.)
 
-- **macOS:** `brew install erofs-utils` (1.9.1+ via Homebrew bottle).
-- **Debian/Ubuntu:** `apt install erofs-utils`.
-
-If absent, shed errors at first `shed create` (or `shed image pull` followed
-by boot) with a clear install hint.
+If you're upgrading from v0.5.1 or earlier, see the
+[v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md) for the
+breaking-change details and the required `shed image rm` / `pull-images`
+steps.
 
 ## Available Variants
 
@@ -92,24 +103,25 @@ The on-disk store under `{images_dir}/` is OCI image-layout-v1:
 {images_dir}/
   oci-layout                                   # {"imageLayoutVersion":"1.0.0"}
   index.json                                   # OCI image index
-  blobs/sha256/<hex>                           # OCI blobs (manifests, configs, layer tar.gz)
-  cache/sha256/<manifest-digest>.erofs         # flattened lower for the whole manifest, materialized lazily
+  blobs/sha256/<hex>                           # OCI blobs (manifests, configs, layer tar.gz, kernel, initrd, rootfs erofs)
   tags/<name>.json                             # tag → manifest digest pointers
   uppers/<shed>/upper.ext4                     # per-shed writable overlay upper
   instances/<shed>/metadata.json               # per-shed bookkeeping (pins manifest digest)
   snapshots/<snap>/snapshot.json               # per-snapshot bookkeeping
 ```
 
-**Two storage roles.** Layer blobs live in `blobs/sha256/` as gzipped
-tarballs and are deduplicated across manifests (the `apt-get install`
-layer is one blob no matter how many variants reference it). The
-materialized boot artifact is a separate object: a single erofs file
-under `cache/sha256/<manifest-digest>.erofs` that represents the entire
-manifest's layers flattened (with OCI whiteouts applied) into one
-read-only filesystem. Both forms stay on disk: the tar.gz so
-`shed image push` can byte-perfectly round-trip the manifest to a
-registry, the erofs so boot is fast and the same artifact is shared
-across every shed booting from that manifest.
+**Everything is a content-addressed blob.** Layer tarballs, kernel,
+initrd, and the prebuilt rootfs erofs all live in `blobs/sha256/` keyed
+by their content sha256. The rootfs erofs is what the VM mounts at boot
+as `/dev/vdb`; the layer tarballs sit alongside it so `shed image push`
+can byte-perfectly round-trip the manifest to a registry and so derived
+images (`FROM` chains) can reuse the lower-numbered layers without
+re-downloading them.
+
+The legacy `cache/sha256/<manifest-digest>.erofs` directory (used
+through v0.5.1 for locally-materialized erofs files) is gone. Older
+installs may still have one — it's safe to `rm -rf` after upgrading;
+see the [v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md).
 
 **Layer sharing happens at the blob layer.** Two tags that share a base
 layer share the underlying blob — pulling `shed-vz-full:v0.5.1` after
@@ -185,9 +197,10 @@ crane manifest --from-archive shed-vz-full.tar
 shed image load -i shed-vz-full.tar
 ```
 
-It unpacks each blob into the local store, advances the tag(s), and
-materializes the flattened erofs cache lazily on first boot. Layers
-already present locally are skipped.
+It unpacks each blob into the local store and advances the tag(s).
+The rootfs erofs blob ships in the OCI archive alongside the layers —
+no on-host `mkfs.erofs` step is needed. Layers already present
+locally are skipped.
 
 ### Push to a registry
 
@@ -219,6 +232,7 @@ Every shed-built manifest carries these annotations (visible via
 | `io.shed.source-ref` | The Docker / OCI reference the image was pulled or built from. |
 | `io.shed.kernel.digest` | Digest of the kernel blob embedded in the image. |
 | `io.shed.initrd.digest` | Digest of the initrd (shed-built initramfs) blob. |
+| `io.shed.rootfs.erofs.digest` | Digest of the prebuilt read-only rootfs erofs blob the VM mounts at `/dev/vdb`. v0.5.2+. Required — images missing this annotation are rejected at boot. |
 | `io.shed.schema-version` | Metadata schema version (currently `v3`). |
 | `io.shed.rootfs.logical-size` | Sum of layer logical sizes — what the merged overlay sees from inside the guest. |
 

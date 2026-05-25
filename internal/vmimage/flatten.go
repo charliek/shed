@@ -47,6 +47,21 @@ func MergeLayersFromManifest(ctx context.Context, imagesDir, manifestDigest, out
 	if len(manifest.Layers) == 0 {
 		return fmt.Errorf("manifest %s has no layers", manifestDigest)
 	}
+	layerDigests := make([]string, len(manifest.Layers))
+	for i, l := range manifest.Layers {
+		layerDigests[i] = l.Digest
+	}
+	return MergeLayers(ctx, imagesDir, layerDigests, outTarPath)
+}
+
+// MergeLayers is the manifest-less variant of MergeLayersFromManifest
+// used during image build, where we have the layer digests in hand
+// but the shed-annotated manifest hasn't been minted yet. layerDigests
+// must be in OCI order (lowest at index 0).
+func MergeLayers(ctx context.Context, imagesDir string, layerDigests []string, outTarPath string) error {
+	if len(layerDigests) == 0 {
+		return fmt.Errorf("MergeLayers: no layers")
+	}
 
 	outFile, err := os.Create(outTarPath)
 	if err != nil {
@@ -64,11 +79,11 @@ func MergeLayersFromManifest(ctx context.Context, imagesDir, manifestDigest, out
 
 	// Walk layers in reverse OCI order so the highest layer's entries
 	// are emitted first and shadow earlier-layer entries.
-	for layerIdx := len(manifest.Layers) - 1; layerIdx >= 0; layerIdx-- {
+	for layerIdx := len(layerDigests) - 1; layerIdx >= 0; layerIdx-- {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		layerDigest := manifest.Layers[layerIdx].Digest
+		layerDigest := layerDigests[layerIdx]
 		blobPath, err := BlobPath(imagesDir, layerDigest)
 		if err != nil {
 			return fmt.Errorf("resolving layer %s: %w", layerDigest, err)

@@ -13,8 +13,8 @@ import (
 
 // installCachedBlob installs a synthetic OCI image into imagesDir under
 // the given tag with the given source-ref annotation. Returns the path
-// to the manifest's cached lower image — the path that config resolution
-// surfaces to callers as ResolvedImage.Path.
+// to the manifest's prebuilt rootfs erofs blob — the path that config
+// resolution surfaces to callers as ResolvedImage.Path (v0.5.2+).
 func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
 	t.Helper()
 	body := []byte("fake-" + tag)
@@ -22,9 +22,17 @@ func installCachedBlob(t *testing.T, imagesDir, tag, sourceRef string) string {
 	if err != nil {
 		t.Fatalf("InstallSyntheticImage: %v", err)
 	}
-	path, err := vmimage.CacheLowerPath(imagesDir, digest)
+	manifest, err := vmimage.LoadManifestByDigest(imagesDir, digest)
 	if err != nil {
-		t.Fatalf("CacheLowerPath: %v", err)
+		t.Fatalf("LoadManifestByDigest: %v", err)
+	}
+	erofsDigest := manifest.ShedRootfsErofsDigest()
+	if erofsDigest == "" {
+		t.Fatalf("synthetic manifest %s missing %s annotation — InstallSyntheticImage should populate it", digest, vmimage.AnnotationRootfsErofsDigest)
+	}
+	path, err := vmimage.BlobPath(imagesDir, erofsDigest)
+	if err != nil {
+		t.Fatalf("BlobPath(erofs): %v", err)
 	}
 	return path
 }

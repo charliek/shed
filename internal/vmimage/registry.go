@@ -148,9 +148,10 @@ func PushFromOCILayout(ctx context.Context, opts PushOptions) error {
 		remote.WithContext(ctx),
 	}
 
-	// Upload kernel / initrd loose blobs first so the manifest's
-	// annotation references resolve when other clients fetch.
-	for _, ann := range []string{AnnotationKernelDigest, AnnotationInitrdDigest} {
+	// Upload kernel / initrd / rootfs-erofs loose blobs first so
+	// the manifest's annotation references resolve when other clients
+	// fetch.
+	for _, ann := range []string{AnnotationKernelDigest, AnnotationInitrdDigest, AnnotationRootfsErofsDigest} {
 		d := manifest.Annotations[ann]
 		if d == "" {
 			continue
@@ -420,6 +421,17 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 			return nil, fmt.Errorf("extracting initrd from layer tar: %w", err)
 		}
 		initrdDigest = d
+	}
+
+	// Pull the prebuilt rootfs erofs blob (v0.5.2+). Same loose-blob
+	// shape as kernel/initrd. When absent (older image), don't fail
+	// here — the host's EnsureImage rejects with a clearer "rebuild
+	// against v0.5.2+ tooling" error so the user knows the upgrade
+	// path. See internal/vmimage/manager.go.
+	if d := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest); d != "" {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts); err != nil {
+			return nil, fmt.Errorf("pulling rootfs erofs blob %s: %w", d, err)
+		}
 	}
 
 	// Record the manifest in the top-level OCI index.

@@ -8,8 +8,6 @@ package vmimage
 import (
 	"encoding/hex"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -33,35 +31,29 @@ func InstallSyntheticImage(imagesDir, tagName, sourceRef string, rootfsContent, 
 	}
 
 	// Layer blob (placeholder — real images store tar.gz here; for tests
-	// the bytes are opaque content addressed by their sha256).
+	// the bytes are opaque content addressed by their sha256). Tests
+	// that need the layer to merge cleanly should construct a real
+	// tar.gz instead and pass it through `Convert` directly.
 	layerDigest := DigestBytes(rootfsContent)
 	if _, err := WriteBlob(imagesDir, layerDigest, rootfsContent); err != nil {
 		return "", fmt.Errorf("writing layer blob: %w", err)
 	}
 
-	// Materialize a fake lower-image in the cache so callers that
-	// expect a ready-to-boot image see CacheLowerExists() returning
-	// true.
-	cachePath, err := CacheLowerPath(imagesDir, layerDigest)
-	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-		return "", err
-	}
-	// Layer cache is content-addressed; if the file is already in
-	// place from an earlier synthetic install with the same content,
-	// leave it alone (it's 0o444 and would otherwise refuse a rewrite).
-	if _, statErr := os.Stat(cachePath); statErr != nil {
-		if err := os.WriteFile(cachePath, rootfsContent, 0o444); err != nil {
-			return "", fmt.Errorf("writing synthetic lower cache: %w", err)
-		}
+	// v0.5.2+: every shed image carries a prebuilt erofs blob
+	// referenced by io.shed.rootfs.erofs.digest. For tests the
+	// blob contents are opaque — we synthesize a unique digest by
+	// hashing a "rootfs-erofs:" + rootfsContent so tests for cache
+	// hits / misses on the lower blob behave correctly.
+	rootfsErofsDigest := DigestBytes(append([]byte("rootfs-erofs:"), rootfsContent...))
+	if _, err := WriteBlob(imagesDir, rootfsErofsDigest, append([]byte("rootfs-erofs:"), rootfsContent...)); err != nil {
+		return "", fmt.Errorf("writing rootfs erofs blob: %w", err)
 	}
 
 	annotations := map[string]string{
-		AnnotationSchemaVersion: ShedSchemaVersion,
-		AnnotationVariant:       tagName,
-		AnnotationSourceRef:     sourceRef,
+		AnnotationSchemaVersion:     ShedSchemaVersion,
+		AnnotationVariant:           tagName,
+		AnnotationSourceRef:         sourceRef,
+		AnnotationRootfsErofsDigest: rootfsErofsDigest,
 	}
 
 	if len(kernelContent) > 0 {
@@ -119,22 +111,6 @@ func InstallSyntheticImage(imagesDir, tagName, sourceRef string, rootfsContent, 
 	manifestDigest := DigestBytes(manData)
 	if _, err := WriteBlob(imagesDir, manifestDigest, manData); err != nil {
 		return "", fmt.Errorf("writing manifest blob: %w", err)
-	}
-
-	// Pre-populate the manifest-digest-keyed cache lower so tests that
-	// expect a ready-to-boot image skip the EnsureLowerFromManifest path
-	// (which would try to flatten the synthetic non-tar layer content).
-	mfCachePath, err := CacheLowerPath(imagesDir, manifestDigest)
-	if err != nil {
-		return "", err
-	}
-	if _, statErr := os.Stat(mfCachePath); statErr != nil {
-		if err := os.MkdirAll(filepath.Dir(mfCachePath), 0o755); err != nil {
-			return "", err
-		}
-		if err := os.WriteFile(mfCachePath, rootfsContent, 0o444); err != nil {
-			return "", fmt.Errorf("writing synthetic manifest cache: %w", err)
-		}
 	}
 
 	// Record the manifest in index.json so ListImages / PruneImages

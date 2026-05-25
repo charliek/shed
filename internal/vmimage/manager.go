@@ -353,14 +353,41 @@ func (m *Manager) resolveCachedTag(ctx context.Context, imagesDir, name, expecte
 	return res, true
 }
 
-// resolveManifestLower materializes (if needed) the single flattened
-// lower image for the manifest and returns its path. The cache file is
-// content-addressed by the manifest digest, so all sheds booting from
-// the same image share one erofs file on disk.
-func (m *Manager) resolveManifestLower(ctx context.Context, imagesDir, manifestDigest string) (EnsureResult, error) {
-	path, err := EnsureLowerFromManifest(ctx, imagesDir, manifestDigest)
+// resolveManifestLower resolves the single read-only lower image for a
+// manifest. v0.5.2+ images carry a prebuilt erofs blob referenced by
+// the io.shed.rootfs.erofs.digest annotation — we return that blob's
+// path directly, no local mkfs.erofs invocation, no cache file. The
+// blob path IS the lower the VM mounts.
+//
+// Images built with v0.5.1 or earlier tooling lack the annotation;
+// since shed-build-tools published a known-good mkfs.erofs starting
+// with v0.5.2, the upgrade path is to re-pull rather than fall back
+// to the host's mkfs.erofs (which has writer-bug exposure on
+// erofs-utils 1.7.x). The error surfaces the precise command needed.
+func (m *Manager) resolveManifestLower(_ context.Context, imagesDir, manifestDigest string) (EnsureResult, error) {
+	manifest, err := LoadManifestByDigest(imagesDir, manifestDigest)
 	if err != nil {
-		return EnsureResult{}, fmt.Errorf("materializing lower for manifest %s: %w", ShortDigest(manifestDigest), err)
+		return EnsureResult{}, fmt.Errorf("loading manifest %s: %w", ShortDigest(manifestDigest), err)
+	}
+	erofsDigest := manifest.ShedRootfsErofsDigest()
+	if erofsDigest == "" {
+		return EnsureResult{}, fmt.Errorf(
+			"image manifest %s lacks %s annotation (built with pre-v0.5.2 tooling); "+
+				"re-pull against current images: shed image rm %s && shed-server pull-images "+
+				"(see docs/upgrades/v0.5.1-to-v0.5.2.md for the full upgrade path)",
+			ShortDigest(manifestDigest), AnnotationRootfsErofsDigest, ShortDigest(manifestDigest),
+		)
+	}
+	if !BlobExists(imagesDir, erofsDigest) {
+		return EnsureResult{}, fmt.Errorf(
+			"rootfs erofs blob %s referenced by manifest %s is missing from the local store; "+
+				"re-pull the image (shed image pull <ref> -t <name>) to recover",
+			ShortDigest(erofsDigest), ShortDigest(manifestDigest),
+		)
+	}
+	path, err := BlobPath(imagesDir, erofsDigest)
+	if err != nil {
+		return EnsureResult{}, fmt.Errorf("resolving rootfs erofs blob path: %w", err)
 	}
 	return EnsureResult{
 		Path:   path,
@@ -747,6 +774,9 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 			reachable[d] = true
 		}
 		if d := manifest.ShedInitrdDigest(); d != "" {
+			reachable[d] = true
+		}
+		if d := manifest.ShedRootfsErofsDigest(); d != "" {
 			reachable[d] = true
 		}
 	}

@@ -70,15 +70,18 @@ The server config `default_backend` supports `vz`, `firecracker`, or `detect` (a
 
 ## VM Images
 
-VZ and Firecracker use multi-stage Dockerfiles (`vz/Dockerfile`, `firecracker/Dockerfile`) to build rootfs ext4 images. Variants: `base`, `default`, `experimental`. The `experimental` variant layers [shed-extensions](https://github.com/charliek/shed-extensions) guest binaries via `COPY --from=` a published multi-arch Docker image, pinned by `ARG SHED_EXT_VERSION`.
+VZ and Firecracker use multi-stage Dockerfiles (`vz/Dockerfile`, `firecracker/Dockerfile`) to build rootfs OCI images. Variants: `base`, `extensions`, `full`. The `extensions` and `full` variants layer [shed-extensions](https://github.com/charliek/shed-extensions) guest binaries via `COPY --from=` a published multi-arch Docker image, pinned by `ARG SHED_EXT_VERSION`.
 
-- Build locally: `./scripts/build-vz-rootfs.sh --variant experimental`
+Since v0.5.2 the read-only rootfs **erofs is built at image-publish time** by `mkfs.erofs` running inside the `ghcr.io/charliek/shed-build-tools:vX.Y.Z` container (pinned `erofs-utils` version, tagged in lockstep with shed releases). The resulting erofs ships as a content-addressed OCI blob referenced by the `io.shed.rootfs.erofs.digest` manifest annotation. Hosts pull the blob and mount it directly — no on-host `mkfs.erofs` invocation. Pre-v0.5.2 images lack the annotation and are rejected at boot with a clear "rebuild against current tooling" error (see `internal/vmimage/manager.go:resolveManifestLower`).
+
+- Build locally: `./scripts/build-vz-rootfs.sh --variant extensions`
 - Local dev with shed-extensions changes: `--shed-ext-version dev` (after building the shed-extensions Docker image locally)
-- See `docs/reference/images.md` for full variant docs and build instructions
+- Local dev iterating on the build-tools image: `make build-tools && ./scripts/build-{vz,firecracker}-rootfs.sh --build-tools-version dev`
+- See `docs/reference/images.md`, `docs/reference/build-tools.md`, and `docs/upgrades/v0.5.1-to-v0.5.2.md` for full docs.
 
 ## Storage Model
 
-Images are stored content-addressed under `{images_dir}/blobs/sha256/<digest>/` with tag indirection at `{images_dir}/tags/<tag>.json`. Each shed and snapshot pins the digest of its lower image in metadata so `shed image prune` can refcount-GC unreferenced blobs. Tags do NOT protect blobs from prune (Docker model). See `docs/reference/storage-model.md` for the full layout and the lifecycle commands (`shed image ls/inspect/tag/pull/rm/prune`).
+Images are stored content-addressed under `{images_dir}/blobs/sha256/<digest>` (flat files, one per blob — manifests, configs, layer tar.gz, kernel, initrd, rootfs erofs). Tags live at `{images_dir}/tags/<tag>.json`. Each shed and snapshot pins the manifest digest in metadata so `shed image prune` can refcount-GC unreferenced blobs. Tags do NOT protect blobs from prune (Docker model). See `docs/reference/storage-model.md` for the full layout and the lifecycle commands (`shed image ls/inspect/tag/pull/rm/prune`).
 
 ## Documentation
 

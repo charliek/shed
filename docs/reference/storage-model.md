@@ -15,8 +15,8 @@ For each VM backend, all on-disk state lives under a single `images_dir`:
   oci-layout                                    # {"imageLayoutVersion":"1.0.0"}
   index.json                                    # OCI image index (manifest references)
   blobs/sha256/<hex>                            # FILES, not dirs — OCI blobs:
-                                                #   manifests, configs, layer tar.gz
-  cache/sha256/<manifest-digest>.erofs          # flattened manifest lower (lazy)
+                                                #   manifests, configs, layer tar.gz,
+                                                #   kernel, initrd, rootfs erofs
   tags/<tag>.json                               # {"digest":"sha256:...","updated_at":"..."}
   uppers/<shed>/upper.ext4                      # per-shed writable overlay upper
   instances/<shed>/metadata.json                # per-shed bookkeeping
@@ -26,20 +26,23 @@ For each VM backend, all on-disk state lives under a single `images_dir`:
 For Firecracker the default is `/var/lib/shed/firecracker/images/`; for
 VZ it's `~/Library/Application Support/shed/vz/`.
 
-Two storage roles to keep straight:
+**Everything in `blobs/sha256/<hex>` is a flat file**, not a directory.
+The blob can be a manifest JSON, an image config, a gzipped tar layer,
+a raw kernel, a raw initrd, or a raw erofs filesystem. All are
+deduplicated by sha256 — the `apt-get install` layer is one blob no
+matter how many manifests reference it.
 
-- **`blobs/sha256/<hex>` is a flat file**, not a directory. It contains
-  the raw OCI blob — a manifest JSON, an image config, or a gzipped tar
-  layer. Blobs are deduplicated across manifests (the `apt-get install`
-  layer is one blob whether `base`, `extensions`, and `full` all
-  reference it).
-- **`cache/sha256/<manifest-digest>.erofs` is the boot artifact**: a
-  single flattened erofs file representing the manifest's layers merged
-  with OCI whiteouts applied. Built lazily the first time a manifest is
-  needed for boot; shared across every shed booting from that manifest.
-  The boot artifact is keyed by manifest digest, not layer digest —
-  different variants get different erofs files, but the underlying layer
-  blobs are still shared.
+The read-only rootfs the VM mounts at `/dev/vdb` is the erofs blob
+referenced by the manifest's `io.shed.rootfs.erofs.digest` annotation.
+It's built once at image-publish time by `mkfs.erofs` inside the
+[shed-build-tools container](build-tools.md) (pinned `erofs-utils`),
+shipped as a content-addressed OCI blob, and downloaded verbatim by
+every host. The on-host pull path does not invoke `mkfs.erofs`.
+
+Through v0.5.1 the erofs was built lazily on the host into a separate
+`cache/sha256/<manifest-digest>.erofs` directory. That directory is no
+longer used; older installs may still have one and can `rm -rf` it.
+See the [v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md).
 
 ## Concepts, mapped to Docker
 
@@ -48,7 +51,8 @@ Two storage roles to keep straight:
 | **Manifest blob** — JSON file at `blobs/sha256/<hex>` whose media type is `application/vnd.oci.image.manifest.v1+json` | Image manifest |
 | **Config blob** — JSON file in `blobs/sha256/<hex>` referenced by the manifest | Image config |
 | **Layer blob** — gzipped tar at `blobs/sha256/<hex>` | Image layer |
-| **Flattened lower** — `cache/sha256/<manifest-digest>.erofs` derived from all of a manifest's layers | (no direct analog — boot-time artifact) |
+| **Rootfs erofs blob** — raw erofs at `blobs/sha256/<hex>` referenced by `io.shed.rootfs.erofs.digest` | (no direct analog — read-only root the VM mounts) |
+| **Kernel / initrd blobs** — raw binaries at `blobs/sha256/<hex>` referenced by `io.shed.kernel.digest` / `io.shed.initrd.digest` | (no direct analog — VM boot artifacts) |
 | **Tag** — `tags/<name>.json` pointing at a manifest digest | Image tag |
 | **Dangling manifest** — manifest with no tag and no shed/snapshot reference | `<none>:<none>` image |
 
@@ -64,10 +68,9 @@ When `shed create --image extensions` runs, the server:
 2. Writes `instances/<name>/metadata.json` with
    `"lower_digest": "sha256:<manifest-digest>"`, `"schema_version": 3`,
    and the list of layer digests captured at create time.
-3. Materializes the flattened erofs lower at
-   `cache/sha256/<manifest-digest>.erofs` if it isn't already cached.
-   This is one `mkfs.erofs --tar=f` over the merged layer tree (with OCI
-   whiteouts applied) — sub-10-second on typical hardware.
+3. Looks up the manifest's `io.shed.rootfs.erofs.digest` annotation
+   and resolves it to a blob path under `blobs/sha256/`. The blob IS
+   the read-only lower the VM mounts — no host-side `mkfs.erofs`.
 4. Creates the per-shed upper at `uppers/<name>/upper.ext4`.
 
 Subsequent `shed start` reads the same metadata. The shed boots from the
@@ -84,8 +87,9 @@ digest after the fact does not change what an existing shed boots.
 2. **Expand** — for every manifest digest in the seed set, parse the
    manifest and add its config blob and layer blob digests.
 3. **Sweep** — delete any blob in `blobs/sha256/` not in the reachable
-   set, and any `cache/sha256/<manifest-digest>.erofs` whose manifest is
-   unreachable.
+   set. (The reachable set includes layer blobs, manifest configs, the
+   kernel / initrd loose blobs, and the rootfs erofs blob via their
+   respective annotations.)
 
 Tags do **not** protect blobs. Following the Docker model,
 `shed image rm <tag>` only removes the tag — the manifest and its layers
@@ -145,16 +149,13 @@ Blob install is atomic:
 2. `fsync` the file.
 3. `rename` to `blobs/sha256/<hex>`; `fsync` the parent dir.
 
-Tag advancement follows the same pattern on `tags/<name>.json`. Cache
-materialization is similarly atomic on
-`cache/sha256/<manifest-digest>.erofs`: write to a staging tempfile,
-chmod 0o444, fsync, atomic rename into place.
+Tag advancement follows the same pattern on `tags/<name>.json`.
 
 Concurrent installs of the same blob are serialized by a flock on
 `blobs/sha256/.<hex>.lock`. Concurrent `EnsureImage` calls for the same
-tag take a flock on `tags/<name>.lock`. Concurrent materializations of
-the same manifest take a flock on
-`cache/sha256/.<manifest-digest>.erofs.lock`.
+tag take a flock on `tags/<name>.lock`. Since v0.5.2 ships the erofs as
+a content-addressed blob there's no separate cache materialization
+lock — `EnsureImage` is pure pull + path resolution.
 
 ## Lifecycle commands
 

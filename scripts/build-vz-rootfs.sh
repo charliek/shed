@@ -35,6 +35,7 @@ VARIANT="full"
 BUILD_ALL=false
 FORCE_KERNEL=false
 SHED_EXT_VERSION=""
+BUILD_TOOLS_VERSION=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -65,6 +66,17 @@ while [[ $# -gt 0 ]]; do
             SHED_EXT_VERSION="$2"
             shift 2
             ;;
+        --build-tools-version)
+            # Forwarded to `shed image build`. Pins the
+            # shed-build-tools image used to mint the rootfs erofs.
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "ERROR: --build-tools-version requires a value"
+                echo "Run '$0 --help' for usage."
+                exit 1
+            fi
+            BUILD_TOOLS_VERSION="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -77,6 +89,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --force-kernel     Force kernel/initrd re-extraction even if files exist"
             echo "  --shed-ext-version Override shed-extensions image version for extensions/full variants"
             echo "                     (e.g., 'dev' to use a locally-built image)"
+            echo "  --build-tools-version  Override the shed-build-tools image tag used to mint the rootfs erofs"
+            echo "                         (e.g., 'dev' to use a locally-built shed-build-tools:dev image)"
             echo "  --help, -h         Show this help message"
             echo ""
             echo "Environment variables:"
@@ -181,6 +195,9 @@ build_variant() {
     echo "========================================"
 
     local extra_args=()
+    if [ -n "$BUILD_TOOLS_VERSION" ]; then
+        extra_args+=(--build-tools-version "$BUILD_TOOLS_VERSION")
+    fi
     if [ -n "$SHED_EXT_VERSION" ]; then
         # shed image build passes --build-arg through to buildx via the
         # builder. Encode as KEY=VALUE so the existing flag plumbing
