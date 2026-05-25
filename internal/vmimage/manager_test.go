@@ -249,18 +249,15 @@ func TestManagerPruneRespectsSnapshotRefs(t *testing.T) {
 	}
 }
 
-// TestEnsureImageTriesRegistryBeforeDocker is the regression for #98.
-// EnsureImage must call PullToOCILayout (registry-direct) before falling
-// back to convertAndInstall (docker-export). Before the fix, only the
-// docker path was tried, which produced a single-layer flatten with
-// Ubuntu's stock initramfs — boot would fail with "No root device".
-//
-// Test strategy: with a bogus registry ref + no docker daemon reachable
-// in the test env, BOTH paths fail. The combined error message
-// "registry pull and docker fallback both failed: registry=... docker=..."
-// only appears in the new code path. The old code would have returned
-// only the docker error.
-func TestEnsureImageTriesRegistryBeforeDocker(t *testing.T) {
+// TestEnsureImageSurfacesRegistryError confirms that a registry pull
+// failure surfaces directly to the caller — v0.5.3 dropped the
+// docker-daemon fallback (it produced single-layer flattens with
+// Ubuntu's stock initramfs that couldn't boot via shed-overlay), so
+// the only sensible behavior on a registry miss is to fail fast.
+// Previously this test verified the "tried registry first, then
+// docker" ordering (#98); after the fallback removal the ordering
+// is degenerate and the error message we assert on changed.
+func TestEnsureImageSurfacesRegistryError(t *testing.T) {
 	imagesDir := t.TempDir()
 	cfg := &testConfig{
 		imagesDir:     imagesDir,
@@ -274,19 +271,15 @@ func TestEnsureImageTriesRegistryBeforeDocker(t *testing.T) {
 		t.Fatalf("EnsureOCILayout: %v", err)
 	}
 
-	// A ref that doesn't exist anywhere. Both registry pull AND docker
-	// daemon pull will fail. We don't care which specific errors fire;
-	// only that the combined error message proves both paths were
-	// attempted in the right order.
 	_, err := mgr.EnsureImage(context.Background(), ResolvedRef{
-		Name:      "test-prefers-registry",
+		Name:      "test-registry-only",
 		DockerRef: "ghcr.io/charliek/this-image-deliberately-does-not-exist:v0.0.0",
 	}, nil)
 	if err == nil {
 		t.Fatal("expected error from EnsureImage against a bogus ref, got nil")
 	}
-	if !strings.Contains(err.Error(), "registry pull and docker fallback both failed") {
-		t.Fatalf("error should indicate both paths were tried (#98 regression).\n  got: %v", err)
+	if !strings.Contains(err.Error(), "pulling ghcr.io/charliek/this-image-deliberately-does-not-exist:v0.0.0 from registry") {
+		t.Fatalf("error should surface the registry pull verbatim — no silent fallback.\n  got: %v", err)
 	}
 }
 

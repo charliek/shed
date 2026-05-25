@@ -1,34 +1,33 @@
-// Docker-to-OCI conversion pipeline.
+// OCI-archive ingestion pipeline.
 //
-// Convert takes a Docker reference, exports its rootfs to a tar, gzips
-// the tar as an OCI layer, writes the layer + OCI image config + OCI
-// manifest as blobs into the local OCI layout, extracts kernel/initrd
-// as additional shed-typed blobs, and materializes an ext4 in the
-// cache directory. Returns the manifest digest.
+// Convert reads an OCI image-layout tar (produced by `docker buildx
+// build --output type=oci,dest=...`), copies its layer + config blobs
+// into the local OCI layout under {ImagesDir}, extracts the kernel
+// and initrd blobs from the image's annotations or fallback layer
+// scan, mints the rootfs erofs via shed-build-tools (when
+// BuildToolsRef is set), and writes a shed-annotated manifest blob.
+// Returns the manifest digest plus the resolved blob digests.
 //
-// Phase 1 of the OCI refactor still uses docker create/export and
-// privileged-Docker mkfs.ext4 for the conversion. Phase 2 replaces the
-// pull half with go-containerregistry's remote.Image so a Docker daemon
-// is no longer required for `shed image pull`.
+// The legacy "DockerRef-without-OCIArchivePath" path (docker create
+// + docker export → single-layer flatten) was removed in v0.5.2 —
+// it produced single-layer images with Ubuntu's stock initrd that
+// couldn't boot through shed-overlay. Callers must hand Convert an
+// OCI archive; `shed image build` produces one via buildx, and the
+// registry-pull path (`PullToOCILayout` in registry.go) is the
+// other supported way to get content into the local store.
 
 package vmimage
 
 import (
 	"archive/tar"
-	"bytes"
-	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/distribution/reference"
 )
@@ -39,27 +38,25 @@ const DefaultPlatform = "linux/arm64"
 // FirecrackerPlatform is the Docker platform used for Firecracker images (x86_64 Linux).
 const FirecrackerPlatform = "linux/amd64"
 
-// ConvertOptions configures a Docker-to-OCI conversion.
+// ConvertOptions configures an OCI-archive ingestion.
 //
-// Two input modes are supported:
-//
-//   - OCIArchivePath set: ingest a buildx-produced OCI image-layout
-//     tar (the path-of-least-surprise for shed image build). The
-//     docker image's layer structure is preserved — extensions and
-//     full variants share base's layers in the on-disk store.
-//   - DockerRef set (and OCIArchivePath empty): flatten the named
-//     local-docker-daemon image via docker create + docker export
-//     into a single OCI layer. Kept for the pull-fallback path that
-//     can't reach a registry but does have the image loaded locally.
+// OCIArchivePath is the only input mode — Convert reads the OCI
+// image-layout tar, copies its layer + config blobs into the local
+// OCI image-layout, extracts kernel/initrd, mints the rootfs erofs
+// when BuildToolsRef is set, and writes a shed-annotated manifest.
+// The docker image's layer structure is preserved across variants
+// (extensions and full share base's layers in the on-disk store).
 type ConvertOptions struct {
 	// OCIArchivePath is the path to an OCI image-layout tar produced
-	// by `docker buildx build --output type=oci,dest=...`. When set,
-	// Convert preserves the buildx layer structure.
+	// by `docker buildx build --output type=oci,dest=...`. Required.
 	OCIArchivePath string
 
-	// DockerRef is the image reference to convert (e.g. ghcr.io/.../shed-vz-full:v1.0.0).
-	// Used only when OCIArchivePath is empty — flattens via docker
-	// create/export into a single layer.
+	// DockerRef is the image reference being converted (e.g.
+	// ghcr.io/.../shed-vz-full:v1.0.0). Recorded verbatim in the
+	// io.shed.source-ref manifest annotation so the server's
+	// resolveImage cache-hit check (compares the annotation to the
+	// configured ref) matches on subsequent pulls. Not used to fetch
+	// content — that's the OCI archive's job.
 	DockerRef string
 
 	// Name is the variant name (e.g. "full"); recorded as io.shed.variant.
@@ -134,12 +131,10 @@ type ConvertResult struct {
 	RootfsLogicalSize int64
 }
 
-// buildShedAnnotations returns the manifest annotation map shed writes
-// to every image it ingests. Centralizing the construction here keeps
-// the OCI-archive and docker-export convert paths in lockstep — they
-// previously each open-coded the map, which let one drift while the
-// other was updated. Empty digest / size strings are omitted so the
-// emitted JSON matches the pre-helper byte shape.
+// buildShedAnnotations returns the manifest annotation map shed
+// writes to every image it ingests. Empty digest / size strings are
+// omitted so the emitted JSON doesn't carry confusing empty-string
+// entries.
 //
 // sourceRef is recorded verbatim in io.shed.source-ref; the server's
 // resolveImage cache-hit check compares this against the configured
@@ -177,14 +172,13 @@ func IsDockerRef(s string) bool {
 	return err == nil
 }
 
-// Resolve looks up a tag and returns the path to the cached ext4 for
-// its first layer, when the tag exists, the blob is installed, and
-// (when expectedRef is non-empty) the manifest's source-ref annotation
-// matches expectedRef. Returns "" otherwise (cache miss).
-//
-// Phase 1 manifests always have exactly one layer, so the first-layer
-// ext4 is the only lower the VM needs. In later phases, callers must
-// migrate to ResolveTagLayers and assemble the multi-lower boot.
+// Resolve looks up a tag and returns the path to the prebuilt
+// rootfs erofs blob referenced by the manifest's
+// io.shed.rootfs.erofs.digest annotation, when the tag exists, the
+// manifest is installed, and (when expectedRef is non-empty) the
+// source-ref annotation matches expectedRef. Returns "" otherwise
+// (cache miss, manifest missing annotation, or expectedRef
+// mismatch).
 func Resolve(imagesDir, tag, expectedRef string) string {
 	t, err := GetTag(imagesDir, tag)
 	if err != nil {
@@ -304,13 +298,16 @@ func Convert(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
 	if err := EnsureOCILayout(opts.ImagesDir); err != nil {
 		return nil, err
 	}
-	if opts.OCIArchivePath != "" {
-		return convertFromOCIArchive(ctx, opts)
+	if opts.OCIArchivePath == "" {
+		// v0.5.2 dropped the docker-create + docker-export flatten
+		// path: it always produced a single-layer manifest with
+		// Ubuntu's stock initrd (instead of shed-overlay's), so the
+		// resulting shed couldn't boot. Producers must hand us an
+		// OCI archive — `shed image build` does this via
+		// `docker buildx --output type=oci,dest=...`.
+		return nil, errors.New("ConvertOptions.OCIArchivePath is required (docker-export flatten path was removed in v0.5.2)")
 	}
-	if opts.DockerRef == "" {
-		return nil, errors.New("ConvertOptions requires OCIArchivePath or DockerRef")
-	}
-	return convertFromDockerExport(ctx, opts)
+	return convertFromOCIArchive(ctx, opts)
 }
 
 // convertFromOCIArchive ingests a docker buildx-produced OCI image-layout
@@ -602,252 +599,6 @@ func jsonUnmarshal(data []byte, v interface{}) error {
 	return json.Unmarshal(data, v)
 }
 
-// convertFromDockerExport implements the single-layer flatten path used
-// when ingesting a docker-daemon-resident image without a buildx OCI
-// tar. Splits out from the original Convert body — see convertFromOCIArchive
-// for the layer-preserving path.
-func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*ConvertResult, error) {
-
-	stagingDir, err := os.MkdirTemp(opts.ImagesDir, ".convert-*")
-	if err != nil {
-		return nil, fmt.Errorf("creating staging dir: %w", err)
-	}
-	defer os.RemoveAll(stagingDir)
-
-	containerID, err := dockerCreate(ctx, opts.Platform, opts.DockerRef)
-	if err != nil {
-		return nil, fmt.Errorf("creating container from %s: %w", opts.DockerRef, err)
-	}
-	defer dockerRemove(ctx, containerID)
-
-	tarPath := filepath.Join(stagingDir, "rootfs.tar")
-	if err := dockerExport(ctx, containerID, tarPath); err != nil {
-		return nil, fmt.Errorf("exporting container: %w", err)
-	}
-	tarStat, err := os.Stat(tarPath)
-	if err != nil {
-		return nil, fmt.Errorf("stat tar: %w", err)
-	}
-
-	// Gzip the tar into a layer blob and capture both digests
-	// (compressed = layer descriptor; uncompressed = config diff_id).
-	gzPath := filepath.Join(stagingDir, "layer.tar.gz")
-	diffID, layerDigest, gzSize, err := gzipFileWithDigests(tarPath, gzPath)
-	if err != nil {
-		return nil, fmt.Errorf("gzipping layer: %w", err)
-	}
-
-	// Install the layer blob.
-	layerBlobPath := mustBlobPath(opts.ImagesDir, layerDigest)
-	if _, err := os.Stat(layerBlobPath); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("stat layer blob: %w", err)
-		}
-		if _, _, err := WriteBlobFromFile(opts.ImagesDir, gzPath, true); err != nil {
-			return nil, fmt.Errorf("installing layer blob: %w", err)
-		}
-	}
-
-	// Optional: extract kernel + initrd from the source image and
-	// install as shed-typed blobs (annotations on the manifest point
-	// at them).
-	var kernelDigest, initrdDigest string
-	if opts.ExtractKernel {
-		kPath := filepath.Join(stagingDir, "vmlinux")
-		if err := extractKernel(ctx, opts.Platform, opts.DockerRef, stagingDir); err != nil {
-			return nil, fmt.Errorf("extracting kernel: %w", err)
-		}
-		d, _, err := WriteBlobFromFile(opts.ImagesDir, kPath, true)
-		if err != nil {
-			return nil, fmt.Errorf("installing kernel blob: %w", err)
-		}
-		kernelDigest = d
-
-		// Install an initrd blob whenever the caller provided one
-		// explicitly OR the backend asks for an Ubuntu-style initrd
-		// extracted from /boot. Both VZ and Firecracker need the
-		// shed-overlay initramfs to assemble overlayfs at boot, so
-		// the build CLI passes --initramfs <path> regardless of
-		// backend.
-		if opts.InitrdSourcePath != "" || opts.NeedsInitrd {
-			var initrdSrc string
-			if opts.InitrdSourcePath != "" {
-				if _, err := os.Stat(opts.InitrdSourcePath); err != nil {
-					return nil, fmt.Errorf("initrd source %q: %w", opts.InitrdSourcePath, err)
-				}
-				initrdSrc = opts.InitrdSourcePath
-			} else {
-				initrdSrc = filepath.Join(stagingDir, "initrd.img")
-				if err := extractInitrd(ctx, opts.Platform, opts.DockerRef, stagingDir); err != nil {
-					return nil, fmt.Errorf("extracting initrd: %w", err)
-				}
-			}
-			d, _, err := WriteBlobFromFile(opts.ImagesDir, initrdSrc, opts.InitrdSourcePath == "")
-			if err != nil {
-				return nil, fmt.Errorf("installing initrd blob: %w", err)
-			}
-			initrdDigest = d
-		}
-	}
-
-	// Build + install the OCI image config.
-	arch := platformArch(opts.Platform)
-	cfg := &OCIConfig{
-		Architecture: arch,
-		OS:           "linux",
-		Created:      time.Now().UTC().Format(time.RFC3339Nano),
-		Author:       "shed",
-		RootFS: OCIRootFS{
-			Type:    "layers",
-			DiffIDs: []string{diffID},
-		},
-		History: []OCIHistory{{
-			Created:   time.Now().UTC().Format(time.RFC3339Nano),
-			CreatedBy: fmt.Sprintf("shed image convert %s", opts.DockerRef),
-		}},
-	}
-	cfgData, err := cfg.MarshalIndent()
-	if err != nil {
-		return nil, fmt.Errorf("marshalling config: %w", err)
-	}
-	configDigest := DigestBytes(cfgData)
-	if _, err := WriteBlob(opts.ImagesDir, configDigest, cfgData); err != nil {
-		return nil, fmt.Errorf("installing config blob: %w", err)
-	}
-
-	// Mint the rootfs erofs blob (v0.5.2+). See convertFromOCIArchive
-	// for rationale. This path (docker create + export) is the legacy
-	// fallback for refs not in an OCI archive; it'll mostly disappear
-	// in PR 4 once we drop the docker-daemon fallback chain. Until
-	// then, mint correctly when BuildToolsRef is set.
-	var rootfsErofsDigest string
-	if opts.BuildToolsRef != "" {
-		d, err := MintRootfsErofs(ctx, MintErofsOptions{
-			ImagesDir:     opts.ImagesDir,
-			LayerDigests:  []string{layerDigest},
-			BuildToolsRef: opts.BuildToolsRef,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("minting rootfs erofs: %w", err)
-		}
-		rootfsErofsDigest = d
-	}
-
-	// Build + install the OCI manifest.
-	manifest := &OCIManifest{
-		SchemaVersion: 2,
-		MediaType:     MediaTypeOCIManifest,
-		Config: Descriptor{
-			MediaType: MediaTypeOCIConfig,
-			Digest:    configDigest,
-			Size:      int64(len(cfgData)),
-		},
-		Layers: []Descriptor{{
-			MediaType: MediaTypeOCILayer,
-			Digest:    layerDigest,
-			Size:      gzSize,
-		}},
-		Annotations: buildShedAnnotations(opts.Name, opts.DockerRef, kernelDigest, initrdDigest, rootfsErofsDigest, fmt.Sprintf("%d", tarStat.Size())),
-	}
-	manData, err := manifest.MarshalIndent()
-	if err != nil {
-		return nil, fmt.Errorf("marshalling manifest: %w", err)
-	}
-	manifestDigest := DigestBytes(manData)
-	if _, err := WriteBlob(opts.ImagesDir, manifestDigest, manData); err != nil {
-		return nil, fmt.Errorf("installing manifest blob: %w", err)
-	}
-
-	// Record the manifest in the top-level OCI index. Foreign tools
-	// (crane, oras) enumerate the store via index.json.
-	if err := indexUpsert(opts.ImagesDir, Descriptor{
-		MediaType: MediaTypeOCIManifest,
-		Digest:    manifestDigest,
-		Size:      int64(len(manData)),
-		Annotations: map[string]string{
-			"org.opencontainers.image.ref.name": opts.Name,
-		},
-	}); err != nil {
-		return nil, fmt.Errorf("updating index.json: %w", err)
-	}
-
-	return &ConvertResult{
-		ManifestDigest:    manifestDigest,
-		ConfigDigest:      configDigest,
-		LayerDigests:      []string{layerDigest},
-		KernelDigest:      kernelDigest,
-		InitrdDigest:      initrdDigest,
-		RootfsErofsDigest: rootfsErofsDigest,
-		RootfsLogicalSize: tarStat.Size(),
-	}, nil
-}
-
-// gzipFileWithDigests reads src, computes its sha256 (the OCI diff_id),
-// gzips it to dst, and computes the gzipped output's sha256 (the OCI
-// layer descriptor digest). Returns both digests plus the gzipped size.
-func gzipFileWithDigests(src, dst string) (diffID, layerDigest string, gzSize int64, err error) {
-	in, err := os.Open(src)
-	if err != nil {
-		return "", "", 0, err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return "", "", 0, err
-	}
-	defer out.Close()
-
-	// Compose: out ← gw ← tee(in, diffH) ; layerH digests gw's bytes.
-	// We hash compressed bytes via a TeeReader on the final output file
-	// after gzipping; a stream-side MultiWriter on gw would only see
-	// uncompressed input. Two-pass keeps the code simple.
-	gw := gzip.NewWriter(out)
-	diffH := sha256.New()
-	tee := io.TeeReader(in, diffH)
-
-	if _, err := io.Copy(gw, tee); err != nil {
-		gw.Close()
-		return "", "", 0, fmt.Errorf("gzipping: %w", err)
-	}
-	if err := gw.Close(); err != nil {
-		return "", "", 0, fmt.Errorf("closing gzip writer: %w", err)
-	}
-	if err := out.Sync(); err != nil {
-		return "", "", 0, fmt.Errorf("sync gz: %w", err)
-	}
-	stat, err := out.Stat()
-	if err != nil {
-		return "", "", 0, fmt.Errorf("stat gz: %w", err)
-	}
-	gzSize = stat.Size()
-
-	// Hash the compressed output.
-	gz, err := os.Open(dst)
-	if err != nil {
-		return "", "", 0, err
-	}
-	defer gz.Close()
-	layerH := sha256.New()
-	if _, err := io.Copy(layerH, gz); err != nil {
-		return "", "", 0, fmt.Errorf("hashing gz: %w", err)
-	}
-
-	diffID = DigestPrefix + hex.EncodeToString(diffH.Sum(nil))
-	layerDigest = DigestPrefix + hex.EncodeToString(layerH.Sum(nil))
-	return diffID, layerDigest, gzSize, nil
-}
-
-// mustBlobPath panics if BlobPath fails; convenience for cases where
-// the digest has already been validated.
-func mustBlobPath(imagesDir, digest string) string {
-	p, err := BlobPath(imagesDir, digest)
-	if err != nil {
-		panic(err)
-	}
-	return p
-}
-
 // indexUpsert adds or replaces a descriptor in index.json by ref-name
 // annotation. Descriptors without ref names are deduplicated by digest.
 //
@@ -892,82 +643,4 @@ func platformArch(platform string) string {
 		return parts[1]
 	}
 	return "arm64"
-}
-
-func dockerCreate(ctx context.Context, platform, imageRef string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "create", "--platform", platform, imageRef)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%s: %w", strings.TrimSpace(stderr.String()), err)
-	}
-	return strings.TrimSpace(stdout.String()), nil
-}
-
-func dockerExport(ctx context.Context, containerID, tarPath string) error {
-	outFile, err := os.Create(tarPath)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	cmd := exec.CommandContext(ctx, "docker", "export", containerID)
-	cmd.Stdout = outFile
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %w", strings.TrimSpace(stderr.String()), err)
-	}
-	return nil
-}
-
-func dockerRemove(ctx context.Context, containerID string) {
-	exec.CommandContext(ctx, "docker", "rm", containerID).Run() //nolint:errcheck
-}
-
-// dockerRunScript runs a bash script inside the Docker image with
-// outputDir mounted at /output.
-func dockerRunScript(ctx context.Context, platform, imageRef, outputDir, script string) error {
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", platform,
-		"--entrypoint", "/bin/bash",
-		"-v", outputDir+":/output",
-		imageRef, "-c", script)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %w", strings.TrimSpace(stderr.String()), err)
-	}
-	return nil
-}
-
-func extractKernel(ctx context.Context, platform, imageRef, outputDir string) error {
-	return dockerRunScript(ctx, platform, imageRef, outputDir, `set -euo pipefail
-VMLINUZ=$(ls -v /boot/vmlinuz-* 2>/dev/null | tail -1 || true)
-if [ -n "$VMLINUZ" ]; then
-    if zcat "$VMLINUZ" > /output/vmlinux 2>/dev/null; then
-        echo 'Decompressed gzip kernel'
-    else
-        cp "$VMLINUZ" /output/vmlinux
-    fi
-    exit 0
-fi
-if [ -f /boot/vmlinux ]; then
-    cp /boot/vmlinux /output/vmlinux
-    echo 'Copied uncompressed kernel'
-    exit 0
-fi
-echo 'ERROR: No kernel found in /boot/'
-exit 1`)
-}
-
-func extractInitrd(ctx context.Context, platform, imageRef, outputDir string) error {
-	return dockerRunScript(ctx, platform, imageRef, outputDir, `set -euo pipefail
-INITRD=$(ls -v /boot/initrd.img-* 2>/dev/null | tail -1 || true)
-if [ -z "$INITRD" ]; then
-    echo 'ERROR: No initrd found in /boot/'
-    exit 1
-fi
-cp "$INITRD" /output/initrd.img`)
 }
