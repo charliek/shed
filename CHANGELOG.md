@@ -2,6 +2,84 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.3 — 2026-05-25
+
+Follow-up to v0.5.2's architectural fix. Two small features and a
+big cleanup. No format changes, no breaking changes — drop-in
+upgrade from v0.5.2.
+
+### New
+
+- **`shed-server doctor`** (PR #108). One-pass health report
+  against the local Firecracker install. Each check reports
+  `PASS` / `WARN` / `FAIL`; exits non-zero if any `FAIL` fires.
+  Covers: KVM readable, docker on PATH, firecracker binary
+  present, server.yaml parses, kernel_path sanity, bridge
+  interface state, every installed tag's manifest + erofs blob
+  chain, every enabled extension's manifest, systemd unit
+  active. Honors `--config` so it reports the actual file in
+  use, not a guess. Linux-only. Run it first when something
+  feels off.
+
+- **Registry-pull retry envelope** (PR #108). Wraps the two
+  network-touching calls (`remote.Get` for the manifest
+  descriptor, `remote.Layer + Compressed` for each loose blob)
+  in a 3-attempt exponential backoff (1 s, 4 s). Retries on
+  transient shapes — `net.OpError`, `io.EOF` /
+  `io.ErrUnexpectedEOF`, `transport.Error` 5xx + 429, plus
+  case-insensitive DNS / connection-reset / TLS-handshake-timeout
+  string fallbacks. 4xx errors and context cancellations
+  short-circuit so the user sees real diagnostics immediately.
+  Closes a class of "shed-server pull-images failed because
+  ghcr blipped for 200 ms during the kernel blob fetch" papercuts.
+
+### Improved
+
+- **File-credential migration hint** (PR #108). When a server.yaml
+  credential's `source` is a regular file (not a directory) the
+  validator now embeds the exact `~/.shed/sync.yaml` snippet the
+  user needs, with name + source + target substituted in — lifts
+  the error from "what do I do now?" to "paste this."
+
+### Removed
+
+- **Docker-daemon fallback dead code** (PR #107, -558 lines).
+  v0.5.2 already made the on-host `mkfs.erofs` + docker-create +
+  docker-export flatten path unreachable; this release deletes the
+  dead implementation:
+  - `internal/vmimage/manager.go`: `convertAndInstall` method;
+    fallback branches in `EnsureImage` and `PullImage` — both now
+    surface the registry pull error verbatim instead of the old
+    "registry pull and docker fallback both failed" compound
+    message.
+  - `internal/vmimage/convert.go`: `convertFromDockerExport` and
+    its helpers (`gzipFileWithDigests`, `mustBlobPath`,
+    `dockerCreate`, `dockerExport`, `dockerRemove`,
+    `dockerRunScript`, `extractKernel`, `extractInitrd`).
+    `Convert()` now requires `OCIArchivePath`.
+  - `internal/vmimage/cache.go`: `EnsureLowerFromManifest` (the
+    local mkfs.erofs invocation), `CacheLowerExists`,
+    `RemoveCachedLower`. Survivors: `CacheLowerPath`,
+    `CacheLowerSize`, `CacheLowerExt` — still used by
+    `PruneImages` to sweep v0.5.1-era legacy cache files during
+    the upgrade window.
+- **`erofs-utils` dep dropped** from both the brew formula and
+  the deb. Hosts running shed-server no longer invoke
+  `mkfs.erofs` anywhere. `apt remove erofs-utils` is safe after
+  upgrade.
+
+### CI
+
+- Linux smoke gate (added in v0.5.2) now runs on every PR
+  against this release line too — both v0.5.3 PRs were validated
+  end-to-end on a fresh ubuntu-latest runner before merge.
+
+### Net diff
+
+```
+v0.5.2 → v0.5.3:  9 files changed, +752 / -678 lines
+```
+
 ## v0.5.2 — 2026-05-25
 
 ### Overlay-stability release
