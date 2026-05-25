@@ -291,11 +291,23 @@ func (d *doctor) checkSystemdUnit(ctx context.Context) {
 	d.pass("shed-server.service", state)
 }
 
-// findConfigPath replicates loadConfig's search order for display
-// purposes only. Best-effort; if the user passed -c we don't see
-// it here because loadConfig doesn't expose its resolved path.
+// findConfigPath mirrors LoadServerConfigFromPath's search order for
+// display purposes. Honors the global --config flag when set so
+// `shed-server doctor --config /tmp/server.yaml` reports the actual
+// file in use rather than a misleading default.
 func findConfigPath() string {
-	for _, p := range []string{"/etc/shed/server.yaml", "configs/server.yaml"} {
+	if configPath != "" {
+		expanded := config.ExpandPath(configPath)
+		if _, err := os.Stat(expanded); err == nil {
+			return expanded
+		}
+		return configPath + " (configured but not present)"
+	}
+	for _, p := range []string{
+		"./server.yaml",
+		config.ExpandPath("~/.config/shed/server.yaml"),
+		"/etc/shed/server.yaml",
+	} {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}

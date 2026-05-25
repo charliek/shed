@@ -93,13 +93,16 @@ func isRetryablePullErr(err error) bool {
 		return code >= 500 || code == 429
 	}
 	// Fallback for string-matched lower-layer errors that don't
-	// implement Is/As nicely. Keep the list narrow.
-	msg := err.Error()
+	// implement Is/As nicely. Lowercased comparison — the net/http
+	// "tls handshake timeout" string is lowercase but historical
+	// reports of it appear in mixed case, and lowercasing once is
+	// cheaper than maintaining both spellings.
+	msg := strings.ToLower(err.Error())
 	for _, fragment := range []string{
 		"connection reset by peer",
 		"connection refused",
 		"i/o timeout",
-		"TLS handshake timeout",
+		"tls handshake timeout",
 		"no such host",
 	} {
 		if strings.Contains(msg, fragment) {

@@ -44,6 +44,8 @@ func TestIsRetryablePullErr(t *testing.T) {
 		{"transport 404", &transport.Error{StatusCode: http.StatusNotFound}, false},
 		{"connection reset string", errors.New("read tcp: connection reset by peer"), true},
 		{"i/o timeout string", errors.New("dial tcp 1.2.3.4: i/o timeout"), true},
+		{"tls handshake timeout lowercase", errors.New("net/http: tls handshake timeout"), true},
+		{"tls handshake timeout mixed case", errors.New("net/http: TLS handshake timeout"), true},
 		{"no such host string", errors.New("lookup foo.invalid: no such host"), true},
 		{"random string", errors.New("disk full"), false},
 	} {
