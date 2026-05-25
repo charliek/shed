@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent build-firstboot test test-integration release clean dev-server dev-cli check coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent build-firstboot build-tools test test-integration release clean dev-server dev-cli check coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -123,3 +123,9 @@ vz-rootfs-base: build-cli build-agent build-firstboot
 # Build all VZ rootfs image variants
 vz-rootfs-all: build-cli build-agent build-firstboot
 	./scripts/build-vz-rootfs.sh --all
+
+# Build the shed-build-tools image (mkfs.erofs + friends) locally, tagged
+# `shed-build-tools:dev`. Consumers in development mode point at this tag
+# via --build-tools-version=dev. See build-tools/README.md for details.
+build-tools:
+	docker build -t shed-build-tools:dev build-tools/
