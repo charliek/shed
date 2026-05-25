@@ -91,6 +91,19 @@ type ConvertOptions struct {
 	// and passes the path here so the resulting image boots through
 	// shed's overlay assembly path rather than Ubuntu's regular initrd.
 	InitrdSourcePath string
+
+	// BuildToolsRef, when set, triggers MintRootfsErofs after the
+	// layer blobs are installed: a docker container running mkfs.erofs
+	// from this image flattens the layers and produces the
+	// io.shed.rootfs.erofs.digest blob. The shed publish workflow pins
+	// this to ghcr.io/charliek/shed-build-tools:<current shed tag>;
+	// local `shed image build` runs default to the same pin via
+	// cmd/shed/image.go's BuildToolsRef flag (see --build-tools-version).
+	// When empty, no erofs is minted — the resulting image will be
+	// rejected by v0.5.2+ servers at EnsureImage. Empty is only
+	// appropriate for tests or for images that will be re-processed
+	// by a later mint pass.
+	BuildToolsRef string
 }
 
 // ConvertResult holds the digests produced by a successful conversion.
@@ -113,6 +126,10 @@ type ConvertResult struct {
 	// InitrdDigest names the shed-typed initrd blob (if extracted).
 	InitrdDigest string
 
+	// RootfsErofsDigest names the prebuilt rootfs erofs blob (only
+	// populated when ConvertOptions.BuildToolsRef was non-empty).
+	RootfsErofsDigest string
+
 	// RootfsLogicalSize records the uncompressed tar size in bytes.
 	RootfsLogicalSize int64
 }
@@ -127,7 +144,7 @@ type ConvertResult struct {
 // sourceRef is recorded verbatim in io.shed.source-ref; the server's
 // resolveImage cache-hit check compares this against the configured
 // `ref:`, so publish flows MUST pass the final registry ref here.
-func buildShedAnnotations(variant, sourceRef, kernelDigest, initrdDigest, rootfsLogicalSize string) map[string]string {
+func buildShedAnnotations(variant, sourceRef, kernelDigest, initrdDigest, rootfsErofsDigest, rootfsLogicalSize string) map[string]string {
 	ann := map[string]string{
 		AnnotationSchemaVersion: ShedSchemaVersion,
 		AnnotationVariant:       variant,
@@ -138,6 +155,9 @@ func buildShedAnnotations(variant, sourceRef, kernelDigest, initrdDigest, rootfs
 	}
 	if initrdDigest != "" {
 		ann[AnnotationInitrdDigest] = initrdDigest
+	}
+	if rootfsErofsDigest != "" {
+		ann[AnnotationRootfsErofsDigest] = rootfsErofsDigest
 	}
 	if rootfsLogicalSize != "" {
 		ann[AnnotationRootfsLogicalSize] = rootfsLogicalSize
@@ -183,19 +203,31 @@ func Resolve(imagesDir, tag, expectedRef string) string {
 	if len(manifest.Layers) == 0 {
 		return ""
 	}
-	cachePath, err := CacheLowerPath(imagesDir, t.Digest)
+	// v0.5.2+: the lower is the prebuilt rootfs erofs blob, not a
+	// locally-materialized cache file. Pre-v0.5.2 images have no
+	// annotation and are treated as cache misses so callers re-pull
+	// against the new tooling (manager.resolveManifestLower returns
+	// the precise "rebuild" error when EnsureImage actually tries to
+	// boot one).
+	erofsDigest := manifest.ShedRootfsErofsDigest()
+	if erofsDigest == "" {
+		return ""
+	}
+	if !BlobExists(imagesDir, erofsDigest) {
+		return ""
+	}
+	blobPath, err := BlobPath(imagesDir, erofsDigest)
 	if err != nil {
 		return ""
 	}
-	if _, err := os.Stat(cachePath); err != nil {
-		return ""
-	}
-	return cachePath
+	return blobPath
 }
 
 // ResolveTag looks up a tag and returns its manifest digest plus the
-// path to the manifest's cached lower image. Returns ErrTagNotFound or
-// ErrBlobNotFound on miss.
+// path to the manifest's prebuilt rootfs erofs blob. Returns
+// ErrTagNotFound or ErrBlobNotFound on miss; returns a clear error
+// when the manifest lacks the v0.5.2+ io.shed.rootfs.erofs.digest
+// annotation.
 func ResolveTag(imagesDir, tag string) (digest, rootfsPath string, err error) {
 	t, err := GetTag(imagesDir, tag)
 	if err != nil {
@@ -211,11 +243,24 @@ func ResolveTag(imagesDir, tag string) (digest, rootfsPath string, err error) {
 	if len(manifest.Layers) == 0 {
 		return t.Digest, "", fmt.Errorf("manifest %s has no layers", t.Digest)
 	}
-	cachePath, err := CacheLowerPath(imagesDir, t.Digest)
+	erofsDigest := manifest.ShedRootfsErofsDigest()
+	if erofsDigest == "" {
+		return t.Digest, "", fmt.Errorf(
+			"manifest %s (tag %q) lacks %s annotation — image was built with pre-v0.5.2 tooling; re-pull against current images",
+			ShortDigest(t.Digest), tag, AnnotationRootfsErofsDigest,
+		)
+	}
+	if !BlobExists(imagesDir, erofsDigest) {
+		return t.Digest, "", fmt.Errorf(
+			"%w: rootfs erofs %s referenced by manifest %s (tag %q)",
+			ErrBlobNotFound, erofsDigest, t.Digest, tag,
+		)
+	}
+	blobPath, err := BlobPath(imagesDir, erofsDigest)
 	if err != nil {
 		return t.Digest, "", err
 	}
-	return t.Digest, cachePath, nil
+	return t.Digest, blobPath, nil
 }
 
 // LoadManifestByDigest reads + parses an OCI manifest blob.
@@ -366,10 +411,25 @@ func convertFromOCIArchive(ctx context.Context, opts ConvertOptions) (*ConvertRe
 		initrdDigest = d
 	}
 
-	// The flattened manifest lower is materialized lazily on the next
-	// EnsureImage call (via resolveManifestLower) — no need to pre-bake
-	// the erofs here. Keeping image-build snappy when iterating on a
-	// rootfs that may not even be booted.
+	// Mint the read-only rootfs erofs blob (v0.5.2+). The publishing
+	// flow pins a known-good mkfs.erofs via the shed-build-tools OCI
+	// image — see internal/vmimage/erofs.go for the rationale. When
+	// BuildToolsRef is empty (test fixtures, special-purpose builds),
+	// skip minting and emit a manifest without the annotation; the
+	// resulting image will fail at EnsureImage on any v0.5.2+ server
+	// with a clear "rebuild with v0.5.2+ tooling" error.
+	var rootfsErofsDigest string
+	if opts.BuildToolsRef != "" {
+		d, err := MintRootfsErofs(ctx, MintErofsOptions{
+			ImagesDir:     opts.ImagesDir,
+			LayerDigests:  layerDigests,
+			BuildToolsRef: opts.BuildToolsRef,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("minting rootfs erofs: %w", err)
+		}
+		rootfsErofsDigest = d
+	}
 
 	// Build our shed-annotated manifest referencing the same layer +
 	// config digests as buildx emitted. Adding annotations changes the
@@ -385,7 +445,7 @@ func convertFromOCIArchive(ctx context.Context, opts ConvertOptions) (*ConvertRe
 			Size:      int64(len(cfgBytes)),
 		},
 		Layers:      append([]Descriptor{}, srcManifest.Layers...),
-		Annotations: buildShedAnnotations(opts.Name, opts.DockerRef, kernelDigest, initrdDigest, ""),
+		Annotations: buildShedAnnotations(opts.Name, opts.DockerRef, kernelDigest, initrdDigest, rootfsErofsDigest, ""),
 	}
 	manData, err := manifest.MarshalIndent()
 	if err != nil {
@@ -422,6 +482,7 @@ func convertFromOCIArchive(ctx context.Context, opts ConvertOptions) (*ConvertRe
 		LayerDigests:      layerDigests,
 		KernelDigest:      kernelDigest,
 		InitrdDigest:      initrdDigest,
+		RootfsErofsDigest: rootfsErofsDigest,
 		RootfsLogicalSize: rootfsLogical,
 	}, nil
 }
@@ -654,6 +715,24 @@ func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*Convert
 		return nil, fmt.Errorf("installing config blob: %w", err)
 	}
 
+	// Mint the rootfs erofs blob (v0.5.2+). See convertFromOCIArchive
+	// for rationale. This path (docker create + export) is the legacy
+	// fallback for refs not in an OCI archive; it'll mostly disappear
+	// in PR 4 once we drop the docker-daemon fallback chain. Until
+	// then, mint correctly when BuildToolsRef is set.
+	var rootfsErofsDigest string
+	if opts.BuildToolsRef != "" {
+		d, err := MintRootfsErofs(ctx, MintErofsOptions{
+			ImagesDir:     opts.ImagesDir,
+			LayerDigests:  []string{layerDigest},
+			BuildToolsRef: opts.BuildToolsRef,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("minting rootfs erofs: %w", err)
+		}
+		rootfsErofsDigest = d
+	}
+
 	// Build + install the OCI manifest.
 	manifest := &OCIManifest{
 		SchemaVersion: 2,
@@ -668,7 +747,7 @@ func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*Convert
 			Digest:    layerDigest,
 			Size:      gzSize,
 		}},
-		Annotations: buildShedAnnotations(opts.Name, opts.DockerRef, kernelDigest, initrdDigest, fmt.Sprintf("%d", tarStat.Size())),
+		Annotations: buildShedAnnotations(opts.Name, opts.DockerRef, kernelDigest, initrdDigest, rootfsErofsDigest, fmt.Sprintf("%d", tarStat.Size())),
 	}
 	manData, err := manifest.MarshalIndent()
 	if err != nil {
@@ -692,16 +771,13 @@ func convertFromDockerExport(ctx context.Context, opts ConvertOptions) (*Convert
 		return nil, fmt.Errorf("updating index.json: %w", err)
 	}
 
-	// Lower is materialized lazily on the next EnsureImage (via
-	// resolveManifestLower) so docker-fallback conversions don't
-	// block waiting on mkfs.erofs.
-
 	return &ConvertResult{
 		ManifestDigest:    manifestDigest,
 		ConfigDigest:      configDigest,
 		LayerDigests:      []string{layerDigest},
 		KernelDigest:      kernelDigest,
 		InitrdDigest:      initrdDigest,
+		RootfsErofsDigest: rootfsErofsDigest,
 		RootfsLogicalSize: tarStat.Size(),
 	}, nil
 }

@@ -49,6 +49,15 @@ const (
 	// associated with this image, when shed extracted one.
 	AnnotationInitrdDigest = "io.shed.initrd.digest"
 
+	// AnnotationRootfsErofsDigest names the blob digest of the
+	// flattened rootfs erofs that shed minted at image-build time
+	// (using a pinned mkfs.erofs from the shed-build-tools image).
+	// When present, the host skips local mkfs.erofs entirely and
+	// mounts this blob directly as the read-only lower; when absent,
+	// the host rejects the image (no on-host fallback in the v0.5.2+
+	// layout — see internal/vmimage/manager.go for the reject path).
+	AnnotationRootfsErofsDigest = "io.shed.rootfs.erofs.digest"
+
 	// AnnotationSchemaVersion records shed's own manifest schema version
 	// alongside OCI's schemaVersion (always 2 for OCI manifests). Lets
 	// us bump shed semantics independently of OCI.
@@ -252,4 +261,16 @@ func (m *OCIManifest) ShedInitrdDigest() string {
 		return ""
 	}
 	return m.Annotations[AnnotationInitrdDigest]
+}
+
+// ShedRootfsErofsDigest returns the prebuilt rootfs erofs blob digest
+// carried in annotations, or "" if the image was built before v0.5.2
+// (when this annotation was introduced). Callers that depend on the
+// blob being present should fail with a clear "image too old" error
+// rather than fall back to local mkfs.erofs — see manager.go.
+func (m *OCIManifest) ShedRootfsErofsDigest() string {
+	if m == nil || m.Annotations == nil {
+		return ""
+	}
+	return m.Annotations[AnnotationRootfsErofsDigest]
 }

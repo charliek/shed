@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"text/tabwriter"
@@ -12,8 +13,65 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
 )
+
+// buildToolsRefDefault resolves the shed-build-tools OCI ref that
+// `shed image build` should use when minting the rootfs erofs blob.
+// Priority: explicit --build-tools-version flag > derive from
+// `version.Version` for clean release builds > "dev" fallback.
+//
+// Why three tiers:
+//   - CI's publish-images workflow passes --build-tools-version
+//     explicitly so a single source-of-truth (the tag being released)
+//     drives every build-tools reference.
+//   - Outside CI, a `go install` or `go build` from a clean checkout
+//     of a release tag has version.Version="X.Y.Z" — we derive
+//     `ghcr.io/charliek/shed-build-tools:vX.Y.Z` so consumers don't
+//     have to remember the flag.
+//   - All other dev builds (dirty, ahead-of-tag, version="dev") fall
+//     back to `:dev` and expect the caller to have run
+//     `make build-tools` first.
+const buildToolsImageBase = "ghcr.io/charliek/shed-build-tools"
+
+var releaseTagRE = regexp.MustCompile(`^v?\d+\.\d+\.\d+$`)
+
+func buildToolsRefDefault(override string) string {
+	if override != "" {
+		// Full image ref (anything containing "/" or ":") passes
+		// through verbatim — `shed-build-tools:dev`,
+		// `ghcr.io/.../shed-build-tools:custom`, or
+		// `localhost:5000/shed-build-tools:test` are all valid.
+		if strings.Contains(override, "/") || strings.Contains(override, ":") {
+			return override
+		}
+		// Bare tag (no path or colon). Only "release-shaped"
+		// tags (vX.Y.Z) are synthesized against the canonical
+		// registry — for anything else (`dev`, `mybuild`), use
+		// the bare image name so a `make build-tools`-produced
+		// local image resolves without an unwanted registry pull.
+		if releaseTagRE.MatchString(override) {
+			tag := override
+			if !strings.HasPrefix(tag, "v") {
+				tag = "v" + tag
+			}
+			return buildToolsImageBase + ":" + tag
+		}
+		return "shed-build-tools:" + override
+	}
+	v := strings.TrimSpace(version.Version)
+	if releaseTagRE.MatchString(v) {
+		if !strings.HasPrefix(v, "v") {
+			v = "v" + v
+		}
+		return buildToolsImageBase + ":" + v
+	}
+	// Dev build of shed CLI. Default to a locally-built
+	// shed-build-tools:dev image — no registry round-trip — and
+	// rely on `make build-tools` having been run first.
+	return "shed-build-tools:dev"
+}
 
 var imageCmd = &cobra.Command{
 	Use:   "image",
@@ -22,15 +80,16 @@ var imageCmd = &cobra.Command{
 }
 
 var (
-	imageBuildFile       string
-	imageBuildInitrd     string
-	imageBuildName       string
-	imageBuildTarget     string
-	imageBuildOutputDir  string
-	imageBuildPlatform   string
-	imageBuildSourceRef  string
-	imageBuildForce      bool
-	imageBuildOCIArchive string
+	imageBuildFile         string
+	imageBuildInitrd       string
+	imageBuildName         string
+	imageBuildTarget       string
+	imageBuildOutputDir    string
+	imageBuildPlatform     string
+	imageBuildSourceRef    string
+	imageBuildForce        bool
+	imageBuildOCIArchive   string
+	imageBuildToolsVersion string
 
 	imageDeleteForce bool
 	imagePruneForce  bool
@@ -153,6 +212,13 @@ func init() {
 	imageBuildCmd.Flags().StringVar(&imageBuildSourceRef, "source-ref", "", "Override the io.shed.source-ref annotation baked into the manifest (default: <prefix><name>:latest). Pass the final registry ref in CI publish flows so server-side cache lookups match.")
 	imageBuildCmd.Flags().BoolVar(&imageBuildForce, "force", false, "Skip base image validation warning")
 	imageBuildCmd.Flags().StringVar(&imageBuildOCIArchive, "from-oci-archive", "", "Skip docker buildx and ingest a pre-built OCI image-layout tar (e.g. produced by `podman build --output type=oci,dest=...` or `buildah bud --output oci-archive,...`). Mutually exclusive with --file/--target/--platform/--force.")
+	// --build-tools-version pins the shed-build-tools OCI image that
+	// runs mkfs.erofs during image build. Defaults to the shed CLI's
+	// own release tag so a `shed image build` invoked from a
+	// shed-server v0.5.2 install produces v0.5.2-shaped erofs blobs.
+	// Override with `dev` (or any other tag) when iterating on the
+	// build-tools image locally — see docs/reference/build-tools.md.
+	imageBuildCmd.Flags().StringVar(&imageBuildToolsVersion, "build-tools-version", "", "Override the shed-build-tools image tag used to mint the rootfs erofs (default: matches the shed CLI version; pass 'dev' for a locally-built shed-build-tools:dev image)")
 	_ = imageBuildCmd.MarkFlagRequired("name")
 
 	imageDeleteCmd.Flags().BoolVar(&imageDeleteForce, "force", false, "Skip confirmation prompt")
@@ -420,6 +486,7 @@ func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir
 		return "", fmt.Errorf("invalid image name %q: %w", imageBuildName, err)
 	}
 
+	buildToolsRef := buildToolsRefDefault(imageBuildToolsVersion)
 	result, err := vmimage.Convert(ctx, vmimage.ConvertOptions{
 		OCIArchivePath:   ociArchivePath,
 		DockerRef:        sourceRef,
@@ -429,6 +496,7 @@ func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir
 		ExtractKernel:    extractKernel,
 		NeedsInitrd:      needsInitrd,
 		InitrdSourcePath: imageBuildInitrd,
+		BuildToolsRef:    buildToolsRef,
 	})
 	if err != nil {
 		return "", fmt.Errorf("conversion failed: %w", err)
