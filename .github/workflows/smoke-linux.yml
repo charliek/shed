@@ -1,0 +1,39 @@
+name: Smoke (Linux)
+
+# Linux smoke test for shed-server. Runs install-only on
+# GitHub-hosted ubuntu-latest (no /dev/kvm available there) and
+# gates release tags through the same check. The full create-cycle
+# smoke is the maintainer's responsibility against bare-metal hosts
+# with KVM; see scripts/smoke-test-linux.sh for the same script
+# usable in that mode.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Reusable workflow target so release.yaml can require this
+  # check as a gate before tagging.
+  workflow_call:
+
+jobs:
+  smoke:
+    name: Linux smoke (install-only on GHA, full on bare-metal release validation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binaries
+        run: make build
+
+      - name: Run smoke test (install-only on GHA)
+        # GitHub-hosted runners don't expose /dev/kvm; the script
+        # detects that and runs install-only. CI's job is to catch
+        # binary / setup regressions; the create-cycle is exercised
+        # by manual release validation on a KVM-capable host.
+        run: sudo ./scripts/smoke-test-linux.sh --from-local
