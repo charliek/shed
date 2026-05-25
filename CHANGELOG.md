@@ -2,9 +2,108 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.5.2 — 2026-05-25
 
-- **BREAKING — `shed exec` now executes argv directly (Docker-style); login-shell sourcing removed (#44, #48).** Previously the backend wrapped every non-empty command in `bash --login -c "<joined argv>"`, which collided with the SSH wire protocol (argv joined with spaces, server-side `shlex.Split` re-parses) to silently mangle pipes, redirects, semicolons, and nested quotes — e.g. `shed exec myvm -- bash -c 'echo hello | wc -c'` returned `1` instead of `6`, and `shed exec myvm -- bash -c 'bun -e "console.log(1+1)"'` syntax-errored on stripped parentheses. The fix has two coordinated parts: the CLI (`sshToShed`) now shell-quotes each command arg before invoking `ssh` so argv survives the SSH server's `shlex.Split` round-trip intact, and both backends (`VZBackend.Exec`, `FirecrackerBackend.Exec`) now pass non-empty `opts.Cmd` through to the agent verbatim — the agent execs `argv[0]` with `argv[1:]` directly, no implicit shell layer. `shed console` (empty argv → interactive `bash --login`) is unaffected. **Behavior change for users:** `shed exec myvm -- mytool` no longer sources `/etc/profile` or `~/.profile`, so tools installed via rustup / mise / nvm / `~/.profile` PATH additions are not on PATH by default. Workaround (same idiom Docker users use daily): `shed exec myvm -- bash -lc 'mytool'` runs an explicit login shell. The agent's existing env setup (`/etc/environment.d`, plus HOME/USER/PATH/SHELL/LANG defaults) still applies in both modes. **No agent or rootfs changes** — host-only fix; existing image blobs continue to boot unchanged.
+### Overlay-stability release
+
+v0.5.1 shipped an end-to-end-broken Linux install: the on-host
+`mkfs.erofs --tar=f -E force-inode-compact -z lz4` invocation in
+`internal/vmimage/cache.go` triggered a writer bug in `erofs-utils`
+1.7.1 (Ubuntu noble, Pop!_OS 24.04, the apt-charliek deployment
+targets — and the version most distros currently package) where
+inodes were marked as using big pcluster without the matching
+superblock feature flag. The guest kernel then rejected the rootfs
+at boot with `erofs: per-inode big pcluster without sb feature for
+nid N`, `z_erofs_read_folio: failed to read, err [-117]`. Userspace
+couldn't read /workspace and `shed create` failed at the 9P mount
+step. The Docker backend and macOS VZ stack were unaffected; only
+Linux+Firecracker was broken.
+
+v0.5.2 moves `mkfs.erofs` off the host entirely. The image producer
+mints the read-only rootfs erofs once at publish time inside the
+new pinned `shed-build-tools` container, then ships the result as a
+content-addressed OCI blob carried by a new manifest annotation.
+Hosts download the blob and mount it directly — no local
+`mkfs.erofs`, no host-distro variance in the on-disk filesystem
+layout, no ~30 s mkfs step at first `shed create`. Net disk usage
+on hosts drops ~37 % per cached image (the duplicate
+`cache/<digest>.erofs` file goes away — the blob *is* the cache).
+
+#### Breaking changes
+
+- **Pre-v0.5.2 images are rejected at boot.** Cached images from
+  v0.5.1 or earlier lack the new
+  `io.shed.rootfs.erofs.digest` annotation and fail with a precise
+  error pointing at the upgrade command. No silent fallback. **See
+  the [v0.5.1 → v0.5.2 upgrade guide](docs/upgrades/v0.5.1-to-v0.5.2.md)
+  for the required `shed image rm` / `shed-server pull-images`
+  sequence — users upgrading from v0.5.1 must wipe their cached
+  images and re-pull.**
+- **Host-side `erofs-utils` is no longer required.** Existing
+  installs can `apt remove erofs-utils` after upgrade (the deb's
+  declared `Depends:` will be relaxed in a follow-up; it currently
+  still pulls erofs-utils as a transitive courtesy, harmless dead
+  weight).
+- **`shed exec` argv handling (carried from rev 1 of this changelog;
+  same notes apply).** The backend no longer wraps non-empty argv
+  in `bash --login -c "<joined argv>"` — argv is exec'd directly,
+  Docker-style. Tools installed via rustup / mise / nvm / `~/.profile`
+  PATH additions need an explicit `shed exec name -- bash -lc 'tool'`
+  to source those startup files; the v0.5.1 wrapped path silently
+  mangled pipes, redirects, and nested quotes through the SSH
+  argv-as-string round-trip and is gone.
+
+#### Architecture
+
+- **New `ghcr.io/charliek/shed-build-tools:vX.Y.Z` image** (PR #103)
+  carries pinned versions of the binaries shed invokes during
+  image publish — currently `erofs-utils` v1.9.1 built from upstream
+  source, `mkfs.erofs` / `dump.erofs` / `fsck.erofs`. Tagged in
+  lockstep with shed-server releases. See
+  [`docs/reference/build-tools.md`](docs/reference/build-tools.md)
+  and the new `build-tools/` directory.
+- **`io.shed.rootfs.erofs.digest` annotation** (PR #104) on every
+  shed-built manifest points at the prebuilt erofs blob. Pull and
+  push paths walk the annotation alongside
+  `io.shed.kernel.digest` / `io.shed.initrd.digest` (same loose-blob
+  pattern). `resolveManifestLower` now resolves the annotation to
+  a blob path; the legacy `cache/sha256/<manifest-digest>.erofs`
+  materializer is unreachable and gets fully deleted in v0.5.3.
+- **`shed image build --build-tools-version <tag>`** pins the
+  build-tools image the CLI invokes when minting the erofs.
+  Defaults: release builds resolve to `ghcr.io/.../shed-build-tools:vX.Y.Z`
+  matching the shed CLI's own version; dev builds resolve to a
+  locally-built `shed-build-tools:dev` (no registry round-trip).
+
+#### Operations
+
+- **`resolveBaseRootfs` populates `Digest` on warm-cache hits** (PR
+  #102) so `EnsureImage` no longer returns an empty digest that
+  the backend defense layer would reject as "image resolved to a
+  path outside the blob store." Without this fix any v0.5.x
+  default `shed create` (no `--image` flag) against a server with
+  the base image already pulled would hit the defense.
+- **New `scripts/smoke-test-linux.sh` and `.github/workflows/smoke-linux.yml`**
+  (PR #105) install-only smoke that gates every push to `main` and
+  every release tag. Catches the v0.5.1 regression class (binary
+  builds + unit tests pass, fresh apt install does not).
+- **Sequenced release workflow** (PR #106) — `release.yaml` is gone;
+  the goreleaser + apt-charliek dispatch jobs now live in
+  `publish-images.yaml` after `publish-build-tools` →
+  `publish-vz` / `publish-fc` → `smoke`. Eliminates the parallel
+  race where the deb could go live on apt-charliek before its
+  referenced ghcr images existed.
+
+#### Documentation
+
+- **New `docs/reference/build-tools.md`**: shed-build-tools image
+  purpose, versioning, bump procedure.
+- **New `docs/upgrades/v0.5.1-to-v0.5.2.md`**: required wipe + pull
+  sequence, rationale for no on-host fallback, rollback notes.
+- **Refreshed `docs/reference/images.md`** and `storage-model.md`:
+  prose updated for the erofs-as-blob model; removed `mkfs.erofs`
+  prerequisite from the "what hosts need" section.
+- **`CLAUDE.md`** updated with the new model.
 
 ## v0.5.1 — 2026-05-22
 
