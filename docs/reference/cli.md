@@ -886,6 +886,30 @@ sudo shed-server setup
 
 Linux only. Not available on macOS.
 
+### shed-server doctor
+
+Runs a one-pass health report against the local shed-server install. Designed as the first diagnostic step when `shed create` or `shed-server pull-images` fail unexpectedly.
+
+```bash
+sudo shed-server doctor
+```
+
+Each check reports `PASS` / `WARN` / `FAIL`. The command exits non-zero if any `FAIL` fires.
+
+| Check | What it verifies |
+|---|---|
+| `/dev/kvm` | KVM is readable (hardware virtualization on, nested-virt enabled) |
+| `docker` | Present on PATH (used by `shed image build`, not by `shed create`) |
+| `firecracker` | `firecracker` binary installed at `/usr/local/bin/firecracker` and reports a version |
+| `server.yaml` | Config parses cleanly via `loadConfig` (same parser as `shed-server serve`) |
+| `kernel_path` | The configured kernel exists and is larger than 10 MB (sanity floor against truncated downloads) |
+| `bridge` | The bridge interface named in `firecracker.bridge_name` exists and is up |
+| `images` | Every installed tag points at a manifest with the v0.5.2+ `io.shed.rootfs.erofs.digest` annotation and the referenced blob exists locally |
+| `extensions` | Every extension named in `extensions.enabled` has its manifest under `/etc/shed-extensions.d/` |
+| `shed-server.service` | systemd unit is active |
+
+Linux only. Not available on macOS.
+
 ### shed-server pull-images
 
 Pre-caches VM images by pulling Docker refs and converting to ext4.
