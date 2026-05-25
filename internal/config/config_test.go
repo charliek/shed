@@ -1350,7 +1350,7 @@ func TestFirecrackerConfigResolveBaseRootfs(t *testing.T) {
 		}
 	})
 
-	t.Run("docker ref", func(t *testing.T) {
+	t.Run("docker ref cold cache", func(t *testing.T) {
 		cfg := &FirecrackerConfig{
 			BaseRootfs: "ghcr.io/charliek/shed-fc-default:v1.0.0",
 			ImagesDir:  t.TempDir(),
@@ -1361,6 +1361,89 @@ func TestFirecrackerConfigResolveBaseRootfs(t *testing.T) {
 		}
 		if resolved.Name != "_base" {
 			t.Errorf("Name = %q, want _base", resolved.Name)
+		}
+		if resolved.Digest != "" {
+			t.Errorf("Digest = %q, want empty on cold cache", resolved.Digest)
+		}
+	})
+
+	t.Run("docker ref warm cache populates Digest", func(t *testing.T) {
+		dir := t.TempDir()
+		ref := "ghcr.io/charliek/shed-fc-default:v1.0.0"
+		rootfsPath := installCachedBlob(t, dir, "_base", ref)
+
+		cfg := &FirecrackerConfig{BaseRootfs: ref, ImagesDir: dir}
+		resolved := cfg.ResolveBaseRootfs()
+		if resolved.Path != rootfsPath {
+			t.Errorf("Path = %q, want %q", resolved.Path, rootfsPath)
+		}
+		if resolved.Digest == "" {
+			t.Error("Digest is empty on warm cache (regression: EnsureImage needs it to refcount the blob)")
+		}
+		if resolved.DockerRef != "" {
+			t.Errorf("DockerRef = %q, want empty on warm cache", resolved.DockerRef)
+		}
+	})
+
+	t.Run("docker ref stale cache falls through to DockerRef", func(t *testing.T) {
+		dir := t.TempDir()
+		installCachedBlob(t, dir, "_base", "ghcr.io/charliek/shed-fc-default:v1.0.0")
+
+		cfg := &FirecrackerConfig{
+			BaseRootfs: "ghcr.io/charliek/shed-fc-default:v2.0.0",
+			ImagesDir:  dir,
+		}
+		resolved := cfg.ResolveBaseRootfs()
+		if resolved.DockerRef != "ghcr.io/charliek/shed-fc-default:v2.0.0" {
+			t.Errorf("DockerRef = %q, want v2.0.0 (stale source-ref should re-pull)", resolved.DockerRef)
+		}
+		if resolved.Path != "" {
+			t.Errorf("Path = %q, want empty when source-ref mismatches", resolved.Path)
+		}
+	})
+}
+
+func TestVZConfigResolveBaseRootfs(t *testing.T) {
+	t.Run("local path", func(t *testing.T) {
+		cfg := &VZConfig{BaseRootfs: "/var/lib/shed/vz/base-rootfs.ext4"}
+		resolved := cfg.ResolveBaseRootfs()
+		if resolved.Path != "/var/lib/shed/vz/base-rootfs.ext4" {
+			t.Errorf("Path = %q", resolved.Path)
+		}
+		if resolved.DockerRef != "" {
+			t.Errorf("DockerRef = %q, want empty", resolved.DockerRef)
+		}
+	})
+
+	t.Run("docker ref cold cache", func(t *testing.T) {
+		cfg := &VZConfig{
+			BaseRootfs: "ghcr.io/charliek/shed-vz-default:v1.0.0",
+			ImagesDir:  t.TempDir(),
+		}
+		resolved := cfg.ResolveBaseRootfs()
+		if resolved.DockerRef != "ghcr.io/charliek/shed-vz-default:v1.0.0" {
+			t.Errorf("DockerRef = %q", resolved.DockerRef)
+		}
+		if resolved.Name != "_base" {
+			t.Errorf("Name = %q, want _base", resolved.Name)
+		}
+	})
+
+	t.Run("docker ref warm cache populates Digest", func(t *testing.T) {
+		dir := t.TempDir()
+		ref := "ghcr.io/charliek/shed-vz-default:v1.0.0"
+		rootfsPath := installCachedBlob(t, dir, "_base", ref)
+
+		cfg := &VZConfig{BaseRootfs: ref, ImagesDir: dir}
+		resolved := cfg.ResolveBaseRootfs()
+		if resolved.Path != rootfsPath {
+			t.Errorf("Path = %q, want %q", resolved.Path, rootfsPath)
+		}
+		if resolved.Digest == "" {
+			t.Error("Digest is empty on warm cache (regression: EnsureImage needs it to refcount the blob)")
+		}
+		if resolved.DockerRef != "" {
+			t.Errorf("DockerRef = %q, want empty on warm cache", resolved.DockerRef)
 		}
 	})
 }

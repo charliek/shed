@@ -590,12 +590,38 @@ func resolveImage(images map[string]string, imagesDir, image, configKey string) 
 // resolveBaseRootfs is the shared implementation for base rootfs resolution.
 func resolveBaseRootfs(baseRootfs, imagesDir string) ResolvedImage {
 	if vmimage.IsDockerRef(baseRootfs) {
-		if cached := vmimage.Resolve(imagesDir, "_base", baseRootfs); cached != "" {
-			return ResolvedImage{Path: cached, Name: "_base"}
+		// Mirror the source-ref + Digest plumbing from resolveImage so
+		// EnsureImage receives a Digest alongside Path. Without it the
+		// backends reject the resolved image as "outside the blob store"
+		// (firecracker/client.go ~494, vz/client.go ~232) because they
+		// can't refcount a Path-only entry.
+		if imagesDir != "" {
+			if digest, cached, ok := resolveCachedBase(imagesDir, baseRootfs); ok {
+				return ResolvedImage{Path: cached, Name: "_base", Digest: digest}
+			}
 		}
 		return ResolvedImage{DockerRef: baseRootfs, Name: "_base"}
 	}
 	return ResolvedImage{Path: baseRootfs, Name: "_base"}
+}
+
+// resolveCachedBase looks up the "_base" tag and returns (digest, path)
+// when the manifest matches baseRootfs AND the cached lower image is
+// materialized on disk. Returns ok=false on any miss so the caller can
+// fall through to the DockerRef path (which forces a fresh pull).
+func resolveCachedBase(imagesDir, baseRootfs string) (string, string, bool) {
+	digest, cached, err := vmimage.ResolveTag(imagesDir, "_base")
+	if err != nil {
+		return "", "", false
+	}
+	manifest, err := vmimage.LoadManifestByDigest(imagesDir, digest)
+	if err != nil || manifest.ShedSourceRef() != baseRootfs {
+		return "", "", false
+	}
+	if _, err := os.Stat(cached); err != nil {
+		return "", "", false
+	}
+	return digest, cached, true
 }
 
 // availableImageVariants returns a sorted list of image names known to
