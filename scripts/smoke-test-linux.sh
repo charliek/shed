@@ -208,11 +208,13 @@ section "Step 4: shed-server pull-images"
 # doesn't. When the config is absent we skip pull-images with a
 # clear note rather than fail — the install-only smoke still
 # catches the binary / setup regressions that motivate this script.
+PULL_IMAGES_RESULT="skipped (no /etc/shed/server.yaml)"
 if [[ ! -f /etc/shed/server.yaml ]]; then
     warn "/etc/shed/server.yaml not present — skipping pull-images (no apt deb postinstall in --from-local mode). Install the deb (--from-apt) or write the config manually to exercise this step."
     echo "SKIPPED (no config)"
 else
     "$SHED_SERVER_BIN" pull-images --variant "$SMOKE_IMAGE" || fail "shed-server pull-images --variant $SMOKE_IMAGE"
+    PULL_IMAGES_RESULT="yes ($SMOKE_IMAGE)"
 fi
 endsection
 
@@ -236,6 +238,7 @@ if [[ -n "$SKIP_REASON" ]]; then
     echo "=== Install-only smoke summary ==="
     echo "  shed-server installed:     yes"
     echo "  shed-server setup:         yes"
+    echo "  shed-server pull-images:   $PULL_IMAGES_RESULT"
     echo "  create + exec + delete:    SKIPPED"
     echo ""
     echo "PASS (install-only)"
@@ -277,9 +280,13 @@ OUTPUT=""
 # Retry briefly: `shed create` returns once the VM is Running but
 # sshd inside the guest needs a moment more to bind :22. Five
 # attempts at 2 s spacing has been enough on every environment
-# tested so far; bump if a slower host needs it.
+# tested so far. Each attempt is bounded by SHED_EXEC_TIMEOUT
+# (default 15 s) so a wedged guest can't deadlock the smoke
+# (without the timeout, a stuck sshd or dropped vsock leaves the
+# whole script blocked on stdin from the dead VM).
+SHED_EXEC_TIMEOUT="${SHED_EXEC_TIMEOUT:-15}"
 for attempt in 1 2 3 4 5; do
-    OUTPUT="$("$SHED_BIN" exec "$SHED_NAME" -- cat /workspace/HELLO.txt 2>&1)" || true
+    OUTPUT="$(timeout "${SHED_EXEC_TIMEOUT}s" "$SHED_BIN" exec "$SHED_NAME" -- cat /workspace/HELLO.txt 2>&1)" || true
     if grep -q "$EXPECTED" <<<"$OUTPUT"; then
         break
     fi
@@ -301,8 +308,8 @@ echo ""
 echo "=== Full lifecycle smoke summary ==="
 echo "  shed-server installed:     yes"
 echo "  shed-server setup:         yes"
-echo "  shed-server pull-images:   yes (base)"
-echo "  shed create:               yes"
+echo "  shed-server pull-images:   $PULL_IMAGES_RESULT"
+echo "  shed create:               yes ($SMOKE_IMAGE)"
 echo "  shed exec (/workspace):    yes"
 echo "  shed delete:               yes"
 echo ""
