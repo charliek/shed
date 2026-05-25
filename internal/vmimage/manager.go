@@ -138,16 +138,17 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		progress("image", fmt.Sprintf("Pulling %s...", ref.DockerRef))
 	}
 
-	// Registry-direct pull is preferred. It produces a multi-layer
-	// manifest with the correct shed-overlay initrd annotation, so the
-	// resulting shed can boot via the overlay-assembly init path.
-	// `convertAndInstall` (the docker-daemon-driven fallback) flattens
-	// to a single layer and extracts Ubuntu's stock /boot/initrd.img,
-	// which doesn't understand shed.upper / shed.lowers and panics at
-	// boot. Only fall back when registry pull truly can't satisfy the
-	// ref (e.g., images pinned in a local Docker daemon, non-OCI refs).
+	// Registry-direct pull only — v0.5.2 dropped the legacy
+	// docker-daemon fallback. The fallback flattened to a single
+	// layer and extracted Ubuntu's stock /boot/initrd.img (which
+	// doesn't understand shed.upper / shed.lowers), so on the rare
+	// occasions it was actually exercised the resulting shed
+	// panicked at boot. The remaining "registry-only" failure path
+	// surfaces the underlying pull error verbatim — no silent
+	// fallback that turns a network blip into a confusing boot
+	// failure ten minutes later.
 	platform := m.cfg.GetPlatform()
-	pullResult, pullErr := PullToOCILayout(ctx, PullOptions{
+	pullResult, err := PullToOCILayout(ctx, PullOptions{
 		Ref:           ref.DockerRef,
 		ImagesDir:     imagesDir,
 		TagName:       ref.Name,
@@ -157,25 +158,10 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
 		Progress:      progress,
 	})
-	if pullErr == nil {
-		return m.resolveManifestLower(ctx, imagesDir, pullResult.ManifestDigest)
-	}
-
-	if progress != nil {
-		progress("image", fmt.Sprintf("Registry pull failed (%v); falling back to docker", pullErr))
-	}
-	log.Printf("Registry pull of %s failed (%v); falling back to docker daemon", ref.DockerRef, pullErr)
-
-	result, err := m.convertAndInstall(ctx, ref.DockerRef, ref.Name, progress)
 	if err != nil {
-		return EnsureResult{}, fmt.Errorf("registry pull and docker fallback both failed: registry=%v docker=%w", pullErr, err)
+		return EnsureResult{}, fmt.Errorf("pulling %s from registry: %w", ref.DockerRef, err)
 	}
-
-	if err := SetTag(imagesDir, ref.Name, result.ManifestDigest); err != nil {
-		return EnsureResult{}, fmt.Errorf("advancing tag %q: %w", ref.Name, err)
-	}
-
-	return m.resolveManifestLower(ctx, imagesDir, result.ManifestDigest)
+	return m.resolveManifestLower(ctx, imagesDir, pullResult.ManifestDigest)
 }
 
 // PullImage pulls a registry reference straight to the OCI layout (no
@@ -215,21 +201,7 @@ func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string
 		Progress:      progress,
 	})
 	if err != nil {
-		// Fall back to the legacy Docker-daemon flow for refs the
-		// registry path cannot satisfy (e.g. images pinned in a local
-		// Docker daemon). This keeps `shed image build --from` and
-		// hand-loaded images working during the transition.
-		if progress != nil {
-			progress("image", fmt.Sprintf("Registry pull failed (%v); falling back to docker", err))
-		}
-		convertResult, cErr := m.convertAndInstall(ctx, dockerRef, tag, progress)
-		if cErr != nil {
-			return "", fmt.Errorf("registry pull and docker fallback both failed: registry=%v docker=%w", err, cErr)
-		}
-		if err := SetTag(imagesDir, tag, convertResult.ManifestDigest); err != nil {
-			return "", fmt.Errorf("advancing tag %q: %w", tag, err)
-		}
-		return convertResult.ManifestDigest, nil
+		return "", fmt.Errorf("pulling %s from registry: %w", dockerRef, err)
 	}
 	return result.ManifestDigest, nil
 }
@@ -393,32 +365,6 @@ func (m *Manager) resolveManifestLower(_ context.Context, imagesDir, manifestDig
 		Path:   path,
 		Digest: manifestDigest,
 	}, nil
-}
-
-// convertAndInstall runs a Docker-to-OCI conversion, writes blobs into
-// the OCI layout, and returns the conversion result. The tag is NOT
-// advanced — caller is responsible.
-func (m *Manager) convertAndInstall(ctx context.Context, dockerRef, name string, progress ProgressFunc) (*ConvertResult, error) {
-	imagesDir := m.cfg.GetImagesDir()
-	if err := os.MkdirAll(imagesDir, 0o755); err != nil {
-		return nil, fmt.Errorf("creating images dir: %w", err)
-	}
-
-	result, err := Convert(ctx, ConvertOptions{
-		DockerRef:     dockerRef,
-		Name:          name,
-		ImagesDir:     imagesDir,
-		Platform:      m.cfg.GetPlatform(),
-		ExtractKernel: m.cfg.GetExtractKernel(),
-		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("converting %s: %w", dockerRef, err)
-	}
-	if progress != nil {
-		progress("image", fmt.Sprintf("Installed manifest %s", ShortDigest(result.ManifestDigest)))
-	}
-	return result, nil
 }
 
 // ListImages returns ImageInfo entries for every known tag plus dangling
