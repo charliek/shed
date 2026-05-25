@@ -912,9 +912,15 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		if info, err := os.Stat(source); err == nil && !info.IsDir() {
 			return nil, fmt.Errorf(
 				"credential %q source %s is a file, not a directory; "+
-					"only directory credentials are supported — "+
-					"use 'shed sync' for single-file configs like .gitconfig",
+					"single-file configs use `shed sync` instead — "+
+					"append to ~/.shed/sync.yaml:\n\n"+
+					"  features:\n"+
+					"    %s:\n"+
+					"      paths:\n"+
+					"        - source: %s\n"+
+					"          target: %s",
 				name, source,
+				name, source, target,
 			)
 		}
 

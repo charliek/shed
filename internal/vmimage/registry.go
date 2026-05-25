@@ -316,7 +316,12 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		opts.Progress("image", fmt.Sprintf("Fetching manifest %s...", ref.String()))
 	}
 
-	desc, err := remote.Get(ref, remoteOpts...)
+	var desc *remote.Descriptor
+	err = withRetry(ctx, "fetching manifest "+ref.String(), func() error {
+		var rerr error
+		desc, rerr = remote.Get(ref, remoteOpts...)
+		return rerr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("fetching descriptor: %w", err)
 	}
@@ -551,16 +556,25 @@ func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir st
 	if err != nil {
 		return fmt.Errorf("forming digest ref: %w", err)
 	}
-	layer, err := remote.Layer(blobRef, remoteOpts...)
-	if err != nil {
-		return fmt.Errorf("requesting layer %s: %w", digest, err)
-	}
-	rc, err := layer.Compressed()
-	if err != nil {
-		return fmt.Errorf("opening loose blob: %w", err)
-	}
-	defer rc.Close()
-	return writeBlobFromReader(imagesDir, digest, rc)
+	// Whole-blob retry: a mid-stream TCP cut leaves a partial
+	// blobs/sha256/<hex>.tmp on disk that writeBlobFromReader's
+	// rename never commits, so each retry attempt re-starts from a
+	// clean slate. Suitable for kernel + initrd + rootfs erofs
+	// blobs (all sub-100 MB); for the multi-hundred-MB rootfs
+	// layers a more granular range-resume would pay off — file a
+	// follow-up if that ever becomes the bottleneck.
+	return withRetry(ctx, "pulling loose blob "+ShortDigest(digest), func() error {
+		layer, lerr := remote.Layer(blobRef, remoteOpts...)
+		if lerr != nil {
+			return fmt.Errorf("requesting layer %s: %w", digest, lerr)
+		}
+		rc, oerr := layer.Compressed()
+		if oerr != nil {
+			return fmt.Errorf("opening loose blob: %w", oerr)
+		}
+		defer rc.Close()
+		return writeBlobFromReader(imagesDir, digest, rc)
+	})
 }
 
 // nameOptsForInsecure returns the name parsing options needed for a
