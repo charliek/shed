@@ -83,7 +83,7 @@ document is mostly about these.
 Both backends run the same ordered chain inside `CreateShed`. None of it
 is parallelized today:
 
-```
+```text
 resolve image (pull if needed)      ── network-bound, 0–minutes
   → allocate writable upper          ── sparse file + fsync
     → [FC only] allocate CID/IP/TAP  ── netlink, privileged
@@ -107,14 +107,14 @@ VZ entry points: `internal/vz/client.go:112` (`CreateShed`),
 
 ### 2b. Verified VZ numbers (this machine, 2026-05-26)
 
-```
-shed -s my-server create vztest --local-dir <tmp>   →  real 0m6.061s
+```bash
+shed -s my-server create vztest --local-dir <tmp>   #  real 0m6.061s
 ```
 
 with a warm image cache (no pull) and no `--repo`/provisioning. The
 guest rootfs at the end is:
 
-```
+```text
 overlay on / type overlay (rw, lowerdir=/lower, upperdir=/upper/data, workdir=/upper/work)
 workspace on /workspace type virtiofs (rw)
 ```
@@ -345,25 +345,36 @@ covered (≈8–11 `_test.go` files each).
 
 ## 9. Measure first — the actual prerequisite
 
-Nothing today instruments the boot phases. The wildly different
-create-time estimates in early analysis (2–5 s vs 20–45 s) exist
-precisely because the phases are invisible. **Before tuning anything,
-add phase timing to `CreateShed`** and emit it over the SSE progress
-stream that already exists (`internal/api` create handler):
+Nothing originally instrumented the boot phases. The wildly different
+create-time estimates in early analysis (2–5 s vs 20–45 s) existed
+precisely because the phases were invisible. **Before tuning anything,
+add per-phase timing to `CreateShed`** across the chain:
 
-```
+```text
 resolve-image  → upper-alloc → [net-alloc] → vmm-spawn →
 kernel-boot → agent-ready → workspace-mount → cred-mount →
 clone → provision
 ```
 
-Each phase as a timestamped SSE event. This is small, low-risk, and
-turns §3–§6 from guesswork into a ranked, data-backed backlog. It also
-gives a regression signal so later optimizations can be proven.
+Timing is captured **server-side against one clock and logged to the
+server log only** — it never travels on the SSE wire. SSE stays the
+user-facing CLI progress channel (clean phase messages); the millisecond
+breakdown is a developer signal read from the server log (over SSH for
+remote hosts). This is small, low-risk, and turns §3–§6 from guesswork
+into a ranked, data-backed backlog, plus a regression signal.
 
-Concretely: a `phase(name)` helper around each step in `CreateShed`,
-logging duration and pushing a progress event. The 6 s VZ create above
-should decompose into named phases the moment this lands.
+**Status: landed.** A `PhaseTimer` taps the existing `ProgressEvent`
+boundaries (`internal/backend/phasetimer.go`), is installed for every
+`CreateShed` (`internal/api` create handler), and logs one line per
+create. The 6 s VZ create decomposes as e.g.:
+
+```text
+timing: create name=vztest backend=vz total=5744ms setup=0ms image=5ms \
+  rootfs=3ms vm=1ms agent=5703ms mount=11ms credentials=17ms err=<nil>
+```
+
+confirming ~99 % of a warm create is the `agent` phase (guest boot incl.
+in-guest `mkfs`) — which is what §3 targets.
 
 ---
 
