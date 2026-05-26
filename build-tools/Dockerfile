@@ -88,8 +88,14 @@ FROM debian:trixie-slim
 # Runtime deps that the dynamically-linked tools need at execution time.
 # liblz4 and liblzma are the compression backends; libuuid1 provides
 # libuuid which mkfs.erofs uses for filesystem UUIDs.
+#
+# e2fsprogs supplies mkfs.ext4, used to pre-format the per-shed writable
+# upper template on the host. Cloning that template into a new shed's
+# upper lets the guest mount it directly and skip the multi-second
+# in-guest mkfs.ext4 on first boot (see internal/vz/uppertemplate.go).
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        e2fsprogs \
         liblz4-1 \
         liblzma5 \
         libuuid1 \
@@ -103,6 +109,7 @@ COPY --from=builder /usr/local/bin/fsck.erofs /usr/local/bin/fsck.erofs
 # binaries at least launch (catches obvious link errors at image-build
 # time rather than at first downstream use).
 RUN mkfs.erofs --help >/dev/null 2>&1 || (echo "mkfs.erofs smoke test failed" && exit 1)
+RUN mkfs.ext4 -V >/dev/null 2>&1 || (echo "mkfs.ext4 smoke test failed" && exit 1)
 
 # Default to mkfs.erofs so `docker run --rm shed-build-tools:tag <args>`
 # is the common case. Callers needing dump.erofs / fsck.erofs override

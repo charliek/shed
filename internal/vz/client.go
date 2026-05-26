@@ -274,6 +274,29 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		if fi, statErr := os.Stat(upperPath); statErr == nil {
 			upperSizeBytes = fi.Size()
 		}
+	} else {
+		// Clone a pre-formatted ext4 template into the upper so the guest
+		// mounts it directly and skips the multi-second in-guest mkfs on
+		// first boot. Best-effort: any failure leaves the freshly-allocated
+		// signature upper in place (formatted in-guest), so create never
+		// regresses.
+		if tmpl, terr := EnsureUpperTemplate(ctx, c.templatesDir(), resolveBuildToolsRef(), upperSizeBytes, ""); terr != nil {
+			// A canceled/timed-out request must abort, not silently fall
+			// back and keep mutating resources past the deadline.
+			if errors.Is(terr, context.Canceled) || errors.Is(terr, context.DeadlineExceeded) {
+				_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+				return nil, fmt.Errorf("upper template provisioning canceled: %w", terr)
+			}
+			log.Printf("[%s] upper template unavailable (%v); formatting in guest", req.Name, terr)
+		} else if perr := provisionUpperFromTemplate(upperPath, tmpl); perr != nil {
+			if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
+				_ = DeleteUpper(c.cfg.UppersDir, req.Name)
+				return nil, fmt.Errorf("upper template provisioning canceled: %w", perr)
+			}
+			log.Printf("[%s] upper template clone failed (%v); formatting in guest", req.Name, perr)
+		} else {
+			backend.Progress(ctx, "rootfs", "Provisioned upper from template (skips in-guest mkfs)")
+		}
 	}
 	rootfsPath := upperPath
 

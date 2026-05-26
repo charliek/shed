@@ -145,6 +145,19 @@ This is the single change that pays off across **speed, disk, and
 complexity simultaneously**, and it is a textbook "lean into platform
 differences" move.
 
+> **Status: implemented for VZ and measured (2026-05-26).** An A/B reboot
+> (fresh upper vs. reused formatted upper) isolated the in-guest
+> `mkfs.ext4` on the raw 5 GB virtio-blk device at **~4.2 s** — it is the
+> dominant cost of a fresh boot, not the cheap operation a sparse-file
+> `mkfs` test suggests. Pre-formatting the upper on the host (`mkfs.ext4`
+> in the build-tools container) and CoW-cloning it per shed
+> (`clone.CloneFile`, APFS clonefile) drops a warm-template create from
+> **~5.9 s to ~1.7 s** (ext4 mounts at 0.1 s instead of 4.3 s), with the
+> template only ~4 MB on disk for a 5 GB fs. See
+> `internal/vz/uppertemplate.go`. The Firecracker mirror (reflink) and
+> shipping a template with the image (instead of minting on the host) are
+> open follow-ups.
+
 ### 3a. What happens today
 
 Both backends allocate a per-shed sparse `upper.ext4`, stamp a
