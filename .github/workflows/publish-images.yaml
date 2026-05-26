@@ -389,3 +389,40 @@ jobs:
             -F "client_payload[package]=shed-server" \
             -F "client_payload[tag]=${{ github.ref_name }}"
           echo "::notice::Watch publish at https://github.com/charliek/apt-charliek/actions"
+
+  # Keep the committed .claude-plugin/plugin.json version in lockstep with the
+  # released tag, so Claude Code installs the right plugin version. Runs only
+  # after a real tag-push release (gated like the release job and needs it).
+  sync-version:
+    name: Commit plugin version to main
+    needs: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set plugin version from tag
+        run: scripts/set-version.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Commit and push if plugin.json drifted
+        # Idempotent: a no-op when the version was bumped by hand before
+        # tagging. The GITHUB_TOKEN push does not re-trigger workflows (GitHub
+        # blocks recursive runs).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$(git status --porcelain .claude-plugin/plugin.json)" ]; then
+            echo "plugin.json already matches ${GITHUB_REF_NAME}; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .claude-plugin/plugin.json
+          git commit -m "chore: set plugin version ${GITHUB_REF_NAME}"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
