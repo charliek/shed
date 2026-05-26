@@ -49,6 +49,23 @@ make build
 go install github.com/charliek/shed/cmd/shed@latest
 ```
 
+#### Claude Code / agent skills
+
+shed ships a skill that teaches your coding agent to drive the shed CLI (create and attach to sheds, forward ports, sync files, work across servers). Install the CLI (above) first, since the skill drives it.
+
+The general route ([`skills`](https://skills.sh)) installs into Claude Code, GitHub Copilot, OpenCode, and other agents:
+
+```bash
+npx skills add charliek/shed
+```
+
+For Claude Code, a native plugin is also available (it namespaces the skill as `shed:shed`):
+
+```text
+/plugin marketplace add charliek/shed
+/plugin install shed@shed
+```
+
 ### 2. Add a Server
 
 ```bash

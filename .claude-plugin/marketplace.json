@@ -1,0 +1,15 @@
+{
+  "name": "shed",
+  "description": "shed skills for driving the shed dev-environment CLI from your agent.",
+  "owner": {
+    "name": "Charlie Knudsen",
+    "url": "https://github.com/charliek"
+  },
+  "plugins": [
+    {
+      "name": "shed",
+      "source": "./",
+      "description": "Guidance for using the shed CLI: persistent VM-based dev environments — create, attach, tunnels, sync, and multi-server workflows."
+    }
+  ]
+}
