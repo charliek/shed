@@ -25,75 +25,81 @@ func TestUpperTemplatePathKeyedBySize(t *testing.T) {
 
 func TestHasExt4MagicAndValidTemplate(t *testing.T) {
 	dir := t.TempDir()
-	size := int64(2048)
+	const size = int64(2048)
 
-	// A file with the ext4 magic (0x53 0xEF) at offset 1080.
+	ext4 := make([]byte, size)
+	ext4[1080] = 0x53
+	ext4[1081] = 0xEF
+
+	tests := []struct {
+		name      string
+		content   []byte
+		write     bool // false => file does not exist
+		wantMagic bool
+		wantValid bool // validTemplate(path, size)
+	}{
+		{name: "ext4_magic_present", content: ext4, write: true, wantMagic: true, wantValid: true},
+		{name: "zeroed_no_magic", content: make([]byte, size), write: true, wantMagic: false, wantValid: false},
+		{name: "too_short_for_magic", content: []byte("hi"), write: true, wantMagic: false, wantValid: false},
+		{name: "missing_file", write: false, wantMagic: false, wantValid: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name+".img")
+			if tc.write {
+				if err := os.WriteFile(path, tc.content, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := hasExt4Magic(path); got != tc.wantMagic {
+				t.Errorf("hasExt4Magic = %v, want %v", got, tc.wantMagic)
+			}
+			if got := validTemplate(path, size); got != tc.wantValid {
+				t.Errorf("validTemplate = %v, want %v", got, tc.wantValid)
+			}
+		})
+	}
+
+	// A correctly-formed template must also be rejected on a size mismatch.
 	good := filepath.Join(dir, "good.img")
-	buf := make([]byte, size)
-	buf[1080] = 0x53
-	buf[1081] = 0xEF
-	if err := os.WriteFile(good, buf, 0o644); err != nil {
+	if err := os.WriteFile(good, ext4, 0o644); err != nil {
 		t.Fatal(err)
-	}
-	if !hasExt4Magic(good) {
-		t.Error("expected ext4 magic to be detected")
-	}
-	if !validTemplate(good, size) {
-		t.Error("expected good file to be a valid template")
 	}
 	if validTemplate(good, size+1) {
 		t.Error("size mismatch must invalidate the template")
 	}
-
-	// A file without the magic.
-	bad := filepath.Join(dir, "bad.img")
-	if err := os.WriteFile(bad, make([]byte, size), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if hasExt4Magic(bad) {
-		t.Error("did not expect ext4 magic in a zeroed file")
-	}
-
-	// A short file (no byte at offset 1080).
-	short := filepath.Join(dir, "short.img")
-	if err := os.WriteFile(short, []byte("hi"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if hasExt4Magic(short) {
-		t.Error("short file cannot carry the magic")
-	}
-
-	if validTemplate(filepath.Join(dir, "missing.img"), size) {
-		t.Error("missing file is not a valid template")
-	}
 }
 
 func TestResolveBuildToolsRef(t *testing.T) {
-	t.Setenv("SHED_BUILD_TOOLS_REF", "shed-build-tools:dev")
-	if got := resolveBuildToolsRef(); got != "shed-build-tools:dev" {
-		t.Errorf("env override not honored: got %q", got)
-	}
-
-	t.Setenv("SHED_BUILD_TOOLS_REF", "")
 	orig := version.Version
 	t.Cleanup(func() { version.Version = orig })
 
-	version.Version = "v0.5.3"
-	if got := resolveBuildToolsRef(); got != "ghcr.io/charliek/shed-build-tools:v0.5.3" {
-		t.Errorf("release version: got %q", got)
+	tests := []struct {
+		name    string
+		envRef  string
+		ver     string
+		wantRef string
+	}{
+		{name: "env_override_wins", envRef: "shed-build-tools:dev", ver: "v0.5.3", wantRef: "shed-build-tools:dev"},
+		{name: "release_version", envRef: "", ver: "v0.5.3", wantRef: "ghcr.io/charliek/shed-build-tools:v0.5.3"},
+		{name: "dev_version_none", envRef: "", ver: "dev", wantRef: ""},
+		{name: "dirty_version_none", envRef: "", ver: "v0.5.3-2-g493976f-dirty", wantRef: ""},
+		{name: "untagged_commit_none", envRef: "", ver: "v0.5.3-5-gabcdef0", wantRef: ""},
 	}
-
-	for _, dev := range []string{"dev", "v0.5.3-2-g493976f-dirty", "v0.5.3-5-gabcdef0"} {
-		version.Version = dev
-		if got := resolveBuildToolsRef(); got != "" {
-			t.Errorf("dev/dirty version %q should yield no ref, got %q", dev, got)
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SHED_BUILD_TOOLS_REF", tc.envRef)
+			version.Version = tc.ver
+			if got := resolveBuildToolsRef(); got != tc.wantRef {
+				t.Errorf("resolveBuildToolsRef() = %q, want %q", got, tc.wantRef)
+			}
+		})
 	}
 }
 
 func TestEnsureUpperTemplateNoRef(t *testing.T) {
-	// With no build-tools ref, EnsureUpperTemplate must error (caller
-	// then falls back to in-guest mkfs) rather than attempting docker.
+	// With no build-tools ref, EnsureUpperTemplate must error (caller then
+	// falls back to in-guest mkfs) rather than attempting docker.
 	if _, err := EnsureUpperTemplate(t.Context(), t.TempDir(), "", 5<<30, ""); err == nil {
 		t.Error("expected error when build-tools ref is empty")
 	}
