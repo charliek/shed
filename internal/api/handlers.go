@@ -141,7 +141,10 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	shed, err := s.backend.CreateShed(r.Context(), req)
+	timer := s.createTimer(req)
+	ctx := backend.ContextWithProgress(r.Context(), timer.Track)
+	shed, err := s.backend.CreateShed(ctx, req)
+	log.Printf("timing: %s", timer.Finish(err))
 	if err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
 		code, errCode, msg := mapBackendError(err)
@@ -150,6 +153,15 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, shed)
+}
+
+// createTimer returns a PhaseTimer labelled for a CreateShed operation.
+// The timer is installed for every create (SSE or not) so the per-phase
+// breakdown always lands in the server log, independent of whether a
+// client is streaming progress.
+func (s *Server) createTimer(req config.CreateShedRequest) *backend.PhaseTimer {
+	return backend.NewPhaseTimer(
+		fmt.Sprintf("create name=%s backend=%s", req.Name, s.backend.Type()), nil)
 }
 
 // handleCreateShedSSE streams create progress as Server-Sent Events.
@@ -165,15 +177,19 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	timer := s.createTimer(req)
 	events := make(chan backend.ProgressEvent, 16)
-	progressFn := func(event backend.ProgressEvent) {
+	sseFn := func(event backend.ProgressEvent) {
 		select {
 		case events <- event:
 		default:
 		}
 	}
 
-	ctx := backend.ContextWithProgress(r.Context(), progressFn)
+	// Tee the progress stream: the timer records per-phase durations
+	// server-side (logged below), while sseFn forwards the human-readable
+	// messages to the streaming client. Timing never goes on the wire.
+	ctx := backend.ContextWithProgress(r.Context(), backend.TeeProgress(timer.Track, sseFn))
 
 	type createResult struct {
 		shed *config.Shed
@@ -211,6 +227,8 @@ drain:
 			break drain
 		}
 	}
+
+	log.Printf("timing: %s", timer.Finish(res.err))
 
 	if res.err != nil {
 		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, res.err)

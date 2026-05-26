@@ -18,6 +18,8 @@ import (
 // key. Built-in defaults cover GitHub; extras come from
 // ServerConfig.Git.ExtraKnownHosts.
 func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.ServerConfig, repo string) error {
+	backend.Progress(ctx, "clone", "Cloning repository...")
+
 	if config.IsSSHRepoURL(repo) {
 		if err := WriteKnownHosts(ctx, agent, BuildKnownHosts(serverCfg)); err != nil {
 			return fmt.Errorf("failed to seed known_hosts: %w", err)

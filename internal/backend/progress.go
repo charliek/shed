@@ -34,3 +34,25 @@ func ProgressWarning(ctx context.Context, phase, message string) {
 		fn(ProgressEvent{Phase: phase, Message: message, Warning: true})
 	}
 }
+
+// TeeProgress returns a ProgressFunc that forwards each event to every
+// non-nil fn, in order. It returns nil when no non-nil fn is supplied, so
+// callers can pass the result straight to ContextWithProgress. This lets
+// a single operation feed both a server-side consumer (e.g. PhaseTimer)
+// and the SSE writer from one progress stream.
+func TeeProgress(fns ...ProgressFunc) ProgressFunc {
+	live := make([]ProgressFunc, 0, len(fns))
+	for _, fn := range fns {
+		if fn != nil {
+			live = append(live, fn)
+		}
+	}
+	if len(live) == 0 {
+		return nil
+	}
+	return func(e ProgressEvent) {
+		for _, fn := range live {
+			fn(e)
+		}
+	}
+}

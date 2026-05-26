@@ -224,6 +224,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 		// Ensure image is available locally (pulls + converts Docker refs if needed).
 		// We only need the digest — the rootfs path is rederived per-boot inside vm.go.
+		backend.Progress(ctx, "image", "Resolving image...")
 		_, ldigest, err := c.EnsureImage(ctx, resolved)
 		if err != nil {
 			return nil, err
