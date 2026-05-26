@@ -478,6 +478,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			resolved = c.cfg.ResolveBaseRootfs()
 		}
 
+		backend.Progress(ctx, "image", "Resolving image...")
 		mgr := vmimage.NewManager(c.cfg, c.refScanner())
 		ensureRes, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 			Path:      resolved.Path,

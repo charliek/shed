@@ -94,12 +94,20 @@ func (c *AgentClient) CheckHealth(ctx context.Context) error {
 	return nil
 }
 
+// healthPollInterval is how often WaitForHealth re-probes the agent. The
+// floor of detection latency is one interval, so this bounds the dead time
+// between the agent actually coming up and the host noticing. Kept small
+// because each probe is a cheap local Unix-socket dial.
+const healthPollInterval = 150 * time.Millisecond
+
 // WaitForHealth waits until the agent is healthy or the context is cancelled.
 func (c *AgentClient) WaitForHealth(ctx context.Context, timeout time.Duration) error {
+	backend.Progress(ctx, "agent", "Waiting for agent to come up...")
+
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(healthPollInterval)
 	defer ticker.Stop()
 
 	for {
