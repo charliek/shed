@@ -533,8 +533,11 @@ and `ssh-keygen`'s `getrandom()` blocks until then.
 
 ### Risk / reward call
 
-**Reward:** ~0.7–1 s off every create, on **both** backends (shared unit).
-High, and it's the top remaining cost.
+**Reward:** firstboot's blame time is 0.967 s (VZ) / 1.361 s (FC), but the
+*realized* create win is smaller because of boot overlap — measured at
+**~0.5 s on VZ** post-Phase-2 (firstboot exits 0.859 s, agent starts
+0.899 s), more on FC. Still the top remaining create-time cost, and it's a
+shared unit (one change helps both backends).
 
 **Risk:** the fix is a **systemd-ordering change to the reliability-critical
 first-boot path** — exactly the "key feature" that must stay correct.
