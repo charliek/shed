@@ -52,8 +52,11 @@ With `mkfs` handled, the dominant remaining create cost is **guest
 userspace boot to agent-healthy**, and the single biggest unit is the
 **shared** `shed-firstboot.service`: **~1.36 s on Firecracker, ~0.97 s on
 VZ**. Because the guest image is identical on both backends, one change
-here speeds up *both*. Investigated in §12 (with an explicit risk/reward
-call, since reliable first boot is a hard requirement).
+here speeds up *both*. Investigated in §12 — validation surfaced a
+**blocker**: the reorder exposes a latent `network-setup.sh`
+interface-rename race that firstboot's slow keygen had been incidentally
+masking (30 s hang). Revised call: **fix `network-setup.sh` first**, then
+the firstboot reorder is safe. The reorder branch is left unmerged.
 
 ---
 
@@ -443,7 +446,8 @@ in-guest `mkfs`) — which is what §3 targets.
 | 2 | Host-side CoW template upper, VZ (§3) | speed + disk + simplicity | medium | ✅ landed (#119) |
 | — | Firecracker CoW-upper mirror | speed (Linux) | medium | ❌ ruled out — FC `mkfs` ~0.18 s (§0) |
 | — | Guest `mkfs`/overlay sub-event (1c) | observability | medium | ❌ shelved — lump too small now (§0) |
-| 3 | **`shed-firstboot` time-to-agent (§12)** | **speed (both)** | **see §12** | 🔎 under investigation |
+| 3a | **`network-setup.sh` interface-rename fix (§12)** | **stability + unblocks 3b** | low–med | 🔎 prereq found during firstboot validation |
+| 3b | `shed-firstboot` time-to-agent reorder (§12) | speed (both) | med | ⛔ blocked on 3a (reorder alone → 30s net hang); branch unmerged |
 | 4 | Reaping / stop correctness (§5a) | stability | medium | open |
 | 5 | Workspace mount retry (§5c) | stability | low | open |
 | 6 | Parallelize create prefix (§4.1) | speed | medium | open |
@@ -541,19 +545,48 @@ regen, every shed would serve identical (shared) host keys — a security
 regression. So the keygen-before-sshd ordering is the invariant that must
 be validated, not just asserted.
 
-**Call: PROCEED to implement + validate on both platforms + review, then
-merge.** Validation is feasible without a registry republish: VZ via a
-locally-built rootfs image on the mac, Firecracker via a build on mini3
-(sudo over tailscale). The bar before merge: **≥2 shed creates per
-platform** with the per-phase timing showing the `agent`/create win,
-**plus a host-key-uniqueness check** across two sheds (proving keygen
-still runs before sshd and per-shed). The safe design is the **split**
-(hostname/identity stays early and fast — it needs no randomness, so it
-never blocks; `ssh-keygen` moves to a unit ordered before `sshd` only),
-which preserves every correctness invariant (hostname-before-keys,
-keys-before-sshd) while taking the `crng`-blocked keygen off the create
-path. (Shipping still requires an image republish at release time, but
-that's the normal release path, not a validation blocker.)
+**Original call (2026-05-27): proceed + validate.** Superseded by the
+validation finding below.
+
+### Validation finding (2026-05-27): exposed a latent network-setup race — DO NOT ship alone
+
+Implemented the reorder (`Before=ssh.service` only;
+branch `optimize/firstboot-ordering`), built a VZ `base` image locally,
+and created sheds. Outcome:
+
+- **Security invariant held**: `ssh.service` started at 1.333 s, after
+  `shed-firstboot` exited at 1.322 s — per-shed keygen still completes
+  before sshd.
+- **But create took ~31 s** (`shed-agent` started at 30.8 s).
+  `network-setup.service` hung for **30.3 s**, and the agent waits on it.
+
+**Mechanism.** `vz/network-setup.sh` resolves the NIC name, but the kernel
+renames `eth0 → enp0s1` (predictable naming) at **0.603 s**. Originally
+`shed-firstboot` was `Before=network-setup.service`, so its slow
+`crng`-blocked keygen delayed network-setup until *after* the rename —
+network-setup saw `enp0s1` and worked. Removing that edge let network-setup
+start at **0.384 s**, *before* the rename; it captured `eth0`, which then
+vanished ("Device eth0 does not exist"), and it polled for 30 s.
+
+So **firstboot's early-blocking was accidentally masking a latent
+interface-rename race in `network-setup.sh`** (it captures the interface
+name once instead of re-resolving / waiting for udev to settle).
+
+**Revised call: do NOT ship the firstboot reorder on its own.** It turns a
+hidden race into a 30 s hang. The reward (~0.5 s on VZ, more on FC) does
+not justify shipping a two-part change to the boot path unsupervised.
+Sequence instead:
+
+1. **Fix `network-setup.sh` first** (both backends — the FC one hardcodes
+   `eth0` too): re-resolve the interface each poll iteration, or order the
+   unit `After=systemd-udev-settle.service` / a `*.device` unit, so it can
+   never latch a name that udev later renames. This is a standalone
+   robustness fix and removes a real latent bug (any future change that
+   shifts network-setup earlier would hit it).
+2. **Then** the firstboot reorder is safe, and the two can be validated
+   together (≥2 creates per platform + timing + host-key uniqueness).
+
+The branch `optimize/firstboot-ordering` is left **unmerged** pending (1).
 
 ---
 
