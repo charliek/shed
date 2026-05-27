@@ -6,37 +6,33 @@
 
 set -e
 
-# Wait for a network interface to be available
+# Wait for a network interface to come up with an IPv4 address (DHCP via
+# systemd-networkd). The interface name is RE-RESOLVED every iteration: the
+# kernel renames the NIC shortly after it first appears (e.g. eth0 -> enp0s1),
+# so latching the name once can leave us polling a device that no longer
+# exists for the full timeout. This matters whenever network-setup runs early
+# in boot (it raced the rename and hung ~30s). See
+# docs/discovery/platform-runtime-optimization.md §12.
 INTERFACE=""
-for i in $(seq 1 15); do
-    # VZ presents the NIC as enp0sN or similar
+IP_ADDR=""
+for i in $(seq 1 30); do
+    # VZ presents the NIC as enp0sN or similar; re-resolve each pass.
     INTERFACE=$(ip -o link show | grep -v 'lo:' | awk -F': ' '{print $2}' | head -1)
     if [ -n "$INTERFACE" ]; then
-        break
-    fi
-    echo "Waiting for network interface..."
-    sleep 1
-done
-
-if [ -z "$INTERFACE" ]; then
-    echo "WARNING: No network interface found, continuing without network"
-fi
-
-# Wait for an IP address (DHCP via systemd-networkd)
-if [ -n "$INTERFACE" ]; then
-    for i in $(seq 1 30); do
         IP_ADDR=$(ip -4 addr show "$INTERFACE" | grep -oP 'inet \K[0-9.]+' || true)
         if [ -n "$IP_ADDR" ]; then
             echo "Network ready: interface=$INTERFACE ip=$IP_ADDR"
             break
         fi
-        echo "Waiting for DHCP on $INTERFACE..."
-        sleep 1
-    done
-
-    if [ -z "$IP_ADDR" ]; then
-        echo "WARNING: No IP address assigned via DHCP"
     fi
+    echo "Waiting for network (interface=${INTERFACE:-none})..."
+    sleep 1
+done
+
+if [ -z "$INTERFACE" ]; then
+    echo "WARNING: No network interface found, continuing without network"
+elif [ -z "$IP_ADDR" ]; then
+    echo "WARNING: No IPv4 address assigned via DHCP on $INTERFACE"
 fi
 
 # Ensure /etc/resolv.conf points to systemd-resolved stub.
