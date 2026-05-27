@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.4 — 2026-05-27
+
+A performance-and-robustness pass on shed creation, plus plugin
+distribution. Drop-in upgrade from v0.5.3 — no config or on-disk format
+changes.
+
+### New
+
+- **Copy-on-write upper on macOS/VZ** (PR #119). A new shed's writable
+  upper is now cloned (APFS `clonefile`) from a pre-formatted ext4
+  template instead of being formatted inside the guest on first boot.
+  That removes the multi-second in-guest `mkfs.ext4` from the boot
+  critical path — a warm-cache `shed create` on Apple Silicon drops from
+  ~5.9s to ~1.7s. The template is minted once via `mkfs.ext4` in the
+  `shed-build-tools` container (which now ships `e2fsprogs`) and is
+  sparse (~4 MB on disk for a 5 GB filesystem). Best-effort with a safe
+  fallback to in-guest formatting, so creation never regresses. VZ only;
+  Firecracker's in-guest `mkfs` is already fast (~0.2s) and is unchanged.
+
+- **Per-phase create timing** (PR #118). `shed-server` logs one
+  structured timing line per `shed create`, breaking the operation into
+  named phases (image, rootfs, vm, agent, mounts, …). Server-log only —
+  the CLI output is unchanged; this is a developer signal for seeing
+  where create time goes. The agent health-poll interval was also
+  tightened (500ms → 150ms).
+
+- **Distributable Claude Code plugin** (PR #117). shed ships as a
+  Claude Code plugin.
+
+### Fixed
+
+- **network-setup interface-rename robustness** (PR #123).
+  `network-setup.sh` now re-resolves the network interface on each poll
+  rather than latching a name the kernel may rename (`eth0 → enp0s1`),
+  and the Firecracker script detects the interface dynamically instead
+  of hardcoding `eth0`. Prevents a ~30s boot stall if network setup runs
+  before the rename — a latent issue today, and a prerequisite for moving
+  first-boot identity setup off the create critical path.
+
 ## v0.5.3 — 2026-05-25
 
 Follow-up to v0.5.2's architectural fix. Two small features and a
