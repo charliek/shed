@@ -22,13 +22,37 @@ structurally the same. Lean into each platform's native primitives.
 This section supersedes the original priorities below where they conflict;
 the later sections are kept for the reasoning trail.
 
-### Landed
+### Released
+
+- **v0.5.4** — shipped Phase 1 instrumentation (#118), Phase 2 CoW upper
+  (#119), the network-setup fix (#123), and plugin distribution (#117).
+  **Caveat:** Phase 2 was silently *inert* on fresh installs — see the
+  build-tools-ref regression below.
+- **v0.5.5** — fixes the Phase 2 activation (#124). **The VZ create
+  speedup actually works as of 0.5.5.** Verified on the shipped brew
+  binary from a clean state: warm `shed create` ~1.6 s (vs ~5.9 s pre-Phase-2).
+
+> **Release rule going forward:** do NOT cut a release without discussion.
+
+### Landed (on `main`)
 
 - **Boot-phase instrumentation** (§9, PR #118) — server-side `PhaseTimer`
   logs one per-phase line per `CreateShed`. This is what made everything
   below measurable rather than guessed.
 - **Host-side CoW template upper, VZ only** (§3, PR #119) — drops a warm
   VZ create from **~5.9 s → ~1.7 s** by skipping the in-guest `mkfs`.
+- **`network-setup.sh` interface-rename fix** (item 3a, PR #123) —
+  re-resolves the NIC name instead of latching one udev may rename
+  (`eth0→enp0s1`). Validated on **both** VZ and Firecracker. Robustness
+  fix + prerequisite for 3c.
+- **build-tools ref v-prefix fix** (PR #124) — the activation fix for
+  Phase 2; see §12.1.
+
+> **Lesson (§12.1):** Phase 2 looked validated but wasn't, because dev
+> testing used the `SHED_BUILD_TOOLS_REF` override and a cached template —
+> both of which bypassed the real version-derived code path. The path that
+> actually ships was never exercised until a clean-state, release-version
+> test. **Validate the shipping path, not an overridden one.**
 
 ### Measured and ruled out
 
@@ -56,13 +80,13 @@ found **firstboot is *not* the bottleneck**: the agent's real gate is
 vsock-only — it doesn't need an IP at all. Two byproducts of that
 investigation:
 
-- A latent `network-setup.sh` interface-rename race (`eth0→enp0s1`) — now
-  fixed (re-resolve the interface; validated on VZ, item 3a). The firstboot
+- The latent `network-setup.sh` interface-rename race (`eth0→enp0s1`) is
+  **fixed and shipped** (item 3a, #123, both platforms). The firstboot
   reorder is **dropped** (validated as not a win).
-- **The real ~1 s win (item 3c):** decouple *agent-healthy* (vsock) from
-  *network-ready* (DHCP), gating `--repo` clone / provisioning on network
-  separately. A create-flow change — designed in §12, needs sign-off +
-  both-platform validation.
+- **The real ~1 s win is item 3c** (the top remaining target): decouple
+  *agent-healthy* (vsock) from *network-ready* (DHCP), gating `--repo`
+  clone / provisioning on network separately. Concrete design + a
+  ready-to-run kickoff plan are in **§13**.
 
 ---
 
@@ -448,13 +472,13 @@ in-guest `mkfs`) — which is what §3 targets.
 
 | # | Item | Goal(s) | Risk | Status |
 |---|---|---|---|---|
-| 1 | Boot-phase instrumentation (§9) | speed (enables all) | low | ✅ landed (#118) |
-| 2 | Host-side CoW template upper, VZ (§3) | speed + disk + simplicity | medium | ✅ landed (#119) |
+| 1 | Boot-phase instrumentation (§9) | speed (enables all) | low | ✅ shipped v0.5.4 (#118) |
+| 2 | Host-side CoW template upper, VZ (§3) | speed + disk + simplicity | medium | ✅ shipped & working v0.5.5 (#119 + activation fix #124) |
 | — | Firecracker CoW-upper mirror | speed (Linux) | medium | ❌ ruled out — FC `mkfs` ~0.18 s (§0) |
 | — | Guest `mkfs`/overlay sub-event (1c) | observability | medium | ❌ shelved — lump too small now (§0) |
-| 3a | `network-setup.sh` interface-rename fix (§12) | stability/robustness | low–med | ✅ validated on VZ (`5008d5a`); pending FC validation before merge |
+| 3a | `network-setup.sh` interface-rename fix (§12) | stability/robustness | low–med | ✅ shipped v0.5.5 (#123), validated VZ + FC |
 | 3b | ~~`shed-firstboot` time-to-agent reorder~~ | speed | — | ❌ dropped — validated as NOT a win; agent's real gate is network-setup→DHCP, not firstboot (§12) |
-| 3c | **Decouple agent-healthy from network-setup/DHCP (§12)** | **speed (~1s, both)** | med–high | 🔎 the real win; create-flow change (clone/provision must gate on network-ready) — needs design + both-platform validation |
+| **3c** | **Decouple agent-healthy from network-setup/DHCP (§12, §13)** | **speed (~1s on plain create, both)** | med–high | 🔎 **TOP REMAINING** — designed (§13); create-flow change, clone/provision gate on network-ready |
 | 4 | Reaping / stop correctness (§5a) | stability | medium | open |
 | 5 | Workspace mount retry (§5c) | stability | low | open |
 | 6 | Parallelize create prefix (§4.1) | speed | medium | open |
@@ -464,10 +488,12 @@ in-guest `mkfs`) — which is what §3 targets.
 | 10 | Honest `GetNetworkEndpoint` (§7) | simplicity | low–med | open |
 | 11 | composefs (§6.5) | disk | high | open |
 
-**Next:** item **3c** — decouple agent-healthy from `network-setup`/DHCP
-(§12), the real ~1 s create win now that firstboot is ruled out as the
-bottleneck. Land the 3a network-setup fix (pending FC validation) first.
-#4/#5 remain a parallel stability track.
+**Next:** item **3c** (§13 has the kickoff plan) — the real ~1 s win for
+plain `shed create`, both backends. After that, the open items split into a
+**speed** track (#6 parallelize create prefix, #7 finish event-driven
+readiness) and a **stability** track (#4 reaping/stop, #5 mount retry, #8
+FC network hardening), plus **disk** (#9 cache eviction) and **simplicity**
+(#10 honest GetNetworkEndpoint). #11 composefs stays deferred.
 
 ---
 
@@ -637,6 +663,36 @@ decoupling).
 
 ---
 
+## 12.1 build-tools-ref regression — the v0.5.4 Phase-2 miss
+
+v0.5.4 shipped Phase 2 but it was **inert on fresh installs**. The upper
+template is minted by `mkfs.ext4` in the `shed-build-tools` container, and
+the VZ code resolved that image ref by string-concatenating
+`version.Version`: `"ghcr.io/charliek/shed-build-tools:" + Version`.
+Release binaries embed `Version="0.5.4"` (no leading `v`), but the
+published tags are **v-prefixed** (`v0.5.4`). So the mint requested
+`:0.5.4` → `docker ... exit status 125` → fall back to slow in-guest
+`mkfs.ext4`. A clean v0.5.4 `shed create` ran ~6.4 s, not the advertised
+~1.7 s.
+
+Root causes:
+
+1. **Divergent duplicated logic.** `cmd/shed/image.go` resolved the ref
+   correctly (v-prefix + a `^v?\d+\.\d+\.\d+$` regex); `internal/vz`
+   reimplemented it and got the prefix wrong. Fix (#124): one canonical
+   resolver, `version.BuildToolsRefForTag` / `version.ReleaseBuildToolsRef`,
+   used by both call sites.
+2. **The test exercised an overridden path, not the shipping path.** All
+   "Phase 2 works" validation used `SHED_BUILD_TOOLS_REF=shed-build-tools:dev`
+   (env override, bypasses version resolution) and/or a cached template
+   from a prior run (skips the mint entirely). The version-derived mint —
+   the only path a real release takes — was never run until a clean-state,
+   release-version (`Version=0.5.4`) test. **When validating, reproduce the
+   shipping path: no overrides, no warm caches, a release-shaped version.**
+
+Fixed in #124, shipped in v0.5.5; verified on the shipped brew binary from
+a clean state (template minted via `build-tools:v0.5.5`, create ~1.6 s).
+
 ### Appendix B: follow-up measurements (2026-05-27)
 
 VZ (this mac), in-guest `mkfs` A/B via stop/start:
@@ -665,3 +721,90 @@ blame time ≠ critical-path time: §12 found the agent's actual gate is
 Firecracker-specific timings and line-level claims (§2c, §5b) are from
 code review and need confirmation on a Linux/KVM host (e.g. `mini2` /
 `mini3`).
+
+---
+
+## 13. Next session: 3c kickoff plan (decouple agent-healthy from network/DHCP)
+
+**Goal.** `shed-agent` talks over **vsock and needs no IP**, but
+`network-setup.service` is `Before=shed-agent.service`, so the agent (and
+thus `shed create`) waits ~1 s for DHCP it doesn't need. Decouple them so a
+**plain `shed create` is ~1 s faster on both backends** (~1.7 s → ~0.7 s on
+VZ; ~3.7 s → ~2.7 s on FC). `--repo` / provisioning creates stay the same
+(they wait for the network right before they use it).
+
+### Create-flow facts (verified, do not re-derive)
+
+- Order in `internal/vz/client.go` `CreateShed` (FC analogous): `vm.Start`
+  → `agent.WaitForHealth` (gates create) → mount workspace (VirtioFS/9P,
+  vsock) → `SetupCredentials` (vsock) → `CloneRepo` (`git clone` — **needs
+  network**) → `RunProvisioning` (hooks — **may need network**).
+- `shed-agent.service` is `After=network.target` (passive). What makes it
+  wait for DHCP is `network-setup.service` being `Before=shed-agent.service`
+  (`vz/network-setup.service`, `firecracker/network-setup.service`).
+- Today, network-readiness before clone/provision is *implicit* (the agent
+  waited for network-setup). Decoupling removes that guarantee, so the
+  create flow must re-establish it explicitly — **this is the correctness
+  crux.**
+
+### Design
+
+1. **Boot ordering (guest, both backends):** remove `shed-agent.service`
+   from `network-setup.service`'s `Before=` so the agent starts as soon as
+   its own deps are met (early), not after DHCP. (Leave network-setup
+   itself running; just stop it gating the agent.)
+2. **Create flow (server):** before `CloneRepo` and before
+   `RunProvisioning`, wait for guest network-ready — only when those steps
+   actually run. A plain create skips the wait entirely. Implement once in
+   shared code (`internal/vmutil`) so VZ and FC share it; the check can
+   `agent.Exec` a tiny guest probe (poll for a default route / an IPv4
+   address, bounded timeout) or wait on `network-online.target`.
+3. Keep the existing per-phase timing; add a `network-wait` phase so the
+   win (and the `--repo` cost) are both visible in the server log.
+
+### Mandatory process for this work (per the owner)
+
+- **PR / review / merge:** open a PR, run **`/git-commands:watch-pr`**,
+  ensure a real review (CodeRabbit; if it's rate-limited/out of credits,
+  fall back to **`/codex:rescue`** then **`/cursor:review`**, or a
+  sub-agent self-review), address findings, then **`/git-commands:merge-pr`**
+  once green. See memory `pr-code-review-workflow`.
+- **No release without discussion.** Land 3c on `main`; do **not** tag a
+  release. (Note: like all guest-image changes, 3c only takes effect once
+  images are rebuilt at the next release.)
+- **Benchmark the expected benefit on BOTH OSes**, the same way the prior
+  items were validated: capture before/after per-phase timing showing the
+  agent/create win on **mac (VZ)** and **Linux (FC, mini3)**. Reproduce the
+  **shipping path** — no `SHED_BUILD_TOOLS_REF` override, no warm template
+  cache, a release-shaped version when build-tools is involved (see §12.1).
+- **Before each PR, start at least 2 sheds on each OS** (VZ on the mac, FC
+  on mini3) and confirm they boot and work — including at least one
+  **`--repo` create per OS** (the correctness crux: clone must still have
+  the network).
+
+### Gotchas / risks
+
+- Validating a guest-unit change needs the unit in the booted image: build
+  a rootfs image (VZ locally; FC on mini3 — note **mini3 has no `go`
+  toolchain**, so either install Go, cross-compile `shed-agent` on the mac
+  and stage it, or exercise the changed unit on a real boot via an
+  **overlay override** of the unit file, as done for the network-setup fix).
+- The network-ready probe must be reliable and bounded (don't reintroduce a
+  30 s hang); fail with a clear error, not an indefinite wait.
+- Confirm nothing else between agent-healthy and clone implicitly assumes
+  the network is up.
+
+### Ready-to-paste kickoff prompt for a new session
+
+> Implement roadmap item **3c** from
+> `docs/discovery/platform-runtime-optimization.md` (§13): decouple
+> `shed-agent` (vsock, needs no IP) from `network-setup`/DHCP so a plain
+> `shed create` is ~1 s faster on both backends, while `--repo` clone and
+> provisioning still wait for the network. Follow the design and the
+> mandatory process in §13: PR → `/git-commands:watch-pr` → review (
+> CodeRabbit, else `/codex:rescue` / `/cursor:review` / sub-agent) →
+> `/git-commands:merge-pr`; **no release without discussion**; benchmark
+> before/after per-phase timing on **both mac (VZ) and Linux (FC/mini3)**
+> reproducing the shipping path; and **before each PR, start ≥2 sheds on
+> each OS** (including one `--repo` create per OS) to confirm no
+> regression. Read §0, §12, §12.1, and §13 first for context.
