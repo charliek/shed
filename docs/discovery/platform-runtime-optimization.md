@@ -464,9 +464,10 @@ in-guest `mkfs`) — which is what §3 targets.
 | 10 | Honest `GetNetworkEndpoint` (§7) | simplicity | low–med | open |
 | 11 | composefs (§6.5) | disk | high | open |
 
-**Next:** the `shed-firstboot` path (§12) is the largest remaining
-create-time cost and is shared across both backends. #4/#5 remain a
-parallel stability track.
+**Next:** item **3c** — decouple agent-healthy from `network-setup`/DHCP
+(§12), the real ~1 s create win now that firstboot is ruled out as the
+bottleneck. Land the 3a network-setup fix (pending FC validation) first.
+#4/#5 remain a parallel stability track.
 
 ---
 
@@ -656,8 +657,10 @@ Firecracker (mini3, fresh upper):
 - Trivial create wall time **~3.7 s** (kernel+initramfs ~0.7 s, rest is
   userspace to agent-healthy).
 
-`shed-firstboot.service` is the biggest userspace unit on both
-(Firecracker 1.361 s, VZ 0.967 s) and is a shared guest unit — see §12.
+`shed-firstboot.service` is the biggest single userspace unit by
+`systemd-analyze blame` on both (Firecracker 1.361 s, VZ 0.967 s) — but
+blame time ≠ critical-path time: §12 found the agent's actual gate is
+`network-setup.service`'s DHCP wait, not firstboot. See §12.
 
 Firecracker-specific timings and line-level claims (§2c, §5b) are from
 code review and need confirmation on a Linux/KVM host (e.g. `mini2` /
