@@ -49,14 +49,20 @@ the later sections are kept for the reasoning trail.
 ### The new top target (both backends)
 
 With `mkfs` handled, the dominant remaining create cost is **guest
-userspace boot to agent-healthy**, and the single biggest unit is the
-**shared** `shed-firstboot.service`: **~1.36 s on Firecracker, ~0.97 s on
-VZ**. Because the guest image is identical on both backends, one change
-here speeds up *both*. Investigated in §12 — validation surfaced a
-**blocker**: the reorder exposes a latent `network-setup.sh`
-interface-rename race that firstboot's slow keygen had been incidentally
-masking (30 s hang). Revised call: **fix `network-setup.sh` first**, then
-the firstboot reorder is safe. The reorder branch is left unmerged.
+userspace boot to agent-healthy**. `shed-firstboot.service` looked like the
+culprit (~0.97 s VZ / ~1.36 s FC), but §12 investigated + validated it and
+found **firstboot is *not* the bottleneck**: the agent's real gate is
+`network-setup.service` **waiting for DHCP (~1 s)**, and `shed-agent` is
+vsock-only — it doesn't need an IP at all. Two byproducts of that
+investigation:
+
+- A latent `network-setup.sh` interface-rename race (`eth0→enp0s1`) — now
+  fixed (re-resolve the interface; validated on VZ, item 3a). The firstboot
+  reorder is **dropped** (validated as not a win).
+- **The real ~1 s win (item 3c):** decouple *agent-healthy* (vsock) from
+  *network-ready* (DHCP), gating `--repo` clone / provisioning on network
+  separately. A create-flow change — designed in §12, needs sign-off +
+  both-platform validation.
 
 ---
 
@@ -446,8 +452,9 @@ in-guest `mkfs`) — which is what §3 targets.
 | 2 | Host-side CoW template upper, VZ (§3) | speed + disk + simplicity | medium | ✅ landed (#119) |
 | — | Firecracker CoW-upper mirror | speed (Linux) | medium | ❌ ruled out — FC `mkfs` ~0.18 s (§0) |
 | — | Guest `mkfs`/overlay sub-event (1c) | observability | medium | ❌ shelved — lump too small now (§0) |
-| 3a | **`network-setup.sh` interface-rename fix (§12)** | **stability + unblocks 3b** | low–med | 🔎 prereq found during firstboot validation |
-| 3b | `shed-firstboot` time-to-agent reorder (§12) | speed (both) | med | ⛔ blocked on 3a (reorder alone → 30s net hang); branch unmerged |
+| 3a | `network-setup.sh` interface-rename fix (§12) | stability/robustness | low–med | ✅ validated on VZ (`5008d5a`); pending FC validation before merge |
+| 3b | ~~`shed-firstboot` time-to-agent reorder~~ | speed | — | ❌ dropped — validated as NOT a win; agent's real gate is network-setup→DHCP, not firstboot (§12) |
+| 3c | **Decouple agent-healthy from network-setup/DHCP (§12)** | **speed (~1s, both)** | med–high | 🔎 the real win; create-flow change (clone/provision must gate on network-ready) — needs design + both-platform validation |
 | 4 | Reaping / stop correctness (§5a) | stability | medium | open |
 | 5 | Workspace mount retry (§5c) | stability | low | open |
 | 6 | Parallelize create prefix (§4.1) | speed | medium | open |
@@ -590,6 +597,42 @@ Sequence instead:
    together (≥2 creates per platform + timing + host-key uniqueness).
 
 The branch `optimize/firstboot-ordering` is left **unmerged** pending (1).
+
+### Update (2026-05-27, cont.): network-setup fixed, reorder validated — NOT a win; real bottleneck found
+
+Implemented (1) the `network-setup.sh` fix (re-resolve the interface each
+pass; VZ + FC) and (2) the firstboot reorder together on branch
+`optimize/fast-firstboot`, built a VZ image, and measured (2 creates):
+
+- **network-setup fix works**: no 30 s hang; interface `enp0s1`, IP
+  assigned, host keys unique per shed, sshd after firstboot. Good
+  standalone robustness fix (commit `5008d5a`).
+- **The firstboot reorder is NOT a win.** firstboot decoupled cleanly
+  (exits 0.921 s, off the agent path), but create got *slower*
+  (~2.15 s vs ~1.8 s): `shed-agent` now starts at **1.563 s**, gated by
+  `network-setup.service` (exits 1.559 s, spends **1.058 s waiting for
+  DHCP**). firstboot was never the real bottleneck — it merely ran
+  concurrently with the DHCP wait. Removing it just exposed that wait on
+  the critical path.
+
+**Real bottleneck (the actual ~1 s win):** `shed-agent` talks over
+**vsock and needs no IP**, yet `network-setup.service` is
+`Before=shed-agent.service`, so the agent waits for DHCP. And the IP-wait
+inside `network-setup.sh` is **purely informational** (it only logs
+"Network ready"; systemd-networkd performs DHCP independently). So the
+agent is blocked ~1 s on a wait it doesn't need.
+
+**Next target:** decouple *agent-healthy* (vsock, fast) from *network-ready*
+(DHCP). Care required: `--repo` clone and provisioning hooks run after
+agent-healthy and **do** need the network, so they must gate on
+network-ready themselves rather than relying on the agent's start
+ordering. This is a create-flow change, not just unit ordering — design +
+both-platform validation needed.
+
+**Disposition:** keep the `network-setup.sh` fix (validated on VZ; pending
+FC validation before merge). **Drop the firstboot reorder** (`ea78d53`) —
+it doesn't help. Roadmap item 3b is superseded by 3c (agent/DHCP
+decoupling).
 
 ---
 
