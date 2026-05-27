@@ -17,6 +17,46 @@ structurally the same. Lean into each platform's native primitives.
 
 ---
 
+## 0. Status & revised priorities (updated 2026-05-27)
+
+This section supersedes the original priorities below where they conflict;
+the later sections are kept for the reasoning trail.
+
+### Landed
+
+- **Boot-phase instrumentation** (§9, PR #118) — server-side `PhaseTimer`
+  logs one per-phase line per `CreateShed`. This is what made everything
+  below measurable rather than guessed.
+- **Host-side CoW template upper, VZ only** (§3, PR #119) — drops a warm
+  VZ create from **~5.9 s → ~1.7 s** by skipping the in-guest `mkfs`.
+
+### Measured and ruled out
+
+- **Firecracker CoW-upper mirror — NOT worth doing.** The in-guest
+  `mkfs.ext4` that costs **~4.2 s on VZ** costs only **~0.18 s on
+  Firecracker** (mini3, 2026-05-27: `/init` at 0.514 s, ext4 mounts at
+  0.698 s). The cost is a **vfkit/VZ virtio-blk write-path
+  characteristic** (~20× slower than Firecracker's), *not* a shared
+  property of the `mkfs` step. So Phase 2 was correctly VZ-specific, and
+  mirroring it to Firecracker would save ~0.18 s — not worth the code.
+  This is the "lean into platform differences" thesis, quantified.
+- **Phase 1c (guest `mkfs`/overlay sub-event) — shelved as low value.**
+  It would decompose the kernel+initramfs lump, but that lump is now
+  ~0.1 s on VZ (post-Phase-2) and ~0.7 s on Firecracker. No big lump left
+  to attribute; `systemd-analyze` already covers the userspace side. High
+  effort (initramfs + agent protocol + image rebuild) for little signal.
+
+### The new top target (both backends)
+
+With `mkfs` handled, the dominant remaining create cost is **guest
+userspace boot to agent-healthy**, and the single biggest unit is the
+**shared** `shed-firstboot.service`: **~1.36 s on Firecracker, ~0.97 s on
+VZ**. Because the guest image is identical on both backends, one change
+here speeds up *both*. Investigated in §12 (with an explicit risk/reward
+call, since reliable first boot is a hard requirement).
+
+---
+
 ## 1. Corrected mental model: what is actually shared
 
 A common misconception is that VZ and Firecracker are two parallel VM
@@ -70,8 +110,8 @@ document is mostly about these.
 | Forced uniformity | Symptom | File |
 |---|---|---|
 | Writable upper is `mkfs.ext4`'d **inside the guest on first boot** | Every new shed's boot blocks on a synchronous in-guest format | `internal/vz/rootfs.go:98-120`, `internal/firecracker/rootfs.go:97-102` (identical `FreshUpperSignature` contract) |
-| Health readiness is a generic host poll | 500 ms tick shared by both; up to 500 ms of dead latency per boot | `internal/vmutil/agent.go:102` |
-| `GetNetworkEndpoint` returns a bare string | VZ returns the sentinel `"127.0.0.1"`; the interface lies about what the value means | `internal/vz/client.go:671` vs `internal/firecracker/client.go:1051` |
+| Health readiness is a generic host poll | 500 ms tick shared by both; up to 500 ms of dead latency per boot | `internal/vmutil/agent.go` |
+| `GetNetworkEndpoint` returns a bare string | VZ returns the sentinel `"127.0.0.1"`; the interface lies about what the value means | `internal/vz/client.go:686` vs `internal/firecracker/client.go:1051` |
 | Two near-identical metadata schemas | Drift risk; VZ carries/omits fields to mirror Firecracker | `internal/vz/metadata.go`, `internal/firecracker/metadata.go` |
 
 ---
@@ -154,9 +194,13 @@ differences" move.
 > (`clone.CloneFile`, APFS clonefile) drops a warm-template create from
 > **~5.9 s to ~1.7 s** (ext4 mounts at 0.1 s instead of 4.3 s), with the
 > template only ~4 MB on disk for a 5 GB fs. See
-> `internal/vz/uppertemplate.go`. The Firecracker mirror (reflink) and
-> shipping a template with the image (instead of minting on the host) are
-> open follow-ups.
+> `internal/vz/uppertemplate.go`. Shipping a template with the image
+> (instead of minting it on the host) is an open follow-up.
+>
+> **Firecracker does NOT need this** (measured 2026-05-27): its in-guest
+> `mkfs` is ~0.18 s, because the slowness is vfkit/VZ's virtio-blk write
+> path, not `mkfs` itself. The CoW mirror for Firecracker is ruled out —
+> see §0.
 
 ### 3a. What happens today
 
@@ -217,7 +261,7 @@ The `FreshUpperSignature` contract is duplicated verbatim in
 2. **Event-driven readiness instead of polling.** Have `shed-agent`
    push a "ready" notification on the existing notify port the instant
    it is up, rather than the host polling every 500 ms
-   (`internal/vmutil/agent.go:102`). Cheapest interim step: drop the
+   (`internal/vmutil/agent.go`). Cheapest interim step: drop the
    tick to 100–200 ms. Real fix: push notification.
 3. **Make post-boot mounts parallel and retriable.** Workspace and each
    credential mount run sequentially after agent-ready; the workspace
@@ -393,21 +437,25 @@ in-guest `mkfs`) — which is what §3 targets.
 
 ## 10. Prioritized roadmap
 
-| # | Item | Goal(s) | Risk | Depends on |
+| # | Item | Goal(s) | Risk | Status |
 |---|---|---|---|---|
-| 1 | Boot-phase instrumentation (§9) | speed (enables all) | low | — |
-| 2 | Host-side CoW template upper (§3) | speed + disk + simplicity | medium | 1 (to prove the win) |
-| 3 | Reaping / stop correctness (§5a) | stability | medium | — |
-| 4 | Workspace mount retry (§5c) | stability | low | — |
-| 5 | Parallelize create prefix (§4.1) | speed | medium | 1 |
-| 6 | Event-driven readiness (§4.2) | speed | low–med | — |
-| 7 | Firecracker network hardening (§5b) | stability (Linux) | medium | — |
-| 8 | erofs/lower cache eviction (§6.2) | disk | low | — |
-| 9 | Honest `GetNetworkEndpoint` (§7) | simplicity | low–med | — |
-| 10 | composefs (§6.5) | disk | high | — |
+| 1 | Boot-phase instrumentation (§9) | speed (enables all) | low | ✅ landed (#118) |
+| 2 | Host-side CoW template upper, VZ (§3) | speed + disk + simplicity | medium | ✅ landed (#119) |
+| — | Firecracker CoW-upper mirror | speed (Linux) | medium | ❌ ruled out — FC `mkfs` ~0.18 s (§0) |
+| — | Guest `mkfs`/overlay sub-event (1c) | observability | medium | ❌ shelved — lump too small now (§0) |
+| 3 | **`shed-firstboot` time-to-agent (§12)** | **speed (both)** | **see §12** | 🔎 under investigation |
+| 4 | Reaping / stop correctness (§5a) | stability | medium | open |
+| 5 | Workspace mount retry (§5c) | stability | low | open |
+| 6 | Parallelize create prefix (§4.1) | speed | medium | open |
+| 7 | Event-driven readiness (§4.2) | speed | low–med | partial (poll 500→150 ms in #118) |
+| 8 | Firecracker network hardening (§5b) | stability (Linux) | medium | open |
+| 9 | erofs/lower cache eviction (§6.2) | disk | low | open |
+| 10 | Honest `GetNetworkEndpoint` (§7) | simplicity | low–med | open |
+| 11 | composefs (§6.5) | disk | high | open |
 
-**Recommended start:** #1 (unblocks everything, ~hours) then #2 (the
-multi-win). #3/#4 can run in parallel as a stability track.
+**Next:** the `shed-firstboot` path (§12) is the largest remaining
+create-time cost and is shared across both backends. #4/#5 remain a
+parallel stability track.
 
 ---
 
@@ -423,11 +471,114 @@ multi-win). #3/#4 can run in parallel as a stability track.
 - Image store after fresh v0.5.3 pull: 3.2 GB across `base` /
   `extensions` / `full`; erofs present as content-addressed blobs;
   `cache/sha256` empty at rest.
-- Health poll interval confirmed at 500 ms (`internal/vmutil/agent.go:102`).
+- Health poll interval was 500 ms at the time of this snapshot; lowered
+  to 150 ms in #118 (`internal/vmutil/agent.go`).
 - `FreshUpperSignature` / in-guest mkfs contract confirmed identical in
   `internal/vz/rootfs.go:119` and `internal/firecracker/rootfs.go:101`.
 - `GetNetworkEndpoint` returns `"127.0.0.1"` for VZ
-  (`internal/vz/client.go:671`).
+  (`internal/vz/client.go:686`).
+
+## 12. `shed-firstboot` — investigation, root cause, and the call
+
+**Goal:** the largest remaining create-time cost (§0). `shed-firstboot` is
+a oneshot (`cmd/shed-firstboot`) that, on a shed whose recorded identity
+doesn't match the `shed.name=` cmdline, sets the hostname and regenerates
+the SSH host keys (`ssh-keygen -A`) so every shed has unique keys. Its
+unit is ordered `Before=sysinit.target … systemd-journald.service
+ssh.service shed-agent.service` and `WantedBy=sysinit.target`
+(`vz/shed-firstboot.service`, `firecracker/shed-firstboot.service`,
+identical) — so it gates **all** of boot, including the agent that
+`shed create` waits on.
+
+### Root cause (measured 2026-05-27)
+
+`systemd-analyze blame`: `shed-firstboot.service` = **0.967 s (VZ) /
+1.361 s (FC)**. But the work decomposes as:
+
+- RSA-3072 keygen: **~220 ms** CPU; ecdsa/ed25519: ~1 ms each.
+- hostname write + identity JSON: sub-ms.
+
+The ~700 ms–1.1 s remainder is **`ssh-keygen` blocking on `crng`
+initialization**. The guest has **no entropy source**: `hw_random`
+current = none, `virtio_rng` is `CONFIG_HW_RANDOM_VIRTIO=m` (module, not
+loaded early), the VZ-exposed ARM CPU does not advertise `rndr`
+(`random.trust_cpu` has nothing to trust), and `efi: UEFI not found` (no
+bootloader RNG seed). Result: `random: crng init done` lands at **~4.98 s**,
+and `ssh-keygen`'s `getrandom()` blocks until then.
+
+### Options considered
+
+1. **Host-side entropy (virtio-rng / `random.trust_cpu` / EFI seed).** The
+   clean fix — but **not available on VZ**: `vfkit v0.6.3` exposes no rng
+   device flag, no CPU RNG, no UEFI. Dead end without a vfkit upgrade.
+   (Firecracker *does* support an entropy device and its custom kernel
+   could build in virtio-rng — a Linux-only follow-up, but FC create
+   isn't `mkfs`-bound and its firstboot is the same shape.)
+2. **ed25519-only host keys.** Saves the ~220 ms RSA CPU but **not** the
+   `crng` wait (`getrandom` blocks regardless of key type/size). Small
+   win, plus SSH-compat risk. Rejected.
+3. **Decouple `ssh-keygen` from the agent/create critical path.** Keep
+   key regen `Before=ssh.service` (correctness for SSH preserved) but stop
+   it gating `sysinit.target`/`shed-agent.service`, so the agent (and thus
+   `shed create`) no longer waits for the `crng`-blocked keygen. The
+   subtlety: today firstboot is early specifically so the **hostname** is
+   set before `journald` caches it; decoupling means relaxing that
+   (journald may log the transient hostname for ~1 s — cosmetic) or
+   splitting firstboot into a fast hostname/identity oneshot (stays early)
+   plus a keygen oneshot ordered only before `sshd`.
+
+### Risk / reward call
+
+**Reward:** ~0.7–1 s off every create, on **both** backends (shared unit).
+High, and it's the top remaining cost.
+
+**Risk:** the fix is a **systemd-ordering change to the reliability-critical
+first-boot path** — exactly the "key feature" that must stay correct.
+Ordering bugs here are high-consequence: the rootfs ships with baked-in
+host keys, and firstboot's job is to regenerate them per-shed *before*
+`sshd` starts. If the new ordering ever lets `sshd` start before the
+regen, every shed would serve identical (shared) host keys — a security
+regression. So the keygen-before-sshd ordering is the invariant that must
+be validated, not just asserted.
+
+**Call: PROCEED to implement + validate on both platforms + review, then
+merge.** Validation is feasible without a registry republish: VZ via a
+locally-built rootfs image on the mac, Firecracker via a build on mini3
+(sudo over tailscale). The bar before merge: **≥2 shed creates per
+platform** with the per-phase timing showing the `agent`/create win,
+**plus a host-key-uniqueness check** across two sheds (proving keygen
+still runs before sshd and per-shed). The safe design is the **split**
+(hostname/identity stays early and fast — it needs no randomness, so it
+never blocks; `ssh-keygen` moves to a unit ordered before `sshd` only),
+which preserves every correctness invariant (hostname-before-keys,
+keys-before-sshd) while taking the `crng`-blocked keygen off the create
+path. (Shipping still requires an image republish at release time, but
+that's the normal release path, not a validation blocker.)
+
+---
+
+### Appendix B: follow-up measurements (2026-05-27)
+
+VZ (this mac), in-guest `mkfs` A/B via stop/start:
+
+| boot | `mkfs`? | ext4 mounts at | kernel time |
+|---|---|---|---|
+| fresh upper | yes | 4.29 s | 4.325 s |
+| reused upper | skipped | 0.096 s | 113 ms |
+
+→ in-guest `mkfs` on the raw 5 GB virtio-blk device ≈ **4.2 s** on VZ.
+Post-Phase-2 (template clone) a warm create is **~1.7 s**.
+
+Firecracker (mini3, fresh upper):
+
+- `/init` at 0.514 s, `EXT4-fs (vda): mounted` at 0.698 s → in-guest
+  `mkfs` ≈ **0.18 s** (not a bottleneck; CoW mirror ruled out).
+- `systemd-analyze blame` top unit: `shed-firstboot.service` **1.361 s**.
+- Trivial create wall time **~3.7 s** (kernel+initramfs ~0.7 s, rest is
+  userspace to agent-healthy).
+
+`shed-firstboot.service` is the biggest userspace unit on both
+(Firecracker 1.361 s, VZ 0.967 s) and is a shared guest unit — see §12.
 
 Firecracker-specific timings and line-level claims (§2c, §5b) are from
 code review and need confirmation on a Linux/KVM host (e.g. `mini2` /
