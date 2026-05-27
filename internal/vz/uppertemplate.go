@@ -49,18 +49,15 @@ func (c *Client) templatesDir() string {
 // resolveBuildToolsRef returns the shed-build-tools image ref used to run
 // mkfs.ext4 for upper templates. SHED_BUILD_TOOLS_REF overrides (e.g.
 // "shed-build-tools:dev" for local iteration). Otherwise it derives from
-// the server version, matching the image-build pipeline's pinning model.
-// Dev/dirty builds have no matching published tag, so they return "" —
-// the caller then falls back to in-guest mkfs.
+// the server version via the shared canonical resolver (which v-prefixes
+// the tag to match the published images — see version.BuildToolsRefForTag).
+// Dev/dirty builds have no matching published tag, so it returns "" and the
+// caller falls back to in-guest mkfs.
 func resolveBuildToolsRef() string {
 	if ref := os.Getenv("SHED_BUILD_TOOLS_REF"); ref != "" {
 		return ref
 	}
-	v := version.Version
-	if v == "" || v == "dev" || strings.Contains(v, "-g") || strings.Contains(v, "-dirty") {
-		return ""
-	}
-	return "ghcr.io/charliek/shed-build-tools:" + v
+	return version.ReleaseBuildToolsRef()
 }
 
 // upperTemplatePath is the cached template image for a given upper size.

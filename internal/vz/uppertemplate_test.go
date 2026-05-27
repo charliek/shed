@@ -81,7 +81,10 @@ func TestResolveBuildToolsRef(t *testing.T) {
 		wantRef string
 	}{
 		{name: "env_override_wins", envRef: "shed-build-tools:dev", ver: "v0.5.3", wantRef: "shed-build-tools:dev"},
-		{name: "release_version", envRef: "", ver: "v0.5.3", wantRef: "ghcr.io/charliek/shed-build-tools:v0.5.3"},
+		// Release binaries embed "X.Y.Z" with no leading v; the ref must
+		// still be the v-prefixed published tag (the v0.5.4 regression).
+		{name: "release_version_no_v", envRef: "", ver: "0.5.4", wantRef: "ghcr.io/charliek/shed-build-tools:v0.5.4"},
+		{name: "release_version_with_v", envRef: "", ver: "v0.5.3", wantRef: "ghcr.io/charliek/shed-build-tools:v0.5.3"},
 		{name: "dev_version_none", envRef: "", ver: "dev", wantRef: ""},
 		{name: "dirty_version_none", envRef: "", ver: "v0.5.3-2-g493976f-dirty", wantRef: ""},
 		{name: "untagged_commit_none", envRef: "", ver: "v0.5.3-5-gabcdef0", wantRef: ""},

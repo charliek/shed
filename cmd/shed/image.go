@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strings"
 	"text/tabwriter"
@@ -33,10 +32,6 @@ import (
 //   - All other dev builds (dirty, ahead-of-tag, version="dev") fall
 //     back to `:dev` and expect the caller to have run
 //     `make build-tools` first.
-const buildToolsImageBase = "ghcr.io/charliek/shed-build-tools"
-
-var releaseTagRE = regexp.MustCompile(`^v?\d+\.\d+\.\d+$`)
-
 func buildToolsRefDefault(override string) string {
 	if override != "" {
 		// Full image ref (anything containing "/" or ":") passes
@@ -46,26 +41,18 @@ func buildToolsRefDefault(override string) string {
 		if strings.Contains(override, "/") || strings.Contains(override, ":") {
 			return override
 		}
-		// Bare tag (no path or colon). Only "release-shaped"
-		// tags (vX.Y.Z) are synthesized against the canonical
-		// registry — for anything else (`dev`, `mybuild`), use
-		// the bare image name so a `make build-tools`-produced
-		// local image resolves without an unwanted registry pull.
-		if releaseTagRE.MatchString(override) {
-			tag := override
-			if !strings.HasPrefix(tag, "v") {
-				tag = "v" + tag
-			}
-			return buildToolsImageBase + ":" + tag
+		// Bare tag (no path or colon). Release-shaped tags (vX.Y.Z) are
+		// synthesized against the canonical registry; for anything else
+		// (`dev`, `mybuild`), use the bare image name so a
+		// `make build-tools`-produced local image resolves without an
+		// unwanted registry pull.
+		if ref := version.BuildToolsRefForTag(override); ref != "" {
+			return ref
 		}
 		return "shed-build-tools:" + override
 	}
-	v := strings.TrimSpace(version.Version)
-	if releaseTagRE.MatchString(v) {
-		if !strings.HasPrefix(v, "v") {
-			v = "v" + v
-		}
-		return buildToolsImageBase + ":" + v
+	if ref := version.ReleaseBuildToolsRef(); ref != "" {
+		return ref
 	}
 	// Dev build of shed CLI. Default to a locally-built
 	// shed-build-tools:dev image — no registry round-trip — and
