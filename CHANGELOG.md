@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.5 — 2026-05-27
+
+Patch release fixing a v0.5.4 regression where the macOS/VZ copy-on-write
+upper (the Phase 2 `shed create` speedup) silently failed to activate.
+
+### Fixed
+
+- **VZ upper-template activation** (PR #124). v0.5.4 resolved the
+  `shed-build-tools` image tag without the leading `v` (`:0.5.4` instead
+  of the published `:v0.5.4`), so the upper-template mint failed and
+  `shed create` fell back to the slow in-guest `mkfs.ext4` — the v0.5.4
+  speedup did nothing on a fresh install. Fixed by routing all
+  build-tools ref resolution through one canonical helper that always
+  v-prefixes the release tag. A warm `shed create` on Apple Silicon is
+  back to ~1.8s (down from ~6s). Firecracker was unaffected.
+
 ## v0.5.4 — 2026-05-27
 
 A performance-and-robustness pass on shed creation, plus plugin
