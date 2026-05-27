@@ -2,7 +2,16 @@
 Description=Shed first-boot identity setup
 DefaultDependencies=no
 After=systemd-remount-fs.service local-fs.target
-Before=sysinit.target systemd-machine-id-commit.service systemd-journald.service ssh.service shed-agent.service network-setup.service
+# Ordered ONLY before ssh.service. The hard invariant: per-shed SSH host
+# keys must be regenerated before sshd starts, or every shed would serve the
+# identical baked-in host keys. We deliberately do NOT order before
+# sysinit.target / shed-agent.service / network-setup.service: ssh-keygen
+# blocks on early-boot crng init (the guest has no hwrng), and gating all of
+# boot on it delayed shed-agent — which `shed create` waits on — by the full
+# firstboot duration. Hostname is still set before the keys here (key-comment
+# correctness); it may now land just after journald starts, so the first few
+# log lines can carry the transient hostname (cosmetic).
+Before=ssh.service
 Requires=local-fs.target
 # No ConditionVirtualization=vm: Docker-built rootfs makes systemd-detect-virt
 # return "docker" even when booted as a VM. The shed-firstboot binary itself
