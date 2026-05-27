@@ -110,8 +110,8 @@ document is mostly about these.
 | Forced uniformity | Symptom | File |
 |---|---|---|
 | Writable upper is `mkfs.ext4`'d **inside the guest on first boot** | Every new shed's boot blocks on a synchronous in-guest format | `internal/vz/rootfs.go:98-120`, `internal/firecracker/rootfs.go:97-102` (identical `FreshUpperSignature` contract) |
-| Health readiness is a generic host poll | 500 ms tick shared by both; up to 500 ms of dead latency per boot | `internal/vmutil/agent.go:102` |
-| `GetNetworkEndpoint` returns a bare string | VZ returns the sentinel `"127.0.0.1"`; the interface lies about what the value means | `internal/vz/client.go:671` vs `internal/firecracker/client.go:1051` |
+| Health readiness is a generic host poll | 500 ms tick shared by both; up to 500 ms of dead latency per boot | `internal/vmutil/agent.go` |
+| `GetNetworkEndpoint` returns a bare string | VZ returns the sentinel `"127.0.0.1"`; the interface lies about what the value means | `internal/vz/client.go:686` vs `internal/firecracker/client.go:1051` |
 | Two near-identical metadata schemas | Drift risk; VZ carries/omits fields to mirror Firecracker | `internal/vz/metadata.go`, `internal/firecracker/metadata.go` |
 
 ---
@@ -261,7 +261,7 @@ The `FreshUpperSignature` contract is duplicated verbatim in
 2. **Event-driven readiness instead of polling.** Have `shed-agent`
    push a "ready" notification on the existing notify port the instant
    it is up, rather than the host polling every 500 ms
-   (`internal/vmutil/agent.go:102`). Cheapest interim step: drop the
+   (`internal/vmutil/agent.go`). Cheapest interim step: drop the
    tick to 100–200 ms. Real fix: push notification.
 3. **Make post-boot mounts parallel and retriable.** Workspace and each
    credential mount run sequentially after agent-ready; the workspace
@@ -471,11 +471,12 @@ parallel stability track.
 - Image store after fresh v0.5.3 pull: 3.2 GB across `base` /
   `extensions` / `full`; erofs present as content-addressed blobs;
   `cache/sha256` empty at rest.
-- Health poll interval confirmed at 500 ms (`internal/vmutil/agent.go:102`).
+- Health poll interval was 500 ms at the time of this snapshot; lowered
+  to 150 ms in #118 (`internal/vmutil/agent.go`).
 - `FreshUpperSignature` / in-guest mkfs contract confirmed identical in
   `internal/vz/rootfs.go:119` and `internal/firecracker/rootfs.go:101`.
 - `GetNetworkEndpoint` returns `"127.0.0.1"` for VZ
-  (`internal/vz/client.go:671`).
+  (`internal/vz/client.go:686`).
 
 ## 12. `shed-firstboot` — investigation, root cause, and the call
 
@@ -533,21 +534,26 @@ High, and it's the top remaining cost.
 
 **Risk:** the fix is a **systemd-ordering change to the reliability-critical
 first-boot path** — exactly the "key feature" that must stay correct.
-Ordering bugs here are high-consequence (sshd starting with stale/missing
-host keys; hostname/keys races) and have subtle, boot-timing-dependent
-failure modes. It also requires an **image rebuild + republish** to ship
-and **Firecracker validation** I can't fully do from a mac.
+Ordering bugs here are high-consequence: the rootfs ships with baked-in
+host keys, and firstboot's job is to regenerate them per-shed *before*
+`sshd` starts. If the new ordering ever lets `sshd` start before the
+regen, every shed would serve identical (shared) host keys — a security
+regression. So the keygen-before-sshd ordering is the invariant that must
+be validated, not just asserted.
 
-**Call: PROCEED to implement + validate-on-VZ + review, but gate the merge
-on human sign-off** — do not auto-merge. The win is real and worth it, but
-the combination of (key-feature sensitivity + systemd subtlety + can't
-validate FC + needs republish to take effect) means the irreversible step
-should have a human in the loop. The safe design is the **split**
+**Call: PROCEED to implement + validate on both platforms + review, then
+merge.** Validation is feasible without a registry republish: VZ via a
+locally-built rootfs image on the mac, Firecracker via a build on mini3
+(sudo over tailscale). The bar before merge: **≥2 shed creates per
+platform** with the per-phase timing showing the `agent`/create win,
+**plus a host-key-uniqueness check** across two sheds (proving keygen
+still runs before sshd and per-shed). The safe design is the **split**
 (hostname/identity stays early and fast — it needs no randomness, so it
 never blocks; `ssh-keygen` moves to a unit ordered before `sshd` only),
 which preserves every correctness invariant (hostname-before-keys,
 keys-before-sshd) while taking the `crng`-blocked keygen off the create
-path.
+path. (Shipping still requires an image republish at release time, but
+that's the normal release path, not a validation blocker.)
 
 ---
 
