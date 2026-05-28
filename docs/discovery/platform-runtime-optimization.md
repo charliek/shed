@@ -88,6 +88,47 @@ investigation:
   clone / provisioning on network separately. Concrete design + a
   ready-to-run kickoff plan are in **§13**.
 
+### Update (2026-05-28): 3c measured — VZ has no win, FC firstboot reorder shipped instead
+
+3c was implemented and benchmarked end-to-end (VZ on mac, FC on mini3,
+shipping path: dev v0.5.5 server + locally-built `base` images, Phase-2
+template active, template cache cleared once per §12.1). The measurement
+**invalidates the premise** above. Full data in §14; the short version:
+
+- **On VZ the literal 3c change (decouple `shed-agent.service` from
+  `network-setup.service`) yields zero win** — `network-setup` was never
+  the gate in the shipped config. The agent's actual gate is
+  `shed-firstboot.service` (~633 ms → sysinit.target → basic.target → agent
+  ~890 ms guest). `network-setup` runs *late* (982 ms) and *fast* (~12 ms)
+  because DHCP completes before it runs.
+- **The ~1 s VZ DHCP wait the doc projected was an artifact** of the
+  firstboot-decoupled branch (where `network-setup` ran early and raced
+  DHCP). That branch's "~1.058 s DHCP wait" was not present in the
+  as-shipped config. We were measuring the side-effect of the workaround,
+  not the bottleneck.
+- **3c + reviving the firstboot reorder on VZ** moves the agent gate to
+  systemd-resolved/sysinit (~650 ms guest), saving ~150 ms wall — but it
+  also makes `--repo` creates **~450 ms slower** (network readiness no
+  longer overlaps boot, so the host's `network-wait` pays for DHCP
+  serially). Mixed-to-negative outcome on VZ; not shipped.
+- **On FC the firstboot reorder alone is a clean ~20% plain-create win
+  (~−450 ms median, every after sample beats every before sample), with
+  no `--repo` regression.** FC uses a static IP (no DHCP), so leaving
+  `network-setup` as the agent's gate keeps it fast and ordered correctly;
+  clone has the network when it runs without any new host-side gate.
+
+The shipping change (single file): `firecracker/shed-firstboot.service`
+ordered `Before=ssh.service` only (the `ea78d53` text, FC-only). All other
+3c artifacts (VZ unit edits, FC `network-setup` decoupling, the host-side
+`WaitForNetwork`/`WaitForNetworkForHooks` machinery and its wiring) are
+**not shipped**. This is "lean into platform differences" (§1c) made
+concrete: VZ and FC have different bottlenecks; the fix lives where the
+win actually is.
+
+The `network-setup.sh` re-resolve fix (#123, both platforms) stands; so do
+all prior status items. §13 is superseded by this update; §14 records the
+measurements that drove it.
+
 ---
 
 ## 1. Corrected mental model: what is actually shared
@@ -808,3 +849,104 @@ VZ; ~3.7 s → ~2.7 s on FC). `--repo` / provisioning creates stay the same
 > reproducing the shipping path; and **before each PR, start ≥2 sheds on
 > each OS** (including one `--repo` create per OS) to confirm no
 > regression. Read §0, §12, §12.1, and §13 first for context.
+
+---
+
+## 14. 3c benchmark — measured data and what it taught us (2026-05-28)
+
+Per §13's mandatory process, 3c was implemented end-to-end and benchmarked
+on both backends, reproducing the shipping path (release-shaped
+`Version=v0.5.5` in the dev `shed-server` so the upper-template mint
+resolves `shed-build-tools:v0.5.5` naturally — see §12.1 — and the
+`templates/` cache cleared once so the mint actually ran). Findings drove
+the §0 update; this section is the record.
+
+### 14a. VZ (this mac) — 3c does not realize the projected win
+
+Measured progression on warm plain creates (`shed create … --image base`),
+`agent` phase from the server-side `PhaseTimer`:
+
+| Config | `agent` phase | Notes |
+|---|---|---|
+| Shipped v0.5.5 (brew, baseline) | 1501–1655 ms (median ~1503 ms) | Boot critical-chain: shed-firstboot (633 ms) → sysinit → basic → shed-agent @890 ms guest. |
+| 3c only (network-setup decoupled from agent) | 1502 / 1503 / 2104 ms | **No change.** With firstboot still gating sysinit, `network-setup` runs *late* (982 ms guest) and *fast* (~12 ms) — DHCP already done by then. |
+| 3c + firstboot reorder (both off agent path) | 1352 ms ×3 | ~150 ms wall. Agent now gated by systemd-resolved/sysinit (~650 ms guest). Fixed VMM+kernel+initramfs (~500 ms) + 150 ms health-poll dominate the rest. |
+
+`--repo` create on the combined config **regressed** by ~450 ms (1856 ms
+shipped → 2305 / 2312 ms after): with firstboot decoupled, `network-setup`
+runs early and hits the inherent ~1 s DHCP wait while the agent comes up
+~1.2 s. The host then pays `network-wait=756 ms` serially before clone,
+where the shipped config absorbed the DHCP wait inside the boot. Network
+readiness on VZ is DHCP-bound regardless — decoupling just changes who waits.
+
+Host-key uniqueness (the firstboot security invariant) was preserved across
+3 sheds (distinct ed25519 fingerprints; `ssh.service` ActiveEnter at
+1176 ms > `shed-firstboot` exit at 1160 ms).
+
+**Conclusion for VZ:** the projected ~1 s DHCP wait on the agent path was a
+**misattribution** — it was measured on the firstboot-decoupled branch
+(`optimize/fast-firstboot`) where `network-setup` ran early and raced DHCP.
+In the shipped config that race doesn't exist; firstboot is the real gate.
+Removing both gates buys only ~150 ms (fixed overhead dominates) and the
+network-wait gate makes `--repo` worse. **Not shipped.**
+
+### 14b. FC (mini3) — firstboot reorder alone is a clean ~20% win
+
+Apples-to-apples: same dev `shed-server` (v0.5.5, built on mini3 from
+this tree), same `shed-build-tools:v0.5.3` for the erofs mint, same image
+build pipeline. The only difference between BEFORE and AFTER is the
+`firecracker/shed-firstboot.service` `Before=` line. 5 plain creates each:
+
+| Plain `create` (5 samples) | Median `agent` | Mean `agent` | Range | Median total |
+|---|---|---|---|---|
+| BEFORE (baseline image) | 2256 ms | 2345 ms | 2105–2705 | 2289 ms |
+| AFTER (firstboot reorder) | **1804 ms** | **1774 ms** | 1654–1806 | **1839 ms** |
+| **Δ** | **−452 ms (~20 %)** | −571 ms | — | −450 ms |
+
+Every "after" sample beats every "before" sample.
+
+`--repo` with the firstboot-reorder image (3 samples): total **2106 ms**
+median, `agent` 1652–1802 ms, `clone` 411–462 ms. **No regression** — and
+no `network-wait` phase (no host-side gate, no extra Go code path). FC's
+static IP means `network-setup` stays fast and still gates the agent, so
+clone has the network when it runs.
+
+Boot order verification (kernel/journald, FC AFTER):
+`Starting network-setup` + `Starting shed-firstboot` (parallel) →
+`Finished network-setup` → `Reached sysinit.target` → `basic.target` →
+`Started shed-agent` → … → `Finished shed-firstboot` (later). firstboot is
+off the agent's critical path; `Before=ssh.service` still ensures
+keygen-before-sshd (security invariant preserved).
+
+The `~3.7 s` FC baseline in §11 / Appendix B predates this mini3
+configuration; current mini3 plain create is ~2.3 s shipped, so the
+firstboot reorder buys ~20 % rather than the ~1 s the doc projected. The
+win is smaller in absolute terms but real, repeatable, and zero-risk for
+`--repo`.
+
+### 14c. What 3c got right, what it got wrong
+
+Right:
+- Validating end-to-end on the **shipping path** caught both the §12.1
+  build-tools-ref class of footgun (avoided here by versioning the dev
+  server as `v0.5.5`) and the misattribution above.
+- Recognising that `shed-agent` is vsock-only and doesn't need an IP.
+- The `network-setup.sh` re-resolve fix (#123) is a real robustness win
+  and stays.
+
+Wrong:
+- Attributing the ~1 s VZ cost to a DHCP wait on the agent's critical path.
+  It is not there in the shipped config; firstboot is the gate.
+- Projecting ~1 s on FC from blame numbers. Mini3 today is faster than the
+  reference; the realizable win is ~20 % (~450 ms), not ~50 %.
+- Treating "decouple `network-setup` from agent" as the lever. On VZ it
+  buys nothing and regresses `--repo`; on FC the lever is firstboot and
+  `network-setup` should stay where it is.
+
+### 14d. Shipped change
+
+`firecracker/shed-firstboot.service` only: `Before=ssh.service` (the
+`ea78d53` text from §12), FC-only. No Go code change. No host-side gate.
+No VZ unit change. See the file's inline comment for the FC-specific
+reasoning (static IP, no DHCP exposure) that makes this safe on FC even
+though §12 dropped the same change on VZ.
