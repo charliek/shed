@@ -2,6 +2,14 @@
 Description=Network Setup for Firecracker VM
 DefaultDependencies=no
 After=local-fs.target
+# `Before=shed-agent.service` is safe here ONLY because FC networking is
+# static IP (see network-setup.sh: `ip addr add` + `ip route add`, no DHCP
+# wait). If FC ever moves to DHCP, a network-wait, or anything else that
+# can block here for >100s of ms, this edge will gate `shed create` on
+# that wait — exactly the regression PR #126 measured and avoided by
+# leaving `network-setup` as the (fast) agent gate on FC while removing
+# `shed-firstboot` from the agent's critical path. See
+# docs/discovery/platform-runtime-optimization.md §14.
 Before=network-online.target docker.service shed-agent.service
 Wants=network-online.target
 

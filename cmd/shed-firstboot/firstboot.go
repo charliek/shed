@@ -1,9 +1,19 @@
 //go:build linux
 
 // Package main implements shed-firstboot, an early-boot oneshot that ensures
-// the guest's identity matches the shed name passed via kernel cmdline.
-// It runs before D-Bus, journald, sshd, and shed-agent so SSH host keys
-// and the hostname are correct before any service caches them.
+// the guest's identity matches the shed name passed via kernel cmdline. It
+// MUST run before sshd starts so the per-shed SSH host keys it regenerates
+// land in /etc/ssh/ before sshd reads them — else every shed would serve
+// the identical baked-in host keys, a security regression.
+//
+// The exact unit ordering varies per backend (see vz/shed-firstboot.service
+// and firecracker/shed-firstboot.service). On VZ the broader ordering is
+// kept (Before=sysinit.target / journald / shed-agent / network-setup);
+// on FC the ordering was reduced to Before=ssh.service only in PR #126,
+// because that broader gating delayed shed-agent (which `shed create`
+// waits on) by firstboot's full crng-blocked `ssh-keygen` duration, and
+// FC's static-IP networking has no DHCP wait to race when network-setup
+// runs earlier — see docs/discovery/platform-runtime-optimization.md §14.
 //
 // machine-id is intentionally NOT touched here: the rootfs Dockerfile
 // symlinks /etc/machine-id to /run/machine-id (transient tmpfs), so PID 1
