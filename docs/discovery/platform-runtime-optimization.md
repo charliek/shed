@@ -1470,40 +1470,188 @@ the orchestrator obsoletes but didn't delete.
 
 ---
 
-## 16. Integration test & evaluation suite (placeholder — 2026-05-28)
+## 16. Integration test & evaluation suite (2026-05-28)
 
 The pattern that drove validation of #126 — manual loops over
 `shed create` / `shed exec` / log-grep, with mini3 deploys handled by
 ad-hoc shell — does not scale to the multi-PR refactor work in §15. A
-more robust integration-test & evaluation suite is needed.
+more robust integration-test & evaluation suite is the natural
+companion to §15 (especially Phase 2, the orchestrator refactor).
 
-**Goals:**
+### Goals
 
-- Prevent regression: live create-cycle tests with PhaseTimer-style
+- **Prevent regression:** live create-cycle tests with PhaseTimer-style
   timing assertions, runnable on either OS, targeting local or remote
   shed-servers.
-- Speed development: a single command that exercises plain + `--repo` +
-  `--local-dir` + `--from-snapshot` against one or both backends, with
-  structured output, so the operator iterating on a change doesn't
+- **Speed development:** a single command that exercises plain + `--repo`
+  + `--local-dir` + `--from-snapshot` against one or both backends,
+  with structured output, so the operator iterating on a change doesn't
   hand-craft shell loops every time.
-- Bare-metal release-validation: replace / augment
-  `scripts/smoke-test-linux.sh`'s create-cycle path with the new suite.
+- **Bare-metal release-validation:** augment
+  `scripts/smoke-test-linux.sh`'s create-cycle path with the new suite,
+  so the timing-threshold gate the bash script can't be becomes a real
+  gate.
+- **Cross-backend symmetry:** assert that same-shape behavior holds
+  across VZ and Firecracker so refactors don't silently diverge them.
 
-**Architecture options under consideration** (chat discussion
-2026-05-28):
+### Decision (chat 2026-05-28): pytest + subprocess + Fabric (in-tree)
 
-- **pytest + subprocess `shed` CLI** (+ optional Fabric for explicit
-  remote orchestration). Python-side strengths: fixtures,
-  parametrization, plugin ecosystem (xdist, benchmark, html, junit).
-  Cost: second language in the project.
-- **Go-based integration framework** using `go test` with build tags
-  for "real-VM-required" tests. Strengths: single toolchain, direct
-  reuse of `internal/` types. Cost: Go's ergonomics for fixtures and
-  parametrization is clunkier than pytest's.
-- **Bash + bats** as an incremental step from the current state.
-  Strengths: no new tooling. Cost: doesn't escape bash's structured-data
-  / parametrization / fixture limits.
+After comparing pytest + subprocess + Fabric against a Go-based
+framework and against bash + bats, the chosen architecture is **pytest
++ subprocess for invoking the `shed` CLI + Fabric for the remote-
+orchestration tasks only**, living in-tree under `tests/integration/`.
 
-**Decision and architecture details:** TBD. Once the MVP is committed
-to, this section will be filled in with the chosen approach, the test
-suite layout, the fixture conventions, and how to add a new test.
+**Why pytest:** every pattern from the #126 workflow that we want to
+avoid re-deriving is a textbook pytest pattern — fixtures,
+parametrization, marker-based skip, statistical assertions, structured
+reporting. Building this in Go is possible but would reimplement
+pytest's value proposition by hand; bash + bats hits the same
+parametrization / fixture / structured-output limits the current smoke
+script does.
+
+**Why subprocess as the primary `shed`-driver:** the `shed` CLI already
+encapsulates HTTP-to-shed-server, SSH-to-guest, and remote-server
+selection (`shed -s <server>`). Most integration tests should invoke
+`shed` and parse its output, not talk to the API or transports
+directly. Keeps tests honest to the actual user experience.
+
+**Why Fabric only for remote orchestration:** Fabric shines at "ssh to
+mini3, deploy a dev binary, run a build, capture journalctl, tear
+down" — exactly the workflow that drove #126's mini3 validation. Most
+tests don't need it; they just call `shed -s mini3 …` which uses the
+existing transport. Fabric earns its place specifically for the dev-
+binary-deploy / log-capture tasks.
+
+**Why in-tree (`tests/integration/`):** the integration suite must stay
+honest to the production code that it exercises. Co-located tests
+version with the code, run with `make test-integration`, and a new
+contributor finds them next to the things they test.
+
+### File layout
+
+```
+tests/integration/
+  pyproject.toml          # uv-managed Python project, ~20 lines
+  README.md               # how to run locally + against mini3, ~40 lines
+  conftest.py             # pytest fixtures + markers + CLI flags, ~80 lines
+  test_smoke.py           # the MVP five tests, ~100 lines
+  fixtures/
+    __init__.py
+    server.py             # LocalServer + RemoteServer fixtures, ~150 lines
+    timing.py             # PhaseTimer log-line parser + BenchmarkResult, ~50 lines
+    mini3.py              # Fabric tasks for binary deploy + log capture (added when first FC test needs it)
+Makefile                  # add `test-integration` target invoking pytest
+```
+
+The Python project is `uv`-managed. `uv` is dramatically faster than
+pip/poetry, has clean lockfile semantics (`uv.lock`), and installs as a
+single binary. The `Makefile` target wraps `uv run pytest …` so callers
+don't need to know about the underlying tool.
+
+### MVP — five tests, one fixture set, one Makefile target
+
+Sized to prove the architecture in roughly a day's work. Every test
+parameterizes `["vz", "fc"]` and skips cleanly when the environment
+can't run it (`/dev/kvm` missing for FC, non-Apple-Silicon for VZ,
+mini3 unreachable for the remote variants).
+
+1. **`test_create_delete_lifecycle`** — `shed create` succeeds,
+   `shed list` shows the new shed, `shed delete -f` removes it cleanly.
+   Proves the happy path on both backends.
+
+2. **`test_phase_timer_emitted`** — server log (homebrew log on mac,
+   journald on Linux) contains a `timing: create name=<n>
+   backend=<b> total=Xms …` line with all expected phase keys present.
+   Proves the timing extraction works.
+
+3. **`test_repo_clone_https`** — `shed create --repo
+   https://github.com/octocat/Hello-World.git`, then `shed exec` into
+   the guest and assert `git log --oneline -1` returns the known
+   commit. Proves the `--repo` happy path + agent.Exec round-trip.
+
+4. **`test_plain_create_timing`** — 5 plain creates, p50 of the
+   `agent` phase must be under a per-backend threshold drawn from a
+   small `THRESHOLDS` dict. Catches general perf regressions. The
+   thresholds start generous (`vz` 2200 ms / `fc` 2200 ms) and tighten
+   over time as Phase 1's 1a + 1b + 2c land.
+
+5. **`test_shed_exec_smoke`** — `shed exec <name> -- echo hello`
+   returns "hello\n". Proves the agent vsock path independent of the
+   `shed create` flow.
+
+### Operating model
+
+- **Local dev loop:** `make test-integration` runs the suite against
+  whatever shed-server is reachable. Tests that need an unavailable
+  backend skip cleanly with a clear reason. No global setup needed
+  beyond `uv sync`.
+
+- **Per-PR validation during §15 phases:** `make test-integration` is
+  the canonical "before each PR" check from the §15 mandatory process.
+  It replaces the §13 / §15 manual loop ("≥2 sheds per OS incl one
+  `--repo` per OS") with a single command — but the underlying
+  requirement is the same: real VMs, real `shed create`, real
+  `shed exec`.
+
+- **Bare-metal release-validation:** the `Smoke (Linux)` workflow's
+  bare-metal half (per the workflow's own comment) invokes the suite.
+  The timing-threshold tests become the dynamic perf-regression gate
+  that PR CI can't be (GHA has no `/dev/kvm`).
+
+- **CI hookup is a follow-up, not blocking.** The MVP runs locally
+  only. Once it's proven, wire it into the bare-metal smoke step.
+
+### Mandatory process (per PR — identical to §13 / §15)
+
+- PR → `/git-commands:watch-pr` → real review (CodeRabbit primary,
+  Codex / Cursor / sub-agent fallback) → address findings →
+  `/git-commands:merge-pr`.
+- **No release** from any single PR; if the suite reaches a state worth
+  a release-tag annotation, discuss first.
+- Validate the shipping path per §12.1: dev `shed-server` built with
+  the active release-shaped `Version=vX.Y.Z`, no overrides, no warm
+  template cache.
+- The new structural unit-ordering tests from PR #127 must remain
+  green — the integration suite is **additive** to them, not a
+  replacement.
+
+### Gotchas / risks
+
+- **`uv` is the right tool but Python deps still need pinning.** A
+  `uv.lock` committed to the repo is mandatory; reproducible test runs
+  start there.
+- **Remote-host TOFU pain.** SSH host-key trust to mini3 (and any other
+  remote shed-server) needs a stable convention — either pre-seed
+  known-hosts in `conftest.py` setup, or wrap `shed`'s SSH transport
+  with strict accept-new on first contact. #126 was bitten by this
+  twice during manual validation.
+- **Server-log location varies by host.** On the mac (brew),
+  `/opt/homebrew/var/log/shed-server.log`. On Linux (systemd),
+  `journalctl -u shed-server`. The `phase_timing` fixture must handle
+  both.
+- **PhaseTimer log format is the brittle parsing target.** If §15 1b
+  (split `Progress` into `Phase` + `Status`) changes the log line shape,
+  the parser updates with it — both should ship in the same PR.
+- **Don't grow Fabric usage unbounded.** Fabric is for explicit
+  remote-orchestration tasks (deploy + log capture). Tests that just
+  invoke `shed -s mini3 …` MUST use subprocess against the local CLI;
+  not Fabric to ssh into mini3 and run a command. Keeps the test surface
+  honest.
+
+### Ready-to-paste kickoff prompt for a new session
+
+> Build the integration test & evaluation suite MVP defined in
+> `docs/discovery/platform-runtime-optimization.md` §16. Architecture:
+> pytest + subprocess + Fabric, in-tree at `tests/integration/`, managed
+> with `uv`. Implement the five MVP tests
+> (`test_create_delete_lifecycle`, `test_phase_timer_emitted`,
+> `test_repo_clone_https`, `test_plain_create_timing`,
+> `test_shed_exec_smoke`), each parameterized across
+> `["vz", "fc"]` and skipping cleanly when the environment can't run.
+> Add `make test-integration`. Ship as one PR per the §13 / §15 / §16
+> mandatory process: `/git-commands:watch-pr` → real review (CodeRabbit,
+> fall back to `/codex:rescue` / sub-agent) → `/git-commands:merge-pr`.
+> **No release.** Validate locally on the mac (VZ) and via mini3 (FC);
+> reproduce the shipping path per §12.1. Once the MVP lands, add the
+> `mini3.py` Fabric helpers as a follow-up PR when the first test
+> needs them. Read §0 update + §15 + §16 first for context.
