@@ -518,8 +518,8 @@ in-guest `mkfs`) — which is what §3 targets.
 | — | Firecracker CoW-upper mirror | speed (Linux) | medium | ❌ ruled out — FC `mkfs` ~0.18 s (§0) |
 | — | Guest `mkfs`/overlay sub-event (1c) | observability | medium | ❌ shelved — lump too small now (§0) |
 | 3a | `network-setup.sh` interface-rename fix (§12) | stability/robustness | low–med | ✅ shipped v0.5.5 (#123), validated VZ + FC |
-| 3b | ~~`shed-firstboot` time-to-agent reorder~~ | speed | — | ❌ dropped — validated as NOT a win; agent's real gate is network-setup→DHCP, not firstboot (§12) |
-| **3c** | **Decouple agent-healthy from network-setup/DHCP (§12, §13)** | **speed (~1s on plain create, both)** | med–high | 🔎 **TOP REMAINING** — designed (§13); create-flow change, clone/provision gate on network-ready |
+| 3b | `shed-firstboot` time-to-agent reorder, **FC-only** | speed (~20% plain create, FC) | medium | ✅ shipped (PR #126) — `Before=ssh.service` on FC only; ~−450 ms (~20 %) plain-create win on mini3, no `--repo` regression. The 3b drop in §12 was based on a VZ-only measurement that exposed a DHCP race; FC has no DHCP wait. See §14. |
+| 3c | ~~Decouple agent-healthy from network-setup/DHCP (§13)~~ | speed | — | ❌ superseded — implemented + benchmarked (§14); the literal change buys 0 ms on VZ (firstboot is the gate, not DHCP) and ~150 ms / **−450 ms `--repo` regression** when combined with the firstboot reorder. The realizable win on VZ is capped by fixed VMM/kernel overhead. FC's win is captured by 3b above. |
 | 4 | Reaping / stop correctness (§5a) | stability | medium | open |
 | 5 | Workspace mount retry (§5c) | stability | low | open |
 | 6 | Parallelize create prefix (§4.1) | speed | medium | open |
@@ -529,12 +529,15 @@ in-guest `mkfs`) — which is what §3 targets.
 | 10 | Honest `GetNetworkEndpoint` (§7) | simplicity | low–med | open |
 | 11 | composefs (§6.5) | disk | high | open |
 
-**Next:** item **3c** (§13 has the kickoff plan) — the real ~1 s win for
-plain `shed create`, both backends. After that, the open items split into a
-**speed** track (#6 parallelize create prefix, #7 finish event-driven
-readiness) and a **stability** track (#4 reaping/stop, #5 mount retry, #8
-FC network hardening), plus **disk** (#9 cache eviction) and **simplicity**
-(#10 honest GetNetworkEndpoint). #11 composefs stays deferred.
+**Next** (2026-05-28 update): item **3c is superseded** — see §14. **3b
+shipped FC-only** in PR #126 (~20 % FC plain-create win). The remaining
+open items split into a **speed** track (#6 parallelize create prefix,
+#7 finish event-driven readiness) and a **stability** track (#4
+reaping/stop, #5 mount retry, #8 FC network hardening), plus **disk** (#9
+cache eviction) and **simplicity** (#10 honest GetNetworkEndpoint). #11
+composefs stays deferred. There is no obvious next big speed win on VZ —
+the ~450 ms of fixed VMM/kernel/initramfs overhead + 150 ms host-poll
+latency is the floor without changing vfkit or the boot path itself.
 
 ---
 
@@ -767,6 +770,14 @@ code review and need confirmation on a Linux/KVM host (e.g. `mini2` /
 
 ## 13. Next session: 3c kickoff plan (decouple agent-healthy from network/DHCP)
 
+> **SUPERSEDED — see §0 update (2026-05-28) and §14.** The plan below was
+> implemented and benchmarked. Its core premise (a ~1 s VZ DHCP wait on
+> the agent's critical path) was a misattribution; the agent's real gate
+> is `shed-firstboot`, not `network-setup`. The literal 3c change is not
+> shipped. The actual shipped change is `firecracker/shed-firstboot.service`
+> ordered `Before=ssh.service` only (FC-only) — §14d. This section is kept
+> as the reasoning trail; do NOT use it as a kickoff plan.
+
 **Goal.** `shed-agent` talks over **vsock and needs no IP**, but
 `network-setup.service` is `Before=shed-agent.service`, so the agent (and
 thus `shed create`) waits ~1 s for DHCP it doesn't need. Decouple them so a
@@ -895,7 +906,11 @@ network-wait gate makes `--repo` worse. **Not shipped.**
 Apples-to-apples: same dev `shed-server` (v0.5.5, built on mini3 from
 this tree), same `shed-build-tools:v0.5.3` for the erofs mint, same image
 build pipeline. The only difference between BEFORE and AFTER is the
-`firecracker/shed-firstboot.service` `Before=` line. 5 plain creates each:
+`firecracker/shed-firstboot.service` `Before=` line. 5 plain creates per
+phase, run sequentially within each phase (BEFORE block first, AFTER
+block second) — not interleaved per sample. The fb*/fa* ranges overlap
+in pattern, so order-of-day cache effects don't explain the median delta
+(but a follow-up interleaved run would be the rigorous next step):
 
 | Plain `create` (5 samples) | Median `agent` | Mean `agent` | Range | Median total |
 |---|---|---|---|---|
@@ -916,13 +931,14 @@ Boot order verification (kernel/journald, FC AFTER):
 `Finished network-setup` → `Reached sysinit.target` → `basic.target` →
 `Started shed-agent` → … → `Finished shed-firstboot` (later). firstboot is
 off the agent's critical path; `Before=ssh.service` still ensures
-keygen-before-sshd (security invariant preserved).
+firstboot is ordered before sshd starts (security ordering invariant
+preserved — see the failure-mode caveat in §14e).
 
 The `~3.7 s` FC baseline in §11 / Appendix B predates this mini3
 configuration; current mini3 plain create is ~2.3 s shipped, so the
 firstboot reorder buys ~20 % rather than the ~1 s the doc projected. The
-win is smaller in absolute terms but real, repeatable, and zero-risk for
-`--repo`.
+win is smaller in absolute terms but real, repeatable, and showed no
+`--repo` regression across the samples taken (3 `--repo` creates after).
 
 ### 14c. What 3c got right, what it got wrong
 
@@ -946,7 +962,57 @@ Wrong:
 ### 14d. Shipped change
 
 `firecracker/shed-firstboot.service` only: `Before=ssh.service` (the
-`ea78d53` text from §12), FC-only. No Go code change. No host-side gate.
-No VZ unit change. See the file's inline comment for the FC-specific
-reasoning (static IP, no DHCP exposure) that makes this safe on FC even
-though §12 dropped the same change on VZ.
+`ea78d53` text from §12), FC-only. No host-side gate. No VZ unit change.
+The PR also (i) updates `cmd/shed-firstboot`'s package comment to
+describe the per-backend divergence, (ii) adds an inline
+`Before=shed-agent.service` guardrail comment to
+`firecracker/network-setup.service` (the line whose accidental loss or
+slowdown would re-create the VZ-style `--repo` regression on FC), and
+(iii) adds `internal/vmutil/firecracker_firstboot_service_test.go` — a
+Go test that asserts the FC firstboot unit contains `Before=ssh.service`
+AND bans the three previously-removed `Before=` tokens (`sysinit.target`,
+`shed-agent.service`, `network-setup.service`). The test runs on every
+CI build and locks in the single load-bearing line of this PR.
+
+### 14e. Security-invariant honesty: what `Before=` guarantees
+
+`Before=ssh.service` is an ORDERING edge, not a `Requires=`/`BindsTo=`
+edge. systemd treats an ordered unit as "finished starting" after either
+success OR failure (see `systemd.unit(5)`), so:
+
+- **What we preserve (same as shipped):** sshd starts AFTER firstboot
+  exits, regardless of firstboot's exit status. If firstboot succeeds
+  (the overwhelming common case), per-shed host keys are in place and
+  sshd serves them.
+- **What we do NOT preserve, and never did:** sshd does NOT refuse to
+  start if firstboot fails. `cmd/shed-firstboot/firstboot.go`
+  `regenerateIdentity` removes the baked-in stale keys *before* running
+  `ssh-keygen -A`; if `ssh-keygen -A` fails mid-regen, the rootfs is left
+  with no/partial host keys and sshd's behavior is then up to sshd
+  itself (typically: refuse to start, or auto-generate ephemeral keys
+  depending on `HostKey` directives). The pre-PR-#126 unit had identical
+  failure-mode semantics — the broad `Before=` list also did not
+  propagate failure. This PR does not introduce a regression here.
+- **Strengthening option (deliberately not in this PR):** adding a drop-in
+  on `ssh.service` with `Requires=shed-firstboot.service` (or
+  `BindsTo=`) would make sshd refuse to start on firstboot failure. That
+  is a strict behavior change versus shipped (sheds with a broken
+  firstboot would be unreachable via SSH instead of reachable with
+  potentially-shared keys). Worth a separate, discussed PR if the
+  tradeoff is desired; out of scope here.
+
+The added Go test (§14d) asserts the *ordering edge* only. A future
+follow-up that wants fail-closed semantics should also extend the test
+to assert the `Requires=` drop-in or equivalent.
+
+### 14f. Rollback
+
+The shipped change is a single `Before=` line in one unit file. To
+revert: restore the prior
+`Before=sysinit.target systemd-machine-id-commit.service systemd-journald.service ssh.service shed-agent.service network-setup.service`
+line in `firecracker/shed-firstboot.service`, rebuild the FC rootfs
+image (e.g. `./scripts/build-firecracker-rootfs.sh --variant base
+--build-tools-version vX.Y.Z`), and republish. The corresponding test in
+`internal/vmutil/firecracker_firstboot_service_test.go` would also need
+to be updated (or deleted) to reflect the reverted state. No data
+migration, no on-disk format change.
