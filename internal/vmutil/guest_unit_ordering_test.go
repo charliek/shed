@@ -24,34 +24,69 @@ import (
 	"testing"
 )
 
-// beforeTokens returns the union of every token that appears in a
-// `Before=` directive inside the file's [Unit] section. Comment lines
-// (starting with `#`) and directives outside [Unit] are ignored.
-func beforeTokens(t *testing.T, path string) map[string]bool {
+// directiveTokens returns the union of every token that appears in
+// `<key>=...` directives inside the named section of a systemd unit file.
+// Whole-line comments (lines starting with `#`) and directives outside
+// the requested section are ignored.
+//
+// Caveats (acceptable today — every unit file in this repo uses simple
+// whole-line comments and no continuation lines):
+//   - Inline comments on the same line as a directive (e.g.
+//     `Before=ssh.service # note`) are NOT stripped; the `# note` would be
+//     read as another token. Add comment-stripping here if a future unit
+//     file starts using that style.
+//   - Systemd `\`-continuation lines are NOT joined; a directive split
+//     across lines would lose tokens after the first line. Same caveat.
+//
+// Multiple directives with the same key in the same section are unioned
+// (systemd-`After=` and `Before=` are themselves additive by spec).
+func directiveTokens(t *testing.T, path, section, key string) map[string]bool {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	tokens := map[string]bool{}
-	inUnit := false
+	want := "[" + section + "]"
+	prefix := key + "="
+	inSection := false
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
-		// Section header switches the inUnit gate.
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			inUnit = line == "[Unit]"
+			inSection = line == want
 			continue
 		}
-		if !inUnit || line == "" || strings.HasPrefix(line, "#") {
+		if !inSection || line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if v, ok := strings.CutPrefix(line, "Before="); ok {
+		if v, ok := strings.CutPrefix(line, prefix); ok {
 			for _, t := range strings.Fields(v) {
 				tokens[t] = true
 			}
 		}
 	}
 	return tokens
+}
+
+// beforeTokens returns `Before=` tokens from the [Unit] section. Thin
+// wrapper for readability at call sites.
+func beforeTokens(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	return directiveTokens(t, path, "Unit", "Before")
+}
+
+// afterTokens returns `After=` tokens from the [Unit] section.
+func afterTokens(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	return directiveTokens(t, path, "Unit", "After")
+}
+
+// wantedByTokens returns `WantedBy=` tokens from the [Install] section.
+// Used to verify a unit is actually enabled into the boot graph (without
+// it, the `Before=`/`After=` edges are unreachable code paths).
+func wantedByTokens(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	return directiveTokens(t, path, "Install", "WantedBy")
 }
 
 // TestFirecrackerFirstbootOrdering: the load-bearing line of PR #126.
@@ -115,5 +150,78 @@ func TestVZNetworkSetupGuardsAgent(t *testing.T) {
 	before := beforeTokens(t, path)
 	if !before["shed-agent.service"] {
 		t.Errorf("%s must order `Before=shed-agent.service` (PR #126 measured that removing this regresses --repo creates by ~450 ms and yields no plain-create win — doc §14a)", path)
+	}
+}
+
+// TestShedAgentNotAfterFirstboot: shed-agent's only `After=` should be
+// the passive `network.target`. Re-introducing `After=shed-firstboot.service`
+// (or `After=network-online.target`) would re-block the agent on
+// firstboot's crng-blocked ssh-keygen on FC (erasing PR #126's ~20 %
+// win) or on systemd-networkd-wait-online (a different kind of gate
+// that's even harder to debug). Each backend's agent unit is checked
+// separately because their shapes are intentionally allowed to diverge.
+// See docs/discovery/platform-runtime-optimization.md §14a / §14b.
+func TestShedAgentNotAfterFirstboot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"firecracker", "../../firecracker/shed-agent.service"},
+		{"vz", "../../vz/shed-agent.service"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			after := afterTokens(t, tc.path)
+			for _, banned := range []string{"shed-firstboot.service", "network-online.target"} {
+				if after[banned] {
+					t.Errorf("%s must NOT order `After=%s` (would re-gate the agent on an earlier-boot unit; see docs/discovery/platform-runtime-optimization.md §14)", tc.path, banned)
+				}
+			}
+		})
+	}
+}
+
+// TestFirstbootInstalledIntoBootGraph: the firstboot units only enforce
+// their `Before=` edges if they are actually pulled into the boot
+// transaction. Both backends rely on `WantedBy=sysinit.target` for that.
+// If a future change disables firstboot from the boot graph (e.g. by
+// removing the [Install] section or changing WantedBy=), the per-shed
+// host-key regeneration silently stops happening — a security regression
+// far worse than the boot-ordering ones the rest of this file locks.
+func TestFirstbootInstalledIntoBootGraph(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"firecracker", "../../firecracker/shed-firstboot.service"},
+		{"vz", "../../vz/shed-firstboot.service"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantedBy := wantedByTokens(t, tc.path)
+			if !wantedBy["sysinit.target"] {
+				t.Errorf("%s must declare `WantedBy=sysinit.target` in [Install] so the unit is actually enabled at boot; without it, per-shed SSH host keys would never be regenerated — every shed would serve the baked-in keys (see docs/discovery/platform-runtime-optimization.md §14e)", tc.path)
+			}
+		})
+	}
+}
+
+// TestNetworkSetupInstalledIntoBootGraph: same logic as
+// TestFirstbootInstalledIntoBootGraph but for network-setup. The
+// `Before=shed-agent.service` guardrail this file locks is only
+// meaningful when network-setup is pulled into the boot transaction;
+// both backends do that via `WantedBy=multi-user.target`.
+func TestNetworkSetupInstalledIntoBootGraph(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"firecracker", "../../firecracker/network-setup.service"},
+		{"vz", "../../vz/network-setup.service"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantedBy := wantedByTokens(t, tc.path)
+			if !wantedBy["multi-user.target"] {
+				t.Errorf("%s must declare `WantedBy=multi-user.target` in [Install] so the unit is actually enabled at boot; without it, the `Before=shed-agent.service` guardrail is unreachable and the agent could start before the network is configured (see docs/discovery/platform-runtime-optimization.md §14)", tc.path)
+			}
+		})
 	}
 }

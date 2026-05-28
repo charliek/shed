@@ -968,11 +968,17 @@ describe the per-backend divergence, (ii) adds an inline
 `Before=shed-agent.service` guardrail comment to
 `firecracker/network-setup.service` (the line whose accidental loss or
 slowdown would re-create the VZ-style `--repo` regression on FC), and
-(iii) adds `internal/vmutil/firecracker_firstboot_service_test.go` — a
-Go test that asserts the FC firstboot unit contains `Before=ssh.service`
-AND bans the three previously-removed `Before=` tokens (`sysinit.target`,
-`shed-agent.service`, `network-setup.service`). The test runs on every
-CI build and locks in the single load-bearing line of this PR.
+(iii) adds `internal/vmutil/guest_unit_ordering_test.go` (extended in
+PR #127) — Go tests that lock all four guest unit-file ordering
+invariants this work depends on: the FC firstboot `Before=ssh.service`
+edge and the bans on the three previously-removed `Before=` tokens
+(`sysinit.target`, `shed-agent.service`, `network-setup.service`); the
+FC `network-setup.service` `Before=shed-agent.service` static-IP
+guardrail; the *intentional* VZ non-changes (broad firstboot ordering +
+`network-setup` agent gating preserved); plus banned `After=` tokens on
+both backends' `shed-agent.service` and `WantedBy=` presence on
+firstboot and network-setup so the edges aren't unreachable code. The
+tests run on every CI build.
 
 ### 14e. Security-invariant honesty: what `Before=` guarantees
 
@@ -1013,6 +1019,8 @@ revert: restore the prior
 line in `firecracker/shed-firstboot.service`, rebuild the FC rootfs
 image (e.g. `./scripts/build-firecracker-rootfs.sh --variant base
 --build-tools-version vX.Y.Z`), and republish. The corresponding test in
-`internal/vmutil/firecracker_firstboot_service_test.go` would also need
-to be updated (or deleted) to reflect the reverted state. No data
-migration, no on-disk format change.
+`internal/vmutil/guest_unit_ordering_test.go` (specifically
+`TestFirecrackerFirstbootOrdering` and any tests added in PR #127 that
+share the FC firstboot assumption) would also need to be updated (or
+deleted) to reflect the reverted state. No data migration, no on-disk
+format change.
