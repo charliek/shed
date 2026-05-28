@@ -17,7 +17,7 @@ structurally the same. Lean into each platform's native primitives.
 
 ---
 
-## 0. Status & revised priorities (updated 2026-05-27)
+## 0. Status & revised priorities (updated 2026-05-28, after v0.5.6 ship)
 
 This section supersedes the original priorities below where they conflict;
 the later sections are kept for the reasoning trail.
@@ -31,6 +31,14 @@ the later sections are kept for the reasoning trail.
 - **v0.5.5** — fixes the Phase 2 activation (#124). **The VZ create
   speedup actually works as of 0.5.5.** Verified on the shipped brew
   binary from a clean state: warm `shed create` ~1.6 s (vs ~5.9 s pre-Phase-2).
+- **v0.5.6** — ships the **Firecracker firstboot reorder** (#126,
+  measured ~20 % FC plain-create win on mini3, no `--repo` regression)
+  plus the **guest unit-file ordering invariant tests** (#127, locks
+  the ordering decisions on every PR — no VM needed). Doc-only updates
+  also in #125. Full measurements + reasoning in §14. The corrected
+  understanding (firstboot is the agent's gate, not the projected
+  `network-setup` DHCP wait) is recorded here in the
+  "Update (2026-05-28)" subsection below.
 
 > **Release rule going forward:** do NOT cut a release without discussion.
 
@@ -47,6 +55,23 @@ the later sections are kept for the reasoning trail.
   fix + prerequisite for 3c.
 - **build-tools ref v-prefix fix** (PR #124) — the activation fix for
   Phase 2; see §12.1.
+- **Firecracker firstboot reorder** (PR #126, shipped v0.5.6) — orders
+  `firecracker/shed-firstboot.service` `Before=ssh.service` only.
+  Apples-to-apples on mini3: median `agent` phase **2256 ms → 1804 ms
+  (−452 ms / ~20 %)**, every after-sample beats every before-sample.
+  `--repo` creates show no regression. Host-key uniqueness invariant
+  preserved. Deliberately FC-only — see §14a / §14b for the VZ
+  measurement that ruled out mirroring. The shipped change is a single
+  `Before=` line; the PR also adds a comment-only FC static-IP guardrail
+  on `firecracker/network-setup.service` and updates
+  `cmd/shed-firstboot/firstboot.go`'s package doc.
+- **Guest unit-file ordering invariant tests** (PR #127, shipped v0.5.6) —
+  seven pure-file-parsing Go tests in
+  `internal/vmutil/guest_unit_ordering_test.go` lock every load-bearing
+  `Before=`/`After=`/`WantedBy=` edge across FC + VZ. Runs on every PR
+  (GHA standard runners; no VM needed). Background in §14d and §15
+  (the "structural perf-regression safety net" half — the dynamic half
+  belongs in a bare-metal release-validation suite, see §16).
 
 > **Lesson (§12.1):** Phase 2 looked validated but wasn't, because dev
 > testing used the `SHED_BUILD_TOOLS_REF` override and a cached template —
@@ -128,6 +153,40 @@ win actually is.
 The `network-setup.sh` re-resolve fix (#123, both platforms) stands; so do
 all prior status items. §13 is superseded by this update; §14 records the
 measurements that drove it.
+
+### Update (2026-05-28, after v0.5.6 ship): next investment = consistency & simplicity
+
+With the FC firstboot reorder shipped (#126) and the boot-ordering
+invariants locked structurally on every PR (#127), the speed work has
+reached a sustainable point. The realistic plain-create floor on VZ
+(~150 ms of VMM/kernel/initramfs + ~150 ms of host-poll latency, modulo
+small tightenings) is acknowledged; FC's next gate after firstboot is
+the same host-poll floor. Further headline speed wins require either
+vendor work (vfkit virtio-rng) or refactoring that primarily pays off
+through consistency rather than raw latency.
+
+The **next investment is consistency & simplicity** — same speed or
+faster, with substantially less code and less per-backend divergence.
+A code walk after the v0.5.6 release identified concrete targets:
+factor `CreateShed` (and its near-duplicates `StartShed` / from-snapshot)
+into a shared backend-agnostic orchestrator (~500–700 lines removed,
+future speed PRs become one-place changes); tighten `healthPollInterval`
+from 150 ms to 50 ms (50–100 ms saved per create, one line); split
+`backend.Progress` into separate `Phase`/`Status` calls (cleaner timer
+logs, simpler reasoning); document divergent backend config defaults;
+move `shed console` to vsock-first; consolidate the two
+`build-*-rootfs.sh` scripts. The phased execution plan is in **§15**;
+each phase ships independently under the same §13 mandatory PR/review/merge
+process.
+
+In parallel, the testing pattern that drove #126 (manual loops over `shed
+create` + log parsing, with mini3 deploys handled by ad-hoc shell) has
+hit its limits and is itself a consistency problem. A more robust
+integration-test suite — pytest- or Go-based, targeting both local and
+SSH-attached shed-servers, capable of PhaseTimer-style timing assertions
+and structured reporting — is the natural companion to the orchestrator
+refactor. **§16** captures the architecture options and the chosen
+approach (decided in chat 2026-05-28; doc TBD once the MVP lands).
 
 ---
 
@@ -1024,3 +1083,427 @@ image (e.g. `./scripts/build-firecracker-rootfs.sh --variant base
 share the FC firstboot assumption) would also need to be updated (or
 deleted) to reflect the reverted state. No data migration, no on-disk
 format change.
+
+---
+
+## 15. Consistency & simplicity: phased plan (2026-05-28)
+
+Now that the speed work is at a sustainable point (§0 update), the next
+investment is consistency and simplicity — same speed or faster, with
+substantially less code and less per-backend divergence. This plan was
+derived from a code walk after the v0.5.6 release. It's organized into
+three phases, each shippable independently, each under the §13 mandatory
+PR/review/merge process. **No release** is cut from any single PR;
+phases bundle into a release after explicit discussion.
+
+### Framing
+
+"Consistency" means three different things pulling in different
+directions:
+
+- **Code-shape consistency** across backends — the two `CreateShed`s
+  should *read* the same when they're doing the same thing.
+- **Concept consistency** across the system — the agent's contract, the
+  create lifecycle, the timer phases, each expressed once.
+- **Behavior consistency** for the user — `shed create` shouldn't produce
+  subtly different output (or error semantics, or cleanup behavior)
+  depending on backend.
+
+"Simplicity" means fewer special cases, less duplicated logic, dead /
+accidental code removed. The trap to avoid: refactoring that increases
+*abstraction* without reducing *surface area*. The goal is fewer lines,
+not more layers.
+
+"Speed" here means at minimum no regression. The simplification itself
+should deliver small bumps (less branching, less init), and Phase 1's
+tightening + Phase 2's orchestrator both enable downstream speed PRs to
+land in one place instead of two.
+
+---
+
+### 15a. Phase 1 — small immediate wins (~1 week, 3 PRs)
+
+Each PR is small enough to ship alone. Total effort: ~1 week incl
+review/merge/validate.
+
+#### 1a — Tighten `healthPollInterval` from 150 ms → 50 ms
+
+**Scope:** one constant in `internal/vmutil/agent.go` (currently
+`healthPollInterval = 150 * time.Millisecond`).
+
+**Rationale:** each probe is a vsock dial + a tiny health JSON exchange
+— sub-millisecond on a local socket. 150 ms was a conservative initial
+default. Dropping to 50 ms saves up to 100 ms per create with zero
+downside (the agent gets probed a bit more often during the first ~1 s
+of boot, then never again).
+
+**Files touched:** `internal/vmutil/agent.go` (the constant + its
+explanatory comment), possibly a unit test.
+
+**Live test criteria (per §13):**
+- ≥2 plain creates on VZ (mac), ≥2 on FC (mini3), incl one `--repo`
+  per OS.
+- Compare PhaseTimer `agent` phase median before/after; should drop by
+  50–100 ms on both backends.
+- Reproduce the shipping path: dev `shed-server` built with the active
+  release tag (`Version=v0.5.6` post-release; current main version pre-
+  release), no overrides, no warm template cache on cold runs.
+- No new test (the existing tests cover the constant; this is just a
+  value change).
+
+**Review:** standard. The change is small enough that any review tool
+will be substantive on it; CodeRabbit / Codex fallback per §13.
+
+#### 1b — Split `backend.Progress` into `backend.Phase` + `backend.Status`
+
+**Scope:** the progress/timer API.
+
+**Rationale:** today `backend.Progress(ctx, phase, message)` does double
+duty — it's both a user-visible SSE event AND a phase-timer boundary
+signal. The timer merges consecutive same-phase events but still logs
+e.g. `repo=0ms ... clone=300ms ... repo=4ms` because the same
+`Progress(ctx, "repo", ...)` call fires twice on either side of the
+clone-time span (see the v0.5.6 `--repo` timing line in §14). It works
+but reads weird, and any future `Progress` refactor risks breaking
+phase timing.
+
+**Proposed API:**
+
+- `backend.Phase(ctx, name)` — moves the timer; no SSE event.
+- `backend.Status(ctx, message)` — emits SSE event; doesn't move the
+  timer.
+- Existing `backend.Progress` becomes a thin convenience that does both
+  (kept for migration; remove after all call sites updated).
+
+**Files touched:** `internal/backend/progress.go`,
+`internal/backend/phasetimer.go`, both backends' `CreateShed` /
+`StartShed` / spawn paths, possibly the SSE handler in
+`internal/api/handlers.go`.
+
+**Live test criteria:**
+- ≥2 plain + ≥1 `--repo` create per backend; PhaseTimer log line shows
+  no duplicate phase entries (vs the `repo=0ms ... repo=4ms` we see
+  today).
+- An SSE-consuming `shed create` (just running `shed create` from the
+  CLI is enough) shows identical user-visible progress lines.
+- No regression in median `agent` phase (this is a refactor; behavior
+  unchanged).
+
+**Review:** medium. Behavior preservation needs careful review of every
+call site; ask the reviewer to specifically check that no SSE event went
+missing.
+
+#### 1c — Document divergent backend config defaults
+
+**Scope:** doc-only / comment-only.
+
+**Rationale:** `defaultVZConfig()` and `defaultFirecrackerConfig()` set
+some fields with subtly different defaults — `StartTimeout` is 60 s on
+VZ vs 30 s on FC; CPU/memory defaults align but it's not obvious from
+the code why each field's value is what it is. Add per-field comments
+explaining the "why" of each non-aligned default and a note when two
+defaults *are* aligned and shouldn't drift.
+
+**Files touched:** `internal/config/server.go`.
+
+**Live test:** none needed (doc-only).
+
+**Review:** light. The substance is "are the explanations correct?"
+which a quick read-through covers.
+
+---
+
+### 15b. Phase 2 — orchestrator refactor (~2–3 weeks, 3–4 PRs)
+
+**Goal:** factor the two backends' `CreateShed` / `StartShed` / stop
+flows into a shared orchestrator. Estimated net code reduction:
+~500–700 lines. Every future feature / speed PR becomes a one-place
+change.
+
+This is the big rock. Ship in 3–4 PRs (not one big bang) so each step
+is reviewable and revertable.
+
+#### 2a — Cleanup-stack helper (foundation; no orchestrator yet)
+
+**Scope:** introduce `internal/backend/cleanup.go` providing a LIFO
+rollback stack. Migrate each backend's `CreateShed` to use it (no other
+changes).
+
+**Rationale:** today both `CreateShed`s have ~10 inline rollback blocks
+that look like:
+
+```go
+if err := x; err != nil {
+    if stopErr := vm.Stop(...); stopErr != nil { log.Printf(...) }
+    if rmErr := meta.Delete(...); rmErr != nil { log.Printf(...) }
+    if rmErr := DeleteUpper(...); rmErr != nil { log.Printf(...) }
+    return nil, fmt.Errorf(...)
+}
+```
+
+Easy to forget a cleanup; easy to do them in the wrong order. The
+helper turns this into:
+
+```go
+cleanup.Register("stop VM", func() error { return vm.Stop(...) })
+// ... later
+cleanup.Register("delete metadata", func() error { return meta.Delete(...) })
+// ... on error:
+return nil, cleanup.RunReverse(err)
+```
+
+Each step registers its own cleanup; the helper runs them in LIFO order
+on any error, logging individual failures but continuing through the
+stack.
+
+**Files touched:** `internal/backend/cleanup.go` (new), both backends'
+`CreateShed` (migration only — no behavior change). Tests in
+`internal/backend/cleanup_test.go`.
+
+**Live test:**
+- ≥2 sheds per backend (incl one `--repo`).
+- One **deliberate failure** test per backend (e.g., an invalid `--repo`
+  URL after `vm.Start`) — verify cleanups run in correct LIFO order
+  with clear log lines and no leaked resources (no orphan upper, no
+  orphan VM process).
+
+**Risk:** low if scoped to mechanical translation. Reward: ~250 lines
+removed; future cleanup logic provably correct.
+
+#### 2b — `internal/backend/orchestrator/create.go` (the lifecycle)
+
+**Scope:** define a small `BackendCreator` interface and implement the
+shared `CreateShed` lifecycle once.
+
+**Sketch:**
+
+```go
+// internal/backend/orchestrator/create.go
+type BackendCreator interface {
+    Name() config.Backend
+    AllocateRootfs(ctx context.Context, req config.CreateShedRequest) (Rootfs, error)
+    SaveMetadata(meta *Metadata) error
+    StartVM(ctx context.Context, rootfs Rootfs, meta *Metadata) (VM, error)
+    MountWorkspace(ctx context.Context, agent *vmutil.AgentClient, src, dst string, ro bool) error
+    NewAgentClient(name string) *vmutil.AgentClient
+    // ... etc.
+}
+
+func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequest) (*config.Shed, error) {
+    cleanup := backend.NewCleanup()
+    defer cleanup.RunOnPanic()
+    // ... shared lifecycle calls b.AllocateRootfs, b.StartVM, ...
+}
+```
+
+**Files touched:** `internal/backend/orchestrator/` (new package),
+`internal/backend/orchestrator/create_test.go` (interface contract tests
++ mock backend), interface scaffolding only — VZ and FC continue using
+their existing `CreateShed` until 2c.
+
+**Live test:** none yet (no backend has migrated to the orchestrator).
+Validate via interface-contract tests against a mock.
+
+**Risk:** the orchestrator interface is *the* design decision of this
+work. Iterate against both backends' shape before committing.
+
+#### 2c — Migrate VZ + FC `CreateShed` to the orchestrator
+
+**Scope:** both backends implement `BackendCreator`; each backend's
+`CreateShed` becomes a 3-line wrapper around the orchestrator. The
+inline duplicate code goes away.
+
+**Files touched:** `internal/vz/client.go`, `internal/firecracker/client.go`,
+each backend's auxiliary lifecycle helpers as needed.
+
+**Live test (the big one):**
+- Full create-cycle suite on both backends: plain create + `--repo` +
+  `--local-dir` + `--from-snapshot` + provisioning hooks (if any
+  test images carry one).
+- PhaseTimer comparison vs main: must show identical timing within
+  measurement noise (~50 ms).
+- ≥3 creates per scenario per backend.
+- Deliberate-failure tests preserved from 2a.
+
+**Risk:** the highest of any PR in this plan. Mitigations: lots of
+tests; bisect-friendly small diffs (split VZ and FC into separate PRs if
+the diff is too large for one review); reviewer specifically asked to
+walk every former-inline-code-block-now-shared-orchestrator-step and
+verify equivalence.
+
+#### 2d — Migrate `StartShed` + `--from-snapshot` paths; kill duplicate code
+
+**Scope:** same interface, fewer steps (no rootfs allocation; existing
+upper). Once these go through the orchestrator, the per-backend
+`client.go` files should shrink to ~200 lines each from ~700, and the
+parallel-but-not-identical drift between Create / Start / SpawnSnapshot
+that exists today is gone.
+
+**Live test:** full lifecycle suite (create → stop → start → delete) per
+backend; from-snapshot create per backend.
+
+**Risk:** lower than 2c (the orchestrator interface is settled by now).
+Mostly mechanical.
+
+---
+
+### 15c. Phase 3 — opt-in follow-ups (timing depends on Phase 2)
+
+Lower priority; each enabled by Phase 2's cleaner interfaces.
+
+#### 3a — Vsock-first `shed console`
+
+**Scope:** `cmd/shed/console.go` (and any related transport selection).
+
+**Rationale:** today `shed console` uses SSH (port 2222), requiring
+sshd in the guest, which requires firstboot's `ssh-keygen` to complete
+— the entire load-bearing chain v0.5.6 just optimized. If `shed console`
+instead uses vsock + the agent's exec path (like `shed exec`), then
+sshd is no longer on the conceptual create critical path, and the
+keygen-before-sshd security argument applies only to *external* SSH
+clients (IDE integrations, `ssh shedname`), which is the right scope.
+A future release can then move sshd outside the agent boot transaction
+entirely (lazy / socket-activated).
+
+**Files touched:** `cmd/shed/console.go`, possibly the agent's exec
+TTY handling.
+
+**Live test:** `shed console` works on both backends with full TTY
+behavior (line editing, signals, resize); fall-back path to SSH still
+works when explicitly requested.
+
+**Risk:** medium — user-facing behavior change.
+
+#### 3b — Build-script consolidation
+
+**Scope:** `scripts/build-vz-rootfs.sh` and
+`scripts/build-firecracker-rootfs.sh` share ~80 % of their logic. Factor
+the common prereqs / source-ref resolution / build-tools handling into
+either a sourced shell library or a small Go-based runner; per-backend
+script becomes a thin caller.
+
+**Files touched:** the two scripts + a new shared library.
+
+**Live test:** rebuild VZ and FC base images on the consolidated
+pipeline; sanity-check that resulting OCI manifests match the
+previously-built ones.
+
+**Risk:** low (scripts are easily testable).
+
+#### 3c — `--from-snapshot` / `StartShed` audit
+
+**Scope:** after Phase 2, these are thin wrappers around the
+orchestrator. Audit pass to identify and remove any vestigial code that
+the orchestrator obsoletes but didn't delete.
+
+**Files touched:** small cleanups across both backends.
+
+**Live test:** lifecycle suite (Phase 2's coverage already covers this).
+
+---
+
+### Mandatory process (per phase / per PR — identical to §13)
+
+- **PR / review / merge:** open a PR, run **`/git-commands:watch-pr`**,
+  ensure a real review (CodeRabbit primary; fall back to **`/codex:rescue`**
+  then **`/cursor:rescue`** or an `Agent`-tool sub-agent if CodeRabbit
+  is rate-limited or returns nothing substantive). Address findings.
+  Then **`/git-commands:merge-pr`** once green. See memory
+  `pr-code-review-workflow`.
+- **No release without discussion.** Phase 1's three PRs can bundle into
+  a single patch release (v0.5.7?) after explicit go-ahead. Phase 2 is
+  larger — consider a minor bump (v0.6.0) at completion *if* the
+  orchestrator interface is exposed; otherwise keep it patch.
+- **Reproduce the shipping path** for every benchmark, per §12.1:
+  release-shaped `Version=vX.Y.Z` in the dev `shed-server`, no
+  `SHED_BUILD_TOOLS_REF` override, template cache cleared once for
+  cold-mint validation.
+- **Before each PR, start ≥2 sheds on each OS** (VZ on the mac, FC on
+  mini3), including one **`--repo` create per OS**. This is the
+  correctness crux preserved across all phases.
+- **Locked invariants from #127 must remain green.** Do not bypass
+  `internal/vmutil/guest_unit_ordering_test.go`; if a refactor needs the
+  test updated, document why in the PR.
+
+### Gotchas / risks
+
+- The **orchestrator interface in Phase 2b is the load-bearing design
+  decision.** Iterate against both backends before committing. Get the
+  reviewer to specifically pressure-test it.
+- **mini3 access** is required for FC validation. Per #126, installing
+  Go via tarball locally on mini3 is the simplest path (reversible).
+- **§12.1 trap:** dev `shed-server` must be built with the active
+  release-shaped version, or `shed-build-tools` resolves to a tag that
+  doesn't exist and the upper-template mint silently falls back to slow
+  in-guest `mkfs`. The fix is the dev-build ldflags
+  `-X github.com/charliek/shed/internal/version.Version=v0.5.6`.
+- **Phase 2 is when the integration-test suite (§16) starts paying for
+  itself.** The manual `shed create` + log-grep loops that drove #126
+  do not scale to "compare full create-cycle suite across both backends
+  + multiple PRs in the same session." Land §16's MVP before or during
+  2c if at all possible.
+
+### Ready-to-paste kickoff prompt for a new session
+
+> Implement the consistency & simplicity follow-up plan in
+> `docs/discovery/platform-runtime-optimization.md` §15. Start with
+> **Phase 1** (three small PRs, each shippable alone): **1a** tighten
+> `internal/vmutil/agent.go`'s `healthPollInterval` constant from
+> 150 ms → 50 ms; **1b** split `backend.Progress(ctx, phase, message)`
+> into separate `backend.Phase(ctx, name)` (timer boundary) and
+> `backend.Status(ctx, message)` (SSE event) calls, migrate every call
+> site; **1c** document divergent backend config defaults in
+> `internal/config/server.go`. Follow the §15 mandatory process: each
+> PR → `/git-commands:watch-pr` → real review (CodeRabbit, fall back to
+> `/codex:rescue` / `/cursor:rescue` / sub-agent) → address findings →
+> `/git-commands:merge-pr`. **No release** from any single PR; bundle
+> Phase 1 into a discussion before tagging. Validate the shipping path
+> per §12.1: dev `shed-server` built with the active release-shaped
+> `Version=v0.5.6` (or current main tag), no overrides, no warm template
+> cache. Before each PR, start ≥2 sheds per OS (VZ on mac, FC on mini3)
+> including one `--repo` per OS. Locked invariants from PR #127
+> (`internal/vmutil/guest_unit_ordering_test.go`) must remain green. Read
+> §0 update + §14 + §15 first for context; if the integration-test suite
+> from §16 has landed by then, prefer it over manual `shed create` loops
+> for validation. After Phase 1, return for discussion before starting
+> Phase 2 (the orchestrator refactor — bigger, more PRs, more risk).
+
+---
+
+## 16. Integration test & evaluation suite (placeholder — 2026-05-28)
+
+The pattern that drove validation of #126 — manual loops over
+`shed create` / `shed exec` / log-grep, with mini3 deploys handled by
+ad-hoc shell — does not scale to the multi-PR refactor work in §15. A
+more robust integration-test & evaluation suite is needed.
+
+**Goals:**
+
+- Prevent regression: live create-cycle tests with PhaseTimer-style
+  timing assertions, runnable on either OS, targeting local or remote
+  shed-servers.
+- Speed development: a single command that exercises plain + `--repo` +
+  `--local-dir` + `--from-snapshot` against one or both backends, with
+  structured output, so the operator iterating on a change doesn't
+  hand-craft shell loops every time.
+- Bare-metal release-validation: replace / augment
+  `scripts/smoke-test-linux.sh`'s create-cycle path with the new suite.
+
+**Architecture options under consideration** (chat discussion
+2026-05-28):
+
+- **pytest + subprocess `shed` CLI** (+ optional Fabric for explicit
+  remote orchestration). Python-side strengths: fixtures,
+  parametrization, plugin ecosystem (xdist, benchmark, html, junit).
+  Cost: second language in the project.
+- **Go-based integration framework** using `go test` with build tags
+  for "real-VM-required" tests. Strengths: single toolchain, direct
+  reuse of `internal/` types. Cost: Go's ergonomics for fixtures and
+  parametrization is clunkier than pytest's.
+- **Bash + bats** as an incremental step from the current state.
+  Strengths: no new tooling. Cost: doesn't escape bash's structured-data
+  / parametrization / fixture limits.
+
+**Decision and architecture details:** TBD. Once the MVP is committed
+to, this section will be filled in with the chosen approach, the test
+suite layout, the fixture conventions, and how to add a new test.
