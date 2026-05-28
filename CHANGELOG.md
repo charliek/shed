@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.6 — 2026-05-28
+
+Patch release shipping a **Firecracker-only `shed create` speedup —
+~20 % faster** (median wall-clock −450 ms on mini3) — plus structural
+test coverage that locks the boot-ordering invariants the speedup depends
+on across both backends. Drop-in upgrade from v0.5.5 — no config or
+on-disk format changes; the FC win takes effect once the rebuilt FC base
+image lands.
+
+### Speed
+
+- **Firecracker firstboot reorder** (PR #126). Order
+  `shed-firstboot.service` `Before=ssh.service` only on the FC unit
+  (was: also `Before=sysinit.target` / `shed-agent.service` /
+  `network-setup.service`). The broad ordering gated `shed-agent` —
+  which `shed create` waits on — by firstboot's full crng-blocked
+  `ssh-keygen` duration. Measured on mini3 (apples-to-apples, same
+  shed-server + same build pipeline, only the `Before=` line differs):
+  median `agent` phase **2256 ms → 1804 ms (−452 ms / ~20 %)**; every
+  after-sample beats every before-sample. `--repo` creates show **no
+  regression** (FC has a static IP — `network-setup` stays fast and
+  still gates the agent, so clone has the network when it runs).
+  Host-key uniqueness invariant preserved (`Before=ssh.service` keeps
+  keygen-before-sshd).
+
+  The same change was deliberately **not** applied to VZ. On VZ the
+  identical edit was measured to buy only ~150 ms on plain creates
+  (fixed VMM/kernel overhead is the ceiling) *and* to regress `--repo`
+  creates by ~450 ms (network readiness no longer overlaps boot — the
+  host pays the DHCP wait serially before clone). See
+  `docs/discovery/platform-runtime-optimization.md` §14 for full
+  measurements and reasoning.
+
+### Tests
+
+- **Guest unit-file ordering invariants locked** (PR #127). Seven
+  pure-file-parsing Go tests in
+  `internal/vmutil/guest_unit_ordering_test.go` lock the boot-ordering
+  decisions across FC and VZ — the FC firstboot `Before=ssh.service`
+  edge and bans on the three removed `Before=` tokens; the FC
+  `network-setup.service` `Before=shed-agent.service` static-IP
+  guardrail; the *intentional* VZ non-changes (broad firstboot ordering
+  + `network-setup` agent gating preserved); plus banned `After=`
+  tokens on both backends' `shed-agent.service` and `WantedBy=`
+  presence on firstboot + network-setup so the edges aren't unreachable
+  code. Runs on every PR (no VM needed; GitHub-hosted runners are
+  fine).
+
+### Docs
+
+- **Platform runtime optimization writeup updated** (PRs #125, #126,
+  #127). §0 now records the corrected understanding — the agent's gate
+  in the shipped config is `shed-firstboot` (~633 ms), not the
+  projected `network-setup` DHCP wait. New §14 records the full v0.5.6
+  measurements (VZ A/B and FC apples-to-apples) plus the failure-mode
+  honesty for the security invariant (`Before=` is an ordering edge,
+  not failure-propagation). §10 / §13 reframed: 3c is superseded; 3b
+  shipped FC-only.
+
 ## v0.5.5 — 2026-05-27
 
 Patch release fixing a v0.5.4 regression where the macOS/VZ copy-on-write
