@@ -144,29 +144,36 @@ def test_plain_create_timing(shed_server):
     run_id = hashlib.sha256(
         f"{os.getpid()}-{time.time_ns()}".encode()
     ).hexdigest()[:6]
+
+    # Delete-between-samples so each measurement reflects the cost
+    # of a SINGLE shed coming up — not the accumulating cost of
+    # N previous sheds running concurrently. The first live FC e2e
+    # run (mini3 v0.5.6) caught the accumulation effect when samples
+    # rose monotonically (1956→2854 ms) under the old "create five,
+    # delete five at end" pattern; the per-create signal is the
+    # regression target we actually want to gate on.
+    #
+    # We also drop the FIRST measured sample because the very first
+    # create after a fresh shed-server install touches a cold blob
+    # store (image pull + erofs conversion) that's irrelevant to
+    # boot-time tracking.
     samples: list[int] = []
-    created: list[str] = []
-    try:
-        for i in range(5):
-            name = f"itest-perf-{shed_server.backend}-{run_id}-{i}"
-            handle = shed_server.create(name, image="base")
-            created.append(name)
+    for i in range(6):  # 1 warm-up + 5 measured
+        name = f"itest-perf-{shed_server.backend}-{run_id}-{i}"
+        handle = shed_server.create(name, image="base")
+        try:
             if handle.timings is None or handle.timings.agent_ms is None:
                 pytest.skip(
                     "PhaseTimer not available; see "
                     "`test_phase_timer_emitted` for the underlying reason."
                 )
-            samples.append(handle.timings.agent_ms)
-            # 1-second gap between creates: workaround for a
-            # CID-allocation race we hit during PR #126 validation
-            # (rapid-back-to-back creates can collide on vsock CID
-            # picking). Underlying issue tracked separately; once
-            # fixed, drop this sleep AND add a `test_rapid_creates`
-            # regression test.
-            time.sleep(1)
-    finally:
-        for n in created:
-            shed_server.delete(n, ignore_missing=True)
+            if i > 0:  # skip the warm-up sample
+                samples.append(handle.timings.agent_ms)
+        finally:
+            shed_server.delete(name, ignore_missing=True)
+        # Small gap before the next iteration so any async resource
+        # release (vsock CID, TAP device) settles before re-use.
+        time.sleep(1)
 
     p50 = int(statistics.median(samples))
     assert p50 < ceiling, (
