@@ -132,6 +132,14 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// creates into corrupting the first caller's rootfs.
 	defer c.acquireCreateLock(req.Name)()
 
+	// LIFO rollback stack. Each successful resource-acquiring step
+	// `Register`s its teardown; on any error-return the deferred
+	// `cleanup.Run` invokes them in reverse. The success path calls
+	// `cleanup.Commit()` just before `return`, which zeroes the stack so
+	// the defer becomes a no-op. See `internal/backend/cleanup.go`.
+	cleanup := backend.NewCleanup()
+	defer cleanup.Run()
+
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
@@ -253,20 +261,21 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to create upper: %w", err)
 	}
+	cleanup.Register("delete upper layer", func() error {
+		return DeleteUpper(c.cfg.UppersDir, req.Name)
+	})
+
 	if snapshotUpperSource != "" {
 		// Replace the freshly allocated empty upper with a clone of the
 		// snapshot's stored upper so the new shed inherits its parent's
 		// writable contents.
 		if err := os.Remove(upperPath); err != nil && !os.IsNotExist(err) {
-			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
 			return nil, fmt.Errorf("failed to clear upper for snapshot clone: %w", err)
 		}
 		if _, err := clone.CloneFile(snapshotUpperSource, upperPath); err != nil {
-			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
 			return nil, fmt.Errorf("failed to clone snapshot upper: %w", err)
 		}
 		if err := os.Chmod(upperPath, 0o644); err != nil {
-			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
 			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
 		}
 		// The metadata's UpperSizeBytes must reflect the *cloned* file's
@@ -286,13 +295,11 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			// A canceled/timed-out request must abort, not silently fall
 			// back and keep mutating resources past the deadline.
 			if errors.Is(terr, context.Canceled) || errors.Is(terr, context.DeadlineExceeded) {
-				_ = DeleteUpper(c.cfg.UppersDir, req.Name)
 				return nil, fmt.Errorf("upper template provisioning canceled: %w", terr)
 			}
 			log.Printf("[%s] upper template unavailable (%v); formatting in guest", req.Name, terr)
 		} else if perr := provisionUpperFromTemplate(upperPath, tmpl); perr != nil {
 			if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
-				_ = DeleteUpper(c.cfg.UppersDir, req.Name)
 				return nil, fmt.Errorf("upper template provisioning canceled: %w", perr)
 			}
 			log.Printf("[%s] upper template clone failed (%v); formatting in guest", req.Name, perr)
@@ -322,15 +329,16 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	}
 
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		// Save can leave a partially-written instance dir even on error —
+		// preserve the console log (if any) and let the LIFO cleanup
+		// remove it on return.
 		c.preserveConsoleLog(meta)
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-		}
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
+	cleanup.Register("preserve console log + delete instance dir", func() error {
+		c.preserveConsoleLog(meta)
+		return meta.Delete(c.cfg.InstanceDir)
+	})
 
 	// Filter credentials to those with existing source directories.
 	// Non-existent sources are skipped to avoid vfkit VirtioFS failures.
@@ -342,35 +350,27 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	backend.Phase(ctx, "vm")
 	backend.Status(ctx, "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
-		c.preserveConsoleLog(meta)
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-		}
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
+	cleanup.Register("stop VM", func() error {
+		return vm.Stop(context.Background())
+	})
 
 	meta.Status = config.StatusRunning
 	meta.PID = vm.meta.PID
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		if stopErr := vm.Stop(context.Background()); stopErr != nil {
-			log.Printf("Warning: failed to stop VM: %v", stopErr)
-		}
-		c.preserveConsoleLog(meta)
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-		}
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
 	c.mu.Lock()
 	c.vms[req.Name] = vm
 	c.mu.Unlock()
+	cleanup.Register("remove from vms map", func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.vms, req.Name)
+		return nil
+	})
 
 	agent := c.newAgentClient(meta.Name)
 
@@ -379,10 +379,10 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		backend.Phase(ctx, "mount")
 		backend.Status(ctx, "Mounting local directory via VirtioFS...")
 		if err := c.mountVirtioFSShare(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
-			// VirtioFS mount is essential for --local-dir; fail the create
-			if stopErr := vm.Stop(context.Background()); stopErr != nil {
-				log.Printf("Warning: failed to stop VM after mount failure: %v", stopErr)
-			}
+			// VirtioFS mount is essential for --local-dir; fail the
+			// create. The deferred cleanup now fully unwinds: vms
+			// map entry, VM, instance dir, upper — previously only
+			// `vm.Stop` ran here, leaking the rest.
 			return nil, fmt.Errorf("VirtioFS mount failed for local dir %s: %w", req.LocalDir, err)
 		}
 	}
@@ -435,6 +435,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
+	// Happy path: zero out the cleanup stack so the deferred `Run` is a
+	// no-op. From here on the shed is the caller's responsibility.
+	cleanup.Commit()
 	return metadataToShed(meta, "127.0.0.1"), nil
 }
 
