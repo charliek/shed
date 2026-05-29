@@ -72,8 +72,8 @@ func TestIsRunning(t *testing.T) {
 	}
 
 	cases := []struct {
-		name       string
-		setupPID   func(t *testing.T) int
+		name        string
+		setupPID    func(t *testing.T) int
 		wantRunning bool
 	}{
 		{
