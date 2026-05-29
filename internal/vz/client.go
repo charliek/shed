@@ -141,6 +141,13 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+	} else if !errors.Is(err, ErrInstanceNotFound) {
+		// Non-not-found errors (corrupt metadata, I/O, permission)
+		// must propagate — falling through here would sweep the
+		// existing upper and overwrite a possibly-real shed. The
+		// pre-orchestrator code silently fell through; CodeRabbit's
+		// review of PR #139 flagged this. Loud failure is correct.
+		return nil, fmt.Errorf("failed to read metadata for %s: %w", req.Name, err)
 	}
 
 	// Sweep an orphan upper from a previously crashed create. We're
