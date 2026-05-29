@@ -355,3 +355,53 @@ func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 		t.Errorf("no complete event found in stream:\n%s", w.Body.String())
 	}
 }
+
+// TestCreateShed_SSE_PhaseOnlyEventsNotStreamed verifies that
+// `backend.Phase` calls (timer boundaries with no user-visible message)
+// do NOT cross the SSE wire. Per §15 1b the SSE handler drops events
+// with empty Message; the PhaseTimer still consumes them server-side.
+// Regression test for the silent-skip in `internal/api/handlers.go`'s
+// `sseFn`.
+func TestCreateShed_SSE_PhaseOnlyEventsNotStreamed(t *testing.T) {
+	be := &createShedFakeBackend{
+		createFn: func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+			// One phase-only event (should NOT appear in SSE), one
+			// status event (should appear), then another phase-only.
+			backend.Phase(ctx, "vm")
+			backend.Status(ctx, "Visible message")
+			backend.Phase(ctx, "agent")
+			return &config.Shed{Name: req.Name, Status: config.StatusRunning}, nil
+		},
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	body, _ := json.Marshal(config.CreateShedRequest{Name: "phase-only"})
+	r := httptest.NewRequest(http.MethodPost, "/api/sheds", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", w.Code, w.Body.String())
+	}
+
+	progressEvents := 0
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		if e.Event != "progress" {
+			continue
+		}
+		progressEvents++
+		// Any progress event we DO emit must carry a non-empty message.
+		// (Phase-only events would serialize as `{"phase":"vm","message":""}`
+		// and an SSE consumer treating them as user-visible would render
+		// blank lines.)
+		if !strings.Contains(e.Data, `"message":"Visible message"`) {
+			t.Errorf("unexpected SSE progress event data: %s", e.Data)
+		}
+	}
+	if progressEvents != 1 {
+		t.Errorf("got %d progress events, want exactly 1 (the Status call); "+
+			"phase-only events must not be streamed", progressEvents)
+	}
+}
