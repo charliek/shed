@@ -4,7 +4,7 @@
 package firecracker
 
 import (
-	"os"
+	"os/exec"
 	"testing"
 )
 
@@ -55,12 +55,23 @@ func TestIsRunning_LivePIDButNotFirecracker(t *testing.T) {
 	// A live PID that isn't firecracker must report not-running. Before
 	// the PID-reuse guard was added, this returned true and shed list
 	// would silently advertise a recycled pid as a running VMM.
-	currentPID := os.Getpid()
+	//
+	// We can't use os.Getpid() here: the test binary's /proc/PID/cmdline
+	// is `/path/to/firecracker.test` and substring-matches "firecracker".
+	// Spawn a sleep child so the cmdline is definitively not firecracker.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep child: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
 
 	dir := mustTempDir(t, "vm-test")
 	cfg := testFirecrackerConfig(dir)
 	meta := testMetadata("test-vm")
-	meta.PID = currentPID
+	meta.PID = cmd.Process.Pid
 
 	vm := &VM{meta: meta, cfg: cfg}
 
