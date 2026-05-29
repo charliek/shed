@@ -100,7 +100,7 @@ RUN printf '%s\n' \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        systemd systemd-sysv dbus \
-       sudo unzip ca-certificates hostname \
+       sudo zip unzip ca-certificates hostname \
        tmux git curl wget neovim jq ncurses-term ripgrep tree \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \

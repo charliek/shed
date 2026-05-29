@@ -75,7 +75,7 @@ RUN printf '%s\n' \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        systemd systemd-sysv systemd-resolved dbus \
-       sudo unzip ca-certificates hostname \
+       sudo zip unzip ca-certificates hostname \
        tmux git gh curl wget neovim jq ncurses-term ripgrep tree \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \
