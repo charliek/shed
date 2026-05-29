@@ -17,7 +17,7 @@ structurally the same. Lean into each platform's native primitives.
 
 ---
 
-## 0. Status & revised priorities (updated 2026-05-28, after v0.5.6 ship)
+## 0. Status & revised priorities (updated 2026-05-29, after §15 Phase 1+2 land on main)
 
 This section supersedes the original priorities below where they conflict;
 the later sections are kept for the reasoning trail.
@@ -72,6 +72,31 @@ the later sections are kept for the reasoning trail.
   (GHA standard runners; no VM needed). Background in §14d and §15
   (the "structural perf-regression safety net" half — the dynamic half
   belongs in a bare-metal release-validation suite, see §16).
+- **§15 Phase 1 — small immediate wins (complete, on main, pending v0.5.7).**
+  All three sub-phases landed: **1a** `healthPollInterval` 150 ms → 50 ms
+  (PR #133), **1b** split `backend.Progress` into `backend.Phase` +
+  `backend.Status` with every call site migrated (PR #135), **1c**
+  per-field comments on divergent backend defaults in
+  `internal/config/server.go` (PR #136). Status per sub-phase recorded
+  inline in §15a.
+- **§15 Phase 2 — orchestrator refactor (complete, on main, pending v0.5.7).**
+  All four sub-phases landed: **2a** LIFO cleanup-stack helper
+  (`internal/backend/cleanup.go`) + VZ/FC `CreateShed` migrated to use it
+  (PR #137); **2b** `internal/backend/orchestrator/` scaffolding +
+  `BackendCreator` interface with contract tests against a mock
+  (PR #138); **2c** VZ `CreateShed` migrated to the orchestrator
+  (PR #139); **2d** Firecracker `CreateShed` migrated to the orchestrator
+  (PR #140). The two per-backend `CreateShed`s now share the orchestrator
+  lifecycle; the inline duplicate code is gone. Status per sub-phase
+  recorded inline in §15b.
+- **§16 integration test suite — MVP live on both backends (complete,
+  on main).** Pytest + subprocess (Fabric reserved for the few
+  remote-orchestration tasks that need it), in-tree at
+  `tests/integration/`, managed with `uv`. Five MVP tests parameterized
+  over `["vz", "fc"]` (PR #132). Suite documented in `CLAUDE.md` + the
+  Development → Testing docs page (PR #141). FC e2e against `mini3`
+  validated and `test_plain_create_timing` ceiling calibrated for the
+  first live FC run (PR #142). Status detail in §16 below.
 
 > **Lesson (§12.1):** Phase 2 looked validated but wasn't, because dev
 > testing used the `SHED_BUILD_TOOLS_REF` override and a cached template —
@@ -1128,8 +1153,10 @@ review/merge/validate.
 
 #### 1a — Tighten `healthPollInterval` from 150 ms → 50 ms
 
-**Scope:** one constant in `internal/vmutil/agent.go` (currently
-`healthPollInterval = 150 * time.Millisecond`).
+**Status:** ✅ Landed on main in **PR #133** (pending v0.5.7 release).
+
+**Scope:** one constant in `internal/vmutil/agent.go` (pre-PR:
+`healthPollInterval = 150 * time.Millisecond`; post-PR: `50ms`).
 
 **Rationale:** each probe is a vsock dial + a tiny health JSON exchange
 — sub-millisecond on a local socket. 150 ms was a conservative initial
@@ -1155,6 +1182,9 @@ explanatory comment), possibly a unit test.
 will be substantive on it; CodeRabbit / Codex fallback per §13.
 
 #### 1b — Split `backend.Progress` into `backend.Phase` + `backend.Status`
+
+**Status:** ✅ Landed on main in **PR #135** (pending v0.5.7 release).
+All call sites migrated; no duplicate phase entries in the timer line.
 
 **Scope:** the progress/timer API.
 
@@ -1195,6 +1225,8 @@ missing.
 
 #### 1c — Document divergent backend config defaults
 
+**Status:** ✅ Landed on main in **PR #136** (pending v0.5.7 release).
+
 **Scope:** doc-only / comment-only.
 
 **Rationale:** `defaultVZConfig()` and `defaultFirecrackerConfig()` set
@@ -1215,15 +1247,25 @@ which a quick read-through covers.
 
 ### 15b. Phase 2 — orchestrator refactor (~2–3 weeks, 3–4 PRs)
 
-**Goal:** factor the two backends' `CreateShed` / `StartShed` / stop
-flows into a shared orchestrator. Estimated net code reduction:
+**Original goal:** factor the two backends' `CreateShed` / `StartShed`
+/ stop flows into a shared orchestrator. Estimated net code reduction:
 ~500–700 lines. Every future feature / speed PR becomes a one-place
 change.
+
+**What landed (2026-05-29):** the `CreateShed` half — PRs #137, #138,
+#139, #140 (see status lines below). The `StartShed` / `--from-snapshot`
+/ stop migration is deferred to a follow-up (2e), and the cross-cutting
+"Phase 3 starts from a fully thin per-backend `client.go`" assumption
+in §15c is not yet true — see §15c's status note.
 
 This is the big rock. Ship in 3–4 PRs (not one big bang) so each step
 is reviewable and revertable.
 
 #### 2a — Cleanup-stack helper (foundation; no orchestrator yet)
+
+**Status:** ✅ Landed on main in **PR #137** (pending v0.5.7 release).
+LIFO stack + tests in `internal/backend/cleanup.go`; both `CreateShed`s
+migrated to it (no behavior change).
 
 **Scope:** introduce `internal/backend/cleanup.go` providing a LIFO
 rollback stack. Migrate each backend's `CreateShed` to use it (no other
@@ -1272,6 +1314,12 @@ removed; future cleanup logic provably correct.
 
 #### 2b — `internal/backend/orchestrator/create.go` (the lifecycle)
 
+**Status:** ✅ Landed on main in **PR #138** (pending v0.5.7 release).
+`internal/backend/orchestrator/` package scaffolded with the
+`BackendCreator` interface, the shared `CreateShed` lifecycle, and
+contract tests against a mock backend. VZ + FC continue using their
+existing inline `CreateShed` until 2c / 2d.
+
 **Scope:** define a small `BackendCreator` interface and implement the
 shared `CreateShed` lifecycle once.
 
@@ -1309,6 +1357,12 @@ work. Iterate against both backends' shape before committing.
 
 #### 2c — Migrate VZ + FC `CreateShed` to the orchestrator
 
+**Status:** ✅ Landed on main split across **PR #139 (VZ)** and
+**PR #140 (Firecracker)** (pending v0.5.7 release). Each backend's
+`CreateShed` is now a thin wrapper that supplies the `BackendCreator`
+implementation; the shared orchestrator runs the lifecycle. The inline
+duplicate code in both `client.go` files is gone.
+
 **Scope:** both backends implement `BackendCreator`; each backend's
 `CreateShed` becomes a 3-line wrapper around the orchestrator. The
 inline duplicate code goes away.
@@ -1331,16 +1385,41 @@ the diff is too large for one review); reviewer specifically asked to
 walk every former-inline-code-block-now-shared-orchestrator-step and
 verify equivalence.
 
-#### 2d — Migrate `StartShed` + `--from-snapshot` paths; kill duplicate code
+#### 2d — Firecracker `CreateShed` migration (split out of 2c)
 
-**Scope:** same interface, fewer steps (no rootfs allocation; existing
-upper). Once these go through the orchestrator, the per-backend
-`client.go` files should shrink to ~200 lines each from ~700, and the
+**Status:** ✅ Landed on main in **PR #140** (pending v0.5.7 release).
+Execution-time split of the originally-planned 2c "both backends in one
+PR" — VZ migration shipped as #139 (2c), FC migration shipped as #140
+(2d). Same orchestrator, same interface, just two bisect-friendly PRs.
+
+**Scope:** Firecracker `CreateShed` implements `BackendCreator` and
+delegates to the shared orchestrator from PR #138; the inline duplicate
+code in `internal/firecracker/client.go` `CreateShed` is removed.
+
+**Live test:** integration suite from §16 (PR #132) green on FC against
+`mini3` after PR #142's `test_plain_create_timing` ceiling calibration.
+
+**Risk realized:** the FC half exposed a small timing variability the VZ
+half didn't (mini3 cold creates near the original 2100 ms ceiling),
+addressed by raising the FC `test_plain_create_timing` ceiling to
+2900 ms in PR #142 — see §16 milestone notes below.
+
+#### 2e (deferred) — `StartShed` + `--from-snapshot` paths through the orchestrator
+
+**Status:** ⏸ **Deferred.** Originally numbered 2d in this plan; the
+2c/2d slot was reused by the execution split above. `StartShed` and the
+`--from-snapshot` spawn path still live in each per-backend `client.go`.
+Reviving this is the natural follow-up once Phase 3 priorities are
+revisited.
+
+**Scope (unchanged):** same interface, fewer steps (no rootfs
+allocation; existing upper). Once these go through the orchestrator, the
+per-backend `client.go` files should shrink further and the
 parallel-but-not-identical drift between Create / Start / SpawnSnapshot
-that exists today is gone.
+that still exists today is gone.
 
-**Live test:** full lifecycle suite (create → stop → start → delete) per
-backend; from-snapshot create per backend.
+**Live test (when revived):** full lifecycle suite (create → stop →
+start → delete) per backend; from-snapshot create per backend.
 
 **Risk:** lower than 2c (the orchestrator interface is settled by now).
 Mostly mechanical.
@@ -1348,6 +1427,11 @@ Mostly mechanical.
 ---
 
 ### 15c. Phase 3 — opt-in follow-ups (timing depends on Phase 2)
+
+**Status (2026-05-29):** ⏸ **Deferred** — out of scope for the v0.5.7
+work cycle. The Phase 3 items below remain valid future work; they did
+not block the v0.5.7 ship. The next session may revisit them once the
+v0.5.7 release notes and the open issue queue are reviewed.
 
 Lower priority; each enabled by Phase 2's cleaner interfaces.
 
@@ -1392,13 +1476,18 @@ previously-built ones.
 
 #### 3c — `--from-snapshot` / `StartShed` audit
 
-**Scope:** after Phase 2, these are thin wrappers around the
-orchestrator. Audit pass to identify and remove any vestigial code that
-the orchestrator obsoletes but didn't delete.
+**Precondition:** §15b 2e (the `StartShed` / `--from-snapshot`
+orchestrator migration deferred out of Phase 2) lands first. Until then
+this item has nothing to audit — both paths are still per-backend in
+`client.go`.
+
+**Scope:** after 2e, these are thin wrappers around the orchestrator.
+Audit pass to identify and remove any vestigial code that the
+orchestrator obsoletes but didn't delete.
 
 **Files touched:** small cleanups across both backends.
 
-**Live test:** lifecycle suite (Phase 2's coverage already covers this).
+**Live test:** lifecycle suite (2e's coverage already covers this).
 
 ---
 
@@ -1471,6 +1560,36 @@ the orchestrator obsoletes but didn't delete.
 ---
 
 ## 16. Integration test & evaluation suite (2026-05-28)
+
+> **Milestone (2026-05-29).** ✅ **MVP live on both backends.** The
+> pytest + subprocess suite from this section's plan landed in
+> **PR #132**, the operator docs landed in **PR #141**
+> (`CLAUDE.md` integration-test paragraph + Development → Testing
+> page), and the first live FC e2e against `mini3` landed in
+> **PR #142** along with a `test_plain_create_timing` ceiling
+> recalibration. Two findings worth recording:
+>
+> - **`test_plain_create_timing` needs delete-between-samples.** The
+>   original pattern was "create N sheds, capture each timing, delete
+>   all at end." On FC the samples rose monotonically (1956 → 2854 ms
+>   on the first FC e2e run) because each new create paid the cost of
+>   N−1 concurrent running sheds — VZ's shared-NAT network masked the
+>   effect; FC's per-shed CID/IP/TAP allocation didn't. Fix: delete
+>   between samples + a warm-up sample, in
+>   `tests/integration/test_smoke.py`.
+> - **FC p50 ceiling bumped 2100 ms → 2900 ms.** The original ceiling
+>   was drawn from PR #126's apples-to-apples session (p50 1804 ms).
+>   The first live FC e2e on the shipped `mini3` `.deb` (19-day
+>   uptime, real workload) showed p50 2405 ms with a 1955–3005 ms
+>   range over 5 isolated samples — production variance is wider than
+>   the original benchmarking session showed. 2900 ms gates a 500 ms+
+>   regression without false-positive noise; expected to tighten once
+>   §15 1a (`healthPoll`) ships to FC via the next release. VZ stays
+>   at 2200 ms (its post-1a p50 is ~1551 ms). Ceilings live at
+>   `tests/integration/fixtures/server.py`.
+>
+> §16 is now the canonical "before each PR" check; the manual loops it
+> replaced are documented for historical interest only.
 
 The pattern that drove validation of #126 — manual loops over
 `shed create` / `shed exec` / log-grep, with mini3 deploys handled by
