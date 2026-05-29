@@ -151,8 +151,13 @@ func (s *Server) waitForReady(ctx context.Context, shedName string) error {
 
 // execInContainer executes a command or shell in the shed.
 func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *config.Shed) error {
-	// Get the command to execute.
-	cmd := sess.Command()
+	// Wrap whatever the client sent into `bash -lc <raw>` so the SSH
+	// command channel runs as a POSIX shell (Docker / Codespaces /
+	// devcontainers / Zed / VS Code / JetBrains Gateway behavior).
+	// `shed exec`'s argv-literal semantics are preserved because the
+	// CLI single-quote-wraps each argv element before SSH (see
+	// cmd/shed/console.go:shellQuoteArgs and wrapCommand's doc).
+	cmd := wrapCommand(sess.RawCommand())
 
 	// Check if we have a PTY request.
 	ptyReq, winCh, isPTY := sess.Pty()

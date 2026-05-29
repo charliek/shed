@@ -73,17 +73,19 @@ See `docs/development/testing.md` (Development → Testing on the docs site) for
 - **Workspace path**: `/workspace` inside VMs (see `config.WorkspacePath`)
 - **VM user**: `shed` (UID 1000) with passwordless sudo
 
-## `shed exec` semantics
+## `shed exec` semantics and the SSH command channel
 
-`shed exec` runs `argv[0]` with `argv[1:]` directly inside the shed — like `docker exec` / `kubectl exec`. There is **no implicit shell wrapping**, so pipes, redirects, semicolons, `$VAR`, command substitution, etc. only fire when the user explicitly invokes a shell. The CLI single-quotes each argv element before handing to `ssh` so the SSH server's `shlex.Split` recovers the original argv intact.
+`shed exec` ships argv literally. The CLI single-quote-wraps each argv element before SSH (`cmd/shed/console.go:shellQuoteArgs`), and the server reparses the SSH command through `bash -lc` (`internal/sshd/wrap.go:wrapCommand`). Because bash treats single-quoted text as literal data, `shed exec name -- echo '$HOME'` echoes the literal `$HOME` — argv is preserved, shell metacharacters in user-supplied data don't escape.
+
+Raw SSH (`ssh shed-name 'cmd | pipe'`) gets the full shell, because the client sends a raw command string and the server's `bash -lc` wrap interprets it. This matches Docker, Codespaces, devcontainers, and every other hosted-shell product, and is what Zed Remote-SSH, VS Code Remote-SSH, JetBrains Gateway, raw `ssh`, and `rsync` assume.
 
 Implications when writing code or docs:
 
-- `shed exec <name> -- mytool` is direct-exec; tools must already be on the agent's `PATH` (`/etc/environment.d/` defaults).
-- Anything needing shell features goes through `bash -c '…'`: `shed exec <name> -- bash -c 'a | b > c'`.
-- Login-shell init (`/etc/profile.d`, `~/.profile`) is opt-in via `bash -lc '…'`.
-- Provisioning hooks are a separate path (`internal/vmutil/provisioning.go`) — they still run as `bash --login -c` and source profile scripts.
-- The legacy idiom `shed exec name "cmd | with | pipes"` no longer works; rewrite as `shed exec name -- bash -c 'cmd | with | pipes'`.
+- `shed exec <name> -- mytool` runs `mytool` direct-argv via `bash -lc "'mytool'"` server-side — `mytool` must be on the shed user's login PATH (`/etc/profile.d/*.sh` and `/etc/environment.d/` defaults are sourced by the `-l`).
+- Anything needing shell features inside `shed exec` still goes through `bash -c '…'` explicitly, as before; the difference is that `bash` is now also implicit on the SSH-server side, so direct argv elements get the same login-shell PATH treatment.
+- Provisioning hooks are a separate path (`internal/vmutil/provisioning.go`) — they still run as `bash --login -c` and bypass the sshd wrap entirely.
+- The CLI quoter (`cmd/shed/console.go:validateAndQuoteArgs`) is the **security gate**. It single-quotes each argv element and rejects empty elements + NUL bytes. The Go-level bash round-trip test (`cmd/shed/console_test.go:TestShellQuoteBashRoundTrip`) is the unit audit; the integration suite (`tests/integration/test_exec_shell.py`) is the live wire audit.
+- The legacy idiom `shed exec name "cmd | with | pipes"` still doesn't work — the CLI strips the pipe by single-quoting; rewrite as `shed exec name -- bash -c 'cmd | with | pipes'`.
 
 This convention is documented end-user-style in `docs/reference/cli.md` under `shed exec`.
 
