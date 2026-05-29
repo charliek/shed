@@ -2,6 +2,129 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.7 — 2026-05-29
+
+Minor release with a **substantive behavior change to the SSH command
+channel** (#131) plus the **consistency & simplicity refactor cycle**
+from `docs/discovery/platform-runtime-optimization.md` §15 Phase 1+2
+landing as one bundle. Also ships the §16 integration test suite (live
+on both backends), a `shed-extensions` v0.3.2 bump, and `zip` in the
+base images.
+
+### Behavior change — raw SSH is now POSIX-shell by default (#131)
+
+`shed-server` now wraps the SSH command channel server-side in
+`bash -lc <raw>` (PR #146). This makes raw `ssh shed 'cmd | pipe'`
+Just Work like every other dev VM (Docker, Codespaces, Coder,
+devcontainers, Zed Remote-SSH, VS Code Remote-SSH, JetBrains Gateway,
+`rsync`):
+
+- Pipes, redirects, semicolons, `$VAR`, `$(…)`, `${…}`, and bash
+  builtins all fire on the guest.
+- `-l` sources `/etc/profile` + `/etc/profile.d/*.sh` + `~/.profile`,
+  so mise, nvm, rustup, and similar PATH-mutating tools take effect
+  for SSH-driven commands.
+
+`shed exec`'s argv-literal semantics are preserved: the CLI single-
+quote-wraps each argv element before SSH, and bash treats single-
+quoted text as literal data. End result — `shed exec name -- echo
+'$HOME'` still echoes the literal `$HOME`. The CLI quoter
+(`cmd/shed/console.go:validateAndQuoteArgs`) is now the security gate;
+a real-bash round-trip test (`TestShellQuoteBashRoundTrip`, 10
+metacharacter cases including `$(rm -rf /)`, backticks, embedded
+newlines, UTF-8) is the audit. NUL byte rejection added to the
+quoter — it's the one byte single-quote wrapping can't safely carry.
+
+Reference docs (`CLAUDE.md`, `docs/reference/cli.md`) rewritten to
+reflect the new contract.
+
+**Possible breakage:** anyone whose tooling relied on the old "raw
+`ssh shed 'cmd'` runs `cmd` as literal argv (no shell)" semantics
+will now see bash expansion. The `shed exec` CLI path is unaffected.
+
+### Code shape (§15 Phase 1+2 — orchestrator refactor)
+
+Same speed (or marginally faster), substantially less code, less
+per-backend divergence. Every future feature / speed PR is now a
+one-place change.
+
+- **`healthPollInterval` 150 ms → 50 ms** (PR #133). Saves up to
+  100 ms per create with zero downside — the agent gets probed a bit
+  more often during the first ~1 s of boot, then never again.
+- **`backend.Progress` split into `backend.Phase` + `backend.Status`**
+  (PR #135). `Phase(ctx, name)` moves the timer; `Status(ctx, message)`
+  emits the SSE event. Every call site migrated; the PhaseTimer log
+  line now shows no duplicate phase entries.
+- **Divergent backend config defaults documented** (PR #136). Per-field
+  comments in `internal/config/server.go` explain the "why" of each
+  VZ-vs-FC value (e.g. why `StartTimeout` is 60 s on VZ vs 30 s on FC).
+- **LIFO cleanup-stack helper** (PR #137). New
+  `internal/backend/cleanup.go` provides a `Register("step", fn)` →
+  `RunReverse(err)` pattern; both backends' `CreateShed` migrated. ~250
+  lines of inline rollback removed; future cleanup logic provably
+  correct.
+- **Shared `BackendCreator` orchestrator** (PR #138). New
+  `internal/backend/orchestrator/create.go` implements the `CreateShed`
+  lifecycle once against a small interface; contract tests against a
+  mock backend pin the design.
+- **VZ + FC `CreateShed` migrated to the orchestrator** (PRs #139 and
+  #140). Each backend's `CreateShed` is now a thin `BackendCreator`
+  implementation that delegates to the shared orchestrator. The inline
+  duplicate code in both `client.go` files is gone.
+
+`StartShed` / `--from-snapshot` orchestrator migration is deferred to
+a follow-up (tracked in `docs/discovery/platform-runtime-optimization.md`
+§15 as "2e (deferred)").
+
+### Tests
+
+- **§16 integration test suite MVP** (PR #132, plus operator docs in
+  #141 and FC e2e calibration in #142). Pytest + subprocess, in-tree at
+  `tests/integration/`, managed with `uv`. Five MVP tests parameterized
+  over `["vz", "fc"]`; runs against VZ on the mac and FC against
+  `mini3` (the brew-installed `my-server` and the SSH-attached
+  `mini3` server respectively). `make test-integration` is now the
+  canonical "before each PR" check.
+- **`test_extensions_image_smoke`** (PR #145). First integration
+  coverage for the `extensions` image variant: creates with
+  `image="extensions"` and asserts each shed-extensions binary
+  (`shed-ext-ssh-agent`, `shed-ext-aws-credentials`,
+  `docker-credential-shed`) is present at `/usr/local/bin/` and
+  executable. Gate for future shed-extensions bumps.
+- **`test_exec_shell.py`** (PR #146). Eight tests × 2 backends that
+  encode the #131 security model: five raw-SSH tests prove the
+  `bash -lc` wrap fires (pipes, `$HOME`, `$(hostname)`, bash builtins,
+  `/etc/profile.d` sourcing); three `shed exec` tests prove argv stays
+  literal across the bash reparse.
+
+### Images
+
+- **`zip` added to the base apt-install** (PR #144, closes #129). Both
+  VZ and Firecracker Dockerfiles already shipped `unzip`; sdkman,
+  gradle wrappers, and any other tool that *creates* zip archives
+  needed the matching `zip` packager. Negligible image-size cost
+  (~110 KB), parity with `unzip`. Affects all three image variants
+  (base / extensions / full).
+- **shed-extensions v0.3.1 → v0.3.2** (PR #145). Picks up the upstream
+  fixes for Touch ID approval in clamshell mode (#13/#14), Docker
+  credential helper PATH under launchd (#15), and a handful of docs /
+  Homebrew quality-of-life improvements. Affects the `extensions` and
+  `full` image variants (the `base` variant doesn't layer
+  shed-extensions).
+
+### Docs
+
+- **Runtime optimization discovery doc updated** (PR #143). §0 records
+  §15 Phase 1 (#133, #135, #136), §15 Phase 2 (#137, #138, #139, #140),
+  and §16 MVP (#132, #141, #142) all landed on `main`. Per-sub-phase
+  `**Status:**` lines added throughout §15a / §15b. §15b 2d / 2e
+  reflects the execution-time split (FC `CreateShed` migration vs the
+  deferred `StartShed` migration). §15c Phase 3 marked deferred. §16
+  milestone block captures the MVP plus the PR #142 calibration finding
+  (delete-between-samples + FC ceiling bump 2100 → 2900 ms).
+- **Integration test operator guide** in `CLAUDE.md` and the new
+  Development → Testing docs page (PR #141).
+
 ## v0.5.6 — 2026-05-28
 
 Patch release shipping a **Firecracker-only `shed create` speedup —
