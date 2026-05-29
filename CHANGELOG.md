@@ -2,6 +2,84 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.8 — 2026-05-29
+
+Maintenance release closing two operational bugs surfaced while rolling
+v0.5.7 out to mini2 / mini3 / the mac, plus a documented playbook for
+the routine "I upgraded shed, clean up the old images and reclaim disk
+space" workflow. No manifest format changes, no image cache wipe
+required — not the v0.5.1 → v0.5.2 kind of upgrade.
+
+See [docs/upgrades/v0.5.7-to-v0.5.8.md](docs/upgrades/v0.5.7-to-v0.5.8.md)
+for the operator upgrade steps and the cleanup playbook.
+
+### `shed image prune` now protects tagged manifests (#147)
+
+Pre-v0.5.8 prune followed Docker's "tags are informational" model: only
+sheds, snapshots, and in-flight create markers protected blobs. That
+made `shed image pull <tag> && shed image prune` a footgun on a fresh
+host — prune deleted the manifest just pulled (no shed was yet pinning
+it), either leaving the tag pointing at a missing blob or silently
+reverting it to an older locally-cached manifest. mini2 saw `base` flip
+from the v0.5.7 manifest back to a v0.5.3 manifest with the missing
+`zip`.
+
+v0.5.8 makes tags protective: the prune walker now treats every tag's
+manifest digest as live, including the manifest's transitive blobs
+(config, layers, kernel, initrd, rootfs erofs). The documented cleanup
+workflow is now `shed image rm <tag>` first, then `shed image prune` —
+same shape as Docker's `docker rmi` followed by `docker image prune`.
+
+`vmimage.ProtectiveRefs()` and the relevant CLI docs were updated to
+match. Four new unit tests in `internal/vmimage/manager_test.go` cover
+the contract (tag protects manifest + transitive blobs; untag-then-
+prune deletes the orphan; prune handles a stale tag without panic;
+shed-pinned manifests still protected). Two existing `internal/vz`
+prune tests were updated to untag their dangling fixtures up-front (the
+snapshot-pin test already followed this pattern).
+
+### Local image builds pin the Ubuntu kernel package (#148)
+
+Pre-v0.5.8 `initramfs/Dockerfile` and `vz/Dockerfile` each installed
+the `linux-image-virtual` apt metapackage independently. The two
+installs run in separate `docker buildx build` invocations with their
+own BuildKit cache; when those caches diverged (common in iterative
+local rebuilds via `./scripts/build-vz-rootfs.sh`), the initramfs's
+staged `erofs.ko` + `libcrc32c.ko` targeted a different kernel ABI
+than the booted `vmlinuz` and the VZ guest panicked with
+`SHED-INIT-03: failed to mount /dev/vdb at /lower (erofs)`.
+
+GitHub Actions builds were safe (fresh BuildKit cache per runner), so
+**published images on ghcr.io are unaffected**. The bug only bit
+operators iterating on the image scripts locally.
+
+v0.5.8 pins both Dockerfiles to `ARG LINUX_IMAGE_VERSION=6.8.0-124`
+and installs `linux-image-${LINUX_IMAGE_VERSION}-generic` directly. A
+new `make check-kernel-pin` target (wired into `make check`) fails
+the build if the two values drift apart. The `initramfs/Dockerfile`'s
+module-staging `find` is scoped to the pinned kver explicitly so a
+wrong pin fails fast rather than silently picking a stale module.
+`firecracker/Dockerfile` is intentionally not pinned: the FC rootfs
+uses the custom `KERNEL_TAG`-built kernel and doesn't install
+`linux-image-virtual` at all; FC's initramfs IS the same artifact
+`initramfs/Dockerfile` produces, so pinning that file covers the FC
+initramfs path automatically.
+
+`docs/reference/images.md` gains a "Kernel version pinning" section
+explaining the ARG, the bump procedure, and the FC carve-out.
+
+### Documentation (#149)
+
+New `docs/upgrades/v0.5.7-to-v0.5.8.md` with operator upgrade steps
+for both Linux/.deb (with an explicit `systemctl restart shed-server`
+callout — the .deb postinst doesn't restart automatically, tracked as
+a follow-up) and macOS/brew (with the manual `server.yaml` images-map
+bump that brew doesn't manage). Includes the four-step image cache
+cleanup playbook covering both the shed-server image store and the
+local Docker layer cache. `mkdocs.yml` nav updated; `images.md`
+cleanup section cross-references the new page and now correctly
+reports that tags are protective.
+
 ## v0.5.7 — 2026-05-29
 
 Minor release with a **substantive behavior change to the SSH command
