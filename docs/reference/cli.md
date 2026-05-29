@@ -523,7 +523,7 @@ shed image rm myimage --force
 
 ### shed image prune
 
-Removes blobs that have no protective shed/snapshot reference. Tags do **not** protect a digest from prune.
+Removes blobs that have no protective tag, shed, snapshot, or in-flight create reference.
 
 ```bash
 shed image prune [flags]
@@ -534,7 +534,9 @@ shed image prune [flags]
 | `--force` | | `false` | Skip confirmation prompt |
 | `--dry-run` | | `false` | List candidates without deleting |
 
-A blob is preserved only if its digest is referenced by an existing shed's `metadata.json` (`lower_digest`) or a snapshot's `snapshot.json` (`lower_digest`). Tags are informational and do not protect blobs. After bumping image refs in server config and re-running `shed-server pull-images`, the previous digests typically become dangling and `shed image prune` reclaims them.
+A blob is preserved if its digest is referenced by a tag, an existing shed's `metadata.json` (`lower_digest`), or a snapshot's `snapshot.json` (`lower_digest`). To delete a tagged blob the workflow is `shed image rm <tag>` first, then `shed image prune` (Docker model — `docker rmi` then `docker image prune`).
+
+**Upgrade note:** pre-v0.5.8 tags were informational and did NOT protect blobs, so `shed image pull <tag> && shed image prune` would delete the manifest just pulled. The v0.5.8 fix makes tags protective. After bumping image refs in server config and re-running `shed-server pull-images`, drop any stale tag with `shed image rm` before `shed image prune` to actually reclaim the previous digest.
 
 **Fail-closed on malformed metadata:** `image prune` aborts (returns an error naming the broken shed and its directory) if any instance's `metadata.json` cannot be parsed for `lower_digest` — pruning while a refcount source is unreadable could orphan a digest still in use. Fix or `rm -rf` the broken instance directory before re-running. Lenient read paths (`shed list`, `shed image ls`, `shed system df`) warn-and-skip on the same fault.
 
