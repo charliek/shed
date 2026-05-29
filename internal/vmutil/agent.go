@@ -99,11 +99,12 @@ func (c *AgentClient) CheckHealth(ctx context.Context) error {
 // time between the agent actually coming up and the host noticing.
 //
 // Tightened from 150 ms → 50 ms (§15 Phase 1 PR 1a): each probe is a
-// sub-millisecond vsock-style dial + a tiny JSON health request, so the
-// extra probes are essentially free, and a 100-ms-tighter detection
-// floor shows up directly as a 50–100 ms drop in the `agent` PhaseTimer
-// phase on every create. Verified end-to-end via the integration suite
-// (`make test-integration`); see
+// low-overhead transient socket dial + a small JSON health request
+// (one Envelope round trip — see CheckHealth above), so the extra
+// probes at higher frequency are essentially free; a 100-ms-tighter
+// detection floor shows up directly as a 50–100 ms drop in the `agent`
+// PhaseTimer phase on every create. Verified end-to-end via the
+// integration suite (`make test-integration`); see
 // docs/discovery/platform-runtime-optimization.md §15a.
 const healthPollInterval = 50 * time.Millisecond
 
