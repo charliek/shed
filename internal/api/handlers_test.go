@@ -290,17 +290,25 @@ func parseSSEEvents(t *testing.T, body string) []struct{ Event, Data string } {
 	return events
 }
 
-// TestCreateShed_SSE_SurfacesProgressAndWarning verifies that ProgressWarning
-// events emitted by the backend during CreateShed reach the SSE stream as
-// progress events with warning=true. Regression test for issue #84 — clone
-// failures used to be journald-only.
+// TestCreateShed_SSE_SurfacesProgressAndWarning verifies that
+// StatusWarning events emitted by the backend during CreateShed reach
+// the SSE stream as progress events with `warning=true`. Regression
+// test for issue #84 — clone failures used to be journald-only.
+//
+// Post-§15 1b note: Phase boundaries are intentionally NOT sent over
+// the SSE wire (they are server-side PhaseTimer events only). The
+// warning message reaches the client as a status-only event with
+// `"phase":""`. The CLI renders the message regardless (see
+// `cmd/shed/shed.go`'s SSE loop, which only consumes `Message` +
+// `Warning`).
 func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 	be := &createShedFakeBackend{
 		createFn: func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
-			backend.Progress(ctx, "repo", "Cloning repository...")
+			backend.Phase(ctx, "repo")
+			backend.Status(ctx, "Cloning repository...")
 			// Match the production sanitized message from vz/firecracker
 			// client.go — no URL, no wrapped err.
-			backend.ProgressWarning(ctx, "repo", "Failed to clone repository (see server logs for details)")
+			backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 			return &config.Shed{Name: req.Name, Status: config.StatusRunning, Repo: req.Repo}, nil
 		},
 	}
@@ -319,14 +327,13 @@ func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 
 	events := parseSSEEvents(t, w.Body.String())
 
-	// Find the warning event and assert its payload carries warning=true.
+	// Find the warning event and assert its payload carries warning=true
+	// AND the user-visible message. Per §15 1b, phase is no longer
+	// included on status-only events.
 	var sawWarning, sawComplete bool
 	for _, e := range events {
 		if e.Event == "progress" && strings.Contains(e.Data, `"warning":true`) {
 			sawWarning = true
-			if !strings.Contains(e.Data, `"phase":"repo"`) {
-				t.Errorf("warning event missing repo phase: %s", e.Data)
-			}
 			if !strings.Contains(e.Data, "Failed to clone repository") {
 				t.Errorf("warning event missing failure message: %s", e.Data)
 			}
@@ -346,5 +353,55 @@ func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 	}
 	if !sawComplete {
 		t.Errorf("no complete event found in stream:\n%s", w.Body.String())
+	}
+}
+
+// TestCreateShed_SSE_PhaseOnlyEventsNotStreamed verifies that
+// `backend.Phase` calls (timer boundaries with no user-visible message)
+// do NOT cross the SSE wire. Per §15 1b the SSE handler drops events
+// with empty Message; the PhaseTimer still consumes them server-side.
+// Regression test for the silent-skip in `internal/api/handlers.go`'s
+// `sseFn`.
+func TestCreateShed_SSE_PhaseOnlyEventsNotStreamed(t *testing.T) {
+	be := &createShedFakeBackend{
+		createFn: func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+			// One phase-only event (should NOT appear in SSE), one
+			// status event (should appear), then another phase-only.
+			backend.Phase(ctx, "vm")
+			backend.Status(ctx, "Visible message")
+			backend.Phase(ctx, "agent")
+			return &config.Shed{Name: req.Name, Status: config.StatusRunning}, nil
+		},
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	body, _ := json.Marshal(config.CreateShedRequest{Name: "phase-only"})
+	r := httptest.NewRequest(http.MethodPost, "/api/sheds", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", w.Code, w.Body.String())
+	}
+
+	progressEvents := 0
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		if e.Event != "progress" {
+			continue
+		}
+		progressEvents++
+		// Any progress event we DO emit must carry a non-empty message.
+		// (Phase-only events would serialize as `{"phase":"vm","message":""}`
+		// and an SSE consumer treating them as user-visible would render
+		// blank lines.)
+		if !strings.Contains(e.Data, `"message":"Visible message"`) {
+			t.Errorf("unexpected SSE progress event data: %s", e.Data)
+		}
+	}
+	if progressEvents != 1 {
+		t.Errorf("got %d progress events, want exactly 1 (the Status call); "+
+			"phase-only events must not be streamed", progressEvents)
 	}
 }

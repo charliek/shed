@@ -26,7 +26,7 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 // handleCreateSnapshot creates a new snapshot from a stopped shed.
 // POST /api/snapshots
 //
-// Non-fatal warnings emitted by the backend via backend.ProgressWarning
+// Non-fatal warnings emitted by the backend via backend.StatusWarning
 // are collected and returned in the response body alongside the snapshot,
 // so the operator can see e.g. the "--local-dir not captured" warning
 // without needing SSE plumbing on this endpoint.

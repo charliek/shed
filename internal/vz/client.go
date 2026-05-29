@@ -224,7 +224,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 		// Ensure image is available locally (pulls + converts Docker refs if needed).
 		// We only need the digest — the rootfs path is rederived per-boot inside vm.go.
-		backend.Progress(ctx, "image", "Resolving image...")
+		backend.Phase(ctx, "image")
+		backend.Status(ctx, "Resolving image...")
 		_, ldigest, err := c.EnsureImage(ctx, resolved)
 		if err != nil {
 			return nil, err
@@ -246,7 +247,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		defer removeCreatingMarker(c.cfg.InstanceDir, req.Name)
 	}
 
-	backend.Progress(ctx, "rootfs", "Allocating writable upper layer...")
+	backend.Phase(ctx, "rootfs")
+	backend.Status(ctx, "Allocating writable upper layer...")
 	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create upper: %w", err)
@@ -295,7 +297,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			}
 			log.Printf("[%s] upper template clone failed (%v); formatting in guest", req.Name, perr)
 		} else {
-			backend.Progress(ctx, "rootfs", "Provisioned upper from template (skips in-guest mkfs)")
+			backend.Phase(ctx, "rootfs")
+			backend.Status(ctx, "Provisioned upper from template (skips in-guest mkfs)")
 		}
 	}
 	rootfsPath := upperPath
@@ -336,7 +339,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	vm := CreateVM(meta, c.cfg)
 	vm.credentialShares = buildCredentialShares(dirCreds)
 
-	backend.Progress(ctx, "vm", "Starting virtual machine...")
+	backend.Phase(ctx, "vm")
+	backend.Status(ctx, "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
 		c.preserveConsoleLog(meta)
 		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
@@ -372,7 +376,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Mount VirtioFS workspace if local dir is configured
 	if req.LocalDir != "" {
-		backend.Progress(ctx, "mount", "Mounting local directory via VirtioFS...")
+		backend.Phase(ctx, "mount")
+		backend.Status(ctx, "Mounting local directory via VirtioFS...")
 		if err := c.mountVirtioFSShare(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
 			// VirtioFS mount is essential for --local-dir; fail the create
 			if stopErr := vm.Stop(context.Background()); stopErr != nil {
@@ -388,16 +393,26 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// Clone repo if specified (skip when using local dir or spawning from snapshot;
 	// snapshot rootfs is already provisioned).
 	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
-		backend.Progress(ctx, "repo", "Cloning repository...")
+		backend.Phase(ctx, "repo")
+		backend.Status(ctx, "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 			// Generic SSE message by design: req.Repo can carry credentials
 			// (e.g., https://user:pw@host/...) and the wrapped err from
 			// git/ssh may include the URL too. Full detail is in the server
 			// log above; SSE consumers get a stable, sanitized signal.
-			backend.ProgressWarning(ctx, "repo", "Failed to clone repository (see server logs for details)")
+			//
+			// Deliberately no `backend.Phase(ctx, "repo")` here: the
+			// preceding `vmutil.CloneRepo` already advanced the timer
+			// to "clone", and re-entering "repo" just to attach a
+			// status would split the timer line into the
+			// `repo=N clone=M repo=K` triple shape documented in §14
+			// and Codex's review of #132. The user still sees the
+			// status message (SSE consumes Status events regardless of
+			// the current phase).
+			backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 		} else {
-			backend.Progress(ctx, "repo", "Repository cloned")
+			backend.Status(ctx, "Repository cloned")
 		}
 	}
 

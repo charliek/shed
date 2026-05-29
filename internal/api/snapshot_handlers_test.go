@@ -110,7 +110,7 @@ func (f *snapshotFakeBackend) DeleteSnapshot(_ context.Context, _ string) error 
 }
 
 // snapshotFakeBackendWarner embeds snapshotFakeBackend and overrides
-// CreateSnapshot to emit warnings via backend.ProgressWarning so the test
+// CreateSnapshot to emit warnings via backend.StatusWarning so the test
 // exercises the warning-collection path through the handler.
 type snapshotFakeBackendWarner struct {
 	snapshotFakeBackend
@@ -121,7 +121,8 @@ type snapshotFakeBackendWarner struct {
 
 func (f *snapshotFakeBackendWarner) CreateSnapshot(ctx context.Context, _ config.SnapshotCreateRequest) (*config.Snapshot, error) {
 	for _, msg := range f.warnings {
-		backend.ProgressWarning(ctx, "test", msg)
+		backend.Phase(ctx, "test")
+		backend.StatusWarning(ctx, msg)
 	}
 	return f.createResp, f.createErr
 }
@@ -204,7 +205,7 @@ func TestHandleCreateSnapshot_Success(t *testing.T) {
 	}
 }
 
-// TestHandleCreateSnapshot_Warnings verifies that backend.ProgressWarning
+// TestHandleCreateSnapshot_Warnings verifies that backend.StatusWarning
 // emitted during CreateSnapshot is surfaced in the response payload.
 func TestHandleCreateSnapshot_Warnings(t *testing.T) {
 	be := &snapshotFakeBackendWarner{

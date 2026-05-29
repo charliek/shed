@@ -49,11 +49,13 @@ func NewCredentialManager(serverCfg *config.ServerConfig, bridge *plugin.Bridge,
 func (cm *CredentialManager) SetupCredentials(ctx context.Context, agent *AgentClient, shedName string, dirCreds map[string]config.MountConfig, mountDir DirMountFunc) {
 	// Mount directory credentials via backend-specific callback
 	if len(dirCreds) > 0 && mountDir != nil {
-		backend.Progress(ctx, "credentials", "Mounting directory credentials...")
+		backend.Phase(ctx, "credentials")
+		backend.Status(ctx, "Mounting directory credentials...")
 		for name, mount := range dirCreds {
 			if err := mountDir(ctx, agent, name, mount); err != nil {
 				log.Printf("Warning: directory credential mount failed for %q: %v", name, err)
-				backend.ProgressWarning(ctx, "credentials", fmt.Sprintf("Failed to mount credential %q", name))
+				backend.Phase(ctx, "credentials")
+				backend.StatusWarning(ctx, fmt.Sprintf("Failed to mount credential %q", name))
 			}
 		}
 	}
