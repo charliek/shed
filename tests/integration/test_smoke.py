@@ -193,3 +193,66 @@ def test_shed_exec_smoke(shed_server, test_shed_name):
     r = shed_server.exec(test_shed_name, ["echo", "hello"])
     assert r.returncode == 0, f"shed exec echo failed: stderr={r.stderr!r}"
     assert "hello" in r.stdout, f"unexpected stdout: {r.stdout!r}"
+
+
+# ---------------------------------------------------------------------------
+# 6. Extensions image smoke (the shed-extensions layer is wired up)
+# ---------------------------------------------------------------------------
+
+
+# Binaries shipped by the upstream ghcr.io/charliek/shed-extensions image
+# and copied into the `extensions` (and transitively `full`) rootfs layer
+# by the Dockerfile's COPY-via-bind RUN. If a bump regresses any of them
+# (missing binary, wrong path, lost +x bit, arch mismatch), this test
+# catches it before the bump ships.
+#
+# Keep this list aligned with the install statements in
+# vz/Dockerfile + firecracker/Dockerfile's `shed-vz-extensions` /
+# `shed-fc-extensions` stage.
+_SHED_EXTENSIONS_BINARIES = (
+    "/usr/local/bin/shed-ext-ssh-agent",
+    "/usr/local/bin/shed-ext-aws-credentials",
+    "/usr/local/bin/docker-credential-shed",
+)
+
+
+def test_extensions_image_smoke(shed_server, test_shed_name):
+    """The `extensions` image variant carries the shed-extensions binaries.
+
+    Smoke test for the `extensions` (and transitively `full`) image
+    variants — verifies that the Dockerfile's
+    `COPY --from=ghcr.io/charliek/shed-extensions:vX.Y.Z` resolved
+    cleanly at image-build time, every documented binary is present in
+    the booted rootfs at the documented path, and each binary has the
+    executable bit. This is the gate future shed-extensions bumps need
+    to survive — added with the v0.3.1 → v0.3.2 bump so the existing
+    `image="base"` tests don't carry the burden.
+
+    Skips with a clear message if the server has no `extensions` tag
+    configured (e.g. a dev box pulling only `base`); the test isn't a
+    regression for that environment, it just doesn't apply.
+    """
+    try:
+        shed_server.create(test_shed_name, image="extensions")
+    except AssertionError as e:
+        msg = str(e)
+        if "extensions" in msg and (
+            "no image tag" in msg or "not found" in msg or "unknown image" in msg
+        ):
+            pytest.skip(
+                "server has no `extensions` image tag configured; this "
+                "smoke gate only applies where the extensions variant is "
+                "installed. Configure one with `shed image tag …` or pull "
+                "ghcr.io/charliek/shed-{vz,fc}-extensions:vX.Y.Z."
+            )
+        raise
+
+    for binary in _SHED_EXTENSIONS_BINARIES:
+        r = shed_server.exec(test_shed_name, ["test", "-x", binary])
+        assert r.returncode == 0, (
+            f"{binary!r} missing or not executable in the booted shed: "
+            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+            f"The Dockerfile's `COPY --from=shed-extensions` likely failed "
+            f"to install this binary (check the COPY RUN in "
+            f"vz/Dockerfile / firecracker/Dockerfile's extensions stage)."
+        )
