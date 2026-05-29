@@ -405,6 +405,59 @@ for the workflow.
 [`go-containerregistry`](https://github.com/google/go-containerregistry)
 directly.
 
+### Kernel version pinning
+
+`initramfs/Dockerfile` and `vz/Dockerfile` both install an Ubuntu
+kernel package — the initramfs to stage `erofs.ko` + `libcrc32c.ko`,
+the VZ rootfs to ship the `vmlinuz` shed extracts at image-publish
+time. The two must target the **same** kernel version: VZ kernels
+don't have erofs built-in, so the initramfs's staged `.ko` files
+must match the booted `vmlinuz` ABI exactly or the in-guest
+overlay mount fails with `SHED-INIT-03`.
+
+Pre-v0.5.8 both stages installed the `linux-image-virtual`
+metapackage without pinning. GitHub Actions builds were safe (each
+runner has a fresh BuildKit cache, so both stages see the same apt
+snapshot), but iterative local builds via `./scripts/build-vz-rootfs.sh`
+could pull two different apt snapshots out of BuildKit's cache and
+produce an unbootable image with kernel-version skew between the
+initramfs and the rootfs.
+
+v0.5.8+ pins via `ARG LINUX_IMAGE_VERSION` in both Dockerfiles:
+
+| File | What the ARG controls |
+|---|---|
+| `initramfs/Dockerfile` | Package the initramfs stages `erofs.ko` + `libcrc32c.ko` from. |
+| `vz/Dockerfile` | Package the VZ rootfs installs as the in-guest kernel. |
+
+`make check-kernel-pin` (wired into `make check`) fails the build
+if the two values drift apart. Bump both in lockstep when picking
+up a new Ubuntu kernel:
+
+```bash
+# Both lines must declare the same package version.
+grep '^ARG LINUX_IMAGE_VERSION=' initramfs/Dockerfile vz/Dockerfile
+```
+
+Firecracker's rootfs uses the custom `KERNEL_TAG`-built kernel
+(`firecracker/Dockerfile` `kernel-builder` stage) and does **not**
+install `linux-image-virtual` — so it's not covered by this pin.
+FC's initramfs IS the same artifact `initramfs/Dockerfile` builds,
+so the FC initramfs path is covered by `LINUX_IMAGE_VERSION`
+automatically; FC's custom kernel has erofs built-in, so the .ko
+load is non-load-bearing on FC anyway.
+
+After bumping the pin, validate locally:
+
+```bash
+docker buildx prune --all --force
+./scripts/build-vz-rootfs.sh --variant base
+# Then boot a shed against the rebuilt blob and verify uname -r.
+```
+
+See `docs/upgrades/v0.5.7-to-v0.5.8.md` for the original SHED-INIT-03
+incident report.
+
 ## Image Caching
 
 Pull / save / load / build all land manifests and blobs in the OCI

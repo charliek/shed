@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent build-firstboot build-tools test test-integration release clean dev-server dev-cli check coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent build-firstboot build-tools test test-integration release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -86,8 +86,40 @@ tidy:
 	go mod tidy
 	cd sdk && go mod tidy
 
-# Run all checks (lint + test)
-check: lint test
+# Verify the LINUX_IMAGE_VERSION pin stays in lockstep across the two
+# Dockerfiles that install the Ubuntu kernel package. Pre-v0.5.8 the
+# initramfs and vz/base each installed `linux-image-virtual` without
+# pinning, and a Docker BuildKit cache split between stages produced
+# initramfs .ko files targeting a different kernel than the rootfs
+# vmlinuz — booting the resulting VZ image panicked in the
+# shed-initramfs with SHED-INIT-03. The two Dockerfiles must declare
+# the same ARG value; this target fails fast if they drift.
+#
+# firecracker/Dockerfile is intentionally skipped: the FC rootfs uses
+# the custom KERNEL_TAG-built kernel and does not install
+# linux-image-virtual at all. FC's initramfs is the SAME initramfs
+# initramfs/Dockerfile produces, so pinning that one file covers the
+# FC initramfs path as well.
+check-kernel-pin:
+	@vz=$$(awk '/^ARG LINUX_IMAGE_VERSION=/ { print; exit }' vz/Dockerfile) ; \
+	 ir=$$(awk '/^ARG LINUX_IMAGE_VERSION=/ { print; exit }' initramfs/Dockerfile) ; \
+	 if [ -z "$$vz" ] || [ -z "$$ir" ]; then \
+	   echo "ERROR: LINUX_IMAGE_VERSION ARG missing:" ; \
+	   echo "  vz/Dockerfile:        $$vz" ; \
+	   echo "  initramfs/Dockerfile: $$ir" ; \
+	   exit 1 ; \
+	 fi ; \
+	 if [ "$$vz" != "$$ir" ]; then \
+	   echo "ERROR: LINUX_IMAGE_VERSION ARG drifted across Dockerfiles:" ; \
+	   echo "  vz/Dockerfile:        $$vz" ; \
+	   echo "  initramfs/Dockerfile: $$ir" ; \
+	   echo "Bump in lockstep (see docs/reference/images.md)." ; \
+	   exit 1 ; \
+	 fi ; \
+	 echo "kernel pin OK: $$vz"
+
+# Run all checks (lint + test + kernel pin)
+check: check-kernel-pin lint test
 
 # Run tests with coverage
 coverage:

@@ -12,15 +12,30 @@
 #     --target shed-initramfs \
 #     --output type=local,dest=./out .
 
-# Stage: pull Ubuntu's linux-image-virtual kernel modules so the
-# initramfs can insmod erofs.ko before mounting the single read-only
-# erofs lower. Ubuntu ships erofs as a *module* (=m) in
-# linux-image-virtual, not built-in, and overlay.ko alone isn't enough
-# — without erofs loaded, the lower mount fails with EINVAL.
+# Stage: pull Ubuntu's linux-image kernel modules so the initramfs can
+# insmod erofs.ko before mounting the single read-only erofs lower.
+# Ubuntu ships erofs as a *module* (=m), not built-in, and overlay.ko
+# alone isn't enough — without erofs loaded, the lower mount fails
+# with EINVAL.
 FROM ubuntu:24.04 AS ubuntu-modules
 
+# LINUX_IMAGE_VERSION pins the apt kernel package the initramfs's
+# erofs.ko + libcrc32c.ko are staged from. Pre-v0.5.8 this stage and
+# vz/Dockerfile each installed the linux-image-virtual metapackage
+# independently; if Docker BuildKit's layer cache held an older apt
+# snapshot for one stage and a fresher one for the other, the staged
+# .ko files targeted a different kernel than the booted vmlinuz and
+# the VZ guest panicked in shed-initramfs with SHED-INIT-03 ("failed
+# to mount /dev/vdb at /lower (erofs)"). Pinning the specific image
+# package across both Dockerfiles closes that drift window.
+#
+# MUST match vz/Dockerfile's ARG of the same name; Makefile's
+# `check-kernel-pin` target enforces parity. See
+# docs/upgrades/v0.5.7-to-v0.5.8.md for the rationale.
+ARG LINUX_IMAGE_VERSION=6.8.0-124
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        linux-image-virtual \
+        "linux-image-${LINUX_IMAGE_VERSION}-generic" \
     && rm -rf /var/lib/apt/lists/*
 
 # Stage erofs.ko AND its dependency libcrc32c.ko (erofs uses crc32c for
@@ -32,14 +47,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # load them in sorted order (libcrc32c=10, erofs=20). Without this,
 # erofs.ko's "Unknown symbol crc32c" fails the load and erofs mounts
 # return EINVAL.
+#
+# Scope the find to /lib/modules/${LINUX_IMAGE_VERSION}-generic
+# explicitly. If the pin ARG is wrong (e.g. operator forgot to bump
+# both Dockerfiles in lockstep), the find returns nothing and the
+# build fails fast with a clear error rather than silently grabbing
+# a module from a different kernel that happens to be present.
 RUN mkdir -p /stage \
-    && erofs_ko=$(find /lib/modules -name 'erofs.ko*' 2>/dev/null | tail -1) \
-    && crc32c_ko=$(find /lib/modules -name 'libcrc32c.ko*' 2>/dev/null | tail -1) \
-    && if [ -z "$erofs_ko" ]; then echo "ERROR: erofs.ko not found in linux-image-virtual" >&2; exit 1; fi \
-    && if [ -z "$crc32c_ko" ]; then echo "ERROR: libcrc32c.ko not found" >&2; exit 1; fi \
+    && kver="${LINUX_IMAGE_VERSION}-generic" \
+    && mod_root="/lib/modules/${kver}" \
+    && [ -d "$mod_root" ] || { echo "ERROR: ${mod_root} not present — LINUX_IMAGE_VERSION=${LINUX_IMAGE_VERSION} did not install the expected kernel" >&2; exit 1; } \
+    && erofs_ko=$(find "$mod_root" -name 'erofs.ko*' 2>/dev/null | tail -1) \
+    && crc32c_ko=$(find "$mod_root" -name 'libcrc32c.ko*' 2>/dev/null | tail -1) \
+    && if [ -z "$erofs_ko" ]; then echo "ERROR: erofs.ko not found under ${mod_root}" >&2; exit 1; fi \
+    && if [ -z "$crc32c_ko" ]; then echo "ERROR: libcrc32c.ko not found under ${mod_root}" >&2; exit 1; fi \
     && cp "$crc32c_ko" "/stage/10-$(basename "$crc32c_ko")" \
     && cp "$erofs_ko"  "/stage/20-$(basename "$erofs_ko")" \
-    && kver=$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$erofs_ko")")")")") \
     && echo "$kver" > /stage/kver.txt \
     && echo "Staged: 10-$(basename "$crc32c_ko"), 20-$(basename "$erofs_ko") for kver $kver"
 
