@@ -1,0 +1,24 @@
+[project]
+name = "shed-integration-tests"
+version = "0.1.0"
+description = "Live integration test suite for shed (drives shed-server via the shed CLI)."
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+markers = [
+    "vz: tests requiring the VZ backend (Apple Silicon mac with vfkit)",
+    "fc: tests requiring the Firecracker backend (Linux/KVM, default mini3)",
+    "slow: tests that take more than ~10 s wall-clock",
+]
+addopts = "-ra --strict-markers"
+# Make repeated runs deterministic: tests pick unique shed names per node id.
+filterwarnings = [
+    "error",
+    # pytest itself can emit DeprecationWarnings about its own config; surface
+    # but don't fail on those.
+    "default::DeprecationWarning",
+]

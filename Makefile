@@ -32,8 +32,18 @@ test:
 	cd sdk && go test -v ./...
 
 # Run integration tests (requires Docker)
+# Live integration tests: drive a running shed-server via the `shed` CLI.
+# Pytest + subprocess, managed with uv. Requires uv on PATH (install via
+# `brew install uv` or https://docs.astral.sh/uv/getting-started/installation/).
+# Tests parameterized over [vz, fc]; each skips cleanly when its target
+# backend is unreachable from this host. See tests/integration/README.md.
 test-integration:
-	go test -v -tags=integration ./integration/...
+	@command -v uv >/dev/null 2>&1 || { \
+	  echo "uv is required for integration tests."; \
+	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
+	  exit 1; \
+	}
+	cd tests/integration && uv sync --quiet && uv run pytest -v
 
 # Cross-compile for release
 release:

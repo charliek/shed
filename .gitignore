@@ -66,3 +66,8 @@ packaging/server.yaml.generated
 site-build/
 .venv/
 uv.lock
+# … but the integration test suite's lockfile is committed for reproducibility:
+!tests/integration/uv.lock
+# Python tooling caches for the integration suite
+tests/integration/.pytest_cache/
+**/__pycache__/
