@@ -1155,8 +1155,8 @@ review/merge/validate.
 
 **Status:** ✅ Landed on main in **PR #133** (pending v0.5.7 release).
 
-**Scope:** one constant in `internal/vmutil/agent.go` (currently
-`healthPollInterval = 150 * time.Millisecond`).
+**Scope:** one constant in `internal/vmutil/agent.go` (pre-PR:
+`healthPollInterval = 150 * time.Millisecond`; post-PR: `50ms`).
 
 **Rationale:** each probe is a vsock dial + a tiny health JSON exchange
 — sub-millisecond on a local socket. 150 ms was a conservative initial
@@ -1247,10 +1247,16 @@ which a quick read-through covers.
 
 ### 15b. Phase 2 — orchestrator refactor (~2–3 weeks, 3–4 PRs)
 
-**Goal:** factor the two backends' `CreateShed` / `StartShed` / stop
-flows into a shared orchestrator. Estimated net code reduction:
+**Original goal:** factor the two backends' `CreateShed` / `StartShed`
+/ stop flows into a shared orchestrator. Estimated net code reduction:
 ~500–700 lines. Every future feature / speed PR becomes a one-place
 change.
+
+**What landed (2026-05-29):** the `CreateShed` half — PRs #137, #138,
+#139, #140 (see status lines below). The `StartShed` / `--from-snapshot`
+/ stop migration is deferred to a follow-up (2e), and the cross-cutting
+"Phase 3 starts from a fully thin per-backend `client.go`" assumption
+in §15c is not yet true — see §15c's status note.
 
 This is the big rock. Ship in 3–4 PRs (not one big bang) so each step
 is reviewable and revertable.
@@ -1470,13 +1476,18 @@ previously-built ones.
 
 #### 3c — `--from-snapshot` / `StartShed` audit
 
-**Scope:** after Phase 2, these are thin wrappers around the
-orchestrator. Audit pass to identify and remove any vestigial code that
-the orchestrator obsoletes but didn't delete.
+**Precondition:** §15b 2e (the `StartShed` / `--from-snapshot`
+orchestrator migration deferred out of Phase 2) lands first. Until then
+this item has nothing to audit — both paths are still per-backend in
+`client.go`.
+
+**Scope:** after 2e, these are thin wrappers around the orchestrator.
+Audit pass to identify and remove any vestigial code that the
+orchestrator obsoletes but didn't delete.
 
 **Files touched:** small cleanups across both backends.
 
-**Live test:** lifecycle suite (Phase 2's coverage already covers this).
+**Live test:** lifecycle suite (2e's coverage already covers this).
 
 ---
 
