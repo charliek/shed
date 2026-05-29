@@ -184,6 +184,30 @@ class LocalServer:
         full = ["shed", "-s", self.name, "exec", name, "--"] + cmd
         return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
 
+    def stop(self, name: str, timeout: int = 60) -> None:
+        """Stop a running shed via `shed stop` (fail-loud)."""
+        r = subprocess.run(
+            ["shed", "-s", self.name, "stop", name],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            raise AssertionError(
+                f"shed stop failed (exit {r.returncode}) on {self.name}: "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+
+    def start(self, name: str, timeout: int = 120) -> None:
+        """Start a stopped shed via `shed start` (fail-loud)."""
+        r = subprocess.run(
+            ["shed", "-s", self.name, "start", name],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            raise AssertionError(
+                f"shed start failed (exit {r.returncode}) on {self.name}: "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+
     def ssh_exec(
         self,
         name: str,
