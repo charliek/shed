@@ -71,16 +71,23 @@ type PreFlightResult interface {
 }
 
 // UpperInfo is the orchestrator-opaque handle to a just-allocated
-// writable upper layer. Backends type-assert back to their concrete
-// type when they need the host-side path or size.
-type UpperInfo interface{ isUpperInfo() }
+// writable upper layer. The orchestrator threads it from
+// AllocateUpper through BuildAndPersistMetadata and StartVM as an
+// `any`-shaped token; backends type-assert to their concrete value
+// when they need the host-side path or size.
+//
+// (Empty interface by design — see the package doc-comment. The
+// orchestrator does not introspect the value; the marker pattern was
+// rejected because Go requires unexported markers to be implemented
+// in the same package as the interface.)
+type UpperInfo any
 
 // NetworkResources is the orchestrator-opaque handle to the per-shed
 // network resources acquired by the backend. Backends without
 // per-shed network allocation (VZ uses Apple's vmnet shared NAT)
-// return a zero-value NetworkResources that satisfies the interface
-// and registers no cleanups.
-type NetworkResources interface{ isNetworkResources() }
+// return a zero-value value of any type that satisfies `any` and
+// registers no cleanups. Same opacity rationale as `UpperInfo`.
+type NetworkResources any
 
 // MetadataHandle is the orchestrator-opaque handle to the persisted
 // per-shed Metadata record. Each backend has its own Metadata type
@@ -98,8 +105,9 @@ type MetadataHandle interface {
 // orchestrator threads it from StartVM through FinalizeStartedVM,
 // MountLocalDir, SetupCredentials, CloneRepo, and RunProvisioning
 // so backends can pass their concrete VM type around without the
-// orchestrator depending on it.
-type VMHandle interface{ isVMHandle() }
+// orchestrator depending on it. Same opacity rationale as
+// `UpperInfo`.
+type VMHandle any
 
 // BackendCreator is the per-backend hook contract used by
 // orchestrator.CreateShed. Methods are listed in the order
