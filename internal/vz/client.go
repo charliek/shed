@@ -22,9 +22,16 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/retry"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
 )
+
+// mountRetryBackoffs is the per-attempt wait schedule wrapping the
+// VirtioFS mount call. 3 attempts total, max ~2.5 s of added latency
+// on the worst failure path — far cheaper than killing a 10 s create
+// over a single transient agent RPC blip.
+var mountRetryBackoffs = []time.Duration{500 * time.Millisecond, 2 * time.Second}
 
 // Client manages VZ VM instances.
 type Client struct {
@@ -345,7 +352,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 
 	// Re-mount VirtioFS workspace on start (mount doesn't persist across reboots)
 	if meta.LocalDir != "" {
-		if err := c.mountVirtioFSShare(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
+		if err := c.mountVirtioFSShareWithRetry(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
 			// VirtioFS mount is essential for --local-dir; stop the VM and fail
 			if stopErr := vm.Stop(context.Background()); stopErr != nil {
 				log.Printf("Warning: failed to stop VM after mount failure: %v", stopErr)
@@ -516,6 +523,19 @@ func (c *Client) mountVirtioFSShare(ctx context.Context, agent *vmutil.AgentClie
 		return fmt.Errorf("virtiofs mount failed for %s at %s: %w", mountTag, target, err)
 	}
 	return nil
+}
+
+// mountVirtioFSShareWithRetry wraps mountVirtioFSShare in a bounded
+// retry envelope. Used by the create/start paths where a transient
+// agent RPC blip during the mount would otherwise kill an entire
+// 10-second VM bring-up. Credential mounts (mountVirtioFSCredential)
+// don't go through here because the credential manager already
+// log-and-continues on failure — extra latency before that log isn't
+// a useful tradeoff.
+func (c *Client) mountVirtioFSShareWithRetry(ctx context.Context, agent *vmutil.AgentClient, mountTag, target string, readOnly bool) error {
+	return retry.Do(ctx, "mount virtiofs "+mountTag, mountRetryBackoffs, nil, func() error {
+		return c.mountVirtioFSShare(ctx, agent, mountTag, target, readOnly)
+	})
 }
 
 // buildCredentialShares creates VirtioFS share entries from classified credentials.

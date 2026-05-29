@@ -20,9 +20,18 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/retry"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
 )
+
+// mountRetryBackoffs is the per-attempt wait schedule wrapping the
+// in-guest 9P mount call. 3 attempts total, max ~2.5 s of added
+// latency on the worst failure path — far cheaper than killing a
+// 10 s create over a single transient agent RPC blip. Tighter than
+// the registry-pull schedule (1s/4s) because mount errors fail fast
+// and a slow retry just wastes wall-clock.
+var mountRetryBackoffs = []time.Duration{500 * time.Millisecond, 2 * time.Second}
 
 // Client manages Firecracker VM instances.
 type Client struct {
@@ -316,6 +325,19 @@ func (c *Client) mount9PInGuest(ctx context.Context, agent *vmutil.AgentClient, 
 		return fmt.Errorf("mount-9p exec failed for %s at %s: %w", serverAddr, target, err)
 	}
 	return nil
+}
+
+// mount9PInGuestWithRetry wraps mount9PInGuest in a bounded retry
+// envelope. Used by the create/start paths where a transient agent
+// RPC blip during the mount would otherwise kill an entire 10-second
+// VM bring-up. Credential mounts (mount9PCredentialFunc) don't go
+// through here because the credential manager already
+// log-and-continues on failure — extra latency before that log isn't
+// a useful tradeoff.
+func (c *Client) mount9PInGuestWithRetry(ctx context.Context, agent *vmutil.AgentClient, serverAddr, target string, readOnly bool, tag string) error {
+	return retry.Do(ctx, "mount 9p "+tag, mountRetryBackoffs, nil, func() error {
+		return c.mount9PInGuest(ctx, agent, serverAddr, target, readOnly, tag)
+	})
 }
 
 // metadataToShed converts Firecracker metadata to a config.Shed.
@@ -616,7 +638,7 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 			_ = meta.Save(c.cfg.InstanceDir)
 			return nil, fmt.Errorf("failed to start 9P server on start: %w", err)
 		}
-		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
+		if err := c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
 			c.stopP9Servers(name)
 			if stopErr := vm.Stop(context.Background()); stopErr != nil {
 				log.Printf("Warning: failed to stop VM: %v", stopErr)

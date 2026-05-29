@@ -357,7 +357,7 @@ func (b *vzCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequ
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "mount")
 	backend.Status(ctx, "Mounting local directory via VirtioFS...")
-	if err := b.c.mountVirtioFSShare(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
+	if err := b.c.mountVirtioFSShareWithRetry(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
 		return fmt.Errorf("VirtioFS mount failed for local dir %s: %w", req.LocalDir, err)
 	}
 	return nil
