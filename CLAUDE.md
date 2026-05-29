@@ -9,15 +9,43 @@ Shed is a CLI tool for managing persistent, VM-based development environments ac
 ## Build & Test
 
 ```bash
-make build          # Build all binaries (shed, shed-server, shed-agent) into bin/
-make test           # Run all unit tests
-make lint           # Run golangci-lint
-make fmt            # Format code with gofmt
-make check          # Run lint + test
-make coverage       # Tests with coverage report
+make build              # Build all binaries (shed, shed-server, shed-agent) into bin/
+make test               # Run all unit tests
+make lint               # Run golangci-lint
+make fmt                # Format code with gofmt
+make check              # Run lint + test
+make coverage           # Tests with coverage report
+make test-integration   # Run the pytest-based integration suite (see below)
 ```
 
 Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to set up Go and golangci-lint.
+
+### Integration test suite (`tests/integration/`)
+
+Live create-cycle tests that drive a running `shed-server` via the `shed` CLI. Pytest + subprocess (Fabric reserved for the few remote-orchestration tasks that need it), managed with `uv`. Complements the Go unit tests — those catch logic / file-shape regressions on every PR; the integration suite catches live boot-path / SSE / timing regressions that need a real VM.
+
+```bash
+# One-time: install uv (https://docs.astral.sh/uv/getting-started/installation/)
+brew install uv
+
+# Run the suite (auto-installs Python deps into a managed venv on first run)
+make test-integration
+```
+
+The suite is **parameterized over `["vz", "fc"]`** and skips cleanly when a backend is unreachable from this host. On a Mac with the brew-installed `shed-server`, VZ tests run against `shed -s my-server`; FC tests target the entry named by `$SHED_FC_HOST` (default `mini3`) over SSH.
+
+**FC live tests require the remote `shed-server` to emit `PhaseTimer` log lines** (added in v0.5.4 via PR #118). Two tests (`test_phase_timer_emitted[fc]`, `test_plain_create_timing[fc]`) skip cleanly with a clear message if the remote is older — the other three FC tests work against any shed-server version. Once the remote upgrades to v0.5.4+, the suite picks up the FC tests automatically with no config change.
+
+Environment overrides (full list in `tests/integration/README.md`):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the local VZ server |
+| `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | brew log path (override for Intel-Mac homebrew prefix or custom installs) |
+| `SHED_FC_HOST` | `mini3` | SSH host for FC live tests |
+| `SHED_FC_SERVER` | same as host | `~/.shed/config.yaml` entry name when it differs from the SSH host |
+
+See `docs/development/testing.md` (Development → Testing on the docs site) for the full operator guide — adding a test, the per-backend timing ceilings, the fixture conventions, the mini3 upgrade procedure for FC e2e, etc.
 
 ## Project Structure
 
