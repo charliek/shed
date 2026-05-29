@@ -567,6 +567,18 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 		meta.PID = 0
 	}
 
+	// Defensive zombie-pid check. Even when status reads "stopped" we
+	// can still hold a stale pid (server crash between vm.Stop() and
+	// the metadata save, hand-edited metadata.json, etc). Refuse to
+	// spawn a second firecracker under the same name when the recorded
+	// pid is still alive AND still looks like firecracker. Plain
+	// liveness without the binary check would false-positive across
+	// PID reuse.
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
+		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrZombiePresentSentinel, name, meta.PID)
+	}
+	meta.PID = 0
+
 	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create VM: %w", err)
@@ -688,6 +700,15 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 
 	if err := vm.Stop(ctx); err != nil {
 		return nil, fmt.Errorf("failed to stop VM: %w", err)
+	}
+
+	// vm.Stop's post-SIGKILL waitForProcessExit swallows its timeout
+	// and returns nil even when firecracker refused to die. Verify
+	// before flipping status — otherwise the next StartShed would find
+	// PID=0 in metadata and silently spawn a second firecracker under
+	// the same name.
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
+		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrStopIncompleteSentinel, meta.Name, meta.PID)
 	}
 
 	meta.Status = config.StatusStopped

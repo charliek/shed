@@ -4,7 +4,7 @@
 package firecracker
 
 import (
-	"os"
+	"os/exec"
 	"testing"
 )
 
@@ -51,62 +51,73 @@ func TestGenerateMACAddress(t *testing.T) {
 	}
 }
 
-func TestIsRunning_CurrentPID(t *testing.T) {
-	// Use current process PID which is definitely running
-	currentPID := os.Getpid()
-
-	dir := mustTempDir(t, "vm-test")
-	cfg := testFirecrackerConfig(dir)
-	meta := testMetadata("test-vm")
-	meta.PID = currentPID
-
-	vm := &VM{meta: meta, cfg: cfg}
-
-	if !vm.IsRunning() {
-		t.Error("IsRunning() = false for current process, want true")
+func TestIsRunning(t *testing.T) {
+	// spawnSleepChild returns a non-firecracker live pid the caller
+	// owns for the duration of the case (cleanup kills + reaps it).
+	// os.Getpid() can't substitute here: the test binary's
+	// /proc/PID/cmdline ends in `firecracker.test` and substring-
+	// matches "firecracker", which would defeat the PID-reuse guard
+	// we're trying to test.
+	spawnSleepChild := func(t *testing.T) int {
+		t.Helper()
+		cmd := exec.Command("sleep", "30")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start sleep child: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		return cmd.Process.Pid
 	}
-}
 
-func TestIsRunning_InvalidPID(t *testing.T) {
-	dir := mustTempDir(t, "vm-test")
-	cfg := testFirecrackerConfig(dir)
-	meta := testMetadata("test-vm")
-
-	tests := []struct {
-		name string
-		pid  int
+	cases := []struct {
+		name        string
+		setupPID    func(t *testing.T) int
+		wantRunning bool
 	}{
-		{"zero PID", 0},
-		{"negative PID", -1},
+		{
+			name:        "zero PID",
+			setupPID:    func(*testing.T) int { return 0 },
+			wantRunning: false,
+		},
+		{
+			name:        "negative PID",
+			setupPID:    func(*testing.T) int { return -1 },
+			wantRunning: false,
+		},
+		{
+			// Tightens the contract added by the PID-reuse guard: a
+			// live PID that isn't firecracker must report not-running.
+			// Before the guard, this returned true and `shed list`
+			// would silently advertise a recycled pid as a running VMM.
+			name:        "live PID but not firecracker",
+			setupPID:    spawnSleepChild,
+			wantRunning: false,
+		},
+		{
+			// 2,000,000,000 is above default Linux pid_max (4,194,304)
+			// but well within int32 — kernels return ESRCH.
+			name:        "impossibly-large PID",
+			setupPID:    func(*testing.T) int { return 2000000000 },
+			wantRunning: false,
+		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			meta.PID = tt.pid
+	dir := mustTempDir(t, "vm-test")
+	cfg := testFirecrackerConfig(dir)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			meta := testMetadata("test-vm")
+			meta.PID = tc.setupPID(t)
 			vm := &VM{meta: meta, cfg: cfg}
 
-			if vm.IsRunning() {
-				t.Errorf("IsRunning() = true for PID %d, want false", tt.pid)
+			if got := vm.IsRunning(); got != tc.wantRunning {
+				t.Errorf("IsRunning() = %v, want %v (pid=%d)", got, tc.wantRunning, meta.PID)
 			}
 		})
 	}
-}
-
-func TestIsRunning_NonexistentPID(t *testing.T) {
-	// Use a very high PID that's unlikely to exist
-	// Note: This test may be flaky on systems with very high PIDs
-	highPID := 2000000000 // Very high, unlikely to exist (fits 32-bit int)
-
-	dir := mustTempDir(t, "vm-test")
-	cfg := testFirecrackerConfig(dir)
-	meta := testMetadata("test-vm")
-	meta.PID = highPID
-
-	vm := &VM{meta: meta, cfg: cfg}
-
-	// On most systems, this should return false
-	// The test verifies the logic handles non-running processes
-	_ = vm.IsRunning() // Just verify it doesn't panic
 }
 
 func TestMACAddressFormat(t *testing.T) {
