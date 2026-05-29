@@ -29,6 +29,25 @@
 //     accepts the in-progress Cleanup and Registers its own teardown,
 //     so the orchestrator never needs to know what resources a
 //     backend acquires.
+//
+// Caller contract (what the per-backend CreateShed wrapper must do
+// BEFORE calling orchestrator.CreateShed):
+//
+//   - Acquire any cross-name locks. VZ + FC use snapshot-lock(source)
+//     then create-lock(new shed) — see the lock-order comments in
+//     each backend's CreateShed. The orchestrator does not own these.
+//   - Reject duplicate-name creates (LoadMetadata check). The
+//     orchestrator's hooks assume the shed is new.
+//   - Sweep any orphan upper from a previously-crashed create. Same
+//     reason — hooks assume a clean slate.
+//   - Validate request-only invariants the orchestrator cannot
+//     express (cpus/memory bounds, upper-size bounds, --image vs
+//     --from-snapshot exclusivity).
+//
+// These tasks intentionally stay in the per-backend wrapper because
+// they need backend-private state (lock maps, instance-dir layout)
+// the orchestrator does not own. PreFlight + the subsequent hooks
+// take it from there.
 package orchestrator
 
 import (
@@ -38,10 +57,11 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// PreFlightResult is the orchestrator-opaque output of the
-// backend's PreFlight step. Carries early-resolved values
-// (image-source digest, snapshot-source path) so the rest of
-// the lifecycle does not re-resolve them.
+// PreFlightResult is the orchestrator-opaque output of the backend's
+// PreFlight step. Carries early-resolved values (image-source digest,
+// snapshot-source path) so the rest of the lifecycle does not
+// re-resolve them. Backends type-assert back to their concrete type
+// inside subsequent hooks.
 type PreFlightResult interface {
 	// IsFromSnapshot reports whether the create is sourced from a
 	// snapshot rather than a fresh image. The orchestrator uses
@@ -50,50 +70,36 @@ type PreFlightResult interface {
 	IsFromSnapshot() bool
 }
 
-// UpperInfo is the orchestrator-opaque handle to a backend's
-// just-allocated writable upper layer.
-type UpperInfo interface {
-	// Path returns the upper layer's filesystem path on the host
-	// (used for diagnostics; the backend internally tracks more).
-	Path() string
-
-	// SizeBytes returns the upper layer's logical size, which may
-	// differ from the freshly-allocated size when the upper was
-	// cloned from a snapshot.
-	SizeBytes() int64
-}
+// UpperInfo is the orchestrator-opaque handle to a just-allocated
+// writable upper layer. Backends type-assert back to their concrete
+// type when they need the host-side path or size.
+type UpperInfo interface{ isUpperInfo() }
 
 // NetworkResources is the orchestrator-opaque handle to the per-shed
-// network resources acquired by the backend. For backends without
-// per-shed network allocation (VZ uses Apple's vmnet shared NAT),
-// implementations return a zero-value NetworkResources that satisfies
-// the interface and registers no cleanups.
-type NetworkResources interface {
-	// Summary returns a short human-readable description of the
-	// allocated resources, used in diagnostic logs. Implementations
-	// may return "" if no per-shed network state was allocated.
-	Summary() string
-}
+// network resources acquired by the backend. Backends without
+// per-shed network allocation (VZ uses Apple's vmnet shared NAT)
+// return a zero-value NetworkResources that satisfies the interface
+// and registers no cleanups.
+type NetworkResources interface{ isNetworkResources() }
 
 // MetadataHandle is the orchestrator-opaque handle to the persisted
 // per-shed Metadata record. Each backend has its own Metadata type
 // today (`vz.Metadata`, `firecracker.Metadata`); the interface keeps
 // the orchestrator from depending on either struct's shape.
+//
+// Only `Name()` is exposed: it's used internally for diagnostic logs
+// and to derive the vms-map key. Backends type-assert to their
+// concrete type when they need other fields.
 type MetadataHandle interface {
-	// Name returns the shed name (used as a key in logs and in the
-	// vms map). Required to match the request's Name.
 	Name() string
 }
 
 // VMHandle is the orchestrator-opaque handle to a started VM. The
-// orchestrator doesn't operate on it directly (the backend's hooks
-// own VM-side work); it threads VMHandle from StartVM to FinalizeVM
-// and CommitVM so backends can pass their concrete VM type around.
-type VMHandle interface {
-	// Backend returns the backend identifier for the started VM
-	// (used for logging and to assert no cross-backend mix-ups).
-	Backend() string
-}
+// orchestrator threads it from StartVM through FinalizeStartedVM,
+// MountLocalDir, SetupCredentials, CloneRepo, and RunProvisioning
+// so backends can pass their concrete VM type around without the
+// orchestrator depending on it.
+type VMHandle interface{ isVMHandle() }
 
 // BackendCreator is the per-backend hook contract used by
 // orchestrator.CreateShed. Methods are listed in the order
@@ -105,27 +111,45 @@ type VMHandle interface {
 // invokes them in LIFO order on any error-return. Implementations
 // MUST NOT call `cleanup.Run()` or `cleanup.Commit()` themselves —
 // those are the orchestrator's responsibility.
+//
+// Hooks that emit user-visible status messages should use
+// `backend.Phase(ctx, name)` + `backend.Status(ctx, message)` from
+// `internal/backend` (split per PR #135). Hooks that DON'T have
+// status text should still emit their own Phase boundary if they
+// represent a distinct cost the operator should see in the
+// PhaseTimer log.
 type BackendCreator interface {
-	// Name returns the backend identifier (used as a PhaseTimer
-	// label and in diagnostic logs).
-	Name() string
-
 	// PreFlight runs early validation and resolves any
-	// image-source or snapshot-source references. Errors here cause
-	// an immediate return from the orchestrator — no cleanups have
-	// been registered yet.
-	PreFlight(ctx context.Context, req config.CreateShedRequest) (PreFlightResult, error)
-
-	// AllocateUpper provisions a writable upper layer for the new
-	// shed. Implementations MUST Register a "delete upper layer"
-	// cleanup on `cleanup` so a downstream failure unwinds it.
-	AllocateUpper(ctx context.Context, req config.CreateShedRequest, pre PreFlightResult, cleanup *backend.Cleanup) (UpperInfo, error)
+	// image-source or snapshot-source references, and registers any
+	// protective cleanups that must hold for the rest of the
+	// lifecycle (e.g., the `.creating` marker that protects the
+	// lower-digest blob from a concurrent `shed image prune`).
+	//
+	// Errors here cause an immediate return from the orchestrator.
+	// Any cleanups registered before the failure WILL still run via
+	// the deferred `cleanup.Run()`, so implementations must register
+	// each protective bit individually rather than as a single
+	// "undo PreFlight" block.
+	PreFlight(ctx context.Context, req config.CreateShedRequest, cleanup *backend.Cleanup) (PreFlightResult, error)
 
 	// AllocateNetwork performs backend-specific per-shed network
-	// resource allocation (FC: CID + IP + TAP; VZ: a no-op
-	// returning empty NetworkResources). Implementations MUST
-	// Register a cleanup for each acquired resource individually.
+	// resource allocation. FC: CID + IP + TAP. VZ: no-op returning
+	// an empty NetworkResources. Implementations MUST Register a
+	// cleanup for each acquired resource individually so a later
+	// failure unwinds them in registration-reverse order.
+	//
+	// Called BEFORE AllocateUpper because per-shed network state is
+	// cheap to fail (CID/IP exhaustion) and the upper layer is
+	// expensive to undo (large sparse file). Matches FC's existing
+	// CreateShed order; preserves measured timing during 2c.
 	AllocateNetwork(ctx context.Context, req config.CreateShedRequest, cleanup *backend.Cleanup) (NetworkResources, error)
+
+	// AllocateUpper provisions a writable upper layer for the new
+	// shed (including any snapshot-clone or template-mint
+	// substeps). Implementations MUST Register a "delete upper
+	// layer" cleanup on `cleanup` so a downstream failure unwinds
+	// it.
+	AllocateUpper(ctx context.Context, req config.CreateShedRequest, pre PreFlightResult, cleanup *backend.Cleanup) (UpperInfo, error)
 
 	// BuildAndPersistMetadata constructs the platform-specific
 	// metadata record and persists it to disk. Implementations MUST
@@ -141,34 +165,37 @@ type BackendCreator interface {
 	// boundary before calling.
 	StartVM(ctx context.Context, meta MetadataHandle, upper UpperInfo, net NetworkResources, cleanup *backend.Cleanup) (VMHandle, error)
 
-	// FinalizeVM updates the persisted metadata with post-Start
-	// state (Status=Running, PID, ...) and registers the
-	// "remove from vms map" cleanup. Splitting this from StartVM
-	// keeps the StartVM contract focused on actually booting the
-	// guest.
-	FinalizeVM(ctx context.Context, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
+	// FinalizeStartedVM updates the persisted metadata with
+	// post-Start state (Status=Running, PID, ...) and registers
+	// the "remove from vms map" cleanup. The name is honest about
+	// the two things it does — the second meta.Save plus the
+	// vms-map registration — both of which must commit-or-rollback
+	// as a unit.
+	FinalizeStartedVM(ctx context.Context, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
 
-	// MountWorkspace mounts the requested local directory (if any)
-	// into the guest via the backend's transport (VirtioFS on VZ,
-	// 9P on FC). A nil-error return is required when no local-dir
-	// is configured.
-	MountWorkspace(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) error
+	// MountLocalDir mounts the requested `--local-dir` into the
+	// guest's `/workspace` via the backend's transport (VirtioFS
+	// on VZ, 9P on FC). No-op return nil when `req.LocalDir` is
+	// empty.
+	MountLocalDir(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) error
 
 	// SetupCredentials mounts any configured credentials into the
-	// guest. Best-effort: failures are logged but do not return an
-	// error (matching today's behavior in
+	// guest. Best-effort: failures are logged inside the hook but
+	// do not return an error (matching today's behavior in
 	// `vmutil.CredentialManager.SetupCredentials`).
 	SetupCredentials(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle)
 
-	// CloneRepo clones the request's --repo into the guest's
-	// workspace if specified. Best-effort: failures emit a
-	// StatusWarning via the ctx-bound progress and return nil so
-	// the create completes (matching today's behavior).
-	CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) error
+	// CloneRepo clones `req.Repo` into the guest's workspace if
+	// specified. Best-effort: hook implementations log + emit
+	// `backend.StatusWarning` on failure and return nothing — the
+	// orchestrator continues to the next step regardless. Matches
+	// today's behavior in both backends.
+	CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle)
 
 	// RunProvisioning runs the shed's provisioning hooks (loaded
 	// from .shed/provision.yaml inside the guest workspace) unless
-	// the request opted out via NoProvision. Best-effort.
+	// the request opted out via NoProvision. Best-effort — same
+	// contract as SetupCredentials.
 	RunProvisioning(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle)
 
 	// ToShedResult returns the *config.Shed value to hand back to
@@ -187,14 +214,21 @@ type BackendCreator interface {
 // success, cleanup.Commit zeroes the stack so the defer is a no-op.
 //
 // CreateShed does not itself acquire per-shed locks or do request
-// validation beyond what a backend's PreFlight does — call sites
-// (the backend's existing CreateShed wrapper) keep that
-// responsibility.
+// validation beyond what a backend's PreFlight does — call sites (the
+// backend's existing CreateShed wrapper) keep that responsibility
+// per the package doc-comment contract.
 func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequest) (*config.Shed, error) {
 	cleanup := backend.NewCleanup()
 	defer cleanup.Run()
 
-	pre, err := b.PreFlight(ctx, req)
+	pre, err := b.PreFlight(ctx, req, cleanup)
+	if err != nil {
+		return nil, err
+	}
+
+	// Network allocation runs first (fail-cheap; matches FC's
+	// existing order). VZ's hook is a no-op and registers nothing.
+	net, err := b.AllocateNetwork(ctx, req, cleanup)
 	if err != nil {
 		return nil, err
 	}
@@ -202,15 +236,6 @@ func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequ
 	backend.Phase(ctx, "rootfs")
 	backend.Status(ctx, "Allocating writable upper layer...")
 	upper, err := b.AllocateUpper(ctx, req, pre, cleanup)
-	if err != nil {
-		return nil, err
-	}
-
-	// Phase boundary for "network" is emitted only by backends that
-	// actually allocate network resources; VZ's AllocateNetwork is a
-	// no-op so emitting "network" there would show a 0-ms entry. The
-	// hook is responsible for its own Phase/Status events.
-	net, err := b.AllocateNetwork(ctx, req, cleanup)
 	if err != nil {
 		return nil, err
 	}
@@ -227,20 +252,16 @@ func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequ
 		return nil, err
 	}
 
-	if err := b.FinalizeVM(ctx, meta, vm, cleanup); err != nil {
+	if err := b.FinalizeStartedVM(ctx, meta, vm, cleanup); err != nil {
 		return nil, err
 	}
 
-	if err := b.MountWorkspace(ctx, req, meta, vm); err != nil {
+	if err := b.MountLocalDir(ctx, req, meta, vm); err != nil {
 		return nil, err
 	}
 
 	b.SetupCredentials(ctx, req, meta, vm)
-
-	if err := b.CloneRepo(ctx, req, meta, vm); err != nil {
-		return nil, err
-	}
-
+	b.CloneRepo(ctx, req, meta, vm)
 	b.RunProvisioning(ctx, req, meta, vm)
 
 	cleanup.Commit()

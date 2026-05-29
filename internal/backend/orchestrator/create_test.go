@@ -25,25 +25,21 @@ type mockPreFlight struct{ fromSnapshot bool }
 
 func (p mockPreFlight) IsFromSnapshot() bool { return p.fromSnapshot }
 
-type mockUpper struct {
-	path string
-	size int64
-}
+type mockUpper struct{}
 
-func (u mockUpper) Path() string     { return u.path }
-func (u mockUpper) SizeBytes() int64 { return u.size }
+func (mockUpper) isUpperInfo() {}
 
-type mockNet struct{ summary string }
+type mockNet struct{}
 
-func (n mockNet) Summary() string { return n.summary }
+func (mockNet) isNetworkResources() {}
 
 type mockMeta struct{ name string }
 
 func (m mockMeta) Name() string { return m.name }
 
-type mockVM struct{ backend string }
+type mockVM struct{}
 
-func (v mockVM) Backend() string { return v.backend }
+func (mockVM) isVMHandle() {}
 
 // mockBackend records every hook invocation in order and exposes
 // failure-injection knobs so each error-propagation path is testable
@@ -75,23 +71,16 @@ func (b *mockBackend) makeCleanup(name string) func() error {
 	}
 }
 
-func (b *mockBackend) Name() string { return config.BackendVZ }
-
-func (b *mockBackend) PreFlight(ctx context.Context, req config.CreateShedRequest) (PreFlightResult, error) {
+func (b *mockBackend) PreFlight(ctx context.Context, req config.CreateShedRequest, c *backend.Cleanup) (PreFlightResult, error) {
 	b.record("PreFlight")
 	if err := b.failAt["PreFlight"]; err != nil {
 		return nil, err
 	}
+	// PreFlight may register protective cleanups (the .creating marker
+	// removal in real backends); the mock simulates one to exercise
+	// the early-stage unwind path.
+	c.Register("remove creating marker", b.makeCleanup("remove creating marker"))
 	return mockPreFlight{}, nil
-}
-
-func (b *mockBackend) AllocateUpper(ctx context.Context, req config.CreateShedRequest, pre PreFlightResult, c *backend.Cleanup) (UpperInfo, error) {
-	b.record("AllocateUpper")
-	if err := b.failAt["AllocateUpper"]; err != nil {
-		return nil, err
-	}
-	c.Register("delete upper", b.makeCleanup("delete upper"))
-	return mockUpper{path: "/tmp/test-upper", size: 1 << 30}, nil
 }
 
 func (b *mockBackend) AllocateNetwork(ctx context.Context, req config.CreateShedRequest, c *backend.Cleanup) (NetworkResources, error) {
@@ -100,13 +89,23 @@ func (b *mockBackend) AllocateNetwork(ctx context.Context, req config.CreateShed
 		return nil, err
 	}
 	c.Register("release network", b.makeCleanup("release network"))
-	return mockNet{summary: "mock-net"}, nil
+	return mockNet{}, nil
+}
+
+func (b *mockBackend) AllocateUpper(ctx context.Context, req config.CreateShedRequest, pre PreFlightResult, c *backend.Cleanup) (UpperInfo, error) {
+	b.record("AllocateUpper")
+	if err := b.failAt["AllocateUpper"]; err != nil {
+		return nil, err
+	}
+	c.Register("delete upper", b.makeCleanup("delete upper"))
+	return mockUpper{}, nil
 }
 
 func (b *mockBackend) BuildAndPersistMetadata(ctx context.Context, req config.CreateShedRequest, pre PreFlightResult, upper UpperInfo, net NetworkResources, c *backend.Cleanup) (MetadataHandle, error) {
 	b.record("BuildAndPersistMetadata")
-	// Register BEFORE the "save would create a partial dir" — same
-	// invariant as the real backends (see PR #137 review).
+	// Register BEFORE the simulated meta.Save — same invariant as the
+	// real backends (see PR #137 review): MkdirAll can leave a partial
+	// dir behind that LIFO must still unwind.
 	c.Register("delete instance dir", b.makeCleanup("delete instance dir"))
 	if err := b.failAt["BuildAndPersistMetadata"]; err != nil {
 		return nil, err
@@ -120,30 +119,29 @@ func (b *mockBackend) StartVM(ctx context.Context, meta MetadataHandle, upper Up
 		return nil, err
 	}
 	c.Register("stop VM", b.makeCleanup("stop VM"))
-	return mockVM{backend: config.BackendVZ}, nil
+	return mockVM{}, nil
 }
 
-func (b *mockBackend) FinalizeVM(ctx context.Context, meta MetadataHandle, vm VMHandle, c *backend.Cleanup) error {
-	b.record("FinalizeVM")
-	if err := b.failAt["FinalizeVM"]; err != nil {
+func (b *mockBackend) FinalizeStartedVM(ctx context.Context, meta MetadataHandle, vm VMHandle, c *backend.Cleanup) error {
+	b.record("FinalizeStartedVM")
+	if err := b.failAt["FinalizeStartedVM"]; err != nil {
 		return err
 	}
 	c.Register("remove from vms map", b.makeCleanup("remove from vms map"))
 	return nil
 }
 
-func (b *mockBackend) MountWorkspace(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) error {
-	b.record("MountWorkspace")
-	return b.failAt["MountWorkspace"]
+func (b *mockBackend) MountLocalDir(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) error {
+	b.record("MountLocalDir")
+	return b.failAt["MountLocalDir"]
 }
 
 func (b *mockBackend) SetupCredentials(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) {
 	b.record("SetupCredentials")
 }
 
-func (b *mockBackend) CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) error {
+func (b *mockBackend) CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) {
 	b.record("CloneRepo")
-	return b.failAt["CloneRepo"]
 }
 
 func (b *mockBackend) RunProvisioning(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) {
@@ -173,12 +171,12 @@ func TestCreateShed_HappyPathOrder(t *testing.T) {
 
 	want := []string{
 		"PreFlight",
-		"AllocateUpper",
 		"AllocateNetwork",
+		"AllocateUpper",
 		"BuildAndPersistMetadata",
 		"StartVM",
-		"FinalizeVM",
-		"MountWorkspace",
+		"FinalizeStartedVM",
+		"MountLocalDir",
 		"SetupCredentials",
 		"CloneRepo",
 		"RunProvisioning",
@@ -197,6 +195,9 @@ func TestCreateShed_HappyPathOrder(t *testing.T) {
 // TestCreateShed_FailureUnwindLIFO injects a failure at each hook that
 // returns an error and asserts the registered cleanups unwind in
 // reverse order. The test name in the table identifies the failure point.
+//
+// Hooks that DON'T return an error (SetupCredentials, CloneRepo,
+// RunProvisioning) are best-effort by design and not failable here.
 func TestCreateShed_FailureUnwindLIFO(t *testing.T) {
 	cases := []struct {
 		failAt       string
@@ -206,51 +207,43 @@ func TestCreateShed_FailureUnwindLIFO(t *testing.T) {
 		{
 			failAt:       "PreFlight",
 			wantCalled:   []string{"PreFlight"},
-			wantCleanups: nil, // nothing registered yet
-		},
-		{
-			failAt:       "AllocateUpper",
-			wantCalled:   []string{"PreFlight", "AllocateUpper"},
-			wantCleanups: nil, // AllocateUpper failed before registering
+			wantCleanups: nil, // PreFlight failed before registering anything (mock registers AFTER fail check)
 		},
 		{
 			failAt:       "AllocateNetwork",
-			wantCalled:   []string{"PreFlight", "AllocateUpper", "AllocateNetwork"},
-			wantCleanups: []string{"delete upper"},
+			wantCalled:   []string{"PreFlight", "AllocateNetwork"},
+			wantCleanups: []string{"remove creating marker"},
+		},
+		{
+			failAt:       "AllocateUpper",
+			wantCalled:   []string{"PreFlight", "AllocateNetwork", "AllocateUpper"},
+			wantCleanups: []string{"release network", "remove creating marker"},
 		},
 		{
 			failAt:     "BuildAndPersistMetadata",
-			wantCalled: []string{"PreFlight", "AllocateUpper", "AllocateNetwork", "BuildAndPersistMetadata"},
-			// Cleanup for delete-instance-dir IS registered before the
-			// fail-injection point (mock mirrors the real backend's
-			// "register before Save" invariant from PR #137).
-			wantCleanups: []string{"delete instance dir", "release network", "delete upper"},
+			wantCalled: []string{"PreFlight", "AllocateNetwork", "AllocateUpper", "BuildAndPersistMetadata"},
+			// "delete instance dir" IS registered before the simulated
+			// save (mock mirrors the real backend's "register before
+			// Save" invariant from PR #137).
+			wantCleanups: []string{"delete instance dir", "delete upper", "release network", "remove creating marker"},
 		},
 		{
 			failAt:       "StartVM",
-			wantCalled:   []string{"PreFlight", "AllocateUpper", "AllocateNetwork", "BuildAndPersistMetadata", "StartVM"},
-			wantCleanups: []string{"delete instance dir", "release network", "delete upper"},
+			wantCalled:   []string{"PreFlight", "AllocateNetwork", "AllocateUpper", "BuildAndPersistMetadata", "StartVM"},
+			wantCleanups: []string{"delete instance dir", "delete upper", "release network", "remove creating marker"},
 		},
 		{
-			failAt:       "FinalizeVM",
-			wantCalled:   []string{"PreFlight", "AllocateUpper", "AllocateNetwork", "BuildAndPersistMetadata", "StartVM", "FinalizeVM"},
-			wantCleanups: []string{"stop VM", "delete instance dir", "release network", "delete upper"},
+			failAt:       "FinalizeStartedVM",
+			wantCalled:   []string{"PreFlight", "AllocateNetwork", "AllocateUpper", "BuildAndPersistMetadata", "StartVM", "FinalizeStartedVM"},
+			wantCleanups: []string{"stop VM", "delete instance dir", "delete upper", "release network", "remove creating marker"},
 		},
 		{
-			failAt: "MountWorkspace",
+			failAt: "MountLocalDir",
 			wantCalled: []string{
-				"PreFlight", "AllocateUpper", "AllocateNetwork", "BuildAndPersistMetadata",
-				"StartVM", "FinalizeVM", "MountWorkspace",
+				"PreFlight", "AllocateNetwork", "AllocateUpper", "BuildAndPersistMetadata",
+				"StartVM", "FinalizeStartedVM", "MountLocalDir",
 			},
-			wantCleanups: []string{"remove from vms map", "stop VM", "delete instance dir", "release network", "delete upper"},
-		},
-		{
-			failAt: "CloneRepo",
-			wantCalled: []string{
-				"PreFlight", "AllocateUpper", "AllocateNetwork", "BuildAndPersistMetadata",
-				"StartVM", "FinalizeVM", "MountWorkspace", "SetupCredentials", "CloneRepo",
-			},
-			wantCleanups: []string{"remove from vms map", "stop VM", "delete instance dir", "release network", "delete upper"},
+			wantCleanups: []string{"remove from vms map", "stop VM", "delete instance dir", "delete upper", "release network", "remove creating marker"},
 		},
 	}
 
@@ -272,6 +265,28 @@ func TestCreateShed_FailureUnwindLIFO(t *testing.T) {
 				t.Errorf("cleanup unwind order =\n  %v\nwant (LIFO)\n  %v", b.cleanupsRun, tc.wantCleanups)
 			}
 		})
+	}
+}
+
+// TestCreateShed_BestEffortHooksDoNotAbort verifies that hooks marked
+// best-effort (SetupCredentials, CloneRepo, RunProvisioning) cannot
+// abort the create. The mock's best-effort hooks don't return errors
+// to inject — this test would catch a regression where someone made
+// them return error AND the orchestrator started propagating.
+func TestCreateShed_BestEffortHooksDoNotAbort(t *testing.T) {
+	b := newMockBackend()
+	got, err := CreateShed(context.Background(), b, config.CreateShedRequest{Name: "best-effort"})
+	if err != nil {
+		t.Fatalf("CreateShed returned error from best-effort path: %v", err)
+	}
+	if got == nil || got.Name != "best-effort" {
+		t.Fatalf("ToShedResult returned %v; want a Shed", got)
+	}
+	// All three best-effort hooks must have been called.
+	wantTail := []string{"SetupCredentials", "CloneRepo", "RunProvisioning", "ToShedResult"}
+	gotTail := b.calls[len(b.calls)-len(wantTail):]
+	if !sliceEqual(gotTail, wantTail) {
+		t.Errorf("best-effort tail = %v, want %v", gotTail, wantTail)
 	}
 }
 
