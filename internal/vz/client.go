@@ -328,17 +328,20 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		FromSnapshot:   req.FromSnapshot,
 	}
 
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		// Save can leave a partially-written instance dir even on error —
-		// preserve the console log (if any) and let the LIFO cleanup
-		// remove it on return.
-		c.preserveConsoleLog(meta)
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
+	// Register the instance-dir cleanup BEFORE calling Save. Save's
+	// `os.MkdirAll` runs first; if any subsequent write fails partway
+	// through, the directory it created is left behind. `meta.Delete`
+	// is `os.RemoveAll`, so it's safe to register against a not-yet-
+	// existent path (the cleanup is a no-op if the dir was never
+	// created). `preserveConsoleLog` is also safe pre-Start (it skips
+	// when console.log is absent — see vz/metadata.go).
 	cleanup.Register("preserve console log + delete instance dir", func() error {
 		c.preserveConsoleLog(meta)
 		return meta.Delete(c.cfg.InstanceDir)
 	})
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("failed to save metadata: %w", err)
+	}
 
 	// Filter credentials to those with existing source directories.
 	// Non-existent sources are skipped to avoid vfkit VirtioFS failures.

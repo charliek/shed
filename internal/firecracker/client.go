@@ -614,12 +614,18 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		FromSnapshot:   req.FromSnapshot,
 	}
 
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
+	// Register the instance-dir cleanup BEFORE calling Save. Save's
+	// `os.MkdirAll` runs first; if any subsequent write fails partway
+	// through, the directory it created is left behind. `meta.Delete`
+	// is `os.RemoveAll`, so it's safe to register against a not-yet-
+	// existent path (the cleanup is a no-op if the dir was never
+	// created).
 	cleanup.Register("delete instance dir", func() error {
 		return meta.Delete(c.cfg.InstanceDir)
 	})
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("failed to save metadata: %w", err)
+	}
 
 	c.RegisterInstance(req.Name, cid, ipAddress)
 

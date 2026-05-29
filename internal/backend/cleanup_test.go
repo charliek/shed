@@ -71,6 +71,23 @@ func TestCleanup_RunIdempotent(t *testing.T) {
 	}
 }
 
+func TestCleanup_PanickingStepDoesNotAbortChain(t *testing.T) {
+	var order []string
+	c := NewCleanup()
+	c.Register("first", func() error { order = append(order, "first"); return nil })
+	c.Register("panicking", func() error {
+		order = append(order, "panicking")
+		panic("synthetic panic from test")
+	})
+	c.Register("third", func() error { order = append(order, "third"); return nil })
+	c.Run()
+
+	want := []string{"third", "panicking", "first"}
+	if !equal(order, want) {
+		t.Errorf("panic recovery broke the LIFO chain; order = %v, want %v", order, want)
+	}
+}
+
 func TestCleanup_ConcurrentRegisters(t *testing.T) {
 	c := NewCleanup()
 	var wg sync.WaitGroup

@@ -112,6 +112,12 @@ func (c *Cleanup) Commit() {
 // still run, so a slow `vm.Stop` doesn't leak an upper-layer file.
 // Idempotent: subsequent calls are no-ops.
 //
+// Cleanup closures are run inside an isolating panic-recovery wrapper —
+// a panic in step N is logged and the remaining steps still execute.
+// Without this, a buggy `vm.Stop` could leave an upper-layer file
+// behind, which is precisely the class of leak this type exists to
+// prevent.
+//
 // Designed to be called from `defer cleanup.Run()` at the top of a
 // lifecycle method. The defer guarantees rollback on panic-mid-create
 // too (the rollback runs before the panic propagates out).
@@ -124,8 +130,20 @@ func (c *Cleanup) Run() {
 
 	for i := len(steps) - 1; i >= 0; i-- {
 		step := steps[i]
-		if err := step.fn(); err != nil {
-			log.Printf("Warning: cleanup %q failed: %v", step.name, err)
+		runCleanupStep(step)
+	}
+}
+
+// runCleanupStep wraps a single cleanup invocation in `defer recover`
+// so a panicking closure does not abort the LIFO unwind. Reported
+// errors and recovered panics share the same log shape.
+func runCleanupStep(step cleanupStep) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Warning: cleanup %q panicked: %v", step.name, r)
 		}
+	}()
+	if err := step.fn(); err != nil {
+		log.Printf("Warning: cleanup %q failed: %v", step.name, err)
 	}
 }
