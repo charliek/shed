@@ -479,16 +479,25 @@ shed image prune --dry-run      # preview reclaim
 shed image prune                # reclaim
 ```
 
-`shed image prune` walks every shed and snapshot, collects the manifest
-digests they pin (`instances/<name>/metadata.json` → `lower_digest`),
-expands each manifest to the layers it references, and deletes any blob
-or cached ext4 not in that reachable set. Tags do NOT protect blobs.
+`shed image prune` walks every tag, shed, and snapshot, collects the
+manifest digests they pin (`tags/<name>.json`,
+`instances/<name>/metadata.json` → `lower_digest`,
+`snapshots/<name>/snapshot.json` → `lower_digest`), expands each
+manifest to the layers it references, and deletes any blob or cached
+ext4 not in that reachable set. Tags ARE protective as of v0.5.8 —
+pre-v0.5.8 they were informational and prune deleted blobs they
+pointed at (see [v0.5.7 → v0.5.8](../upgrades/v0.5.7-to-v0.5.8.md)).
 
 Deleting a tag for an image that's still pinned by a running or stopped
 shed is safe — the shed boots from the digest pinned in its metadata,
 not the tag.
 
 ### Cookbook: upgrading image versions
+
+For the full step-by-step (with Linux/.deb + macOS/brew variants and
+local-image-build cache cleanup), see the
+[v0.5.7 → v0.5.8 upgrade guide](../upgrades/v0.5.7-to-v0.5.8.md#image-cache-cleanup-playbook).
+Same shape applies to every shed version bump:
 
 1. Delete any sheds you no longer need.
    ```bash
@@ -513,12 +522,17 @@ not the tag.
    ```bash
    sudo shed-server pull-images
    ```
-5. Reclaim stale blobs.
+5. Drop any stale tags you added by hand (the configured tags
+   advance in place during step 4 and are not stale).
+   ```bash
+   shed image rm <stale-experimental-tag>
+   ```
+6. Reclaim unreferenced blobs.
    ```bash
    shed image prune --dry-run
    shed image prune --force
    ```
-6. Verify.
+7. Verify.
    ```bash
    shed image ls
    shed system df
