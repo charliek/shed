@@ -16,11 +16,11 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmimage"
-	"github.com/charliek/shed/internal/vmimage/clone"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -372,6 +372,12 @@ func metadataToShed(meta *Metadata) *config.Shed {
 }
 
 // CreateShed creates a new Firecracker-based shed.
+//
+// This wrapper handles the parts the orchestrator does NOT own
+// (per-shed-name locking, existence-check, orphan-upper sweep, the
+// --image vs --from-snapshot exclusivity check). Per-step lifecycle
+// logic lives in fcCreator (see orchestrator.go) and is invoked by
+// orchestrator.CreateShed.
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
@@ -390,21 +396,17 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		defer c.acquireSnapshotLock(req.FromSnapshot)()
 	}
 
-	// Serialize CreateShed calls for the same name so the existence check
-	// below and CopyRootfs's os.Remove(dst) can't race two concurrent
-	// creates into corrupting the first caller's rootfs.
+	// Serialize CreateShed calls for the same name so the existence
+	// check below and CopyRootfs's os.Remove(dst) can't race two
+	// concurrent creates into corrupting the first caller's rootfs.
 	defer c.acquireCreateLock(req.Name)()
-
-	// LIFO rollback stack. Each successful resource-acquiring step
-	// Registers its teardown; on any error-return the deferred
-	// `cleanup.Run` invokes them in reverse. The success path calls
-	// `cleanup.Commit()` just before `return`, which zeroes the stack
-	// so the defer becomes a no-op. See `internal/backend/cleanup.go`.
-	cleanup := backend.NewCleanup()
-	defer cleanup.Run()
 
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
+	} else if !errors.Is(err, ErrInstanceNotFound) {
+		// Same safety guard as VZ — see internal/vz/client.go for the
+		// CodeRabbit-flagged regression history.
+		return nil, fmt.Errorf("failed to read metadata for %s: %w", req.Name, err)
 	}
 
 	// Sweep an orphan upper from a previously crashed create. We're
@@ -412,8 +414,6 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// (the LoadMetadata check above returned NotFound) and we hold the
 	// per-name create lock, so anything still sitting at
 	// uppers/<name>/ is leftover state from a half-completed run.
-	// Without this, EnsureUpper's strict-rejection would force the
-	// operator to manually `rm -rf` to recover.
 	if _, err := os.Stat(UpperPath(c.cfg.UppersDir, req.Name)); err == nil {
 		log.Printf("CreateShed %s: sweeping orphan upper from a prior crashed create", req.Name)
 		if err := DeleteUpper(c.cfg.UppersDir, req.Name); err != nil {
@@ -421,318 +421,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	upperSizeBytes := req.UpperSizeBytes
-	if upperSizeBytes == 0 {
-		sz := c.cfg.UpperSizeDefault
-		if sz == "" {
-			sz = config.DefaultUpperSize
-		}
-		parsed, err := config.ParseUpperSize(sz)
-		if err != nil {
-			return nil, fmt.Errorf("invalid upper_size_default: %w", err)
-		}
-		upperSizeBytes = parsed
-	} else {
-		if upperSizeBytes < config.MinUpperSizeBytes || upperSizeBytes > config.MaxUpperSizeBytes {
-			return nil, fmt.Errorf("upper size out of range: must be between %dG and %dG",
-				config.MinUpperSizeBytes/(1024*1024*1024), config.MaxUpperSizeBytes/(1024*1024*1024))
-		}
-	}
-
-	var snapshotUpperSource, lowerDigest, lowerImageTag string
-	if req.FromSnapshot != "" {
-		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
-		if err != nil {
-			return nil, err
-		}
-		if snap.Backend != config.BackendFirecracker {
-			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
-				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendFirecracker)
-		}
-		// The lower-digest pin must still be cached or the new shed
-		// can't boot — overlay needs both layers present.
-		if snap.LowerDigest == "" {
-			return nil, fmt.Errorf("snapshot %q is missing lower_digest; recreate the snapshot from a current shed", req.FromSnapshot)
-		}
-		if !vmimage.BlobExists(c.cfg.ImagesDir, snap.LowerDigest) {
-			ref := snap.SourceImage
-			if ref == "" {
-				ref = "(unknown)"
-			}
-			return nil, fmt.Errorf("snapshot %q references lower digest %s which is no longer cached; pull the original image (%s) first",
-				req.FromSnapshot, vmimage.ShortDigest(snap.LowerDigest), ref)
-		}
-		snapshotUpperSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
-		// Inherit the lower-digest pin from the snapshot so this new
-		// shed continues to protect the underlying blob from prune.
-		lowerDigest = snap.LowerDigest
-		lowerImageTag = snap.SourceImage
-	} else {
-		// Resolve and ensure image before allocating network resources.
-		// Image resolution is fast (config lookup + os.Stat), but EnsureImage may
-		// pull from Docker which can take minutes. Doing this first avoids holding
-		// scarce network resources (TAP devices, IPs) during slow operations.
-		var resolved config.ResolvedImage
-		var err error
-		if req.Image != "" {
-			resolved, err = c.cfg.ResolveImage(req.Image)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			if c.cfg.BaseRootfs == "" {
-				return nil, fmt.Errorf("%w: no --image specified and no base_rootfs configured in firecracker.base_rootfs; pass --image <tag> or set base_rootfs in server.yaml", config.ErrInvalidShedRequestSentinel)
-			}
-			resolved = c.cfg.ResolveBaseRootfs()
-		}
-
-		backend.Phase(ctx, "image")
-		backend.Status(ctx, "Resolving image...")
-		mgr := vmimage.NewManager(c.cfg, c.refScanner())
-		ensureRes, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
-			Path:      resolved.Path,
-			DockerRef: resolved.DockerRef,
-			Name:      resolved.Name,
-			Digest:    resolved.Digest,
-		}, func(stage, msg string) {
-			backend.Phase(ctx, stage)
-			backend.Status(ctx, msg)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to ensure image: %w", err)
-		}
-		if ensureRes.Digest == "" {
-			return nil, fmt.Errorf("image %q resolved to a path outside the blob store; the overlay model requires content-addressed images", resolved.Name)
-		}
-		lowerDigest = ensureRes.Digest
-		lowerImageTag = resolved.Name
-	}
-
-	// Drop a `.creating` marker recording the lower digest so a
-	// concurrent `shed image prune` can't sweep the blob between
-	// here and meta.Save. The marker counts as a Pending protective
-	// ref in the refscanner (systemprune.ScanInstanceCreatingMarkers)
-	// for up to InstanceCreatingMaxAge (1h); stale markers from
-	// crashed creates expire and stop protecting on their own.
-	//
-	// Skip for from-snapshot: the snapshot already pins the digest
-	// via its own LowerDigest field.
-	if lowerDigest != "" && req.FromSnapshot == "" {
-		if err := writeCreatingMarker(c.cfg.InstanceDir, req.Name, lowerDigest); err != nil {
-			return nil, fmt.Errorf("failed to write creating marker: %w", err)
-		}
-		defer removeCreatingMarker(c.cfg.InstanceDir, req.Name)
-	}
-
-	backend.Phase(ctx, "network")
-	backend.Status(ctx, "Allocating network resources...")
-	cid, err := c.AllocateCID(req.Name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate CID: %w", err)
-	}
-	cleanup.Register("release CID", func() error {
-		c.ReleaseCID(cid)
-		return nil
-	})
-
-	tapDevice, ipAddress, err := c.AllocateNetwork(req.Name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate network: %w", err)
-	}
-	cleanup.Register("release IP", func() error {
-		c.ReleaseIP(ipAddress)
-		return nil
-	})
-
-	if err := c.netMgr.CreateTAPDevice(tapDevice); err != nil {
-		return nil, fmt.Errorf("failed to create TAP device: %w", err)
-	}
-	cleanup.Register("delete TAP device", func() error {
-		return c.netMgr.DeleteTAPDevice(tapDevice)
-	})
-
-	backend.Phase(ctx, "rootfs")
-	backend.Status(ctx, "Allocating writable upper layer...")
-	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create upper: %w", err)
-	}
-	cleanup.Register("delete upper layer", func() error {
-		return DeleteUpper(c.cfg.UppersDir, req.Name)
-	})
-
-	// from-snapshot: replace the freshly allocated empty upper with a
-	// reflink clone of the snapshot's stored upper so the new shed
-	// inherits its parent's writable contents.
-	if snapshotUpperSource != "" {
-		if err := os.Remove(upperPath); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to clear upper for snapshot clone: %w", err)
-		}
-		if _, err := clone.CloneFile(snapshotUpperSource, upperPath); err != nil {
-			return nil, fmt.Errorf("failed to clone snapshot upper: %w", err)
-		}
-		if err := os.Chmod(upperPath, 0o644); err != nil {
-			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
-		}
-		// The metadata's UpperSizeBytes must reflect the *cloned* file's
-		// actual size, not the freshly-allocated sparse size — otherwise
-		// `shed system df` and reset/snapshot bookkeeping report the
-		// pre-snapshot size for what is now a different file.
-		if fi, statErr := os.Stat(upperPath); statErr == nil {
-			upperSizeBytes = fi.Size()
-		}
-	}
-	rootfsPath := upperPath
-
-	cpus := req.CPUs
-	if cpus == 0 {
-		cpus = c.cfg.DefaultCPUs
-	}
-	memoryMB := req.MemoryMB
-	if memoryMB == 0 {
-		memoryMB = c.cfg.DefaultMemoryMB
-	}
-
-	meta := &Metadata{
-		Name:           req.Name,
-		Status:         config.StatusStopped,
-		CreatedAt:      time.Now(),
-		Backend:        config.BackendFirecracker,
-		CID:            cid,
-		IPAddress:      ipAddress,
-		TAPDevice:      tapDevice,
-		CPUs:           cpus,
-		MemoryMB:       memoryMB,
-		RootfsPath:     rootfsPath,
-		UpperPath:      upperPath,
-		UpperSizeBytes: upperSizeBytes,
-		Repo:           req.Repo,
-		LocalDir:       req.LocalDir,
-		Image:          req.Image,
-		LowerDigest:    lowerDigest,
-		LowerImageTag:  lowerImageTag,
-		FromSnapshot:   req.FromSnapshot,
-	}
-
-	// Register the instance-dir cleanup BEFORE calling Save. Save's
-	// `os.MkdirAll` runs first; if any subsequent write fails partway
-	// through, the directory it created is left behind. `meta.Delete`
-	// is `os.RemoveAll`, so it's safe to register against a not-yet-
-	// existent path (the cleanup is a no-op if the dir was never
-	// created).
-	cleanup.Register("delete instance dir", func() error {
-		return meta.Delete(c.cfg.InstanceDir)
-	})
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
-
-	c.RegisterInstance(req.Name, cid, ipAddress)
-
-	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create VM: %w", err)
-	}
-
-	backend.Phase(ctx, "vm")
-	backend.Status(ctx, "Starting virtual machine...")
-	if err := vm.Start(ctx); err != nil {
-		return nil, fmt.Errorf("failed to start VM: %w", err)
-	}
-	cleanup.Register("stop VM", func() error {
-		return vm.Stop(context.Background())
-	})
-
-	meta.Status = config.StatusRunning
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
-
-	c.mu.Lock()
-	c.vms[req.Name] = vm
-	c.mu.Unlock()
-	cleanup.Register("remove from vms map", func() error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		delete(c.vms, req.Name)
-		return nil
-	})
-
-	agent := c.newAgentClient(meta.Name)
-
-	// Mount local directory via 9P if specified
-	if req.LocalDir != "" {
-		backend.Phase(ctx, "9p")
-		backend.Status(ctx, "Mounting local directory via 9P...")
-		bridgeIP := c.netMgr.Gateway()
-		srv, err := c.startP9Server(req.Name, bridgeIP, req.LocalDir, config.WorkspacePath, false)
-		if err != nil {
-			return nil, fmt.Errorf("failed to start 9P server for local dir: %w", err)
-		}
-		// Register the 9P teardown after the server starts so a guest-
-		// mount failure below cleans up the server too.
-		cleanup.Register("stop 9P servers", func() error {
-			c.stopP9Servers(req.Name)
-			return nil
-		})
-		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
-			return nil, fmt.Errorf("failed to mount 9P in guest: %w", err)
-		}
-	}
-
-	// Mount credentials via 9P
-	{
-		dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
-		if len(dirCreds) > 0 {
-			backend.Phase(ctx, "credentials")
-			backend.Status(ctx, "Setting up credentials...")
-		}
-		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mount9PCredentialFunc(req.Name))
-	}
-
-	// Clone repo if specified (skip when using local dir or spawning from snapshot;
-	// snapshot rootfs is already provisioned).
-	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
-		backend.Phase(ctx, "repo")
-		backend.Status(ctx, "Cloning repository...")
-		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
-			log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
-			// Generic SSE message by design: req.Repo can carry credentials
-			// (e.g., https://user:pw@host/...) and the wrapped err from
-			// git/ssh may include the URL too. Full detail is in the server
-			// log above; SSE consumers get a stable, sanitized signal.
-			//
-			// Deliberately no `backend.Phase(ctx, "repo")` here: see
-			// the matching note in `internal/vz/client.go`. Re-entering
-			// "repo" just to attach a status would split the timer line
-			// into the `repo=N clone=M repo=K` triple shape.
-			backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
-		} else {
-			backend.Status(ctx, "Repository cloned")
-		}
-	}
-
-	// Run provisioning. When spawning from a snapshot the rootfs is already
-	// provisioned, so we skip the one-shot install hook but still run the
-	// startup hook on every boot — matching StartShed's behavior.
-	if !req.NoProvision {
-		provisioner := vmutil.NewProvisioner(agent, req.Name)
-		provisioner.SetOutput(os.Stdout, os.Stderr)
-		cfg, err := provisioner.LoadConfig(ctx)
-		if err != nil {
-			log.Printf("Warning: failed to load provisioning config: %v", err)
-		} else {
-			runInstall := req.FromSnapshot == ""
-			if err := provisioner.RunProvisioning(ctx, cfg, runInstall); err != nil {
-				log.Printf("Warning: provisioning failed: %v", err)
-			}
-		}
-	}
-
-	// Happy path: zero out the cleanup stack so the deferred Run is a
-	// no-op. From here on the shed is the caller's responsibility.
-	cleanup.Commit()
-	return metadataToShed(meta), nil
+	return orchestrator.CreateShed(ctx, &fcCreator{c: c}, req)
 }
 
 // GetShed returns a shed by name.

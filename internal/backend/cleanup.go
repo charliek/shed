@@ -64,9 +64,21 @@ import (
 // (e.g. CreateShed). Safe for concurrent use; the lifecycle methods
 // don't share Cleanup instances across goroutines, but Register from
 // inside an in-flight goroutine is legal.
+//
+// Two stacks live inside one Cleanup:
+//
+//   - `steps` — error-only cleanups (the typical `Register` case).
+//     Run on `Run()`; cleared by `Commit()` so the success-path
+//     `defer cleanup.Run()` is a no-op.
+//   - `deferred` — always-run cleanups (the `AddDeferred` case).
+//     Run on BOTH `Run()` (after the error-only stack unwinds) and
+//     on `Commit()`. Semantically equivalent to a Go `defer` — useful
+//     for protective bits (e.g., a `.creating` marker) whose lifetime
+//     is the operation, not the resulting resource.
 type Cleanup struct {
 	mu        sync.Mutex
 	steps     []cleanupStep
+	deferred  []cleanupStep
 	committed bool
 }
 
@@ -97,14 +109,50 @@ func (c *Cleanup) Register(name string, fn func() error) {
 	c.steps = append(c.steps, cleanupStep{name: name, fn: fn})
 }
 
-// Commit declares the operation successful — Run becomes a no-op.
-// Idempotent. Call from the happy path right before returning the
-// successful result.
-func (c *Cleanup) Commit() {
+// AddDeferred pushes a cleanup onto the always-run stack. Unlike
+// `Register`, the cleanup runs on BOTH `Run()` (error return) and
+// `Commit()` (success return) — semantically equivalent to a Go
+// `defer` inside the lifecycle method's body.
+//
+// Use this for operations whose lifetime is bounded by the lifecycle
+// method itself, not by the resource the method produces. The
+// canonical example is a `.creating` marker that protects an image
+// blob from a concurrent `shed image prune` for the duration of a
+// `CreateShed` — it must be removed whether the create succeeded
+// (the meta now keeps the digest pinned) or failed (no shed to
+// protect anymore).
+//
+// `AddDeferred` cleanups run AFTER all error-only `Register` cleanups
+// have unwound (on error) so they see the post-rollback state. On
+// success they run after Commit's main work.
+func (c *Cleanup) AddDeferred(name string, fn func() error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.committed = true
+	if c.committed {
+		return
+	}
+	c.deferred = append(c.deferred, cleanupStep{name: name, fn: fn})
+}
+
+// Commit declares the operation successful — error-only cleanups are
+// cleared so the deferred `Run()` is a no-op for them, but the
+// always-run (`AddDeferred`) cleanups still execute in LIFO order
+// from THIS call. Idempotent. Call from the happy path right before
+// returning the successful result.
+func (c *Cleanup) Commit() {
+	c.mu.Lock()
+	deferred := c.deferred
+	c.deferred = nil
 	c.steps = nil
+	c.committed = true
+	c.mu.Unlock()
+
+	// Run the always-deferred cleanups (success path). Same panic-
+	// recovery wrapper as Run uses, so a buggy deferred cleanup can
+	// not stop a sibling from executing.
+	for i := len(deferred) - 1; i >= 0; i-- {
+		runCleanupStep(deferred[i])
+	}
 }
 
 // Run invokes every registered cleanup in LIFO order. Individual
@@ -124,13 +172,21 @@ func (c *Cleanup) Commit() {
 func (c *Cleanup) Run() {
 	c.mu.Lock()
 	steps := c.steps
+	deferred := c.deferred
 	c.steps = nil
+	c.deferred = nil
 	c.committed = true
 	c.mu.Unlock()
 
+	// Error-only cleanups unwind first.
 	for i := len(steps) - 1; i >= 0; i-- {
-		step := steps[i]
-		runCleanupStep(step)
+		runCleanupStep(steps[i])
+	}
+	// Always-deferred cleanups run after the rest of the rollback,
+	// so they see the post-rollback state (a marker file's protected
+	// blob is now gone, etc.).
+	for i := len(deferred) - 1; i >= 0; i-- {
+		runCleanupStep(deferred[i])
 	}
 }
 
