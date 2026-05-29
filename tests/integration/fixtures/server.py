@@ -184,6 +184,94 @@ class LocalServer:
         full = ["shed", "-s", self.name, "exec", name, "--"] + cmd
         return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
 
+    def ssh_exec(
+        self,
+        name: str,
+        raw_command: str,
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess:
+        """Drive the SSH wire directly with a raw command string,
+        bypassing the `shed exec` CLI's argv quoter.
+
+        This exercises the server-side `bash -lc` wrap on the same path
+        OpenSSH, Zed Remote-SSH, VS Code Remote-SSH, and JetBrains
+        Gateway take. The `shed exec` CLI path is covered by
+        `exec(...)` above; use *this* helper when you want to assert
+        that shell metacharacters in the raw command actually fire on
+        the server side.
+
+        Resolves connection params (host, SSH port, known-hosts file)
+        through the running shed's own connection metadata via
+        `shed --json -s <server> get-host <shed>` so we line up with
+        whatever the CLI would have used (StrictHostKeyChecking=yes
+        against the known-hosts populated at create-time). Falls back
+        to the server's plain `ssh_port` from config and -o
+        StrictHostKeyChecking=no when the metadata isn't surfaced —
+        the integration suite only ever talks to known-good test sheds.
+        """
+        host, port, known_hosts = self._ssh_connect_params()
+        ssh_argv = [
+            "ssh",
+            "-p", str(port),
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+        ]
+        if known_hosts is not None:
+            ssh_argv += [
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", "StrictHostKeyChecking=yes",
+            ]
+        else:
+            ssh_argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+        ssh_argv += [f"{name}@{host}", raw_command]
+        return subprocess.run(
+            ssh_argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def _ssh_connect_params(self) -> tuple[str, int, Optional[Path]]:
+        """Return (host, ssh_port, known_hosts) for raw `ssh` invocations.
+
+        For LocalServer the host is the localhost-mapped ssh_port from
+        `~/.shed/config.yaml`. Subclasses (RemoteServer) override to
+        return the remote host's address. Known-hosts path is
+        ~/.shed/known_hosts (per `config.GetKnownHostsPath` — the same
+        file `shed console` uses), or None if it doesn't exist yet.
+        """
+        # The CLI's known-hosts default; only set if it exists so a
+        # fresh test environment skips StrictHostKeyChecking rather than
+        # failing with "no known-hosts file."
+        kh = Path.home() / ".shed" / "known_hosts"
+        if not kh.exists():
+            kh = None
+        host, port = self._resolve_ssh_endpoint()
+        return host, port, kh
+
+    def _resolve_ssh_endpoint(self) -> tuple[str, int]:
+        """LocalServer: assume the server hosts the shed on localhost.
+
+        Reads the SSH port from the server's config via the `shed`
+        CLI's view of the server entry; falls back to 2222 (the brew
+        default).
+        """
+        try:
+            r = subprocess.run(
+                ["shed", "--json", "server", "list"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                entries = json.loads(r.stdout) or []
+                for e in entries:
+                    if isinstance(e, dict) and e.get("name") == self.name:
+                        host = e.get("host", "localhost")
+                        port = int(e.get("ssh_port", 2222))
+                        return host, port
+        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, ValueError):
+            pass
+        return "localhost", 2222
+
     def delete(self, name: str, ignore_missing: bool = False) -> None:
         """Delete a shed.
 

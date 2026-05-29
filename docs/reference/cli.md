@@ -653,25 +653,24 @@ shed exec <name> <command...>
 |------|-------|---------|-------------|
 | `--session` | `-S` | None | Run in tmux session context |
 
-**Execution model.** `shed exec` runs `argv[0]` with `argv[1:]` directly inside the shed (matching `docker exec` / `kubectl exec` semantics). There is **no implicit shell wrapping** — pipes, redirects, semicolons, `$VAR` expansion, command substitution, and other shell metacharacters only take effect when *you* explicitly invoke a shell as part of the command (e.g. `bash -c '...'`). The CLI shell-quotes each argv element before transmission so nested quotes, spaces, and metacharacters survive the SSH wire intact.
+**Execution model.** `shed exec` ships argv literally. The CLI single-quote-wraps each argv element before transmission so nested quotes, spaces, and shell metacharacters in *your* data survive the SSH wire intact and reach the guest as argv, not as shell code. The server-side SSH command channel does run those quoted tokens through `bash -lc` (so login PATH adjustments — `/etc/profile.d/*.sh`, `~/.profile`, mise, nvm, rustup — are in effect), but bash treats single-quoted text as literal data, so argv stays argv. End result: `shed exec name -- mytool` just works for tools installed via login-shell PATH managers, and `shed exec name -- echo '$HOME'` still prints the literal `$HOME` — no expansion, no command splitting.
 
-The agent provides a reasonable baseline environment for direct exec — `PATH`, `HOME`, `USER`, `SHELL`, `LANG` defaults plus anything written to `/etc/environment.d/` — but **does not source `/etc/profile` or `~/.profile`**. Tools installed via rustup, mise, nvm, asdf, or any other manager that adds itself to `PATH` from `~/.profile` will not be on `PATH` unless you opt into a login shell.
+This is the same model Docker, devcontainers, Codespaces, and Coder follow on their `exec` path. Pipes, redirects, semicolons, `$VAR` expansion, command substitution, and other shell metacharacters only take effect when *you* explicitly invoke a shell as part of the command (e.g. `bash -c '...'`).
 
-**Login-shell workaround.** If you need `/etc/profile.d/*.sh` and `~/.profile` sourced before your command runs, invoke `bash -lc` explicitly — the same idiom Docker users use daily:
-
-```bash
-shed exec codelens -- bash -lc 'rustc --version'
-shed exec codelens -- bash -lc 'mise current && which node'
-```
+**Raw SSH gets the full shell.** If you connect with raw `ssh shed-name 'cmd | pipe'` (the path Zed Remote-SSH, VS Code Remote-SSH, JetBrains Gateway, and `rsync` take), the SSH server runs your command string through `bash -lc <raw>` — so the pipe runs as a shell pipeline on the shed, exactly like a normal dev VM. The `shed exec` CLI is the path that preserves argv literally; raw SSH is the path that runs a shell.
 
 **Examples:**
 
 ```bash
-# Direct argv — no shell involved
+# Direct argv — bash on the server side, but argv stays argv because of
+# the single-quote wrap. Tools installed via login PATH (mise, nvm, rustup,
+# etc.) just work because `bash -lc` sources profile scripts.
 shed exec codelens git status
 shed exec codelens ls -la /workspace
+shed exec codelens rustc --version
+shed exec codelens mise current
 
-# Explicit shell for pipes, redirects, multi-statements
+# Explicit shell when YOU want pipes/redirects/multi-statements
 shed exec codelens -- bash -c 'echo hello | wc -c'
 shed exec codelens -- bash -c 'cd /workspace && npm test'
 shed exec codelens -- bash -c 'for f in *.go; do gofmt -l $f; done'
@@ -679,8 +678,13 @@ shed exec codelens -- bash -c 'for f in *.go; do gofmt -l $f; done'
 # Nested quotes survive intact
 shed exec codelens -- bash -c 'bun -e "console.log(1+1)"'
 
-# Login shell (sources /etc/profile + ~/.profile)
-shed exec codelens -- bash -lc 'rustup show'
+# Variables in argv are LITERAL — no expansion (security gate)
+shed exec codelens -- echo '$HOME'      # prints literal '$HOME'
+shed exec codelens -- echo 'a;b;c'      # prints literal 'a;b;c'
+
+# Raw SSH from any other client gets the full shell (Zed, VS Code, etc.)
+ssh codelens 'echo $HOME'               # prints /home/shed
+ssh codelens 'cat file | wc -l'         # pipe runs server-side
 
 # Run in an existing tmux session
 shed exec codelens --session default -- git status

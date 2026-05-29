@@ -101,14 +101,29 @@ func shellQuoteArgs(args []string) []string {
 }
 
 // validateAndQuoteArgs single-quotes each argv element (so shell metacharacters
-// survive the SSH wire) and rejects empty elements. The gliderlabs/ssh server
-// uses anmitsu/go-shlex in posix mode, which drops empty quoted tokens — so
-// without this guard, an empty argv element would silently shift the rest of
-// argv on the server side.
+// survive the SSH wire) and rejects argv elements that the SSH/bash downstream
+// can't safely round-trip.
+//
+// Rejected:
+//   - Empty elements — the gliderlabs/ssh server uses anmitsu/go-shlex in posix
+//     mode, which drops empty quoted tokens; without this guard an empty argv
+//     element would silently shift the rest of argv on the server side.
+//   - NUL bytes — bash and Go's os/exec both reject embedded NUL with confusing
+//     errors; reject early at the CLI so the user sees a clear message. NUL is
+//     also the one byte single-quote wrapping can't safely carry through SSH
+//     and the server-side `bash -lc` reparse (see internal/sshd/wrap.go).
+//
+// The single-quote wrap itself survives the server-side `bash -lc` reparse
+// because bash treats single-quoted text as literal data — that is the
+// security gate that lets `shed exec` preserve argv literally while raw SSH
+// gains shell semantics.
 func validateAndQuoteArgs(args []string) ([]string, error) {
 	for i, a := range args {
 		if a == "" {
 			return nil, fmt.Errorf("argv[%d] is empty; the SSH transport cannot represent empty arguments (posix shlex drops '' tokens)", i)
+		}
+		if strings.ContainsRune(a, 0) {
+			return nil, fmt.Errorf("argv[%d] contains a NUL byte; not representable over SSH or in POSIX argv", i)
 		}
 	}
 	return shellQuoteArgs(args), nil
