@@ -201,13 +201,13 @@ class LocalServer:
         the server side.
 
         Resolves connection params (host, SSH port, known-hosts file)
-        through the running shed's own connection metadata via
-        `shed --json -s <server> get-host <shed>` so we line up with
-        whatever the CLI would have used (StrictHostKeyChecking=yes
-        against the known-hosts populated at create-time). Falls back
-        to the server's plain `ssh_port` from config and -o
-        StrictHostKeyChecking=no when the metadata isn't surfaced —
-        the integration suite only ever talks to known-good test sheds.
+        via `shed --json server list` so we line up with whatever the
+        CLI would have used. Uses `~/.shed/known_hosts` with
+        StrictHostKeyChecking=yes when it exists (the file the CLI
+        populates at create-time); falls back to
+        StrictHostKeyChecking=no for fresh test environments. The
+        integration suite only ever talks to known-good test sheds, so
+        the fallback is safe.
         """
         host, port, known_hosts = self._ssh_connect_params()
         ssh_argv = [

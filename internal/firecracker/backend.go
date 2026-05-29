@@ -169,12 +169,17 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 	}
 
 	// Non-empty argv is passed through verbatim: the agent execs argv[0] with
-	// argv[1:] directly (matching docker exec / kubectl exec semantics). This
-	// avoids a second layer of shell parsing that previously mangled pipes,
-	// redirects, and nested quotes (issues #44 and #48). Users wanting
-	// login-shell sourcing of /etc/profile or ~/.profile invoke
-	// `bash -lc 'cmd'` explicitly. Empty argv still defaults to an
-	// interactive login shell for `shed console`.
+	// argv[1:] directly. The caller decides whether opts.Cmd is direct argv
+	// or a shell wrapper. Today's callers:
+	//   - SSH session path (internal/sshd/session.go) wraps in `bash -lc <raw>`
+	//     so raw SSH from IDE clients gets POSIX-shell semantics and login PATH
+	//     (#131). `shed exec`'s argv-literal contract is preserved because the
+	//     CLI single-quote-wraps each argv element before SSH (single-quoted
+	//     text is literal under bash reparse — that is the security gate; see
+	//     cmd/shed/console.go:validateAndQuoteArgs).
+	//   - Provisioning hooks (internal/vmutil/provisioning.go) build their own
+	//     `bash --login -c <script>` argv directly and bypass sshd entirely.
+	// Empty argv still defaults to an interactive login shell for `shed console`.
 	if len(opts.Cmd) == 0 {
 		opts.Cmd = []string{"/bin/bash", "--login"}
 	}

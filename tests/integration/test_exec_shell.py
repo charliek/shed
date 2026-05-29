@@ -113,8 +113,11 @@ def test_ssh_exec_login_profile_sourced(shed_server, test_shed_name):
     sourced and PATH-mutating tools (mise, nvm, rustup) wouldn't take
     effect for SSH-driven commands.
 
-    Uses `shed_server.exec` (argv-literal path) to drop the script in
-    place, then raw `ssh_exec` to read it back.
+    Uses raw `ssh_exec` for both the seed and the read-back: the seed
+    relies on a here-doc + `sudo tee`, which needs shell features the
+    argv-literal `exec()` path doesn't provide. Same wire, symmetric
+    semantics — and any wrap-related regression would surface on both
+    halves uniformly.
     """
     shed_server.create(test_shed_name, image="base")
 
