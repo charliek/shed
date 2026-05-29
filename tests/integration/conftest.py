@@ -18,6 +18,7 @@ Two environment overrides for non-default setups:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -31,7 +32,12 @@ VZ_SERVER_NAME = os.environ.get("SHED_VZ_SERVER", "my-server")
 FC_SSH_HOST = os.environ.get("SHED_FC_HOST", "mini3")
 FC_SERVER_NAME = os.environ.get("SHED_FC_SERVER", FC_SSH_HOST)
 
-VZ_BREW_LOG = Path("/opt/homebrew/var/log/shed-server.log")
+# Where the brew-installed mac shed-server writes its log file. Override
+# for non-default Homebrew prefixes (Intel Macs at /usr/local, custom
+# installs, etc.) or to point at a different file entirely.
+VZ_BREW_LOG = Path(
+    os.environ.get("SHED_VZ_LOG_PATH", "/opt/homebrew/var/log/shed-server.log")
+)
 
 
 # ----------------------------------------------------------------------------
@@ -106,17 +112,23 @@ _SHED_NAME_SAFE = re.compile(r"[^a-z0-9-]+")
 def test_shed_name(shed_server, request):
     """Allocate a unique shed name per test, with automatic cleanup.
 
-    Pattern: `itest-<short-test-id>`. The id is sanitized to the shed-name
-    alphabet so parameterized variants get distinct names without
-    accidentally clashing or producing invalid names.
+    Pattern: `itest-<sanitized-prefix>-<6-char-hash>`. The hash is over
+    the full pytest nodeid (including parameterization), so two tests
+    whose names collapse to the same sanitized prefix get distinct
+    names — and a single test always gets the same name across runs
+    (helpful when a previous run leaked state).
     """
-    raw = request.node.name.lower()
-    sanitized = _SHED_NAME_SAFE.sub("-", raw).strip("-")
-    name = f"itest-{sanitized}"[:48]
+    raw = request.node.nodeid
+    sanitized = _SHED_NAME_SAFE.sub("-", raw.lower()).strip("-")
+    suffix = hashlib.sha256(raw.encode()).hexdigest()[:6]
+    # Budget: "itest-" (6) + dashes (2) + suffix (6) = 14 chars of overhead
+    # against the 48-char shed-name ceiling, leaving 34 for the prefix.
+    prefix = sanitized[:34].rstrip("-")
+    name = f"itest-{prefix}-{suffix}"
     yield name
-    # Teardown is best-effort: a test that died mid-create might leave a
-    # half-created shed, but the next run picks up the same name and the
-    # server's idempotent delete handles it.
+    # Teardown is best-effort. A test that died mid-create might leave a
+    # half-created shed; ignore_missing=True keeps cleanup from masking
+    # the original failure.
     try:
         shed_server.delete(name, ignore_missing=True)
     except Exception:

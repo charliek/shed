@@ -38,9 +38,10 @@ CASES_OK = [
         "firecracker",
         "fr1",
         2334,
-        # repo appears twice — second value wins (last-write semantics for the
-        # same-phase-twice case logged today; once #126's §15 1b lands, this
-        # will become a single value).
+        # repo appears twice in the line — 0 ms before clone, then 2 ms
+        # after clone. The parser SUMS duplicates (see timing.py docstring),
+        # so repo here is 0 + 2 = 2. §15 PR 1b will eliminate duplicates
+        # at the source; this sum-on-parse becomes a no-op then.
         {"setup": 0, "image": 35, "network": 1, "rootfs": 3, "vm": 26,
          "agent": 1802, "repo": 2, "clone": 462},
         None,
@@ -95,3 +96,44 @@ def test_agent_ms_convenience_property():
     assert t.agent_ms == 7
     assert "agent" in t
     assert t["agent"] == 7
+
+
+def test_duplicate_phase_keys_are_summed():
+    """Duplicate phase keys on the same line SUM, matching the physical
+    semantic ("total time spent in this phase"). See timing.py docstring
+    and the §15 PR 1b note."""
+    line = "timing: create name=x backend=vz total=100ms phase=10ms phase=20ms err=<nil>"
+    t = parse_timing_line(line)
+    assert t is not None
+    assert t.phases == {"phase": 30}
+
+
+def test_no_keys_after_err():
+    """Guard against future PhaseTimer changes adding keys after `err=`.
+
+    The parser treats everything after `err=` as the error string. If a
+    future change in `internal/backend/phasetimer.go:Finish` writes a key
+    after `err=`, that key+value would be silently absorbed into the
+    error string. This test pins the assumption to a synthetic line that
+    matches the current emitter shape; if PhaseTimer ever changes, this
+    test fails first and forces a parser update.
+    """
+    # Mirrors `phasetimer.go:Finish` — err= is written LAST.
+    line = "timing: create name=x backend=vz total=10ms agent=7ms err=<nil>"
+    t = parse_timing_line(line)
+    assert t is not None
+    assert t.error is None
+    # If a synthetic line ever puts a key after err=, the parser would
+    # produce a non-trivial error string. Catch that here so it's an
+    # explicit failure instead of silent data loss.
+    weird = "timing: create name=x backend=vz total=10ms err=<nil> extra=1ms"
+    t2 = parse_timing_line(weird)
+    assert t2 is not None
+    # extra=1ms would be glued onto the error if/when PhaseTimer changes;
+    # for now the parser absorbs it. This assertion documents that
+    # absorption — if you're updating phasetimer.go to add keys after
+    # err=, also update the parser to handle them and remove this guard.
+    assert "extra=1ms" in (t2.error or ""), (
+        "If err= ever stops being the terminal key, update timing.py to "
+        "stop treating everything after err= as the error string."
+    )

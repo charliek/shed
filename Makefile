@@ -43,7 +43,7 @@ test-integration:
 	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
 	  exit 1; \
 	}
-	cd tests/integration && uv sync --quiet && uv run pytest -v
+	cd tests/integration && uv sync && uv run pytest -v
 
 # Cross-compile for release
 release:

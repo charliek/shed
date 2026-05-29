@@ -19,6 +19,8 @@ those over time as §15 1a / 1b / 2c land.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import statistics
 import time
 
@@ -27,15 +29,34 @@ import pytest
 from fixtures.server import DEFAULT_AGENT_P50_MS
 
 
+# Pinned to the long-stable octocat/Hello-World head. This repo hasn't
+# been touched in roughly a decade; if it ever moves, the test fails
+# loudly and we update the constant. Better than the previous
+# "stdout is non-empty" check, which would pass under partial failure.
+OCTOCAT_HELLO_WORLD_HEAD_SHA = "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+
+
 # ---------------------------------------------------------------------------
 # 1. Happy-path lifecycle
 # ---------------------------------------------------------------------------
 
 
 def test_create_delete_lifecycle(shed_server, test_shed_name):
-    """`shed create` succeeds; the `test_shed_name` teardown then deletes it."""
+    """A shed can be created, observed in `shed list`, deleted explicitly,
+    and then absent from `shed list`."""
     handle = shed_server.create(test_shed_name, image="base")
     assert handle.name == test_shed_name
+    listed_before = shed_server.list_shed_names()
+    assert test_shed_name in listed_before, (
+        f"shed {test_shed_name!r} not visible in `shed list` after create; got {listed_before}"
+    )
+    # Explicit delete with FAIL-LOUD semantics — proves delete works,
+    # not just that teardown silenced any failure.
+    shed_server.delete(test_shed_name, ignore_missing=False)
+    listed_after = shed_server.list_shed_names()
+    assert test_shed_name not in listed_after, (
+        f"shed {test_shed_name!r} still present after explicit delete; got {listed_after}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +82,12 @@ def test_phase_timer_emitted(shed_server, test_shed_name):
     )
     assert t.name == test_shed_name
     assert t.total_ms > 0, "total= must be a positive integer"
-    for required in ("vm", "agent"):
+    # `setup` is always emitted (the gap between PhaseTimer start and
+    # the first Progress event becomes `setup`, per phasetimer.go); `vm`
+    # and `agent` are the two phases tests will most often assert on.
+    # `total` is parsed separately and exposed as `total_ms`, not as
+    # a phase key — don't require it inside `phases`.
+    for required in ("setup", "vm", "agent"):
         assert required in t, (
             f"phase {required!r} missing from timing line; got phases={t.phases}"
         )
@@ -73,7 +99,7 @@ def test_phase_timer_emitted(shed_server, test_shed_name):
 
 
 def test_repo_clone_https(shed_server, test_shed_name):
-    """`--repo <https url>` clones; `git log` in the guest succeeds."""
+    """`--repo <https url>` clones; the cloned HEAD matches the known SHA."""
     handle = shed_server.create(
         test_shed_name,
         image="base",
@@ -86,14 +112,17 @@ def test_repo_clone_https(shed_server, test_shed_name):
 
     r = shed_server.exec(
         test_shed_name,
-        ["git", "-C", "/workspace", "log", "--oneline", "-1"],
+        ["git", "-C", "/workspace", "rev-parse", "HEAD"],
     )
     assert r.returncode == 0, (
-        f"`git log` in guest failed: exit={r.returncode} stderr={r.stderr!r}"
+        f"`git rev-parse HEAD` in guest failed: exit={r.returncode} stderr={r.stderr!r}"
     )
-    # The known head commit of octocat/Hello-World is the "Spaceghost" merge.
-    # We assert weakly to tolerate occasional future updates to the repo.
-    assert r.stdout.strip(), "`git log` produced no output"
+    head = r.stdout.strip()
+    assert head == OCTOCAT_HELLO_WORLD_HEAD_SHA, (
+        f"cloned HEAD {head!r} does not match the pinned "
+        f"{OCTOCAT_HELLO_WORLD_HEAD_SHA!r}; the upstream repo may have moved "
+        f"or the clone wrote to the wrong directory"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -104,16 +133,22 @@ def test_repo_clone_https(shed_server, test_shed_name):
 def test_plain_create_timing(shed_server):
     """The `agent` phase p50 (5 samples) stays below the per-backend ceiling.
 
-    Catches general boot-path regressions across both backends — not just
-    the unit-file ordering tests from PR #127 protect against. This is the
-    dynamic gate that PR-time GHA CI can't be (no /dev/kvm).
+    Catches general boot-path regressions across both backends — the
+    dynamic gate that PR-time GHA CI can't be (no /dev/kvm). Names
+    include a per-process hash so a concurrent run against the same
+    server doesn't collide on `itest-perf-{backend}-0`. The suite isn't
+    *designed* for concurrent runs, but failing-closed beats
+    failing-weird.
     """
     ceiling = DEFAULT_AGENT_P50_MS[shed_server.backend]
+    run_id = hashlib.sha256(
+        f"{os.getpid()}-{time.time_ns()}".encode()
+    ).hexdigest()[:6]
     samples: list[int] = []
     created: list[str] = []
     try:
         for i in range(5):
-            name = f"itest-perf-{shed_server.backend}-{i}"
+            name = f"itest-perf-{shed_server.backend}-{run_id}-{i}"
             handle = shed_server.create(name, image="base")
             created.append(name)
             if handle.timings is None or handle.timings.agent_ms is None:
@@ -122,7 +157,13 @@ def test_plain_create_timing(shed_server):
                     "`test_phase_timer_emitted` for the underlying reason."
                 )
             samples.append(handle.timings.agent_ms)
-            time.sleep(1)  # avoid CID-allocation conflicts between rapid creates
+            # 1-second gap between creates: workaround for a
+            # CID-allocation race we hit during PR #126 validation
+            # (rapid-back-to-back creates can collide on vsock CID
+            # picking). Underlying issue tracked separately; once
+            # fixed, drop this sleep AND add a `test_rapid_creates`
+            # regression test.
+            time.sleep(1)
     finally:
         for n in created:
             shed_server.delete(n, ignore_missing=True)

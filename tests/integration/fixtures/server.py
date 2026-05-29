@@ -30,6 +30,16 @@ from typing import Optional, Union
 from .timing import PhaseTimings, parse_timing_line
 
 
+# Budget for finding the PhaseTimer log line for a create. Per-iteration
+# subprocess timeouts (LocalServer journalctl: 5 s, RemoteServer ssh:
+# 10 s) plus a 200 ms sleep between probes mean a stuck log-reader can
+# eat most of this budget on one iteration — that's intentional. We
+# bound the WALL CLOCK, not the iteration count, so a single slow
+# journalctl call still terminates the probe.
+TIMING_LOOKUP_BUDGET_S = 15.0
+TIMING_LOOKUP_INTERVAL_S = 0.2
+
+
 # Default per-backend ceilings for timing assertions. Generous enough to
 # tolerate noise on a moderately-loaded host; tight enough to catch a
 # >200 ms regression on a healthy run. Anchored on #126's measured
@@ -89,6 +99,11 @@ class LocalServer:
         """Whether this server can actually be reached from this host.
 
         Returns False (not raises) so the calling fixture can skip cleanly.
+
+        Probes via `shed -s NAME list`. This has a minor side effect
+        (the CLI may rewrite `~/.shed/config.yaml`'s `sheds:` map on
+        completion); a side-effect-free probe via `/api/info` is a
+        follow-up, tracked in §16 as a "first big test" improvement.
         """
         if not shutil.which("shed"):
             return False
@@ -110,7 +125,7 @@ class LocalServer:
     def create(
         self,
         name: str,
-        image: str = "base",
+        image: Optional[str] = "base",
         repo: Optional[str] = None,
         local_dir: Optional[str] = None,
         from_snapshot: Optional[str] = None,
@@ -122,8 +137,14 @@ class LocalServer:
         find the PhaseTimer line for this shed afterward. Caller MUST
         delete the shed (the `test_shed_name` fixture in conftest.py does
         this automatically).
+
+        `image` and `from_snapshot` are mutually exclusive at the server
+        (see `internal/api/handlers.go`); pass `image=None` together with
+        `from_snapshot=...` to skip the `--image` flag.
         """
-        cmd = ["shed", "-s", self.name, "create", name, "--image", image]
+        cmd = ["shed", "-s", self.name, "create", name]
+        if image is not None:
+            cmd += ["--image", image]
         if repo is not None:
             cmd += ["--repo", repo]
         if local_dir is not None:
@@ -151,9 +172,15 @@ class LocalServer:
         full = ["shed", "-s", self.name, "exec", name, "--"] + cmd
         return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
 
-    def delete(self, name: str, ignore_missing: bool = True) -> None:
-        """Delete a shed. By default missing-shed is silent so cleanup is
-        safe to call even when the test never created the shed."""
+    def delete(self, name: str, ignore_missing: bool = False) -> None:
+        """Delete a shed.
+
+        Default is FAIL-LOUD (`ignore_missing=False`): if the delete
+        fails (including "shed not found"), the test sees an
+        AssertionError. Pass `ignore_missing=True` only from cleanup
+        teardown, where you want best-effort delete that doesn't
+        confuse a real-bug signal.
+        """
         try:
             r = subprocess.run(
                 ["shed", "-s", self.name, "delete", name, "-f"],
@@ -171,10 +198,14 @@ class LocalServer:
             )
 
     def list_shed_names(self) -> list[str]:
-        """Best-effort: return the list of shed names known to the server.
+        """Return the list of shed names known to the server.
 
-        Returns [] on any parsing or connectivity failure (this fixture
-        method is used for cleanup, not for primary assertions).
+        `shed --json list` emits a bare JSON array of `shedJSON`
+        objects (see `cmd/shed/shed.go:runList`); we extract the `name`
+        field of each. Returns `[]` on any parsing or connectivity
+        failure since the primary use is positive assertions in tests
+        ("did my create show up?"); a quiet `[]` makes the assertion
+        fail with a clear message rather than crash the test runner.
         """
         try:
             r = subprocess.run(
@@ -188,20 +219,12 @@ class LocalServer:
         if r.returncode != 0:
             return []
         try:
-            d = json.loads(r.stdout)
+            sheds = json.loads(r.stdout)
         except json.JSONDecodeError:
             return []
-        # Accept either {"sheds": [...]} or a bare list shape.
-        sheds = d.get("sheds", d) if isinstance(d, dict) else d
         if not isinstance(sheds, list):
             return []
-        out: list[str] = []
-        for s in sheds:
-            if isinstance(s, dict) and "name" in s:
-                out.append(s["name"])
-            elif isinstance(s, str):
-                out.append(s)
-        return out
+        return [s["name"] for s in sheds if isinstance(s, dict) and "name" in s]
 
     # ------------------------------------------------------------------
     # Log handling (overridden in RemoteServer)
@@ -223,7 +246,10 @@ class LocalServer:
             with self.log_path.open("rb") as f:
                 f.seek(int(offset))
                 return f.read().decode("utf-8", errors="replace")
-        # journald path: requires `sudo -n` to be non-interactive (passwordless).
+        # journald path: requires `sudo -n` to be non-interactive
+        # (passwordless). 5 s upper bound — local journalctl over a
+        # small time window is fast; if it doesn't return in 5 s,
+        # something else is wrong and we shouldn't block the test.
         try:
             r = subprocess.run(
                 [
@@ -234,7 +260,7 @@ class LocalServer:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=5,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return ""
@@ -246,14 +272,20 @@ class LocalServer:
         offset: Union[int, str],
     ) -> Optional[PhaseTimings]:
         """Find the PhaseTimer line for `shed_name`. Polls briefly because
-        the log line may not have flushed before `shed create` returns."""
+        the log line may not have flushed before `shed create` returns.
+
+        Bounded by `TIMING_LOOKUP_BUDGET_S` of wall-clock time, not by
+        an iteration count — that keeps a single slow `_read_log_since`
+        call from blowing past the budget.
+        """
         marker = f"name={shed_name} "
-        for _ in range(15):
+        deadline = time.monotonic() + TIMING_LOOKUP_BUDGET_S
+        while time.monotonic() < deadline:
             blob = self._read_log_since(offset)
             for line in blob.splitlines():
                 if "timing: create" in line and marker in line:
                     return parse_timing_line(line)
-            time.sleep(0.2)
+            time.sleep(TIMING_LOOKUP_INTERVAL_S)
         return None
 
 
@@ -270,7 +302,40 @@ class RemoteServer(LocalServer):
         super().__init__(name=name, backend=backend, log_path=None)
         self.ssh_host = ssh_host
 
+    def available(self) -> bool:
+        """Verify both the `shed -s NAME` CLI path AND raw SSH access.
+
+        The CLI may go through SSH transparently for some operations,
+        but `_read_log_since` shells out to `ssh <host> sudo -n
+        journalctl` directly — so a timing-threshold test could fail
+        for the wrong reason ("test failed: timing not found") when
+        the actual cause is "ssh to mini3 doesn't work non-interactively".
+        Catching that here turns it into a clean skip.
+        """
+        if not super().available():
+            return False
+        try:
+            r = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=5",
+                    self.ssh_host,
+                    "true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        return r.returncode == 0
+
     def _read_log_since(self, offset: Union[int, str]) -> str:
+        # 10 s upper bound — remote journalctl is slower than local
+        # (SSH handshake + remote process spawn), but a stuck ssh
+        # should never block the test loop indefinitely. The wall-clock
+        # budget in `_read_timing` is the ultimate safety net.
         try:
             r = subprocess.run(
                 [
@@ -282,7 +347,7 @@ class RemoteServer(LocalServer):
                 ],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=10,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return ""

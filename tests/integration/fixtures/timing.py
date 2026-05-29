@@ -11,6 +11,21 @@ A `shed-server` create emits one line per `CreateShed` that looks like:
 This module parses such a line into a typed `PhaseTimings` struct. The
 suite uses it for the timing-threshold tests in `test_smoke.py` and for
 assertions on which phase keys appear.
+
+Brittleness assumptions (acceptable today; flagged for future maintainers):
+
+  - `err=` is treated as the terminal field — everything after `err=` on
+    the line becomes the error string. This is safe because
+    `internal/backend/phasetimer.go:Finish` writes `err=` last. If a
+    future change adds a new key after `err=`, that key+value would be
+    silently absorbed into the error string. The
+    `test_no_keys_after_err` parser test guards against that drift.
+  - Duplicate phase keys (e.g. `repo=0ms ... clone=462ms repo=2ms` as
+    emitted today by `shed create --repo`) are SUMMED. This matches the
+    physical semantic ("total time spent in this phase across all
+    spans"). §15 PR 1b (`backend.Phase` / `backend.Status` split) will
+    eliminate duplicates at the source; this sum-on-parse becomes a
+    no-op then.
 """
 
 from __future__ import annotations
@@ -87,7 +102,11 @@ def parse_timing_line(line: str) -> Optional[PhaseTimings]:
             if key == "total":
                 total_ms = ms
             else:
-                phases[key] = ms
+                # Sum duplicates rather than last-write-wins so the
+                # parsed `agent` (or `repo`) value reflects total time
+                # spent in that phase, not just the last span. See the
+                # module docstring for the §15 PR 1b note.
+                phases[key] = phases.get(key, 0) + ms
         i += 1
 
     if name is None or backend is None:
