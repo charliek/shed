@@ -504,7 +504,13 @@ func (b *vzStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 	meta := metaRaw.(*vzMetaHandle).meta
 	vm := vmRaw.(vzVMHandle).vm
 
+	// vm.meta aliases the same *Metadata as meta (CreateVM stores the
+	// pointer), so vm.Start's `vm.meta.PID = cmd.Process.Pid` write
+	// already lands here. The explicit assignment mirrors
+	// vzCreator.FinalizeStartedVM — keeps the PID transfer visible at
+	// the persistence boundary in case the aliasing changes later.
 	meta.Status = config.StatusRunning
+	meta.PID = vm.meta.PID
 	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}

@@ -20,9 +20,10 @@ def test_lifecycle_plain(shed_server, test_shed_name):
 
     shed_server.stop(test_shed_name)
 
-    # Re-list MUST show the shed in stopped state (`shed list` flips
-    # a crashed/missing VM to stopped lazily; an explicit stop should
-    # land at stopped immediately).
+    # Re-list must still include the shed — `shed stop` only halts
+    # the VMM, it doesn't delete the shed. (`list_shed_names()` only
+    # returns names, not per-shed status; that's covered by the
+    # implicit "shed_server.start succeeded" assertion below.)
     names = shed_server.list_shed_names()
     assert test_shed_name in names, (
         f"shed {test_shed_name!r} disappeared after stop; got {names}"
