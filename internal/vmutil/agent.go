@@ -95,10 +95,17 @@ func (c *AgentClient) CheckHealth(ctx context.Context) error {
 }
 
 // healthPollInterval is how often WaitForHealth re-probes the agent. The
-// floor of detection latency is one interval, so this bounds the dead time
-// between the agent actually coming up and the host noticing. Kept small
-// because each probe is a cheap local Unix-socket dial.
-const healthPollInterval = 150 * time.Millisecond
+// floor of detection latency is one interval, so this bounds the dead
+// time between the agent actually coming up and the host noticing.
+//
+// Tightened from 150 ms → 50 ms (§15 Phase 1 PR 1a): each probe is a
+// sub-millisecond vsock-style dial + a tiny JSON health request, so the
+// extra probes are essentially free, and a 100-ms-tighter detection
+// floor shows up directly as a 50–100 ms drop in the `agent` PhaseTimer
+// phase on every create. Verified end-to-end via the integration suite
+// (`make test-integration`); see
+// docs/discovery/platform-runtime-optimization.md §15a.
+const healthPollInterval = 50 * time.Millisecond
 
 // WaitForHealth waits until the agent is healthy or the context is cancelled.
 func (c *AgentClient) WaitForHealth(ctx context.Context, timeout time.Duration) error {
