@@ -180,7 +180,13 @@ func (b *vzCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 		}
 		pre.hasCreatingMarker = true
 		shedName := req.Name
-		cleanup.Register("remove creating marker", func() error {
+		// AddDeferred (not Register) so the marker is also removed
+		// on the success path — the marker's lifetime is the create
+		// operation itself, not the resulting shed. The shed's
+		// Metadata.LowerDigest takes over blob protection from here.
+		// PR #140's Codex review caught this regression in both
+		// backends.
+		cleanup.AddDeferred("remove creating marker", func() error {
 			removeCreatingMarker(b.c.cfg.InstanceDir, shedName)
 			return nil
 		})

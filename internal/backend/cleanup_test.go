@@ -71,6 +71,50 @@ func TestCleanup_RunIdempotent(t *testing.T) {
 	}
 }
 
+func TestCleanup_AddDeferredRunsOnCommit(t *testing.T) {
+	var order []string
+	c := NewCleanup()
+	c.Register("error-only", func() error { order = append(order, "error-only"); return nil })
+	c.AddDeferred("deferred-1", func() error { order = append(order, "deferred-1"); return nil })
+	c.AddDeferred("deferred-2", func() error { order = append(order, "deferred-2"); return nil })
+	c.Commit()
+
+	// On success: error-only steps NEVER run; deferred steps run in LIFO.
+	want := []string{"deferred-2", "deferred-1"}
+	if !equal(order, want) {
+		t.Errorf("Commit() order = %v, want %v (error-only must NOT run)", order, want)
+	}
+}
+
+func TestCleanup_AddDeferredRunsOnError(t *testing.T) {
+	var order []string
+	c := NewCleanup()
+	c.Register("error-A", func() error { order = append(order, "error-A"); return nil })
+	c.AddDeferred("always-X", func() error { order = append(order, "always-X"); return nil })
+	c.Register("error-B", func() error { order = append(order, "error-B"); return nil })
+	c.AddDeferred("always-Y", func() error { order = append(order, "always-Y"); return nil })
+	c.Run()
+
+	// On error: error-only stack unwinds first (LIFO), then
+	// deferred stack unwinds (also LIFO).
+	want := []string{"error-B", "error-A", "always-Y", "always-X"}
+	if !equal(order, want) {
+		t.Errorf("Run() order = %v, want %v", order, want)
+	}
+}
+
+func TestCleanup_AddDeferredAfterCommitIgnored(t *testing.T) {
+	called := false
+	c := NewCleanup()
+	c.Commit()
+	c.AddDeferred("late", func() error { called = true; return nil })
+	c.Run()
+
+	if called {
+		t.Error("AddDeferred after Commit ran; should have been ignored")
+	}
+}
+
 func TestCleanup_PanickingStepDoesNotAbortChain(t *testing.T) {
 	var order []string
 	c := NewCleanup()

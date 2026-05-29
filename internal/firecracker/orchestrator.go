@@ -188,7 +188,13 @@ func (b *fcCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 			return nil, fmt.Errorf("failed to write creating marker: %w", err)
 		}
 		shedName := req.Name
-		cleanup.Register("remove creating marker", func() error {
+		// AddDeferred (not Register) so the marker is also removed
+		// on the success path — the marker's lifetime is the create
+		// operation itself, not the resulting shed. The shed's
+		// Metadata.LowerDigest takes over blob protection from here.
+		// PR #140's Codex review caught this regression in both
+		// backends.
+		cleanup.AddDeferred("remove creating marker", func() error {
 			removeCreatingMarker(b.c.cfg.InstanceDir, shedName)
 			return nil
 		})
@@ -236,8 +242,7 @@ func (b *fcCreator) AllocateNetwork(ctx context.Context, req config.CreateShedRe
 func (b *fcCreator) AllocateUpper(ctx context.Context, req config.CreateShedRequest, preRaw orchestrator.PreFlightResult, cleanup *backend.Cleanup) (orchestrator.UpperInfo, error) {
 	pre := preRaw.(*fcPreFlight)
 
-	backend.Phase(ctx, "rootfs")
-	backend.Status(ctx, "Allocating writable upper layer...")
+	// Phase/Status emitted by the orchestrator before calling this hook.
 	upperPath, err := EnsureUpper(b.c.cfg.UppersDir, req.Name, pre.upperSizeBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create upper: %w", err)
@@ -321,8 +326,7 @@ func (b *fcCreator) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHa
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	backend.Phase(ctx, "vm")
-	backend.Status(ctx, "Starting virtual machine...")
+	// Phase/Status emitted by the orchestrator before calling this hook.
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
