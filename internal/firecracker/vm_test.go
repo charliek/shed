@@ -51,8 +51,10 @@ func TestGenerateMACAddress(t *testing.T) {
 	}
 }
 
-func TestIsRunning_CurrentPID(t *testing.T) {
-	// Use current process PID which is definitely running
+func TestIsRunning_LivePIDButNotFirecracker(t *testing.T) {
+	// A live PID that isn't firecracker must report not-running. Before
+	// the PID-reuse guard was added, this returned true and shed list
+	// would silently advertise a recycled pid as a running VMM.
 	currentPID := os.Getpid()
 
 	dir := mustTempDir(t, "vm-test")
@@ -62,8 +64,8 @@ func TestIsRunning_CurrentPID(t *testing.T) {
 
 	vm := &VM{meta: meta, cfg: cfg}
 
-	if !vm.IsRunning() {
-		t.Error("IsRunning() = false for current process, want true")
+	if vm.IsRunning() {
+		t.Error("IsRunning() = true for non-firecracker PID, want false (PID-reuse guard)")
 	}
 }
 

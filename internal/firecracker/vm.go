@@ -383,7 +383,15 @@ func (vm *VM) IsRunning() bool {
 	// Send signal 0 to check if process exists.
 	// EPERM means the process exists but we lack permission to signal it.
 	err = process.Signal(syscall.Signal(0))
-	return err == nil || errors.Is(err, syscall.EPERM)
+	if err != nil && !errors.Is(err, syscall.EPERM) {
+		return false
+	}
+
+	// Guard against PID reuse: verify the process is actually
+	// firecracker. Matches VZ's vfkit check in vz/vm.go:IsRunning.
+	// Without this, a recycled PID (host reboot + churn) could keep
+	// shed reporting status=running indefinitely.
+	return isFirecrackerProcess(vm.meta.PID)
 }
 
 // isFirecrackerProcess checks if the given PID belongs to a Firecracker process

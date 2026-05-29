@@ -61,6 +61,21 @@ var (
 	// field-conflict cases (e.g., --from-snapshot combined with --image or --repo)
 	// under this sentinel rather than minting per-conflict sentinels.
 	ErrInvalidShedRequestSentinel = errors.New("invalid create-shed request")
+
+	// ErrStopIncompleteSentinel is returned when StopShed asked the VMM to
+	// terminate but the recorded PID is still alive after the stop
+	// sequence (vm.Stop returned without error). Surfacing this prevents
+	// the metadata from advertising status=stopped while a zombie VMM
+	// still holds the workspace upper / vsock sockets.
+	ErrStopIncompleteSentinel = errors.New("VMM did not exit after stop sequence")
+
+	// ErrZombiePresentSentinel is returned when StartShed sees a non-zero
+	// PID in metadata whose process is still alive AND looks like the
+	// expected VMM binary (vfkit / firecracker). This protects against
+	// silently spawning a second VMM under the same name when metadata
+	// got out of sync (partial save / external tampering / server crash
+	// between vm.Start and metadata.Save).
+	ErrZombiePresentSentinel = errors.New("recorded VMM pid is still alive; refusing to spawn a second instance")
 )
 
 // shedNameRegex validates shed names: lowercase alphanumeric and hyphens, starting with a letter.
