@@ -421,3 +421,151 @@ func (b *vzCreator) RunProvisioning(ctx context.Context, req config.CreateShedRe
 func (b *vzCreator) ToShedResult(metaRaw orchestrator.MetadataHandle) *config.Shed {
 	return metadataToShed(metaRaw.(*vzMetaHandle).meta, "127.0.0.1")
 }
+
+// ---------------------------------------------------------------------------
+// BackendStarter implementation (orchestrator.StartShed lifecycle)
+//
+// vzStarter wraps the same *Client as vzCreator. Hooks that overlap
+// with vzCreator (mount, credentials, ToShedResult) reuse the
+// underlying Client helpers directly rather than delegating to the
+// vzCreator methods — the contracts diverge on input shape
+// (CreateShedRequest vs persisted metadata) and keeping the codepaths
+// distinct makes the start-only behaviors easier to follow.
+// ---------------------------------------------------------------------------
+
+type vzStarter struct{ c *Client }
+
+// LoadMetadata reads the per-shed metadata and wraps the canonical
+// NotFound error with the API-level sentinel.
+func (b *vzStarter) LoadMetadata(_ context.Context, req orchestrator.StartRequest) (orchestrator.MetadataHandle, error) {
+	meta, err := LoadMetadata(b.c.cfg.InstanceDir, req.Name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, req.Name)
+		}
+		return nil, err
+	}
+	return &vzMetaHandle{meta: meta}, nil
+}
+
+// CheckNotRunning enforces the same two-sentinel contract documented
+// on BackendStarter: ErrShedAlreadyRunningSentinel for a live VMM,
+// ErrZombiePresentSentinel for a stale-PID alive process. Falls
+// through clearing meta.Status / meta.PID when the recorded state
+// turns out to be stale (status=Running but no live vfkit).
+func (b *vzStarter) CheckNotRunning(_ context.Context, metaRaw orchestrator.MetadataHandle) error {
+	meta := metaRaw.(*vzMetaHandle).meta
+
+	if meta.Status == config.StatusRunning {
+		vm := &VM{meta: meta, cfg: b.c.cfg}
+		if vm.IsRunning() {
+			return fmt.Errorf("%w: %s", config.ErrShedAlreadyRunningSentinel, meta.Name)
+		}
+		meta.Status = config.StatusStopped
+		meta.PID = 0
+	}
+
+	// Defensive zombie-pid check — same shape as client.go:StartShed
+	// before the orchestrator migration. Refuse to double-spawn even
+	// if status reads "stopped" but the recorded PID is still a live
+	// vfkit (server crash mid-Save, hand-edited metadata, etc).
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isVfkitProcess(meta.PID) {
+		return fmt.Errorf("%w: %s (pid %d)", config.ErrZombiePresentSentinel, meta.Name, meta.PID)
+	}
+	meta.PID = 0
+
+	return nil
+}
+
+// StartVM builds the credential-share list (vfkit needs every share
+// declared before boot) and starts the VM. Registers the "stop VM"
+// cleanup. Mirrors vzCreator.StartVM but takes no UpperInfo/
+// NetworkResources (StartShed loads everything from metadata).
+func (b *vzStarter) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHandle, cleanup *backend.Cleanup) (orchestrator.VMHandle, error) {
+	meta := metaRaw.(*vzMetaHandle).meta
+
+	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	vm := CreateVM(meta, b.c.cfg)
+	vm.credentialShares = buildCredentialShares(dirCreds)
+
+	if err := vm.Start(ctx); err != nil {
+		return nil, fmt.Errorf("failed to start VM: %w", err)
+	}
+	cleanup.Register("stop VM", func() error {
+		return vm.Stop(context.Background())
+	})
+	return vzVMHandle{vm: vm}, nil
+}
+
+// PersistRunningState flips the metadata to Running, re-saves, and
+// registers the c.vms map entry's removal cleanup. Mirrors
+// vzCreator.FinalizeStartedVM.
+func (b *vzStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.MetadataHandle, vmRaw orchestrator.VMHandle, cleanup *backend.Cleanup) error {
+	meta := metaRaw.(*vzMetaHandle).meta
+	vm := vmRaw.(vzVMHandle).vm
+
+	meta.Status = config.StatusRunning
+	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
+		return fmt.Errorf("failed to save metadata: %w", err)
+	}
+
+	b.c.mu.Lock()
+	b.c.vms[meta.Name] = vm
+	b.c.mu.Unlock()
+	shedName := meta.Name
+	cleanup.Register("remove from vms map", func() error {
+		b.c.mu.Lock()
+		defer b.c.mu.Unlock()
+		delete(b.c.vms, shedName)
+		return nil
+	})
+	return nil
+}
+
+// MountLocalDir re-mounts the workspace VirtioFS share when
+// meta.LocalDir is set. VirtioFS mounts don't persist across vfkit
+// restarts; this is the start-time refresh.
+func (b *vzStarter) MountLocalDir(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) error {
+	meta := metaRaw.(*vzMetaHandle).meta
+	if meta.LocalDir == "" {
+		return nil
+	}
+	agent := b.c.newAgentClient(meta.Name)
+	if err := b.c.mountVirtioFSShareWithRetry(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
+		return fmt.Errorf("VirtioFS mount failed on start for local dir %s: %w", meta.LocalDir, err)
+	}
+	return nil
+}
+
+// SetupCredentials re-mounts configured credentials. Best-effort
+// (the credentials manager itself log-and-continues per credential).
+func (b *vzStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
+	meta := metaRaw.(*vzMetaHandle).meta
+	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	agent := b.c.newAgentClient(meta.Name)
+	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mountVirtioFSCredential)
+}
+
+// RunStartupHook runs ONLY the `startup` hook from provision.yaml
+// (runInstall=false). Best-effort: a failure logs but doesn't fail
+// the start (matches the pre-migration inline behavior).
+func (b *vzStarter) RunStartupHook(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
+	meta := metaRaw.(*vzMetaHandle).meta
+	agent := b.c.newAgentClient(meta.Name)
+	provisioner := vmutil.NewProvisioner(agent, meta.Name)
+	provisioner.SetOutput(os.Stdout, os.Stderr)
+	cfg, err := provisioner.LoadConfig(ctx)
+	if err != nil {
+		log.Printf("Warning: failed to load provisioning config: %v", err)
+		return
+	}
+	if err := provisioner.RunProvisioning(ctx, cfg, false); err != nil {
+		log.Printf("Warning: startup hook failed: %v", err)
+	}
+}
+
+// ToShedResult mirrors vzCreator.ToShedResult — VZ's endpoint is the
+// shared-NAT localhost.
+func (b *vzStarter) ToShedResult(metaRaw orchestrator.MetadataHandle) *config.Shed {
+	return metadataToShed(metaRaw.(*vzMetaHandle).meta, "127.0.0.1")
+}

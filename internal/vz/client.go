@@ -294,89 +294,14 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 	return nil
 }
 
-// StartShed starts a stopped shed.
+// StartShed starts a stopped shed via the BackendStarter orchestrator.
+// The per-shed create lock is acquired here (the orchestrator does
+// not own it — same contract as CreateShed). All platform-specific
+// behavior lives in vzStarter; see internal/backend/orchestrator/
+// start.go for the lifecycle contract.
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
-
-	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
-	if err != nil {
-		if errors.Is(err, ErrInstanceNotFound) {
-			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
-		}
-		return nil, err
-	}
-
-	if meta.Status == config.StatusRunning {
-		vm := &VM{meta: meta, cfg: c.cfg}
-		if vm.IsRunning() {
-			return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyRunningSentinel, name)
-		}
-		meta.Status = config.StatusStopped
-		meta.PID = 0
-	}
-
-	// Defensive zombie-pid check. Even when status reads "stopped" we
-	// can still hold a stale pid (server crash between vm.Stop() and
-	// the metadata save, hand-edited metadata.json, etc). Refuse to
-	// spawn a second vfkit under the same name when the recorded pid
-	// is still alive AND still looks like a vfkit. Plain liveness
-	// without the binary check would false-positive across PID reuse.
-	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isVfkitProcess(meta.PID) {
-		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrZombiePresentSentinel, name, meta.PID)
-	}
-	meta.PID = 0
-
-	// Filter credentials to those with existing source directories.
-	dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
-
-	vm := CreateVM(meta, c.cfg)
-	vm.credentialShares = buildCredentialShares(dirCreds)
-
-	if err := vm.Start(ctx); err != nil {
-		return nil, fmt.Errorf("failed to start VM: %w", err)
-	}
-
-	meta.Status = config.StatusRunning
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		if stopErr := vm.Stop(context.Background()); stopErr != nil {
-			log.Printf("Warning: failed to stop VM: %v", stopErr)
-		}
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
-
-	c.mu.Lock()
-	c.vms[name] = vm
-	c.mu.Unlock()
-
-	agent := c.newAgentClient(meta.Name)
-
-	// Re-mount VirtioFS workspace on start (mount doesn't persist across reboots)
-	if meta.LocalDir != "" {
-		if err := c.mountVirtioFSShareWithRetry(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
-			// VirtioFS mount is essential for --local-dir; stop the VM and fail
-			if stopErr := vm.Stop(context.Background()); stopErr != nil {
-				log.Printf("Warning: failed to stop VM after mount failure: %v", stopErr)
-			}
-			return nil, fmt.Errorf("VirtioFS mount failed on start for local dir %s: %w", meta.LocalDir, err)
-		}
-	}
-
-	// Mount credentials
-	c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, c.mountVirtioFSCredential)
-
-	// Run startup hook only (not install)
-	provisioner := vmutil.NewProvisioner(agent, name)
-	provisioner.SetOutput(os.Stdout, os.Stderr)
-	cfg, err := provisioner.LoadConfig(ctx)
-	if err != nil {
-		log.Printf("Warning: failed to load provisioning config: %v", err)
-	} else {
-		if err := provisioner.RunProvisioning(ctx, cfg, false); err != nil {
-			log.Printf("Warning: startup hook failed: %v", err)
-		}
-	}
-
-	return metadataToShed(meta, "127.0.0.1"), nil
+	return orchestrator.StartShed(ctx, &vzStarter{c: c}, orchestrator.StartRequest{Name: name})
 }
 
 // StopShed stops a running shed.
