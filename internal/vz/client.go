@@ -18,11 +18,11 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmimage"
-	"github.com/charliek/shed/internal/vmimage/clone"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -109,6 +109,13 @@ func (c *Client) preserveConsoleLog(meta *Metadata) {
 }
 
 // CreateShed creates a new VZ-based shed.
+//
+// This wrapper handles the parts the orchestrator does NOT own
+// (per-shed-name locking, existence-check, orphan-upper sweep, the
+// --image vs --from-snapshot exclusivity check). Per-step lifecycle
+// logic lives in vzCreator (see orchestrator.go) and is invoked by
+// orchestrator.CreateShed. See `internal/backend/orchestrator/create.go`
+// for the BackendCreator contract.
 func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
 	if err := config.ValidateShedName(req.Name); err != nil {
 		return nil, err
@@ -127,18 +134,10 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		defer c.acquireSnapshotLock(req.FromSnapshot)()
 	}
 
-	// Serialize CreateShed calls for the same name so the existence check
-	// below and CopyRootfs's os.Remove(dst) can't race two concurrent
-	// creates into corrupting the first caller's rootfs.
+	// Serialize CreateShed calls for the same name so the existence
+	// check below and CopyRootfs's os.Remove(dst) can't race two
+	// concurrent creates into corrupting the first caller's rootfs.
 	defer c.acquireCreateLock(req.Name)()
-
-	// LIFO rollback stack. Each successful resource-acquiring step
-	// `Register`s its teardown; on any error-return the deferred
-	// `cleanup.Run` invokes them in reverse. The success path calls
-	// `cleanup.Commit()` just before `return`, which zeroes the stack so
-	// the defer becomes a no-op. See `internal/backend/cleanup.go`.
-	cleanup := backend.NewCleanup()
-	defer cleanup.Run()
 
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
@@ -158,290 +157,7 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
-	cpus := req.CPUs
-	if cpus == 0 {
-		cpus = c.cfg.DefaultCPUs
-	}
-	if cpus < 1 || cpus > config.MaxVZCPUs {
-		return nil, fmt.Errorf("invalid cpus %d: must be between 1 and %d", cpus, config.MaxVZCPUs)
-	}
-	memoryMB := req.MemoryMB
-	if memoryMB == 0 {
-		memoryMB = c.cfg.DefaultMemoryMB
-	}
-	if memoryMB < 128 || memoryMB > config.MaxVZMemoryMB {
-		return nil, fmt.Errorf("invalid memory_mb %d: must be between 128 and %d", memoryMB, config.MaxVZMemoryMB)
-	}
-
-	upperSizeBytes := req.UpperSizeBytes
-	if upperSizeBytes == 0 {
-		sz := c.cfg.UpperSizeDefault
-		if sz == "" {
-			sz = config.DefaultUpperSize
-		}
-		parsed, perr := config.ParseUpperSize(sz)
-		if perr != nil {
-			return nil, fmt.Errorf("invalid upper_size_default: %w", perr)
-		}
-		upperSizeBytes = parsed
-	} else {
-		if upperSizeBytes < config.MinUpperSizeBytes || upperSizeBytes > config.MaxUpperSizeBytes {
-			return nil, fmt.Errorf("upper size out of range: must be between %dG and %dG",
-				config.MinUpperSizeBytes/(1024*1024*1024), config.MaxUpperSizeBytes/(1024*1024*1024))
-		}
-	}
-
-	var snapshotUpperSource, lowerDigest, lowerImageTag string
-	if req.FromSnapshot != "" {
-		snap, err := loadSnapshot(c.cfg.SnapshotsDir, req.FromSnapshot)
-		if err != nil {
-			return nil, err
-		}
-		if snap.Backend != config.BackendVZ {
-			return nil, fmt.Errorf("%w: snapshot %q is for backend %q, server is %q",
-				config.ErrSnapshotBackendMismatchSentinel, req.FromSnapshot, snap.Backend, config.BackendVZ)
-		}
-		if snap.LowerDigest == "" {
-			return nil, fmt.Errorf("snapshot %q is missing lower_digest; recreate the snapshot from a current shed", req.FromSnapshot)
-		}
-		if !vmimage.BlobExists(c.cfg.ImagesDir, snap.LowerDigest) {
-			ref := snap.SourceImage
-			if ref == "" {
-				ref = "(unknown)"
-			}
-			return nil, fmt.Errorf("snapshot %q references lower digest %s which is no longer cached; pull the original image (%s) first",
-				req.FromSnapshot, vmimage.ShortDigest(snap.LowerDigest), ref)
-		}
-		snapshotUpperSource = SnapshotRootfsPath(c.cfg.SnapshotsDir, req.FromSnapshot)
-		lowerDigest = snap.LowerDigest
-		lowerImageTag = snap.SourceImage
-	} else {
-		var resolved config.ResolvedImage
-		if req.Image != "" {
-			var err error
-			resolved, err = c.cfg.ResolveImage(req.Image)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			if c.cfg.BaseRootfs == "" {
-				return nil, fmt.Errorf("%w: no --image specified and no base_rootfs configured in vz.base_rootfs; pass --image <tag> or set base_rootfs in server.yaml", config.ErrInvalidShedRequestSentinel)
-			}
-			resolved = c.cfg.ResolveBaseRootfs()
-		}
-
-		// Ensure image is available locally (pulls + converts Docker refs if needed).
-		// We only need the digest — the rootfs path is rederived per-boot inside vm.go.
-		backend.Phase(ctx, "image")
-		backend.Status(ctx, "Resolving image...")
-		_, ldigest, err := c.EnsureImage(ctx, resolved)
-		if err != nil {
-			return nil, err
-		}
-		if ldigest == "" {
-			return nil, fmt.Errorf("image %q resolved to a path outside the blob store; the overlay model requires content-addressed images", resolved.Name)
-		}
-		lowerDigest = ldigest
-		lowerImageTag = resolved.Name
-	}
-
-	// Drop a `.creating` marker so a concurrent `shed image prune`
-	// can't sweep the blob between here and meta.Save. See the
-	// matching block in firecracker/client.go for rationale.
-	if lowerDigest != "" && req.FromSnapshot == "" {
-		if err := writeCreatingMarker(c.cfg.InstanceDir, req.Name, lowerDigest); err != nil {
-			return nil, fmt.Errorf("failed to write creating marker: %w", err)
-		}
-		defer removeCreatingMarker(c.cfg.InstanceDir, req.Name)
-	}
-
-	backend.Phase(ctx, "rootfs")
-	backend.Status(ctx, "Allocating writable upper layer...")
-	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create upper: %w", err)
-	}
-	cleanup.Register("delete upper layer", func() error {
-		return DeleteUpper(c.cfg.UppersDir, req.Name)
-	})
-
-	if snapshotUpperSource != "" {
-		// Replace the freshly allocated empty upper with a clone of the
-		// snapshot's stored upper so the new shed inherits its parent's
-		// writable contents.
-		if err := os.Remove(upperPath); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to clear upper for snapshot clone: %w", err)
-		}
-		if _, err := clone.CloneFile(snapshotUpperSource, upperPath); err != nil {
-			return nil, fmt.Errorf("failed to clone snapshot upper: %w", err)
-		}
-		if err := os.Chmod(upperPath, 0o644); err != nil {
-			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
-		}
-		// The metadata's UpperSizeBytes must reflect the *cloned* file's
-		// actual size, not the freshly-allocated sparse size — otherwise
-		// `shed system df` and reset/snapshot bookkeeping report the
-		// pre-snapshot size for what is now a different file.
-		if fi, statErr := os.Stat(upperPath); statErr == nil {
-			upperSizeBytes = fi.Size()
-		}
-	} else {
-		// Clone a pre-formatted ext4 template into the upper so the guest
-		// mounts it directly and skips the multi-second in-guest mkfs on
-		// first boot. Best-effort: any failure leaves the freshly-allocated
-		// signature upper in place (formatted in-guest), so create never
-		// regresses.
-		if tmpl, terr := EnsureUpperTemplate(ctx, c.templatesDir(), resolveBuildToolsRef(), upperSizeBytes, ""); terr != nil {
-			// A canceled/timed-out request must abort, not silently fall
-			// back and keep mutating resources past the deadline.
-			if errors.Is(terr, context.Canceled) || errors.Is(terr, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("upper template provisioning canceled: %w", terr)
-			}
-			log.Printf("[%s] upper template unavailable (%v); formatting in guest", req.Name, terr)
-		} else if perr := provisionUpperFromTemplate(upperPath, tmpl); perr != nil {
-			if errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("upper template provisioning canceled: %w", perr)
-			}
-			log.Printf("[%s] upper template clone failed (%v); formatting in guest", req.Name, perr)
-		} else {
-			backend.Phase(ctx, "rootfs")
-			backend.Status(ctx, "Provisioned upper from template (skips in-guest mkfs)")
-		}
-	}
-	rootfsPath := upperPath
-
-	meta := &Metadata{
-		Name:           req.Name,
-		Status:         config.StatusStopped,
-		CreatedAt:      time.Now(),
-		Backend:        config.BackendVZ,
-		CPUs:           cpus,
-		MemoryMB:       memoryMB,
-		RootfsPath:     rootfsPath,
-		UpperPath:      upperPath,
-		UpperSizeBytes: upperSizeBytes,
-		Repo:           req.Repo,
-		LocalDir:       req.LocalDir,
-		Image:          req.Image,
-		LowerDigest:    lowerDigest,
-		LowerImageTag:  lowerImageTag,
-		FromSnapshot:   req.FromSnapshot,
-	}
-
-	// Register the instance-dir cleanup BEFORE calling Save. Save's
-	// `os.MkdirAll` runs first; if any subsequent write fails partway
-	// through, the directory it created is left behind. `meta.Delete`
-	// is `os.RemoveAll`, so it's safe to register against a not-yet-
-	// existent path (the cleanup is a no-op if the dir was never
-	// created). `preserveConsoleLog` is also safe pre-Start (it skips
-	// when console.log is absent — see vz/metadata.go).
-	cleanup.Register("preserve console log + delete instance dir", func() error {
-		c.preserveConsoleLog(meta)
-		return meta.Delete(c.cfg.InstanceDir)
-	})
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
-
-	// Filter credentials to those with existing source directories.
-	// Non-existent sources are skipped to avoid vfkit VirtioFS failures.
-	dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
-
-	vm := CreateVM(meta, c.cfg)
-	vm.credentialShares = buildCredentialShares(dirCreds)
-
-	backend.Phase(ctx, "vm")
-	backend.Status(ctx, "Starting virtual machine...")
-	if err := vm.Start(ctx); err != nil {
-		return nil, fmt.Errorf("failed to start VM: %w", err)
-	}
-	cleanup.Register("stop VM", func() error {
-		return vm.Stop(context.Background())
-	})
-
-	meta.Status = config.StatusRunning
-	meta.PID = vm.meta.PID
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
-
-	c.mu.Lock()
-	c.vms[req.Name] = vm
-	c.mu.Unlock()
-	cleanup.Register("remove from vms map", func() error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		delete(c.vms, req.Name)
-		return nil
-	})
-
-	agent := c.newAgentClient(meta.Name)
-
-	// Mount VirtioFS workspace if local dir is configured
-	if req.LocalDir != "" {
-		backend.Phase(ctx, "mount")
-		backend.Status(ctx, "Mounting local directory via VirtioFS...")
-		if err := c.mountVirtioFSShare(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
-			// VirtioFS mount is essential for --local-dir; fail the
-			// create. The deferred cleanup now fully unwinds: vms
-			// map entry, VM, instance dir, upper — previously only
-			// `vm.Stop` ran here, leaking the rest.
-			return nil, fmt.Errorf("VirtioFS mount failed for local dir %s: %w", req.LocalDir, err)
-		}
-	}
-
-	// Mount credentials
-	c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mountVirtioFSCredential)
-
-	// Clone repo if specified (skip when using local dir or spawning from snapshot;
-	// snapshot rootfs is already provisioned).
-	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
-		backend.Phase(ctx, "repo")
-		backend.Status(ctx, "Cloning repository...")
-		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
-			log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
-			// Generic SSE message by design: req.Repo can carry credentials
-			// (e.g., https://user:pw@host/...) and the wrapped err from
-			// git/ssh may include the URL too. Full detail is in the server
-			// log above; SSE consumers get a stable, sanitized signal.
-			//
-			// Deliberately no `backend.Phase(ctx, "repo")` here: the
-			// preceding `vmutil.CloneRepo` already advanced the timer
-			// to "clone", and re-entering "repo" just to attach a
-			// status would split the timer line into the
-			// `repo=N clone=M repo=K` triple shape documented in §14
-			// and Codex's review of #132. The user still sees the
-			// status message (SSE consumes Status events regardless of
-			// the current phase).
-			backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
-		} else {
-			backend.Status(ctx, "Repository cloned")
-		}
-	}
-
-	// Run provisioning. When spawning from a snapshot the rootfs is already
-	// provisioned, so we skip the one-shot install hook but still run the
-	// startup hook on every boot — matching StartShed's behavior. This means
-	// a snapshot-spawned shed gets the same first-boot startup hook as if
-	// the operator had started it manually.
-	if !req.NoProvision {
-		provisioner := vmutil.NewProvisioner(agent, req.Name)
-		provisioner.SetOutput(os.Stdout, os.Stderr)
-		cfg, err := provisioner.LoadConfig(ctx)
-		if err != nil {
-			log.Printf("Warning: failed to load provisioning config: %v", err)
-		} else {
-			runInstall := req.FromSnapshot == ""
-			if err := provisioner.RunProvisioning(ctx, cfg, runInstall); err != nil {
-				log.Printf("Warning: provisioning failed: %v", err)
-			}
-		}
-	}
-
-	// Happy path: zero out the cleanup stack so the deferred `Run` is a
-	// no-op. From here on the shed is the caller's responsibility.
-	cleanup.Commit()
-	return metadataToShed(meta, "127.0.0.1"), nil
+	return orchestrator.CreateShed(ctx, &vzCreator{c: c}, req)
 }
 
 // GetShed returns a shed by name.

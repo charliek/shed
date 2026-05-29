@@ -27,19 +27,13 @@ func (p mockPreFlight) IsFromSnapshot() bool { return p.fromSnapshot }
 
 type mockUpper struct{}
 
-func (mockUpper) isUpperInfo() {}
-
 type mockNet struct{}
-
-func (mockNet) isNetworkResources() {}
 
 type mockMeta struct{ name string }
 
 func (m mockMeta) Name() string { return m.name }
 
 type mockVM struct{}
-
-func (mockVM) isVMHandle() {}
 
 // mockBackend records every hook invocation in order and exposes
 // failure-injection knobs so each error-propagation path is testable
