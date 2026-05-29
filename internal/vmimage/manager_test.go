@@ -249,6 +249,209 @@ func TestManagerPruneRespectsSnapshotRefs(t *testing.T) {
 	}
 }
 
+// TestPruneProtectsTaggedManifest covers the v0.5.7 → v0.5.8 prune
+// fix: a tag pointing at a manifest now keeps that manifest (and
+// every blob the manifest references — config, layers, kernel,
+// initrd, and the rootfs erofs blob) alive across `shed image
+// prune`. Before the fix, `shed image pull X && shed image prune`
+// would delete the manifest just pulled. See refs.go RefKindTag and
+// docs/upgrades/v0.5.7-to-v0.5.8.md.
+func TestPruneProtectsTaggedManifest(t *testing.T) {
+	imagesDir := t.TempDir()
+	cfg := &testConfig{imagesDir: imagesDir}
+	mgr := NewManager(cfg, nil)
+
+	digest, err := InstallSyntheticImage(
+		imagesDir,
+		"protected",
+		"ghcr.io/example/protected:v1",
+		[]byte("rootfs"),
+		[]byte("kernel"),
+		[]byte("initrd"),
+	)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
+	}
+
+	manifest, err := LoadManifestByDigest(imagesDir, digest)
+	if err != nil {
+		t.Fatalf("LoadManifestByDigest: %v", err)
+	}
+
+	// Dry run should leave the tagged manifest out of the candidate set.
+	cands, err := mgr.PruneImages(true)
+	if err != nil {
+		t.Fatalf("PruneImages(dryRun): %v", err)
+	}
+	if hasCandidate(cands, digest) {
+		t.Fatalf("tagged manifest %s appears in prune candidates: %#v", digest, cands)
+	}
+
+	// Real prune should leave the manifest, its config, every layer,
+	// kernel, initrd, and the erofs rootfs blob on disk.
+	if _, err := mgr.PruneImages(false); err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+	if !BlobExists(imagesDir, digest) {
+		t.Fatalf("tagged manifest blob removed by prune: %s", digest)
+	}
+	if !BlobExists(imagesDir, manifest.Config.Digest) {
+		t.Fatalf("config blob for tagged manifest removed: %s", manifest.Config.Digest)
+	}
+	for _, layer := range manifest.Layers {
+		if !BlobExists(imagesDir, layer.Digest) {
+			t.Fatalf("layer blob for tagged manifest removed: %s", layer.Digest)
+		}
+	}
+	if d := manifest.ShedKernelDigest(); d != "" && !BlobExists(imagesDir, d) {
+		t.Fatalf("kernel blob for tagged manifest removed: %s", d)
+	}
+	if d := manifest.ShedInitrdDigest(); d != "" && !BlobExists(imagesDir, d) {
+		t.Fatalf("initrd blob for tagged manifest removed: %s", d)
+	}
+	if d := manifest.ShedRootfsErofsDigest(); d != "" && !BlobExists(imagesDir, d) {
+		t.Fatalf("rootfs erofs blob for tagged manifest removed: %s", d)
+	}
+
+	// Tag file itself must remain.
+	if _, err := GetTag(imagesDir, "protected"); err != nil {
+		t.Fatalf("tag should still exist post-prune: %v", err)
+	}
+}
+
+// TestPruneAfterUntagDeletesOrphan covers the documented cleanup
+// workflow: `shed image rm <name>` to drop the tag, then `shed
+// image prune` to GC the now-orphaned manifest and its transitive
+// blobs. Verifies the tag is what's protective; removing the tag
+// hands the underlying blobs back to prune.
+func TestPruneAfterUntagDeletesOrphan(t *testing.T) {
+	imagesDir := t.TempDir()
+	cfg := &testConfig{imagesDir: imagesDir}
+	mgr := NewManager(cfg, nil)
+
+	digest, err := InstallSyntheticImage(
+		imagesDir,
+		"orphan-soon",
+		"ghcr.io/example/orphan-soon:v1",
+		[]byte("rootfs"),
+		[]byte("kernel"),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
+	}
+
+	manifest, err := LoadManifestByDigest(imagesDir, digest)
+	if err != nil {
+		t.Fatalf("LoadManifestByDigest: %v", err)
+	}
+
+	// Untag and prune.
+	if err := mgr.DeleteImage("orphan-soon"); err != nil {
+		t.Fatalf("DeleteImage: %v", err)
+	}
+	deleted, err := mgr.PruneImages(false)
+	if err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+	if !hasDeleted(deleted, digest) {
+		t.Fatalf("orphaned manifest %s not in deleted set: %#v", digest, deleted)
+	}
+	if BlobExists(imagesDir, digest) {
+		t.Fatalf("orphaned manifest blob still present after prune: %s", digest)
+	}
+	for _, layer := range manifest.Layers {
+		if BlobExists(imagesDir, layer.Digest) {
+			t.Fatalf("orphaned layer blob still present after prune: %s", layer.Digest)
+		}
+	}
+	if d := manifest.ShedKernelDigest(); d != "" && BlobExists(imagesDir, d) {
+		t.Fatalf("orphaned kernel blob still present after prune: %s", d)
+	}
+	if d := manifest.ShedRootfsErofsDigest(); d != "" && BlobExists(imagesDir, d) {
+		t.Fatalf("orphaned rootfs erofs blob still present after prune: %s", d)
+	}
+}
+
+// TestPruneHandlesStaleTag covers the failure mode where the
+// underlying manifest blob is missing (host disk corruption,
+// partial restore from backup, etc.). Prune must log a warning and
+// proceed instead of crashing or treating the missing digest as
+// protective.
+func TestPruneHandlesStaleTag(t *testing.T) {
+	imagesDir := t.TempDir()
+	cfg := &testConfig{imagesDir: imagesDir}
+	mgr := NewManager(cfg, nil)
+
+	// Install a real image to give prune some blobs to walk past.
+	realDigest := installFakeBlob(t, imagesDir, "real", "ghcr.io/example/real:v1", []byte("real-body"))
+
+	// Write a tag file directly pointing at a fabricated digest whose
+	// blob has never been written to disk. SetTag's digest validator
+	// accepts well-formed sha256:<hex> regardless of whether the blob
+	// exists, so this is the production stale-tag shape.
+	staleDigest := SyntheticDigestFromString("stale-manifest-never-on-disk")
+	if err := SetTag(imagesDir, "stale", staleDigest); err != nil {
+		t.Fatalf("SetTag(stale): %v", err)
+	}
+	if BlobExists(imagesDir, staleDigest) {
+		t.Fatalf("test setup invalid: stale digest blob unexpectedly present: %s", staleDigest)
+	}
+
+	// Prune must not panic, must not error, and must leave the real
+	// manifest's blobs alone.
+	if _, err := mgr.PruneImages(false); err != nil {
+		t.Fatalf("PruneImages with stale tag returned err: %v", err)
+	}
+	if !BlobExists(imagesDir, realDigest) {
+		t.Fatalf("real manifest %s deleted while a stale tag was present", realDigest)
+	}
+}
+
+// TestPruneStillProtectsShedPinnedManifest is a regression check that
+// scanner-supplied RefKindShed refs continue to be protective after
+// the v0.5.8 tag-protection change. The fixture matches the
+// production shape: a manifest with kernel + initrd + erofs blobs,
+// pinned by a shed but with no tag.
+func TestPruneStillProtectsShedPinnedManifest(t *testing.T) {
+	imagesDir := t.TempDir()
+	cfg := &testConfig{imagesDir: imagesDir}
+
+	digest, err := InstallSyntheticImage(
+		imagesDir,
+		"",
+		"ghcr.io/example/shed-pinned:v1",
+		[]byte("shed-pinned-rootfs"),
+		[]byte("shed-pinned-kernel"),
+		[]byte("shed-pinned-initrd"),
+	)
+	if err != nil {
+		t.Fatalf("InstallSyntheticImage: %v", err)
+	}
+	manifest, err := LoadManifestByDigest(imagesDir, digest)
+	if err != nil {
+		t.Fatalf("LoadManifestByDigest: %v", err)
+	}
+
+	scanner := &fakeScanner{refs: []Reference{
+		{Digest: digest, Kind: RefKindShed, Name: "live-shed"},
+	}}
+	mgr := NewManager(cfg, scanner)
+
+	if _, err := mgr.PruneImages(false); err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+	if !BlobExists(imagesDir, digest) {
+		t.Fatalf("shed-pinned manifest deleted by prune: %s", digest)
+	}
+	if !BlobExists(imagesDir, manifest.Config.Digest) {
+		t.Fatalf("shed-pinned config deleted: %s", manifest.Config.Digest)
+	}
+	if d := manifest.ShedRootfsErofsDigest(); d != "" && !BlobExists(imagesDir, d) {
+		t.Fatalf("shed-pinned erofs deleted: %s", d)
+	}
+}
+
 // TestEnsureImageSurfacesRegistryError confirms that a registry pull
 // failure surfaces directly to the caller — v0.5.3 dropped the
 // docker-daemon fallback (it produced single-layer flattens with
