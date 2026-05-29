@@ -16,7 +16,10 @@ set -e
 
 # Guard against non-systemd environments (chroots, container builds).
 # `systemctl --system` returns nonzero outside a real systemd host.
-if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --system 2>/dev/null; then
+# Redirect both stdout (which would otherwise dump the full unit list
+# into dpkg's install output — caught by CodeRabbit on PR #150) and
+# stderr.
+if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --system >/dev/null 2>&1; then
     exit 0
 fi
 
