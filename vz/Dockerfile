@@ -44,6 +44,21 @@ LABEL org.opencontainers.image.source="https://github.com/charliek/shed"
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
+# LINUX_IMAGE_VERSION pins the apt kernel package the VZ rootfs and the
+# shed initramfs share. Pre-v0.5.8 both stages installed the
+# linux-image-virtual metapackage independently; if Docker BuildKit's
+# layer cache held an older apt snapshot for one stage and a fresher
+# one for the other, the initramfs's staged erofs.ko / libcrc32c.ko
+# targeted a different kernel than this stage's booted vmlinuz and
+# the VZ guest panicked in shed-initramfs with SHED-INIT-03 ("failed
+# to mount /dev/vdb at /lower (erofs)"). VZ kernels lack erofs as
+# built-in, so the .ko load is load-bearing.
+#
+# MUST match initramfs/Dockerfile's ARG of the same name; Makefile's
+# `check-kernel-pin` target enforces parity. See
+# docs/upgrades/v0.5.7-to-v0.5.8.md for the rationale.
+ARG LINUX_IMAGE_VERSION=6.8.0-124
+
 # Strip man pages, docs, and non-English locales from every subsequent
 # dpkg/apt operation. Must come BEFORE the first apt-get install so the
 # excludes apply to all packages. Keep en/en_US locales — many tools
@@ -57,19 +72,19 @@ RUN printf '%s\n' \
     > /etc/dpkg/dpkg.cfg.d/01-shed-strip
 
 # Layer 1: APT-installed system + dev tools + Docker CE in one go.
-# linux-image-virtual + initramfs-tools provide the in-VM kernel
-# (extracted at image-build time by shed image build for VZ booting).
-# linux-image-virtual is ~100 MB smaller than linux-image-generic because
-# it ships a minimal recommended-modules set: virtio_blk, virtio_net,
-# virtio_pci, 9p, 9pnet_virtio, loop, overlay. It does NOT ship the
-# vsock guest-transport modules (vmw_vsock_virtio_transport[_common]);
-# those live in linux-modules-extra-$KVERS-generic, which Noble does
-# NOT expose as a -virtual metapackage (only kernel-flavor-specific
-# aliases like -extra-aws/-azure/-gcp exist). We derive the exact
-# kernel version from the linux-image-*-generic package the
-# linux-image-virtual metapackage pulled in and install the matching
-# -extra package by name. Without it, shed-agent.service can't open
-# its vsock listener and host health checks time out.
+# linux-image-${LINUX_IMAGE_VERSION}-generic + initramfs-tools provide
+# the in-VM kernel (extracted at image-build time by shed image build
+# for VZ booting). Pre-v0.5.8 this stage installed the
+# linux-image-virtual metapackage; we install the specific generic
+# kernel image directly so the kernel version matches the initramfs's
+# .ko staging (see the ARG comment above). The -generic flavor is
+# ~100 MB larger than -virtual but ships the same recommended
+# virtio_* / overlay modules, so the boot path is unchanged. The
+# vsock guest-transport modules
+# (vmw_vsock_virtio_transport[_common]) still live in
+# linux-modules-extra-$KVERS-generic; we install that by name too.
+# Without it, shed-agent.service can't open its vsock listener and
+# host health checks time out.
 # Editor lineup: neovim only. vim/nano/jed/htop dropped to save ~80 MB;
 # users who need them can `apt install` inside a shed.
 RUN apt-get update \
@@ -80,10 +95,11 @@ RUN apt-get update \
        openssh-server \
        iproute2 iputils-ping dnsutils netcat-openbsd \
        build-essential bubblewrap \
-       linux-image-virtual initramfs-tools \
-    && KVERS=$(dpkg-query -W -f='${Package}\n' 'linux-image-*-generic' | head -1 | sed 's/linux-image-//') \
-    && [ -n "$KVERS" ] || { echo "ERROR: could not derive kernel version from linux-image-*-generic"; exit 1; } \
-    && apt-get install -y --no-install-recommends "linux-modules-extra-$KVERS" \
+       "linux-image-${LINUX_IMAGE_VERSION}-generic" \
+       "linux-modules-extra-${LINUX_IMAGE_VERSION}-generic" \
+       initramfs-tools \
+    && [ -d "/lib/modules/${LINUX_IMAGE_VERSION}-generic" ] \
+       || { echo "ERROR: /lib/modules/${LINUX_IMAGE_VERSION}-generic not present after install — LINUX_IMAGE_VERSION ARG is wrong" >&2; exit 1; } \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 2: stage shed-built binaries + service files from the build
