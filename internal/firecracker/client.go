@@ -395,6 +395,14 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// creates into corrupting the first caller's rootfs.
 	defer c.acquireCreateLock(req.Name)()
 
+	// LIFO rollback stack. Each successful resource-acquiring step
+	// Registers its teardown; on any error-return the deferred
+	// `cleanup.Run` invokes them in reverse. The success path calls
+	// `cleanup.Commit()` just before `return`, which zeroes the stack
+	// so the defer becomes a no-op. See `internal/backend/cleanup.go`.
+	cleanup := backend.NewCleanup()
+	defer cleanup.Run()
+
 	if _, err := LoadMetadata(c.cfg.InstanceDir, req.Name); err == nil {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyExistsSentinel, req.Name)
 	}
@@ -522,58 +530,48 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate CID: %w", err)
 	}
+	cleanup.Register("release CID", func() error {
+		c.ReleaseCID(cid)
+		return nil
+	})
+
 	tapDevice, ipAddress, err := c.AllocateNetwork(req.Name)
 	if err != nil {
-		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to allocate network: %w", err)
 	}
+	cleanup.Register("release IP", func() error {
+		c.ReleaseIP(ipAddress)
+		return nil
+	})
 
 	if err := c.netMgr.CreateTAPDevice(tapDevice); err != nil {
-		c.ReleaseIP(ipAddress)
-		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to create TAP device: %w", err)
 	}
+	cleanup.Register("delete TAP device", func() error {
+		return c.netMgr.DeleteTAPDevice(tapDevice)
+	})
 
 	backend.Phase(ctx, "rootfs")
 	backend.Status(ctx, "Allocating writable upper layer...")
 	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
 	if err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
-		c.ReleaseIP(ipAddress)
-		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to create upper: %w", err)
 	}
+	cleanup.Register("delete upper layer", func() error {
+		return DeleteUpper(c.cfg.UppersDir, req.Name)
+	})
+
 	// from-snapshot: replace the freshly allocated empty upper with a
 	// reflink clone of the snapshot's stored upper so the new shed
 	// inherits its parent's writable contents.
 	if snapshotUpperSource != "" {
 		if err := os.Remove(upperPath); err != nil && !os.IsNotExist(err) {
-			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
-			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-			}
-			c.ReleaseIP(ipAddress)
-			c.ReleaseCID(cid)
 			return nil, fmt.Errorf("failed to clear upper for snapshot clone: %w", err)
 		}
 		if _, err := clone.CloneFile(snapshotUpperSource, upperPath); err != nil {
-			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
-			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-			}
-			c.ReleaseIP(ipAddress)
-			c.ReleaseCID(cid)
 			return nil, fmt.Errorf("failed to clone snapshot upper: %w", err)
 		}
 		if err := os.Chmod(upperPath, 0o644); err != nil {
-			_ = DeleteUpper(c.cfg.UppersDir, req.Name)
-			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-			}
-			c.ReleaseIP(ipAddress)
-			c.ReleaseCID(cid)
 			return nil, fmt.Errorf("failed to chmod cloned upper: %w", err)
 		}
 		// The metadata's UpperSizeBytes must reflect the *cloned* file's
@@ -616,18 +614,16 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		FromSnapshot:   req.FromSnapshot,
 	}
 
+	// Register the instance-dir cleanup BEFORE calling Save. Save's
+	// `os.MkdirAll` runs first; if any subsequent write fails partway
+	// through, the directory it created is left behind. `meta.Delete`
+	// is `os.RemoveAll`, so it's safe to register against a not-yet-
+	// existent path (the cleanup is a no-op if the dir was never
+	// created).
+	cleanup.Register("delete instance dir", func() error {
+		return meta.Delete(c.cfg.InstanceDir)
+	})
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-		}
-		c.ReleaseIP(ipAddress)
-		c.ReleaseCID(cid)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
@@ -635,56 +631,32 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
 	if err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-		}
-		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
 	backend.Phase(ctx, "vm")
 	backend.Status(ctx, "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-		}
-		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
+	cleanup.Register("stop VM", func() error {
+		return vm.Stop(context.Background())
+	})
 
 	meta.Status = config.StatusRunning
 	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		if stopErr := vm.Stop(context.Background()); stopErr != nil {
-			log.Printf("Warning: failed to stop VM: %v", stopErr)
-		}
-		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-		}
-		if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-			log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-		}
-		if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-			log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-		}
-		c.UnregisterInstance(req.Name, cid, ipAddress)
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
 	c.mu.Lock()
 	c.vms[req.Name] = vm
 	c.mu.Unlock()
+	cleanup.Register("remove from vms map", func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.vms, req.Name)
+		return nil
+	})
 
 	agent := c.newAgentClient(meta.Name)
 
@@ -695,37 +667,15 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		bridgeIP := c.netMgr.Gateway()
 		srv, err := c.startP9Server(req.Name, bridgeIP, req.LocalDir, config.WorkspacePath, false)
 		if err != nil {
-			c.stopP9Servers(req.Name)
-			if stopErr := vm.Stop(context.Background()); stopErr != nil {
-				log.Printf("Warning: failed to stop VM: %v", stopErr)
-			}
-			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-			}
-			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-			}
-			if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-				log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-			}
-			c.UnregisterInstance(req.Name, cid, ipAddress)
 			return nil, fmt.Errorf("failed to start 9P server for local dir: %w", err)
 		}
-		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
+		// Register the 9P teardown after the server starts so a guest-
+		// mount failure below cleans up the server too.
+		cleanup.Register("stop 9P servers", func() error {
 			c.stopP9Servers(req.Name)
-			if stopErr := vm.Stop(context.Background()); stopErr != nil {
-				log.Printf("Warning: failed to stop VM: %v", stopErr)
-			}
-			if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
-				log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
-			}
-			if rmErr := meta.Delete(c.cfg.InstanceDir); rmErr != nil {
-				log.Printf("Warning: failed to delete instance dir for %s: %v", req.Name, rmErr)
-			}
-			if rmErr := DeleteUpper(c.cfg.UppersDir, req.Name); rmErr != nil {
-				log.Printf("Warning: failed to delete upper for %s: %v", req.Name, rmErr)
-			}
-			c.UnregisterInstance(req.Name, cid, ipAddress)
+			return nil
+		})
+		if err := c.mount9PInGuest(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
 			return nil, fmt.Errorf("failed to mount 9P in guest: %w", err)
 		}
 	}
@@ -779,6 +729,9 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		}
 	}
 
+	// Happy path: zero out the cleanup stack so the deferred Run is a
+	// no-op. From here on the shed is the caller's responsibility.
+	cleanup.Commit()
 	return metadataToShed(meta), nil
 }
 
