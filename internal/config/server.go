@@ -303,6 +303,36 @@ func (c *VZConfig) GetExtractKernel() bool { return true }
 func (c *VZConfig) GetNeedsInitrd() bool { return true }
 
 // DefaultVZConfig returns a VZConfig with default values.
+//
+// Cross-backend alignment (DO NOT drift between this and
+// DefaultFirecrackerConfig without an explicit reason):
+//
+//   - DefaultCPUs / DefaultMemoryMB / DefaultDiskGB: same physical
+//     resource shape per shed on both backends. A user moving a shed
+//     between platforms should see identical resource sizing by
+//     default.
+//   - ConsolePort (1024) / NotifyPort (1026): the agent's vsock
+//     contract. Same on both so the same shed-agent binary speaks
+//     to both backends without per-platform port plumbing.
+//   - StopTimeout (10 s): the budget for the shutdown-hook + sync +
+//     graceful-stop sequence. Same on both because the in-guest work
+//     (sync, hook execution) is identical regardless of VMM.
+//
+// Intentionally divergent from FC:
+//
+//   - StartTimeout (60 s vs FC 30 s): historical VZ create wall time
+//     was ~5.9 s (pre-Phase-2 in-guest mkfs.ext4 on the vfkit
+//     virtio-blk write path, which is ~20× slower than Firecracker's
+//     per §0 of the runtime-opt doc). 60 s gave ~10× headroom for
+//     that worst case. As of v0.5.5 warm VZ create is ~1.6 s, so 60 s
+//     is generous; the value stands to absorb cold-state and
+//     overloaded-host variance without surprising the operator.
+//   - TCPProxyPort (1028): VZ exposes a TCP proxy via vsock for
+//     `shed forward`-style use cases. Firecracker uses its own
+//     network stack with TAP devices and does not need it.
+//   - VfkitPath: VZ-only (vfkit is the macOS VMM); Firecracker
+//     equivalent is invoked directly by the binary at FirecrackerPath
+//     (set elsewhere).
 func DefaultVZConfig() *VZConfig {
 	return &VZConfig{
 		VfkitPath: "vfkit",
@@ -319,15 +349,19 @@ func DefaultVZConfig() *VZConfig {
 		SnapshotsDir:     ExpandPath(DefaultVZImagesDir + "/snapshots"),
 		UppersDir:        ExpandPath(DefaultVZImagesDir + "/uppers"),
 		UpperSizeDefault: DefaultUpperSize,
-		SocketDir:        ExpandPath("~/.shed/vz/sockets"),
-		DefaultCPUs:      2,
-		DefaultMemoryMB:  4096,
-		DefaultDiskGB:    20,
-		ConsolePort:      1024,
-		NotifyPort:       1026,
-		TCPProxyPort:     1028,
-		StartTimeout:     Duration(60 * time.Second),
-		StopTimeout:      Duration(10 * time.Second),
+		// SocketDir under $HOME on VZ because macOS users typically
+		// run shed-server as themselves (homebrew); the FC equivalent
+		// runs under /var/run because it's a Linux systemd service
+		// running as root.
+		SocketDir:       ExpandPath("~/.shed/vz/sockets"),
+		DefaultCPUs:     2,                          // see "Cross-backend alignment" above
+		DefaultMemoryMB: 4096,                       // see "Cross-backend alignment" above
+		DefaultDiskGB:   20,                         // see "Cross-backend alignment" above
+		ConsolePort:     1024,                       // see "Cross-backend alignment" above
+		NotifyPort:      1026,                       // see "Cross-backend alignment" above
+		TCPProxyPort:    1028,                       // VZ-only — see header comment
+		StartTimeout:    Duration(60 * time.Second), // diverges from FC's 30s — see header comment
+		StopTimeout:     Duration(10 * time.Second), // see "Cross-backend alignment" above
 	}
 }
 
@@ -746,32 +780,58 @@ func (c *FirecrackerConfig) ResolveBaseRootfs() ResolvedImage {
 }
 
 // DefaultFirecrackerConfig returns a FirecrackerConfig with default values.
+//
+// Cross-backend alignment (DO NOT drift between this and DefaultVZConfig
+// without an explicit reason — see DefaultVZConfig's header comment for
+// the rationale on each field):
+//
+//   - DefaultCPUs / DefaultMemoryMB / DefaultDiskGB: same physical
+//     resource shape per shed on both backends.
+//   - ConsolePort (1024) / NotifyPort (1026): the shared agent vsock
+//     contract.
+//   - StopTimeout (10 s): same in-guest stop sequence.
+//
+// Intentionally divergent from VZ:
+//
+//   - StartTimeout (30 s vs VZ 60 s): FC's create wall time is around
+//     3.7 s baseline (mini3 measurements in §11 of the runtime-opt
+//     doc); ~8× headroom. FC's in-guest mkfs.ext4 is ~0.18 s vs VZ's
+//     ~4.2 s on vfkit's slower virtio-blk write path — the historical
+//     reason VZ's StartTimeout is bigger does not apply here.
+//   - SocketDir under /var/run/shed/firecracker (not a $HOME path)
+//     because Firecracker hosts run shed-server as root via systemd
+//     (see packaging/shed-server.service); the VZ equivalent runs in
+//     $HOME because macOS users typically run via homebrew.
+//   - VsockBaseCID (100): FC needs an explicit CID per VM (vsock CIDs
+//     are integers ≥ 3); 100 leaves room for hand-assigned CIDs below
+//     it. VZ assigns CIDs through Apple's Virtualization framework,
+//     which uses its own scheme, so the field doesn't apply there.
+//   - BridgeName / BridgeCIDR / TAPPrefix: FC uses a Linux bridge +
+//     TAP devices for its NAT-style network; VZ uses Apple's built-in
+//     vmnet shared/NAT network, which has no analogous tunables.
+//
+// (KernelPath and BaseRootfs left empty by default — Phase A retired
+// the flat-file layout, Phase B made the in-blob kernel canonical.
+// Operators who want the legacy fallbacks set them explicitly.)
 func DefaultFirecrackerConfig() *FirecrackerConfig {
 	return &FirecrackerConfig{
-		// KernelPath and BaseRootfs are intentionally left empty by
-		// default — Phase A retired the flat-file layout (the previous
-		// /var/lib/shed/firecracker/base-rootfs.ext4 default) in favor
-		// of the content-addressed blob store under
-		// {ImagesDir}/blobs/sha256/<digest>/, and Phase B made the
-		// in-blob kernel the canonical source. Operators who want the
-		// legacy fallbacks set them explicitly in server.yaml.
 		ImagesDir:        DefaultFirecrackerImagesDir,
 		InstanceDir:      "/var/lib/shed/firecracker/instances",
 		SnapshotsDir:     "/var/lib/shed/firecracker/snapshots",
 		UppersDir:        "/var/lib/shed/firecracker/uppers",
 		UpperSizeDefault: DefaultUpperSize,
-		SocketDir:        "/var/run/shed/firecracker",
-		DefaultCPUs:      2,
-		DefaultMemoryMB:  4096,
-		DefaultDiskGB:    20,
-		VsockBaseCID:     100,
-		ConsolePort:      1024,
-		NotifyPort:       1026,
-		StartTimeout:     Duration(30 * time.Second),
-		StopTimeout:      Duration(10 * time.Second),
-		BridgeName:       "shed-br0",
-		BridgeCIDR:       "172.30.0.1/24",
-		TAPPrefix:        "shed-tap",
+		SocketDir:        "/var/run/shed/firecracker", // root systemd default; see header
+		DefaultCPUs:      2,                           // aligned with VZ — see header
+		DefaultMemoryMB:  4096,                        // aligned with VZ — see header
+		DefaultDiskGB:    20,                          // aligned with VZ — see header
+		VsockBaseCID:     100,                         // FC-only — see header
+		ConsolePort:      1024,                        // aligned with VZ — see header
+		NotifyPort:       1026,                        // aligned with VZ — see header
+		StartTimeout:     Duration(30 * time.Second),  // diverges from VZ's 60s — see header
+		StopTimeout:      Duration(10 * time.Second),  // aligned with VZ — see header
+		BridgeName:       "shed-br0",                  // FC-only — see header
+		BridgeCIDR:       "172.30.0.1/24",             // FC-only — see header
+		TAPPrefix:        "shed-tap",                  // FC-only — see header
 	}
 }
 
