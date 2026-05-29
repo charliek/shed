@@ -290,17 +290,25 @@ func parseSSEEvents(t *testing.T, body string) []struct{ Event, Data string } {
 	return events
 }
 
-// TestCreateShed_SSE_SurfacesProgressAndWarning verifies that ProgressWarning
-// events emitted by the backend during CreateShed reach the SSE stream as
-// progress events with warning=true. Regression test for issue #84 — clone
-// failures used to be journald-only.
+// TestCreateShed_SSE_SurfacesProgressAndWarning verifies that
+// StatusWarning events emitted by the backend during CreateShed reach
+// the SSE stream as progress events with `warning=true`. Regression
+// test for issue #84 — clone failures used to be journald-only.
+//
+// Post-§15 1b note: Phase boundaries are intentionally NOT sent over
+// the SSE wire (they are server-side PhaseTimer events only). The
+// warning message reaches the client as a status-only event with
+// `"phase":""`. The CLI renders the message regardless (see
+// `cmd/shed/shed.go`'s SSE loop, which only consumes `Message` +
+// `Warning`).
 func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 	be := &createShedFakeBackend{
 		createFn: func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error) {
-			backend.Progress(ctx, "repo", "Cloning repository...")
+			backend.Phase(ctx, "repo")
+			backend.Status(ctx, "Cloning repository...")
 			// Match the production sanitized message from vz/firecracker
 			// client.go — no URL, no wrapped err.
-			backend.ProgressWarning(ctx, "repo", "Failed to clone repository (see server logs for details)")
+			backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 			return &config.Shed{Name: req.Name, Status: config.StatusRunning, Repo: req.Repo}, nil
 		},
 	}
@@ -319,14 +327,13 @@ func TestCreateShed_SSE_SurfacesProgressAndWarning(t *testing.T) {
 
 	events := parseSSEEvents(t, w.Body.String())
 
-	// Find the warning event and assert its payload carries warning=true.
+	// Find the warning event and assert its payload carries warning=true
+	// AND the user-visible message. Per §15 1b, phase is no longer
+	// included on status-only events.
 	var sawWarning, sawComplete bool
 	for _, e := range events {
 		if e.Event == "progress" && strings.Contains(e.Data, `"warning":true`) {
 			sawWarning = true
-			if !strings.Contains(e.Data, `"phase":"repo"`) {
-				t.Errorf("warning event missing repo phase: %s", e.Data)
-			}
 			if !strings.Contains(e.Data, "Failed to clone repository") {
 				t.Errorf("warning event missing failure message: %s", e.Data)
 			}

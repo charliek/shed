@@ -30,7 +30,8 @@ func (c *Client) EnsureImage(ctx context.Context, resolved config.ResolvedImage)
 		Name:      resolved.Name,
 		Digest:    resolved.Digest,
 	}, func(stage, msg string) {
-		backend.Progress(ctx, stage, msg)
+		backend.Phase(ctx, stage)
+		backend.Status(ctx, msg)
 	})
 	if err != nil {
 		return "", "", err
@@ -73,7 +74,8 @@ func (c *Client) TagImage(srcTagOrDigest, newTag string) error {
 func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error) {
 	mgr := vmimage.NewManager(c.cfg, c.refScanner())
 	return mgr.PullImage(ctx, dockerRef, tag, platform, func(stage, msg string) {
-		backend.Progress(ctx, stage, msg)
+		backend.Phase(ctx, stage)
+		backend.Status(ctx, msg)
 	})
 }
 
@@ -83,7 +85,8 @@ func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string)
 func (c *Client) PushImage(ctx context.Context, tagOrDigest, dstRef string) error {
 	mgr := vmimage.NewManager(c.cfg, c.refScanner())
 	return mapSentinelErrors(mgr.PushImage(ctx, tagOrDigest, dstRef, func(stage, msg string) {
-		backend.Progress(ctx, stage, msg)
+		backend.Phase(ctx, stage)
+		backend.Status(ctx, msg)
 	}))
 }
 

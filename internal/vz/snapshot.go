@@ -173,8 +173,8 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	}
 
 	if srcMeta.LocalDir != "" {
-		backend.ProgressWarning(ctx, "snapshot",
-			fmt.Sprintf("source shed uses --local-dir; workspace contents at %s are NOT included in the snapshot", srcMeta.LocalDir))
+		backend.Phase(ctx, "snapshot")
+		backend.StatusWarning(ctx, fmt.Sprintf("source shed uses --local-dir; workspace contents at %s are NOT included in the snapshot", srcMeta.LocalDir))
 	}
 
 	dir := SnapshotDir(c.cfg.SnapshotsDir, req.Name)
@@ -211,7 +211,8 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	if src == "" {
 		src = srcMeta.RootfsPath
 	}
-	backend.Progress(ctx, "snapshot", "Copying upper layer to snapshot...")
+	backend.Phase(ctx, "snapshot")
+	backend.Status(ctx, "Copying upper layer to snapshot...")
 	strategy, err := clone.CloneFile(src, dstRootfs)
 	if err != nil {
 		os.RemoveAll(dir)
@@ -261,7 +262,8 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		LowerDigest:    srcMeta.LowerDigest,
 	}
 
-	backend.Progress(ctx, "snapshot", "Writing snapshot metadata...")
+	backend.Phase(ctx, "snapshot")
+	backend.Status(ctx, "Writing snapshot metadata...")
 	if err := saveSnapshot(c.cfg.SnapshotsDir, snap); err != nil {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("failed to save snapshot metadata: %w", err)

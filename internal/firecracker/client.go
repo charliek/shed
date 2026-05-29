@@ -478,7 +478,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			resolved = c.cfg.ResolveBaseRootfs()
 		}
 
-		backend.Progress(ctx, "image", "Resolving image...")
+		backend.Phase(ctx, "image")
+		backend.Status(ctx, "Resolving image...")
 		mgr := vmimage.NewManager(c.cfg, c.refScanner())
 		ensureRes, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 			Path:      resolved.Path,
@@ -486,7 +487,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 			Name:      resolved.Name,
 			Digest:    resolved.Digest,
 		}, func(stage, msg string) {
-			backend.Progress(ctx, stage, msg)
+			backend.Phase(ctx, stage)
+			backend.Status(ctx, msg)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure image: %w", err)
@@ -514,7 +516,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		defer removeCreatingMarker(c.cfg.InstanceDir, req.Name)
 	}
 
-	backend.Progress(ctx, "network", "Allocating network resources...")
+	backend.Phase(ctx, "network")
+	backend.Status(ctx, "Allocating network resources...")
 	cid, err := c.AllocateCID(req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate CID: %w", err)
@@ -531,7 +534,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to create TAP device: %w", err)
 	}
 
-	backend.Progress(ctx, "rootfs", "Allocating writable upper layer...")
+	backend.Phase(ctx, "rootfs")
+	backend.Status(ctx, "Allocating writable upper layer...")
 	upperPath, err := EnsureUpper(c.cfg.UppersDir, req.Name, upperSizeBytes)
 	if err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
@@ -644,7 +648,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	backend.Progress(ctx, "vm", "Starting virtual machine...")
+	backend.Phase(ctx, "vm")
+	backend.Status(ctx, "Starting virtual machine...")
 	if err := vm.Start(ctx); err != nil {
 		if delErr := c.netMgr.DeleteTAPDevice(tapDevice); delErr != nil {
 			log.Printf("Warning: failed to delete TAP device %s: %v", tapDevice, delErr)
@@ -685,7 +690,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 
 	// Mount local directory via 9P if specified
 	if req.LocalDir != "" {
-		backend.Progress(ctx, "9p", "Mounting local directory via 9P...")
+		backend.Phase(ctx, "9p")
+		backend.Status(ctx, "Mounting local directory via 9P...")
 		bridgeIP := c.netMgr.Gateway()
 		srv, err := c.startP9Server(req.Name, bridgeIP, req.LocalDir, config.WorkspacePath, false)
 		if err != nil {
@@ -728,7 +734,8 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	{
 		dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
 		if len(dirCreds) > 0 {
-			backend.Progress(ctx, "credentials", "Setting up credentials...")
+			backend.Phase(ctx, "credentials")
+			backend.Status(ctx, "Setting up credentials...")
 		}
 		c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, c.mount9PCredentialFunc(req.Name))
 	}
@@ -736,16 +743,22 @@ func (c *Client) CreateShed(ctx context.Context, req config.CreateShedRequest) (
 	// Clone repo if specified (skip when using local dir or spawning from snapshot;
 	// snapshot rootfs is already provisioned).
 	if req.Repo != "" && req.LocalDir == "" && req.FromSnapshot == "" {
-		backend.Progress(ctx, "repo", "Cloning repository...")
+		backend.Phase(ctx, "repo")
+		backend.Status(ctx, "Cloning repository...")
 		if err := vmutil.CloneRepo(ctx, agent, c.serverCfg, req.Repo); err != nil {
 			log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 			// Generic SSE message by design: req.Repo can carry credentials
 			// (e.g., https://user:pw@host/...) and the wrapped err from
 			// git/ssh may include the URL too. Full detail is in the server
 			// log above; SSE consumers get a stable, sanitized signal.
-			backend.ProgressWarning(ctx, "repo", "Failed to clone repository (see server logs for details)")
+			//
+			// Deliberately no `backend.Phase(ctx, "repo")` here: see
+			// the matching note in `internal/vz/client.go`. Re-entering
+			// "repo" just to attach a status would split the timer line
+			// into the `repo=N clone=M repo=K` triple shape.
+			backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 		} else {
-			backend.Progress(ctx, "repo", "Repository cloned")
+			backend.Status(ctx, "Repository cloned")
 		}
 	}
 

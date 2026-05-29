@@ -110,7 +110,8 @@ const healthPollInterval = 50 * time.Millisecond
 
 // WaitForHealth waits until the agent is healthy or the context is cancelled.
 func (c *AgentClient) WaitForHealth(ctx context.Context, timeout time.Duration) error {
-	backend.Progress(ctx, "agent", "Waiting for agent to come up...")
+	backend.Phase(ctx, "agent")
+	backend.Status(ctx, "Waiting for agent to come up...")
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

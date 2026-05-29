@@ -89,19 +89,22 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 		}
 		if !installRan {
 			fmt.Fprintln(p.output, "Running install hook...")
-			backend.Progress(ctx, "provision", "Running install hook...")
+			backend.Phase(ctx, "provision")
+			backend.Status(ctx, "Running install hook...")
 			if err := p.runHook(ctx, cfg, provision.HookTypeInstall, cfg.Hooks.Install); err != nil {
 				if hookErr, ok := err.(*provision.HookError); ok {
 					fmt.Fprintf(p.errOut, "Install hook failed (exit code %d)\n", hookErr.ExitCode)
 					fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
 					fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
-					backend.ProgressWarning(ctx, "provision", fmt.Sprintf("Install hook failed (exit code %d)", hookErr.ExitCode))
+					backend.Phase(ctx, "provision")
+					backend.StatusWarning(ctx, fmt.Sprintf("Install hook failed (exit code %d)", hookErr.ExitCode))
 					_ = state.MarkInstallFailed(ctx, err)
 				}
 				return err
 			}
 			fmt.Fprintln(p.output, "Install hook complete")
-			backend.Progress(ctx, "provision", "Install hook complete")
+			backend.Phase(ctx, "provision")
+			backend.Status(ctx, "Install hook complete")
 			_ = state.MarkInstallComplete(ctx)
 		}
 	}
@@ -109,18 +112,21 @@ func (p *Provisioner) RunProvisioning(ctx context.Context, cfg *provision.Config
 	// Run startup hook
 	if cfg.HasStartupHook() {
 		fmt.Fprintln(p.output, "Running startup hook...")
-		backend.Progress(ctx, "provision", "Running startup hook...")
+		backend.Phase(ctx, "provision")
+		backend.Status(ctx, "Running startup hook...")
 		if err := p.runHook(ctx, cfg, provision.HookTypeStartup, cfg.Hooks.Startup); err != nil {
 			if hookErr, ok := err.(*provision.HookError); ok {
 				fmt.Fprintf(p.errOut, "Startup hook failed (exit code %d)\n", hookErr.ExitCode)
 				fmt.Fprintf(p.errOut, "  Last output: %s\n", hookErr.LastOutput)
 				fmt.Fprintf(p.errOut, "  Full log: %s\n", hookErr.LogFile)
-				backend.ProgressWarning(ctx, "provision", fmt.Sprintf("Startup hook failed (exit code %d)", hookErr.ExitCode))
+				backend.Phase(ctx, "provision")
+				backend.StatusWarning(ctx, fmt.Sprintf("Startup hook failed (exit code %d)", hookErr.ExitCode))
 			}
 			return err
 		}
 		fmt.Fprintln(p.output, "Startup hook complete")
-		backend.Progress(ctx, "provision", "Startup hook complete")
+		backend.Phase(ctx, "provision")
+		backend.Status(ctx, "Startup hook complete")
 	}
 
 	return nil

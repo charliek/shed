@@ -48,15 +48,24 @@ func NewPhaseTimer(op string, now func() time.Time) *PhaseTimer {
 	return t
 }
 
-// Track is a ProgressFunc. Each event ends the current phase (recording
-// its duration) and begins the phase it names. The interval before the
-// first event is recorded as "setup". Safe for concurrent use.
+// Track is a ProgressFunc. Each phase-bearing event ends the current
+// phase (recording its duration) and begins the phase it names. The
+// interval before the first event is recorded as "setup". Safe for
+// concurrent use.
+//
+// Status-only events (those with an empty `Phase` field, emitted by
+// backend.Status / backend.StatusWarning) are ignored here — they are
+// user-visible SSE messages that should NOT split a phase span. Same-
+// phase events (Phase == current) are also no-ops, so a `Phase(ctx,
+// "snapshot")` repeated mid-snapshot keeps accumulating into one span
+// rather than producing zero-length micro-spans.
 func (t *PhaseTimer) Track(e ProgressEvent) {
+	if e.Phase == "" {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if e.Phase == t.current {
-		// Same phase emitting another message — keep accumulating into
-		// the current span rather than splitting it.
 		return
 	}
 	n := t.now()

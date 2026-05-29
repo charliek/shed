@@ -180,6 +180,13 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 	timer := s.createTimer(req)
 	events := make(chan backend.ProgressEvent, 16)
 	sseFn := func(event backend.ProgressEvent) {
+		// Phase-only events (Message == "") are server-side timer
+		// boundaries; they should not appear as user-visible SSE
+		// progress lines. The PhaseTimer (via TeeProgress) still
+		// receives them through `timer.Track`.
+		if event.Message == "" {
+			return
+		}
 		select {
 		case events <- event:
 		default:
