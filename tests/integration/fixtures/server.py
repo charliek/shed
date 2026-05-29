@@ -40,18 +40,30 @@ TIMING_LOOKUP_BUDGET_S = 15.0
 TIMING_LOOKUP_INTERVAL_S = 0.2
 
 
-# Default per-backend ceilings for timing assertions. Generous enough to
-# tolerate noise on a moderately-loaded host; tight enough to catch a
-# >200 ms regression on a healthy run. Anchored on #126's measured
-# medians (VZ ~1.5 s, FC ~1.8 s post-firstboot-reorder).
+# Default per-backend ceilings for timing assertions. Calibrated to
+# tolerate normal variance on a moderately-loaded host while still
+# flagging a ~300 ms+ regression on a healthy run.
 #
 # Keys are the full backend names as reported by the server's PhaseTimer
 # line (`backend=vz` / `backend=firecracker`), NOT the short pytest-param
 # labels ("vz" / "fc"). Keeping them aligned with the server's own
 # identifier avoids a translation layer at the call site.
+#
+# Calibration data:
+#   - VZ (this mac, post-§15 1a healthPoll cut): median ~1551 ms,
+#     range ~1450-1700. Ceiling 2200 leaves ~500 ms regression budget.
+#   - Firecracker (mini3 v0.5.6 .deb, 19+ day uptime, 2026-05-29):
+#     median ~2405 ms agent phase, range ~1955-3005 across 5 isolated
+#     samples. Higher than #126's apples-to-apples measurement
+#     (median 1804 ms on a fresh dev binary in May 2026) — production
+#     variance is wider than a single benchmarking session showed.
+#     Ceiling 2900 ms accommodates today's p50 + headroom for normal
+#     load drift without crying wolf, while still catching a 500ms+
+#     regression. Tighten when Phase 1's healthPoll cut ships to FC
+#     users (the next release will bring agent_p50 down on FC too).
 DEFAULT_AGENT_P50_MS = {
     "vz": 2200,
-    "firecracker": 2100,
+    "firecracker": 2900,
 }
 
 
