@@ -384,7 +384,7 @@ func (b *fcCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequ
 	// In practice, the 9P server is per-shed and lives until shed
 	// deletion, so we don't register a cleanup here; the wider shed
 	// cleanup (StopShed/DeleteShed) calls stopP9Servers.
-	if err := b.c.mount9PInGuest(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
+	if err := b.c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
 		// On mount failure we need to stop the just-started 9P
 		// server explicitly, since we couldn't register a cleanup.
 		b.c.stopP9Servers(req.Name)

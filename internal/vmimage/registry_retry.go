@@ -15,12 +15,13 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+
+	"github.com/charliek/shed/internal/retry"
 )
 
 // retryAttempts and retryBackoffs configure the retry envelope.
@@ -35,30 +36,12 @@ import (
 // etc.).
 var retryBackoffs = []time.Duration{1 * time.Second, 4 * time.Second}
 
-// withRetry calls fn, and on transient failure waits + retries
-// according to retryBackoffs. opName is included in the log line
-// emitted on each retry so the user can see which fetch is
-// stuttering. Returns the last attempt's error verbatim — no
-// wrapping that would hide retry semantics from a caller that
-// pattern-matches on the original error.
+// withRetry is a registry-flavoured wrapper around retry.Do: same
+// loop and cancellation contract, paired with the HTTP/network
+// classifier below. Mount-side callers in the VZ/FC clients use
+// retry.Do directly with the permissive default classifier.
 func withRetry(ctx context.Context, opName string, fn func() error) error {
-	err := fn()
-	if err == nil || !isRetryablePullErr(err) {
-		return err
-	}
-	for i, backoff := range retryBackoffs {
-		log.Printf("retrying %s after transient error (attempt %d/%d in %v): %v", opName, i+2, len(retryBackoffs)+1, backoff, err)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-		err = fn()
-		if err == nil || !isRetryablePullErr(err) {
-			return err
-		}
-	}
-	return err
+	return retry.Do(ctx, opName, retryBackoffs, isRetryablePullErr, fn)
 }
 
 // isRetryablePullErr returns true for the error shapes a brief
