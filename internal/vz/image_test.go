@@ -165,6 +165,16 @@ func TestPruneImagesRespectsRefs(t *testing.T) {
 	danglingDigest := createFakeImage(t, imagesDir, "dangling")
 	createFakeInstance(t, client.cfg.InstanceDir, "live-shed", "pinned", pinnedDigest)
 
+	// As of v0.5.8 tags themselves are protective (see
+	// vmimage.RefKindTag's doc). Drop the dangling tag so the
+	// "no shed pin → prune candidate" arm of this test still
+	// exercises the unreferenced-blob path; the pinned tag is
+	// fine to leave in place — its manifest is protected by the
+	// shed ref anyway, so the test's expectations don't shift.
+	if err := vmimage.DeleteTag(imagesDir, "dangling"); err != nil {
+		t.Fatalf("DeleteTag(dangling): %v", err)
+	}
+
 	// Dry-run reports the dangling manifest (and its config/layer); the
 	// pinned manifest and its chain are protected.
 	cands, err := client.PruneImages(true)

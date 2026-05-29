@@ -10,8 +10,16 @@ const (
 	// RefKindSnapshot indicates a reference held by a snapshot.
 	RefKindSnapshot RefKind = "snapshot"
 
-	// RefKindTag indicates a reference held by a tag. Tags are
-	// informational and DO NOT protect a digest from prune (Docker model).
+	// RefKindTag indicates a reference held by a tag. Tags ARE
+	// protective from prune (changed in v0.5.8 — pre-v0.5.8 the prune
+	// walker followed Docker's "tags don't protect" model, which made
+	// `shed image pull X && shed image prune` delete the manifest
+	// blob just pulled if no shed pinned it yet, leaving operators
+	// with a tag pointing at a missing blob or, worse, silently
+	// reverting to a stale locally-cached manifest). To delete a
+	// blob a tag points at, the workflow is `shed image rm <tag>`
+	// followed by `shed image prune`. See
+	// docs/upgrades/v0.5.7-to-v0.5.8.md.
 	RefKindTag RefKind = "tag"
 
 	// RefKindPending indicates a reference held by an in-flight
@@ -66,16 +74,18 @@ type RefScanner interface {
 }
 
 // ProtectiveRefs reports whether a digest has any protective
-// reference — Shed, Snapshot, or Pending (in-flight create).
+// reference — Shed, Snapshot, Pending (in-flight create), or Tag.
 //
-// Tag references are NOT protective and are excluded from this check.
+// As of v0.5.8 tag references are protective: see RefKindTag's doc
+// for the rationale. RefScanner implementations still don't emit
+// tag refs (tags live in the central store the Manager owns, not in
+// per-backend metadata), so the Manager merges them into the ref
+// list at the caller sites that need protection (notably
+// PruneImages).
 func ProtectiveRefs(refs []Reference, digest string) []Reference {
 	var out []Reference
 	for _, r := range refs {
 		if r.Digest != digest {
-			continue
-		}
-		if r.Kind == RefKindTag {
 			continue
 		}
 		out = append(out, r)

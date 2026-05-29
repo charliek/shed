@@ -690,13 +690,36 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 	}
 
 	// Live manifest digests come from: every protective ref (shed,
-	// snapshot, pending-create). Tags do NOT keep manifests alive.
+	// snapshot, pending-create) PLUS every tag. RefScanner
+	// implementations don't emit tag refs (tags live in the central
+	// store the Manager owns, not in per-backend metadata), so we
+	// walk them here and merge. Pre-v0.5.8 tags were treated as
+	// informational and prune deleted blobs they pointed at; the
+	// `shed image pull X && shed image prune` workflow then deleted
+	// the manifest just pulled. See refs.go RefKindTag and
+	// docs/upgrades/v0.5.7-to-v0.5.8.md.
 	liveManifests := make(map[string]bool)
 	for _, r := range refs {
-		if r.Kind == RefKindTag {
+		liveManifests[r.Digest] = true
+	}
+	tagNames, err := ListTags(imagesDir)
+	if err != nil {
+		return nil, fmt.Errorf("listing tags for prune protection: %w", err)
+	}
+	for _, name := range tagNames {
+		t, err := GetTag(imagesDir, name)
+		if err != nil {
+			log.Printf("Warning: skipping tag %q for prune protection: %v", name, err)
 			continue
 		}
-		liveManifests[r.Digest] = true
+		if !BlobExists(imagesDir, t.Digest) {
+			// Stale tag — manifest blob is already gone. Nothing to
+			// protect; leave it out of liveManifests so the prune
+			// reachability walk doesn't trip on the missing blob.
+			log.Printf("Warning: tag %q points at missing manifest %s; tag is stale", name, t.Digest)
+			continue
+		}
+		liveManifests[t.Digest] = true
 	}
 
 	// Expand to a full reachable-set: configs, layers, kernel, initrd

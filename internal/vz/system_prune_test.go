@@ -397,6 +397,18 @@ func TestPrune_InstancesBeforeImages_ReleasesImageRef(t *testing.T) {
 	digest := createFakeImage(t, imagesDir, "tobereclaimed")
 	seedStoppedShedWithDigest(t, instanceDir, "old-shed", "tobereclaimed", digest, 4096, 0, 5*24*time.Hour)
 
+	// As of v0.5.8 tags themselves are protective, so without
+	// dropping the tag the image-prune phase would keep the blob
+	// alive after the shed ref releases (the documented cleanup
+	// flow is `shed image rm` then `shed image prune`). This test
+	// is about the ordering — instance prune phase must run BEFORE
+	// the image prune phase so the released shed ref is visible —
+	// not about the tag-protection rule, so drop the tag up-front
+	// to isolate the ordering behavior.
+	if err := vmimage.DeleteTag(imagesDir, "tobereclaimed"); err != nil {
+		t.Fatalf("DeleteTag(tobereclaimed): %v", err)
+	}
+
 	report, err := c.Prune(context.Background(), backend.PruneOptions{
 		Images:    true,
 		Instances: true,
@@ -418,10 +430,12 @@ func TestPrune_InstancesBeforeImages_ReleasesImageRef(t *testing.T) {
 	if !contains(shedsDeleted, "old-shed") {
 		t.Errorf("expected old-shed deleted, got %v", shedsDeleted)
 	}
-	if !contains(imagesDeleted, "tobereclaimed") {
-		t.Errorf("expected tobereclaimed image deleted after shed ref released, got %v", imagesDeleted)
+	if len(imagesDeleted) == 0 {
+		t.Errorf("expected at least one image deleted after shed ref released, got %v", imagesDeleted)
 	}
-	// The blob should actually be gone.
+	// The blob should actually be gone. With the untagged
+	// pre-condition above this means the image prune phase saw the
+	// released shed ref and walked the now-orphaned digest.
 	if vmimage.BlobExists(imagesDir, digest) {
 		t.Errorf("blob still present after prune")
 	}
