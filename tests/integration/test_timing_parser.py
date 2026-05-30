@@ -98,6 +98,23 @@ def test_agent_ms_convenience_property():
     assert t["agent"] == 7
 
 
+def test_rootfs_ms_convenience_property():
+    """`rootfs_ms` mirrors `agent_ms`: returns the phase value if
+    present, else None. The split timing gate's
+    `test_create_rootfs_template_present` uses it to discriminate the
+    template-clone fast path (sub-100 ms) from the in-guest mkfs
+    fallback (multi-second)."""
+    with_rootfs = "timing: create name=x backend=vz total=10ms rootfs=7ms err=<nil>"
+    t = parse_timing_line(with_rootfs)
+    assert t is not None
+    assert t.rootfs_ms == 7
+
+    without_rootfs = "timing: create name=x backend=vz total=10ms agent=7ms err=<nil>"
+    t2 = parse_timing_line(without_rootfs)
+    assert t2 is not None
+    assert t2.rootfs_ms is None
+
+
 def test_duplicate_phase_keys_are_summed():
     """Duplicate phase keys on the same line SUM, matching the physical
     semantic ("total time spent in this phase"). See timing.py docstring

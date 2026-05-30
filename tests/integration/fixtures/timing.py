@@ -48,6 +48,18 @@ class PhaseTimings:
     def agent_ms(self) -> Optional[int]:
         return self.phases.get("agent")
 
+    @property
+    def rootfs_ms(self) -> Optional[int]:
+        """The `rootfs` phase duration, used by
+        `test_create_rootfs_template_present` as the fast-path /
+        slow-path discriminator (sub-100 ms = pre-formatted template
+        clone; multi-second = in-guest mkfs.ext4 fallback).
+
+        See `docs/discovery/integration-suite-server-coverage.md` §7
+        "Locked invariants" for why this phase diverges between dev and
+        release builds."""
+        return self.phases.get("rootfs")
+
     def __getitem__(self, key: str) -> int:
         return self.phases[key]
 

@@ -47,8 +47,9 @@ tests they would have run, not the whole session.
   the PhaseTimer log-line fetch in tests 2 and 4. Without it, those two
   tests skip cleanly with a clear reason.
 - The remote shed-server must be **v0.5.4 or newer** for any
-  PhaseTimer-dependent assertion (`test_phase_timer_emitted` and
-  `test_plain_create_timing`). Older servers skip those tests.
+  PhaseTimer-dependent assertion (`test_phase_timer_emitted`,
+  `test_create_agent_p50`, `test_create_rootfs_template_present`).
+  Older servers skip those tests.
 
 ## Environment overrides
 
@@ -76,13 +77,39 @@ tests/integration/
 
 ## The MVP five tests
 
-| Test                              | What it asserts                                                    |
-|-----------------------------------|--------------------------------------------------------------------|
-| `test_create_delete_lifecycle`    | `shed create` succeeds; teardown deletes it cleanly.               |
-| `test_phase_timer_emitted`        | Server log contains a `timing: create` line with the expected keys.|
-| `test_repo_clone_https`           | `--repo <https url>` + `git log` round-trip in the guest works.    |
-| `test_plain_create_timing`        | `agent` phase p50 (5 samples) stays under a per-backend ceiling.   |
-| `test_shed_exec_smoke`            | `shed exec name -- echo hello` returns `hello`.                    |
+| Test                                  | What it asserts                                                    |
+|---------------------------------------|--------------------------------------------------------------------|
+| `test_create_delete_lifecycle`        | `shed create` succeeds; teardown deletes it cleanly.               |
+| `test_phase_timer_emitted`            | Server log contains a `timing: create` line with the expected keys.|
+| `test_repo_clone_https`               | `--repo <https url>` + `git log` round-trip in the guest works.    |
+| `test_create_agent_p50`               | `agent` phase p50 (5 samples) stays under a per-backend ceiling. Skips when the VZ upper-template fast path was unavailable (in-guest mkfs cost inflates `agent_ms` by ~4 s). |
+| `test_create_rootfs_template_present` | VZ-only: the host-side upper-template fast path is active. Skips on FC (no template path) and on VZ dev mode (where the fast path is unavailable by design). |
+| `test_shed_exec_smoke`                | `shed exec name -- echo hello` returns `hello`.                    |
+
+### The split timing gate
+
+`test_create_agent_p50` and `test_create_rootfs_template_present`
+replaced the single `test_plain_create_timing` gate. Both use the
+server log line `[<shed-name>] upper template unavailable (...);
+formatting in guest` (emitted from `internal/vz/orchestrator.go:249`
+when the VZ host-side template clone is unavailable) as their
+"dev-mode active" discriminator, exposed as
+`ShedHandle.template_fallback`:
+
+- `test_create_agent_p50` skips when the fallback was seen on any
+  sample — the in-guest `mkfs.ext4` lands inside the agent phase and
+  inflates `agent_p50` by ~4 s on VZ, which would fire the gate for
+  a structural reason that's not a real regression.
+- `test_create_rootfs_template_present` skips on FC entirely (no
+  host-side template path; FC always uses in-guest mkfs and its
+  agent ceiling already accommodates that cost — see
+  `internal/firecracker/orchestrator.go:AllocateUpper`) and on VZ
+  dev mode. On VZ release mode it asserts `rootfs_ms ≤ 100 ms` as a
+  sanity check that the host-side clone actually happened fast.
+
+This lets the suite run against either binary kind on either backend
+without false-positive timing failures. Background:
+`docs/discovery/integration-suite-server-coverage.md` §7.
 
 ## Per-backend timing ceilings
 
