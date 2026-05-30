@@ -80,9 +80,11 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
    ```bash
    # Pick the arch matching the host (uname -m): x86_64 → amd64, aarch64 → arm64.
    ARCH=$(dpkg --print-architecture)
-   VERSION=<latest>  # e.g. 0.5.8
+   # Fetch the latest release tag from GitHub (strips the leading `v`).
+   VERSION=$(curl -fsSL https://api.github.com/repos/charliek/shed/releases/latest \
+     | grep -m1 '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/')
    curl -L -o /tmp/shed-server.deb \
-     https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_${ARCH}.deb
+     "https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_${ARCH}.deb"
    sudo dpkg -i /tmp/shed-server.deb
    sudo systemctl restart shed-server
    systemctl is-active shed-server     # active

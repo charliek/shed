@@ -116,7 +116,7 @@ result is that **validating a server-side PR locally currently
 requires the developer to:**
 
 - Build the binary
-- Codesign it adhoc (`codesign -s -`)  — macOS will SIGKILL an
+- Codesign it ad-hoc (`codesign -s -`)  — macOS will SIGKILL an
   unsigned binary on launchd start
 - Chmod the brew Cellar path writable, copy in, chmod read-only
 - `launchctl setenv SHED_BUILD_TOOLS_REF
