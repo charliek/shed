@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent build-firstboot build-tools test test-integration release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent build-firstboot build-tools test test-integration test-integration-local install-local-server restore-brew-server release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -44,6 +44,136 @@ test-integration:
 	  exit 1; \
 	}
 	cd tests/integration && uv sync && uv run pytest -v
+
+# Local dev-binary swap + integration suite + restore (Mac VZ only).
+#
+# Closes the integration-suite-server-coverage gap documented in
+# docs/discovery/integration-suite-server-coverage.md: by default
+# `make test-integration` runs against whichever shed-server binary is
+# currently installed (typically the brew release), so server-side PRs
+# can pass the suite without exercising their own code. These targets
+# swap in the just-built dev binary, run the suite against it, and
+# restore the brew binary regardless of suite outcome.
+#
+# Discovery surfaced during PR-B1 (#153) and formalised in
+# ~/.claude/plans/patient-bridging-heron.md §2. The corresponding FC
+# remote (mini3 via SSH) workflow lives in PR 3's
+# `test-integration-local-fc` target.
+
+# Brew install paths. Resolved dynamically because the Cellar version
+# changes per release; we don't want to hardcode a stale path.
+# All three variables collapse to empty when brew shed isn't installed;
+# the install-local-server recipe checks that before doing anything
+# destructive.
+BREW_SHED_PREFIX := $(shell brew --prefix shed 2>/dev/null)
+BREW_VERSION := $(shell test -n "$(BREW_SHED_PREFIX)" && basename "$$(readlink "$(BREW_SHED_PREFIX)" 2>/dev/null)" 2>/dev/null)
+BREW_SHED_BIN := $(BREW_SHED_PREFIX)/bin/shed-server
+BACKUP_PATH := /tmp/shed-server-v$(BREW_VERSION).bak
+
+# shed-build-tools image ref to inject when the dev binary runs.
+# Dev binaries embed Version="vX.Y.Z-N-gHASH-dirty", which
+# BuildToolsRefForTag returns "" for by design (dev-build isolation —
+# see docs/discovery/integration-suite-server-coverage.md §7). Without
+# the env var the dev binary falls back to in-guest mkfs.ext4 on first
+# boot (~4 s on VZ), which the split timing gate (PR #157) skips
+# cleanly but it's still not the path we want when validating server
+# changes against release-shaped behavior. Override with
+# `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:vX.Y.Z`
+# to pin to a non-latest release.
+RELEASE_BUILD_TOOLS_REF ?= $(shell git tag --list 'v*' --sort=-version:refname | head -1 | sed 's|^|ghcr.io/charliek/shed-build-tools:|')
+
+# Swap the just-built bin/shed-server into the brew Cellar, codesign
+# ad-hoc (launchd SIGKILLs unsigned binaries), set SHED_BUILD_TOOLS_REF
+# in the user's launchd domain, and restart the brew service.
+# Refuses to clobber an existing backup unless FORCE=1, so a developer
+# who runs this twice doesn't lose the original brew binary.
+install-local-server: build
+	@case "$$(uname -s)" in \
+	  Darwin) ;; \
+	  *) echo "ERROR: install-local-server targets the brew-installed shed-server on macOS;"; \
+	     echo "       run this on a Mac. For the FC remote (mini3) workflow see"; \
+	     echo "       'make install-remote-server' (planned for PR 3)."; exit 1 ;; \
+	esac
+	@if [ -z "$(BREW_VERSION)" ]; then \
+	  echo "ERROR: brew shed is not installed (or 'brew --prefix shed' failed)."; \
+	  echo "       Install with 'brew install charliek/shed/shed' and retry."; exit 1; \
+	fi
+	@if [ -f "$(BACKUP_PATH)" ] && [ "$(FORCE)" != "1" ]; then \
+	  echo "ERROR: backup already exists at $(BACKUP_PATH)."; \
+	  echo "       Run 'make restore-brew-server' first, or pass FORCE=1 to overwrite"; \
+	  echo "       (FORCE=1 is destructive — the existing backup is lost)."; exit 1; \
+	fi
+	@cp -f "$(BREW_SHED_BIN)" "$(BACKUP_PATH)"
+	@brew services stop shed
+	@chmod +w "$(BREW_SHED_BIN)"
+	@cp -f bin/shed-server "$(BREW_SHED_BIN)"
+	@# --force lets us re-sign cleanly on subsequent runs without
+	@# tripping codesign's "is already signed" error. macOS launchd
+	@# SIGKILLs unsigned binaries so this step is non-optional.
+	@codesign --force -s - "$(BREW_SHED_BIN)"
+	@chmod -w "$(BREW_SHED_BIN)"
+	@launchctl setenv SHED_BUILD_TOOLS_REF "$(RELEASE_BUILD_TOOLS_REF)"
+	@brew services start shed
+	@echo ""
+	@echo "Dev shed-server installed in brew Cellar at $(BREW_SHED_BIN)."
+	@echo "Build-tools ref: $(RELEASE_BUILD_TOOLS_REF)"
+	@echo "Backup at $(BACKUP_PATH)."
+	@echo "Run 'make restore-brew-server' to revert (or it runs automatically"
+	@echo "at the end of 'make test-integration-local')."
+
+# Reverse of install-local-server: restore the brew binary from the
+# backup, clear the launchctl env var, restart the brew service, and
+# remove the backup file. Idempotent — re-running after a successful
+# restore is a no-op with a clear message.
+restore-brew-server:
+	@case "$$(uname -s)" in \
+	  Darwin) ;; \
+	  *) echo "ERROR: restore-brew-server is macOS-only; see install-local-server."; exit 1 ;; \
+	esac
+	@# Always clear the launchctl env var, even in the no-backup branch:
+	@# install-local-server sets the env var ALONGSIDE creating the
+	@# backup, so a stranded env (manual setenv, partial-failure run, or
+	@# a backup that someone rm'd by hand) is the case where "restore"
+	@# is most likely to be invoked. Skipping the unset there would
+	@# leave the dev binary's behavior wired into the brew binary's
+	@# next start.
+	@launchctl unsetenv SHED_BUILD_TOOLS_REF
+	@# Single shell block so the no-op branch can short-circuit cleanly
+	@# (a separate `@if ... exit 0` line only exits its sub-shell, not
+	@# the recipe — make would continue running the restore steps even
+	@# though there's no backup to restore from).
+	@if [ ! -f "$(BACKUP_PATH)" ]; then \
+	  echo "No backup at $(BACKUP_PATH); nothing to restore (env var cleared anyway). (Idempotent: this is OK.)"; \
+	else \
+	  set -e; \
+	  brew services stop shed; \
+	  chmod +w "$(BREW_SHED_BIN)"; \
+	  cp -f "$(BACKUP_PATH)" "$(BREW_SHED_BIN)"; \
+	  codesign --force -s - "$(BREW_SHED_BIN)"; \
+	  chmod -w "$(BREW_SHED_BIN)"; \
+	  brew services start shed; \
+	  rm -f "$(BACKUP_PATH)"; \
+	  echo "Brew shed-server restored from backup; backup removed."; \
+	fi
+
+# Chain: install dev binary locally, run the integration suite against
+# it, restore the brew binary REGARDLESS of suite outcome. Captures
+# BOTH the suite and the restore exit codes — a restore failure is at
+# least as serious as a suite failure (it strands the host), so the
+# chain target reports non-zero if either step fails.
+test-integration-local: install-local-server
+	@$(MAKE) test-integration; SUITE=$$?; \
+	 $(MAKE) restore-brew-server; RESTORE=$$?; \
+	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
+	   echo "test-integration-local: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect host state"; \
+	   exit $$SUITE; \
+	 elif [ $$SUITE -ne 0 ]; then \
+	   echo "test-integration-local: suite FAILED (exit $$SUITE); restore succeeded"; \
+	   exit $$SUITE; \
+	 elif [ $$RESTORE -ne 0 ]; then \
+	   echo "test-integration-local: suite passed BUT restore FAILED (exit $$RESTORE); inspect host state"; \
+	   exit $$RESTORE; \
+	 fi
 
 # Cross-compile for release
 release:

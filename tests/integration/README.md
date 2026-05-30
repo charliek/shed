@@ -145,6 +145,63 @@ def test_only_on_fc(fc_server, ...):
 (Markers are declared in `pyproject.toml` under
 `[tool.pytest.ini_options].markers` — keep them in sync.)
 
+## Validating server-side changes (VZ local)
+
+By default `make test-integration` runs against whichever `shed-server`
+binary is currently *installed* on the host (typically the brew
+release). A server-side-only PR — orchestrator change, lifecycle
+internals, backend handler refactor — can pass that suite without ever
+exercising its own code, because the installed binary is the OLD one.
+
+`make test-integration-local` closes that gap on the local Mac (VZ):
+
+```sh
+make test-integration-local
+```
+
+That target:
+
+1. `install-local-server` — builds `bin/shed-server`, backs up the
+   brew binary to `/tmp/shed-server-vN.M.K.bak`, swaps the dev
+   binary into the brew Cellar, ad-hoc-codesigns it (launchd
+   SIGKILLs unsigned binaries), sets `SHED_BUILD_TOOLS_REF` to the
+   latest release tag (so the dev binary uses the release-shaped
+   pre-formatted-template fast path instead of the in-guest mkfs
+   fallback — see the split-gate explanation above), and restarts
+   the brew service.
+2. `test-integration` — runs the full suite against the dev binary.
+3. `restore-brew-server` — restores the brew binary from the backup,
+   clears the env var, restarts the brew service, removes the
+   backup. Runs unconditionally (even if the suite fails).
+
+Run `make install-local-server` and `make restore-brew-server`
+standalone if you want to drive the suite manually between the swap
+and restore (e.g. for an ad-hoc `shed create` repro against the dev
+binary). Both are macOS-only and idempotent:
+
+- `install-local-server` refuses to overwrite an existing backup
+  without `FORCE=1` (so a developer who runs it twice doesn't lose
+  the original).
+- `restore-brew-server` is a no-op when no backup exists.
+
+`RELEASE_BUILD_TOOLS_REF` defaults to the latest `git tag` matching
+`v*`. Override to pin to an older release if your source has drifted
+from `main`:
+
+```sh
+RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7 \
+  make install-local-server
+```
+
+The FC remote (mini3 over SSH) sibling — `make
+test-integration-local-fc` — will close the same gap on the
+Firecracker backend. **Planned for a follow-up PR** (not yet in the
+repo); tracked in `docs/discovery/integration-suite-server-coverage.md`
+§5 Option 1b. Until it lands, validate FC server-side changes via the
+manual swap on `$SHED_FC_HOST` (cross-compile +
+`scp` + systemd unit override + restore — see the discovery doc for
+the full sequence).
+
 ## What this suite is *not*
 
 - Not a replacement for the Go unit tests (`make test`) — those run on
