@@ -528,6 +528,27 @@ func (b *vzStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 	return nil
 }
 
+// RestoreStoppedMetadata rewrites the persisted metadata back to
+// Stopped/PID=0 so a post-PersistRunningState failure doesn't leave
+// disk lying. The orchestrator wires this in as a cleanup BEFORE
+// StartVM (so LIFO runs it AFTER "stop VM" has unwound); see
+// orchestrator/start.go for the ordering rationale.
+//
+// Defensive check mirrors StopShed's pre-flip guard at client.go's
+// IsProcessAlive call: if the "stop VM" cleanup couldn't actually
+// kill vfkit (uninterruptible I/O, kernel hang, etc.), refuse to
+// clear the PID — the GetShed lazy-staleness check is a better
+// backstop than the lying-Stopped state a force-clear would write.
+func (b *vzStarter) RestoreStoppedMetadata(metaRaw orchestrator.MetadataHandle) error {
+	meta := metaRaw.(*vzMetaHandle).meta
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isVfkitProcess(meta.PID) {
+		return fmt.Errorf("vfkit still alive (pid %d) after stop-VM cleanup; leaving metadata as-is for GetShed staleness check", meta.PID)
+	}
+	meta.Status = config.StatusStopped
+	meta.PID = 0
+	return meta.Save(b.c.cfg.InstanceDir)
+}
+
 // MountLocalDir re-mounts the workspace VirtioFS share when
 // meta.LocalDir is set. VirtioFS mounts don't persist across vfkit
 // restarts; this is the start-time refresh.

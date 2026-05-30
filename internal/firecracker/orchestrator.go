@@ -556,6 +556,26 @@ func (b *fcStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 	return nil
 }
 
+// RestoreStoppedMetadata rewrites the persisted metadata back to
+// Stopped/PID=0 so a post-PersistRunningState failure doesn't leave
+// disk lying. The orchestrator wires this in as a cleanup BEFORE
+// StartVM (so LIFO runs it AFTER "stop VM" has unwound); see
+// orchestrator/start.go for the ordering rationale.
+//
+// Defensive check mirrors the VZ sibling: if "stop VM" couldn't
+// actually kill firecracker, refuse to clear the PID. GetShed's
+// lazy-staleness is a better backstop than a force-cleared
+// lying-Stopped state.
+func (b *fcStarter) RestoreStoppedMetadata(metaRaw orchestrator.MetadataHandle) error {
+	meta := metaRaw.(*fcMetaHandle).meta
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
+		return fmt.Errorf("firecracker still alive (pid %d) after stop-VM cleanup; leaving metadata as-is for GetShed staleness check", meta.PID)
+	}
+	meta.Status = config.StatusStopped
+	meta.PID = 0
+	return meta.Save(b.c.cfg.InstanceDir)
+}
+
 // MountLocalDir starts the 9P server and mounts it in the guest when
 // meta.LocalDir is set. Mounts don't persist across firecracker
 // restarts; this is the start-time refresh.

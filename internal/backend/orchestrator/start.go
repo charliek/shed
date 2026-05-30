@@ -86,6 +86,23 @@ type BackendStarter interface {
 	// it. Mirrors BackendCreator.FinalizeStartedVM.
 	PersistRunningState(ctx context.Context, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
 
+	// RestoreStoppedMetadata rewrites the persisted metadata back to
+	// status=Stopped, PID=0. The orchestrator wires it into the
+	// cleanup stack BEFORE StartVM (so LIFO runs it LAST, after the
+	// vms-map and "stop VM" cleanups have terminated the VMM) and
+	// gates the call on PersistRunningState having succeeded — there
+	// is nothing to restore otherwise.
+	//
+	// Implementations should refuse to clear the PID when the recorded
+	// process is still alive after the LIFO unwind (i.e. when "stop VM"
+	// failed to actually kill it). Same defensive shape as StopShed's
+	// pre-flip IsProcessAlive guard: returning an error from this hook
+	// leaves the lying-"Running" state on disk for the GetShed
+	// lazy-staleness check to repair, which is safer than the lying-
+	// "Stopped" state that a force-clear would produce. Errors logged
+	// but not propagated.
+	RestoreStoppedMetadata(meta MetadataHandle) error
+
 	// MountLocalDir re-mounts the configured `--local-dir` via the
 	// backend's transport (VirtioFS on VZ, 9P on FC). Mount state
 	// does not persist across VMM restarts, so this runs on every
@@ -134,6 +151,28 @@ func StartShed(ctx context.Context, b BackendStarter, req StartRequest) (*config
 		return nil, err
 	}
 
+	// Register the metadata-restore cleanup BEFORE StartVM so that LIFO
+	// ordering puts it LAST on unwind — after "stop VM" has terminated
+	// the VMM. Restoring disk to Stopped/PID=0 only after the process
+	// is confirmed dead matches StopShed's verify-before-clear pattern
+	// (see e.g. vz/client.go's `IsProcessAlive` guard) and avoids the
+	// CodeRabbit-flagged race where a silent stop-VM failure could leave
+	// disk=Stopped/PID=0 + a still-alive VMM, opening the door to a
+	// double-spawn on the next start.
+	//
+	// The closure is gated on `persistedRunning` so that a failure
+	// BEFORE PersistRunningState succeeds is a no-op — at that point
+	// the metadata never reached Running on disk, so there's nothing
+	// to restore, and clobbering whatever CheckNotRunning left would
+	// be wrong.
+	persistedRunning := false
+	cleanup.Register("restore stopped metadata", func() error {
+		if !persistedRunning {
+			return nil
+		}
+		return b.RestoreStoppedMetadata(meta)
+	})
+
 	backend.Phase(ctx, "vm")
 	backend.Status(ctx, "Starting virtual machine...")
 	vm, err := b.StartVM(ctx, meta, cleanup)
@@ -144,6 +183,7 @@ func StartShed(ctx context.Context, b BackendStarter, req StartRequest) (*config
 	if err := b.PersistRunningState(ctx, meta, vm, cleanup); err != nil {
 		return nil, err
 	}
+	persistedRunning = true
 
 	if err := b.MountLocalDir(ctx, meta, vm); err != nil {
 		return nil, err

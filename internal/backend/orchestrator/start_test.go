@@ -68,6 +68,16 @@ func (b *mockStarter) PersistRunningState(ctx context.Context, meta MetadataHand
 	return nil
 }
 
+// RestoreStoppedMetadata is registered by the orchestrator (not the
+// backend) as a cleanup, so its execution shows up in cleanupsRun via
+// the closure the orchestrator wraps around it — recording the call
+// here is enough to verify the cleanup fired and slot it into the
+// LIFO ordering.
+func (b *mockStarter) RestoreStoppedMetadata(meta MetadataHandle) error {
+	b.cleanupsRun = append(b.cleanupsRun, "restore stopped metadata")
+	return nil
+}
+
 func (b *mockStarter) MountLocalDir(ctx context.Context, meta MetadataHandle, vm VMHandle) error {
 	b.record("MountLocalDir")
 	return b.failAt["MountLocalDir"]
@@ -151,7 +161,14 @@ func TestStartShed_FailureUnwindLIFO(t *testing.T) {
 				"LoadMetadata", "CheckNotRunning", "StartVM", "PersistRunningState",
 				"MountLocalDir",
 			},
-			wantCleanups: []string{"remove from vms map", "stop VM"},
+			// LIFO: registered order is "restore stopped metadata"
+			// (orchestrator, BEFORE StartVM) → "stop VM" (StartVM) →
+			// "remove from vms map" (PersistRunningState); unwind runs
+			// reverse. "Restore stopped metadata" running LAST is the
+			// CodeRabbit-flagged invariant — only rewrite disk after
+			// "stop VM" has actually terminated the VMM, matching
+			// StopShed's verify-before-clear shape.
+			wantCleanups: []string{"remove from vms map", "stop VM", "restore stopped metadata"},
 		},
 	}
 
@@ -171,6 +188,32 @@ func TestStartShed_FailureUnwindLIFO(t *testing.T) {
 			}
 			if !sliceEqual(b.cleanupsRun, tc.wantCleanups) {
 				t.Errorf("cleanup unwind order =\n  %v\nwant (LIFO)\n  %v", b.cleanupsRun, tc.wantCleanups)
+			}
+		})
+	}
+}
+
+// TestStartShed_RestoreStoppedMetadataNotInvokedOnEarlyFail ensures
+// the metadata-restore cleanup never actually invokes
+// RestoreStoppedMetadata when PersistRunningState hasn't succeeded.
+// The orchestrator registers the cleanup early (BEFORE StartVM, so
+// LIFO puts it AFTER "stop VM" — see start.go for the rationale), but
+// the closure is gated on a persistedRunning flag set immediately
+// after PersistRunningState returns. If the metadata never reached
+// Running on disk, rewriting "Stopped" could clobber whatever
+// CheckNotRunning left the in-memory shape as.
+func TestStartShed_RestoreStoppedMetadataNotInvokedOnEarlyFail(t *testing.T) {
+	for _, failAt := range []string{"LoadMetadata", "CheckNotRunning", "StartVM", "PersistRunningState"} {
+		t.Run(failAt, func(t *testing.T) {
+			b := newMockStarter()
+			b.failAt[failAt] = errors.New("injected failure")
+			if _, err := StartShed(context.Background(), b, StartRequest{Name: "x"}); err == nil {
+				t.Fatal("expected error from injected failure")
+			}
+			for _, c := range b.cleanupsRun {
+				if c == "restore stopped metadata" {
+					t.Fatalf("RestoreStoppedMetadata fired on %s failure; cleanups=%v", failAt, b.cleanupsRun)
+				}
 			}
 		})
 	}
