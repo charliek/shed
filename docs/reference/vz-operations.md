@@ -109,7 +109,7 @@ ls ~/.shed/vz/sockets/
 
 VZ uses NAT networking provided by Apple's Virtualization.framework. The guest obtains an IP address via DHCP through `systemd-networkd`.
 
-From the host, `shed` commands communicate with the VM over vsock (Unix sockets), not TCP. The `GetNetworkEndpoint` API returns `127.0.0.1`.
+From the host, `shed` commands communicate with the VM over vsock (Unix sockets), not TCP. `shed list` and the API still report a `127.0.0.1` IP for running VZ sheds (so the field has a sensible value in JSON output), but service traffic itself routes through `DialService`'s vsock TCP-proxy hop rather than that IP.
 
 ## Docker Inside VZ
 
