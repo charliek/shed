@@ -12,6 +12,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -336,13 +337,19 @@ func (b *fcCreator) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHa
 	return fcVMHandle{vm: vm}, nil
 }
 
-// FinalizeStartedVM bumps the metadata's Status, re-saves, and
-// registers the c.vms map entry's removal cleanup.
+// FinalizeStartedVM bumps the metadata's Status, persists the PID,
+// re-saves, and registers the c.vms map entry's removal cleanup.
 func (b *fcCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.MetadataHandle, vmRaw orchestrator.VMHandle, cleanup *backend.Cleanup) error {
 	meta := metaRaw.(*fcMetaHandle).meta
 	vm := vmRaw.(fcVMHandle).vm
 
+	// vm.meta aliases the same *Metadata as meta (CreateVM stores the
+	// pointer), so vm.Start's PID write already lands here. Mirror
+	// the explicit assignment from vzCreator.FinalizeStartedVM and
+	// fcStarter.PersistRunningState — keeps the PID transfer visible
+	// at the persistence boundary if the aliasing ever changes.
 	meta.Status = config.StatusRunning
+	meta.PID = vm.meta.PID
 	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
@@ -448,5 +455,156 @@ func (b *fcCreator) RunProvisioning(ctx context.Context, req config.CreateShedRe
 // ToShedResult returns the *config.Shed value the orchestrator hands
 // back to the per-backend CreateShed wrapper's caller.
 func (b *fcCreator) ToShedResult(metaRaw orchestrator.MetadataHandle) *config.Shed {
+	return metadataToShed(metaRaw.(*fcMetaHandle).meta)
+}
+
+// ---------------------------------------------------------------------------
+// BackendStarter implementation (orchestrator.StartShed lifecycle)
+//
+// fcStarter wraps the same *Client as fcCreator. Same rationale as VZ
+// (see internal/vz/orchestrator.go): the start hooks have different
+// input shapes than the create hooks, and keeping them as separate
+// methods on a separate type avoids forcing every hook to know which
+// mode it's running in.
+// ---------------------------------------------------------------------------
+
+type fcStarter struct{ c *Client }
+
+// LoadMetadata reads the per-shed metadata and wraps the canonical
+// NotFound error with the API-level sentinel.
+func (b *fcStarter) LoadMetadata(_ context.Context, req orchestrator.StartRequest) (orchestrator.MetadataHandle, error) {
+	meta, err := LoadMetadata(b.c.cfg.InstanceDir, req.Name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, req.Name)
+		}
+		return nil, err
+	}
+	return &fcMetaHandle{meta: meta}, nil
+}
+
+// CheckNotRunning enforces the BackendStarter two-sentinel contract.
+// Falls through clearing meta.Status / meta.PID when the recorded
+// state turns out to be stale (status=Running but no live firecracker).
+func (b *fcStarter) CheckNotRunning(_ context.Context, metaRaw orchestrator.MetadataHandle) error {
+	meta := metaRaw.(*fcMetaHandle).meta
+
+	if meta.Status == config.StatusRunning {
+		vm := &VM{meta: meta, cfg: b.c.cfg}
+		if vm.IsRunning() {
+			return fmt.Errorf("%w: %s", config.ErrShedAlreadyRunningSentinel, meta.Name)
+		}
+		meta.Status = config.StatusStopped
+		meta.PID = 0
+	}
+
+	// Defensive zombie-pid check — same shape as VZ. Refuse to
+	// double-spawn even if status reads "stopped" but the recorded
+	// PID is still a live firecracker.
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
+		return fmt.Errorf("%w: %s (pid %d)", config.ErrZombiePresentSentinel, meta.Name, meta.PID)
+	}
+	meta.PID = 0
+
+	return nil
+}
+
+// StartVM constructs and starts the per-shed firecracker VM. Mirrors
+// fcCreator.StartVM but skips RegisterInstance — for StartShed the
+// CID + IP are already registered (loadExistingInstances at server
+// startup re-populates the maps from on-disk metadata).
+func (b *fcStarter) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHandle, cleanup *backend.Cleanup) (orchestrator.VMHandle, error) {
+	meta := metaRaw.(*fcMetaHandle).meta
+
+	vm, err := CreateVM(ctx, meta, b.c.cfg, b.c.netMgr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VM: %w", err)
+	}
+	if err := vm.Start(ctx); err != nil {
+		return nil, fmt.Errorf("failed to start VM: %w", err)
+	}
+	cleanup.Register("stop VM", func() error {
+		return vm.Stop(context.Background())
+	})
+	return fcVMHandle{vm: vm}, nil
+}
+
+// PersistRunningState flips the metadata to Running, persists the PID
+// (see vz/orchestrator.go for why this assignment is kept explicit
+// despite the aliasing through CreateVM), re-saves, and registers the
+// c.vms map removal cleanup.
+func (b *fcStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.MetadataHandle, vmRaw orchestrator.VMHandle, cleanup *backend.Cleanup) error {
+	meta := metaRaw.(*fcMetaHandle).meta
+	vm := vmRaw.(fcVMHandle).vm
+
+	meta.Status = config.StatusRunning
+	meta.PID = vm.meta.PID
+	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
+		return fmt.Errorf("failed to save metadata: %w", err)
+	}
+
+	b.c.mu.Lock()
+	b.c.vms[meta.Name] = vm
+	b.c.mu.Unlock()
+	shedName := meta.Name
+	cleanup.Register("remove from vms map", func() error {
+		b.c.mu.Lock()
+		defer b.c.mu.Unlock()
+		delete(b.c.vms, shedName)
+		return nil
+	})
+	return nil
+}
+
+// MountLocalDir starts the 9P server and mounts it in the guest when
+// meta.LocalDir is set. Mounts don't persist across firecracker
+// restarts; this is the start-time refresh.
+func (b *fcStarter) MountLocalDir(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) error {
+	meta := metaRaw.(*fcMetaHandle).meta
+	if meta.LocalDir == "" {
+		return nil
+	}
+	agent := b.c.newAgentClient(meta.Name)
+	bridgeIP := b.c.netMgr.Gateway()
+	srv, err := b.c.startP9Server(meta.Name, bridgeIP, meta.LocalDir, config.WorkspacePath, false)
+	if err != nil {
+		return fmt.Errorf("failed to start 9P server on start: %w", err)
+	}
+	if err := b.c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
+		b.c.stopP9Servers(meta.Name)
+		return fmt.Errorf("failed to mount 9P in guest on start: %w", err)
+	}
+	return nil
+}
+
+// SetupCredentials re-mounts configured credentials via 9P.
+// Best-effort (the credentials manager itself log-and-continues
+// per credential).
+func (b *fcStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
+	meta := metaRaw.(*fcMetaHandle).meta
+	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
+	agent := b.c.newAgentClient(meta.Name)
+	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name))
+}
+
+// RunStartupHook runs ONLY the `startup` hook from provision.yaml
+// (runInstall=false). Best-effort.
+func (b *fcStarter) RunStartupHook(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
+	meta := metaRaw.(*fcMetaHandle).meta
+	agent := b.c.newAgentClient(meta.Name)
+	provisioner := vmutil.NewProvisioner(agent, meta.Name)
+	provisioner.SetOutput(os.Stdout, os.Stderr)
+	cfg, err := provisioner.LoadConfig(ctx)
+	if err != nil {
+		log.Printf("Warning: failed to load provisioning config: %v", err)
+		return
+	}
+	if err := provisioner.RunProvisioning(ctx, cfg, false); err != nil {
+		log.Printf("Warning: startup hook failed: %v", err)
+	}
+}
+
+// ToShedResult mirrors fcCreator.ToShedResult.
+func (b *fcStarter) ToShedResult(metaRaw orchestrator.MetadataHandle) *config.Shed {
 	return metadataToShed(metaRaw.(*fcMetaHandle).meta)
 }

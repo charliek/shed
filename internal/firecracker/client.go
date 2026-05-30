@@ -568,107 +568,14 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 	return nil
 }
 
-// StartShed starts a stopped shed.
+// StartShed starts a stopped shed via the BackendStarter orchestrator.
+// The per-shed create lock is acquired here (the orchestrator does
+// not own it — same contract as CreateShed). All platform-specific
+// behavior lives in fcStarter; see internal/backend/orchestrator/
+// start.go for the lifecycle contract.
 func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
-
-	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
-	if err != nil {
-		if errors.Is(err, ErrInstanceNotFound) {
-			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
-		}
-		return nil, err
-	}
-
-	if meta.Status == config.StatusRunning {
-		vm := &VM{meta: meta, cfg: c.cfg}
-		if vm.IsRunning() {
-			return nil, fmt.Errorf("%w: %s", config.ErrShedAlreadyRunningSentinel, name)
-		}
-		meta.Status = config.StatusStopped
-		meta.PID = 0
-	}
-
-	// Defensive zombie-pid check. Even when status reads "stopped" we
-	// can still hold a stale pid (server crash between vm.Stop() and
-	// the metadata save, hand-edited metadata.json, etc). Refuse to
-	// spawn a second firecracker under the same name when the recorded
-	// pid is still alive AND still looks like firecracker. Plain
-	// liveness without the binary check would false-positive across
-	// PID reuse.
-	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
-		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrZombiePresentSentinel, name, meta.PID)
-	}
-	meta.PID = 0
-
-	vm, err := CreateVM(ctx, meta, c.cfg, c.netMgr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create VM: %w", err)
-	}
-
-	if err := vm.Start(ctx); err != nil {
-		return nil, fmt.Errorf("failed to start VM: %w", err)
-	}
-
-	meta.Status = config.StatusRunning
-	if err := meta.Save(c.cfg.InstanceDir); err != nil {
-		if stopErr := vm.Stop(context.Background()); stopErr != nil {
-			log.Printf("Warning: failed to stop VM: %v", stopErr)
-		}
-		return nil, fmt.Errorf("failed to save metadata: %w", err)
-	}
-
-	c.mu.Lock()
-	c.vms[name] = vm
-	c.mu.Unlock()
-
-	agent := c.newAgentClient(meta.Name)
-
-	// Remount local directory via 9P if set
-	if meta.LocalDir != "" {
-		bridgeIP := c.netMgr.Gateway()
-		srv, err := c.startP9Server(name, bridgeIP, meta.LocalDir, config.WorkspacePath, false)
-		if err != nil {
-			c.stopP9Servers(name)
-			if stopErr := vm.Stop(context.Background()); stopErr != nil {
-				log.Printf("Warning: failed to stop VM: %v", stopErr)
-			}
-			meta.Status = config.StatusStopped
-			meta.PID = 0
-			_ = meta.Save(c.cfg.InstanceDir)
-			return nil, fmt.Errorf("failed to start 9P server on start: %w", err)
-		}
-		if err := c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
-			c.stopP9Servers(name)
-			if stopErr := vm.Stop(context.Background()); stopErr != nil {
-				log.Printf("Warning: failed to stop VM: %v", stopErr)
-			}
-			meta.Status = config.StatusStopped
-			meta.PID = 0
-			_ = meta.Save(c.cfg.InstanceDir)
-			return nil, fmt.Errorf("failed to mount 9P in guest on start: %w", err)
-		}
-	}
-
-	// Refresh credentials on start: 9P mounts for directories
-	{
-		dirCreds := vmutil.FilterExistingCredentials(c.serverCfg)
-		c.credMgr.SetupCredentials(ctx, agent, name, dirCreds, c.mount9PCredentialFunc(name))
-	}
-
-	// Run startup hook only (not install)
-	provisioner := vmutil.NewProvisioner(agent, name)
-	provisioner.SetOutput(os.Stdout, os.Stderr)
-	cfg, err := provisioner.LoadConfig(ctx)
-	if err != nil {
-		log.Printf("Warning: failed to load provisioning config: %v", err)
-	} else {
-		if err := provisioner.RunProvisioning(ctx, cfg, false); err != nil {
-			log.Printf("Warning: startup hook failed: %v", err)
-		}
-	}
-
-	return metadataToShed(meta), nil
+	return orchestrator.StartShed(ctx, &fcStarter{c: c}, orchestrator.StartRequest{Name: name})
 }
 
 // StopShed stops a running shed.
