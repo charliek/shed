@@ -279,7 +279,7 @@ See [VZ Configuration](../reference/configuration.md#vz-configuration) for all a
 
 The VZ backend launches each VM as a `vfkit` subprocess. Communication with the guest uses vsock over per-port Unix sockets (one socket per port, named `<name>-<port>.sock`). This differs from Firecracker, which uses a single multiplexed socket with a CONNECT/OK handshake.
 
-Networking uses NAT provided by Virtualization.framework. The guest obtains an IP via DHCP through `systemd-networkd`. From the host's perspective, `GetNetworkEndpoint` always returns `127.0.0.1`.
+Networking uses NAT provided by Virtualization.framework. The guest obtains an IP via DHCP through `systemd-networkd`. From the host's perspective, the guest IP isn't routable; service traffic from the host goes through `DialService`'s vsock TCP-proxy hop. `shed list` and the API report `127.0.0.1` as the shed's IP so the field has a sensible value, but no host code dials that address.
 
 The rootfs is a standard ext4 image, same as Firecracker. Each instance gets its own copy.
 

@@ -69,10 +69,6 @@ type Backend interface {
 
 	// Network
 
-	// GetNetworkEndpoint returns the network endpoint (IP or hostname) for a shed.
-	// This is used for API responses and informational purposes.
-	GetNetworkEndpoint(ctx context.Context, shedName string) (string, error)
-
 	// DialService opens a TCP connection to a port inside a running shed's VM.
 	// For VZ: dials via vsock TCP proxy (port 1028) with CONNECT handshake.
 	// For Firecracker: dials the VM's bridge IP directly over TCP.

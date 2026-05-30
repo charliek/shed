@@ -66,9 +66,6 @@ func (f *snapshotFakeBackend) KillSession(_ context.Context, _, _ string) error 
 func (f *snapshotFakeBackend) Exec(_ context.Context, _ string, _ backend.ExecOptions) error {
 	panic("unexpected")
 }
-func (f *snapshotFakeBackend) GetNetworkEndpoint(_ context.Context, _ string) (string, error) {
-	panic("unexpected")
-}
 func (f *snapshotFakeBackend) DialService(_ context.Context, _ string, _ uint16) (net.Conn, error) {
 	panic("unexpected")
 }

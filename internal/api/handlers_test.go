@@ -220,9 +220,6 @@ func (f *createShedFakeBackend) KillSession(_ context.Context, _, _ string) erro
 func (f *createShedFakeBackend) Exec(_ context.Context, _ string, _ backend.ExecOptions) error {
 	panic("unexpected")
 }
-func (f *createShedFakeBackend) GetNetworkEndpoint(_ context.Context, _ string) (string, error) {
-	panic("unexpected")
-}
 func (f *createShedFakeBackend) DialService(_ context.Context, _ string, _ uint16) (net.Conn, error) {
 	panic("unexpected")
 }
