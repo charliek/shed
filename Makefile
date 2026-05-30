@@ -183,15 +183,34 @@ restore-brew-server:
 # least as serious as a suite failure (it strands the host), so the
 # chain target reports non-zero if either step fails.
 # install-local-server is invoked from the recipe body (not as a make
-# prerequisite) so that a partial-failure install — backup created but
-# brew restart fails, codesign hiccup, etc. — still runs the restore
-# step. A make prerequisite would halt the recipe before it reaches
-# the restore block, leaving the host stranded.
+# prerequisite) so a partial-failure install — backup created but
+# brew restart fails, codesign hiccup mid-stream — still runs the
+# restore step. A make prerequisite would halt the recipe before it
+# reaches the restore block, stranding the host.
+#
+# Crucially the auto-restore must ONLY fire when THIS invocation
+# created new state. Bare "is there a backup?" detection would also
+# restore when install bailed at the preflight 'backup already
+# exists' check, silently consuming a backup that belongs to an
+# EARLIER manual install — reverting someone's in-flight dev
+# workflow. Snapshot pre-state, compare post-state, restore only on
+# new mutation.
 test-integration-local:
-	@$(MAKE) install-local-server; INSTALL=$$?; \
+	@HAD_BACKUP=0; HAD_ENV=0; \
+	 [ -f "$(BACKUP_PATH)" ] && HAD_BACKUP=1; \
+	 [ -n "$$(launchctl getenv SHED_BUILD_TOOLS_REF)" ] && HAD_ENV=1; \
+	 $(MAKE) install-local-server; INSTALL=$$?; \
 	 if [ $$INSTALL -ne 0 ]; then \
-	   echo "test-integration-local: install FAILED (exit $$INSTALL); attempting restore for safety"; \
-	   $(MAKE) restore-brew-server; \
+	   HAS_BACKUP=0; HAS_ENV=0; \
+	   [ -f "$(BACKUP_PATH)" ] && HAS_BACKUP=1; \
+	   [ -n "$$(launchctl getenv SHED_BUILD_TOOLS_REF)" ] && HAS_ENV=1; \
+	   if { [ $$HAD_BACKUP -eq 0 ] && [ $$HAS_BACKUP -eq 1 ]; } || \
+	      { [ $$HAD_ENV -eq 0 ] && [ $$HAS_ENV -eq 1 ]; }; then \
+	     echo "test-integration-local: install FAILED (exit $$INSTALL); NEW mutation created during this run; running restore"; \
+	     $(MAKE) restore-brew-server; \
+	   else \
+	     echo "test-integration-local: install FAILED (exit $$INSTALL); no new mutation detected (any pre-existing backup/env belongs to a prior install); leaving brew install alone"; \
+	   fi; \
 	   exit $$INSTALL; \
 	 fi; \
 	 SHED_VZ_SERVER=$(SHED_VZ_SERVER) $(MAKE) test-integration; SUITE=$$?; \
@@ -279,9 +298,9 @@ install-remote-server: build-fc-remote-server
 	@TMP=/tmp/shed-server-dev.$$$$; \
 	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$TMP && \
 	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
+	   trap 'rm -f $$TMP' EXIT; \
 	   if [ -f $(FC_REMOTE_BACKUP) ] && [ '$(FORCE)' != '1' ]; then \
 	     echo 'ERROR: backup already exists at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP); run make restore-remote-server first, or pass FORCE=1'; \
-	     rm -f $$TMP; \
 	     exit 1; \
 	   fi; \
 	   sudo cp $(FC_REMOTE_BIN_PATH) $(FC_REMOTE_BACKUP); \
@@ -290,8 +309,7 @@ install-remote-server: build-fc-remote-server
 	   sudo mkdir -p \$$(dirname $(FC_REMOTE_ENVOVERRIDE)); \
 	   printf '[Service]\nEnvironment=SHED_BUILD_TOOLS_REF=$(RELEASE_BUILD_TOOLS_REF)\n' | sudo tee $(FC_REMOTE_ENVOVERRIDE) > /dev/null; \
 	   sudo systemctl daemon-reload; \
-	   sudo systemctl start shed-server; \
-	   rm -f $$TMP"
+	   sudo systemctl start shed-server"
 	@# systemctl start returns before the service has bound 8080. Poll
 	@# the local `shed -s $(FC_REMOTE_HOST) list` (matches the suite's
 	@# probe) so the chain target's suite invocation doesn't race the
@@ -344,17 +362,29 @@ restore-remote-server:
 # of suite outcome. Same exit-code propagation pattern as
 # test-integration-local: surfaces a restore failure separately
 # rather than silently swallowing it.
-# install-remote-server is invoked from the recipe body (not as a make
-# prerequisite) so that a partial-failure install — backup created but
-# systemctl restart fails, scp succeeds but daemon-reload errors, etc.
-# — still runs the restore step. A make prerequisite would halt the
-# recipe before it reaches the restore block, leaving the remote
-# stranded. Same shape as test-integration-local.
+# Same shape as test-integration-local: install in body (not as a
+# prerequisite) so partial-failure installs reach the restore block,
+# with pre/post snapshot so the auto-restore doesn't consume a
+# pre-existing backup that belongs to a prior manual install.
 test-integration-local-fc:
-	@$(MAKE) install-remote-server; INSTALL=$$?; \
+	@HAD_REMOTE_STATE=0; \
+	 if ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
+	      "test -f $(FC_REMOTE_BACKUP) || test -f $(FC_REMOTE_ENVOVERRIDE)" 2>/dev/null; then \
+	   HAD_REMOTE_STATE=1; \
+	 fi; \
+	 $(MAKE) install-remote-server; INSTALL=$$?; \
 	 if [ $$INSTALL -ne 0 ]; then \
-	   echo "test-integration-local-fc: install FAILED (exit $$INSTALL); attempting restore on $(FC_REMOTE_HOST) for safety"; \
-	   $(MAKE) restore-remote-server; \
+	   HAS_REMOTE_STATE=0; \
+	   if ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
+	        "test -f $(FC_REMOTE_BACKUP) || test -f $(FC_REMOTE_ENVOVERRIDE)" 2>/dev/null; then \
+	     HAS_REMOTE_STATE=1; \
+	   fi; \
+	   if [ $$HAD_REMOTE_STATE -eq 0 ] && [ $$HAS_REMOTE_STATE -eq 1 ]; then \
+	     echo "test-integration-local-fc: install FAILED (exit $$INSTALL); NEW remote mutation on $(FC_REMOTE_HOST); running restore"; \
+	     $(MAKE) restore-remote-server; \
+	   else \
+	     echo "test-integration-local-fc: install FAILED (exit $$INSTALL); no new mutation on $(FC_REMOTE_HOST) (any pre-existing state belongs to a prior install); leaving deb install alone"; \
+	   fi; \
 	   exit $$INSTALL; \
 	 fi; \
 	 SHED_FC_HOST=$(FC_REMOTE_HOST) SHED_FC_SERVER=$(SHED_FC_SERVER) $(MAKE) test-integration; SUITE=$$?; \
