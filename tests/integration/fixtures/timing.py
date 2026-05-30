@@ -46,7 +46,25 @@ class PhaseTimings:
 
     @property
     def agent_ms(self) -> Optional[int]:
+        """The `agent` phase duration. Covers vsock dial + healthPoll
+        + first agent health response, plus any in-guest activity that
+        happens before the agent can respond (e.g. the VZ in-guest
+        `mkfs.ext4` fallback when the host-side template clone is
+        unavailable). `test_create_agent_p50` uses this as its
+        regression gate."""
         return self.phases.get("agent")
+
+    @property
+    def rootfs_ms(self) -> Optional[int]:
+        """The `rootfs` phase duration, used by
+        `test_create_rootfs_template_present` as the fast-path /
+        slow-path discriminator (sub-100 ms = pre-formatted template
+        clone; multi-second = in-guest mkfs.ext4 fallback).
+
+        See `docs/discovery/integration-suite-server-coverage.md` §7
+        "Locked invariants" for why this phase diverges between dev and
+        release builds."""
+        return self.phases.get("rootfs")
 
     def __getitem__(self, key: str) -> int:
         return self.phases[key]

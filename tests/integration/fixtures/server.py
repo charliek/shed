@@ -40,9 +40,27 @@ TIMING_LOOKUP_BUDGET_S = 15.0
 TIMING_LOOKUP_INTERVAL_S = 0.2
 
 
-# Default per-backend ceilings for timing assertions. Calibrated to
-# tolerate normal variance on a moderately-loaded host while still
-# flagging a ~300 ms+ regression on a healthy run.
+# Default per-backend ceilings for the AGENT-phase timing assertion.
+# Calibrated to tolerate normal variance on a moderately-loaded host
+# while still flagging a ~300 ms+ regression on a healthy run.
+#
+# SCOPE: AGENT phase only (vsock dial + healthPoll + first health
+# response). This ceiling is structurally identical between dev and
+# release builds — `make build` and the brew/deb binary share the same
+# agent path. Use `test_create_agent_p50` to gate on regressions here.
+#
+# OUT OF SCOPE: the ROOTFS phase. The upper-allocation path diverges
+# sharply between dev and release builds:
+#   - Release builds: pre-formatted template clone, sub-100 ms.
+#   - Dev builds without SHED_BUILD_TOOLS_REF: in-guest mkfs.ext4, ~4 s.
+# That divergence is intentional — see
+# `internal/version/buildtools.go:BuildToolsRefForTag` returning `""`
+# for non-release version strings. Rootfs is gated by
+# `test_create_rootfs_template_present`, which skips cleanly on dev
+# builds rather than firing as a false-positive against THIS ceiling.
+# The split is what makes it safe to run the integration suite against
+# dev binaries — see `docs/discovery/integration-suite-server-coverage.md`
+# §7 "Locked invariants".
 #
 # Keys are the full backend names as reported by the server's PhaseTimer
 # line (`backend=vz` / `backend=firecracker`), NOT the short pytest-param
@@ -74,10 +92,24 @@ class ShedHandle:
     `timings` is None when the server is too old to emit PhaseTimer lines
     (pre-v0.5.4) or when the log fetch failed. Tests that need timing data
     should check for None and skip with a clear reason.
+
+    `template_fallback` is True if the server logged
+    `[<name>] upper template unavailable ...; formatting in guest` during
+    this create — i.e., the VZ upper-template fast path was inactive and
+    the writable upper was instead created raw, with the in-guest
+    initramfs `mkfs.ext4`'ing it on first boot. This is the canonical
+    "dev binary or `SHED_BUILD_TOOLS_REF` unset" signal and is what
+    `test_create_agent_p50` / `test_create_rootfs_template_present` use
+    to skip cleanly instead of false-positive on the resulting ~4 s
+    cost. FC has no host-side template path; this flag stays False on
+    FC regardless. See `internal/vz/orchestrator.go:249` for the emitter
+    and `docs/discovery/integration-suite-server-coverage.md` §7 for
+    the locked-invariant rationale.
     """
 
     name: str
     timings: Optional[PhaseTimings] = None
+    template_fallback: bool = False
 
 
 class LocalServer:
@@ -171,8 +203,10 @@ class LocalServer:
                 f"shed create failed (exit {r.returncode}) on {self.name}: "
                 f"stdout={r.stdout!r} stderr={r.stderr!r}"
             )
-        timings = self._read_timing(name, offset)
-        return ShedHandle(name=name, timings=timings)
+        timings, template_fallback = self._read_timing(name, offset)
+        return ShedHandle(
+            name=name, timings=timings, template_fallback=template_fallback,
+        )
 
     def exec(
         self,
@@ -394,23 +428,41 @@ class LocalServer:
         self,
         shed_name: str,
         offset: Union[int, str],
-    ) -> Optional[PhaseTimings]:
-        """Find the PhaseTimer line for `shed_name`. Polls briefly because
-        the log line may not have flushed before `shed create` returns.
+    ) -> tuple[Optional[PhaseTimings], bool]:
+        """Find the PhaseTimer line for `shed_name`, plus whether the
+        VZ upper-template fast path fell back to in-guest mkfs.
 
-        Bounded by `TIMING_LOOKUP_BUDGET_S` of wall-clock time, not by
-        an iteration count — that keeps a single slow `_read_log_since`
-        call from blowing past the budget.
+        Returns `(timings, template_fallback)`. `template_fallback` is
+        True if the server emitted the canonical
+        `[<shed_name>] upper template unavailable ...; formatting in
+        guest` line (see `internal/vz/orchestrator.go:249`) during this
+        create. Both signals come from the same log blob so we only
+        pay the journalctl / file-read cost once.
+
+        Polls briefly because the log line may not have flushed before
+        `shed create` returns. Bounded by `TIMING_LOOKUP_BUDGET_S` of
+        wall-clock time, not by an iteration count — that keeps a
+        single slow `_read_log_since` call from blowing past the
+        budget.
         """
         marker = f"name={shed_name} "
+        # Per `internal/vz/orchestrator.go:249` — emitted from the
+        # host-side VZ orchestrator path only. FC has no template
+        # fast path and never emits this line.
+        fallback_marker = f"[{shed_name}] upper template unavailable"
         deadline = time.monotonic() + TIMING_LOOKUP_BUDGET_S
+        # `fallback` is sticky: once we've seen the marker in any blob,
+        # keep it set even if a subsequent re-read window misses it.
+        fallback = False
         while time.monotonic() < deadline:
             blob = self._read_log_since(offset)
+            if fallback_marker in blob:
+                fallback = True
             for line in blob.splitlines():
                 if "timing: create" in line and marker in line:
-                    return parse_timing_line(line)
+                    return parse_timing_line(line), fallback
             time.sleep(TIMING_LOOKUP_INTERVAL_S)
-        return None
+        return None, fallback
 
 
 class RemoteServer(LocalServer):

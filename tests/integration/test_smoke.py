@@ -126,19 +126,68 @@ def test_repo_clone_https(shed_server, test_shed_name):
 
 
 # ---------------------------------------------------------------------------
-# 4. Plain-create timing threshold (the regression gate)
+# 4. Plain-create timing threshold (the regression gate — split)
 # ---------------------------------------------------------------------------
+#
+# Split into two assertions because the per-create boot path has two
+# structurally independent signals that used to share one gate:
+#
+#   - `agent` phase ceiling (`test_create_agent_p50`): vsock dial +
+#     healthPoll + first health response. A genuine regression in
+#     healthPoll, vsock setup, or agent init fires this.
+#   - VZ upper-template fast-path active
+#     (`test_create_rootfs_template_present`): a release-only
+#     invariant — the VZ host-side AllocateUpper clones a
+#     pre-formatted ext4 template instead of writing a raw upper that
+#     the in-guest initramfs has to `mkfs.ext4` on first boot.
+#
+# Empirically the in-guest mkfs cost (~4 s on VZ) lands inside the
+# `agent` phase, NOT the `rootfs` phase — `rootfs_ms` stays sub-100 ms
+# in both modes because that phase only covers host-side allocation,
+# which is fast either way. The original `test_plain_create_timing`
+# couldn't distinguish "dev binary, in-guest mkfs is on the agent
+# critical path" from "genuine agent-phase regression."
+#
+# Discriminator: the server log emits
+# `[<shed-name>] upper template unavailable (...); formatting in guest`
+# from `internal/vz/orchestrator.go:249` whenever the host-side fast
+# path is unavailable (dev build, missing `SHED_BUILD_TOOLS_REF`, or a
+# failed template clone). `ShedHandle.template_fallback` exposes that
+# signal per-create. Both tests use it: `test_create_agent_p50` skips
+# when at least one sample saw the fallback, and
+# `test_create_rootfs_template_present` skips on dev mode and skips
+# on FC entirely (FC has no host-side template fast path —
+# see `internal/firecracker/orchestrator.go:AllocateUpper`).
+#
+# See `docs/discovery/integration-suite-server-coverage.md` §7
+# "Locked invariants" for the dev-build-isolation rationale that makes
+# this divergence intentional.
+
+# Sanity ceiling for the host-side rootfs phase when the fast path is
+# active. Template clone + sibling-swap is ~5-10 ms on a healthy host;
+# 100 ms is generous headroom that would still catch a 10x regression
+# (e.g., a reflink that silently falls back to a full copy).
+ROOTFS_TEMPLATE_FAST_PATH_CEILING_MS = 100
 
 
-def test_plain_create_timing(shed_server):
-    """The `agent` phase p50 (5 samples) stays below the per-backend ceiling.
+def test_create_agent_p50(shed_server):
+    """Boot-path p50 regression gate for the `agent` phase.
 
-    Catches general boot-path regressions across both backends — the
-    dynamic gate that PR-time GHA CI can't be (no /dev/kvm). Names
-    include a per-process hash so a concurrent run against the same
-    server doesn't collide on `itest-perf-{backend}-0`. The suite isn't
-    *designed* for concurrent runs, but failing-closed beats
-    failing-weird.
+    Reads `agent_ms` from PhaseTimer log lines; takes 5 samples
+    (post-warm-up) and asserts the median stays below the per-backend
+    ceiling in `fixtures/server.py:DEFAULT_AGENT_P50_MS`.
+
+    Skips cleanly when ANY sample saw the VZ
+    `template_fallback` signal — on dev binaries the in-guest mkfs.ext4
+    falls inside the agent phase and inflates p50 by ~4 s, which would
+    fire the gate for a structural reason that's NOT a real regression.
+    `test_create_rootfs_template_present` covers the orthogonal "is the
+    fast path active" question; this test focuses on the agent-init
+    path only.
+
+    See `docs/discovery/integration-suite-server-coverage.md` §7
+    "Locked invariants" for why splitting these signals is necessary
+    to make the suite safe to run against dev binaries.
     """
     ceiling = DEFAULT_AGENT_P50_MS[shed_server.backend]
     run_id = hashlib.sha256(
@@ -158,6 +207,7 @@ def test_plain_create_timing(shed_server):
     # store (image pull + erofs conversion) that's irrelevant to
     # boot-time tracking.
     samples: list[int] = []
+    fallback_seen = False
     for i in range(6):  # 1 warm-up + 5 measured
         name = f"itest-perf-{shed_server.backend}-{run_id}-{i}"
         handle = shed_server.create(name, image="base")
@@ -167,6 +217,8 @@ def test_plain_create_timing(shed_server):
                     "PhaseTimer not available; see "
                     "`test_phase_timer_emitted` for the underlying reason."
                 )
+            if handle.template_fallback:
+                fallback_seen = True
             if i > 0:  # skip the warm-up sample
                 samples.append(handle.timings.agent_ms)
         finally:
@@ -175,10 +227,85 @@ def test_plain_create_timing(shed_server):
         # release (vsock CID, TAP device) settles before re-use.
         time.sleep(1)
 
+    if fallback_seen:
+        pytest.skip(
+            f"at least one sample used the VZ in-guest mkfs.ext4 "
+            f"fallback (log marker '[<name>] upper template unavailable' "
+            f"present). agent_p50 is inflated by ~4 s on VZ dev builds "
+            f"because the in-guest mkfs lands inside the agent phase; "
+            f"the gate would fire for a structural reason, not a real "
+            f"regression. Set SHED_BUILD_TOOLS_REF on the shed-server "
+            f"process (e.g. via `launchctl setenv SHED_BUILD_TOOLS_REF "
+            f"ghcr.io/charliek/shed-build-tools:vX.Y.Z` + "
+            f"`brew services restart shed`) or run a release binary "
+            f"to exercise the fast path. samples_collected={samples}"
+        )
+
     p50 = int(statistics.median(samples))
     assert p50 < ceiling, (
         f"agent p50 regressed on {shed_server.backend}: "
         f"{p50}ms >= {ceiling}ms ceiling; samples={samples}"
+    )
+
+
+def test_create_rootfs_template_present(shed_server, test_shed_name):
+    """The VZ upper-template fast-path (pre-formatted template clone) is active.
+
+    Release builds embed a `SHED_BUILD_TOOLS_REF` and the VZ
+    orchestrator's `AllocateUpper` clones a pre-formatted ext4 template
+    on the host — no in-guest mkfs needed. Dev builds (or release
+    builds with the env var unset) fall back to writing a raw upper
+    and letting the in-guest initramfs `mkfs.ext4` on first boot,
+    which costs ~4 s on the agent critical path. The server log line
+    `[<name>] upper template unavailable (...); formatting in guest`
+    (`internal/vz/orchestrator.go:249`) is the canonical "fast path
+    NOT active" signal, surfaced as `ShedHandle.template_fallback`.
+
+    This test:
+      - Skips on FC: `internal/firecracker/orchestrator.go:AllocateUpper`
+        has no template path; FC always uses in-guest mkfs and its
+        agent ceiling already accommodates that cost.
+      - Skips on VZ dev mode: `template_fallback` is True → log says
+        the fast path was unavailable.
+      - On VZ release mode: asserts the host-side host phase
+        (`rootfs_ms`) is sub-100 ms as a sanity check that the
+        template clone actually happened fast.
+
+    See `docs/discovery/integration-suite-server-coverage.md` §7
+    "Locked invariants" for why this divergence is intentional.
+    """
+    if shed_server.backend != "vz":
+        pytest.skip(
+            f"backend={shed_server.backend!r} has no host-side "
+            f"upper-template fast path; only VZ uses it (see "
+            f"`internal/firecracker/orchestrator.go:AllocateUpper`)."
+        )
+    handle = shed_server.create(test_shed_name, image="base")
+    if handle.timings is None or handle.timings.rootfs_ms is None:
+        pytest.skip(
+            "PhaseTimer / rootfs phase not available; see "
+            "`test_phase_timer_emitted` for the underlying reason."
+        )
+    if handle.template_fallback:
+        pytest.skip(
+            "VZ upper-template fast path not active — log emitted "
+            "'upper template unavailable ...; formatting in guest' "
+            "(see `internal/vz/orchestrator.go:249`). Dev binaries "
+            "intentionally don't embed a shed-build-tools image ref "
+            "(see `internal/version/buildtools.go:BuildToolsRefForTag`); "
+            "set SHED_BUILD_TOOLS_REF on the shed-server process or "
+            "run a release binary to exercise the fast path. See "
+            "docs/discovery/integration-suite-server-coverage.md §7."
+        )
+    rootfs_ms = handle.timings.rootfs_ms
+    assert rootfs_ms <= ROOTFS_TEMPLATE_FAST_PATH_CEILING_MS, (
+        f"VZ rootfs fast-path regressed: rootfs={rootfs_ms}ms > "
+        f"{ROOTFS_TEMPLATE_FAST_PATH_CEILING_MS}ms ceiling. The host-side "
+        f"template clone + sibling-swap should be sub-100ms on a healthy "
+        f"reflink-capable FS; a regression here suggests a silent "
+        f"clone-to-full-copy fallback or a slow stat path. Bisect "
+        f"against `internal/vz/uppertemplate.go` and "
+        f"`internal/vz/orchestrator.go:AllocateUpper`."
     )
 
 
