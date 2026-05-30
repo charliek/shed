@@ -56,9 +56,6 @@ func (f *fakeBackend) KillSession(ctx context.Context, shedName, sessionName str
 func (f *fakeBackend) Exec(ctx context.Context, shedName string, opts backend.ExecOptions) error {
 	panic("unexpected")
 }
-func (f *fakeBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
-	panic("unexpected")
-}
 func (f *fakeBackend) DialService(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
 	panic("unexpected")
 }

@@ -377,20 +377,6 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	return metadataToShed(meta, ""), nil
 }
 
-// GetNetworkEndpoint returns the network endpoint for a shed.
-// VZ uses NAT, so the endpoint is always localhost.
-func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, error) {
-	_, err := LoadMetadata(c.cfg.InstanceDir, name)
-	if err != nil {
-		if errors.Is(err, ErrInstanceNotFound) {
-			return "", fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
-		}
-		return "", err
-	}
-
-	return "127.0.0.1", nil
-}
-
 // DialService opens a TCP connection to a service port inside a running VZ shed.
 // It dials the vsock TCP proxy port and performs a CONNECT handshake.
 func (c *Client) DialService(ctx context.Context, name string, port uint16) (net.Conn, error) {

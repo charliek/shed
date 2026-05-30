@@ -99,11 +99,6 @@ func (b *VZBackend) Exec(ctx context.Context, shedName string, opts backend.Exec
 	return errNonDarwin
 }
 
-// GetNetworkEndpoint returns an error on non-darwin platforms.
-func (b *VZBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
-	return "", errNonDarwin
-}
-
 // DialService returns an error on non-darwin platforms.
 func (b *VZBackend) DialService(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
 	return nil, errNonDarwin

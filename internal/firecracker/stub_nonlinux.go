@@ -101,11 +101,6 @@ func (b *FirecrackerBackend) Exec(ctx context.Context, shedName string, opts bac
 	return errNonLinux()
 }
 
-// GetNetworkEndpoint returns an error on non-linux platforms.
-func (b *FirecrackerBackend) GetNetworkEndpoint(ctx context.Context, shedName string) (string, error) {
-	return "", errNonLinux()
-}
-
 // DialService returns an error on non-linux platforms.
 func (b *FirecrackerBackend) DialService(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
 	return nil, errNonLinux()

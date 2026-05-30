@@ -653,19 +653,6 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	return metadataToShed(meta), nil
 }
 
-// GetNetworkEndpoint returns the IP address for a shed.
-func (c *Client) GetNetworkEndpoint(ctx context.Context, name string) (string, error) {
-	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
-	if err != nil {
-		if errors.Is(err, ErrInstanceNotFound) {
-			return "", fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
-		}
-		return "", err
-	}
-
-	return meta.IPAddress, nil
-}
-
 // DialService opens a TCP connection to a service port inside a running Firecracker shed.
 // Firecracker VMs have routable bridge IPs, so this dials directly.
 func (c *Client) DialService(ctx context.Context, name string, port uint16) (net.Conn, error) {

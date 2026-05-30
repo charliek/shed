@@ -48,9 +48,6 @@ func (routesFakeBackend) KillSession(_ context.Context, _, _ string) error { ret
 func (routesFakeBackend) Exec(_ context.Context, _ string, _ backend.ExecOptions) error {
 	return nil
 }
-func (routesFakeBackend) GetNetworkEndpoint(_ context.Context, _ string) (string, error) {
-	return "", config.ErrShedNotFoundSentinel
-}
 func (routesFakeBackend) DialService(_ context.Context, _ string, _ uint16) (net.Conn, error) {
 	return nil, config.ErrShedNotFoundSentinel
 }

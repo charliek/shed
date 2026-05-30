@@ -66,57 +66,6 @@ func TestBuildEnvForGitNoEnvVars(t *testing.T) {
 	}
 }
 
-func TestGetNetworkEndpoint(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	cfg := &config.VZConfig{
-		InstanceDir: tmpDir,
-	}
-
-	// Create a valid metadata file
-	meta := &Metadata{
-		Name:     "test-vm",
-		Status:   config.StatusRunning,
-		Backend:  config.BackendVZ,
-		CPUs:     2,
-		MemoryMB: 4096,
-	}
-	meta.Save(tmpDir)
-
-	client := &Client{
-		cfg:     cfg,
-		vms:     make(map[string]*VM),
-		credMgr: newTestCredMgr(),
-	}
-
-	endpoint, err := client.GetNetworkEndpoint(context.Background(), "test-vm")
-	if err != nil {
-		t.Fatalf("GetNetworkEndpoint() error = %v", err)
-	}
-	if endpoint != "127.0.0.1" {
-		t.Errorf("GetNetworkEndpoint() = %q, want %q", endpoint, "127.0.0.1")
-	}
-}
-
-func TestGetNetworkEndpointNotFound(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	cfg := &config.VZConfig{
-		InstanceDir: tmpDir,
-	}
-
-	client := &Client{
-		cfg:     cfg,
-		vms:     make(map[string]*VM),
-		credMgr: newTestCredMgr(),
-	}
-
-	_, err := client.GetNetworkEndpoint(context.Background(), "nonexistent")
-	if err == nil {
-		t.Error("GetNetworkEndpoint() expected error for nonexistent shed")
-	}
-}
-
 func TestDialServiceNotFound(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := &config.VZConfig{
