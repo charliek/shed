@@ -193,14 +193,70 @@ RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7 \
   make install-local-server
 ```
 
-The FC remote (mini3 over SSH) sibling — `make
-test-integration-local-fc` — will close the same gap on the
-Firecracker backend. **Planned for a follow-up PR** (not yet in the
-repo); tracked in `docs/discovery/integration-suite-server-coverage.md`
-§5 Option 1b. Until it lands, validate FC server-side changes via the
-manual swap on `$SHED_FC_HOST` (cross-compile +
-`scp` + systemd unit override + restore — see the discovery doc for
-the full sequence).
+## Validating server-side changes (FC remote)
+
+`make test-integration-local-fc` closes the same gap for the
+Firecracker backend over SSH to `$SHED_FC_HOST` (default `mini3`):
+
+```sh
+make test-integration-local-fc
+```
+
+That target:
+
+1. `build-fc-remote-server` — cross-compiles `shed-server` for the
+   remote host's GOARCH (detected at recipe time via `ssh <host>
+   uname -m`; today `mini3` is x86_64 → amd64, but an arm64 Linux
+   box works without code changes). Output lands at
+   `bin/shed-server-fc-remote`.
+2. `install-remote-server` — refuses to clobber an existing backup
+   without `FORCE=1`, then `scp`s the dev binary, backs up
+   `/usr/local/bin/shed-server` on the remote, swaps in the dev
+   binary via `install -m 755` (atomic copy + perms), writes a
+   systemd drop-in at `/etc/systemd/system/shed-server.service.d/
+   dev-override.conf` setting `Environment=SHED_BUILD_TOOLS_REF=...`,
+   `daemon-reload`s, and restarts `shed-server.service`. Polls the
+   remote for readiness before returning so the chained suite doesn't
+   race the systemd start.
+3. `test-integration` runs against `SHED_FC_HOST` (full suite — VZ
+   tests still run against your local brew install).
+4. `restore-remote-server` — restores the deb binary from the
+   remote backup, removes the systemd drop-in, `daemon-reload`s,
+   restarts the service, removes the backup. Idempotent: the
+   systemd drop-in is always removed (even when no backup exists),
+   matching `restore-brew-server`'s "env override is the companion
+   to the binary swap" semantics. Runs unconditionally after the
+   suite, regardless of pass/fail.
+
+Backup lives on the **remote host** (`/tmp/shed-server-deb.bak`), so
+a developer who reboots their workstation mid-test can still recover
+the remote with `make restore-remote-server`.
+
+Assumed infrastructure (same as the existing FC test path):
+
+- Passwordless SSH from this host to `$SHED_FC_HOST`.
+- Passwordless `sudo` for the SSH user (the integration suite's
+  journalctl read already requires this).
+- `shed-server` installed at `/usr/local/bin/shed-server` (the deb's
+  install location). Override with `FC_REMOTE_BIN_PATH=...` if the
+  deploy location changes.
+- systemd unit named `shed-server.service`.
+
+```sh
+# Pin a specific build-tools tag (default: latest git v* tag):
+RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7 \
+  make install-remote-server
+
+# Target a different remote:
+SHED_FC_HOST=other-host make test-integration-local-fc
+# or: FC_REMOTE_HOST=other-host make test-integration-local-fc
+```
+
+After `install-remote-server` + `restore-remote-server` ship,
+the workflow promise is concrete: every server-side PR — VZ or FC —
+has a one-command path to exercise its own branch on the appropriate
+host. See `docs/discovery/integration-suite-server-coverage.md` §12
+"Cross-host bootstrap framing" for the broader motivation.
 
 ## What this suite is *not*
 
