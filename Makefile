@@ -182,8 +182,19 @@ restore-brew-server:
 # BOTH the suite and the restore exit codes — a restore failure is at
 # least as serious as a suite failure (it strands the host), so the
 # chain target reports non-zero if either step fails.
-test-integration-local: install-local-server
-	@SHED_VZ_SERVER=$(SHED_VZ_SERVER) $(MAKE) test-integration; SUITE=$$?; \
+# install-local-server is invoked from the recipe body (not as a make
+# prerequisite) so that a partial-failure install — backup created but
+# brew restart fails, codesign hiccup, etc. — still runs the restore
+# step. A make prerequisite would halt the recipe before it reaches
+# the restore block, leaving the host stranded.
+test-integration-local:
+	@$(MAKE) install-local-server; INSTALL=$$?; \
+	 if [ $$INSTALL -ne 0 ]; then \
+	   echo "test-integration-local: install FAILED (exit $$INSTALL); attempting restore for safety"; \
+	   $(MAKE) restore-brew-server; \
+	   exit $$INSTALL; \
+	 fi; \
+	 SHED_VZ_SERVER=$(SHED_VZ_SERVER) $(MAKE) test-integration; SUITE=$$?; \
 	 $(MAKE) restore-brew-server; RESTORE=$$?; \
 	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
 	   echo "test-integration-local: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect host state"; \
@@ -258,21 +269,29 @@ install-remote-server: build-fc-remote-server
 	@if [ -z "$(RELEASE_BUILD_TOOLS_REF)" ]; then \
 	  echo "ERROR: RELEASE_BUILD_TOOLS_REF is empty; can't infer from git tag."; \
 	  echo "       Either tag this repo (git tag --list 'v*' returned nothing)"; \
-	  echo "       or override: RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:vX.Y.Z"; exit 1; \
+	  echo "       or override: shed-build-tools image ref"; exit 1; \
 	fi
-	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
-	  "test ! -f $(FC_REMOTE_BACKUP) || ( [ '$(FORCE)' = '1' ] || \
-	   ( echo 'ERROR: backup already exists at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP); run make restore-remote-server first, or pass FORCE=1' && exit 1 ) )"
-	@scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):/tmp/shed-server-dev
-	@ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
-	  sudo cp $(FC_REMOTE_BIN_PATH) $(FC_REMOTE_BACKUP); \
-	  sudo systemctl stop shed-server; \
-	  sudo install -m 755 /tmp/shed-server-dev $(FC_REMOTE_BIN_PATH); \
-	  sudo mkdir -p $$(dirname $(FC_REMOTE_ENVOVERRIDE)); \
-	  printf '[Service]\nEnvironment=SHED_BUILD_TOOLS_REF=$(RELEASE_BUILD_TOOLS_REF)\n' | sudo tee $(FC_REMOTE_ENVOVERRIDE) > /dev/null; \
-	  sudo systemctl daemon-reload; \
-	  sudo systemctl start shed-server; \
-	  rm -f /tmp/shed-server-dev"
+	@# Use a PID-unique tmp path on the remote so two concurrent
+	@# install-remote-server runs on the same host don't clobber each
+	@# other's uploaded binary at /tmp/shed-server-dev. Belt-and-suspenders
+	@# — the dev workstation is single-user — but the cost is one $$
+	@# substitution.
+	@TMP=/tmp/shed-server-dev.$$$$; \
+	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$TMP && \
+	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
+	   if [ -f $(FC_REMOTE_BACKUP) ] && [ '$(FORCE)' != '1' ]; then \
+	     echo 'ERROR: backup already exists at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP); run make restore-remote-server first, or pass FORCE=1'; \
+	     rm -f $$TMP; \
+	     exit 1; \
+	   fi; \
+	   sudo cp $(FC_REMOTE_BIN_PATH) $(FC_REMOTE_BACKUP); \
+	   sudo systemctl stop shed-server; \
+	   sudo install -m 755 $$TMP $(FC_REMOTE_BIN_PATH); \
+	   sudo mkdir -p \$$(dirname $(FC_REMOTE_ENVOVERRIDE)); \
+	   printf '[Service]\nEnvironment=SHED_BUILD_TOOLS_REF=$(RELEASE_BUILD_TOOLS_REF)\n' | sudo tee $(FC_REMOTE_ENVOVERRIDE) > /dev/null; \
+	   sudo systemctl daemon-reload; \
+	   sudo systemctl start shed-server; \
+	   rm -f $$TMP"
 	@# systemctl start returns before the service has bound 8080. Poll
 	@# the local `shed -s $(FC_REMOTE_HOST) list` (matches the suite's
 	@# probe) so the chain target's suite invocation doesn't race the
@@ -325,8 +344,20 @@ restore-remote-server:
 # of suite outcome. Same exit-code propagation pattern as
 # test-integration-local: surfaces a restore failure separately
 # rather than silently swallowing it.
-test-integration-local-fc: install-remote-server
-	@SHED_FC_HOST=$(FC_REMOTE_HOST) SHED_FC_SERVER=$(SHED_FC_SERVER) $(MAKE) test-integration; SUITE=$$?; \
+# install-remote-server is invoked from the recipe body (not as a make
+# prerequisite) so that a partial-failure install — backup created but
+# systemctl restart fails, scp succeeds but daemon-reload errors, etc.
+# — still runs the restore step. A make prerequisite would halt the
+# recipe before it reaches the restore block, leaving the remote
+# stranded. Same shape as test-integration-local.
+test-integration-local-fc:
+	@$(MAKE) install-remote-server; INSTALL=$$?; \
+	 if [ $$INSTALL -ne 0 ]; then \
+	   echo "test-integration-local-fc: install FAILED (exit $$INSTALL); attempting restore on $(FC_REMOTE_HOST) for safety"; \
+	   $(MAKE) restore-remote-server; \
+	   exit $$INSTALL; \
+	 fi; \
+	 SHED_FC_HOST=$(FC_REMOTE_HOST) SHED_FC_SERVER=$(SHED_FC_SERVER) $(MAKE) test-integration; SUITE=$$?; \
 	 $(MAKE) restore-remote-server; RESTORE=$$?; \
 	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
 	   echo "test-integration-local-fc: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect $(FC_REMOTE_HOST) state"; \
