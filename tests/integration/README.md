@@ -194,9 +194,13 @@ RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7 \
 ```
 
 The FC remote (mini3 over SSH) sibling — `make
-test-integration-local-fc` — closes the same gap on the Firecracker
-backend. Tracked in
-`docs/discovery/integration-suite-server-coverage.md` §5 Option 1b.
+test-integration-local-fc` — will close the same gap on the
+Firecracker backend. **Planned for a follow-up PR** (not yet in the
+repo); tracked in `docs/discovery/integration-suite-server-coverage.md`
+§5 Option 1b. Until it lands, validate FC server-side changes via the
+manual swap on `$SHED_FC_HOST` (cross-compile +
+`scp` + systemd unit override + restore — see the discovery doc for
+the full sequence).
 
 ## What this suite is *not*
 

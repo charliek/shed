@@ -130,12 +130,20 @@ restore-brew-server:
 	  Darwin) ;; \
 	  *) echo "ERROR: restore-brew-server is macOS-only; see install-local-server."; exit 1 ;; \
 	esac
+	@# Always clear the launchctl env var, even in the no-backup branch:
+	@# install-local-server sets the env var ALONGSIDE creating the
+	@# backup, so a stranded env (manual setenv, partial-failure run, or
+	@# a backup that someone rm'd by hand) is the case where "restore"
+	@# is most likely to be invoked. Skipping the unset there would
+	@# leave the dev binary's behavior wired into the brew binary's
+	@# next start.
+	@launchctl unsetenv SHED_BUILD_TOOLS_REF
 	@# Single shell block so the no-op branch can short-circuit cleanly
 	@# (a separate `@if ... exit 0` line only exits its sub-shell, not
 	@# the recipe — make would continue running the restore steps even
 	@# though there's no backup to restore from).
 	@if [ ! -f "$(BACKUP_PATH)" ]; then \
-	  echo "No backup at $(BACKUP_PATH); nothing to restore. (Idempotent: this is OK.)"; \
+	  echo "No backup at $(BACKUP_PATH); nothing to restore (env var cleared anyway). (Idempotent: this is OK.)"; \
 	else \
 	  set -e; \
 	  brew services stop shed; \
@@ -143,18 +151,29 @@ restore-brew-server:
 	  cp -f "$(BACKUP_PATH)" "$(BREW_SHED_BIN)"; \
 	  codesign --force -s - "$(BREW_SHED_BIN)"; \
 	  chmod -w "$(BREW_SHED_BIN)"; \
-	  launchctl unsetenv SHED_BUILD_TOOLS_REF; \
 	  brew services start shed; \
 	  rm -f "$(BACKUP_PATH)"; \
 	  echo "Brew shed-server restored from backup; backup removed."; \
 	fi
 
 # Chain: install dev binary locally, run the integration suite against
-# it, restore the brew binary REGARDLESS of suite outcome. The
-# restore step runs in a sub-make of restore-brew-server so a suite
-# failure doesn't strand the host on the dev binary.
+# it, restore the brew binary REGARDLESS of suite outcome. Captures
+# BOTH the suite and the restore exit codes — a restore failure is at
+# least as serious as a suite failure (it strands the host), so the
+# chain target reports non-zero if either step fails.
 test-integration-local: install-local-server
-	@$(MAKE) test-integration; STATUS=$$?; $(MAKE) restore-brew-server; exit $$STATUS
+	@$(MAKE) test-integration; SUITE=$$?; \
+	 $(MAKE) restore-brew-server; RESTORE=$$?; \
+	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
+	   echo "test-integration-local: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect host state"; \
+	   exit $$SUITE; \
+	 elif [ $$SUITE -ne 0 ]; then \
+	   echo "test-integration-local: suite FAILED (exit $$SUITE); restore succeeded"; \
+	   exit $$SUITE; \
+	 elif [ $$RESTORE -ne 0 ]; then \
+	   echo "test-integration-local: suite passed BUT restore FAILED (exit $$RESTORE); inspect host state"; \
+	   exit $$RESTORE; \
+	 fi
 
 # Cross-compile for release
 release:
