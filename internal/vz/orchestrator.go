@@ -528,6 +528,18 @@ func (b *vzStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 	return nil
 }
 
+// RestoreStoppedMetadata rewrites the persisted metadata back to
+// Stopped/PID=0 so a post-PersistRunningState failure doesn't leave
+// disk lying. The orchestrator wires this in as a cleanup right after
+// PersistRunningState succeeds; see orchestrator/start.go for the
+// ordering rationale.
+func (b *vzStarter) RestoreStoppedMetadata(metaRaw orchestrator.MetadataHandle) error {
+	meta := metaRaw.(*vzMetaHandle).meta
+	meta.Status = config.StatusStopped
+	meta.PID = 0
+	return meta.Save(b.c.cfg.InstanceDir)
+}
+
 // MountLocalDir re-mounts the workspace VirtioFS share when
 // meta.LocalDir is set. VirtioFS mounts don't persist across vfkit
 // restarts; this is the start-time refresh.

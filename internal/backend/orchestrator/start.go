@@ -86,6 +86,17 @@ type BackendStarter interface {
 	// it. Mirrors BackendCreator.FinalizeStartedVM.
 	PersistRunningState(ctx context.Context, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
 
+	// RestoreStoppedMetadata rewrites the persisted metadata back to
+	// status=Stopped, PID=0. Registered as a cleanup AFTER
+	// PersistRunningState succeeds so that a failure in a later hook
+	// (typically MountLocalDir) unwinds the lying "Running" state on
+	// disk BEFORE the vms-map and VM-stop cleanups run. Errors are
+	// logged but not propagated — the caller is already handling a
+	// failure, and the GetShed lazy-staleness check remains as the
+	// backstop. Not registered when PersistRunningState itself fails;
+	// the metadata was never bumped to Running in that case.
+	RestoreStoppedMetadata(meta MetadataHandle) error
+
 	// MountLocalDir re-mounts the configured `--local-dir` via the
 	// backend's transport (VirtioFS on VZ, 9P on FC). Mount state
 	// does not persist across VMM restarts, so this runs on every
@@ -144,6 +155,17 @@ func StartShed(ctx context.Context, b BackendStarter, req StartRequest) (*config
 	if err := b.PersistRunningState(ctx, meta, vm, cleanup); err != nil {
 		return nil, err
 	}
+
+	// Register the metadata-restore cleanup HERE rather than inside
+	// PersistRunningState so a PersistRunningState failure does NOT
+	// trigger a Stopped-rewrite — the metadata never reached Running
+	// in that case, and CheckNotRunning may have left the in-memory
+	// state in a different shape we shouldn't clobber. LIFO ordering
+	// means this runs FIRST on unwind, ahead of "remove from vms map"
+	// and "stop VM", closing the window where `shed list` would lie.
+	cleanup.Register("restore stopped metadata", func() error {
+		return b.RestoreStoppedMetadata(meta)
+	})
 
 	if err := b.MountLocalDir(ctx, meta, vm); err != nil {
 		return nil, err

@@ -68,6 +68,16 @@ func (b *mockStarter) PersistRunningState(ctx context.Context, meta MetadataHand
 	return nil
 }
 
+// RestoreStoppedMetadata is registered by the orchestrator (not the
+// backend) as a cleanup, so its execution shows up in cleanupsRun via
+// the closure the orchestrator wraps around it — recording the call
+// here is enough to verify the cleanup fired and slot it into the
+// LIFO ordering.
+func (b *mockStarter) RestoreStoppedMetadata(meta MetadataHandle) error {
+	b.cleanupsRun = append(b.cleanupsRun, "restore stopped metadata")
+	return nil
+}
+
 func (b *mockStarter) MountLocalDir(ctx context.Context, meta MetadataHandle, vm VMHandle) error {
 	b.record("MountLocalDir")
 	return b.failAt["MountLocalDir"]
@@ -151,7 +161,12 @@ func TestStartShed_FailureUnwindLIFO(t *testing.T) {
 				"LoadMetadata", "CheckNotRunning", "StartVM", "PersistRunningState",
 				"MountLocalDir",
 			},
-			wantCleanups: []string{"remove from vms map", "stop VM"},
+			// LIFO: registered order is "stop VM" → "remove from vms
+			// map" → "restore stopped metadata"; unwind runs reverse.
+			// Restoring the on-disk Stopped status FIRST closes the
+			// window where `shed list` would see status=Running with a
+			// dead PID.
+			wantCleanups: []string{"restore stopped metadata", "remove from vms map", "stop VM"},
 		},
 	}
 
@@ -171,6 +186,30 @@ func TestStartShed_FailureUnwindLIFO(t *testing.T) {
 			}
 			if !sliceEqual(b.cleanupsRun, tc.wantCleanups) {
 				t.Errorf("cleanup unwind order =\n  %v\nwant (LIFO)\n  %v", b.cleanupsRun, tc.wantCleanups)
+			}
+		})
+	}
+}
+
+// TestStartShed_RestoreStoppedMetadataNotRegisteredOnEarlyFail ensures
+// the metadata-restore cleanup is wired in AFTER PersistRunningState
+// succeeds, not before. If PersistRunningState itself fails, the
+// metadata never reached Running on disk and rewriting "Stopped" could
+// clobber whatever CheckNotRunning left the in-memory shape as. The
+// LIFO test above asserts the cleanup IS registered post-success; this
+// test asserts it ISN'T registered when PersistRunningState fails.
+func TestStartShed_RestoreStoppedMetadataNotRegisteredOnEarlyFail(t *testing.T) {
+	for _, failAt := range []string{"LoadMetadata", "CheckNotRunning", "StartVM", "PersistRunningState"} {
+		t.Run(failAt, func(t *testing.T) {
+			b := newMockStarter()
+			b.failAt[failAt] = errors.New("injected failure")
+			if _, err := StartShed(context.Background(), b, StartRequest{Name: "x"}); err == nil {
+				t.Fatal("expected error from injected failure")
+			}
+			for _, c := range b.cleanupsRun {
+				if c == "restore stopped metadata" {
+					t.Fatalf("RestoreStoppedMetadata fired on %s failure; cleanups=%v", failAt, b.cleanupsRun)
+				}
 			}
 		})
 	}

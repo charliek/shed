@@ -556,6 +556,18 @@ func (b *fcStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 	return nil
 }
 
+// RestoreStoppedMetadata rewrites the persisted metadata back to
+// Stopped/PID=0 so a post-PersistRunningState failure doesn't leave
+// disk lying. The orchestrator wires this in as a cleanup right after
+// PersistRunningState succeeds; see orchestrator/start.go for the
+// ordering rationale.
+func (b *fcStarter) RestoreStoppedMetadata(metaRaw orchestrator.MetadataHandle) error {
+	meta := metaRaw.(*fcMetaHandle).meta
+	meta.Status = config.StatusStopped
+	meta.PID = 0
+	return meta.Save(b.c.cfg.InstanceDir)
+}
+
 // MountLocalDir starts the 9P server and mounts it in the guest when
 // meta.LocalDir is set. Mounts don't persist across firecracker
 // restarts; this is the start-time refresh.
