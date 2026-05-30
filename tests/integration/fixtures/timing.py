@@ -46,6 +46,12 @@ class PhaseTimings:
 
     @property
     def agent_ms(self) -> Optional[int]:
+        """The `agent` phase duration. Covers vsock dial + healthPoll
+        + first agent health response, plus any in-guest activity that
+        happens before the agent can respond (e.g. the VZ in-guest
+        `mkfs.ext4` fallback when the host-side template clone is
+        unavailable). `test_create_agent_p50` uses this as its
+        regression gate."""
         return self.phases.get("agent")
 
     @property

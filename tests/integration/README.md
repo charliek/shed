@@ -68,14 +68,14 @@ tests/integration/
   uv.lock                 # committed for reproducibility (gitignore exception)
   README.md               # this file
   conftest.py             # vz_server, fc_server, shed_server, test_shed_name
-  test_smoke.py           # the MVP five tests
+  test_smoke.py           # the MVP smoke tests
   fixtures/
     __init__.py
     server.py             # LocalServer + RemoteServer + ShedHandle
     timing.py             # PhaseTimer log-line parser
 ```
 
-## The MVP five tests
+## The MVP smoke tests
 
 | Test                                  | What it asserts                                                    |
 |---------------------------------------|--------------------------------------------------------------------|
