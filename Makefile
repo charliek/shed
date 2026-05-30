@@ -60,6 +60,13 @@ test-integration:
 # remote (mini3 via SSH) workflow lives in PR 3's
 # `test-integration-local-fc` target.
 
+# Shed CLI entry name for the local VZ server (the entry in
+# `~/.shed/config.yaml`). Mirrors the integration suite's
+# `SHED_VZ_SERVER` env var (see tests/integration/conftest.py); the
+# install-local-server readiness probe uses this so a developer with
+# a non-default VZ entry name still gets a useful ready signal.
+SHED_VZ_SERVER ?= my-server
+
 # Brew install paths. Resolved dynamically because the Cellar version
 # changes per release; we don't want to hardcode a stale path.
 # All three variables collapse to empty when brew shed isn't installed;
@@ -91,8 +98,8 @@ install-local-server: build
 	@case "$$(uname -s)" in \
 	  Darwin) ;; \
 	  *) echo "ERROR: install-local-server targets the brew-installed shed-server on macOS;"; \
-	     echo "       run this on a Mac. For the FC remote (mini3) workflow see"; \
-	     echo "       'make install-remote-server' (planned for PR 3)."; exit 1 ;; \
+	     echo "       run this on a Mac. For the FC remote ($(FC_REMOTE_HOST)) workflow see"; \
+	     echo "       'make install-remote-server'."; exit 1 ;; \
 	esac
 	@if [ -z "$(BREW_VERSION)" ]; then \
 	  echo "ERROR: brew shed is not installed (or 'brew --prefix shed' failed)."; \
@@ -120,11 +127,11 @@ install-local-server: build
 	@# integration suite uses) or 15 s elapses. Without this the suite
 	@# silently skips all VZ tests with "shed-server not reachable."
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if shed -s my-server list >/dev/null 2>&1; then \
-	    echo "VZ shed-server ready after $${i}s."; break; \
+	  if shed -s $(SHED_VZ_SERVER) list >/dev/null 2>&1; then \
+	    echo "VZ shed-server ($(SHED_VZ_SERVER)) ready after $${i}s."; break; \
 	  fi; \
 	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: VZ shed-server not reachable after 15 s; integration suite may skip VZ tests."; \
+	    echo "WARNING: VZ shed-server ($(SHED_VZ_SERVER)) not reachable after 15 s; integration suite may skip VZ tests."; \
 	  fi; \
 	  sleep 1; \
 	done
@@ -176,7 +183,7 @@ restore-brew-server:
 # least as serious as a suite failure (it strands the host), so the
 # chain target reports non-zero if either step fails.
 test-integration-local: install-local-server
-	@$(MAKE) test-integration; SUITE=$$?; \
+	@SHED_VZ_SERVER=$(SHED_VZ_SERVER) $(MAKE) test-integration; SUITE=$$?; \
 	 $(MAKE) restore-brew-server; RESTORE=$$?; \
 	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
 	   echo "test-integration-local: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect host state"; \
@@ -210,6 +217,14 @@ FC_REMOTE_HOST ?= $(or $(SHED_FC_HOST),mini3)
 FC_REMOTE_BIN_PATH ?= /usr/local/bin/shed-server
 FC_REMOTE_BACKUP := /tmp/shed-server-deb.bak
 FC_REMOTE_ENVOVERRIDE := /etc/systemd/system/shed-server.service.d/dev-override.conf
+
+# Shed CLI entry name for the FC server. Mirrors the integration
+# suite's `SHED_FC_SERVER` env var (see tests/integration/conftest.py):
+# defaults to `$(FC_REMOTE_HOST)` (the same string), but a developer
+# whose `~/.shed/config.yaml` entry differs from the SSH hostname can
+# override with SHED_FC_SERVER=... to align both the readiness probe
+# AND the chain target's suite invocation.
+SHED_FC_SERVER ?= $(FC_REMOTE_HOST)
 
 # Cross-compile shed-server for the remote host's GOARCH. Detects arch
 # at recipe time via `ssh <host> uname -m`; refuses to silently default
@@ -263,11 +278,11 @@ install-remote-server: build-fc-remote-server
 	@# probe) so the chain target's suite invocation doesn't race the
 	@# startup and skip all FC tests.
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if shed -s $(FC_REMOTE_HOST) list >/dev/null 2>&1; then \
-	    echo "Remote FC shed-server on $(FC_REMOTE_HOST) ready after $${i}s."; break; \
+	  if shed -s $(SHED_FC_SERVER) list >/dev/null 2>&1; then \
+	    echo "Remote FC shed-server ($(SHED_FC_SERVER) on $(FC_REMOTE_HOST)) ready after $${i}s."; break; \
 	  fi; \
 	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: $(FC_REMOTE_HOST) shed-server not reachable after 15 s; integration suite may skip FC tests."; \
+	    echo "WARNING: FC shed-server ($(SHED_FC_SERVER) on $(FC_REMOTE_HOST)) not reachable after 15 s; integration suite may skip FC tests."; \
 	  fi; \
 	  sleep 1; \
 	done
@@ -311,7 +326,7 @@ restore-remote-server:
 # test-integration-local: surfaces a restore failure separately
 # rather than silently swallowing it.
 test-integration-local-fc: install-remote-server
-	@SHED_FC_HOST=$(FC_REMOTE_HOST) $(MAKE) test-integration; SUITE=$$?; \
+	@SHED_FC_HOST=$(FC_REMOTE_HOST) SHED_FC_SERVER=$(SHED_FC_SERVER) $(MAKE) test-integration; SUITE=$$?; \
 	 $(MAKE) restore-remote-server; RESTORE=$$?; \
 	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
 	   echo "test-integration-local-fc: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect $(FC_REMOTE_HOST) state"; \
