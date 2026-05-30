@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent build-firstboot build-tools test test-integration test-integration-local install-local-server restore-brew-server release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-local test-integration-local-fc install-local-server restore-brew-server install-remote-server restore-remote-server release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -114,6 +114,20 @@ install-local-server: build
 	@chmod -w "$(BREW_SHED_BIN)"
 	@launchctl setenv SHED_BUILD_TOOLS_REF "$(RELEASE_BUILD_TOOLS_REF)"
 	@brew services start shed
+	@# launchd start is async — the suite's session-scoped probe runs
+	@# the moment make returns and can race the server before it binds
+	@# 8080. Poll until \`shed list\` succeeds (the same probe the
+	@# integration suite uses) or 15 s elapses. Without this the suite
+	@# silently skips all VZ tests with "shed-server not reachable."
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	  if shed -s my-server list >/dev/null 2>&1; then \
+	    echo "VZ shed-server ready after $${i}s."; break; \
+	  fi; \
+	  if [ "$$i" = "15" ]; then \
+	    echo "WARNING: VZ shed-server not reachable after 15 s; integration suite may skip VZ tests."; \
+	  fi; \
+	  sleep 1; \
+	done
 	@echo ""
 	@echo "Dev shed-server installed in brew Cellar at $(BREW_SHED_BIN)."
 	@echo "Build-tools ref: $(RELEASE_BUILD_TOOLS_REF)"
@@ -172,6 +186,141 @@ test-integration-local: install-local-server
 	   exit $$SUITE; \
 	 elif [ $$RESTORE -ne 0 ]; then \
 	   echo "test-integration-local: suite passed BUT restore FAILED (exit $$RESTORE); inspect host state"; \
+	   exit $$RESTORE; \
+	 fi
+
+# Remote dev-binary swap + integration suite + restore for the FC
+# backend on `$SHED_FC_HOST` (default `mini3`) over SSH. The FC sibling
+# of test-integration-local: closes the same gap for FC-side PRs.
+# Together they make the workflow promise — every server-side PR (VZ
+# or FC) can validate against its own branch in one command — true.
+#
+# Assumes (and the install recipe sanity-checks):
+#  - Passwordless SSH from this host to $(FC_REMOTE_HOST).
+#  - Passwordless sudo on the remote for the SSH user (the integration
+#    suite's journalctl read already requires this, so this is the
+#    same bar).
+#  - shed-server on the remote installed at $(FC_REMOTE_BIN_PATH) and
+#    run by systemd as shed-server.service. Default path is
+#    /usr/local/bin/shed-server, matching the deb's install location
+#    (verified on mini3 v0.5.8: ExecStart=/usr/local/bin/shed-server).
+#    Override with FC_REMOTE_BIN_PATH=... if the deploy location moves.
+
+FC_REMOTE_HOST ?= $(or $(SHED_FC_HOST),mini3)
+FC_REMOTE_BIN_PATH ?= /usr/local/bin/shed-server
+FC_REMOTE_BACKUP := /tmp/shed-server-deb.bak
+FC_REMOTE_ENVOVERRIDE := /etc/systemd/system/shed-server.service.d/dev-override.conf
+
+# Cross-compile shed-server for the remote host's GOARCH. Detects arch
+# at recipe time via `ssh <host> uname -m`; refuses to silently default
+# (a mismatch here produces a "cannot execute binary" failure later
+# that's painful to debug). Today mini3 is x86_64 → amd64; future
+# arm64 Linux boxes work without code changes. Always builds to a
+# fixed output path so install-remote-server doesn't need to re-detect.
+build-fc-remote-server:
+	@ARCH=$$(ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) "uname -m" 2>/dev/null); \
+	 case "$$ARCH" in \
+	   x86_64)  GOARCH=amd64 ;; \
+	   aarch64) GOARCH=arm64 ;; \
+	   "")  echo "ERROR: could not detect arch on $(FC_REMOTE_HOST); is SSH reachable?"; exit 1 ;; \
+	   *)   echo "ERROR: unsupported remote arch on $(FC_REMOTE_HOST): $$ARCH"; exit 1 ;; \
+	 esac; \
+	 echo "Cross-compiling shed-server for linux/$$GOARCH (remote $(FC_REMOTE_HOST) is $$ARCH)..."; \
+	 GOOS=linux GOARCH=$$GOARCH go build $(LDFLAGS) -o bin/shed-server-fc-remote ./cmd/shed-server
+
+# Swap the just-built dev binary into the remote at $(FC_REMOTE_BIN_PATH),
+# back up the deb-installed binary on the REMOTE (so a developer
+# rebooting their workstation mid-test can still recover the host via
+# `make restore-remote-server`), drop a systemd Environment= override
+# for SHED_BUILD_TOOLS_REF, daemon-reload, restart shed-server.
+# Refuses to clobber an existing backup unless FORCE=1, matching the
+# local install-local-server safety pattern.
+#
+# WARNING: this swaps the binary on the SHARED dev/test host. Any
+# active sessions against $(FC_REMOTE_HOST) will see the service
+# restart. Don't run while another developer is mid-create.
+install-remote-server: build-fc-remote-server
+	@if [ -z "$(RELEASE_BUILD_TOOLS_REF)" ]; then \
+	  echo "ERROR: RELEASE_BUILD_TOOLS_REF is empty; can't infer from git tag."; \
+	  echo "       Either tag this repo (git tag --list 'v*' returned nothing)"; \
+	  echo "       or override: RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:vX.Y.Z"; exit 1; \
+	fi
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
+	  "test ! -f $(FC_REMOTE_BACKUP) || ( [ '$(FORCE)' = '1' ] || \
+	   ( echo 'ERROR: backup already exists at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP); run make restore-remote-server first, or pass FORCE=1' && exit 1 ) )"
+	@scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):/tmp/shed-server-dev
+	@ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
+	  sudo cp $(FC_REMOTE_BIN_PATH) $(FC_REMOTE_BACKUP); \
+	  sudo systemctl stop shed-server; \
+	  sudo install -m 755 /tmp/shed-server-dev $(FC_REMOTE_BIN_PATH); \
+	  sudo mkdir -p $$(dirname $(FC_REMOTE_ENVOVERRIDE)); \
+	  printf '[Service]\nEnvironment=SHED_BUILD_TOOLS_REF=$(RELEASE_BUILD_TOOLS_REF)\n' | sudo tee $(FC_REMOTE_ENVOVERRIDE) > /dev/null; \
+	  sudo systemctl daemon-reload; \
+	  sudo systemctl start shed-server; \
+	  rm -f /tmp/shed-server-dev"
+	@# systemctl start returns before the service has bound 8080. Poll
+	@# the local `shed -s $(FC_REMOTE_HOST) list` (matches the suite's
+	@# probe) so the chain target's suite invocation doesn't race the
+	@# startup and skip all FC tests.
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+	  if shed -s $(FC_REMOTE_HOST) list >/dev/null 2>&1; then \
+	    echo "Remote FC shed-server on $(FC_REMOTE_HOST) ready after $${i}s."; break; \
+	  fi; \
+	  if [ "$$i" = "15" ]; then \
+	    echo "WARNING: $(FC_REMOTE_HOST) shed-server not reachable after 15 s; integration suite may skip FC tests."; \
+	  fi; \
+	  sleep 1; \
+	done
+	@echo ""
+	@echo "Dev shed-server installed on $(FC_REMOTE_HOST) at $(FC_REMOTE_BIN_PATH)."
+	@echo "Build-tools ref (via $(FC_REMOTE_ENVOVERRIDE)): $(RELEASE_BUILD_TOOLS_REF)"
+	@echo "Backup at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP)."
+	@echo "Run 'make restore-remote-server' to revert (or it runs automatically"
+	@echo "at the end of 'make test-integration-local-fc')."
+
+# Reverse of install-remote-server. Idempotent: a no-op when no backup
+# exists. The systemd drop-in is removed in BOTH branches so a
+# stranded override doesn't survive a manual restore.
+restore-remote-server:
+	@# Always remove the env override + daemon-reload, even if the
+	@# binary backup is missing — same reasoning as restore-brew-server's
+	@# unconditional launchctl unsetenv: the override is the companion
+	@# to the binary swap, and restoring the binary without removing
+	@# the override leaves dev-binary behavior wired into shed-server.
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) "set -e; \
+	  if [ ! -f $(FC_REMOTE_BACKUP) ]; then \
+	    echo 'No backup at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP); nothing to restore.'; \
+	    if [ -f $(FC_REMOTE_ENVOVERRIDE) ]; then \
+	      echo 'Removing stranded env override $(FC_REMOTE_ENVOVERRIDE)...'; \
+	      sudo rm -f $(FC_REMOTE_ENVOVERRIDE); \
+	      sudo systemctl daemon-reload; \
+	      sudo systemctl restart shed-server; \
+	    fi; \
+	  else \
+	    sudo systemctl stop shed-server; \
+	    sudo install -m 755 $(FC_REMOTE_BACKUP) $(FC_REMOTE_BIN_PATH); \
+	    sudo rm -f $(FC_REMOTE_ENVOVERRIDE) $(FC_REMOTE_BACKUP); \
+	    sudo systemctl daemon-reload; \
+	    sudo systemctl start shed-server; \
+	    echo 'Remote shed-server restored from backup; backup + env override removed.'; \
+	  fi"
+
+# Chain: install dev binary on the remote, run integration suite
+# against it (via SHED_FC_HOST), restore the remote binary REGARDLESS
+# of suite outcome. Same exit-code propagation pattern as
+# test-integration-local: surfaces a restore failure separately
+# rather than silently swallowing it.
+test-integration-local-fc: install-remote-server
+	@SHED_FC_HOST=$(FC_REMOTE_HOST) $(MAKE) test-integration; SUITE=$$?; \
+	 $(MAKE) restore-remote-server; RESTORE=$$?; \
+	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
+	   echo "test-integration-local-fc: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect $(FC_REMOTE_HOST) state"; \
+	   exit $$SUITE; \
+	 elif [ $$SUITE -ne 0 ]; then \
+	   echo "test-integration-local-fc: suite FAILED (exit $$SUITE); restore succeeded"; \
+	   exit $$SUITE; \
+	 elif [ $$RESTORE -ne 0 ]; then \
+	   echo "test-integration-local-fc: suite passed BUT restore FAILED (exit $$RESTORE); inspect $(FC_REMOTE_HOST) state"; \
 	   exit $$RESTORE; \
 	 fi
 
