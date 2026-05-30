@@ -337,13 +337,19 @@ func (b *fcCreator) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHa
 	return fcVMHandle{vm: vm}, nil
 }
 
-// FinalizeStartedVM bumps the metadata's Status, re-saves, and
-// registers the c.vms map entry's removal cleanup.
+// FinalizeStartedVM bumps the metadata's Status, persists the PID,
+// re-saves, and registers the c.vms map entry's removal cleanup.
 func (b *fcCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.MetadataHandle, vmRaw orchestrator.VMHandle, cleanup *backend.Cleanup) error {
 	meta := metaRaw.(*fcMetaHandle).meta
 	vm := vmRaw.(fcVMHandle).vm
 
+	// vm.meta aliases the same *Metadata as meta (CreateVM stores the
+	// pointer), so vm.Start's PID write already lands here. Mirror
+	// the explicit assignment from vzCreator.FinalizeStartedVM and
+	// fcStarter.PersistRunningState — keeps the PID transfer visible
+	// at the persistence boundary if the aliasing ever changes.
 	meta.Status = config.StatusRunning
+	meta.PID = vm.meta.PID
 	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
