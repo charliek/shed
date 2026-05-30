@@ -250,14 +250,25 @@ against the deb-installed v_{N-1} `shed-server` on `mini3` (or
 parity with Option 1, the validation gap closes for VZ but stays
 open for FC.
 
+> **Note (post-implementation):** the sketch below was the original
+> framing. The shipped form (see §11) corrected some assumptions —
+> the deb installs at `/usr/local/bin/shed-server` (not `/usr/bin/`),
+> the GOARCH is detected at recipe time via `ssh <host> uname -m`
+> rather than hardcoded to `arm64`, and the systemd drop-in uses an
+> inline `Environment=` directive (not `EnvironmentFile=`). The
+> sketch is preserved as the original record.
+
 Shape mirrors Option 1 with three platform deltas:
 
-- **Cross-compile** (`GOOS=linux GOARCH=arm64 go build -o
-  bin/shed-server-linux-arm64 ./cmd/shed-server`) since the dev
-  workstation is a Mac.
-- **systemd `EnvironmentFile` drop-in** at
+- **Cross-compile** for the remote GOARCH. The original sketch
+  hardcoded `arm64`; the shipped `build-fc-remote-server` target
+  detects the remote arch at recipe time so x86_64 hosts (today's
+  default `mini3`) also work.
+- **systemd `Environment=` drop-in** at
   `/etc/systemd/system/shed-server.service.d/dev-override.conf`
-  replaces the launchd `setenv` step.
+  replaces the launchd `setenv` step. (The original sketch said
+  `EnvironmentFile=`; the shipped form uses an inline `Environment=`
+  directive — same effect, fewer indirections.)
 - **No codesign** (Linux launches unsigned binaries fine).
 
 ```makefile
@@ -293,7 +304,9 @@ exercise its own branch.
 path the integration suite uses):
 - Passwordless SSH from dev workstation to `$SHED_FC_HOST`.
 - `sudo NOPASSWD` for the SSH user (needed for systemd + install).
-- Deb-installed shed-server at a stable path (`/usr/bin/shed-server`).
+- Deb-installed shed-server at `/usr/local/bin/shed-server`
+  (the deb's actual install path, verified live on `mini3`;
+  the shipped Makefile exposes `FC_REMOTE_BIN_PATH` for overrides).
 - systemd unit named `shed-server.service`.
 
 ### Option 2 — Fixture-launched transient shed-server
@@ -345,19 +358,34 @@ availability gap gets a separate answer).
 
 A regression in either fires the same alarm. Splitting them:
 
+> **Note (post-implementation):** the sketch below assumed `rootfs_ms`
+> would be the discriminator. Validation during PR #157 showed the
+> in-guest `mkfs.ext4` cost actually lands inside `agent_ms` (not
+> `rootfs_ms`, which stays sub-100 ms in both modes because it only
+> covers host-side allocation). The shipped form uses the server log
+> marker `[<name>] upper template unavailable (...); formatting in
+> guest` from `internal/vz/orchestrator.go:249` as the dev-mode
+> discriminator, exposed via `ShedHandle.template_fallback`. Both
+> tests SKIP cleanly in dev mode rather than asserting against a
+> ceiling that holds in both modes. The intent (split the gates so
+> dev binaries are safe to test against) is preserved; the
+> implementation mechanism diverged.
+
 ```python
 def test_create_agent_p50(shed_server):
-    """Boot-path p50 regression gate. Calibrated for both dev and
-    release builds because both follow the same vsock + healthPoll
-    path post-mkfs. Reads `agent_ms` from PhaseTimer."""
+    """Boot-path p50 regression gate. Skips when the VZ
+    template-fallback signal is present on any sample (in-guest
+    mkfs.ext4 inflates agent_ms by ~4 s on VZ dev builds for a
+    structural reason that isn't a real regression). Reads
+    `agent_ms` from PhaseTimer."""
     ...
 
 def test_create_rootfs_template_present(shed_server):
-    """When SHED_BUILD_TOOLS_REF is set (release build or local-dev
-    override), `rootfs_ms` is sub-100ms. When unset (default
-    dev-build), the in-guest mkfs path adds ~4s. The test asserts
-    that the test environment matches an explicit expectation
-    rather than collapsing both into one ceiling."""
+    """VZ-only assertion that the host-side upper-template fast
+    path is active. Skips on FC (no host-side template path) and
+    on VZ dev mode (template_fallback set). On VZ release mode,
+    asserts `rootfs_ms` ≤ 100 ms as a sanity check that the
+    host-side clone actually happened fast."""
     ...
 ```
 
@@ -452,11 +480,11 @@ For a future session executing the recommended path, "done" means:
 - `tests/integration/README.md` gains a "Validating server-side changes" subsection pointing at these targets.
 - Running `make test-integration-local` from a clean checkout with PR-A1's changes hits a non-trivial line count in `internal/{vz,firecracker}/client.go:StartShed`'s defensive zombie check (verifiable via `go test -cover` against the running server — out of scope for v1, but the suite should at minimum exercise the path).
 
-**Option 3 (split the timing gate):**
-- `test_plain_create_timing` is renamed `test_create_agent_p50` and asserts only on PhaseTimer's `agent` phase, with a ceiling that holds for both dev and release builds (~2200 ms).
-- A new `test_create_rootfs_template_present` asserts that `rootfs` is sub-100 ms when `SHED_BUILD_TOOLS_REF` is set (release-mode) and skips with a clear message when unset (dev-mode).
+**Option 3 (split the timing gate) — as written; see the post-implementation note in §5 Option 3 above for the corrections that landed in the shipped form:**
+- `test_plain_create_timing` is renamed `test_create_agent_p50` and asserts on PhaseTimer's `agent` phase, with a ceiling that holds for release builds AND for dev builds whose template fast path is active. **(Correction: the shipped form skips when `template_fallback` is set on any sample, because the in-guest mkfs cost on VZ dev binaries inflates `agent_ms` by ~4 s for a structural reason that isn't a real regression. The ceiling itself is unchanged from the original `test_plain_create_timing` — `DEFAULT_AGENT_P50_MS["vz"]=2200`, `DEFAULT_AGENT_P50_MS["firecracker"]=2900`, each leaving ~500 ms regression budget.)**
+- A new `test_create_rootfs_template_present` asserts that `rootfs_ms` is sub-100 ms when the VZ template fast path is active (signal: absence of the `template_fallback` log marker) and skips with a clear message when the fast path isn't active. FC has no host-side template path and skips unconditionally on FC. **(Correction: the original sketch used `rootfs_ms` as the discriminator; empirically `rootfs_ms` stays sub-100 ms in both dev and release modes, so the shipped form uses the server log marker `[<name>] upper template unavailable` as the discriminator instead.)**
 - The fixtures file's `DEFAULT_AGENT_P50_MS` comment block is updated to describe what the gate is *not* covering (the rootfs path) so the next person who fires the alarm doesn't bisect into the upper-template path again.
-- A change to `internal/vmutil/agent.go:healthPoll` that genuinely regresses the agent phase by ~300 ms (e.g., changing the poll interval to 350 ms) fires the gate; a `make build` against current main does not.
+- A change to `internal/vmutil/agent.go:healthPoll` that genuinely regresses the agent phase by ~500 ms or more (e.g., a noticeable poll-interval bump on top of the existing ~1550 ms VZ median) fires the gate; a `make build` against current main does not.
 
 **Both together — combined recommendation:**
 - A developer with a server-side-only change can do: `git checkout -b foo; make build; make test-integration-local`; the suite runs against their code; if green they push with confidence; if red the failure points at their change, not at the upper-template path.

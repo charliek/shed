@@ -69,7 +69,7 @@ That target verifies `uv` is on `PATH`, runs `uv sync` into a managed venv (giti
 - `shed -s <host> list` succeeds (the entry exists in `~/.shed/config.yaml` and the server responds).
 - Passwordless `sudo -n journalctl -u shed-server` on the remote, for the PhaseTimer log-line fetch. Two tests skip cleanly if it's unavailable (you still get the others).
 - **The remote shed-server must be v0.5.4 or newer** for the PhaseTimer-dependent assertions. PhaseTimer was added in PR #118 / v0.5.4; older servers cause those tests to skip with a clear reason while the rest of the suite still runs.
-- For the dev-binary variant (`make test-integration-local-fc`): the remote shed-server runs under systemd as `shed-server.service`, the binary lives at `/usr/local/bin/shed-server` (the deb default; override via `FC_REMOTE_BIN_PATH=...`), and the SSH user has passwordless `sudo` for both `systemctl` and `cp` against that path. These are the same assumptions the deb-installed shed-server already makes.
+- For the dev-binary variant (`make test-integration-local-fc`): the remote shed-server runs under systemd as `shed-server.service`, the binary lives at `/usr/local/bin/shed-server` (the deb default; override via `FC_REMOTE_BIN_PATH=...`), and the SSH user has passwordless `sudo` for the operations the install/restore recipes drive (`systemctl`, `cp`, `install`, `mkdir`, `tee`, `rm`). `sudo -n true` succeeding from the SSH session is a reasonable smoke test. These are the same assumptions the deb-installed shed-server already makes.
 
 #### Enabling FC tests on a fresh remote host (first-time setup)
 
@@ -154,7 +154,7 @@ Standalone `make install-local-server` / `make install-remote-server` and `make 
 
 For changes that touch the boot path, agent dial, healthPoll, upper-allocation, mount, image-resolution, or any other hot path: **measure the impact on each platform the change affects, against the most recent release binary, before merging.**
 
-The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it fires on regressions ≥ 300 ms or so — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it. The dynamic timing gate complements the unit tests; this manual per-platform measurement is the only safety net for changes whose value-add IS the timing characteristic.
+The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it fires on regressions around 500 ms or more (see `tests/integration/fixtures/server.py:DEFAULT_AGENT_P50_MS` for the per-backend ceiling; VZ has ~500 ms regression budget over its ~1550 ms median, FC has ~500 ms over its ~2400 ms median) — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it. The dynamic timing gate complements the unit tests; this manual per-platform measurement is the only safety net for changes whose value-add IS the timing characteristic.
 
 The workflow:
 

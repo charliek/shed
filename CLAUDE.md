@@ -58,7 +58,7 @@ Both targets build the dev binary, swap it in (codesigned on Mac; systemd drop-i
 
 #### Performance impact — vet against the released version
 
-For changes that touch the boot path, agent dial, healthPoll, upper-allocation, mount, image-resolution, or any other hot path: **measure the impact on each platform the change affects, against the most recent release binary, before merging.** The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it'll fire on regressions ≥ 300 ms — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it.
+For changes that touch the boot path, agent dial, healthPoll, upper-allocation, mount, image-resolution, or any other hot path: **measure the impact on each platform the change affects, against the most recent release binary, before merging.** The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it'll fire on regressions around 500 ms or more (see `tests/integration/fixtures/server.py:DEFAULT_AGENT_P50_MS` for the per-backend regression budget) — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it.
 
 The workflow:
 
