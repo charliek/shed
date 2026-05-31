@@ -9,7 +9,7 @@ This document covers Shed's testing strategy, how to run each tier of tests, and
 | Unit | Pure logic, file-shape, ordering invariants | `go test` | Go toolchain | Yes |
 | Integration suite (installed binary) | Live create-cycle via `shed` CLI against the brew/deb-installed shed-server | `pytest` + subprocess (uv-managed) | Reachable shed-server (local or remote); for FC: SSH to the host | No (locally + bare-metal release-validation) |
 | Integration suite (dev binary, VZ) | Same, but targets a parallel dev shed-server running from the just-built source on the local Mac | `make dev-server-up` + `make test-integration-dev` | All of the above + a `~/.shed/config.yaml` entry for the dev server | No |
-| Integration suite (dev binary, FC) | Same, but targets a swap-installed dev shed-server on the FC remote | `make test-integration-local-fc` | SSH + sudo NOPASSWD on the remote | No |
+| Integration suite (dev binary, FC) | Same, but targets a parallel dev shed-server on the FC remote (alongside the deb one on a different port) | `make dev-server-up-fc` + `make test-integration-dev-fc` | SSH + sudo NOPASSWD on the remote + a `~/.shed/config.yaml` entry for the FC dev server | No |
 | E2E (Firecracker, legacy) | Full VM lifecycle via API directly | `go test -tags=e2e` | KVM, root, Firecracker assets | No |
 
 The **integration suite** (PR #132) is the recommended path for live create-cycle verification on both backends. The Go-tagged FC e2e tests predate it and remain available for low-level API exercise.
@@ -70,7 +70,7 @@ That target verifies `uv` is on `PATH`, runs `uv sync` into a managed venv (giti
 - `shed -s <host> list` succeeds (the entry exists in `~/.shed/config.yaml` and the server responds).
 - Passwordless `sudo -n journalctl -u shed-server` on the remote, for the PhaseTimer log-line fetch. Two tests skip cleanly if it's unavailable (you still get the others).
 - **The remote shed-server must be v0.5.4 or newer** for the PhaseTimer-dependent assertions. PhaseTimer was added in PR #118 / v0.5.4; older servers cause those tests to skip with a clear reason while the rest of the suite still runs.
-- For the dev-binary variant (`make test-integration-local-fc`): the remote shed-server runs under systemd as `shed-server.service`, the binary lives at `/usr/local/bin/shed-server` (the deb default; override via `FC_REMOTE_BIN_PATH=...`), and the SSH user has passwordless `sudo` for the operations the install/restore recipes drive (`systemctl`, `cp`, `install`, `mkdir`, `tee`, `rm`). `sudo -n true` succeeding from the SSH session is a reasonable smoke test. These are the same assumptions the deb-installed shed-server already makes.
+- For the parallel-dev variant (`make dev-server-up-fc` / `test-integration-dev-fc`): the deb shed-server keeps running under systemd at `/usr/local/bin/shed-server`; the dev shed-server runs from `/tmp/shed-server-dev` via `sudo nohup` (no systemd unit), with PID at `/tmp/shed-server-dev.pid` and log at `/tmp/shed-server-dev.log`. The SSH user needs passwordless `sudo` for the operations the dev-server-* recipes drive (`install`, `cp`, `rm`, `nohup`, `tail`, `cat`, `stat`, `kill`, `ps`). `sudo -n true` succeeding from the SSH session is a reasonable smoke test.
 
 #### Enabling FC tests on a fresh remote host (first-time setup)
 
@@ -98,7 +98,7 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
    sudo -n journalctl -u shed-server --since "1 minute ago" --no-pager
    ```
 
-   If this prompts for a password, the suite's PhaseTimer-dependent FC tests can't fetch logs. Either keep your sudo cache warm during the run or add a NOPASSWD rule for `/usr/bin/journalctl` (and `/usr/bin/systemctl` + `/usr/bin/cp` + `/usr/bin/install` if you intend to use `make test-integration-local-fc`).
+   If this prompts for a password, the suite's PhaseTimer-dependent FC tests can't fetch logs. Either keep your sudo cache warm during the run or add a NOPASSWD rule for `/usr/bin/journalctl` (and `/usr/bin/install` + `/usr/bin/cat` + `/usr/bin/rm` + `/usr/bin/kill` + `/usr/bin/nohup` if you intend to use `make dev-server-up-fc`).
 
 3. **Add the entry to `~/.shed/config.yaml`** on the dev workstation (or point at an existing entry with `SHED_FC_SERVER=<entry-name>`), then run the suite:
 
@@ -115,9 +115,10 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 | `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew-installed VZ server. The `dev-server-*` and `test-integration-dev` Makefile targets use `SHED_VZ_DEV_SERVER` instead. |
 | `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | Where the local VZ server writes its log file. Override for Intel-Mac Homebrew (`/usr/local/...`) or custom installs. Set automatically by `make test-integration-dev` to the dev server's log file. |
 | `SHED_VZ_DEV_SERVER` | `my-server-dev` | `~/.shed/config.yaml` entry for the parallel dev VZ server. Honored by the `dev-server-*` Makefile targets. |
-| `SHED_FC_HOST` | `mini3` | SSH hostname for the FC server. Also honored by `make install-remote-server` / `make test-integration-local-fc`. |
-| `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name when it differs from the SSH host. |
-| `FC_REMOTE_BIN_PATH` | `/usr/local/bin/shed-server` | Path to the shed-server binary on the FC remote. Override if the deb's install location moves or you've installed elsewhere. |
+| `SHED_FC_HOST` | `mini3` | SSH hostname for the FC server. Also honored by `make dev-server-up-fc` / `dev-server-status-fc` / `test-integration-dev-fc`. |
+| `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name for the deb FC server. |
+| `SHED_FC_DEV_SERVER` | `$(SHED_FC_HOST)-dev` | `~/.shed/config.yaml` entry name for the parallel dev FC server. |
+| `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from. `test-integration-dev-fc` sets this to the dev server's log file so the existing tests find PhaseTimer lines (the dev server runs via `sudo nohup`, not systemd). |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 
 #### Validating server-side changes — parallel dev server
@@ -150,15 +151,29 @@ The dev server:
 - Uses isolated state-dirs under `~/Library/Application Support/shed-dev/vz/` — separate `images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`, `socket_dir`. `shed image prune` from the brew server never touches dev blobs, and vice versa.
 - Has `SHED_BUILD_TOOLS_REF` set inline to the latest release tag, so the dev binary uses the release-shaped upper-template fast path (sub-100 ms rootfs phase) — the suite's `test_create_rootfs_template_present` test passes against the dev server when the env var is wired correctly.
 
-**FC (remote Linux over SSH; default `$SHED_FC_HOST=mini3`) — current state:**
+**FC (remote Linux over SSH; default `$SHED_FC_HOST=mini3`):**
 
 ```sh
-make test-integration-local-fc
+# One-time setup per developer:
+#   shed server add mini3 --port 18080 --name mini3-dev  # after first dev-server-up-fc
+#   (or manually add the entry to ~/.shed/config.yaml)
+
+# Per dev cycle:
+make dev-server-up-fc           # launches dev shed-server on mini3:18080 via sudo nohup
+make test-integration-dev-fc    # runs suite against FC dev (auto-ups if needed)
+# ... edit source ...
+make build && make dev-server-restart-fc
+make test-integration-dev-fc
+make dev-server-down-fc         # when done
 ```
 
-(The parallel-dev sibling `make test-integration-dev-fc` lands in a follow-up PR. Today, FC server-side validation uses the swap-based workflow that cross-compiles for the remote, scps, drops a systemd Environment= override, runs the suite, and restores. See the next subsection.)
+The FC dev server runs via `sudo nohup` on the remote (needs root for FC's CAP_NET_ADMIN bridge/TAP operations). No systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server (crashes visible, no survives-reboot). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Isolated state-dirs under `/var/lib/shed-dev/firecracker/`.
 
-A server-side PR should open with **"`make test-integration-dev`: N/N pass against dev-build at commit `<sha>`"** (or `test-integration-local-fc` for FC changes until the FC parallel-dev sibling ships). That sentence is then true and meaningful — not a brew/deb-binary alibi.
+FC-specific isolation:
+- **Offset `vsock_base_cid: 600`** (deb default is 100) so the two servers' vsock CIDs don't collide. vsock allocation is in-memory per-server with no kernel check.
+- **Shared bridge + CIDR + tap_prefix.** Kernel-level TAP existence check in `internal/firecracker/network.go:FindAvailableTAPIndex` coordinates cross-server. Known race window: two servers can both pick the same TAP index before either calls `LinkAdd`; the second call fails loudly with EEXIST. Diagnosable, not silent. For PR-validation workloads (one dev creating one shed at a time on the dev server while the deb server handles its own creates) this never fires; for production-style concurrent stress it would need a server-side `retry-on-EEXIST` fix.
+
+A server-side PR should open with **"`make test-integration-dev`: N/N pass against dev-build at commit `<sha>`"** (or `make test-integration-dev-fc` for FC changes). That sentence is then true and meaningful — not a brew/deb-binary alibi.
 
 **`~/.shed/config.yaml` entry** to add for the parallel-dev VZ server:
 

@@ -50,6 +50,15 @@ VZ_DEV_LOG_PATH = os.environ.get("SHED_VZ_DEV_LOG_PATH", "")
 FC_DEV_SERVER_NAME = os.environ.get("SHED_FC_DEV_SERVER", "")
 FC_DEV_LOG_PATH = os.environ.get("SHED_FC_DEV_LOG_PATH", "")
 
+# Remote-file log path for the PROD `fc_server` fixture. Defaults to
+# unset, in which case `fc_server` reads logs via `ssh + sudo journalctl
+# -u shed-server` (the deb-installed shed-server's systemd-captured
+# logs). `make test-integration-dev-fc` sets this to the dev server's
+# remote log file so the existing fc_server-using tests can read
+# PhaseTimer lines from the file (the dev FC server runs via sudo
+# nohup, not systemd, so journald has no records for it).
+FC_LOG_PATH = os.environ.get("SHED_FC_LOG_PATH", "")
+
 
 # ----------------------------------------------------------------------------
 # Server fixtures (session-scoped — one connection probe per pytest run)
@@ -81,6 +90,13 @@ def fc_server() -> RemoteServer:
     Overrides:
         SHED_FC_HOST   = SSH hostname (default: mini3)
         SHED_FC_SERVER = `~/.shed/config.yaml` entry name (default: same)
+        SHED_FC_LOG_PATH = remote file path to read logs from. When set,
+                           the fixture uses `ssh + sudo -n tail -c +N`
+                           against this file instead of journalctl.
+                           `make test-integration-dev-fc` sets this to
+                           the dev FC server's log file (the dev server
+                           runs via sudo nohup, not systemd, so journald
+                           has no records for it).
 
     Skips if SSH to the host fails or `shed -s <name> list` returns nonzero.
     """
@@ -88,6 +104,7 @@ def fc_server() -> RemoteServer:
         ssh_host=FC_SSH_HOST,
         name=FC_SERVER_NAME,
         backend="firecracker",
+        remote_log_path=FC_LOG_PATH or None,
     )
     if not s.available():
         pytest.skip(

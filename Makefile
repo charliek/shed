@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-local-fc install-remote-server restore-remote-server dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -250,42 +250,67 @@ test-integration-dev: build
 	  SHED_VZ_DEV_LOG_PATH=$(DEV_LOG_PATH) \
 	  $(MAKE) test-integration
 
-# Remote dev-binary swap + integration suite + restore for the FC
-# backend on `$SHED_FC_HOST` (default `mini3`) over SSH. The FC sibling
-# of test-integration-local: closes the same gap for FC-side PRs.
-# Together they make the workflow promise — every server-side PR (VZ
-# or FC) can validate against its own branch in one command — true.
+# Parallel dev shed-server lifecycle (FC remote).
 #
-# Assumes (and the install recipe sanity-checks):
-#  - Passwordless SSH from this host to $(FC_REMOTE_HOST).
-#  - Passwordless sudo on the remote for the SSH user (the integration
-#    suite's journalctl read already requires this, so this is the
-#    same bar).
-#  - shed-server on the remote installed at $(FC_REMOTE_BIN_PATH) and
-#    run by systemd as shed-server.service. Default path is
-#    /usr/local/bin/shed-server, matching the deb's install location
-#    (verified on mini3 v0.5.8: ExecStart=/usr/local/bin/shed-server).
-#    Override with FC_REMOTE_BIN_PATH=... if the deploy location moves.
+# Runs a SECOND shed-server (the dev binary, cross-compiled for the
+# remote's GOARCH) on $(FC_REMOTE_HOST) ALONGSIDE the deb-installed
+# one. The deb server keeps running undisturbed on 8080/2222; the
+# dev server runs on 18080/12222.
+#
+# Same shape as the Mac local dev-server-* targets, but the lifecycle
+# happens over SSH (with sudo, because the FC backend needs
+# CAP_NET_ADMIN for TAP/bridge operations). No systemd unit — the
+# remote dev server runs via `sudo nohup` with a PID file in /tmp,
+# matching the intentionally-ephemeral lifecycle of the Mac dev
+# server (crashes visible, no survives-reboot).
+#
+# Setup (one-time per dev workstation):
+#   1. Add a ~/.shed/config.yaml entry for $(SHED_FC_DEV_SERVER)
+#      (snippet in CLAUDE.md / tests/integration/README.md), OR run
+#      `shed server add $(FC_REMOTE_HOST) --port 18080 --name $(SHED_FC_DEV_SERVER)`
+#      after the first `make dev-server-up-fc`.
+#
+# Assumed infrastructure (same as today's deb install):
+#   - Passwordless SSH from this host to $(FC_REMOTE_HOST).
+#   - sudo NOPASSWD on the remote for the SSH user. The recipes drive
+#     systemctl, install, cp, rm, nohup, tail, cat, stat, kill, ps.
+#   - The remote has FC + KVM available (which the deb shed-server
+#     already requires).
+#
+# FC isolation notes:
+#   - Different ports (18080/12222 vs deb's 8080/2222).
+#   - Separate state-dirs under /var/lib/shed-dev/firecracker/.
+#   - Offset vsock_base_cid=600 (deb default is 100) to avoid CID
+#     collision. See configs/server.dev-parallel.linux-fc.yaml.
+#   - SHARED bridge/CIDR/tap_prefix with the deb server. Kernel-level
+#     TAP existence check in `internal/firecracker/network.go:
+#     FindAvailableTAPIndex` coordinates across the two servers.
 
 FC_REMOTE_HOST ?= $(or $(SHED_FC_HOST),mini3)
-FC_REMOTE_BIN_PATH ?= /usr/local/bin/shed-server
-FC_REMOTE_BACKUP := /tmp/shed-server-deb.bak
-FC_REMOTE_ENVOVERRIDE := /etc/systemd/system/shed-server.service.d/dev-override.conf
 
-# Shed CLI entry name for the FC server. Mirrors the integration
-# suite's `SHED_FC_SERVER` env var (see tests/integration/conftest.py):
-# defaults to `$(FC_REMOTE_HOST)` (the same string), but a developer
-# whose `~/.shed/config.yaml` entry differs from the SSH hostname can
-# override with SHED_FC_SERVER=... to align both the readiness probe
-# AND the chain target's suite invocation.
+# Shed CLI entry name for the deb FC server (today's default).
+# Mirrors `SHED_FC_SERVER` in the test suite's conftest.
 SHED_FC_SERVER ?= $(FC_REMOTE_HOST)
+
+# Shed CLI entry name for the parallel dev FC server. Mirrors
+# `SHED_FC_DEV_SERVER` in the conftest. By convention `<host>-dev`.
+SHED_FC_DEV_SERVER ?= $(FC_REMOTE_HOST)-dev
+
+# Remote paths for the parallel dev FC server's binary, config, log,
+# PID file. Lives in /tmp because nothing here is meant to survive a
+# reboot (no systemd unit). Override via env vars if your remote is
+# unusual.
+FC_DEV_BIN_PATH  ?= /tmp/shed-server-dev
+FC_DEV_CONFIG    ?= /tmp/shed-server-dev.yaml
+FC_DEV_LOG_PATH  ?= /tmp/shed-server-dev.log
+FC_DEV_PID_PATH  ?= /tmp/shed-server-dev.pid
 
 # Cross-compile shed-server for the remote host's GOARCH. Detects arch
 # at recipe time via `ssh <host> uname -m`; refuses to silently default
 # (a mismatch here produces a "cannot execute binary" failure later
 # that's painful to debug). Today mini3 is x86_64 → amd64; future
 # arm64 Linux boxes work without code changes. Always builds to a
-# fixed output path so install-remote-server doesn't need to re-detect.
+# fixed output path.
 build-fc-remote-server:
 	@ARCH=$$(ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) "uname -m" 2>/dev/null); \
 	 case "$$ARCH" in \
@@ -297,132 +322,168 @@ build-fc-remote-server:
 	 echo "Cross-compiling shed-server for linux/$$GOARCH (remote $(FC_REMOTE_HOST) is $$ARCH)..."; \
 	 GOOS=linux GOARCH=$$GOARCH go build $(LDFLAGS) -o bin/shed-server-fc-remote ./cmd/shed-server
 
-# Swap the just-built dev binary into the remote at $(FC_REMOTE_BIN_PATH),
-# back up the deb-installed binary on the REMOTE (so a developer
-# rebooting their workstation mid-test can still recover the host via
-# `make restore-remote-server`), drop a systemd Environment= override
-# for SHED_BUILD_TOOLS_REF, daemon-reload, restart shed-server.
-# Refuses to clobber an existing backup unless FORCE=1, matching the
-# local install-local-server safety pattern.
+# Launch the parallel dev shed-server on the remote via sudo nohup.
+# Refuses to start if a dev server is already running there (PID file
+# check, with comm verification). Polls `shed -s $(SHED_FC_DEV_SERVER)
+# list` for readiness (15 s).
 #
-# WARNING: this swaps the binary on the SHARED dev/test host. Any
-# active sessions against $(FC_REMOTE_HOST) will see the service
-# restart. Don't run while another developer is mid-create.
-install-remote-server: build-fc-remote-server
+# WARNING: this starts a SECOND shed-server on the shared FC host.
+# Any other developer using $(FC_REMOTE_HOST) won't see the deb
+# server change, but if they're also running their own dev server
+# on the same ports, this will conflict. Coordinate.
+dev-server-up-fc: build-fc-remote-server
 	@if [ -z "$(RELEASE_BUILD_TOOLS_REF)" ]; then \
 	  echo "ERROR: RELEASE_BUILD_TOOLS_REF is empty; can't infer from git tag."; \
-	  echo "       Either tag this repo (git tag --list 'v*' returned nothing)"; \
-	  echo "       or override: shed-build-tools image ref"; exit 1; \
+	  echo "       Either tag this repo or override on the command line."; exit 1; \
 	fi
-	@# Use a PID-unique tmp path on the remote so two concurrent
-	@# install-remote-server runs on the same host don't clobber each
-	@# other's uploaded binary at /tmp/shed-server-dev. Belt-and-suspenders
-	@# — the dev workstation is single-user — but the cost is one $$
-	@# substitution.
-	@TMP=/tmp/shed-server-dev.$$$$; \
-	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$TMP && \
+	@# Refuse to start if a dev server is already running on the remote.
+	@# Same shape as the Mac local dev-server-up's PID check.
+	@# Use `ps -p PID` instead of `kill -0` for the liveness check —
+	@# the dev server runs as root via sudo nohup, and `kill -0` from
+	@# the SSH user can't signal a root-owned process even though it's
+	@# alive. `ps -p PID` works cross-user.
+	@if ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
+	     "test -f $(FC_DEV_PID_PATH) && ps -p \$$(sudo -n cat $(FC_DEV_PID_PATH) 2>/dev/null) -o comm= 2>/dev/null | grep -q shed-server" 2>/dev/null; then \
+	  echo "ERROR: dev server already running on $(FC_REMOTE_HOST) (pid in $(FC_DEV_PID_PATH))."; \
+	  echo "       Use 'make dev-server-restart-fc' to pick up a rebuild,"; \
+	  echo "       or 'make dev-server-down-fc' to stop it first."; \
+	  exit 1; \
+	fi
+	@# scp binary + config to the remote. PID-unique tmp suffix so two
+	@# concurrent install runs on the same host don't clobber each
+	@# other's uploaded files (belt-and-suspenders — the dev
+	@# workstation is single-user).
+	@UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
+	 UPLOAD_CFG=/tmp/shed-server-dev.upload.$$$$.yaml; \
+	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_BIN && \
+	 scp configs/server.dev-parallel.linux-fc.yaml $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
 	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
-	   trap 'rm -f $$TMP' EXIT; \
-	   if [ -f $(FC_REMOTE_BACKUP) ] && [ '$(FORCE)' != '1' ]; then \
-	     echo 'ERROR: backup already exists at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP); run make restore-remote-server first, or pass FORCE=1'; \
-	     exit 1; \
-	   fi; \
-	   sudo cp $(FC_REMOTE_BIN_PATH) $(FC_REMOTE_BACKUP); \
-	   sudo systemctl stop shed-server; \
-	   sudo install -m 755 $$TMP $(FC_REMOTE_BIN_PATH); \
-	   sudo mkdir -p \$$(dirname $(FC_REMOTE_ENVOVERRIDE)); \
-	   printf '[Service]\nEnvironment=SHED_BUILD_TOOLS_REF=$(RELEASE_BUILD_TOOLS_REF)\n' | sudo tee $(FC_REMOTE_ENVOVERRIDE) > /dev/null; \
-	   sudo systemctl daemon-reload; \
-	   sudo systemctl start shed-server"
-	@# systemctl start returns before the service has bound 8080. Poll
-	@# the local `shed -s $(FC_REMOTE_HOST) list` (matches the suite's
-	@# probe) so the chain target's suite invocation doesn't race the
-	@# startup and skip all FC tests.
+	   sudo install -m 755 $$UPLOAD_BIN $(FC_DEV_BIN_PATH); \
+	   sudo install -m 644 $$UPLOAD_CFG $(FC_DEV_CONFIG); \
+	   rm -f $$UPLOAD_BIN $$UPLOAD_CFG; \
+	   sudo install -m 644 /dev/null $(FC_DEV_LOG_PATH); \
+	   sudo bash -c 'SHED_BUILD_TOOLS_REF=\"$(RELEASE_BUILD_TOOLS_REF)\" \
+	     nohup $(FC_DEV_BIN_PATH) serve --config $(FC_DEV_CONFIG) \
+	     >> $(FC_DEV_LOG_PATH) 2>&1 < /dev/null & \
+	     echo \$$! > $(FC_DEV_PID_PATH)'"
+	@# Readiness probe — same shape as the Mac local dev-server-up's.
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if shed -s $(SHED_FC_SERVER) list >/dev/null 2>&1; then \
-	    echo "Remote FC shed-server ($(SHED_FC_SERVER) on $(FC_REMOTE_HOST)) ready after $${i}s."; break; \
+	  if shed -s $(SHED_FC_DEV_SERVER) list >/dev/null 2>&1; then \
+	    echo "Remote FC dev shed-server ($(SHED_FC_DEV_SERVER) on $(FC_REMOTE_HOST)) ready after $${i}s."; \
+	    break; \
 	  fi; \
 	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: FC shed-server ($(SHED_FC_SERVER) on $(FC_REMOTE_HOST)) not reachable after 15 s; integration suite may skip FC tests."; \
+	    echo "WARNING: FC dev shed-server ($(SHED_FC_DEV_SERVER) on $(FC_REMOTE_HOST)) not reachable after 15 s."; \
+	    echo "  - Tail the remote log:  make dev-server-logs-fc"; \
+	    echo "  - CLI entry:            verify ~/.shed/config.yaml has '$(SHED_FC_DEV_SERVER)' on $(FC_REMOTE_HOST):18080"; \
+	    echo "  - Deb server:           should be unaffected; 'shed -s $(SHED_FC_SERVER) list' still works"; \
 	  fi; \
 	  sleep 1; \
 	done
 	@echo ""
-	@echo "Dev shed-server installed on $(FC_REMOTE_HOST) at $(FC_REMOTE_BIN_PATH)."
-	@echo "Build-tools ref (via $(FC_REMOTE_ENVOVERRIDE)): $(RELEASE_BUILD_TOOLS_REF)"
-	@echo "Backup at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP)."
-	@echo "Run 'make restore-remote-server' to revert (or it runs automatically"
-	@echo "at the end of 'make test-integration-local-fc')."
+	@echo "Dev FC shed-server up on $(FC_REMOTE_HOST):"
+	@echo "  Binary:  $(FC_DEV_BIN_PATH)"
+	@echo "  Config:  $(FC_DEV_CONFIG)"
+	@echo "  Log:     $(FC_DEV_LOG_PATH)"
+	@echo "  PID:     $(FC_DEV_PID_PATH)"
+	@echo "  CLI:     shed -s $(SHED_FC_DEV_SERVER) list"
+	@echo "Build-tools ref (via SHED_BUILD_TOOLS_REF env): $(RELEASE_BUILD_TOOLS_REF)"
+	@echo "Run 'make test-integration-dev-fc' to run the suite against it."
 
-# Reverse of install-remote-server. Idempotent: a no-op when no backup
-# exists. The systemd drop-in is removed in BOTH branches so a
-# stranded override doesn't survive a manual restore.
-restore-remote-server:
-	@# Always remove the env override + daemon-reload, even if the
-	@# binary backup is missing — same reasoning as restore-brew-server's
-	@# unconditional launchctl unsetenv: the override is the companion
-	@# to the binary swap, and restoring the binary without removing
-	@# the override leaves dev-binary behavior wired into shed-server.
+dev-server-down-fc:
+	@# Same PID-safety shape as Mac dev-server-down: verify the PID
+	@# points at a shed-server process before sending signals, so a
+	@# stale PID file pointing at an unrelated remote process doesn't
+	@# get killed. Liveness is checked via `ps -p PID -o comm=` rather
+	@# than `kill -0` because the dev server runs as root (sudo nohup)
+	@# and the SSH user's `kill -0` can't signal a root-owned process
+	@# (would report 'dead' for a live root-owned process).
 	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) "set -e; \
-	  if [ ! -f $(FC_REMOTE_BACKUP) ]; then \
-	    echo 'No backup at $(FC_REMOTE_HOST):$(FC_REMOTE_BACKUP); nothing to restore.'; \
-	    if [ -f $(FC_REMOTE_ENVOVERRIDE) ]; then \
-	      echo 'Removing stranded env override $(FC_REMOTE_ENVOVERRIDE)...'; \
-	      sudo rm -f $(FC_REMOTE_ENVOVERRIDE); \
-	      sudo systemctl daemon-reload; \
-	      sudo systemctl restart shed-server; \
-	    fi; \
+	  if [ ! -f $(FC_DEV_PID_PATH) ]; then \
+	    echo 'Dev FC server not running (no PID file at $(FC_REMOTE_HOST):$(FC_DEV_PID_PATH)).'; \
+	    echo '  (Idempotent: this is OK.)'; \
+	    exit 0; \
+	  fi; \
+	  PID=\$$(sudo -n cat $(FC_DEV_PID_PATH) 2>/dev/null || cat $(FC_DEV_PID_PATH)); \
+	  COMM=\$$(ps -p \$$PID -o comm= 2>/dev/null || true); \
+	  if [ -z \"\$$COMM\" ]; then \
+	    echo \"Dev FC server PID \$$PID is stale (process already gone); cleaning up PID file.\"; \
+	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_LOG_PATH); \
+	  elif ! echo \"\$$COMM\" | grep -q 'shed-server'; then \
+	    echo \"Dev FC server PID \$$PID points at an unrelated process (current comm: \$$COMM).\"; \
+	    echo '  Refusing to send signals; cleaning up the stale PID file only.'; \
+	    sudo rm -f $(FC_DEV_PID_PATH); \
 	  else \
-	    sudo systemctl stop shed-server; \
-	    sudo install -m 755 $(FC_REMOTE_BACKUP) $(FC_REMOTE_BIN_PATH); \
-	    sudo rm -f $(FC_REMOTE_ENVOVERRIDE) $(FC_REMOTE_BACKUP); \
-	    sudo systemctl daemon-reload; \
-	    sudo systemctl start shed-server; \
-	    echo 'Remote shed-server restored from backup; backup + env override removed.'; \
+	    sudo -n kill -TERM \$$PID 2>/dev/null; \
+	    for i in 1 2 3 4 5; do \
+	      if [ -z \"\$$(ps -p \$$PID -o comm= 2>/dev/null)\" ]; then break; fi; \
+	      sleep 1; \
+	    done; \
+	    if [ -n \"\$$(ps -p \$$PID -o comm= 2>/dev/null)\" ]; then \
+	      echo \"Dev FC server didn't stop gracefully after 5 s; SIGKILL\"; \
+	      sudo -n kill -KILL \$$PID 2>/dev/null; \
+	    fi; \
+	    echo \"Dev FC server (pid \$$PID) stopped on $(FC_REMOTE_HOST).\"; \
+	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
 	  fi"
 
-# Chain: install dev binary on the remote, run integration suite
-# against it (via SHED_FC_HOST), restore the remote binary REGARDLESS
-# of suite outcome. Same exit-code propagation pattern as
-# test-integration-local: surfaces a restore failure separately
-# rather than silently swallowing it.
-# Same shape as test-integration-local: install in body (not as a
-# prerequisite) so partial-failure installs reach the restore block,
-# with pre/post snapshot so the auto-restore doesn't consume a
-# pre-existing backup that belongs to a prior manual install.
-test-integration-local-fc:
-	@HAD_REMOTE_STATE=0; \
-	 if ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
-	      "test -f $(FC_REMOTE_BACKUP) || test -f $(FC_REMOTE_ENVOVERRIDE)" 2>/dev/null; then \
-	   HAD_REMOTE_STATE=1; \
-	 fi; \
-	 $(MAKE) install-remote-server; INSTALL=$$?; \
-	 if [ $$INSTALL -ne 0 ]; then \
-	   HAS_REMOTE_STATE=0; \
-	   if ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
-	        "test -f $(FC_REMOTE_BACKUP) || test -f $(FC_REMOTE_ENVOVERRIDE)" 2>/dev/null; then \
-	     HAS_REMOTE_STATE=1; \
-	   fi; \
-	   if [ $$HAD_REMOTE_STATE -eq 0 ] && [ $$HAS_REMOTE_STATE -eq 1 ]; then \
-	     echo "test-integration-local-fc: install FAILED (exit $$INSTALL); NEW remote mutation on $(FC_REMOTE_HOST); running restore"; \
-	     $(MAKE) restore-remote-server; \
-	   else \
-	     echo "test-integration-local-fc: install FAILED (exit $$INSTALL); no new mutation on $(FC_REMOTE_HOST) (any pre-existing state belongs to a prior install); leaving deb install alone"; \
-	   fi; \
-	   exit $$INSTALL; \
-	 fi; \
-	 SHED_FC_HOST=$(FC_REMOTE_HOST) SHED_FC_SERVER=$(SHED_FC_SERVER) $(MAKE) test-integration; SUITE=$$?; \
-	 $(MAKE) restore-remote-server; RESTORE=$$?; \
-	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
-	   echo "test-integration-local-fc: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect $(FC_REMOTE_HOST) state"; \
-	   exit $$SUITE; \
-	 elif [ $$SUITE -ne 0 ]; then \
-	   echo "test-integration-local-fc: suite FAILED (exit $$SUITE); restore succeeded"; \
-	   exit $$SUITE; \
-	 elif [ $$RESTORE -ne 0 ]; then \
-	   echo "test-integration-local-fc: suite passed BUT restore FAILED (exit $$RESTORE); inspect $(FC_REMOTE_HOST) state"; \
-	   exit $$RESTORE; \
-	 fi
+dev-server-status-fc:
+	@# `ps -p PID -o comm=` instead of `kill -0`: the dev server runs
+	@# as root and the SSH user's `kill -0` can't signal it.
+	@ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) "\
+	  if [ -f $(FC_DEV_PID_PATH) ]; then \
+	    PID=\$$(sudo -n cat $(FC_DEV_PID_PATH) 2>/dev/null || cat $(FC_DEV_PID_PATH)); \
+	    COMM=\$$(ps -p \$$PID -o comm= 2>/dev/null || true); \
+	    if [ -n \"\$$COMM\" ] && echo \"\$$COMM\" | grep -q 'shed-server'; then \
+	      echo \"Dev FC server: running on $(FC_REMOTE_HOST) (pid \$$PID)\"; \
+	    else \
+	      echo 'Dev FC server: NOT running on $(FC_REMOTE_HOST)'; \
+	      echo '  (Stale PID file at $(FC_DEV_PID_PATH); make dev-server-down-fc will clean up.)'; \
+	    fi; \
+	  else \
+	    echo 'Dev FC server: NOT running on $(FC_REMOTE_HOST)'; \
+	  fi"
+	@if shed -s $(SHED_FC_DEV_SERVER) list >/dev/null 2>&1; then \
+	  echo "Reachable:     YES (shed -s $(SHED_FC_DEV_SERVER) list succeeds)"; \
+	else \
+	  echo "Reachable:     NO (shed -s $(SHED_FC_DEV_SERVER) list failed)"; \
+	fi
+	@echo "Log:           $(FC_REMOTE_HOST):$(FC_DEV_LOG_PATH)"
+	@echo "Config:        $(FC_REMOTE_HOST):$(FC_DEV_CONFIG)"
+
+dev-server-logs-fc:
+	@ssh -t $(FC_REMOTE_HOST) "sudo -n tail -F $(FC_DEV_LOG_PATH)"
+
+dev-server-restart-fc: dev-server-down-fc dev-server-up-fc
+
+# Run the integration suite against the parallel dev FC shed-server.
+# Auto-ups the dev server if it isn't already running. Doesn't
+# auto-stop after — the dev server is intentionally long-lived for
+# iterative work. Use `make dev-server-down-fc` to stop.
+#
+# Sets BOTH the prod-fixture vars (SHED_FC_HOST + SHED_FC_SERVER, so
+# the existing fc_server fixture retargets at the dev server) AND the
+# dev-fixture vars (SHED_FC_DEV_SERVER + SHED_FC_DEV_LOG_PATH, so the
+# fc_server_dev fixture activates for future dev-specific tests).
+# VZ tests still target the brew server unless you also set the
+# Mac dev env vars; the typical dev workflow runs test-integration-dev
+# OR test-integration-dev-fc depending on which backend you're
+# changing.
+test-integration-dev-fc:
+	@# Auto-up if not running on the remote (`ps -p PID` check; the
+	@# dev server runs as root and the SSH user's `kill -0` can't
+	@# signal a root-owned process).
+	@if ! ssh -o BatchMode=yes -o ConnectTimeout=5 $(FC_REMOTE_HOST) \
+	     "test -f $(FC_DEV_PID_PATH) && ps -p \$$(sudo -n cat $(FC_DEV_PID_PATH) 2>/dev/null) -o comm= 2>/dev/null | grep -q shed-server" 2>/dev/null; then \
+	  echo "Dev FC server not running on $(FC_REMOTE_HOST); starting via dev-server-up-fc..."; \
+	  $(MAKE) dev-server-up-fc; \
+	fi
+	SHED_FC_HOST=$(FC_REMOTE_HOST) \
+	  SHED_FC_SERVER=$(SHED_FC_DEV_SERVER) \
+	  SHED_FC_LOG_PATH=$(FC_DEV_LOG_PATH) \
+	  SHED_FC_DEV_SERVER=$(SHED_FC_DEV_SERVER) \
+	  SHED_FC_DEV_LOG_PATH=$(FC_DEV_LOG_PATH) \
+	  $(MAKE) test-integration
 
 # Cross-compile for release
 release:
