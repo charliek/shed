@@ -71,8 +71,8 @@ TIMING_LOOKUP_INTERVAL_S = 0.2
 # `test_create_rootfs_template_present`, which skips cleanly on dev
 # builds rather than firing as a false-positive against THIS ceiling.
 # The split is what makes it safe to run the integration suite against
-# dev binaries — see `docs/discovery/integration-suite-server-coverage.md`
-# §7 "Locked invariants".
+# dev binaries — see the module-level comment in
+# `tests/integration/test_smoke.py` for the full rationale.
 #
 # Keys are the full backend names as reported by the server's PhaseTimer
 # line (`backend=vz` / `backend=firecracker`), NOT the short pytest-param
@@ -114,9 +114,9 @@ class ShedHandle:
     `test_create_agent_p50` / `test_create_rootfs_template_present` use
     to skip cleanly instead of false-positive on the resulting ~4 s
     cost. FC has no host-side template path; this flag stays False on
-    FC regardless. See `internal/vz/orchestrator.go:249` for the emitter
-    and `docs/discovery/integration-suite-server-coverage.md` §7 for
-    the locked-invariant rationale.
+    FC regardless. See `internal/vz/orchestrator.go:249` for the
+    emitter and the module-level comment in
+    `tests/integration/test_smoke.py` for the split-gate rationale.
     """
 
     name: str

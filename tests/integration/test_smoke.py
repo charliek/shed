@@ -159,9 +159,14 @@ def test_repo_clone_https(shed_server, test_shed_name):
 # on FC entirely (FC has no host-side template fast path —
 # see `internal/firecracker/orchestrator.go:AllocateUpper`).
 #
-# See `docs/discovery/integration-suite-server-coverage.md` §7
-# "Locked invariants" for the dev-build-isolation rationale that makes
-# this divergence intentional.
+# Dev-build isolation rationale: `BuildToolsRefForTag` in
+# `internal/version/buildtools.go` returns "" for any non-release
+# version string (including `-dirty` / `-N-g<hash>` suffixes), which
+# means dev binaries DON'T resolve a build-tools image and fall back
+# to in-guest mkfs.ext4 by design — a dev binary can't assume a
+# published build-tools image matches its source state. The
+# template_fallback signal lets the suite stay safe when run against
+# either dev or release binaries on either backend.
 
 # Sanity ceiling for the host-side rootfs phase when the fast path is
 # active. Template clone + sibling-swap is ~5-10 ms on a healthy host;
@@ -183,11 +188,7 @@ def test_create_agent_p50(shed_server):
     fire the gate for a structural reason that's NOT a real regression.
     `test_create_rootfs_template_present` covers the orthogonal "is the
     fast path active" question; this test focuses on the agent-init
-    path only.
-
-    See `docs/discovery/integration-suite-server-coverage.md` §7
-    "Locked invariants" for why splitting these signals is necessary
-    to make the suite safe to run against dev binaries.
+    path only. See the module-level comment for the split rationale.
     """
     ceiling = DEFAULT_AGENT_P50_MS[shed_server.backend]
     run_id = hashlib.sha256(
@@ -271,8 +272,7 @@ def test_create_rootfs_template_present(shed_server, test_shed_name):
         (`rootfs_ms`) is sub-100 ms as a sanity check that the
         template clone actually happened fast.
 
-    See `docs/discovery/integration-suite-server-coverage.md` §7
-    "Locked invariants" for why this divergence is intentional.
+    See the module-level comment for the split rationale.
     """
     if shed_server.backend != "vz":
         pytest.skip(
@@ -294,8 +294,7 @@ def test_create_rootfs_template_present(shed_server, test_shed_name):
             "intentionally don't embed a shed-build-tools image ref "
             "(see `internal/version/buildtools.go:BuildToolsRefForTag`); "
             "set SHED_BUILD_TOOLS_REF on the shed-server process or "
-            "run a release binary to exercise the fast path. See "
-            "docs/discovery/integration-suite-server-coverage.md §7."
+            "run a release binary to exercise the fast path."
         )
     rootfs_ms = handle.timings.rootfs_ms
     assert rootfs_ms <= ROOTFS_TEMPLATE_FAST_PATH_CEILING_MS, (

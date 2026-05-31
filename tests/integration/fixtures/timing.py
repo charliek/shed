@@ -56,14 +56,12 @@ class PhaseTimings:
 
     @property
     def rootfs_ms(self) -> Optional[int]:
-        """The `rootfs` phase duration, used by
-        `test_create_rootfs_template_present` as the fast-path /
-        slow-path discriminator (sub-100 ms = pre-formatted template
-        clone; multi-second = in-guest mkfs.ext4 fallback).
-
-        See `docs/discovery/integration-suite-server-coverage.md` §7
-        "Locked invariants" for why this phase diverges between dev and
-        release builds."""
+        """The `rootfs` phase duration on the host. Sub-100 ms when the
+        pre-formatted template clone path is active; stays sub-100 ms
+        on dev binaries too because the in-guest `mkfs.ext4` fallback
+        cost lands in the `agent` phase (not rootfs). See the
+        module-level comment in `tests/integration/test_smoke.py` for
+        the split-gate rationale that uses this property."""
         return self.phases.get("rootfs")
 
     def __getitem__(self, key: str) -> int:

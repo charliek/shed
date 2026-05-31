@@ -145,8 +145,10 @@ when the VZ host-side template clone is unavailable) as their
   sanity check that the host-side clone actually happened fast.
 
 This lets the suite run against either binary kind on either backend
-without false-positive timing failures. Background:
-`docs/discovery/integration-suite-server-coverage.md` §7.
+without false-positive timing failures. The dev-build-isolation
+rationale lives in `internal/version/buildtools.go:BuildToolsRefForTag`
+(which returns `""` for any non-release version string by design) and
+in the module-level comment in `tests/integration/test_smoke.py`.
 
 ## Per-backend timing ceilings
 
