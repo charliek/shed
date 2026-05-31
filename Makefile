@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-local test-integration-local-fc install-local-server restore-brew-server install-remote-server restore-remote-server release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-local-fc install-remote-server restore-remote-server dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -45,186 +45,193 @@ test-integration:
 	}
 	cd tests/integration && uv sync && uv run pytest -v
 
-# Local dev-binary swap + integration suite + restore (Mac VZ only).
+# Parallel dev shed-server lifecycle (Mac VZ).
 #
-# Closes the integration-suite-server-coverage gap documented in
-# docs/discovery/integration-suite-server-coverage.md: by default
-# `make test-integration` runs against whichever shed-server binary is
-# currently installed (typically the brew release), so server-side PRs
-# can pass the suite without exercising their own code. These targets
-# swap in the just-built dev binary, run the suite against it, and
-# restore the brew binary regardless of suite outcome.
+# Runs the just-built bin/shed-server ALONGSIDE the brew-installed
+# shed-server on a different port (18080/12222). The brew server keeps
+# running undisturbed; the dev server is for testing server-side
+# changes against the developer's source tree.
 #
-# Discovery surfaced during PR-B1 (#153) and formalised in
-# ~/.claude/plans/patient-bridging-heron.md §2. The corresponding FC
-# remote (mini3 via SSH) workflow lives in PR 3's
-# `test-integration-local-fc` target.
+# Workflow:
+#   1. make dev-server-up                # once (or after rebuild via -restart)
+#   2. make test-integration-dev         # runs the suite against the dev server
+#   3. ... iterate on source ...
+#   4. make build && make dev-server-restart  # pick up the new binary
+#   5. make dev-server-down              # when done
+#
+# Setup (one-time per developer):
+#   - Add a ~/.shed/config.yaml entry for $(SHED_VZ_DEV_SERVER); see
+#     CLAUDE.md or tests/integration/README.md for the snippet.
+#
+# Why no launchd plist:
+#   The dev server is intentionally ephemeral — no auto-restart on
+#   crash (crashes should be visible), no survives-reboot (re-up after
+#   reboot). `nohup` + PID file gives clean start/stop/restart
+#   semantics without an Apple-specific lifecycle layer.
 
-# Shed CLI entry name for the local VZ server (the entry in
-# `~/.shed/config.yaml`). Mirrors the integration suite's
-# `SHED_VZ_SERVER` env var (see tests/integration/conftest.py); the
-# install-local-server readiness probe uses this so a developer with
-# a non-default VZ entry name still gets a useful ready signal.
+# Shed CLI entry name for the brew VZ server (the entry in
+# `~/.shed/config.yaml`). Mirrors `SHED_VZ_SERVER` in the test suite.
 SHED_VZ_SERVER ?= my-server
 
-# Brew install paths. Resolved dynamically because the Cellar version
-# changes per release; we don't want to hardcode a stale path.
-# All three variables collapse to empty when brew shed isn't installed;
-# the install-local-server recipe checks that before doing anything
-# destructive.
-BREW_SHED_PREFIX := $(shell brew --prefix shed 2>/dev/null)
-BREW_VERSION := $(shell test -n "$(BREW_SHED_PREFIX)" && basename "$$(readlink "$(BREW_SHED_PREFIX)" 2>/dev/null)" 2>/dev/null)
-BREW_SHED_BIN := $(BREW_SHED_PREFIX)/bin/shed-server
-BACKUP_PATH := /tmp/shed-server-v$(BREW_VERSION).bak
+# Shed CLI entry name for the parallel dev VZ server. Mirrors
+# `SHED_VZ_DEV_SERVER` in the test suite's conftest.
+SHED_VZ_DEV_SERVER ?= my-server-dev
+
+DEV_LOG_PATH := $(HOME)/.shed/dev/server.log
+DEV_PID_PATH := $(HOME)/.shed/dev/server.pid
+DEV_CONFIG   := $(CURDIR)/configs/server.dev-parallel.mac.yaml
 
 # shed-build-tools image ref to inject when the dev binary runs.
 # Dev binaries embed Version="vX.Y.Z-N-gHASH-dirty", which
-# BuildToolsRefForTag returns "" for by design (dev-build isolation —
-# see docs/discovery/integration-suite-server-coverage.md §7). Without
-# the env var the dev binary falls back to in-guest mkfs.ext4 on first
-# boot (~4 s on VZ), which the split timing gate (PR #157) skips
-# cleanly but it's still not the path we want when validating server
+# BuildToolsRefForTag returns "" for by design (dev-build isolation).
+# Without the env var the dev binary falls back to in-guest mkfs.ext4
+# on first boot (~4 s on VZ), which the split timing gate (PR #157)
+# skips cleanly but isn't the path we want when validating server
 # changes against release-shaped behavior. Override with
 # `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:vX.Y.Z`
 # to pin to a non-latest release.
 RELEASE_BUILD_TOOLS_REF ?= $(shell git tag --list 'v*' --sort=-version:refname | head -1 | sed 's|^|ghcr.io/charliek/shed-build-tools:|')
 
-# Swap the just-built bin/shed-server into the brew Cellar, codesign
-# ad-hoc (launchd SIGKILLs unsigned binaries), set SHED_BUILD_TOOLS_REF
-# in the user's launchd domain, and restart the brew service.
-# Refuses to clobber an existing backup unless FORCE=1, so a developer
-# who runs this twice doesn't lose the original brew binary.
-install-local-server: build
+dev-server-up: build
 	@case "$$(uname -s)" in \
 	  Darwin) ;; \
-	  *) echo "ERROR: install-local-server targets the brew-installed shed-server on macOS;"; \
-	     echo "       run this on a Mac. For the FC remote ($(FC_REMOTE_HOST)) workflow see"; \
-	     echo "       'make install-remote-server'."; exit 1 ;; \
+	  *) echo "ERROR: dev-server-up targets the local Mac VZ shed-server."; \
+	     echo "       For the FC remote workflow see 'make dev-server-up-fc'."; exit 1 ;; \
 	esac
-	@if [ -z "$(BREW_VERSION)" ]; then \
-	  echo "ERROR: brew shed is not installed (or 'brew --prefix shed' failed)."; \
-	  echo "       Install with 'brew install charliek/shed/shed' and retry."; exit 1; \
+	@mkdir -p "$(HOME)/.shed/dev"
+	@# Refuse if already running — `dev-server-restart` is the way to
+	@# pick up a rebuilt binary. Plain `dev-server-up` should never
+	@# silently kill an existing server.
+	@if [ -f "$(DEV_PID_PATH)" ] && kill -0 "$$(cat $(DEV_PID_PATH))" 2>/dev/null; then \
+	  echo "ERROR: dev server already running (pid $$(cat $(DEV_PID_PATH)))."; \
+	  echo "       Use 'make dev-server-restart' to pick up a rebuild,"; \
+	  echo "       or 'make dev-server-down' to stop it first."; \
+	  exit 1; \
 	fi
-	@if [ -f "$(BACKUP_PATH)" ] && [ "$(FORCE)" != "1" ]; then \
-	  echo "ERROR: backup already exists at $(BACKUP_PATH)."; \
-	  echo "       Run 'make restore-brew-server' first, or pass FORCE=1 to overwrite"; \
-	  echo "       (FORCE=1 is destructive — the existing backup is lost)."; exit 1; \
-	fi
-	@cp -f "$(BREW_SHED_BIN)" "$(BACKUP_PATH)"
-	@brew services stop shed
-	@chmod +w "$(BREW_SHED_BIN)"
-	@cp -f bin/shed-server "$(BREW_SHED_BIN)"
-	@# --force lets us re-sign cleanly on subsequent runs without
-	@# tripping codesign's "is already signed" error. macOS launchd
-	@# SIGKILLs unsigned binaries so this step is non-optional.
-	@codesign --force -s - "$(BREW_SHED_BIN)"
-	@chmod -w "$(BREW_SHED_BIN)"
-	@launchctl setenv SHED_BUILD_TOOLS_REF "$(RELEASE_BUILD_TOOLS_REF)"
-	@brew services start shed
-	@# launchd start is async — the suite's session-scoped probe runs
-	@# the moment make returns and can race the server before it binds
-	@# 8080. Poll until \`shed list\` succeeds (the same probe the
-	@# integration suite uses) or 15 s elapses. Without this the suite
-	@# silently skips all VZ tests with "shed-server not reachable."
+	@# Inline env so we don't pollute the caller's launchctl domain
+	@# (and so the brew server's launchctl env is left alone). Note
+	@# the env var name: shed-server reads SHED_BUILD_TOOLS_REF; the
+	@# Makefile-level variable that holds its value is named
+	@# RELEASE_BUILD_TOOLS_REF (because it points at the *release*
+	@# tooling image).
+	@SHED_BUILD_TOOLS_REF="$(RELEASE_BUILD_TOOLS_REF)" \
+	  nohup bin/shed-server serve --config "$(DEV_CONFIG)" \
+	    > "$(DEV_LOG_PATH)" 2>&1 & \
+	  echo $$! > "$(DEV_PID_PATH)"
+	@# Readiness probe — same shape used everywhere in this Makefile.
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if shed -s $(SHED_VZ_SERVER) list >/dev/null 2>&1; then \
-	    echo "VZ shed-server ($(SHED_VZ_SERVER)) ready after $${i}s."; break; \
+	  if shed -s $(SHED_VZ_DEV_SERVER) list >/dev/null 2>&1; then \
+	    echo "Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) ready after $${i}s."; \
+	    break; \
 	  fi; \
 	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: VZ shed-server ($(SHED_VZ_SERVER)) not reachable after 15 s; integration suite may skip VZ tests."; \
+	    echo "WARNING: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) not reachable after 15 s."; \
+	    echo "  - Tail the log:  make dev-server-logs   (or 'tail $(DEV_LOG_PATH)')"; \
+	    echo "  - CLI entry:     verify ~/.shed/config.yaml has '$(SHED_VZ_DEV_SERVER)' on port 18080"; \
+	    echo "  - Brew server:   should be unaffected; 'shed -s $(SHED_VZ_SERVER) list' still works"; \
 	  fi; \
 	  sleep 1; \
 	done
 	@echo ""
-	@echo "Dev shed-server installed in brew Cellar at $(BREW_SHED_BIN)."
-	@echo "Build-tools ref: $(RELEASE_BUILD_TOOLS_REF)"
-	@echo "Backup at $(BACKUP_PATH)."
-	@echo "Run 'make restore-brew-server' to revert (or it runs automatically"
-	@echo "at the end of 'make test-integration-local')."
+	@echo "Dev shed-server up: pid $$(cat $(DEV_PID_PATH))"
+	@echo "  Config:  $(DEV_CONFIG)"
+	@echo "  Log:     $(DEV_LOG_PATH)"
+	@echo "  CLI:     shed -s $(SHED_VZ_DEV_SERVER) list"
+	@echo "Run 'make test-integration-dev' to run the suite against it."
 
-# Reverse of install-local-server: restore the brew binary from the
-# backup, clear the launchctl env var, restart the brew service, and
-# remove the backup file. Idempotent — re-running after a successful
-# restore is a no-op with a clear message.
-restore-brew-server:
+dev-server-down:
 	@case "$$(uname -s)" in \
 	  Darwin) ;; \
-	  *) echo "ERROR: restore-brew-server is macOS-only; see install-local-server."; exit 1 ;; \
+	  *) echo "ERROR: dev-server-down is macOS-only (Mac VZ)."; exit 1 ;; \
 	esac
-	@# Always clear the launchctl env var, even in the no-backup branch:
-	@# install-local-server sets the env var ALONGSIDE creating the
-	@# backup, so a stranded env (manual setenv, partial-failure run, or
-	@# a backup that someone rm'd by hand) is the case where "restore"
-	@# is most likely to be invoked. Skipping the unset there would
-	@# leave the dev binary's behavior wired into the brew binary's
-	@# next start.
-	@launchctl unsetenv SHED_BUILD_TOOLS_REF
-	@# Single shell block so the no-op branch can short-circuit cleanly
-	@# (a separate `@if ... exit 0` line only exits its sub-shell, not
-	@# the recipe — make would continue running the restore steps even
-	@# though there's no backup to restore from).
-	@if [ ! -f "$(BACKUP_PATH)" ]; then \
-	  echo "No backup at $(BACKUP_PATH); nothing to restore (env var cleared anyway). (Idempotent: this is OK.)"; \
+	@# Single shell block so the no-PID-file branch can short-circuit
+	@# cleanly (a separate `@if ... exit 0` line only exits its
+	@# sub-shell, not the recipe — make would continue to the next
+	@# `@cat $(DEV_PID_PATH)` line and emit a confusing "No such file
+	@# or directory").
+	@if [ ! -f "$(DEV_PID_PATH)" ]; then \
+	  echo "Dev server not running (no PID file at $(DEV_PID_PATH))."; \
+	  echo "  (Idempotent: this is OK.)"; \
 	else \
-	  set -e; \
-	  brew services stop shed; \
-	  chmod +w "$(BREW_SHED_BIN)"; \
-	  cp -f "$(BACKUP_PATH)" "$(BREW_SHED_BIN)"; \
-	  codesign --force -s - "$(BREW_SHED_BIN)"; \
-	  chmod -w "$(BREW_SHED_BIN)"; \
-	  brew services start shed; \
-	  rm -f "$(BACKUP_PATH)"; \
-	  echo "Brew shed-server restored from backup; backup removed."; \
+	  PID=$$(cat "$(DEV_PID_PATH)"); \
+	  if kill -0 $$PID 2>/dev/null; then \
+	    kill -TERM $$PID 2>/dev/null; \
+	    for i in 1 2 3 4 5; do \
+	      if ! kill -0 $$PID 2>/dev/null; then break; fi; \
+	      sleep 1; \
+	    done; \
+	    if kill -0 $$PID 2>/dev/null; then \
+	      echo "Dev server didn't stop gracefully after 5s; SIGKILL"; \
+	      kill -KILL $$PID 2>/dev/null; \
+	    fi; \
+	    echo "Dev server (pid $$PID) stopped."; \
+	  else \
+	    echo "Dev server PID $$PID is stale (process already gone); cleaning up PID file."; \
+	  fi; \
+	  rm -f "$(DEV_PID_PATH)"; \
 	fi
 
-# Chain: install dev binary locally, run the integration suite against
-# it, restore the brew binary REGARDLESS of suite outcome. Captures
-# BOTH the suite and the restore exit codes — a restore failure is at
-# least as serious as a suite failure (it strands the host), so the
-# chain target reports non-zero if either step fails.
-# install-local-server is invoked from the recipe body (not as a make
-# prerequisite) so a partial-failure install — backup created but
-# brew restart fails, codesign hiccup mid-stream — still runs the
-# restore step. A make prerequisite would halt the recipe before it
-# reaches the restore block, stranding the host.
+dev-server-status:
+	@case "$$(uname -s)" in \
+	  Darwin) ;; \
+	  *) echo "ERROR: dev-server-status is macOS-only (Mac VZ)."; exit 1 ;; \
+	esac
+	@if [ -f "$(DEV_PID_PATH)" ] && kill -0 "$$(cat $(DEV_PID_PATH))" 2>/dev/null; then \
+	  PID=$$(cat "$(DEV_PID_PATH)"); \
+	  echo "Dev server: running (pid $$PID)"; \
+	  if shed -s $(SHED_VZ_DEV_SERVER) list >/dev/null 2>&1; then \
+	    echo "Reachable:  YES (shed -s $(SHED_VZ_DEV_SERVER) list succeeds)"; \
+	  else \
+	    echo "Reachable:  NO (shed -s $(SHED_VZ_DEV_SERVER) list failed)"; \
+	    echo "            (process is running but the CLI can't reach it —"; \
+	    echo "             check ~/.shed/config.yaml has '$(SHED_VZ_DEV_SERVER)')"; \
+	  fi; \
+	  echo "Log:        $(DEV_LOG_PATH)"; \
+	  echo "Config:     $(DEV_CONFIG)"; \
+	else \
+	  echo "Dev server: NOT running"; \
+	  if [ -f "$(DEV_PID_PATH)" ]; then \
+	    echo "  (Stale PID file at $(DEV_PID_PATH); 'make dev-server-down' will clean up.)"; \
+	  fi; \
+	fi
+
+dev-server-logs:
+	@if [ ! -f "$(DEV_LOG_PATH)" ]; then \
+	  echo "No log at $(DEV_LOG_PATH). Run 'make dev-server-up' first."; \
+	  exit 1; \
+	fi
+	@tail -F "$(DEV_LOG_PATH)"
+
+dev-server-restart: dev-server-down dev-server-up
+
+# Run the integration suite against the parallel dev shed-server.
+# Auto-starts the dev server if it isn't already running. Doesn't
+# auto-stop after — the dev server is intentionally long-lived for
+# iterative work. Use 'make dev-server-down' to stop.
 #
-# Crucially the auto-restore must ONLY fire when THIS invocation
-# created new state. Bare "is there a backup?" detection would also
-# restore when install bailed at the preflight 'backup already
-# exists' check, silently consuming a backup that belongs to an
-# EARLIER manual install — reverting someone's in-flight dev
-# workflow. Snapshot pre-state, compare post-state, restore only on
-# new mutation.
-test-integration-local:
-	@HAD_BACKUP=0; HAD_ENV=0; \
-	 [ -f "$(BACKUP_PATH)" ] && HAD_BACKUP=1; \
-	 [ -n "$$(launchctl getenv SHED_BUILD_TOOLS_REF)" ] && HAD_ENV=1; \
-	 $(MAKE) install-local-server; INSTALL=$$?; \
-	 if [ $$INSTALL -ne 0 ]; then \
-	   HAS_BACKUP=0; HAS_ENV=0; \
-	   [ -f "$(BACKUP_PATH)" ] && HAS_BACKUP=1; \
-	   [ -n "$$(launchctl getenv SHED_BUILD_TOOLS_REF)" ] && HAS_ENV=1; \
-	   if { [ $$HAD_BACKUP -eq 0 ] && [ $$HAS_BACKUP -eq 1 ]; } || \
-	      { [ $$HAD_ENV -eq 0 ] && [ $$HAS_ENV -eq 1 ]; }; then \
-	     echo "test-integration-local: install FAILED (exit $$INSTALL); NEW mutation created during this run; running restore"; \
-	     $(MAKE) restore-brew-server; \
-	   else \
-	     echo "test-integration-local: install FAILED (exit $$INSTALL); no new mutation detected (any pre-existing backup/env belongs to a prior install); leaving brew install alone"; \
-	   fi; \
-	   exit $$INSTALL; \
-	 fi; \
-	 SHED_VZ_SERVER=$(SHED_VZ_SERVER) $(MAKE) test-integration; SUITE=$$?; \
-	 $(MAKE) restore-brew-server; RESTORE=$$?; \
-	 if [ $$SUITE -ne 0 ] && [ $$RESTORE -ne 0 ]; then \
-	   echo "test-integration-local: suite FAILED (exit $$SUITE) AND restore FAILED (exit $$RESTORE); inspect host state"; \
-	   exit $$SUITE; \
-	 elif [ $$SUITE -ne 0 ]; then \
-	   echo "test-integration-local: suite FAILED (exit $$SUITE); restore succeeded"; \
-	   exit $$SUITE; \
-	 elif [ $$RESTORE -ne 0 ]; then \
-	   echo "test-integration-local: suite passed BUT restore FAILED (exit $$RESTORE); inspect host state"; \
-	   exit $$RESTORE; \
-	 fi
+# The suite is env-var-retargeted: SHED_VZ_SERVER points at the dev
+# entry, SHED_VZ_LOG_PATH points at the dev log file. The existing
+# `shed_server` fixture (parameterized over [vz, fc]) honors these
+# without any test-side changes — VZ tests run against the dev server;
+# FC tests still target $(FC_REMOTE_HOST) (the deb prod on mini3) as
+# in `make test-integration`. PR 3 adds the FC parallel-dev sibling
+# `test-integration-dev-fc` for testing FC changes.
+#
+# If you rebuilt the source but the dev server is still running the
+# old binary, run 'make dev-server-restart' before this target.
+test-integration-dev: build
+	@case "$$(uname -s)" in \
+	  Darwin) ;; \
+	  *) echo "ERROR: test-integration-dev targets the local Mac VZ dev server."; \
+	     echo "       For the FC remote workflow see 'make test-integration-dev-fc'."; exit 1 ;; \
+	esac
+	@if [ ! -f "$(DEV_PID_PATH)" ] || ! kill -0 "$$(cat $(DEV_PID_PATH))" 2>/dev/null; then \
+	  echo "Dev server not running; starting via dev-server-up..."; \
+	  $(MAKE) dev-server-up; \
+	fi
+	SHED_VZ_SERVER=$(SHED_VZ_DEV_SERVER) \
+	  SHED_VZ_LOG_PATH=$(DEV_LOG_PATH) \
+	  $(MAKE) test-integration
 
 # Remote dev-binary swap + integration suite + restore for the FC
 # backend on `$SHED_FC_HOST` (default `mini3`) over SSH. The FC sibling

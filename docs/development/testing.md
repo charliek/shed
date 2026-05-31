@@ -7,13 +7,14 @@ This document covers Shed's testing strategy, how to run each tier of tests, and
 | Tier | Scope | Tool | Requirements | CI |
 |------|-------|------|--------------|-----|
 | Unit | Pure logic, file-shape, ordering invariants | `go test` | Go toolchain | Yes |
-| Integration suite (installed binary) | Live create-cycle via `shed` CLI (both backends) | `pytest` + subprocess (uv-managed) | Reachable shed-server (local or remote); for FC: SSH to the host | No (locally + bare-metal release-validation) |
-| Integration suite (dev binary) | Same, but runs the suite against the just-built source | `make test-integration-local` / `make test-integration-local-fc` | All of the above + brew shed on Mac (VZ), or SSH + sudo NOPASSWD on the remote (FC) | No |
+| Integration suite (installed binary) | Live create-cycle via `shed` CLI against the brew/deb-installed shed-server | `pytest` + subprocess (uv-managed) | Reachable shed-server (local or remote); for FC: SSH to the host | No (locally + bare-metal release-validation) |
+| Integration suite (dev binary, VZ) | Same, but targets a parallel dev shed-server running from the just-built source on the local Mac | `make dev-server-up` + `make test-integration-dev` | All of the above + a `~/.shed/config.yaml` entry for the dev server | No |
+| Integration suite (dev binary, FC) | Same, but targets a swap-installed dev shed-server on the FC remote | `make test-integration-local-fc` | SSH + sudo NOPASSWD on the remote | No |
 | E2E (Firecracker, legacy) | Full VM lifecycle via API directly | `go test -tags=e2e` | KVM, root, Firecracker assets | No |
 
 The **integration suite** (PR #132) is the recommended path for live create-cycle verification on both backends. The Go-tagged FC e2e tests predate it and remain available for low-level API exercise.
 
-**Server-side changes require the dev-binary variant** (`make test-integration-local` / `-local-fc`). The plain `make test-integration` runs whatever binary is currently *installed* on the host, not your source — so a server-side-only change can pass the installed-binary tier without ever exercising the new code path. See [Validating server-side changes](#validating-server-side-changes-required-for-server-side-prs) below for the workflow.
+**Server-side changes require the dev-binary variant.** The plain `make test-integration` runs whatever binary is currently *installed* on the host, not your source — so a server-side-only change can pass the installed-binary tier without ever exercising the new code path. See [Validating server-side changes — parallel dev server](#validating-server-side-changes-parallel-dev-server) below for the workflow.
 
 ## Running Tests
 
@@ -111,59 +112,78 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the local VZ server. Also honored by `make install-local-server` / `make test-integration-local`. |
-| `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | Where the local VZ server writes its log file. Override for Intel-Mac Homebrew (`/usr/local/...`) or custom installs. |
+| `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew-installed VZ server. The `dev-server-*` and `test-integration-dev` Makefile targets use `SHED_VZ_DEV_SERVER` instead. |
+| `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | Where the local VZ server writes its log file. Override for Intel-Mac Homebrew (`/usr/local/...`) or custom installs. Set automatically by `make test-integration-dev` to the dev server's log file. |
+| `SHED_VZ_DEV_SERVER` | `my-server-dev` | `~/.shed/config.yaml` entry for the parallel dev VZ server. Honored by the `dev-server-*` Makefile targets. |
 | `SHED_FC_HOST` | `mini3` | SSH hostname for the FC server. Also honored by `make install-remote-server` / `make test-integration-local-fc`. |
 | `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name when it differs from the SSH host. |
 | `FC_REMOTE_BIN_PATH` | `/usr/local/bin/shed-server` | Path to the shed-server binary on the FC remote. Override if the deb's install location moves or you've installed elsewhere. |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 
-#### Validating server-side changes (required for server-side PRs)
+#### Validating server-side changes — parallel dev server
 
-`make test-integration` runs against whichever `shed-server` binary is currently *installed* on the host (brew on Mac, deb on Linux), not the source tree you're editing. A server-side-only change (orchestrator, lifecycle internals, backend handlers with no CLI-visible surface) can pass that suite without ever exercising its own code, because the installed binary is the OLD one. This pattern silently masked coverage on PRs #151-156 — see [`docs/discovery/integration-suite-server-coverage.md`](../discovery/integration-suite-server-coverage.md) for the full motivation.
+`make test-integration` runs against whichever `shed-server` binary is currently *installed* on the host (brew on Mac, deb on Linux), not the source tree you're editing. A server-side-only change (orchestrator, lifecycle internals, backend handlers with no CLI-visible surface) can pass that suite without ever exercising its own code, because the installed binary is the OLD one.
 
-Two one-command targets close the gap:
+The mechanism for closing this gap is a **parallel dev shed-server** that runs alongside the brew/deb one on a different port. The production server keeps running undisturbed; the dev server is what the suite targets when you run the dev-targeted Makefile chain.
 
 **VZ (local Mac):**
 
 ```sh
-make test-integration-local
+# One-time setup per developer:
+#   Add a ~/.shed/config.yaml entry for the dev server (snippet at the
+#   end of this section), OR run `shed server add localhost --port 18080
+#   --name my-server-dev` after the first `make dev-server-up`.
+
+# Per dev cycle:
+make dev-server-up              # launches dev shed-server on 18080/12222
+make test-integration-dev       # runs suite against dev server (auto-ups if needed)
+# ... edit source ...
+make build && make dev-server-restart
+make test-integration-dev
+make dev-server-down            # when done
 ```
 
-That target builds the dev `bin/shed-server`, backs up the brew binary at `/tmp/shed-server-v<VERSION>.bak`, swaps the dev binary into the Cellar (codesigned ad-hoc so launchd will exec it), sets `SHED_BUILD_TOOLS_REF` via `launchctl`, restarts the brew service, runs the suite, then restores the brew binary. The restore runs unconditionally — a suite failure can't strand the host on the dev binary.
+The dev server:
 
-**FC (remote Linux over SSH; default `$SHED_FC_HOST=mini3`):**
+- Runs from `bin/shed-server` (the just-built dev binary) via `nohup` — no launchd plist, no auto-restart, no survives-reboot. Crashes are visible (not silently recovered); re-up after a reboot is one command.
+- Listens on ports `18080` (HTTP) + `12222` (SSH), separate from the brew server's `8080` + `2222`. Both servers run simultaneously without conflict.
+- Uses isolated state-dirs under `~/Library/Application Support/shed-dev/vz/` — separate `images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`, `socket_dir`. `shed image prune` from the brew server never touches dev blobs, and vice versa.
+- Has `SHED_BUILD_TOOLS_REF` set inline to the latest release tag, so the dev binary uses the release-shaped upper-template fast path (sub-100 ms rootfs phase) — the suite's `test_create_rootfs_template_present` test passes against the dev server when the env var is wired correctly.
+
+**FC (remote Linux over SSH; default `$SHED_FC_HOST=mini3`) — current state:**
 
 ```sh
 make test-integration-local-fc
 ```
 
-Cross-compiles `shed-server` for the remote's GOARCH (detected at recipe time via `ssh <host> uname -m` — `x86_64` → `amd64`, `aarch64` → `arm64`), `scp`s the dev binary, backs up the deb binary on the remote at `/tmp/shed-server-deb.bak`, swaps via `install -m 755`, writes a systemd drop-in at `/etc/systemd/system/shed-server.service.d/dev-override.conf` setting `Environment=SHED_BUILD_TOOLS_REF=<release-tag>`, `daemon-reload`s, restarts the service, runs the suite, then restores. The backup lives on the **remote** so a workstation reboot mid-test doesn't strand the remote in dev-binary state.
+(The parallel-dev sibling `make test-integration-dev-fc` lands in a follow-up PR. Today, FC server-side validation uses the swap-based workflow that cross-compiles for the remote, scps, drops a systemd Environment= override, runs the suite, and restores. See the next subsection.)
 
-Both chained targets:
+A server-side PR should open with **"`make test-integration-dev`: N/N pass against dev-build at commit `<sha>`"** (or `test-integration-local-fc` for FC changes until the FC parallel-dev sibling ships). That sentence is then true and meaningful — not a brew/deb-binary alibi.
 
-- Capture BOTH the suite exit code and the restore exit code, and report each separately if either fails. A restore failure is at least as serious as a suite failure (a stranded host vs. a normal red test).
-- Snapshot pre/post state around the install step. If install fails AND your invocation didn't create new state (e.g., the preflight rejected because a prior manual install left a backup), the chain does NOT auto-restore — it leaves your existing dev install alone. If install fails AND it had started mutating state, auto-restore runs to clean up.
-- Refuse to clobber an existing backup without `FORCE=1`, so `make install-X-server` followed accidentally by a second `make install-X-server` doesn't lose the original.
+**`~/.shed/config.yaml` entry** to add for the parallel-dev VZ server:
 
-A server-side PR should open with **"`make test-integration-local`: N/N pass against dev-build at commit `<sha>`"** (or its `-fc` sibling) in the body. That sentence is then true and meaningful — not a brew/deb-binary alibi.
-
-Standalone `make install-local-server` / `make install-remote-server` and `make restore-brew-server` / `make restore-remote-server` exist as targets too, for manual repro flows (e.g. running `shed create` against the dev binary by hand between the swap and the restore).
+```yaml
+servers:
+  my-server-dev:
+    host: localhost
+    http_port: 18080
+    ssh_port: 12222
+```
 
 #### Performance validation against the released version
 
 For changes that touch the boot path, agent dial, healthPoll, upper-allocation, mount, image-resolution, or any other hot path: **measure the impact on each platform the change affects, against the most recent release binary, before merging.**
 
-The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it fires on regressions around 500 ms or more (see `tests/integration/fixtures/server.py:DEFAULT_AGENT_P50_MS` for the per-backend ceiling; VZ has ~500 ms regression budget over its ~1550 ms median, FC has ~500 ms over its ~2400 ms median) — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it. The dynamic timing gate complements the unit tests; this manual per-platform measurement is the only safety net for changes whose value-add IS the timing characteristic.
+The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it fires on regressions around 500 ms or more (see `tests/integration/fixtures/server.py:DEFAULT_AGENT_P50_MS` for the per-backend ceiling; VZ has ~500 ms regression budget over its ~1550 ms median, FC has ~500 ms over its ~2400 ms median) — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it.
 
-The workflow:
+The workflow uses the parallel-dev pair on both sides of the comparison — no service interruption needed:
 
-1. **Baseline against release.** Run `make test-integration` (it picks up the brew/deb install). Record the agent_p50 and rootfs_ms (and total wall-clock) from the PhaseTimer line for each backend you're changing.
-2. **Compare against your branch.** Run `make test-integration-local` and/or `make test-integration-local-fc` (it swaps in your dev binary with `SHED_BUILD_TOOLS_REF=<latest-tag>` so the comparison is apples-to-apples). Same measurements.
+1. **Baseline against release.** `make test-integration` (it targets the brew/deb install). Record the agent_p50 and rootfs_ms (and total wall-clock) from the PhaseTimer line for each backend you're changing.
+2. **Compare against your branch.** `make build && make dev-server-restart && make test-integration-dev` (it targets the parallel dev server running your source). Same measurements.
 3. **Repeat on every affected backend.** A change shipping for both VZ and FC needs both backends measured — Apple Silicon vfkit and Linux KVM Firecracker have different floors, and the same code can be faster on one and slower on the other.
 4. **Record the measurements in the PR body.** Hypothesised gains that don't show up are worth investigating before merge.
 
-The v0.5.4 build-tools-ref regression (caught by a user noticing slow creates after `brew upgrade`, not by the suite) is the canonical example of "the binary built correctly but a config knob silently disabled the fast path." Measuring on the actual swapped-in dev binary is what catches that class of bug before users do.
+The v0.5.4 build-tools-ref regression (caught by a user noticing slow creates after `brew upgrade`, not by the suite) is the canonical example of "the binary built correctly but a config knob silently disabled the fast path." Measuring on the actual dev binary is what catches that class of bug before users do.
 
 #### Adding a test
 

@@ -181,53 +181,84 @@ def test_only_on_fc(fc_server, ...):
 (Markers are declared in `pyproject.toml` under
 `[tool.pytest.ini_options].markers` — keep them in sync.)
 
-## Validating server-side changes (VZ local)
+## Validating server-side changes — parallel dev server (Mac VZ)
 
 By default `make test-integration` runs against whichever `shed-server`
-binary is currently *installed* on the host (typically the brew
-release). A server-side-only PR — orchestrator change, lifecycle
+binary is currently *installed* on the host (brew on Mac, deb on
+Linux). A server-side-only PR — orchestrator change, lifecycle
 internals, backend handler refactor — can pass that suite without ever
 exercising its own code, because the installed binary is the OLD one.
 
-`make test-integration-local` closes that gap on the local Mac (VZ):
+The mechanism for closing this gap on Mac is a **parallel dev
+shed-server** that runs alongside the brew one on a different port
+(`18080/12222`). The brew server keeps running undisturbed; the dev
+server is what the suite targets.
 
 ```sh
-make test-integration-local
+# One-time setup: add a ~/.shed/config.yaml entry for the dev server.
+# Either copy this snippet:
+cat >> ~/.shed/config.yaml <<'EOF'
+servers:
+  my-server-dev:
+    host: localhost
+    http_port: 18080
+    ssh_port: 12222
+EOF
+# Or run after the first `make dev-server-up`:
+shed server add localhost --port 18080 --name my-server-dev
+
+# Per dev cycle:
+make dev-server-up              # launches dev server (nohup, PID file)
+make test-integration-dev       # runs suite against dev server (auto-ups if needed)
+
+# ... edit source ...
+make build && make dev-server-restart
+make test-integration-dev
+
+make dev-server-down            # when done
 ```
 
-That target:
+The dev server's lifecycle is intentionally simple — `nohup` writing
+to `~/.shed/dev/server.log` with PID tracked at
+`~/.shed/dev/server.pid`. No launchd plist, no auto-restart on crash
+(crashes should be visible), no survives-reboot (re-up after reboot is
+one command). State-dirs are isolated under
+`~/Library/Application Support/shed-dev/vz/` so `shed image prune`
+from the brew server never touches dev blobs.
 
-1. `install-local-server` — builds `bin/shed-server`, backs up the
-   brew binary to `/tmp/shed-server-vN.M.K.bak`, swaps the dev
-   binary into the brew Cellar, ad-hoc-codesigns it (launchd
-   SIGKILLs unsigned binaries), sets `SHED_BUILD_TOOLS_REF` to the
-   latest release tag (so the dev binary uses the release-shaped
-   pre-formatted-template fast path instead of the in-guest mkfs
-   fallback — see the split-gate explanation above), and restarts
-   the brew service.
-2. `test-integration` — runs the full suite against the dev binary.
-3. `restore-brew-server` — restores the brew binary from the backup,
-   clears the env var, restarts the brew service, removes the
-   backup. Runs unconditionally (even if the suite fails).
-
-Run `make install-local-server` and `make restore-brew-server`
-standalone if you want to drive the suite manually between the swap
-and restore (e.g. for an ad-hoc `shed create` repro against the dev
-binary). Both are macOS-only and idempotent:
-
-- `install-local-server` refuses to overwrite an existing backup
-  without `FORCE=1` (so a developer who runs it twice doesn't lose
-  the original).
-- `restore-brew-server` is a no-op when no backup exists.
-
-`RELEASE_BUILD_TOOLS_REF` defaults to the latest `git tag` matching
-`v*`. Override to pin to an older release if your source has drifted
-from `main`:
+The dev server's `SHED_BUILD_TOOLS_REF` is set inline to the latest
+release tag so the dev binary uses release-shaped upper-template
+behavior (sub-100 ms rootfs phase). `RELEASE_BUILD_TOOLS_REF`
+defaults to the latest `git tag` matching `v*`; override to pin to
+an older release if your source has drifted from `main`:
 
 ```sh
 RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7 \
-  make install-local-server
+  make dev-server-restart
 ```
+
+Lifecycle helpers:
+
+- `make dev-server-up` — refuses to start if a dev server is already
+  running (use `dev-server-restart`).
+- `make dev-server-down` — graceful TERM with 5 s wait, then KILL.
+  Idempotent (no-op with clear message if not running).
+- `make dev-server-status` — running / reachable / log / config.
+- `make dev-server-logs` — `tail -F ~/.shed/dev/server.log`.
+- `make dev-server-restart` — down + up. Use this after `make build`
+  to pick up a rebuilt binary.
+
+Why this isn't a `launchd` plist: the dev server is intentionally
+ephemeral. A crash should surface to the developer, not be silently
+recovered. A reboot should require an explicit `make dev-server-up`,
+not auto-start a possibly-stale binary. The PID-file lifecycle gives
+us start / stop / restart semantics with zero Apple-specific machinery.
+
+**Coexistence:** brew shed-server on port 8080/2222 + dev shed-server
+on port 18080/12222. Both run simultaneously. The SSH host key
+(`~/.shed/host_key`) is shared between them; the CLI's
+`~/.shed/known_hosts` keys by `host:port` so each entry's
+fingerprint is recorded independently.
 
 ## Validating server-side changes (FC remote)
 
@@ -259,10 +290,9 @@ That target:
 4. `restore-remote-server` — restores the deb binary from the
    remote backup, removes the systemd drop-in, `daemon-reload`s,
    restarts the service, removes the backup. Idempotent: the
-   systemd drop-in is always removed (even when no backup exists),
-   matching `restore-brew-server`'s "env override is the companion
-   to the binary swap" semantics. Runs unconditionally after the
-   suite, regardless of pass/fail.
+   systemd drop-in is always removed (even when no backup exists)
+   so a stranded override doesn't survive a manual restore. Runs
+   unconditionally after the suite, regardless of pass/fail.
 
 Backup lives on the **remote host** (`/tmp/shed-server-deb.bak`), so
 a developer who reboots their workstation mid-test can still recover
