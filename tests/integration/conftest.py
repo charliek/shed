@@ -39,6 +39,17 @@ VZ_BREW_LOG = Path(
     os.environ.get("SHED_VZ_LOG_PATH", "/opt/homebrew/var/log/shed-server.log")
 )
 
+# Parallel-dev server overrides. Set by `make test-integration-dev` /
+# `make test-integration-dev-fc` (or manually) to point the suite at a
+# second shed-server running alongside the brew/deb one on a different
+# port. When unset, the `vz_server_dev` / `fc_server_dev` / `shed_server_dev`
+# fixtures skip cleanly so today's `make test-integration` flow against
+# the brew/deb server is unaffected.
+VZ_DEV_SERVER_NAME = os.environ.get("SHED_VZ_DEV_SERVER", "")
+VZ_DEV_LOG_PATH = os.environ.get("SHED_VZ_DEV_LOG_PATH", "")
+FC_DEV_SERVER_NAME = os.environ.get("SHED_FC_DEV_SERVER", "")
+FC_DEV_LOG_PATH = os.environ.get("SHED_FC_DEV_LOG_PATH", "")
+
 
 # ----------------------------------------------------------------------------
 # Server fixtures (session-scoped — one connection probe per pytest run)
@@ -96,6 +107,93 @@ def shed_server(request):
     when that backend would actually have run.
     """
     return request.getfixturevalue(f"{request.param}_server")
+
+
+# ----------------------------------------------------------------------------
+# Parallel-dev server fixtures
+# ----------------------------------------------------------------------------
+#
+# These mirror the brew/deb-targeted fixtures above but read the dev-
+# specific env vars (`SHED_VZ_DEV_SERVER`, `SHED_VZ_DEV_LOG_PATH`,
+# `SHED_FC_DEV_SERVER`, `SHED_FC_DEV_LOG_PATH`). When those env vars
+# aren't set, the dev fixtures skip cleanly — so a developer running
+# `make test-integration` (the brew/deb-targeted default) doesn't get
+# spurious "dev server unreachable" failures.
+#
+# Tests that want to run against the dev server use the `shed_server_dev`
+# fixture instead of (or in addition to) `shed_server`. The Makefile's
+# `test-integration-dev` / `test-integration-dev-fc` targets set both
+# the prod env vars (`SHED_VZ_SERVER`, `SHED_FC_SERVER`) AND the
+# matching `_DEV_` env vars so a test file can use either fixture
+# depending on what it's exercising.
+
+
+@pytest.fixture(scope="session")
+def vz_server_dev() -> LocalServer:
+    """Parallel-dev VZ shed-server (Mac, launched via `make dev-server-up`).
+
+    Skips when `SHED_VZ_DEV_SERVER` is unset (the default — no dev
+    server expected). When set, behaves like `vz_server` but targets
+    the dev server entry name and reads the dev log file path.
+    """
+    if not VZ_DEV_SERVER_NAME:
+        pytest.skip(
+            "SHED_VZ_DEV_SERVER not set; this test targets the parallel "
+            "dev VZ server. Run `make dev-server-up` then "
+            "`make test-integration-dev`, or set SHED_VZ_DEV_SERVER + "
+            "SHED_VZ_DEV_LOG_PATH manually."
+        )
+    log_path = Path(VZ_DEV_LOG_PATH) if VZ_DEV_LOG_PATH else None
+    if log_path is not None and not log_path.exists():
+        log_path = None
+    s = LocalServer(name=VZ_DEV_SERVER_NAME, backend="vz", log_path=log_path)
+    if not s.available():
+        pytest.skip(
+            f"VZ dev shed-server ({VZ_DEV_SERVER_NAME!r}) is not reachable; "
+            f"start it with `make dev-server-up`."
+        )
+    return s
+
+
+@pytest.fixture(scope="session")
+def fc_server_dev() -> RemoteServer:
+    """Parallel-dev FC shed-server (remote, launched via `make dev-server-up-fc`).
+
+    Skips when `SHED_FC_DEV_SERVER` is unset (the default — no dev
+    server expected). When set, behaves like `fc_server` but targets
+    the dev server entry name and reads logs from the remote dev log
+    file via `ssh + sudo cat` (not journald — the dev server isn't
+    under systemd).
+    """
+    if not FC_DEV_SERVER_NAME:
+        pytest.skip(
+            "SHED_FC_DEV_SERVER not set; this test targets the parallel "
+            "dev FC server. Run `make dev-server-up-fc` then "
+            "`make test-integration-dev-fc`, or set SHED_FC_DEV_SERVER + "
+            "SHED_FC_DEV_LOG_PATH manually."
+        )
+    s = RemoteServer(
+        ssh_host=FC_SSH_HOST,
+        name=FC_DEV_SERVER_NAME,
+        backend="firecracker",
+        remote_log_path=FC_DEV_LOG_PATH or None,
+    )
+    if not s.available():
+        pytest.skip(
+            f"FC dev shed-server ({FC_DEV_SERVER_NAME!r} on "
+            f"{FC_SSH_HOST!r}) is not reachable; start it with "
+            f"`make dev-server-up-fc`."
+        )
+    return s
+
+
+@pytest.fixture(params=["vz", "fc"])
+def shed_server_dev(request):
+    """Parallel-dev counterpart of `shed_server`. Parameterized across
+    backends; lazily instantiates only the requested sub-fixture and
+    skips cleanly when the corresponding dev server isn't configured.
+    """
+    return request.getfixturevalue(f"{request.param}_server_dev")
 
 
 # ----------------------------------------------------------------------------
