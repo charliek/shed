@@ -1,0 +1,96 @@
+# Shed Server — Parallel Dev Configuration (Linux / Firecracker)
+#
+# Runs ALONGSIDE the deb-installed shed-server on the same Linux host
+# (today: `mini3`). Different ports, different state-dirs, separate
+# images_dir, offset vsock_base_cid. Bridge + CIDR + tap_prefix are
+# SHARED with the deb — coordination is via the kernel's TAP-existence
+# check in `internal/firecracker/network.go:FindAvailableTAPIndex`.
+#
+# Used by `make dev-server-up-fc` + `make test-integration-dev-fc` for
+# testing server-side changes against the developer's source tree
+# without restarting the deb shed-server (and disrupting any sheds
+# attached to it).
+#
+# Launch directly on the remote (run as root for CAP_NET_ADMIN):
+#   sudo /tmp/shed-server-dev serve --config /tmp/shed-server-dev.yaml
+#
+# Add this entry to ~/.shed/config.yaml on the dev workstation:
+#   servers:
+#     mini3-dev:                # or whatever your remote is called
+#       host: mini3
+#       http_port: 18080
+#       ssh_port: 12222
+#
+# See docs/development/testing.md for the full workflow.
+
+name: mini3-dev
+
+# Offset from deb's 8080/2222 so both can run simultaneously.
+http_port: 18080
+ssh_port: 12222
+
+default_backend: firecracker
+log_level: debug
+
+# No credentials, no extensions — see the rationale in the macOS
+# parallel-dev config. Dev sheds exist to exercise the server, not
+# to host the developer's working environment.
+
+firecracker:
+  # Same as deb config — kernel + images pinned to the latest release
+  # so the dev binary uses release-shaped image-resolution behavior.
+  kernel_path: /var/lib/shed/firecracker/images/vmlinux
+  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.8
+  images:
+    base:       ghcr.io/charliek/shed-fc-base:v0.5.8
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.8
+    full:       ghcr.io/charliek/shed-fc-full:v0.5.8
+
+  # Separate state-dirs so prune from the deb server never touches
+  # the dev server's blobs.
+  images_dir:    /var/lib/shed-dev/firecracker/images
+  instance_dir:  /var/lib/shed-dev/firecracker/instances
+  snapshots_dir: /var/lib/shed-dev/firecracker/snapshots
+  uppers_dir:    /var/lib/shed-dev/firecracker/uppers
+  socket_dir:    /var/run/shed-dev/firecracker
+
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+
+  # CRITICAL: offset from deb's default 100. CID allocation is
+  # in-memory per-server with no kernel check, so two servers sharing
+  # the same vsock_base_cid would collide on the very first VM. 500
+  # CIDs of headroom per server is plenty (no realistic dev workload
+  # creates 500+ concurrent sheds).
+  vsock_base_cid: 600
+
+  console_port: 1024
+  notify_port: 1026
+  start_timeout: 90s
+  stop_timeout: 10s
+
+  # SAME as deb config — bridge, CIDR, and tap_prefix coordinate
+  # cross-server via the kernel-level TAP existence check in
+  # `internal/firecracker/network.go:FindAvailableTAPIndex`. Each
+  # server picks the next unused TAP index (e.g. shed-tap-0 for the
+  # first deb VM, shed-tap-1 for the first dev VM if the deb VM is
+  # still up). IPs flow from the index via `AllocateIP` — same
+  # function, different index, different IP. No collision for already-
+  # existing TAPs.
+  #
+  # Known race window (small, fails loudly when it fires): the
+  # `FindAvailableTAPIndex` call returns an index before the actual
+  # `netlink.LinkAdd` creates the TAP. Two shed-server processes
+  # concurrently creating a VM can both pick the same index, then
+  # the second `LinkAdd` fails with EEXIST. The error propagates to
+  # the user as `failed to create TAP device shed-tap-N: file exists`
+  # — diagnosable, not silent. For PR-validation workloads (one dev
+  # creating one shed at a time on the dev server while the deb
+  # server handles its own creates) this never fires. If concurrent-
+  # create stress becomes a real workload, the fix is server-side:
+  # retry-on-EEXIST in `internal/firecracker/orchestrator.go`'s
+  # AllocateNetwork hook.
+  bridge_name: shed-br0
+  bridge_cidr: 172.30.0.1/24
+  tap_prefix:  shed-tap

@@ -5,11 +5,21 @@ Both classes drive a running `shed-server` via the `shed` CLI:
     shed -s <name> create / exec / delete / list
 
 `shed -s <name>` resolves through `~/.shed/config.yaml` and selects either
-a local server (HTTP to `localhost:8080`) or a remote one (HTTP+SSH to the
-named host). Most operations are identical between local and remote; the
-only meaningful divergence is *where the server log lives* — a file path
-on a brew-installed mac vs `journalctl -u shed-server` on a systemd Linux
-host. That divergence is encapsulated in `_read_log_since`.
+a local server (HTTP to `localhost:<port>`) or a remote one (HTTP+SSH to
+the named host). Most operations are identical between local and remote;
+the only meaningful divergence is *where the server log lives*:
+
+  - brew-installed Mac shed-server: a file at
+    `/opt/homebrew/var/log/shed-server.log`. `LocalServer(log_path=...)`.
+  - deb-installed Linux shed-server: journald via
+    `journalctl -u shed-server`. `RemoteServer(remote_log_path=None)`.
+  - parallel-dev shed-server (Mac or Linux, launched via the Makefile's
+    `dev-server-up`/`-fc` targets): a known file at
+    `~/.shed/dev/server.log` (Mac) or `/tmp/shed-server-dev.log`
+    (remote). `LocalServer(log_path=...)` or
+    `RemoteServer(remote_log_path=...)`.
+
+That divergence is encapsulated in `_log_offset` + `_read_log_since`.
 
 Fabric is intentionally NOT used here (see §16): for the MVP, plain
 `subprocess` + `ssh` covers everything we need. Fabric earns its place
@@ -20,8 +30,10 @@ unnecessary surface.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -470,13 +482,31 @@ class RemoteServer(LocalServer):
 
     Most operations are identical to LocalServer because the `shed` CLI
     already encapsulates the remote transport. The only divergence is
-    journald log fetching, which needs an `ssh <host> sudo -n journalctl
-    …` round trip.
+    log fetching, which goes over SSH:
+
+      - If `remote_log_path` is set (the parallel-dev case), reads the
+        remote file directly via `ssh <host> sudo -n cat <path>`.
+        The dev shed-server is launched with stdout/stderr redirected to
+        a known file owned by root, so this is the cheapest read.
+      - Otherwise (the deb-installed case), falls through to
+        `ssh <host> sudo -n journalctl -u shed-server --since <when>`
+        because the deb's systemd unit captures stdout into journald.
+
+    `remote_log_path` is a str (not Path) because it names a file on the
+    REMOTE host; `pathlib.Path` semantics (existence checks, parent
+    resolution) would apply to the local filesystem and mislead.
     """
 
-    def __init__(self, ssh_host: str, name: str, backend: str) -> None:
+    def __init__(
+        self,
+        ssh_host: str,
+        name: str,
+        backend: str,
+        remote_log_path: Optional[str] = None,
+    ) -> None:
         super().__init__(name=name, backend=backend, log_path=None)
         self.ssh_host = ssh_host
+        self.remote_log_path = remote_log_path
 
     def available(self) -> bool:
         """Verify both the `shed -s NAME` CLI path AND raw SSH access.
@@ -507,11 +537,94 @@ class RemoteServer(LocalServer):
             return False
         return r.returncode == 0
 
+    def _log_offset(self) -> Union[int, str]:
+        """Return an offset opaque to the caller but understood by
+        `_read_log_since`. For remote-file mode, that's the current
+        byte length of the remote file; for the journald fallback,
+        it's an ISO-ish timestamp (the parent class's default).
+        """
+        if self.remote_log_path is not None:
+            try:
+                r = subprocess.run(
+                    [
+                        "ssh",
+                        "-o", "BatchMode=yes",
+                        "-o", "ConnectTimeout=5",
+                        self.ssh_host,
+                        # `stat -c %s FILE` returns the byte size and
+                        # is opened by `stat` (under sudo), so root-only
+                        # log files are readable here. We can't use
+                        # `wc -c < FILE` because the shell redirect runs
+                        # BEFORE sudo and fails to open a root-only
+                        # file — leaving us with offset=0 and the suite
+                        # reading the entire log every time (stale
+                        # PhaseTimer lines from prior tests can then
+                        # match a re-used shed name).
+                        f"sudo -n stat -c %s {shlex.quote(self.remote_log_path)}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if r.returncode == 0:
+                    return int(r.stdout.strip() or "0")
+            except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+                pass
+            return 0
+        return super()._log_offset()
+
     def _read_log_since(self, offset: Union[int, str]) -> str:
-        # 10 s upper bound — remote journalctl is slower than local
+        # 10 s upper bound — remote operations are slower than local
         # (SSH handshake + remote process spawn), but a stuck ssh
         # should never block the test loop indefinitely. The wall-clock
         # budget in `_read_timing` is the ultimate safety net.
+        if self.remote_log_path is not None:
+            # File-backed mode: read everything past the byte offset
+            # captured at the start of the operation. `tail -c +N` reads
+            # from byte N (1-indexed), so +1 means from the start;
+            # +(offset+1) means "past the bytes that existed before".
+            try:
+                start = int(offset)
+            except (TypeError, ValueError):
+                start = 0
+            try:
+                r = subprocess.run(
+                    [
+                        "ssh",
+                        "-o", "BatchMode=yes",
+                        "-o", "ConnectTimeout=5",
+                        self.ssh_host,
+                        # No `2>/dev/null || true` — let the SSH
+                        # command's stderr surface naturally so a
+                        # misconfigured sudo (NOPASSWD missing) or
+                        # missing log file reports the real error
+                        # rather than silently returning "" (which
+                        # the suite would interpret as "no PhaseTimer
+                        # found" and skip the test with a misleading
+                        # reason).
+                        f"sudo -n tail -c +{start + 1} {shlex.quote(self.remote_log_path)}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                return ""
+            if r.returncode != 0:
+                # Surface the underlying error to pytest's stderr so a
+                # misconfigured dev server (wrong log path, sudo NOPASSWD
+                # not set) is diagnosable from the test output instead
+                # of looking like a flaky timing-test skip.
+                print(
+                    f"[fixtures.RemoteServer] remote log read failed "
+                    f"(exit {r.returncode}) for {self.ssh_host}:"
+                    f"{self.remote_log_path}: {r.stderr.strip()!r}",
+                    file=sys.stderr,
+                )
+                return ""
+            return r.stdout
+
+        # Journald fallback (deb-installed shed-server).
         try:
             r = subprocess.run(
                 [

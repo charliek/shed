@@ -1,0 +1,70 @@
+# Shed Server — Parallel Dev Configuration (macOS / VZ)
+#
+# Runs ALONGSIDE the brew-installed `my-server` shed-server on the same
+# host. Different ports, different state-dirs, separate images_dir.
+# Used by `make dev-server-up` + `make test-integration-dev` for testing
+# server-side changes against the developer's source tree without
+# restarting (and disrupting) the brew shed-server.
+#
+# Launch directly:
+#   bin/shed-server serve --config configs/server.dev-parallel.mac.yaml
+#
+# Add this entry to ~/.shed/config.yaml so the CLI can reach it:
+#   servers:
+#     my-server-dev:
+#       host: localhost
+#       http_port: 18080
+#       ssh_port: 12222
+#
+# See docs/development/testing.md for the full workflow.
+
+name: my-server-dev
+
+# Offset from brew's 8080/2222 so both can run simultaneously.
+http_port: 18080
+ssh_port: 12222
+
+default_backend: vz
+log_level: debug
+
+# Intentionally NO credentials block:
+#   The dev server is for testing the SERVER itself, not for hosting
+#   the developer's working sheds. The brew install (`my-server`)
+#   is where ~/.shed/mounts/{claude,codex,opencode,gh} get mounted.
+#   Adding them here would mean two VMs concurrently writing to the
+#   same host files for the same tool — a race the integration suite
+#   doesn't need.
+
+# Intentionally NO extensions block:
+#   Same reason as credentials. Dev sheds don't need
+#   ssh-agent / docker-credentials brokering.
+
+vz:
+  vfkit_path: vfkit
+
+  # Pin to the latest release's images so the dev binary uses the
+  # release-shaped upper-template fast path (sub-100 ms rootfs phase).
+  # Bump in lockstep with shed releases; see docs/reference/images.md.
+  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.8
+  images:
+    base: ghcr.io/charliek/shed-vz-base:v0.5.8
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.8
+    full: ghcr.io/charliek/shed-vz-full:v0.5.8
+
+  # Separate state-dirs under `shed-dev/` so prune from the brew server
+  # never touches the dev server's blobs (the v0.5.7 prune behavior
+  # walks ONLY the configured server's instance_dir + snapshots_dir).
+  images_dir:    ~/Library/Application Support/shed-dev/vz
+  instance_dir:  ~/Library/Application Support/shed-dev/vz/instances
+  snapshots_dir: ~/Library/Application Support/shed-dev/vz/snapshots
+  uppers_dir:    ~/Library/Application Support/shed-dev/vz/uppers
+  socket_dir:    ~/.shed-dev/vz/sockets
+
+  default_cpus: 2
+  default_memory_mb: 4096
+  default_disk_gb: 20
+  console_port: 1024
+  notify_port: 1026
+  tcp_proxy_port: 1028
+  start_timeout: 60s
+  stop_timeout: 10s

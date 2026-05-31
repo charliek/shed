@@ -53,12 +53,48 @@ tests they would have run, not the whole session.
 
 ## Environment overrides
 
-| Variable          | Default                                            | Effect |
-|-------------------|----------------------------------------------------|--------|
-| `SHED_VZ_SERVER`  | `my-server`                                        | Entry name in `~/.shed/config.yaml` for the local VZ server. |
-| `SHED_VZ_LOG_PATH`| `/opt/homebrew/var/log/shed-server.log`            | Where the VZ shed-server's log file lives. Override for Intel Macs (`/usr/local/...`) or custom installs. |
-| `SHED_FC_HOST`    | `mini3`                                            | SSH hostname for the FC server (used for journald log fetch). |
-| `SHED_FC_SERVER`  | same as host                                       | Entry name for the FC server (when it differs from the SSH host). |
+| Variable               | Default                                            | Effect |
+|------------------------|----------------------------------------------------|--------|
+| `SHED_VZ_SERVER`       | `my-server`                                        | Entry name in `~/.shed/config.yaml` for the local VZ server. |
+| `SHED_VZ_LOG_PATH`     | `/opt/homebrew/var/log/shed-server.log`            | Where the VZ shed-server's log file lives. Override for Intel Macs (`/usr/local/...`) or custom installs. |
+| `SHED_FC_HOST`         | `mini3`                                            | SSH hostname for the FC server (used for journald log fetch). |
+| `SHED_FC_SERVER`       | same as host                                       | Entry name for the FC server (when it differs from the SSH host). |
+| `SHED_VZ_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev VZ shed-server (alongside the brew one on a different port). When unset, the `vz_server_dev` fixture skips cleanly. Set by `make test-integration-dev` once that target lands (PR 2). |
+| `SHED_VZ_DEV_LOG_PATH` | _unset_                                            | Where the parallel dev VZ shed-server writes its log file. Required when `SHED_VZ_DEV_SERVER` is set. |
+| `SHED_FC_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev FC shed-server (alongside the deb one on a different port). When unset, the `fc_server_dev` fixture skips cleanly. Set by `make test-integration-dev-fc` once that target lands (PR 3). |
+| `SHED_FC_DEV_LOG_PATH` | _unset_                                            | Path on the FC remote where the parallel dev shed-server writes its log file. Required when `SHED_FC_DEV_SERVER` is set; the fixture reads it via `ssh + sudo -n cat` because the dev server runs as root via `sudo nohup` and is not under systemd. |
+
+## Fixtures
+
+- `shed_server` (params: `["vz", "fc"]`) — parameterized across the
+  brew/deb-installed shed-server on each backend. This is what the
+  existing test files use.
+- `shed_server_dev` (params: `["vz", "fc"]`) — parameterized across
+  the PARALLEL dev shed-server on each backend. Skips per-backend
+  when the corresponding `SHED_*_DEV_SERVER` env var isn't set. New
+  tests targeting server-side changes against the developer's source
+  tree use this fixture.
+
+The `vz_server_dev` / `fc_server_dev` sub-fixtures are session-scoped
+mirrors of `vz_server` / `fc_server`, reading the `_DEV_` env vars.
+The parallel-dev workflow (`make dev-server-up`, `test-integration-dev`)
+lands in PR 2 (Mac) + PR 3 (FC remote) of the
+`lets-defer-remote-mac-deep-brook` plan.
+
+## Framework meta-tests
+
+`test_framework_meta.py` covers the suite's own infra — fixture
+availability probing, log-path fall-through, raw-SSH endpoint
+resolution, the `template_fallback` per-shed-name marker, the
+remote-file-vs-journald log read branch, and a brew-targeted
+regression backstop. These don't need a live shed-server (mocked
+subprocess), except the backstop which spawns a real
+`test_create_delete_lifecycle[vz]` against brew and skips cleanly
+when brew isn't reachable. Run them with:
+
+```sh
+cd tests/integration && uv run pytest -v test_framework_meta.py
+```
 
 ## Layout
 
