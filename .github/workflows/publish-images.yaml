@@ -353,6 +353,28 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Tag/manifest invariant check — the local-bump flow's safety net.
+      # Replaces the deleted sync-version job's contract: instead of
+      # fixing plugin.json drift after the fact in CI, fail the release
+      # if the tagged commit's plugin.json doesn't match the tag. Cheap
+      # server-side check; the maintainer reruns
+      # /release-workflows:release against a corrected tag rather than
+      # shipping mismatched bytes.
+      - name: Verify plugin.json matches tag
+        run: |
+          set -euo pipefail
+          expect="${GITHUB_REF_NAME#v}"
+          # Use jq to anchor to the top-level .version field; a regex
+          # would also (incorrectly) match a future nested "version"
+          # field (e.g. in a future "dependencies" block). jq is
+          # preinstalled on ubuntu-latest and fails loudly on malformed
+          # JSON.
+          got="$(jq -r '.version' .claude-plugin/plugin.json)"
+          if [ "${got}" != "${expect}" ]; then
+            echo "::error::plugin.json .version=${got} != tag=${expect}. Re-run /release-workflows:release after correcting."
+            exit 1
+          fi
+
       - name: Run Tests
         run: go test ./...
 
@@ -361,6 +383,27 @@ jobs:
         with:
           version: v2.10.1
 
+      # Mint a release-bot App token scoped to charliek/homebrew-tap for
+      # GoReleaser's `brews:` step (formula push). The App must be
+      # installed on homebrew-tap (verify via sanity-check-app.yml).
+      # Replaces the legacy HOMEBREW_TAP_TOKEN PAT — GoReleaser is
+      # token-source-agnostic; it just uses HOMEBREW_TAP_TOKEN from the
+      # env for git authentication.
+      - name: Mint a homebrew-tap App token
+        id: tap
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner:        charliek
+          repositories: homebrew-tap
+          # Defense-in-depth: explicit permission floor on the minted
+          # token so a future widening of the App's installation perms
+          # doesn't silently broaden what this token can do. GoReleaser
+          # only needs contents:write on the tap repo (to push the
+          # formula).
+          permission-contents: write
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -368,61 +411,64 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # GoReleaser reads HOMEBREW_TAP_TOKEN from this env var (see
+          # .goreleaser.yaml: brews[].repository.token). Feed it the
+          # App-minted token instead of a PAT.
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
 
-      # Tell apt-charliek to pick up the new shed-server.deb attached to
-      # this release. The dispatch is fire-and-forget — apt-charliek's
-      # publish workflow re-scans every tracked package on every run, so
-      # a missed dispatch self-heals on the next one. Requires
-      # APT_DISPATCH_TOKEN (fine-grained PAT scoped to charliek/apt-charliek
-      # with Contents: write) to be set on this repo; skipped silently if
-      # the secret isn't present so the release still ships.
-      - name: Trigger apt-charliek publish
-        if: success() && env.APT_DISPATCH_TOKEN != ''
-        env:
-          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
-          APT_DISPATCH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
-        run: |
-          gh api repos/charliek/apt-charliek/dispatches \
-            --method POST \
-            -f event_type=publish \
-            -F "client_payload[package]=shed-server" \
-            -F "client_payload[tag]=${{ github.ref_name }}"
-          echo "::notice::Watch publish at https://github.com/charliek/apt-charliek/actions"
-
-  # Keep the committed .claude-plugin/plugin.json version in lockstep with the
-  # released tag, so Claude Code installs the right plugin version. Runs only
-  # after a real tag-push release (gated like the release job and needs it).
-  sync-version:
-    name: Commit plugin version to main
-    needs: release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout main
-        uses: actions/checkout@v6
+      # Mint a release-bot App token scoped to charliek/apt-charliek for
+      # the publish dispatch. The App must be installed on apt-charliek
+      # (verify via sanity-check-app.yml). Replaces the legacy
+      # APT_DISPATCH_TOKEN PAT.
+      - name: Mint an apt-charliek App token
+        if: success()
+        id: apt
+        uses: actions/create-github-app-token@v3
         with:
-          ref: main
-          persist-credentials: false
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner:        charliek
+          repositories: apt-charliek
+          # POST /repos/.../dispatches requires contents:write.
+          permission-contents: write
 
-      - name: Set plugin version from tag
-        run: scripts/set-version.sh "${GITHUB_REF_NAME#v}"
-
-      - name: Commit and push if plugin.json drifted
-        # Idempotent: a no-op when the version was bumped by hand before
-        # tagging. The GITHUB_TOKEN push does not re-trigger workflows (GitHub
-        # blocks recursive runs).
+      - name: Trigger apt-charliek publish
+        if: success()
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.apt.outputs.token }}
         run: |
-          if [ -z "$(git status --porcelain .claude-plugin/plugin.json)" ]; then
-            echo "plugin.json already matches ${GITHUB_REF_NAME}; nothing to commit"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .claude-plugin/plugin.json
-          git commit -m "chore: set plugin version ${GITHUB_REF_NAME}"
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          # Retry the dispatch a few times — a transient network/API
+          # blip shouldn't fail the release after GoReleaser already
+          # succeeded. apt-charliek's publish workflow is idempotent so
+          # a missed dispatch self-heals on the next release, but we
+          # still want to flag genuinely persistent failures.
+          for attempt in 1 2 3; do
+            # Capture stderr so a real install-state failure (App not
+            # installed on apt-charliek, scoped-perms mismatch, etc.)
+            # is diagnosable from the workflow log without re-running.
+            if gh api repos/charliek/apt-charliek/dispatches \
+              --method POST \
+              -f event_type=publish \
+              -F "client_payload[package]=shed-server" \
+              -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
+              echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
+              exit 0
+            fi
+            echo "::warning::dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-charliek dispatch failed after 3 attempts — check the stderr above for the API error"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+# The earlier sync-version job that checked out main, ran
+# scripts/set-version.sh, and pushed the bumped
+# .claude-plugin/plugin.json back to main is REMOVED in this
+# migration. Plugin.json bumping is now LOCAL via
+# scripts/release/update-version.sh (the cc-plugins:release-workflows
+# convention's source-tree-bump-local rule). The release skill runs
+# update-version.sh before tagging, so main always has plugin.json at
+# the released tag's version before the workflow even fires. The
+# inline "Verify plugin.json matches tag" step above is the cross-check
+# that replaces sync-version's after-the-fact bump.
