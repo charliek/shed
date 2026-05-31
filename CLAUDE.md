@@ -72,7 +72,20 @@ servers:
 
 Or run `shed server add localhost --port 18080 --name my-server-dev` after the first `make dev-server-up` — it registers the entry by probing the running server's `/info` endpoint.
 
-The FC remote sibling (`make dev-server-up-fc` / `make test-integration-dev-fc` targeting `$SHED_FC_HOST`) lands in a follow-up PR; today validate FC changes via the existing `make test-integration-local-fc` swap workflow.
+**FC remote parallel-dev** (same shape, over SSH to `$SHED_FC_HOST`):
+
+```bash
+# One-time setup: register the FC dev entry (after first dev-server-up-fc):
+shed server add mini3 --port 18080 --name mini3-dev
+
+# Per dev cycle:
+make dev-server-up-fc                    # launches dev shed-server on mini3:18080
+make test-integration-dev-fc             # runs suite against FC dev (auto-ups if needed)
+make build && make dev-server-restart-fc # pick up the rebuild
+make dev-server-down-fc                  # when done
+```
+
+The FC dev server runs via `sudo nohup` on the remote (no systemd unit — same intentionally-ephemeral lifecycle as the Mac dev server). Listens on `mini3:18080/12222` alongside the deb shed-server's `mini3:8080/2222`. Separate state-dirs under `/var/lib/shed-dev/firecracker/`. Offset `vsock_base_cid: 600` (deb default is 100) to avoid CID collision. SHARED bridge/CIDR/tap_prefix — kernel-level TAP coordination handles the cross-server case.
 
 **Open a server-side PR with `make test-integration-dev: N/N pass against dev-build at commit <sha>`**, and that statement is true and meaningful — not a brew-binary alibi.
 
@@ -96,9 +109,10 @@ This catches the v0.5.4-class regression where the binary built correctly but a 
 | `SHED_VZ_SERVER` | `my-server` | `~/.shed/config.yaml` entry for the brew/deb VZ server. |
 | `SHED_VZ_DEV_SERVER` | `my-server-dev` | `~/.shed/config.yaml` entry for the parallel dev VZ server. Honored by `make dev-server-up` / `dev-server-status` / `test-integration-dev`. |
 | `SHED_VZ_LOG_PATH` | `/opt/homebrew/var/log/shed-server.log` | brew log path (override for Intel-Mac homebrew prefix or custom installs). Set by `test-integration-dev` to the dev log path automatically. |
-| `SHED_FC_HOST` | `mini3` | SSH host for FC live tests + the existing `test-integration-local-fc` workflow. |
-| `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name when it differs from the SSH host. |
-| `FC_REMOTE_BIN_PATH` | `/usr/local/bin/shed-server` | shed-server install path on the FC remote. |
+| `SHED_FC_HOST` | `mini3` | SSH host for FC live tests + the `dev-server-*-fc` Makefile targets. |
+| `SHED_FC_SERVER` | same as `$SHED_FC_HOST` | `~/.shed/config.yaml` entry name for the deb FC server. |
+| `SHED_FC_DEV_SERVER` | `$(SHED_FC_HOST)-dev` | `~/.shed/config.yaml` entry name for the parallel dev FC server. |
+| `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from (set by `test-integration-dev-fc` to the dev server's log file because the dev FC server runs via `sudo nohup` and isn't under systemd). |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
 
 See `docs/development/testing.md` for the full operator guide — adding a test, the per-backend timing ceilings, the fixture conventions, the dev-server lifecycle.

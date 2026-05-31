@@ -59,10 +59,11 @@ tests they would have run, not the whole session.
 | `SHED_VZ_LOG_PATH`     | `/opt/homebrew/var/log/shed-server.log`            | Where the VZ shed-server's log file lives. Override for Intel Macs (`/usr/local/...`) or custom installs. |
 | `SHED_FC_HOST`         | `mini3`                                            | SSH hostname for the FC server (used for journald log fetch). |
 | `SHED_FC_SERVER`       | same as host                                       | Entry name for the FC server (when it differs from the SSH host). |
-| `SHED_VZ_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev VZ shed-server (alongside the brew one on a different port). When unset, the `vz_server_dev` fixture skips cleanly. Set by `make test-integration-dev` once that target lands (PR 2). |
+| `SHED_VZ_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev VZ shed-server (alongside the brew one on a different port). When unset, the `vz_server_dev` fixture skips cleanly. Set by `make test-integration-dev`. |
 | `SHED_VZ_DEV_LOG_PATH` | _unset_                                            | Where the parallel dev VZ shed-server writes its log file. Required when `SHED_VZ_DEV_SERVER` is set. |
-| `SHED_FC_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev FC shed-server (alongside the deb one on a different port). When unset, the `fc_server_dev` fixture skips cleanly. Set by `make test-integration-dev-fc` once that target lands (PR 3). |
-| `SHED_FC_DEV_LOG_PATH` | _unset_                                            | Path on the FC remote where the parallel dev shed-server writes its log file. Required when `SHED_FC_DEV_SERVER` is set; the fixture reads it via `ssh + sudo -n cat` because the dev server runs as root via `sudo nohup` and is not under systemd. |
+| `SHED_FC_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev FC shed-server (alongside the deb one on a different port). When unset, the `fc_server_dev` fixture skips cleanly. Set by `make test-integration-dev-fc`. |
+| `SHED_FC_DEV_LOG_PATH` | _unset_                                            | Path on the FC remote where the parallel dev shed-server writes its log file. Required when `SHED_FC_DEV_SERVER` is set; the fixture reads it via `ssh + sudo -n tail -c +N` (offset-based) because the dev server runs as root via `sudo nohup` and is not under systemd. |
+| `SHED_FC_LOG_PATH`     | _unset_ (uses journald)                            | Remote file path for the prod `fc_server` fixture to read logs from. When set, the fixture uses `ssh + sudo -n tail -c +N` against this file instead of journalctl. `make test-integration-dev-fc` sets this to the dev FC server's log file so the existing `shed_server`-using tests find PhaseTimer lines (the dev server isn't under systemd). |
 
 ## Fixtures
 
@@ -260,69 +261,97 @@ on port 18080/12222. Both run simultaneously. The SSH host key
 `~/.shed/known_hosts` keys by `host:port` so each entry's
 fingerprint is recorded independently.
 
-## Validating server-side changes (FC remote)
+## Validating server-side changes — parallel dev server (FC remote)
 
-`make test-integration-local-fc` closes the same gap for the
-Firecracker backend over SSH to `$SHED_FC_HOST` (default `mini3`):
+Same shape as the Mac VZ section above, but over SSH to
+`$SHED_FC_HOST` (default `mini3`). The deb shed-server keeps running
+undisturbed on `mini3:8080/2222`; the parallel dev FC server runs on
+`mini3:18080/12222`.
 
 ```sh
-make test-integration-local-fc
+# One-time setup: add a ~/.shed/config.yaml entry for the FC dev server.
+# Either copy this snippet:
+cat >> ~/.shed/config.yaml <<'EOF'
+servers:
+  mini3-dev:
+    host: mini3
+    http_port: 18080
+    ssh_port: 12222
+EOF
+# Or run after the first `make dev-server-up-fc`:
+shed server add mini3 --port 18080 --name mini3-dev
+
+# Per dev cycle:
+make dev-server-up-fc              # launches dev shed-server on mini3:18080
+make test-integration-dev-fc       # runs suite against FC dev (auto-ups if needed)
+
+# ... edit source ...
+make build && make dev-server-restart-fc
+make test-integration-dev-fc
+
+make dev-server-down-fc            # when done
 ```
 
-That target:
+The FC dev server:
 
-1. `build-fc-remote-server` — cross-compiles `shed-server` for the
-   remote host's GOARCH (detected at recipe time via `ssh <host>
-   uname -m`; today `mini3` is x86_64 → amd64, but an arm64 Linux
-   box works without code changes). Output lands at
-   `bin/shed-server-fc-remote`.
-2. `install-remote-server` — refuses to clobber an existing backup
-   without `FORCE=1`, then `scp`s the dev binary, backs up
-   `/usr/local/bin/shed-server` on the remote, swaps in the dev
-   binary via `install -m 755` (atomic copy + perms), writes a
-   systemd drop-in at `/etc/systemd/system/shed-server.service.d/
-   dev-override.conf` setting `Environment=SHED_BUILD_TOOLS_REF=...`,
-   `daemon-reload`s, and restarts `shed-server.service`. Polls the
-   remote for readiness before returning so the chained suite doesn't
-   race the systemd start.
-3. `test-integration` runs against `SHED_FC_HOST` (full suite — VZ
-   tests still run against your local brew install).
-4. `restore-remote-server` — restores the deb binary from the
-   remote backup, removes the systemd drop-in, `daemon-reload`s,
-   restarts the service, removes the backup. Idempotent: the
-   systemd drop-in is always removed (even when no backup exists)
-   so a stranded override doesn't survive a manual restore. Runs
-   unconditionally after the suite, regardless of pass/fail.
+- Runs from `/tmp/shed-server-dev` via `sudo nohup` on the remote
+  (needs root for FC's CAP_NET_ADMIN bridge/TAP operations). PID at
+  `/tmp/shed-server-dev.pid`, log at `/tmp/shed-server-dev.log`.
+- No systemd unit — same intentionally-ephemeral lifecycle as the
+  Mac dev server. Crashes visible (not silently auto-restarted), no
+  survives-reboot, re-up after reboot is one command.
+- Isolated state-dirs under `/var/lib/shed-dev/firecracker/`: separate
+  `images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`,
+  `socket_dir`. `shed image prune` from the deb server never touches
+  dev blobs.
 
-Backup lives on the **remote host** (`/tmp/shed-server-deb.bak`), so
-a developer who reboots their workstation mid-test can still recover
-the remote with `make restore-remote-server`.
+**FC-specific isolation:**
 
-Assumed infrastructure (same as the existing FC test path):
+- **Different ports** (18080/12222 vs deb's 8080/2222).
+- **Offset `vsock_base_cid: 600`** (deb default is 100). vsock
+  allocation is in-memory per-server with no kernel check; two
+  servers with the same base would collide on the first VM.
+- **SHARED bridge + CIDR + tap_prefix** with the deb server.
+  Kernel-level TAP existence check in
+  `internal/firecracker/network.go:FindAvailableTAPIndex` coordinates
+  cross-server. Known race window: two servers can both pick the
+  same TAP index before either calls `LinkAdd`; the second call fails
+  loudly with EEXIST. Diagnosable, not silent. For PR-validation
+  workloads (one dev creating one shed at a time on the dev server
+  while the deb server handles its own creates) this never fires.
+
+**Assumed infrastructure** (same as the existing FC test path):
 
 - Passwordless SSH from this host to `$SHED_FC_HOST`.
-- Passwordless `sudo` for the SSH user (the integration suite's
-  journalctl read already requires this).
-- `shed-server` installed at `/usr/local/bin/shed-server` (the deb's
-  install location). Override with `FC_REMOTE_BIN_PATH=...` if the
-  deploy location changes.
-- systemd unit named `shed-server.service`.
+- Passwordless `sudo` for the SSH user. The recipes drive `install`,
+  `cp`, `rm`, `nohup`, `tail`, `cat`, `stat`, `kill`, `ps`. The
+  integration suite's existing journalctl read already requires
+  sudo NOPASSWD for `journalctl`, so this is the same bar.
+- The remote has FC + KVM available (which the deb shed-server
+  already requires).
+
+**Lifecycle helpers** (all mirror the Mac dev-server-* targets):
+
+- `make dev-server-up-fc` — refuses if already running (use
+  `dev-server-restart-fc`).
+- `make dev-server-down-fc` — graceful TERM with 5 s wait, then
+  KILL. Verifies the PID points at a `shed-server` process before
+  signaling (so a stale PID file pointing at an unrelated process
+  on the remote doesn't get killed). Idempotent.
+- `make dev-server-status-fc` — running / reachable / log / config.
+- `make dev-server-logs-fc` — `ssh -t mini3 "sudo -n tail -F
+  /tmp/shed-server-dev.log"`.
+- `make dev-server-restart-fc` — down + up. Use after `make build`
+  to pick up a rebuilt binary on the remote.
 
 ```sh
 # Pin a specific build-tools tag (default: latest git v* tag):
 RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7 \
-  make install-remote-server
+  make dev-server-up-fc
 
 # Target a different remote:
-SHED_FC_HOST=other-host make test-integration-local-fc
-# or: FC_REMOTE_HOST=other-host make test-integration-local-fc
+SHED_FC_HOST=other-host make dev-server-up-fc
 ```
-
-After `install-remote-server` + `restore-remote-server` ship,
-the workflow promise is concrete: every server-side PR — VZ or FC —
-has a one-command path to exercise its own branch on the appropriate
-host. See `docs/discovery/integration-suite-server-coverage.md` §12
-"Cross-host bootstrap framing" for the broader motivation.
 
 ## What this suite is *not*
 
