@@ -159,14 +159,25 @@ def test_repo_clone_https(shed_server, test_shed_name):
 # on FC entirely (FC has no host-side template fast path —
 # see `internal/firecracker/orchestrator.go:AllocateUpper`).
 #
-# Dev-build isolation rationale: `BuildToolsRefForTag` in
-# `internal/version/buildtools.go` returns "" for any non-release
-# version string (including `-dirty` / `-N-g<hash>` suffixes), which
-# means dev binaries DON'T resolve a build-tools image and fall back
-# to in-guest mkfs.ext4 by design — a dev binary can't assume a
-# published build-tools image matches its source state. The
-# template_fallback signal lets the suite stay safe when run against
-# either dev or release binaries on either backend.
+# Two locked invariants make this split design correct (a future PR
+# changing either of these needs to reconsider the split first):
+#
+# 1. `BuildToolsRefForTag` in `internal/version/buildtools.go` returns
+#    "" for any non-release version string (including `-dirty` /
+#    `-N-g<hash>` suffixes). Dev binaries DON'T resolve a
+#    shed-build-tools image and fall back to in-guest mkfs.ext4 by
+#    design — a dev binary can't assume a published build-tools image
+#    matches its source state. The `template_fallback` log marker is
+#    what surfaces this so the suite skips cleanly.
+# 2. `fixtures/server.py:DEFAULT_AGENT_P50_MS` is calibrated against
+#    RELEASE-build behavior (sub-100 ms rootfs + ~1500-2400 ms agent).
+#    A dev binary's in-guest mkfs would inflate `agent_ms` by ~4 s
+#    and trip the gate. The skip-on-template_fallback shape in
+#    `test_create_agent_p50` is what makes one ceiling safe for
+#    both build modes — without it, the ceiling would have to be
+#    bifurcated per build mode (and the suite would have to know
+#    which mode it was running against, which is the contortion the
+#    split-gate redesign avoids).
 
 # Sanity ceiling for the host-side rootfs phase when the fast path is
 # active. Template clone + sibling-swap is ~5-10 ms on a healthy host;
@@ -268,9 +279,9 @@ def test_create_rootfs_template_present(shed_server, test_shed_name):
         agent ceiling already accommodates that cost.
       - Skips on VZ dev mode: `template_fallback` is True → log says
         the fast path was unavailable.
-      - On VZ release mode: asserts the host-side host phase
-        (`rootfs_ms`) is sub-100 ms as a sanity check that the
-        template clone actually happened fast.
+      - On VZ release mode: asserts the host-side `rootfs_ms` phase
+        is sub-100 ms as a sanity check that the template clone
+        actually happened fast.
 
     See the module-level comment for the split rationale.
     """
