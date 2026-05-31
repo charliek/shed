@@ -135,6 +135,12 @@ def vz_server_dev() -> LocalServer:
     Skips when `SHED_VZ_DEV_SERVER` is unset (the default — no dev
     server expected). When set, behaves like `vz_server` but targets
     the dev server entry name and reads the dev log file path.
+
+    Fails (not skips) when `SHED_VZ_DEV_SERVER` is set but
+    `SHED_VZ_DEV_LOG_PATH` is empty: the suite's PhaseTimer-dependent
+    tests need a log path, and silently falling back to journald
+    (which Mac launchd-less dev servers don't write to) would produce
+    confusing "no PhaseTimer found" skips deep in the suite.
     """
     if not VZ_DEV_SERVER_NAME:
         pytest.skip(
@@ -143,10 +149,21 @@ def vz_server_dev() -> LocalServer:
             "`make test-integration-dev`, or set SHED_VZ_DEV_SERVER + "
             "SHED_VZ_DEV_LOG_PATH manually."
         )
-    log_path = Path(VZ_DEV_LOG_PATH) if VZ_DEV_LOG_PATH else None
-    if log_path is not None and not log_path.exists():
-        log_path = None
-    s = LocalServer(name=VZ_DEV_SERVER_NAME, backend="vz", log_path=log_path)
+    if not VZ_DEV_LOG_PATH:
+        pytest.fail(
+            "SHED_VZ_DEV_SERVER is set but SHED_VZ_DEV_LOG_PATH is "
+            "empty. The parallel dev VZ shed-server writes its log "
+            "to a known file (typically ~/.shed/dev/server.log); set "
+            "SHED_VZ_DEV_LOG_PATH to that path. Without it, the "
+            "PhaseTimer-dependent tests would skip with a confusing "
+            "'no PhaseTimer found' reason."
+        )
+    log_path = Path(VZ_DEV_LOG_PATH)
+    s = LocalServer(
+        name=VZ_DEV_SERVER_NAME,
+        backend="vz",
+        log_path=log_path if log_path.exists() else None,
+    )
     if not s.available():
         pytest.skip(
             f"VZ dev shed-server ({VZ_DEV_SERVER_NAME!r}) is not reachable; "
@@ -164,6 +181,11 @@ def fc_server_dev() -> RemoteServer:
     the dev server entry name and reads logs from the remote dev log
     file via `ssh + sudo cat` (not journald — the dev server isn't
     under systemd).
+
+    Fails (not skips) when `SHED_FC_DEV_SERVER` is set but
+    `SHED_FC_DEV_LOG_PATH` is empty: the dev FC server runs via `sudo
+    nohup` (no systemd unit), so journald has no records and the
+    fixture's PhaseTimer fetch needs the file path.
     """
     if not FC_DEV_SERVER_NAME:
         pytest.skip(
@@ -172,11 +194,20 @@ def fc_server_dev() -> RemoteServer:
             "`make test-integration-dev-fc`, or set SHED_FC_DEV_SERVER + "
             "SHED_FC_DEV_LOG_PATH manually."
         )
+    if not FC_DEV_LOG_PATH:
+        pytest.fail(
+            "SHED_FC_DEV_SERVER is set but SHED_FC_DEV_LOG_PATH is "
+            "empty. The parallel dev FC shed-server runs via "
+            "`sudo nohup` (not systemd), so journald has no records "
+            "for it; the fixture reads its log file via "
+            "`ssh + sudo -n tail`. Set SHED_FC_DEV_LOG_PATH to the "
+            "remote file path (typically /tmp/shed-server-dev.log)."
+        )
     s = RemoteServer(
         ssh_host=FC_SSH_HOST,
         name=FC_DEV_SERVER_NAME,
         backend="firecracker",
-        remote_log_path=FC_DEV_LOG_PATH or None,
+        remote_log_path=FC_DEV_LOG_PATH,
     )
     if not s.available():
         pytest.skip(
@@ -206,9 +237,8 @@ def shed_server_dev(request):
 _SHED_NAME_SAFE = re.compile(r"[^a-z0-9-]+")
 
 
-@pytest.fixture
-def test_shed_name(shed_server, request):
-    """Allocate a unique shed name per test, with automatic cleanup.
+def _gen_shed_name(request) -> str:
+    """Compute the canonical per-test shed name from a pytest request.
 
     Pattern: `itest-<sanitized-prefix>-<6-char-hash>`. The hash is over
     the full pytest nodeid (including parameterization), so two tests
@@ -222,12 +252,47 @@ def test_shed_name(shed_server, request):
     # Budget: "itest-" (6) + dashes (2) + suffix (6) = 14 chars of overhead
     # against the 48-char shed-name ceiling, leaving 34 for the prefix.
     prefix = sanitized[:34].rstrip("-")
-    name = f"itest-{prefix}-{suffix}"
+    return f"itest-{prefix}-{suffix}"
+
+
+@pytest.fixture
+def test_shed_name(shed_server, request):
+    """Per-test shed name with automatic cleanup on the PROD shed-server.
+
+    Tests using the `shed_server` fixture (brew/deb-installed
+    shed-server) pair with this one. The teardown calls
+    `shed_server.delete(name)`.
+
+    Tests targeting the parallel-dev server must use `test_shed_name_dev`
+    instead — using `test_shed_name` with `shed_server_dev` would
+    silently instantiate BOTH the prod and dev backends AND clean up
+    against the wrong server. The two name fixtures are intentionally
+    separate so a misconfigured test fails at collection-time rather
+    than running half-correctly.
+    """
+    name = _gen_shed_name(request)
     yield name
     # Teardown is best-effort. A test that died mid-create might leave a
     # half-created shed; ignore_missing=True keeps cleanup from masking
     # the original failure.
     try:
         shed_server.delete(name, ignore_missing=True)
+    except Exception:
+        pass
+
+
+@pytest.fixture
+def test_shed_name_dev(shed_server_dev, request):
+    """Per-test shed name with automatic cleanup on the DEV shed-server.
+
+    Mirror of `test_shed_name` for tests targeting the parallel-dev
+    shed-server (the `shed_server_dev` fixture). Keeps the two
+    server-target paths cleanly separated — see `test_shed_name`'s
+    docstring for the reasoning.
+    """
+    name = _gen_shed_name(request)
+    yield name
+    try:
+        shed_server_dev.delete(name, ignore_missing=True)
     except Exception:
         pass

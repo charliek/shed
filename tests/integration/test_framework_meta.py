@@ -235,6 +235,55 @@ def test_meta_remote_log_path_uses_ssh_cat(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 6b. RemoteServer._log_offset uses `stat -c %s` (sudo opens the file)
+# ---------------------------------------------------------------------------
+
+
+def test_meta_remote_log_offset_uses_stat_not_wc_redirect(monkeypatch):
+    """`RemoteServer._log_offset` for `remote_log_path` mode uses
+    `sudo -n stat -c %s FILE`, NOT `sudo -n wc -c < FILE`. The shell
+    redirect `<` would run BEFORE sudo, so a root-owned dev log file
+    couldn't be opened and offset would always be 0 — defeating the
+    stale-PhaseTimer protection in `_read_timing`.
+
+    Catches: regression where someone "simplifies" the SSH command
+    back to `wc -c < ...` and the suite silently re-introduces a
+    flake class where re-running the same test name matches a prior
+    run's PhaseTimer line.
+    """
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        class R:
+            returncode = 0
+            stdout = "12345\n"
+            stderr = ""
+        return R()
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    s = RemoteServer(
+        ssh_host="fake-host",
+        name="any",
+        backend="firecracker",
+        remote_log_path="/tmp/shed-server-dev.log",
+    )
+    offset = s._log_offset()
+    assert offset == 12345
+
+    remote_cmd = captured["cmd"][-1]
+    assert "stat -c" in remote_cmd, (
+        f"expected `stat -c %s` (sudo opens the file), got: {remote_cmd!r}"
+    )
+    # The `wc -c < FILE` antipattern is the regression we're preventing.
+    assert "wc -c <" not in remote_cmd, (
+        f"`wc -c < FILE` shell-redirects BEFORE sudo runs; for a "
+        f"root-only dev log the shell can't open it. Use "
+        f"`sudo -n stat -c %s FILE` instead. Got: {remote_cmd!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 7. RemoteServer with no remote_log_path uses journalctl
 # ---------------------------------------------------------------------------
 

@@ -76,7 +76,21 @@ firecracker:
   # server picks the next unused TAP index (e.g. shed-tap-0 for the
   # first deb VM, shed-tap-1 for the first dev VM if the deb VM is
   # still up). IPs flow from the index via `AllocateIP` — same
-  # function, different index, different IP. No collision.
+  # function, different index, different IP. No collision for already-
+  # existing TAPs.
+  #
+  # Known race window (small, fails loudly when it fires): the
+  # `FindAvailableTAPIndex` call returns an index before the actual
+  # `netlink.LinkAdd` creates the TAP. Two shed-server processes
+  # concurrently creating a VM can both pick the same index, then
+  # the second `LinkAdd` fails with EEXIST. The error propagates to
+  # the user as `failed to create TAP device shed-tap-N: file exists`
+  # — diagnosable, not silent. For PR-validation workloads (one dev
+  # creating one shed at a time on the dev server while the deb
+  # server handles its own creates) this never fires. If concurrent-
+  # create stress becomes a real workload, the fix is server-side:
+  # retry-on-EEXIST in `internal/firecracker/orchestrator.go`'s
+  # AllocateNetwork hook.
   bridge_name: shed-br0
   bridge_cidr: 172.30.0.1/24
   tap_prefix:  shed-tap

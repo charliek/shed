@@ -33,6 +33,7 @@ import json
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -550,10 +551,16 @@ class RemoteServer(LocalServer):
                         "-o", "BatchMode=yes",
                         "-o", "ConnectTimeout=5",
                         self.ssh_host,
-                        # `wc -c < FILE` returns the byte count and exits
-                        # non-zero if FILE doesn't exist; the sudo -n
-                        # bracket lets us read root-owned dev logs.
-                        f"sudo -n wc -c < {shlex.quote(self.remote_log_path)} 2>/dev/null || echo 0",
+                        # `stat -c %s FILE` returns the byte size and
+                        # is opened by `stat` (under sudo), so root-only
+                        # log files are readable here. We can't use
+                        # `wc -c < FILE` because the shell redirect runs
+                        # BEFORE sudo and fails to open a root-only
+                        # file — leaving us with offset=0 and the suite
+                        # reading the entire log every time (stale
+                        # PhaseTimer lines from prior tests can then
+                        # match a re-used shed name).
+                        f"sudo -n stat -c %s {shlex.quote(self.remote_log_path)}",
                     ],
                     capture_output=True,
                     text=True,
@@ -587,7 +594,15 @@ class RemoteServer(LocalServer):
                         "-o", "BatchMode=yes",
                         "-o", "ConnectTimeout=5",
                         self.ssh_host,
-                        f"sudo -n tail -c +{start + 1} {shlex.quote(self.remote_log_path)} 2>/dev/null || true",
+                        # No `2>/dev/null || true` — let the SSH
+                        # command's stderr surface naturally so a
+                        # misconfigured sudo (NOPASSWD missing) or
+                        # missing log file reports the real error
+                        # rather than silently returning "" (which
+                        # the suite would interpret as "no PhaseTimer
+                        # found" and skip the test with a misleading
+                        # reason).
+                        f"sudo -n tail -c +{start + 1} {shlex.quote(self.remote_log_path)}",
                     ],
                     capture_output=True,
                     text=True,
@@ -595,7 +610,19 @@ class RemoteServer(LocalServer):
                 )
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 return ""
-            return r.stdout if r.returncode == 0 else ""
+            if r.returncode != 0:
+                # Surface the underlying error to pytest's stderr so a
+                # misconfigured dev server (wrong log path, sudo NOPASSWD
+                # not set) is diagnosable from the test output instead
+                # of looking like a flaky timing-test skip.
+                print(
+                    f"[fixtures.RemoteServer] remote log read failed "
+                    f"(exit {r.returncode}) for {self.ssh_host}:"
+                    f"{self.remote_log_path}: {r.stderr.strip()!r}",
+                    file=sys.stderr,
+                )
+                return ""
+            return r.stdout
 
         # Journald fallback (deb-installed shed-server).
         try:
