@@ -50,8 +50,8 @@ The suite is **parameterized over `["vz", "fc"]`** and skips cleanly when a back
 #   2. make dev-server-up           # launches dev shed-server on ports 18080/12222
 #
 # Per development cycle:
-make dev-server-up                  # idempotent; no-op if already running
-make test-integration-dev           # run suite against dev server
+make dev-server-up                  # refuses if already running (use dev-server-restart)
+make test-integration-dev           # run suite against dev server (auto-ups if needed)
 # ... edit source ...
 make build && make dev-server-restart   # pick up the rebuild
 make test-integration-dev           # re-run

@@ -154,7 +154,17 @@ dev-server-down:
 	  echo "  (Idempotent: this is OK.)"; \
 	else \
 	  PID=$$(cat "$(DEV_PID_PATH)"); \
-	  if kill -0 $$PID 2>/dev/null; then \
+	  if ! kill -0 $$PID 2>/dev/null; then \
+	    echo "Dev server PID $$PID is stale (process already gone); cleaning up PID file."; \
+	    rm -f "$(DEV_PID_PATH)"; \
+	  elif ! ps -p $$PID -o comm= 2>/dev/null | grep -q "shed-server"; then \
+	    echo "Dev server PID $$PID points at an unrelated process"; \
+	    echo "  (current comm: $$(ps -p $$PID -o comm= 2>/dev/null))."; \
+	    echo "  Refusing to send signals; cleaning up the stale PID file only."; \
+	    echo "  If you have a stranded shed-server somewhere, find it with"; \
+	    echo "  'pgrep -fl shed-server' and stop it by hand."; \
+	    rm -f "$(DEV_PID_PATH)"; \
+	  else \
 	    kill -TERM $$PID 2>/dev/null; \
 	    for i in 1 2 3 4 5; do \
 	      if ! kill -0 $$PID 2>/dev/null; then break; fi; \
@@ -165,10 +175,8 @@ dev-server-down:
 	      kill -KILL $$PID 2>/dev/null; \
 	    fi; \
 	    echo "Dev server (pid $$PID) stopped."; \
-	  else \
-	    echo "Dev server PID $$PID is stale (process already gone); cleaning up PID file."; \
+	    rm -f "$(DEV_PID_PATH)"; \
 	  fi; \
-	  rm -f "$(DEV_PID_PATH)"; \
 	fi
 
 dev-server-status:
@@ -229,8 +237,17 @@ test-integration-dev: build
 	  echo "Dev server not running; starting via dev-server-up..."; \
 	  $(MAKE) dev-server-up; \
 	fi
+	@# Set BOTH the prod env-var pair (so the existing `shed_server`
+	@# fixture in test_smoke / test_lifecycle / test_exec_shell retargets
+	@# at the dev server) AND the dev env-var pair (so the
+	@# `shed_server_dev` fixture activates for any test that explicitly
+	@# uses it). Today's tests all use `shed_server`; future
+	@# dev-specific meta-tests can use `shed_server_dev` without needing
+	@# a different Make target.
 	SHED_VZ_SERVER=$(SHED_VZ_DEV_SERVER) \
 	  SHED_VZ_LOG_PATH=$(DEV_LOG_PATH) \
+	  SHED_VZ_DEV_SERVER=$(SHED_VZ_DEV_SERVER) \
+	  SHED_VZ_DEV_LOG_PATH=$(DEV_LOG_PATH) \
 	  $(MAKE) test-integration
 
 # Remote dev-binary swap + integration suite + restore for the FC
