@@ -2,6 +2,201 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.5.9 — 2026-05-31
+
+Substantial maintenance release covering three areas: a complete
+rebuild of the developer's local-shed-server validation workflow
+(parallel dev server replacing the old swap-the-binary dance),
+a hardening pass on the VM lifecycle and packaging (mount retries,
+VMM exit verification, .deb postinst restart, `StartShed`
+late-failure metadata persistence), and an internal refactor pulling
+both backends onto a shared orchestrator `BackendStarter`. Also
+adopts the `cc-plugins:release-workflows` convention for the release
+pipeline.
+
+No manifest format changes, no image cache wipe required — same
+`shed image rm <tag> && shed image prune` upgrade workflow as v0.5.8.
+
+### Parallel dev shed-server workflow (#157, #158, #159, #161, #162, #163)
+
+**Why**: every server-side PR — VZ or FC — now has a one-command
+path to validate against the developer's source tree, **without**
+the pre-v0.5.9 swap-the-binary workflows that were stateful, hard
+to back out of, and easy to leave dirty.
+
+Replaces:
+
+- The Mac "swap brew shed-server binary, run the suite, restore"
+  workflow (deleted in #162).
+- The Linux/FC "swap the .deb-installed binary on a remote box"
+  workflow (deleted in #163).
+
+…with a parallel dev shed-server running **alongside** the brew or
+.deb production server on different ports + sockets, driven by new
+Makefile targets:
+
+| Target | Platform | What it does |
+|---|---|---|
+| `make dev-server-up` | Mac | Builds + launches `bin/shed-server` via `nohup` with `SHED_BUILD_TOOLS_REF` inline. Polls `shed -s my-server-dev list` for readiness. |
+| `make dev-server-down` | Mac | Graceful TERM (5s budget) then KILL. Idempotent. |
+| `make dev-server-up-fc` | Linux remote (`$SHED_FC_HOST=mini3` default) | Cross-compiles for remote GOARCH, scps binary + config, launches via `sudo nohup`. |
+| `make dev-server-down-fc` | Linux remote | Same shape as the Mac target. |
+| `make install-local-server` | Mac | Earlier-cycle "swap brew binary" path, kept for cases where parallel doesn't apply. Refuses to clobber without `FORCE=1`. (#158) |
+| `make restore-brew-server` | Mac | Restore brew binary + clear env + restart brew. No-op when no backup. (#158) |
+| `make install-remote-server` | Linux remote | scp + backup + swap + systemd notify. (#159) |
+| `make restore-remote-server` | Linux remote | Same pattern as Mac restore. (#159) |
+| `make test-integration-local` | Mac | End-to-end integration suite against local-built `shed-server`. (#158) |
+| `make test-integration-local-fc` | Linux remote | Same suite, FC backend. (#159) |
+
+The integration suite is the core fixture (#161): a Pytest harness
+that bring-up + tears-down sheds against a known-up server, with the
+"is the server ready" probe + timing assertions hardened to skip
+correctly when the suite runs against a freshly-launched dev binary
+(template_fallback cost inflates `agent_ms` ~4 s; not a regression).
+
+The timing gates were split into two narrower regressions (#157):
+- `test_create_agent_p50` — agent-phase p50 ≤ per-backend ceiling
+  (skipped if any sample triggered `template_fallback`).
+- `test_create_rootfs_template_present` — `rootfs_ms ≤ 100 ms`
+  (host-side template-cache hit, no in-guest mkfs).
+
+End result: a typical server-side PR cycle is now `make dev-server-up
+&& make test-integration-local && make dev-server-down` on Mac, and
+the same shape on the FC side. No binary swap, no leftover state.
+
+### Lifecycle + packaging hardening (#150, #151, #152, #156)
+
+**`.deb` postinst now restarts shed-server on upgrade (#150).** The
+v0.5.8 → mini2/mini3 rollout surfaced that `sudo dpkg -i
+shed-server_0.5.x_amd64.deb` over an existing install left the running
+0.5.(x-1) process serving while `dpkg-query` reported 0.5.x — a
+silent version skew between the package manager's view and the
+actual binary in memory. `packaging/postinstall.sh` now does a
+`try-restart` of `shed-server.service` only on **upgrade** (`$2` set);
+fresh installs preserve the existing "edit `server.yaml`, then
+start" contract. Closes the gap documented as a follow-up in
+`docs/upgrades/v0.5.7-to-v0.5.8.md`.
+
+**VMM-exit verification + PID-reuse guard on FC (#151).** Three gaps
+in the stop/start lifecycle could silently leave shed running a
+second VMM under the same name:
+
+1. `stopShedLocked` flipped `meta.Status=stopped`/`PID=0` after
+   `vm.Stop()` returned `nil`, even when the post-SIGKILL
+   `waitForProcessExit` swallowed its 2s timeout.
+2. `StartShed` only checked `IsRunning()` when `meta.Status=Running` —
+   a stale `Status=stopped` with the process still alive bypassed
+   the guard and spawned a second VMM.
+3. FC's `IsRunning()` was a bare `kill -0 PID` check, false-positive
+   on PID reuse after a long-stopped shed.
+
+Fixed: lifecycle now verifies actual process exit before flipping
+metadata, the start guard runs unconditionally, and FC's running
+check cross-references the process command line.
+
+**VirtioFS/9P workspace mount retry (#152).** A single transient
+agent-RPC blip during the workspace mount used to kill an entire
+10s VM bring-up — the only recovery was `shed delete` + recreate.
+Both backends' mount paths now use a small bounded retry envelope
+(new leaf package `internal/retry/`, scoped narrowly to avoid the
+`config → vmimage → vmutil → config` import cycle that promoting
+`withRetry` to `internal/vmutil` would have closed). Brief flakes
+no longer escalate to a full failure.
+
+**`StartShed` late-failure metadata persistence (#156).** When
+`StartShed` succeeded through `PersistRunningState` and then a
+downstream hook failed (most likely `MountLocalDir`, even with
+#152's retries — a terminal third-attempt 9P/VirtioFS failure is
+still possible), the cleanup stack unwound `remove from vms map` +
+`stop VM` but never wrote `Status=Stopped` back to disk. Next list
+would show the shed as `Running` with no underlying process. Now
+the cleanup explicitly persists `Stopped` metadata as part of the
+unwind.
+
+### Internal refactors (#153, #154, #155)
+
+**`StartShed` migrated to orchestrator `BackendStarter` on both
+backends (#153 VZ, #154 FC).** Pre-v0.5.9, VZ and FC each had their
+own ~200-line `StartShed` that duplicated metadata lifecycle, hook
+sequencing, and cleanup unwinding. Both now delegate to a shared
+`internal/orchestrator/BackendStarter` that owns the lifecycle
+contract; each backend supplies only the actual VMM-bringup steps
+via the `Starter` interface. Cuts each backend's bring-up code by
+roughly half and gives the lifecycle a single source of truth (set
+up to make #151's hardening simpler to land — the verification
+logic now lives in one place, not two).
+
+**Deleted `Backend.GetNetworkEndpoint` (#155).** Vestigial — zero
+callers via the interface. The API layer's network-routing
+(`internal/api/connect.go`) uses `Backend.DialService`, and
+`Shed.IPAddress` is populated directly in each backend's
+`metadataToShed`. The method was flagged as "a lie" in the
+discovery doc (VZ returned a hardcoded `"127.0.0.1"`). Deleted
+rather than typed-up; the contract is now `DialService`.
+
+### Documentation (#160, #164, #165)
+
+- **Integration suite workflow + e2e validation discipline (#160).**
+  Documents the parallel-dev-server flow (post-#157/#158/#159) as the
+  primary path for server-side PR validation, with the swap workflows
+  deprecated and slated for deletion in the next cycle.
+- **Retired discovery doc (#164).** `docs/discovery/integration-suite-server-coverage.md`
+  is closed-out — every gap it identified is now addressed by #157-163.
+- **Pre-release validation for build-tools + base image changes
+  (#165).** New section in `docs/development/releasing.md` covering
+  when `scripts/release-validation.sh` is the right gate (any change
+  to `build-tools/`, `firecracker/`, `vz/`, `initramfs/`, or
+  `scripts/build-*.sh`) vs the lighter local check (everything else).
+
+### Release process — convention adoption (#166)
+
+Adopts the `cc-plugins:release-workflows` convention now used by
+every other repo in the constellation (strix, roost, prox, codelens,
+envsecrets, shed-extensions). Net effect for maintainers: one
+command (`/release-workflows:release vX.Y.Z`) handles changelog +
+plugin.json bump + commit + tag + push, replacing the prior
+"tag-then-let-CI-bump-plugin.json" pattern.
+
+Specifically:
+
+- **`HOMEBREW_TAP_TOKEN` + `APT_DISPATCH_TOKEN` PATs retired.** Both
+  are now minted at workflow time as scoped `charliek-release-bot`
+  GitHub App tokens (`owner: charliek` + `repositories: homebrew-tap`
+  / `apt-charliek`) with `permission-contents: write` defense-in-
+  depth. GoReleaser still reads `HOMEBREW_TAP_TOKEN` from env (it's
+  token-source-agnostic); the workflow now sources it from
+  `steps.tap.outputs.token`.
+- **`sync-version` job deleted.** Plugin.json is now bumped LOCALLY
+  by `/release-workflows:release` before tagging (the convention's
+  source-tree-bump-local rule). Replaced by an inline
+  `Verify plugin.json matches tag` jq cross-check in the `release`
+  job that fails the release loud if a developer ever tags the
+  wrong commit instead of silently fixing it up.
+- **`actions/create-github-app-token@v3`** on both new mint steps
+  (Node 24; resolves the upcoming Sep 2026 Node 20 EOL on GHA
+  runners).
+- **Branch protection ruleset on `main`** with the App
+  (`charliek-release-bot`, id `3902108`) + admin role (id `5`) in
+  `bypass_actors`. Previously shed had no branch protection at all.
+- **New `sanity-check-app.yml`** (manual workflow) verifies the
+  release-bot App reaches `charliek/shed` + `charliek/homebrew-tap`
+  + `charliek/apt-charliek` before each release. Both runs validated
+  before this release.
+- **New `RELEASING.md`** — per-repo policy + failure-mode table +
+  break-glass recovery runbooks.
+- **`scripts/release/update-version.sh`** (new wrapper around the
+  existing `scripts/set-version.sh`) adds a jq-verify of the bump,
+  defending against the silent-failure mode of `set-version.sh`'s
+  regex substitution if the JSON ever gains a nested `"version"`
+  field.
+
+All Docker pushes (build-tools + 6 image variants) intentionally
+stay on `GITHUB_TOKEN` — canonical pattern for same-repo ghcr.io
+packages, no need for an App token. The strict job ordering
+(build-tools → vz+fc → smoke → release) is preserved; it's the
+v0.5.2-era race fix that ensures the apt-charliek dispatch only
+fires after every referenced ghcr image is live.
+
 ## v0.5.8 — 2026-05-29
 
 Maintenance release closing two operational bugs surfaced while rolling
