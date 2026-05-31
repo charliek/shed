@@ -159,9 +159,25 @@ def test_repo_clone_https(shed_server, test_shed_name):
 # on FC entirely (FC has no host-side template fast path —
 # see `internal/firecracker/orchestrator.go:AllocateUpper`).
 #
-# See `docs/discovery/integration-suite-server-coverage.md` §7
-# "Locked invariants" for the dev-build-isolation rationale that makes
-# this divergence intentional.
+# Two locked invariants make this split design correct (a future PR
+# changing either of these needs to reconsider the split first):
+#
+# 1. `BuildToolsRefForTag` in `internal/version/buildtools.go` returns
+#    "" for any non-release version string (including `-dirty` /
+#    `-N-g<hash>` suffixes). Dev binaries DON'T resolve a
+#    shed-build-tools image and fall back to in-guest mkfs.ext4 by
+#    design — a dev binary can't assume a published build-tools image
+#    matches its source state. The `template_fallback` log marker is
+#    what surfaces this so the suite skips cleanly.
+# 2. `fixtures/server.py:DEFAULT_AGENT_P50_MS` is calibrated against
+#    RELEASE-build behavior (sub-100 ms rootfs + ~1500-2400 ms agent).
+#    A dev binary's in-guest mkfs would inflate `agent_ms` by ~4 s
+#    and trip the gate. The skip-on-template_fallback shape in
+#    `test_create_agent_p50` is what makes one ceiling safe for
+#    both build modes — without it, the ceiling would have to be
+#    bifurcated per build mode (and the suite would have to know
+#    which mode it was running against, which is the contortion the
+#    split-gate redesign avoids).
 
 # Sanity ceiling for the host-side rootfs phase when the fast path is
 # active. Template clone + sibling-swap is ~5-10 ms on a healthy host;
@@ -183,11 +199,7 @@ def test_create_agent_p50(shed_server):
     fire the gate for a structural reason that's NOT a real regression.
     `test_create_rootfs_template_present` covers the orthogonal "is the
     fast path active" question; this test focuses on the agent-init
-    path only.
-
-    See `docs/discovery/integration-suite-server-coverage.md` §7
-    "Locked invariants" for why splitting these signals is necessary
-    to make the suite safe to run against dev binaries.
+    path only. See the module-level comment for the split rationale.
     """
     ceiling = DEFAULT_AGENT_P50_MS[shed_server.backend]
     run_id = hashlib.sha256(
@@ -267,12 +279,11 @@ def test_create_rootfs_template_present(shed_server, test_shed_name):
         agent ceiling already accommodates that cost.
       - Skips on VZ dev mode: `template_fallback` is True → log says
         the fast path was unavailable.
-      - On VZ release mode: asserts the host-side host phase
-        (`rootfs_ms`) is sub-100 ms as a sanity check that the
-        template clone actually happened fast.
+      - On VZ release mode: asserts the host-side `rootfs_ms` phase
+        is sub-100 ms as a sanity check that the template clone
+        actually happened fast.
 
-    See `docs/discovery/integration-suite-server-coverage.md` §7
-    "Locked invariants" for why this divergence is intentional.
+    See the module-level comment for the split rationale.
     """
     if shed_server.backend != "vz":
         pytest.skip(
@@ -294,8 +305,7 @@ def test_create_rootfs_template_present(shed_server, test_shed_name):
             "intentionally don't embed a shed-build-tools image ref "
             "(see `internal/version/buildtools.go:BuildToolsRefForTag`); "
             "set SHED_BUILD_TOOLS_REF on the shed-server process or "
-            "run a release binary to exercise the fast path. See "
-            "docs/discovery/integration-suite-server-coverage.md §7."
+            "run a release binary to exercise the fast path."
         )
     rootfs_ms = handle.timings.rootfs_ms
     assert rootfs_ms <= ROOTFS_TEMPLATE_FAST_PATH_CEILING_MS, (
