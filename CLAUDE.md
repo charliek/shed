@@ -89,6 +89,8 @@ The FC dev server runs via `sudo nohup` on the remote (no systemd unit — same 
 
 **Open a server-side PR with `make test-integration-dev: N/N pass against dev-build at commit <sha>`**, and that statement is true and meaningful — not a brew-binary alibi.
 
+**For PRs that change `shed-build-tools` (`build-tools/`) or base images (`vz/Dockerfile`, `firecracker/Dockerfile`, shed-extensions bumps):** the dev-server workflow extends to those too — see `docs/development/testing.md` § "Validating pre-release: build-tools image changes" and § "Validating pre-release: base image changes" for the `RELEASE_BUILD_TOOLS_REF=shed-build-tools:dev` and `OUTPUT_DIR=...shed-dev/vz ./scripts/build-vz-rootfs.sh ...` overrides that wire local builds into the dev server's blob store.
+
 #### Performance impact — vet against the released version
 
 For changes that touch the boot path, agent dial, healthPoll, upper-allocation, mount, image-resolution, or any other hot path: **measure the impact on each platform the change affects, against the most recent release binary, before merging.** The split timing gate (`test_create_agent_p50` + `test_create_rootfs_template_present`) is the floor — it fires on regressions around 500 ms or more (see `tests/integration/fixtures/server.py:DEFAULT_AGENT_P50_MS` for the per-backend regression budget) — but a sub-threshold regression (or worse, a "no regression" that masks an actual gain that didn't materialise) won't trip it.

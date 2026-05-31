@@ -185,6 +185,119 @@ servers:
     ssh_port: 12222
 ```
 
+#### Validating pre-release: build-tools image changes
+
+The parallel dev server uses `SHED_BUILD_TOOLS_REF` to pick which
+`shed-build-tools` image mints the pre-formatted upper template ext4
+on first VM create. By default that's the latest release tag
+(resolved from `git tag --list 'v*'` at recipe time). To validate a
+change to the `build-tools/` tree before cutting a release:
+
+```sh
+# 1. Build the local shed-build-tools image. Tags it as
+#    shed-build-tools:dev in the local Docker daemon.
+make build-tools
+
+# 2. Restart the dev server with the local image override.
+#    Works on either platform (Mac VZ or FC remote).
+RELEASE_BUILD_TOOLS_REF=shed-build-tools:dev make dev-server-restart
+# or:
+RELEASE_BUILD_TOOLS_REF=shed-build-tools:dev make dev-server-restart-fc
+
+# 3. Run the suite (or a focused subset). The dev shed-server will
+#    invoke shed-build-tools:dev for upper-template formatting.
+make test-integration-dev   # or test-integration-dev-fc
+```
+
+How to confirm the override took effect: after a `shed create` the
+PhaseTimer line should show `rootfs=` sub-100 ms (fast template
+clone), AND the server log should NOT contain a
+`[<shed-name>] upper template unavailable` line for the created
+shed. If you see `rootfs=` in the multi-second range, or the
+"unavailable" log line, the override didn't take and the dev binary
+fell back to in-guest mkfs.
+
+For an FC remote validation you may want to push `shed-build-tools:dev`
+to a registry the remote can pull from (or `docker save` + `docker load`
+across the SSH boundary). The local-only path works on Mac because
+the same Docker daemon serves both `make build-tools` and the
+shed-server's image-resolution call.
+
+#### Validating pre-release: base image changes (vz/firecracker Dockerfiles, shed-extensions)
+
+Base images (`shed-vz-base`, `shed-vz-extensions`, `shed-vz-full`,
+and the FC counterparts) are built by
+`scripts/build-vz-rootfs.sh` / `scripts/build-firecracker-rootfs.sh`,
+which write OCI blobs + a tag pointer into an `OUTPUT_DIR`. The
+default `OUTPUT_DIR` is the BREW server's `images_dir`
+(`~/Library/Application Support/shed/vz` for Mac VZ;
+`/var/lib/shed/firecracker/images` for Linux FC) — which means a
+naive local build lands in the brew/deb server's blob store, NOT the
+parallel dev server's.
+
+To make the local-built image visible to the dev server, override
+`OUTPUT_DIR` to point at the dev server's `images_dir`:
+
+**Mac VZ:**
+
+```sh
+# 1. Build the variant you changed. OUTPUT_DIR is the key override —
+#    it lands the blobs in the dev server's images_dir so `shed -s
+#    my-server-dev create --image base` picks them up.
+OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
+  ./scripts/build-vz-rootfs.sh --variant base
+
+# If your change is in shed-extensions or build-tools too:
+OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
+  ./scripts/build-vz-rootfs.sh --variant extensions \
+    --shed-ext-version dev \
+    --build-tools-version dev
+
+# 2. Restart the dev server (it picks up the new blobs automatically
+#    — the OCI store is content-addressed so a `shed image ls` will
+#    show the new tag pointing at the new manifest digest).
+make dev-server-restart
+
+# 3. Run the suite, or just a focused test that uses the variant.
+make test-integration-dev
+# or for a focused single test:
+SHED_VZ_SERVER=my-server-dev SHED_VZ_LOG_PATH=~/.shed/dev/server.log \
+  cd tests/integration && uv run pytest -v test_smoke.py::test_create_delete_lifecycle
+```
+
+**FC remote:**
+
+The build script needs to run on Linux (or cross-compile via Docker
+on Mac), and the resulting OCI blobs need to land in
+`/var/lib/shed-dev/firecracker/images/` ON THE REMOTE. There's no
+one-command target for this yet; the manual sequence is:
+
+```sh
+# 1. Build the image on the remote (or on the dev workstation if
+#    Docker is set up to cross-build linux/arm64 or linux/amd64
+#    via buildx).
+ssh $SHED_FC_HOST "cd /path/to/shed && \
+  OUTPUT_DIR=/var/lib/shed-dev/firecracker/images \
+  sudo ./scripts/build-firecracker-rootfs.sh --variant base"
+
+# 2. Restart the dev FC server so it sees the new blobs.
+make dev-server-restart-fc
+
+# 3. Run the suite.
+make test-integration-dev-fc
+```
+
+A `make build-dev-image` / `build-dev-image-fc` Makefile helper that
+wraps these flows is worth adding if these workflows become
+frequent — for now the explicit `OUTPUT_DIR` override is the
+load-bearing piece to know.
+
+How to confirm the override took effect: `shed -s my-server-dev
+image ls` (Mac) or `shed -s mini3-dev image ls` (FC) will list the
+locally-built image with its new manifest digest. If you don't see
+your change, `OUTPUT_DIR` didn't land the blobs in the dev server's
+images_dir.
+
 #### Performance validation against the released version
 
 For changes that touch the boot path, agent dial, healthPoll, upper-allocation, mount, image-resolution, or any other hot path: **measure the impact on each platform the change affects, against the most recent release binary, before merging.**
