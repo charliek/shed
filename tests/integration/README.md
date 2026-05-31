@@ -59,10 +59,11 @@ tests they would have run, not the whole session.
 | `SHED_VZ_LOG_PATH`     | `/opt/homebrew/var/log/shed-server.log`            | Where the VZ shed-server's log file lives. Override for Intel Macs (`/usr/local/...`) or custom installs. |
 | `SHED_FC_HOST`         | `mini3`                                            | SSH hostname for the FC server (used for journald log fetch). |
 | `SHED_FC_SERVER`       | same as host                                       | Entry name for the FC server (when it differs from the SSH host). |
-| `SHED_VZ_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev VZ shed-server (alongside the brew one on a different port). When unset, the `vz_server_dev` fixture skips cleanly. Set by `make test-integration-dev` once that target lands (PR 2). |
+| `SHED_VZ_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev VZ shed-server (alongside the brew one on a different port). When unset, the `vz_server_dev` fixture skips cleanly. Set by `make test-integration-dev`. |
 | `SHED_VZ_DEV_LOG_PATH` | _unset_                                            | Where the parallel dev VZ shed-server writes its log file. Required when `SHED_VZ_DEV_SERVER` is set. |
-| `SHED_FC_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev FC shed-server (alongside the deb one on a different port). When unset, the `fc_server_dev` fixture skips cleanly. Set by `make test-integration-dev-fc` once that target lands (PR 3). |
-| `SHED_FC_DEV_LOG_PATH` | _unset_                                            | Path on the FC remote where the parallel dev shed-server writes its log file. Required when `SHED_FC_DEV_SERVER` is set; the fixture reads it via `ssh + sudo -n cat` because the dev server runs as root via `sudo nohup` and is not under systemd. |
+| `SHED_FC_DEV_SERVER`   | _unset_                                            | Entry name for a PARALLEL dev FC shed-server (alongside the deb one on a different port). When unset, the `fc_server_dev` fixture skips cleanly. Set by `make test-integration-dev-fc`. |
+| `SHED_FC_DEV_LOG_PATH` | _unset_                                            | Path on the FC remote where the parallel dev shed-server writes its log file. Required when `SHED_FC_DEV_SERVER` is set; the fixture reads it via `ssh + sudo -n tail -c +N` (offset-based) because the dev server runs as root via `sudo nohup` and is not under systemd. |
+| `SHED_FC_LOG_PATH`     | _unset_ (uses journald)                            | Remote file path for the prod `fc_server` fixture to read logs from. When set, the fixture uses `ssh + sudo -n tail -c +N` against this file instead of journalctl. `make test-integration-dev-fc` sets this to the dev FC server's log file so the existing `shed_server`-using tests find PhaseTimer lines (the dev server isn't under systemd). |
 
 ## Fixtures
 

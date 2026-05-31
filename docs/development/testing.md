@@ -70,7 +70,7 @@ That target verifies `uv` is on `PATH`, runs `uv sync` into a managed venv (giti
 - `shed -s <host> list` succeeds (the entry exists in `~/.shed/config.yaml` and the server responds).
 - Passwordless `sudo -n journalctl -u shed-server` on the remote, for the PhaseTimer log-line fetch. Two tests skip cleanly if it's unavailable (you still get the others).
 - **The remote shed-server must be v0.5.4 or newer** for the PhaseTimer-dependent assertions. PhaseTimer was added in PR #118 / v0.5.4; older servers cause those tests to skip with a clear reason while the rest of the suite still runs.
-- For the parallel-dev variant (`make dev-server-up-fc` / `test-integration-dev-fc`): the deb shed-server keeps running under systemd at `/usr/local/bin/shed-server`; the dev shed-server runs from `/tmp/shed-server-dev` via `sudo nohup` (no systemd unit), with PID at `/tmp/shed-server-dev.pid` and log at `/tmp/shed-server-dev.log`. The SSH user needs passwordless `sudo` for the operations the dev-server-* recipes drive (`install`, `cp`, `rm`, `nohup`, `tail`, `cat`, `stat`, `kill`, `ps`). `sudo -n true` succeeding from the SSH session is a reasonable smoke test.
+- For the parallel-dev variant (`make dev-server-up-fc` / `test-integration-dev-fc`): the deb shed-server keeps running under systemd at `/usr/local/bin/shed-server`; the dev shed-server runs from `/tmp/shed-server-dev` via `sudo nohup` (no systemd unit), with PID at `/tmp/shed-server-dev.pid` and log at `/tmp/shed-server-dev.log`. The SSH user needs passwordless `sudo` for the operations the dev-server-* recipes drive (`bash` — the launcher wraps in `sudo bash -c '...'` so the log redirect runs as root; plus `install`, `rm`, `tail`, `cat`, `stat`, `kill`). `sudo -n true` succeeding from the SSH session is a reasonable smoke test.
 
 #### Enabling FC tests on a fresh remote host (first-time setup)
 
@@ -98,7 +98,7 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
    sudo -n journalctl -u shed-server --since "1 minute ago" --no-pager
    ```
 
-   If this prompts for a password, the suite's PhaseTimer-dependent FC tests can't fetch logs. Either keep your sudo cache warm during the run or add a NOPASSWD rule for `/usr/bin/journalctl` (and `/usr/bin/install` + `/usr/bin/cat` + `/usr/bin/rm` + `/usr/bin/kill` + `/usr/bin/nohup` if you intend to use `make dev-server-up-fc`).
+   If this prompts for a password, the suite's PhaseTimer-dependent FC tests can't fetch logs. Either keep your sudo cache warm during the run or add a NOPASSWD rule for `/usr/bin/journalctl` (and `/usr/bin/bash` + `/usr/bin/install` + `/usr/bin/cat` + `/usr/bin/rm` + `/usr/bin/kill` + `/usr/bin/tail` + `/usr/bin/stat` if you intend to use `make dev-server-up-fc`).
 
 3. **Add the entry to `~/.shed/config.yaml`** on the dev workstation (or point at an existing entry with `SHED_FC_SERVER=<entry-name>`), then run the suite:
 
