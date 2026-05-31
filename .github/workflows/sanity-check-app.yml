@@ -1,0 +1,106 @@
+name: sanity-check-app
+
+# Manual verification that the release-bot App is installed on every
+# repo shed's release pipeline touches:
+#   1. charliek/shed itself (the running repo's secrets must resolve)
+#   2. charliek/homebrew-tap (GoReleaser's brews step pushes Formula/shed.rb)
+#   3. charliek/apt-charliek (publish dispatch sent at end of release)
+#
+# Run from the Actions UI ("Run workflow") after setting the
+# RELEASE_BOT_APP_* secrets and confirming the App is installed on all
+# three repos. Useful when:
+#   * first wiring the App into a new repo (verify before touching
+#     publish-images.yaml)
+#   * rotating the App's private key (re-verify after updating the secret)
+#   * migrating to a new App
+#   * after adopting a new cross-repo target
+#
+# Each block mints a short-lived installation token scoped to one repo
+# and calls a read-only endpoint. A failure to mint, or a 404 on the
+# reach check, means the App isn't installed on that repo — fix the
+# install before the next release runs.
+#
+# Bot identity comes from the action's `app-slug` output, NOT
+# `gh api /user`, which returns 403 for installation tokens (they
+# don't authenticate as a user).
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}   # this workflow needs nothing from the workflow token
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. self (charliek/shed) ──
+      - id: self-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+
+      - name: Token sees shed + bot identity
+        env:
+          GH_TOKEN: ${{ steps.self-token.outputs.token }}
+          BOT_SLUG: ${{ steps.self-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          echo "::group::This repo (must print charliek/shed)"
+          gh api "/repos/${GITHUB_REPOSITORY}" --jq '.full_name'
+          echo "::endgroup::"
+
+          # Per-repo selective installs (the typical pattern) show count=1
+          # from each repo's own installation. Informational only; the
+          # per-target reach checks below are the real verification.
+          echo "::group::Installation repository count (informational)"
+          gh api /installation/repositories --jq '.total_count'
+          echo "::endgroup::"
+
+          echo "::group::Bot identity (should end with [bot])"
+          echo "${BOT_SLUG}[bot]"
+          echo "::endgroup::"
+
+      # ── 2. charliek/homebrew-tap (GoReleaser brews push target) ──
+      - id: tap-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner:        charliek
+          repositories: homebrew-tap
+          # Defense-in-depth: pin the permission floor to what the real
+          # mint step in publish-images.yaml requests. If this passes
+          # with contents:write, GoReleaser's `brews:` push (which
+          # needs the same permission) will too.
+          permission-contents: write
+
+      - name: Token can reach charliek/homebrew-tap
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::Token can reach charliek/homebrew-tap"
+          gh api /repos/charliek/homebrew-tap --jq '.full_name'
+          echo "::endgroup::"
+
+      # ── 3. charliek/apt-charliek (publish dispatch target) ──
+      - id: apt-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id:      ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner:        charliek
+          repositories: apt-charliek
+          # POST /repos/.../dispatches requires contents:write — match
+          # what the real publish-images.yaml mint step requests.
+          permission-contents: write
+
+      - name: Token can reach charliek/apt-charliek
+        env:
+          GH_TOKEN: ${{ steps.apt-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::Token can reach charliek/apt-charliek"
+          gh api /repos/charliek/apt-charliek --jq '.full_name'
+          echo "::endgroup::"
