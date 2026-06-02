@@ -411,6 +411,7 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 		RootfsPath:   meta.RootfsPath,
 		LocalDir:     meta.LocalDir,
 		Image:        meta.Image,
+		ImageDigest:  meta.LowerDigest,
 		FromSnapshot: meta.FromSnapshot,
 	}
 }

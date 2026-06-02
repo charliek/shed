@@ -98,6 +98,42 @@ func TestManagerListImages(t *testing.T) {
 	}
 }
 
+// TestListImagesDisplaysConfiguredRefForDivergentTag guards the ref-keyed
+// display fix: an image pulled by a mutable tag (whose manifest source-ref is
+// the publish version) must be listed by the CONFIGURED ref and classified
+// "config" — not by the publish source-ref, which would drop it from the
+// config bucket.
+func TestListImagesDisplaysConfiguredRefForDivergentTag(t *testing.T) {
+	imagesDir := t.TempDir()
+	// Manifest published as :v0.6.0, but the operator configured/pulled :latest.
+	digest := installFakeBlob(t, imagesDir, "full", "ghcr.io/x/y:v0.6.0", []byte("body"))
+	if err := RefIndexPut(imagesDir, "ghcr.io/x/y:latest", digest); err != nil {
+		t.Fatalf("RefIndexPut: %v", err)
+	}
+	cfg := &testConfig{defaultImage: "ghcr.io/x/y:latest", imagesDir: imagesDir}
+	mgr := NewManager(cfg, nil)
+
+	got, err := mgr.ListImages()
+	if err != nil {
+		t.Fatalf("ListImages: %v", err)
+	}
+	var found *ImageInfo
+	for i := range got {
+		if got[i].Digest == digest {
+			found = &got[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("manifest %s not listed: %#v", digest, got)
+	}
+	if found.DockerRef != "ghcr.io/x/y:latest" {
+		t.Errorf("DockerRef = %q, want the configured ref ghcr.io/x/y:latest (not the publish source-ref)", found.DockerRef)
+	}
+	if found.Source != "config" {
+		t.Errorf("Source = %q, want config", found.Source)
+	}
+}
+
 func TestManagerInspectAndTag(t *testing.T) {
 	imagesDir := t.TempDir()
 	cfg := &testConfig{imagesDir: imagesDir}

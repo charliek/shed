@@ -235,23 +235,59 @@ func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, onProg
 		return nil, c.parseError(resp)
 	}
 
-	return c.readSSEStream(resp.Body, onProgress)
+	shed, err := c.readShedSSEStream(resp.Body, onProgress)
+	return shed, err
 }
 
-// readSSEStream parses an SSE event stream, calling onProgress for progress events
-// and returning the final Shed from the complete event.
+// readShedSSEStream is the create-shed wrapper around readSSEStream: it
+// decodes the terminal "complete" payload into a config.Shed.
+func (c *APIClient) readShedSSEStream(body io.Reader, onProgress func(backend.ProgressEvent)) (*config.Shed, error) {
+	data, err := c.readSSEStream(body, onProgress)
+	if err != nil {
+		return nil, err
+	}
+	var shed config.Shed
+	if err := json.Unmarshal(data, &shed); err != nil {
+		return nil, fmt.Errorf("failed to parse complete event: %w", err)
+	}
+	return &shed, nil
+}
+
+// readSSEStream parses an SSE event stream, calling onProgress for progress
+// events and returning the RAW JSON payload of the terminal "complete" event
+// (the caller decodes it into the operation-specific type — a Shed for create,
+// an ImagePullResponse for pull). An "error" event is surfaced as a Go error.
 //
 // This implements the key parts of the SSE specification:
 //   - "event:" sets the event type for the next dispatch
 //   - "data:" lines are concatenated (with newlines) to form the event payload
 //   - Lines starting with ":" are comments (used for keep-alive pings)
 //   - A blank line dispatches the accumulated event
-func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.ProgressEvent)) (*config.Shed, error) {
+func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.ProgressEvent)) ([]byte, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
 
 	var eventType string
 	var dataBuf strings.Builder
+
+	dispatch := func(eventType, data string) (done bool, payload []byte, err error) {
+		switch eventType {
+		case "progress":
+			var event backend.ProgressEvent
+			if uerr := json.Unmarshal([]byte(data), &event); uerr == nil && onProgress != nil {
+				onProgress(event)
+			}
+		case "complete":
+			return true, []byte(data), nil
+		case "error":
+			var apiErr config.APIError
+			if uerr := json.Unmarshal([]byte(data), &apiErr); uerr != nil {
+				return true, nil, fmt.Errorf("server error: %s", data)
+			}
+			return true, nil, fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+		}
+		return false, nil, nil
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -261,25 +297,8 @@ func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.Progre
 			if dataBuf.Len() > 0 {
 				data := dataBuf.String()
 				dataBuf.Reset()
-
-				switch eventType {
-				case "progress":
-					var event backend.ProgressEvent
-					if err := json.Unmarshal([]byte(data), &event); err == nil && onProgress != nil {
-						onProgress(event)
-					}
-				case "complete":
-					var shed config.Shed
-					if err := json.Unmarshal([]byte(data), &shed); err != nil {
-						return nil, fmt.Errorf("failed to parse complete event: %w", err)
-					}
-					return &shed, nil
-				case "error":
-					var apiErr config.APIError
-					if err := json.Unmarshal([]byte(data), &apiErr); err != nil {
-						return nil, fmt.Errorf("server error: %s", data)
-					}
-					return nil, fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
+				if done, payload, err := dispatch(eventType, data); done {
+					return payload, err
 				}
 			}
 			eventType = ""
@@ -308,25 +327,8 @@ func (c *APIClient) readSSEStream(body io.Reader, onProgress func(backend.Progre
 
 	// Handle a final event if EOF occurs before a trailing blank line.
 	if dataBuf.Len() > 0 {
-		data := dataBuf.String()
-		switch eventType {
-		case "complete":
-			var shed config.Shed
-			if err := json.Unmarshal([]byte(data), &shed); err != nil {
-				return nil, fmt.Errorf("failed to parse complete event: %w", err)
-			}
-			return &shed, nil
-		case "error":
-			var apiErr config.APIError
-			if err := json.Unmarshal([]byte(data), &apiErr); err != nil {
-				return nil, fmt.Errorf("server error: %s", data)
-			}
-			return nil, fmt.Errorf("%s: %s", apiErr.Error.Code, apiErr.Error.Message)
-		case "progress":
-			var event backend.ProgressEvent
-			if err := json.Unmarshal([]byte(data), &event); err == nil && onProgress != nil {
-				onProgress(event)
-			}
+		if done, payload, err := dispatch(eventType, dataBuf.String()); done {
+			return payload, err
 		}
 	}
 
@@ -436,6 +438,48 @@ func (c *APIClient) PullImage(dockerRef, tag, platform string) (*config.ImagePul
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// PullImageWithProgress pulls a Docker reference and streams per-stage
+// progress via SSE (mirrors CreateShedWithProgress). Falls back to the
+// non-streaming PullImage path only if the server rejects the stream.
+func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, onProgress func(backend.ProgressEvent)) (*config.ImagePullResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	bodyData, err := json.Marshal(config.ImagePullRequest{DockerRef: dockerRef, Tag: tag, Platform: platform})
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/images/pull", bytes.NewReader(bodyData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	resp, err := (&http.Client{}).Do(httpReq)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("pull timed out after 30m")
+		}
+		return nil, fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.parseError(resp)
+	}
+
+	data, err := c.readSSEStream(resp.Body, onProgress)
+	if err != nil {
+		return nil, err
+	}
+	var out config.ImagePullResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("failed to parse complete event: %w", err)
+	}
+	return &out, nil
 }
 
 // PushImage uploads the manifest held by source (tag or digest) to a

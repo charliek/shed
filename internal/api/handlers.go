@@ -628,6 +628,10 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "tag: "+err.Error())
 		return
 	}
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		s.handlePullImageSSE(w, r, req)
+		return
+	}
 	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag, req.Platform)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
@@ -635,6 +639,74 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, config.ImagePullResponse{Tag: req.Tag, Digest: digest})
+}
+
+// handlePullImageSSE streams pull progress as Server-Sent Events. The backend
+// already emits per-stage progress into the context via backend.Phase/Status
+// (see internal/vz/image.go, internal/firecracker/image.go), so we only need
+// to install a progress sink and forward the human-readable messages.
+func (s *Server) handlePullImageSSE(w http.ResponseWriter, r *http.Request, req config.ImagePullRequest) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	events := make(chan backend.ProgressEvent, 16)
+	sseFn := func(event backend.ProgressEvent) {
+		if event.Message == "" {
+			return
+		}
+		select {
+		case events <- event:
+		default:
+		}
+	}
+	ctx := backend.ContextWithProgress(r.Context(), sseFn)
+
+	type pullResult struct {
+		digest string
+		err    error
+	}
+	done := make(chan pullResult, 1)
+	go func() {
+		digest, err := s.backend.PullImage(ctx, req.DockerRef, req.Tag, req.Platform)
+		done <- pullResult{digest, err}
+	}()
+
+	var res pullResult
+	for streaming := true; streaming; {
+		select {
+		case event := <-events:
+			writeSSEEvent(w, "progress", event)
+			flusher.Flush()
+		case res = <-done:
+			streaming = false
+		}
+	}
+drain:
+	for {
+		select {
+		case event := <-events:
+			writeSSEEvent(w, "progress", event)
+			flusher.Flush()
+		default:
+			break drain
+		}
+	}
+
+	if res.err != nil {
+		log.Printf("PullImage failed for %q: %v", req.DockerRef, res.err)
+		_, errCode, msg := mapBackendError(res.err)
+		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
+	} else {
+		writeSSEEvent(w, "complete", config.ImagePullResponse{Tag: req.Tag, Digest: res.digest})
+	}
+	flusher.Flush()
 }
 
 // handlePushImage uploads the manifest held by the named tag (or by a
