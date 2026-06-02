@@ -137,11 +137,10 @@ not work with v0.5.0+ `shed-server`; v0.5.0 cached images use the
 per-layer cache layout and need a one-time
 `rm -rf {images_dir}/cache` on upgrade to v0.5.1.
 
-The first `shed create` pulls each layer blob, flattens them into a
-single erofs lower at `cache/sha256/<manifest-digest>.erofs`, and
-boots. Subsequent sheds from the same manifest reuse the cached erofs
-directly; other variants that share layer blobs skip the registry pull
-but build their own flattened erofs the first time they're used.
+The first `shed create` pulls the layer blobs plus the pre-built rootfs
+erofs blob (built at publish time, not on the host since v0.5.2) and
+boots from it directly. Subsequent sheds from the same manifest reuse the
+cached blobs; images that share layer blobs skip re-downloading them.
 
 #### Build images from source
 
@@ -160,7 +159,7 @@ This builds the `full` variant. Build other variants with `--variant`:
 The script writes directly into the local blob store and advances the
 `base`, `extensions`, and `full` tags. Confirm with `shed image ls`.
 
-See [Image Variants](../reference/images.md) for details. The OCI image
+See [Images](../reference/images.md) for details. The OCI image
 store lives under `~/Library/Application Support/shed/vz/` — see
 [Storage Model](../reference/storage-model.md) and the
 [upgrade-and-reclaim cookbook](../reference/images.md#cookbook-upgrading-image-versions) for how to manage disk space.

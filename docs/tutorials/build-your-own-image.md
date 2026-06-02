@@ -294,7 +294,7 @@ To roll a shed onto the new image, `shed delete devbox` and recreate.
 
 ## See also
 
-- [Image Variants](../reference/images.md) — the full variant lineup,
+- [Images](../reference/images.md) — the full variant lineup,
   annotations, and the boot stack.
 - [Storage Model](../reference/storage-model.md) — how the OCI store
   is laid out on disk.

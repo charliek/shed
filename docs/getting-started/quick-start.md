@@ -195,5 +195,5 @@ shed tunnels start myproj -t 3000:3000 -d
 - [Firecracker Setup (Linux)](fc-setup.md) - Set up the Firecracker backend
 - [CLI Reference](../reference/cli.md) - All available commands
 - [Configuration](../reference/configuration.md) - Client and server config options
-- [Extensions](../reference/extensions.md) - Credential brokering with the experimental image variant
+- [Extensions](../reference/extensions.md) - Credential brokering with the `extensions` image
 - [Tunnels](../reference/tunnels.md) - Port forwarding configuration

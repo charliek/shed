@@ -183,7 +183,7 @@ Since v0.5.2 the read-only rootfs **erofs is built at image-publish time** by `m
 
 ## Storage Model
 
-Images are stored content-addressed under `{images_dir}/blobs/sha256/<digest>` (flat files, one per blob — manifests, configs, layer tar.gz, kernel, initrd, rootfs erofs). Tags live at `{images_dir}/tags/<tag>.json`. Each shed and snapshot pins the manifest digest in metadata so `shed image prune` can refcount-GC unreferenced blobs. Tags do NOT protect blobs from prune (Docker model). See `docs/reference/storage-model.md` for the full layout and the lifecycle commands (`shed image ls/inspect/tag/pull/rm/prune`).
+Images are stored content-addressed under `{images_dir}/blobs/sha256/<digest>` (flat files, one per blob — manifests, configs, layer tar.gz, kernel, initrd, rootfs erofs). Since v0.6.0 an image's identity is its **Docker ref** (the `io.shed.source-ref` annotation value), resolved O(1) through a ref-index at `{images_dir}/refs/<sha256(ref)>.json` (ref → manifest digest, written as the final commit of every pull/build). `shed create` resolves the configured ref (`default_image`, or `--image <alias|ref|/abs/path|label>`) through this index per `pull_policy` (missing|always|never). Tags (`{images_dir}/tags/<tag>.json`) are now optional cosmetic labels, decoupled from resolution; the internal `_base` tag was removed. Each shed and snapshot pins the manifest digest in metadata; `shed image prune` walks reachability (sheds, snapshots, every tag, and the configured `default_image`/`image_aliases` digests are protective). See `docs/reference/storage-model.md` for the full layout and lifecycle commands (`shed image ls/inspect/tag/pull/rm/prune`).
 
 ## Documentation
 

@@ -1,4 +1,4 @@
-# Image Variants
+# Images
 
 Shed images are OCI-compliant container images. The on-disk store is an
 [OCI image-layout-v1](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)
@@ -36,7 +36,7 @@ If you're upgrading from v0.5.1 or earlier, see the
 breaking-change details and the required `shed image rm` / `pull-images`
 steps.
 
-## Available Variants
+## Available images
 
 | Variant | Description |
 |---------|-------------|

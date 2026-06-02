@@ -25,7 +25,8 @@ Each server stores four kinds of data in its backend directory:
 | Orphan sidecars | `*.tmp` from a crashed install staging dir | Same | Partial or crashed image conversions | `shed system prune --orphans` |
 
 See [Storage Model](storage-model.md) for the content-addressed layout
-and [Image Variants](images.md) for how named tags resolve to digests.
+and [Images](images.md) for how Docker refs resolve to digests via the
+ref-index.
 
 ## Measuring usage with `shed system df`
 
@@ -63,7 +64,7 @@ The full flag table is in the [CLI reference](cli.md#system-disk-usage). The raw
 
 `shed system prune` runs a scoped cleanup pass with four scopes that can be combined:
 
-- `--images` — remove cached image variants that aren't referenced by config or any existing shed.
+- `--images` — remove cached images that aren't referenced by config (`default_image`/`image_aliases`) or any existing shed.
 - `--instances` — delete stopped sheds older than `--until` (default 72 h).
 - `--logs` — truncate VZ console logs to the last `--log-tail-bytes` (default 5 MiB). No-op on Firecracker.
 - `--orphans` — remove leftover state from crashed operations: `*.tmp` staging directories from interrupted image installs, partial snapshot directories whose `snapshot.json` never landed, and per-shed `uppers/<name>/` directories whose `metadata.json` was never written. Lock files are preserved to avoid an inode-reuse race, and any `.creating` marker fresher than 1 h keeps its directory in skipped status so in-flight operations aren't swept.
@@ -77,9 +78,9 @@ $ shed system prune
 SERVER: prod-mac (dry-run) --until 72h0m0s scope=images+instances+orphans
 
 IMAGES (2, 40.0 GB)
-NAME          PATH                                                                                       LOGICAL  PHYSICAL
-base          /Users/alice/Library/Application Support/shed/vz/blobs/sha256/abc123.../rootfs.ext4        20.0 GB  1.9 GB
-full          /Users/alice/Library/Application Support/shed/vz/blobs/sha256/def456.../rootfs.ext4        20.0 GB  3.2 GB
+NAME                                          PATH                                                                                  LOGICAL  PHYSICAL
+ghcr.io/charliek/shed-vz-base:v0.6.0          /Users/alice/Library/Application Support/shed/vz/blobs/sha256/abc123.../rootfs.erofs  20.0 GB  1.9 GB
+ghcr.io/charliek/shed-vz-full:v0.6.0          /Users/alice/Library/Application Support/shed/vz/blobs/sha256/def456.../rootfs.erofs  20.0 GB  3.2 GB
 
 SKIPPED (3)
 KIND      NAME/PATH                                                                            REASON

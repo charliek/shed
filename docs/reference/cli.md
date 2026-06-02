@@ -8,7 +8,7 @@ Complete reference for the `shed` command-line interface.
     - `shed image build --from <ref>` — use [`shed image pull`](#shed-image-pull) instead. Pulls are now registry-direct via `go-containerregistry` and don't require a Docker daemon.
     - `shed image install` — host-side blob install. The same effect is now produced by `shed image build`, `shed image pull`, or `shed image load`.
 
-    The variant lineup also changed. The old `default`, `devtools`, and `experimental` variants are replaced by `base`, `extensions`, and `full`. See [Image Variants](images.md) for the new lineup.
+    The variant lineup also changed. The old `default`, `devtools`, and `experimental` variants are replaced by `base`, `extensions`, and `full`. See [Images](images.md) for the new lineup.
 
 ## Global Flags
 
@@ -420,10 +420,10 @@ If `--tag` is omitted, the tag is derived from the last path segment of
 the ref minus the `shed-{vz,fc}-` prefix and the version suffix (e.g.
 `ghcr.io/charliek/shed-vz-extensions:v0.5.1` → `extensions`).
 
-The flattened erofs lower at
-`cache/sha256/<manifest-digest>.erofs` is materialized lazily on first
-boot via host-native `mkfs.erofs --tar=f` — `pull` itself only writes
-blobs into `blobs/sha256/`.
+`pull` writes the image's blobs into `blobs/sha256/` — including the
+pre-built rootfs erofs blob (built at publish time since v0.5.2, mounted
+as-is with no host-side `mkfs.erofs`) — and records the ref→digest
+mapping in the ref-index.
 
 ### shed image push
 

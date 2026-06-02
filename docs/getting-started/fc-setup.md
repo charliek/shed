@@ -91,10 +91,10 @@ Pull and convert VM images before creating your first shed:
 sudo shed-server pull-images
 ```
 
-This pulls each configured image registry-direct and lands the OCI
-blobs under `images_dir/blobs/sha256/`. The flattened erofs lower at
-`images_dir/cache/sha256/<manifest-digest>.erofs` is materialized
-lazily on first boot via host-native `mkfs.erofs --tar=f`.
+This pulls the `default_image` and every `image_aliases` ref
+registry-direct and lands the OCI blobs under `images_dir/blobs/sha256/`,
+including the pre-built rootfs erofs blob — mounted as-is on boot, with no
+host-side `mkfs.erofs` (since v0.5.2).
 
 The OCI image store lives under `/var/lib/shed/firecracker/images/`. See
 [Storage Model](../reference/storage-model.md) for the full layout and
@@ -305,7 +305,7 @@ Pin a concrete version. Once `v0.5.1` is tagged the corresponding
 images become available — check
 <https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
 
-See [Image Variants](../reference/images.md) for available images and
+See [Images](../reference/images.md) for available images and
 configuration details.
 
 #### Option B: Build from source

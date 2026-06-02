@@ -109,7 +109,7 @@ nav:
       - Provisioning: reference/provisioning.md
       - Firecracker Operations: reference/fc-operations.md
       - VZ Operations (macOS): reference/vz-operations.md
-      - Image Variants: reference/images.md
+      - Images: reference/images.md
       - Build Tools: reference/build-tools.md
       - Extensions: reference/extensions.md
       - HTTP API: reference/api.md
