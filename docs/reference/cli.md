@@ -332,7 +332,11 @@ removed in the OCI rollout.
 
 ### shed image ls
 
-Lists installed images by their Docker ref. The `SOURCE` column is `config` (the ref is the configured `default_image` or an `image_aliases` value), `user` (pulled or labeled ad-hoc), or `dangling` (an untagged, unconfigured leftover). `shed image list` is a deprecated alias.
+Lists installed images with their resolved Docker ref in the `IMAGE`
+column. The `SOURCE` column is `config` (the ref is the configured
+`default_image` or an `image_aliases` value), `user` (pulled or labeled
+ad-hoc), or `dangling` (an untagged, unconfigured leftover). `shed image
+list` is a deprecated alias.
 
 ```bash
 shed image ls
@@ -341,11 +345,11 @@ shed image ls
 **Output:**
 
 ```text
-NAME          DIGEST          SOURCE      SIZE      LAYERS   IN USE   REF
-base          sha256:abc123…  config      2.1 GB    1        yes      ghcr.io/charliek/shed-vz-base:v0.5.1
-extensions    sha256:7c2e5d…  config      2.3 GB    2        no       ghcr.io/charliek/shed-vz-extensions:v0.5.1
-full          sha256:def456…  config      3.8 GB    3        no       ghcr.io/charliek/shed-vz-full:v0.5.1
-sha256:ff…    sha256:ff8800…  dangling    2.0 GB    1        yes      ghcr.io/test/legacy:v1
+IMAGE                                       DIGEST          SOURCE    SIZE     IN USE
+ghcr.io/charliek/shed-vz-base:v0.6.0        sha256:abc123…  config    2.1 GB   yes
+ghcr.io/charliek/shed-vz-extensions:v0.6.0  sha256:7c2e5d…  config    2.3 GB   no
+ghcr.io/charliek/shed-vz-full:v0.6.0        sha256:def456…  config    3.8 GB   no
+ghcr.io/test/legacy:v1                      sha256:ff8800…  dangling  2.0 GB   no
 ```
 
 ### shed image history

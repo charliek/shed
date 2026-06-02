@@ -112,7 +112,7 @@ Creates a new shed.
 {
   "name": "codelens",
   "repo": "charliek/codelens",
-  "image": "shed-base:latest"
+  "image": "full"
 }
 ```
 
