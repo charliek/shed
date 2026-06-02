@@ -398,18 +398,27 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		return nil, nil
 	}
 
-	// Refs the server config points at (default_image + alias values).
-	// A manifest whose source-ref is in this set is sourced from config;
-	// anything else with a source-ref was pulled ad-hoc by the user.
-	configuredRefs := map[string]bool{}
-	if dr := m.cfg.GetDefaultImage(); IsDockerRef(dr) {
-		configuredRefs[dr] = true
-	}
-	for _, v := range m.cfg.GetImageAliases() {
-		if IsDockerRef(v) {
-			configuredRefs[v] = true
+	// Map manifest digests to the ref the server config points at
+	// (default_image + alias values), resolved through the ref-index. A
+	// manifest in this set is sourced from config and displayed by its
+	// configured ref. Anything else with a ref-index entry was pulled
+	// ad-hoc by the user and displayed by the ref it was pulled by — NOT
+	// the manifest's publish-time source-ref, which differs for mutable
+	// tags / digest pins / mirrors.
+	configuredDigests := map[string]string{}
+	configuredRefSet := map[string]bool{}
+	for _, ref := range m.configuredRefs() {
+		configuredRefSet[ref] = true
+		if d, ok := RefIndexGet(imagesDir, ref); ok {
+			// First writer wins (configuredRefs is deterministically ordered:
+			// default_image, then sorted aliases) so two configured refs
+			// sharing one digest display stably.
+			if _, seen := configuredDigests[d]; !seen {
+				configuredDigests[d] = ref
+			}
 		}
 	}
+	pulledRefs := RefIndexReverse(imagesDir)
 
 	tags, err := ListTags(imagesDir)
 	if err != nil {
@@ -509,10 +518,28 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 			Tag:    mi.tag,
 			Cached: mi.manifest != nil,
 		}
+		// Identity is the ref the image was pulled by (ref-index), with the
+		// configured ref taking precedence. Source-ref is the cold fallback
+		// for images that predate the ref-index (and lets a configured image
+		// still be recognized via its publish ref).
+		srcRef := ""
 		if mi.manifest != nil {
-			info.DockerRef = mi.manifest.ShedSourceRef()
+			srcRef = mi.manifest.ShedSourceRef()
 		}
-		// Identity is the Docker ref (io.shed.source-ref) when present.
+		var configured, pulled bool
+		switch {
+		case configuredDigests[mi.digest] != "":
+			info.DockerRef = configuredDigests[mi.digest]
+			configured = true
+		case configuredRefSet[srcRef]:
+			info.DockerRef = srcRef
+			configured = true
+		case pulledRefs[mi.digest] != "":
+			info.DockerRef = pulledRefs[mi.digest]
+			pulled = true
+		default:
+			info.DockerRef = srcRef // provenance only
+		}
 		switch {
 		case info.DockerRef != "":
 			info.Name = info.DockerRef
@@ -521,13 +548,13 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		default:
 			info.Name = ShortDigest(mi.digest)
 		}
-		// Source: config when the ref is what the server is configured to
-		// use; user when the operator labeled it with a cosmetic tag;
-		// dangling when it's an untagged, unconfigured leftover.
+		// Source: config when configured; user when addressable by a pulled
+		// ref or a cosmetic tag; dangling when it's an untagged, unconfigured
+		// leftover (even if it still carries a provenance source-ref).
 		switch {
-		case configuredRefs[info.DockerRef]:
+		case configured:
 			info.Source = "config"
-		case mi.tag != "":
+		case pulled || mi.tag != "":
 			info.Source = "user"
 		default:
 			info.Source = "dangling"
@@ -579,21 +606,58 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 	}
 
 	info := &ImageInfo{
-		Digest:    digest,
-		Tag:       tagName,
-		Cached:    BlobExists(imagesDir, digest),
-		DockerRef: manifest.ShedSourceRef(),
-		Source:    "user",
+		Digest: digest,
+		Tag:    tagName,
+		Cached: BlobExists(imagesDir, digest),
+		Source: "user",
 	}
-	if info.DockerRef != "" {
-		info.Name = info.DockerRef
-		if m.isConfiguredRef(info.DockerRef) {
-			info.Source = "config"
+	// Display by the ref the image was pulled by (ref-index), configured ref
+	// first; manifest source-ref is the cold fallback. Mirrors ListImages.
+	srcRef := manifest.ShedSourceRef()
+	configuredRefSet := map[string]bool{}
+	var configured, pulled bool
+	for _, ref := range m.configuredRefs() {
+		configuredRefSet[ref] = true
+		// First match wins (configuredRefs is default-first, sorted aliases),
+		// matching ListImages so inspect + list agree on the displayed ref.
+		if !configured {
+			if d, ok := RefIndexGet(imagesDir, ref); ok && d == digest {
+				info.DockerRef = ref
+				configured = true
+			}
 		}
-	} else if tagName != "" {
-		info.Name = tagName
-	} else {
-		info.Name = ShortDigest(digest)
+	}
+	if !configured {
+		switch {
+		case configuredRefSet[srcRef]:
+			info.DockerRef = srcRef
+			configured = true
+		default:
+			if pref := RefIndexReverse(imagesDir)[digest]; pref != "" {
+				info.DockerRef = pref
+				pulled = true
+			} else {
+				info.DockerRef = srcRef // provenance only
+			}
+		}
+	}
+	switch {
+	case configured:
+		info.Name = info.DockerRef
+		info.Source = "config"
+	case pulled || tagName != "":
+		if info.DockerRef != "" {
+			info.Name = info.DockerRef
+		} else {
+			info.Name = tagName
+		}
+		info.Source = "user"
+	default:
+		if info.DockerRef != "" {
+			info.Name = info.DockerRef
+		} else {
+			info.Name = ShortDigest(digest)
+		}
 		info.Source = "dangling"
 	}
 	for _, layer := range manifest.Layers {
@@ -677,35 +741,22 @@ func resolveDigestPrefix(imagesDir, prefix string) (string, error) {
 }
 
 // configuredRefs returns the Docker refs the server config currently points
-// at: the default_image plus every image_aliases value.
+// at: the default_image first, then every image_aliases value in sorted order.
+// The deterministic ordering lets callers (e.g. ListImages' first-writer-wins
+// digest map) display a stable ref when several configured refs share a digest.
 func (m *Manager) configuredRefs() []string {
 	var out []string
 	if dr := m.cfg.GetDefaultImage(); IsDockerRef(dr) {
 		out = append(out, dr)
 	}
+	var aliases []string
 	for _, v := range m.cfg.GetImageAliases() {
 		if IsDockerRef(v) {
-			out = append(out, v)
+			aliases = append(aliases, v)
 		}
 	}
-	return out
-}
-
-// isConfiguredRef reports whether ref is the configured default_image or one
-// of the configured image_aliases values.
-func (m *Manager) isConfiguredRef(ref string) bool {
-	if ref == "" {
-		return false
-	}
-	if m.cfg.GetDefaultImage() == ref {
-		return true
-	}
-	for _, v := range m.cfg.GetImageAliases() {
-		if v == ref {
-			return true
-		}
-	}
-	return false
+	sort.Strings(aliases)
+	return append(out, aliases...)
 }
 
 // resolveDeleteTarget maps a user-supplied identifier (a cosmetic tag label,

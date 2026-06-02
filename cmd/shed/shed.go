@@ -19,6 +19,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/sync"
 	"github.com/charliek/shed/internal/tunnels"
+	"github.com/charliek/shed/internal/vmimage"
 )
 
 var createCmd = &cobra.Command{
@@ -435,6 +436,9 @@ func runList(cmd *cobra.Command, args []string) error {
 				fmt.Printf("Server:         %s\n", s.server)
 			}
 			fmt.Printf("Created:        %s\n", s.shed.CreatedAt.Format("2006-01-02 15:04:05"))
+			if img := formatShedImage(s.shed); img != "" {
+				fmt.Printf("Image:          %s\n", img)
+			}
 			if s.shed.Status == config.StatusRunning {
 				// Use agent boot time for uptime if available
 				if s.shed.StartedAt != nil {
@@ -617,6 +621,22 @@ func valueOrDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// formatShedImage renders the image a shed runs as "<label> (sha256:short)".
+// The label is the variant/ref the shed was created from; the short digest
+// pins the exact manifest. Returns "" when neither is known. Use
+// `shed image inspect <digest>` for the full ref.
+func formatShedImage(s config.Shed) string {
+	label := s.Image
+	if s.ImageDigest == "" {
+		return label
+	}
+	short := vmimage.ShortDigest(s.ImageDigest)
+	if label == "" {
+		return short
+	}
+	return fmt.Sprintf("%s (%s)", label, short)
 }
 
 func runDelete(cmd *cobra.Command, args []string) error {

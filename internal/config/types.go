@@ -139,6 +139,7 @@ type Shed struct {
 	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
 	LocalDir    string    `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
 	Image       string    `json:"image,omitempty" yaml:"image,omitempty"`
+	ImageDigest string    `json:"image_digest,omitempty" yaml:"image_digest,omitempty"` // pinned manifest digest (sha256:...)
 	// FromSnapshot records the snapshot name this shed was spawned from (immediate parent only).
 	FromSnapshot string                         `json:"from_snapshot,omitempty" yaml:"from_snapshot,omitempty"`
 	LastHealthy  *time.Time                     `json:"last_healthy,omitempty" yaml:"last_healthy,omitempty"` // last heartbeat from agent (VM backends only)

@@ -180,6 +180,42 @@ func FindDigestBySourceRef(imagesDir, ref string) (digest string, ok bool) {
 	return "", false
 }
 
+// RefIndexReverse returns a digest -> ref map built from all sidecar entries
+// (first entry wins when several refs share a digest). Read-only; used by
+// `ls`/`inspect` so an image is displayed by the ref it was pulled by, not the
+// manifest's publish-time io.shed.source-ref (which differs for mutable tags,
+// digest pins, and mirrors).
+func RefIndexReverse(imagesDir string) map[string]string {
+	out := map[string]string{}
+	dir := filepath.Join(imagesDir, refIndexSubdir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var entry refIndexEntry
+		if err := json.Unmarshal(data, &entry); err != nil || entry.Digest == "" || entry.Ref == "" {
+			continue
+		}
+		// Skip entries whose manifest blob is gone so a broken/half-pruned
+		// image isn't displayed under a stale ref.
+		if !BlobExists(imagesDir, entry.Digest) {
+			continue
+		}
+		if _, ok := out[entry.Digest]; !ok {
+			out[entry.Digest] = entry.Ref
+		}
+	}
+	return out
+}
+
 // RefIndexDeleteByDigest removes every ref-index entry pointing at digest.
 // Called by prune/rm after a manifest blob is deleted so a later resolve
 // can't hit a dangling entry. Best-effort: scan errors are logged, not fatal.

@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
@@ -78,9 +79,10 @@ var (
 	imageBuildOCIArchive   string
 	imageBuildToolsVersion string
 
-	imageDeleteForce bool
-	imagePruneForce  bool
-	imagePruneDryRun bool
+	imageDeleteForce  bool
+	imagePruneForce   bool
+	imagePruneDryRun  bool
+	imagePruneVerbose bool
 )
 
 var imageBuildCmd = &cobra.Command{
@@ -211,6 +213,7 @@ func init() {
 	imageDeleteCmd.Flags().BoolVar(&imageDeleteForce, "force", false, "Skip confirmation prompt")
 	imagePruneCmd.Flags().BoolVar(&imagePruneForce, "force", false, "Skip confirmation prompt")
 	imagePruneCmd.Flags().BoolVar(&imagePruneDryRun, "dry-run", false, "List candidates without deleting")
+	imagePruneCmd.Flags().BoolVarP(&imagePruneVerbose, "verbose", "v", false, "Show individual blob digests, not just per-image rows")
 	imagePullCmd.Flags().StringVarP(&imagePullTag, "tag", "t", "", "Tag name (default: derived from docker ref)")
 	imagePullCmd.Flags().StringVar(&imagePullPlatform, "platform", "", "Platform override for multi-arch images (e.g. linux/arm64). Empty means the backend's native platform.")
 	imagePushCmd.Flags().BoolVar(&imagePushLocal, "local", false, "Push from the local OCI store (no shed-server required). Implied when -c is set without -s.")
@@ -524,7 +527,8 @@ func runImageList(_ *cobra.Command, _ []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tDIGEST\tSOURCE\tSIZE\tIN USE\tREF")
+	// IMAGE is the Docker ref (the identity); SOURCE is config|user|dangling.
+	fmt.Fprintln(w, "IMAGE\tDIGEST\tSOURCE\tSIZE\tIN USE")
 	for _, img := range resp.Images {
 		size := "-"
 		if img.SizeBytes > 0 {
@@ -538,16 +542,12 @@ func runImageList(_ *cobra.Command, _ []string) error {
 		if img.InUse {
 			inUse = "yes"
 		}
-		ref := img.DockerRef
-		if ref == "" {
-			ref = "-"
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", img.Name, digest, img.Source, size, inUse, ref)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", img.Name, digest, img.Source, size, inUse)
 	}
 	w.Flush()
 	if !jsonFlag && len(resp.Images) > 0 {
 		fmt.Println()
-		fmt.Println("Use 'shed image rm <name>' to remove a tag, or 'shed image prune' to GC unused blobs.")
+		fmt.Println("Use 'shed image rm <image>' to remove an image, or 'shed image prune' to GC unused blobs.")
 	}
 	return nil
 }
@@ -574,14 +574,23 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to list images: %w", err)
 		}
 		for i := range resp.Images {
-			if resp.Images[i].Name == name {
-				targetImage = &resp.Images[i]
+			img := &resp.Images[i]
+			// Match however the user referred to the image: by ref (Name),
+			// cosmetic tag, full or short digest.
+			if img.Name == name || img.Tag == name ||
+				img.Digest == name || vmimage.ShortDigest(img.Digest) == name ||
+				(img.Digest != "" && strings.HasPrefix(img.Digest, name)) {
+				targetImage = img
 				break
 			}
 		}
 	}
 
 	if !imageDeleteForce {
+		if targetImage != nil && targetImage.Source == "config" {
+			fmt.Fprintf(os.Stderr, "Warning: %q is referenced by the server config (default_image / image_aliases).\n", name)
+			fmt.Fprintln(os.Stderr, "Removing it means the next 'shed create' for this image will re-pull it.")
+		}
 		prompt := fmt.Sprintf("Delete image %q", name)
 		if targetImage != nil && targetImage.SizeBytes > 0 {
 			prompt += fmt.Sprintf(" (%s)", formatSize(targetImage.SizeBytes))
@@ -692,7 +701,16 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	client := NewAPIClientFromEntry(entry, DefaultTimeout)
-	resp, err := client.PullImage(dockerRef, tag, imagePullPlatform)
+	resp, err := client.PullImageWithProgress(dockerRef, tag, imagePullPlatform, func(event backend.ProgressEvent) {
+		if jsonFlag {
+			return
+		}
+		if event.Warning {
+			fmt.Fprintf(os.Stderr, "  Warning: %s\n", event.Message)
+		} else {
+			fmt.Printf("  %s\n", event.Message)
+		}
+	})
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}
@@ -777,28 +795,49 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 		return nil
 	}
 
-	// Compute total size across all candidates
+	// Candidates are a mix of image-level rows (manifests, which carry a ref
+	// + aggregate size) and the constituent blobs (config/layers/kernel/
+	// initrd/erofs, size folded into their manifest). Group for display: one
+	// row per image by default, with the blob digests behind --verbose.
+	//
+	// Server contract (internal/vmimage Manager.PruneImages): only manifest
+	// candidates get DockerRef + aggregate SizeBytes set; blobs have both
+	// zero. This partition relies on that — if the server ever sizes blobs
+	// individually, give ImageInfo an explicit manifest/blob discriminator.
+	var images, blobs []config.ImageInfo
 	var totalSize int64
 	for _, img := range dryResp.Deleted {
-		totalSize += img.SizeBytes
+		if img.SizeBytes > 0 || img.DockerRef != "" {
+			images = append(images, img)
+			totalSize += img.SizeBytes
+		} else {
+			blobs = append(blobs, img)
+		}
 	}
 
-	// Show candidates table in non-JSON mode
 	if !jsonFlag {
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tSIZE\tREF")
-		for _, img := range dryResp.Deleted {
+		fmt.Fprintln(w, "IMAGE\tSIZE")
+		for _, img := range images {
+			name := img.Name
+			if img.DockerRef != "" {
+				name = img.DockerRef
+			}
 			size := "-"
 			if img.SizeBytes > 0 {
 				size = formatSize(img.SizeBytes)
 			}
-			ref := img.DockerRef
-			if ref == "" {
-				ref = "-"
-			}
-			fmt.Fprintf(w, "%s\t%s\t%s\n", img.Name, size, ref)
+			fmt.Fprintf(w, "%s\t%s\n", name, size)
 		}
 		w.Flush()
+		if imagePruneVerbose && len(blobs) > 0 {
+			fmt.Printf("\n%d constituent blob(s):\n", len(blobs))
+			for _, b := range blobs {
+				fmt.Printf("  %s\n", vmimage.ShortDigest(b.Digest))
+			}
+		} else if len(blobs) > 0 {
+			fmt.Printf("(+ %d constituent blob(s); use --verbose to list)\n", len(blobs))
+		}
 		fmt.Println()
 	}
 
@@ -806,7 +845,7 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 		if jsonFlag {
 			return outputJSON(config.PruneImagesResponse{Deleted: dryResp.Deleted})
 		}
-		fmt.Printf("Would prune %d image(s)", len(dryResp.Deleted))
+		fmt.Printf("Would prune %d image(s)", len(images))
 		if totalSize > 0 {
 			fmt.Printf(" (%s)", formatSize(totalSize))
 		}
@@ -815,7 +854,7 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 	}
 
 	if !imagePruneForce {
-		prompt := fmt.Sprintf("Delete %d image(s)", len(dryResp.Deleted))
+		prompt := fmt.Sprintf("Delete %d image(s)", len(images))
 		if totalSize > 0 {
 			prompt += fmt.Sprintf(" (%s)", formatSize(totalSize))
 		}
@@ -837,10 +876,14 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 	}
 
 	var freedSize int64
+	var prunedImages int
 	for _, img := range pruneResp.Deleted {
 		freedSize += img.SizeBytes
+		if img.SizeBytes > 0 || img.DockerRef != "" {
+			prunedImages++
+		}
 	}
-	msg := fmt.Sprintf("Pruned %d image(s)", len(pruneResp.Deleted))
+	msg := fmt.Sprintf("Pruned %d image(s)", prunedImages)
 	if freedSize > 0 {
 		msg += fmt.Sprintf(" (freed %s)", formatSize(freedSize))
 	}
