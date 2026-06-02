@@ -94,9 +94,10 @@ func createFakeInstance(t *testing.T, instanceDir, name, image, lowerDigest stri
 
 // TestDeleteImage covers removal under the Docker model: `image rm` drops the
 // tag but leaves the blob. With ref-keyed identity, deletion is hard-blocked
-// only when a live shed/snapshot pins the manifest (the configured
-// default_image is no longer a blanket refusal — warn-and-confirm is a CLI
-// concern).
+// when ANY shed (running or stopped) or snapshot still pins the manifest —
+// matching `docker rmi`, which refuses while any container references the
+// image. The configured default_image is no longer a blanket refusal
+// (warn-and-confirm is a CLI concern).
 func TestDeleteImage(t *testing.T) {
 	tests := []struct {
 		name      string

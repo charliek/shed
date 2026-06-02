@@ -38,6 +38,7 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 		if err != nil {
 			return du, fmt.Errorf("listing images: %w", err)
 		}
+		seenDigest := make(map[string]bool)
 		for _, img := range imgs {
 			if !img.Cached {
 				continue
@@ -47,14 +48,20 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 				Path:      img.Path,
 				DockerRef: img.DockerRef,
 			}
-			if img.Path != "" {
-				entry.Size.LogicalBytes, entry.Size.PhysicalBytes, _ = diskstat.Stat(img.Path)
-			}
-			// Fall back to the manifest-computed footprint (layers + lower)
-			// when there's no single statable lower file.
-			if entry.Size.LogicalBytes == 0 {
-				entry.Size.LogicalBytes = img.SizeBytes
-				entry.Size.PhysicalBytes = img.SizeBytes
+			// Count on-disk bytes once per content digest: multiple refs can
+			// point at the same cached manifest, but the blob exists once.
+			// Subsequent rows for the same digest stay visible with zero size.
+			if !seenDigest[img.Digest] {
+				if img.Path != "" {
+					entry.Size.LogicalBytes, entry.Size.PhysicalBytes, _ = diskstat.Stat(img.Path)
+				}
+				// Fall back to the manifest-computed footprint (layers + lower)
+				// when there's no single statable lower file.
+				if entry.Size.LogicalBytes == 0 {
+					entry.Size.LogicalBytes = img.SizeBytes
+					entry.Size.PhysicalBytes = img.SizeBytes
+				}
+				seenDigest[img.Digest] = true
 			}
 			du.Images = append(du.Images, entry)
 		}

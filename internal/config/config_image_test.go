@@ -221,6 +221,11 @@ func TestRejectRemovedImageKeys(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "top-level default_image rejected",
+			yaml:    "name: s\ndefault_image: full\nvz:\n  default_image: ghcr.io/x/y:v1\n",
+			wantErr: true,
+		},
+		{
 			name:    "new keys accepted",
 			yaml:    "name: s\nvz:\n  default_image: ghcr.io/x/y:v1\n  pull_policy: missing\n",
 			wantErr: false,

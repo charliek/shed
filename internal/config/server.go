@@ -877,6 +877,11 @@ func rejectRemovedImageKeys(data []byte) error {
 		// Malformed YAML — let the typed unmarshal surface the parse error.
 		return nil
 	}
+	if _, present := raw["default_image"]; present {
+		return fmt.Errorf(
+			"top-level config key %q was removed in v0.6.0; move it into the active backend block as vz.default_image / firecracker.default_image (see docs/upgrades/v0.5.9-to-v0.6.0.md)",
+			"default_image")
+	}
 	for _, backend := range []string{"vz", "firecracker"} {
 		sub, ok := raw[backend].(map[string]any)
 		if !ok {
