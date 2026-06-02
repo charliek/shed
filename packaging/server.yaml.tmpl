@@ -40,11 +40,14 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v{{VERSION}}
-  images:
+  default_image: ghcr.io/charliek/shed-vz-full:v{{VERSION}}
+  # Optional convenience aliases for `shed create --image <alias>`.
+  image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v{{VERSION}}
     extensions: ghcr.io/charliek/shed-vz-extensions:v{{VERSION}}
     full: ghcr.io/charliek/shed-vz-full:v{{VERSION}}
+  # missing (default) | always | never
+  pull_policy: missing
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2
@@ -58,11 +61,14 @@ vz:
 
 firecracker:
   kernel_path: /var/lib/shed/firecracker/images/vmlinux
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v{{VERSION}}
-  images:
+  default_image: ghcr.io/charliek/shed-fc-full:v{{VERSION}}
+  # Optional convenience aliases for `shed create --image <alias>`.
+  image_aliases:
     base: ghcr.io/charliek/shed-fc-base:v{{VERSION}}
     extensions: ghcr.io/charliek/shed-fc-extensions:v{{VERSION}}
     full: ghcr.io/charliek/shed-fc-full:v{{VERSION}}
+  # missing (default) | always | never
+  pull_policy: missing
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2

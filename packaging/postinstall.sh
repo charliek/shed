@@ -27,11 +27,34 @@ systemctl daemon-reload || true
 systemctl enable shed-server.service || true
 
 if [ -n "${2:-}" ]; then
-    # Upgrade path. `try-restart` is the Debian-standard primitive for
-    # "restart only if the unit is already active". If the operator had
-    # stopped the service deliberately (maintenance window, config
-    # debugging) we don't surprise them by auto-starting it; we just
-    # swap binaries and leave activation state alone.
+    # Upgrade path. Config files are installed `noreplace`, so an operator
+    # upgrading across a breaking config change keeps their old
+    # /etc/shed/server.yaml. v0.6.0 removed base_rootfs + images in favor of
+    # default_image + image_aliases + pull_policy, and the new binary
+    # rejects the old keys — so a blind restart would crash the service.
+    # Preflight the config and SKIP the restart (pointing at the upgrade
+    # guide) when it no longer validates, rather than take the service down.
+    if ! shed-server --config /etc/shed/server.yaml config-validate >/dev/null 2>&1; then
+        echo ""
+        echo "shed-server was upgraded, but /etc/shed/server.yaml did not validate"
+        echo "against the new binary, so the service was NOT restarted (the old"
+        echo "process keeps running)."
+        echo ""
+        echo "This usually means the config still uses keys removed in v0.6.0"
+        echo "(base_rootfs / images). Migrate to default_image + image_aliases +"
+        echo "pull_policy, then restart:"
+        echo "  sudo shed-server --config /etc/shed/server.yaml config-validate"
+        echo "  sudo systemctl restart shed-server"
+        echo ""
+        echo "Upgrade guide: https://github.com/charliek/shed/blob/main/docs/upgrades/v0.5.9-to-v0.6.0.md"
+        exit 0
+    fi
+
+    # `try-restart` is the Debian-standard primitive for "restart only if
+    # the unit is already active". If the operator had stopped the service
+    # deliberately (maintenance window, config debugging) we don't surprise
+    # them by auto-starting it; we just swap binaries and leave activation
+    # state alone.
     if command -v deb-systemd-invoke >/dev/null 2>&1; then
         deb-systemd-invoke try-restart shed-server.service || true
     else

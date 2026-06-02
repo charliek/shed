@@ -23,10 +23,10 @@ func newTestClient(t *testing.T) (*Client, string) {
 		ImagesDir:    imagesDir,
 		InstanceDir:  instanceDir,
 		SnapshotsDir: snapshotsDir,
-		Images: map[string]string{
+		DefaultImage: "ghcr.io/example/base:v1",
+		ImageAliases: map[string]string{
 			"managed": "ghcr.io/example/managed:v1",
 		},
-		BaseRootfs: "ghcr.io/example/base:v1",
 	}
 
 	client := &Client{cfg: cfg}
@@ -92,9 +92,12 @@ func createFakeInstance(t *testing.T, instanceDir, name, image, lowerDigest stri
 	}
 }
 
-// TestDeleteImage covers tag-level removal under the Docker model:
-// `image rm` drops the tag but leaves the blob; refusal of config-managed
-// tags works as before.
+// TestDeleteImage covers removal under the Docker model: `image rm` drops the
+// tag but leaves the blob. With ref-keyed identity, deletion is hard-blocked
+// when ANY shed (running or stopped) or snapshot still pins the manifest —
+// matching `docker rmi`, which refuses while any container references the
+// image. The configured default_image is no longer a blanket refusal
+// (warn-and-confirm is a CLI concern).
 func TestDeleteImage(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -110,15 +113,11 @@ func TestDeleteImage(t *testing.T) {
 			},
 		},
 		{
-			name:      "config-managed image refused",
-			imageName: "managed",
-			wantErr:   config.ErrImageInUseSentinel,
-		},
-		{
-			name:      "_base with docker ref refused",
-			imageName: "_base",
-			setup: func(t *testing.T, _ *Client, imagesDir string) {
-				createFakeImage(t, imagesDir, "_base")
+			name:      "pinned by live shed refused",
+			imageName: "pinned",
+			setup: func(t *testing.T, client *Client, imagesDir string) {
+				d := createFakeImage(t, imagesDir, "pinned")
+				createFakeInstance(t, client.cfg.InstanceDir, "live-shed", "pinned", d)
 			},
 			wantErr: config.ErrImageInUseSentinel,
 		},

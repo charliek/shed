@@ -53,11 +53,12 @@ extensions:
 default_backend: firecracker
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.0-dev
-  images:
+  default_image: ghcr.io/charliek/shed-fc-full:v0.5.0-dev
+  image_aliases:
     base: ghcr.io/charliek/shed-fc-base:v0.5.0-dev
     extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.0-dev
     full: ghcr.io/charliek/shed-fc-full:v0.5.0-dev
+  pull_policy: missing
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   default_cpus: 2

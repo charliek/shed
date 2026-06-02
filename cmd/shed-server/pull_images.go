@@ -53,20 +53,30 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("unsupported backend: %s", cfg.DefaultBackend)
 	}
 
-	images := imgCfg.GetImages()
+	// Pre-warm the default_image plus every image_aliases ref. Keyed by
+	// the ref itself (the io.shed.source-ref identity); duplicate refs
+	// (e.g. an alias equal to default_image) converge on one blob and one
+	// ref-index entry, so a second EnsureImage is an O(stat) cache hit.
+	refs := map[string]string{} // selector label -> ref
+	if dr := imgCfg.GetDefaultImage(); dr != "" {
+		refs["default_image"] = dr
+	}
+	for alias, ref := range imgCfg.GetImageAliases() {
+		refs[alias] = ref
+	}
 
-	// Filter to specific variant if requested
+	// Filter to a specific selector if requested.
 	if pullVariant != "" {
-		ref, ok := images[pullVariant]
+		ref, ok := refs[pullVariant]
 		if !ok {
 			var names []string
-			for name := range images {
+			for name := range refs {
 				names = append(names, name)
 			}
 			sort.Strings(names)
-			return fmt.Errorf("unknown variant %q; available: %v", pullVariant, names)
+			return fmt.Errorf("unknown selector %q; available: %v", pullVariant, names)
 		}
-		images = map[string]string{pullVariant: ref}
+		refs = map[string]string{pullVariant: ref}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -75,15 +85,14 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 	mgr := vmimage.NewManager(imgCfg, nil)
 	pulled := 0
 
-	// Sort variant names for deterministic output
 	var names []string
-	for name := range images {
+	for name := range refs {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	for _, name := range names {
-		ref := images[name]
+		ref := refs[name]
 		if !vmimage.IsDockerRef(ref) {
 			fmt.Printf("Skipping %s (local path: %s)\n", name, ref)
 			continue
@@ -92,7 +101,7 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Pulling %s (%s)...\n", name, ref)
 		_, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 			DockerRef: ref,
-			Name:      name,
+			Name:      vmimage.DeriveTagFromRef(ref),
 		}, func(stage, msg string) {
 			fmt.Printf("  [%s] %s\n", stage, msg)
 		})
@@ -101,52 +110,6 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("Done: %s\n", name)
 		pulled++
-	}
-
-	// Hydrate _base from base_rootfs. With the content-addressed blob
-	// store, two tags (_base and a variant) sharing the same Docker ref
-	// converge on the same digest after first conversion — so all we
-	// need to do is pull/ensure for _base. If a sibling tag already has
-	// a matching blob installed, EnsureImage's cache hit makes this an
-	// O(stat) operation; otherwise it falls through to a full convert.
-	baseRootfs := imgCfg.GetBaseRootfs()
-	if vmimage.IsDockerRef(baseRootfs) {
-		imagesDir := imgCfg.GetImagesDir()
-		// Fast path: another tag in this run already installed the
-		// matching digest. Point _base at it directly.
-		var sourceTag string
-		for name, ref := range imgCfg.GetImages() {
-			if ref != baseRootfs || !vmimage.IsDockerRef(ref) {
-				continue
-			}
-			if vmimage.Resolve(imagesDir, name, ref) != "" {
-				sourceTag = name
-				break
-			}
-		}
-
-		if sourceTag != "" {
-			if err := mgr.TagImage(sourceTag, "_base"); err != nil {
-				fmt.Printf("  [warn] tagging _base from %s failed (%v); falling back to full pull\n", sourceTag, err)
-			} else {
-				fmt.Printf("Done: _base (tagged from %s)\n", sourceTag)
-				pulled++
-				goto baseDone
-			}
-		}
-
-		fmt.Printf("Pulling _base (%s)...\n", baseRootfs)
-		if _, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
-			DockerRef: baseRootfs,
-			Name:      "_base",
-		}, func(stage, msg string) {
-			fmt.Printf("  [%s] %s\n", stage, msg)
-		}); err != nil {
-			return fmt.Errorf("failed to pull base rootfs: %w", err)
-		}
-		fmt.Println("Done: _base")
-		pulled++
-	baseDone:
 	}
 
 	if pulled == 0 {

@@ -56,17 +56,17 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  # base_rootfs: ~/Library/Application Support/shed/vz/full-rootfs.ext4
-  # images:
-  #   base: ~/Library/Application Support/shed/vz/base-rootfs.ext4
-  #   extensions: ~/Library/Application Support/shed/vz/extensions-rootfs.ext4
-  #   full: ~/Library/Application Support/shed/vz/full-rootfs.ext4
+  # default_image / image_aliases values are Docker refs (resolved and pulled
+  # on first use), e.g.:
+  #   default_image: ghcr.io/charliek/shed-vz-full:v0.5.9
+  # See docs/reference/configuration.md for the ref-keyed image model.
 
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.0-dev
-  images:
+  default_image: ghcr.io/charliek/shed-vz-full:v0.5.0-dev
+  image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.5.0-dev
     extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.0-dev
     full: ghcr.io/charliek/shed-vz-full:v0.5.0-dev
+  pull_policy: missing
   
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets

@@ -58,7 +58,6 @@ sheds:
 name: mini-desktop
 http_port: 8080
 ssh_port: 2222
-default_image: full
 
 credentials:
   claude:
@@ -78,7 +77,6 @@ log_level: info
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
-| `default_image` | string | `full` | Default image variant for sheds (one of `base`, `extensions`, `full`, or a tag in the `images:` map) |
 | `credentials` | map | `{}` | Credential directories to mount into sheds |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
@@ -204,11 +202,12 @@ When enabling Firecracker, configure the Firecracker-specific settings:
 default_backend: firecracker
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
-  images:
+  default_image: ghcr.io/charliek/shed-fc-full:v{version}
+  image_aliases:
     base: ghcr.io/charliek/shed-fc-base:v{version}
     extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
     full: ghcr.io/charliek/shed-fc-full:v{version}
+  pull_policy: missing
   images_dir: /var/lib/shed/firecracker/images
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
@@ -232,9 +231,10 @@ Replace `{version}` with the version matching your `shed` binary — run `shed v
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `kernel_path` | string | `""` | Optional. Path to a Linux kernel image (auto-populated by published-image pulls). The Phase B initramfs prefers the kernel embedded in the image blob (`{images_dir}/blobs/sha256/<digest>/kernel`); this path is the fallback for legacy blobs that lack an embedded kernel. |
-| `base_rootfs` | string | `""` | Optional. Path or Docker ref for the default rootfs. Only consulted when `shed create` runs without `--image`. Empty is fine if every create passes `--image` explicitly; otherwise `shed create` errors with `INVALID_REQUEST: no --image specified and no base_rootfs configured`. |
-| `images` | map | - | Named image variants (ext4 paths or Docker refs) |
-| `images_dir` | string | `/var/lib/shed/firecracker/images` | Directory for converted/discovered ext4 images and the content-addressed blob store |
+| `default_image` | string | `""` | Path or Docker ref used for new sheds when `shed create` runs without `--image`. Empty is fine if every create passes `--image`; otherwise `shed create` errors with `INVALID_REQUEST: no --image specified and no default_image configured`. |
+| `image_aliases` | map | - | Optional short alias → Docker ref (or path) map for `shed create --image <alias>`. Listings always show the resolved ref, not the alias. |
+| `pull_policy` | string | `missing` | `missing` (use cache, pull if absent), `always` (always pull), or `never` (error if not cached). Ignored for local-path images. |
+| `images_dir` | string | `/var/lib/shed/firecracker/images` | Directory for the content-addressed blob store and the ref→digest index |
 | `upper_size_default` | string | `5G` | Default logical size of the per-shed writable overlay upper layer when `shed create --upper-size` is omitted. Validated to the range 1–100 GiB. |
 | `instance_dir` | string | - | Directory for VM instances |
 | `socket_dir` | string | - | Directory for API/vsock sockets |
@@ -251,9 +251,9 @@ Replace `{version}` with the version matching your `shed` binary — run `shed v
 | `tap_prefix` | string | `shed-tap` | TAP device name prefix |
 
 Path-existence validation only fires when **all** configured image sources
-are local paths. When `base_rootfs` (or any `images:` entry) is a Docker
-ref, the path-existence check is skipped because the file is created on
-first pull. `kernel_path` is still required to point at a real file when
+are local paths. When `default_image` (or any `image_aliases` entry) is a
+Docker ref, the path-existence check is skipped because the file is created
+on first pull. `kernel_path` is still required to point at a real file when
 set non-empty.
 
 See [Firecracker Setup](../getting-started/fc-setup.md) for setup details.
@@ -262,7 +262,7 @@ See [Firecracker Setup](../getting-started/fc-setup.md) for setup details.
 
 When enabling the VZ backend on macOS Apple Silicon, configure the VZ-specific settings:
 
-Image values in `base_rootfs` and `images` can be either ext4 file paths or Docker image references. Docker refs are auto-pulled and converted to ext4 on first use.
+Image values in `default_image` and `image_aliases` can be either ext4 file paths or Docker image references. Docker refs are auto-pulled and converted on first use.
 
 ```yaml
 default_backend: vz
@@ -271,11 +271,12 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
-  images:
+  default_image: ghcr.io/charliek/shed-vz-full:v{version}
+  image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v{version}
     extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
     full: ghcr.io/charliek/shed-vz-full:v{version}
+  pull_policy: missing
   images_dir: ~/Library/Application Support/shed/vz/
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
@@ -296,9 +297,10 @@ vz:
 | `vfkit_path` | string | `vfkit` | Path to vfkit binary |
 | `kernel_path` | string | `""` | Optional. Path to a decompressed Linux kernel (auto-populated by published-image pulls). Phase B prefers the kernel embedded in the image blob; this is the fallback for legacy blobs that lack an embedded kernel. |
 | `initrd_path` | string | `""` | Optional. Path to an initial RAM disk image. The shed-overlay initramfs lives inside the image blob, so this field is only consulted for legacy blobs. |
-| `base_rootfs` | string | `""` | Optional. Path or Docker ref for the default rootfs. Only consulted when `shed create` runs without `--image`. Empty is fine if every create passes `--image` explicitly; otherwise `shed create` errors with `INVALID_REQUEST: no --image specified and no base_rootfs configured`. |
-| `images` | map | - | Named image variants mapping variant name to rootfs path or Docker image reference (see [Image Variants](images.md)) |
-| `images_dir` | string | `~/Library/Application Support/shed/vz/` | Directory for converted/auto-discovered ext4 images and the content-addressed blob store |
+| `default_image` | string | `""` | Path or Docker ref used for new sheds when `shed create` runs without `--image`. Empty is fine if every create passes `--image`; otherwise `shed create` errors with `INVALID_REQUEST: no --image specified and no default_image configured`. |
+| `image_aliases` | map | - | Optional short alias → Docker ref (or path) map for `shed create --image <alias>` (see [Images](images.md)). Listings always show the resolved ref. |
+| `pull_policy` | string | `missing` | `missing` (use cache, pull if absent), `always` (always pull), or `never` (error if not cached). Ignored for local-path images. |
+| `images_dir` | string | `~/Library/Application Support/shed/vz/` | Directory for the content-addressed blob store and the ref→digest index |
 | `upper_size_default` | string | `5G` | Default logical size of the per-shed writable overlay upper layer when `shed create --upper-size` is omitted. Validated to the range 1–100 GiB. |
 | `instance_dir` | string | - | Directory for VM instances |
 | `socket_dir` | string | - | Directory for vsock Unix sockets (must not contain spaces) |

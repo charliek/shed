@@ -121,11 +121,12 @@ overlayfs lowers on first boot.
 
 ```yaml
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.1
-  images:
+  default_image: ghcr.io/charliek/shed-vz-full:v0.5.1
+  image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.5.1
     extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
     full: ghcr.io/charliek/shed-vz-full:v0.5.1
+  pull_policy: missing
 ```
 
 Pin a concrete version that matches the `shed-server` you built.
@@ -215,11 +216,12 @@ vz:
   # you're booting a legacy raw-rootfs image (rare).
   # kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   # initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v0.5.1
-  images:
+  default_image: ghcr.io/charliek/shed-vz-full:v0.5.1
+  image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.5.1
     extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
     full: ghcr.io/charliek/shed-vz-full:v0.5.1
+  pull_policy: missing
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
   default_cpus: 2

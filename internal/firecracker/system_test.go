@@ -18,10 +18,10 @@ func newSystemTestClient(t *testing.T) (*Client, string, string) {
 	instanceDir := t.TempDir()
 
 	cfg := &config.FirecrackerConfig{
-		ImagesDir:   imagesDir,
-		InstanceDir: instanceDir,
-		Images:      map[string]string{},
-		BaseRootfs:  "ghcr.io/example/base:v1",
+		ImagesDir:    imagesDir,
+		InstanceDir:  instanceDir,
+		ImageAliases: map[string]string{},
+		DefaultImage: "ghcr.io/example/base:v1",
 	}
 	serverCfg := &config.ServerConfig{Name: "test-fc"}
 
@@ -78,9 +78,8 @@ func TestPrune_FC_LogsSkippedWithReason(t *testing.T) {
 func TestDiskUsage_Populated_FC(t *testing.T) {
 	client, imagesDir, instanceDir := newSystemTestClient(t)
 
-	// _base and a variant — install via the content-addressed blob
-	// store so DiskUsage can resolve them through the tag layer.
-	installTestBlob(t, imagesDir, "_base", make([]byte, 4096))
+	// Two installed images, listed by their Docker ref identity.
+	installTestBlob(t, imagesDir, "base", make([]byte, 4096))
 	installTestBlob(t, imagesDir, "default", make([]byte, 8192))
 
 	// One stopped shed with rootfs — but NO console.log (FC has no console log file).
@@ -104,8 +103,8 @@ func TestDiskUsage_Populated_FC(t *testing.T) {
 	for _, img := range du.Images {
 		names[img.Name] = true
 	}
-	if !names["_base"] || !names["default"] {
-		t.Errorf("expected both _base and default; got %+v", names)
+	if !names["ghcr.io/test/base:v1"] || !names["ghcr.io/test/default:v1"] {
+		t.Errorf("expected both base and default refs; got %+v", names)
 	}
 
 	if len(du.Sheds) != 1 {

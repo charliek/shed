@@ -35,9 +35,10 @@ var (
 // ImageConfig provides the configuration data needed by image management operations.
 // Both VZConfig and FirecrackerConfig implement this interface.
 type ImageConfig interface {
-	GetImages() map[string]string
+	GetDefaultImage() string            // ref (or path) for new sheds when no --image
+	GetImageAliases() map[string]string // alias -> ref convenience map
+	GetPullPolicy() string              // "missing" (default) | "always" | "never"
 	GetImagesDir() string
-	GetBaseRootfs() string
 	GetPlatform() string    // "linux/arm64" or "linux/amd64"
 	GetExtractKernel() bool // true for both VZ and Firecracker
 	GetNeedsInitrd() bool   // true for VZ, false for Firecracker
@@ -78,8 +79,12 @@ type ProgressFunc func(stage, msg string)
 type ResolvedRef struct {
 	Path      string // set when the ext4 image already exists on disk
 	DockerRef string // set when the image needs to be pulled and converted
-	Name      string // variant name, used as a tag in the blob store
+	Name      string // cosmetic label derived from the ref; not an identity key
 	Digest    string // set when Path came from a tag in the blob store; preserved through to EnsureResult.Digest
+
+	// Policy governs cache-vs-pull for a DockerRef. Empty means PullMissing.
+	// Ignored for local-path refs.
+	Policy PullPolicy
 }
 
 // EnsureResult is what EnsureImage returns: the path to the
@@ -114,24 +119,39 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		return EnsureResult{}, err
 	}
 
-	// Cache hit fast path: tag points at a manifest whose source-ref
-	// annotation matches the requested DockerRef. Confirm every layer's
-	// ext4 is materialized, since a previous cache eviction might have
-	// removed them.
-	if res, ok := m.resolveCachedTag(ctx, imagesDir, ref.Name, ref.DockerRef); ok {
-		return res, nil
+	policy := ref.Policy
+	if policy == "" {
+		policy = PullMissing
 	}
 
-	// Serialize concurrent EnsureImage calls for the same tag.
-	tagLockPath := filepath.Join(imagesDir, tagsDir, ref.Name+".lock")
-	unlock, err := acquireFileLock(tagLockPath)
+	// Cache lookup by ref identity (the io.shed.source-ref annotation),
+	// resolved O(1) through the ref-index. PullAlways bypasses the cache
+	// entirely so a stale tag/index can't short-circuit the pull (F1).
+	if policy != PullAlways {
+		if res, ok := m.resolveCachedRef(ctx, imagesDir, ref.DockerRef); ok {
+			return res, nil
+		}
+	}
+
+	// Serialize concurrent EnsureImage calls for the SAME ref (keyed by a
+	// hash of the full ref, so distinct refs never block each other).
+	refLockPath := filepath.Join(imagesDir, tagsDir, refIndexKey(ref.DockerRef)+".lock")
+	unlock, err := acquireFileLock(refLockPath)
 	if err != nil {
-		return EnsureResult{}, fmt.Errorf("acquiring tag lock: %w", err)
+		return EnsureResult{}, fmt.Errorf("acquiring image lock: %w", err)
 	}
 	defer unlock()
 
-	if res, ok := m.resolveCachedTag(ctx, imagesDir, ref.Name, ref.DockerRef); ok {
-		return res, nil
+	// Re-check under lock (another caller may have just pulled this ref).
+	if policy != PullAlways {
+		if res, ok := m.resolveCachedRef(ctx, imagesDir, ref.DockerRef); ok {
+			return res, nil
+		}
+	}
+
+	// Cache miss. PullNever must not contact the registry (F2).
+	if policy == PullNever {
+		return EnsureResult{}, fmt.Errorf("%w: %s", ErrPullDisabled, ref.DockerRef)
 	}
 
 	if progress != nil {
@@ -161,7 +181,41 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 	if err != nil {
 		return EnsureResult{}, fmt.Errorf("pulling %s from registry: %w", ref.DockerRef, err)
 	}
-	return m.resolveManifestLower(ctx, imagesDir, pullResult.ManifestDigest)
+	res, err := m.resolveManifestLower(ctx, imagesDir, pullResult.ManifestDigest)
+	if err != nil {
+		return EnsureResult{}, err
+	}
+	// Final commit: record ref -> digest only after the manifest + all
+	// blobs (verified by resolveManifestLower) and the OCI index are
+	// durable, so the ref-index can never point at an incomplete pull.
+	if err := RefIndexPut(imagesDir, ref.DockerRef, pullResult.ManifestDigest); err != nil {
+		log.Printf("vmimage: failed to record ref-index entry for %s: %v", ref.DockerRef, err)
+	}
+	return res, nil
+}
+
+// resolveCachedRef is the by-ref validated cache lookup used on the create
+// hot path. It consults the O(1) ref-index first and falls back to a
+// one-time index rebuild (scan) when the entry is missing — e.g. images
+// pulled before the ref-index existed — so a cold index self-heals.
+func (m *Manager) resolveCachedRef(ctx context.Context, imagesDir, ref string) (EnsureResult, bool) {
+	// Sidecar-only: a create cache hit requires a ref-index entry written by
+	// a prior pull of THIS ref. We deliberately do NOT scan manifests by
+	// source-ref here — a blob left behind by `shed image rm` (which deletes
+	// the sidecar but leaves the blob for prune) must force a re-pull, not be
+	// silently reused.
+	digest, ok := RefIndexGet(imagesDir, ref)
+	if !ok {
+		return EnsureResult{}, false
+	}
+	res, err := m.resolveManifestLower(ctx, imagesDir, digest)
+	if err != nil {
+		// Manifest present but a required blob (erofs) is gone. Drop the
+		// stale entry so policy (pull/never) governs the repair.
+		RefIndexDeleteByDigest(imagesDir, digest)
+		return EnsureResult{}, false
+	}
+	return res, true
 }
 
 // PullImage pulls a registry reference straight to the OCI layout (no
@@ -202,6 +256,12 @@ func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string
 	})
 	if err != nil {
 		return "", fmt.Errorf("pulling %s from registry: %w", dockerRef, err)
+	}
+	// Record the ref->digest mapping so `shed create` (and prune protection)
+	// can resolve this ref O(1) without a manifest scan, and so a configured
+	// default_image pulled via `shed image pull` is protected from prune.
+	if err := RefIndexPut(imagesDir, dockerRef, result.ManifestDigest); err != nil {
+		log.Printf("vmimage: failed to record ref-index entry for %s: %v", dockerRef, err)
 	}
 	return result.ManifestDigest, nil
 }
@@ -286,45 +346,6 @@ func (m *Manager) ResolveImageBlobs(manifestDigest string) (manifest *OCIManifes
 	return manifest, kernelPath, initrdPath, nil
 }
 
-// resolveCachedTag returns an EnsureResult derived from a cached tag
-// when one is available and every layer is materialized.
-//
-// Local tags always win over the configured registry ref: if a tag
-// named `name` exists locally and its layers are fully materialized,
-// we use it regardless of whether the manifest's io.shed.source-ref
-// matches the configured Docker ref. The previous strict equality
-// check forced a registry re-pull every time the server config or a
-// local build set a different source-ref — that overwrote
-// locally-built manifests with whatever was published, which is
-// exactly backwards for development workflows. To force a refresh
-// from the registry, run `shed image pull <ref> -t <name>` (or
-// `shed image rm <name>` first).
-//
-// `expectedRef` is still accepted for the signature compat but only
-// logged for debugging when there's a mismatch.
-func (m *Manager) resolveCachedTag(ctx context.Context, imagesDir, name, expectedRef string) (EnsureResult, bool) {
-	t, err := GetTag(imagesDir, name)
-	if err != nil {
-		return EnsureResult{}, false
-	}
-	if !BlobExists(imagesDir, t.Digest) {
-		return EnsureResult{}, false
-	}
-	manifest, err := LoadManifestByDigest(imagesDir, t.Digest)
-	if err != nil {
-		return EnsureResult{}, false
-	}
-	if expectedRef != "" && manifest.ShedSourceRef() != expectedRef {
-		log.Printf("vmimage: tag %q points at manifest with source-ref %q which differs from configured ref %q — using local tag anyway (run `shed image rm %s` then re-pull to refresh from registry)",
-			name, manifest.ShedSourceRef(), expectedRef, name)
-	}
-	res, err := m.resolveManifestLower(ctx, imagesDir, t.Digest)
-	if err != nil {
-		return EnsureResult{}, false
-	}
-	return res, true
-}
-
 // resolveManifestLower resolves the single read-only lower image for a
 // manifest. v0.5.2+ images carry a prebuilt erofs blob referenced by
 // the io.shed.rootfs.erofs.digest annotation — we return that blob's
@@ -377,9 +398,17 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		return nil, nil
 	}
 
-	configMap := m.cfg.GetImages()
-	if configMap == nil {
-		configMap = map[string]string{}
+	// Refs the server config points at (default_image + alias values).
+	// A manifest whose source-ref is in this set is sourced from config;
+	// anything else with a source-ref was pulled ad-hoc by the user.
+	configuredRefs := map[string]bool{}
+	if dr := m.cfg.GetDefaultImage(); IsDockerRef(dr) {
+		configuredRefs[dr] = true
+	}
+	for _, v := range m.cfg.GetImageAliases() {
+		if IsDockerRef(v) {
+			configuredRefs[v] = true
+		}
 	}
 
 	tags, err := ListTags(imagesDir)
@@ -480,22 +509,30 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 			Tag:    mi.tag,
 			Cached: mi.manifest != nil,
 		}
-		if mi.tag != "" {
+		if mi.manifest != nil {
+			info.DockerRef = mi.manifest.ShedSourceRef()
+		}
+		// Identity is the Docker ref (io.shed.source-ref) when present.
+		switch {
+		case info.DockerRef != "":
+			info.Name = info.DockerRef
+		case mi.tag != "":
 			info.Name = mi.tag
-			if dockerRef, ok := configMap[mi.tag]; ok && IsDockerRef(dockerRef) {
-				info.Source = "config"
-				info.DockerRef = dockerRef
-			} else {
-				info.Source = "discovered"
-			}
-		} else {
+		default:
 			info.Name = ShortDigest(mi.digest)
+		}
+		// Source: config when the ref is what the server is configured to
+		// use; user when the operator labeled it with a cosmetic tag;
+		// dangling when it's an untagged, unconfigured leftover.
+		switch {
+		case configuredRefs[info.DockerRef]:
+			info.Source = "config"
+		case mi.tag != "":
+			info.Source = "user"
+		default:
 			info.Source = "dangling"
 		}
 		if mi.manifest != nil {
-			if info.DockerRef == "" {
-				info.DockerRef = mi.manifest.ShedSourceRef()
-			}
 			for _, layer := range mi.manifest.Layers {
 				info.SizeBytes += layer.Size
 				if layerRefs[layer.Digest] <= 1 {
@@ -546,13 +583,15 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 		Tag:       tagName,
 		Cached:    BlobExists(imagesDir, digest),
 		DockerRef: manifest.ShedSourceRef(),
-		Source:    "discovered",
+		Source:    "user",
 	}
-	if tagName != "" {
-		info.Name = tagName
-		if dockerRef, ok := m.cfg.GetImages()[tagName]; ok && IsDockerRef(dockerRef) {
+	if info.DockerRef != "" {
+		info.Name = info.DockerRef
+		if m.isConfiguredRef(info.DockerRef) {
 			info.Source = "config"
 		}
+	} else if tagName != "" {
+		info.Name = tagName
 	} else {
 		info.Name = ShortDigest(digest)
 		info.Source = "dangling"
@@ -637,27 +676,97 @@ func resolveDigestPrefix(imagesDir, prefix string) (string, error) {
 	}
 }
 
-// DeleteImage removes a tag. Following the Docker model, the underlying
-// manifest blob is NOT removed — call PruneImages to garbage-collect.
-func (m *Manager) DeleteImage(name string) error {
-	if err := ValidateImageName(name); err != nil {
-		return err
+// configuredRefs returns the Docker refs the server config currently points
+// at: the default_image plus every image_aliases value.
+func (m *Manager) configuredRefs() []string {
+	var out []string
+	if dr := m.cfg.GetDefaultImage(); IsDockerRef(dr) {
+		out = append(out, dr)
 	}
-	imagesDir := m.cfg.GetImagesDir()
-
-	if _, ok := m.cfg.GetImages()[name]; ok {
-		return ErrImageInUse
-	}
-	if name == "_base" && IsDockerRef(m.cfg.GetBaseRootfs()) {
-		return ErrImageInUse
-	}
-
-	if err := DeleteTag(imagesDir, name); err != nil {
-		if errors.Is(err, ErrTagNotFound) {
-			return ErrImageNotFound
+	for _, v := range m.cfg.GetImageAliases() {
+		if IsDockerRef(v) {
+			out = append(out, v)
 		}
+	}
+	return out
+}
+
+// isConfiguredRef reports whether ref is the configured default_image or one
+// of the configured image_aliases values.
+func (m *Manager) isConfiguredRef(ref string) bool {
+	if ref == "" {
+		return false
+	}
+	if m.cfg.GetDefaultImage() == ref {
+		return true
+	}
+	for _, v := range m.cfg.GetImageAliases() {
+		if v == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveDeleteTarget maps a user-supplied identifier (a cosmetic tag label,
+// a digest, or a Docker ref) to a manifest digest. A bare label like "full"
+// parses as a Docker ref (docker.io/library/full), so tag/digest resolution
+// is tried first; the ref-index is the fallback for full registry refs.
+func (m *Manager) resolveDeleteTarget(imagesDir, ident string) (string, error) {
+	if digest, _, err := m.resolveTagOrDigest(ident); err == nil {
+		return digest, nil
+	}
+	if IsDockerRef(ident) {
+		// Sidecar first (O(1)); fall back to a manifest scan so an image
+		// visible in `shed image ls` (which scans manifests) is also
+		// removable by ref even without a sidecar entry.
+		if digest, ok := RefIndexGet(imagesDir, ident); ok {
+			return digest, nil
+		}
+		if digest, ok := FindDigestBySourceRef(imagesDir, ident); ok {
+			return digest, nil
+		}
+	}
+	return "", ErrImageNotFound
+}
+
+// DeleteImage removes an image's addressability — every cosmetic tag and the
+// ref-index entry pointing at the resolved manifest. Following the Docker
+// model, the underlying manifest blob is NOT removed; call PruneImages to
+// garbage-collect once nothing references it. ident may be a Docker ref, a
+// digest, or a cosmetic tag label.
+//
+// Hard-blocks only when the manifest is pinned by a live shed or snapshot.
+// (Warning when the target is the configured default_image is a CLI concern.)
+func (m *Manager) DeleteImage(ident string) error {
+	imagesDir := m.cfg.GetImagesDir()
+	digest, err := m.resolveDeleteTarget(imagesDir, ident)
+	if err != nil {
 		return err
 	}
+
+	if m.scanner != nil {
+		refs, serr := m.scanner.ScanRefs(false)
+		if serr != nil {
+			return fmt.Errorf("scanning refs: %w", serr)
+		}
+		if len(ProtectiveRefs(refs, digest)) > 0 {
+			return ErrImageInUse
+		}
+	}
+
+	// Untag every cosmetic tag pointing at this manifest and drop its
+	// ref-index entry so the image is no longer resolvable.
+	tags, err := ListTags(imagesDir)
+	if err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if t, gerr := GetTag(imagesDir, tag); gerr == nil && t.Digest == digest {
+			_ = DeleteTag(imagesDir, tag)
+		}
+	}
+	RefIndexDeleteByDigest(imagesDir, digest)
 	return nil
 }
 
@@ -720,6 +829,23 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 			continue
 		}
 		liveManifests[t.Digest] = true
+	}
+
+	// Protect the digests the server config currently resolves to
+	// (default_image + image_aliases), independent of cosmetic tags.
+	// Tags are now cosmetic labels a user can `rm`; without this, removing
+	// the derived tag and then pruning could GC the blob a fresh `shed
+	// create` still resolves to via the ref-index — a use-after-free.
+	for _, ref := range m.configuredRefs() {
+		digest, ok := RefIndexGet(imagesDir, ref)
+		if !ok {
+			// Cold (no sidecar yet): scan manifests so a configured image
+			// present from before the ref-index existed is still protected.
+			digest, ok = FindDigestBySourceRef(imagesDir, ref)
+		}
+		if ok && BlobExists(imagesDir, digest) {
+			liveManifests[digest] = true
+		}
 	}
 
 	// Expand to a full reachable-set: configs, layers, kernel, initrd
@@ -798,12 +924,14 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		if tagName, ok := tagMap[b]; ok {
 			info.Tag = tagName
 			info.Name = tagName
-			info.Source = "discovered"
 		} else {
 			info.Name = ShortDigest(b)
 		}
 		if m, ok := manifestCandidates[b]; ok {
 			info.DockerRef = m.ShedSourceRef()
+			if info.DockerRef != "" {
+				info.Name = info.DockerRef
+			}
 			for _, layer := range m.Layers {
 				info.SizeBytes += layer.Size
 			}
@@ -857,6 +985,9 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 		// see a descriptor pointing at a now-missing blob.
 		if indexed[c.Digest] {
 			_ = IndexRemoveByDigest(imagesDir, c.Digest)
+			// Drop any ref-index entry pointing at this manifest so a
+			// later resolve can't hit a dangling sidecar entry (F5).
+			RefIndexDeleteByDigest(imagesDir, c.Digest)
 		}
 		deleted = append(deleted, c)
 	}

@@ -9,20 +9,22 @@ import (
 
 // testConfig implements ImageConfig for testing.
 type testConfig struct {
-	images        map[string]string
+	defaultImage  string
+	imageAliases  map[string]string
+	pullPolicy    string
 	imagesDir     string
-	baseRootfs    string
 	platform      string
 	extractKernel bool
 	needsInitrd   bool
 }
 
-func (c *testConfig) GetImages() map[string]string { return c.images }
-func (c *testConfig) GetImagesDir() string         { return c.imagesDir }
-func (c *testConfig) GetBaseRootfs() string        { return c.baseRootfs }
-func (c *testConfig) GetPlatform() string          { return c.platform }
-func (c *testConfig) GetExtractKernel() bool       { return c.extractKernel }
-func (c *testConfig) GetNeedsInitrd() bool         { return c.needsInitrd }
+func (c *testConfig) GetDefaultImage() string            { return c.defaultImage }
+func (c *testConfig) GetImageAliases() map[string]string { return c.imageAliases }
+func (c *testConfig) GetPullPolicy() string              { return c.pullPolicy }
+func (c *testConfig) GetImagesDir() string               { return c.imagesDir }
+func (c *testConfig) GetPlatform() string                { return c.platform }
+func (c *testConfig) GetExtractKernel() bool             { return c.extractKernel }
+func (c *testConfig) GetNeedsInitrd() bool               { return c.needsInitrd }
 
 // fakeScanner is a static RefScanner used by tests.
 type fakeScanner struct {
@@ -46,8 +48,8 @@ func installFakeBlob(t *testing.T, imagesDir, tag, sourceRef string, body []byte
 func TestManagerListImages(t *testing.T) {
 	imagesDir := t.TempDir()
 	cfg := &testConfig{
-		images:    map[string]string{"default": "ghcr.io/example/default:v1"},
-		imagesDir: imagesDir,
+		defaultImage: "ghcr.io/example/default:v1",
+		imagesDir:    imagesDir,
 	}
 	mgr := NewManager(cfg, nil)
 
@@ -138,17 +140,27 @@ func TestManagerInspectAndTag(t *testing.T) {
 func TestManagerDeleteImage(t *testing.T) {
 	imagesDir := t.TempDir()
 	cfg := &testConfig{
-		images:    map[string]string{"managed": "ghcr.io/example/managed:v1"},
-		imagesDir: imagesDir,
+		defaultImage: "ghcr.io/example/managed:v1",
+		imagesDir:    imagesDir,
 	}
-	mgr := NewManager(cfg, nil)
 
-	installFakeBlob(t, imagesDir, "managed", "ghcr.io/example/managed:v1", []byte("a"))
+	managedDigest := installFakeBlob(t, imagesDir, "managed", "ghcr.io/example/managed:v1", []byte("a"))
 	installFakeBlob(t, imagesDir, "removable", "ghcr.io/example/removable:v1", []byte("b"))
 
-	// Refuse config-managed.
-	if err := mgr.DeleteImage("managed"); !errors.Is(err, ErrImageInUse) {
-		t.Errorf("DeleteImage(managed) = %v, want ErrImageInUse", err)
+	// A manifest pinned by a live shed/snapshot is hard-blocked.
+	pinnedMgr := NewManager(cfg, &fakeScanner{refs: []Reference{{Digest: managedDigest, Kind: RefKindShed, Name: "s1"}}})
+	if err := pinnedMgr.DeleteImage("managed"); !errors.Is(err, ErrImageInUse) {
+		t.Errorf("DeleteImage(pinned) = %v, want ErrImageInUse", err)
+	}
+
+	// Without a live ref, the configured default_image is NOT hard-blocked
+	// (warn-and-confirm is a CLI concern); delete untags it (blob remains).
+	mgr := NewManager(cfg, nil)
+	if err := mgr.DeleteImage("managed"); err != nil {
+		t.Errorf("DeleteImage(managed, unpinned): %v", err)
+	}
+	if _, err := GetTag(imagesDir, "managed"); !errors.Is(err, ErrTagNotFound) {
+		t.Errorf("expected managed tag gone, got %v", err)
 	}
 
 	// Removable tag deletes (Docker model: tag removed, blob remains).

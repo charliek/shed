@@ -151,10 +151,14 @@ func (b *vzCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 				return nil, err
 			}
 		} else {
-			if b.c.cfg.BaseRootfs == "" {
-				return nil, fmt.Errorf("%w: no --image specified and no base_rootfs configured in vz.base_rootfs; pass --image <tag> or set base_rootfs in server.yaml", config.ErrInvalidShedRequestSentinel)
+			if b.c.cfg.DefaultImage == "" {
+				return nil, fmt.Errorf("%w: no --image specified and no default_image configured in vz.default_image; pass --image <ref> or set default_image in server.yaml", config.ErrInvalidShedRequestSentinel)
 			}
-			resolved = b.c.cfg.ResolveBaseRootfs()
+			var err error
+			resolved, err = b.c.cfg.ResolveBaseRootfs()
+			if err != nil {
+				return nil, err
+			}
 		}
 		backend.Phase(ctx, "image")
 		backend.Status(ctx, "Resolving image...")

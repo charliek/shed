@@ -24,10 +24,10 @@ func newPruneTestClient(t *testing.T) (*Client, string, string) {
 	instanceDir := t.TempDir()
 
 	cfg := &config.VZConfig{
-		ImagesDir:   imagesDir,
-		InstanceDir: instanceDir,
-		Images:      map[string]string{},
-		BaseRootfs:  "",
+		ImagesDir:    imagesDir,
+		InstanceDir:  instanceDir,
+		ImageAliases: map[string]string{},
+		DefaultImage: "",
 	}
 	serverCfg := &config.ServerConfig{Name: "test-prune"}
 
