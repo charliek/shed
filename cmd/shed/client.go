@@ -471,11 +471,21 @@ func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, onPro
 		return nil, c.parseError(resp)
 	}
 
+	var out config.ImagePullResponse
+	// Fall back to the non-streaming path against a server that ignores the
+	// Accept header (e.g. a pre-SSE shed-server): it returns a plain JSON
+	// ImagePullResponse with Content-Type application/json.
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, fmt.Errorf("failed to decode pull response: %w", err)
+		}
+		return &out, nil
+	}
+
 	data, err := c.readSSEStream(resp.Body, onProgress)
 	if err != nil {
 		return nil, err
 	}
-	var out config.ImagePullResponse
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("failed to parse complete event: %w", err)
 	}

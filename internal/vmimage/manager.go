@@ -410,7 +410,12 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 	for _, ref := range m.configuredRefs() {
 		configuredRefSet[ref] = true
 		if d, ok := RefIndexGet(imagesDir, ref); ok {
-			configuredDigests[d] = ref
+			// First writer wins (configuredRefs is deterministically ordered:
+			// default_image, then sorted aliases) so two configured refs
+			// sharing one digest display stably.
+			if _, seen := configuredDigests[d]; !seen {
+				configuredDigests[d] = ref
+			}
 		}
 	}
 	pulledRefs := RefIndexReverse(imagesDir)
@@ -623,11 +628,13 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 		case configuredRefSet[srcRef]:
 			info.DockerRef = srcRef
 			configured = true
-		case RefIndexReverse(imagesDir)[digest] != "":
-			info.DockerRef = RefIndexReverse(imagesDir)[digest]
-			pulled = true
 		default:
-			info.DockerRef = srcRef // provenance only
+			if pref := RefIndexReverse(imagesDir)[digest]; pref != "" {
+				info.DockerRef = pref
+				pulled = true
+			} else {
+				info.DockerRef = srcRef // provenance only
+			}
 		}
 	}
 	switch {
@@ -730,18 +737,22 @@ func resolveDigestPrefix(imagesDir, prefix string) (string, error) {
 }
 
 // configuredRefs returns the Docker refs the server config currently points
-// at: the default_image plus every image_aliases value.
+// at: the default_image first, then every image_aliases value in sorted order.
+// The deterministic ordering lets callers (e.g. ListImages' first-writer-wins
+// digest map) display a stable ref when several configured refs share a digest.
 func (m *Manager) configuredRefs() []string {
 	var out []string
 	if dr := m.cfg.GetDefaultImage(); IsDockerRef(dr) {
 		out = append(out, dr)
 	}
+	var aliases []string
 	for _, v := range m.cfg.GetImageAliases() {
 		if IsDockerRef(v) {
-			out = append(out, v)
+			aliases = append(aliases, v)
 		}
 	}
-	return out
+	sort.Strings(aliases)
+	return append(out, aliases...)
 }
 
 // resolveDeleteTarget maps a user-supplied identifier (a cosmetic tag label,

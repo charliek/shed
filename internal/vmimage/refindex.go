@@ -204,6 +204,11 @@ func RefIndexReverse(imagesDir string) map[string]string {
 		if err := json.Unmarshal(data, &entry); err != nil || entry.Digest == "" || entry.Ref == "" {
 			continue
 		}
+		// Skip entries whose manifest blob is gone so a broken/half-pruned
+		// image isn't displayed under a stale ref.
+		if !BlobExists(imagesDir, entry.Digest) {
+			continue
+		}
 		if _, ok := out[entry.Digest]; !ok {
 			out[entry.Digest] = entry.Ref
 		}

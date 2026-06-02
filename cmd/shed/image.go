@@ -574,8 +574,13 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to list images: %w", err)
 		}
 		for i := range resp.Images {
-			if resp.Images[i].Name == name {
-				targetImage = &resp.Images[i]
+			img := &resp.Images[i]
+			// Match however the user referred to the image: by ref (Name),
+			// cosmetic tag, full or short digest.
+			if img.Name == name || img.Tag == name ||
+				img.Digest == name || vmimage.ShortDigest(img.Digest) == name ||
+				(img.Digest != "" && strings.HasPrefix(img.Digest, name)) {
+				targetImage = img
 				break
 			}
 		}
