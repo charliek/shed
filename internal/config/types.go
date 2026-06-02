@@ -348,8 +348,6 @@ type ImageDiskEntry struct {
 	Path      string   `json:"path"`
 	DockerRef string   `json:"docker_ref,omitempty"`
 	Size      DiskSize `json:"size"`
-	// IsBase is true for the _base-rootfs.ext4 cache entry.
-	IsBase bool `json:"is_base,omitempty"`
 }
 
 // ShedDiskEntry describes one shed's per-instance disk footprint.

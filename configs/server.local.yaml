@@ -85,11 +85,11 @@ log_level: debug
 default_backend: firecracker
 
 firecracker:
-  default_image: ghcr.io/charliek/shed-fc-full:v0.5.0-dev
+  default_image: ghcr.io/charliek/shed-fc-full:v0.5.9
   image_aliases:
-    base: ghcr.io/charliek/shed-fc-base:v0.5.0-dev
-    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.0-dev
-    full: ghcr.io/charliek/shed-fc-full:v0.5.0-dev
+    base: ghcr.io/charliek/shed-fc-base:v0.5.9
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.9
+    full: ghcr.io/charliek/shed-fc-full:v0.5.9
   pull_policy: missing
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker

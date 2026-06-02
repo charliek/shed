@@ -167,29 +167,29 @@ store lives under `~/Library/Application Support/shed/vz/` — see
 
 #### Configure server for local builds
 
-When you build images locally, the source `server.yaml` should **omit**
-`base_rootfs` and the `images:` map entirely. The runtime falls back to
-tag auto-discovery, and you pass the tag explicitly on `shed create`:
+When you build images locally, label them with `shed image build/pull -t
+<label>` and reference the label. You can either set `default_image` to a
+label (used when no `--image` is passed) or omit it and pass `--image
+<label>` on every create:
 
 ```yaml
 vz:
   vfkit_path: vfkit
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
-  # no base_rootfs, no images: — tags resolved from the local blob store
+  default_image: full   # a local label, or a ghcr.io/...:vX ref
 ```
 
-Then pass `--image <tag>` on every create:
+Then create (omit `--image` to use `default_image`, or override per shed):
 
 ```bash
-shed create test --image full
-shed create dev  --image base
+shed create test            # uses default_image
+shed create dev --image base
 ```
 
-`base_rootfs` is treated as a literal path when it doesn't look like a
-Docker reference, so the bare tag form (`base_rootfs: full`) does not
-work today. Use either a fully-qualified `ghcr.io/...:vX` ref or omit
-the field and pass `--image`.
+`default_image` may be a Docker ref (`ghcr.io/...:vX`), an `image_aliases`
+name, a local label set with `-t`, or an absolute path to an ext4/erofs
+image. Docker refs are pulled on first use per `pull_policy`.
 
 ### 4. Create directories
 
@@ -269,7 +269,7 @@ working directory. `shed-server` without `--config` only looks at
 ```bash
 shed server add localhost
 shed server list                  # shows the registered name (e.g. "my-mac")
-shed create test --image full     # required when base_rootfs is omitted
+shed create test --image full     # required when default_image is omitted
 shed console test
 ```
 
@@ -297,7 +297,7 @@ The rootfs is a standard ext4 image, same as Firecracker. Each instance gets its
 : Check that you're running macOS 13+ (Ventura or later).
 
 **VM fails to boot**
-: Verify `kernel_path`, `initrd_path`, and `base_rootfs` point to valid files. Check that the rootfs was built successfully. Check the console log at `<instance_dir>/<name>/console.log` for boot messages.
+: Verify `kernel_path`, `initrd_path`, and `default_image` point to valid files (or a pullable ref). Check that the rootfs was built successfully. Check the console log at `<instance_dir>/<name>/console.log` for boot messages.
 
 **Health check timeout**
 : Check that vsock socket files exist in `~/.shed/vz/sockets/`. Verify vfkit is running with `ps aux | grep vfkit`. Check the console log for systemd boot errors.

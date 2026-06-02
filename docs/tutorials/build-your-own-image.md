@@ -265,12 +265,13 @@ default, edit your server config:
 
 ```yaml
 vz:
-  base_rootfs: my-image          # or the full ghcr.io ref
-  images:
+  default_image: my-image        # a local label (-t), or the full ghcr.io ref
+  image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v0.5.1
     extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
     full: ghcr.io/charliek/shed-vz-full:v0.5.1
     my-image: ghcr.io/myorg/my-shed-image:v1
+  pull_policy: missing
 ```
 
 Restart the server. Subsequent `shed create <name>` calls without

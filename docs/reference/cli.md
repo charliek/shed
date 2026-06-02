@@ -332,7 +332,7 @@ removed in the OCI rollout.
 
 ### shed image ls
 
-Lists available image variants from server config plus any tags discovered in the blob store. `shed image list` is a deprecated alias.
+Lists installed images by their Docker ref. The `SOURCE` column is `config` (the ref is the configured `default_image` or an `image_aliases` value), `user` (pulled or labeled ad-hoc), or `dangling` (an untagged, unconfigured leftover). `shed image list` is a deprecated alias.
 
 ```bash
 shed image ls
@@ -510,7 +510,7 @@ shed image rm <name> [flags]
 |------|-------|---------|-------------|
 | `--force` | | `false` | Skip confirmation prompt |
 
-Following the Docker model, this removes the **tag** only — the underlying blob persists for `shed image prune` to garbage-collect once nothing references it. Config-managed tags (those listed in `images:` in server config, plus `_base` while `base_rootfs` is a Docker ref) cannot be removed by `image rm` — bump them via config instead.
+Accepts a Docker ref, a digest, or a cosmetic tag label. Following the Docker model, this drops the image's addressability (tags + ref-index entry) but leaves the underlying blob for `shed image prune` to garbage-collect once nothing references it. Removal is hard-blocked only when a live shed or snapshot still pins the manifest (matching `docker rmi`); removing an image referenced by server config (`default_image` / `image_aliases`) prompts for confirmation and means the next `shed create` for it re-pulls.
 
 **Note:** When using `--json`, the `--force` flag is required.
 
@@ -926,17 +926,17 @@ shed-server pull-images [flags]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--variant` | All | Pull a specific image variant only |
+| `--variant` | All | Pre-pull only one selector (`default_image`, or an `image_aliases` name) |
 | `--config` | Auto-detect | Path to server config file |
 
 **Examples:**
 
 ```bash
-sudo shed-server pull-images                  # Pull all configured variants
-sudo shed-server pull-images --variant base   # Pull only the base variant
+sudo shed-server pull-images                  # Pull default_image + all aliases
+sudo shed-server pull-images --variant base   # Pull only the "base" alias
 ```
 
-Works on both macOS (VZ) and Linux (Firecracker). Uses the images configured in `server.yaml` for the active backend. When `base_rootfs` shares an OCI ref with any `images:` entry, the underlying manifest is deduplicated — `_base` and the variant tag point at the same digest without a second pull. See [Storage Model](storage-model.md) for the on-disk layout and the [upgrade cookbook](images.md#cookbook-upgrading-image-versions) in the images reference.
+Works on both macOS (VZ) and Linux (Firecracker). Pre-pulls the `default_image` and every `image_aliases` ref configured in `server.yaml` for the active backend. Refs that resolve to the same content-addressed manifest are pulled once. See [Storage Model](storage-model.md) for the on-disk layout and the [upgrade cookbook](images.md#cookbook-upgrading-image-versions) in the images reference.
 
 ### shed-server install
 

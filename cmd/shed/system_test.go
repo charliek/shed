@@ -37,8 +37,8 @@ func sampleDiskUsage() config.DiskUsage {
 		Backend:     "vz",
 		GeneratedAt: time.Date(2026, 4, 20, 11, 23, 45, 0, time.UTC),
 		Images: []config.ImageDiskEntry{
-			{Name: "default", DockerRef: "ghcr.io/x/default:v1", Size: config.DiskSize{LogicalBytes: 5 * 1024 * 1024 * 1024, PhysicalBytes: 4 * 1024 * 1024 * 1024}},
-			{Name: "_base", IsBase: true, Size: config.DiskSize{LogicalBytes: 5 * 1024 * 1024 * 1024, PhysicalBytes: 0}},
+			{Name: "ghcr.io/x/default:v1", DockerRef: "ghcr.io/x/default:v1", Size: config.DiskSize{LogicalBytes: 5 * 1024 * 1024 * 1024, PhysicalBytes: 4 * 1024 * 1024 * 1024}},
+			{Name: "ghcr.io/x/extensions:v1", DockerRef: "ghcr.io/x/extensions:v1", Size: config.DiskSize{LogicalBytes: 5 * 1024 * 1024 * 1024, PhysicalBytes: 0}},
 		},
 		Kernel: &config.FileEntry{Path: "/tmp/vmlinux", Size: config.DiskSize{LogicalBytes: 8 * 1024 * 1024, PhysicalBytes: 8 * 1024 * 1024}, Kind: "kernel"},
 		Initrd: &config.FileEntry{Path: "/tmp/initrd", Size: config.DiskSize{LogicalBytes: 100 * 1024, PhysicalBytes: 100 * 1024}, Kind: "initrd"},
@@ -107,8 +107,8 @@ func TestRenderDF_Verbose(t *testing.T) {
 
 	for _, want := range []string{
 		"IMAGES (2)",
-		"default",
-		"_base",
+		"ghcr.io/x/default:v1",
+		"ghcr.io/x/extensions:v1",
 		"SHEDS (2)",
 		"api-dev",
 		"api-test",

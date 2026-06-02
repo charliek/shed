@@ -27,7 +27,7 @@ The `shed-server` exposes a REST API for managing sheds.
 | POST | `/api/snapshots` | Create a snapshot from a stopped shed |
 | GET | `/api/snapshots/{name}` | Get snapshot details |
 | DELETE | `/api/snapshots/{name}` | Delete a snapshot |
-| GET | `/api/images` | List available image variants |
+| GET | `/api/images` | List installed images (by Docker ref) |
 | GET | `/api/images/inspect/{name}` | Inspect a tag or digest (manifest + info) |
 | POST | `/api/images/tag` | Point a new tag at an existing digest |
 | POST | `/api/images/pull` | Pull a Docker reference into the blob store |
@@ -120,7 +120,7 @@ Creates a new shed.
 |-------|----------|---------|-------------|
 | `name` | Yes | - | Shed name (alphanumeric + hyphens) |
 | `repo` | No | null | Repository to clone (`owner/repo` shorthand or full URL) |
-| `image` | No | Server config | Image variant name (see [Image Variants](images.md)) |
+| `image` | No | `default_image` | Docker ref, `image_aliases` name, or local label (see [Images](images.md)) |
 | `backend` | No | Server default | Backend to use: `firecracker`, `vz`, or `detect` |
 | `local_dir` | No | null | Absolute path to host directory to mount as workspace (mutually exclusive with `repo`) |
 | `cpus` | No | Backend default | Number of vCPUs |
@@ -180,7 +180,7 @@ Without the `Accept: text/event-stream` header, the endpoint behaves synchronous
 | 400 | `INVALID_SHED_NAME` | Invalid name format |
 | 400 | `INVALID_REPO_URL` | Invalid repository URL |
 | 400 | `INVALID_LOCAL_DIR` | Invalid local directory path |
-| 400 | `INVALID_REQUEST` | No `image` specified and `base_rootfs` is not configured on the chosen backend, or `upper_size_bytes` is outside the 1–100 GiB range, or `from_snapshot` was passed together with `image`/`repo`. |
+| 400 | `INVALID_REQUEST` | No `image` specified and `default_image` is not configured on the chosen backend, or `upper_size_bytes` is outside the 1–100 GiB range, or `from_snapshot` was passed together with `image`/`repo`. |
 | 409 | `SHED_ALREADY_EXISTS` | Shed already exists |
 | 500 | `CLONE_FAILED` / `BACKEND_ERROR` | Backend or clone failure |
 
@@ -454,7 +454,7 @@ Lists all tmux sessions across all running sheds.
 
 ### GET /api/images
 
-Returns available image variants across all backends. Each entry is an
+Returns installed images across all backends, keyed by Docker ref. Each entry is an
 `ImageInfo`: tag-or-dangling-digest plus content-addressed metadata.
 
 **Response:**
@@ -674,16 +674,16 @@ Returns disk usage information for the server: image cache, per-instance rootfs 
   "generated_at": "2026-04-20T11:23:45Z",
   "images": [
     {
-      "name": "default",
-      "path": "/Users/alice/Library/Application Support/shed/vz/default-rootfs.ext4",
-      "docker_ref": "ghcr.io/example/default:v1",
+      "name": "ghcr.io/charliek/shed-vz-full:v0.6.0",
+      "path": "/Users/alice/Library/Application Support/shed/vz/blobs/sha256/abc.../rootfs.erofs",
+      "docker_ref": "ghcr.io/charliek/shed-vz-full:v0.6.0",
       "size": {"logical_bytes": 5368709120, "physical_bytes": 4831838208}
     },
     {
-      "name": "_base",
-      "path": "/Users/alice/Library/Application Support/shed/vz/_base-rootfs.ext4",
-      "size": {"logical_bytes": 5368709120, "physical_bytes": 0},
-      "is_base": true
+      "name": "ghcr.io/charliek/shed-vz-base:v0.6.0",
+      "path": "/Users/alice/Library/Application Support/shed/vz/blobs/sha256/def.../rootfs.erofs",
+      "docker_ref": "ghcr.io/charliek/shed-vz-base:v0.6.0",
+      "size": {"logical_bytes": 5368709120, "physical_bytes": 0}
     }
   ],
   "kernel": {
@@ -740,7 +740,7 @@ Returns disk usage information for the server: image cache, per-instance rootfs 
 - `console_log` is always absent on Firecracker (the FC SDK writes to stderr, not a per-instance file).
 - `initrd` is VZ-only — Firecracker has no initrd.
 - `physical_bytes` comes from `stat.Blocks * 512`. Files that share extents via clonefile/FICLONE or hardlinks may have those bytes counted against each referencing file, inflating sums.
-- `is_base` marks the runtime-managed `_base-rootfs.ext4` cache.
+- Images are keyed by their Docker ref (`name` == `docker_ref`); on-disk bytes are counted once per content digest even when several refs share it.
 
 **Multi-server aggregation:** the server never fans out; `shed system df --all` issues one request per configured server from the client and assembles the per-server results.
 

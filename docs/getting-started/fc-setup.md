@@ -331,29 +331,28 @@ The script writes directly into the local blob store at
 
 ##### Configure server for local builds
 
-When you build images locally, the source `server.yaml` should **omit**
-`base_rootfs` and the `images:` map entirely. The runtime falls back to
-tag auto-discovery, and you pass the tag explicitly on `shed create`:
+When you build images locally, label them with `shed image build/pull -t
+<label>` and reference the label. Either set `default_image` to a label
+(used when no `--image` is passed) or pass `--image <label>` per create:
 
 ```yaml
 firecracker:
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   images_dir: /var/lib/shed/firecracker/images
-  # no base_rootfs, no images: — tags resolved from the local blob store
+  default_image: full   # a local label, or a ghcr.io/...:vX ref
 ```
 
-Then pass `--image <tag>` on every create:
+Then create (omit `--image` to use `default_image`, or override per shed):
 
 ```bash
-shed create test --image full
-shed create dev  --image base
+shed create test            # uses default_image
+shed create dev --image base
 ```
 
-`base_rootfs` is treated as a literal path when it doesn't look like a
-Docker reference, so the bare tag form (`base_rootfs: full`) does not
-work today. Use either a fully-qualified `ghcr.io/...:vX` ref or omit
-the field and pass `--image`.
+`default_image` may be a Docker ref (`ghcr.io/...:vX`), an `image_aliases`
+name, a local label set with `-t`, or an absolute path to an ext4/erofs
+image. Docker refs are pulled on first use per `pull_policy`.
 
 ### Set Up Bridge Network
 
