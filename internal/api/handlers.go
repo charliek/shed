@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -656,6 +657,7 @@ func (s *Server) handlePullImageSSE(w http.ResponseWriter, r *http.Request, req 
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	start := time.Now()
 	events := make(chan backend.ProgressEvent, 16)
 	sseFn := func(event backend.ProgressEvent) {
 		if event.Message == "" {
@@ -700,10 +702,11 @@ drain:
 	}
 
 	if res.err != nil {
-		log.Printf("PullImage failed for %q: %v", req.DockerRef, res.err)
+		log.Printf("PullImage failed for %q after %s: %v", req.DockerRef, time.Since(start).Round(time.Millisecond), res.err)
 		_, errCode, msg := mapBackendError(res.err)
 		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
 	} else {
+		log.Printf("PullImage %q -> %s in %s", req.DockerRef, vmimage.ShortDigest(res.digest), time.Since(start).Round(time.Millisecond))
 		writeSSEEvent(w, "complete", config.ImagePullResponse{Tag: req.Tag, Digest: res.digest})
 	}
 	flusher.Flush()

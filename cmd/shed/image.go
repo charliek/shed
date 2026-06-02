@@ -799,6 +799,11 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 	// + aggregate size) and the constituent blobs (config/layers/kernel/
 	// initrd/erofs, size folded into their manifest). Group for display: one
 	// row per image by default, with the blob digests behind --verbose.
+	//
+	// Server contract (internal/vmimage Manager.PruneImages): only manifest
+	// candidates get DockerRef + aggregate SizeBytes set; blobs have both
+	// zero. This partition relies on that — if the server ever sizes blobs
+	// individually, give ImageInfo an explicit manifest/blob discriminator.
 	var images, blobs []config.ImageInfo
 	var totalSize int64
 	for _, img := range dryResp.Deleted {
