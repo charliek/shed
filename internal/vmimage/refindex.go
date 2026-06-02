@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,20 +149,35 @@ func RefIndexGet(imagesDir, ref string) (digest string, ok bool) {
 	return entry.Digest, true
 }
 
-// ResolveRefDigest maps a ref to its cached manifest digest via the O(1)
-// ref-index, falling back to a one-time index rebuild (so a cold/missing
-// sidecar self-heals for images whose publish ref matches the lookup ref).
-// Used by the create hot path, prune protection, and delete resolution so all
-// three agree on what "the image for this ref" is.
-func ResolveRefDigest(imagesDir, ref string) (digest string, ok bool) {
-	if d, ok := RefIndexGet(imagesDir, ref); ok {
-		return d, true
-	}
-	if err := RebuildRefIndex(imagesDir); err != nil {
-		log.Printf("vmimage: ref-index rebuild failed: %v", err)
+// FindDigestBySourceRef scans installed manifests for one whose
+// io.shed.source-ref equals ref, returning its digest. This is a READ-ONLY,
+// O(N-manifests) fallback for the cold paths (rm, prune protection) where a
+// ref may not have a sidecar entry yet (e.g. images present from before the
+// ref-index existed). It deliberately does NOT write the sidecar: the create
+// hot path resolves sidecar-only, so a manifest left behind by `shed image
+// rm` (blob persists until prune, Docker model) must not be silently
+// re-cached for create — `rm` then `create` should re-pull.
+func FindDigestBySourceRef(imagesDir, ref string) (digest string, ok bool) {
+	if imagesDir == "" || ref == "" {
 		return "", false
 	}
-	return RefIndexGet(imagesDir, ref)
+	indexed, err := IndexManifestDigests(imagesDir)
+	if err != nil {
+		return "", false
+	}
+	for d := range indexed {
+		if !BlobExists(imagesDir, d) {
+			continue
+		}
+		manifest, err := LoadManifestByDigest(imagesDir, d)
+		if err != nil {
+			continue
+		}
+		if manifest.ShedSourceRef() == ref {
+			return d, true
+		}
+	}
+	return "", false
 }
 
 // RefIndexDeleteByDigest removes every ref-index entry pointing at digest.
@@ -192,36 +206,4 @@ func RefIndexDeleteByDigest(imagesDir, digest string) {
 			_ = os.Remove(p)
 		}
 	}
-}
-
-// RebuildRefIndex repopulates the ref-index from the authoritative source —
-// every manifest in index.json that carries an io.shed.source-ref. Used as a
-// one-time self-healing fallback when a RefIndexGet misses (e.g. images
-// pulled before the index existed). A missing/stale index is therefore never
-// a correctness bug, only a one-time O(N-manifests) cost.
-func RebuildRefIndex(imagesDir string) error {
-	if imagesDir == "" {
-		return nil
-	}
-	indexed, err := IndexManifestDigests(imagesDir)
-	if err != nil {
-		return fmt.Errorf("reading OCI index for ref-index rebuild: %w", err)
-	}
-	for digest := range indexed {
-		if !BlobExists(imagesDir, digest) {
-			continue
-		}
-		manifest, err := LoadManifestByDigest(imagesDir, digest)
-		if err != nil {
-			continue
-		}
-		ref := manifest.ShedSourceRef()
-		if ref == "" {
-			continue
-		}
-		if err := RefIndexPut(imagesDir, ref, digest); err != nil {
-			log.Printf("vmimage: ref-index rebuild: failed to record %s: %v", ref, err)
-		}
-	}
-	return nil
 }

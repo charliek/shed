@@ -61,6 +61,33 @@ func TestRefIndexDeleteByDigest(t *testing.T) {
 	}
 }
 
+// TestRmThenCreateDoesNotResurrect is the regression guard for the
+// rm-leaves-blob bug: `shed image rm` deletes the sidecar entry but leaves the
+// manifest blob (Docker model — prune GCs later). The create hot path
+// (RefIndexGet, sidecar-only) must NOT find the image, so `shed create`
+// re-pulls; only the cold rm/prune paths (FindDigestBySourceRef) still see it.
+func TestRmThenCreateDoesNotResurrect(t *testing.T) {
+	imagesDir := t.TempDir()
+	ref := "ghcr.io/x/y:v1"
+	digest := installFakeBlob(t, imagesDir, "full", ref, []byte("body"))
+	if err := RefIndexPut(imagesDir, ref, digest); err != nil {
+		t.Fatalf("RefIndexPut: %v", err)
+	}
+
+	// Simulate `shed image rm`: drop tag + sidecar, leave the blob.
+	_ = DeleteTag(imagesDir, "full")
+	RefIndexDeleteByDigest(imagesDir, digest)
+
+	// Create hot path: sidecar gone → miss → forces a re-pull.
+	if _, ok := RefIndexGet(imagesDir, ref); ok {
+		t.Error("RefIndexGet hit after rm — create would silently reuse a removed image")
+	}
+	// Cold rm/prune path: the leftover blob is still discoverable by source-ref.
+	if _, ok := FindDigestBySourceRef(imagesDir, ref); !ok {
+		t.Error("FindDigestBySourceRef should still locate the leftover blob for rm/prune")
+	}
+}
+
 // TestPruneProtectsConfiguredRefViaPullIndex is the regression guard for the
 // prune use-after-free: a configured default_image installed via PullImage
 // (not a create-triggered EnsureImage) and stripped of its cosmetic tag must

@@ -199,7 +199,12 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 // one-time index rebuild (scan) when the entry is missing — e.g. images
 // pulled before the ref-index existed — so a cold index self-heals.
 func (m *Manager) resolveCachedRef(ctx context.Context, imagesDir, ref string) (EnsureResult, bool) {
-	digest, ok := ResolveRefDigest(imagesDir, ref)
+	// Sidecar-only: a create cache hit requires a ref-index entry written by
+	// a prior pull of THIS ref. We deliberately do NOT scan manifests by
+	// source-ref here — a blob left behind by `shed image rm` (which deletes
+	// the sidecar but leaves the blob for prune) must force a re-pull, not be
+	// silently reused.
+	digest, ok := RefIndexGet(imagesDir, ref)
 	if !ok {
 		return EnsureResult{}, false
 	}
@@ -712,7 +717,13 @@ func (m *Manager) resolveDeleteTarget(imagesDir, ident string) (string, error) {
 		return digest, nil
 	}
 	if IsDockerRef(ident) {
-		if digest, ok := ResolveRefDigest(imagesDir, ident); ok {
+		// Sidecar first (O(1)); fall back to a manifest scan so an image
+		// visible in `shed image ls` (which scans manifests) is also
+		// removable by ref even without a sidecar entry.
+		if digest, ok := RefIndexGet(imagesDir, ident); ok {
+			return digest, nil
+		}
+		if digest, ok := FindDigestBySourceRef(imagesDir, ident); ok {
 			return digest, nil
 		}
 	}
@@ -826,7 +837,13 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 	// the derived tag and then pruning could GC the blob a fresh `shed
 	// create` still resolves to via the ref-index — a use-after-free.
 	for _, ref := range m.configuredRefs() {
-		if digest, ok := ResolveRefDigest(imagesDir, ref); ok && BlobExists(imagesDir, digest) {
+		digest, ok := RefIndexGet(imagesDir, ref)
+		if !ok {
+			// Cold (no sidecar yet): scan manifests so a configured image
+			// present from before the ref-index existed is still protected.
+			digest, ok = FindDigestBySourceRef(imagesDir, ref)
+		}
+		if ok && BlobExists(imagesDir, digest) {
 			liveManifests[digest] = true
 		}
 	}
