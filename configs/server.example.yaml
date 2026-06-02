@@ -75,11 +75,12 @@ log_level: info
 #   vfkit_path: vfkit
 #   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
 #   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-#   base_rootfs: ghcr.io/charliek/shed-vz-full:{version}
-#   images:
+#   default_image: ghcr.io/charliek/shed-vz-full:{version}
+#   image_aliases:
 #     base: ghcr.io/charliek/shed-vz-base:{version}
 #     extensions: ghcr.io/charliek/shed-vz-extensions:{version}
 #     full: ghcr.io/charliek/shed-vz-full:{version}
+#   pull_policy: missing   # missing (default) | always | never
 #   images_dir: ~/Library/Application Support/shed/vz/
 #   instance_dir: ~/Library/Application Support/shed/vz/instances
 #   socket_dir: ~/.shed/vz/sockets
@@ -87,9 +88,10 @@ log_level: info
 # --- Firecracker Backend (Linux with KVM) ---
 # firecracker:
 #   kernel_path: /var/lib/shed/firecracker/vmlinux
-#   base_rootfs: ghcr.io/charliek/shed-fc-full:{version}
-#   images:
+#   default_image: ghcr.io/charliek/shed-fc-full:{version}
+#   image_aliases:
 #     base: ghcr.io/charliek/shed-fc-base:{version}
 #     extensions: ghcr.io/charliek/shed-fc-extensions:{version}
 #     full: ghcr.io/charliek/shed-fc-full:{version}
+#   pull_policy: missing   # missing (default) | always | never
 #   images_dir: /var/lib/shed/firecracker/images

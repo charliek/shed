@@ -36,7 +36,7 @@ func testFirecrackerConfig(tmpDir string) *config.FirecrackerConfig {
 	return &config.FirecrackerConfig{
 		InstanceDir:     tmpDir,
 		KernelPath:      "/tmp/vmlinux",
-		BaseRootfs:      "/tmp/rootfs.ext4",
+		DefaultImage:    "/tmp/rootfs.ext4",
 		SocketDir:       filepath.Join(tmpDir, "sockets"),
 		BridgeName:      "fc-br0",
 		BridgeCIDR:      "172.30.0.1/24",

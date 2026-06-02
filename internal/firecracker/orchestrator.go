@@ -153,10 +153,13 @@ func (b *fcCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 				return nil, err
 			}
 		} else {
-			if b.c.cfg.BaseRootfs == "" {
-				return nil, fmt.Errorf("%w: no --image specified and no base_rootfs configured in firecracker.base_rootfs; pass --image <tag> or set base_rootfs in server.yaml", config.ErrInvalidShedRequestSentinel)
+			if b.c.cfg.DefaultImage == "" {
+				return nil, fmt.Errorf("%w: no --image specified and no default_image configured in firecracker.default_image; pass --image <ref> or set default_image in server.yaml", config.ErrInvalidShedRequestSentinel)
 			}
-			resolved = b.c.cfg.ResolveBaseRootfs()
+			resolved, err = b.c.cfg.ResolveBaseRootfs()
+			if err != nil {
+				return nil, err
+			}
 		}
 		backend.Phase(ctx, "image")
 		backend.Status(ctx, "Resolving image...")
@@ -166,6 +169,7 @@ func (b *fcCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 			DockerRef: resolved.DockerRef,
 			Name:      resolved.Name,
 			Digest:    resolved.Digest,
+			Policy:    vmimage.PullPolicy(resolved.PullPolicy),
 		}, func(stage, msg string) {
 			backend.Phase(ctx, stage)
 			backend.Status(ctx, msg)

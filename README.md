@@ -308,22 +308,24 @@ env_file: ~/.shed/env
 
 # VZ backend (macOS Apple Silicon)
 vz:
-  base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
-  images:
+  default_image: ghcr.io/charliek/shed-vz-full:v{version}
+  image_aliases:
     base: ghcr.io/charliek/shed-vz-base:v{version}
     extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
     full: ghcr.io/charliek/shed-vz-full:v{version}
+  pull_policy: missing
   images_dir: ~/Library/Application Support/shed/vz/
   default_cpus: 2
   default_memory_mb: 4096
 
 # Firecracker backend (Linux with KVM)
 # firecracker:
-#   base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
-#   images:
+#   default_image: ghcr.io/charliek/shed-fc-full:v{version}
+#   image_aliases:
 #     base: ghcr.io/charliek/shed-fc-base:v{version}
 #     extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
 #     full: ghcr.io/charliek/shed-fc-full:v{version}
+#   pull_policy: missing
 #   images_dir: /var/lib/shed/firecracker/images
 #   default_cpus: 2
 #   default_memory_mb: 4096

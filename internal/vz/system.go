@@ -37,14 +37,14 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 
 	imagesDir := c.cfg.ImagesDir
 	if imagesDir != "" {
-		// Discovered variants and config-referenced images. `ListImages`
-		// intentionally skips `_base`, so we stat it directly below.
+		// All installed images (config-sourced + user-pulled), keyed by
+		// their Docker ref via ListImages.
 		imgs, err := c.ListImages()
 		if err != nil {
 			return du, fmt.Errorf("listing images: %w", err)
 		}
 		for _, img := range imgs {
-			if !img.Cached || img.Path == "" {
+			if !img.Cached {
 				continue
 			}
 			entry := config.ImageDiskEntry{
@@ -52,34 +52,16 @@ func (c *Client) DiskUsage(ctx context.Context) (config.DiskUsage, error) {
 				Path:      img.Path,
 				DockerRef: img.DockerRef,
 			}
-			entry.Size.LogicalBytes, entry.Size.PhysicalBytes, _ = diskstat.Stat(img.Path)
-			du.Images = append(du.Images, entry)
-		}
-
-		// _base is produced by the runtime when base_rootfs is a Docker ref,
-		// and is intentionally omitted from ListImages(). Resolve via the
-		// content-addressed blob store and stat the underlying rootfs.
-		// Skip when its path matches an existing entry — under content-
-		// addressing, _base often resolves to the same blob as a tagged
-		// variant, and double-counting would inflate `df` totals.
-		// Path comparison is digest-equivalent here: both go through
-		// BlobRootfsPath(imagesDir, digest), which is deterministic
-		// from the digest, and Resolve is called with no expectedRef so
-		// it never short-circuits on a mismatched manifest.SourceRef.
-		if basePath := vmimage.Resolve(imagesDir, "_base", ""); basePath != "" && !imagesContainPath(du.Images, basePath) {
-			if logical, physical, err := diskstat.Stat(basePath); err == nil {
-				baseRef := ""
-				if vmimage.IsDockerRef(c.cfg.BaseRootfs) {
-					baseRef = c.cfg.BaseRootfs
-				}
-				du.Images = append(du.Images, config.ImageDiskEntry{
-					Name:      "_base",
-					Path:      basePath,
-					DockerRef: baseRef,
-					Size:      config.DiskSize{LogicalBytes: logical, PhysicalBytes: physical},
-					IsBase:    true,
-				})
+			if img.Path != "" {
+				entry.Size.LogicalBytes, entry.Size.PhysicalBytes, _ = diskstat.Stat(img.Path)
 			}
+			// Fall back to the manifest-computed footprint (layers + lower)
+			// when there's no single statable lower file.
+			if entry.Size.LogicalBytes == 0 {
+				entry.Size.LogicalBytes = img.SizeBytes
+				entry.Size.PhysicalBytes = img.SizeBytes
+			}
+			du.Images = append(du.Images, entry)
 		}
 
 		orphans, err := systemprune.FindOrphans(imagesDir)
@@ -617,16 +599,4 @@ func truncateConsoleLogInPlace(path string, origSize, tailBytes int64) error {
 		return fmt.Errorf("write tail: %w", err)
 	}
 	return nil
-}
-
-// imagesContainPath reports whether any entry's Path equals path.
-// Used to dedupe `_base` when it resolves to the same blob as a
-// tagged variant under the content-addressed image layout.
-func imagesContainPath(entries []config.ImageDiskEntry, path string) bool {
-	for _, e := range entries {
-		if e.Path == path {
-			return true
-		}
-	}
-	return false
 }

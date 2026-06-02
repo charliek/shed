@@ -18,10 +18,10 @@ func newSystemTestClient(t *testing.T) (*Client, string, string) {
 	instanceDir := t.TempDir()
 
 	cfg := &config.VZConfig{
-		ImagesDir:   imagesDir,
-		InstanceDir: instanceDir,
-		Images:      map[string]string{},
-		BaseRootfs:  "ghcr.io/example/base:v1",
+		ImagesDir:    imagesDir,
+		InstanceDir:  instanceDir,
+		ImageAliases: map[string]string{},
+		DefaultImage: "ghcr.io/example/base:v1",
 	}
 	serverCfg := &config.ServerConfig{Name: "test-server"}
 
@@ -53,8 +53,8 @@ func TestDiskUsage_Empty(t *testing.T) {
 func TestDiskUsage_Populated(t *testing.T) {
 	client, imagesDir, instanceDir := newSystemTestClient(t)
 
-	// _base (discovered via tag indirection) + one variant (auto-discovered via ListImages).
-	createFakeImage(t, imagesDir, "_base")
+	// Two installed images, listed by their Docker ref identity.
+	createFakeImage(t, imagesDir, "base")
 	createFakeImage(t, imagesDir, "experimental")
 
 	// One stopped shed with a rootfs copy and a console.log.
@@ -89,13 +89,13 @@ func TestDiskUsage_Populated(t *testing.T) {
 		t.Fatalf("DiskUsage: %v", err)
 	}
 
-	// Must include both _base and experimental.
+	// Must include both images, keyed by their Docker ref.
 	names := map[string]bool{}
 	for _, img := range du.Images {
 		names[img.Name] = true
 	}
-	if !names["_base"] || !names["experimental"] {
-		t.Errorf("expected both _base and experimental; got images %+v", names)
+	if !names["ghcr.io/example/base:v1"] || !names["ghcr.io/example/experimental:v1"] {
+		t.Errorf("expected both base and experimental refs; got images %+v", names)
 	}
 
 	if len(du.Sheds) != 1 || du.Sheds[0].Name != "api-dev" {

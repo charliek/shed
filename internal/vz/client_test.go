@@ -433,8 +433,8 @@ func TestCreateShedValidatesResources(t *testing.T) {
 
 	client := &Client{
 		cfg: &config.VZConfig{
-			BaseRootfs:  baseRootfs,
-			InstanceDir: tmpDir,
+			DefaultImage: baseRootfs,
+			InstanceDir:  tmpDir,
 		},
 		vms:     make(map[string]*VM),
 		credMgr: newTestCredMgr(),

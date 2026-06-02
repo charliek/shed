@@ -27,14 +27,13 @@ var validCredentialName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
 // ServerConfig represents the server-side configuration.
 type ServerConfig struct {
-	Name         string                 `yaml:"name"`
-	HTTPPort     int                    `yaml:"http_port"`
-	SSHPort      int                    `yaml:"ssh_port"`
-	DefaultImage string                 `yaml:"default_image"`
-	Credentials  map[string]MountConfig `yaml:"credentials"`
-	EnvFile      string                 `yaml:"env_file"`
-	LogLevel     string                 `yaml:"log_level"`
-	Terminal     *terminal.Config       `yaml:"terminal"`
+	Name        string                 `yaml:"name"`
+	HTTPPort    int                    `yaml:"http_port"`
+	SSHPort     int                    `yaml:"ssh_port"`
+	Credentials map[string]MountConfig `yaml:"credentials"`
+	EnvFile     string                 `yaml:"env_file"`
+	LogLevel    string                 `yaml:"log_level"`
+	Terminal    *terminal.Config       `yaml:"terminal"`
 
 	// DefaultBackend specifies the backend type: "vz", "firecracker", or "detect".
 	// When set to "detect", the backend is chosen based on the platform
@@ -153,17 +152,22 @@ type FirecrackerConfig struct {
 	// KernelPath is the path to the Linux kernel image
 	KernelPath string `yaml:"kernel_path"`
 
-	// BaseRootfs is the path to the base rootfs image or a Docker image reference.
-	// Docker refs are lazily pulled and converted to ext4 on first use.
-	BaseRootfs string `yaml:"base_rootfs"`
+	// DefaultImage is the Docker ref (or local rootfs path) used for new
+	// sheds when no --image is given. Docker refs are resolved by their
+	// io.shed.source-ref identity and pulled per PullPolicy on first use.
+	DefaultImage string `yaml:"default_image"`
 
-	// Images maps variant names to rootfs paths or Docker image references.
-	// Users can reference these with: shed create mydev --image experimental
-	// Values can be ext4 file paths or Docker refs (e.g., "ghcr.io/charliek/shed-fc-default:v1.0.0").
-	Images map[string]string `yaml:"images,omitempty"`
+	// ImageAliases maps short alias names to Docker refs (or paths) for
+	// convenience with: shed create mydev --image <alias>. Aliases resolve
+	// to the underlying ref; image listings always show the resolved ref.
+	ImageAliases map[string]string `yaml:"image_aliases,omitempty"`
 
-	// ImagesDir is the directory for converted/discovered ext4 images.
-	// Images matching {name}-rootfs.ext4 are auto-discovered as available variants.
+	// PullPolicy controls cache-vs-pull at create: "missing" (default —
+	// use the cached ref, pull only if absent), "always" (always pull),
+	// or "never" (error if not cached). Ignored for local-path images.
+	PullPolicy string `yaml:"pull_policy,omitempty"`
+
+	// ImagesDir is the directory for the content-addressed image store.
 	ImagesDir string `yaml:"images_dir,omitempty"`
 
 	// InstanceDir is the directory for instance data
@@ -228,16 +232,22 @@ type VZConfig struct {
 	// InitrdPath is the path to the initial RAM disk image
 	InitrdPath string `yaml:"initrd_path"`
 
-	// BaseRootfs is the path to the base rootfs image (used when no --image is specified)
-	BaseRootfs string `yaml:"base_rootfs"`
+	// DefaultImage is the Docker ref (or local rootfs path) used for new
+	// sheds when no --image is given. Docker refs are resolved by their
+	// io.shed.source-ref identity and pulled per PullPolicy on first use.
+	DefaultImage string `yaml:"default_image"`
 
-	// Images maps variant names to rootfs paths or Docker image references.
-	// Users can reference these with: shed create mydev --image experimental
-	// Values can be ext4 file paths or Docker refs (e.g., "ghcr.io/charliek/shed-vz-default:v1.0.0").
-	Images map[string]string `yaml:"images,omitempty"`
+	// ImageAliases maps short alias names to Docker refs (or paths) for
+	// convenience with: shed create mydev --image <alias>. Aliases resolve
+	// to the underlying ref; image listings always show the resolved ref.
+	ImageAliases map[string]string `yaml:"image_aliases,omitempty"`
 
-	// ImagesDir is the directory for converted/discovered ext4 images.
-	// Images matching {name}-rootfs.ext4 are auto-discovered as available variants.
+	// PullPolicy controls cache-vs-pull at create: "missing" (default —
+	// use the cached ref, pull only if absent), "always" (always pull),
+	// or "never" (error if not cached). Ignored for local-path images.
+	PullPolicy string `yaml:"pull_policy,omitempty"`
+
+	// ImagesDir is the directory for the content-addressed image store.
 	ImagesDir string `yaml:"images_dir,omitempty"`
 
 	// InstanceDir is the directory for instance data
@@ -284,14 +294,17 @@ type VZConfig struct {
 	StopTimeout Duration `yaml:"stop_timeout"`
 }
 
-// GetImages implements vmimage.ImageConfig.
-func (c *VZConfig) GetImages() map[string]string { return c.Images }
+// GetDefaultImage implements vmimage.ImageConfig.
+func (c *VZConfig) GetDefaultImage() string { return c.DefaultImage }
+
+// GetImageAliases implements vmimage.ImageConfig.
+func (c *VZConfig) GetImageAliases() map[string]string { return c.ImageAliases }
+
+// GetPullPolicy implements vmimage.ImageConfig.
+func (c *VZConfig) GetPullPolicy() string { return c.PullPolicy }
 
 // GetImagesDir implements vmimage.ImageConfig.
 func (c *VZConfig) GetImagesDir() string { return c.ImagesDir }
-
-// GetBaseRootfs implements vmimage.ImageConfig.
-func (c *VZConfig) GetBaseRootfs() string { return c.BaseRootfs }
 
 // GetPlatform implements vmimage.ImageConfig.
 func (c *VZConfig) GetPlatform() string { return "linux/arm64" }
@@ -377,11 +390,17 @@ func (c *VZConfig) applyDefaults() {
 	// Expand ~ in paths
 	c.KernelPath = ExpandPath(c.KernelPath)
 	c.InitrdPath = ExpandPath(c.InitrdPath)
-	c.BaseRootfs = ExpandPath(c.BaseRootfs)
+	if !vmimage.IsDockerRef(c.DefaultImage) {
+		c.DefaultImage = ExpandPath(c.DefaultImage)
+	}
 	c.ImagesDir = ExpandPath(c.ImagesDir)
 	c.InstanceDir = ExpandPath(c.InstanceDir)
 	c.SnapshotsDir = ExpandPath(c.SnapshotsDir)
 	c.SocketDir = ExpandPath(c.SocketDir)
+
+	if c.PullPolicy == "" {
+		c.PullPolicy = string(vmimage.PullMissing)
+	}
 
 	// Default ImagesDir if not set
 	if c.ImagesDir == "" {
@@ -403,10 +422,10 @@ func (c *VZConfig) applyDefaults() {
 		c.UpperSizeDefault = DefaultUpperSize
 	}
 
-	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
-	for name, val := range c.Images {
+	// Expand ~ in alias paths (only for filesystem paths, not Docker refs)
+	for name, val := range c.ImageAliases {
 		if !vmimage.IsDockerRef(val) {
-			c.Images[name] = ExpandPath(val)
+			c.ImageAliases[name] = ExpandPath(val)
 		}
 	}
 }
@@ -506,7 +525,7 @@ func (c *VZConfig) Validate() error {
 	// reads the kernel from the blob). The previous hasAnyDockerRef
 	// gate was too loose — a mix of local + remote sources still
 	// needs the legacy kernel/initrd for the local-spawn path.
-	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.BaseRootfs, c.Images) {
+	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.DefaultImage, c.ImageAliases) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("vz: kernel_path does not exist: %s", c.KernelPath)
 		}
@@ -517,21 +536,25 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
-	// base_rootfs path-existence check only applies when configured as
+	// default_image path-existence check only applies when configured as
 	// a local path. An empty value is allowed (see Validate header).
-	if c.BaseRootfs != "" && !vmimage.IsDockerRef(c.BaseRootfs) {
-		if _, err := os.Stat(c.BaseRootfs); err != nil {
-			return fmt.Errorf("vz: base_rootfs does not exist: %s", c.BaseRootfs)
+	if c.DefaultImage != "" && !vmimage.IsDockerRef(c.DefaultImage) {
+		if _, err := os.Stat(c.DefaultImage); err != nil {
+			return fmt.Errorf("vz: default_image does not exist: %s", c.DefaultImage)
 		}
 	}
 
-	// Validate image variant paths exist (skip Docker refs)
-	for name, val := range c.Images {
+	// Validate alias paths exist (skip Docker refs)
+	for name, val := range c.ImageAliases {
 		if !vmimage.IsDockerRef(val) {
 			if _, err := os.Stat(val); err != nil {
-				return fmt.Errorf("vz: image %q path does not exist: %s", name, val)
+				return fmt.Errorf("vz: image_aliases %q path does not exist: %s", name, val)
 			}
 		}
+	}
+
+	if _, err := vmimage.ParsePullPolicy(c.PullPolicy); err != nil {
+		return fmt.Errorf("vz: %w", err)
 	}
 
 	return nil
@@ -556,121 +579,80 @@ type ResolvedImage struct {
 	// second lookup was both awkward and racey (tag could advance
 	// between resolve and ensure).
 	Digest string
+
+	// PullPolicy is the configured pull_policy ("missing"|"always"|"never",
+	// validated at config load) carried through to EnsureImage. Empty/local
+	// paths treat it as a no-op.
+	PullPolicy string
 }
 
-// resolveImage is the shared implementation for image name resolution.
-// configKey is used in error messages (e.g., "vz.images" or "firecracker.images").
+// resolveImageRef classifies an image selector into a ResolvedImage. It is a
+// thin classifier — all cache-vs-pull logic (the ref-index lookup and
+// pull_policy enforcement) lives in vmimage.EnsureImage, so this returns
+// either a Docker ref (to ensure) or a local path (escape hatch).
 //
-// Resolution order:
-//  1. Look up in images map — if value is a Docker ref, check the
-//     blob-store tag cache first
-//  2. Auto-discover existing tag in {imagesDir}/tags/
-//  3. Absolute path escape hatch
-//  4. Error with available variants
-func resolveImage(images map[string]string, imagesDir, image, configKey string) (ResolvedImage, error) {
-	if val, ok := images[image]; ok {
-		if vmimage.IsDockerRef(val) {
-			// ResolveTag returns the digest too — carry it through
-			// so EnsureImage doesn't have to re-do tag lookup
-			// (which races against concurrent `shed image pull`).
-			digest, cached, err := vmimage.ResolveTag(imagesDir, image)
-			if err == nil {
-				manifest, mErr := vmimage.LoadManifestByDigest(imagesDir, digest)
-				if mErr != nil && errors.Is(mErr, vmimage.ErrLegacyBundledBlob) {
-					return ResolvedImage{}, mErr
-				}
-				if mErr == nil && manifest.ShedSourceRef() == val {
-					return ResolvedImage{Path: cached, Name: image, Digest: digest}, nil
-				}
+// Selector resolution order:
+//  1. "" → default_image
+//  2. an alias key in image_aliases → its underlying ref/path
+//  3. a Docker ref → used directly
+//  4. a local tag label (set via `shed image pull/build -t`) → cached path+digest
+//  5. an existing local path → escape hatch
+//  6. otherwise → error listing available aliases
+func resolveImageRef(defaultImage string, aliases map[string]string, pullPolicy, imagesDir, selector, configKey string) (ResolvedImage, error) {
+	ref := selector
+	switch ref {
+	case "":
+		ref = defaultImage
+		if ref == "" {
+			return ResolvedImage{}, fmt.Errorf("%w: no --image specified and no default_image configured (set %s in server.yaml)", ErrUnknownImageSentinel, configKey)
+		}
+	default:
+		if aliased, ok := aliases[ref]; ok {
+			ref = aliased
+		} else if imagesDir != "" {
+			// A raw selector may be a cosmetic tag label set via
+			// `shed image pull/build -t`. Resolve that first — a bare
+			// word like "mylabel" otherwise parses as a Docker ref
+			// (docker.io/library/mylabel), which would mask the label.
+			if digest, cached, err := vmimage.ResolveTag(imagesDir, selector); err == nil {
+				return ResolvedImage{Path: cached, Name: selector, Digest: digest}, nil
 			} else if errors.Is(err, vmimage.ErrLegacyBundledBlob) {
 				return ResolvedImage{}, err
 			}
-			return ResolvedImage{DockerRef: val, Name: image}, nil
-		}
-		return ResolvedImage{Path: val, Name: image}, nil
-	}
-
-	// Auto-discover by tag in the blob store.
-	if imagesDir != "" {
-		digest, discovered, err := vmimage.ResolveTag(imagesDir, image)
-		if err == nil {
-			return ResolvedImage{Path: discovered, Name: image, Digest: digest}, nil
-		}
-		if errors.Is(err, vmimage.ErrLegacyBundledBlob) {
-			return ResolvedImage{}, err
 		}
 	}
 
-	// Absolute path escape hatch
-	expanded := ExpandPath(image)
-	if filepath.IsAbs(expanded) {
-		if _, err := os.Stat(expanded); err != nil {
-			if os.IsNotExist(err) {
-				return ResolvedImage{}, fmt.Errorf("%w: image path does not exist: %q", ErrUnknownImageSentinel, expanded)
-			}
-			return ResolvedImage{}, fmt.Errorf("failed to stat image path %q: %w", expanded, err)
-		}
-		return ResolvedImage{Path: expanded, Name: image}, nil
+	if vmimage.IsDockerRef(ref) {
+		return ResolvedImage{DockerRef: ref, Name: vmimage.DeriveTagFromRef(ref), PullPolicy: pullPolicy}, nil
 	}
 
-	// Not found — build error with available variants
-	available := availableImageVariants(images, imagesDir)
+	// Local-path escape hatch (behavior unchanged; pull_policy is a no-op).
+	expanded := ExpandPath(ref)
+	if _, err := os.Stat(expanded); err == nil {
+		return ResolvedImage{Path: expanded, Name: vmimage.DeriveTagFromRef(ref)}, nil
+	} else if !os.IsNotExist(err) {
+		return ResolvedImage{}, fmt.Errorf("failed to stat image path %q: %w", expanded, err)
+	}
+
+	available := availableImageVariants(aliases, imagesDir)
 	if len(available) > 0 {
-		return ResolvedImage{}, fmt.Errorf("%w %q; available variants: %s", ErrUnknownImageSentinel, image, strings.Join(available, ", "))
+		return ResolvedImage{}, fmt.Errorf("%w %q; available aliases: %s (or pass a Docker ref / local path)", ErrUnknownImageSentinel, selector, strings.Join(available, ", "))
 	}
-	return ResolvedImage{}, fmt.Errorf("%w %q; no image variants configured (set %s in server config)", ErrUnknownImageSentinel, image, configKey)
+	return ResolvedImage{}, fmt.Errorf("%w %q; no image_aliases configured (pass a Docker ref or local path, or set %s)", ErrUnknownImageSentinel, selector, configKey)
 }
 
-// resolveBaseRootfs is the shared implementation for base rootfs resolution.
-func resolveBaseRootfs(baseRootfs, imagesDir string) ResolvedImage {
-	if vmimage.IsDockerRef(baseRootfs) {
-		// Mirror the source-ref + Digest plumbing from resolveImage so
-		// EnsureImage receives a Digest alongside Path. Without it the
-		// backends reject the resolved image as "outside the blob store"
-		// (firecracker/client.go ~494, vz/client.go ~232) because they
-		// can't refcount a Path-only entry.
-		if imagesDir != "" {
-			if digest, cached, ok := resolveCachedBase(imagesDir, baseRootfs); ok {
-				return ResolvedImage{Path: cached, Name: "_base", Digest: digest}
-			}
-		}
-		return ResolvedImage{DockerRef: baseRootfs, Name: "_base"}
-	}
-	return ResolvedImage{Path: baseRootfs, Name: "_base"}
-}
-
-// resolveCachedBase looks up the "_base" tag and returns (digest, path)
-// when the manifest matches baseRootfs AND the cached lower image is
-// materialized on disk. Returns ok=false on any miss so the caller can
-// fall through to the DockerRef path (which forces a fresh pull).
-func resolveCachedBase(imagesDir, baseRootfs string) (string, string, bool) {
-	digest, cached, err := vmimage.ResolveTag(imagesDir, "_base")
-	if err != nil {
-		return "", "", false
-	}
-	manifest, err := vmimage.LoadManifestByDigest(imagesDir, digest)
-	if err != nil || manifest.ShedSourceRef() != baseRootfs {
-		return "", "", false
-	}
-	if _, err := os.Stat(cached); err != nil {
-		return "", "", false
-	}
-	return digest, cached, true
-}
-
-// availableImageVariants returns a sorted list of image names known to
-// the system: every key in the Images config map plus every tag present
-// in the blob store. The synthetic "_base" tag is excluded.
-func availableImageVariants(images map[string]string, imagesDir string) []string {
+// availableImageVariants returns a sorted list of selector names known to the
+// system: every alias key plus every local tag label in the blob store.
+func availableImageVariants(aliases map[string]string, imagesDir string) []string {
 	seen := make(map[string]bool)
-	for name := range images {
+	for name := range aliases {
 		seen[name] = true
 	}
 	if imagesDir != "" {
 		tags, err := vmimage.ListTags(imagesDir)
 		if err == nil {
 			for _, name := range tags {
-				if name != "" && name != "_base" {
+				if name != "" {
 					seen[name] = true
 				}
 			}
@@ -684,14 +666,14 @@ func availableImageVariants(images map[string]string, imagesDir string) []string
 	return available
 }
 
-// ResolveImage resolves an image name to a local ext4 path or Docker reference.
+// ResolveImage resolves an image selector to a local path or Docker ref.
 func (c *VZConfig) ResolveImage(image string) (ResolvedImage, error) {
-	return resolveImage(c.Images, c.ImagesDir, image, "vz.images")
+	return resolveImageRef(c.DefaultImage, c.ImageAliases, c.PullPolicy, c.ImagesDir, image, "vz.default_image")
 }
 
-// ResolveBaseRootfs resolves the base rootfs (used when no --image flag is specified).
-func (c *VZConfig) ResolveBaseRootfs() ResolvedImage {
-	return resolveBaseRootfs(c.BaseRootfs, c.ImagesDir)
+// ResolveBaseRootfs resolves the default image (used when no --image is given).
+func (c *VZConfig) ResolveBaseRootfs() (ResolvedImage, error) {
+	return resolveImageRef(c.DefaultImage, c.ImageAliases, c.PullPolicy, c.ImagesDir, "", "vz.default_image")
 }
 
 // Firecracker validation upper bounds.
@@ -747,14 +729,17 @@ func (d Duration) Duration() time.Duration {
 // with the kernel, instance directories, and sockets that already live there.
 const DefaultFirecrackerImagesDir = "/var/lib/shed/firecracker/images"
 
-// GetImages implements vmimage.ImageConfig.
-func (c *FirecrackerConfig) GetImages() map[string]string { return c.Images }
+// GetDefaultImage implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetDefaultImage() string { return c.DefaultImage }
+
+// GetImageAliases implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetImageAliases() map[string]string { return c.ImageAliases }
+
+// GetPullPolicy implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetPullPolicy() string { return c.PullPolicy }
 
 // GetImagesDir implements vmimage.ImageConfig.
 func (c *FirecrackerConfig) GetImagesDir() string { return c.ImagesDir }
-
-// GetBaseRootfs implements vmimage.ImageConfig.
-func (c *FirecrackerConfig) GetBaseRootfs() string { return c.BaseRootfs }
 
 // GetPlatform implements vmimage.ImageConfig.
 func (c *FirecrackerConfig) GetPlatform() string { return "linux/amd64" }
@@ -769,14 +754,14 @@ func (c *FirecrackerConfig) GetExtractKernel() bool { return true }
 // be installed alongside every shed image regardless of backend.
 func (c *FirecrackerConfig) GetNeedsInitrd() bool { return true }
 
-// ResolveImage resolves an image name to a local ext4 path or Docker reference.
+// ResolveImage resolves an image selector to a local path or Docker ref.
 func (c *FirecrackerConfig) ResolveImage(image string) (ResolvedImage, error) {
-	return resolveImage(c.Images, c.ImagesDir, image, "firecracker.images")
+	return resolveImageRef(c.DefaultImage, c.ImageAliases, c.PullPolicy, c.ImagesDir, image, "firecracker.default_image")
 }
 
-// ResolveBaseRootfs resolves the base rootfs (used when no --image flag is specified).
-func (c *FirecrackerConfig) ResolveBaseRootfs() ResolvedImage {
-	return resolveBaseRootfs(c.BaseRootfs, c.ImagesDir)
+// ResolveBaseRootfs resolves the default image (used when no --image is given).
+func (c *FirecrackerConfig) ResolveBaseRootfs() (ResolvedImage, error) {
+	return resolveImageRef(c.DefaultImage, c.ImageAliases, c.PullPolicy, c.ImagesDir, "", "firecracker.default_image")
 }
 
 // DefaultFirecrackerConfig returns a FirecrackerConfig with default values.
@@ -880,6 +865,34 @@ func DefaultServerConfig() *ServerConfig {
 	}
 }
 
+// rejectRemovedImageKeys fails loudly if a config still carries the
+// pre-v0.6.0 per-backend image keys (base_rootfs / images). yaml.Unmarshal
+// silently ignores unknown fields, so without this an upgraded operator's
+// stale config would be accepted while the new binary quietly ignored their
+// configured image — exactly the silent-drift failure this rework exists to
+// fix. The raw-map scan runs before the typed unmarshal is trusted.
+func rejectRemovedImageKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		// Malformed YAML — let the typed unmarshal surface the parse error.
+		return nil
+	}
+	for _, backend := range []string{"vz", "firecracker"} {
+		sub, ok := raw[backend].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, removed := range []string{"base_rootfs", "images"} {
+			if _, present := sub[removed]; present {
+				return fmt.Errorf(
+					"config key %q under %q was removed in v0.6.0; replace base_rootfs + images with default_image + image_aliases + pull_policy (see docs/upgrades/v0.5.9-to-v0.6.0.md)",
+					removed, backend)
+			}
+		}
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -922,6 +935,9 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
+	if err := rejectRemovedImageKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
+	}
 
 	// Apply defaults for zero values
 	if cfg.HTTPPort == 0 {
@@ -930,8 +946,6 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if cfg.SSHPort == 0 {
 		cfg.SSHPort = 2222
 	}
-	// DefaultImage is unused for VM backends (they use BaseRootfs),
-	// but keep the field for potential future use.
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
@@ -1074,6 +1088,9 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
+	}
+	if err := rejectRemovedImageKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
 	if cfg.HTTPPort == 0 {
@@ -1298,10 +1315,17 @@ func (c *FirecrackerConfig) applyDefaults() {
 		c.KernelPath = c.ImagesDir + "/vmlinux"
 	}
 
-	// Expand ~ in image paths (only for filesystem paths, not Docker refs)
-	for name, val := range c.Images {
+	if !vmimage.IsDockerRef(c.DefaultImage) {
+		c.DefaultImage = ExpandPath(c.DefaultImage)
+	}
+	if c.PullPolicy == "" {
+		c.PullPolicy = string(vmimage.PullMissing)
+	}
+
+	// Expand ~ in alias paths (only for filesystem paths, not Docker refs)
+	for name, val := range c.ImageAliases {
 		if !vmimage.IsDockerRef(val) {
-			c.Images[name] = ExpandPath(val)
+			c.ImageAliases[name] = ExpandPath(val)
 		}
 	}
 }
@@ -1394,27 +1418,31 @@ func (c *FirecrackerConfig) Validate() error {
 	// reads the kernel from the blob). The previous hasAnyDockerRef
 	// gate was too loose — a mix of local + remote sources still
 	// needs the legacy kernel/initrd for the local-spawn path.
-	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.BaseRootfs, c.Images) {
+	if c.KernelPath != "" && !allSourcesAreDockerRefs(c.DefaultImage, c.ImageAliases) {
 		if _, err := os.Stat(c.KernelPath); err != nil {
 			return fmt.Errorf("kernel_path does not exist: %s", c.KernelPath)
 		}
 	}
 
-	// Validate base rootfs path exists when configured as a local
+	// Validate default_image path exists when configured as a local
 	// path. An empty value is allowed (see Validate header).
-	if c.BaseRootfs != "" && !vmimage.IsDockerRef(c.BaseRootfs) {
-		if _, err := os.Stat(c.BaseRootfs); err != nil {
-			return fmt.Errorf("base_rootfs does not exist: %s", c.BaseRootfs)
+	if c.DefaultImage != "" && !vmimage.IsDockerRef(c.DefaultImage) {
+		if _, err := os.Stat(c.DefaultImage); err != nil {
+			return fmt.Errorf("default_image does not exist: %s", c.DefaultImage)
 		}
 	}
 
-	// Validate image variant paths exist (skip Docker refs)
-	for name, val := range c.Images {
+	// Validate alias paths exist (skip Docker refs)
+	for name, val := range c.ImageAliases {
 		if !vmimage.IsDockerRef(val) {
 			if _, err := os.Stat(val); err != nil {
-				return fmt.Errorf("image %q path does not exist: %s", name, val)
+				return fmt.Errorf("image_aliases %q path does not exist: %s", name, val)
 			}
 		}
+	}
+
+	if _, err := vmimage.ParsePullPolicy(c.PullPolicy); err != nil {
+		return fmt.Errorf("firecracker: %w", err)
 	}
 
 	// Validate network configuration
@@ -1555,15 +1583,15 @@ func loadEnvFile(path string) (map[string]string, error) {
 }
 
 // allSourcesAreDockerRefs returns true when the kernel/initrd validation
-// can be safely skipped: either base_rootfs is empty (the optional-Phase-B
-// case) or it's a Docker ref, AND every entry in images is either a Docker
-// ref or empty. A single local-path source means the legacy kernel/initrd
-// files must still exist to support spawning from it.
-func allSourcesAreDockerRefs(baseRootfs string, images map[string]string) bool {
-	if baseRootfs != "" && !vmimage.IsDockerRef(baseRootfs) {
+// can be safely skipped: either default_image is empty (the optional-Phase-B
+// case) or it's a Docker ref, AND every alias value is either a Docker ref or
+// empty. A single local-path source means the legacy kernel/initrd files must
+// still exist to support spawning from it.
+func allSourcesAreDockerRefs(defaultImage string, aliases map[string]string) bool {
+	if defaultImage != "" && !vmimage.IsDockerRef(defaultImage) {
 		return false
 	}
-	for _, val := range images {
+	for _, val := range aliases {
 		if val != "" && !vmimage.IsDockerRef(val) {
 			return false
 		}

@@ -29,6 +29,7 @@ func (c *Client) EnsureImage(ctx context.Context, resolved config.ResolvedImage)
 		DockerRef: resolved.DockerRef,
 		Name:      resolved.Name,
 		Digest:    resolved.Digest,
+		Policy:    vmimage.PullPolicy(resolved.PullPolicy),
 	}, func(stage, msg string) {
 		backend.Phase(ctx, stage)
 		backend.Status(ctx, msg)

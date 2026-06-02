@@ -132,11 +132,12 @@ env_file: /root/.shed/env
 #     - docker-credentials
 
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.1
-  images:
+  default_image: ghcr.io/charliek/shed-fc-full:v0.5.1
+  image_aliases:
     base: ghcr.io/charliek/shed-fc-base:v0.5.1
     extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.1
     full: ghcr.io/charliek/shed-fc-full:v0.5.1
+  pull_policy: missing
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   # uppers_dir is optional. Defaults to <images_dir>/uppers. If you set
@@ -291,11 +292,12 @@ build needed.
 
 ```yaml
 firecracker:
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.1
-  images:
+  default_image: ghcr.io/charliek/shed-fc-full:v0.5.1
+  image_aliases:
     base: ghcr.io/charliek/shed-fc-base:v0.5.1
     extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.1
     full: ghcr.io/charliek/shed-fc-full:v0.5.1
+  pull_policy: missing
   images_dir: /var/lib/shed/firecracker/images
 ```
 

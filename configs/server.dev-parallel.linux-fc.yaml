@@ -40,11 +40,12 @@ firecracker:
   # Same as deb config — kernel + images pinned to the latest release
   # so the dev binary uses release-shaped image-resolution behavior.
   kernel_path: /var/lib/shed/firecracker/images/vmlinux
-  base_rootfs: ghcr.io/charliek/shed-fc-full:v0.5.8
-  images:
+  default_image: ghcr.io/charliek/shed-fc-full:v0.5.8
+  image_aliases:
     base:       ghcr.io/charliek/shed-fc-base:v0.5.8
     extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.8
     full:       ghcr.io/charliek/shed-fc-full:v0.5.8
+  pull_policy: missing
 
   # Separate state-dirs so prune from the deb server never touches
   # the dev server's blobs.
