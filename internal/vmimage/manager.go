@@ -618,9 +618,13 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 	var configured, pulled bool
 	for _, ref := range m.configuredRefs() {
 		configuredRefSet[ref] = true
-		if d, ok := RefIndexGet(imagesDir, ref); ok && d == digest {
-			info.DockerRef = ref
-			configured = true
+		// First match wins (configuredRefs is default-first, sorted aliases),
+		// matching ListImages so inspect + list agree on the displayed ref.
+		if !configured {
+			if d, ok := RefIndexGet(imagesDir, ref); ok && d == digest {
+				info.DockerRef = ref
+				configured = true
+			}
 		}
 	}
 	if !configured {
