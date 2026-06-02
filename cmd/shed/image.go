@@ -742,31 +742,10 @@ func runImagePush(_ *cobra.Command, args []string) error {
 
 // deriveTagFromRef extracts a sensible default tag from a Docker ref:
 // ghcr.io/charliek/shed-vz-experimental:v0.4.0 → "experimental".
+// Delegates to the shared implementation so the CLI-derived default tag can
+// never drift from the server's ref→tag derivation.
 func deriveTagFromRef(ref string) string {
-	// Strip everything after the last colon (tag/digest).
-	name := ref
-	if i := strings.LastIndexByte(name, '@'); i >= 0 {
-		name = name[:i]
-	}
-	if i := strings.LastIndexByte(name, ':'); i >= 0 {
-		// Avoid stripping registry-port colons by checking for '/' after.
-		if !strings.Contains(name[i:], "/") {
-			name = name[:i]
-		}
-	}
-	if i := strings.LastIndexByte(name, '/'); i >= 0 {
-		name = name[i+1:]
-	}
-	for _, prefix := range []string{"shed-vz-", "shed-fc-"} {
-		if strings.HasPrefix(name, prefix) {
-			name = strings.TrimPrefix(name, prefix)
-			break
-		}
-	}
-	if name == "" {
-		name = "default"
-	}
-	return name
+	return vmimage.DeriveTagFromRef(ref)
 }
 
 func runImagePrune(_ *cobra.Command, _ []string) error {

@@ -199,18 +199,9 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 // one-time index rebuild (scan) when the entry is missing — e.g. images
 // pulled before the ref-index existed — so a cold index self-heals.
 func (m *Manager) resolveCachedRef(ctx context.Context, imagesDir, ref string) (EnsureResult, bool) {
-	digest, ok := RefIndexGet(imagesDir, ref)
+	digest, ok := ResolveRefDigest(imagesDir, ref)
 	if !ok {
-		// Cold/stale index: rebuild once from the authoritative manifests,
-		// then retry. Bounded O(N-manifests), off the steady-state path.
-		if err := RebuildRefIndex(imagesDir); err != nil {
-			log.Printf("vmimage: ref-index rebuild failed: %v", err)
-			return EnsureResult{}, false
-		}
-		digest, ok = RefIndexGet(imagesDir, ref)
-		if !ok {
-			return EnsureResult{}, false
-		}
+		return EnsureResult{}, false
 	}
 	res, err := m.resolveManifestLower(ctx, imagesDir, digest)
 	if err != nil {
@@ -260,6 +251,12 @@ func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string
 	})
 	if err != nil {
 		return "", fmt.Errorf("pulling %s from registry: %w", dockerRef, err)
+	}
+	// Record the ref->digest mapping so `shed create` (and prune protection)
+	// can resolve this ref O(1) without a manifest scan, and so a configured
+	// default_image pulled via `shed image pull` is protected from prune.
+	if err := RefIndexPut(imagesDir, dockerRef, result.ManifestDigest); err != nil {
+		log.Printf("vmimage: failed to record ref-index entry for %s: %v", dockerRef, err)
 	}
 	return result.ManifestDigest, nil
 }
@@ -715,13 +712,8 @@ func (m *Manager) resolveDeleteTarget(imagesDir, ident string) (string, error) {
 		return digest, nil
 	}
 	if IsDockerRef(ident) {
-		if digest, ok := RefIndexGet(imagesDir, ident); ok {
+		if digest, ok := ResolveRefDigest(imagesDir, ident); ok {
 			return digest, nil
-		}
-		if err := RebuildRefIndex(imagesDir); err == nil {
-			if digest, ok := RefIndexGet(imagesDir, ident); ok {
-				return digest, nil
-			}
 		}
 	}
 	return "", ErrImageNotFound
@@ -834,7 +826,7 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 	// the derived tag and then pruning could GC the blob a fresh `shed
 	// create` still resolves to via the ref-index — a use-after-free.
 	for _, ref := range m.configuredRefs() {
-		if digest, ok := RefIndexGet(imagesDir, ref); ok && BlobExists(imagesDir, digest) {
+		if digest, ok := ResolveRefDigest(imagesDir, ref); ok && BlobExists(imagesDir, digest) {
 			liveManifests[digest] = true
 		}
 	}

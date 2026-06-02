@@ -116,13 +116,19 @@ func RefIndexPut(imagesDir, ref, digest string) error {
 }
 
 // RefIndexGet returns the cached manifest digest for ref as a VALIDATED hit:
-// the sidecar entry exists, its manifest blob is present, and the manifest's
-// io.shed.source-ref equals ref. On any validation failure it removes the
-// stale entry and reports a miss (ok=false), so the caller's pull_policy then
-// governs (missing repairs, never errors, always already bypassed this).
+// the sidecar entry exists, its stored ref matches the lookup ref (guarding
+// against a sha256 key collision), and the manifest blob is still present. On
+// any validation failure it removes the stale entry and reports a miss
+// (ok=false), so the caller's pull_policy then governs.
 //
-// Blob-completeness beyond the manifest (erofs/kernel/initrd) is validated by
-// resolveManifestLower at the call site, matching the tag fast path.
+// Identity here is the ref the image was PULLED BY (the index key), NOT the
+// manifest's io.shed.source-ref annotation — those legitimately differ when
+// the configured ref is a mutable tag (:latest), a digest pin, or a mirror
+// host, while the annotation records the immutable publish ref. Validating
+// against the annotation would delete the entry EnsureImage just wrote.
+//
+// Blob-completeness beyond the manifest digest (erofs/kernel/initrd) is
+// validated by resolveManifestLower at the call site.
 func RefIndexGet(imagesDir, ref string) (digest string, ok bool) {
 	if imagesDir == "" || ref == "" {
 		return "", false
@@ -133,7 +139,7 @@ func RefIndexGet(imagesDir, ref string) (digest string, ok bool) {
 		return "", false
 	}
 	var entry refIndexEntry
-	if err := json.Unmarshal(data, &entry); err != nil || entry.Digest == "" {
+	if err := json.Unmarshal(data, &entry); err != nil || entry.Digest == "" || entry.Ref != ref {
 		_ = os.Remove(path)
 		return "", false
 	}
@@ -141,12 +147,23 @@ func RefIndexGet(imagesDir, ref string) (digest string, ok bool) {
 		_ = os.Remove(path)
 		return "", false
 	}
-	manifest, err := LoadManifestByDigest(imagesDir, entry.Digest)
-	if err != nil || manifest.ShedSourceRef() != ref {
-		_ = os.Remove(path)
+	return entry.Digest, true
+}
+
+// ResolveRefDigest maps a ref to its cached manifest digest via the O(1)
+// ref-index, falling back to a one-time index rebuild (so a cold/missing
+// sidecar self-heals for images whose publish ref matches the lookup ref).
+// Used by the create hot path, prune protection, and delete resolution so all
+// three agree on what "the image for this ref" is.
+func ResolveRefDigest(imagesDir, ref string) (digest string, ok bool) {
+	if d, ok := RefIndexGet(imagesDir, ref); ok {
+		return d, true
+	}
+	if err := RebuildRefIndex(imagesDir); err != nil {
+		log.Printf("vmimage: ref-index rebuild failed: %v", err)
 		return "", false
 	}
-	return entry.Digest, true
+	return RefIndexGet(imagesDir, ref)
 }
 
 // RefIndexDeleteByDigest removes every ref-index entry pointing at digest.
