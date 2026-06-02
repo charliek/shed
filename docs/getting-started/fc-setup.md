@@ -91,10 +91,10 @@ Pull and convert VM images before creating your first shed:
 sudo shed-server pull-images
 ```
 
-This pulls each configured image registry-direct and lands the OCI
-blobs under `images_dir/blobs/sha256/`. The flattened erofs lower at
-`images_dir/cache/sha256/<manifest-digest>.erofs` is materialized
-lazily on first boot via host-native `mkfs.erofs --tar=f`.
+This pulls the `default_image` and every `image_aliases` ref
+registry-direct and lands the OCI blobs under `images_dir/blobs/sha256/`,
+including the pre-built rootfs erofs blob — mounted as-is on boot, with no
+host-side `mkfs.erofs` (since v0.5.2).
 
 The OCI image store lives under `/var/lib/shed/firecracker/images/`. See
 [Storage Model](../reference/storage-model.md) for the full layout and
@@ -305,7 +305,7 @@ Pin a concrete version. Once `v0.5.1` is tagged the corresponding
 images become available — check
 <https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
 
-See [Image Variants](../reference/images.md) for available images and
+See [Images](../reference/images.md) for available images and
 configuration details.
 
 #### Option B: Build from source
@@ -331,29 +331,28 @@ The script writes directly into the local blob store at
 
 ##### Configure server for local builds
 
-When you build images locally, the source `server.yaml` should **omit**
-`base_rootfs` and the `images:` map entirely. The runtime falls back to
-tag auto-discovery, and you pass the tag explicitly on `shed create`:
+When you build images locally, label them with `shed image build/pull -t
+<label>` and reference the label. Either set `default_image` to a label
+(used when no `--image` is passed) or pass `--image <label>` per create:
 
 ```yaml
 firecracker:
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
   images_dir: /var/lib/shed/firecracker/images
-  # no base_rootfs, no images: — tags resolved from the local blob store
+  default_image: full   # a local label, or a ghcr.io/...:vX ref
 ```
 
-Then pass `--image <tag>` on every create:
+Then create (omit `--image` to use `default_image`, or override per shed):
 
 ```bash
-shed create test --image full
-shed create dev  --image base
+shed create test            # uses default_image
+shed create dev --image base
 ```
 
-`base_rootfs` is treated as a literal path when it doesn't look like a
-Docker reference, so the bare tag form (`base_rootfs: full`) does not
-work today. Use either a fully-qualified `ghcr.io/...:vX` ref or omit
-the field and pass `--image`.
+`default_image` may be a Docker ref (`ghcr.io/...:vX`), an `image_aliases`
+name, a local label set with `-t`, or an absolute path to an ext4/erofs
+image. Docker refs are pulled on first use per `pull_policy`.
 
 ### Set Up Bridge Network
 

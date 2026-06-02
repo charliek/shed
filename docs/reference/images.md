@@ -1,4 +1,4 @@
-# Image Variants
+# Images
 
 Shed images are OCI-compliant container images. The on-disk store is an
 [OCI image-layout-v1](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)
@@ -36,7 +36,7 @@ If you're upgrading from v0.5.1 or earlier, see the
 breaking-change details and the required `shed image rm` / `pull-images`
 steps.
 
-## Available Variants
+## Available images
 
 | Variant | Description |
 |---------|-------------|
@@ -276,11 +276,12 @@ first `shed create` (no Docker daemon needed for pull):
 
     ```yaml
     vz:
-      base_rootfs: ghcr.io/charliek/shed-vz-full:v{version}
-      images:
+      default_image: ghcr.io/charliek/shed-vz-full:v{version}
+      image_aliases:
         base: ghcr.io/charliek/shed-vz-base:v{version}
         extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
         full: ghcr.io/charliek/shed-vz-full:v{version}
+      pull_policy: missing
       images_dir: ~/Library/Application Support/shed/vz/
     ```
 
@@ -288,56 +289,76 @@ first `shed create` (no Docker daemon needed for pull):
 
     ```yaml
     firecracker:
-      base_rootfs: ghcr.io/charliek/shed-fc-full:v{version}
-      images:
+      default_image: ghcr.io/charliek/shed-fc-full:v{version}
+      image_aliases:
         base: ghcr.io/charliek/shed-fc-base:v{version}
         extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
         full: ghcr.io/charliek/shed-fc-full:v{version}
+      pull_policy: missing
       images_dir: /var/lib/shed/firecracker/images
     ```
 
 ### Using local images
 
-If you build images locally, point to OCI references in a local
-registry or to tags already present in the blob store:
+If you build images locally, point `default_image` (and any aliases) at a
+local OCI ref, a ref in a local registry, or a cosmetic tag you applied with
+`shed image build/pull -t <label>`:
 
 ```yaml
 vz:
-  base_rootfs: full
-  images:
-    base: base
-    extensions: extensions
-    full: full
+  default_image: ghcr.io/charliek/shed-vz-full:dev
+  image_aliases:
+    base: my-base-label
 ```
 
-You can mix registry refs and local tags in the same config.
+You can mix registry refs and local labels in the same config.
 
-The `base_rootfs` field is the default when no `--image` flag is passed
-to `shed create`. The `images` map enables per-shed variant selection.
-`images_dir` is the OCI store root.
+`default_image` is the image used when no `--image` flag is passed to
+`shed create`. `image_aliases` is an optional convenience map for
+`shed create --image <alias>`. `images_dir` is the content-addressed OCI
+store root.
 
-### `base_rootfs` vs `images:`
+### Identity, `default_image`, and `image_aliases`
 
-- `images:` is a map of named variants. Each entry is selectable via
-  `shed create --image <name>`, pre-pullable via
-  `shed-server pull-images`, and visible in `shed image ls`.
-- `base_rootfs` is the fallback for `shed create` invocations without
-  `--image`. It's stored as the underscore-prefixed tag `_base` so it
-  doesn't collide with user-facing variant names.
+- An image's identity is its **Docker ref** (recorded as the
+  `io.shed.source-ref` manifest annotation and indexed by the ref it was
+  pulled by). `shed image ls` lists images by ref.
+- `default_image` is the ref `shed create` resolves when given no `--image`.
+- `image_aliases` are short names that resolve to a ref — `shed create
+  --image full` is shorthand for the aliased ref. Listings always show the
+  resolved ref, never the alias.
+- `pull_policy` controls cache-vs-pull (see [Pull policy](#pull-policy)
+  below). A version bump to `default_image` is a cache miss and re-pulls on
+  the next `shed create`.
 
-When `base_rootfs` matches an `images:` entry, the underlying manifest
-digest is shared — `_base` and the variant tag point at the same OCI
-manifest, and pulls deduplicate to a single layer set.
+When `default_image` and an alias point at the same ref, they converge on one
+content-addressed manifest — a single pull, shared layers.
 
-## Using Variants
+### Pull policy
+
+`pull_policy` (per backend) governs how `shed create` reconciles the
+configured ref against the local store:
+
+| Value | Behavior |
+|-------|----------|
+| `missing` (default) | Use the cached ref; pull only if absent. Fast and offline-tolerant. |
+| `always` | Always contact the registry and pull, even if cached. |
+| `never` | Use the cached ref; error if absent. Never contacts the registry. |
+
+Policy is ignored for local-path images and for the explicit
+`shed image pull` command. Avoid mutable tags (`:latest`) with `missing` —
+pin versioned tags so a cache hit is always the right image.
+
+## Using image aliases
 
 ```bash
 shed create myproject --image full        # batteries-included
 shed create myproject --image extensions  # credential brokering, no agents
 shed create tools --image base            # minimal
+shed create app --image ghcr.io/you/custom:v1   # any ref directly
 ```
 
-Default (no `--image` flag) uses `base_rootfs`:
+Default (no `--image` flag) uses `default_image`:
 
 ```bash
 shed create myproject

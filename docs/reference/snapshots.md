@@ -146,16 +146,17 @@ hosts), the pin's protection is bypassed and the lower may go missing.
 Lower digest:   sha256:abc123... (MISSING — pull or rebuild the image before spawning)
 
 Warning: this snapshot's lower image is no longer cached.
-  shed create --from-snapshot <snap> will fail until you pull/rebuild <tag>.
+  shed create --from-snapshot <snap> will fail until you pull/rebuild the original image <ref>.
 ```
 
 `shed create --from-snapshot` then fails fast with
 `BACKEND_ERROR: snapshot ... references lower digest sha256:... which is no
-longer cached; pull the original image (<tag>) first`. Recover by pulling
-the original image:
+longer cached; pull the original image (<ref>) first`. Recover by pulling
+the original image (the digest is what the snapshot pins; the tag/label is
+optional):
 
 ```bash
-shed image pull <docker-ref> -t <tag>
+shed image pull <docker-ref>
 shed create my-new-shed --from-snapshot <snap>
 ```
 

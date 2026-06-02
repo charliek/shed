@@ -84,7 +84,7 @@ shed create my-project --repo git@github.com:user/repo.git
 # Or mount a local directory as the workspace
 shed create my-project --local-dir ~/projects/my-project
 
-# Pick a specific image variant (base / extensions / full — full is the default)
+# Pick a specific image alias or ref (base / extensions / full; default_image is used otherwise)
 shed create big-project --image full --upper-size 20G
 ```
 
@@ -104,9 +104,9 @@ shed ssh-config >> ~/.ssh/config
 Both backends boot from **layered OCI images**. Each shed's rootfs is a
 stack of read-only ext4 layers (pulled registry-direct from `ghcr.io`,
 no Docker daemon needed) plus a per-shed writable upper layer, mounted
-together via overlayfs inside the guest. Three variants ship per
-backend: `base`, `extensions`, and `full`. See
-[Image Variants](docs/reference/images.md).
+together via overlayfs inside the guest. Three images ship per backend —
+`base`, `extensions`, and `full` — wired up as the backend's
+`default_image` and `image_aliases`. See [Images](docs/reference/images.md).
 
 ### VZ (macOS)
 
@@ -201,7 +201,7 @@ shed exec <name> <cmd>           # Run command in shed
 
 # Image Management
 shed image build                 # Build an OCI image from a Dockerfile
-shed image ls                    # List cached images (alias: list)
+shed image ls                    # List images by ref (SOURCE: config/user/dangling; alias: list)
 shed image history <tag>         # Show the layer stack for an image
 shed image inspect <tag-or-digest>  # Show manifest + annotations + digest
 shed image pull <ref>            # Pull an OCI image registry-direct
@@ -209,7 +209,7 @@ shed image push <src> <dst>      # Push a tag/digest to a registry (byte-perfect
 shed image save <tag> -o <file>  # Save an image to an OCI archive
 shed image load -i <file>        # Load an OCI archive into the local store
 shed image tag <src> <new>       # Point a new tag at an existing digest
-shed image rm <name>             # Remove a tag (alias: delete)
+shed image rm <ref|digest|label> # Remove an image from the ref-index (alias: delete)
 shed image prune                 # Reclaim unreferenced layer blobs
 
 # Session Management

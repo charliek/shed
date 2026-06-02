@@ -416,7 +416,7 @@ The core smoke tests in `test_smoke.py`:
 | `test_create_agent_p50` | `agent` phase p50 (5 samples) stays under a per-backend ceiling. Skips cleanly when the VZ upper-template fast path was unavailable (in-guest mkfs cost would inflate `agent_ms` for a structural reason that's not a real regression). |
 | `test_create_rootfs_template_present` | VZ-only: the host-side upper-template fast path is active (`rootfs_ms ≤ 100 ms`). Skips on FC (no host-side template path) and on VZ dev mode (where the fast path is unavailable by design). |
 | `test_shed_exec_smoke` | `shed exec <name> -- echo hello` returns `hello`. |
-| `test_extensions_image_smoke` | The `extensions` image variant carries the shed-extensions binaries at the documented paths with the executable bit. Skips when no `extensions` tag is configured. |
+| `test_extensions_image_smoke` | The `extensions` image carries the shed-extensions binaries at the documented paths with the executable bit. Skips when no `extensions` alias is configured. |
 
 `test_create_agent_p50` + `test_create_rootfs_template_present` are the **dynamic perf-regression gates** PR-time CI can't be (no `/dev/kvm` on GHA). The split replaced the single-gate `test_plain_create_timing` (renamed during PR #157) so the suite runs against either a brew/deb release binary or a `make build` dev binary without false-positive failures from the dev-build in-guest `mkfs.ext4` fallback. See the module-level comment in `tests/integration/test_smoke.py` for the split rationale, and `tests/integration/README.md` for the workflow guide.
 

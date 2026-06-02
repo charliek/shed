@@ -317,7 +317,7 @@ for env := range ch {
 
 ## shed-extensions
 
-The `extensions` and `full` image variants come with [shed-extensions](https://charliek.github.io/shed-extensions/) pre-installed, providing SSH agent forwarding and AWS credential proxying. `extensions` is the lightweight starting point (base OS + shed-extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run the host agent to enable credential brokering.
+The `extensions` and `full` images come with [shed-extensions](https://charliek.github.io/shed-extensions/) pre-installed, providing SSH agent forwarding and AWS credential proxying. `extensions` is the lightweight starting point (base OS + shed-extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run the host agent to enable credential brokering.
 
 shed-extensions is a concrete implementation built on this plugin bus. See the [shed-extensions documentation](https://charliek.github.io/shed-extensions/) for credential brokering setup and usage.
 

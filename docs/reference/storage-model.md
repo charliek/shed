@@ -17,7 +17,8 @@ For each VM backend, all on-disk state lives under a single `images_dir`:
   blobs/sha256/<hex>                            # FILES, not dirs — OCI blobs:
                                                 #   manifests, configs, layer tar.gz,
                                                 #   kernel, initrd, rootfs erofs
-  tags/<tag>.json                               # {"digest":"sha256:...","updated_at":"..."}
+  refs/<sha256(ref)>.json                       # {"ref":"...","digest":"sha256:..."} — Docker-ref index (drives create-time resolution)
+  tags/<tag>.json                               # {"digest":"sha256:...","updated_at":"..."} — optional cosmetic labels
   uppers/<shed>/upper.ext4                      # per-shed writable overlay upper
   instances/<shed>/metadata.json                # per-shed bookkeeping
   snapshots/<snap>/snapshot.json                # per-snapshot bookkeeping
@@ -53,18 +54,23 @@ See the [v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md).
 | **Layer blob** — gzipped tar at `blobs/sha256/<hex>` | Image layer |
 | **Rootfs erofs blob** — raw erofs at `blobs/sha256/<hex>` referenced by `io.shed.rootfs.erofs.digest` | (no direct analog — read-only root the VM mounts) |
 | **Kernel / initrd blobs** — raw binaries at `blobs/sha256/<hex>` referenced by `io.shed.kernel.digest` / `io.shed.initrd.digest` | (no direct analog — VM boot artifacts) |
-| **Tag** — `tags/<name>.json` pointing at a manifest digest | Image tag |
-| **Dangling manifest** — manifest with no tag and no shed/snapshot reference | `<none>:<none>` image |
+| **Ref-index entry** — `refs/<sha256(ref)>.json` mapping a Docker ref to a manifest digest | Registry name → digest (the resolution path) |
+| **Tag** — `tags/<name>.json` pointing at a manifest digest (optional cosmetic label) | Image tag |
+| **Dangling image** — manifest with no ref-index entry, no tag, and no shed/snapshot reference | `<none>:<none>` image |
 
-Two tags can point at the same manifest digest, and two manifests can
+Two refs can point at the same manifest digest, and two manifests can
 share layer blobs — both forms of sharing are zero extra disk cost.
 
 ## How a shed pins an image
 
-When `shed create --image extensions` runs, the server:
+When `shed create` runs (no `--image` uses the backend's `default_image`;
+`--image <alias|ref|/abs/path|label>` overrides it), the server:
 
-1. Resolves the `extensions` tag to a manifest digest via
-   `tags/extensions.json`.
+1. Resolves the configured ref (mapping an `image_aliases` name to its ref
+   first) to a manifest digest via the ref-index at
+   `refs/<sha256(ref)>.json`. This is an O(1) sidecar read; `pull_policy`
+   governs whether a cache miss pulls (`missing`/`always`) or errors
+   (`never`).
 2. Writes `instances/<name>/metadata.json` with
    `"lower_digest": "sha256:<manifest-digest>"`, `"schema_version": 3`,
    and the list of layer digests captured at create time.
@@ -74,8 +80,8 @@ When `shed create --image extensions` runs, the server:
 4. Creates the per-shed upper at `uppers/<name>/upper.ext4`.
 
 Subsequent `shed start` reads the same metadata. The shed boots from the
-exact manifest it was created against — re-tagging `extensions` to a new
-digest after the fact does not change what an existing shed boots.
+exact manifest it was created against — re-pulling the ref to a new digest
+after the fact does not change what an existing shed boots.
 
 ## Reachability and prune
 
@@ -91,9 +97,14 @@ digest after the fact does not change what an existing shed boots.
    kernel / initrd loose blobs, and the rootfs erofs blob via their
    respective annotations.)
 
-Tags do **not** protect blobs. Following the Docker model,
-`shed image rm <tag>` only removes the tag — the manifest and its layers
-stay until prune walks them out.
+The seed set also includes the digests the server config currently points
+at (`default_image` + every `image_aliases` ref, resolved through the
+ref-index) and every cosmetic tag, so a configured or labeled image isn't
+swept out from under a future `shed create`. Following the Docker model,
+`shed image rm <ref|digest|label>` removes an image's addressability (its
+ref-index entry + any tags) but leaves the manifest and its layers for
+prune to GC; it is hard-blocked only when a live shed or snapshot pins the
+manifest.
 
 Stopped sheds count as references. In-flight creates protect their
 target manifest for up to 1 hour via a `.creating` marker in
@@ -138,7 +149,7 @@ code. Quick reference:
 | `SHED-INIT-08` | Mounting the upper as ext4 failed |
 | `SHED-INIT-09` | `switch_root` failed (should never reach the user) |
 
-See [Image Variants → Boot stack](images.md#boot-stack) for the full
+See [Images → Boot stack](images.md#boot-stack) for the full
 description of each code.
 
 ## Atomicity and concurrency
@@ -149,13 +160,18 @@ Blob install is atomic:
 2. `fsync` the file.
 3. `rename` to `blobs/sha256/<hex>`; `fsync` the parent dir.
 
-Tag advancement follows the same pattern on `tags/<name>.json`.
+Ref-index and tag advancement follow the same temp-write + rename pattern
+on `refs/<sha256(ref)>.json` and `tags/<name>.json`. The ref-index entry
+is the final commit of a pull — written only after the manifest, all
+blobs, and the OCI index are durable, so a crash never leaves the index
+pointing at an incomplete digest.
 
 Concurrent installs of the same blob are serialized by a flock on
 `blobs/sha256/.<hex>.lock`. Concurrent `EnsureImage` calls for the same
-tag take a flock on `tags/<name>.lock`. Since v0.5.2 ships the erofs as
-a content-addressed blob there's no separate cache materialization
-lock — `EnsureImage` is pure pull + path resolution.
+ref take a flock keyed by the ref hash (so distinct refs never block each
+other). Since v0.5.2 ships the erofs as a content-addressed blob there's
+no separate cache materialization lock — `EnsureImage` is pure pull +
+path resolution.
 
 ## Lifecycle commands
 
@@ -166,27 +182,28 @@ lock — `EnsureImage` is pure pull + path resolution.
 | `shed image push <src> <dst>` | Push a tag or digest to a registry, byte-perfect |
 | `shed image save <tag> -o <file>` | Write a tag to an OCI archive (for air-gap transport) |
 | `shed image load -i <file>` | Load an OCI archive into the store |
-| `shed image ls` | List tags + dangling manifests |
+| `shed image ls` | List images by ref with a SOURCE column (config / user / dangling) |
 | `shed image history <tag>` | List layers (top-down) for a manifest |
-| `shed image inspect <tag-or-digest>` | Show manifest + annotations + cached path |
-| `shed image tag <src> <new>` | Point a new tag at an existing digest |
-| `shed image rm <tag>` | Remove a tag (blobs persist for prune to GC) |
-| `shed image prune` | Reachability-sweep unreachable blobs and flattened erofs files |
+| `shed image inspect <ref-or-digest>` | Show manifest + annotations + cached path |
+| `shed image tag <src> <new>` | Point a new cosmetic tag at an existing digest |
+| `shed image rm <ref\|digest\|label>` | Remove an image from the ref-index (blobs persist for prune to GC; blocked if a live shed/snapshot pins it) |
+| `shed image prune` | Reachability-sweep unreachable blobs, grouped by image |
 
-`shed create --image <tag>` resolves through the tag → manifest digest
-chain and materializes the flattened erofs lower lazily if it's not
-already cached.
+`shed create` with no `--image` resolves the backend's `default_image`;
+`--image <alias\|ref\|/abs/path\|label>` resolves through the ref-index to
+a manifest digest. The read-only lower is the pre-built erofs blob the
+manifest references — no host-side materialization.
 
-## Tag updates don't propagate to existing sheds
+## Re-pulling a ref doesn't propagate to existing sheds
 
 A shed's metadata pins the manifest digest its lower was resolved from
-at create time, not the tag string. After
-`shed image pull <ref> -t full` advances the `full` tag to a new digest,
+at create time, not the ref string. After
+`shed image pull <ref>` advances the ref-index to a new digest,
 existing sheds keep booting from the old digest. `shed stop && shed start`
-re-reads the metadata and does not re-resolve the tag. This is
+re-reads the metadata and does not re-resolve the ref. This is
 intentional: live re-resolution would change the read-only lowers out
 from under a running guest. To roll a shed onto new content,
-`shed delete <name>` and `shed create <name> --image full`.
+`shed delete <name>` and `shed create <name> --image <ref>`.
 
 ## Why this matters
 
@@ -198,8 +215,8 @@ from under a running guest. To roll a shed onto new content,
 - **Byte-perfect push.** `shed image push <local-tag> <remote-ref>`
   produces a manifest at the destination whose digest matches the local
   manifest digest.
-- **Layer sharing across variants.** `base`, `extensions`, and `full`
-  share base layers; pulling all three is barely more than pulling
+- **Layer sharing across images.** The `base`, `extensions`, and `full`
+  images share base layers; pulling all three is barely more than pulling
   `full`.
 - **Reachability-based GC.** Prune walks from the live shed and
   snapshot set, so unreferenced layers go away even if they were once
@@ -208,6 +225,6 @@ from under a running guest. To roll a shed onto new content,
   across every shed pinning the same manifest; host filesystem reflink
   support is no longer load-bearing.
 
-See also: [Image Variants](images.md),
+See also: [Images](images.md),
 [Disk Management](disk-management.md), [Snapshots](snapshots.md),
 [Layer storage optimization](../discovery/layer-storage-optimization.md).
