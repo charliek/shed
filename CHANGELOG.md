@@ -2,6 +2,82 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.6.0 — 2026-06-03
+
+Image-system milestone: VM images move to a **Docker-style, ref-keyed
+identity model**, replacing the old `_base`-tag / `base_rootfs` scheme.
+This is a **breaking config change** — read
+`docs/upgrades/v0.5.9-to-v0.6.0.md` before upgrading. The work lands in
+three parts (the breaking core, an additive UX layer, a docs pass) plus
+a CI-auth follow-up.
+
+### Breaking: ref-keyed image identity + `pull_policy` (#168)
+
+**Why**: a real upgrade-day failure — after a brew bump + config edit,
+`shed image ls` still showed an internal `_base` tag pinned to the old
+version, the old blob was un-addressable, and `shed create` silently
+reused it.
+
+Config keys change (the loader now **rejects** the removed keys rather
+than silently ignoring them, which would recreate the original bug):
+
+| Old (≤0.5.9) | New (0.6.0) |
+|---|---|
+| `base_rootfs: <ref>` | `default_image: <ref>` |
+| `images: {…}` | `image_aliases: {…}` (optional) |
+| _(none)_ | `pull_policy: missing` *(missing\|always\|never)* |
+
+- **Identity is the Docker ref**, resolved O(1) via a
+  `refs/<sha256(ref)>.json` sidecar index; `_base` is gone everywhere
+  user-visible.
+- **`pull_policy`** enforced in `EnsureImage`: `missing` (cache, pull if
+  absent), `always`, `never`. A configured version bump is now a cache
+  miss → auto-pull on next create.
+- **`ls`/`rm`/`prune` are ref-keyed**: `rm` takes a ref/digest/label,
+  blocks only on live shed/snapshot pins, and leaves the blob for prune
+  (Docker model); prune protects the configured `default_image`/alias
+  digests.
+- **Packaging**: template, brew formula, example/dev configs migrated.
+  New `shed-server config-validate`; the deb postinstall preflights the
+  config and **skips the restart** on an un-migrated config (no
+  crash-loop).
+
+### Image UX layer (#169)
+
+Additive — no `shed create` / boot-path change.
+
+- **`shed image pull` streams progress over SSE** (like `shed create`),
+  with a plain-JSON fallback so a new CLI still works against a pre-SSE
+  server.
+- **`shed image ls`/`inspect`** display the configured/pulled ref (then
+  the manifest source-ref only as a cold fallback), so divergent tags
+  (`:latest`, digest pin, mirror) stay in the `config` bucket.
+- **`shed image rm`** warns + confirms when the target is referenced by
+  server config (`default_image` / `image_aliases`).
+- **`shed image prune`** groups output by image (ref + reclaimed size +
+  total); `--verbose` lists the constituent blob digests.
+- **`shed list -vv`** shows each shed's image as `<label> (sha256:short)`.
+
+### Docs + cleanup (#170)
+
+- Rewrote the residual prose still describing the old `base_rootfs` /
+  `images:` / `_base` / tag-auto-discovery model across
+  `reference/{images,cli,api}.md`, the VZ/FC setup guides, the
+  build-your-own-image tutorial, and `development/testing.md`.
+- Bumped stale `v0.5.0-dev` example configs to `v0.5.9`.
+- Removed the now-dead `ImageDiskEntry.IsBase` API field.
+
+### Release process
+
+- CI: switched the release-bot token from the deprecated `app-id` to
+  `client-id` for `create-github-app-token` v3 (#167).
+
+**Upgrade**: this release changes the config format. Follow
+`docs/upgrades/v0.5.9-to-v0.6.0.md` — rename `base_rootfs` →
+`default_image`, `images:` → `image_aliases:`, and (optionally) set
+`pull_policy`. The deb postinstall skips the service restart until the
+config is migrated.
+
 ## v0.5.9 — 2026-05-31
 
 Substantial maintenance release covering three areas: a complete
