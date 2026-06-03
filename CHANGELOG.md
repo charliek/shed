@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.6.1 — 2026-06-03
 
 ### Images API: `alias` + `is_default` metadata (#171)
 
