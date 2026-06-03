@@ -55,9 +55,11 @@ type ImageInfo struct {
 	SizeBytes   int64  // sum of layer descriptor sizes + cached ext4 bytes
 	UniqueBytes int64  // bytes attributable to layers only this manifest references
 	SharedBytes int64  // bytes attributable to layers also referenced by other manifests
-	Source      string // "config", "discovered", or "dangling"
+	Source      string // "config", "user", or "dangling"
 	Cached      bool   // manifest blob is installed
 	InUse       bool   // protected by a shed or snapshot reference
+	Alias       string // friendly image_aliases key (empty for user/dangling)
+	IsDefault   bool   // this image's ref is the configured default_image
 }
 
 // Manager handles image lifecycle: ensure, list, delete, prune.
@@ -418,6 +420,8 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 			}
 		}
 	}
+	// Labels for config-sourced images: alias key + which ref is the default.
+	aliasByRef, defaultRef := m.configuredImageLabels()
 	pulledRefs := RefIndexReverse(imagesDir)
 
 	tags, err := ListTags(imagesDir)
@@ -540,6 +544,10 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 		default:
 			info.DockerRef = srcRef // provenance only
 		}
+		if configured {
+			info.Alias = aliasByRef[info.DockerRef]
+			info.IsDefault = info.DockerRef == defaultRef
+		}
 		switch {
 		case info.DockerRef != "":
 			info.Name = info.DockerRef
@@ -611,6 +619,7 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 		Cached: BlobExists(imagesDir, digest),
 		Source: "user",
 	}
+	aliasByRef, defaultRef := m.configuredImageLabels()
 	// Display by the ref the image was pulled by (ref-index), configured ref
 	// first; manifest source-ref is the cold fallback. Mirrors ListImages.
 	srcRef := manifest.ShedSourceRef()
@@ -645,6 +654,8 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 	case configured:
 		info.Name = info.DockerRef
 		info.Source = "config"
+		info.Alias = aliasByRef[info.DockerRef]
+		info.IsDefault = info.DockerRef == defaultRef
 	case pulled || tagName != "":
 		if info.DockerRef != "" {
 			info.Name = info.DockerRef
@@ -757,6 +768,26 @@ func (m *Manager) configuredRefs() []string {
 	}
 	sort.Strings(aliases)
 	return append(out, aliases...)
+}
+
+// configuredImageLabels returns a configured-ref -> friendly image_aliases key
+// map plus the default_image ref, for labelling config-sourced images in
+// ListImages / InspectImage. Sorted + first-writer-wins so two aliases sharing
+// one ref resolve to a stable name (mirrors configuredRefs' ordering).
+func (m *Manager) configuredImageLabels() (aliasByRef map[string]string, defaultRef string) {
+	aliases := m.cfg.GetImageAliases()
+	aliasByRef = make(map[string]string, len(aliases))
+	names := make([]string, 0, len(aliases))
+	for name := range aliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if ref := aliases[name]; aliasByRef[ref] == "" {
+			aliasByRef[ref] = name
+		}
+	}
+	return aliasByRef, m.cfg.GetDefaultImage()
 }
 
 // resolveDeleteTarget maps a user-supplied identifier (a cosmetic tag label,

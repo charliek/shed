@@ -134,6 +134,66 @@ func TestListImagesDisplaysConfiguredRefForDivergentTag(t *testing.T) {
 	}
 }
 
+// TestListImagesAliasAndDefault pins the picker-enabling metadata: a
+// config image carries its friendly image_aliases key, exactly the
+// default_image entry reports IsDefault, and a user-pulled image (neither
+// default nor aliased) carries neither.
+func TestListImagesAliasAndDefault(t *testing.T) {
+	imagesDir := t.TempDir()
+	cfg := &testConfig{
+		defaultImage: "ghcr.io/example/full:v1",
+		imageAliases: map[string]string{
+			"full": "ghcr.io/example/full:v1", // also the default
+			"base": "ghcr.io/example/base:v1",
+		},
+		imagesDir: imagesDir,
+	}
+	mgr := NewManager(cfg, nil)
+
+	installFakeBlob(t, imagesDir, "full", "ghcr.io/example/full:v1", []byte("full-body"))
+	installFakeBlob(t, imagesDir, "base", "ghcr.io/example/base:v1", []byte("base-body"))
+	// A user-pulled image: addressable by its ref-index entry, not configured.
+	pulled := installFakeBlob(t, imagesDir, "scratch", "ghcr.io/example/scratch:v1", []byte("scratch-body"))
+	if err := RefIndexPut(imagesDir, "ghcr.io/example/scratch:v1", pulled); err != nil {
+		t.Fatalf("RefIndexPut: %v", err)
+	}
+
+	got, err := mgr.ListImages()
+	if err != nil {
+		t.Fatalf("ListImages: %v", err)
+	}
+	byRef := map[string]ImageInfo{}
+	for _, img := range got {
+		byRef[img.DockerRef] = img
+	}
+
+	if d := byRef["ghcr.io/example/full:v1"]; d.Alias != "full" || !d.IsDefault {
+		t.Errorf("default image: Alias=%q IsDefault=%v, want full/true (%#v)", d.Alias, d.IsDefault, d)
+	}
+	if a := byRef["ghcr.io/example/base:v1"]; a.Alias != "base" || a.IsDefault {
+		t.Errorf("alias image: Alias=%q IsDefault=%v, want base/false (%#v)", a.Alias, a.IsDefault, a)
+	}
+	if u := byRef["ghcr.io/example/scratch:v1"]; u.Alias != "" || u.IsDefault || u.Source != "user" {
+		t.Errorf("user image: Alias=%q IsDefault=%v Source=%q, want \"\"/false/user (%#v)", u.Alias, u.IsDefault, u.Source, u)
+	}
+
+	// InspectImage must agree with ListImages on the alias/default metadata.
+	di, _, err := mgr.InspectImage("full")
+	if err != nil {
+		t.Fatalf("InspectImage(full): %v", err)
+	}
+	if di.Alias != "full" || !di.IsDefault {
+		t.Errorf("inspect default: Alias=%q IsDefault=%v, want full/true (%#v)", di.Alias, di.IsDefault, di)
+	}
+	bi, _, err := mgr.InspectImage("base")
+	if err != nil {
+		t.Fatalf("InspectImage(base): %v", err)
+	}
+	if bi.Alias != "base" || bi.IsDefault {
+		t.Errorf("inspect alias: Alias=%q IsDefault=%v, want base/false (%#v)", bi.Alias, bi.IsDefault, bi)
+	}
+}
+
 func TestManagerInspectAndTag(t *testing.T) {
 	imagesDir := t.TempDir()
 	cfg := &testConfig{imagesDir: imagesDir}

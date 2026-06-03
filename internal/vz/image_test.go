@@ -92,6 +92,31 @@ func createFakeInstance(t *testing.T, instanceDir, name, image, lowerDigest stri
 	}
 }
 
+// TestListImagesPropagatesAliasAndDefault confirms the vz backend wrapper's
+// toConfigImageInfo carries the new alias/is_default metadata out to the
+// wire shape. newTestClient's config sets default_image=base:v1 (not an
+// alias) and alias managed=managed:v1, so the two fields exercise independently.
+func TestListImagesPropagatesAliasAndDefault(t *testing.T) {
+	client, imagesDir := newTestClient(t)
+	createFakeImage(t, imagesDir, "base")    // == cfg.DefaultImage ref
+	createFakeImage(t, imagesDir, "managed") // == alias "managed" ref
+
+	imgs, err := client.ListImages()
+	if err != nil {
+		t.Fatalf("ListImages: %v", err)
+	}
+	byRef := map[string]config.ImageInfo{}
+	for _, img := range imgs {
+		byRef[img.DockerRef] = img
+	}
+	if d := byRef["ghcr.io/example/base:v1"]; !d.IsDefault || d.Alias != "" {
+		t.Errorf("default entry: IsDefault=%v Alias=%q, want true/\"\" (%#v)", d.IsDefault, d.Alias, d)
+	}
+	if a := byRef["ghcr.io/example/managed:v1"]; a.Alias != "managed" || a.IsDefault {
+		t.Errorf("alias entry: Alias=%q IsDefault=%v, want managed/false (%#v)", a.Alias, a.IsDefault, a)
+	}
+}
+
 // TestDeleteImage covers removal under the Docker model: `image rm` drops the
 // tag but leaves the blob. With ref-keyed identity, deletion is hard-blocked
 // when ANY shed (running or stopped) or snapshot still pins the manifest —

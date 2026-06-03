@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Images API: `alias` + `is_default` metadata (#171)
+
+`GET /api/images` (and `shed --json image ls`) now label each config-sourced
+image with its friendly `image_aliases` key (`alias`) and flag the
+`default_image` entry (`is_default`). Both fields are additive and
+`omitempty`, so existing clients and the `shed image ls` table view are
+unchanged. This lets the shed-desktop New-Shed picker list aliases by name
+with the default preselected, instead of requiring a raw ref. Also corrects
+the documented `source` values to `config` / `user` / `dangling`.
+
 ## v0.6.0 — 2026-06-03
 
 Image-system milestone: VM images move to a **Docker-style, ref-keyed

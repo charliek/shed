@@ -471,7 +471,9 @@ Returns installed images across all backends, keyed by Docker ref. Each entry is
       "cached": true,
       "digest": "sha256:abc123...",
       "tag": "base",
-      "in_use": true
+      "in_use": true,
+      "alias": "base",
+      "is_default": true
     },
     {
       "name": "sha256:ff8800...",
@@ -491,11 +493,13 @@ Returns installed images across all backends, keyed by Docker ref. Each entry is
 | `path` | string | Blob rootfs path (empty if not cached) |
 | `docker_ref` | string | Docker image reference (empty for local-only images) |
 | `size_bytes` | int | File size in bytes (0 if not cached) |
-| `source` | string | `config` (from server config), `discovered` (in blob store), or `dangling` (blob with no tag) |
+| `source` | string | `config` (from server config), `user` (pulled or tagged ad-hoc), or `dangling` (blob with no tag) |
 | `cached` | bool | Whether the underlying blob exists locally |
 | `digest` | string | Content digest (`sha256:...`) of the blob; empty when the image is uncached |
 | `tag` | string | Tag name pointing at this blob; empty for dangling entries |
 | `in_use` | bool | True when any existing shed or snapshot pins this digest |
+| `alias` | string | Friendly `image_aliases` key (e.g. `base`); set only on `config` images, omitted otherwise |
+| `is_default` | bool | True for the `config` image whose ref is the backend's `default_image`; omitted otherwise |
 
 ### GET /api/images/inspect/{name}
 
@@ -516,7 +520,9 @@ truncated).
     "cached": true,
     "digest": "sha256:abc123...",
     "tag": "full",
-    "in_use": false
+    "in_use": false,
+    "alias": "full",
+    "is_default": true
   },
   "manifest": {
     "schema_version": 1,

@@ -199,6 +199,8 @@ func toConfigImageInfo(img vmimage.ImageInfo) config.ImageInfo {
 		Digest:    img.Digest,
 		Tag:       img.Tag,
 		InUse:     img.InUse,
+		Alias:     img.Alias,
+		IsDefault: img.IsDefault,
 	}
 }
 
