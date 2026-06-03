@@ -1,6 +1,6 @@
 {
   "name": "shed",
-  "version": "0.5.9",
+  "version": "0.6.0",
   "description": "Guidance for using the shed CLI: persistent VM-based dev environments — create, attach, tunnels, sync, and multi-server workflows.",
   "author": {
     "name": "Charlie Knudsen",
