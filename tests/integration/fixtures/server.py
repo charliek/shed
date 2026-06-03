@@ -396,6 +396,29 @@ class LocalServer:
             return []
         return [s["name"] for s in sheds if isinstance(s, dict) and "name" in s]
 
+    def list_images(self) -> list[dict]:
+        """Return the server's images (the `GET /api/images` wire shape).
+
+        `shed --json image ls` emits `config.ImagesResponse`
+        (`{"images": [...]}`, see `cmd/shed/image.go:runImageList`); we
+        return that array of image dicts. Raises on a failed call so a
+        misconfigured server surfaces loudly (unlike `list_shed_names`,
+        callers here assert on field presence, not just membership).
+        """
+        r = subprocess.run(
+            ["shed", "--json", "-s", self.name, "image", "ls"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            raise AssertionError(
+                f"shed image ls failed (exit {r.returncode}) on {self.name}: "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+        resp = json.loads(r.stdout)
+        return resp.get("images") or []
+
     # ------------------------------------------------------------------
     # Log handling (overridden in RemoteServer)
     # ------------------------------------------------------------------

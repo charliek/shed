@@ -234,11 +234,16 @@ type ImageInfo struct {
 	Path      string `json:"path,omitempty"`
 	DockerRef string `json:"docker_ref,omitempty"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
-	Source    string `json:"source"` // "config", "discovered", or "dangling"
+	Source    string `json:"source"` // "config", "user", or "dangling"
 	Cached    bool   `json:"cached"`
 	Digest    string `json:"digest,omitempty"` // "sha256:..." digest of the blob
 	Tag       string `json:"tag,omitempty"`    // tag name pointing at this blob
 	InUse     bool   `json:"in_use,omitempty"` // protected by a shed/snapshot reference
+	// Alias is the friendly image_aliases key (e.g. "base"), set only for
+	// config-sourced images; empty for user-pulled or dangling blobs.
+	Alias string `json:"alias,omitempty"`
+	// IsDefault is true for the config image whose ref is default_image.
+	IsDefault bool `json:"is_default,omitempty"`
 }
 
 // ImageInspectResponse is returned by GET /api/images/{tag-or-digest}.
