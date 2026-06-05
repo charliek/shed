@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -409,15 +410,29 @@ func (c *APIClient) KillSession(shedName, sessionName string) error {
 	return c.doRequest(http.MethodDelete, path, nil, nil, http.StatusNoContent, http.StatusOK)
 }
 
-// DeleteImage removes a tag (Docker model). The blob is GC'd by PruneImages.
-func (c *APIClient) DeleteImage(name string) error {
-	return c.doRequest(http.MethodDelete, "/api/images/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
+// imageIdentURL builds the request URL for an endpoint that targets a single
+// image by identifier (a Docker ref, digest, or cosmetic tag). A Docker ref
+// contains slashes, which can't ride in a single URL path segment (the
+// server's chi {name} param stops at the first '/'), so slash-bearing
+// identifiers are passed as a ?ref= query. Slash-free identifiers (digests,
+// tags) keep the path form so a newer CLI still drives an older server.
+func imageIdentURL(collection, ident string) string {
+	if strings.Contains(ident, "/") {
+		return collection + "?ref=" + url.QueryEscape(ident)
+	}
+	return collection + "/" + ident
 }
 
-// InspectImage returns full details for a tag or digest.
-func (c *APIClient) InspectImage(name string) (*config.ImageInspectResponse, error) {
+// DeleteImage removes an image's addressability (Docker model). The blob is
+// GC'd by PruneImages. ident may be a Docker ref, a digest, or a tag label.
+func (c *APIClient) DeleteImage(ident string) error {
+	return c.doRequest(http.MethodDelete, imageIdentURL("/api/images", ident), nil, nil, http.StatusNoContent, http.StatusOK)
+}
+
+// InspectImage returns full details for a ref, tag, or digest.
+func (c *APIClient) InspectImage(ident string) (*config.ImageInspectResponse, error) {
 	var resp config.ImageInspectResponse
-	if err := c.doRequest(http.MethodGet, "/api/images/inspect/"+name, nil, &resp); err != nil {
+	if err := c.doRequest(http.MethodGet, imageIdentURL("/api/images/inspect", ident), nil, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

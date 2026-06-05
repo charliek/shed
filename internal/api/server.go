@@ -52,6 +52,11 @@ func (s *Server) Router() chi.Router {
 		// Images
 		r.Route("/images", func(r chi.Router) {
 			r.Get("/", s.handleListImages)
+			// Ref-keyed forms (?ref=) for slash-bearing Docker refs; see
+			// imageIdent. The legacy /{name} + /inspect/{name} forms below
+			// stay for slash-free identifiers from older clients.
+			r.Delete("/", s.handleDeleteImage)
+			r.Get("/inspect", s.handleInspectImage)
 			r.Post("/prune", s.handlePruneImages)
 			r.Post("/tag", s.handleTagImage)
 			r.Post("/pull", s.handlePullImage)

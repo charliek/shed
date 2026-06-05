@@ -77,11 +77,15 @@ func (routesFakeBackend) GetSnapshot(_ context.Context, _ string) (*config.Snaps
 }
 func (routesFakeBackend) DeleteSnapshot(_ context.Context, _ string) error { return nil }
 
-func newRoutesTestServer() *Server {
-	return NewServer(routesFakeBackend{}, &config.ServerConfig{
+func newRoutesTestServerWith(b backend.Backend) *Server {
+	return NewServer(b, &config.ServerConfig{
 		Name:     "test-server",
 		HTTPPort: 8080,
 	}, "", nil, nil)
+}
+
+func newRoutesTestServer() *Server {
+	return newRoutesTestServerWith(routesFakeBackend{})
 }
 
 // TestRouteImagesNo405 is a regression test for a chi trie precedence bug
