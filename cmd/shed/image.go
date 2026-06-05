@@ -62,9 +62,10 @@ func buildToolsRefDefault(override string) string {
 }
 
 var imageCmd = &cobra.Command{
-	Use:   "image",
-	Short: "Manage rootfs images",
-	Long:  "Build, list, and manage rootfs images for VM backends.",
+	Use:     "image",
+	Aliases: []string{"images"},
+	Short:   "Manage rootfs images",
+	Long:    "Build, list, and manage rootfs images for VM backends.",
 }
 
 var (

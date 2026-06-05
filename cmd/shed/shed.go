@@ -33,19 +33,21 @@ If a repository URL is provided, it will be cloned into the shed.`,
 }
 
 var listCmd = &cobra.Command{
-	Use:   "list",
-	Short: "List sheds",
-	Long:  "List all sheds on the configured servers.",
-	Args:  cobra.NoArgs,
-	RunE:  runList,
+	Use:     "list",
+	Aliases: []string{"ls"},
+	Short:   "List sheds",
+	Long:    "List all sheds on the configured servers.",
+	Args:    cobra.NoArgs,
+	RunE:    runList,
 }
 
 var deleteCmd = &cobra.Command{
-	Use:   "delete <name>",
-	Short: "Delete a shed",
-	Long:  "Delete a shed and optionally its data volume.",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runDelete,
+	Use:     "delete <name>",
+	Aliases: []string{"rm"},
+	Short:   "Delete a shed",
+	Long:    "Delete a shed and optionally its data volume.",
+	Args:    cobra.ExactArgs(1),
+	RunE:    runDelete,
 }
 
 var startCmd = &cobra.Command{
