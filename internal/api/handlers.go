@@ -534,10 +534,25 @@ func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, config.ImagesResponse{Images: images})
 }
 
-// handleDeleteImage removes a cached image by name.
-// DELETE /api/images/{name}
+// imageIdent extracts the image identifier (a Docker ref, digest, or cosmetic
+// tag) a single-image request targets. A Docker ref contains slashes that
+// chi's {name} path param can't carry, so it rides in ?ref=; the {name} path
+// param remains for slash-free identifiers from older clients.
+func imageIdent(r *http.Request) string {
+	if ref := r.URL.Query().Get("ref"); ref != "" {
+		return ref
+	}
+	return chi.URLParam(r, "name")
+}
+
+// handleDeleteImage removes a cached image by ref, digest, or tag.
+// DELETE /api/images?ref={ref} (preferred) or DELETE /api/images/{name} (legacy)
 func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	name := imageIdent(r)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "missing image identifier (pass ?ref=)")
+		return
+	}
 
 	if err := s.backend.DeleteImage(r.Context(), name); err != nil {
 		code, errCode, msg := mapBackendError(err)
@@ -574,10 +589,14 @@ func (s *Server) handlePruneImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, config.PruneImagesResponse{Deleted: deleted})
 }
 
-// handleInspectImage returns the manifest + info for a tag or digest.
-// GET /api/images/inspect/{name}
+// handleInspectImage returns the manifest + info for a ref, tag, or digest.
+// GET /api/images/inspect?ref={ref} (preferred) or GET /api/images/inspect/{name} (legacy)
 func (s *Server) handleInspectImage(w http.ResponseWriter, r *http.Request) {
-	name := chi.URLParam(r, "name")
+	name := imageIdent(r)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "missing image identifier (pass ?ref=)")
+		return
+	}
 	resp, err := s.backend.InspectImage(r.Context(), name)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
