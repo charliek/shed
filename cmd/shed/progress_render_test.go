@@ -68,17 +68,35 @@ func TestLiveRenderer(t *testing.T) {
 		notSubstr  []string
 	}{
 		{
-			name: "header shows, then per-layer plain lines suppressed once bars start",
+			name: "header shows; redundant per-layer plain line suppressed once bars start",
 			cols: 200, rows: 50,
 			events: []backend.ProgressEvent{
 				{Message: "Fetching manifest ghcr.io/x:v1..."}, // header (pre-blob)
 				blob("sha256:aaa", "layer 1/1 sha256:aaa", vmimage.BlobStatusDownloading, 0, 100),
 				blob("sha256:aaa", "layer 1/1 sha256:aaa", vmimage.BlobStatusDownloading, 50, 100),
 				blob("sha256:aaa", "layer 1/1 sha256:aaa", vmimage.BlobStatusDone, 100, 100),
-				{Message: "SHOULD_NOT_APPEAR_after_bars"}, // plain, post-blob → suppressed
+				{Message: "Pulling layer 1/1 sha256:aaa"}, // per-layer plain → suppressed (bar covers it)
 			},
-			wantSubstr: []string{"Fetching manifest", "#", "✓"},
-			notSubstr:  []string{"SHOULD_NOT_APPEAR_after_bars"},
+			wantSubstr: []string{"Fetching manifest", "#", "✓", "layer 1/1"},
+			notSubstr:  []string{"Pulling layer 1/1"}, // the verbose per-layer line, not the bar label
+		},
+		{
+			// `shed create`: boot-phase plain lines arrive both before AND
+			// after the pull bars. Only the per-layer pull line is suppressed;
+			// every boot phase shows.
+			name: "create: boot phases before and after bars all show",
+			cols: 200, rows: 50,
+			events: []backend.ProgressEvent{
+				{Message: "Resolving image..."},   // pre-pull phase
+				{Message: "Pulling ghcr.io/x:v1"}, // not a per-layer line → shows
+				blob("sha256:aaa", "layer 1/1 sha256:aaa", vmimage.BlobStatusDownloading, 0, 100),
+				{Message: "Pulling layer 1/1 sha256:aaa"}, // per-layer → suppressed
+				blob("sha256:aaa", "layer 1/1 sha256:aaa", vmimage.BlobStatusDone, 100, 100),
+				{Message: "Booting VM..."},        // post-pull phase → must show
+				{Message: "Waiting for agent..."}, // post-pull phase → must show
+			},
+			wantSubstr: []string{"Resolving image", "Pulling ghcr.io/x:v1", "Booting VM", "Waiting for agent"},
+			notSubstr:  []string{"Pulling layer 1/1"},
 		},
 		{
 			// Old server that ignores ?progress=blob: only plain lines arrive,

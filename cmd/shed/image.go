@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
@@ -703,36 +702,11 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 	}
 	client := NewAPIClientFromEntry(entry, DefaultTimeout)
 
-	// On an interactive terminal, opt into structured byte progress and draw
-	// a live block of per-blob bars. Otherwise (pipe, --json, redirected, or
-	// an old server) fall back to the plain line stream.
-	useLive := !jsonFlag && isProgressTTY(os.Stdout)
-	var renderer *liveRenderer
-	if useLive {
-		renderer = newLiveRenderer(os.Stdout, func() (int, int) { return terminalSize(os.Stdout) })
-	}
-	resp, err := client.PullImageWithProgress(dockerRef, tag, imagePullPlatform, useLive, func(event backend.ProgressEvent) {
-		switch {
-		case jsonFlag:
-			// --json suppresses progress; only the final response is printed.
-		case event.Warning:
-			// Warnings go to stderr; when a live block is up, erase and
-			// redraw around the write so the block isn't corrupted.
-			warn := func() { fmt.Fprintf(os.Stderr, "  Warning: %s\n", event.Message) }
-			if renderer != nil {
-				renderer.printAbove(warn)
-			} else {
-				warn()
-			}
-		case renderer != nil:
-			renderer.handle(event)
-		default:
-			fmt.Printf("  %s\n", event.Message)
-		}
-	})
-	if renderer != nil {
-		renderer.finish()
-	}
+	// On an interactive terminal, draw a live block of per-blob bars; pipe,
+	// --json, redirected, or an old server fall back to the plain line stream.
+	onProgress, finish, wantBlob := progressSink(jsonFlag)
+	resp, err := client.PullImageWithProgress(dockerRef, tag, imagePullPlatform, wantBlob, onProgress)
+	finish()
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}

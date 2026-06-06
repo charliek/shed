@@ -4,12 +4,23 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/vmimage"
 	"golang.org/x/term"
 )
+
+// layerProgressLineRe matches the per-layer pull lines the server emits
+// (internal/vmimage/registry.go): "Pulling layer N/M …" and
+// "Layer N/M … already present". A renderer client suppresses these once bars
+// are live because the per-blob bar conveys the same thing; every other plain
+// line still shows — the manifest header for `image pull`, and the boot-phase
+// lines for `create`, which arrive after the pull bars.
+var layerProgressLineRe = regexp.MustCompile(`^(Pulling layer|Layer) \d+/\d+\b`)
+
+func isLayerProgressLine(msg string) bool { return layerProgressLineRe.MatchString(msg) }
 
 // isProgressTTY reports whether f is an interactive terminal we can draw a
 // live progress block on.
@@ -81,6 +92,9 @@ type blobState struct {
 // liveRenderer draws a Docker-style block of per-blob progress bars that
 // redraw in place. It is fed backend.ProgressEvent values and owns a
 // contiguous block of lines at the bottom of the terminal.
+//
+// Not safe for concurrent use: it is driven serially by the single SSE
+// reader goroutine (readSSEStream), which delivers one event at a time.
 type liveRenderer struct {
 	w       io.Writer
 	size    func() (cols, rows int) // re-read per frame so a resize is honored
@@ -115,13 +129,14 @@ func (r *liveRenderer) handle(ev backend.ProgressEvent) {
 		r.redraw()
 		return
 	}
-	// Plain (non-blob) event. Show it until bars take over: the pre-blob
-	// "Fetching manifest..." header shows, and once blob events start the
-	// per-layer plain lines ("Pulling layer 2/6") are redundant with the
-	// bars, so suppress them. Crucially, if NO blob events ever arrive (an
-	// older server that ignores ?progress=blob and streams only plain
-	// lines), nothing is suppressed and the user still sees full progress.
-	if ev.Message == "" || r.sawBlob {
+	// Plain (non-blob) event. Suppress only the redundant per-layer pull
+	// lines once bars are live (their bar conveys the same thing). Everything
+	// else shows: the "Fetching manifest..." header for `image pull`, and the
+	// boot-phase lines for `create` (which arrive after the pull bars — so a
+	// blanket "suppress after first blob" would wrongly hide them). If NO blob
+	// event ever arrives (an older server that ignores ?progress=blob and
+	// streams only plain lines), nothing is suppressed.
+	if ev.Message == "" || (r.sawBlob && isLayerProgressLine(ev.Message)) {
 		return
 	}
 	r.printAbove(func() { fmt.Fprintf(r.w, "  %s\n", ev.Message) })
@@ -201,4 +216,41 @@ func (r *liveRenderer) line(id string, b *blobState, width int) string {
 // finish redraws the final state and leaves the block in the scrollback.
 func (r *liveRenderer) finish() {
 	r.redraw()
+}
+
+// progressSink wires a backend.ProgressEvent stream (from `image pull` or
+// `create`) to either a live TTY renderer or the plain line printer. It
+// returns the onProgress callback, a finish func to call when the stream
+// ends, and wantBlob — whether the caller should request ?progress=blob
+// (true only on an interactive, non-JSON terminal). Warnings always go to
+// stderr, erased/redrawn around so they don't corrupt the live block.
+func progressSink(jsonOutput bool) (onProgress func(backend.ProgressEvent), finish func(), wantBlob bool) {
+	useLive := !jsonOutput && isProgressTTY(os.Stdout)
+	var renderer *liveRenderer
+	if useLive {
+		renderer = newLiveRenderer(os.Stdout, func() (int, int) { return terminalSize(os.Stdout) })
+	}
+	onProgress = func(event backend.ProgressEvent) {
+		switch {
+		case jsonOutput:
+			// --json suppresses progress; only the final response prints.
+		case event.Warning:
+			warn := func() { fmt.Fprintf(os.Stderr, "  Warning: %s\n", event.Message) }
+			if renderer != nil {
+				renderer.printAbove(warn)
+			} else {
+				warn()
+			}
+		case renderer != nil:
+			renderer.handle(event)
+		default:
+			fmt.Printf("  %s\n", event.Message)
+		}
+	}
+	finish = func() {
+		if renderer != nil {
+			renderer.finish()
+		}
+	}
+	return onProgress, finish, useLive
 }

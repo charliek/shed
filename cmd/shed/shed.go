@@ -15,7 +15,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/sync"
 	"github.com/charliek/shed/internal/tunnels"
@@ -221,16 +220,12 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		UpperSizeBytes: upperSizeBytes,
 	}
 
-	shed, err := client.CreateShedWithProgress(req, func(event backend.ProgressEvent) {
-		if jsonFlag {
-			return
-		}
-		if event.Warning {
-			fmt.Fprintf(os.Stderr, "  Warning: %s\n", event.Message)
-		} else {
-			fmt.Printf("  %s\n", event.Message)
-		}
-	})
+	// On an interactive terminal, the image-pull leg renders as live per-blob
+	// bars interleaved with the boot-phase lines; pipe/--json/old server fall
+	// back to the plain line stream.
+	onProgress, finish, wantBlob := progressSink(jsonFlag)
+	shed, err := client.CreateShedWithProgress(req, wantBlob, onProgress)
+	finish()
 	if err != nil {
 		return fmt.Errorf("failed to create shed: %w", err)
 	}

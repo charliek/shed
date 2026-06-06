@@ -206,7 +206,7 @@ func (c *APIClient) CreateShed(req *config.CreateShedRequest) (*config.Shed, err
 }
 
 // CreateShedWithProgress creates a new shed and streams progress events via SSE.
-func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, onProgress func(backend.ProgressEvent)) (*config.Shed, error) {
+func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, wantBlobProgress bool, onProgress func(backend.ProgressEvent)) (*config.Shed, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.createTimeout)
 	defer cancel()
 
@@ -215,7 +215,13 @@ func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, onProg
 		return nil, fmt.Errorf("failed to encode request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/sheds", bytes.NewReader(bodyData))
+	// Opt into structured per-blob byte events (the image-pull leg) only when
+	// the caller can render them; older servers ignore the param.
+	url := c.baseURL + "/api/sheds"
+	if wantBlobProgress {
+		url += "?progress=blob"
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
