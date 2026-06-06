@@ -734,8 +734,11 @@ func runImagePush(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := mgr.PushImage(context.Background(), source, dest, func(stage, msg string) {
-			fmt.Printf("  %s: %s\n", stage, msg)
+		if err := mgr.PushImage(context.Background(), source, dest, func(ev vmimage.ProgressEvent) {
+			if ev.IsBlob() {
+				return
+			}
+			fmt.Printf("  %s: %s\n", ev.Stage, ev.Message)
 		}); err != nil {
 			return fmt.Errorf("failed to push image: %w", err)
 		}

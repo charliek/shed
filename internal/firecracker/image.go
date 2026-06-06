@@ -49,10 +49,25 @@ func (c *Client) TagImage(srcTagOrDigest, newTag string) error {
 // the backend's native platform.
 func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error) {
 	mgr := vmimage.NewManager(c.cfg, c.refScanner())
-	return mgr.PullImage(ctx, dockerRef, tag, platform, func(stage, msg string) {
-		backend.Phase(ctx, stage)
-		backend.Status(ctx, msg)
-	})
+	return mgr.PullImage(ctx, dockerRef, tag, platform, progressBridge(ctx))
+}
+
+// progressBridge translates vmimage progress events into backend SSE events.
+// Plain events advance the phase and emit a status line; blob events emit
+// structured byte progress without advancing the phase (safe under parallel
+// download). vmimage must not import backend, so this lives in the backend.
+func progressBridge(ctx context.Context) vmimage.ProgressFunc {
+	return func(ev vmimage.ProgressEvent) {
+		backend.EmitProgress(ctx, backend.ProgressEvent{
+			Phase:   ev.Stage,
+			Message: ev.Message,
+			Kind:    ev.Kind,
+			ID:      ev.ID,
+			Status:  ev.Status,
+			Current: ev.Current,
+			Total:   ev.Total,
+		})
+	}
 }
 
 // PushImage uploads the manifest currently held by tagOrDigest to the
@@ -60,10 +75,7 @@ func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string)
 // on-disk OCI store.
 func (c *Client) PushImage(ctx context.Context, tagOrDigest, dstRef string) error {
 	mgr := vmimage.NewManager(c.cfg, c.refScanner())
-	return mapSentinelErrors(mgr.PushImage(ctx, tagOrDigest, dstRef, func(stage, msg string) {
-		backend.Phase(ctx, stage)
-		backend.Status(ctx, msg)
-	}))
+	return mapSentinelErrors(mgr.PushImage(ctx, tagOrDigest, dstRef, progressBridge(ctx)))
 }
 
 // DeleteImage removes a tag (Docker model). The underlying blob is GC'd

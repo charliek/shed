@@ -156,9 +156,7 @@ func PushFromOCILayout(ctx context.Context, opts PushOptions) error {
 		if d == "" {
 			continue
 		}
-		if opts.Progress != nil {
-			opts.Progress("image", fmt.Sprintf("Pushing %s %s", ann, ShortDigest(d)))
-		}
+		emitStatus(opts.Progress, "image", fmt.Sprintf("Pushing %s %s", ann, ShortDigest(d)))
 		if err := pushLooseBlob(ctx, dst, d, opts.ImagesDir, remoteOpts, nameOpts); err != nil {
 			return fmt.Errorf("pushing %s blob: %w", ann, err)
 		}
@@ -180,9 +178,7 @@ func PushFromOCILayout(ctx context.Context, opts PushOptions) error {
 	if err != nil {
 		return fmt.Errorf("loading image from layout: %w", err)
 	}
-	if opts.Progress != nil {
-		opts.Progress("image", fmt.Sprintf("Pushing manifest %s → %s", ShortDigest(opts.ManifestDigest), opts.Ref))
-	}
+	emitStatus(opts.Progress, "image", fmt.Sprintf("Pushing manifest %s → %s", ShortDigest(opts.ManifestDigest), opts.Ref))
 	if err := remote.Write(dst, img, remoteOpts...); err != nil {
 		return fmt.Errorf("uploading image: %w", err)
 	}
@@ -312,9 +308,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		remoteOpts = append(remoteOpts, remote.WithPlatform(*p))
 	}
 
-	if opts.Progress != nil {
-		opts.Progress("image", fmt.Sprintf("Fetching manifest %s...", ref.String()))
-	}
+	emitStatus(opts.Progress, "image", fmt.Sprintf("Fetching manifest %s...", ref.String()))
 
 	var desc *remote.Descriptor
 	err = withRetry(ctx, "fetching manifest "+ref.String(), func() error {
@@ -381,23 +375,26 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 			// this, the i+1/N counter leaves gaps (e.g. "1/7 … 4/7") for
 			// layers already on disk, which reads as "missing layers".
 			// Mirrors Docker's "Already exists".
-			if opts.Progress != nil {
-				opts.Progress("image", fmt.Sprintf("Layer %d/%d %s already present", i+1, len(layers), ShortDigest(digest)))
-			}
+			human := fmt.Sprintf("Layer %d/%d %s already present", i+1, len(layers), ShortDigest(digest))
+			emitStatus(opts.Progress, "image", human)
+			size, _ := layer.Size()
+			emitBlob(opts.Progress, digest, human, BlobStatusExists, size, size)
 			continue
 		}
-		if opts.Progress != nil {
-			opts.Progress("image", fmt.Sprintf("Pulling layer %d/%d %s", i+1, len(layers), ShortDigest(digest)))
-		}
+		human := fmt.Sprintf("Pulling layer %d/%d %s", i+1, len(layers), ShortDigest(digest))
+		emitStatus(opts.Progress, "image", human)
+		size, _ := layer.Size()
 		rc, err := layer.Compressed()
 		if err != nil {
 			return nil, fmt.Errorf("opening layer %s: %w", digest, err)
 		}
-		if err := writeBlobFromReader(opts.ImagesDir, digest, rc); err != nil {
-			rc.Close()
+		err = streamBlobWithProgress(digest, human, size, opts.Progress, rc, func(r io.Reader) error {
+			return writeBlobFromReader(opts.ImagesDir, digest, r)
+		})
+		rc.Close()
+		if err != nil {
 			return nil, fmt.Errorf("streaming layer %s: %w", digest, err)
 		}
-		rc.Close()
 	}
 
 	// Write the manifest verbatim (preserves the registry digest).
@@ -411,7 +408,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		// Kernel is a sibling blob in the registry — fetch it as a
 		// loose blob (the registry doesn't surface it via Image()
 		// because it isn't a layer).
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "Pulling kernel "+ShortDigest(d)); err != nil {
 			return nil, fmt.Errorf("pulling kernel blob %s: %w", d, err)
 		}
 		kernelDigest = d
@@ -423,7 +420,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		kernelDigest = d
 	}
 	if d := annotationFromManifest(manifestDesc, AnnotationInitrdDigest); d != "" {
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "Pulling initrd "+ShortDigest(d)); err != nil {
 			return nil, fmt.Errorf("pulling initrd blob %s: %w", d, err)
 		}
 		initrdDigest = d
@@ -441,7 +438,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 	// against v0.5.2+ tooling" error so the user knows the upgrade
 	// path. See internal/vmimage/manager.go.
 	if d := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest); d != "" {
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "Pulling rootfs "+ShortDigest(d)); err != nil {
 			return nil, fmt.Errorf("pulling rootfs erofs blob %s: %w", d, err)
 		}
 	}
@@ -555,8 +552,17 @@ func streamHashCopy(dst io.Writer, src io.Reader) (string, int64, error) {
 // from the same repo as `ref`, writing it under blobs/sha256/<hex>.
 // The caller passes the same insecure flag they set on the originating
 // pull so the sibling-blob request honors the same TLS policy.
-func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir string, insecure bool, remoteOpts []remote.Option) error {
+// progress + human carry structured per-blob byte progress for the loose
+// blob (kernel / initrd / rootfs erofs). Unlike layers these emit NO plain
+// status line — they were silent before, so line-mode output is unchanged;
+// only the structured (renderer-only) blob events are added.
+func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir string, insecure bool, remoteOpts []remote.Option, progress ProgressFunc, human string) error {
 	if BlobExists(imagesDir, digest) {
+		// Report the on-disk size (like cached layers do) so an opted-in
+		// renderer shows a full bar and can tell a real zero-byte blob from
+		// "size unknown".
+		size := BlobSize(imagesDir, digest)
+		emitBlob(progress, digest, human+" (already present)", BlobStatusExists, size, size)
 		return nil
 	}
 	blobRef, err := name.NewDigest(ref.Context().Name()+"@"+digest, nameOptsForInsecure(insecure)...)
@@ -575,12 +581,17 @@ func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir st
 		if lerr != nil {
 			return fmt.Errorf("requesting layer %s: %w", digest, lerr)
 		}
+		size, _ := layer.Size()
 		rc, oerr := layer.Compressed()
 		if oerr != nil {
 			return fmt.Errorf("opening loose blob: %w", oerr)
 		}
 		defer rc.Close()
-		return writeBlobFromReader(imagesDir, digest, rc)
+		// New progressReader per attempt: a retry restarts the byte count
+		// from 0 (the renderer shows the restart), which is correct.
+		return streamBlobWithProgress(digest, human, size, progress, rc, func(r io.Reader) error {
+			return writeBlobFromReader(imagesDir, digest, r)
+		})
 	})
 }
 

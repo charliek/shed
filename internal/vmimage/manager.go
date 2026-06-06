@@ -74,8 +74,7 @@ func NewManager(cfg ImageConfig, scanner RefScanner) *Manager {
 	return &Manager{cfg: cfg, scanner: scanner}
 }
 
-// ProgressFunc is called to report progress during long-running operations.
-type ProgressFunc func(stage, msg string)
+// ProgressFunc and ProgressEvent are defined in progress.go.
 
 // ResolvedRef describes an image to ensure: either a local path or a Docker ref to pull.
 type ResolvedRef struct {
@@ -156,9 +155,7 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		return EnsureResult{}, fmt.Errorf("%w: %s", ErrPullDisabled, ref.DockerRef)
 	}
 
-	if progress != nil {
-		progress("image", fmt.Sprintf("Pulling %s...", ref.DockerRef))
-	}
+	emitStatus(progress, "image", fmt.Sprintf("Pulling %s...", ref.DockerRef))
 
 	// Registry-direct pull only — v0.5.2 dropped the legacy
 	// docker-daemon fallback. The fallback flattened to a single

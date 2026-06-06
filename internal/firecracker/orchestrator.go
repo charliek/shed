@@ -170,10 +170,7 @@ func (b *fcCreator) PreFlight(ctx context.Context, req config.CreateShedRequest,
 			Name:      resolved.Name,
 			Digest:    resolved.Digest,
 			Policy:    vmimage.PullPolicy(resolved.PullPolicy),
-		}, func(stage, msg string) {
-			backend.Phase(ctx, stage)
-			backend.Status(ctx, msg)
-		})
+		}, progressBridge(ctx))
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure image: %w", err)
 		}
