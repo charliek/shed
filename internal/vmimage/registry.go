@@ -375,20 +375,27 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 			// this, the i+1/N counter leaves gaps (e.g. "1/7 … 4/7") for
 			// layers already on disk, which reads as "missing layers".
 			// Mirrors Docker's "Already exists".
-			human := fmt.Sprintf("Layer %d/%d %s already present", i+1, len(layers), ShortDigest(digest))
-			emitStatus(opts.Progress, "image", human)
+			// Emit the blob event BEFORE the verbose line: a renderer client
+			// suppresses per-layer plain lines once it has seen a blob event,
+			// so this ordering keeps the bar without a redundant header.
+			// Line-mode clients never receive the blob event (it's gated
+			// server-side), so they still get the verbose line.
+			label := fmt.Sprintf("layer %d/%d %s", i+1, len(layers), ShortDigest(digest))
 			size, _ := layer.Size()
-			emitBlob(opts.Progress, digest, human, BlobStatusExists, size, size)
+			emitBlob(opts.Progress, digest, label, BlobStatusExists, size, size)
+			emitStatus(opts.Progress, "image", fmt.Sprintf("Layer %d/%d %s already present", i+1, len(layers), ShortDigest(digest)))
 			continue
 		}
-		human := fmt.Sprintf("Pulling layer %d/%d %s", i+1, len(layers), ShortDigest(digest))
-		emitStatus(opts.Progress, "image", human)
+		label := fmt.Sprintf("layer %d/%d %s", i+1, len(layers), ShortDigest(digest))
 		size, _ := layer.Size()
 		rc, err := layer.Compressed()
 		if err != nil {
 			return nil, fmt.Errorf("opening layer %s: %w", digest, err)
 		}
-		err = streamBlobWithProgress(digest, human, size, opts.Progress, rc, func(r io.Reader) error {
+		// Blob start before the verbose line (see the cached branch above).
+		emitBlob(opts.Progress, digest, label, BlobStatusDownloading, 0, size)
+		emitStatus(opts.Progress, "image", fmt.Sprintf("Pulling layer %d/%d %s", i+1, len(layers), ShortDigest(digest)))
+		err = streamBlobWithProgress(digest, label, size, opts.Progress, rc, func(r io.Reader) error {
 			return writeBlobFromReader(opts.ImagesDir, digest, r)
 		})
 		rc.Close()
@@ -408,7 +415,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		// Kernel is a sibling blob in the registry — fetch it as a
 		// loose blob (the registry doesn't surface it via Image()
 		// because it isn't a layer).
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "Pulling kernel "+ShortDigest(d)); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "kernel "+ShortDigest(d)); err != nil {
 			return nil, fmt.Errorf("pulling kernel blob %s: %w", d, err)
 		}
 		kernelDigest = d
@@ -420,7 +427,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		kernelDigest = d
 	}
 	if d := annotationFromManifest(manifestDesc, AnnotationInitrdDigest); d != "" {
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "Pulling initrd "+ShortDigest(d)); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "initrd "+ShortDigest(d)); err != nil {
 			return nil, fmt.Errorf("pulling initrd blob %s: %w", d, err)
 		}
 		initrdDigest = d
@@ -438,7 +445,7 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 	// against v0.5.2+ tooling" error so the user knows the upgrade
 	// path. See internal/vmimage/manager.go.
 	if d := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest); d != "" {
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "Pulling rootfs "+ShortDigest(d)); err != nil {
+		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "rootfs "+ShortDigest(d)); err != nil {
 			return nil, fmt.Errorf("pulling rootfs erofs blob %s: %w", d, err)
 		}
 	}
@@ -562,7 +569,7 @@ func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir st
 		// renderer shows a full bar and can tell a real zero-byte blob from
 		// "size unknown".
 		size := BlobSize(imagesDir, digest)
-		emitBlob(progress, digest, human+" (already present)", BlobStatusExists, size, size)
+		emitBlob(progress, digest, human, BlobStatusExists, size, size)
 		return nil
 	}
 	blobRef, err := name.NewDigest(ref.Context().Name()+"@"+digest, nameOptsForInsecure(insecure)...)
@@ -589,6 +596,7 @@ func pullLooseBlob(ctx context.Context, ref name.Reference, digest, imagesDir st
 		defer rc.Close()
 		// New progressReader per attempt: a retry restarts the byte count
 		// from 0 (the renderer shows the restart), which is correct.
+		emitBlob(progress, digest, human, BlobStatusDownloading, 0, size)
 		return streamBlobWithProgress(digest, human, size, progress, rc, func(r io.Reader) error {
 			return writeBlobFromReader(imagesDir, digest, r)
 		})

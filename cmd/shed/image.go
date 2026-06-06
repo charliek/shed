@@ -702,16 +702,37 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	client := NewAPIClientFromEntry(entry, DefaultTimeout)
-	resp, err := client.PullImageWithProgress(dockerRef, tag, imagePullPlatform, func(event backend.ProgressEvent) {
-		if jsonFlag {
-			return
-		}
-		if event.Warning {
-			fmt.Fprintf(os.Stderr, "  Warning: %s\n", event.Message)
-		} else {
+
+	// On an interactive terminal, opt into structured byte progress and draw
+	// a live block of per-blob bars. Otherwise (pipe, --json, redirected, or
+	// an old server) fall back to the plain line stream.
+	useLive := !jsonFlag && isProgressTTY(os.Stdout)
+	var renderer *liveRenderer
+	if useLive {
+		renderer = newLiveRenderer(os.Stdout, func() (int, int) { return terminalSize(os.Stdout) })
+	}
+	resp, err := client.PullImageWithProgress(dockerRef, tag, imagePullPlatform, useLive, func(event backend.ProgressEvent) {
+		switch {
+		case jsonFlag:
+			// --json suppresses progress; only the final response is printed.
+		case event.Warning:
+			// Warnings go to stderr; when a live block is up, erase and
+			// redraw around the write so the block isn't corrupted.
+			warn := func() { fmt.Fprintf(os.Stderr, "  Warning: %s\n", event.Message) }
+			if renderer != nil {
+				renderer.printAbove(warn)
+			} else {
+				warn()
+			}
+		case renderer != nil:
+			renderer.handle(event)
+		default:
 			fmt.Printf("  %s\n", event.Message)
 		}
 	})
+	if renderer != nil {
+		renderer.finish()
+	}
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}

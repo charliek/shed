@@ -137,6 +137,9 @@ func (p *progressReader) emit(status string) {
 // byte ticks, and a terminal "done" (Current==Total). human is the message
 // carried on each event for line-mode fallback. write performs the actual
 // hash-verified write (writeBlobFromReader-shaped).
+// The caller emits the 0-byte "downloading" start (so the renderer learns
+// Total up front and, for layers, so the start precedes the verbose line);
+// this function emits the throttled byte ticks and the terminal "done".
 func streamBlobWithProgress(digest, human string, total int64, progress ProgressFunc, rc io.Reader, write func(io.Reader) error) error {
 	pr := &progressReader{
 		r:        rc,
@@ -146,7 +149,6 @@ func streamBlobWithProgress(digest, human string, total int64, progress Progress
 		progress: progress,
 		throttle: blobThrottle{interval: defaultBlobTickInterval},
 	}
-	pr.emit(BlobStatusDownloading) // 0-byte start so the renderer learns Total up front
 	if err := write(pr); err != nil {
 		return err
 	}

@@ -90,10 +90,10 @@ func TestProgressReaderByteTicks(t *testing.T) {
 	}
 }
 
-func TestStreamBlobWithProgressStartAndDone(t *testing.T) {
+func TestStreamBlobWithProgressEmitsDone(t *testing.T) {
 	var events []ProgressEvent
 	var written bytes.Buffer
-	err := streamBlobWithProgress("sha256:x", "Pulling x", 500,
+	err := streamBlobWithProgress("sha256:x", "x", 500,
 		func(ev ProgressEvent) { events = append(events, ev) },
 		bytes.NewReader(make([]byte, 500)),
 		func(r io.Reader) error { _, e := io.Copy(&written, r); return e },
@@ -104,13 +104,16 @@ func TestStreamBlobWithProgressStartAndDone(t *testing.T) {
 	if written.Len() != 500 {
 		t.Fatalf("wrote %d bytes, want 500", written.Len())
 	}
-	if len(events) < 2 {
-		t.Fatalf("want at least a start and a done event, got %d", len(events))
+	if len(events) == 0 {
+		t.Fatal("want at least a done event")
 	}
-	if first := events[0]; first.Status != BlobStatusDownloading || first.Current != 0 || first.Total != 500 || first.ID != "sha256:x" {
-		t.Errorf("first event = %+v, want downloading 0/500 id sha256:x", first)
+	// The caller emits the 0-byte start; this function emits ticks + done.
+	for i, ev := range events {
+		if !ev.IsBlob() || ev.ID != "sha256:x" || ev.Total != 500 {
+			t.Errorf("event %d = %+v, want a blob event for sha256:x total 500", i, ev)
+		}
 	}
-	if last := events[len(events)-1]; last.Status != BlobStatusDone || last.Current != 500 || last.Total != 500 {
+	if last := events[len(events)-1]; last.Status != BlobStatusDone || last.Current != 500 {
 		t.Errorf("last event = %+v, want done 500/500", last)
 	}
 }
