@@ -458,7 +458,7 @@ func (c *APIClient) PullImage(dockerRef, tag, platform string) (*config.ImagePul
 // PullImageWithProgress pulls a Docker reference and streams per-stage
 // progress via SSE (mirrors CreateShedWithProgress). Falls back to the
 // non-streaming PullImage path only if the server rejects the stream.
-func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, onProgress func(backend.ProgressEvent)) (*config.ImagePullResponse, error) {
+func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, wantBlobProgress bool, onProgress func(backend.ProgressEvent)) (*config.ImagePullResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
@@ -466,7 +466,14 @@ func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, onPro
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/images/pull", bytes.NewReader(bodyData))
+	// Opt into structured per-blob byte events only when the caller can
+	// render them (interactive TTY). Older servers ignore the param and a
+	// non-opted-in request keeps today's plain line stream.
+	url := c.baseURL + "/api/images/pull"
+	if wantBlobProgress {
+		url += "?progress=blob"
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
