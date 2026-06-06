@@ -25,6 +25,13 @@ here with a pointer to the upgrade guide.`,
 			return err
 		}
 		fmt.Println("config OK")
+		fmt.Printf("backend: %s\n", cfg.DefaultBackend)
+		if img := cfg.ActiveDefaultImage(); img != "" {
+			// Surface the resolved default_image — it may be synthesized
+			// from the server version or expanded from ${shed.version}, in
+			// which case it never appears literally in the config file.
+			fmt.Printf("default_image: %s\n", img)
+		}
 		return nil
 	},
 }

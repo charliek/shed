@@ -23,11 +23,12 @@ import (
 // GET /api/info
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	info := config.ServerInfo{
-		Name:     s.cfg.Name,
-		Version:  version.Info(),
-		SSHPort:  s.cfg.SSHPort,
-		HTTPPort: s.cfg.HTTPPort,
-		Backend:  s.cfg.DefaultBackend,
+		Name:         s.cfg.Name,
+		Version:      version.Info(),
+		SSHPort:      s.cfg.SSHPort,
+		HTTPPort:     s.cfg.HTTPPort,
+		Backend:      s.cfg.DefaultBackend,
+		DefaultImage: s.cfg.ActiveDefaultImage(),
 	}
 
 	writeJSON(w, http.StatusOK, info)

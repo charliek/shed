@@ -70,7 +70,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create firecracker client: %w", err)
 		}
-		log.Printf("Initialized Firecracker backend")
+		log.Printf("Initialized Firecracker backend (default_image=%q, pull_policy=%s)", fcCfg.DefaultImage, fcCfg.PullPolicy)
 		be = firecracker.NewBackend(fcClient)
 
 	case config.BackendVZ:
@@ -82,7 +82,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create vz client: %w", err)
 		}
-		log.Printf("Initialized VZ backend")
+		log.Printf("Initialized VZ backend (default_image=%q, pull_policy=%s)", vzCfg.DefaultImage, vzCfg.PullPolicy)
 		be = vz.NewBackend(vzClient)
 
 	default:

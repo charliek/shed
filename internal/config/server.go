@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/charliek/shed/internal/terminal"
+	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
 )
 
@@ -391,6 +392,81 @@ func DefaultVZConfig() *VZConfig {
 	}
 }
 
+// shedVersionToken is the config token expanded to the running binary's
+// release tag (vX.Y.Z) at load time. It lets a config pin image refs to the
+// server version without hand-editing on every upgrade, e.g.
+//
+//	default_image: ghcr.io/charliek/shed-vz-full:${shed.version}
+const shedVersionToken = "${shed.version}"
+
+// expandImageVersion replaces ${shed.version} in an image ref with the
+// running binary's release tag. On a dev/dirty/ahead-of-tag build (which has
+// no matching published image) the token is left in place; Validate then
+// rejects it with an actionable message rather than silently resolving to a
+// tag that does not exist.
+func expandImageVersion(s string) string {
+	if !strings.Contains(s, shedVersionToken) {
+		return s
+	}
+	tag, ok := version.CurrentReleaseTag()
+	if !ok {
+		return s
+	}
+	return strings.ReplaceAll(s, shedVersionToken, tag)
+}
+
+// applyImageVersionDefaults expands the ${shed.version} token in the default
+// image and aliases, then synthesizes the lockstep release refs for any that
+// are still unset — so a release binary needs no image refs in its config at
+// all. backend is "vz" or "fc". On a non-release build nothing is synthesized
+// (blank fields stay blank, preserving the historical "no default_image
+// configured" error surfaced at create time).
+func applyImageVersionDefaults(backend, defaultImage string, aliases map[string]string) (string, map[string]string) {
+	defaultImage = expandImageVersion(defaultImage)
+	for name, val := range aliases {
+		aliases[name] = expandImageVersion(val)
+	}
+
+	// Synthesize the lockstep release refs for anything still unset. Resolve
+	// the tag once; a dev/dirty/ahead-of-tag build has no published images, so
+	// leave blanks blank (the create path / "no default_image" error stands).
+	tag, ok := version.CurrentReleaseTag()
+	if !ok {
+		return defaultImage, aliases
+	}
+	if defaultImage == "" {
+		defaultImage = version.RootfsRef(backend, "full", tag)
+	}
+	if len(aliases) == 0 {
+		aliases = map[string]string{
+			"base":       version.RootfsRef(backend, "base", tag),
+			"extensions": version.RootfsRef(backend, "extensions", tag),
+			"full":       version.RootfsRef(backend, "full", tag),
+		}
+	}
+	return defaultImage, aliases
+}
+
+// validateImageVersionTokens rejects an unexpanded ${shed.version} token,
+// which only survives expansion on a non-release build (dev/dirty/ahead-of-
+// tag), where there is no matching published image to resolve it to.
+func validateImageVersionTokens(backend, defaultImage string, aliases map[string]string) error {
+	reject := func(field string) error {
+		return fmt.Errorf("%s.%s uses %s but this is not a release build (version %q); "+
+			"pin an explicit image ref/tag or run a released shed-server",
+			backend, field, shedVersionToken, version.Version)
+	}
+	if strings.Contains(defaultImage, shedVersionToken) {
+		return reject("default_image")
+	}
+	for name, val := range aliases {
+		if strings.Contains(val, shedVersionToken) {
+			return reject("image_aliases." + name)
+		}
+	}
+	return nil
+}
+
 // applyDefaults fills in zero-valued fields with defaults and expands ~ in paths.
 func (c *VZConfig) applyDefaults() {
 	if c.NotifyPort == 0 {
@@ -399,6 +475,12 @@ func (c *VZConfig) applyDefaults() {
 	if c.TCPProxyPort == 0 {
 		c.TCPProxyPort = 1028
 	}
+
+	// Resolve version-aware image refs before path handling: expand the
+	// ${shed.version} token and synthesize the lockstep release default /
+	// aliases when unset (release builds only). Runs first so a synthesized
+	// or expanded Docker ref isn't mistaken for a path below.
+	c.DefaultImage, c.ImageAliases = applyImageVersionDefaults("vz", c.DefaultImage, c.ImageAliases)
 
 	// Expand ~ in paths
 	c.KernelPath = ExpandPath(c.KernelPath)
@@ -450,6 +532,9 @@ func (c *VZConfig) applyDefaults() {
 func (c *VZConfig) Validate() error {
 	if c.VfkitPath == "" {
 		return fmt.Errorf("vfkit_path is required")
+	}
+	if err := validateImageVersionTokens("vz", c.DefaultImage, c.ImageAliases); err != nil {
+		return err
 	}
 	// kernel_path is optional under Phase B: vm.Start prefers the
 	// kernel inside the blob (blobs/<digest>/kernel, written by
@@ -1204,6 +1289,23 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	return nil
 }
 
+// ActiveDefaultImage returns the resolved default_image for the configured
+// default_backend (after ${shed.version} expansion / version synthesis at
+// load), or "" if the active backend block is absent or has no default.
+func (c *ServerConfig) ActiveDefaultImage() string {
+	switch c.DefaultBackend {
+	case BackendFirecracker:
+		if c.Firecracker != nil {
+			return c.Firecracker.DefaultImage
+		}
+	case BackendVZ:
+		if c.VZ != nil {
+			return c.VZ.DefaultImage
+		}
+	}
+	return ""
+}
+
 // Validate checks that the configuration is valid.
 func (c *ServerConfig) Validate() error {
 	if c.Name == "" {
@@ -1320,6 +1422,13 @@ func (c *FirecrackerConfig) applyDefaults() {
 		c.NotifyPort = 1026
 	}
 
+	// Resolve version-aware image refs before path handling: expand the
+	// ${shed.version} token and synthesize the lockstep release default /
+	// aliases when unset (release builds only). Runs before the IsDockerRef
+	// path-expansion below so a synthesized/expanded ref isn't treated as a
+	// path.
+	c.DefaultImage, c.ImageAliases = applyImageVersionDefaults("fc", c.DefaultImage, c.ImageAliases)
+
 	// Default ImagesDir if not set
 	if c.ImagesDir == "" {
 		c.ImagesDir = DefaultFirecrackerImagesDir
@@ -1370,6 +1479,9 @@ func (c *FirecrackerConfig) Validate() error {
 	// runs without --image (handled separately by CreateShed). The
 	// legacy path-based fields remain as fallbacks; an empty value
 	// means "rely on the blob."
+	if err := validateImageVersionTokens("firecracker", c.DefaultImage, c.ImageAliases); err != nil {
+		return err
+	}
 	if c.InstanceDir == "" {
 		return fmt.Errorf("instance_dir is required")
 	}

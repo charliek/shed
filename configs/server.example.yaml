@@ -70,16 +70,29 @@ log_level: info
 #   extra_known_hosts:
 #     - "gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf"
 
+# --- Images and the server version ---
+# When default_image / image_aliases are omitted, a released shed-server
+# pulls the rootfs images published in lockstep with its own version —
+# ghcr.io/charliek/shed-<backend>-{base,extensions,full}:vX.Y.Z. Upgrading
+# the server is all it takes to move to the new images; no config edit.
+#
+# To pin a custom or mirrored ref while still tracking the server version,
+# use the ${shed.version} token — it expands to the running server's tag
+# (e.g. v0.6.2) at load:
+#
+#   default_image: myregistry.example.com/shed-vz-full:${shed.version}
+#
+# (A dev/dirty build has no matching published image, so on a source build
+# the token is rejected and an unset default errors — pin an explicit ref.)
+
 # --- VZ Backend (macOS Apple Silicon) ---
 # vz:
 #   vfkit_path: vfkit
 #   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
 #   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-#   default_image: ghcr.io/charliek/shed-vz-full:{version}
-#   image_aliases:
-#     base: ghcr.io/charliek/shed-vz-base:{version}
-#     extensions: ghcr.io/charliek/shed-vz-extensions:{version}
-#     full: ghcr.io/charliek/shed-vz-full:{version}
+#   # default_image / image_aliases omitted -> synthesized from the server
+#   # version (see "Images and the server version" above). Set them only to
+#   # override the registry/variant.
 #   pull_policy: missing   # missing (default) | always | never
 #   images_dir: ~/Library/Application Support/shed/vz/
 #   instance_dir: ~/Library/Application Support/shed/vz/instances
@@ -88,10 +101,7 @@ log_level: info
 # --- Firecracker Backend (Linux with KVM) ---
 # firecracker:
 #   kernel_path: /var/lib/shed/firecracker/vmlinux
-#   default_image: ghcr.io/charliek/shed-fc-full:{version}
-#   image_aliases:
-#     base: ghcr.io/charliek/shed-fc-base:{version}
-#     extensions: ghcr.io/charliek/shed-fc-extensions:{version}
-#     full: ghcr.io/charliek/shed-fc-full:{version}
+#   # default_image / image_aliases omitted -> synthesized from the server
+#   # version (see "Images and the server version" above).
 #   pull_policy: missing   # missing (default) | always | never
 #   images_dir: /var/lib/shed/firecracker/images
