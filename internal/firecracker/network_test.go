@@ -5,8 +5,12 @@ package firecracker
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"syscall"
 	"testing"
+
+	"github.com/vishvananda/netlink"
 )
 
 func TestNewNetworkManager_Valid(t *testing.T) {
@@ -251,6 +255,8 @@ func TestFindAvailableTAPIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNetworkManager() error = %v", err)
 	}
+	// Hermetic: don't let host IP assignments influence index selection.
+	nm.ipInUse = func(string) bool { return false }
 
 	tests := []struct {
 		name        string
@@ -287,6 +293,69 @@ func TestFindAvailableTAPIndex(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("FindAvailableTAPIndex() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFindAvailableTAPIndex_SkipsInUseIP verifies the passive IP-conflict
+// check (the (a) fix): an index whose derived IP is already claimed on the
+// host is skipped, even when the index itself is free.
+func TestFindAvailableTAPIndex_SkipsInUseIP(t *testing.T) {
+	nm, err := NewNetworkManager("fc-br0", "172.30.0.1/24", "fc-tap")
+	if err != nil {
+		t.Fatalf("NewNetworkManager() error = %v", err)
+	}
+	// Pretend index 0's IP (172.30.0.2) is already claimed elsewhere on the
+	// host; the allocator must skip it and pick index 1 (172.30.0.3).
+	nm.ipInUse = func(ip string) bool { return ip == "172.30.0.2" }
+
+	got, err := nm.FindAvailableTAPIndex(map[int]bool{})
+	if err != nil {
+		t.Fatalf("FindAvailableTAPIndex() unexpected error = %v", err)
+	}
+	if got != 1 {
+		t.Errorf("FindAvailableTAPIndex() = %d, want 1 (index 0's IP is in use)", got)
+	}
+}
+
+func TestNeighStateInUse(t *testing.T) {
+	inUse := []int{netlink.NUD_REACHABLE, netlink.NUD_DELAY, netlink.NUD_PROBE, netlink.NUD_PERMANENT}
+	for _, s := range inUse {
+		if !neighStateInUse(s) {
+			t.Errorf("neighStateInUse(%d) = false, want true", s)
+		}
+	}
+	// STALE in particular must be treated as free: it lingers for an IP a
+	// just-deleted shed released, and skipping it would fight our own maps.
+	notInUse := []int{netlink.NUD_NONE, netlink.NUD_INCOMPLETE, netlink.NUD_FAILED, netlink.NUD_STALE}
+	for _, s := range notInUse {
+		if neighStateInUse(s) {
+			t.Errorf("neighStateInUse(%d) = true, want false", s)
+		}
+	}
+}
+
+func TestIsRetryableNetlink(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"eagain", syscall.EAGAIN, true},
+		{"ebusy", syscall.EBUSY, true},
+		{"eintr", syscall.EINTR, true},
+		{"wrapped eagain", fmt.Errorf("create tap: %w", syscall.EAGAIN), true},
+		{"einval permanent", syscall.EINVAL, false},
+		{"enodev permanent", syscall.ENODEV, false},
+		{"eexist permanent", syscall.EEXIST, false},
+		{"non-errno", errors.New("boom"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRetryableNetlink(tt.err); got != tt.want {
+				t.Errorf("isRetryableNetlink(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
