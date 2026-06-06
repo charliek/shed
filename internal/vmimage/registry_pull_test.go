@@ -48,22 +48,37 @@ func pushRandomImage(t *testing.T, refStr string, layers int) string {
 }
 
 // pullCollecting runs PullToOCILayout against the test registry and returns
-// every progress message it emitted.
+// the plain (line-mode) progress messages it emitted. Structured blob events
+// are excluded so these assertions track exactly what a line-mode client
+// renders; the byte-progress events are exercised by pullCollectingEvents.
 func pullCollecting(t *testing.T, ref, imagesDir string) []string {
 	t.Helper()
 	var msgs []string
+	for _, ev := range pullCollectingEvents(t, ref, imagesDir) {
+		if ev.IsBlob() {
+			continue
+		}
+		msgs = append(msgs, ev.Message)
+	}
+	return msgs
+}
+
+// pullCollectingEvents runs PullToOCILayout and returns every progress event.
+func pullCollectingEvents(t *testing.T, ref, imagesDir string) []ProgressEvent {
+	t.Helper()
+	var events []ProgressEvent
 	_, err := PullToOCILayout(context.Background(), PullOptions{
 		Ref:       ref,
 		ImagesDir: imagesDir,
 		Insecure:  true,
-		Progress: func(_, msg string) {
-			msgs = append(msgs, msg)
+		Progress: func(ev ProgressEvent) {
+			events = append(events, ev)
 		},
 	})
 	if err != nil {
 		t.Fatalf("PullToOCILayout(%q): %v", ref, err)
 	}
-	return msgs
+	return events
 }
 
 var layerCounterRe = regexp.MustCompile(`\b(\d+/\d+)\b`)

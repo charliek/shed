@@ -102,8 +102,11 @@ func runPullImages(cmd *cobra.Command, args []string) error {
 		_, err := mgr.EnsureImage(ctx, vmimage.ResolvedRef{
 			DockerRef: ref,
 			Name:      vmimage.DeriveTagFromRef(ref),
-		}, func(stage, msg string) {
-			fmt.Printf("  [%s] %s\n", stage, msg)
+		}, func(ev vmimage.ProgressEvent) {
+			if ev.IsBlob() {
+				return // byte-tick events would spam the server log
+			}
+			fmt.Printf("  [%s] %s\n", ev.Stage, ev.Message)
 		})
 		if err != nil {
 			return fmt.Errorf("failed to pull image %s: %w", name, err)

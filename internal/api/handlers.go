@@ -165,6 +165,38 @@ func (s *Server) createTimer(req config.CreateShedRequest) *backend.PhaseTimer {
 		fmt.Sprintf("create name=%s backend=%s", req.Name, s.backend.Type()), nil)
 }
 
+// sseProgressBuffer is the depth of the per-request progress channel. The
+// sink send is ctx-aware-blocking (never a silent drop), so this is just
+// decoupling headroom for bursts; byte ticks are coalesced at the source.
+const sseProgressBuffer = 64
+
+// newProgressSink builds the SSE progress sink. It forwards user-visible
+// events into ch and:
+//   - gates structured byte-progress (Kind=="blob") behind the client's
+//     ?progress=blob opt-in, so older / line-mode clients never receive
+//     byte-tick events (no spam, no behavior change);
+//   - drops phase-only (Message=="") events, which are server-side timer
+//     boundaries, not user-visible lines;
+//   - blocks until the drain goroutine catches up or the request is
+//     cancelled, so a status transition is never silently dropped (the old
+//     `default:`-drop could lose a terminal "done", freezing a bar at 99%).
+func newProgressSink(r *http.Request, ch chan<- backend.ProgressEvent) backend.ProgressFunc {
+	blobCapable := r.URL.Query().Get("progress") == backend.KindBlob
+	done := r.Context().Done()
+	return func(event backend.ProgressEvent) {
+		if event.Kind == backend.KindBlob && !blobCapable {
+			return
+		}
+		if event.Message == "" {
+			return
+		}
+		select {
+		case ch <- event:
+		case <-done:
+		}
+	}
+}
+
 // handleCreateShedSSE streams create progress as Server-Sent Events.
 func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req config.CreateShedRequest) {
 	flusher, ok := w.(http.Flusher)
@@ -179,20 +211,8 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 	flusher.Flush()
 
 	timer := s.createTimer(req)
-	events := make(chan backend.ProgressEvent, 16)
-	sseFn := func(event backend.ProgressEvent) {
-		// Phase-only events (Message == "") are server-side timer
-		// boundaries; they should not appear as user-visible SSE
-		// progress lines. The PhaseTimer (via TeeProgress) still
-		// receives them through `timer.Track`.
-		if event.Message == "" {
-			return
-		}
-		select {
-		case events <- event:
-		default:
-		}
-	}
+	events := make(chan backend.ProgressEvent, sseProgressBuffer)
+	sseFn := newProgressSink(r, events)
 
 	// Tee the progress stream: the timer records per-phase durations
 	// server-side (logged below), while sseFn forwards the human-readable
@@ -677,16 +697,8 @@ func (s *Server) handlePullImageSSE(w http.ResponseWriter, r *http.Request, req 
 	flusher.Flush()
 
 	start := time.Now()
-	events := make(chan backend.ProgressEvent, 16)
-	sseFn := func(event backend.ProgressEvent) {
-		if event.Message == "" {
-			return
-		}
-		select {
-		case events <- event:
-		default:
-		}
-	}
+	events := make(chan backend.ProgressEvent, sseProgressBuffer)
+	sseFn := newProgressSink(r, events)
 	ctx := backend.ContextWithProgress(r.Context(), sseFn)
 
 	type pullResult struct {
