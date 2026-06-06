@@ -17,7 +17,7 @@ import (
 // SSE remains the user-facing CLI progress channel; the millisecond
 // breakdown is a developer signal reachable via the server log (over SSH
 // for remote hosts). See
-// docs/discovery/platform-runtime-optimization.md.
+// docs/discovery/runtime-optimization-backlog.md.
 type PhaseTimer struct {
 	op  string
 	now func() time.Time

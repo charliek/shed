@@ -16,7 +16,7 @@ After=systemd-remount-fs.service local-fs.target
 # agent, which means clone has the network when it runs. Decoupling firstboot
 # here is a clean ~20% plain-create win on mini3 with no --repo regression.
 # The same change on VZ is intentionally NOT applied (see §12 / §13 of
-# docs/discovery/platform-runtime-optimization.md for the measured trade-off).
+# docs/discovery/runtime-optimization-backlog.md for the measured trade-off).
 #
 # Hostname is still set before the keys here (key-comment correctness); it
 # may now land just after journald starts, so the first few log lines can

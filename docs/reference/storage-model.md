@@ -139,9 +139,10 @@ ext4). The layers are re-fetchable via `shed image pull <ref>
 their layers, so building and pushing your own image is unaffected.
 `shed image ls` shows a boot-only image under `LAYERS` as `boot-only`.
 
-See [Layer storage optimization](../discovery/layer-storage-optimization.md)
-for design notes on reducing this further (composefs, blob-level shared
-content, cache eviction).
+See [Lazy rootfs streaming](../discovery/lazy-rootfs-streaming.md) (lazy
+fetch + composefs dedup) and the [Runtime optimization
+backlog](../discovery/runtime-optimization-backlog.md) (cache eviction)
+for design notes on reducing this further.
 
 ## Initramfs panic codes
 
@@ -237,4 +238,4 @@ from under a running guest. To roll a shed onto new content,
 
 See also: [Images](images.md),
 [Disk Management](disk-management.md), [Snapshots](snapshots.md),
-[Layer storage optimization](../discovery/layer-storage-optimization.md).
+[Runtime optimization backlog](../discovery/runtime-optimization-backlog.md).

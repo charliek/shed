@@ -13,7 +13,7 @@
 // because that broader gating delayed shed-agent (which `shed create`
 // waits on) by firstboot's full crng-blocked `ssh-keygen` duration, and
 // FC's static-IP networking has no DHCP wait to race when network-setup
-// runs earlier — see docs/discovery/platform-runtime-optimization.md §14.
+// runs earlier — see docs/discovery/runtime-optimization-backlog.md §14.
 //
 // machine-id is intentionally NOT touched here: the rootfs Dockerfile
 // symlinks /etc/machine-id to /run/machine-id (transient tmpfs), so PID 1

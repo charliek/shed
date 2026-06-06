@@ -12,7 +12,7 @@ set -e
 # so latching the name once can leave us polling a device that no longer
 # exists for the full timeout. This matters whenever network-setup runs early
 # in boot (it raced the rename and hung ~30s). See
-# docs/discovery/platform-runtime-optimization.md §12.
+# docs/discovery/runtime-optimization-backlog.md §12.
 INTERFACE=""
 IP_ADDR=""
 for i in $(seq 1 30); do

@@ -114,10 +114,9 @@ nav:
       - Extensions: reference/extensions.md
       - HTTP API: reference/api.md
   - Discovery:
-      - Docker-Free Builds: discovery/docker-free-builds.md
-      - Layer Storage Optimization: discovery/layer-storage-optimization.md
+      - Lazy Rootfs Streaming: discovery/lazy-rootfs-streaming.md
       - Proxy Integration: discovery/proxy_integration_design.md
-      - Web Proxy: discovery/web_proxy_discovery.md
+      - Runtime Optimization Backlog: discovery/runtime-optimization-backlog.md
   - Development:
       - Setup: development/setup.md
       - Testing: development/testing.md

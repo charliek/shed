@@ -10,7 +10,7 @@ package vmutil
 // kept as the agent's static-IP gate). Without these tests, a future
 // well-intentioned "make the two platforms uniform" change would silently
 // re-create the regressions PR #126 measured and avoided — see
-// docs/discovery/platform-runtime-optimization.md §14.
+// docs/discovery/runtime-optimization-backlog.md §14.
 //
 // Each test asserts a specific `Before=` directive (presence and absence)
 // in a specific guest unit file and points the reader at the doc section
@@ -95,7 +95,7 @@ func wantedByTokens(t *testing.T, path string) map[string]bool {
 // NOT order before sysinit.target / shed-agent.service /
 // network-setup.service — those edges were the broad gating that delayed
 // shed-agent by firstboot's crng-blocked ssh-keygen and erased the ~20 %
-// plain-create win. See docs/discovery/platform-runtime-optimization.md §14.
+// plain-create win. See docs/discovery/runtime-optimization-backlog.md §14.
 func TestFirecrackerFirstbootOrdering(t *testing.T) {
 	const path = "../../firecracker/shed-firstboot.service"
 	before := beforeTokens(t, path)
@@ -160,7 +160,7 @@ func TestVZNetworkSetupGuardsAgent(t *testing.T) {
 // win) or on systemd-networkd-wait-online (a different kind of gate
 // that's even harder to debug). Each backend's agent unit is checked
 // separately because their shapes are intentionally allowed to diverge.
-// See docs/discovery/platform-runtime-optimization.md §14a / §14b.
+// See docs/discovery/runtime-optimization-backlog.md §14a / §14b.
 func TestShedAgentNotAfterFirstboot(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -173,7 +173,7 @@ func TestShedAgentNotAfterFirstboot(t *testing.T) {
 			after := afterTokens(t, tc.path)
 			for _, banned := range []string{"shed-firstboot.service", "network-online.target"} {
 				if after[banned] {
-					t.Errorf("%s must NOT order `After=%s` (would re-gate the agent on an earlier-boot unit; see docs/discovery/platform-runtime-optimization.md §14)", tc.path, banned)
+					t.Errorf("%s must NOT order `After=%s` (would re-gate the agent on an earlier-boot unit; see docs/discovery/runtime-optimization-backlog.md §14)", tc.path, banned)
 				}
 			}
 		})
@@ -198,7 +198,7 @@ func TestFirstbootInstalledIntoBootGraph(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			wantedBy := wantedByTokens(t, tc.path)
 			if !wantedBy["sysinit.target"] {
-				t.Errorf("%s must declare `WantedBy=sysinit.target` in [Install] so the unit is actually enabled at boot; without it, per-shed SSH host keys would never be regenerated — every shed would serve the baked-in keys (see docs/discovery/platform-runtime-optimization.md §14e)", tc.path)
+				t.Errorf("%s must declare `WantedBy=sysinit.target` in [Install] so the unit is actually enabled at boot; without it, per-shed SSH host keys would never be regenerated — every shed would serve the baked-in keys (see docs/discovery/runtime-optimization-backlog.md §14e)", tc.path)
 			}
 		})
 	}
@@ -220,7 +220,7 @@ func TestNetworkSetupInstalledIntoBootGraph(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			wantedBy := wantedByTokens(t, tc.path)
 			if !wantedBy["multi-user.target"] {
-				t.Errorf("%s must declare `WantedBy=multi-user.target` in [Install] so the unit is actually enabled at boot; without it, the `Before=shed-agent.service` guardrail is unreachable and the agent could start before the network is configured (see docs/discovery/platform-runtime-optimization.md §14)", tc.path)
+				t.Errorf("%s must declare `WantedBy=multi-user.target` in [Install] so the unit is actually enabled at boot; without it, the `Before=shed-agent.service` guardrail is unreachable and the agent could start before the network is configured (see docs/discovery/runtime-optimization-backlog.md §14)", tc.path)
 			}
 		})
 	}

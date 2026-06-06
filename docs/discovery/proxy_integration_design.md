@@ -2,6 +2,17 @@
 
 Design document for exposing services running inside shed VMs via a reverse proxy on the host.
 
+> **Status (as of v0.6.2).** Phases 1–2 have **shipped** (PR #62, v0.3.1):
+> the vsock TCP proxy, `DialService`, the Connect API, the VZ SSH-tunnel
+> fix, and the tunnel rewrite onto the Connect API are all in the tree and
+> documented in [Tunnels](../reference/tunnels.md) and
+> [HTTP API](../reference/api.md). **Phases 3–5 are not built** — the
+> external `shed-ext-proxy` repo (reverse proxy, prox watcher, hostname
+> routing) does not exist yet. The phase headings below are kept in their
+> original planning form; read §8 with this status in mind. Historical
+> note: `Backend.GetNetworkEndpoint`, referenced in §1, was later removed
+> (PR #155) — `DialService` is now the sole contract for reaching a VM.
+
 ## 1. Current State Summary
 
 ### What Prox Writes
@@ -642,3 +653,46 @@ COPY --from=shed-ext-proxy /etc/shed-extensions.d/proxy.yaml /etc/shed-extension
 | Protocol types | `internal/protocol/proxy.go` | Event payload structs |
 | Systemd unit | `systemd/shed-ext-proxy.service` | Guest service definition |
 | Manifest | `manifests/proxy.yaml` | Extension manifest |
+
+---
+
+## Appendix: Prior alternatives considered (from the retired Web Proxy Discovery)
+
+This appendix absorbs the earlier `web_proxy_discovery.md` exploration —
+the option-survey that preceded this design. The design above is the chosen
+realization, so these are recorded as "considered / superseded," not open
+questions.
+
+### Proxy-placement options
+
+| Option | Sketch | Verdict |
+|---|---|---|
+| A. Reverse proxy *inside* shed-server | Add an `httputil` reverse proxy to the chi router; resolve shed→IP internally | Rejected — mixes proxy concerns into VM management; hard to extend later |
+| B. SSH tunnels (`ssh -L`) | Reuse `handleDirectTCPIP` | Superseded — static mappings, needs an SSH client; VZ SSH tunnels were broken until the `DialService` fix |
+| C. Standalone external proxy | Separate process resolves routes via a shed-server API | **Chosen (as a variant)** — became `shed-ext-proxy-host` |
+| Hybrid A+C | shed-server exposes a resolution primitive; a standalone proxy owns routing | **Chosen** — the primitive is the Connect API (not a name→IP lookup); routing lives in the extension |
+
+Key refinement over the original survey: instead of the proxy querying
+`GET /api/sheds/{name}` for a bridge IP (Firecracker-only, and dependent on
+the now-removed `GetNetworkEndpoint`), the proxy tunnels through the
+**Connect API**, which works uniformly on VZ and Firecracker.
+
+### Port-resolution schemes considered
+
+- **Subdomain encoding** (`my-shed-3000.server…`) — simple, stateless, but ugly subdomains.
+- **Path prefix** (`…/port/3000/path`) — clean subdomain, mangles the path.
+- **Default-port convention** (always `:8080`) — simplest, one service per shed.
+- **User-declared `exposed_ports`** in shed metadata — explicit, needs a declaration step.
+- **Agent auto-discovery** — shed-agent scans `/proc/net/tcp` (or watches a `~/.shed/exposed-ports.json` the shed user can write) and reports listening ports over vsock.
+
+The design above takes routes from the **prox daemon** instead of any of
+these. Agent auto-discovery survives as the "Future: auto-discovery (port
+scanning without prox)" item in §8.
+
+### Networking substrate (unchanged finding)
+
+The survey's one durable fact still holds and underpins this design: the
+host can reach Firecracker VMs directly on the bridge (`172.30.0.x`), but
+VZ VMs are not host-routable (`127.0.0.1`). That asymmetry is exactly why
+the uniform primitive is `DialService` (vsock CONNECT on VZ, bridge TCP on
+FC) rather than a raw IP.
