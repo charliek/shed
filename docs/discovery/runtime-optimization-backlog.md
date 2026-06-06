@@ -41,22 +41,24 @@ see [healthPoll](#per-backend-timing-floors-and-the-healthpoll)). The
 existing notify port instead of being polled. The poll shipped as the
 pragmatic interim; the push design did not.
 
-### Stop/reap correctness (latent bug)
+### Firecracker IP-conflict: residual (active probe)
 
-`StopShed` can mark a shed `status=stopped` even when the VM process was
-not actually reaped. A subsequent `StartShed` can then spawn a second
-process over a zombie. Fix direction: verify the PID is reaped before
-recording `stopped`, and surface reap errors rather than swallowing them.
-**This is a correctness bug, not an optimization** — a candidate to
-elevate to a tracked issue.
+Most of the original FC-network gap is now closed: allocation skips an
+index whose IP is already claimed on the host (passive `AddrList` + bridge
+`NeighList` check), TAP setup retries transient netlink errors, and the
+create path tears down partial state via the LIFO cleanup stack.
 
-### Firecracker network hardening
+The **residual** is the one case the passive check can't see: an IP held by
+a *silent* host that has never been ARP'd and isn't a host interface.
+Catching that needs an **active ARP probe**, deliberately *not* done — it
+would add a fixed wait to the create hot path (the `agent_p50` gate).
+Revisit only if duplicate-IP incidents actually occur on a shared-bridge
+deployment.
 
-FC IP allocation is offset-based (`gateway + instance_index + 1`) with
-**no conflict detection** against external services already on the
-bridge/subnet, no bounded retry on transient netlink failures, and
-unclear teardown on partial-failure paths. Linux/FC only. Real
-robustness gap.
+> The earlier "stop/reap correctness" item was removed: verification
+> against current code + a live VZ stop/start showed it is already fixed
+> (verify-before-flip on stop, `ErrZombiePresent` guard on start; PRs
+> #151/#156).
 
 ### Blob & lower cache eviction
 
