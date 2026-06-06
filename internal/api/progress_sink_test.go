@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -19,43 +20,54 @@ func drain(ch chan backend.ProgressEvent) []backend.ProgressEvent {
 	return got
 }
 
-// TestProgressSinkGatesBlobWithoutOptIn: a client that did not request
-// ?progress=blob gets the plain line and never the byte-tick events, and
-// phase-only (Message-less) events are dropped. This is the compat guard —
-// older/line-mode clients see exactly today's output.
-func TestProgressSinkGatesBlobWithoutOptIn(t *testing.T) {
-	r := httptest.NewRequest("POST", "/api/images/pull", nil)
-	ch := make(chan backend.ProgressEvent, 8)
-	sink := newProgressSink(r, ch)
-
-	sink(backend.ProgressEvent{Message: "Pulling layer 1/2"})
-	sink(backend.ProgressEvent{Kind: backend.KindBlob, Message: "blob", Status: "downloading", Current: 1, Total: 2})
-	sink(backend.ProgressEvent{Phase: "image"}) // Message == "" → dropped
-
-	got := drain(ch)
-	if len(got) != 1 || got[0].Message != "Pulling layer 1/2" {
-		t.Fatalf("without opt-in got %+v, want only the plain line", got)
+// TestProgressSinkGating covers the ?progress=blob opt-in: a client that did
+// not opt in gets the plain line and never byte-tick events (the compat
+// guard), and phase-only (Message-less) events are always dropped; an
+// opted-in client receives the structured events verbatim.
+func TestProgressSinkGating(t *testing.T) {
+	blobEvent := backend.ProgressEvent{Kind: backend.KindBlob, Message: "blob", Status: "downloading", Current: 1, Total: 2}
+	cases := []struct {
+		name string
+		url  string
+		send []backend.ProgressEvent
+		want []backend.ProgressEvent
+	}{
+		{
+			name: "without opt-in: blob dropped, plain kept, phase-only dropped",
+			url:  "/api/images/pull",
+			send: []backend.ProgressEvent{
+				{Message: "Pulling layer 1/2"},
+				blobEvent,
+				{Phase: "image"}, // Message == "" → dropped
+			},
+			want: []backend.ProgressEvent{{Message: "Pulling layer 1/2"}},
+		},
+		{
+			name: "with opt-in: blob forwarded verbatim",
+			url:  "/api/images/pull?progress=blob",
+			send: []backend.ProgressEvent{blobEvent},
+			want: []backend.ProgressEvent{blobEvent},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", tc.url, nil)
+			ch := make(chan backend.ProgressEvent, 8)
+			sink := newProgressSink(r, ch)
+			for _, ev := range tc.send {
+				sink(ev)
+			}
+			if got := drain(ch); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
 	}
 }
 
-// TestProgressSinkForwardsBlobWithOptIn: a client that requested
-// ?progress=blob receives the structured byte events verbatim.
-func TestProgressSinkForwardsBlobWithOptIn(t *testing.T) {
-	r := httptest.NewRequest("POST", "/api/images/pull?progress=blob", nil)
-	ch := make(chan backend.ProgressEvent, 8)
-	sink := newProgressSink(r, ch)
-
-	sink(backend.ProgressEvent{Kind: backend.KindBlob, Message: "blob", Status: "downloading", Current: 1, Total: 2})
-
-	got := drain(ch)
-	if len(got) != 1 || got[0].Kind != backend.KindBlob || got[0].Current != 1 || got[0].Total != 2 {
-		t.Fatalf("with opt-in got %+v, want the blob event", got)
-	}
-}
-
-// TestProgressSinkSendUnblocksOnCancel: the send is non-dropping (blocks
-// rather than silently discarding a status transition), but a cancelled
-// request must release it instead of deadlocking the pull goroutine.
+// TestProgressSinkSendUnblocksOnCancel exercises a distinct concurrency
+// invariant (not a data case): the send is non-dropping — it blocks rather
+// than silently discarding a status transition — but a cancelled request must
+// release it instead of deadlocking the pull goroutine.
 func TestProgressSinkSendUnblocksOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := httptest.NewRequest("POST", "/api/images/pull", nil).WithContext(ctx)

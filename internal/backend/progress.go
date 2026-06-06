@@ -109,7 +109,11 @@ func EmitProgress(ctx context.Context, ev ProgressEvent) {
 		Phase(ctx, ev.Phase)
 	}
 	if ev.Message != "" {
-		Status(ctx, ev.Message)
+		if ev.Warning {
+			StatusWarning(ctx, ev.Message)
+		} else {
+			Status(ctx, ev.Message)
+		}
 	}
 }
 

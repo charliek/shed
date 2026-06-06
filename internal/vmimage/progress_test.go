@@ -30,68 +30,63 @@ func TestBlobThrottle(t *testing.T) {
 }
 
 func TestProgressReaderByteTicks(t *testing.T) {
-	var events []ProgressEvent
-	now := time.Unix(0, 0)
-	pr := &progressReader{
-		r:        bytes.NewReader(make([]byte, 1000)),
-		id:       "sha256:abc",
-		human:    "Pulling",
-		total:    1000,
-		progress: func(ev ProgressEvent) { events = append(events, ev) },
-		throttle: blobThrottle{interval: 100 * time.Millisecond, now: func() time.Time { return now }},
+	cases := []struct {
+		name           string
+		advancePerRead time.Duration
+		wantTicks      func(t *testing.T, events []ProgressEvent)
+	}{
+		{
+			name:           "advancing clock emits a tick per read up to the full byte count",
+			advancePerRead: 200 * time.Millisecond, // past the 100ms interval every read
+			wantTicks: func(t *testing.T, events []ProgressEvent) {
+				if len(events) == 0 {
+					t.Fatal("expected byte-tick events")
+				}
+				if last := events[len(events)-1]; last.Current != 1000 {
+					t.Errorf("last tick current = %d, want 1000", last.Current)
+				}
+			},
+		},
+		{
+			name:           "frozen clock emits only the first tick",
+			advancePerRead: 0,
+			wantTicks: func(t *testing.T, events []ProgressEvent) {
+				if len(events) != 1 {
+					t.Errorf("with a frozen clock want exactly 1 tick, got %d", len(events))
+				}
+			},
+		},
 	}
-	buf := make([]byte, 100)
-	for {
-		now = now.Add(200 * time.Millisecond) // advance past the interval every read
-		_, err := pr.Read(buf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("read: %v", err)
-		}
-	}
-	if len(events) == 0 {
-		t.Fatal("expected byte-tick events")
-	}
-	for i, ev := range events {
-		if !ev.IsBlob() {
-			t.Errorf("event %d is not a blob event: %+v", i, ev)
-		}
-		if ev.Status != BlobStatusDownloading {
-			t.Errorf("event %d status = %q, want downloading", i, ev.Status)
-		}
-		if ev.Total != 1000 {
-			t.Errorf("event %d total = %d, want 1000", i, ev.Total)
-		}
-	}
-	if last := events[len(events)-1]; last.Current != 1000 {
-		t.Errorf("last tick current = %d, want 1000", last.Current)
-	}
-}
-
-func TestProgressReaderThrottleSuppresses(t *testing.T) {
-	var events []ProgressEvent
-	now := time.Unix(0, 0)
-	pr := &progressReader{
-		r:        bytes.NewReader(make([]byte, 1000)),
-		total:    1000,
-		progress: func(ev ProgressEvent) { events = append(events, ev) },
-		throttle: blobThrottle{interval: 100 * time.Millisecond, now: func() time.Time { return now }},
-	}
-	// Clock never advances: only the very first read emits a tick.
-	buf := make([]byte, 100)
-	for {
-		_, err := pr.Read(buf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("read: %v", err)
-		}
-	}
-	if len(events) != 1 {
-		t.Errorf("with a frozen clock want exactly 1 tick, got %d", len(events))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []ProgressEvent
+			now := time.Unix(0, 0)
+			pr := &progressReader{
+				r:        bytes.NewReader(make([]byte, 1000)),
+				id:       "sha256:abc",
+				human:    "Pulling",
+				total:    1000,
+				progress: func(ev ProgressEvent) { events = append(events, ev) },
+				throttle: blobThrottle{interval: 100 * time.Millisecond, now: func() time.Time { return now }},
+			}
+			buf := make([]byte, 100)
+			for {
+				now = now.Add(tc.advancePerRead)
+				_, err := pr.Read(buf)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("read: %v", err)
+				}
+			}
+			for i, ev := range events {
+				if !ev.IsBlob() || ev.Status != BlobStatusDownloading || ev.Total != 1000 {
+					t.Errorf("event %d = %+v, want a downloading blob tick with total 1000", i, ev)
+				}
+			}
+			tc.wantTicks(t, events)
+		})
 	}
 }
 
