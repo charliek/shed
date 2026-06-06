@@ -113,27 +113,31 @@ The on-disk store under `{images_dir}/` is OCI image-layout-v1:
 **Everything is a content-addressed blob.** Layer tarballs, kernel,
 initrd, and the prebuilt rootfs erofs all live in `blobs/sha256/` keyed
 by their content sha256. The rootfs erofs is what the VM mounts at boot
-as `/dev/vdb`; the layer tarballs sit alongside it so `shed image push`
-can byte-perfectly round-trip the manifest to a registry and so derived
-images (`FROM` chains) can reuse the lower-numbered layers without
-re-downloading them.
+as `/dev/vdb`. The layer tarballs are only needed to byte-perfectly
+re-push a *pulled* image (`shed image push`) — booting never reads them —
+so by default `shed image pull` and `shed create` pull **boot-only**,
+skipping the layer tarballs entirely (see [Pulling, building,
+pushing](#pulling-building-pushing) below and the
+[boot-only section](cli.md#boot-only-by-default) in the CLI reference).
 
 The legacy `cache/sha256/<manifest-digest>.erofs` directory (used
 through v0.5.1 for locally-materialized erofs files) is gone. Older
 installs may still have one — it's safe to `rm -rf` after upgrading;
 see the [v0.5.1 → v0.5.2 upgrade guide](../upgrades/v0.5.1-to-v0.5.2.md).
 
-**Layer sharing happens at the blob layer.** Two tags that share a base
-layer share the underlying blob — pulling `shed-vz-full:v0.5.1` after
-`shed-vz-extensions:v0.5.1` only fetches the top layers from the
-registry. The flattened erofs is per-manifest, so each variant has its
-own erofs file (no cross-variant sharing for the boot artifact), but the
-big shared layers underneath cost once across all variants.
+**Layer sharing happens at the blob layer.** When layers *are* present
+(a `--with-layers` pull, or a locally-built image), two tags that share a
+base layer share the underlying blob, deduplicated by digest. The
+flattened erofs is per-manifest, so each variant has its own erofs file
+(no cross-variant sharing for the boot artifact).
 
 **Disk overhead.** Each manifest's flattened erofs file is roughly
-0.5–0.7× the equivalent uncompressed ext4 (lz4 compression). Total cost
-for an image is the sum of its layer tar.gz blobs (deduplicated across
-manifests) plus its flattened erofs (per-manifest). See
+0.5–0.7× the equivalent uncompressed ext4 (lz4 compression). A boot-only
+image costs essentially just its erofs (+ the small shared kernel/initrd);
+a full image adds its layer tar.gz blobs (deduplicated across manifests)
+on top. `shed image ls` reports the real on-disk size and flags boot-only
+images under a `LAYERS` column. See
+[Storage Model → Disk overhead](storage-model.md#disk-overhead) and
 [Layer storage optimization](../discovery/layer-storage-optimization.md)
 for design notes.
 
@@ -220,6 +224,65 @@ Registry authentication uses your Docker credential helper (e.g. the
 shed-extensions Docker credential proxy when the `extensions` variant is
 running). For host-side `shed image push` invocations, the regular
 `~/.docker/config.json` credential resolution applies.
+
+The upload streams the layer blobs straight from disk, so they must all
+be present. An image pulled **boot-only** has none — push fails a layer
+preflight (HTTP 409, `image layers not present locally`); re-pull it with
+`shed image pull <ref> --with-layers` first. Images you built locally
+already have their layers, so build → push needs no extra step.
+
+## Pulling, building, pushing
+
+How the three flows move bytes, and what each needs on disk.
+
+### Pull (registry → store)
+
+`shed image pull` (and the implicit pull during `shed create`) is
+**registry-direct** — no Docker daemon. It fetches the manifest, config,
+kernel, initrd, and the prebuilt rootfs erofs, downloading blobs
+**concurrently** (bounded; Docker-style, ~half the wall-clock of serial
+on a high-latency link).
+
+By default the pull is **boot-only**: it skips the layer tarballs (the
+host boots from the erofs and never reads them), saving roughly half the
+bytes and disk of a typical image. `--with-layers` pulls the full image,
+and on an already-boot-only image it *hydrates* — re-runs the pull and
+fetches only the missing layer blobs (present blobs are content-addressed
+no-ops). On an interactive terminal the pull renders Docker-style live
+per-blob progress bars; piped/`--json`/older-server output falls back to
+plain status lines. Pre-v0.5.2 images (no erofs annotation) can't be
+pulled boot-only and require `--with-layers`. See
+[boot-only pulls](cli.md#boot-only-by-default).
+
+### Build (Dockerfile → store)
+
+`shed image build` is **self-contained** and does not consume any
+previously-pulled layers. The `FROM <shed-vz-*|shed-fc-*>` base is
+resolved by `docker buildx` (or podman/buildah, or a pre-built OCI
+archive via `--from-oci-archive`) into the build tool's own cache; shed
+then ingests the produced OCI image — installing its layer blobs and
+minting the rootfs erofs from *those just-built* layers (via the
+`shed-build-tools` container). So a built image is always **full** (it
+has its layers), and building/pushing your own image is unaffected by
+boot-only pulls. See [Creating Custom Images](#creating-custom-images)
+and the [Build Your Own Image](../tutorials/build-your-own-image.md)
+tutorial.
+
+### Push (store → registry)
+
+`shed image push` is byte-perfect and streams the layer blobs from disk,
+so the image must be **full** — a boot-only pull must be hydrated with
+`--with-layers` first (see above). The only host that re-pushes a
+*pulled* image is a mirror/relay; build hosts push images they just
+built (which already have their layers).
+
+### On disk
+
+Everything is a content-addressed blob under `{images_dir}/blobs/sha256/`.
+Boot mounts the erofs directly; a boot-only image stores the erofs +
+kernel + initrd and omits the layer tarballs. See the
+[Storage Model](storage-model.md) for the full layout, reachability, and
+prune behavior (which tolerates the absent layers of a boot-only image).
 
 ## Manifest annotations
 
