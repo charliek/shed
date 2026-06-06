@@ -377,6 +377,13 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		digest := ld.String()
 		layerDigests = append(layerDigests, digest)
 		if BlobExists(opts.ImagesDir, digest) {
+			// Report cached layers instead of skipping silently. Without
+			// this, the i+1/N counter leaves gaps (e.g. "1/7 … 4/7") for
+			// layers already on disk, which reads as "missing layers".
+			// Mirrors Docker's "Already exists".
+			if opts.Progress != nil {
+				opts.Progress("image", fmt.Sprintf("Layer %d/%d %s already present", i+1, len(layers), ShortDigest(digest)))
+			}
 			continue
 		}
 		if opts.Progress != nil {
