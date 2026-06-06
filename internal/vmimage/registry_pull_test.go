@@ -89,6 +89,11 @@ func layerProgressSeq(msgs []string, marker string) []string {
 // TestPullToOCILayout_CachedLayerProgress asserts that a re-pull reports every
 // already-present layer (no silent skips), so the i+1/N counter never leaves
 // gaps that read as "missing layers".
+//
+// The cases run in order against the SAME store: the fresh pull populates the
+// cache that the re-pull then reports. Each case asserts the layer counter is
+// the exact contiguous 1/N..N/N sequence (the bug being fixed is a *gap* in
+// that sequence) and that the opposite marker never appears.
 func TestPullToOCILayout_CachedLayerProgress(t *testing.T) {
 	host := startTestRegistry(t)
 	const layers = 3
@@ -96,24 +101,23 @@ func TestPullToOCILayout_CachedLayerProgress(t *testing.T) {
 	dir := t.TempDir()
 	want := []string{"1/3", "2/3", "3/3"}
 
-	// First pull populates the blob store: every layer is freshly pulled in
-	// a contiguous 1/3..3/3 sequence, and none are reported as cached.
-	first := pullCollecting(t, ref, dir)
-	if got := layerProgressSeq(first, "Pulling layer"); !slices.Equal(got, want) {
-		t.Errorf("first pull: 'Pulling layer' sequence = %v, want %v (msgs: %v)", got, want, first)
+	cases := []struct {
+		name         string
+		wantMarker   string // marker whose lines must form the 1/N..N/N sequence
+		absentMarker string // marker that must not appear
+	}{
+		{"fresh pull pulls every layer", "Pulling layer", "already present"},
+		{"re-pull reports every cached layer", "already present", "Pulling layer"},
 	}
-	if got := layerProgressSeq(first, "already present"); len(got) != 0 {
-		t.Errorf("first pull: got %d 'already present' messages, want 0 (msgs: %v)", len(got), first)
-	}
-
-	// Second pull into the same dir: every layer is cached, so each one is
-	// reported as already present in the same contiguous 1/3..3/3 sequence
-	// (no gaps) and none are re-pulled.
-	second := pullCollecting(t, ref, dir)
-	if got := layerProgressSeq(second, "already present"); !slices.Equal(got, want) {
-		t.Errorf("re-pull: 'already present' sequence = %v, want %v (msgs: %v)", got, want, second)
-	}
-	if got := layerProgressSeq(second, "Pulling layer"); len(got) != 0 {
-		t.Errorf("re-pull: got %d 'Pulling layer' messages, want 0 (msgs: %v)", len(got), second)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := pullCollecting(t, ref, dir)
+			if got := layerProgressSeq(msgs, tc.wantMarker); !slices.Equal(got, want) {
+				t.Errorf("%q sequence = %v, want %v (msgs: %v)", tc.wantMarker, got, want, msgs)
+			}
+			if got := layerProgressSeq(msgs, tc.absentMarker); len(got) != 0 {
+				t.Errorf("got %d %q messages, want 0 (msgs: %v)", len(got), tc.absentMarker, msgs)
+			}
+		})
 	}
 }
