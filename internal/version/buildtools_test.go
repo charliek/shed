@@ -27,6 +27,40 @@ func TestBuildToolsRefForTag(t *testing.T) {
 	}
 }
 
+func TestReleaseTag(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		wantTag string
+		wantOK  bool
+	}{
+		{name: "release no v-prefix", in: "0.6.2", wantTag: "v0.6.2", wantOK: true},
+		{name: "release with v-prefix", in: "v0.6.2", wantTag: "v0.6.2", wantOK: true},
+		{name: "whitespace tolerated", in: "  0.6.2 ", wantTag: "v0.6.2", wantOK: true},
+		{name: "dev", in: "dev", wantTag: "", wantOK: false},
+		{name: "empty", in: "", wantTag: "", wantOK: false},
+		{name: "ahead-of-tag/dirty", in: "v0.6.2-2-g493976f", wantTag: "", wantOK: false},
+		{name: "dirty suffix", in: "0.6.2-dirty", wantTag: "", wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTag, gotOK := ReleaseTag(tc.in)
+			if gotTag != tc.wantTag || gotOK != tc.wantOK {
+				t.Errorf("ReleaseTag(%q) = (%q, %v), want (%q, %v)", tc.in, gotTag, gotOK, tc.wantTag, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestRootfsRef(t *testing.T) {
+	if got := RootfsRef("vz", "full", "v0.6.2"); got != "ghcr.io/charliek/shed-vz-full:v0.6.2" {
+		t.Errorf("RootfsRef(vz, full, v0.6.2) = %q", got)
+	}
+	if got := RootfsRef("fc", "base", "v0.6.2"); got != "ghcr.io/charliek/shed-fc-base:v0.6.2" {
+		t.Errorf("RootfsRef(fc, base, v0.6.2) = %q", got)
+	}
+}
+
 func TestReleaseBuildToolsRefUsesVersion(t *testing.T) {
 	orig := Version
 	t.Cleanup(func() { Version = orig })

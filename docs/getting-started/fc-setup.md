@@ -132,11 +132,11 @@ env_file: /root/.shed/env
 #     - docker-credentials
 
 firecracker:
-  default_image: ghcr.io/charliek/shed-fc-full:v0.5.1
-  image_aliases:
-    base: ghcr.io/charliek/shed-fc-base:v0.5.1
-    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.1
-    full: ghcr.io/charliek/shed-fc-full:v0.5.1
+  # default_image / image_aliases omitted -> resolved from the server
+  # version: ghcr.io/charliek/shed-fc-{base,extensions,full}:vX.Y.Z. A
+  # released (deb) shed-server fills these in automatically; pin them
+  # explicitly only on an ahead-of-tag/dirty source build or to use a
+  # custom registry (see "Set Up Images" below).
   pull_policy: missing
   instance_dir: /var/lib/shed/firecracker/instances
   socket_dir: /var/run/shed/firecracker
@@ -158,14 +158,21 @@ firecracker:
   tap_prefix: shed-tap
 ```
 
-Pin a concrete version that matches your `shed-server`. v0.5.1
-published images are live now — check
-<https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
-Pre-v0.5.0 published images use the legacy flattened layout and will
-not work with v0.5.0+ `shed-server`; v0.5.0 cached images use the
-per-layer cache layout and need a one-time
-`rm -rf {images_dir}/cache` on upgrade to v0.5.1 (see the
-[changelog](../CHANGELOG.md)).
+You usually don't need to name the images: a released `shed-server`
+resolves `default_image` and `image_aliases` from its **own version**, so
+the config carries no tag to bump on upgrade. Pin an explicit ref only on
+an ahead-of-tag/dirty source build (which has no matching published
+image), or to use a custom registry. To pin a mirror while still tracking
+the server version, use the `${shed.version}` token:
+
+```yaml
+firecracker:
+  default_image: myregistry.example.com/shed-fc-full:${shed.version}
+```
+
+Check <https://github.com/charliek/shed/pkgs/container/shed-fc-full> for
+tags. Pre-v0.5.0 published images use the legacy flattened layout and will
+not work with v0.5.0+ `shed-server`.
 
 The deb package generates this config with a matching version
 automatically.
@@ -284,28 +291,37 @@ This installs `/usr/local/bin/firecracker` (v1.14.1). When using published image
 
 #### Option A: Use published images (recommended)
 
-Configure your server to use published OCI references. Shed pulls them
-registry-direct (no Docker daemon needed) and stacks the layers as
-overlayfs lowers on first boot. Published images include a custom
-Firecracker kernel with Docker, 9P, and BPF support — no separate kernel
-build needed.
+Shed pulls published OCI references registry-direct (no Docker daemon
+needed) and stacks the layers as overlayfs lowers on first boot. Published
+images include a custom Firecracker kernel with Docker, 9P, and BPF
+support — no separate kernel build needed.
+
+A released `shed-server` resolves the images from its own version, so the
+common config names none of them:
 
 ```yaml
 firecracker:
-  default_image: ghcr.io/charliek/shed-fc-full:v0.5.1
+  pull_policy: missing
+  images_dir: /var/lib/shed/firecracker/images
+  # default_image / image_aliases omitted -> resolved from the server version
+```
+
+Pin an explicit ref only on an ahead-of-tag/dirty source build, or to use
+a different release/registry:
+
+```yaml
+firecracker:
+  default_image: ghcr.io/charliek/shed-fc-full:v0.6.2
   image_aliases:
-    base: ghcr.io/charliek/shed-fc-base:v0.5.1
-    extensions: ghcr.io/charliek/shed-fc-extensions:v0.5.1
-    full: ghcr.io/charliek/shed-fc-full:v0.5.1
+    base: ghcr.io/charliek/shed-fc-base:v0.6.2
+    extensions: ghcr.io/charliek/shed-fc-extensions:v0.6.2
+    full: ghcr.io/charliek/shed-fc-full:v0.6.2
   pull_policy: missing
   images_dir: /var/lib/shed/firecracker/images
 ```
 
-Pin a concrete version. Once `v0.5.1` is tagged the corresponding
-images become available — check
-<https://github.com/charliek/shed/pkgs/container/shed-fc-full> for tags.
-
-See [Images](../reference/images.md) for available images and
+Check <https://github.com/charliek/shed/pkgs/container/shed-fc-full> for
+tags. See [Images](../reference/images.md) for available images and
 configuration details.
 
 #### Option B: Build from source

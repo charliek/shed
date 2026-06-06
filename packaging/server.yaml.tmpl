@@ -40,12 +40,9 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  default_image: ghcr.io/charliek/shed-vz-full:v{{VERSION}}
-  # Optional convenience aliases for `shed create --image <alias>`.
-  image_aliases:
-    base: ghcr.io/charliek/shed-vz-base:v{{VERSION}}
-    extensions: ghcr.io/charliek/shed-vz-extensions:v{{VERSION}}
-    full: ghcr.io/charliek/shed-vz-full:v{{VERSION}}
+  # default_image / image_aliases resolve from the server version when unset:
+  # ghcr.io/charliek/shed-vz-{base,extensions,full}:vX.Y.Z. Pin explicitly to
+  # override the registry or variant — see the full reference above.
   # missing (default) | always | never
   pull_policy: missing
   instance_dir: ~/Library/Application Support/shed/vz/instances
@@ -61,12 +58,9 @@ vz:
 
 firecracker:
   kernel_path: /var/lib/shed/firecracker/images/vmlinux
-  default_image: ghcr.io/charliek/shed-fc-full:v{{VERSION}}
-  # Optional convenience aliases for `shed create --image <alias>`.
-  image_aliases:
-    base: ghcr.io/charliek/shed-fc-base:v{{VERSION}}
-    extensions: ghcr.io/charliek/shed-fc-extensions:v{{VERSION}}
-    full: ghcr.io/charliek/shed-fc-full:v{{VERSION}}
+  # default_image / image_aliases resolve from the server version when unset:
+  # ghcr.io/charliek/shed-fc-{base,extensions,full}:vX.Y.Z. Pin explicitly to
+  # override the registry or variant — see the full reference above.
   # missing (default) | always | never
   pull_policy: missing
   instance_dir: /var/lib/shed/firecracker/instances

@@ -206,6 +206,11 @@ type ServerInfo struct {
 	SSHPort  int    `json:"ssh_port"`
 	HTTPPort int    `json:"http_port"`
 	Backend  string `json:"backend"`
+	// DefaultImage is the resolved default_image for the active backend
+	// (after ${shed.version} expansion / version synthesis at load). Exposed
+	// so clients can see which image a `shed create` without --image will
+	// use — useful when the ref is synthesized and never written in config.
+	DefaultImage string `json:"default_image,omitempty"`
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.

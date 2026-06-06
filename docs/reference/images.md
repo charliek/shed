@@ -350,34 +350,57 @@ Panic messages from the initramfs are numbered for triage:
 
 ### Using published images (recommended)
 
-Point your config at OCI references. Shed pulls them registry-direct on
-first `shed create` (no Docker daemon needed for pull):
+Shed pulls published OCI references registry-direct on first `shed create`
+(no Docker daemon needed for pull). The rootfs images are published in
+lockstep with each release — `ghcr.io/charliek/shed-<backend>-{base,
+extensions,full}:vX.Y.Z`.
+
+A released `shed-server` resolves them from **its own version**, so the
+common config names no image at all and never carries a tag to bump:
 
 === "VZ (macOS)"
 
     ```yaml
     vz:
-      default_image: ghcr.io/charliek/shed-vz-full:v{version}
-      image_aliases:
-        base: ghcr.io/charliek/shed-vz-base:v{version}
-        extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
-        full: ghcr.io/charliek/shed-vz-full:v{version}
       pull_policy: missing
       images_dir: ~/Library/Application Support/shed/vz/
+      # default_image / image_aliases omitted -> resolved from the server version
     ```
 
 === "Firecracker (Linux)"
 
     ```yaml
     firecracker:
-      default_image: ghcr.io/charliek/shed-fc-full:v{version}
-      image_aliases:
-        base: ghcr.io/charliek/shed-fc-base:v{version}
-        extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
-        full: ghcr.io/charliek/shed-fc-full:v{version}
       pull_policy: missing
       images_dir: /var/lib/shed/firecracker/images
+      # default_image / image_aliases omitted -> resolved from the server version
     ```
+
+Upgrading the server (brew/deb) is all it takes to move to the new images;
+`pull_policy: missing` means the new tag is a cache miss and pulls on the
+next `shed create`. `shed server <name> /info` and the server's startup log
+report the resolved `default_image`.
+
+### Resolving images from the server version
+
+When `default_image` (or `image_aliases`) is unset, a release build fills
+it with the lockstep ref for its version. To keep an explicit ref — a
+specific release, a private mirror — while still tracking the server
+version, use the **`${shed.version}`** token. It expands to the running
+server's tag (e.g. `v0.6.2`) when the config loads:
+
+```yaml
+vz:
+  default_image: myregistry.example.com/shed-vz-full:${shed.version}
+  image_aliases:
+    base: myregistry.example.com/shed-vz-base:${shed.version}
+```
+
+The token and version-synthesis only apply to **release builds**. A
+dev/dirty/ahead-of-tag `shed-server` has no matching published image, so it
+does not synthesize a default, and a `${shed.version}` token is rejected at
+load with an actionable error — pin an explicit ref on such builds (see
+[Using local images](#using-local-images)).
 
 ### Using local images
 

@@ -19,7 +19,7 @@ The fastest way to get started. Homebrew handles vfkit, code signing, config gen
 brew install charliek/tap/shed
 ```
 
-This installs `shed` (CLI) and `shed-server`, installs the vfkit dependency, generates a default server config with version-pinned VZ images, and codesigns the server binary.
+This installs `shed` (CLI) and `shed-server`, installs the vfkit dependency, generates a default server config (image refs resolve from the server version — no pinned tags to bump on upgrade), and codesigns the server binary.
 
 For credential brokering (SSH agent forwarding, AWS credentials, Docker registry auth):
 
@@ -115,27 +115,48 @@ make build
 
 #### Published images (recommended)
 
-Configure your server to use published OCI references. Shed pulls them
-registry-direct (no Docker daemon needed) and stacks the layers as
-overlayfs lowers on first boot.
+Shed pulls published OCI references registry-direct (no Docker daemon
+needed) and stacks the layers as overlayfs lowers on first boot.
+
+You usually don't need to name them. When `default_image` and
+`image_aliases` are omitted, the server resolves them from its **own
+version** — `ghcr.io/charliek/shed-vz-{base,extensions,full}:vX.Y.Z` — so
+the config never carries a version to bump. A `make build` from a clean
+release tag (`git describe` yields `vX.Y.Z`) is release-shaped and gets
+this automatically:
 
 ```yaml
 vz:
-  default_image: ghcr.io/charliek/shed-vz-full:v0.5.1
+  pull_policy: missing
+  # default_image / image_aliases omitted -> resolved from the server version
+```
+
+If your tree is ahead of a tag or dirty (a typical contributor build),
+there is no matching published image, so pin an explicit ref to the
+release whose images you want to pull:
+
+```yaml
+vz:
+  default_image: ghcr.io/charliek/shed-vz-full:v0.6.2
   image_aliases:
-    base: ghcr.io/charliek/shed-vz-base:v0.5.1
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
-    full: ghcr.io/charliek/shed-vz-full:v0.5.1
+    base: ghcr.io/charliek/shed-vz-base:v0.6.2
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.6.2
+    full: ghcr.io/charliek/shed-vz-full:v0.6.2
   pull_policy: missing
 ```
 
-Pin a concrete version that matches the `shed-server` you built.
-v0.5.1 published images are live now — check
-<https://github.com/charliek/shed/pkgs/container/shed-vz-full> for tags.
-Pre-v0.5.0 published images use the legacy flattened layout and will
-not work with v0.5.0+ `shed-server`; v0.5.0 cached images use the
-per-layer cache layout and need a one-time
-`rm -rf {images_dir}/cache` on upgrade to v0.5.1.
+To pin a custom or mirrored registry while still tracking the server
+version, use the `${shed.version}` token (expands to the running server's
+tag on release builds):
+
+```yaml
+vz:
+  default_image: myregistry.example.com/shed-vz-full:${shed.version}
+```
+
+Check <https://github.com/charliek/shed/pkgs/container/shed-vz-full> for
+published tags. Pre-v0.5.0 published images use the legacy flattened
+layout and will not work with v0.5.0+ `shed-server`.
 
 The first `shed create` pulls the layer blobs plus the pre-built rootfs
 erofs blob (built at publish time, not on the host since v0.5.2) and
@@ -215,11 +236,9 @@ vz:
   # you're booting a legacy raw-rootfs image (rare).
   # kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   # initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  default_image: ghcr.io/charliek/shed-vz-full:v0.5.1
-  image_aliases:
-    base: ghcr.io/charliek/shed-vz-base:v0.5.1
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.1
-    full: ghcr.io/charliek/shed-vz-full:v0.5.1
+  # default_image / image_aliases omitted -> resolved from the server
+  # version (see "Published images" above). On an ahead-of-tag or dirty
+  # build, pin them explicitly instead.
   pull_policy: missing
   instance_dir: ~/Library/Application Support/shed/vz/instances
   socket_dir: ~/.shed/vz/sockets
