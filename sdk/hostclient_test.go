@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,9 +9,32 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
+
+// waitFor polls pred until true or the deadline, failing the test otherwise.
+func waitFor(t *testing.T, what string, pred func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if pred() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func nsState(client *HostClient, ns string) (SubStatus, bool) {
+	for _, s := range client.Status() {
+		if s.Namespace == ns {
+			return s, true
+		}
+	}
+	return SubStatus{}, false
+}
 
 func TestSubscribeReceivesEnvelopes(t *testing.T) {
 	env1 := NewEnvelope("test-ns", MessageTypeRequest, json.RawMessage(`{"cmd":"read"}`))
@@ -162,6 +186,69 @@ func TestNewHostClientDefaults(t *testing.T) {
 	}
 	if client.logger == nil {
 		t.Fatal("expected non-nil logger")
+	}
+}
+
+func TestStatusReportsConnected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done() // hold the stream open
+	}))
+	defer srv.Close()
+
+	client := NewHostClient(WithServerURL(srv.URL), WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = client.Subscribe(ctx, "ns1")
+
+	waitFor(t, "ns1 connected", func() bool {
+		s, ok := nsState(client, "ns1")
+		return ok && s.State == ConnConnected && s.LastError == ""
+	})
+}
+
+func TestStatusReportsReconnectingWithError(t *testing.T) {
+	// A server that's been shut down → connections refused → reconnecting + error.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	client := NewHostClient(WithServerURL(deadURL), WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = client.Subscribe(ctx, "ns1")
+
+	waitFor(t, "ns1 reconnecting with error", func() bool {
+		s, ok := nsState(client, "ns1")
+		return ok && s.State == ConnReconnecting && s.LastError != ""
+	})
+}
+
+func TestReconnectLogDedup(t *testing.T) {
+	// At WARN level the per-retry DEBUG lines are dropped, so a persistently
+	// down server logs the "connection lost" WARN exactly once — not once per
+	// backoff cycle (the 21 MB-log regression).
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	client := NewHostClient(WithServerURL(deadURL), WithLogger(logger))
+
+	// Long enough for several retries (initialBackoff is 1s), short enough to
+	// keep the test quick.
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	for range client.Subscribe(ctx, "ns1") {
+	}
+
+	if n := strings.Count(buf.String(), "SSE connection lost"); n != 1 {
+		t.Fatalf("expected exactly 1 'connection lost' WARN after dedup, got %d:\n%s", n, buf.String())
 	}
 }
 
