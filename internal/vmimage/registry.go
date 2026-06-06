@@ -73,6 +73,14 @@ type PullOptions struct {
 	// Concurrency caps how many blobs download in parallel. <=1 means
 	// serial. Callers should pass cfg.GetPullConcurrency().
 	Concurrency int
+
+	// SkipLayers pulls "boot-only": config + kernel + initrd + erofs +
+	// manifest, but NOT the layer tarballs (the host boots from the erofs
+	// and never reads layers). Requires a v0.5.2+ image whose kernel/initrd/
+	// erofs come from manifest annotations; rejected otherwise. The skipped
+	// layers are re-fetchable later via a full pull (`--with-layers`), which
+	// is required before `shed image push` of a boot-only image.
+	SkipLayers bool
 }
 
 // PullResult mirrors ConvertResult so callers can use either flow.
@@ -108,6 +116,18 @@ type PushOptions struct {
 	Progress ProgressFunc
 }
 
+// missingLayers returns the manifest layer digests whose blobs are absent
+// from the local store (the boot-only case). Empty for a full image.
+func missingLayers(imagesDir string, manifest *OCIManifest) []string {
+	var missing []string
+	for _, l := range manifest.Layers {
+		if !BlobExists(imagesDir, l.Digest) {
+			missing = append(missing, l.Digest)
+		}
+	}
+	return missing
+}
+
 // PushFromOCILayout uploads the on-disk manifest + config + layers to
 // the destination registry. Layer bytes are streamed straight from the
 // OCI store so the registry digests are preserved end-to-end (the
@@ -133,6 +153,15 @@ func PushFromOCILayout(ctx context.Context, opts PushOptions) error {
 	manifest, err := ParseManifest(manifestBytes)
 	if err != nil {
 		return fmt.Errorf("parsing manifest: %w", err)
+	}
+
+	// Preflight: a byte-perfect push streams every layer blob from disk, so
+	// they must all be present. An image pulled boot-only has none — fail
+	// here with an actionable message instead of an opaque "no such file"
+	// from deep inside go-containerregistry's remote.Write.
+	if missing := missingLayers(opts.ImagesDir, manifest); len(missing) > 0 {
+		return fmt.Errorf("%w: %d of %d layer blob(s) absent (e.g. %s). The image was pulled boot-only; run `shed image pull <ref> --with-layers` to fetch the layers, then push",
+			ErrLayersMissing, len(missing), len(manifest.Layers), ShortDigest(missing[0]))
 	}
 
 	keychain := opts.AuthKeychain
@@ -395,14 +424,35 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		layerDigests[i] = ld.String()
 	}
 
-	// Download layers + annotated loose blobs concurrently, bounded by
-	// opts.Concurrency. Per-blob writes are already atomic (file lock +
-	// content-verified rename); a singleflight keyed by digest dedups
-	// concurrent fetches of the SAME digest, so a duplicate layer never
-	// opens two network streams (and distinct digests never contend on the
-	// same blob lock). The first error cancels the group, and the manifest /
-	// index / tag are written only after a clean Wait, so a partial pull can
-	// never advance a tag.
+	kernelAnn := annotationFromManifest(manifestDesc, AnnotationKernelDigest)
+	initrdAnn := annotationFromManifest(manifestDesc, AnnotationInitrdDigest)
+	erofsAnn := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest)
+
+	// Boot-only pull: skip the layer tarballs entirely. The host boots from
+	// the erofs blob and never reads layers, so they are dead weight for any
+	// host that doesn't re-push this pulled image. Only safe when the boot
+	// blobs all come from manifest annotations — without layers we can't run
+	// the legacy extract-from-layers kernel/initrd fallback — so reject
+	// pre-v0.5.2 images that lack the annotations, pointing at --with-layers.
+	if opts.SkipLayers {
+		switch {
+		case erofsAnn == "":
+			return nil, fmt.Errorf("cannot pull %q boot-only: image has no %s annotation (built with pre-v0.5.2 tooling); re-pull with --with-layers", opts.Ref, AnnotationRootfsErofsDigest)
+		case opts.ExtractKernel && kernelAnn == "":
+			return nil, fmt.Errorf("cannot pull %q boot-only: image has no kernel annotation (the kernel would need layer extraction); re-pull with --with-layers", opts.Ref)
+		case opts.NeedsInitrd && initrdAnn == "":
+			return nil, fmt.Errorf("cannot pull %q boot-only: image has no initrd annotation (the initrd would need layer extraction); re-pull with --with-layers", opts.Ref)
+		}
+	}
+
+	// Download layers (unless boot-only) + annotated loose blobs
+	// concurrently, bounded by opts.Concurrency. Per-blob writes are already
+	// atomic (file lock + content-verified rename); a singleflight keyed by
+	// digest dedups concurrent fetches of the SAME digest, so a duplicate
+	// layer never opens two network streams (and distinct digests never
+	// contend on the same blob lock). The first error cancels the group, and
+	// the manifest / index / tag are written only after a clean Wait, so a
+	// partial pull can never advance a tag.
 	//
 	// Note on cancellation: gctx cancels *scheduling* (queued goroutines
 	// don't start once a sibling fails), but the HTTP reads themselves are
@@ -418,20 +468,21 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
-	for i := range layers {
-		i, layer, digest := i, layers[i], layerDigests[i]
-		g.Go(func() error {
-			return pullLayerBlob(gctx, &sf, opts, i, len(layers), digest, layer)
-		})
+	if !opts.SkipLayers {
+		for i := range layers {
+			i, layer, digest := i, layers[i], layerDigests[i]
+			g.Go(func() error {
+				return pullLayerBlob(gctx, &sf, opts, i, len(layers), digest, layer)
+			})
+		}
 	}
 
 	// Annotated loose blobs (kernel/initrd/erofs) are independent of the
 	// layers, so they download in the same group. The extract-from-layers
 	// fallbacks (no annotation) need the layers present and so run after
-	// Wait below — they must not race a still-downloading layer.
-	kernelAnn := annotationFromManifest(manifestDesc, AnnotationKernelDigest)
-	initrdAnn := annotationFromManifest(manifestDesc, AnnotationInitrdDigest)
-	erofsAnn := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest)
+	// Wait below — they must not race a still-downloading layer (and are
+	// unreachable in boot-only mode, which the precondition above guarantees
+	// has all three annotations).
 	for _, lb := range []struct{ digest, label, kind string }{
 		{kernelAnn, "kernel " + ShortDigest(kernelAnn), "kernel"},
 		{initrdAnn, "initrd " + ShortDigest(initrdAnn), "initrd"},

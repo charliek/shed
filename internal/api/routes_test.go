@@ -55,10 +55,12 @@ func (routesFakeBackend) ListImages(_ context.Context) ([]config.ImageInfo, erro
 func (routesFakeBackend) InspectImage(_ context.Context, _ string) (config.ImageInspectResponse, error) {
 	return config.ImageInspectResponse{}, config.ErrImageNotFoundSentinel
 }
-func (routesFakeBackend) TagImage(_ context.Context, _, _ string) error               { return nil }
-func (routesFakeBackend) PullImage(_ context.Context, _, _, _ string) (string, error) { return "", nil }
-func (routesFakeBackend) PushImage(_ context.Context, _, _ string) error              { return nil }
-func (routesFakeBackend) DeleteImage(_ context.Context, _ string) error               { return nil }
+func (routesFakeBackend) TagImage(_ context.Context, _, _ string) error { return nil }
+func (routesFakeBackend) PullImage(_ context.Context, _, _, _ string, _ bool) (string, error) {
+	return "", nil
+}
+func (routesFakeBackend) PushImage(_ context.Context, _, _ string) error { return nil }
+func (routesFakeBackend) DeleteImage(_ context.Context, _ string) error  { return nil }
 func (routesFakeBackend) PruneImages(_ context.Context, _ bool) ([]config.ImageInfo, error) {
 	return nil, nil
 }

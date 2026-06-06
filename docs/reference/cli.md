@@ -412,22 +412,46 @@ Pulls an OCI reference registry-direct (no Docker daemon needed),
 installs every blob into the local store, and advances a tag.
 
 ```bash
-shed image pull <ref> [-t <tag>] [--platform <os/arch>]
+shed image pull <ref> [-t <tag>] [--platform <os/arch>] [--with-layers]
 ```
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--tag` | `-t` | derived from the ref | Tag to advance |
 | `--platform` | | host (`linux/arm64` on VZ, `linux/amd64` on Firecracker) | Override the manifest selection for multi-arch indexes (e.g. `linux/amd64`, `linux/arm64`) |
+| `--with-layers` | | off | Pull the full image including layer tarballs (see below) |
 
 If `--tag` is omitted, the tag is derived from the last path segment of
 the ref minus the `shed-{vz,fc}-` prefix and the version suffix (e.g.
 `ghcr.io/charliek/shed-vz-extensions:v0.5.1` → `extensions`).
 
-`pull` writes the image's blobs into `blobs/sha256/` — including the
-pre-built rootfs erofs blob (built at publish time since v0.5.2, mounted
-as-is with no host-side `mkfs.erofs`) — and records the ref→digest
-mapping in the ref-index.
+#### Boot-only by default
+
+A shed host **boots from the prebuilt rootfs erofs blob and never reads
+the OCI layer tarballs**. So `pull` (and the implicit pull during
+`shed create`) is **boot-only** by default: it fetches the config,
+kernel, initrd, erofs, and manifest, but **skips the layer tarballs** —
+roughly half the bytes of a typical image. The image boots normally;
+`shed image ls` shows it under `LAYERS` as `boot-only`.
+
+The layers are only needed to **re-push a *pulled* image** byte-perfect
+(`shed image push`). That's rare — building and pushing your *own* image
+is unaffected, because `shed image build` produces its layers locally
+(see [Build Your Own Image](../tutorials/build-your-own-image.md)). When
+you do need to push a pulled image:
+
+```bash
+shed image pull <ref> --with-layers   # full pull (or hydrate a boot-only image)
+shed image push <ref> <dst>
+```
+
+`--with-layers` on an already-boot-only image fetches just the missing
+layer blobs (everything already present is a content-addressed no-op).
+Pre-v0.5.2 images (no erofs annotation) can't be pulled boot-only and
+require `--with-layers`.
+
+`pull` writes the image's blobs into `blobs/sha256/` and records the
+ref→digest mapping in the ref-index.
 
 ### shed image push
 
@@ -456,6 +480,13 @@ shed image push full ghcr.io/myorg/shed-vz-full:v0.5.1
 shed image push --local --output-dir ./store full ghcr.io/myorg/shed-vz-full:v0.5.1
 shed -c ./publish-server.yaml image push full ghcr.io/myorg/shed-vz-full:v0.5.1
 ```
+
+A byte-perfect push streams the layer tarballs from disk, so they must
+be present. An image that was **pulled boot-only** has none — push fails
+the layer preflight with an actionable error; re-pull it with
+`shed image pull <ref> --with-layers` first. Images you **built**
+locally (`shed image build`) already have their layers, so building and
+pushing your own image needs no extra step.
 
 Authentication uses the standard Docker credential resolution chain
 (`~/.docker/config.json` and any installed credential helpers — `docker

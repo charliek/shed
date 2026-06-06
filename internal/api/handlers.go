@@ -475,6 +475,11 @@ func mapBackendError(err error) (int, string, string) {
 	if errors.Is(err, config.ErrImageInUseSentinel) {
 		return http.StatusConflict, config.ErrImageInUse, err.Error()
 	}
+	if errors.Is(err, vmimage.ErrLayersMissing) {
+		// Pushing a boot-only image: client-recoverable (re-pull
+		// --with-layers). Preserve the actionable message.
+		return http.StatusConflict, config.ErrBackendError, err.Error()
+	}
 	if errors.Is(err, config.ErrNotSupportedSentinel) {
 		return http.StatusNotImplemented, config.ErrBackendError, err.Error()
 	}
@@ -672,7 +677,7 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		s.handlePullImageSSE(w, r, req)
 		return
 	}
-	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag, req.Platform)
+	digest, err := s.backend.PullImage(r.Context(), req.DockerRef, req.Tag, req.Platform, req.WithLayers)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
@@ -707,7 +712,7 @@ func (s *Server) handlePullImageSSE(w http.ResponseWriter, r *http.Request, req 
 	}
 	done := make(chan pullResult, 1)
 	go func() {
-		digest, err := s.backend.PullImage(ctx, req.DockerRef, req.Tag, req.Platform)
+		digest, err := s.backend.PullImage(ctx, req.DockerRef, req.Tag, req.Platform, req.WithLayers)
 		done <- pullResult{digest, err}
 	}()
 

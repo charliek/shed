@@ -171,8 +171,9 @@ suffix (e.g. ghcr.io/charliek/shed-vz-experimental:v0.4.0 → 'experimental').`,
 }
 
 var (
-	imagePullTag      string
-	imagePullPlatform string
+	imagePullTag        string
+	imagePullPlatform   string
+	imagePullWithLayers bool
 )
 
 var imagePruneCmd = &cobra.Command{
@@ -216,6 +217,7 @@ func init() {
 	imagePruneCmd.Flags().BoolVarP(&imagePruneVerbose, "verbose", "v", false, "Show individual blob digests, not just per-image rows")
 	imagePullCmd.Flags().StringVarP(&imagePullTag, "tag", "t", "", "Tag name (default: derived from docker ref)")
 	imagePullCmd.Flags().StringVar(&imagePullPlatform, "platform", "", "Platform override for multi-arch images (e.g. linux/arm64). Empty means the backend's native platform.")
+	imagePullCmd.Flags().BoolVar(&imagePullWithLayers, "with-layers", false, "Pull the full image including layer tarballs. The default is boot-only (skip layers — the host boots from the erofs blob). Required before 'shed image push' of a pulled image.")
 	imagePushCmd.Flags().BoolVar(&imagePushLocal, "local", false, "Push from the local OCI store (no shed-server required). Implied when -c is set without -s.")
 
 	imageCmd.AddCommand(imageBuildCmd)
@@ -528,7 +530,7 @@ func runImageList(_ *cobra.Command, _ []string) error {
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	// IMAGE is the Docker ref (the identity); SOURCE is config|user|dangling.
-	fmt.Fprintln(w, "IMAGE\tDIGEST\tSOURCE\tSIZE\tIN USE")
+	fmt.Fprintln(w, "IMAGE\tDIGEST\tSOURCE\tSIZE\tLAYERS\tIN USE")
 	for _, img := range resp.Images {
 		size := "-"
 		if img.SizeBytes > 0 {
@@ -542,7 +544,11 @@ func runImageList(_ *cobra.Command, _ []string) error {
 		if img.InUse {
 			inUse = "yes"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", img.Name, digest, img.Source, size, inUse)
+		layers := "full"
+		if img.BootOnly {
+			layers = "boot-only"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", img.Name, digest, img.Source, size, layers, inUse)
 	}
 	w.Flush()
 	if !jsonFlag && len(resp.Images) > 0 {
@@ -656,6 +662,9 @@ func runImageInspect(_ *cobra.Command, args []string) error {
 	if resp.Image.SizeBytes > 0 {
 		fmt.Fprintf(w, "Size:\t%s\n", formatSize(resp.Image.SizeBytes))
 	}
+	if resp.Image.BootOnly {
+		fmt.Fprintf(w, "Boot-only:\tyes (layer tarballs not present; re-pull --with-layers to push)\n")
+	}
 	fmt.Fprintf(w, "In use:\t%v\n", resp.Image.InUse)
 	if resp.Manifest.Variant != "" {
 		fmt.Fprintf(w, "Variant:\t%s\n", resp.Manifest.Variant)
@@ -705,7 +714,7 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 	// On an interactive terminal, draw a live block of per-blob bars; pipe,
 	// --json, redirected, or an old server fall back to the plain line stream.
 	onProgress, finish, wantBlob := progressSink(jsonFlag)
-	resp, err := client.PullImageWithProgress(dockerRef, tag, imagePullPlatform, wantBlob, onProgress)
+	resp, err := client.PullImageWithProgress(dockerRef, tag, imagePullPlatform, imagePullWithLayers, wantBlob, onProgress)
 	finish()
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)

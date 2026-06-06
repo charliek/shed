@@ -24,9 +24,9 @@ The three published variants are:
   and Docker registry auth work without further setup.
 - No coding agents are pinned, so you choose versions yourself without
   fighting `full`'s defaults.
-- You get layer sharing with `extensions` and `full` for free: anyone
-  who's already pulled either variant only fetches the top layer of
-  your derived image.
+- Building on a published variant means the shed-overlay boot setup,
+  kernel/initrd, and credential brokering are already in place — you only
+  add your own top layers.
 
 ## Prerequisites
 
@@ -229,19 +229,25 @@ the shed server. Authentication uses
 the shed-extensions Docker credential proxy when an `extensions`-based
 shed is running).
 
-Verify the layer stack:
+The pull is **boot-only** by default: the host boots from the prebuilt
+erofs blob, so the layer tarballs aren't downloaded (roughly half the
+bytes — see [boot-only pulls](../reference/cli.md#boot-only-by-default)).
+That's the right default for a host that just *boots* your image. The
+layers are only needed to byte-perfect **re-push a pulled image**; if you
+ever need that on this host, re-pull with `--with-layers`.
+
+Verify the manifest:
 
 ```bash
-shed image history my-image
+shed image inspect my-image
 ```
 
-You should see roughly 9–11 layers: your `RUN curl … uv …`,
+You should see roughly 9–11 layers in the manifest: your `RUN curl … uv …`,
 `RUN curl … opencode …`, the `LABEL` and any other top-of-Dockerfile
 instructions you added, then the 7-or-so layers from the parent
-`extensions` variant. The big shared layers (`ubuntu:24.04`,
-`apt-get install …`) appear with the same digest the parent uses, so on
-disk you only pay for the bytes your top-of-Dockerfile additions
-brought in.
+`extensions` variant. `shed image ls` shows the image under `LAYERS` as
+`boot-only` (the layer *blobs* weren't downloaded) and its `SIZE` is the
+on-disk footprint (erofs + kernel + initrd), not the full layer set.
 
 ## 5. Boot a shed from it
 
