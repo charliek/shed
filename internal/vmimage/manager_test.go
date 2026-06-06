@@ -25,6 +25,7 @@ func (c *testConfig) GetImagesDir() string               { return c.imagesDir }
 func (c *testConfig) GetPlatform() string                { return c.platform }
 func (c *testConfig) GetExtractKernel() bool             { return c.extractKernel }
 func (c *testConfig) GetNeedsInitrd() bool               { return c.needsInitrd }
+func (c *testConfig) GetPullConcurrency() int            { return 0 }
 
 // fakeScanner is a static RefScanner used by tests.
 type fakeScanner struct {
