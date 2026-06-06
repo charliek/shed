@@ -451,9 +451,10 @@ func (c *APIClient) TagImage(src, dst string) error {
 }
 
 // PullImage pulls a Docker reference into the blob store under the named tag.
-// platform is an optional override (e.g. "linux/arm64").
-func (c *APIClient) PullImage(dockerRef, tag, platform string) (*config.ImagePullResponse, error) {
-	body := config.ImagePullRequest{DockerRef: dockerRef, Tag: tag, Platform: platform}
+// platform is an optional override (e.g. "linux/arm64"); withLayers pulls the
+// full image (false = boot-only, the default).
+func (c *APIClient) PullImage(dockerRef, tag, platform string, withLayers bool) (*config.ImagePullResponse, error) {
+	body := config.ImagePullRequest{DockerRef: dockerRef, Tag: tag, Platform: platform, WithLayers: withLayers}
 	var resp config.ImagePullResponse
 	if err := c.doRequestWithTimeout(http.MethodPost, "/api/images/pull", body, &resp, 30*time.Minute); err != nil {
 		return nil, err
@@ -464,11 +465,11 @@ func (c *APIClient) PullImage(dockerRef, tag, platform string) (*config.ImagePul
 // PullImageWithProgress pulls a Docker reference and streams per-stage
 // progress via SSE (mirrors CreateShedWithProgress). Falls back to the
 // non-streaming PullImage path only if the server rejects the stream.
-func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, wantBlobProgress bool, onProgress func(backend.ProgressEvent)) (*config.ImagePullResponse, error) {
+func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, withLayers, wantBlobProgress bool, onProgress func(backend.ProgressEvent)) (*config.ImagePullResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	bodyData, err := json.Marshal(config.ImagePullRequest{DockerRef: dockerRef, Tag: tag, Platform: platform})
+	bodyData, err := json.Marshal(config.ImagePullRequest{DockerRef: dockerRef, Tag: tag, Platform: platform, WithLayers: withLayers})
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode request: %w", err)
 	}

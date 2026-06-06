@@ -210,8 +210,8 @@ func (b *FirecrackerBackend) TagImage(_ context.Context, src, dst string) error 
 }
 
 // PullImage pulls a Docker reference into the blob store under the named tag.
-func (b *FirecrackerBackend) PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error) {
-	return b.client.PullImage(ctx, dockerRef, tag, platform)
+func (b *FirecrackerBackend) PullImage(ctx context.Context, dockerRef, tag, platform string, withLayers bool) (string, error) {
+	return b.client.PullImage(ctx, dockerRef, tag, platform, withLayers)
 }
 
 // PushImage uploads the manifest held by tagOrDigest to dstRef.

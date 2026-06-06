@@ -129,6 +129,16 @@ alone for typical Ubuntu-rootfs content. The trade-off:
 - `shed image inspect` matches `docker manifest inspect` for the same
   reference.
 
+**Boot-only pulls.** A host boots from the erofs and never reads the
+layer tarballs, so `shed image pull` (and `shed create`) is **boot-only**
+by default — it stores the erofs + kernel + initrd but *not* the layer
+blobs, cutting on-disk cost to roughly the erofs alone (~0.5–0.7× the
+ext4). The layers are re-fetchable via `shed image pull <ref>
+--with-layers`, which is required before re-pushing a *pulled* image
+(`shed image push`). Images built locally with `shed image build` keep
+their layers, so building and pushing your own image is unaffected.
+`shed image ls` shows a boot-only image under `LAYERS` as `boot-only`.
+
 See [Layer storage optimization](../discovery/layer-storage-optimization.md)
 for design notes on reducing this further (composefs, blob-level shared
 content, cache eviction).

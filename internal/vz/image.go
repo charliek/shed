@@ -87,9 +87,9 @@ func (c *Client) TagImage(srcTagOrDigest, newTag string) error {
 // PullImage pulls a Docker ref, installs into the blob store, and tags.
 // platform is an optional override (e.g. "linux/arm64"); empty means
 // the backend's native platform.
-func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error) {
+func (c *Client) PullImage(ctx context.Context, dockerRef, tag, platform string, withLayers bool) (string, error) {
 	mgr := vmimage.NewManager(c.cfg, c.refScanner())
-	return mgr.PullImage(ctx, dockerRef, tag, platform, progressBridge(ctx))
+	return mgr.PullImage(ctx, dockerRef, tag, platform, withLayers, progressBridge(ctx))
 }
 
 // PushImage uploads the manifest currently held by tagOrDigest to the
@@ -233,6 +233,7 @@ func toConfigImageInfo(img vmimage.ImageInfo) config.ImageInfo {
 		InUse:     img.InUse,
 		Alias:     img.Alias,
 		IsDefault: img.IsDefault,
+		BootOnly:  img.BootOnly,
 	}
 }
 

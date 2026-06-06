@@ -244,6 +244,9 @@ type ImageInfo struct {
 	Alias string `json:"alias,omitempty"`
 	// IsDefault is true for the config image whose ref is default_image.
 	IsDefault bool `json:"is_default,omitempty"`
+	// BootOnly is true when the image was pulled without layer tarballs
+	// (boots fine; `shed image push` needs a `--with-layers` re-pull first).
+	BootOnly bool `json:"boot_only,omitempty"`
 }
 
 // ImageInspectResponse is returned by GET /api/images/{tag-or-digest}.
@@ -293,6 +296,11 @@ type ImagePullRequest struct {
 	// Platform is an optional override (e.g. "linux/arm64"). Empty
 	// means the server-side backend's native platform.
 	Platform string `json:"platform,omitempty"`
+	// WithLayers pulls the full image (layer tarballs included). Default
+	// (false) pulls boot-only — config + kernel + initrd + erofs only —
+	// which the host boots from without the layers. Set true (the CLI's
+	// --with-layers) when the image will be re-pushed.
+	WithLayers bool `json:"with_layers,omitempty"`
 }
 
 // ImagePushRequest is the body of POST /api/images/push.

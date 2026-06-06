@@ -92,8 +92,9 @@ type Backend interface {
 	// PullImage pulls a registry reference into the blob store and
 	// advances the named tag. platform is an optional override
 	// (e.g. "linux/arm64"); empty means the backend's native platform.
-	// Returns the manifest digest.
-	PullImage(ctx context.Context, dockerRef, tag, platform string) (string, error)
+	// withLayers pulls the full image (layer tarballs included); false
+	// pulls boot-only (no layers). Returns the manifest digest.
+	PullImage(ctx context.Context, dockerRef, tag, platform string, withLayers bool) (string, error)
 
 	// PushImage uploads the manifest currently held by tagOrDigest to
 	// the destination registry ref. Byte-perfect — original layer

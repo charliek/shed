@@ -30,6 +30,11 @@ var (
 	// ErrImageInUse is returned when trying to delete an image referenced
 	// by config or an existing shed.
 	ErrImageInUse = errors.New("image is in use")
+
+	// ErrLayersMissing is returned when an operation needs layer blobs that
+	// aren't present locally — e.g. pushing an image that was pulled
+	// boot-only. Re-pull with --with-layers to recover.
+	ErrLayersMissing = errors.New("image layers not present locally")
 )
 
 // ImageConfig provides the configuration data needed by image management operations.
@@ -61,6 +66,7 @@ type ImageInfo struct {
 	InUse       bool   // protected by a shed or snapshot reference
 	Alias       string // friendly image_aliases key (empty for user/dangling)
 	IsDefault   bool   // this image's ref is the configured default_image
+	BootOnly    bool   // pulled without layer tarballs (boots, can't push without --with-layers)
 }
 
 // Manager handles image lifecycle: ensure, list, delete, prune.
@@ -178,6 +184,10 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
 		Progress:      progress,
 		Concurrency:   m.cfg.GetPullConcurrency(),
+		// create only boots the image; it never re-pushes it, so the layer
+		// tarballs are dead weight. Pull boot-only (re-fetchable later via
+		// `shed image pull <ref> --with-layers` if a push is ever needed).
+		SkipLayers: true,
 	})
 	if err != nil {
 		return EnsureResult{}, fmt.Errorf("pulling %s from registry: %w", ref.DockerRef, err)
@@ -222,7 +232,7 @@ func (m *Manager) resolveCachedRef(ctx context.Context, imagesDir, ref string) (
 // PullImage pulls a registry reference straight to the OCI layout (no
 // Docker daemon required) and advances the named tag. Defaults to the
 // backend's native platform when platform is empty.
-func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string, progress ProgressFunc) (string, error) {
+func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string, withLayers bool, progress ProgressFunc) (string, error) {
 	if err := ValidateImageName(tag); err != nil {
 		return "", err
 	}
@@ -255,6 +265,10 @@ func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string
 		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
 		Progress:      progress,
 		Concurrency:   m.cfg.GetPullConcurrency(),
+		// Boot-only by default; --with-layers (withLayers=true) pulls the
+		// full image and, on an already-boot-only image, hydrates the missing
+		// layer blobs (present blobs are content-addressed no-ops).
+		SkipLayers: !withLayers,
 	})
 	if err != nil {
 		return "", fmt.Errorf("pulling %s from registry: %w", dockerRef, err)
@@ -388,6 +402,40 @@ func (m *Manager) resolveManifestLower(_ context.Context, imagesDir, manifestDig
 		Path:   path,
 		Digest: manifestDigest,
 	}, nil
+}
+
+// accumulateBlobSizes fills info's size fields from the on-disk blobs the
+// manifest references: present layers, the prebuilt erofs (referenced by
+// annotation, not as a layer), and the legacy ext4 cache. Absent layers
+// (a boot-only pull) are not counted and flag info.BootOnly, so SIZE always
+// reflects real on-disk usage. layerRefs (digest -> cross-manifest refcount)
+// drives the unique/shared attribution; pass nil to compute SizeBytes only.
+func accumulateBlobSizes(info *ImageInfo, imagesDir, digest string, manifest *OCIManifest, layerRefs map[string]int) {
+	for _, layer := range manifest.Layers {
+		if !BlobExists(imagesDir, layer.Digest) {
+			info.BootOnly = true
+			continue
+		}
+		info.SizeBytes += layer.Size
+		if layerRefs != nil {
+			if layerRefs[layer.Digest] <= 1 {
+				info.UniqueBytes += layer.Size
+			} else {
+				info.SharedBytes += layer.Size
+			}
+		}
+	}
+	if d := manifest.ShedRootfsErofsDigest(); d != "" && BlobExists(imagesDir, d) {
+		sz := BlobSize(imagesDir, d)
+		info.SizeBytes += sz
+		if layerRefs != nil {
+			info.UniqueBytes += sz
+		}
+	}
+	info.SizeBytes += CacheLowerSize(imagesDir, digest)
+	if layerRefs != nil {
+		info.UniqueBytes += CacheLowerSize(imagesDir, digest)
+	}
 }
 
 // ListImages returns ImageInfo entries for every known tag plus dangling
@@ -568,19 +616,7 @@ func (m *Manager) ListImages() ([]ImageInfo, error) {
 			info.Source = "dangling"
 		}
 		if mi.manifest != nil {
-			for _, layer := range mi.manifest.Layers {
-				info.SizeBytes += layer.Size
-				if layerRefs[layer.Digest] <= 1 {
-					info.UniqueBytes += layer.Size
-				} else {
-					info.SharedBytes += layer.Size
-				}
-			}
-			// The flattened lower is keyed by manifest digest and
-			// unique-per-manifest (no cross-manifest sharing for the
-			// erofs file, only for layer blobs above).
-			info.SizeBytes += CacheLowerSize(imagesDir, mi.digest)
-			info.UniqueBytes += CacheLowerSize(imagesDir, mi.digest)
+			accumulateBlobSizes(&info, imagesDir, mi.digest, mi.manifest, layerRefs)
 			if path, err := CacheLowerPath(imagesDir, mi.digest); err == nil {
 				info.Path = path
 			}
@@ -671,10 +707,7 @@ func (m *Manager) InspectImage(tagOrDigest string) (*ImageInfo, *OCIManifest, er
 		}
 		info.Source = "dangling"
 	}
-	for _, layer := range manifest.Layers {
-		info.SizeBytes += layer.Size
-	}
-	info.SizeBytes += CacheLowerSize(imagesDir, digest)
+	accumulateBlobSizes(info, imagesDir, digest, manifest, nil)
 	if path, err := CacheLowerPath(imagesDir, digest); err == nil {
 		info.Path = path
 	}
@@ -1014,10 +1047,9 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 			if info.DockerRef != "" {
 				info.Name = info.DockerRef
 			}
-			for _, layer := range m.Layers {
-				info.SizeBytes += layer.Size
-			}
-			info.SizeBytes += CacheLowerSize(imagesDir, b)
+			// Same on-disk accounting as ls/inspect: count present layers +
+			// erofs, skip absent (boot-only) layers, flag BootOnly.
+			accumulateBlobSizes(&info, imagesDir, b, m, nil)
 		}
 		candidates = append(candidates, info)
 	}
