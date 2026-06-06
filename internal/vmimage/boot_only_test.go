@@ -83,62 +83,89 @@ func bootOnlyOpts(ref, dir string, skipLayers bool) PullOptions {
 	}
 }
 
-// TestPullBootOnlySkipsLayers: a boot-only pull writes the erofs/kernel/initrd
-// (and manifest/config) but NONE of the layer tarballs.
-func TestPullBootOnlySkipsLayers(t *testing.T) {
+// TestBootOnlyPull covers the boot-only pull of an annotated (v0.5.2+) image:
+// each case shares the pushed image but pulls into its own store, then varies
+// what it does next (verify skip / hydrate / push preflight).
+func TestBootOnlyPull(t *testing.T) {
 	host := startTestRegistry(t)
 	si := pushShedImage(t, fmt.Sprintf("%s/test/bootonly:v1", host), 4)
-	dir := t.TempDir()
 
-	res, err := PullToOCILayout(context.Background(), bootOnlyOpts(si.ref, dir, true))
-	if err != nil {
-		t.Fatalf("boot-only pull: %v", err)
+	cases := []struct {
+		name  string
+		check func(t *testing.T, dir string, res *PullResult)
+	}{
+		{
+			// A boot-only pull writes erofs/kernel/initrd (+manifest/config)
+			// but NONE of the layer tarballs.
+			name: "skips layer tarballs",
+			check: func(t *testing.T, dir string, res *PullResult) {
+				for i, d := range res.LayerDigests {
+					if BlobExists(dir, d) {
+						t.Errorf("layer %d (%s) present after boot-only pull — should be skipped", i, ShortDigest(d))
+					}
+				}
+				for name, d := range map[string]string{"erofs": si.erofsDigest, "kernel": si.kernelDigest, "initrd": si.initrdDigest} {
+					if !BlobExists(dir, d) {
+						t.Errorf("%s blob %s missing after boot-only pull", name, ShortDigest(d))
+					}
+				}
+				if !BlobExists(dir, res.ConfigDigest) {
+					t.Error("config blob missing after boot-only pull")
+				}
+			},
+		},
+		{
+			// --with-layers (SkipLayers=false) re-pulls and fetches the
+			// previously-skipped layer blobs.
+			name: "with-layers hydrates the missing layers",
+			check: func(t *testing.T, dir string, res *PullResult) {
+				if _, err := PullToOCILayout(context.Background(), bootOnlyOpts(si.ref, dir, false)); err != nil {
+					t.Fatalf("--with-layers hydration pull: %v", err)
+				}
+				for i, d := range res.LayerDigests {
+					if !BlobExists(dir, d) {
+						t.Errorf("layer %d (%s) still missing after --with-layers hydration", i, ShortDigest(d))
+					}
+				}
+			},
+		},
+		{
+			// Pushing a boot-only image fails the layer preflight with the
+			// actionable ErrLayersMissing.
+			name: "push preflight errors on missing layers",
+			check: func(t *testing.T, dir string, res *PullResult) {
+				err := PushFromOCILayout(context.Background(), PushOptions{
+					Ref:            fmt.Sprintf("%s/test/push-dest:v1", host),
+					ImagesDir:      dir,
+					ManifestDigest: res.ManifestDigest,
+					Insecure:       true,
+					Progress:       func(ProgressEvent) {},
+				})
+				if !errors.Is(err, ErrLayersMissing) {
+					t.Fatalf("push of a boot-only image: got %v, want ErrLayersMissing", err)
+				}
+				if !strings.Contains(err.Error(), "--with-layers") {
+					t.Errorf("push error %q should point at --with-layers", err)
+				}
+			},
+		},
 	}
-	for i, d := range res.LayerDigests {
-		if BlobExists(dir, d) {
-			t.Errorf("layer %d (%s) present after a boot-only pull — should be skipped", i, ShortDigest(d))
-		}
-	}
-	for name, d := range map[string]string{"erofs": si.erofsDigest, "kernel": si.kernelDigest, "initrd": si.initrdDigest} {
-		if !BlobExists(dir, d) {
-			t.Errorf("%s blob %s missing after boot-only pull", name, ShortDigest(d))
-		}
-	}
-	if !BlobExists(dir, res.ConfigDigest) {
-		t.Error("config blob missing after boot-only pull")
-	}
-}
-
-// TestPullWithLayersHydrates: after a boot-only pull, a --with-layers pull
-// (SkipLayers=false) fetches the previously-skipped layer blobs.
-func TestPullWithLayersHydrates(t *testing.T) {
-	host := startTestRegistry(t)
-	si := pushShedImage(t, fmt.Sprintf("%s/test/hydrate:v1", host), 4)
-	dir := t.TempDir()
-
-	res, err := PullToOCILayout(context.Background(), bootOnlyOpts(si.ref, dir, true))
-	if err != nil {
-		t.Fatalf("boot-only pull: %v", err)
-	}
-	for _, d := range res.LayerDigests {
-		if BlobExists(dir, d) {
-			t.Fatalf("layer present before hydration")
-		}
-	}
-	// Hydrate.
-	if _, err := PullToOCILayout(context.Background(), bootOnlyOpts(si.ref, dir, false)); err != nil {
-		t.Fatalf("--with-layers hydration pull: %v", err)
-	}
-	for i, d := range res.LayerDigests {
-		if !BlobExists(dir, d) {
-			t.Errorf("layer %d (%s) still missing after --with-layers hydration", i, ShortDigest(d))
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			res, err := PullToOCILayout(context.Background(), bootOnlyOpts(si.ref, dir, true))
+			if err != nil {
+				t.Fatalf("boot-only pull: %v", err)
+			}
+			tc.check(t, dir, res)
+		})
 	}
 }
 
 // TestPullBootOnlyRejectsUnannotated: an image without the erofs annotation
 // (pre-v0.5.2 shape) can't be pulled boot-only — it would need layer
-// extraction. random.Image has no shed annotations.
+// extraction. random.Image has no shed annotations. (Kept separate from the
+// matrix above because it uses a different, un-annotated image.)
 func TestPullBootOnlyRejectsUnannotated(t *testing.T) {
 	host := startTestRegistry(t)
 	ref := pushRandomImage(t, fmt.Sprintf("%s/test/preerofs:v1", host), 2)
@@ -149,31 +176,5 @@ func TestPullBootOnlyRejectsUnannotated(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "boot-only") || !strings.Contains(err.Error(), "--with-layers") {
 		t.Errorf("error %q should mention boot-only and --with-layers", err)
-	}
-}
-
-// TestPushPreflightMissingLayers: pushing a boot-only image fails the layer
-// preflight with the actionable ErrLayersMissing.
-func TestPushPreflightMissingLayers(t *testing.T) {
-	host := startTestRegistry(t)
-	si := pushShedImage(t, fmt.Sprintf("%s/test/push:v1", host), 3)
-	dir := t.TempDir()
-
-	res, err := PullToOCILayout(context.Background(), bootOnlyOpts(si.ref, dir, true))
-	if err != nil {
-		t.Fatalf("boot-only pull: %v", err)
-	}
-	err = PushFromOCILayout(context.Background(), PushOptions{
-		Ref:            fmt.Sprintf("%s/test/push-dest:v1", host),
-		ImagesDir:      dir,
-		ManifestDigest: res.ManifestDigest,
-		Insecure:       true,
-		Progress:       func(ProgressEvent) {},
-	})
-	if !errors.Is(err, ErrLayersMissing) {
-		t.Fatalf("push of a boot-only image: got %v, want ErrLayersMissing", err)
-	}
-	if !strings.Contains(err.Error(), "--with-layers") {
-		t.Errorf("push error %q should point at --with-layers", err)
 	}
 }

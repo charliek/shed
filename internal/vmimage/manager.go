@@ -1047,10 +1047,9 @@ func (m *Manager) PruneImages(dryRun bool) ([]ImageInfo, error) {
 			if info.DockerRef != "" {
 				info.Name = info.DockerRef
 			}
-			for _, layer := range m.Layers {
-				info.SizeBytes += layer.Size
-			}
-			info.SizeBytes += CacheLowerSize(imagesDir, b)
+			// Same on-disk accounting as ls/inspect: count present layers +
+			// erofs, skip absent (boot-only) layers, flag BootOnly.
+			accumulateBlobSizes(&info, imagesDir, b, m, nil)
 		}
 		candidates = append(candidates, info)
 	}

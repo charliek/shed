@@ -390,6 +390,24 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		return nil, fmt.Errorf("manifest digest: %w", err)
 	}
 
+	// Read the boot-blob annotations and, for a boot-only pull, validate
+	// them BEFORE writing anything to the store — so a rejected pull (a
+	// pre-v0.5.2 image that would need layer extraction for kernel/initrd)
+	// doesn't leave an orphan config blob behind.
+	kernelAnn := annotationFromManifest(manifestDesc, AnnotationKernelDigest)
+	initrdAnn := annotationFromManifest(manifestDesc, AnnotationInitrdDigest)
+	erofsAnn := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest)
+	if opts.SkipLayers {
+		switch {
+		case erofsAnn == "":
+			return nil, fmt.Errorf("cannot pull %q boot-only: image has no %s annotation (built with pre-v0.5.2 tooling); re-pull with --with-layers", opts.Ref, AnnotationRootfsErofsDigest)
+		case opts.ExtractKernel && kernelAnn == "":
+			return nil, fmt.Errorf("cannot pull %q boot-only: image has no kernel annotation (the kernel would need layer extraction); re-pull with --with-layers", opts.Ref)
+		case opts.NeedsInitrd && initrdAnn == "":
+			return nil, fmt.Errorf("cannot pull %q boot-only: image has no initrd annotation (the initrd would need layer extraction); re-pull with --with-layers", opts.Ref)
+		}
+	}
+
 	// Config bytes.
 	configBytes, err := img.RawConfigFile()
 	if err != nil {
@@ -424,28 +442,8 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		layerDigests[i] = ld.String()
 	}
 
-	kernelAnn := annotationFromManifest(manifestDesc, AnnotationKernelDigest)
-	initrdAnn := annotationFromManifest(manifestDesc, AnnotationInitrdDigest)
-	erofsAnn := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest)
-
-	// Boot-only pull: skip the layer tarballs entirely. The host boots from
-	// the erofs blob and never reads layers, so they are dead weight for any
-	// host that doesn't re-push this pulled image. Only safe when the boot
-	// blobs all come from manifest annotations — without layers we can't run
-	// the legacy extract-from-layers kernel/initrd fallback — so reject
-	// pre-v0.5.2 images that lack the annotations, pointing at --with-layers.
-	if opts.SkipLayers {
-		switch {
-		case erofsAnn == "":
-			return nil, fmt.Errorf("cannot pull %q boot-only: image has no %s annotation (built with pre-v0.5.2 tooling); re-pull with --with-layers", opts.Ref, AnnotationRootfsErofsDigest)
-		case opts.ExtractKernel && kernelAnn == "":
-			return nil, fmt.Errorf("cannot pull %q boot-only: image has no kernel annotation (the kernel would need layer extraction); re-pull with --with-layers", opts.Ref)
-		case opts.NeedsInitrd && initrdAnn == "":
-			return nil, fmt.Errorf("cannot pull %q boot-only: image has no initrd annotation (the initrd would need layer extraction); re-pull with --with-layers", opts.Ref)
-		}
-	}
-
-	// Download layers (unless boot-only) + annotated loose blobs
+	// Download layers (unless boot-only — see the precondition above) +
+	// annotated loose blobs
 	// concurrently, bounded by opts.Concurrency. Per-blob writes are already
 	// atomic (file lock + content-verified rename); a singleflight keyed by
 	// digest dedups concurrent fetches of the SAME digest, so a duplicate
