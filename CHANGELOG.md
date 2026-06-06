@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.6.2 — 2026-06-06
+
+Image-pull overhaul: faster, clearer, and smaller. Pulls now download
+blobs in parallel, render Docker-style live progress, and skip the layer
+tarballs the host never boots from. **Non-breaking** — see
+`docs/upgrades/v0.6.1-to-v0.6.2.md` for the one behavior change
+(boot-only pulls).
+
+### Boot-only image pulls (#179)
+
+`shed image pull` and `shed create` now pull **boot-only** by default —
+config + kernel + initrd + erofs, but not the OCI layer tarballs (the
+host boots from the erofs and never reads them), cutting roughly 40% of
+the download and on-disk size of a typical image (measured: VZ base
+945→540 MB, FC base 539→333 MB). `--with-layers` pulls the full image or
+hydrates a boot-only one; `shed image push` of a *pulled* image needs it
+first (it fails a clear preflight, HTTP 409, otherwise). Building your
+own image is unaffected — `shed image build` produces its layers locally.
+`shed image ls` gains a `LAYERS` column (`full` / `boot-only`) and SIZE
+now reflects real on-disk usage.
+
+### Parallel blob downloads (#177)
+
+Image blobs (layers + kernel/initrd/erofs) download concurrently, bounded
+by a new `pull_concurrency` server config (default 3) — ~2× faster on a
+high-latency link. Per-digest singleflight dedup; the first error cancels
+the group; no tag advances on a partial pull.
+
+### Docker-style live progress (#174, #175, #176, #178)
+
+`shed image pull` and the pull leg of `shed create` render live per-blob
+progress bars on an interactive terminal (size, percent, ✓), backed by a
+structured byte-level progress wire format gated behind a `?progress=blob`
+opt-in (so line-mode and older clients are byte-for-byte unchanged).
+Piped / `--json` output is unchanged. Cached layers are now reported
+("already present") instead of leaving gaps in the layer counter.
+
+### Docs (#180, #181)
+
+Image pull / build / push / on-disk architecture folded into the
+[Images reference](docs/reference/images.md); new v0.6.1→v0.6.2
+[upgrade guide](docs/upgrades/v0.6.1-to-v0.6.2.md).
+
 ## v0.6.1 — 2026-06-03
 
 ### Images API: `alias` + `is_default` metadata (#171)
