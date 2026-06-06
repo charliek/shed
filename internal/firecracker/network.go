@@ -245,7 +245,7 @@ func (nm *NetworkManager) ipInUseNetlink(ip string) bool {
 	// (1) Already assigned to some host interface?
 	if addrs, err := netlink.AddrList(nil, netlink.FAMILY_V4); err == nil {
 		for _, a := range addrs {
-			if a.IPNet != nil && a.IPNet.IP.Equal(target) {
+			if a.IPNet != nil && a.IP.Equal(target) {
 				return true
 			}
 		}
