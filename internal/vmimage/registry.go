@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -26,6 +27,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // PullOptions configures a registry-direct image pull.
@@ -66,6 +69,10 @@ type PullOptions struct {
 
 	// Progress receives stage messages during the pull.
 	Progress ProgressFunc
+
+	// Concurrency caps how many blobs download in parallel. <=1 means
+	// serial. Callers should pass cfg.GetPullConcurrency().
+	Concurrency int
 }
 
 // PullResult mirrors ConvertResult so callers can use either flow.
@@ -282,6 +289,20 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		return nil, err
 	}
 
+	// The progress callback is invoked from parallel download goroutines
+	// below, so serialize it: direct callers (tests, the bulk pull-images
+	// command) may pass a non-thread-safe sink. The server's SSE sink is
+	// already channel-safe; the mutex is cheap because progress is throttled.
+	if opts.Progress != nil {
+		orig := opts.Progress
+		var progMu sync.Mutex
+		opts.Progress = func(ev ProgressEvent) {
+			progMu.Lock()
+			defer progMu.Unlock()
+			orig(ev)
+		}
+	}
+
 	keychain := opts.AuthKeychain
 	if keychain == nil {
 		keychain = authn.DefaultKeychain
@@ -362,46 +383,77 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		return nil, fmt.Errorf("image has %d layers (max %d). This image was probably built with the pre-v0.5.0 build pipeline. Pull a v0.5.0 or later tag from ghcr.io, or build locally with the consolidated Dockerfile under {vz,firecracker}/Dockerfile", len(layers), MaxLayers)
 	}
 
-	layerDigests := make([]string, 0, len(layers))
-	for i, layer := range layers {
-		ld, err := layer.Digest()
+	// Resolve every layer digest up front (cheap, from the manifest) so
+	// layerDigests keeps manifest order and the parallel workers below
+	// address it by index without racing on append.
+	layerDigests := make([]string, len(layers))
+	for i := range layers {
+		ld, err := layers[i].Digest()
 		if err != nil {
 			return nil, fmt.Errorf("layer %d digest: %w", i, err)
 		}
-		digest := ld.String()
-		layerDigests = append(layerDigests, digest)
-		if BlobExists(opts.ImagesDir, digest) {
-			// Report cached layers instead of skipping silently. Without
-			// this, the i+1/N counter leaves gaps (e.g. "1/7 … 4/7") for
-			// layers already on disk, which reads as "missing layers".
-			// Mirrors Docker's "Already exists".
-			// Emit the blob event BEFORE the verbose line: a renderer client
-			// suppresses per-layer plain lines once it has seen a blob event,
-			// so this ordering keeps the bar without a redundant header.
-			// Line-mode clients never receive the blob event (it's gated
-			// server-side), so they still get the verbose line.
-			label := fmt.Sprintf("layer %d/%d %s", i+1, len(layers), ShortDigest(digest))
-			size, _ := layer.Size()
-			emitBlob(opts.Progress, digest, label, BlobStatusExists, size, size)
-			emitStatus(opts.Progress, "image", fmt.Sprintf("Layer %d/%d %s already present", i+1, len(layers), ShortDigest(digest)))
+		layerDigests[i] = ld.String()
+	}
+
+	// Download layers + annotated loose blobs concurrently, bounded by
+	// opts.Concurrency. Per-blob writes are already atomic (file lock +
+	// content-verified rename); a singleflight keyed by digest dedups
+	// concurrent fetches of the SAME digest, so a duplicate layer never
+	// opens two network streams (and distinct digests never contend on the
+	// same blob lock). The first error cancels the group, and the manifest /
+	// index / tag are written only after a clean Wait, so a partial pull can
+	// never advance a tag.
+	//
+	// Note on cancellation: gctx cancels *scheduling* (queued goroutines
+	// don't start once a sibling fails), but the HTTP reads themselves are
+	// bound to the original ctx via remoteOpts, so an already-streaming blob
+	// finishes rather than being killed mid-read. That's acceptable — the
+	// reads are wrapped in withRetry which bails on ctx cancellation, and a
+	// few extra in-flight bytes on the error path don't matter.
+	concurrency := opts.Concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var sf singleflight.Group
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
+	for i := range layers {
+		i, layer, digest := i, layers[i], layerDigests[i]
+		g.Go(func() error {
+			return pullLayerBlob(gctx, &sf, opts, i, len(layers), digest, layer)
+		})
+	}
+
+	// Annotated loose blobs (kernel/initrd/erofs) are independent of the
+	// layers, so they download in the same group. The extract-from-layers
+	// fallbacks (no annotation) need the layers present and so run after
+	// Wait below — they must not race a still-downloading layer.
+	kernelAnn := annotationFromManifest(manifestDesc, AnnotationKernelDigest)
+	initrdAnn := annotationFromManifest(manifestDesc, AnnotationInitrdDigest)
+	erofsAnn := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest)
+	for _, lb := range []struct{ digest, label, kind string }{
+		{kernelAnn, "kernel " + ShortDigest(kernelAnn), "kernel"},
+		{initrdAnn, "initrd " + ShortDigest(initrdAnn), "initrd"},
+		{erofsAnn, "rootfs " + ShortDigest(erofsAnn), "rootfs erofs"},
+	} {
+		if lb.digest == "" {
 			continue
 		}
-		label := fmt.Sprintf("layer %d/%d %s", i+1, len(layers), ShortDigest(digest))
-		size, _ := layer.Size()
-		rc, err := layer.Compressed()
-		if err != nil {
-			return nil, fmt.Errorf("opening layer %s: %w", digest, err)
-		}
-		// Blob start before the verbose line (see the cached branch above).
-		emitBlob(opts.Progress, digest, label, BlobStatusDownloading, 0, size)
-		emitStatus(opts.Progress, "image", fmt.Sprintf("Pulling layer %d/%d %s", i+1, len(layers), ShortDigest(digest)))
-		err = streamBlobWithProgress(digest, label, size, opts.Progress, rc, func(r io.Reader) error {
-			return writeBlobFromReader(opts.ImagesDir, digest, r)
+		lb := lb
+		g.Go(func() error {
+			_, err, _ := sf.Do(lb.digest, func() (any, error) {
+				return nil, pullLooseBlob(gctx, ref, lb.digest, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, lb.label)
+			})
+			if err != nil {
+				return fmt.Errorf("pulling %s blob %s: %w", lb.kind, lb.digest, err)
+			}
+			return nil
 		})
-		rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("streaming layer %s: %w", digest, err)
-		}
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	// Write the manifest verbatim (preserves the registry digest).
@@ -409,16 +461,13 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		return nil, fmt.Errorf("writing manifest blob: %w", err)
 	}
 
-	// Fetch or extract kernel / initrd.
+	// Resolve kernel / initrd digests: an annotation means the blob was
+	// already pulled above; otherwise extract it from the now-present layers
+	// (the legacy pre-v0.5.2 fallback). This MUST stay after g.Wait() — the
+	// extraction reads layer blobs and must not race a still-downloading one.
 	var kernelDigest, initrdDigest string
-	if d := annotationFromManifest(manifestDesc, AnnotationKernelDigest); d != "" {
-		// Kernel is a sibling blob in the registry — fetch it as a
-		// loose blob (the registry doesn't surface it via Image()
-		// because it isn't a layer).
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "kernel "+ShortDigest(d)); err != nil {
-			return nil, fmt.Errorf("pulling kernel blob %s: %w", d, err)
-		}
-		kernelDigest = d
+	if kernelAnn != "" {
+		kernelDigest = kernelAnn
 	} else if opts.ExtractKernel {
 		d, err := extractKernelFromLayers(opts.ImagesDir, layerDigests)
 		if err != nil {
@@ -426,28 +475,14 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		}
 		kernelDigest = d
 	}
-	if d := annotationFromManifest(manifestDesc, AnnotationInitrdDigest); d != "" {
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "initrd "+ShortDigest(d)); err != nil {
-			return nil, fmt.Errorf("pulling initrd blob %s: %w", d, err)
-		}
-		initrdDigest = d
+	if initrdAnn != "" {
+		initrdDigest = initrdAnn
 	} else if opts.NeedsInitrd && opts.ExtractKernel {
 		d, err := extractInitrdFromLayers(opts.ImagesDir, layerDigests)
 		if err != nil {
 			return nil, fmt.Errorf("extracting initrd from layer tar: %w", err)
 		}
 		initrdDigest = d
-	}
-
-	// Pull the prebuilt rootfs erofs blob (v0.5.2+). Same loose-blob
-	// shape as kernel/initrd. When absent (older image), don't fail
-	// here — the host's EnsureImage rejects with a clearer "rebuild
-	// against v0.5.2+ tooling" error so the user knows the upgrade
-	// path. See internal/vmimage/manager.go.
-	if d := annotationFromManifest(manifestDesc, AnnotationRootfsErofsDigest); d != "" {
-		if err := pullLooseBlob(ctx, ref, d, opts.ImagesDir, opts.Insecure, remoteOpts, opts.Progress, "rootfs "+ShortDigest(d)); err != nil {
-			return nil, fmt.Errorf("pulling rootfs erofs blob %s: %w", d, err)
-		}
 	}
 
 	// Record the manifest in the top-level OCI index.
@@ -479,6 +514,45 @@ func PullToOCILayout(ctx context.Context, opts PullOptions) (*PullResult, error)
 		KernelDigest:   kernelDigest,
 		InitrdDigest:   initrdDigest,
 	}, nil
+}
+
+// pullLayerBlob downloads (or reports cached) a single layer. It emits the
+// blob event before the verbose line so a renderer client suppresses the
+// redundant per-layer line, then runs the fetch under a singleflight keyed by
+// digest so a duplicate layer is fetched exactly once.
+func pullLayerBlob(ctx context.Context, sf *singleflight.Group, opts PullOptions, i, n int, digest string, layer v1.Layer) error {
+	if err := ctx.Err(); err != nil {
+		return err // the group already failed; don't start another download
+	}
+	label := fmt.Sprintf("layer %d/%d %s", i+1, n, ShortDigest(digest))
+	if BlobExists(opts.ImagesDir, digest) {
+		size, _ := layer.Size()
+		emitBlob(opts.Progress, digest, label, BlobStatusExists, size, size)
+		emitStatus(opts.Progress, "image", fmt.Sprintf("Layer %d/%d %s already present", i+1, n, ShortDigest(digest)))
+		return nil
+	}
+	size, _ := layer.Size()
+	emitBlob(opts.Progress, digest, label, BlobStatusDownloading, 0, size)
+	emitStatus(opts.Progress, "image", fmt.Sprintf("Pulling layer %d/%d %s", i+1, n, ShortDigest(digest)))
+	_, err, _ := sf.Do(digest, func() (any, error) {
+		// Re-check under the singleflight: a duplicate layer may have just
+		// written this blob.
+		if BlobExists(opts.ImagesDir, digest) {
+			return nil, nil
+		}
+		rc, err := layer.Compressed()
+		if err != nil {
+			return nil, fmt.Errorf("opening layer %s: %w", digest, err)
+		}
+		defer rc.Close()
+		return nil, streamBlobWithProgress(digest, label, size, opts.Progress, rc, func(r io.Reader) error {
+			return writeBlobFromReader(opts.ImagesDir, digest, r)
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("streaming layer %s: %w", digest, err)
+	}
+	return nil
 }
 
 // writeBlobFromReader streams a reader through sha256 verification into

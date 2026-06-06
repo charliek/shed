@@ -167,6 +167,11 @@ type FirecrackerConfig struct {
 	// or "never" (error if not cached). Ignored for local-path images.
 	PullPolicy string `yaml:"pull_policy,omitempty"`
 
+	// PullConcurrency caps how many image blobs (layers + kernel/initrd/
+	// erofs) download in parallel during a registry pull. Defaults to
+	// DefaultPullConcurrency; must be >= 1 (1 == serial).
+	PullConcurrency int `yaml:"pull_concurrency,omitempty"`
+
 	// ImagesDir is the directory for the content-addressed image store.
 	ImagesDir string `yaml:"images_dir,omitempty"`
 
@@ -247,6 +252,11 @@ type VZConfig struct {
 	// or "never" (error if not cached). Ignored for local-path images.
 	PullPolicy string `yaml:"pull_policy,omitempty"`
 
+	// PullConcurrency caps how many image blobs (layers + kernel/initrd/
+	// erofs) download in parallel during a registry pull. Defaults to
+	// DefaultPullConcurrency; must be >= 1 (1 == serial).
+	PullConcurrency int `yaml:"pull_concurrency,omitempty"`
+
 	// ImagesDir is the directory for the content-addressed image store.
 	ImagesDir string `yaml:"images_dir,omitempty"`
 
@@ -314,6 +324,9 @@ func (c *VZConfig) GetExtractKernel() bool { return true }
 
 // GetNeedsInitrd implements vmimage.ImageConfig.
 func (c *VZConfig) GetNeedsInitrd() bool { return true }
+
+// GetPullConcurrency implements vmimage.ImageConfig.
+func (c *VZConfig) GetPullConcurrency() int { return c.PullConcurrency }
 
 // DefaultVZConfig returns a VZConfig with default values.
 //
@@ -400,6 +413,9 @@ func (c *VZConfig) applyDefaults() {
 
 	if c.PullPolicy == "" {
 		c.PullPolicy = string(vmimage.PullMissing)
+	}
+	if c.PullConcurrency < 1 {
+		c.PullConcurrency = DefaultPullConcurrency
 	}
 
 	// Default ImagesDir if not set
@@ -688,6 +704,11 @@ const (
 )
 
 // DefaultVZImagesDir is the default directory for VZ rootfs images.
+// DefaultPullConcurrency is the default number of image blobs downloaded in
+// parallel per registry pull (Docker's default). Bounded to avoid tripping
+// registry connection/rate limits.
+const DefaultPullConcurrency = 3
+
 const DefaultVZImagesDir = "~/Library/Application Support/shed/vz"
 
 // VZ validation upper bounds (decoupled from Firecracker).
@@ -753,6 +774,9 @@ func (c *FirecrackerConfig) GetExtractKernel() bool { return true }
 // (it owns overlayfs assembly + pivot_root), so an initrd blob must
 // be installed alongside every shed image regardless of backend.
 func (c *FirecrackerConfig) GetNeedsInitrd() bool { return true }
+
+// GetPullConcurrency implements vmimage.ImageConfig.
+func (c *FirecrackerConfig) GetPullConcurrency() int { return c.PullConcurrency }
 
 // ResolveImage resolves an image selector to a local path or Docker ref.
 func (c *FirecrackerConfig) ResolveImage(image string) (ResolvedImage, error) {
@@ -1325,6 +1349,9 @@ func (c *FirecrackerConfig) applyDefaults() {
 	}
 	if c.PullPolicy == "" {
 		c.PullPolicy = string(vmimage.PullMissing)
+	}
+	if c.PullConcurrency < 1 {
+		c.PullConcurrency = DefaultPullConcurrency
 	}
 
 	// Expand ~ in alias paths (only for filesystem paths, not Docker refs)

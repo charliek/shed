@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"slices"
@@ -21,9 +22,16 @@ import (
 // HTTP on loopback and returns its host:port. Reusable across pull tests
 // (cached-layer reporting, byte counting, parallel/dedup) — pulls target it
 // with PullOptions{Insecure: true}.
-func startTestRegistry(t *testing.T) string {
+func startTestRegistry(t testing.TB) string {
 	t.Helper()
-	srv := httptest.NewServer(registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+	return startTestRegistryHandler(t, registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+}
+
+// startTestRegistryHandler serves the given handler (typically a wrapped
+// registry that counts in-flight requests) and returns its host:port.
+func startTestRegistryHandler(t testing.TB, h http.Handler) string {
+	t.Helper()
+	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")
 }
@@ -31,7 +39,7 @@ func startTestRegistry(t *testing.T) string {
 // pushRandomImage builds a random image with the given number of layers and
 // pushes it to refStr (e.g. "<host>/test/img:v1") on the test registry,
 // returning the full reference string for PullToOCILayout.
-func pushRandomImage(t *testing.T, refStr string, layers int) string {
+func pushRandomImage(t testing.TB, refStr string, layers int) string {
 	t.Helper()
 	img, err := random.Image(1024, int64(layers))
 	if err != nil {

@@ -39,9 +39,10 @@ type ImageConfig interface {
 	GetImageAliases() map[string]string // alias -> ref convenience map
 	GetPullPolicy() string              // "missing" (default) | "always" | "never"
 	GetImagesDir() string
-	GetPlatform() string    // "linux/arm64" or "linux/amd64"
-	GetExtractKernel() bool // true for both VZ and Firecracker
-	GetNeedsInitrd() bool   // true for VZ, false for Firecracker
+	GetPlatform() string     // "linux/arm64" or "linux/amd64"
+	GetExtractKernel() bool  // true for both VZ and Firecracker
+	GetNeedsInitrd() bool    // true for VZ, false for Firecracker
+	GetPullConcurrency() int // max concurrent blob downloads per pull (>=1)
 }
 
 // ImageInfo describes an image known to the blob store, addressed by tag.
@@ -176,6 +177,7 @@ func (m *Manager) EnsureImage(ctx context.Context, ref ResolvedRef, progress Pro
 		ExtractKernel: m.cfg.GetExtractKernel(),
 		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
 		Progress:      progress,
+		Concurrency:   m.cfg.GetPullConcurrency(),
 	})
 	if err != nil {
 		return EnsureResult{}, fmt.Errorf("pulling %s from registry: %w", ref.DockerRef, err)
@@ -252,6 +254,7 @@ func (m *Manager) PullImage(ctx context.Context, dockerRef, tag, platform string
 		ExtractKernel: m.cfg.GetExtractKernel(),
 		NeedsInitrd:   m.cfg.GetNeedsInitrd(),
 		Progress:      progress,
+		Concurrency:   m.cfg.GetPullConcurrency(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("pulling %s from registry: %w", dockerRef, err)
