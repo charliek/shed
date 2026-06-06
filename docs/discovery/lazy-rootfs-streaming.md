@@ -28,7 +28,7 @@ the flattened erofs, never the layers).
 
 Boot path (both backends):
 
-```
+```text
 guest mounts erofs read-only  →  /dev/vdb (the whole 1.2 GB blob, local)
         +  per-shed writable upper (overlay)
         →  switch_root
@@ -277,7 +277,7 @@ lands squarely back in the complexity *category* that took three releases
 to escape. That history is the strongest argument for keeping C deferred
 and behind a high bar.
 
-#### Specific lessons carried from the v0.5.1 materializer (now deleted)
+### Specific lessons carried from the v0.5.1 materializer (now deleted)
 
 Learned the hard way building the materializer/flatten path — worth not
 re-learning if C is ever built:
