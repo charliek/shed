@@ -9,7 +9,7 @@ After=local-fs.target
 # that wait — exactly the regression PR #126 measured and avoided by
 # leaving `network-setup` as the (fast) agent gate on FC while removing
 # `shed-firstboot` from the agent's critical path. See
-# docs/discovery/platform-runtime-optimization.md §14.
+# docs/discovery/runtime-optimization-backlog.md §14.
 Before=network-online.target docker.service shed-agent.service
 Wants=network-online.target
 

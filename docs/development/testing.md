@@ -42,7 +42,7 @@ go test ./internal/firecracker/...
 
 Live create-cycle tests that drive a running `shed-server` via the `shed` CLI. The suite lives at `tests/integration/` and is the recommended path for verifying that the host-side and guest-side pieces actually fit together — boot timing, SSE events, `--repo` clone, `shed exec` round-trip, etc.
 
-Architecture: pytest + subprocess (+ Fabric reserved for remote-orchestration tasks like deploying a dev binary), managed with [`uv`](https://docs.astral.sh/uv/). The decision rationale + the full architecture is captured in `docs/discovery/platform-runtime-optimization.md` §16.
+Architecture: pytest + subprocess (+ Fabric reserved for remote-orchestration tasks like deploying a dev binary), managed with [`uv`](https://docs.astral.sh/uv/). This guide is the canonical reference for the suite's design and operation.
 
 #### Running the suite
 

@@ -8,7 +8,7 @@ suite catches **live** create-cycle regressions that need a real VM.
 Architecture: pytest + subprocess (+ Fabric later, only when needed for
 remote-orchestration tasks). Managed with [`uv`](https://docs.astral.sh/uv/).
 Background and decision rationale: see
-`docs/discovery/platform-runtime-optimization.md` §16.
+`docs/discovery/runtime-optimization-backlog.md` §16.
 
 ## Running
 

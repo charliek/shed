@@ -105,7 +105,7 @@ func (c *AgentClient) CheckHealth(ctx context.Context) error {
 // detection floor shows up directly as a 50–100 ms drop in the `agent`
 // PhaseTimer phase on every create. Verified end-to-end via the
 // integration suite (`make test-integration`); see
-// docs/discovery/platform-runtime-optimization.md §15a.
+// docs/discovery/runtime-optimization-backlog.md §15a.
 const healthPollInterval = 50 * time.Millisecond
 
 // WaitForHealth waits until the agent is healthy or the context is cancelled.

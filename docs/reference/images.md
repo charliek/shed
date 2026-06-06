@@ -138,8 +138,8 @@ a full image adds its layer tar.gz blobs (deduplicated across manifests)
 on top. `shed image ls` reports the real on-disk size and flags boot-only
 images under a `LAYERS` column. See
 [Storage Model → Disk overhead](storage-model.md#disk-overhead) and
-[Layer storage optimization](../discovery/layer-storage-optimization.md)
-for design notes.
+[Lazy rootfs streaming](../discovery/lazy-rootfs-streaming.md)
+for design notes on shrinking this further.
 
 **Layer cap.** `MaxLayers = 16`. Manifests with more than 16 layers are
 rejected at pull/load time. Shed's own variants ship 5–10 layers (`base`
@@ -176,6 +176,24 @@ big shared layers — `ubuntu:24.04` (ordinal 1) and the APT install
 (ordinal 2) — appear with the same digest in `base`, `extensions`, and
 `full`, so the underlying tar.gz blobs cost once across all three
 variants.
+
+### Known build quirks
+
+Two artifacts of the Docker/BuildKit build pipeline are worth knowing when
+reading `shed image history` or reasoning about blob sharing:
+
+- **Layer non-determinism across "identical" builds.** BuildKit's gzip/tar
+  emission is not byte-stable, so a layer intended to be identical across
+  variants (or across two builds of the same variant) can differ by a few
+  bytes and get a different digest — defeating cross-variant blob sharing
+  and causing a post-build `pull` of the published tag to re-download
+  content you already have locally. Pinning `SOURCE_DATE_EPOCH` and using
+  `BUILDKIT_INLINE_CACHE` mitigate but do not fully eliminate this.
+- **32-byte empty layers.** Stages that only set `ENV` / `LABEL` /
+  `WORKDIR` produce a 32-byte gzipped-empty-tar layer (e.g. digest
+  `sha256:4f4fb700…`, visible in the history output above). They are
+  cosmetic but pollute `shed image history` and count against the
+  `MaxLayers = 16` budget.
 
 ### Air-gap transport with `shed image save` / `shed image load`
 

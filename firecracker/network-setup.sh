@@ -40,7 +40,7 @@ echo "Configuring network: IP=$IP_ADDR, Gateway=$GATEWAY"
 # Resolve the primary non-loopback interface, re-resolving each pass until it
 # appears. Previously hardcoded to eth0; the kernel can rename the NIC
 # (e.g. eth0 -> enp0s1), so resolve dynamically with eth0 as a last-resort
-# fallback. See docs/discovery/platform-runtime-optimization.md §12.
+# fallback. See docs/discovery/runtime-optimization-backlog.md §12.
 INTERFACE=""
 for i in $(seq 1 10); do
     INTERFACE=$(ip -o link show | grep -v 'lo:' | awk -F': ' '{print $2}' | head -1)

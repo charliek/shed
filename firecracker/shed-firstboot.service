@@ -15,8 +15,9 @@ After=systemd-remount-fs.service local-fs.target
 # static IP — no DHCP wait — so network-setup stays fast and still gates the
 # agent, which means clone has the network when it runs. Decoupling firstboot
 # here is a clean ~20% plain-create win on mini3 with no --repo regression.
-# The same change on VZ is intentionally NOT applied (see §12 / §13 of
-# docs/discovery/platform-runtime-optimization.md for the measured trade-off).
+# The same change on VZ is intentionally NOT applied (see the "Guest
+# boot-ordering invariants" section of
+# docs/discovery/runtime-optimization-backlog.md for the measured trade-off).
 #
 # Hostname is still set before the keys here (key-comment correctness); it
 # may now land just after journald starts, so the first few log lines can
