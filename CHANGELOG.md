@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.6.3 — 2026-06-06
+
+Image refs that no longer need re-pinning each release; quieter,
+self-observable host-agent reconnects; and a Firecracker networking fix.
+
+### Image refs resolved from the server version (#187)
+
+`default_image` / `image_aliases`, when unset, are now synthesized from a
+release `shed-server`'s own version and resolved once at config load — so
+`create`, image-prune reachability, and `/info` all see concrete refs,
+without hand-editing pinned image tags on every upgrade.
+
+### SDK: reconnect-log dedup + connection state (#186, #182)
+
+The host-client SDK no longer logs a `WARN` on every reconnect attempt — a
+persistently-down or namespace-conflicting server used to flood the log
+(observed at 21 MB downstream in `shed-host-agent`). It now logs once on the
+down-transition and `DEBUG` while it stays down. New `HostClient.Status()`
+exposes per-namespace connection state (connected / reconnecting + reason),
+so a host agent can report its own health without scraping logs.
+
+### Firecracker: IP-conflict detection, netlink retry, TAP cleanup (#185)
+
+Hardens the Firecracker network allocation path (Linux-only): passive
+netlink-based IP-conflict detection in TAP/IP selection, netlink retry, and
+TAP cleanup.
+
+### Docs (#184)
+
+Discovery docs cut to release shape.
+
 ## v0.6.2 — 2026-06-06
 
 Image-pull overhaul: faster, clearer, and smaller. Pulls now download
