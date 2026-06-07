@@ -268,4 +268,13 @@ func TestServerConfigMountsCredentialsFallback(t *testing.T) {
 			t.Error("credentials entry should be ignored when mounts is present")
 		}
 	})
+
+	t.Run("explicit empty mounts does not fall back", func(t *testing.T) {
+		// `mounts: {}` is a non-nil empty map and means "no mounts"; it must
+		// NOT trigger the deprecated-credentials fallback.
+		cfg := load(t, base+"mounts: {}\n"+entry("credentials", "test", "/home/shed/.test")+backendYAML)
+		if _, ok := cfg.Mounts["test"]; ok {
+			t.Error("explicit empty mounts:{} should not fall back to credentials")
+		}
+	})
 }

@@ -153,6 +153,9 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 	if createLocalDir != "" {
 		resolveMountDir := func(flagName, p string) (string, error) {
+			if p == "" {
+				return "", fmt.Errorf("%s must not be empty", flagName)
+			}
 			absDir, err := filepath.Abs(p)
 			if err != nil {
 				return "", fmt.Errorf("invalid %s path %q: %w", flagName, p, err)

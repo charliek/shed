@@ -971,10 +971,14 @@ func MatchesExcludePatterns(relPath string, patterns []string) bool {
 // DefaultServerConfig returns a ServerConfig with default values.
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Name:           "shed-server",
-		HTTPPort:       8080,
-		SSHPort:        2222,
-		Mounts:         make(map[string]MountConfig),
+		Name:     "shed-server",
+		HTTPPort: 8080,
+		SSHPort:  2222,
+		// Mounts is intentionally left nil here: a nil map means the
+		// "mounts" key was absent (so the loader can fall back to the
+		// deprecated "credentials" key), whereas an explicit `mounts: {}`
+		// unmarshals to a non-nil empty map. Consumers range/len it, which
+		// are nil-safe.
 		LogLevel:       "info",
 		Terminal:       terminal.DefaultConfig(),
 		EnvVars:        make(map[string]string),
@@ -1062,11 +1066,13 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	}
 
 	// Backwards compatibility: the "credentials" config section was renamed to
-	// "mounts". Prefer "mounts"; fall back to the deprecated "credentials" key
-	// when "mounts" is absent. After this, the rest of the code reads cfg.Mounts.
-	if len(cfg.Mounts) == 0 && len(cfg.Credentials) != 0 {
+	// "mounts". Fall back to the deprecated "credentials" key only when "mounts"
+	// is entirely ABSENT (nil map). An explicitly empty `mounts: {}` is a
+	// non-nil map and means "no mounts" — it wins over a leftover credentials
+	// block. After this, the rest of the code reads cfg.Mounts.
+	if cfg.Mounts == nil {
 		cfg.Mounts = cfg.Credentials
-	} else if len(cfg.Mounts) != 0 && len(cfg.Credentials) != 0 {
+	} else if len(cfg.Credentials) != 0 {
 		fmt.Fprintf(os.Stderr, "Warning: both \"mounts\" and the deprecated \"credentials\" are set in %s; ignoring \"credentials\"\n", configPath)
 	}
 	cfg.Credentials = nil
