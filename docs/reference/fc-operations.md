@@ -16,9 +16,20 @@ shed create myproject --backend=firecracker --cpus=4 --memory=8192
 # Create from a git repository
 shed create myproject --backend=firecracker --repo=https://github.com/user/repo.git
 
-# Mount a local host directory as the workspace (requires 9P kernel support)
+# Mount a local host directory at /home/shed/<basename> (requires 9P kernel support)
 shed create myproject --backend=firecracker --local-dir ~/projects/myproject
+
+# Mount additional reference directories alongside it (valid only with --local-dir)
+shed create myproject --backend=firecracker \
+  --local-dir ~/projects/myproject \
+  --add-dir ~/projects/shared-lib
 ```
+
+`--local-dir` mounts the host directory at `/home/shed/<basename>` (the last
+path segment of the host directory) over 9P, and the shed lands there on login.
+Each `--add-dir` mounts another host directory at `/home/shed/<basename>` as a
+sibling. No two mounted directories may share a basename, dotfile basenames are
+rejected, and `--local-dir`/`--add-dir` are mutually exclusive with `--repo`.
 
 ### Starting and Stopping
 
@@ -53,16 +64,18 @@ shed delete myproject
 shed delete myproject --force
 ```
 
-## Credentials
+## Mounts
 
-All credentials configured in `server.yaml` are mounted into Firecracker VMs via 9P over the TAP bridge network. Each credential directory gets its own TCP-based 9P server. Changes are immediately visible on both sides, similar to Docker bind mounts.
+All mounts configured under the `mounts:` section of `server.yaml` are bound into Firecracker VMs via 9P over the TAP bridge network. Each mount directory gets its own TCP-based 9P server. Changes are immediately visible on both sides, similar to Docker bind mounts.
 
-Read-only credentials (`readonly: true`) are enforced as read-only at the mount level. Writable credentials (`readonly: false`) reflect changes immediately in both directions.
+The legacy `credentials:` key is still honored as a fallback when `mounts:` is absent.
 
-### Verifying Credentials
+Read-only mounts (`readonly: true`) are enforced as read-only at the mount level. Writable mounts (`readonly: false`) reflect changes immediately in both directions.
+
+### Verifying Mounts
 
 ```bash
-# Check credential directories were mounted
+# Check mount directories were bound
 shed exec myproject -- ls -la /home/shed/.claude/
 
 # Test SSH access to GitHub (with shed-extensions SSH agent forwarding)
@@ -72,7 +85,7 @@ shed exec myproject -- ssh -T git@github.com
 ### Private Repository Access
 
 For private repos, ensure:
-1. SSH credentials are configured in `server.yaml`
+1. SSH credentials are configured under `mounts:` in `server.yaml`
 2. `GIT_SSH_COMMAND` is set in your env file (`~/.shed/env`)
 
 ```bash
@@ -89,7 +102,7 @@ Shed supports automatic provisioning via `.shed/provision.yaml` in your reposito
 
 ### Provisioning Flow
 
-Provisioning hooks work the same as all backends — credentials are mounted via 9P, then hooks execute via vsock. For the full sequence of operations during create, start, stop, and delete (including when credentials and mounts are set up relative to hooks), see [Shed Lifecycle](provisioning.md#shed-lifecycle).
+Provisioning hooks work the same as all backends — mounts are bound via 9P, then hooks execute via vsock. For the full sequence of operations during create, start, stop, and delete (including when mounts are set up relative to hooks), see [Shed Lifecycle](provisioning.md#shed-lifecycle).
 
 ### Skip Provisioning
 
@@ -266,13 +279,15 @@ shed create myproject --from-snapshot pre-resize --upper-size 20G
 ```
 
 To wipe accumulated upper-layer writes without resizing, use `shed reset` —
-it deletes and re-creates the upper at its current size while leaving
-`/workspace` and the lower untouched.
+it deletes and re-creates the upper at its current size, wiping the writable
+home directory (including any cloned `--repo`) while leaving host-backed
+`--local-dir`/`--add-dir` mounts and the lower untouched.
 
 ### Backing Up a VM
 
-The writable upper plus `metadata.json` is what's per-shed. `/workspace`
-lives outside the overlay (volume- or virtiofs-backed) and is the typical
+The writable upper plus `metadata.json` is what's per-shed. Host-backed
+`--local-dir`/`--add-dir` directories (mounted under `/home/shed/<basename>`)
+live outside the overlay (volume- or 9P-backed) and are the typical
 backup target.
 
 ```bash

@@ -259,6 +259,9 @@ echo "smoke marker $(date)" > "$LOCAL_DIR/HELLO.txt"
 chmod 0755 "$LOCAL_DIR"
 chmod 0644 "$LOCAL_DIR/HELLO.txt"
 
+# --local-dir mounts the host directory at ~/<basename> inside the guest.
+WS_DIR="/home/shed/$(basename "$LOCAL_DIR")"
+
 # The `shed` CLI requires a configured server entry to know where
 # to talk to. Add a localhost entry if root's client config doesn't
 # already have one (idempotent — `shed server add` errors if the
@@ -274,7 +277,7 @@ section "Step 6: shed create"
 CREATED=true
 endsection
 
-section "Step 7: shed exec — confirm /workspace mount"
+section "Step 7: shed exec — confirm project mount"
 EXPECTED="smoke marker"
 OUTPUT=""
 # Retry briefly: `shed create` returns once the VM is Running but
@@ -286,7 +289,7 @@ OUTPUT=""
 # whole script blocked on stdin from the dead VM).
 SHED_EXEC_TIMEOUT="${SHED_EXEC_TIMEOUT:-15}"
 for attempt in 1 2 3 4 5; do
-    OUTPUT="$(timeout "${SHED_EXEC_TIMEOUT}s" "$SHED_BIN" exec "$SHED_NAME" -- cat /workspace/HELLO.txt 2>&1)" || true
+    OUTPUT="$(timeout "${SHED_EXEC_TIMEOUT}s" "$SHED_BIN" exec "$SHED_NAME" -- cat "$WS_DIR/HELLO.txt" 2>&1)" || true
     if grep -q "$EXPECTED" <<<"$OUTPUT"; then
         break
     fi
@@ -294,9 +297,9 @@ for attempt in 1 2 3 4 5; do
 done
 if ! grep -q "$EXPECTED" <<<"$OUTPUT"; then
     echo "shed exec returned (last attempt): $OUTPUT"
-    fail "shed exec — /workspace mount did not surface the test file"
+    fail "shed exec — project mount ($WS_DIR) did not surface the test file"
 fi
-echo "OK: /workspace mount carries the test file"
+echo "OK: project mount carries the test file"
 endsection
 
 section "Step 8: shed delete"
@@ -310,7 +313,7 @@ echo "  shed-server installed:     yes"
 echo "  shed-server setup:         yes"
 echo "  shed-server pull-images:   $PULL_IMAGES_RESULT"
 echo "  shed create:               yes ($SMOKE_IMAGE)"
-echo "  shed exec (/workspace):    yes"
+echo "  shed exec (project mount): yes"
 echo "  shed delete:               yes"
 echo ""
 echo "PASS"

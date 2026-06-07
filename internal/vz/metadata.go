@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/charliek/shed/internal/config"
 )
 
 // MetadataVersion is the current metadata schema version.
@@ -83,8 +85,12 @@ type Metadata struct {
 	// Repo is the optional git repository URL
 	Repo string `json:"repo,omitempty"`
 
-	// LocalDir is the host directory mounted via VirtioFS (if set)
-	LocalDir string `json:"local_dir,omitempty"`
+	// ProjectMounts are the host directories mounted via VirtioFS under the
+	// home directory (--local-dir / --add-dir).
+	ProjectMounts []config.MountConfig `json:"project_mounts,omitempty"`
+
+	// LandingDir is the directory interactive logins land in.
+	LandingDir string `json:"landing_dir,omitempty"`
 
 	// Image is the image variant name (tag) used to create this instance.
 	// Display-only; identity lives in LowerDigest.

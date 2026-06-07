@@ -144,16 +144,14 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 	execDone := make(chan struct{})
 	defer close(execDone)
 
-	// Build exec request
-	workingDir := opts.WorkingDir
-	if workingDir == "" {
-		workingDir = "/workspace"
-	}
+	// Build exec request. An empty WorkingDir is passed through; the guest
+	// agent resolves it to the shed user's home directory (it knows the
+	// real resolved home), so we don't impose a host-side default here.
 	req := agentproto.ExecRequest{
 		Cmd:        opts.Cmd,
 		Env:        opts.Env,
 		TTY:        opts.TTY,
-		WorkingDir: workingDir,
+		WorkingDir: opts.WorkingDir,
 	}
 
 	if opts.InitialSize != nil {

@@ -76,6 +76,7 @@ var (
 	createCPUs         int
 	createMemory       int
 	createLocalDir     string
+	createAddDirs      []string
 	createFromSnapshot string
 	createUpperSize    string
 	startTimeout       time.Duration
@@ -94,7 +95,8 @@ func init() {
 	createCmd.Flags().StringVar(&createBackend, "backend", "", "Backend to use: firecracker or vz (default: server default)")
 	createCmd.Flags().IntVar(&createCPUs, "cpus", 0, "Number of vCPUs (firecracker/vz only)")
 	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
-	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a local directory as the workspace (mutually exclusive with --repo)")
+	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a host directory under the home directory (at ~/<name>) and land there; mutually exclusive with --repo")
+	createCmd.Flags().StringArrayVar(&createAddDirs, "add-dir", nil, "Mount an additional host directory under the home directory (repeatable; requires --local-dir)")
 	createCmd.Flags().StringVar(&createFromSnapshot, "from-snapshot", "", "Spawn from a snapshot's rootfs (mutually exclusive with --image and --repo)")
 	createCmd.Flags().StringVar(&createUpperSize, "upper-size", "", "Logical size of the per-shed writable upper layer (e.g. 5G, 20G; default: server config)")
 
@@ -130,9 +132,12 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid memory %d: must be at least 0 MB", createMemory)
 	}
 
-	// Validate --local-dir flag
+	// Validate --local-dir / --add-dir flags
 	if createLocalDir != "" && createRepo != "" {
 		return fmt.Errorf("--local-dir and --repo are mutually exclusive")
+	}
+	if len(createAddDirs) > 0 && createLocalDir == "" {
+		return fmt.Errorf("--add-dir requires --local-dir")
 	}
 
 	// Validate --from-snapshot flag
@@ -148,21 +153,41 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if createLocalDir != "" {
-		absDir, err := filepath.Abs(createLocalDir)
+		resolveMountDir := func(flagName, p string) (string, error) {
+			absDir, err := filepath.Abs(p)
+			if err != nil {
+				return "", fmt.Errorf("invalid %s path %q: %w", flagName, p, err)
+			}
+			info, err := os.Stat(absDir)
+			if err != nil {
+				return "", fmt.Errorf("%s %q does not exist: %w", flagName, absDir, err)
+			}
+			if !info.IsDir() {
+				return "", fmt.Errorf("%s %q is not a directory", flagName, absDir)
+			}
+			if strings.Contains(absDir, ",") {
+				return "", fmt.Errorf("%s path must not contain commas (incompatible with VirtioFS device arguments)", flagName)
+			}
+			return absDir, nil
+		}
+
+		absLocal, err := resolveMountDir("--local-dir", createLocalDir)
 		if err != nil {
-			return fmt.Errorf("invalid local-dir path: %w", err)
+			return err
 		}
-		info, err := os.Stat(absDir)
-		if err != nil {
-			return fmt.Errorf("local-dir %q does not exist: %w", absDir, err)
+		createLocalDir = absLocal
+		for i, d := range createAddDirs {
+			absAdd, err := resolveMountDir("--add-dir", d)
+			if err != nil {
+				return err
+			}
+			createAddDirs[i] = absAdd
 		}
-		if !info.IsDir() {
-			return fmt.Errorf("local-dir %q is not a directory", absDir)
+
+		// Structural validation: basename uniqueness + dotfile/home-infra guard.
+		if _, _, err := config.BuildProjectMounts(createLocalDir, createAddDirs); err != nil {
+			return err
 		}
-		if strings.Contains(absDir, ",") {
-			return fmt.Errorf("local-dir path must not contain commas (incompatible with VirtioFS device arguments)")
-		}
-		createLocalDir = absDir
 	}
 
 	entry, serverName, err := getServerEntry()
@@ -216,6 +241,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		CPUs:           createCPUs,
 		MemoryMB:       createMemory,
 		LocalDir:       createLocalDir,
+		AddDirs:        createAddDirs,
 		FromSnapshot:   createFromSnapshot,
 		UpperSizeBytes: upperSizeBytes,
 	}
@@ -362,39 +388,41 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	if jsonFlag {
 		type shedJSON struct {
-			Name        string                                `json:"name"`
-			Server      string                                `json:"server"`
-			Status      string                                `json:"status"`
-			CreatedAt   time.Time                             `json:"created_at"`
-			Backend     string                                `json:"backend,omitempty"`
-			IPAddress   string                                `json:"ip_address,omitempty"`
-			CPUs        int                                   `json:"cpus,omitempty"`
-			MemoryMB    int                                   `json:"memory_mb,omitempty"`
-			Repo        string                                `json:"repo,omitempty"`
-			PID         int                                   `json:"pid,omitempty"`
-			RootfsPath  string                                `json:"rootfs_path,omitempty"`
-			LocalDir    string                                `json:"local_dir,omitempty"`
-			SSH         string                                `json:"ssh,omitempty"`
-			Uptime      string                                `json:"uptime,omitempty"`
-			LastHealthy *time.Time                            `json:"last_healthy,omitempty"`
-			StartedAt   *time.Time                            `json:"started_at,omitempty"`
-			Extensions  map[string]config.ExtensionHealthInfo `json:"extensions,omitempty"`
+			Name          string                                `json:"name"`
+			Server        string                                `json:"server"`
+			Status        string                                `json:"status"`
+			CreatedAt     time.Time                             `json:"created_at"`
+			Backend       string                                `json:"backend,omitempty"`
+			IPAddress     string                                `json:"ip_address,omitempty"`
+			CPUs          int                                   `json:"cpus,omitempty"`
+			MemoryMB      int                                   `json:"memory_mb,omitempty"`
+			Repo          string                                `json:"repo,omitempty"`
+			PID           int                                   `json:"pid,omitempty"`
+			RootfsPath    string                                `json:"rootfs_path,omitempty"`
+			ProjectMounts []config.MountConfig                  `json:"project_mounts,omitempty"`
+			LandingDir    string                                `json:"landing_dir,omitempty"`
+			SSH           string                                `json:"ssh,omitempty"`
+			Uptime        string                                `json:"uptime,omitempty"`
+			LastHealthy   *time.Time                            `json:"last_healthy,omitempty"`
+			StartedAt     *time.Time                            `json:"started_at,omitempty"`
+			Extensions    map[string]config.ExtensionHealthInfo `json:"extensions,omitempty"`
 		}
 		result := make([]shedJSON, 0, len(allSheds))
 		for _, s := range allSheds {
 			sj := shedJSON{
-				Name:       s.shed.Name,
-				Server:     s.server,
-				Status:     s.shed.Status,
-				CreatedAt:  s.shed.CreatedAt,
-				Backend:    s.shed.Backend,
-				IPAddress:  s.shed.IPAddress,
-				CPUs:       s.shed.CPUs,
-				MemoryMB:   s.shed.MemoryMB,
-				Repo:       s.shed.Repo,
-				PID:        s.shed.PID,
-				RootfsPath: s.shed.RootfsPath,
-				LocalDir:   s.shed.LocalDir,
+				Name:          s.shed.Name,
+				Server:        s.server,
+				Status:        s.shed.Status,
+				CreatedAt:     s.shed.CreatedAt,
+				Backend:       s.shed.Backend,
+				IPAddress:     s.shed.IPAddress,
+				CPUs:          s.shed.CPUs,
+				MemoryMB:      s.shed.MemoryMB,
+				Repo:          s.shed.Repo,
+				PID:           s.shed.PID,
+				RootfsPath:    s.shed.RootfsPath,
+				ProjectMounts: s.shed.ProjectMounts,
+				LandingDir:    s.shed.LandingDir,
 			}
 			if s.shed.Status == config.StatusRunning {
 				sj.SSH = shedSSHString(s.shed.Name, s.server)
@@ -491,9 +519,16 @@ func runList(cmd *cobra.Command, args []string) error {
 				fmt.Println()
 				fmt.Printf("Repo:           %s\n", s.shed.Repo)
 			}
-			if s.shed.LocalDir != "" {
+			if len(s.shed.ProjectMounts) > 0 {
 				fmt.Println()
-				fmt.Printf("Local Dir:      %s\n", s.shed.LocalDir)
+				fmt.Println("Mounts:")
+				for _, m := range s.shed.ProjectMounts {
+					fmt.Printf("  %s -> %s\n", m.Source, m.Target)
+				}
+			}
+			if s.shed.LandingDir != "" && s.shed.LandingDir != config.HomePath {
+				fmt.Println()
+				fmt.Printf("Landing Dir:    %s\n", s.shed.LandingDir)
 			}
 
 			// Runtime section
@@ -545,8 +580,11 @@ func runList(cmd *cobra.Command, args []string) error {
 				resources = fmt.Sprintf("%dMB", s.shed.MemoryMB)
 			}
 			source := valueOrDash(s.shed.Repo)
-			if s.shed.LocalDir != "" {
-				source = s.shed.LocalDir
+			if len(s.shed.ProjectMounts) > 0 {
+				source = s.shed.ProjectMounts[0].Source
+				if len(s.shed.ProjectMounts) > 1 {
+					source = fmt.Sprintf("%s (+%d)", source, len(s.shed.ProjectMounts)-1)
+				}
 			}
 			if listAll {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",

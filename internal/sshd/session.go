@@ -191,7 +191,11 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 		}
 	}
 
-	// Create the exec options.
+	// Create the exec options. WorkingDir is the shed's landing directory
+	// (the cloned repo / --local-dir mount, or the home directory) so
+	// interactive logins (console, raw ssh, VS Code Remote-SSH) and
+	// `shed exec` all start in the project directory. Empty for older sheds
+	// without a landing dir; the agent then falls back to the home directory.
 	opts := backend.ExecOptions{
 		Cmd:         cmd,
 		Stdin:       &sessionReadCloser{sess},
@@ -199,6 +203,7 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 		Stderr:      &sessionStderrWriteCloser{sess},
 		TTY:         isPTY,
 		Env:         env,
+		WorkingDir:  shed.LandingDir,
 		InitialSize: initialSize,
 		ResizeChan:  resizeChan,
 	}

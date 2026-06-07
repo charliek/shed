@@ -814,9 +814,9 @@ func TestCredentialNameValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := validCredentialName.MatchString(tt.name)
+			got := validMountName.MatchString(tt.name)
 			if got != tt.valid {
-				t.Errorf("validCredentialName.MatchString(%q) = %v, want %v", tt.name, got, tt.valid)
+				t.Errorf("validMountName.MatchString(%q) = %v, want %v", tt.name, got, tt.valid)
 			}
 		})
 	}

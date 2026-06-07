@@ -128,6 +128,50 @@ func TestCreateShed_LocalDirIsFile(t *testing.T) {
 	}
 }
 
+func TestCreateShed_AddDirsRequireLocalDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	srv := newTestServer()
+	w := postCreateShed(t, srv, config.CreateShedRequest{
+		Name:    "test-shed",
+		AddDirs: []string{tmpDir},
+	})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseErrorResponse(t, w)
+	if resp.Error.Code != config.ErrInvalidLocalDir {
+		t.Errorf("expected error code %q, got %q", config.ErrInvalidLocalDir, resp.Error.Code)
+	}
+}
+
+func TestCreateShed_AddDirsDuplicateBasename(t *testing.T) {
+	base := t.TempDir()
+	// Two distinct host directories that share a basename ("app").
+	a := filepath.Join(base, "a", "app")
+	b := filepath.Join(base, "b", "app")
+	for _, d := range []string{a, b} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	srv := newTestServer()
+	w := postCreateShed(t, srv, config.CreateShedRequest{
+		Name:     "test-shed",
+		LocalDir: a,
+		AddDirs:  []string{b},
+	})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseErrorResponse(t, w)
+	if resp.Error.Code != config.ErrInvalidLocalDir {
+		t.Errorf("expected error code %q, got %q", config.ErrInvalidLocalDir, resp.Error.Code)
+	}
+}
+
 func TestMapBackendError_UnknownImage(t *testing.T) {
 	err := fmt.Errorf("%w %q; available variants: base, default", config.ErrUnknownImageSentinel, "rust")
 	code, errCode, msg := mapBackendError(err)

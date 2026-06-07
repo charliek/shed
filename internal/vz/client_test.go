@@ -126,7 +126,7 @@ func TestNewClientCreation(t *testing.T) {
 		InstanceDir: t.TempDir(),
 	}
 	serverCfg := &config.ServerConfig{
-		Credentials: make(map[string]config.MountConfig),
+		Mounts: make(map[string]config.MountConfig),
 	}
 
 	client, err := NewClient(cfg, serverCfg, nil)

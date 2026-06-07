@@ -9,7 +9,18 @@ Provisioning works with both VM backends:
 
 ## Shed Lifecycle
 
-Understanding the full sequence of events during shed operations helps you know what's available at each stage — for example, credentials are set up before hooks run, so your install script can use SSH keys or API tokens.
+Understanding the full sequence of events during shed operations helps you know what's available at each stage — for example, mounts are set up before hooks run, so your install script can use SSH keys or API tokens.
+
+Hooks run in — and `.shed/provision.yaml` is read from — the shed's
+**landing directory** (the project directory):
+
+| Create flag | Landing directory |
+|-------------|-------------------|
+| `--repo <url>` | `/home/shed/<reponame>` (the clone target) |
+| `--local-dir <hostdir>` | `/home/shed/<basename>` (the mount point) |
+| neither | `/home/shed` |
+
+The `SHED_WORKSPACE` environment variable equals this landing directory.
 
 ### Create Sequence
 
@@ -19,9 +30,9 @@ When you run `shed create`, the following steps execute in order:
 |------|-------------|-----|
 | 1. Storage setup | Copy base rootfs to instance directory | Copy base rootfs to instance directory |
 | 2. VM start | Spawn Firecracker process, allocate TAP device and IP, wait for agent health | Spawn vfkit process, wait for agent health |
-| 3. Local-dir mount | Not supported | VirtioFS mount at `/workspace` |
-| 4. Credential setup | All credentials mounted via 9P | All credentials mounted via VirtioFS |
-| 5. Repo clone | `git clone` in `/workspace` (skipped if `--local-dir`) | Same |
+| 3. Local-dir mount | 9P mount at `/home/shed/<basename>` (plus each `--add-dir`) | VirtioFS mount at `/home/shed/<basename>` (plus each `--add-dir`) |
+| 4. Mount setup | All `mounts:` entries mounted via 9P | All `mounts:` entries mounted via VirtioFS |
+| 5. Repo clone | `git clone` into `/home/shed/<reponame>` (skipped if `--local-dir`) | Same |
 | 6. Install hook | Runs via vsock; state file marks completion | Same as Firecracker |
 | 7. Startup hook | Runs via vsock | Same as Firecracker |
 | 8. Auto-sync | Default [sync](sync.md) profile from `~/.shed/sync.yaml` runs (unless `--no-sync`) | Same |
@@ -35,8 +46,8 @@ When you run `shed start` on a stopped shed, the sequence is shorter:
 | Step | Firecracker | VZ |
 |------|-------------|-----|
 | 1. VM start | Spawn Firecracker process, wait for agent health | Spawn vfkit process, wait for agent health |
-| 2. Local-dir re-mount | Not supported | VirtioFS re-mount (mounts do not persist across VM reboots) |
-| 3. Credential refresh | All credentials re-mounted via 9P | All credentials re-mounted via VirtioFS |
+| 2. Local-dir re-mount | 9P re-mount (mounts do not persist across VM reboots) | VirtioFS re-mount (mounts do not persist across VM reboots) |
+| 3. Mount refresh | All `mounts:` entries re-mounted via 9P | All `mounts:` entries re-mounted via VirtioFS |
 | 4. Startup hook | Runs (install hook skipped — state file records it already ran) | Same |
 
 No storage setup, repo clone, install hook, or auto-sync on start.
@@ -57,11 +68,11 @@ No storage setup, repo clone, install hook, or auto-sync on start.
 
 | Feature | Firecracker | VZ |
 |---------|-------------|-----|
-| Credential mechanism | 9P mount | VirtioFS mount |
-| Local-dir support | Not supported | VirtioFS |
+| Mount mechanism | 9P mount | VirtioFS mount |
+| Local-dir / add-dir support | 9P | VirtioFS |
 | Shutdown hook | Supported | Supported |
-| Credential live sync | Automatic via 9P | Automatic via VirtioFS |
-| Workspace persistence | Rootfs image (survives stop/start) | Rootfs image (survives stop/start) |
+| Mount live sync | Automatic via 9P | Automatic via VirtioFS |
+| Home-directory persistence | Rootfs image (survives stop/start) | Rootfs image (survives stop/start) |
 
 ### Error Handling
 
@@ -70,8 +81,8 @@ Not all failures during create are fatal:
 | Step | On failure |
 |------|-----------|
 | Storage setup, VM start, agent health check | **Fatal** — create fails, resources cleaned up |
-| Local-dir mount (VZ) | **Fatal** — VM stopped, create fails |
-| Credential setup | Warning logged, create continues |
+| Local-dir mount | **Fatal** — VM stopped, create fails |
+| Mount setup | Warning logged, create continues |
 | Repo clone | Warning logged, create continues |
 | Provisioning hooks | Warning logged, create continues |
 | Auto-sync | Warning logged, create continues |
@@ -94,7 +105,11 @@ env:
 
 ### Provision File Location
 
-Place `.shed/provision.yaml` in your repository root. Shed detects and executes it automatically.
+Place `.shed/provision.yaml` in your repository root. Shed reads it from
+the shed's landing directory — `/home/shed/<reponame>` for `--repo`,
+`/home/shed/<basename>` for `--local-dir`, otherwise `/home/shed` — and
+hooks execute from that same directory. Shed detects and executes it
+automatically.
 
 ### Fields
 
@@ -273,7 +288,7 @@ Shed sets these variables automatically:
 |----------|-------------|
 | `SHED_CONTAINER` | Always `true` in shed containers |
 | `SHED_NAME` | Shed name (e.g., `myproject`) |
-| `SHED_WORKSPACE` | Workspace path (`/workspace`) |
+| `SHED_WORKSPACE` | The shed's landing directory — `/home/shed/<reponame>` for `--repo`, `/home/shed/<basename>` for `--local-dir`, otherwise `/home/shed` |
 
 Add custom variables in `provision.yaml`:
 

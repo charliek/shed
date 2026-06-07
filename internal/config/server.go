@@ -20,17 +20,23 @@ import (
 	"github.com/charliek/shed/internal/vmimage"
 )
 
-// validCredentialName matches names starting with an alphanumeric character,
-// followed by alphanumerics, underscores, or hyphens. Credential names are
-// used as VirtioFS mount tags (cred-{name}), so they must not contain spaces,
+// validMountName matches names starting with an alphanumeric character,
+// followed by alphanumerics, underscores, or hyphens. Mount names are
+// used as VirtioFS/9P mount tags (cred-{name}), so they must not contain spaces,
 // commas, or other special characters.
-var validCredentialName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
+var validMountName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 
 // ServerConfig represents the server-side configuration.
 type ServerConfig struct {
-	Name        string                 `yaml:"name"`
-	HTTPPort    int                    `yaml:"http_port"`
-	SSHPort     int                    `yaml:"ssh_port"`
+	Name     string `yaml:"name"`
+	HTTPPort int    `yaml:"http_port"`
+	SSHPort  int    `yaml:"ssh_port"`
+	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
+	// ~/.config/gh). This was previously named "credentials".
+	Mounts map[string]MountConfig `yaml:"mounts"`
+	// Credentials is the deprecated alias for Mounts. When "mounts" is unset
+	// it is used as a fallback (see LoadServerConfigFromPath). Remove in a
+	// future release.
 	Credentials map[string]MountConfig `yaml:"credentials"`
 	EnvFile     string                 `yaml:"env_file"`
 	LogLevel    string                 `yaml:"log_level"`
@@ -929,12 +935,14 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 	}
 }
 
-// MountConfig represents a bind mount configuration.
+// MountConfig represents a bind mount configuration. JSON tags are present so
+// it serializes cleanly when embedded in shed metadata and API responses
+// (config.Shed.ProjectMounts); the yaml tags drive server-config parsing.
 type MountConfig struct {
-	Source   string   `yaml:"source"`
-	Target   string   `yaml:"target"`
-	ReadOnly bool     `yaml:"readonly"`
-	Exclude  []string `yaml:"exclude,omitempty"`
+	Source   string   `yaml:"source" json:"source,omitempty"`
+	Target   string   `yaml:"target" json:"target,omitempty"`
+	ReadOnly bool     `yaml:"readonly" json:"readonly,omitempty"`
+	Exclude  []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
 }
 
 // MatchesExclude reports whether the given relative path matches any of the
@@ -966,7 +974,7 @@ func DefaultServerConfig() *ServerConfig {
 		Name:           "shed-server",
 		HTTPPort:       8080,
 		SSHPort:        2222,
-		Credentials:    make(map[string]MountConfig),
+		Mounts:         make(map[string]MountConfig),
 		LogLevel:       "info",
 		Terminal:       terminal.DefaultConfig(),
 		EnvVars:        make(map[string]string),
@@ -1053,6 +1061,16 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
+	// Backwards compatibility: the "credentials" config section was renamed to
+	// "mounts". Prefer "mounts"; fall back to the deprecated "credentials" key
+	// when "mounts" is absent. After this, the rest of the code reads cfg.Mounts.
+	if len(cfg.Mounts) == 0 && len(cfg.Credentials) != 0 {
+		cfg.Mounts = cfg.Credentials
+	} else if len(cfg.Mounts) != 0 && len(cfg.Credentials) != 0 {
+		fmt.Fprintf(os.Stderr, "Warning: both \"mounts\" and the deprecated \"credentials\" are set in %s; ignoring \"credentials\"\n", configPath)
+	}
+	cfg.Credentials = nil
+
 	// Apply defaults for zero values
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
@@ -1069,11 +1087,11 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 	cfg.normalizeBackends()
 
-	// Expand and validate paths in credentials
-	for name, mount := range cfg.Credentials {
-		// Credential names must be safe for use as VirtioFS mount tags
-		if !validCredentialName.MatchString(name) {
-			return nil, fmt.Errorf("credential name %q must contain only alphanumeric characters, underscores, and hyphens", name)
+	// Expand and validate paths in mounts
+	for name, mount := range cfg.Mounts {
+		// Mount names must be safe for use as VirtioFS/9P mount tags
+		if !validMountName.MatchString(name) {
+			return nil, fmt.Errorf("mount name %q must contain only alphanumeric characters, underscores, and hyphens", name)
 		}
 
 		source := filepath.Clean(ExpandPath(mount.Source))
@@ -1081,25 +1099,25 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 		// Source must be an absolute path
 		if !filepath.IsAbs(source) {
-			return nil, fmt.Errorf("credential %q source must be an absolute path: %s", name, mount.Source)
+			return nil, fmt.Errorf("mount %q source must be an absolute path: %s", name, mount.Source)
 		}
 
 		// Target must be an absolute path
 		if !filepath.IsAbs(target) {
-			return nil, fmt.Errorf("credential %q target must be an absolute path: %s", name, mount.Target)
+			return nil, fmt.Errorf("mount %q target must be an absolute path: %s", name, mount.Target)
 		}
 
 		// Source paths with commas break vfkit VirtioFS device arguments
 		if strings.Contains(source, ",") {
-			return nil, fmt.Errorf("credential %q source path must not contain commas: %s", name, source)
+			return nil, fmt.Errorf("mount %q source path must not contain commas: %s", name, source)
 		}
 
-		// Credential sources must be directories. Single-file credentials are
-		// no longer supported — use shed sync for individual files instead.
+		// Mount sources must be directories. Single-file mounts are
+		// not supported — use shed sync for individual files instead.
 		// Missing sources are OK (skipped at runtime with a warning).
 		if info, err := os.Stat(source); err == nil && !info.IsDir() {
 			return nil, fmt.Errorf(
-				"credential %q source %s is a file, not a directory; "+
+				"mount %q source %s is a file, not a directory; "+
 					"single-file configs use `shed sync` instead — "+
 					"append to ~/.shed/sync.yaml:\n\n"+
 					"  features:\n"+
@@ -1114,7 +1132,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 		mount.Source = source
 		mount.Target = target
-		cfg.Credentials[name] = mount
+		cfg.Mounts[name] = mount
 	}
 
 	// Load environment file if specified

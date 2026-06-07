@@ -102,7 +102,7 @@ the [upgrade cookbook](../reference/images.md#cookbook-upgrading-image-versions)
 
 ## 4. Configure
 
-Edit `/etc/shed/server.yaml` to configure credentials and extensions:
+Edit `/etc/shed/server.yaml` to configure mounts and extensions:
 
 ```yaml
 name: my-server
@@ -113,8 +113,10 @@ ssh_port: 2222
 default_backend: firecracker
 log_level: info
 
-# Credentials to mount into VMs via 9P
-credentials:
+# Host directories to mount into VMs via 9P (map of name -> {source, target, readonly}).
+# The older `credentials:` key is still honored as a fallback when `mounts:`
+# is absent, but `mounts:` is preferred.
+mounts:
   claude:
     source: /root/.shed/mounts/claude
     target: /home/shed/.claude
@@ -460,7 +462,7 @@ Firecracker is spawned as a child process, and Linux capabilities don't inherit 
 
 ## 9P Kernel Configuration
 
-The `--local-dir` flag and directory credential mounts use the 9P filesystem protocol over the TAP bridge network. This requires the following kernel configuration options to be built into the guest kernel:
+The `--local-dir` and `--add-dir` flags and `mounts:` directory mounts use the 9P filesystem protocol over the TAP bridge network (each `--local-dir`/`--add-dir` host directory is mounted at `/home/shed/<basename>` in the guest). This requires the following kernel configuration options to be built into the guest kernel:
 
 ```
 CONFIG_NET_9P=y
@@ -483,7 +485,7 @@ If the output includes `nodev	9p`, the kernel has 9P support.
 
 ### Server restart does not recover 9P mounts
 
-If `shed-server` restarts while VMs with `--local-dir` or directory credential mounts are running, the 9P servers are not automatically restarted. Running VMs will have stale mounts that return I/O errors. Recovery requires stopping and starting the affected sheds:
+If `shed-server` restarts while VMs with `--local-dir`/`--add-dir` or `mounts:` directory mounts are running, the 9P servers are not automatically restarted. Running VMs will have stale mounts that return I/O errors. Recovery requires stopping and starting the affected sheds:
 
 ```bash
 shed stop myproject

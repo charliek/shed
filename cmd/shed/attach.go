@@ -61,7 +61,8 @@ func runAttach(cmd *cobra.Command, args []string) error {
 
 	// Ensure the shed is running (auto-start if stopped)
 	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
-	if _, err := ensureRunningShed(client, name); err != nil {
+	shed, err := ensureRunningShed(client, name)
+	if err != nil {
 		return err
 	}
 
@@ -85,6 +86,15 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	// Build SSH command with tmux
 	knownHostsPath := config.GetKnownHostsPath()
 
+	// Start the session in the shed's landing directory (cloned repo,
+	// --local-dir mount, or the home directory). Older sheds without a
+	// landing dir fall back to the home directory. The path is shell-quoted
+	// because mount basenames may contain spaces.
+	landingDir := shed.LandingDir
+	if landingDir == "" {
+		landingDir = config.HomePath
+	}
+
 	// Build the tmux command to run on the remote
 	// -s: session name
 	// -c: start directory
@@ -92,10 +102,10 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	var tmuxCmd string
 	if attachNewFlag {
 		// Without -A: tmux will fail if session already exists (extra safety)
-		tmuxCmd = fmt.Sprintf("tmux new-session -s %s -c /workspace", attachSessionFlag)
+		tmuxCmd = fmt.Sprintf("tmux new-session -s %s -c %s", attachSessionFlag, shellQuoteArg(landingDir))
 	} else {
 		// With -A: attach to existing session or create new one
-		tmuxCmd = fmt.Sprintf("tmux new-session -A -s %s -c /workspace", attachSessionFlag)
+		tmuxCmd = fmt.Sprintf("tmux new-session -A -s %s -c %s", attachSessionFlag, shellQuoteArg(landingDir))
 	}
 
 	sshArgs := []string{

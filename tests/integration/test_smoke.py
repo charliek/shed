@@ -110,9 +110,10 @@ def test_repo_clone_https(shed_server, test_shed_name):
             f"server reported err={handle.timings.error!r}"
         )
 
+    # --repo clones into ~/<reponame>; octocat/Hello-World -> ~/Hello-World.
     r = shed_server.exec(
         test_shed_name,
-        ["git", "-C", "/workspace", "rev-parse", "HEAD"],
+        ["git", "-C", "/home/shed/Hello-World", "rev-parse", "HEAD"],
     )
     assert r.returncode == 0, (
         f"`git rev-parse HEAD` in guest failed: exit={r.returncode} stderr={r.stderr!r}"

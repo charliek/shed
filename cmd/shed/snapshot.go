@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -194,8 +195,8 @@ func runSnapshotInfo(cmd *cobra.Command, args []string) error {
 	if snap.SourceImage != "" {
 		fmt.Printf("Source image:   %s\n", snap.SourceImage)
 	}
-	if snap.SourceLocalDir != "" {
-		fmt.Printf("Source local:   %s (NOT included in snapshot)\n", snap.SourceLocalDir)
+	if len(snap.SourceLocalDirs) > 0 {
+		fmt.Printf("Source mounts:  %s (NOT included in snapshot)\n", strings.Join(snap.SourceLocalDirs, ", "))
 	}
 	fmt.Printf("Size:           %s\n", formatSize(snap.SizeBytes))
 	fmt.Printf("Created:        %s\n", snap.CreatedAt.Format("2006-01-02 15:04:05"))

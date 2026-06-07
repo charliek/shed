@@ -493,7 +493,7 @@ ENV PATH="/home/shed/.cargo/bin:${PATH}"
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 USER root
-WORKDIR /workspace
+WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
 ```
 
@@ -676,9 +676,11 @@ To upgrade from a v2 install:
 3. Install the new release.
 4. Restart the server and re-pull images.
 
-Workspace data under `--local-dir` mounts is unaffected. Workspace data
-that lived only inside the deleted upper layers is lost, by design — the
-upper layer is per-shed scratch space, not durable storage.
+Host-backed `--local-dir`/`--add-dir` mounts (bound under
+`/home/shed/<basename>`) are unaffected. Data that lived only inside the
+deleted upper layers — including a cloned `--repo` and anything written
+under `/home/shed` — is lost, by design: the upper layer is per-shed
+scratch space, not durable storage.
 
 ## Disk Space
 

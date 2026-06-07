@@ -593,7 +593,8 @@ func TestExecWorkingDir(t *testing.T) {
 
 	client := NewAgentClient(dialer, 1024, 1026)
 
-	// Test default working dir
+	// An empty working dir is passed through verbatim; the guest agent
+	// resolves it to the shed user's home directory.
 	opts := backend.ExecOptions{
 		Cmd: []string{"ls"},
 		TTY: false,
@@ -601,8 +602,8 @@ func TestExecWorkingDir(t *testing.T) {
 	if err := client.Exec(context.Background(), opts); err != nil {
 		t.Fatalf("Exec() error = %v", err)
 	}
-	if receivedReq.WorkingDir != "/workspace" {
-		t.Errorf("default WorkingDir = %q, want %q", receivedReq.WorkingDir, "/workspace")
+	if receivedReq.WorkingDir != "" {
+		t.Errorf("default WorkingDir = %q, want %q (pass-through)", receivedReq.WorkingDir, "")
 	}
 
 	// Test custom working dir

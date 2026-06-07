@@ -132,9 +132,9 @@ brews:
             default_backend: vz
             log_level: info
 
-            # Credentials to mount into VMs
+            # Host directories to mount into every shed (formerly "credentials")
             # Using ~/.shed/mounts/ keeps host and VM configs separate.
-            # credentials:
+            # mounts:
             #   claude:
             #     source: ~/.shed/mounts/claude
             #     target: /home/shed/.claude
@@ -201,9 +201,9 @@ brews:
             default_backend: firecracker
             log_level: info
 
-            # Credentials to mount into VMs
+            # Host directories to mount into every shed (formerly "credentials")
             # Using ~/.shed/mounts/ keeps host and VM configs separate.
-            # credentials:
+            # mounts:
             #   claude:
             #     source: ~/.shed/mounts/claude
             #     target: /home/shed/.claude

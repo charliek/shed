@@ -142,7 +142,7 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - **Tests**: Table-driven tests with `t.Run()`. Place `_test.go` files alongside source.
 - **Build tags**: `linux` for Firecracker code, `darwin` for VZ code, `e2e` for Firecracker VM tests (requires KVM)
 - **Config types**: All in `internal/config/types.go`
-- **Workspace path**: `/workspace` inside VMs (see `config.WorkspacePath`)
+- **Home-rooted workspaces**: everything lives under the shed user's home dir `/home/shed` (`config.HomePath`). `--repo` clones into `~/<reponame>`; `--local-dir` mounts a host dir at `~/<basename>` and becomes the landing dir; `--add-dir` (repeatable, requires `--local-dir`) mounts additional host dirs at `~/<basename>` each. Interactive logins land in the shed's `LandingDir` (project dir, or `~` by default). There is no `/workspace` (removed in the home-rooted-workspaces change).
 - **VM user**: `shed` (UID 1000) with passwordless sudo
 
 ## `shed exec` semantics and the SSH command channel
@@ -166,7 +166,7 @@ This convention is documented end-user-style in `docs/reference/cli.md` under `s
 | Backend | Platform | Isolation | Workspace |
 |---------|----------|-----------|-----------|
 | Firecracker | Linux (KVM) | microVM | Rootfs ext4 image |
-| VZ | macOS (Apple Silicon) | VM via vfkit | Rootfs ext4 or VirtioFS (`--local-dir`) |
+| VZ | macOS (Apple Silicon) | VM via vfkit | Overlay rootfs; host dirs via VirtioFS (`--local-dir`/`--add-dir`) |
 
 The server config `default_backend` supports `vz`, `firecracker`, or `detect` (auto-selects based on platform).
 

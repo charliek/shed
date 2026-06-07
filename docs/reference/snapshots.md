@@ -14,16 +14,19 @@ Snapshots are useful for:
 
 ## What is captured
 
-A snapshot is an offline (Tier 1) clone of the rootfs only:
+A snapshot is an offline (Tier 1) clone of the rootfs only, which includes the
+per-shed writable upper (the `/home/shed` home directory):
 
-- ✅ Captured: everything in the rootfs — installed packages, system config,
-  home-directory dotfiles, files outside the workspace mount.
+- ✅ Captured: everything in the rootfs and writable upper — installed packages,
+  system config, the home directory under `/home/shed` (including any cloned
+  `--repo` and home-directory dotfiles).
 - ❌ Not captured: in-memory state (running processes, tmux sessions, page
-  cache); host-side mounts (`--local-dir` workspace contents, credential
-  syncs).
-- ⚠️  If the source shed used `--local-dir`, the workspace is mounted from
-  the host, so its contents are not in the rootfs. The CLI surfaces this as a
-  warning at create time.
+  cache); host-backed mounts (`--local-dir`/`--add-dir` directory contents,
+  configured `mounts:` syncs). These live outside the overlay, under
+  `/home/shed/<basename>`.
+- ⚠️  If the source shed used `--local-dir`/`--add-dir`, each host-backed
+  directory is mounted from the host, so its contents are not in the rootfs.
+  The CLI surfaces this as a warning at create time.
 
 ## Commands
 
@@ -75,13 +78,13 @@ across snapshot-spawned sheds.
 |---|---|
 | Source shed must be stopped | `shed snapshot create` errors with a `stop the shed first` message otherwise. |
 | Same backend only | A VZ snapshot can only spawn VZ sheds; a Firecracker snapshot only Firecracker. The CLI surfaces this as a clear error. |
-| `--from-snapshot` is mutually exclusive with `--image` and `--repo` | The snapshot rootfs is the source of truth. `--local-dir` and credential mounts are still allowed because they are runtime mounts. |
+| `--from-snapshot` is mutually exclusive with `--image` and `--repo` | The snapshot rootfs is the source of truth. `--local-dir`/`--add-dir` and configured `mounts:` are still allowed because they are runtime mounts. |
 | Snapshot rootfs is immutable | Stored mode `0444`. Spawned sheds get a writable (`0644`) copy via reflink. |
 
 ## `--from-snapshot` combined with `--local-dir`
 
 These compose. `--from-snapshot` selects the rootfs; `--local-dir` is a
-runtime VirtioFS / 9P mount that overlays the workspace path inside the VM.
+runtime VirtioFS / 9P mount bound at `/home/shed/<basename>` inside the VM.
 Both can be set at the same time:
 
 ```bash
@@ -89,11 +92,10 @@ shed create work --from-snapshot baseline-v1 --local-dir /Users/me/proj
 ```
 
 In that example the rootfs is the snapshot's (so installed tools / dotfiles
-are present) but `/workspace` inside the VM is the host's `/Users/me/proj`,
-not whatever the snapshot's rootfs had at `/workspace`. If the source shed
-also used `--local-dir`, the snapshot's `/workspace` is whatever the rootfs
-held *before* the local dir was first mounted — typically empty — so the
-overlay behavior matches what you'd intuitively expect.
+are present) but `/home/shed/proj` inside the VM is the host's `/Users/me/proj`,
+not whatever the snapshot's rootfs held at that path. The host mount overlays
+the captured home directory at that one basename; the rest of `/home/shed`
+comes from the snapshot.
 
 ## Storage layout
 

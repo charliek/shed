@@ -181,10 +181,10 @@ type BackendCreator interface {
 	// as a unit.
 	FinalizeStartedVM(ctx context.Context, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
 
-	// MountLocalDir mounts the requested `--local-dir` into the
-	// guest's `/workspace` via the backend's transport (VirtioFS
-	// on VZ, 9P on FC). No-op return nil when `req.LocalDir` is
-	// empty.
+	// MountLocalDir mounts the requested project directories
+	// (--local-dir / --add-dir) under the guest's home directory via
+	// the backend's transport (VirtioFS on VZ, 9P on FC). No-op
+	// return nil when there are no project mounts.
 	MountLocalDir(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) error
 
 	// SetupCredentials mounts any configured credentials into the

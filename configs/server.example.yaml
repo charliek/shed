@@ -17,10 +17,11 @@ ssh_port: 2222
 # "detect" picks vz on macOS Apple Silicon and firecracker on Linux.
 default_backend: detect
 
-# Credentials to mount into VMs
+# Host directories to mount into every shed (formerly "credentials")
 # Each entry creates a directory mount from host to VM
 # Paths support ~ expansion
-credentials:
+# (The deprecated key "credentials" is still accepted as a fallback.)
+mounts:
   claude:
     source: ~/.claude
     target: /home/shed/.claude

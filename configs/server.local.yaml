@@ -9,7 +9,7 @@ http_port: 8080
 ssh_port: 2222
 
 
-credentials:
+mounts:
   # Claude Code - credentials and settings
   claude:
     source: /home/charliek/.shed/mounts/claude

@@ -101,11 +101,11 @@ The diagrams below show the internal implementation flow for each backend.
         Server->>VM: Spawn Firecracker process
         Server->>Agent: Wait for agent health (poll vsock:1026)
         Agent-->>Server: Healthy
-        alt local-dir specified
+        alt local-dir / add-dir specified
             Server->>Server: Start 9P TCP server on bridge IP
-            Server->>Agent: Mount 9P share at /workspace
+            Server->>Agent: Mount 9P shares at /home/shed/<basename>
         end
-        Server->>Agent: Mount 9P credential directories
+        Server->>Agent: Mount 9P configured directories (mounts)
         alt repo specified
             Server->>Agent: git clone via vsock exec
         end
@@ -128,13 +128,13 @@ The diagrams below show the internal implementation flow for each backend.
         CLI->>Server: POST /api/sheds {name, repo, local_dir}
         Server->>Server: Copy base rootfs to instance dir
         Server->>vfkit: Spawn vfkit with VirtioFS devices
-        Note right of vfkit: Devices: rootfs, local-dir share,<br/>credential directory shares
+        Note right of vfkit: Devices: rootfs, local-dir / add-dir shares,<br/>configured mount shares
         Server->>Agent: Wait for agent health (poll vsock:1026)
         Agent-->>Server: Healthy
-        alt local-dir specified
-            Server->>Agent: Mount VirtioFS share at /workspace
+        alt local-dir / add-dir specified
+            Server->>Agent: Mount VirtioFS shares at /home/shed/<basename>
         end
-        Server->>Agent: Mount VirtioFS credential directories
+        Server->>Agent: Mount VirtioFS configured directories (mounts)
         alt repo specified
             Server->>Agent: git clone via vsock exec
         end
@@ -145,13 +145,13 @@ The diagrams below show the internal implementation flow for each backend.
         CLI->>CLI: Auto-sync default profile via SSH+tar
     ```
 
-### Credential Mechanisms
+### Mount Mechanisms
 
-Each backend handles credentials differently based on its isolation model. All credentials must be directories.
+The server-config `mounts:` section (which falls back to the deprecated `credentials:` key when absent) binds host directories into each VM. Each backend handles them differently based on its isolation model. All mount sources must be directories.
 
-**Firecracker** — Credentials are mounted via 9P over the TAP bridge network. Each credential directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
+**Firecracker** — Mounts are bound via 9P over the TAP bridge network. Each mount directory gets a TCP-based 9P server on the bridge IP. Changes are immediately visible on both sides.
 
-**VZ** — Credentials are mounted via VirtioFS. Each credential directory gets a VirtioFS share added as a vfkit device argument at VM launch, then mounted inside the guest. Changes are immediately visible on both sides.
+**VZ** — Mounts are bound via VirtioFS. Each mount directory gets a VirtioFS share added as a vfkit device argument at VM launch, then mounted inside the guest. Changes are immediately visible on both sides.
 
 ### SSH Connection
 

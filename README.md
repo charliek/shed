@@ -295,14 +295,16 @@ ssh_port: 2222
 # Auto-detect backend: vz on macOS, firecracker on Linux
 default_backend: detect
 
-credentials:
+# Host directories mounted into every shed (the deprecated key
+# "credentials" is still accepted as a fallback).
+mounts:
   ssh:
     source: ~/.ssh
     target: /home/shed/.ssh
     readonly: true
-  gitconfig:
-    source: ~/.gitconfig
-    target: /home/shed/.gitconfig
+  gh:
+    source: ~/.config/gh
+    target: /home/shed/.config/gh
     readonly: true
 env_file: ~/.shed/env
 

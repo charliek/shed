@@ -197,9 +197,10 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", consoleLogPath),
 	)
 
-	// Add VirtioFS shared directory if a local dir is configured
-	if vm.meta.LocalDir != "" {
-		args = append(args, "--device", fmt.Sprintf("virtio-fs,sharedDir=%s,mountTag=%s", vm.meta.LocalDir, config.VirtioFSMountTag))
+	// Add VirtioFS shared directories for project mounts (--local-dir / --add-dir)
+	for _, m := range vm.meta.ProjectMounts {
+		tag := config.ProjectMountTagForTarget(m.Target)
+		args = append(args, "--device", fmt.Sprintf("virtio-fs,sharedDir=%s,mountTag=%s", m.Source, tag))
 	}
 
 	// Add VirtioFS shared directories for credential mounts

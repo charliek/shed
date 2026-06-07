@@ -21,7 +21,7 @@ func TestNewCredentialManager_NilConfig(t *testing.T) {
 
 func TestNewCredentialManager_EmptyCredentials(t *testing.T) {
 	serverCfg := &config.ServerConfig{
-		Credentials: map[string]config.MountConfig{},
+		Mounts: map[string]config.MountConfig{},
 	}
 
 	cm := NewCredentialManager(serverCfg, nil, "test", nil)
@@ -49,7 +49,7 @@ func TestCredentialManager_Close(t *testing.T) {
 
 func TestCredentialManager_CloseWithEmptyListeners(t *testing.T) {
 	serverCfg := &config.ServerConfig{
-		Credentials: map[string]config.MountConfig{},
+		Mounts: map[string]config.MountConfig{},
 	}
 
 	cm := NewCredentialManager(serverCfg, nil, "test", nil)

@@ -164,8 +164,8 @@ RUN set -euo pipefail && \
         '[ -f ~/.bashrc ] && . ~/.bashrc' \
         > /home/shed/.bash_profile && \
     chown shed:shed /home/shed/.bash_profile && \
-    # Workspace + log dir + .ssh.
-    mkdir -p /workspace && chown shed:shed /workspace && \
+    # Log dir + .ssh. Project directories (--repo / --local-dir / --add-dir)
+    # live under the home directory, created at create time.
     mkdir -p /var/log/shed && chown shed:shed /var/log/shed && \
     mkdir -p /home/shed/.ssh && chown shed:shed /home/shed/.ssh && chmod 700 /home/shed/.ssh && \
     # Vsock kernel modules at boot.
@@ -214,7 +214,7 @@ __git_prompt() {
 export PS1='\[\033[1;36m\][\[\033[1;32m\]shed:${SHED_NAME:-dev}\[\033[1;36m\]]\[\033[0m\] \[\033[01;34m\]\w\[\033[00m\]$(__git_prompt) \$ '
 PROMPT_EOF
 
-WORKDIR /workspace
+WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
 
 
@@ -245,7 +245,7 @@ RUN --mount=type=bind,from=shed-extensions,source=/,target=/ext \
     chown -R shed:shed /home/shed/.docker
     # Units ship disabled — shed-agent enables them from server config.
 
-WORKDIR /workspace
+WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
 
 
@@ -312,5 +312,5 @@ RUN set -euo pipefail && \
         /home/shed/.bun/bin/bun install -g @openai/codex \
     '
 
-WORKDIR /workspace
+WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
