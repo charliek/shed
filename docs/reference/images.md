@@ -40,13 +40,22 @@ steps.
 
 | Variant | Description |
 |---------|-------------|
-| `base` | Minimal OS layer: systemd, SSH, Docker CE, git, gh, build-essential, the shed-agent. No coding agents, no language runtimes. |
-| `extensions` | `base` + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering (SSH agent forwarding, AWS STS proxy, Docker credential helper). No coding agents pinned — start here for custom images. |
-| `full` | `extensions` + Node.js LTS, Python 3.13, Claude Code, OpenCode, Codex CLI, and (VZ only) Cursor CLI. The batteries-included default. |
+| `base` | Minimal OS layer: systemd, SSH, git, gh, build-essential, jq, ripgrep, neovim, tmux, and the shed-agent. No Docker, no coding agents, no language runtimes. |
+| `extensions` | `base` + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering (SSH agent forwarding, AWS STS proxy, Docker credential helper). No Docker daemon, no coding agents pinned — start here for custom images. |
+| `full` | `extensions` + Docker CE (with `docker compose`), [mise](https://mise.jdx.dev/), [bun](https://bun.sh/), and coding agents (Claude Code, OpenCode, Codex CLI). The batteries-included default. |
 
 Each variant inherits from the one above it as a discrete OCI layer, so
 `shed image pull shed-vz-full` reuses the `base` and `extensions` layers
 already cached locally.
+
+!!! note "Docker is only in `full`"
+    The Docker daemon ships **only** in the `full` variant. `base` and
+    `extensions` install the `docker-credential-shed` helper config but not
+    the daemon. Provisioning hooks that use `docker` / `docker compose`
+    (Testcontainers, service stacks) therefore require the `full` image.
+    `full` does **not** ship a system Node.js or Python — install language
+    runtimes per-project (e.g. `uv` provisions Python, `bun` is built in).
+    See [Provisioning](provisioning.md) for the patterns.
 
 ### `extensions` variant
 

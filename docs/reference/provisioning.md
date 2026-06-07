@@ -158,7 +158,107 @@ All shed hooks run as login shells (`bash --login -c`), which source `~/.bash_pr
 
 The base images also include `/etc/profile.d/shed-path.sh` which ensures [mise](https://mise.jdx.dev/) shims and `~/.local/bin` are in PATH for login shells.
 
-## Example: PostgreSQL Setup
+## Installing Language Toolchains
+
+The `full` image ships [mise](https://mise.jdx.dev/) and [bun](https://bun.sh/),
+but **not** `uv`, a JDK, or a system Node/Python. Install what your project needs
+in the install hook. Write each step to be idempotent (check first, install if
+missing) so it is a no-op when a tool is already present and re-running the hook
+is safe:
+
+```bash
+ensure_uv()  { command -v uv  >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh; }
+ensure_bun() { command -v bun >/dev/null 2>&1 || curl -fsSL https://bun.com/install | bash; }
+```
+
+| Language | Recommended tool | Notes |
+|----------|------------------|-------|
+| Python | [uv](https://docs.astral.sh/uv/) | `uv sync` auto-downloads the interpreter pinned in `.python-version`; no system Python needed. |
+| TypeScript / JS | [bun](https://bun.sh/) | Built into the `full` image. `bun install`, `bun test`, `bun run build`. |
+| Java / Kotlin | [SDKMAN](https://sdkman.io/) | `sdk env install` installs the JDK pinned in `.sdkmanrc`. Wrap `sdk` calls in `set +u` — SDKMAN's scripts reference unset variables. |
+
+These tools install into the shed user's home (`~/.local/bin`, `~/.bun/bin`,
+`~/.sdkman`), which survives stop/start on the rootfs upper layer.
+
+!!! warning "Login PATH for `shed exec`"
+    `shed exec` and `shed console` run a **non-interactive** login shell. Tools
+    that only add themselves to `~/.bashrc` (e.g. SDKMAN's snippet) won't be on
+    `PATH` there. To expose a tool to every session, write an
+    `/etc/profile.d/*.sh` snippet from your install hook — login shells source
+    it regardless of interactivity:
+
+    ```bash
+    sudo tee /etc/profile.d/zz-java.sh >/dev/null <<'EOF'
+    if [ -d "$HOME/.sdkman/candidates/java/current/bin" ]; then
+      export JAVA_HOME="$HOME/.sdkman/candidates/java/current"
+      export PATH="$JAVA_HOME/bin:$PATH"
+    fi
+    EOF
+    ```
+
+## Running Services with Docker Compose
+
+The `full` image ships the Docker daemon (started automatically) and `docker
+compose`. Provisioning a service stack is now as simple as bringing up your
+project's own `compose.yaml` — no need to apt-install and hand-manage databases.
+
+**`.shed/provision.yaml`:**
+
+```yaml
+hooks:
+  install: .shed/scripts/install.sh
+  startup: .shed/scripts/startup.sh
+  shutdown: .shed/scripts/shutdown.sh
+```
+
+**`startup.sh`** brings the stack up every boot and waits for health:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+cd "${SHED_WORKSPACE:-$PWD}"
+
+# Daemon auto-starts, but may not be ready the instant the hook fires.
+for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+
+docker compose up -d
+# Wait until every service with a healthcheck reports healthy.
+for i in $(seq 1 30); do
+  pending="$(docker compose ps --format '{{.Name}} {{.Health}}' \
+    | awk '$2 != "" && $2 != "healthy" {print $1}')"
+  [ -z "$pending" ] && break
+  sleep 2
+done
+```
+
+**`shutdown.sh`** stops it gracefully (named volumes persist):
+
+```bash
+#!/bin/bash
+set -euo pipefail
+cd "${SHED_WORKSPACE:-$PWD}"
+docker compose down || true
+```
+
+!!! warning "Docker requires the `full` image"
+    Only the `full` variant ships the Docker daemon. With `base`/`extensions`,
+    `docker` is absent and these hooks will warn and continue.
+
+### Docker quirks inside a shed
+
+The `full` image's Docker is tuned for the nested-VM environment, which affects
+two common workflows. Handle them in your install hook:
+
+| Behavior | Effect | Fix in the install hook |
+|----------|--------|-------------------------|
+| `credsStore=shed` in `~/.docker/config.json` | Anonymous Docker Hub pulls fail when the host doesn't broker the registry. | Reset it so public images pull: `echo '{}' > ~/.docker/config.json` (back up first if you use a private registry via the host). |
+| `bridge: none` in `daemon.json` | The default `docker0` bridge is absent, so containers started on the **default** network get no published ports. `docker compose` is unaffected (it creates its own user-defined network), but [Testcontainers](https://testcontainers.com/) is not. | Re-enable it for Testcontainers: `jq 'del(.bridge)' /etc/docker/daemon.json` → write back → `sudo systemctl restart docker`. |
+
+## Example: PostgreSQL via Docker Compose
+
+For most projects, run Postgres from your `compose.yaml` (above) rather than
+installing it into the image. The example below is the **no-Docker alternative**
+— installing the service directly — kept for `base`/`extensions` images.
 
 **`.shed/provision.yaml`:**
 
@@ -297,6 +397,20 @@ env:
   DATABASE_URL: "postgresql://localhost/myapp"
   NODE_ENV: "development"
 ```
+
+!!! warning "`provision.yaml` `env:` reaches hooks only"
+    Variables in the `env:` map are injected into the **provisioning hooks**,
+    not into later `shed exec` / `shed console` sessions or the app. To make a
+    variable available everywhere, write it to `/etc/environment.d/*.conf` from
+    your install hook (it is read per-exec):
+
+    ```bash
+    # In the install hook — available to every session afterward.
+    sudo tee /etc/environment.d/90-myapp.conf >/dev/null <<'EOF'
+    DATABASE_URL=postgresql://localhost/myapp
+    TESTCONTAINERS_RYUK_DISABLED=true
+    EOF
+    ```
 
 ## Skipping Provisioning
 
