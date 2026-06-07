@@ -108,15 +108,25 @@ This connects to the server, retrieves its SSH host key, and saves the configura
 ## Create a Shed
 
 ```bash
-# Create an empty shed
+# Create an empty shed — you land in /home/shed
 shed create my-project
 
-# Or clone a repository
+# Or clone a repository — cloned into ~/repo, login lands there
 shed create my-project --repo git@github.com:user/repo.git
 
-# Or mount a local directory as the workspace
+# Or mount a local directory — mounted at ~/<basename>, login lands there
 shed create my-project --local-dir ~/projects/my-project
+
+# Mount additional reference dirs alongside the primary --local-dir
+# (each lands at ~/<basename>; repeatable; --add-dir requires --local-dir)
+shed create app --local-dir ~/projects/app --add-dir ~/projects/shared-lib
 ```
+
+Interactive logins (`shed console`, `shed attach`, raw `ssh`, VS Code
+Remote-SSH) land in the shed's project directory: `~/<reponame>` with
+`--repo`, `~/<basename>` with `--local-dir`, otherwise `/home/shed`.
+`shed exec <name> -- <cmd>` runs there too. `--repo` and
+`--local-dir`/`--add-dir` are mutually exclusive.
 
 Once you have a few sheds, `shed system df` shows what's on disk and `shed system prune` reclaims unused space. See [Disk Management](../reference/disk-management.md).
 

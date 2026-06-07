@@ -120,11 +120,13 @@ func TestBuildVfkitArgs(t *testing.T) {
 func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
 	imagesDir, digest := setupBlobForTest(t)
 	meta := &Metadata{
-		Name:        "test-vm",
-		CPUs:        2,
-		MemoryMB:    4096,
-		RootfsPath:  "/tmp/rootfs.ext4",
-		LocalDir:    "/Users/charlie/projects/myapp",
+		Name:       "test-vm",
+		CPUs:       2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/rootfs.ext4",
+		ProjectMounts: []config.MountConfig{
+			{Source: "/Users/charlie/projects/myapp", Target: "/home/shed/myapp"},
+		},
 		LowerDigest: digest,
 	}
 	cfg := &config.VZConfig{
@@ -144,8 +146,9 @@ func TestBuildVfkitArgsWithLocalDir(t *testing.T) {
 	}
 	argsStr := strings.Join(args, " ")
 
-	// Should have VirtioFS device
-	expected := fmt.Sprintf("virtio-fs,sharedDir=/Users/charlie/projects/myapp,mountTag=%s", config.VirtioFSMountTag)
+	// Should have VirtioFS device for the project mount
+	tag := config.ProjectMountTagForTarget("/home/shed/myapp")
+	expected := fmt.Sprintf("virtio-fs,sharedDir=/Users/charlie/projects/myapp,mountTag=%s", tag)
 	if !strings.Contains(argsStr, expected) {
 		t.Errorf("expected VirtioFS device %q in args, got: %s", expected, argsStr)
 	}
@@ -204,20 +207,22 @@ func TestBuildVfkitArgsWithCredentialShares(t *testing.T) {
 		t.Errorf("expected 9 --device flags, got %d", deviceCount)
 	}
 
-	// No workspace VirtioFS device (LocalDir is empty)
-	if strings.Contains(argsStr, fmt.Sprintf("mountTag=%s", config.VirtioFSMountTag)) {
-		t.Error("should not have workspace virtio-fs device when LocalDir is empty")
+	// No project VirtioFS device (no ProjectMounts)
+	if strings.Contains(argsStr, "mountTag=proj-") {
+		t.Error("should not have a project virtio-fs device when there are no project mounts")
 	}
 }
 
 func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
 	imagesDir, digest := setupBlobForTest(t)
 	meta := &Metadata{
-		Name:        "test-vm",
-		CPUs:        2,
-		MemoryMB:    4096,
-		RootfsPath:  "/tmp/rootfs.ext4",
-		LocalDir:    "/Users/charlie/projects/myapp",
+		Name:       "test-vm",
+		CPUs:       2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/rootfs.ext4",
+		ProjectMounts: []config.MountConfig{
+			{Source: "/Users/charlie/projects/myapp", Target: "/home/shed/myapp"},
+		},
 		LowerDigest: digest,
 	}
 	cfg := &config.VZConfig{
@@ -243,9 +248,9 @@ func TestBuildVfkitArgsWithCredentialSharesAndLocalDir(t *testing.T) {
 	}
 	argsStr := strings.Join(args, " ")
 
-	// Should have workspace VirtioFS
-	if !strings.Contains(argsStr, fmt.Sprintf("mountTag=%s", config.VirtioFSMountTag)) {
-		t.Error("expected workspace VirtioFS device")
+	// Should have project VirtioFS
+	if !strings.Contains(argsStr, "mountTag=proj-") {
+		t.Error("expected project VirtioFS device")
 	}
 
 	// Should have credential VirtioFS

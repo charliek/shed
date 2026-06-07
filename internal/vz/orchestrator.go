@@ -271,6 +271,11 @@ func (b *vzCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 	pre := preRaw.(*vzPreFlight)
 	upper := upperRaw.(vzUpper)
 
+	projectMounts, landingDir, err := config.ResolveCreateLayout(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve workspace layout: %w", err)
+	}
+
 	meta := &Metadata{
 		Name:           req.Name,
 		Status:         config.StatusStopped,
@@ -282,7 +287,8 @@ func (b *vzCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		UpperPath:      upper.path,
 		UpperSizeBytes: pre.upperSizeBytes,
 		Repo:           req.Repo,
-		LocalDir:       req.LocalDir,
+		ProjectMounts:  projectMounts,
+		LandingDir:     landingDir,
 		Image:          req.Image,
 		LowerDigest:    pre.lowerDigest,
 		LowerImageTag:  pre.lowerImageTag,
@@ -352,17 +358,21 @@ func (b *vzCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.
 	return nil
 }
 
-// MountLocalDir mounts `--local-dir` via VirtioFS when set; no-op otherwise.
+// MountLocalDir mounts each project directory (--local-dir / --add-dir) via
+// VirtioFS when set; no-op otherwise.
 func (b *vzCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) error {
-	if req.LocalDir == "" {
+	meta := metaRaw.(*vzMetaHandle).meta
+	if len(meta.ProjectMounts) == 0 {
 		return nil
 	}
-	meta := metaRaw.(*vzMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "mount")
-	backend.Status(ctx, "Mounting local directory via VirtioFS...")
-	if err := b.c.mountVirtioFSShareWithRetry(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
-		return fmt.Errorf("VirtioFS mount failed for local dir %s: %w", req.LocalDir, err)
+	backend.Status(ctx, "Mounting project directories via VirtioFS...")
+	for _, m := range meta.ProjectMounts {
+		tag := config.ProjectMountTagForTarget(m.Target)
+		if err := b.c.mountVirtioFSShareWithRetry(ctx, agent, tag, m.Target, m.ReadOnly); err != nil {
+			return fmt.Errorf("VirtioFS mount failed for %s: %w", m.Source, err)
+		}
 	}
 	return nil
 }
@@ -408,6 +418,7 @@ func (b *vzCreator) RunProvisioning(ctx context.Context, req config.CreateShedRe
 	meta := metaRaw.(*vzMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	provisioner := vmutil.NewProvisioner(agent, req.Name)
+	provisioner.SetWorkDir(meta.LandingDir)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {
@@ -553,17 +564,20 @@ func (b *vzStarter) RestoreStoppedMetadata(metaRaw orchestrator.MetadataHandle) 
 	return meta.Save(b.c.cfg.InstanceDir)
 }
 
-// MountLocalDir re-mounts the workspace VirtioFS share when
-// meta.LocalDir is set. VirtioFS mounts don't persist across vfkit
+// MountLocalDir re-mounts each project VirtioFS share when
+// meta.ProjectMounts is set. VirtioFS mounts don't persist across vfkit
 // restarts; this is the start-time refresh.
 func (b *vzStarter) MountLocalDir(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) error {
 	meta := metaRaw.(*vzMetaHandle).meta
-	if meta.LocalDir == "" {
+	if len(meta.ProjectMounts) == 0 {
 		return nil
 	}
 	agent := b.c.newAgentClient(meta.Name)
-	if err := b.c.mountVirtioFSShareWithRetry(ctx, agent, config.VirtioFSMountTag, config.WorkspacePath, false); err != nil {
-		return fmt.Errorf("VirtioFS mount failed on start for local dir %s: %w", meta.LocalDir, err)
+	for _, m := range meta.ProjectMounts {
+		tag := config.ProjectMountTagForTarget(m.Target)
+		if err := b.c.mountVirtioFSShareWithRetry(ctx, agent, tag, m.Target, m.ReadOnly); err != nil {
+			return fmt.Errorf("VirtioFS mount failed on start for %s: %w", m.Source, err)
+		}
 	}
 	return nil
 }
@@ -584,6 +598,7 @@ func (b *vzStarter) RunStartupHook(ctx context.Context, metaRaw orchestrator.Met
 	meta := metaRaw.(*vzMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	provisioner := vmutil.NewProvisioner(agent, meta.Name)
+	provisioner.SetWorkDir(meta.LandingDir)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {

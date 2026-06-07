@@ -29,14 +29,14 @@ brew install charliek/tap/shed-host-agent
 
 ### 2. Configure
 
-Edit the server config to enable credential mounts and extensions:
+Edit the server config to enable mounts and extensions:
 
 ```bash
 # Open the config in your editor
 $EDITOR $(brew --prefix)/etc/shed/server.yaml
 ```
 
-Uncomment the `credentials` section to mount tool configs into VMs, and the `extensions` section if you installed `shed-host-agent`.
+Uncomment the `mounts` section to mount tool configs into VMs, and the `extensions` section if you installed `shed-host-agent`. (The older `credentials` key still works as a fallback when `mounts` is absent, but `mounts` is preferred.)
 
 ### 3. Start services
 
@@ -251,7 +251,7 @@ vz:
   start_timeout: 60s
   stop_timeout: 10s
 
-credentials:
+mounts:
   claude:
     source: ~/.shed/mounts/claude
     target: /home/shed/.claude

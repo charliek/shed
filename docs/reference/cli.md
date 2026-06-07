@@ -86,14 +86,15 @@ shed create <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--repo` | `-r` | None | Repository to clone (`owner/repo` shorthand or full URL) |
+| `--repo` | `-r` | None | Repository to clone into `~/<reponame>` (`owner/repo` shorthand or full URL). The login lands in the cloned repo directory. Mutually exclusive with `--local-dir`/`--add-dir`. |
 | `--server` | `-s` | Default server | Target server |
 | `--image` | `-i` | Server default | Image [variant name](images.md) to use |
 | `--backend` | | Server default | Backend to use: `firecracker` or `vz` |
 | `--cpus` | | Server default | Number of vCPUs |
 | `--memory` | | Server default | Memory in MB |
 | `--upper-size` | | Server default (`5G`) | Logical size of the per-shed writable overlay upper layer (e.g. `1G`, `5G`, `10G`, `100G`). Validated range: 1–100 GiB. The overlay grows copy-on-write, so this is the maximum, not the on-disk physical bytes. |
-| `--local-dir` | | None | Mount a local host directory as the workspace (mutually exclusive with `--repo`) |
+| `--local-dir` | | None | Mount a local host directory into the guest at `~/<basename>`. The login lands there. Mutually exclusive with `--repo`. |
+| `--add-dir` | | None | Mount an additional local host directory at `~/<basename>` as a reference sibling. Repeatable. Requires `--local-dir`. |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
@@ -109,12 +110,19 @@ shed create myproj --sync-profile full
 shed create myproj --no-sync
 shed create bigproj --repo org/large-repo --timeout 30m
 
-# Mount a local directory as the workspace
+# Mount a local directory; the login lands in ~/myproj inside the shed
 shed create myproj --local-dir ~/projects/myproj
+
+# Mount additional reference directories alongside the primary one
+shed create myproj --local-dir ~/projects/myproj --add-dir ~/projects/shared-lib
 ```
 
 !!! note "Local directory mounts"
-    When using `--local-dir`, the specified host directory is mounted directly as the workspace. No volume is created and `--repo` cannot be used. VZ uses VirtioFS; Firecracker uses 9P over TCP.
+    When using `--local-dir`, the specified host directory is mounted into the guest at `~/<basename>` (i.e. `/home/shed/<basename>`), and an interactive login lands there. No volume is created and `--repo` cannot be used. VZ uses VirtioFS; Firecracker uses 9P over TCP.
+
+    `--add-dir` mounts each additional host directory at `~/<basename>` as a reference sibling. It is repeatable and valid only together with `--local-dir`. No two mounted directories may share a basename, and dotfile-style basenames (leading `.`) are rejected.
+
+    Host-mounted directories live outside the writable upper layer, so their contents are **not** captured by `shed snapshot create`. The cloned repo from `--repo` lives in the upper layer and **is** captured.
 
 ### shed list
 
@@ -258,10 +266,12 @@ shed reset <name> [flags]
 |------|-------|---------|-------------|
 | `--force` | `-f` | `false` | Skip confirmation prompt |
 
-The lower image (shared, read-only) and `/workspace` (mounted post-boot from
-outside the overlay) are unaffected — only the writable upper is deleted and
-re-created empty. This is the equivalent of "throw away anything I wrote
-inside the VM and start fresh from the same image."
+The writable upper holds the shed user's home directory (`/home/shed`),
+including any repo cloned via `--repo` — `shed reset` deletes it and re-creates
+it empty. The shared, read-only lower image is untouched, and host-mounted
+directories from `--local-dir`/`--add-dir` survive (they live outside the
+overlay). This is the equivalent of "throw away anything I wrote inside the VM
+and start fresh from the same image."
 
 The shed must be stopped. Otherwise the API returns `SHED_NOT_STOPPED` (HTTP
 409). When using `--json`, `--force` is required.
@@ -270,7 +280,7 @@ Common uses:
 
 - Recovering from the upper-corruption panic (`shed-initramfs PANIC: ... no
   ext4 magic at offset 1080 ...`) emitted by the in-guest initramfs.
-- Throwing away accumulated experiment state without losing `/workspace`.
+- Throwing away accumulated experiment state without losing host-mounted `--local-dir`/`--add-dir` contents.
 
 **Example:**
 
@@ -676,7 +686,7 @@ Opens an interactive shell in a shed.
 shed console <name>
 ```
 
-Opens `/bin/bash` in the shed. If the shed is stopped, it will be started automatically.
+Opens `/bin/bash` in the shed, landing in the shed's landing directory — the shed user's home (`/home/shed`) by default, or the project directory when the shed was created with `--repo` (`~/<reponame>`) or `--local-dir` (`~/<basename>`). If the shed is stopped, it will be started automatically.
 
 ### shed exec
 
@@ -689,6 +699,8 @@ shed exec <name> <command...>
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--session` | `-S` | None | Run in tmux session context |
+
+**Working directory.** Commands run in the shed's landing directory — the shed user's home (`/home/shed`) by default, or the project directory when the shed was created with `--repo` (`~/<reponame>`) or `--local-dir` (`~/<basename>`).
 
 **Execution model.** `shed exec` ships argv literally. The CLI single-quote-wraps each argv element before transmission so nested quotes, spaces, and shell metacharacters in *your* data survive the SSH wire intact and reach the guest as argv, not as shell code. The server-side SSH command channel does run those quoted tokens through `bash -lc` (so login PATH adjustments — `/etc/profile.d/*.sh`, `~/.profile`, mise, nvm, rustup — are in effect), but bash treats single-quoted text as literal data, so argv stays argv. End result: `shed exec name -- mytool` just works for tools installed via login-shell PATH managers, and `shed exec name -- echo '$HOME'` still prints the literal `$HOME` — no expansion, no command splitting.
 
@@ -703,13 +715,13 @@ This is the same model Docker, devcontainers, Codespaces, and Coder follow on th
 # the single-quote wrap. Tools installed via login PATH (mise, nvm, rustup,
 # etc.) just work because `bash -lc` sources profile scripts.
 shed exec codelens git status
-shed exec codelens ls -la /workspace
+shed exec codelens ls -la /home/shed
 shed exec codelens rustc --version
 shed exec codelens mise current
 
 # Explicit shell when YOU want pipes/redirects/multi-statements
 shed exec codelens -- bash -c 'echo hello | wc -c'
-shed exec codelens -- bash -c 'cd /workspace && npm test'
+shed exec codelens -- bash -c 'cd ~/codelens && npm test'
 shed exec codelens -- bash -c 'for f in *.go; do gofmt -l $f; done'
 
 # Nested quotes survive intact

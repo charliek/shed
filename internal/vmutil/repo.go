@@ -11,7 +11,8 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// CloneRepo clones a git repository into the VM's workspace.
+// CloneRepo clones a git repository into the VM's home directory at
+// ~/<reponame> (the same directory name `git clone` would choose).
 //
 // For SSH-form URLs (git@host:path or ssh://...), the in-VM
 // ~/.ssh/known_hosts is seeded first so OpenSSH can verify the remote host
@@ -20,6 +21,11 @@ import (
 func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.ServerConfig, repo string) error {
 	backend.Phase(ctx, "clone")
 	backend.Status(ctx, "Cloning repository...")
+
+	dirName, err := config.RepoDirName(repo)
+	if err != nil {
+		return fmt.Errorf("invalid repository URL: %w", err)
+	}
 
 	if config.IsSSHRepoURL(repo) {
 		if err := WriteKnownHosts(ctx, agent, BuildKnownHosts(serverCfg)); err != nil {
@@ -31,11 +37,11 @@ func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.Server
 
 	var output strings.Builder
 	opts := backend.ExecOptions{
-		Cmd:        []string{"git", "clone", repo, "."},
+		Cmd:        []string{"git", "clone", repo, dirName},
 		Env:        env,
 		Stdout:     NopWriteCloser(io.MultiWriter(&output, os.Stdout)),
 		Stderr:     NopWriteCloser(io.MultiWriter(&output, os.Stderr)),
-		WorkingDir: config.WorkspacePath,
+		WorkingDir: config.HomePath,
 		TTY:        false,
 	}
 

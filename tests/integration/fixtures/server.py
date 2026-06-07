@@ -184,6 +184,7 @@ class LocalServer:
         image: Optional[str] = "base",
         repo: Optional[str] = None,
         local_dir: Optional[str] = None,
+        add_dirs: Optional[list[str]] = None,
         from_snapshot: Optional[str] = None,
         timeout: int = 180,
     ) -> ShedHandle:
@@ -205,6 +206,8 @@ class LocalServer:
             cmd += ["--repo", repo]
         if local_dir is not None:
             cmd += ["--local-dir", local_dir]
+        for d in add_dirs or []:
+            cmd += ["--add-dir", d]
         if from_snapshot is not None:
             cmd += ["--from-snapshot", from_snapshot]
 

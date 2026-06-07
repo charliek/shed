@@ -98,7 +98,7 @@ Lists all sheds on this server.
 }
 ```
 
-Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, and `local_dir` are omitted when empty or zero.
+Fields like `ip_address`, `cpus`, `memory_mb`, `pid`, `rootfs_path`, `project_mounts`, and `landing_dir` are omitted when empty or zero.
 
 **Status values:** `running`, `stopped`, `starting`, `error`
 
@@ -122,7 +122,8 @@ Creates a new shed.
 | `repo` | No | null | Repository to clone (`owner/repo` shorthand or full URL) |
 | `image` | No | `default_image` | Docker ref, `image_aliases` name, or local label (see [Images](images.md)) |
 | `backend` | No | Server default | Backend to use: `firecracker`, `vz`, or `detect` |
-| `local_dir` | No | null | Absolute path to host directory to mount as workspace (mutually exclusive with `repo`) |
+| `local_dir` | No | null | Absolute path to a host directory to mount at `/home/shed/<basename>`; the shed's landing directory. Mutually exclusive with `repo`. |
+| `add_dirs` | No | `[]` | Array of absolute host directory paths, each mounted at `/home/shed/<basename>` as a reference sibling. Requires `local_dir`. Mutually exclusive with `repo`. No two mounted directories may share a basename; dotfile-style basenames (leading `.`) are rejected. |
 | `cpus` | No | Backend default | Number of vCPUs |
 | `memory_mb` | No | Backend default | Memory in MB |
 | `from_snapshot` | No | null | Snapshot name to spawn from (mutually exclusive with `image` and `repo`). Provisioning is skipped because the snapshot is already provisioned. |
@@ -196,9 +197,22 @@ Gets details for a specific shed.
   "status": "running",
   "created_at": "2026-01-20T10:30:00Z",
   "repo": "charliek/codelens",
-  "backend": "vz"
+  "backend": "vz",
+  "landing_dir": "/home/shed/codelens",
+  "project_mounts": [
+    {
+      "source": "/Users/alice/projects/codelens",
+      "target": "/home/shed/codelens",
+      "readonly": false
+    }
+  ]
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `landing_dir` | string | Directory an interactive login lands in: `/home/shed` by default, the cloned repo path for `repo`, or the primary mount target for `local_dir`. Omitted when it is the default home. |
+| `project_mounts` | array | Host directories mounted into the guest via `local_dir`/`add_dirs`. Each entry is `{source, target, readonly}`. Omitted when the shed has no project mounts. |
 
 **Errors:**
 
@@ -262,9 +276,10 @@ Stops a running shed.
 
 ### POST /api/sheds/{name}/reset
 
-Wipes and recreates the shed's per-shed writable overlay upper. The shared
-lower image is untouched; `/workspace` (mounted outside the overlay) is
-unaffected. The shed must be stopped first.
+Wipes and recreates the shed's per-shed writable overlay upper (the shed
+user's home directory, including any repo cloned via `repo`). The shared lower
+image is untouched, and host-mounted `local_dir`/`add_dirs` directories
+(outside the overlay) are unaffected. The shed must be stopped first.
 
 **Response (200 OK):** the (still-stopped) Shed object, same shape as
 `GET /api/sheds/{name}`.
@@ -306,9 +321,11 @@ persisted to `snapshot.json`.
 
 ### POST /api/snapshots
 
-Creates a snapshot from a stopped shed. Backend-emitted warnings (e.g., the
-source used `--local-dir`, so workspace contents are not captured) are
-returned alongside the snapshot rather than failing the request.
+Creates a snapshot from a stopped shed. The snapshot captures the writable
+upper (the home directory, including any cloned repo) but not host-mounted
+`local_dir`/`add_dirs` contents. Backend-emitted warnings (e.g., the source
+used `local_dir`, so those mounted directories are not captured) are returned
+alongside the snapshot rather than failing the request.
 
 **Request:**
 
@@ -341,7 +358,7 @@ returned alongside the snapshot rather than failing the request.
     "created_at": "2026-05-10T12:00:00Z"
   },
   "warnings": [
-    "source shed used --local-dir; workspace contents are not captured in the snapshot"
+    "source shed used --local-dir; host-mounted directories are not captured in the snapshot"
   ]
 }
 ```

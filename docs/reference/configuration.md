@@ -59,7 +59,7 @@ name: mini-desktop
 http_port: 8080
 ssh_port: 2222
 
-credentials:
+mounts:
   claude:
     source: ~/.claude
     target: /home/shed/.claude
@@ -77,7 +77,7 @@ log_level: info
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
-| `credentials` | map | `{}` | Credential directories to mount into sheds |
+| `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
 | `env_file` | string | - | Path to environment variables file |
 | `log_level` | string | `info` | Logging level (debug, info, warn, error) |
 | `extensions` | object | `{}` | Extensions to activate in VMs (see [Extensions](extensions.md)) |
@@ -87,31 +87,34 @@ log_level: info
 
 **Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
 
-### Credentials
+### Mounts
 
-Credentials are directories from the host that are shared with sheds. The method depends on the backend:
+Mounts are directories from the host that are shared with sheds. The method depends on the backend:
 
 - **Firecracker**: Mounted via 9P over the TAP bridge network.
 - **VZ**: Mounted via VirtioFS.
 
 Both mechanisms provide live filesystem sharing -- changes on either side are immediately visible to the other.
 
+!!! note "Renamed from `credentials`"
+    This section was previously named `credentials`. The `mounts` key has the identical shape. The deprecated `credentials` key still works as a fallback when `mounts` is absent, but new configs should use `mounts`.
+
 ```yaml
-credentials:
+mounts:
   name:
     source: /host/path      # Path on the host (~ supported, must be a directory)
     target: /container/path  # Path inside shed
     readonly: true           # Optional, default false
 ```
 
-**Credentials must be directories.** Single-file credentials are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the shed-extensions SSH agent forwarding instead of mounting `~/.ssh`.
+**Mount sources must be directories.** Single-file mounts are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the shed-extensions SSH agent forwarding instead of mounting `~/.ssh`.
 
-**Missing sources:** If a credential's source path does not exist on the host, it is skipped with a log warning. Create the source directory on the host before starting the shed.
+**Missing sources:** If a mount's source path does not exist on the host, it is skipped with a log warning. Create the source directory on the host before starting the shed.
 
-**Common credential mounts:**
+**Common mounts:**
 
 ```yaml
-credentials:
+mounts:
   # Claude Code config (needs write for token refresh)
   claude:
     source: ~/.claude
@@ -139,10 +142,10 @@ credentials:
 
 ### Exclude Patterns
 
-The credential config accepts an `exclude` field with glob patterns. This field is currently accepted but has no effect on VM backends -- VirtioFS and 9P mount entire directories. Exclude patterns are used by [`shed sync`](sync.md) path mappings. The field is retained for forward compatibility.
+The mount config accepts an `exclude` field with glob patterns. This field is currently accepted but has no effect on VM backends -- VirtioFS and 9P mount entire directories. Exclude patterns are used by [`shed sync`](sync.md) path mappings. The field is retained for forward compatibility.
 
 ```yaml
-credentials:
+mounts:
   claude:
     source: ~/.claude
     target: /home/shed/.claude

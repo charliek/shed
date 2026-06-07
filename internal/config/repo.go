@@ -34,6 +34,28 @@ func ExpandRepoShorthand(repo string) string {
 	return repo
 }
 
+// RepoDirName returns the directory name `git clone <repo>` would create: the
+// last path segment of the URL with a trailing ".git" removed. It mirrors git's
+// own default-directory logic for the URL forms shed accepts (https://, git://,
+// ssh://, git@host:path, and expanded owner/repo shorthand).
+func RepoDirName(repo string) (string, error) {
+	s := strings.TrimSpace(repo)
+	if s == "" {
+		return "", fmt.Errorf("empty repository URL")
+	}
+	s = strings.TrimRight(s, "/")
+	// The dir name is whatever follows the last '/' (path separator) or ':'
+	// (the SCP-like git@host:owner/repo separator when there is no path slash).
+	if i := strings.LastIndexAny(s, "/:"); i >= 0 {
+		s = s[i+1:]
+	}
+	s = strings.TrimSuffix(s, ".git")
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\x00") {
+		return "", fmt.Errorf("cannot derive a directory name from repository URL %q", repo)
+	}
+	return s, nil
+}
+
 // SanitizeRepoURL returns repo with the password component removed from the
 // URL's userinfo, if any. The username is preserved (it's informational, not
 // a secret). SSH-form URLs (git@host:path) and shorthand pass through

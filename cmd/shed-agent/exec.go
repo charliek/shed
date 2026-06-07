@@ -61,10 +61,15 @@ func handleExecConnection(conn net.Conn, user *userInfo) {
 		cmd.SysProcAttr.Credential = user.cred
 	}
 
-	// Set working directory
+	// Set working directory. An empty working dir defaults to the shed
+	// user's home directory (the interactive landing default); fall back to
+	// "/" if the home or requested directory doesn't exist.
 	workDir := req.WorkingDir
+	if workDir == "" && user != nil {
+		workDir = user.homeDir
+	}
 	if workDir == "" {
-		workDir = "/workspace"
+		workDir = "/"
 	}
 	if _, err := os.Stat(workDir); err == nil {
 		cmd.Dir = workDir

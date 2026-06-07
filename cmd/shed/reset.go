@@ -48,8 +48,9 @@ func runReset(cmd *cobra.Command, args []string) error {
 
 	if !resetForce {
 		prompt := fmt.Sprintf(
-			"Reset shed %q on %s? This wipes the writable upper (uncommitted in-VM changes) "+
-				"but keeps /workspace and the lower image. [y/N] ", name, serverName)
+			"Reset shed %q on %s? This wipes the writable upper (the home directory, "+
+				"including any cloned repo and uncommitted changes) but keeps "+
+				"--local-dir/--add-dir mounts and the lower image. [y/N] ", name, serverName)
 		if !confirmAction(prompt) {
 			fmt.Println("Cancelled.")
 			return nil

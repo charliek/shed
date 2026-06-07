@@ -376,21 +376,22 @@ func (c *Client) mount9PCredentialFunc(shedName string) vmutil.DirMountFunc {
 
 func metadataToShed(meta *Metadata) *config.Shed {
 	return &config.Shed{
-		Name:         meta.Name,
-		Status:       meta.Status,
-		CreatedAt:    meta.CreatedAt,
-		Repo:         meta.Repo,
-		ContainerID:  fmt.Sprintf("fc-%s", meta.Name),
-		Backend:      meta.Backend,
-		IPAddress:    meta.IPAddress,
-		CPUs:         meta.CPUs,
-		MemoryMB:     meta.MemoryMB,
-		PID:          meta.PID,
-		RootfsPath:   meta.RootfsPath,
-		LocalDir:     meta.LocalDir,
-		Image:        meta.Image,
-		ImageDigest:  meta.LowerDigest,
-		FromSnapshot: meta.FromSnapshot,
+		Name:          meta.Name,
+		Status:        meta.Status,
+		CreatedAt:     meta.CreatedAt,
+		Repo:          meta.Repo,
+		ContainerID:   fmt.Sprintf("fc-%s", meta.Name),
+		Backend:       meta.Backend,
+		IPAddress:     meta.IPAddress,
+		CPUs:          meta.CPUs,
+		MemoryMB:      meta.MemoryMB,
+		PID:           meta.PID,
+		RootfsPath:    meta.RootfsPath,
+		ProjectMounts: meta.ProjectMounts,
+		LandingDir:    meta.LandingDir,
+		Image:         meta.Image,
+		ImageDigest:   meta.LowerDigest,
+		FromSnapshot:  meta.FromSnapshot,
 	}
 }
 
@@ -612,7 +613,7 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	agent := c.newAgentClient(meta.Name)
 
 	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, agent, meta.Name, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+	vmutil.RunShutdownSequence(ctx, agent, meta.Name, meta.LandingDir, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
 
 	// Ask the guest to flush dirty buffers to the virtio-blk devices
 	// before firecracker terminates. Without this, post-stop snapshots
@@ -675,8 +676,9 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 
 // ResetShed nukes the per-shed upper and recreates it as a fresh
 // sparse, unformatted ext4-sized file. The shed must be stopped.
-// /workspace is mounted post-boot via 9P from outside the overlay so
-// it is not affected by this operation.
+// Project mounts (--local-dir / --add-dir) are mounted post-boot via
+// 9P from outside the overlay so they are not affected by this
+// operation; the home directory (on the upper) is wiped.
 func (c *Client) ResetShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
 

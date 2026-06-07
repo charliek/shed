@@ -385,7 +385,10 @@ func TestMetadataToShed(t *testing.T) {
 		MemoryMB:   8192,
 		RootfsPath: "/var/lib/shed/firecracker/instances/test-vm/rootfs.ext4",
 		Repo:       "https://github.com/example/repo",
-		LocalDir:   "/home/user/projects/myproject",
+		ProjectMounts: []config.MountConfig{
+			{Source: "/home/user/projects/myproject", Target: "/home/shed/myproject"},
+		},
+		LandingDir: "/home/shed/myproject",
 	}
 
 	shed := metadataToShed(meta)
@@ -424,14 +427,17 @@ func TestMetadataToShed(t *testing.T) {
 	if shed.RootfsPath != meta.RootfsPath {
 		t.Errorf("RootfsPath = %q, want %q", shed.RootfsPath, meta.RootfsPath)
 	}
-	if shed.LocalDir != meta.LocalDir {
-		t.Errorf("LocalDir = %q, want %q", shed.LocalDir, meta.LocalDir)
+	if len(shed.ProjectMounts) != 1 || shed.ProjectMounts[0].Source != meta.ProjectMounts[0].Source {
+		t.Errorf("ProjectMounts = %+v, want %+v", shed.ProjectMounts, meta.ProjectMounts)
+	}
+	if shed.LandingDir != meta.LandingDir {
+		t.Errorf("LandingDir = %q, want %q", shed.LandingDir, meta.LandingDir)
 	}
 }
 
-func TestMetadataToShed_EmptyLocalDir(t *testing.T) {
+func TestMetadataToShed_NoProjectMounts(t *testing.T) {
 	meta := &Metadata{
-		Name:      "no-localdir",
+		Name:      "no-mounts",
 		Status:    config.StatusStopped,
 		Backend:   config.BackendFirecracker,
 		IPAddress: "172.30.0.2",
@@ -441,15 +447,17 @@ func TestMetadataToShed_EmptyLocalDir(t *testing.T) {
 
 	shed := metadataToShed(meta)
 
-	if shed.LocalDir != "" {
-		t.Errorf("LocalDir = %q, want empty string", shed.LocalDir)
+	if len(shed.ProjectMounts) != 0 {
+		t.Errorf("ProjectMounts = %+v, want none", shed.ProjectMounts)
+	}
+	if shed.LandingDir != "" {
+		t.Errorf("LandingDir = %q, want empty string", shed.LandingDir)
 	}
 }
 
 func TestMetadataBackwardCompat(t *testing.T) {
-	// Test loading metadata JSON that doesn't include the local_dir field
-	// (written before 9P support was added). The LocalDir field should be
-	// empty after loading.
+	// Test loading metadata JSON that doesn't include the project_mounts
+	// field. ProjectMounts should be empty after loading.
 	dir := mustTempDir(t, "metadata-compat")
 
 	instanceDir := filepath.Join(dir, "old-vm")
@@ -482,9 +490,9 @@ func TestMetadataBackwardCompat(t *testing.T) {
 		t.Fatalf("LoadMetadata() error = %v", err)
 	}
 
-	// Verify LocalDir is empty (zero value)
-	if loaded.LocalDir != "" {
-		t.Errorf("LocalDir = %q, want empty string for backward-compat metadata", loaded.LocalDir)
+	// Verify ProjectMounts is empty (zero value)
+	if len(loaded.ProjectMounts) != 0 {
+		t.Errorf("ProjectMounts = %+v, want none for backward-compat metadata", loaded.ProjectMounts)
 	}
 
 	// Verify other fields loaded correctly
@@ -495,15 +503,15 @@ func TestMetadataBackwardCompat(t *testing.T) {
 		t.Errorf("Repo = %q, want %q", loaded.Repo, "https://github.com/example/repo")
 	}
 
-	// Verify metadataToShed also works with empty LocalDir
+	// Verify metadataToShed also works with no project mounts
 	shed := metadataToShed(loaded)
-	if shed.LocalDir != "" {
-		t.Errorf("metadataToShed().LocalDir = %q, want empty string", shed.LocalDir)
+	if len(shed.ProjectMounts) != 0 {
+		t.Errorf("metadataToShed().ProjectMounts = %+v, want none", shed.ProjectMounts)
 	}
 }
 
-func TestMetadataBackwardCompat_WithLocalDir(t *testing.T) {
-	// Verify metadata with local_dir field loads correctly
+func TestMetadataLoad_WithProjectMounts(t *testing.T) {
+	// Verify metadata with project_mounts / landing_dir fields loads correctly
 	dir := mustTempDir(t, "metadata-compat")
 
 	instanceDir := filepath.Join(dir, "new-vm")
@@ -524,7 +532,8 @@ func TestMetadataBackwardCompat_WithLocalDir(t *testing.T) {
   "cpus": 4,
   "memory_mb": 8192,
   "rootfs_path": "/var/lib/shed/firecracker/instances/new-vm/rootfs.ext4",
-  "local_dir": "/home/user/projects/myapp"
+  "project_mounts": [{"source": "/home/user/projects/myapp", "target": "/home/shed/myapp"}],
+  "landing_dir": "/home/shed/myapp"
 }`
 	metaPath := filepath.Join(instanceDir, "metadata.json")
 	if err := os.WriteFile(metaPath, []byte(raw), 0644); err != nil {
@@ -536,17 +545,23 @@ func TestMetadataBackwardCompat_WithLocalDir(t *testing.T) {
 		t.Fatalf("LoadMetadata() error = %v", err)
 	}
 
-	if loaded.LocalDir != "/home/user/projects/myapp" {
-		t.Errorf("LocalDir = %q, want %q", loaded.LocalDir, "/home/user/projects/myapp")
+	if len(loaded.ProjectMounts) != 1 || loaded.ProjectMounts[0].Source != "/home/user/projects/myapp" {
+		t.Errorf("ProjectMounts = %+v, want one entry for /home/user/projects/myapp", loaded.ProjectMounts)
+	}
+	if loaded.LandingDir != "/home/shed/myapp" {
+		t.Errorf("LandingDir = %q, want %q", loaded.LandingDir, "/home/shed/myapp")
 	}
 }
 
-func TestMetadataLocalDir_RoundTrip(t *testing.T) {
-	// Save metadata with LocalDir and verify it round-trips correctly
+func TestMetadataProjectMounts_RoundTrip(t *testing.T) {
+	// Save metadata with project mounts and verify it round-trips correctly
 	dir := mustTempDir(t, "metadata-roundtrip")
 
 	meta := testMetadata("roundtrip-vm")
-	meta.LocalDir = "/tmp/test-project"
+	meta.ProjectMounts = []config.MountConfig{
+		{Source: "/tmp/test-project", Target: "/home/shed/test-project"},
+	}
+	meta.LandingDir = "/home/shed/test-project"
 
 	if err := meta.Save(dir); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -557,11 +572,14 @@ func TestMetadataLocalDir_RoundTrip(t *testing.T) {
 		t.Fatalf("LoadMetadata() error = %v", err)
 	}
 
-	if loaded.LocalDir != meta.LocalDir {
-		t.Errorf("LocalDir = %q, want %q", loaded.LocalDir, meta.LocalDir)
+	if len(loaded.ProjectMounts) != 1 || loaded.ProjectMounts[0].Source != meta.ProjectMounts[0].Source {
+		t.Errorf("ProjectMounts = %+v, want %+v", loaded.ProjectMounts, meta.ProjectMounts)
+	}
+	if loaded.LandingDir != meta.LandingDir {
+		t.Errorf("LandingDir = %q, want %q", loaded.LandingDir, meta.LandingDir)
 	}
 
-	// Verify it's in the JSON
+	// Verify the keys are in the JSON
 	data, err := os.ReadFile(MetadataPath(dir, "roundtrip-vm"))
 	if err != nil {
 		t.Fatalf("failed to read metadata file: %v", err)
@@ -572,18 +590,11 @@ func TestMetadataLocalDir_RoundTrip(t *testing.T) {
 		t.Fatalf("failed to parse raw JSON: %v", err)
 	}
 
-	localDirRaw, ok := raw["local_dir"]
-	if !ok {
-		t.Fatal("local_dir key missing from JSON output")
+	if _, ok := raw["project_mounts"]; !ok {
+		t.Fatal("project_mounts key missing from JSON output")
 	}
-
-	var localDir string
-	if err := json.Unmarshal(localDirRaw, &localDir); err != nil {
-		t.Fatalf("failed to parse local_dir value: %v", err)
-	}
-
-	if localDir != "/tmp/test-project" {
-		t.Errorf("local_dir in JSON = %q, want %q", localDir, "/tmp/test-project")
+	if _, ok := raw["landing_dir"]; !ok {
+		t.Fatal("landing_dir key missing from JSON output")
 	}
 }
 

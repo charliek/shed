@@ -53,7 +53,7 @@ def test_ssh_exec_dollar_var(shed_server, test_shed_name):
     """`ssh host 'echo "$HOME"'` expands `$HOME` to `/home/shed`.
 
     Proves env expansion happens server-side. The shed user is `shed`
-    (UID 1000) per CLAUDE.md / config.WorkspacePath; the login shell's
+    (UID 1000) per CLAUDE.md / config.HomePath; the login shell's
     `$HOME` is `/home/shed`.
     """
     shed_server.create(test_shed_name, image="base")

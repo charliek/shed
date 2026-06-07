@@ -43,35 +43,46 @@ shed list
 
 ## Local Directory Mounting
 
-When using `--local-dir`, the host directory is shared with the VM via VirtioFS and mounted at `/workspace` inside the guest. Changes on either side are immediately visible to the other.
+When using `--local-dir`, the host directory is shared with the VM via VirtioFS and mounted at `/home/shed/<basename>` inside the guest, where `<basename>` is the last path segment of the host directory. Changes on either side are immediately visible to the other, and the shed lands there on login.
 
 ```bash
 shed create myproject --backend=vz --local-dir=~/projects/myapp
 shed console myproject
-# Inside the VM: ls /workspace shows the contents of ~/projects/myapp
+# Inside the VM: lands in /home/shed/myapp, the contents of ~/projects/myapp
 ```
 
-`--local-dir` is mutually exclusive with `--repo`. If the VirtioFS mount fails (e.g., the guest kernel lacks `CONFIG_VIRTIO_FS`), the create or start operation will fail with an error.
+To mount additional reference directories alongside the primary one, repeat `--add-dir` (valid only with `--local-dir`). Each is mounted at `/home/shed/<basename>` as a sibling:
 
-## Credentials
+```bash
+shed create myproject --backend=vz \
+  --local-dir=~/projects/myapp \
+  --add-dir=~/projects/shared-lib
+# /home/shed/myapp and /home/shed/shared-lib are both VirtioFS-backed
+```
 
-All credentials configured in `server.yaml` are mounted into VZ VMs via VirtioFS. Changes are immediately visible on both sides, similar to Docker bind mounts.
+No two mounted directories may share a basename, and dotfile basenames are rejected. `--local-dir`/`--add-dir` are mutually exclusive with `--repo`. If the VirtioFS mount fails (e.g., the guest kernel lacks `CONFIG_VIRTIO_FS`), the create or start operation will fail with an error.
 
-Read-only credentials (`readonly: true`) are enforced as read-only at the mount level. Writable credentials (`readonly: false`) reflect changes immediately in both directions.
+## Mounts
 
-Configure credentials in `server.yaml`:
+All mounts configured under the `mounts:` section of `server.yaml` are bound into VZ VMs via VirtioFS. Changes are immediately visible on both sides, similar to Docker bind mounts.
+
+Read-only mounts (`readonly: true`) are enforced as read-only at the mount level. Writable mounts (`readonly: false`) reflect changes immediately in both directions.
+
+Configure mounts in `server.yaml`:
 
 ```yaml
-credentials:
+mounts:
   claude:
     source: ~/.claude
     target: /home/shed/.claude
     readonly: false
 ```
 
+The legacy `credentials:` key is still honored as a fallback when `mounts:` is absent.
+
 ## Provisioning
 
-Provisioning hooks execute in the VM via vsock, identically to Firecracker. Credentials are mounted via VirtioFS before hooks run.
+Provisioning hooks execute in the VM via vsock, identically to Firecracker. Mounts are bound via VirtioFS before hooks run.
 
 For the full sequence of operations during create, start, stop, and delete (including how VZ differs from other backends), see [Shed Lifecycle](provisioning.md#shed-lifecycle). For hook configuration, see [Provisioning](provisioning.md).
 

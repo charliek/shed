@@ -284,6 +284,11 @@ func (b *fcCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 	upper := upperRaw.(fcUpper)
 	net := netRaw.(fcNet)
 
+	projectMounts, landingDir, err := config.ResolveCreateLayout(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve workspace layout: %w", err)
+	}
+
 	meta := &Metadata{
 		Name:           req.Name,
 		Status:         config.StatusStopped,
@@ -298,7 +303,8 @@ func (b *fcCreator) BuildAndPersistMetadata(ctx context.Context, req config.Crea
 		UpperPath:      upper.path,
 		UpperSizeBytes: pre.upperSizeBytes,
 		Repo:           req.Repo,
-		LocalDir:       req.LocalDir,
+		ProjectMounts:  projectMounts,
+		LandingDir:     landingDir,
 		Image:          req.Image,
 		LowerDigest:    pre.lowerDigest,
 		LowerImageTag:  pre.lowerImageTag,
@@ -368,35 +374,34 @@ func (b *fcCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.
 	return nil
 }
 
-// MountLocalDir mounts --local-dir via 9P when set; no-op otherwise.
-// The 9P server runs in-process on the host; we start it after VM
-// boot, then ask the guest to mount it.
+// MountLocalDir mounts each project directory (--local-dir / --add-dir) via
+// 9P when set; no-op otherwise. Each 9P server runs in-process on the host; we
+// start them after VM boot, then ask the guest to mount each.
+//
+// The 9P servers are per-shed and live until shed deletion, so we don't
+// register per-server cleanups here; the wider shed cleanup (StopShed /
+// DeleteShed) calls stopP9Servers. On any mount failure we stop all of this
+// shed's servers (no leaked listeners) and fail the create.
 func (b *fcCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) error {
-	if req.LocalDir == "" {
+	meta := metaRaw.(*fcMetaHandle).meta
+	if len(meta.ProjectMounts) == 0 {
 		return nil
 	}
-	meta := metaRaw.(*fcMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "9p")
-	backend.Status(ctx, "Mounting local directory via 9P...")
+	backend.Status(ctx, "Mounting project directories via 9P...")
 	bridgeIP := b.c.netMgr.Gateway()
-	srv, err := b.c.startP9Server(req.Name, bridgeIP, req.LocalDir, config.WorkspacePath, false)
-	if err != nil {
-		return fmt.Errorf("failed to start 9P server for local dir: %w", err)
-	}
-	// Register the 9P teardown only AFTER startP9Server succeeds.
-	// The orchestrator's cleanup is the only path that runs this hook,
-	// so we can't access it directly from MountLocalDir's signature —
-	// the cleanup must be wired through the orchestrator.
-	//
-	// In practice, the 9P server is per-shed and lives until shed
-	// deletion, so we don't register a cleanup here; the wider shed
-	// cleanup (StopShed/DeleteShed) calls stopP9Servers.
-	if err := b.c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
-		// On mount failure we need to stop the just-started 9P
-		// server explicitly, since we couldn't register a cleanup.
-		b.c.stopP9Servers(req.Name)
-		return fmt.Errorf("failed to mount 9P in guest: %w", err)
+	for _, m := range meta.ProjectMounts {
+		srv, err := b.c.startP9Server(meta.Name, bridgeIP, m.Source, m.Target, m.ReadOnly)
+		if err != nil {
+			b.c.stopP9Servers(meta.Name)
+			return fmt.Errorf("failed to start 9P server for %s: %w", m.Source, err)
+		}
+		tag := config.ProjectMountTagForTarget(m.Target)
+		if err := b.c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), m.Target, m.ReadOnly, tag); err != nil {
+			b.c.stopP9Servers(meta.Name)
+			return fmt.Errorf("failed to mount 9P in guest for %s: %w", m.Source, err)
+		}
 	}
 	return nil
 }
@@ -441,6 +446,7 @@ func (b *fcCreator) RunProvisioning(ctx context.Context, req config.CreateShedRe
 	meta := metaRaw.(*fcMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	provisioner := vmutil.NewProvisioner(agent, req.Name)
+	provisioner.SetWorkDir(meta.LandingDir)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {
@@ -577,23 +583,27 @@ func (b *fcStarter) RestoreStoppedMetadata(metaRaw orchestrator.MetadataHandle) 
 	return meta.Save(b.c.cfg.InstanceDir)
 }
 
-// MountLocalDir starts the 9P server and mounts it in the guest when
-// meta.LocalDir is set. Mounts don't persist across firecracker
-// restarts; this is the start-time refresh.
+// MountLocalDir starts a 9P server and mounts it in the guest for each project
+// directory when meta.ProjectMounts is set. Mounts don't persist across
+// firecracker restarts; this is the start-time refresh.
 func (b *fcStarter) MountLocalDir(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) error {
 	meta := metaRaw.(*fcMetaHandle).meta
-	if meta.LocalDir == "" {
+	if len(meta.ProjectMounts) == 0 {
 		return nil
 	}
 	agent := b.c.newAgentClient(meta.Name)
 	bridgeIP := b.c.netMgr.Gateway()
-	srv, err := b.c.startP9Server(meta.Name, bridgeIP, meta.LocalDir, config.WorkspacePath, false)
-	if err != nil {
-		return fmt.Errorf("failed to start 9P server on start: %w", err)
-	}
-	if err := b.c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), config.WorkspacePath, false, "workspace"); err != nil {
-		b.c.stopP9Servers(meta.Name)
-		return fmt.Errorf("failed to mount 9P in guest on start: %w", err)
+	for _, m := range meta.ProjectMounts {
+		srv, err := b.c.startP9Server(meta.Name, bridgeIP, m.Source, m.Target, m.ReadOnly)
+		if err != nil {
+			b.c.stopP9Servers(meta.Name)
+			return fmt.Errorf("failed to start 9P server on start for %s: %w", m.Source, err)
+		}
+		tag := config.ProjectMountTagForTarget(m.Target)
+		if err := b.c.mount9PInGuestWithRetry(ctx, agent, srv.Addr(), m.Target, m.ReadOnly, tag); err != nil {
+			b.c.stopP9Servers(meta.Name)
+			return fmt.Errorf("failed to mount 9P in guest on start for %s: %w", m.Source, err)
+		}
 	}
 	return nil
 }
@@ -614,6 +624,7 @@ func (b *fcStarter) RunStartupHook(ctx context.Context, metaRaw orchestrator.Met
 	meta := metaRaw.(*fcMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
 	provisioner := vmutil.NewProvisioner(agent, meta.Name)
+	provisioner.SetWorkDir(meta.LandingDir)
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {

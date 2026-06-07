@@ -21,17 +21,30 @@ import (
 type Provisioner struct {
 	agent    *AgentClient
 	shedName string
+	workDir  string
 	output   io.Writer
 	errOut   io.Writer
 }
 
-// NewProvisioner creates a new Provisioner.
+// NewProvisioner creates a new Provisioner. The working directory defaults to
+// the home directory; callers should SetWorkDir to the shed's landing directory
+// so hooks run in (and provision.yaml is read from) the project directory.
 func NewProvisioner(agent *AgentClient, shedName string) *Provisioner {
 	return &Provisioner{
 		agent:    agent,
 		shedName: shedName,
+		workDir:  config.HomePath,
 		output:   os.Stdout,
 		errOut:   os.Stderr,
+	}
+}
+
+// SetWorkDir sets the directory provisioning hooks run in and where
+// .shed/provision.yaml is read from (the shed's landing directory). Empty is
+// ignored, keeping the default (HomePath).
+func (p *Provisioner) SetWorkDir(dir string) {
+	if dir != "" {
+		p.workDir = dir
 	}
 }
 
@@ -44,7 +57,7 @@ func (p *Provisioner) SetOutput(stdout, stderr io.Writer) {
 // LoadConfig loads provisioning configuration from within the VM.
 // It reads .shed/provision.yaml from the workspace directory.
 func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error) {
-	configPath := filepath.Join(config.WorkspacePath, provision.ShedProvisionYAML)
+	configPath := filepath.Join(p.workDir, provision.ShedProvisionYAML)
 
 	// Read the config file via exec
 	var stdout, stderr strings.Builder
@@ -52,7 +65,7 @@ func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error)
 		Cmd:        []string{"cat", configPath},
 		Stdout:     NopWriteCloser(&stdout),
 		Stderr:     NopWriteCloser(&stderr),
-		WorkingDir: config.WorkspacePath,
+		WorkingDir: p.workDir,
 		TTY:        false,
 	}
 
@@ -173,7 +186,7 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 
 	fullScriptPath := scriptPath
 	if !filepath.IsAbs(scriptPath) {
-		fullScriptPath = filepath.Join(config.WorkspacePath, scriptPath)
+		fullScriptPath = filepath.Join(p.workDir, scriptPath)
 	}
 
 	logFile := p.logFileForHook(hookType)
@@ -193,7 +206,7 @@ func (p *Provisioner) runHook(ctx context.Context, cfg *provision.Config, hookTy
 		Env:        env,
 		Stdout:     NopWriteCloser(multiWriter),
 		Stderr:     NopWriteCloser(p.errOut),
-		WorkingDir: config.WorkspacePath,
+		WorkingDir: p.workDir,
 		TTY:        false,
 	}
 
@@ -239,7 +252,7 @@ func (p *Provisioner) buildEnv(cfg *provision.Config) []string {
 	env = append(env,
 		fmt.Sprintf("%s=true", provision.EnvShedContainer),
 		fmt.Sprintf("%s=%s", provision.EnvShedName, p.shedName),
-		fmt.Sprintf("%s=%s", provision.EnvShedWorkspace, config.WorkspacePath),
+		fmt.Sprintf("%s=%s", provision.EnvShedWorkspace, p.workDir),
 	)
 
 	for key, value := range cfg.Env {
@@ -279,13 +292,14 @@ func getLastLines(s string, n int) string {
 // RunShutdownSequence runs the shutdown hook for a VM with appropriate timeout budgeting.
 // This encapsulates the identical shutdown pattern used by both VZ and Firecracker backends.
 // Failures are logged as warnings but never cause the sequence to fail.
-func RunShutdownSequence(ctx context.Context, agent *AgentClient, name string, stopTimeout time.Duration, stdout, stderr io.Writer) {
+func RunShutdownSequence(ctx context.Context, agent *AgentClient, name, workDir string, stopTimeout time.Duration, stdout, stderr io.Writer) {
 	hookBudget := stopTimeout / 2
 	if hookBudget > 30*time.Second {
 		hookBudget = 30 * time.Second
 	}
 
 	provisioner := NewProvisioner(agent, name)
+	provisioner.SetWorkDir(workDir)
 	provisioner.SetOutput(stdout, stderr)
 
 	hookCtx, hookCancel := context.WithTimeout(ctx, hookBudget)

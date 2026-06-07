@@ -2,6 +2,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -137,9 +139,14 @@ type Shed struct {
 	MemoryMB    int       `json:"memory_mb,omitempty" yaml:"memory_mb,omitempty"`
 	PID         int       `json:"pid,omitempty" yaml:"pid,omitempty"`
 	RootfsPath  string    `json:"rootfs_path,omitempty" yaml:"rootfs_path,omitempty"`
-	LocalDir    string    `json:"local_dir,omitempty" yaml:"local_dir,omitempty"`
-	Image       string    `json:"image,omitempty" yaml:"image,omitempty"`
-	ImageDigest string    `json:"image_digest,omitempty" yaml:"image_digest,omitempty"` // pinned manifest digest (sha256:...)
+	// ProjectMounts are host directories mounted under the home directory
+	// (--local-dir / --add-dir), each at /home/shed/<basename>.
+	ProjectMounts []MountConfig `json:"project_mounts,omitempty" yaml:"project_mounts,omitempty"`
+	// LandingDir is the directory interactive logins land in (a project
+	// subdirectory of the home directory, or the home directory itself).
+	LandingDir  string `json:"landing_dir,omitempty" yaml:"landing_dir,omitempty"`
+	Image       string `json:"image,omitempty" yaml:"image,omitempty"`
+	ImageDigest string `json:"image_digest,omitempty" yaml:"image_digest,omitempty"` // pinned manifest digest (sha256:...)
 	// FromSnapshot records the snapshot name this shed was spawned from (immediate parent only).
 	FromSnapshot string                         `json:"from_snapshot,omitempty" yaml:"from_snapshot,omitempty"`
 	LastHealthy  *time.Time                     `json:"last_healthy,omitempty" yaml:"last_healthy,omitempty"` // last heartbeat from agent (VM backends only)
@@ -499,9 +506,15 @@ type CreateShedRequest struct {
 	// MemoryMB specifies the memory in MB (firecracker/vz only)
 	MemoryMB int `json:"memory_mb,omitempty"`
 
-	// LocalDir mounts a host directory as the workspace instead of creating
-	// a volume. Mutually exclusive with Repo.
+	// LocalDir mounts a host directory under the home directory (at
+	// /home/shed/<basename>) and makes it the landing directory.
+	// Mutually exclusive with Repo.
 	LocalDir string `json:"local_dir,omitempty"`
+
+	// AddDirs mounts additional host directories under the home directory
+	// (each at /home/shed/<basename>) as reference siblings of LocalDir.
+	// Only valid together with LocalDir.
+	AddDirs []string `json:"add_dirs,omitempty"`
 
 	// FromSnapshot spawns the shed from a snapshot's rootfs instead of a base image.
 	// Mutually exclusive with Image and Repo. Provisioning steps (repo clone, install
@@ -534,8 +547,9 @@ type Snapshot struct {
 	// SourceImage is the image variant the source shed was created from (provenance hint).
 	SourceImage string `json:"source_image,omitempty"`
 
-	// SourceLocalDir is the host directory the source shed was using (hint only; not bound at spawn).
-	SourceLocalDir string `json:"source_local_dir,omitempty"`
+	// SourceLocalDirs are the host directories the source shed mounted
+	// (--local-dir / --add-dir); hint only, not bound at spawn.
+	SourceLocalDirs []string `json:"source_local_dirs,omitempty"`
 
 	// Comment is an optional user-supplied note attached at create time.
 	Comment string `json:"comment,omitempty"`
@@ -650,14 +664,49 @@ const (
 	BackendDetect      = "detect"
 )
 
-// WorkspacePath is the path where the workspace volume is mounted in containers.
-const WorkspacePath = "/workspace"
+// HomePath is the shed user's home directory inside the VM. Repos, --local-dir,
+// and --add-dir mounts all live under here, and interactive logins land here by
+// default (or in a project subdirectory when one is present).
+const HomePath = "/home/shed"
 
-// VirtioFSMountTag is the mount tag used for VirtioFS shared directories.
-const VirtioFSMountTag = "workspace"
-
-// CredentialMountTag returns the VirtioFS mount tag for a credential share.
-// Tags use the format "cred-{name}" to avoid collisions with the workspace tag.
+// CredentialMountTag returns the VirtioFS/9P mount tag for a credential share.
+// Tags use the format "cred-{name}" to avoid collisions with project mounts.
 func CredentialMountTag(name string) string {
 	return "cred-" + name
+}
+
+// maxMountTagLen is the maximum length of a virtio-fs mount tag (the guest's
+// virtio_fs device tag field is 36 bytes).
+const maxMountTagLen = 36
+
+// ProjectMountTag returns a stable, unique, virtio-fs-safe mount tag for a
+// project mount (--local-dir / --add-dir) identified by its guest-dir basename.
+// The tag is "proj-<sanitized>-<hash>": the hash keeps tags distinct even when
+// two different basenames sanitize to the same prefix, and the whole tag is
+// capped at maxMountTagLen.
+func ProjectMountTag(basename string) string {
+	const prefix = "proj-"
+	sum := sha256.Sum256([]byte(basename))
+	suffix := hex.EncodeToString(sum[:])[:8]
+	san := sanitizeMountTag(basename)
+	// Budget: len(prefix) + len(san) + len("-") + len(suffix) <= maxMountTagLen.
+	maxSan := maxMountTagLen - len(prefix) - 1 - len(suffix)
+	if len(san) > maxSan {
+		san = san[:maxSan]
+	}
+	return prefix + san + "-" + suffix
+}
+
+// sanitizeMountTag replaces every byte outside [A-Za-z0-9_-] with '_'.
+func sanitizeMountTag(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
+			// keep
+		default:
+			b[i] = '_'
+		}
+	}
+	return string(b)
 }

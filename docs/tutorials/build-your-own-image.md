@@ -67,7 +67,7 @@ LABEL io.shed.variant=myorg-python-opencode
 
 # Mandatory shed boot setup — keep these.
 USER root
-WORKDIR /workspace
+WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
 ```
 

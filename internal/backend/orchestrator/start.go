@@ -103,11 +103,12 @@ type BackendStarter interface {
 	// but not propagated.
 	RestoreStoppedMetadata(meta MetadataHandle) error
 
-	// MountLocalDir re-mounts the configured `--local-dir` via the
-	// backend's transport (VirtioFS on VZ, 9P on FC). Mount state
-	// does not persist across VMM restarts, so this runs on every
-	// start even when CreateShed already mounted at create time.
-	// No-op when the metadata has no local-dir.
+	// MountLocalDir re-mounts the configured project directories
+	// (--local-dir / --add-dir) via the backend's transport (VirtioFS
+	// on VZ, 9P on FC). Mount state does not persist across VMM
+	// restarts, so this runs on every start even when CreateShed
+	// already mounted at create time. No-op when the metadata has no
+	// project mounts.
 	MountLocalDir(ctx context.Context, meta MetadataHandle, vm VMHandle) error
 
 	// SetupCredentials re-mounts any configured credentials into the

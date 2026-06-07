@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +83,10 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, "local_dir and repo are mutually exclusive")
 		return
 	}
+	if len(req.AddDirs) > 0 && req.LocalDir == "" {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, "add_dirs requires local_dir")
+		return
+	}
 
 	// from_snapshot validation runs BEFORE either the SSE branch or the
 	// backend call: handleCreateShedSSE writes "200 OK" before the backend
@@ -102,29 +104,29 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Validate local_dir exists on the server
+	// Validate local_dir / add_dirs exist on the server. validateMountDir
+	// writes the appropriate 400 and returns false on the first problem.
 	if req.LocalDir != "" {
-		if !filepath.IsAbs(req.LocalDir) {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, "local_dir must be an absolute path")
-			return
-		}
-		if strings.Contains(req.LocalDir, ",") {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, "local_dir path must not contain commas")
-			return
-		}
-		info, err := os.Stat(req.LocalDir)
-		if err != nil {
-			if os.IsNotExist(err) {
-				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q does not exist", req.LocalDir))
-			} else if os.IsPermission(err) {
-				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q: permission denied", req.LocalDir))
-			} else {
-				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q: %v", req.LocalDir, err))
+		validateMountDir := func(field, p string) bool {
+			if err := config.ValidateMountDir(p); err != nil {
+				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("%s %q %s", field, p, err.Error()))
+				return false
 			}
+			return true
+		}
+
+		if !validateMountDir("local_dir", req.LocalDir) {
 			return
 		}
-		if !info.IsDir() {
-			writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("local_dir %q is not a directory", req.LocalDir))
+		for _, d := range req.AddDirs {
+			if !validateMountDir("add_dir", d) {
+				return
+			}
+		}
+
+		// Structural validation: basename uniqueness + dotfile/home-infra guard.
+		if _, _, err := config.BuildProjectMounts(req.LocalDir, req.AddDirs); err != nil {
+			writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, err.Error())
 			return
 		}
 	}

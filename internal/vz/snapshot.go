@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
@@ -172,9 +173,9 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 		return nil, fmt.Errorf("%w: %s", config.ErrSnapshotSourceRunningSentinel, req.SourceShed)
 	}
 
-	if srcMeta.LocalDir != "" {
+	if len(srcMeta.ProjectMounts) != 0 {
 		backend.Phase(ctx, "snapshot")
-		backend.StatusWarning(ctx, fmt.Sprintf("source shed uses --local-dir; workspace contents at %s are NOT included in the snapshot", srcMeta.LocalDir))
+		backend.StatusWarning(ctx, fmt.Sprintf("source shed mounts host directories (%s); their contents are NOT included in the snapshot", strings.Join(config.ProjectMountSources(srcMeta.ProjectMounts), ", ")))
 	}
 
 	dir := SnapshotDir(c.cfg.SnapshotsDir, req.Name)
@@ -250,16 +251,16 @@ func (c *Client) CreateSnapshot(ctx context.Context, req config.SnapshotCreateRe
 	log.Printf("snapshot strategy=%s src=%s dst=%s logical_bytes=%d", strategy, src, dstRootfs, sizeBytes)
 
 	snap := &config.Snapshot{
-		Version:        config.SnapshotSchemaVersion,
-		Name:           req.Name,
-		Backend:        config.BackendVZ,
-		SourceShed:     req.SourceShed,
-		SourceImage:    snapshotSourceImage(srcMeta),
-		SourceLocalDir: srcMeta.LocalDir,
-		Comment:        req.Comment,
-		CreatedAt:      time.Now(),
-		SizeBytes:      sizeBytes,
-		LowerDigest:    srcMeta.LowerDigest,
+		Version:         config.SnapshotSchemaVersion,
+		Name:            req.Name,
+		Backend:         config.BackendVZ,
+		SourceShed:      req.SourceShed,
+		SourceImage:     snapshotSourceImage(srcMeta),
+		SourceLocalDirs: config.ProjectMountSources(srcMeta.ProjectMounts),
+		Comment:         req.Comment,
+		CreatedAt:       time.Now(),
+		SizeBytes:       sizeBytes,
+		LowerDigest:     srcMeta.LowerDigest,
 	}
 
 	backend.Phase(ctx, "snapshot")

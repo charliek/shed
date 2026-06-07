@@ -45,7 +45,8 @@ type ExecOptions struct {
 	// Env contains additional environment variables.
 	Env []string
 
-	// WorkingDir overrides the default working directory (/workspace).
+	// WorkingDir overrides the default working directory. Empty defaults to
+	// the shed user's home directory (resolved by the guest agent).
 	WorkingDir string
 
 	// InitialSize is the initial terminal size (if TTY is true).
