@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -158,15 +157,8 @@ func runCreate(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return "", fmt.Errorf("invalid %s path %q: %w", flagName, p, err)
 			}
-			info, err := os.Stat(absDir)
-			if err != nil {
-				return "", fmt.Errorf("%s %q does not exist: %w", flagName, absDir, err)
-			}
-			if !info.IsDir() {
-				return "", fmt.Errorf("%s %q is not a directory", flagName, absDir)
-			}
-			if strings.Contains(absDir, ",") {
-				return "", fmt.Errorf("%s path must not contain commas (incompatible with VirtioFS device arguments)", flagName)
+			if err := config.ValidateMountDir(absDir); err != nil {
+				return "", fmt.Errorf("%s %q %w", flagName, absDir, err)
 			}
 			return absDir, nil
 		}

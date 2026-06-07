@@ -2,10 +2,41 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
 )
+
+// ValidateMountDir checks that a project-mount host directory is usable: an
+// absolute path, comma-free (commas break vfkit VirtioFS device arguments),
+// existing, and a directory. The returned errors are phrased as predicates
+// ("must be an absolute path", "does not exist", ...) so callers can prefix
+// them with the relevant flag/field name. Shared by the CLI (cmd/shed) and the
+// API handler so both validate identically.
+func ValidateMountDir(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("must be an absolute path")
+	}
+	if strings.Contains(path, ",") {
+		return fmt.Errorf("path must not contain commas (incompatible with VirtioFS device arguments)")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		switch {
+		case os.IsNotExist(err):
+			return fmt.Errorf("does not exist")
+		case os.IsPermission(err):
+			return fmt.Errorf("permission denied")
+		default:
+			return err
+		}
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("is not a directory")
+	}
+	return nil
+}
 
 // ProjectMountBasename validates a host directory destined to be mounted under
 // the shed user's home directory and returns the guest-directory basename it

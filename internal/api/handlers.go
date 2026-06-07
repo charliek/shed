@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -110,28 +108,8 @@ func (s *Server) handleCreateShed(w http.ResponseWriter, r *http.Request) {
 	// writes the appropriate 400 and returns false on the first problem.
 	if req.LocalDir != "" {
 		validateMountDir := func(field, p string) bool {
-			if !filepath.IsAbs(p) {
-				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, field+" must be an absolute path")
-				return false
-			}
-			if strings.Contains(p, ",") {
-				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, field+" path must not contain commas")
-				return false
-			}
-			info, err := os.Stat(p)
-			if err != nil {
-				switch {
-				case os.IsNotExist(err):
-					writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("%s %q does not exist", field, p))
-				case os.IsPermission(err):
-					writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("%s %q: permission denied", field, p))
-				default:
-					writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("%s %q: %v", field, p, err))
-				}
-				return false
-			}
-			if !info.IsDir() {
-				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("%s %q is not a directory", field, p))
+			if err := config.ValidateMountDir(p); err != nil {
+				writeError(w, http.StatusBadRequest, config.ErrInvalidLocalDir, fmt.Sprintf("%s %q %s", field, p, err.Error()))
 				return false
 			}
 			return true
