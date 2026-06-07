@@ -131,7 +131,12 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid memory %d: must be at least 0 MB", createMemory)
 	}
 
-	// Validate --local-dir / --add-dir flags
+	// Validate --local-dir / --add-dir flags. An explicitly empty
+	// `--local-dir ""` is rejected (it's indistinguishable from "unset" by
+	// value alone, so check whether the flag was actually provided).
+	if cmd.Flags().Changed("local-dir") && createLocalDir == "" {
+		return fmt.Errorf("--local-dir must not be empty")
+	}
 	if createLocalDir != "" && createRepo != "" {
 		return fmt.Errorf("--local-dir and --repo are mutually exclusive")
 	}

@@ -715,7 +715,7 @@ This is the same model Docker, devcontainers, Codespaces, and Coder follow on th
 # the single-quote wrap. Tools installed via login PATH (mise, nvm, rustup,
 # etc.) just work because `bash -lc` sources profile scripts.
 shed exec codelens git status
-shed exec codelens ls -la ~
+shed exec codelens ls -la /home/shed
 shed exec codelens rustc --version
 shed exec codelens mise current
 

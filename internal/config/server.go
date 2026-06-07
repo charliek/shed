@@ -1025,6 +1025,21 @@ func LoadServerConfig() (*ServerConfig, error) {
 	return LoadServerConfigFromPath("")
 }
 
+// normalizeMounts applies the credentials→mounts backwards-compat fallback so
+// both the server and CLI config loaders behave identically. The deprecated
+// "credentials" key is used only when "mounts" is entirely ABSENT (nil map); an
+// explicitly empty `mounts: {}` is non-nil and means "no mounts", winning over a
+// leftover credentials block. Idempotent; after it runs the rest of the code
+// reads only cfg.Mounts.
+func normalizeMounts(cfg *ServerConfig, configPath string) {
+	if cfg.Mounts == nil {
+		cfg.Mounts = cfg.Credentials
+	} else if len(cfg.Credentials) != 0 {
+		fmt.Fprintf(os.Stderr, "Warning: both \"mounts\" and the deprecated \"credentials\" are set in %s; ignoring \"credentials\"\n", configPath)
+	}
+	cfg.Credentials = nil
+}
+
 // LoadServerConfigFromPath loads server configuration from a specific path.
 // If path is empty, it searches standard locations.
 func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
@@ -1065,17 +1080,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
-	// Backwards compatibility: the "credentials" config section was renamed to
-	// "mounts". Fall back to the deprecated "credentials" key only when "mounts"
-	// is entirely ABSENT (nil map). An explicitly empty `mounts: {}` is a
-	// non-nil map and means "no mounts" — it wins over a leftover credentials
-	// block. After this, the rest of the code reads cfg.Mounts.
-	if cfg.Mounts == nil {
-		cfg.Mounts = cfg.Credentials
-	} else if len(cfg.Credentials) != 0 {
-		fmt.Fprintf(os.Stderr, "Warning: both \"mounts\" and the deprecated \"credentials\" are set in %s; ignoring \"credentials\"\n", configPath)
-	}
-	cfg.Credentials = nil
+	normalizeMounts(cfg, configPath)
 
 	// Apply defaults for zero values
 	if cfg.HTTPPort == 0 {
@@ -1230,6 +1235,8 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	if err := rejectRemovedImageKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
+
+	normalizeMounts(cfg, configPath)
 
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
