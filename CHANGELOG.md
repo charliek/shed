@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.6.4 — 2026-06-07
+
+Home-rooted workspaces: a shed's repo and mounted directories now live under
+the home directory instead of the magic `/workspace` path, plus a new
+`--add-dir` flag for mounting reference projects alongside a primary. The
+server-config `credentials:` section is renamed to `mounts:`.
+
+### Home-rooted workspaces (#188)
+
+`/workspace` is removed (clean break). A bare shed lands in `/home/shed`;
+`--repo` clones into `~/<reponame>` and lands there; `--local-dir` mounts a host
+directory at `~/<basename>` and becomes the landing directory; the new
+repeatable `--add-dir` (requires `--local-dir`) mounts additional host
+directories at `~/<basename>` each as reference siblings. Two mounts can't share
+a basename, and dotfile-style basenames are rejected. Interactive logins
+(`console`, `attach`, raw `ssh`, VS Code Remote-SSH) and `shed exec` start in the
+shed's landing directory. Project directories mount via VirtioFS (VZ) / 9P (FC),
+each with a unique tag.
+
+**Breaking:** pre-existing sheds created with `--local-dir` should be recreated —
+their mount is not migrated and won't reattach on restart; other existing sheds
+now land in `/home/shed` rather than `/workspace`.
+
+### Config: `credentials:` renamed to `mounts:` (#188)
+
+The server-config `credentials:` section is renamed to `mounts:` (identical
+shape). The deprecated `credentials:` key still works as a fallback when
+`mounts:` is absent; an explicit `mounts: {}` wins.
+
 ## v0.6.3 — 2026-06-06
 
 Image refs that no longer need re-pinning each release; quieter,
