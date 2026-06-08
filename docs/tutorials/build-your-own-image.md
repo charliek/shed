@@ -14,9 +14,9 @@ The three published variants are:
 
 | Variant | Contents | Recommended use |
 |---|---|---|
-| `base` | OS layer only. systemd, SSH, Docker, the shed-agent. | Tiny images. You'll wire up coding agents and credentials yourself. |
-| `extensions` | `base` + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering. No coding agents pinned. | **Custom images.** Credentials work out of the box; you choose the runtime/agent set. |
-| `full` | `extensions` + Node.js LTS, Python 3.13, Claude Code, OpenCode, Codex CLI. | Default for `shed create`. |
+| `base` | OS layer only. systemd, SSH, git, build tools, the shed-agent. No Docker. | Tiny images. You'll wire up coding agents and credentials yourself. |
+| `extensions` | `base` + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering. No Docker daemon, no coding agents pinned. | **Custom images.** Credentials work out of the box; you choose the runtime/agent set. |
+| `full` | `extensions` + Docker CE (with `docker compose`), mise, bun, and coding agents (Claude Code, OpenCode, Codex CLI). | Default for `shed create`. |
 
 `extensions` is the right starting point because:
 

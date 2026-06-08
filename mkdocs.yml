@@ -98,6 +98,9 @@ nav:
           - v0.5.7 → v0.5.8: upgrades/v0.5.7-to-v0.5.8.md
   - Tutorials:
       - Build Your Own Image: tutorials/build-your-own-image.md
+      - Provisioning a Gradle Project: tutorials/gradle-provisioning.md
+      - Provisioning a TypeScript Project: tutorials/typescript-provisioning.md
+      - Provisioning a Python Project: tutorials/python-provisioning.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
