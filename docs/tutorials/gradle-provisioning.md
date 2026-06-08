@@ -55,10 +55,12 @@ wait_for_docker() {
   docker info >/dev/null 2>&1 || log "WARN: docker not ready (needs the 'full' image)"
 }
 
-# Public Docker Hub pulls fail under the image's credsStore=shed; reset it.
+# Public Docker Hub pulls fail under the image's credsStore=shed; drop only that
+# key (keeping any auths/credHelpers).
 enable_public_image_pulls() {
   local cfg="$HOME/.docker/config.json"
-  grep -q '"credsStore"' "$cfg" 2>/dev/null && { cp "$cfg" "$cfg.bak"; echo '{}' >"$cfg"; }
+  grep -q '"credsStore"' "$cfg" 2>/dev/null || return
+  cp "$cfg" "$cfg.bak"; jq 'del(.credsStore)' "$cfg" >"$cfg.tmp" && mv "$cfg.tmp" "$cfg"
 }
 
 # Testcontainers launches containers on docker's DEFAULT bridge, which the image

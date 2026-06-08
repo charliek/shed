@@ -49,7 +49,8 @@ wait_for_docker() {
 
 enable_public_image_pulls() {
   local cfg="$HOME/.docker/config.json"
-  grep -q '"credsStore"' "$cfg" 2>/dev/null && { cp "$cfg" "$cfg.bak"; echo '{}' >"$cfg"; }
+  grep -q '"credsStore"' "$cfg" 2>/dev/null || return
+  cp "$cfg" "$cfg.bak"; jq 'del(.credsStore)' "$cfg" >"$cfg.tmp" && mv "$cfg.tmp" "$cfg"
 }
 
 # Testcontainers uses docker's DEFAULT bridge, which the image disables.
