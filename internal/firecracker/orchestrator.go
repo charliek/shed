@@ -447,6 +447,7 @@ func (b *fcCreator) RunProvisioning(ctx context.Context, req config.CreateShedRe
 	agent := b.c.newAgentClient(meta.Name)
 	provisioner := vmutil.NewProvisioner(agent, req.Name)
 	provisioner.SetWorkDir(meta.LandingDir)
+	provisioner.SetAddDirs(config.ProjectAddDirTargets(meta.ProjectMounts, meta.LandingDir))
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {
@@ -625,6 +626,7 @@ func (b *fcStarter) RunStartupHook(ctx context.Context, metaRaw orchestrator.Met
 	agent := b.c.newAgentClient(meta.Name)
 	provisioner := vmutil.NewProvisioner(agent, meta.Name)
 	provisioner.SetWorkDir(meta.LandingDir)
+	provisioner.SetAddDirs(config.ProjectAddDirTargets(meta.ProjectMounts, meta.LandingDir))
 	provisioner.SetOutput(os.Stdout, os.Stderr)
 	cfg, err := provisioner.LoadConfig(ctx)
 	if err != nil {

@@ -19,6 +19,9 @@ const (
 	EnvShedContainer = "SHED_CONTAINER"
 	EnvShedName      = "SHED_NAME"
 	EnvShedWorkspace = "SHED_WORKSPACE"
+	// EnvShedAddDirs is a colon-separated list of the guest paths of any
+	// --add-dir mounts (empty/unset when there are none).
+	EnvShedAddDirs = "SHED_ADD_DIRS"
 )
 
 // Log file paths in the container/VM.

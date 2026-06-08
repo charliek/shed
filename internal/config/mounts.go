@@ -95,6 +95,21 @@ func BuildProjectMounts(localDir string, addDirs []string) ([]MountConfig, strin
 	return mounts, landing, nil
 }
 
+// ProjectAddDirTargets returns the guest target paths of a shed's --add-dir
+// mounts: every project mount except the --local-dir mount the shed lands in
+// (identified by landingDir). Order is preserved. Returns nil when there are no
+// add-dir mounts (a bare, --repo, or --local-dir-only shed). Used to expose
+// SHED_ADD_DIRS to sessions and provisioning hooks.
+func ProjectAddDirTargets(mounts []MountConfig, landingDir string) []string {
+	var out []string
+	for _, m := range mounts {
+		if m.Target != "" && m.Target != landingDir {
+			out = append(out, m.Target)
+		}
+	}
+	return out
+}
+
 // ResolveCreateLayout computes the project mounts and landing directory for a
 // (already-validated) create request. --repo lands in the cloned repository
 // directory (no project mounts); --local-dir/--add-dir mount under the home
