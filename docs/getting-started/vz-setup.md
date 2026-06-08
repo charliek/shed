@@ -1,6 +1,13 @@
-# VZ Setup (macOS Apple Silicon)
+# macOS Developer Setup (VZ)
 
-This guide covers setting up the VZ backend, which uses Apple's Virtualization.framework to run Linux VMs on macOS via [vfkit](https://github.com/crc-org/vfkit).
+This is the in-depth VZ guide: the full setup, including **building from source**
+and custom images. The VZ backend uses Apple's Virtualization.framework to run
+Linux VMs on macOS via [vfkit](https://github.com/crc-org/vfkit).
+
+!!! tip "Just want shed running?"
+    Use the **[macOS Quickstart](macos-quickstart.md)** — Homebrew + shed-desktop,
+    no source build. This page is for contributors, custom images, or running an
+    unreleased commit.
 
 ## Prerequisites
 

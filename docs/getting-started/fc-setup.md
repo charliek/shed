@@ -1,10 +1,14 @@
-# Firecracker Setup
+# Firecracker Developer Setup
 
-This guide covers the installation and setup of the Firecracker backend
-for shed. Firecracker is Linux-only and requires KVM. The remote-Linux-host
-workflow is the common case: you run `shed` on your laptop and `shed-server`
-on a separate Linux box you SSH into (e.g.,
-`ssh charliek@your.linux.host.example.com`).
+This is the in-depth Firecracker guide: the full manual setup, **building from
+source**, and custom kernels/images. Firecracker is Linux-only and requires KVM.
+The remote-Linux-host workflow is the common case: you run `shed` on your laptop
+and `shed-server` on a separate Linux box you SSH into.
+
+!!! tip "Just want a server running?"
+    Use the **[Linux Quickstart](linux-quickstart.md)** — the `shed-server` deb
+    plus `sudo shed-server setup`. This page is for the manual/from-source setup,
+    custom kernels, and operations detail.
 
 ## Prerequisites
 

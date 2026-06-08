@@ -1,99 +1,26 @@
-# Quick Start
+# Getting Started
 
-Get up and running with Shed in a few minutes.
+Shed runs persistent, VM-based dev environments you reach over SSH. Start with
+the packaged quickstart for your platform, then use the reference below for the
+day-to-day commands.
 
-## Prerequisites
+## Choose your path
 
-- **macOS Apple Silicon** — Homebrew (recommended) or Go 1.24+ for source builds
-- **Linux with KVM** — deb package (recommended) or Go 1.24+ for source builds
-- Docker (for VM image management)
-- Tailscale (or other private network) if connecting to remote servers
+**Quickstarts (packaged, recommended)** — install from a package manager, copy a
+config, create a shed:
 
-## Install
+- **[macOS Quickstart](macos-quickstart.md)** — Homebrew + the shed-desktop
+  approval app; runs VMs via Apple's Virtualization.framework (VZ backend).
+- **[Linux Quickstart](linux-quickstart.md)** — the `shed-server` deb running
+  Firecracker microVMs (the tested remote-host path).
 
-Shed has two install paths:
+**Developer setup** — build from source, custom images, or the full manual setup:
 
-- **Published packages (Homebrew on macOS, deb on Linux)** are the
-  easiest path. They install pre-built binaries and pull pre-built VM
-  images from `ghcr.io`. Pick this if you want shed running quickly and
-  don't need to modify the rootfs / kernel / initramfs.
-- **Build from source** is for contributors and bleeding-edge use. It
-  builds binaries locally from the repo and (optionally) builds the VM
-  rootfs images from the local `vz/` and `firecracker/` Dockerfiles.
-  Pick this if you're hacking on shed itself or want to run an unreleased
-  commit.
+- **[macOS Developer Setup](vz-setup.md)** (VZ backend)
+- **[Firecracker Developer Setup](fc-setup.md)** (Linux / KVM backend)
 
-Upgrading from v0.4.x? See the [v0.4 → v0.5 Upgrade Guide](../upgrades/v0.4-to-v0.5.md) —
-the v0.5.0 image store is not backwards-compatible.
-
-### Homebrew (macOS, Recommended)
-
-```bash
-brew install charliek/tap/shed
-```
-
-This installs both `shed` (CLI) and `shed-server`, generates a default server config with the VZ backend, codesigns the server binary, and sets up a launchd service.
-
-For credential brokering (SSH agent forwarding, AWS credentials, Docker registry auth), also install the host agent:
-
-```bash
-brew install charliek/tap/shed-host-agent
-```
-
-Edit the server config at `$(brew --prefix)/etc/shed/server.yaml` to configure credentials and extensions, then start the services:
-
-```bash
-brew services start shed
-brew services start shed-host-agent  # if installed
-```
-
-See [VZ Setup](vz-setup.md) for the full macOS setup guide.
-
-### deb Package (Linux, Recommended)
-
-Download and install the `.deb` from the [latest release](https://github.com/charliek/shed/releases):
-
-```bash
-# Find the latest version at https://github.com/charliek/shed/releases
-# or, with the gh CLI:
-VERSION=$(gh release view --repo charliek/shed --json tagName -q .tagName | sed 's/^v//')
-
-wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
-sudo dpkg -i shed-server_${VERSION}_amd64.deb
-```
-
-This installs `shed` (CLI) and `shed-server`, generates a default Firecracker server config, and sets up a systemd service.
-
-Complete the Firecracker infrastructure setup:
-
-```bash
-sudo shed-server setup
-sudo shed-server pull-images
-sudo systemctl start shed-server
-```
-
-See [Firecracker Setup](fc-setup.md) for the full Linux setup guide.
-
-### Build from Source
-
-```bash
-git clone https://github.com/charliek/shed.git
-cd shed
-make build
-
-# Or install the CLI only
-go install github.com/charliek/shed/cmd/shed@latest
-```
-
-`make build` produces `bin/shed`, `bin/shed-server`, and `bin/shed-agent`.
-That's only step one of a source install — `shed-server` still needs a
-server config, VM images, and (on Linux) bridge networking before it can
-launch a VM.
-
-Continue with the backend-specific setup guide:
-
-- macOS Apple Silicon: [VZ Setup — Build from Source](vz-setup.md#build-from-source-alternative)
-- Linux with KVM: [Firecracker Setup — Build from Source](fc-setup.md#build-from-source-alternative)
+The rest of this page is the platform-agnostic command reference once a server is
+running.
 
 ## Add a Server
 
@@ -111,7 +38,7 @@ This connects to the server, retrieves its SSH host key, and saves the configura
 # Create an empty shed — you land in /home/shed
 shed create my-project
 
-# Or clone a repository — cloned into ~/repo, login lands there
+# Or clone a repository — cloned into ~/<reponame>, login lands there
 shed create my-project --repo git@github.com:user/repo.git
 
 # Or mount a local directory — mounted at ~/<basename>, login lands there
@@ -122,13 +49,14 @@ shed create my-project --local-dir ~/projects/my-project
 shed create app --local-dir ~/projects/app --add-dir ~/projects/shared-lib
 ```
 
-Interactive logins (`shed console`, `shed attach`, raw `ssh`, VS Code
-Remote-SSH) land in the shed's project directory: `~/<reponame>` with
-`--repo`, `~/<basename>` with `--local-dir`, otherwise `/home/shed`.
-`shed exec <name> -- <cmd>` runs there too. `--repo` and
-`--local-dir`/`--add-dir` are mutually exclusive.
+Interactive logins (`shed console`, `shed attach`, raw `ssh`, VS Code Remote-SSH)
+land in the shed's project directory: `~/<reponame>` with `--repo`, `~/<basename>`
+with `--local-dir`, otherwise `/home/shed`. `shed exec <name> -- <cmd>` runs there
+too, with `$SHED_WORKSPACE` (the project dir) and `$SHED_ADD_DIRS` (any `--add-dir`
+mounts) set. `--repo` and `--local-dir`/`--add-dir` are mutually exclusive.
 
-Once you have a few sheds, `shed system df` shows what's on disk and `shed system prune` reclaims unused space. See [Disk Management](../reference/disk-management.md).
+Once you have a few sheds, `shed system df` shows what's on disk and
+`shed system prune` reclaims unused space. See [Disk Management](../reference/disk-management.md).
 
 ## Connect
 
@@ -146,7 +74,8 @@ Opens a bash shell in the VM. Exits when you disconnect.
 shed attach my-project
 ```
 
-Opens a tmux session that persists after you disconnect. Detach with `Ctrl-B D` and reconnect later with the same command.
+Opens a tmux session that persists after you disconnect. Detach with `Ctrl-B D`
+and reconnect later with the same command.
 
 ## IDE Integration
 
@@ -174,36 +103,21 @@ shed attach myproj
 # Inside the session, start Claude Code
 claude
 
-# Detach with Ctrl-B D - the agent keeps running
-# Later, reattach to see progress
+# Detach with Ctrl-B D - the agent keeps running; reattach later
 shed attach myproj
-```
-
-### Multiple sessions
-
-```bash
-# Attach to a named session
-shed attach myproj --session debug
-
-# List all sessions
-shed sessions --all
 ```
 
 ### Port forwarding
 
 ```bash
-# Start tunnels for web development
-shed tunnels start myproj -t 3000:3000
-
-# Run in background
+# Start tunnels for web development (-d runs in background)
 shed tunnels start myproj -t 3000:3000 -d
 ```
 
 ## Next Steps
 
-- [VZ Setup (macOS)](vz-setup.md) - Set up the VZ backend on Apple Silicon
-- [Firecracker Setup (Linux)](fc-setup.md) - Set up the Firecracker backend
-- [CLI Reference](../reference/cli.md) - All available commands
-- [Configuration](../reference/configuration.md) - Client and server config options
-- [Extensions](../reference/extensions.md) - Credential brokering with the `extensions` image
-- [Tunnels](../reference/tunnels.md) - Port forwarding configuration
+- [CLI Reference](../reference/cli.md) — all available commands
+- [Configuration](../reference/configuration.md) — client and server config options
+- [Extensions](../reference/extensions.md) — credential brokering with the host agent
+- [Tunnels](../reference/tunnels.md) — port forwarding configuration
+- [Provisioning](../reference/provisioning.md) — `.shed/` install/startup hooks
