@@ -39,15 +39,14 @@ sudo apt install shed-server
 This installs `shed` + `shed-server`, generates a default Firecracker config at
 `/etc/shed/server.yaml`, and registers a systemd service.
 
-??? note "Alternative: install the `.deb` directly"
-    Without the apt repo, grab the `.deb` from the
-    [releases page](https://github.com/charliek/shed/releases):
+**Alternative — without the apt repo**, grab the `.deb` from the
+[releases page](https://github.com/charliek/shed/releases):
 
-    ```bash
-    VERSION=$(gh release view --repo charliek/shed --json tagName -q .tagName | sed 's/^v//')
-    wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
-    sudo dpkg -i shed-server_${VERSION}_amd64.deb
-    ```
+```bash
+VERSION=$(gh release view --repo charliek/shed --json tagName -q .tagName | sed 's/^v//')
+wget https://github.com/charliek/shed/releases/download/v${VERSION}/shed-server_${VERSION}_amd64.deb
+sudo dpkg -i shed-server_${VERSION}_amd64.deb
+```
 
 ## 2. Set up Firecracker infrastructure
 

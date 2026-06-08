@@ -37,7 +37,7 @@ Three binaries:
 - **`shed-server`** — the daemon on each host (HTTP API + SSH server) that runs VMs via the VZ (macOS) or Firecracker (Linux) backend.
 - **`shed-host-agent`** — optional host-side credential broker, from [shed-extensions](https://github.com/charliek/shed-extensions); on macOS it pairs with the [shed-desktop](https://github.com/charliek/shed-desktop) approval app.
 
-```
+```text
 Developer Machine                Remote Server / Local Mac
 ┌─────────────┐   HTTP/SSH    ┌──────────────────────────────┐
 │  shed CLI   │ ────────────▶ │  shed-server                 │
