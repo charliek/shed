@@ -83,15 +83,19 @@ Pre-built images for each variant are published per release to `ghcr.io`:
 
 | Image | Platform | Tag Format |
 |-------|----------|------------|
-| `ghcr.io/charliek/shed-vz-base` | linux/arm64 | `:v{version}` |
-| `ghcr.io/charliek/shed-vz-extensions` | linux/arm64 | `:v{version}` |
-| `ghcr.io/charliek/shed-vz-full` | linux/arm64 | `:v{version}` |
-| `ghcr.io/charliek/shed-fc-base` | linux/amd64 | `:v{version}` |
-| `ghcr.io/charliek/shed-fc-extensions` | linux/amd64 | `:v{version}` |
-| `ghcr.io/charliek/shed-fc-full` | linux/amd64 | `:v{version}` |
+| `ghcr.io/charliek/shed-vz-base` | linux/arm64 | `:vX.Y.Z` |
+| `ghcr.io/charliek/shed-vz-extensions` | linux/arm64 | `:vX.Y.Z` |
+| `ghcr.io/charliek/shed-vz-full` | linux/arm64 | `:vX.Y.Z` |
+| `ghcr.io/charliek/shed-fc-base` | linux/amd64 | `:vX.Y.Z` |
+| `ghcr.io/charliek/shed-fc-extensions` | linux/amd64 | `:vX.Y.Z` |
+| `ghcr.io/charliek/shed-fc-full` | linux/amd64 | `:vX.Y.Z` |
 
-Replace `{version}` with the version matching your `shed` binary — run
-`shed version` to check.
+Each release publishes a `:vX.Y.Z` tag matching the `shed` version (e.g.
+`:v0.6.5`) — run `shed version` to check. In **server config**, leave
+`default_image`/`image_aliases` unset to track the version automatically, or use
+the `${shed.version}` token — see
+[Configuration](configuration.md#image-references-and-shedversion). (That token
+is shed-config only; a Dockerfile `FROM` must pin a concrete tag.)
 
 Both VZ and Firecracker images embed the kernel needed to boot the VM. For
 VZ, the kernel and initrd are extracted from the Ubuntu
@@ -491,7 +495,7 @@ free, no coding agents are pre-pinned, and your layer sits on top of a
 stable shed-managed base.
 
 ```dockerfile
-FROM ghcr.io/charliek/shed-vz-extensions:v{version}
+FROM ghcr.io/charliek/shed-vz-extensions:vX.Y.Z
 
 USER shed
 ENV PATH="/home/shed/.local/bin:${PATH}"

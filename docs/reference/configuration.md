@@ -197,6 +197,35 @@ The `git.extra_known_hosts` list is *additive* — it extends the built-in defau
 
 **Key rotation:** If GitHub or another host rotates its keys, you can extend the trust list via `extra_known_hosts` immediately without waiting for a shed release. The default GitHub keys ship with the server binary and are updated in releases.
 
+## Image references and `${shed.version}`
+
+`default_image` and `image_aliases` are **optional**. On a release build of
+`shed-server`, when they are unset they are **synthesized from the server's own
+version**: `default_image` becomes `ghcr.io/charliek/shed-<backend>-full:vX.Y.Z`
+and the `base` / `extensions` / `full` aliases resolve to the matching tags. So
+upgrading `shed-server` moves new sheds to the new images with **no config edit**.
+
+Set them explicitly only to pin a custom or mirrored registry. To track the
+server version without hand-editing the tag on every upgrade, use the
+`${shed.version}` token — it expands to the running server's release tag
+(`vX.Y.Z`) at config load:
+
+```yaml
+vz:
+  default_image: myregistry.example.com/shed-vz-full:${shed.version}
+```
+
+**Why this is version-coupled:** the base images bundle the in-VM `shed-agent`
+and the shed-extensions guest binaries, which are versioned in lockstep with
+`shed`. Pinning the image to the server version — via the default synthesis or
+the `${shed.version}` token — keeps the guest components compatible with the
+server instead of drifting on upgrade.
+
+!!! note "`${shed.version}` is the only accepted token"
+    A literal `{version}` or `v{version}` is **not** expanded. On a dev/unreleased
+    build the token has nothing to resolve to, so set concrete refs (or leave them
+    unset and pass `--image` on each `create`).
+
 ## Firecracker Configuration
 
 When enabling Firecracker, configure the Firecracker-specific settings:
@@ -205,11 +234,11 @@ When enabling Firecracker, configure the Firecracker-specific settings:
 default_backend: firecracker
 
 firecracker:
-  default_image: ghcr.io/charliek/shed-fc-full:v{version}
+  default_image: ghcr.io/charliek/shed-fc-full:${shed.version}
   image_aliases:
-    base: ghcr.io/charliek/shed-fc-base:v{version}
-    extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
-    full: ghcr.io/charliek/shed-fc-full:v{version}
+    base: ghcr.io/charliek/shed-fc-base:${shed.version}
+    extensions: ghcr.io/charliek/shed-fc-extensions:${shed.version}
+    full: ghcr.io/charliek/shed-fc-full:${shed.version}
   pull_policy: missing
   images_dir: /var/lib/shed/firecracker/images
   instance_dir: /var/lib/shed/firecracker/instances
@@ -227,7 +256,10 @@ firecracker:
   tap_prefix: shed-tap
 ```
 
-Replace `{version}` with the version matching your `shed` binary — run `shed version` to check.
+The `${shed.version}` token above resolves to the running server's release tag —
+see [Image references and `${shed.version}`](#image-references-and-shedversion).
+These fields are optional; left unset on a release build they are synthesized
+from the server version.
 
 ### Firecracker Fields
 
@@ -274,11 +306,11 @@ vz:
   vfkit_path: vfkit
   kernel_path: ~/Library/Application Support/shed/vz/vmlinux
   initrd_path: ~/Library/Application Support/shed/vz/initrd.img
-  default_image: ghcr.io/charliek/shed-vz-full:v{version}
+  default_image: ghcr.io/charliek/shed-vz-full:${shed.version}
   image_aliases:
-    base: ghcr.io/charliek/shed-vz-base:v{version}
-    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
-    full: ghcr.io/charliek/shed-vz-full:v{version}
+    base: ghcr.io/charliek/shed-vz-base:${shed.version}
+    extensions: ghcr.io/charliek/shed-vz-extensions:${shed.version}
+    full: ghcr.io/charliek/shed-vz-full:${shed.version}
   pull_policy: missing
   images_dir: ~/Library/Application Support/shed/vz/
   instance_dir: ~/Library/Application Support/shed/vz/instances
