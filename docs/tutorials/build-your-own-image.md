@@ -295,7 +295,7 @@ shed image pull ghcr.io/myorg/my-shed-image:v2 -t my-image
 
 Existing sheds keep booting from the digest they were created against —
 tag updates don't propagate to running sheds (see
-[Storage Model → Tag updates](../reference/storage-model.md#tag-updates-dont-propagate-to-existing-sheds)).
+[Storage Model → Re-pulling a ref doesn't propagate](../reference/storage-model.md#re-pulling-a-ref-doesnt-propagate-to-existing-sheds)).
 To roll a shed onto the new image, `shed delete devbox` and recreate.
 
 ## See also
