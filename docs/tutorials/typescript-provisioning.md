@@ -119,7 +119,9 @@ shed exec myproj -- bash -lc 'cd ~/myproj && bun run build'
 shed exec myproj -- bash -lc 'cd ~/myproj && bun run lint'
 ```
 
-!!! note "Compose networking just works"
+!!! note "Compose vs Testcontainers networking"
     `docker compose` creates its own user-defined network, which publishes ports
-    normally in a shed. (Only Testcontainers, which uses docker's *default*
-    bridge, needs the extra step in the [Gradle tutorial](gradle-provisioning.md).)
+    normally on both backends. Testcontainers uses docker's *default* bridge,
+    which the `full` image enables on **VZ** but which is unavailable on
+    Firecracker — see the backend note in
+    [Provisioning](../reference/provisioning.md).

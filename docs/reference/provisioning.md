@@ -244,14 +244,15 @@ docker compose down || true
     Only the `full` variant ships the Docker daemon. With `base`/`extensions`,
     `docker` is absent and these hooks will warn and continue.
 
-### Docker networking inside a shed
-
-The `full` image's Docker is tuned for the nested-VM environment, which affects
-one common workflow — handle it in your install hook:
-
-| Behavior | Effect | Fix in the install hook |
-|----------|--------|-------------------------|
-| `bridge: none` in `daemon.json` | The default `docker0` bridge is absent, so containers started on the **default** network get no published ports. `docker compose` is unaffected (it creates its own user-defined network), but [Testcontainers](https://testcontainers.com/) is not. | Re-enable it for Testcontainers: `jq 'del(.bridge)' /etc/docker/daemon.json` → write back → `sudo systemctl restart docker`. |
+!!! note "Docker networking differs by backend"
+    On **VZ**, the `full` image enables Docker's default `docker0` bridge, so
+    `docker run`, published ports, and [Testcontainers](https://testcontainers.com/)
+    work normally. On **Firecracker**, the microVM guest kernel has no
+    netfilter/iptables NAT, so Docker runs with `bridge: none` + `iptables:
+    false` and containers must use `--network host` — the default bridge,
+    published ports, and Testcontainers are unavailable there. Compose stacks
+    that need to reach published ports therefore run only on VZ (or use
+    `network_mode: host` on Firecracker).
 
 ## Example: PostgreSQL via Docker Compose
 
