@@ -172,10 +172,11 @@ FAIL lines come in a few flavours:
   `dial tcp 127.0.0.1:5050: connect: connection refused` during the
   `shed image build` phase - BuildKit reaches its own loopback, not
   the shed's.
-- Docker daemon in the shed ships with `"bridge": "none"` in
-  `daemon.json`, so `docker run` without `--network host` will not
-  give the container network access. The script accounts for this by
-  using `--network host` on the registry container as well.
+- The publish script runs its `registry:2` with `--network host` so the
+  in-shed BuildKit (also `network=host`) reaches it at `127.0.0.1:5050`.
+  (The `full` image now enables the default `docker0` bridge, so general
+  `docker run` works without `--network host` — but this loopback-registry
+  pattern still needs it.)
 - The 'full' image variant has docker + buildx, but it does NOT have
   Go installed. Cross-build the shed CLI on the host and `scp` it in
   rather than trying to `go build` inside the shed.

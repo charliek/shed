@@ -54,16 +54,6 @@ wait_for_docker() {
   for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
   docker info >/dev/null 2>&1 || log "WARN: docker not ready (needs the 'full' image)"
 }
-
-# Testcontainers launches containers on docker's DEFAULT bridge, which the image
-# disables (bridge: none). Re-enable it (compose is unaffected; it uses its own).
-enable_docker_default_bridge() {
-  docker network inspect bridge >/dev/null 2>&1 && return
-  local cfg=/etc/docker/daemon.json tmp; tmp="$(mktemp)"
-  jq 'del(.bridge) | del(.iptables)' "$cfg" >"$tmp" && sudo install -m 0644 "$tmp" "$cfg"; rm -f "$tmp"
-  sudo systemctl restart docker
-  for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
-}
 ```
 
 ## `scripts/install.sh`
@@ -75,7 +65,6 @@ source "$(dirname "$0")/lib.sh"
 cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 wait_for_docker
-enable_docker_default_bridge
 ensure_sdkman
 
 # Install the JDK pinned in .sdkmanrc (e.g. java=21.0.5-tem). Disable nounset
@@ -113,7 +102,6 @@ services to start or stop:
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 wait_for_docker
-enable_docker_default_bridge   # no-op after first create (config persists)
 ```
 
 ```bash

@@ -268,6 +268,11 @@ ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
 # who want nested containers pull `full`. docker-buildx-plugin is NOT
 # installed (rarely used by coding agents; users can `apt install` on
 # demand). docker-compose-plugin is kept for `docker compose`.
+#
+# daemon.json keeps the default docker0 bridge here (unlike firecracker/,
+# which disables it): the vfkit/VZ guest kernel has the netfilter/iptables
+# NAT that docker's bridge driver needs, so `docker run`, published ports,
+# and Testcontainers work out of the box.
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \

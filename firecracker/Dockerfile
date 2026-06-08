@@ -267,6 +267,12 @@ ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
 # who want nested containers pull `full`. docker-buildx-plugin is NOT
 # installed (rarely used by coding agents; users can `apt install` on
 # demand). docker-compose-plugin is kept for `docker compose`.
+#
+# daemon.json keeps "bridge": "none" + "iptables": false here (unlike vz/,
+# which enables docker0): the Firecracker microVM guest kernel has no
+# netfilter/iptables NAT, so dockerd fails to start if it tries to create
+# the bridge NAT chains. Containers on Firecracker must use `--network host`;
+# the default bridge, published ports, and Testcontainers are unavailable.
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \

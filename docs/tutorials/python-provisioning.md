@@ -47,15 +47,6 @@ wait_for_docker() {
   docker info >/dev/null 2>&1 || log "WARN: docker not ready (needs the 'full' image)"
 }
 
-# Testcontainers uses docker's DEFAULT bridge, which the image disables.
-enable_docker_default_bridge() {
-  docker network inspect bridge >/dev/null 2>&1 && return
-  local cfg=/etc/docker/daemon.json tmp; tmp="$(mktemp)"
-  jq 'del(.bridge) | del(.iptables)' "$cfg" >"$tmp" && sudo install -m 0644 "$tmp" "$cfg"; rm -f "$tmp"
-  sudo systemctl restart docker
-  for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
-}
-
 wait_for_compose_healthy() {
   for i in $(seq 1 30); do
     pending="$(docker compose ps --format '{{.Name}} {{.Health}}' \
@@ -82,7 +73,6 @@ cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 ensure_uv
 wait_for_docker
-enable_docker_default_bridge   # for Testcontainers integration tests
 
 # UV_LINK_MODE=copy avoids a hardlink warning on the VirtioFS-mounted project.
 # RYUK is reaped by the test process; the reaper is flaky under nested docker.
@@ -107,7 +97,6 @@ source "$(dirname "$0")/lib.sh"
 cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 wait_for_docker
-enable_docker_default_bridge   # no-op after first create
 docker compose up -d
 wait_for_compose_healthy
 uv run alembic upgrade head || log "WARN: migrations failed"
