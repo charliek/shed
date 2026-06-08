@@ -24,7 +24,7 @@
 
 # Bump this when shed-extensions releases a new version.
 # The extensions and full variants pull binaries from this tag.
-ARG SHED_EXT_VERSION=v0.3.2
+ARG SHED_EXT_VERSION=v0.3.7
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
 # Note: the shed initramfs (overlay-on-the-guest init) is built from
@@ -268,11 +268,10 @@ ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
 # installed (rarely used by coding agents; users can `apt install` on
 # demand). docker-compose-plugin is kept for `docker compose`.
 #
-# daemon.json keeps "bridge": "none" + "iptables": false here (unlike vz/,
-# which enables docker0): the Firecracker microVM guest kernel has no
-# netfilter/iptables NAT, so dockerd fails to start if it tries to create
-# the bridge NAT chains. Containers on Firecracker must use `--network host`;
-# the default bridge, published ports, and Testcontainers are unavailable.
+# daemon.json enables docker's default docker0 bridge (no "bridge": "none").
+# The custom Firecracker guest kernel is built with the netfilter/NAT options
+# docker's bridge driver needs (see kernel-config-docker.fragment), so docker0,
+# published ports (DNAT), and outbound MASQUERADE work — same as VZ.
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -284,6 +283,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        docker-ce docker-ce-cli containerd.io docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/* \
     && install -m 0644 /usr/local/share/shed-docker-daemon.json /etc/docker/daemon.json \
+    && printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-docker-forward.conf \
     && SYSTEMD_OFFLINE=1 systemctl enable docker
 
 # Layer: install all language runtimes + coding agents as the shed user,

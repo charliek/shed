@@ -388,7 +388,7 @@ shed exec myproject -- dockerd --debug
 
 The `vfs` storage driver is slower than overlay2 but always works in VM environments where overlay filesystems may not be supported.
 
-**Note:** Docker bridge networking is disabled (kernel lacks nftables support), so containers use `--network=host` by default. This means containers share the VM's network namespace. The custom 6.1 kernel built by `build-firecracker-kernel.sh` has BPF cgroup support, so containers start correctly.
+**Note:** The custom 6.1 kernel built by `build-firecracker-kernel.sh` includes BPF cgroup support and the netfilter/NAT options Docker's default bridge needs (see `firecracker/kernel-config-docker.fragment`), so `docker0` is enabled — `docker run`, published ports (DNAT), and outbound NAT work, same as VZ.
 
 If using a minimal kernel without BPF support, containers will fail with BPF errors. Build the custom kernel for Docker support: `./scripts/build-firecracker-kernel.sh`
 

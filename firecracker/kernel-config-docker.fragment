@@ -1,7 +1,6 @@
 # Kernel config fragment for Docker support inside Firecracker VMs.
 #
-# The Firecracker CI 6.1 config already includes all configs needed for
-# our Docker setup (vfs driver, cgroupfs, host networking, no iptables):
+# The Firecracker CI 6.1 config already includes the base configs:
 #
 #   BPF:        CONFIG_BPF=y, CONFIG_BPF_SYSCALL=y, CONFIG_CGROUP_BPF=y
 #   Cgroups:    CONFIG_CGROUPS=y, CONFIG_MEMCG=y, CONFIG_CGROUP_PIDS=y
@@ -11,6 +10,48 @@
 #
 # This fragment is an extension point for future additions. Lines below
 # are merged into the base config before building.
+
+# ----------------------------------------------------------------------------
+# Docker default-bridge (docker0) netfilter/NAT support.
+#
+# Without these, dockerd fails to start with the default bridge enabled —
+# `iptables -t nat -N DOCKER` returns "Failed to initialize nft: Protocol not
+# supported" because the nf_tables netlink family (NETLINK_NETFILTER) isn't
+# built in. The CI config + `make olddefconfig` leave the nf_tables NAT path
+# and the x_tables extensions docker's rules use turned off, so assert them
+# explicitly. Everything is =y — a Firecracker microVM has no loadable modules.
+# This enables `docker run`, published ports (DNAT), outbound MASQUERADE, and
+# Testcontainers, on top of the compose/docker-proxy path that already worked.
+# Core netfilter/conntrack/NAT framework. Several of these are already =y in the
+# CI base config; re-asserted defensively so a future base change can't silently
+# drop a dependency the nf_tables path below relies on.
+CONFIG_NETFILTER=y
+CONFIG_NETFILTER_ADVANCED=y
+CONFIG_NETFILTER_NETLINK=y
+CONFIG_NF_CONNTRACK=y
+CONFIG_NF_NAT=y
+CONFIG_NF_NAT_MASQUERADE=y
+CONFIG_NETFILTER_XTABLES=y
+CONFIG_BRIDGE_NETFILTER=y
+# nf_tables family + expressions (CI base ships NF_TABLES off — this turns it on,
+# which is what Docker 29's default iptables-nft backend needs):
+CONFIG_NF_TABLES=y
+CONFIG_NF_TABLES_INET=y
+CONFIG_NF_TABLES_IPV4=y
+CONFIG_NF_TABLES_IPV6=y
+CONFIG_NFT_COMPAT=y
+CONFIG_NFT_NAT=y
+CONFIG_NFT_MASQ=y
+CONFIG_NFT_REDIR=y
+# x_tables extensions nft_compat wraps (docker0's iptables rules use these):
+CONFIG_NETFILTER_XT_NAT=y
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y
+CONFIG_NETFILTER_XT_TARGET_REDIRECT=y
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
+CONFIG_NETFILTER_XT_MATCH_COMMENT=y
+CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y
+# ----------------------------------------------------------------------------
 
 # Uncomment if live mounts (SSHFS over vsock) are needed:
 # CONFIG_FUSE_FS=y

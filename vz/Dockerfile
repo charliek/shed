@@ -24,7 +24,7 @@
 
 # Bump this when shed-extensions releases a new version.
 # The extensions and full variants pull binaries from this tag.
-ARG SHED_EXT_VERSION=v0.3.2
+ARG SHED_EXT_VERSION=v0.3.7
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
 # Note: the shed initramfs (overlay-on-the-guest init) is built from
@@ -269,10 +269,11 @@ ENV CLAUDE_CONFIG_DIR="/home/shed/.claude"
 # installed (rarely used by coding agents; users can `apt install` on
 # demand). docker-compose-plugin is kept for `docker compose`.
 #
-# daemon.json keeps the default docker0 bridge here (unlike firecracker/,
-# which disables it): the vfkit/VZ guest kernel has the netfilter/iptables
-# NAT that docker's bridge driver needs, so `docker run`, published ports,
-# and Testcontainers work out of the box.
+# daemon.json keeps the default docker0 bridge enabled: the vfkit/VZ guest
+# kernel has the netfilter/iptables NAT docker's bridge driver needs, so
+# `docker run`, published ports, and Testcontainers work out of the box.
+# (firecracker/ enables docker0 too, via a custom kernel with netfilter built
+# in — see firecracker/kernel-config-docker.fragment.)
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \

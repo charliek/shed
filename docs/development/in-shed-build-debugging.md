@@ -94,8 +94,9 @@ preceding `FAIL:` identifies which variant tripped.
 
 3. Neutralise the docker credential helper. The shed-agent inside the
    shed installs a `credsStore` that talks to the host over vsock;
-   inside a validation shed there is no host to answer, so any
-   `docker pull` / `docker push` hangs forever waiting for creds.
+   inside a validation shed there is no host to answer, so the helper
+   fails after its ~5s bus timeout and `docker pull` / `docker push`
+   errors out (with the v0.3.7+ guest helper) instead of succeeding.
 
    ```bash
    echo '{}' > "$HOME/.docker/config.json"
