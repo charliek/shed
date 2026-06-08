@@ -15,6 +15,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/provision"
+	"github.com/charliek/shed/internal/retry"
 )
 
 // Provisioner runs provisioning hooks in VMs using the agent.
@@ -54,33 +55,107 @@ func (p *Provisioner) SetOutput(stdout, stderr io.Writer) {
 	p.errOut = stderr
 }
 
+// provisionReadBackoffs bounds the retry of the provision-config read. The
+// read can momentarily fail right after the --local-dir VirtioFS/9P mount: the
+// mount syscall returns before the host share is serving reads, so the first
+// `cat` of .shed/provision.yaml hits a transient I/O error. Without a retry the
+// entire provisioning step is silently skipped (RunProvisioning's caller
+// log-and-continues), so a shed comes up with no hooks run. A genuinely-absent
+// config is the common case and is NOT retried — see LoadConfig.
+var provisionReadBackoffs = []time.Duration{
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
+}
+
+// errProvisionConfigNotReady marks a read that succeeded but returned no content
+// on a project mount — treated as coherence lag and retried.
+var errProvisionConfigNotReady = errors.New("provision config not ready (empty read on project mount)")
+
+// loadConfigProbe reads .shed/provision.yaml and reports, via exit code,
+// whether a missing file looks like a genuinely-absent config or a mount that
+// is not serving yet. $1 is the config path, $2 the landing (work) dir:
+//
+//	0  → config read; its contents are on stdout
+//	66 → no config file, and the landing dir lists content (mount serving)
+//	75 → landing dir empty/unreadable (mount almost certainly not serving)
+const loadConfigProbe = `if out=$(cat "$1" 2>/dev/null); then printf '%s' "$out"; exit 0; fi; ` +
+	`if [ -n "$(ls -A "$2" 2>/dev/null)" ]; then exit 66; fi; exit 75`
+
 // LoadConfig loads provisioning configuration from within the VM.
 // It reads .shed/provision.yaml from the workspace directory.
+//
+// On a --local-dir shed the read can race the project mount: the VirtioFS/9P
+// mount syscall returns before the host share is coherent, so the landing dir
+// momentarily lists empty (probe exit 75) — or lists a partial set without
+// .shed yet (probe exit 66) — and the config read finds nothing. Without
+// resilience here, provisioning is silently skipped and the shed comes up with
+// no hooks run.
+//
+// The retry distinguishes the common no-provisioning case from the race using
+// the landing dir: a bare shed (landing == HomePath) that reports "no config"
+// is terminal, so sheds without provisioning pay no latency. A project landing
+// dir (--local-dir / --repo) keeps retrying a "no config" result, since it may
+// be a mount that hasn't settled; if it stays absent the retries drain and we
+// conclude there genuinely is no config.
 func (p *Provisioner) LoadConfig(ctx context.Context) (*provision.Config, error) {
 	configPath := filepath.Join(p.workDir, provision.ShedProvisionYAML)
+	projectDir := p.workDir != config.HomePath
 
-	// Read the config file via exec
-	var stdout, stderr strings.Builder
-	opts := backend.ExecOptions{
-		Cmd:        []string{"cat", configPath},
-		Stdout:     NopWriteCloser(&stdout),
-		Stderr:     NopWriteCloser(&stderr),
-		WorkingDir: p.workDir,
-		TTY:        false,
-	}
-
-	if err := p.agent.Exec(ctx, opts); err != nil {
-		// Check if file doesn't exist (expected case - no config file).
-		combined := stdout.String() + stderr.String()
-		if strings.Contains(combined, "No such file") {
-			return &provision.Config{
-				Env: make(map[string]string),
-			}, nil
+	var content string
+	lastCode := -1
+	readErr := retry.Do(ctx, "read provision config", provisionReadBackoffs, nil, func() error {
+		var stdout, stderr strings.Builder
+		opts := backend.ExecOptions{
+			Cmd: []string{"sh", "-c", loadConfigProbe, "sh", configPath, p.workDir},
+			// Run from "/" so the exec itself never depends on the racing mount.
+			Stdout:     NopWriteCloser(&stdout),
+			Stderr:     NopWriteCloser(&stderr),
+			WorkingDir: "/",
+			TTY:        false,
 		}
-		return nil, fmt.Errorf("failed to read provision config: %w", err)
-	}
+		err := p.agent.Exec(ctx, opts)
+		if err == nil {
+			content = stdout.String()
+			lastCode = 0
+			// A successful-but-empty read on a project mount is most likely
+			// coherence lag (the dentry appeared before the file data), so
+			// retry. A genuinely-empty provision.yaml is a no-op anyway, so
+			// retrying then concluding "no config" is harmless.
+			if projectDir && strings.TrimSpace(content) == "" {
+				return errProvisionConfigNotReady
+			}
+			return nil
+		}
+		var exitErr *ExitError
+		if errors.As(err, &exitErr) {
+			lastCode = exitErr.Code
+		} else {
+			lastCode = -1
+		}
+		// On a bare shed, "no config" (66) is terminal — the common case stays
+		// fast. On a project landing dir it may be an unsettled mount, so retry.
+		if lastCode == 66 && !projectDir {
+			return nil
+		}
+		return err
+	})
 
-	return provision.ParseConfigContent([]byte(stdout.String()))
+	switch {
+	case strings.TrimSpace(content) != "":
+		// Got config content (possibly after retries) — parse it.
+		return provision.ParseConfigContent([]byte(content))
+	case lastCode == 66 || lastCode == 0:
+		// Dir served but no config file (66), or an empty config file (0):
+		// genuinely no provisioning. Not an error.
+		return &provision.Config{Env: make(map[string]string)}, nil
+	case readErr != nil:
+		// Drained retries on a mount that never served (75) or an RPC error.
+		return nil, fmt.Errorf("failed to read provision config: %w", readErr)
+	default:
+		return &provision.Config{Env: make(map[string]string)}, nil
+	}
 }
 
 // RunProvisioning runs provisioning hooks for a VM.
