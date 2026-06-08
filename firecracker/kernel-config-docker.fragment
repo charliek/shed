@@ -22,7 +22,9 @@
 # explicitly. Everything is =y — a Firecracker microVM has no loadable modules.
 # This enables `docker run`, published ports (DNAT), outbound MASQUERADE, and
 # Testcontainers, on top of the compose/docker-proxy path that already worked.
-# nf_tables path (Docker 29's default iptables-nft backend):
+# Core netfilter/conntrack/NAT framework. Several of these are already =y in the
+# CI base config; re-asserted defensively so a future base change can't silently
+# drop a dependency the nf_tables path below relies on.
 CONFIG_NETFILTER=y
 CONFIG_NETFILTER_ADVANCED=y
 CONFIG_NETFILTER_NETLINK=y
@@ -31,6 +33,8 @@ CONFIG_NF_NAT=y
 CONFIG_NF_NAT_MASQUERADE=y
 CONFIG_NETFILTER_XTABLES=y
 CONFIG_BRIDGE_NETFILTER=y
+# nf_tables family + expressions (CI base ships NF_TABLES off — this turns it on,
+# which is what Docker 29's default iptables-nft backend needs):
 CONFIG_NF_TABLES=y
 CONFIG_NF_TABLES_INET=y
 CONFIG_NF_TABLES_IPV4=y

@@ -7,9 +7,8 @@ installed with [SDKMAN](https://sdkman.io/), pinned to the project's
 `.sdkmanrc`.
 
 It assumes the [`full` image](../reference/images.md) (the default), which ships
-the Docker daemon that Testcontainers needs, on the **VZ** backend.
-Testcontainers uses Docker's default bridge, which is unavailable on Firecracker
-— see the backend note in [Provisioning](../reference/provisioning.md).
+the Docker daemon that Testcontainers needs. The default `docker0` bridge
+Testcontainers relies on is enabled on both the VZ and Firecracker backends.
 
 ## Layout
 

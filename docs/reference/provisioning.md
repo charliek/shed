@@ -244,15 +244,12 @@ docker compose down || true
     Only the `full` variant ships the Docker daemon. With `base`/`extensions`,
     `docker` is absent and these hooks will warn and continue.
 
-!!! note "Docker networking differs by backend"
-    On **VZ**, the `full` image enables Docker's default `docker0` bridge, so
-    `docker run`, published ports, and [Testcontainers](https://testcontainers.com/)
-    work normally. On **Firecracker**, the microVM guest kernel has no
-    netfilter/iptables NAT, so Docker runs with `bridge: none` + `iptables:
-    false` and containers must use `--network host` — the default bridge,
-    published ports, and Testcontainers are unavailable there. Compose stacks
-    that need to reach published ports therefore run only on VZ (or use
-    `network_mode: host` on Firecracker).
+!!! note "Docker networking"
+    The `full` image enables Docker's default `docker0` bridge on **both**
+    backends — VZ via the vfkit guest kernel, Firecracker via a custom kernel
+    built with the netfilter/NAT options docker needs. So `docker run`,
+    published ports, outbound NAT, and [Testcontainers](https://testcontainers.com/)
+    work the same on VZ and Firecracker.
 
 ## Example: PostgreSQL via Docker Compose
 

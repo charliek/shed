@@ -119,9 +119,8 @@ shed exec myproj -- bash -lc 'cd ~/myproj && bun run build'
 shed exec myproj -- bash -lc 'cd ~/myproj && bun run lint'
 ```
 
-!!! note "Compose vs Testcontainers networking"
-    `docker compose` creates its own user-defined network, which publishes ports
-    normally on both backends. Testcontainers uses docker's *default* bridge,
-    which the `full` image enables on **VZ** but which is unavailable on
-    Firecracker — see the backend note in
-    [Provisioning](../reference/provisioning.md).
+!!! note "Compose and Testcontainers networking"
+    `docker compose` creates its own user-defined network, and the `full` image
+    enables Docker's default `docker0` bridge — both work on the VZ and
+    Firecracker backends, so published ports and Testcontainers behave the same
+    on each.
