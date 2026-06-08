@@ -2,6 +2,62 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.6.5 — 2026-06-08
+
+Docker's default `docker0` bridge now works on **both** backends, so plain
+`docker run`, published ports, outbound NAT, and Testcontainers behave the same
+on VZ and Firecracker — no per-project workarounds. Plus a fix for
+`--local-dir` provisioning being silently skipped, and the `shed-extensions`
+v0.3.7 credential-helper fix.
+
+### Docker default bridge (docker0) on both backends (#191, #192)
+
+The `full` image previously shipped `daemon.json` with `"bridge": "none"`,
+disabling Docker's default `docker0` bridge — only `docker compose`
+(user-defined networks) worked, so plain `docker run`, published ports, and
+**Testcontainers** (the default network) got no IP and no port forwarding. Every
+Testcontainers project had to carry a bridge-enabling workaround.
+
+- **VZ (#191):** drop `"bridge": "none"` from `vz/daemon.json`. The vfkit guest
+  kernel already has the netfilter/iptables NAT the bridge driver needs, and the
+  image already sets `net.ipv4.ip_forward=1`.
+- **Firecracker (#192):** the microVM's custom kernel shipped with `NF_TABLES`
+  off, so dockerd couldn't create the `nat DOCKER` chain. The kernel-config
+  fragment now asserts the `nf_tables` + `nft_compat` NAT path and the
+  `x_tables` extensions Docker's rules use (all `=y` — a microVM has no loadable
+  modules); `daemon.json` drops `"bridge": "none"` + `"iptables": false`; and
+  the Dockerfile adds `net.ipv4.ip_forward=1` (the other half of outbound NAT,
+  which FC was missing). Validated end-to-end on real FC hardware: clean boot
+  with the bridge enabled, `docker0` present, published-port DNAT and outbound
+  MASQUERADE both working.
+
+### `--local-dir` provisioning no longer silently skipped (#190)
+
+On a `--local-dir` shed, provisioning could be silently skipped (~1-in-6 on a
+fast VZ host): `LoadConfig` read `.shed/provision.yaml` immediately after the
+project mount, but the VirtioFS mount syscall returns before the host share is
+coherent, so the read momentarily saw the file missing or empty and skipped all
+hooks. `LoadConfig` now reads through a probe that distinguishes a genuinely
+absent config from an unsettled mount and retries with backoff — a bare shed
+with no config pays zero latency; a project landing dir retries until the mount
+settles.
+
+### shed-extensions v0.3.7 — credential-helper fix (#192)
+
+Both images bump `SHED_EXT_VERSION` `v0.3.2 → v0.3.7`. The guest
+`docker-credential-shed` helper now emits the standard `credentials not found
+in native keychain` sentinel, so anonymous public image pulls work with
+`credsStore=shed` intact (previously a misbehaving helper could block pulls).
+
+### Docs (#189, #191, #192)
+
+Refreshed the provisioning guide for the Docker-capable `full` image (the
+docker-compose service pattern, an "installing language toolchains" section for
+uv/bun/SDKMAN, and the `/etc/profile.d` / `/etc/environment.d` PATH-and-env
+caveats for `shed exec`), added Gradle/TypeScript/Python provisioning tutorials,
+and corrected stale image-variant claims (`base`/`extensions` don't ship Docker;
+`full` ships Docker + mise + bun, not system Node/Python).
+
 ## v0.6.4 — 2026-06-07
 
 Home-rooted workspaces: a shed's repo and mounted directories now live under
