@@ -7,7 +7,9 @@ the project's `compose.yaml`, and integration tests use
 [Testcontainers](https://testcontainers.com/).
 
 It assumes the [`full` image](../reference/images.md) (the default), which ships
-the Docker daemon Testcontainers needs.
+the Docker daemon Testcontainers needs, on the **VZ** backend. Testcontainers
+uses Docker's default bridge, which is unavailable on Firecracker — see the
+backend note in [Provisioning](../reference/provisioning.md).
 
 ## Layout
 
