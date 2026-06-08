@@ -244,14 +244,13 @@ docker compose down || true
     Only the `full` variant ships the Docker daemon. With `base`/`extensions`,
     `docker` is absent and these hooks will warn and continue.
 
-### Docker quirks inside a shed
+### Docker networking inside a shed
 
 The `full` image's Docker is tuned for the nested-VM environment, which affects
-two common workflows. Handle them in your install hook:
+one common workflow — handle it in your install hook:
 
 | Behavior | Effect | Fix in the install hook |
 |----------|--------|-------------------------|
-| `credsStore=shed` in `~/.docker/config.json` | Anonymous Docker Hub pulls fail when the host doesn't broker the registry. | Drop just that key so public images pull while keeping any `auths`/`credHelpers`: `jq 'del(.credsStore)' ~/.docker/config.json` written back in place. |
 | `bridge: none` in `daemon.json` | The default `docker0` bridge is absent, so containers started on the **default** network get no published ports. `docker compose` is unaffected (it creates its own user-defined network), but [Testcontainers](https://testcontainers.com/) is not. | Re-enable it for Testcontainers: `jq 'del(.bridge)' /etc/docker/daemon.json` → write back → `sudo systemctl restart docker`. |
 
 ## Example: PostgreSQL via Docker Compose

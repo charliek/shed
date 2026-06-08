@@ -47,12 +47,6 @@ wait_for_docker() {
   docker info >/dev/null 2>&1 || log "WARN: docker not ready (needs the 'full' image)"
 }
 
-enable_public_image_pulls() {
-  local cfg="$HOME/.docker/config.json"
-  grep -q '"credsStore"' "$cfg" 2>/dev/null || return
-  cp "$cfg" "$cfg.bak"; jq 'del(.credsStore)' "$cfg" >"$cfg.tmp" && mv "$cfg.tmp" "$cfg"
-}
-
 # Testcontainers uses docker's DEFAULT bridge, which the image disables.
 enable_docker_default_bridge() {
   docker network inspect bridge >/dev/null 2>&1 && return
@@ -89,7 +83,6 @@ cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 ensure_uv
 wait_for_docker
 enable_docker_default_bridge   # for Testcontainers integration tests
-enable_public_image_pulls
 
 # UV_LINK_MODE=copy avoids a hardlink warning on the VirtioFS-mounted project.
 # RYUK is reaped by the test process; the reaper is flaky under nested docker.
@@ -115,7 +108,6 @@ cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 wait_for_docker
 enable_docker_default_bridge   # no-op after first create
-enable_public_image_pulls
 docker compose up -d
 wait_for_compose_healthy
 uv run alembic upgrade head || log "WARN: migrations failed"

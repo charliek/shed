@@ -45,14 +45,6 @@ wait_for_docker() {
   docker info >/dev/null 2>&1 || log "WARN: docker not ready (needs the 'full' image)"
 }
 
-# Public Docker Hub pulls fail under the image's credsStore=shed; drop only that
-# key (keeping any auths/credHelpers).
-enable_public_image_pulls() {
-  local cfg="$HOME/.docker/config.json"
-  grep -q '"credsStore"' "$cfg" 2>/dev/null || return
-  cp "$cfg" "$cfg.bak"; jq 'del(.credsStore)' "$cfg" >"$cfg.tmp" && mv "$cfg.tmp" "$cfg"
-}
-
 # Wait until every compose service with a healthcheck reports healthy.
 wait_for_compose_healthy() {
   for i in $(seq 1 30); do
@@ -81,7 +73,6 @@ cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 ensure_bun
 wait_for_docker
-enable_public_image_pulls
 
 # App/session env (used by the dev server, migrations, and `shed exec`). Tests
 # usually load their own .env.test, so this just mirrors compose.yaml.
@@ -102,7 +93,6 @@ source "$(dirname "$0")/lib.sh"
 cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 wait_for_docker
-enable_public_image_pulls
 docker compose up -d
 wait_for_compose_healthy
 

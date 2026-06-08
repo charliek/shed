@@ -55,14 +55,6 @@ wait_for_docker() {
   docker info >/dev/null 2>&1 || log "WARN: docker not ready (needs the 'full' image)"
 }
 
-# Public Docker Hub pulls fail under the image's credsStore=shed; drop only that
-# key (keeping any auths/credHelpers).
-enable_public_image_pulls() {
-  local cfg="$HOME/.docker/config.json"
-  grep -q '"credsStore"' "$cfg" 2>/dev/null || return
-  cp "$cfg" "$cfg.bak"; jq 'del(.credsStore)' "$cfg" >"$cfg.tmp" && mv "$cfg.tmp" "$cfg"
-}
-
 # Testcontainers launches containers on docker's DEFAULT bridge, which the image
 # disables (bridge: none). Re-enable it (compose is unaffected; it uses its own).
 enable_docker_default_bridge() {
@@ -84,7 +76,6 @@ cd "${SHED_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
 wait_for_docker
 enable_docker_default_bridge
-enable_public_image_pulls
 ensure_sdkman
 
 # Install the JDK pinned in .sdkmanrc (e.g. java=21.0.5-tem). Disable nounset
