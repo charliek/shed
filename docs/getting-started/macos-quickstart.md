@@ -162,16 +162,46 @@ are denied. See the shed-desktop
 and [approvals](https://charliek.github.io/shed-desktop/reference/approvals/)
 docs for the full policy model.
 
-## 5. Register the server and create your first shed
+## 5. Register the server and create a shed
 
 ```bash
-shed server add localhost --name my-mac      # registers the local server
-shed create demo --repo charliek/your-repo   # or --local-dir ~/projects/app
-shed attach demo
+shed server add localhost --name my-mac   # registers the local server
+shed create hello-world                   # a small shed to verify with
+shed console hello-world                  # drop into a shell inside it
 ```
 
-The first SSH credential use inside the shed (e.g. a `git push`) raises a Touch
-ID approval in shed-desktop; once approved per your policy, it's seamless.
+(You can also create from a repo or a local directory:
+`shed create demo --repo charliek/your-repo`, or
+`shed create demo --local-dir ~/projects/app`.)
+
+## 6. Verify credential brokering
+
+Run these **inside the shed** — the `shed console hello-world` shell from step 5.
+The first SSH or Docker credential use raises a Touch ID approval in shed-desktop;
+approve it (pick a policy like *Time Based Allow* so you aren't asked again for a
+while).
+
+```bash
+# SSH — signs with your host key via the forwarded agent (-> approval in shed-desktop).
+# Success prints: Hi <you>! You've successfully authenticated...
+ssh -T git@github.com
+
+# Docker — pull a small public image (anonymous pulls work with credsStore=shed):
+docker pull postgres:16-alpine
+# ...and a private registry to exercise credential brokering (-> approval):
+# docker pull ghcr.io/your-org/your-image:tag
+
+# AWS — only if you set default_role + aws.approval.policy in step 3:
+aws sts get-caller-identity
+```
+
+Back on the **host**, check each shed's extension health and connection state:
+
+```bash
+shed list -vv
+```
+
+Remove the test shed when you're done: `shed delete hello-world`.
 
 ## Next steps
 
