@@ -106,7 +106,7 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
    SHED_FC_HOST=<your-host> make test-integration
    ```
 
-   FC tests now run live against the installed binary. To validate against your source tree instead, see [Validating server-side changes](#validating-server-side-changes-required-for-server-side-prs) below.
+   FC tests now run live against the installed binary. To validate against your source tree instead, see [Validating server-side changes](#validating-server-side-changes-parallel-dev-server) below.
 
 #### Environment overrides
 

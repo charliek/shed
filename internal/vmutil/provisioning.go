@@ -23,6 +23,7 @@ type Provisioner struct {
 	agent    *AgentClient
 	shedName string
 	workDir  string
+	addDirs  []string
 	output   io.Writer
 	errOut   io.Writer
 }
@@ -47,6 +48,12 @@ func (p *Provisioner) SetWorkDir(dir string) {
 	if dir != "" {
 		p.workDir = dir
 	}
+}
+
+// SetAddDirs records the guest target paths of any --add-dir mounts so hooks
+// see them via SHED_ADD_DIRS (colon-separated), matching the session env.
+func (p *Provisioner) SetAddDirs(dirs []string) {
+	p.addDirs = dirs
 }
 
 // SetOutput sets the output writers for streaming hook output.
@@ -322,13 +329,16 @@ func (p *Provisioner) ensureLogDir(ctx context.Context) error {
 
 // buildEnv builds the environment variables list for hook execution.
 func (p *Provisioner) buildEnv(cfg *provision.Config) []string {
-	env := make([]string, 0, len(cfg.Env)+3)
+	env := make([]string, 0, len(cfg.Env)+4)
 
 	env = append(env,
 		fmt.Sprintf("%s=true", provision.EnvShedContainer),
 		fmt.Sprintf("%s=%s", provision.EnvShedName, p.shedName),
 		fmt.Sprintf("%s=%s", provision.EnvShedWorkspace, p.workDir),
 	)
+	if len(p.addDirs) > 0 {
+		env = append(env, fmt.Sprintf("%s=%s", provision.EnvShedAddDirs, strings.Join(p.addDirs, ":")))
+	}
 
 	for key, value := range cfg.Env {
 		env = append(env, fmt.Sprintf("%s=%s", key, value))

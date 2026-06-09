@@ -278,3 +278,43 @@ func TestServerConfigMountsCredentialsFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestProjectAddDirTargets(t *testing.T) {
+	tests := []struct {
+		name    string
+		mounts  []MountConfig
+		landing string
+		want    []string
+	}{
+		{name: "nil mounts (bare or --repo)", mounts: nil, landing: HomePath, want: nil},
+		{
+			name:    "--local-dir only has no add-dirs",
+			mounts:  []MountConfig{{Target: HomePath + "/proj"}},
+			landing: HomePath + "/proj",
+			want:    nil,
+		},
+		{
+			name: "--add-dirs are every mount but the landing one, in order",
+			mounts: []MountConfig{
+				{Target: HomePath + "/proj"}, // --local-dir (landing)
+				{Target: HomePath + "/sibling"},
+				{Target: HomePath + "/other"},
+			},
+			landing: HomePath + "/proj",
+			want:    []string{HomePath + "/sibling", HomePath + "/other"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ProjectAddDirTargets(tt.mounts, tt.landing)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ProjectAddDirTargets() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("index %d: got %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}

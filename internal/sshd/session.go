@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/gliderlabs/ssh"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/provision"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -173,6 +175,11 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 	// Add shed name for shell prompt customization
 	env = append(env, fmt.Sprintf("SHED_NAME=%s", shed.Name))
 
+	// Project-directory context, mirroring the provisioning-hook env so
+	// `shed exec` / interactive logins see the same SHED_WORKSPACE (the landing
+	// dir) and SHED_ADD_DIRS (any --add-dir mounts) the install/startup hooks do.
+	env = append(env, projectSessionEnv(shed)...)
+
 	// Create resize channel for window changes.
 	resizeChan := make(chan backend.TerminalSize, 10)
 	defer close(resizeChan)
@@ -211,6 +218,22 @@ func (s *Server) execInContainer(ctx context.Context, sess ssh.Session, shed *co
 	log.Printf("Executing in shed %s: tty=%v cmd=%v", shed.Name, isPTY, cmd)
 
 	return s.backend.Exec(ctx, shed.Name, opts)
+}
+
+// projectSessionEnv returns the SHED_WORKSPACE / SHED_ADD_DIRS variables for a
+// session (`shed exec` + interactive logins), mirroring the provisioning-hook
+// env. SHED_WORKSPACE is the shed's landing directory; SHED_ADD_DIRS is the
+// colon-joined list of --add-dir mount targets. Each is omitted when not
+// applicable (e.g. an older shed with no landing dir, or no add-dir mounts).
+func projectSessionEnv(shed *config.Shed) []string {
+	var env []string
+	if shed.LandingDir != "" {
+		env = append(env, fmt.Sprintf("%s=%s", provision.EnvShedWorkspace, shed.LandingDir))
+	}
+	if dirs := config.ProjectAddDirTargets(shed.ProjectMounts, shed.LandingDir); len(dirs) > 0 {
+		env = append(env, fmt.Sprintf("%s=%s", provision.EnvShedAddDirs, strings.Join(dirs, ":")))
+	}
+	return env
 }
 
 // handleWindowResize forwards window resize events from SSH to the resize channel.

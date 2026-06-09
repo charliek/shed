@@ -1,352 +1,85 @@
 # Shed
 
-Shed is a lightweight tool for managing persistent, VM-based development environments across multiple servers. It enables developers to spin up isolated coding sessions with AI tools (Claude Code, OpenCode) pre-installed, disconnect, and reconnect later to continue work.
+Shed manages persistent, VM-based development environments across multiple
+servers. Spin up isolated coding sessions (with Claude Code / OpenCode
+pre-installed), disconnect, and reconnect later to continue — backed by
+Firecracker microVMs on Linux or Apple Virtualization VMs on macOS Apple Silicon.
+
+**📖 Full documentation: <https://charliek.github.io/shed/>**
 
 ## Features
 
-- **Simple CLI** - Create and manage dev environments with minimal commands
-- **Session Persistence** - VMs keep running after disconnect
-- **Multi-Server** - Manage sheds across home servers and cloud VPS instances
-- **IDE Integration** - Native Cursor/VS Code support via SSH Remote
-- **AI-Ready** - Pre-configured for Claude Code and OpenCode workflows
-- **VM Backends** - Firecracker microVMs (Linux) or Apple VZ virtual machines (macOS Apple Silicon)
+- **Simple CLI** — create and manage dev environments with minimal commands.
+- **Session persistence** — VMs (and your tmux sessions) keep running after you disconnect.
+- **Multi-server** — manage sheds across home servers and cloud VPS instances.
+- **IDE integration** — native Cursor / VS Code Remote-SSH support.
+- **AI-ready** — pre-configured for Claude Code and OpenCode workflows.
+- **VM backends** — Firecracker microVMs (Linux) or Apple VZ (macOS Apple Silicon).
 
-## Quick Start
+## Quick start
 
-### 1. Install
+Follow the packaged quickstart for your platform:
 
-#### Homebrew (macOS, Recommended)
+- **[macOS Quickstart](https://charliek.github.io/shed/getting-started/macos-quickstart/)** — Homebrew + the shed-desktop approval app.
+- **[Linux Quickstart](https://charliek.github.io/shed/getting-started/linux-quickstart/)** — the `shed-server` deb running Firecracker.
 
-```bash
-brew install charliek/tap/shed
-brew install charliek/tap/shed-host-agent  # optional: credential brokering
-```
+Building from source or customizing images? See
+[Developer Setup](https://charliek.github.io/shed/getting-started/quick-start/).
 
-This installs `shed` (CLI) and `shed-server`, generates a default server config, codesigns the server binary, and sets up launchd services. Pulls `vfkit` and `erofs-utils` as dependencies. See [VZ Setup](docs/getting-started/vz-setup.md) for the full macOS setup guide.
-
-#### Debian / Ubuntu (apt)
-
-```bash
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://apt.stridelabs.ai/pubkey.gpg | \
-  sudo tee /etc/apt/keyrings/apt-charliek.gpg > /dev/null
-echo 'deb [signed-by=/etc/apt/keyrings/apt-charliek.gpg] https://apt.stridelabs.ai noble main' | \
-  sudo tee /etc/apt/sources.list.d/apt-charliek.list
-sudo apt update
-sudo apt install shed-server
-```
-
-Installs the `shed-server` binary, default config at `/etc/shed/server.yaml`, and the systemd unit. Pulls `erofs-utils` as a dependency. The `shed` CLI is built from source on Linux today (see below).
-
-#### Build from Source
-
-```bash
-git clone https://github.com/charliek/shed.git
-cd shed
-make build
-
-# Or install the CLI only
-go install github.com/charliek/shed/cmd/shed@latest
-```
-
-#### Claude Code / agent skills
-
-shed ships a skill that teaches your coding agent to drive the shed CLI (create and attach to sheds, forward ports, sync files, work across servers). Install the CLI (above) first, since the skill drives it.
-
-The general route ([`skills`](https://skills.sh)) installs into Claude Code, GitHub Copilot, OpenCode, and other agents:
-
-```bash
-npx skills add charliek/shed
-```
-
-For Claude Code, a native plugin is also available (it namespaces the skill as `shed:shed`):
-
-```text
-/plugin marketplace add charliek/shed
-/plugin install shed@shed
-```
-
-### 2. Add a Server
-
-```bash
-shed server add my-server.local --name my-server
-```
-
-### 3. Create a Shed
-
-```bash
-# Create an empty shed
-shed create my-project
-
-# Or clone a repository
-shed create my-project --repo git@github.com:user/repo.git
-
-# Or mount a local directory as the workspace
-shed create my-project --local-dir ~/projects/my-project
-
-# Pick a specific image alias or ref (base / extensions / full; default_image is used otherwise)
-shed create big-project --image full --upper-size 20G
-```
-
-### 4. Connect
-
-```bash
-# Open a terminal session
-shed console my-project
-
-# Or use VS Code/Cursor with SSH Remote
-# The shed ssh-config command generates SSH config entries
-shed ssh-config >> ~/.ssh/config
-```
-
-## Backends
-
-Both backends boot from **layered OCI images**. Each shed's rootfs is a
-stack of read-only ext4 layers (pulled registry-direct from `ghcr.io`,
-no Docker daemon needed) plus a per-shed writable upper layer, mounted
-together via overlayfs inside the guest. Three images ship per backend —
-`base`, `extensions`, and `full` — wired up as the backend's
-`default_image` and `image_aliases`. See [Images](docs/reference/images.md).
-
-### VZ (macOS)
-
-Uses Apple's Virtualization.framework for native Linux VMs on macOS. Best for:
-- Local development on macOS with full VM isolation
-- Running Docker inside the shed (no Docker Desktop needed)
-- Vsock + agent architecture for fast host-guest communication
-
-```bash
-# Create with VZ backend (default on macOS)
-shed create myproject
-
-# With custom resources
-shed create myproject --cpus=4 --memory=8192
-```
-
-See [VZ Setup](docs/getting-started/vz-setup.md) and [VZ Operations](docs/reference/vz-operations.md) for setup and usage details.
-
-### Firecracker
-
-Uses Firecracker microVMs for stronger isolation. Best for:
-- Security-sensitive workloads
-- Full VM-level isolation
-- Running Docker inside the shed
-
-```bash
-# Create with Firecracker backend (default on Linux)
-shed create myproject
-
-# With custom resources
-shed create myproject --cpus=4 --memory=8192
-
-# Clone a private repo (requires SSH credentials configured)
-shed create myproject --repo=git@github.com:user/repo.git
-```
-
-See [Firecracker Setup](docs/getting-started/fc-setup.md) and [Firecracker Operations](docs/reference/fc-operations.md) for setup and usage details.
-
-## Requirements
-
-- **Client**: macOS or Linux (Homebrew or Go 1.24+ for source builds)
-- **Server (VZ)**: macOS 13+ (Ventura) on Apple Silicon (arm64), Docker
-- **Server (Firecracker)**: Linux with KVM support, Docker
-- **Network**: Tailscale (or any private network) connecting all machines
+The CLI also ships a coding-agent skill — `npx skills add charliek/shed` (or, for
+Claude Code, `/plugin marketplace add charliek/shed` then `/plugin install shed@shed`).
 
 ## Architecture
 
-Shed consists of three binaries:
+Three binaries:
 
-- **`shed`** - CLI for developer machines
-- **`shed-server`** - Server daemon exposing HTTP API (port 8080) and SSH server (port 2222)
-- **`shed-host-agent`** - Optional host-side credential brokering daemon (from [shed-extensions](https://github.com/charliek/shed-extensions))
+- **`shed`** — the CLI on your developer machine.
+- **`shed-server`** — the daemon on each host (HTTP API + SSH server) that runs VMs via the VZ (macOS) or Firecracker (Linux) backend.
+- **`shed-host-agent`** — optional host-side credential broker, from [shed-extensions](https://github.com/charliek/shed-extensions); on macOS it pairs with the [shed-desktop](https://github.com/charliek/shed-desktop) approval app.
 
-The server supports two backends:
-- **VZ** - Uses Apple Virtualization.framework VMs via vfkit (macOS Apple Silicon only)
-- **Firecracker** - Uses microVMs with vsock communication for better isolation (Linux only)
-
-```
-Developer Machine                    Remote Server / Local Mac
-┌─────────────────┐                 ┌──────────────────────────────────────┐
-│    shed CLI     │ ──HTTP/SSH───▶ │  shed-server                         │
-└─────────────────┘                 │  ├── HTTP API (CRUD operations)      │
-                                    │  └── SSH Server (terminal/IDE)       │
-                                    │              │                        │
-                                    │      ┌───────┴───────┐               │
-                                    │      ▼               ▼               │
-                                    │  ┌──────┐       ┌────┐              │
-                                    │  │  FC  │       │ VZ │              │
-                                    │  │┌────┐│       │┌──┐│              │
-                                    │  ││ VM ││       ││VM││              │
-                                    │  │└────┘│       │└──┘│              │
-                                    │  └──────┘       └────┘              │
-                                    └──────────────────────────────────────┘
+```text
+Developer Machine                Remote Server / Local Mac
+┌─────────────┐   HTTP/SSH    ┌──────────────────────────────┐
+│  shed CLI   │ ────────────▶ │  shed-server                 │
+└─────────────┘               │   ├── HTTP API (lifecycle)   │
+                              │   └── SSH server (shell/IDE) │
+                              │        VZ │ Firecracker VMs  │
+                              └──────────────────────────────┘
 ```
 
-## CLI Commands
+Both backends boot from layered OCI images (`base` / `extensions` / `full`)
+pulled registry-direct from `ghcr.io`. See
+[Images](https://charliek.github.io/shed/reference/images/).
 
-```bash
-# Shed Management
-shed create <name> [--repo URL]  # Create a new shed (or --local-dir PATH)
-shed list                        # List all sheds on the current server
-shed start <name>                # Start a stopped shed
-shed stop <name>                 # Stop a running shed
-shed reset <name>                # Wipe and recreate the per-shed writable upper
-shed delete <name> [--force]     # Delete a shed
+## Documentation
 
-# Connection & Execution
-shed console <name>              # Open direct terminal session
-shed attach <name>               # Attach to tmux session (persistent)
-shed attach <name> -S <session>  # Attach to named session
-shed exec <name> <cmd>           # Run command in shed
+- [Getting Started](https://charliek.github.io/shed/getting-started/quick-start/) — quickstarts + developer setup
+- [CLI Reference](https://charliek.github.io/shed/reference/cli/) — every command
+- [Configuration](https://charliek.github.io/shed/reference/configuration/) — client + server config
+- [Images](https://charliek.github.io/shed/reference/images/) · [Storage Model](https://charliek.github.io/shed/reference/storage-model/)
+- [Extensions](https://charliek.github.io/shed/reference/extensions/) — credential brokering
+- [Provisioning](https://charliek.github.io/shed/reference/provisioning/) — `.shed/` install/startup hooks + tutorials
+- Related projects: [shed-extensions](https://charliek.github.io/shed-extensions/) · [shed-desktop](https://charliek.github.io/shed-desktop/)
 
-# Image Management
-shed image build                 # Build an OCI image from a Dockerfile
-shed image ls                    # List images by ref (SOURCE: config/user/dangling; alias: list)
-shed image history <tag>         # Show the layer stack for an image
-shed image inspect <tag-or-digest>  # Show manifest + annotations + digest
-shed image pull <ref>            # Pull an OCI image registry-direct
-shed image push <src> <dst>      # Push a tag/digest to a registry (byte-perfect)
-shed image save <tag> -o <file>  # Save an image to an OCI archive
-shed image load -i <file>        # Load an OCI archive into the local store
-shed image tag <src> <new>       # Point a new tag at an existing digest
-shed image rm <ref|digest|label> # Remove an image from the ref-index (alias: delete)
-shed image prune                 # Reclaim unreferenced layer blobs
+## Requirements
 
-# Session Management
-shed sessions                    # List all sessions on default server
-shed sessions <name>             # List sessions in a specific shed
-shed sessions --all              # List sessions across all servers
-shed sessions kill <shed> <session>  # Kill a session
+- **Client**: macOS or Linux (the `shed` CLI).
+- **Server (VZ)**: macOS 13+ on Apple Silicon (arm64); macOS 14+ for shed-desktop.
+- **Server (Firecracker)**: Linux with KVM.
+- **Network**: Tailscale (or any private network) connecting the machines.
 
-# Port Forwarding
-shed tunnels start <name> -t <ports>  # Forward ports from a shed
-shed tunnels stop <name>              # Stop port forwarding
-shed tunnels list                     # List active tunnels
+## Security model
 
-# Server & IDE
-shed server add <name>           # Add a server to client config
-shed server list                 # List configured servers
-shed server remove <name>        # Remove a server from client config
-shed ssh-config                  # Generate SSH config for IDE integration
-```
-
-## Session Persistence
-
-Shed supports persistent sessions via tmux. This allows you to:
-
-1. Start a long-running agent (Claude Code, OpenCode)
-2. Detach from the session (Ctrl-B D)
-3. Reconnect later to check on progress
-4. Run multiple named sessions per shed
-
-### Quick Example
-
-```bash
-# Create a shed and attach to a persistent session
-shed create myproj --repo user/repo
-shed attach myproj
-
-# Inside the session, start an agent
-claude
-
-# Detach with Ctrl-B D (tmux default)
-# The agent keeps running!
-
-# Later, reattach to see progress
-shed attach myproj
-
-# List all active sessions
-shed sessions --all
-```
-
-### console vs attach
-
-- `shed console` - Direct shell, no persistence (exits when you disconnect)
-- `shed attach` - tmux session, persists after disconnect
-
-## Setup
-
-See [VZ Setup (macOS)](docs/getting-started/vz-setup.md) or [Firecracker Setup (Linux)](docs/getting-started/fc-setup.md) for detailed server installation and configuration instructions.
+Shed targets single-user setups where every machine is on a private network
+(e.g. Tailscale), the developer controls all of them, and network access implies
+trust. Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo.
+It is **not** built for multi-tenant use, public-internet exposure, or untrusted
+networks.
 
 ## Development
 
-See [Development Setup](docs/development/setup.md) for building from source and contributing.
-
-## Configuration
-
-### Client Configuration (`~/.shed/config.yaml`)
-
-```yaml
-default_server: my-server
-servers:
-  my-server:
-    host: my-server.local
-    http_port: 8080
-    ssh_port: 2222
-```
-
-### Server Configuration (`/etc/shed/server.yaml` or `~/.config/shed/server.yaml`)
-
-```yaml
-name: my-server
-http_port: 8080
-ssh_port: 2222
-
-# Auto-detect backend: vz on macOS, firecracker on Linux
-default_backend: detect
-
-# Host directories mounted into every shed (the deprecated key
-# "credentials" is still accepted as a fallback).
-mounts:
-  ssh:
-    source: ~/.ssh
-    target: /home/shed/.ssh
-    readonly: true
-  gh:
-    source: ~/.config/gh
-    target: /home/shed/.config/gh
-    readonly: true
-env_file: ~/.shed/env
-
-# VZ backend (macOS Apple Silicon)
-vz:
-  default_image: ghcr.io/charliek/shed-vz-full:v{version}
-  image_aliases:
-    base: ghcr.io/charliek/shed-vz-base:v{version}
-    extensions: ghcr.io/charliek/shed-vz-extensions:v{version}
-    full: ghcr.io/charliek/shed-vz-full:v{version}
-  pull_policy: missing
-  images_dir: ~/Library/Application Support/shed/vz/
-  default_cpus: 2
-  default_memory_mb: 4096
-
-# Firecracker backend (Linux with KVM)
-# firecracker:
-#   default_image: ghcr.io/charliek/shed-fc-full:v{version}
-#   image_aliases:
-#     base: ghcr.io/charliek/shed-fc-base:v{version}
-#     extensions: ghcr.io/charliek/shed-fc-extensions:v{version}
-#     full: ghcr.io/charliek/shed-fc-full:v{version}
-#   pull_policy: missing
-#   images_dir: /var/lib/shed/firecracker/images
-#   default_cpus: 2
-#   default_memory_mb: 4096
-```
-
-Replace `{version}` with the version matching your `shed` binary — run `shed version` to check. See [Configuration](docs/reference/configuration.md) for all options.
-
-## Security Model
-
-Shed is designed for single-user scenarios where:
-- All machines are connected via Tailscale (or similar private network)
-- The developer owns/controls all machines
-- Network access implies trust
-- Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo
-
-**Not suitable for:**
-- Multi-tenant environments
-- Public internet exposure
-- Untrusted network access
+See [Development Setup](docs/development/setup.md) for building from source and
+contributing.
 
 ## License
 

@@ -702,6 +702,8 @@ shed exec <name> <command...>
 
 **Working directory.** Commands run in the shed's landing directory — the shed user's home (`/home/shed`) by default, or the project directory when the shed was created with `--repo` (`~/<reponame>`) or `--local-dir` (`~/<basename>`).
 
+**Environment.** Sessions (`shed exec` and interactive logins) export `SHED_NAME` (the shed name), `SHED_WORKSPACE` (the landing/project directory), and — when the shed was created with `--add-dir` — `SHED_ADD_DIRS` (a colon-separated list of the additional mount paths, e.g. `/home/shed/lib-a:/home/shed/lib-b`). These mirror the variables provisioning hooks receive.
+
 **Execution model.** `shed exec` ships argv literally. The CLI single-quote-wraps each argv element before transmission so nested quotes, spaces, and shell metacharacters in *your* data survive the SSH wire intact and reach the guest as argv, not as shell code. The server-side SSH command channel does run those quoted tokens through `bash -lc` (so login PATH adjustments — `/etc/profile.d/*.sh`, `~/.profile`, mise, nvm, rustup — are in effect), but bash treats single-quoted text as literal data, so argv stays argv. End result: `shed exec name -- mytool` just works for tools installed via login-shell PATH managers, and `shed exec name -- echo '$HOME'` still prints the literal `$HOME` — no expansion, no command splitting.
 
 This is the same model Docker, devcontainers, Codespaces, and Coder follow on their `exec` path. Pipes, redirects, semicolons, `$VAR` expansion, command substitution, and other shell metacharacters only take effect when *you* explicitly invoke a shell as part of the command (e.g. `bash -c '...'`).
