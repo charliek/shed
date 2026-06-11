@@ -77,7 +77,8 @@ Restart after editing: `brew services restart shed`.
 
 The host agent holds your real keys and decides each request; its config is at
 `/opt/homebrew/etc/shed/extensions.yaml`. To route approvals to shed-desktop, set
-each provider's policy to `shed-desktop` and turn on the desktop channel:
+each provider's policy to `shed-desktop` (the agent always serves the local
+socket the app connects to — there's nothing to enable):
 
 ```yaml
 # /opt/homebrew/etc/shed/extensions.yaml
@@ -86,10 +87,8 @@ discovery:
   servers: all            # broker for every server in ~/.shed/config.yaml
   watch: fsnotify         # pick up `shed server add/remove` live
 
-desktop:
-  enabled: true           # serve the local socket shed-desktop connects to
-  # socket_path: ~/Library/Application Support/shed/host-agent.sock
-  # timeout_ms: 25000     # fail-closed (deny) if the app doesn't answer in time
+# Optional: how long to wait for a shed-desktop decision before failing closed (default 25s)
+# approval_timeout: 25s
 
 ssh:
   approval:
@@ -123,16 +122,18 @@ logging:
   path: ~/.local/share/shed/extensions-audit.log
 ```
 
-Restart and verify — point `status` at the Homebrew config (bare `status` reads
-`~/.config/shed/extensions.yaml`, which the brew service doesn't use):
+Restart and verify. `status` queries the running agent directly and prints the
+config it loaded, so there's no need to point it at a path:
 
 ```bash
 brew services restart shed-host-agent
-shed-host-agent -config /opt/homebrew/etc/shed/extensions.yaml status
+shed-host-agent status
 ```
 
-Each delegated provider should read `shed-desktop` and the desktop channel
-`state: listening`. Policies, roles, and registries are off by default — see the
+It should report `config: /opt/homebrew/etc/shed/extensions.yaml`, each delegated
+provider's policy reading `shed-desktop`, and the approval channel (its consumer
+shows as connected once shed-desktop is running, next step). Policies, roles, and
+registries are off by default — see the
 [full reference](https://charliek.github.io/shed-extensions/reference/configuration/).
 
 ## 4. Install shed-desktop
