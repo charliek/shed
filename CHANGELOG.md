@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.7.0 — 2026-06-13
+
+Optional, default-off authentication and transport encryption so a shed server
+can be deployed on a public-internet VPS. Tailscale / LAN remains the unchanged
+primary path — every new control is off by default, and existing deployments
+are byte-identical until opted in.
+
+### Optional auth + pinned TLS for public-VPS deployment (#198)
+
+- **SSH key allowlist** — restrict the SSH control channel to specific public
+  keys, optionally seeded from GitHub (`auth.ssh.github_users`), with a
+  fail-closed last-known-good cache.
+- **Scoped HTTP bearer tokens** — `control` / `credentials` / `admin` scopes
+  minted with `shed-server token new --scope`, enforced deny-by-default when
+  `auth.http.mode=enforce`. Bootstrap endpoints (`/api/info`,
+  `/api/ssh-host-key`) stay exempt.
+- **Native pinned TLS** — the server self-signs an ECDSA P-256 cert; clients
+  pin it by SHA-256 fingerprint (`shed server add --https-port`), the same
+  trust model as the SSH host key. No CA, ACME, or domain required.
+- **Credential-bus hardening** — the plugin bus drops forged `/respond`
+  envelopes and requires the `credentials` scope under enforcement.
+- **`public_exposure` preflight** — refuses to start a public server unless the
+  full bundle is present (SSH enforce + HTTP enforce + a strong token + TLS).
+- **Network-surface controls** — `http_bind` / `ssh_bind` / `internal_http_port`
+  / `trusted_proxy`, and an idle SSE keepalive for NAT survival.
+
+See the new [Security reference](reference/security.md), the
+[Public VPS deployment guide](guides/vps-deployment.md), and the
+[v0.6 → v0.7 upgrade guide](upgrades/v0.6-to-v0.7.md).
+
+### shed-extensions v0.4.1 (#200)
+
+The `extensions`/`full` rootfs images bundle shed-extensions v0.4.1, whose
+host-agent gains pinned-TLS + scoped-token support for the credential bus.
+Guest binaries are unchanged from v0.4.0, so no guest-side migration is needed.
+
 ## v0.6.6 — 2026-06-12
 
 Session env vars for the landing directory, a credential-brokering refresh
