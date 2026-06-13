@@ -24,7 +24,28 @@ import (
 const (
 	// shutdownTimeout is the maximum time to wait for graceful shutdown
 	shutdownTimeout = 30 * time.Second
+
+	// HTTP server timeouts. WriteTimeout is intentionally omitted (0):
+	// SSE streams (create/pull progress and the plugin bus) write for
+	// arbitrarily long, and a WriteTimeout would kill them mid-stream.
+	// ReadHeaderTimeout/ReadTimeout bound slowloris-style header/body
+	// reads; IdleTimeout reaps idle keep-alive conns (it does not apply
+	// during an active SSE response).
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 60 * time.Second
+	httpIdleTimeout       = 120 * time.Second
 )
+
+// newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
+}
 
 // defaultHostKeyPath returns the default path for the SSH host key.
 // Uses /etc/shed/host_key when running as root (Linux servers), otherwise
@@ -51,8 +72,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Printf("Starting shed-server...")
-	log.Printf("HTTP port: %d", cfg.HTTPPort)
-	log.Printf("SSH port: %d", cfg.SSHPort)
+	log.Printf("HTTP listen: %s", cfg.HTTPListenAddr())
+	log.Printf("SSH listen: %s", cfg.SSHListenAddr())
 
 	// Initialize plugin system (before backends, since backends use the bridge)
 	pluginRegistry := plugin.NewRegistry()
@@ -91,7 +112,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer be.Close()
 
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, defaultHostKeyPath(), cfg.SSHPort, cfg.Terminal)
+	sshServer, err := sshd.NewServer(be, defaultHostKeyPath(), cfg.SSHListenAddr(), cfg.Terminal)
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}
@@ -99,24 +120,38 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
-	router := apiServer.Router()
 
-	// Create HTTP server
-	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler: router,
+	// Public HTTP listener. When the internal-listener split is enabled,
+	// apiServer.Router() omits the credential bus + Connect tunnel.
+	httpServer := newHTTPServer(cfg.HTTPListenAddr(), apiServer.Router())
+
+	// Optional internal (loopback) listener carrying the credential bus +
+	// Connect tunnel, kept off the public interface.
+	var internalServer *http.Server
+	if addr := cfg.InternalHTTPListenAddr(); addr != "" {
+		internalServer = newHTTPServer(addr, apiServer.InternalRouter())
 	}
 
-	// Channel to collect errors from servers
-	errChan := make(chan error, 2)
+	// Channel to collect errors from servers (HTTP, SSH, internal HTTP).
+	errChan := make(chan error, 3)
 
 	// Start HTTP server in goroutine
 	go func() {
-		log.Printf("HTTP server listening on :%d", cfg.HTTPPort)
+		log.Printf("HTTP server listening on %s", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errChan <- fmt.Errorf("HTTP server error: %w", err)
 		}
 	}()
+
+	// Start internal HTTP server in goroutine (when split enabled)
+	if internalServer != nil {
+		go func() {
+			log.Printf("Internal HTTP server (bus+connect) listening on %s", internalServer.Addr)
+			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("internal HTTP server error: %w", err)
+			}
+		}()
+	}
 
 	// Start SSH server in goroutine
 	go func() {
@@ -148,6 +183,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("Shutting down HTTP server...")
 	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server shutdown error: %v", err)
+	}
+
+	// Shutdown internal HTTP server (when enabled)
+	if internalServer != nil {
+		log.Printf("Shutting down internal HTTP server...")
+		if err := internalServer.Shutdown(ctx); err != nil {
+			log.Printf("internal HTTP server shutdown error: %v", err)
+		}
 	}
 
 	// Shutdown SSH server

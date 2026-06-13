@@ -76,6 +76,10 @@ log_level: info
 | `name` | string | `shed-server` | Server identifier |
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
+| `http_bind` | string | `""` | Interface to bind the HTTP listener to (e.g. `127.0.0.1`, or a tailnet IP). Empty binds all interfaces. |
+| `ssh_bind` | string | `""` | Interface to bind the SSH listener to. Empty binds all interfaces. |
+| `internal_http_port` | int | `0` | When greater than 0, moves the credential bus (`/api/plugins/*`) and the Connect tunnel (`/api/sheds/*/connect/*`) onto a loopback-only listener on this port, keeping them off the public interface. `0` keeps every route on the public listener (default). |
+| `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
 | `env_file` | string | - | Path to environment variables file |

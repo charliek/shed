@@ -31,6 +31,29 @@ type ServerConfig struct {
 	Name     string `yaml:"name"`
 	HTTPPort int    `yaml:"http_port"`
 	SSHPort  int    `yaml:"ssh_port"`
+
+	// Network surface. All optional. The bind/port zero values preserve the
+	// legacy all-interfaces, single-listener behavior. TrustedProxy defaults
+	// to false, which disables RealIP (see below) — the intended security
+	// default, not the legacy always-on RealIP.
+	//
+	// HTTPBind / SSHBind restrict a listener to one interface (e.g.
+	// "127.0.0.1" or a tailnet IP). Empty = all interfaces (":port").
+	HTTPBind string `yaml:"http_bind,omitempty"`
+	SSHBind  string `yaml:"ssh_bind,omitempty"`
+	// InternalHTTPPort, when >0, splits the HTTP surface: the credential
+	// bus (/api/plugins/*) and the Connect tunnel (/api/sheds/*/connect/*)
+	// move to a loopback-only listener on this port, and the public
+	// listener omits them. 0 (default) keeps every route on the public
+	// listener (legacy behavior), so existing clients are unaffected.
+	InternalHTTPPort int `yaml:"internal_http_port,omitempty"`
+	// TrustedProxy enables chi's RealIP middleware, which trusts the
+	// client-supplied X-Forwarded-For. Only safe behind a proxy that
+	// overwrites that header; the default (false) uses the real TCP peer
+	// so an attacker can't forge a source IP to evade per-IP rate limits
+	// or poison audit logs.
+	TrustedProxy bool `yaml:"trusted_proxy,omitempty"`
+
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
 	Mounts map[string]MountConfig `yaml:"mounts"`
@@ -62,6 +85,49 @@ type ServerConfig struct {
 
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
+}
+
+// HTTPListenAddr returns the bind address for the public HTTP listener.
+func (c *ServerConfig) HTTPListenAddr() string { return listenAddr(c.HTTPBind, c.HTTPPort) }
+
+// SSHListenAddr returns the bind address for the SSH listener.
+func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.SSHBind, c.SSHPort) }
+
+// InternalListenerEnabled reports whether the HTTP surface is split onto a
+// separate loopback internal listener (credential bus + Connect). This is
+// the single definition of "split on" consulted by the router and serve.
+func (c *ServerConfig) InternalListenerEnabled() bool { return c.InternalHTTPPort > 0 }
+
+// InternalHTTPListenAddr returns the loopback address for the internal
+// HTTP listener, or "" when the split is disabled.
+func (c *ServerConfig) InternalHTTPListenAddr() string {
+	if !c.InternalListenerEnabled() {
+		return ""
+	}
+	return listenAddr("127.0.0.1", c.InternalHTTPPort)
+}
+
+// listenAddr joins a bind interface and port. An empty bind means all
+// interfaces (":port").
+func listenAddr(bind string, port int) string {
+	if bind == "" {
+		return fmt.Sprintf(":%d", port)
+	}
+	return net.JoinHostPort(bind, strconv.Itoa(port))
+}
+
+// validateNetworkSurface checks the optional internal-listener port. Shared
+// by Validate and ValidateNoHostCoupling, both of which range-check
+// HTTPPort/SSHPort immediately before calling this (the collision check
+// below assumes those are already valid).
+func (c *ServerConfig) validateNetworkSurface() error {
+	if c.InternalHTTPPort < 0 || c.InternalHTTPPort > 65535 {
+		return fmt.Errorf("invalid internal_http_port: %d", c.InternalHTTPPort)
+	}
+	if c.InternalHTTPPort > 0 && (c.InternalHTTPPort == c.HTTPPort || c.InternalHTTPPort == c.SSHPort) {
+		return fmt.Errorf("internal_http_port (%d) must differ from http_port and ssh_port", c.InternalHTTPPort)
+	}
+	return nil
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -1280,6 +1346,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if c.SSHPort < 0 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
 	}
+	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -1347,6 +1416,9 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.SSHPort < 1 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
+	}
+	if err := c.validateNetworkSurface(); err != nil {
+		return err
 	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}

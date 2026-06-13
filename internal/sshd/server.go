@@ -26,18 +26,19 @@ type Server struct {
 	sshServer   *ssh.Server
 	backend     backend.Backend
 	hostKeyPath string
-	port        int
+	listenAddr  string
 	hostKey     gossh.Signer
 	listener    net.Listener
 	termConfig  *terminal.Config
 }
 
-// NewServer creates a new SSH server.
-func NewServer(b backend.Backend, hostKeyPath string, port int, termConfig *terminal.Config) (*Server, error) {
+// NewServer creates a new SSH server. listenAddr is the TCP bind address
+// (e.g. ":2222" for all interfaces, or "127.0.0.1:2222" / "<tailnet-ip>:2222").
+func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config) (*Server, error) {
 	s := &Server{
 		backend:     b,
 		hostKeyPath: hostKeyPath,
-		port:        port,
+		listenAddr:  listenAddr,
 		termConfig:  termConfig,
 	}
 
@@ -50,7 +51,7 @@ func NewServer(b backend.Backend, hostKeyPath string, port int, termConfig *term
 
 	// Create the SSH server.
 	s.sshServer = &ssh.Server{
-		Addr: fmt.Sprintf(":%d", port),
+		Addr: listenAddr,
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
 			return s.handlePublicKey(ctx, key)
 		},
@@ -150,7 +151,7 @@ func (s *Server) GetHostPublicKey() string {
 
 // Start begins listening for SSH connections.
 func (s *Server) Start() error {
-	addr := fmt.Sprintf(":%d", s.port)
+	addr := s.listenAddr
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
