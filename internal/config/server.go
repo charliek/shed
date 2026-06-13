@@ -99,24 +99,45 @@ func (c *ServerConfig) SSHAuth() *SSHAuthConfig {
 	return c.Auth.SSH
 }
 
+// HTTPAuth returns the HTTP auth config, or nil when unset.
+func (c *ServerConfig) HTTPAuth() *HTTPAuthConfig {
+	if c.Auth == nil {
+		return nil
+	}
+	return c.Auth.HTTP
+}
+
 // validateAuth checks the optional auth config. Shared by Validate and
 // ValidateNoHostCoupling.
 func (c *ServerConfig) validateAuth() error {
-	ssh := c.SSHAuth()
-	if ssh == nil {
-		return nil
+	if ssh := c.SSHAuth(); ssh != nil {
+		switch ssh.Mode {
+		case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
+		default:
+			return fmt.Errorf("invalid auth.ssh.mode: %q (must be off, warn, or enforce)", ssh.Mode)
+		}
+		if ssh.MaxAuthTries < 0 {
+			return fmt.Errorf("invalid auth.ssh.max_auth_tries: %d", ssh.MaxAuthTries)
+		}
+		for _, u := range ssh.GitHubUsers {
+			if !ValidGitHubUsername(u) {
+				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
+			}
+		}
 	}
-	switch ssh.Mode {
-	case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
-	default:
-		return fmt.Errorf("invalid auth.ssh.mode: %q (must be off, warn, or enforce)", ssh.Mode)
-	}
-	if ssh.MaxAuthTries < 0 {
-		return fmt.Errorf("invalid auth.ssh.max_auth_tries: %d", ssh.MaxAuthTries)
-	}
-	for _, u := range ssh.GitHubUsers {
-		if !ValidGitHubUsername(u) {
-			return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
+	if h := c.HTTPAuth(); h != nil {
+		switch h.Mode {
+		case "", HTTPAuthOff, HTTPAuthEnforce:
+		default:
+			return fmt.Errorf("invalid auth.http.mode: %q (must be off or enforce)", h.Mode)
+		}
+		for i, tok := range h.Tokens {
+			if tok.Token == "" {
+				return fmt.Errorf("auth.http.tokens[%d]: token is empty", i)
+			}
+			if !ValidTokenScope(tok.Scope) {
+				return fmt.Errorf("auth.http.tokens[%d]: invalid scope %q (must be control, credentials, or admin)", i, tok.Scope)
+			}
 		}
 	}
 	return nil

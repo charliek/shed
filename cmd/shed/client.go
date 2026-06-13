@@ -26,6 +26,14 @@ type APIClient struct {
 	baseURL       string
 	httpClient    *http.Client
 	createTimeout time.Duration
+	token         string // bearer token (control scope), sent when non-empty
+}
+
+// setAuth adds the bearer token header when the client is configured with one.
+func (c *APIClient) setAuth(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 }
 
 // NewAPIClient creates a new API client for the given host and port.
@@ -41,7 +49,9 @@ func NewAPIClient(host string, port int, createTimeout time.Duration) *APIClient
 
 // NewAPIClientFromEntry creates a new API client from a server entry.
 func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
-	return NewAPIClient(entry.Host, entry.HTTPPort, createTimeout)
+	c := NewAPIClient(entry.Host, entry.HTTPPort, createTimeout)
+	c.token = entry.ControlToken
+	return c
 }
 
 // doRequest performs an HTTP request with JSON body and response handling.
@@ -63,6 +73,7 @@ func (c *APIClient) doRequest(method, path string, body, result interface{}, exp
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -118,6 +129,8 @@ func (c *APIClient) doRequestWithTimeout(method, path string, body, result inter
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+
+	c.setAuth(req)
 
 	// Create a client without a Timeout for long-running requests.
 	// Important: When both http.Client.Timeout and context deadline are set,
@@ -227,6 +240,7 @@ func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, wantBl
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	c.setAuth(httpReq)
 
 	client := &http.Client{}
 	resp, err := client.Do(httpReq)
@@ -486,6 +500,7 @@ func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, withL
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	c.setAuth(httpReq)
 
 	resp, err := (&http.Client{}).Do(httpReq)
 	if err != nil {

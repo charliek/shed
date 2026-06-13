@@ -45,6 +45,7 @@ type HostClient struct {
 	serverURL  string
 	httpClient *http.Client
 	logger     *slog.Logger
+	token      string
 
 	mu     sync.Mutex
 	states map[string]SubStatus
@@ -73,6 +74,21 @@ func WithHTTPClient(hc *http.Client) HostClientOption {
 func WithLogger(logger *slog.Logger) HostClientOption {
 	return func(c *HostClient) {
 		c.logger = logger
+	}
+}
+
+// WithToken sets the bearer token sent on requests (the host-agent's
+// credentials-scoped token). Sent when non-empty.
+func WithToken(token string) HostClientOption {
+	return func(c *HostClient) {
+		c.token = token
+	}
+}
+
+// setAuth adds the bearer token header when the client is configured with one.
+func (c *HostClient) setAuth(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 }
 
@@ -184,6 +200,7 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -256,6 +273,7 @@ func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelop
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

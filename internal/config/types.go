@@ -671,10 +671,36 @@ const (
 	SSHAuthEnforce = "enforce" // reject keys not in the allowlist
 )
 
+// HTTP auth modes for HTTPAuthConfig.Mode.
+const (
+	HTTPAuthOff     = "off"     // accept all requests (legacy default)
+	HTTPAuthEnforce = "enforce" // require a valid bearer token (except bootstrap endpoints)
+)
+
 // AuthConfig configures optional authentication layers (all default-off).
 type AuthConfig struct {
 	// SSH configures the SSH public-key allowlist.
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
+	// HTTP configures bearer-token auth on the HTTP API.
+	HTTP *HTTPAuthConfig `yaml:"http,omitempty"`
+}
+
+// HTTPAuthConfig configures bearer-token auth on the HTTP API.
+type HTTPAuthConfig struct {
+	// Mode is off | enforce (default off). off accepts all requests (legacy);
+	// enforce requires a valid bearer token (except the bootstrap endpoints
+	// GET /api/info and GET /api/ssh-host-key). Enforcement itself lands with
+	// the middleware in a later sub-phase; clients send tokens regardless.
+	Mode string `yaml:"mode,omitempty"`
+	// Tokens are the accepted bearer tokens with their scopes.
+	Tokens []HTTPToken `yaml:"tokens,omitempty"`
+}
+
+// HTTPToken is an accepted bearer token and its scope.
+type HTTPToken struct {
+	Name  string `yaml:"name,omitempty"`
+	Scope string `yaml:"scope"`
+	Token string `yaml:"token"`
 }
 
 // SSHAuthConfig configures the SSH public-key allowlist. Identity comes from
