@@ -50,6 +50,16 @@ func TestConnectTargetFromEntry(t *testing.T) {
 		}
 	})
 
+	t.Run("https api_url without a port errors upfront", func(t *testing.T) {
+		entry := &config.ServerEntry{
+			Host: "host.example", HTTPPort: 8080,
+			APIURL: "https://host.example", TLSCertFingerprint: "sha256:abc",
+		}
+		if _, err := connectTargetFromEntry(entry); err == nil {
+			t.Error("a port-less https api_url should error in resolution, not at dial time")
+		}
+	})
+
 	t.Run("non-https api_url falls back to plain", func(t *testing.T) {
 		entry := &config.ServerEntry{
 			Host: "host.example", HTTPPort: 8080,

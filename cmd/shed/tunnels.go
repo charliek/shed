@@ -35,6 +35,9 @@ func connectTargetFromEntry(entry *config.ServerEntry) (tunnels.ConnectTarget, e
 				return tunnels.ConnectTarget{}, fmt.Errorf(
 					"server has an https api_url but no tls_cert_fingerprint to pin; re-add with `shed server add --https-port`")
 			}
+			if u.Port() == "" {
+				return tunnels.ConnectTarget{}, fmt.Errorf("api_url %q must include a port (e.g. https://host:8443)", entry.APIURL)
+			}
 			return tunnels.ConnectTarget{
 				Addr:   u.Host,
 				TLSPin: entry.TLSCertFingerprint,
