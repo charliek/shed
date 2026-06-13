@@ -26,6 +26,8 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,9 @@ from fixtures.server import resolve_server_entry
 
 HTTPS_PORT = 18443
 TEST_SAN = "shed-tls-test.example"
+# Hermetic scoped tokens for the bus-over-TLS lockstep (the host-agent posture).
+CREDS_TOKEN = "shed_credentials_itesttls"
+CONTROL_TOKEN = "shed_control_itesttls0"
 # Persist the cert outside ~/.shed so it never collides with a real server's
 # pinned material; a fresh path per run regenerates with the configured SANs.
 DEV_TLS_DIR = Path.home() / ".shed" / "dev" / "tls-itest"
@@ -165,5 +170,68 @@ def test_tls_client_pin(vz_server_dev):
             )
             assert r.returncode != 0, "a wrong --tls-fingerprint must be rejected"
             assert "mismatch" in (r.stdout + r.stderr).lower(), f"expected a mismatch error: {r.stdout!r} {r.stderr!r}"
+    finally:
+        shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
+
+
+def _https_status(port: int, path: str, ca_pem: str | None, token: str | None) -> int | None:
+    # ca_pem trusts exactly the server's cert (the pin); None uses the system
+    # CA bundle (which must NOT trust the self-signed cert).
+    if ca_pem:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cadata=ca_pem)
+    else:
+        ctx = ssl.create_default_context()
+    req = urllib.request.Request(f"https://localhost:{port}{path}")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        e.close()  # warnings-as-errors: don't leak the response body
+        return e.code
+
+
+@pytest.mark.vz
+@pytest.mark.slow
+def test_tls_bus_over_tls_with_token(vz_server_dev):
+    """The host-agent posture: credential bus reached over pinned TLS + a
+    credentials-scoped token. Proves the server accepts exactly what the pinned,
+    authed host-agent (sdk WithTLSPin + WithToken) presents, and rejects the
+    negatives — wrong scope, no token, and an untrusted (mis-pinned) cert."""
+    server = vz_server_dev.name
+    shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
+    DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
+    overrides = {
+        **_tls_overrides(),
+        "auth": {
+            "http": {
+                "mode": "enforce",
+                "tokens": [
+                    {"scope": "credentials", "token": CREDS_TOKEN},
+                    {"scope": "control", "token": CONTROL_TOKEN},
+                ],
+            }
+        },
+    }
+    try:
+        with dev_config(overrides, server):
+            pin = _server_cert_pem("localhost", HTTPS_PORT)
+
+            # Pinned cert + credentials token → the bus is reachable.
+            assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, CREDS_TOKEN) == 200
+            # Pinned cert but wrong scope / no token → rejected by auth.
+            assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, CONTROL_TOKEN) == 403
+            assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, None) == 401
+            # Bootstrap stays open over TLS (no token needed).
+            assert _https_status(HTTPS_PORT, "/api/info", pin, None) == 200
+
+            # Without the pin (system CAs), the self-signed cert is untrusted:
+            # a client that doesn't pin it cannot connect at all. urllib wraps
+            # the TLS verification failure in a URLError.
+            with pytest.raises(urllib.error.URLError) as exc:
+                _https_status(HTTPS_PORT, "/api/info", None, None)
+            assert "CERTIFICATE_VERIFY_FAILED" in str(exc.value), f"expected a cert-verify failure: {exc.value!r}"
     finally:
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
