@@ -52,8 +52,8 @@ func (m *Manager) State() *TunnelState {
 
 // StartTunnels starts tunnels for all port mappings using the Connect API.
 // Returns the active tunnels that the caller should manage (stop on shutdown).
-func (m *Manager) StartTunnels(serverAddr, shedName string, ports []PortMapping) ([]*Tunnel, error) {
-	client := NewConnectClient(serverAddr)
+func (m *Manager) StartTunnels(target ConnectTarget, shedName string, ports []PortMapping) ([]*Tunnel, error) {
+	client := NewConnectClient(target)
 	var tunnels []*Tunnel
 
 	for _, pm := range ports {

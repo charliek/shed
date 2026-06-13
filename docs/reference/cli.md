@@ -32,15 +32,38 @@ shed server add <host> [flags]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--name` | `-n` | Derived from host | Friendly name for server |
-| `--port` | `-p` | `8080` | HTTP API port |
+| `--port` | `-p` | `8080` | HTTP API port (bootstrap; ignored when `--https-port` is set) |
+| `--https-port` | | | HTTPS port; when set, bootstrap over TLS and pin the server's self-signed cert |
+| `--fingerprint` | | | Expected SSH host-key fingerprint (`SHA256:...`); verified out-of-band and fails on mismatch |
+| `--tls-fingerprint` | | | Expected TLS cert fingerprint (`sha256:...`); verified out-of-band and fails on mismatch |
+| `--trust-on-first-use` | | `false` | Trust the server's SSH host key (and TLS cert) without prompting |
 
 The SSH port is automatically discovered from the server's `/api/info` endpoint.
+
+The command pins the server's SSH host key (in `~/.shed/known_hosts`). It prints the SHA256 fingerprint and, on an interactive terminal, asks you to confirm it before trusting — closing the add-time MITM window. Supply `--fingerprint SHA256:...` (read from the server's startup log) to verify out-of-band, or `--trust-on-first-use` to accept without a prompt. When stdin is not a terminal (scripts/CI), the key is trusted on first use unless `--fingerprint` is given.
+
+With `--https-port`, the command also pins the server's TLS certificate (over a connection it verifies before trusting), shows its fingerprint, and writes `api_url` + `tls_cert_fingerprint` into the server entry so the control plane runs over TLS. See [Security](security.md#native-pinned-tls).
 
 **Example:**
 
 ```bash
 shed server add mini-desktop.tailnet.ts.net --name mini
+shed server add vps.example.com --name vps --fingerprint SHA256:HtYK...j4Y
+shed server add vps.example.com --https-port 8443 --name vps   # pin TLS
 ```
+
+### shed server update
+
+Rotates the pinned TLS certificate fingerprint for a server (after the server
+regenerates its cert).
+
+```bash
+shed server update <name> --tls-fingerprint sha256:<new>   # pin a new value out-of-band
+shed server update <name> --refetch                        # fetch the cert and re-pin
+```
+
+Rotating an existing pin in a non-interactive session requires
+`--trust-on-first-use`.
 
 ### shed server list
 

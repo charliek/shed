@@ -1,0 +1,230 @@
+package sshd
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	gossh "golang.org/x/crypto/ssh"
+
+	"github.com/charliek/shed/internal/config"
+)
+
+const (
+	defaultGitHubRefresh = time.Hour
+	githubFetchTimeout   = 15 * time.Second
+	githubKeysMaxBytes   = 1 << 20 // 1 MiB ceiling on a .keys response
+)
+
+// githubKeysBaseURL is the GitHub base for `<user>.keys`; overridable in tests.
+var githubKeysBaseURL = "https://github.com"
+
+// KeyAllowlist is the SSH public-key allowlist, resolved from inline keys, an
+// authorized_keys file, and GitHub users. GitHub keys are cached to disk and
+// fail closed to the last-known-good cache when a refetch fails, so a GitHub
+// outage never silently empties the allowlist.
+type KeyAllowlist struct {
+	mode         string
+	maxAuthTries int
+
+	inline   []string
+	file     string
+	users    []string
+	cacheDir string
+	refresh  time.Duration
+	client   *http.Client
+
+	// lastGitHub holds each GitHub user's last successfully-resolved .keys
+	// bytes — the ultimate last-known-good fallback when both the live fetch
+	// and the disk cache fail, so a refresh can never silently drop keys that
+	// were valid moments ago. Only touched by rebuild() (never concurrent).
+	lastGitHub map[string][]byte
+
+	mu   sync.RWMutex
+	keys map[string]struct{} // set of marshaled public keys
+}
+
+// NewKeyAllowlist builds the allowlist from config and does the initial GitHub
+// fetch (falling back to cache). cacheDir is where GitHub .keys are cached.
+//
+// Returns an error when mode==enforce but no keys resolved — failing closed
+// rather than starting a server that would lock the operator out (and must not
+// silently fall back to accept-all).
+func NewKeyAllowlist(cfg *config.SSHAuthConfig, cacheDir string) (*KeyAllowlist, error) {
+	a := &KeyAllowlist{
+		mode:       config.SSHAuthOff,
+		keys:       map[string]struct{}{},
+		lastGitHub: map[string][]byte{},
+	}
+	if cfg == nil || cfg.Mode == "" || cfg.Mode == config.SSHAuthOff {
+		return a, nil // off: accept-all, nothing to resolve
+	}
+
+	a.mode = cfg.Mode
+	a.maxAuthTries = cfg.MaxAuthTries
+	a.inline = cfg.AuthorizedKeys
+	a.file = config.ExpandPath(cfg.AuthorizedKeysFile)
+	a.users = cfg.GitHubUsers
+	a.cacheDir = cacheDir
+	a.client = &http.Client{Timeout: githubFetchTimeout}
+	a.refresh = time.Duration(cfg.GitHubRefresh)
+	if a.refresh <= 0 {
+		a.refresh = defaultGitHubRefresh
+	}
+
+	if err := a.rebuild(); err != nil {
+		return nil, err
+	}
+	if a.mode == config.SSHAuthEnforce && a.size() == 0 {
+		return nil, fmt.Errorf(
+			"auth.ssh.mode=enforce but no authorized keys resolved " +
+				"(inline/file empty and GitHub fetch failed with no cache); " +
+				"use mode=warn for first boot or provide authorized_keys")
+	}
+	return a, nil
+}
+
+// Mode returns the allowlist mode (off/warn/enforce).
+func (a *KeyAllowlist) Mode() string { return a.mode }
+
+// MaxAuthTries returns the per-connection public-key attempt cap (0 = default).
+func (a *KeyAllowlist) MaxAuthTries() int { return a.maxAuthTries }
+
+// IsAuthorized reports whether key is in the allowlist.
+func (a *KeyAllowlist) IsAuthorized(key gossh.PublicKey) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	_, ok := a.keys[string(key.Marshal())]
+	return ok
+}
+
+func (a *KeyAllowlist) size() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return len(a.keys)
+}
+
+// StartRefresh launches a background goroutine that periodically re-resolves
+// the GitHub-seeded keys, until ctx is cancelled. No-op when there are no
+// GitHub users to refresh.
+func (a *KeyAllowlist) StartRefresh(ctx context.Context) {
+	if a.mode == config.SSHAuthOff || len(a.users) == 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(a.refresh)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := a.rebuild(); err != nil {
+					log.Printf("auth.ssh: key refresh failed: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+// rebuild re-resolves the full key set from all sources. Only a keys-file read
+// error is fatal (a config error); GitHub fetch failures fall back to cache.
+func (a *KeyAllowlist) rebuild() error {
+	set := make(map[string]struct{})
+	addAuthorizedKeys(set, []byte(strings.Join(a.inline, "\n")))
+
+	if a.file != "" {
+		data, err := os.ReadFile(a.file)
+		if err != nil {
+			return fmt.Errorf("auth.ssh.authorized_keys_file %q: %w", a.file, err)
+		}
+		addAuthorizedKeys(set, data)
+	}
+
+	for _, user := range a.users {
+		a.addGitHubUser(set, user)
+	}
+
+	a.mu.Lock()
+	a.keys = set
+	a.mu.Unlock()
+	return nil
+}
+
+// addGitHubUser fetches a user's keys (failing closed to cache) and adds them.
+func (a *KeyAllowlist) addGitHubUser(set map[string]struct{}, user string) {
+	if !config.ValidGitHubUsername(user) {
+		log.Printf("auth.ssh: skipping invalid github username %q", user)
+		return
+	}
+	data, err := a.fetchGitHub(user)
+	if err != nil {
+		// Fail closed to last-known-good: prefer the disk cache, then the
+		// in-memory snapshot, so a refresh that hits both a GitHub outage and
+		// an unreadable cache still keeps the keys that were valid before.
+		switch cached, cerr := os.ReadFile(a.cachePath(user)); {
+		case cerr == nil:
+			log.Printf("auth.ssh: github fetch for %q failed (%v); using disk-cached keys", user, err)
+			data = cached
+		case a.lastGitHub[user] != nil:
+			log.Printf("auth.ssh: github fetch+cache for %q failed (%v); using last-known-good keys", user, err)
+			data = a.lastGitHub[user]
+		default:
+			log.Printf("auth.ssh: github fetch for %q failed (%v) and no cache; keys unavailable", user, err)
+			return
+		}
+	} else if werr := a.writeCache(user, data); werr != nil {
+		log.Printf("auth.ssh: failed to cache github keys for %q: %v", user, werr)
+	}
+	a.lastGitHub[user] = data
+	addAuthorizedKeys(set, data)
+}
+
+func (a *KeyAllowlist) fetchGitHub(user string) ([]byte, error) {
+	url := fmt.Sprintf("%s/%s.keys", githubKeysBaseURL, user)
+	resp, err := a.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github returned %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, githubKeysMaxBytes))
+}
+
+func (a *KeyAllowlist) cachePath(user string) string {
+	return filepath.Join(a.cacheDir, user+".keys")
+}
+
+func (a *KeyAllowlist) writeCache(user string, data []byte) error {
+	if a.cacheDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(a.cacheDir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(a.cachePath(user), data, 0o600)
+}
+
+// addAuthorizedKeys parses authorized_keys-format data and adds each key's
+// marshaled form to set. Best-effort: stops at the first unparseable trailing
+// content (the enforce+empty startup check catches an all-garbage source).
+func addAuthorizedKeys(set map[string]struct{}, data []byte) {
+	rest := data
+	for len(rest) > 0 {
+		key, _, _, next, err := gossh.ParseAuthorizedKey(rest)
+		if err != nil {
+			return
+		}
+		set[string(key.Marshal())] = struct{}{}
+		rest = next
+	}
+}

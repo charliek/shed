@@ -14,6 +14,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/servertls"
 )
 
 const (
@@ -25,23 +26,60 @@ const (
 type APIClient struct {
 	baseURL       string
 	httpClient    *http.Client
+	transport     http.RoundTripper // non-nil when TLS-pinned; shared by every client below
 	createTimeout time.Duration
+	token         string // bearer token (control scope), sent when non-empty
 }
 
-// NewAPIClient creates a new API client for the given host and port.
-func NewAPIClient(host string, port int, createTimeout time.Duration) *APIClient {
-	return &APIClient{
-		baseURL: fmt.Sprintf("http://%s:%d", host, port),
-		httpClient: &http.Client{
-			Timeout: DefaultTimeout,
-		},
-		createTimeout: createTimeout,
+// setAuth adds the bearer token header when the client is configured with one.
+func (c *APIClient) setAuth(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 }
 
-// NewAPIClientFromEntry creates a new API client from a server entry.
+// newHTTPClient builds an *http.Client carrying the pinning transport (if any),
+// so every request path — including the long-running, ad-hoc clients used for
+// SSE and timeouts — verifies the pinned TLS cert. timeout 0 means no
+// client-level timeout (the caller bounds it with a context).
+func (c *APIClient) newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, Transport: c.transport}
+}
+
+// pinnedTransport returns a transport that verifies the server's leaf cert
+// against the pinned "sha256:<hex>" fingerprint instead of a CA chain, or nil
+// when there is no pin (plain HTTP). It wraps the shared servertls pin config
+// so the CLI and the Connect tunnel verify identically.
+func pinnedTransport(fingerprint string) http.RoundTripper {
+	if fingerprint == "" {
+		return nil
+	}
+	return &http.Transport{TLSClientConfig: servertls.PinnedClientConfig(fingerprint)}
+}
+
+// NewAPIClient creates a plain-HTTP API client for the given host and port
+// (the bootstrap path, before any TLS pin is known).
+func NewAPIClient(host string, port int, createTimeout time.Duration) *APIClient {
+	return newAPIClient(fmt.Sprintf("http://%s:%d", host, port), "", "", createTimeout)
+}
+
+// newAPIClient is the shared constructor: an explicit base URL, an optional
+// bearer token, and an optional TLS pin fingerprint.
+func newAPIClient(baseURL, token, tlsFingerprint string, createTimeout time.Duration) *APIClient {
+	c := &APIClient{
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		transport:     pinnedTransport(tlsFingerprint),
+		createTimeout: createTimeout,
+		token:         token,
+	}
+	c.httpClient = c.newHTTPClient(DefaultTimeout)
+	return c
+}
+
+// NewAPIClientFromEntry creates an API client from a server entry, honoring its
+// api_url/TLS pin and control token.
 func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
-	return NewAPIClient(entry.Host, entry.HTTPPort, createTimeout)
+	return newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
 }
 
 // doRequest performs an HTTP request with JSON body and response handling.
@@ -63,6 +101,7 @@ func (c *APIClient) doRequest(method, path string, body, result interface{}, exp
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -119,12 +158,14 @@ func (c *APIClient) doRequestWithTimeout(method, path string, body, result inter
 		req.Header.Set("Content-Type", "application/json")
 	}
 
+	c.setAuth(req)
+
 	// Create a client without a Timeout for long-running requests.
 	// Important: When both http.Client.Timeout and context deadline are set,
 	// the shorter one wins. Since c.httpClient has a 30s timeout, we must use
 	// a separate client here to allow the context timeout (potentially minutes)
-	// to control cancellation.
-	client := &http.Client{}
+	// to control cancellation. It still carries the pinning transport.
+	client := c.newHTTPClient(0)
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -227,8 +268,9 @@ func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, wantBl
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	c.setAuth(httpReq)
 
-	client := &http.Client{}
+	client := c.newHTTPClient(0)
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -486,8 +528,9 @@ func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, withL
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	c.setAuth(httpReq)
 
-	resp, err := (&http.Client{}).Do(httpReq)
+	resp, err := c.newHTTPClient(0).Do(httpReq)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("pull timed out after 30m")
@@ -649,10 +692,7 @@ func (c *APIClient) SystemPrune(opts SystemPruneOptions) (*config.PruneReport, e
 
 // Ping checks if the server is reachable.
 func (c *APIClient) Ping() bool {
-	client := &http.Client{
-		Timeout: 2 * time.Second,
-	}
-	resp, err := client.Get(c.baseURL + "/api/info")
+	resp, err := c.newHTTPClient(2 * time.Second).Get(c.baseURL + "/api/info")
 	if err != nil {
 		return false
 	}

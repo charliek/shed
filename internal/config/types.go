@@ -664,6 +664,74 @@ const (
 	BackendDetect      = "detect"
 )
 
+// SSH auth modes for SSHAuthConfig.Mode.
+const (
+	SSHAuthOff     = "off"     // accept all keys (legacy default)
+	SSHAuthWarn    = "warn"    // log would-deny attempts, but still accept
+	SSHAuthEnforce = "enforce" // reject keys not in the allowlist
+)
+
+// HTTP auth modes for HTTPAuthConfig.Mode.
+const (
+	HTTPAuthOff     = "off"     // accept all requests (legacy default)
+	HTTPAuthEnforce = "enforce" // require a valid bearer token (except bootstrap endpoints)
+)
+
+// AuthConfig configures optional authentication layers (all default-off).
+type AuthConfig struct {
+	// SSH configures the SSH public-key allowlist.
+	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
+	// HTTP configures bearer-token auth on the HTTP API.
+	HTTP *HTTPAuthConfig `yaml:"http,omitempty"`
+}
+
+// HTTPAuthConfig configures bearer-token auth on the HTTP API.
+type HTTPAuthConfig struct {
+	// Mode is off | enforce (default off). off accepts all requests (legacy);
+	// enforce requires a valid bearer token (except the bootstrap endpoints
+	// GET /api/info and GET /api/ssh-host-key). Enforcement itself lands with
+	// the middleware in a later sub-phase; clients send tokens regardless.
+	Mode string `yaml:"mode,omitempty"`
+	// Tokens are the accepted bearer tokens with their scopes.
+	Tokens []HTTPToken `yaml:"tokens,omitempty"`
+}
+
+// HTTPToken is an accepted bearer token and its scope.
+type HTTPToken struct {
+	Name  string `yaml:"name,omitempty"`
+	Scope string `yaml:"scope"`
+	Token string `yaml:"token"`
+}
+
+// SSHAuthConfig configures the SSH public-key allowlist. Identity comes from
+// the offered key (the username still selects the shed), GitHub-style.
+type SSHAuthConfig struct {
+	// Mode is off | warn | enforce (default off). off accepts all keys
+	// (legacy); warn logs would-deny attempts but accepts; enforce rejects
+	// keys not in the allowlist.
+	Mode string `yaml:"mode,omitempty"`
+	// AuthorizedKeys are inline OpenSSH authorized_keys lines.
+	AuthorizedKeys []string `yaml:"authorized_keys,omitempty"`
+	// AuthorizedKeysFile is a path to an authorized_keys-format file.
+	AuthorizedKeysFile string `yaml:"authorized_keys_file,omitempty"`
+	// GitHubUsers seeds the allowlist from https://github.com/<user>.keys,
+	// cached to disk and failing closed to the last-known-good cache.
+	GitHubUsers []string `yaml:"github_users,omitempty"`
+	// GitHubRefresh is how often to re-fetch GitHub keys (default 1h).
+	GitHubRefresh Duration `yaml:"github_refresh,omitempty"`
+	// MaxAuthTries caps public-key attempts per connection (0 = SSH default 6).
+	MaxAuthTries int `yaml:"max_auth_tries,omitempty"`
+}
+
+// githubUsernamePattern guards the URL built from github_users. GitHub
+// usernames are alphanumeric with single internal hyphens, 1–39 chars; this
+// also blocks path traversal (no '/' or '.').
+var githubUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
+
+// ValidGitHubUsername reports whether s is a syntactically valid GitHub
+// username (and, by construction, safe to interpolate into the .keys URL).
+func ValidGitHubUsername(s string) bool { return githubUsernamePattern.MatchString(s) }
+
 // HomePath is the shed user's home directory inside the VM. Repos, --local-dir,
 // and --add-dir mounts all live under here, and interactive logins land here by
 // default (or in a project subdirectory when one is present).

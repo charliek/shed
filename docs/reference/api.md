@@ -2,10 +2,17 @@
 
 The `shed-server` exposes a REST API for managing sheds.
 
-**Base URL:** `http://{host}:8080/api`
+**Base URL:** `http://{host}:8080/api` (or `https://{host}:8443/api` with TLS)
 
-!!! warning "No Authentication"
-    The API has no built-in authentication. Security relies on network-level access control (e.g., Tailscale, firewall rules). Only expose the API on trusted networks.
+!!! note "Authentication is optional"
+    By default the API has no authentication — security relies on a trusted
+    network (Tailscale, firewall rules). When `auth.http.mode: enforce` is set,
+    every request requires an `Authorization: Bearer <token>` header of the
+    required scope, except the bootstrap endpoints `GET /api/info` and
+    `GET /api/ssh-host-key`. The credential bus (`/api/plugins/*`) and the
+    Connect tunnel (`/api/sheds/{name}/connect/{port}`) require the
+    `credentials` scope. See [Security](security.md) for the full model,
+    scoped tokens, and pinned TLS.
 
 ## Endpoints
 

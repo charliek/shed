@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/sshd"
 	"github.com/charliek/shed/internal/vz"
 )
@@ -24,7 +27,28 @@ import (
 const (
 	// shutdownTimeout is the maximum time to wait for graceful shutdown
 	shutdownTimeout = 30 * time.Second
+
+	// HTTP server timeouts. WriteTimeout is intentionally omitted (0):
+	// SSE streams (create/pull progress and the plugin bus) write for
+	// arbitrarily long, and a WriteTimeout would kill them mid-stream.
+	// ReadHeaderTimeout/ReadTimeout bound slowloris-style header/body
+	// reads; IdleTimeout reaps idle keep-alive conns (it does not apply
+	// during an active SSE response).
+	httpReadHeaderTimeout = 10 * time.Second
+	httpReadTimeout       = 60 * time.Second
+	httpIdleTimeout       = 120 * time.Second
 )
+
+// newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
+}
 
 // defaultHostKeyPath returns the default path for the SSH host key.
 // Uses /etc/shed/host_key when running as root (Linux servers), otherwise
@@ -34,6 +58,22 @@ func defaultHostKeyPath() string {
 		return "/etc/shed/host_key"
 	}
 	return config.ExpandPath("~/.shed/host_key")
+}
+
+// tlsCertPaths returns the cert + key file paths for the HTTPS listener,
+// honoring tls_cert_file / tls_key_file and otherwise placing them in stateDir
+// (the directory that holds the SSH host key: /etc/shed as root, ~/.shed
+// otherwise).
+func tlsCertPaths(cfg *config.ServerConfig, stateDir string) (certPath, keyPath string) {
+	certPath = filepath.Join(stateDir, "tls_cert.pem")
+	if cfg.TLSCertFile != "" {
+		certPath = config.ExpandPath(cfg.TLSCertFile)
+	}
+	keyPath = filepath.Join(stateDir, "tls_key.pem")
+	if cfg.TLSKeyFile != "" {
+		keyPath = config.ExpandPath(cfg.TLSKeyFile)
+	}
+	return certPath, keyPath
 }
 
 var serveCmd = &cobra.Command{
@@ -50,12 +90,25 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
+	// Public-exposure preflight: refuse to start an internet-facing deployment
+	// without the full security bundle. Runs before anything binds; inert
+	// unless public_exposure is set.
+	if err := cfg.PreflightPublicExposure(); err != nil {
+		return fmt.Errorf("public_exposure preflight: %w", err)
+	}
+
 	log.Printf("Starting shed-server...")
-	log.Printf("HTTP port: %d", cfg.HTTPPort)
-	log.Printf("SSH port: %d", cfg.SSHPort)
+	log.Printf("HTTP listen: %s", cfg.HTTPListenAddr())
+	log.Printf("SSH listen: %s", cfg.SSHListenAddr())
 
 	// Initialize plugin system (before backends, since backends use the bridge)
 	pluginRegistry := plugin.NewRegistry()
+	// Track pending requests only when HTTP auth is enforced — the /respond
+	// ownership gate is consulted only then, so an unauthenticated server does
+	// no bookkeeping.
+	if h := cfg.HTTPAuth(); h != nil && h.Mode == config.HTTPAuthEnforce {
+		pluginRegistry.EnableOwnershipTracking()
+	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
 
 	// Initialize the configured backend
@@ -90,8 +143,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	defer be.Close()
 
+	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
+	// keys are cached next to the host key. Fails closed (returns an error)
+	// when mode=enforce but no keys resolved.
+	hostKeyPath := defaultHostKeyPath()
+	githubCacheDir := filepath.Join(filepath.Dir(hostKeyPath), "github_keys")
+	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.SSHAuth(), githubCacheDir)
+	if err != nil {
+		return fmt.Errorf("ssh auth: %w", err)
+	}
+	log.Printf("SSH auth mode: %s", sshAllowlist.Mode())
+
+	// Refresh GitHub-seeded keys in the background until shutdown.
+	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
+	defer cancelRefresh()
+	sshAllowlist.StartRefresh(refreshCtx)
+
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, defaultHostKeyPath(), cfg.SSHPort, cfg.Terminal)
+	sshServer, err := sshd.NewServer(be, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshAllowlist)
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}
@@ -99,24 +168,68 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
-	router := apiServer.Router()
 
-	// Create HTTP server
-	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler: router,
+	// Public router (HTTP and, when enabled, HTTPS share one handler). When
+	// the internal-listener split is enabled, it omits the credential bus +
+	// Connect tunnel.
+	publicHandler := apiServer.Router()
+	httpServer := newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
+
+	// Optional internal (loopback) listener carrying the credential bus +
+	// Connect tunnel, kept off the public interface.
+	var internalServer *http.Server
+	if addr := cfg.InternalHTTPListenAddr(); addr != "" {
+		internalServer = newHTTPServer(addr, apiServer.InternalRouter())
 	}
 
-	// Channel to collect errors from servers
-	errChan := make(chan error, 2)
+	// Optional HTTPS listener: same public router over TLS with a self-signed,
+	// client-pinned cert. Off by default (https_port unset).
+	var httpsServer *http.Server
+	if cfg.HTTPSEnabled() {
+		certPath, keyPath := tlsCertPaths(cfg, filepath.Dir(hostKeyPath))
+		cert, der, err := servertls.LoadOrGenerate(certPath, keyPath, cfg.TLSNames)
+		if err != nil {
+			return fmt.Errorf("tls cert: %w", err)
+		}
+		log.Printf("TLS cert fingerprint: %s", servertls.Fingerprint(der))
+		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
+		httpsServer.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+
+	// Channel to collect errors from servers (HTTP, HTTPS, SSH, internal HTTP).
+	errChan := make(chan error, 4)
 
 	// Start HTTP server in goroutine
 	go func() {
-		log.Printf("HTTP server listening on :%d", cfg.HTTPPort)
+		log.Printf("HTTP server listening on %s", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errChan <- fmt.Errorf("HTTP server error: %w", err)
 		}
 	}()
+
+	// Start internal HTTP server in goroutine (when split enabled)
+	if internalServer != nil {
+		go func() {
+			log.Printf("Internal HTTP server (bus+connect) listening on %s", internalServer.Addr)
+			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("internal HTTP server error: %w", err)
+			}
+		}()
+	}
+
+	// Start HTTPS server in goroutine (when https_port set). The cert + key
+	// are already loaded into TLSConfig, so the file args are empty.
+	if httpsServer != nil {
+		go func() {
+			log.Printf("HTTPS server listening on %s", httpsServer.Addr)
+			if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("HTTPS server error: %w", err)
+			}
+		}()
+	}
 
 	// Start SSH server in goroutine
 	go func() {
@@ -148,6 +261,22 @@ func runServe(cmd *cobra.Command, args []string) error {
 	log.Printf("Shutting down HTTP server...")
 	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server shutdown error: %v", err)
+	}
+
+	// Shutdown internal HTTP server (when enabled)
+	if internalServer != nil {
+		log.Printf("Shutting down internal HTTP server...")
+		if err := internalServer.Shutdown(ctx); err != nil {
+			log.Printf("internal HTTP server shutdown error: %v", err)
+		}
+	}
+
+	// Shutdown HTTPS server (when enabled)
+	if httpsServer != nil {
+		log.Printf("Shutting down HTTPS server...")
+		if err := httpsServer.Shutdown(ctx); err != nil {
+			log.Printf("HTTPS server shutdown error: %v", err)
+		}
 	}
 
 	// Shutdown SSH server

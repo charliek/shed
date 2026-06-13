@@ -99,14 +99,18 @@ nav:
           - v0.4 → v0.5: upgrades/v0.4-to-v0.5.md
           - v0.5.1 → v0.5.2: upgrades/v0.5.1-to-v0.5.2.md
           - v0.5.7 → v0.5.8: upgrades/v0.5.7-to-v0.5.8.md
+          - v0.6 → v0.7: upgrades/v0.6-to-v0.7.md
   - Tutorials:
       - Build Your Own Image: tutorials/build-your-own-image.md
       - Provisioning a Gradle Project: tutorials/gradle-provisioning.md
       - Provisioning a TypeScript Project: tutorials/typescript-provisioning.md
       - Provisioning a Python Project: tutorials/python-provisioning.md
+  - Guides:
+      - Public VPS Deployment: guides/vps-deployment.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
+      - Security: reference/security.md
       - Snapshots: reference/snapshots.md
       - Disk Management: reference/disk-management.md
       - Storage Model: reference/storage-model.md

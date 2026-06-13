@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -139,6 +140,35 @@ func TestHandlePluginSubscribeSSE(t *testing.T) {
 	}
 }
 
+func TestHandlePluginSubscribeKeepalive(t *testing.T) {
+	// Shorten the keepalive so an idle subscription emits several pings quickly.
+	prev := sseKeepaliveInterval
+	sseKeepaliveInterval = 20 * time.Millisecond
+	defer func() { sseKeepaliveInterval = prev }()
+
+	srv := newTestServerWithPlugins()
+
+	done := make(chan struct{})
+	var recorder *httptest.ResponseRecorder
+	go func() {
+		defer close(done)
+		r := httptest.NewRequest(http.MethodGet, "/api/plugins/listeners/op/messages", nil)
+		r.Header.Set("Accept", "text/event-stream")
+		recorder = httptest.NewRecorder()
+		srv.Router().ServeHTTP(recorder, r)
+	}()
+
+	// Stay idle (publish nothing) long enough for multiple keepalive ticks,
+	// then close the handler by unregistering.
+	time.Sleep(120 * time.Millisecond)
+	srv.plugins.Unregister("op")
+	<-done
+
+	if n := strings.Count(recorder.Body.String(), ": keepalive"); n < 2 {
+		t.Errorf("expected >= 2 idle keepalive pings, got %d in %q", n, recorder.Body.String())
+	}
+}
+
 func TestHandlePluginRespondMissingShed(t *testing.T) {
 	srv := newTestServerWithPlugins()
 	body := `{"namespace":"op","type":"response","payload":{}}`
@@ -192,6 +222,47 @@ func TestHandlePluginRespondSuccess(t *testing.T) {
 	}
 	if sent.InReplyTo != "abc" {
 		t.Errorf("InReplyTo = %q, want %q", sent.InReplyTo, "abc")
+	}
+}
+
+func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
+	srv := newTestServerWithPlugins()
+	creds := "shed_credentials_itest"
+	srv.cfg.Auth = &config.AuthConfig{HTTP: &config.HTTPAuthConfig{
+		Mode:   config.HTTPAuthEnforce,
+		Tokens: []config.HTTPToken{{Scope: config.TokenScopeCredentials, Token: creds}},
+	}}
+	srv.plugins.EnableOwnershipTracking() // a server with HTTP auth enforced does this
+	srv.bridge.RegisterShed("dev", &plugin.ShedConn{
+		Name: "dev",
+		Send: func(*plugin.Envelope) error { return nil },
+	})
+	if _, err := srv.plugins.Register("op"); err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(inReplyTo string) int {
+		body := fmt.Sprintf(`{"namespace":"op","type":"response","in_reply_to":%q,"final":true,"shed":{"name":"dev"}}`, inReplyTo)
+		r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+creds)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, r)
+		return w.Code
+	}
+
+	// A forged response (no pending request was dispatched) is rejected.
+	if code := post("forged-id"); code != http.StatusForbidden {
+		t.Errorf("forged respond under enforce = %d, want 403", code)
+	}
+
+	// After a real request is dispatched (records pending), the matching
+	// response is accepted.
+	req := plugin.NewEnvelope("op", plugin.MessageTypeRequest, nil)
+	if err := srv.bridge.PublishToHost("dev", req); err != nil {
+		t.Fatalf("PublishToHost: %v", err)
+	}
+	if code := post(req.ID); code != http.StatusNoContent {
+		t.Errorf("owned respond under enforce = %d, want 204", code)
 	}
 }
 

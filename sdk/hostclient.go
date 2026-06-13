@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,8 @@ type HostClient struct {
 	serverURL  string
 	httpClient *http.Client
 	logger     *slog.Logger
+	token      string
+	tlsPin     string // "sha256:<hex>" pin applied in NewHostClient, or ""
 
 	mu     sync.Mutex
 	states map[string]SubStatus
@@ -76,6 +79,95 @@ func WithLogger(logger *slog.Logger) HostClientOption {
 	}
 }
 
+// WithToken sets the bearer token sent on requests (the host-agent's
+// credentials-scoped token). Sent when non-empty.
+func WithToken(token string) HostClientOption {
+	return func(c *HostClient) {
+		c.token = token
+	}
+}
+
+// WithTLSPin pins shed-server's self-signed TLS certificate by the SHA-256
+// fingerprint of its DER ("sha256:<hex>") — the trust model the HTTPS listener
+// expects (no CA). Pass it alongside an https WithServerURL.
+//
+// Fail-closed: a pin only protects an https endpoint, so if the resolved
+// serverURL is not https the client refuses to send (every request errors)
+// rather than silently downgrading to unpinned plaintext.
+//
+// Composition with WithHTTPClient: order-independent. The pin is applied once,
+// after all options, onto the resolved HTTP client — its Timeout and a custom
+// *http.Transport's other settings (including any existing TLS config: client
+// certs, ServerName, NextProtos) are preserved by cloning, never mutating the
+// caller's client. If the custom client uses a non-*http.Transport
+// RoundTripper, it owns its own TLS and the pin is skipped with a warning.
+func WithTLSPin(fingerprint string) HostClientOption {
+	return func(c *HostClient) {
+		c.tlsPin = fingerprint
+	}
+}
+
+// applyTLSPin installs cert pinning on the resolved HTTP client's transport.
+// Called once after all options so it composes with WithHTTPClient regardless
+// of option order.
+func (c *HostClient) applyTLSPin() {
+	if c.tlsPin == "" {
+		return
+	}
+	// A pin only protects an https endpoint; with an http serverURL the TLS
+	// config is never exercised and traffic would go plaintext. Fail closed.
+	if !strings.HasPrefix(strings.ToLower(c.serverURL), "https://") {
+		c.httpClient = &http.Client{
+			Timeout: c.httpClient.Timeout,
+			Transport: errorRoundTripper{fmt.Errorf(
+				"WithTLSPin set but serverURL %q is not https; refusing to send unpinned plaintext", c.serverURL)},
+		}
+		return
+	}
+	var base *http.Transport
+	switch t := c.httpClient.Transport.(type) {
+	case *http.Transport:
+		base = t.Clone()
+	case nil:
+		// Clone DefaultTransport to keep proxy/HTTP2 defaults; guard the
+		// assertion in case it was globally replaced with another RoundTripper.
+		if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+			base = dt.Clone()
+		} else {
+			base = &http.Transport{}
+		}
+	default:
+		c.logger.Warn("WithTLSPin ignored: custom HTTP client uses a non-*http.Transport RoundTripper that owns its own TLS")
+		return
+	}
+	// Overlay the pin onto the caller's existing TLS settings rather than
+	// replacing them wholesale, so client certs / ServerName / NextProtos /
+	// a stricter MinVersion survive.
+	tlsCfg := base.TLSClientConfig.Clone()
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{}
+	}
+	if tlsCfg.MinVersion < tls.VersionTLS12 {
+		tlsCfg.MinVersion = tls.VersionTLS12
+	}
+	tlsCfg.InsecureSkipVerify = true
+	tlsCfg.VerifyPeerCertificate = pinVerifier(c.tlsPin)
+	base.TLSClientConfig = tlsCfg
+	c.httpClient = &http.Client{
+		Transport:     base,
+		Timeout:       c.httpClient.Timeout,
+		CheckRedirect: c.httpClient.CheckRedirect,
+		Jar:           c.httpClient.Jar,
+	}
+}
+
+// setAuth adds the bearer token header when the client is configured with one.
+func (c *HostClient) setAuth(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+}
+
 // NewHostClient creates a new HostClient with the given options.
 func NewHostClient(opts ...HostClientOption) *HostClient {
 	c := &HostClient{
@@ -87,6 +179,7 @@ func NewHostClient(opts ...HostClientOption) *HostClient {
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.applyTLSPin()
 	return c
 }
 
@@ -184,6 +277,7 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -256,6 +350,7 @@ func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelop
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

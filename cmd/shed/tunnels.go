@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -14,8 +15,38 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/tunnels"
 )
+
+// connectTargetFromEntry resolves how `shed forward` dials the Connect API for a
+// server entry. When the entry pins a TLS cert on an https api_url, the tunnel
+// dials that host:port over pinned TLS and sends the credentials-scoped token
+// (the Connect route requires the credentials scope when auth is enforced).
+// Otherwise it is the legacy plain-TCP dial to host:http_port, byte-identical.
+func connectTargetFromEntry(entry *config.ServerEntry) (tunnels.ConnectTarget, error) {
+	if entry.APIURL != "" {
+		u, err := url.Parse(entry.APIURL)
+		if err != nil {
+			return tunnels.ConnectTarget{}, fmt.Errorf("invalid api_url %q: %w", entry.APIURL, err)
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			if entry.TLSCertFingerprint == "" {
+				return tunnels.ConnectTarget{}, fmt.Errorf(
+					"server has an https api_url but no tls_cert_fingerprint to pin; re-add with `shed server add --https-port`")
+			}
+			if u.Port() == "" {
+				return tunnels.ConnectTarget{}, fmt.Errorf("api_url %q must include a port (e.g. https://host:8443)", entry.APIURL)
+			}
+			return tunnels.ConnectTarget{
+				Addr:   u.Host,
+				TLSPin: entry.TLSCertFingerprint,
+				Token:  entry.CredentialsToken,
+			}, nil
+		}
+	}
+	return tunnels.ConnectTarget{Addr: fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)}, nil
+}
 
 var (
 	tunnelProfiles   []string
@@ -226,21 +257,25 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Resolve shed-server address for the Connect API
-	serverAddr := fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)
+	// Resolve how to reach the Connect API: pinned TLS + credentials token when
+	// the entry has an https api_url, else the legacy plain-TCP dial.
+	target, err := connectTargetFromEntry(entry)
+	if err != nil {
+		return err
+	}
 
 	if tunnelBackground {
 		// Start tunnels, save state, and stay alive as a daemon process.
 		// Re-exec ourselves with a --daemon flag to detach from the terminal.
-		return startBackgroundTunnel(mgr, shedName, serverName, serverAddr, allPorts, profileName)
+		return startBackgroundTunnel(mgr, shedName, serverName, target, allPorts, profileName)
 	}
 
 	// Foreground mode: start tunnels and block on signal.
-	return runForegroundTunnel(mgr, shedName, serverAddr, allPorts, profileName)
+	return runForegroundTunnel(mgr, shedName, target, allPorts, profileName)
 }
 
-func runForegroundTunnel(mgr *tunnels.Manager, shedName, serverAddr string, ports []tunnels.PortMapping, profile string) error {
-	activeTunnels, err := mgr.StartTunnels(serverAddr, shedName, ports)
+func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, ports []tunnels.PortMapping, profile string) error {
+	activeTunnels, err := mgr.StartTunnels(target, shedName, ports)
 	if err != nil {
 		return fmt.Errorf("failed to start tunnels: %w", err)
 	}
@@ -265,9 +300,9 @@ func runForegroundTunnel(mgr *tunnels.Manager, shedName, serverAddr string, port
 	return nil
 }
 
-func startBackgroundTunnel(mgr *tunnels.Manager, shedName, serverName, serverAddr string, ports []tunnels.PortMapping, profile string) error {
+func startBackgroundTunnel(mgr *tunnels.Manager, shedName, serverName string, target tunnels.ConnectTarget, ports []tunnels.PortMapping, profile string) error {
 	// Start the tunnels in this process.
-	activeTunnels, err := mgr.StartTunnels(serverAddr, shedName, ports)
+	activeTunnels, err := mgr.StartTunnels(target, shedName, ports)
 	if err != nil {
 		return fmt.Errorf("failed to start tunnels: %w", err)
 	}
@@ -435,19 +470,27 @@ func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	serverAddr := fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)
+	// Show the address the tunnel would actually dial (the https api_url
+	// endpoint when the entry is TLS-pinned, else host:http_port).
+	target, err := connectTargetFromEntry(entry)
+	if err != nil {
+		return err
+	}
+	serverAddr := target.Addr
 
 	if jsonFlag {
 		return outputJSON(struct {
 			Shed       string                `json:"shed"`
 			Server     string                `json:"server"`
 			ServerAddr string                `json:"server_addr"`
+			TLS        bool                  `json:"tls"`
 			Profile    string                `json:"profile"`
 			Ports      []tunnels.PortMapping `json:"ports"`
 		}{
 			Shed:       shedName,
 			Server:     serverName,
 			ServerAddr: serverAddr,
+			TLS:        target.TLSPin != "",
 			Profile:    profileName,
 			Ports:      allPorts,
 		})

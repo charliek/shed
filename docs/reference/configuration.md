@@ -42,6 +42,10 @@ sheds:
 | `servers.<name>.host` | string | Server hostname or IP |
 | `servers.<name>.http_port` | int | HTTP API port |
 | `servers.<name>.ssh_port` | int | SSH server port |
+| `servers.<name>.api_url` | string | HTTPS control-plane URL (e.g. `https://host:8443`); overrides scheme+host+port. Set by `shed server add --https-port`. |
+| `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`). |
+| `servers.<name>.control_token` | string | Control-scoped bearer token sent by the CLI/desktop. |
+| `servers.<name>.credentials_token` | string | Credentials-scoped bearer token sent by the host-agent. |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
 | `create_timeout` | duration | Timeout for create/start operations (default: `10m`) |
@@ -76,6 +80,10 @@ log_level: info
 | `name` | string | `shed-server` | Server identifier |
 | `http_port` | int | `8080` | HTTP API port |
 | `ssh_port` | int | `2222` | SSH server port |
+| `http_bind` | string | `""` | Interface to bind the HTTP listener to (e.g. `127.0.0.1`, or a tailnet IP). Empty binds all interfaces. |
+| `ssh_bind` | string | `""` | Interface to bind the SSH listener to. Empty binds all interfaces. |
+| `internal_http_port` | int | `0` | When greater than 0, moves the credential bus (`/api/plugins/*`) and the Connect tunnel (`/api/sheds/*/connect/*`) onto a loopback-only listener on this port, keeping them off the public interface. `0` keeps every route on the public listener (default). |
+| `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
 | `env_file` | string | - | Path to environment variables file |
@@ -84,8 +92,50 @@ log_level: info
 | `git` | object | - | Git behaviour for in-VM clones (see [Git](#git)) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
+| `auth` | object | - | Optional authentication (see [SSH authentication](#ssh-authentication)) |
 
 **Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
+
+### SSH authentication
+
+`auth.ssh` gates SSH public-key access against an allowlist. The default (omitted, or `mode: off`) accepts all keys — the legacy behavior. Identity comes from the offered key, GitHub-style; the username still selects the shed.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.ssh.mode` | string | `off` | `off` accepts all keys; `warn` logs would-deny attempts but still accepts (use to roll out safely); `enforce` rejects keys not in the allowlist. |
+| `auth.ssh.authorized_keys` | list | `[]` | Inline OpenSSH `authorized_keys` lines. |
+| `auth.ssh.authorized_keys_file` | string | - | Path to an `authorized_keys`-format file. |
+| `auth.ssh.github_users` | list | `[]` | Seed the allowlist from `https://github.com/<user>.keys`. Keys are cached to disk and fail closed to the last-known-good cache if GitHub is unreachable. |
+| `auth.ssh.github_refresh` | duration | `1h` | How often to re-fetch GitHub keys. |
+| `auth.ssh.max_auth_tries` | int | `6` | Public-key attempts allowed per connection. |
+
+With `mode: enforce`, the server refuses to start if no keys resolve (empty inline/file and a failed GitHub fetch with no cache) — use `warn` for first boot, or provide inline keys.
+
+```yaml
+auth:
+  ssh:
+    mode: enforce
+    github_users: [charliek]
+```
+
+### HTTP authentication, TLS, and network surface
+
+These optional fields harden the HTTP API. All default to off, so the legacy
+open-on-a-trusted-network posture is unchanged. See [Security](security.md) for
+the full model and [Public VPS Deployment](../guides/vps-deployment.md) for a
+walkthrough.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.http.mode` | string | `off` | `off` accepts all requests; `enforce` requires a valid bearer token (except `GET /api/info` and `GET /api/ssh-host-key`). |
+| `auth.http.tokens` | list | `[]` | Accepted tokens: `{ name, scope, token }`. Scope is `control`, `credentials`, or `admin`. Mint with `shed-server token new --scope <scope>`. |
+| `https_port` | int | - | Serve HTTPS on this port (in addition to `http_port`) with a self-signed, client-pinned cert. |
+| `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
+| `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
+| `http_bind` / `ssh_bind` | string | all interfaces | Restrict a listener to one interface (e.g. `127.0.0.1`, a tailnet IP). |
+| `internal_http_port` | int | - | Move the credential bus + Connect tunnel to a loopback-only internal listener (co-located host-agent model; see the [route matrix](security.md#route-matrix)). |
+| `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
+| `public_exposure` | bool | `false` | Opt into an internet-facing deployment: refuse to start unless the full bundle (SSH enforce + HTTP enforce + TLS) is present. Inert when unset. |
 
 ### Mounts
 

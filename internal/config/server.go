@@ -31,6 +31,51 @@ type ServerConfig struct {
 	Name     string `yaml:"name"`
 	HTTPPort int    `yaml:"http_port"`
 	SSHPort  int    `yaml:"ssh_port"`
+
+	// Network surface. All optional. The bind/port zero values preserve the
+	// legacy all-interfaces, single-listener behavior. TrustedProxy defaults
+	// to false, which disables RealIP (see below) — the intended security
+	// default, not the legacy always-on RealIP.
+	//
+	// HTTPBind / SSHBind restrict a listener to one interface (e.g.
+	// "127.0.0.1" or a tailnet IP). Empty = all interfaces (":port").
+	HTTPBind string `yaml:"http_bind,omitempty"`
+	SSHBind  string `yaml:"ssh_bind,omitempty"`
+	// InternalHTTPPort, when >0, splits the HTTP surface: the credential
+	// bus (/api/plugins/*) and the Connect tunnel (/api/sheds/*/connect/*)
+	// move to a loopback-only listener on this port, and the public
+	// listener omits them. 0 (default) keeps every route on the public
+	// listener (legacy behavior), so existing clients are unaffected.
+	InternalHTTPPort int `yaml:"internal_http_port,omitempty"`
+	// TrustedProxy enables chi's RealIP middleware, which trusts the
+	// client-supplied X-Forwarded-For. Only safe behind a proxy that
+	// overwrites that header; the default (false) uses the real TCP peer
+	// so an attacker can't forge a source IP to evade per-IP rate limits
+	// or poison audit logs.
+	TrustedProxy bool `yaml:"trusted_proxy,omitempty"`
+
+	// HTTPSPort, when >0, starts an HTTPS listener (bound to HTTPBind)
+	// serving the same public router as the plain HTTP listener, presenting
+	// a self-signed cert that clients pin by fingerprint. 0 (default) = no
+	// HTTPS; plain HTTP only (legacy, unchanged).
+	HTTPSPort int `yaml:"https_port,omitempty"`
+	// TLSNames are extra hostnames/IPs added as SANs in the generated cert
+	// so hostname verification (curl --cacert, browsers) passes for each
+	// advertised address. localhost + 127.0.0.1 + ::1 are always included.
+	TLSNames []string `yaml:"tls_names,omitempty"`
+	// TLSCertFile / TLSKeyFile override where the cert + key are persisted.
+	// Empty (default) places them next to the SSH host key.
+	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
+
+	// PublicExposure opts the server into an internet-facing deployment. When
+	// true, the startup preflight (PreflightPublicExposure) refuses to start
+	// unless the full security bundle is present (SSH allowlist enforced, HTTP
+	// auth enforced, TLS on, credential bus on an internal listener). Unset
+	// (default) it is inert — bind behavior is exactly as today, so the
+	// tailnet/LAN fleet (incl. non-loopback binds) is unaffected.
+	PublicExposure bool `yaml:"public_exposure,omitempty"`
+
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
 	Mounts map[string]MountConfig `yaml:"mounts"`
@@ -60,8 +105,187 @@ type ServerConfig struct {
 	// the SSH known_hosts content seeded before `git clone` runs.
 	Git *GitConfig `yaml:"git,omitempty"`
 
+	// Auth configures optional authentication. Default (nil) preserves the
+	// legacy accept-all behavior.
+	Auth *AuthConfig `yaml:"auth,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
+}
+
+// SSHAuth returns the SSH auth config, or nil when unset.
+func (c *ServerConfig) SSHAuth() *SSHAuthConfig {
+	if c.Auth == nil {
+		return nil
+	}
+	return c.Auth.SSH
+}
+
+// HTTPAuth returns the HTTP auth config, or nil when unset.
+func (c *ServerConfig) HTTPAuth() *HTTPAuthConfig {
+	if c.Auth == nil {
+		return nil
+	}
+	return c.Auth.HTTP
+}
+
+// validateAuth checks the optional auth config. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateAuth() error {
+	if ssh := c.SSHAuth(); ssh != nil {
+		switch ssh.Mode {
+		case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
+		default:
+			return fmt.Errorf("invalid auth.ssh.mode: %q (must be off, warn, or enforce)", ssh.Mode)
+		}
+		if ssh.MaxAuthTries < 0 {
+			return fmt.Errorf("invalid auth.ssh.max_auth_tries: %d", ssh.MaxAuthTries)
+		}
+		for _, u := range ssh.GitHubUsers {
+			if !ValidGitHubUsername(u) {
+				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
+			}
+		}
+	}
+	if h := c.HTTPAuth(); h != nil {
+		switch h.Mode {
+		case "", HTTPAuthOff, HTTPAuthEnforce:
+		default:
+			return fmt.Errorf("invalid auth.http.mode: %q (must be off or enforce)", h.Mode)
+		}
+		for i, tok := range h.Tokens {
+			if tok.Token == "" {
+				return fmt.Errorf("auth.http.tokens[%d]: token is empty", i)
+			}
+			if !ValidTokenScope(tok.Scope) {
+				return fmt.Errorf("auth.http.tokens[%d]: invalid scope %q (must be control, credentials, or admin)", i, tok.Scope)
+			}
+		}
+	}
+	return nil
+}
+
+// HTTPListenAddr returns the bind address for the plain-HTTP listener. Under
+// public_exposure it is forced to loopback so the plaintext control-plane API
+// is never reachable off-box — only the TLS (https_port) listener and the
+// loopback internal bus face the network. Otherwise it honors http_bind
+// (default all interfaces), unchanged.
+func (c *ServerConfig) HTTPListenAddr() string {
+	if c.PublicExposure {
+		return listenAddr(loopbackBind, c.HTTPPort)
+	}
+	return listenAddr(c.HTTPBind, c.HTTPPort)
+}
+
+// loopbackBind is the IPv4 loopback interface used for listeners that must not
+// be reachable off-box (the internal bus, and plain HTTP under public_exposure).
+const loopbackBind = "127.0.0.1"
+
+// HTTPSEnabled reports whether the HTTPS listener is configured.
+func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
+
+// HTTPSListenAddr returns the bind address for the HTTPS listener (sharing
+// HTTPBind with the plain listener), or "" when HTTPS is disabled.
+func (c *ServerConfig) HTTPSListenAddr() string {
+	if !c.HTTPSEnabled() {
+		return ""
+	}
+	return listenAddr(c.HTTPBind, c.HTTPSPort)
+}
+
+// SSHListenAddr returns the bind address for the SSH listener.
+func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.SSHBind, c.SSHPort) }
+
+// InternalListenerEnabled reports whether the HTTP surface is split onto a
+// separate loopback internal listener (credential bus + Connect). This is
+// the single definition of "split on" consulted by the router and serve.
+func (c *ServerConfig) InternalListenerEnabled() bool { return c.InternalHTTPPort > 0 }
+
+// InternalHTTPListenAddr returns the loopback address for the internal
+// HTTP listener, or "" when the split is disabled.
+func (c *ServerConfig) InternalHTTPListenAddr() string {
+	if !c.InternalListenerEnabled() {
+		return ""
+	}
+	return listenAddr(loopbackBind, c.InternalHTTPPort)
+}
+
+// minPublicTokenLen is the shortest HTTP bearer token accepted under
+// public_exposure. Generated tokens (shed_<scope>_<base64url of 24 bytes>) are
+// ~45+ chars; this floor rejects an obviously weak hand-set token while
+// admitting every generated one.
+const minPublicTokenLen = 24
+
+// PreflightPublicExposure gates an internet-facing deployment. When
+// public_exposure is set, the server must not bind unless every layer that
+// makes a public bind safe is present — the SSH key allowlist enforced, HTTP
+// bearer-token auth enforced (with at least one strong token), and TLS on. It
+// returns a descriptive error naming the FIRST missing piece. When
+// public_exposure is unset (the default) it is inert (returns nil), so the
+// existing tailnet/LAN fleet — including a non-loopback bind or a routine
+// restart — is unaffected.
+//
+// The credential bus is automatically "gated" by HTTP-enforce: the auth
+// middleware requires the credentials scope for /api/plugins/* and the Connect
+// tunnel, so a remote host-agent reaches them over TLS+credentials (the plan's
+// route matrix). Moving the bus to a loopback internal listener
+// (internal_http_port) is an optional co-located optimization, not required —
+// requiring it would break the remote-host-agent / remote `shed forward` case.
+//
+// This is a server-start check (called from runServe before anything binds),
+// not part of Validate, so config-only CLI tooling never trips it.
+func (c *ServerConfig) PreflightPublicExposure() error {
+	if !c.PublicExposure {
+		return nil
+	}
+	if ssh := c.SSHAuth(); ssh == nil || ssh.Mode != SSHAuthEnforce {
+		return errors.New("public_exposure requires auth.ssh.mode: enforce (the SSH key allowlist must reject non-allowlisted keys)")
+	}
+	h := c.HTTPAuth()
+	if h == nil || h.Mode != HTTPAuthEnforce {
+		return errors.New("public_exposure requires auth.http.mode: enforce (HTTP requests must require a bearer token; this also gates the credential bus by the credentials scope)")
+	}
+	if len(h.Tokens) == 0 {
+		return errors.New("public_exposure requires at least one auth.http.tokens entry")
+	}
+	for _, tok := range h.Tokens {
+		if len(tok.Token) < minPublicTokenLen {
+			return fmt.Errorf("public_exposure requires strong auth.http.tokens (>= %d chars; mint with `shed-server token new`)", minPublicTokenLen)
+		}
+	}
+	if c.HTTPSPort <= 0 {
+		return errors.New("public_exposure requires https_port (TLS must be on)")
+	}
+	return nil
+}
+
+// listenAddr joins a bind interface and port. An empty bind means all
+// interfaces (":port").
+func listenAddr(bind string, port int) string {
+	if bind == "" {
+		return fmt.Sprintf(":%d", port)
+	}
+	return net.JoinHostPort(bind, strconv.Itoa(port))
+}
+
+// validateNetworkSurface checks the optional internal-listener port. Shared
+// by Validate and ValidateNoHostCoupling, both of which range-check
+// HTTPPort/SSHPort immediately before calling this (the collision check
+// below assumes those are already valid).
+func (c *ServerConfig) validateNetworkSurface() error {
+	if c.InternalHTTPPort < 0 || c.InternalHTTPPort > 65535 {
+		return fmt.Errorf("invalid internal_http_port: %d", c.InternalHTTPPort)
+	}
+	if c.InternalHTTPPort > 0 && (c.InternalHTTPPort == c.HTTPPort || c.InternalHTTPPort == c.SSHPort) {
+		return fmt.Errorf("internal_http_port (%d) must differ from http_port and ssh_port", c.InternalHTTPPort)
+	}
+	if c.HTTPSPort < 0 || c.HTTPSPort > 65535 {
+		return fmt.Errorf("invalid https_port: %d", c.HTTPSPort)
+	}
+	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort || c.HTTPSPort == c.InternalHTTPPort) {
+		return fmt.Errorf("https_port (%d) must differ from http_port, ssh_port, and internal_http_port", c.HTTPSPort)
+	}
+	return nil
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -1280,6 +1504,12 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if c.SSHPort < 0 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
 	}
+	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateAuth(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -1347,6 +1577,12 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.SSHPort < 1 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
+	}
+	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateAuth(); err != nil {
+		return err
 	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
