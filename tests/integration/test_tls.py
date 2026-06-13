@@ -202,9 +202,12 @@ def test_tls_pin_rotation(vz_server_dev):
                 v2 = _fingerprint(_server_cert_pem("localhost", HTTPS_PORT))
                 assert v2 != v1, "expected a fresh cert after rotation"
 
-                # The client still pins v1 → control plane is rejected.
-                assert _shed(["-s", "rot", "list"], home).returncode != 0, \
-                    "stale v1 pin must reject the rotated cert"
+                # The client still pins v1 → control plane is rejected, and
+                # specifically for a pin mismatch (not some unrelated error).
+                stale = _shed(["-s", "rot", "list"], home)
+                assert stale.returncode != 0, "stale v1 pin must reject the rotated cert"
+                assert "fingerprint mismatch" in (stale.stdout + stale.stderr).lower(), \
+                    f"expected a pin-mismatch error, got: {stale.stdout!r} {stale.stderr!r}"
 
                 # Re-pin v2 (a rotation of an existing pin needs an explicit trust).
                 r = _shed(["server", "update", "rot", "--refetch", "--trust-on-first-use"], home)
