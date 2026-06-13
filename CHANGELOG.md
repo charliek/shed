@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Guest MTU auto-detection for VPNs / reduced-MTU paths (#196)
+
+Behind a VPN (or any host path with an MTU below 1500), full-size guest packets
+were silently black-holed — `docker pull` failed with a TLS handshake timeout
+even though `curl` to the same registry worked, because dockerd's larger
+ClientHello exceeded the path MTU. shed-server now **detects the host's egress
+path MTU when a shed starts** and lowers the guest's primary interface to match
+(passed via a `shed.mtu=` kernel arg). On a normal 1500 path nothing changes, so
+there is no penalty for the common no-VPN case.
+
+- **Both backends** lower the guest MTU; on VZ an MSS-clamp rule additionally
+  fixes Docker *container* egress behind a reduced-MTU path. (The Firecracker
+  container-egress clamp is a fast-follow — its custom kernel lacks the
+  `xt_TCPMSS` target.)
+- New optional `vz.guest_mtu` / `firecracker.guest_mtu` config field (`0` =
+  auto-detect; set `1280`–`1500` to pin a value when detection misses).
+- Detection runs at VM start: toggling a VPN under a running shed needs
+  `shed restart <name>` to re-detect.
+- **Requires a rebuilt rootfs image** (the guest-side change ships in the image)
+  — published with this release.
+
 ## v0.7.0 — 2026-06-13
 
 Optional, default-off authentication and transport encryption so a shed server

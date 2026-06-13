@@ -447,6 +447,14 @@ type FirecrackerConfig struct {
 	// StopTimeout is the timeout for graceful VM shutdown
 	StopTimeout Duration `yaml:"stop_timeout"`
 
+	// GuestMTU, when non-zero, forces the guest's primary interface MTU
+	// instead of auto-detecting the host's egress path MTU at VM start.
+	// 0 (the default) means auto-detect: behind a reduced-MTU path (e.g. a
+	// VPN/overlay) the guest is lowered to match; otherwise it stays at
+	// 1500. Set this only to pin a value when detection misses. Validated to
+	// [MinGuestMTU, MaxGuestMTU] when non-zero.
+	GuestMTU int `yaml:"guest_mtu,omitempty"`
+
 	// BridgeName is the name of the Linux bridge for VM networking
 	BridgeName string `yaml:"bridge_name"`
 
@@ -533,6 +541,14 @@ type VZConfig struct {
 
 	// StopTimeout is the timeout for graceful VM shutdown
 	StopTimeout Duration `yaml:"stop_timeout"`
+
+	// GuestMTU, when non-zero, forces the guest's primary interface MTU
+	// instead of auto-detecting the host's egress path MTU at VM start.
+	// 0 (the default) means auto-detect: behind a reduced-MTU path (e.g. a
+	// VPN/overlay) the guest is lowered to match; otherwise it stays at
+	// 1500. Set this only to pin a value when detection misses. Validated to
+	// [MinGuestMTU, MaxGuestMTU] when non-zero.
+	GuestMTU int `yaml:"guest_mtu,omitempty"`
 }
 
 // GetDefaultImage implements vmimage.ImageConfig.
@@ -844,6 +860,12 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
+	// guest_mtu: 0 means auto-detect; an explicit override must be a value
+	// the host vmnet path can actually carry.
+	if c.GuestMTU != 0 && (c.GuestMTU < MinGuestMTU || c.GuestMTU > MaxGuestMTU) {
+		return fmt.Errorf("vz: guest_mtu must be 0 (auto-detect) or in [%d, %d]", MinGuestMTU, MaxGuestMTU)
+	}
+
 	if c.UpperSizeDefault != "" {
 		if _, err := ParseUpperSize(c.UpperSizeDefault); err != nil {
 			return fmt.Errorf("vz: upper_size_default: %w", err)
@@ -1016,6 +1038,14 @@ const (
 	MaxVsockPort           uint32 = 65535
 	MinTimeout                    = 1 * time.Second
 	MaxTimeout                    = 30 * time.Minute
+
+	// Guest-MTU bounds, shared by the auto-detection clamp
+	// (vmutil.ClampGuestMTU) and the guest_mtu override validation on both
+	// backends. Floor is the IPv6 minimum link MTU (RFC 8200) — guaranteed
+	// routable on any path; ceiling is the host vmnet/TAP MTU, above which a
+	// guest packet would itself black-hole.
+	MinGuestMTU = 1280
+	MaxGuestMTU = 1500
 )
 
 // DefaultVZImagesDir is the default directory for VZ rootfs images.
@@ -1821,6 +1851,12 @@ func (c *FirecrackerConfig) Validate() error {
 		if stopTimeout > MaxTimeout {
 			return fmt.Errorf("stop_timeout must be at most %s", MaxTimeout)
 		}
+	}
+
+	// guest_mtu: 0 means auto-detect; an explicit override must be a value
+	// the host TAP/bridge path can actually carry.
+	if c.GuestMTU != 0 && (c.GuestMTU < MinGuestMTU || c.GuestMTU > MaxGuestMTU) {
+		return fmt.Errorf("guest_mtu must be 0 (auto-detect) or in [%d, %d]", MinGuestMTU, MaxGuestMTU)
 	}
 
 	// Defer kernel/rootfs path validation when every configured source

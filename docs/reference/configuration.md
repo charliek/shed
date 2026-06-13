@@ -331,6 +331,7 @@ from the server version.
 | `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins) |
 | `start_timeout` | duration | `30s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
+| `guest_mtu` | int | `0` | Guest primary-interface MTU. `0` (default) auto-detects the host egress path MTU at VM start and lowers the guest to match a reduced path (e.g. a VPN/overlay), otherwise leaves it at 1500. Set `1280`–`1500` to pin a value when detection misses. See note below. |
 | `bridge_name` | string | `shed-br0` | Linux bridge name |
 | `bridge_cidr` | string | `172.30.0.1/24` | Bridge network CIDR |
 | `tap_prefix` | string | `shed-tap` | TAP device name prefix |
@@ -397,6 +398,20 @@ vz:
 | `tcp_proxy_port` | int | `1028` | Vsock port for TCP proxy (used by DialService for tunnels and Connect API) |
 | `start_timeout` | duration | `60s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
+| `guest_mtu` | int | `0` | Guest primary-interface MTU. `0` (default) auto-detects the host egress path MTU at VM start and lowers the guest to match a reduced path (e.g. a VPN), otherwise leaves it at 1500. Set `1280`–`1500` to pin a value when detection misses. See note below. |
+
+### Guest MTU and VPNs
+
+Behind a VPN (or any path whose MTU is below 1500), full-size guest packets can
+be silently dropped — most visibly, `docker pull` fails with a TLS handshake
+timeout while `curl` to the same registry works. With `guest_mtu: 0` (the
+default), shed-server detects the host's egress path MTU when a shed starts and
+lowers the guest interface to match; on a normal 1500 path nothing changes.
+
+Detection runs **at VM start**, so if you connect or disconnect the VPN while a
+shed is already running, run `shed restart <name>` to re-detect. Set `guest_mtu`
+explicitly only to override detection (for example, to pin a value for a VPN
+whose tunnel interface still reports 1500).
 
 See [VZ Setup](../getting-started/vz-setup.md) for setup details.
 
