@@ -129,6 +129,13 @@ func (vm *VM) Start(ctx context.Context) error {
 		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
 	)
 
+	// Pass the resolved guest MTU so network-setup lowers eth0 to match a
+	// reduced host egress path (e.g. a VPN/overlay on the FC host). Omitted
+	// entirely when detection finds no reduction and no override is set.
+	if mtu, ok := vmutil.ResolveGuestMTU(vm.cfg.GuestMTU); ok {
+		kernelArgs += fmt.Sprintf(" shed.mtu=%d", mtu)
+	}
+
 	drives := []models.Drive{
 		// Upper (writable). The initramfs runs mkfs.ext4 on first
 		// boot when no FS signature is present.

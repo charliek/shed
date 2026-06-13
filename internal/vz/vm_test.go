@@ -344,6 +344,36 @@ func TestBuildVfkitArgsKernelCmdline(t *testing.T) {
 	if !strings.Contains(argsStr, "shed.name=test-vm") {
 		t.Errorf("expected shed.name=test-vm in kernel cmdline (read by shed-firstboot for identity regen), got: %s", argsStr)
 	}
+	// With no guest_mtu override and auto-detection of the host egress MTU,
+	// shed.mtu= must be omitted on a normal (1500) path — never shed.mtu=0.
+	if strings.Contains(argsStr, "shed.mtu=0") {
+		t.Errorf("shed.mtu=0 must never be emitted, got: %s", argsStr)
+	}
+}
+
+// TestBuildVfkitArgsGuestMTUOverride exercises the shed.mtu= cmdline wiring
+// deterministically via the guest_mtu override (which short-circuits host
+// detection), independent of whatever MTU the test host's egress interface has.
+func TestBuildVfkitArgsGuestMTUOverride(t *testing.T) {
+	imagesDir, digest := setupBlobForTest(t)
+	meta := &Metadata{Name: "test-vm", CPUs: 2, MemoryMB: 4096, RootfsPath: "/tmp/rootfs.ext4", LowerDigest: digest}
+	cfg := &config.VZConfig{
+		ImagesDir:    imagesDir,
+		SocketDir:    "/tmp/sockets",
+		ConsolePort:  1024,
+		NotifyPort:   1026,
+		TCPProxyPort: 1028,
+		GuestMTU:     1400,
+	}
+
+	vm := &VM{meta: meta, cfg: cfg}
+	args, err := vm.buildVfkitArgs()
+	if err != nil {
+		t.Fatalf("buildVfkitArgs: %v", err)
+	}
+	if argsStr := strings.Join(args, " "); !strings.Contains(argsStr, "shed.mtu=1400") {
+		t.Errorf("expected shed.mtu=1400 in kernel cmdline with guest_mtu override, got: %s", argsStr)
+	}
 }
 
 func TestCleanupSockets(t *testing.T) {

@@ -61,6 +61,20 @@ ip addr add "${IP_ADDR}/24" dev "$INTERFACE" 2>/dev/null || true
 ip link set "$INTERFACE" up
 ip route add default via "$GATEWAY" 2>/dev/null || true
 
+# Lower the guest MTU when shed-server detected a reduced host egress path
+# (e.g. a VPN/overlay on the FC host routing through a <1500 link). shed.mtu=
+# is emitted on the kernel cmdline ONLY in that case (see
+# vmutil.ResolveGuestMTU), so a normal 1500 path leaves the guest unchanged.
+# FC uses a static IP (no systemd-networkd to re-assert the link), so an
+# imperative set sticks. No MSS clamp here: the FC custom kernel lacks the
+# xt_TCPMSS target (tracked as a fast-follow); the MTU-lowering alone fixes
+# dockerd's own registry pulls. Bounds mirror config.MinGuestMTU/MaxGuestMTU.
+SHED_MTU=$(grep -oP 'shed\.mtu=\K[0-9]+' /proc/cmdline 2>/dev/null || true)
+if [ -n "$SHED_MTU" ] && [ "$SHED_MTU" -ge 1280 ] && [ "$SHED_MTU" -le 1500 ] && [ -n "$INTERFACE" ]; then
+    echo "Applying guest MTU $SHED_MTU to $INTERFACE (reduced host egress path)"
+    ip link set "$INTERFACE" mtu "$SHED_MTU" || true
+fi
+
 # Configure DNS
 echo "nameserver $DNS" > /etc/resolv.conf
 

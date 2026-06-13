@@ -178,6 +178,13 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		vm.meta.Name,
 	)
 
+	// Pass the resolved guest MTU so network-setup lowers enp0s1 to match a
+	// reduced host egress path (e.g. a VPN). Omitted entirely when detection
+	// finds no reduction and no override is set — the guest stays at 1500.
+	if mtu, ok := vmutil.ResolveGuestMTU(vm.cfg.GuestMTU); ok {
+		kernelArgs += fmt.Sprintf(" shed.mtu=%d", mtu)
+	}
+
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
 

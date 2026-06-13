@@ -35,6 +35,32 @@ elif [ -z "$IP_ADDR" ]; then
     echo "WARNING: No IPv4 address assigned via DHCP on $INTERFACE"
 fi
 
+# Lower the guest MTU when shed-server detected a reduced host egress path
+# (e.g. a VPN routing the vfkit subnet through a <1500 tunnel). shed.mtu= is
+# emitted on the kernel cmdline ONLY in that case (see vmutil.ResolveGuestMTU),
+# so a normal 1500 path leaves this block dormant and the guest unchanged.
+# Bounds mirror config.MinGuestMTU/MaxGuestMTU (1280/1500).
+SHED_MTU=$(grep -oP 'shed\.mtu=\K[0-9]+' /proc/cmdline 2>/dev/null || true)
+if [ -n "$SHED_MTU" ] && [ "$SHED_MTU" -ge 1280 ] && [ "$SHED_MTU" -le 1500 ] && [ -n "$INTERFACE" ]; then
+    echo "Applying guest MTU $SHED_MTU to $INTERFACE (reduced host egress path)"
+    # Immediate effect for this boot...
+    ip link set "$INTERFACE" mtu "$SHED_MTU" || true
+    # ...plus a systemd-networkd drop-in so the value survives a DHCP renew
+    # (networkd would otherwise re-assert the link default on reconfigure).
+    mkdir -p /run/systemd/network/80-dhcp.network.d
+    printf '[Link]\nMTUBytes=%s\n' "$SHED_MTU" > /run/systemd/network/80-dhcp.network.d/10-shed-mtu.conf
+    networkctl reload 2>/dev/null || true
+    # MSS-clamp forwarded Docker container egress to the now-lowered route PMTU
+    # so container TLS handshakes don't black-hole behind the VPN. Guarded on
+    # iptables (only the `full` image ships it) and idempotent. Works with both
+    # iptables-legacy and iptables-nft.
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+            || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+            || echo "WARNING: failed to install MSS clamp rule"
+    fi
+fi
+
 # Ensure /etc/resolv.conf points to systemd-resolved stub.
 # Docker overwrites resolv.conf during image build, so we restore the symlink.
 if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf)" != "../run/systemd/resolve/stub-resolv.conf" ]; then
