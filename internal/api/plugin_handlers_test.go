@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -221,6 +222,46 @@ func TestHandlePluginRespondSuccess(t *testing.T) {
 	}
 	if sent.InReplyTo != "abc" {
 		t.Errorf("InReplyTo = %q, want %q", sent.InReplyTo, "abc")
+	}
+}
+
+func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
+	srv := newTestServerWithPlugins()
+	creds := "shed_credentials_itest"
+	srv.cfg.Auth = &config.AuthConfig{HTTP: &config.HTTPAuthConfig{
+		Mode:   config.HTTPAuthEnforce,
+		Tokens: []config.HTTPToken{{Scope: config.TokenScopeCredentials, Token: creds}},
+	}}
+	srv.bridge.RegisterShed("dev", &plugin.ShedConn{
+		Name: "dev",
+		Send: func(*plugin.Envelope) error { return nil },
+	})
+	if _, err := srv.plugins.Register("op"); err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(inReplyTo string) int {
+		body := fmt.Sprintf(`{"namespace":"op","type":"response","in_reply_to":%q,"final":true,"shed":{"name":"dev"}}`, inReplyTo)
+		r := httptest.NewRequest(http.MethodPost, "/api/plugins/listeners/op/respond", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+creds)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, r)
+		return w.Code
+	}
+
+	// A forged response (no pending request was dispatched) is rejected.
+	if code := post("forged-id"); code != http.StatusForbidden {
+		t.Errorf("forged respond under enforce = %d, want 403", code)
+	}
+
+	// After a real request is dispatched (records pending), the matching
+	// response is accepted.
+	req := plugin.NewEnvelope("op", plugin.MessageTypeRequest, nil)
+	if err := srv.bridge.PublishToHost("dev", req); err != nil {
+		t.Fatalf("PublishToHost: %v", err)
+	}
+	if code := post(req.ID); code != http.StatusNoContent {
+		t.Errorf("owned respond under enforce = %d, want 204", code)
 	}
 }
 

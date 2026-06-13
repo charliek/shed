@@ -51,6 +51,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// busOwnershipEnforced reports whether credential-bus /respond ownership is
+// validated against the registry's pending set. It is gated on HTTP auth being
+// on, so the default token-less fleet keeps today's bus behavior.
+func (s *Server) busOwnershipEnforced() bool {
+	h := s.cfg.HTTPAuth()
+	return h != nil && h.Mode == config.HTTPAuthEnforce
+}
+
 // isBootstrapExempt reports whether r targets an endpoint reachable without a
 // token, so `shed server add` can bootstrap trust before holding one.
 func isBootstrapExempt(r *http.Request) bool {

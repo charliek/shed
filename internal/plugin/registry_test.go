@@ -124,6 +124,92 @@ func TestRegistryPublish(t *testing.T) {
 	}
 }
 
+// dispatchRequest registers (if needed) and publishes a request to record a
+// pending entry, returning the request ID.
+func dispatchRequest(t *testing.T, r *Registry, namespace, shed string) string {
+	t.Helper()
+	req := NewEnvelope(namespace, MessageTypeRequest, nil)
+	req.Shed = &ShedInfo{Name: shed}
+	if err := r.Publish(req); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	return req.ID
+}
+
+func TestConsumeResponseMatchesPending(t *testing.T) {
+	r := NewRegistry()
+	r.Register("op")
+	id := dispatchRequest(t, r, "op", "dev")
+
+	if !r.ConsumeResponse("op", "dev", id, true) {
+		t.Error("a response to a dispatched request must be accepted")
+	}
+	// Consumed on the final response → a replay is rejected.
+	if r.ConsumeResponse("op", "dev", id, true) {
+		t.Error("a replayed response must be rejected")
+	}
+}
+
+func TestConsumeResponseRejectsForged(t *testing.T) {
+	r := NewRegistry()
+	r.Register("op")
+	id := dispatchRequest(t, r, "op", "dev")
+
+	if r.ConsumeResponse("op", "dev", "made-up-id", true) {
+		t.Error("a forged requestID must be rejected")
+	}
+	if r.ConsumeResponse("op", "other-shed", id, true) {
+		t.Error("a response naming the wrong shed must be rejected")
+	}
+	if r.ConsumeResponse("other-ns", "dev", id, true) {
+		t.Error("a response for the wrong namespace must be rejected")
+	}
+}
+
+func TestConsumeResponseNonFinalKeepsPending(t *testing.T) {
+	r := NewRegistry()
+	r.Register("op")
+	id := dispatchRequest(t, r, "op", "dev")
+
+	if !r.ConsumeResponse("op", "dev", id, false) {
+		t.Error("a non-final response must match")
+	}
+	if !r.ConsumeResponse("op", "dev", id, true) {
+		t.Error("the final response must still match")
+	}
+	if r.ConsumeResponse("op", "dev", id, true) {
+		t.Error("after the final response the request must be consumed")
+	}
+}
+
+func TestUnregisterSweepsPendingAcrossReconnect(t *testing.T) {
+	r := NewRegistry()
+	r.Register("op")
+	id := dispatchRequest(t, r, "op", "dev")
+
+	// The listener drops; its pending requests are discarded.
+	r.Unregister("op")
+	// A new listener reclaims the namespace (reconnect). A late response for the
+	// pre-disconnect request must not be honored by the new listener.
+	r.Register("op")
+	if r.ConsumeResponse("op", "dev", id, true) {
+		t.Error("a response for a request dispatched before reconnect must be rejected")
+	}
+}
+
+func TestEventsCreateNoPending(t *testing.T) {
+	r := NewRegistry()
+	r.Register("op")
+	ev := NewEnvelope("op", MessageTypeEvent, nil)
+	ev.Shed = &ShedInfo{Name: "dev"}
+	if err := r.Publish(ev); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if r.ConsumeResponse("op", "dev", ev.ID, true) {
+		t.Error("an event must not create a pending entry")
+	}
+}
+
 func TestRegistryPublishNoListener(t *testing.T) {
 	r := NewRegistry()
 	env := NewEnvelope("unregistered", MessageTypeRequest, nil)

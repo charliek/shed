@@ -102,7 +102,10 @@ func (s *Server) handlePluginSubscribe(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePluginRespond(w http.ResponseWriter, r *http.Request) {
 	namespace := chi.URLParam(r, "namespace")
 
-	if s.bridge == nil {
+	// The bridge and registry are wired together (NewBridge(registry)); require
+	// both so the ownership gate below can't be skipped by a half-initialized
+	// server (a fail-open under enforce).
+	if s.bridge == nil || s.plugins == nil {
 		writeError(w, http.StatusServiceUnavailable, "PLUGINS_DISABLED", "plugin system not initialized")
 		return
 	}
@@ -121,6 +124,17 @@ func (s *Server) handlePluginRespond(w http.ResponseWriter, r *http.Request) {
 	// Require shed target for routing
 	if env.Shed == nil || env.Shed.Name == "" {
 		writeError(w, http.StatusBadRequest, "MISSING_SHED", "envelope must include shed.name for routing")
+		return
+	}
+
+	// Validate the response against the registry's pending-request set: a caller
+	// may only answer a request its listener actually received (the requestID is
+	// delivered only to the sole registered listener). Consumed unconditionally
+	// (keeps the set tidy in token-less mode too); rejection is enforced only
+	// when HTTP auth is on, so the default fleet behaves exactly as before.
+	owned := s.plugins.ConsumeResponse(env.Namespace, env.Shed.Name, env.InReplyTo, env.Final)
+	if !owned && s.busOwnershipEnforced() {
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "response does not match a pending request for this namespace")
 		return
 	}
 
