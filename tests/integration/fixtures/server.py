@@ -97,6 +97,34 @@ DEFAULT_AGENT_P50_MS = {
 }
 
 
+def resolve_server_entry(name: str, timeout: int = 10) -> Optional[dict]:
+    """Return the `~/.shed/config.yaml` entry for `name`, or None.
+
+    Runs `shed --json server list` and finds the dict whose `name`
+    matches — the single parser both `LocalServer._resolve_ssh_endpoint`
+    and the dev-control primitives (`fixtures/devcontrol.py`) share, so
+    the `shed --json server list` shape (and its failure modes) is
+    decoded in exactly one place.
+    """
+    try:
+        r = subprocess.run(
+            ["shed", "--json", "server", "list"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        entries = json.loads(r.stdout) or []
+    except json.JSONDecodeError:
+        return None
+    for e in entries:
+        if isinstance(e, dict) and e.get("name") == name:
+            return e
+    return None
+
+
 @dataclass
 class ShedHandle:
     """A reference to a successfully-created shed.
@@ -329,20 +357,12 @@ class LocalServer:
         CLI's view of the server entry; falls back to 2222 (the brew
         default).
         """
-        try:
-            r = subprocess.run(
-                ["shed", "--json", "server", "list"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                entries = json.loads(r.stdout) or []
-                for e in entries:
-                    if isinstance(e, dict) and e.get("name") == self.name:
-                        host = e.get("host", "localhost")
-                        port = int(e.get("ssh_port", 2222))
-                        return host, port
-        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, ValueError):
-            pass
+        entry = resolve_server_entry(self.name, timeout=5)
+        if entry is not None:
+            try:
+                return entry.get("host", "localhost"), int(entry.get("ssh_port", 2222))
+            except (TypeError, ValueError):
+                pass
         return "localhost", 2222
 
     def delete(self, name: str, ignore_missing: bool = False) -> None:
