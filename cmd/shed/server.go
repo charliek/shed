@@ -185,9 +185,12 @@ func tlsFingerprintEqual(got, expected string) bool {
 // confirmTLSCert verifies or confirms the server's TLS cert fingerprint before
 // it is pinned, mirroring confirmHostKey's discipline: an expected value is
 // checked out-of-band (fail on mismatch); otherwise --trust-on-first-use
-// accepts, --json refuses to silently trust, an interactive terminal prompts,
-// and a non-interactive script trusts on first use.
-func confirmTLSCert(fingerprint, expected string, trustOnFirstUse, interactive, jsonMode bool) error {
+// accepts, --json refuses to silently trust, and an interactive terminal
+// prompts. firstUse distinguishes a first trust (a non-interactive script
+// trusts on first use, preserving automation) from a rotation of an existing
+// pin (a silent non-interactive re-pin is refused — a MITM at fetch time could
+// otherwise permanently repin the client).
+func confirmTLSCert(fingerprint, expected string, trustOnFirstUse, interactive, jsonMode, firstUse bool) error {
 	if expected != "" {
 		if !tlsFingerprintEqual(fingerprint, expected) {
 			return fmt.Errorf("TLS cert fingerprint mismatch: server presented %s, expected %s", fingerprint, expected)
@@ -202,6 +205,9 @@ func confirmTLSCert(fingerprint, expected string, trustOnFirstUse, interactive, 
 		return fmt.Errorf("refusing to trust TLS cert %s in --json mode; pass --tls-fingerprint or --trust-on-first-use", fingerprint)
 	}
 	if !interactive {
+		if !firstUse {
+			return fmt.Errorf("refusing to silently rotate the TLS pin to %s in a non-interactive session; pass --tls-fingerprint or --trust-on-first-use", fingerprint)
+		}
 		fmt.Fprintf(os.Stderr, "Trusting server TLS cert %s\n", fingerprint)
 		return nil
 	}
@@ -228,11 +234,11 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := confirmTLSCert(fp, serverAddTLSFingerprint, serverAddTrustTOFU, isStdinTTY(), jsonFlag); err != nil {
+		if err := confirmTLSCert(fp, serverAddTLSFingerprint, serverAddTrustTOFU, isStdinTTY(), jsonFlag, true); err != nil {
 			return err
 		}
 		tlsFingerprint = fp
-		apiURL = fmt.Sprintf("https://%s:%d", host, serverAddHTTPSPort)
+		apiURL = "https://" + net.JoinHostPort(host, strconv.Itoa(serverAddHTTPSPort))
 		if verboseLevel > 0 {
 			fmt.Printf("Connecting to %s (TLS, pinned)...\n", apiURL)
 		}
@@ -457,6 +463,12 @@ func normalizeTLSFingerprint(s string) string {
 	return "sha256:" + s
 }
 
+// isHTTPSURL reports whether s is an https:// URL — the only scheme a TLS pin
+// can apply to (a plain-http client never performs a TLS handshake).
+func isHTTPSURL(s string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(s)), "https://")
+}
+
 func runServerUpdate(cmd *cobra.Command, args []string) error {
 	name := args[0]
 	entry, err := clientConfig.GetServer(name)
@@ -464,16 +476,19 @@ func runServerUpdate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// A pin only takes effect over https — the client never does a TLS
+	// handshake on a plain-http api_url, so a pin there is silently unused.
+	if !isHTTPSURL(entry.APIURL) {
+		return fmt.Errorf("server %q has no https api_url; a TLS pin only applies over https — re-add it with --https-port", name)
+	}
+
 	var newFingerprint string
 	switch {
 	case serverUpdateTLSFingerprint != "":
 		newFingerprint = normalizeTLSFingerprint(serverUpdateTLSFingerprint)
 	case serverUpdateRefetch:
-		if entry.APIURL == "" {
-			return fmt.Errorf("server %q has no api_url to re-fetch from; re-add it with --https-port", name)
-		}
 		u, err := url.Parse(entry.APIURL)
-		if err != nil {
+		if err != nil || u.Hostname() == "" {
 			return fmt.Errorf("invalid api_url %q: %w", entry.APIURL, err)
 		}
 		port, err := strconv.Atoi(u.Port())
@@ -484,7 +499,16 @@ func runServerUpdate(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := confirmTLSCert(fp, "", serverUpdateTrustTOFU, isStdinTTY(), jsonFlag); err != nil {
+		if fp == entry.TLSCertFingerprint {
+			if !jsonFlag {
+				printSuccess("Server %s TLS pin unchanged: %s", name, fp)
+			}
+			return nil
+		}
+		// firstUse only when there is no prior pin; rotating an existing one
+		// must not be silently accepted in a non-interactive session.
+		firstUse := entry.TLSCertFingerprint == ""
+		if err := confirmTLSCert(fp, "", serverUpdateTrustTOFU, isStdinTTY(), jsonFlag, firstUse); err != nil {
 			return err
 		}
 		newFingerprint = fp

@@ -73,30 +73,57 @@ func TestNormalizeTLSFingerprint(t *testing.T) {
 func TestConfirmTLSCert(t *testing.T) {
 	const fp = "sha256:abcdef0123456789"
 
-	// Args: (fingerprint, expected, trustOnFirstUse, interactive, jsonMode).
+	// Args: (fingerprint, expected, trustOnFirstUse, interactive, jsonMode, firstUse).
 	t.Run("matching expected verifies", func(t *testing.T) {
-		if err := confirmTLSCert(fp, fp, false, false, false); err != nil {
+		if err := confirmTLSCert(fp, fp, false, false, false, true); err != nil {
 			t.Errorf("matching fingerprint should succeed: %v", err)
 		}
 	})
 	t.Run("mismatch fails closed", func(t *testing.T) {
-		if err := confirmTLSCert(fp, "sha256:deadbeef", false, false, false); err == nil {
+		if err := confirmTLSCert(fp, "sha256:deadbeef", false, false, false, true); err == nil {
 			t.Error("mismatched fingerprint must fail")
 		}
 	})
-	t.Run("non-interactive trusts on first use", func(t *testing.T) {
-		if err := confirmTLSCert(fp, "", false, false, false); err != nil {
-			t.Errorf("non-interactive TOFU should succeed: %v", err)
+	t.Run("non-interactive first use trusts", func(t *testing.T) {
+		if err := confirmTLSCert(fp, "", false, false, false, true); err != nil {
+			t.Errorf("non-interactive first-use TOFU should succeed: %v", err)
+		}
+	})
+	t.Run("non-interactive rotation refused without trust flag", func(t *testing.T) {
+		// firstUse=false: a silent re-pin in a script would let a MITM repin.
+		if err := confirmTLSCert(fp, "", false, false, false, false); err == nil {
+			t.Error("non-interactive rotation without --trust-on-first-use must fail")
+		}
+	})
+	t.Run("non-interactive rotation accepts with trust flag", func(t *testing.T) {
+		if err := confirmTLSCert(fp, "", true, false, false, false); err != nil {
+			t.Errorf("--trust-on-first-use should accept a rotation: %v", err)
 		}
 	})
 	t.Run("json mode without trust flag fails closed", func(t *testing.T) {
-		if err := confirmTLSCert(fp, "", false, false, true); err == nil {
+		if err := confirmTLSCert(fp, "", false, false, true, true); err == nil {
 			t.Error("json mode without --tls-fingerprint/--trust-on-first-use must fail")
 		}
 	})
 	t.Run("trust-on-first-use accepts in json mode", func(t *testing.T) {
-		if err := confirmTLSCert(fp, "", true, false, true); err != nil {
+		if err := confirmTLSCert(fp, "", true, false, true, true); err != nil {
 			t.Errorf("--trust-on-first-use should accept: %v", err)
 		}
 	})
+}
+
+func TestIsHTTPSURL(t *testing.T) {
+	cases := map[string]bool{
+		"https://host:8443": true,
+		"HTTPS://host:8443": true,
+		"  https://host  ":  true,
+		"http://host:8080":  false,
+		"":                  false,
+		"host:8443":         false,
+	}
+	for in, want := range cases {
+		if got := isHTTPSURL(in); got != want {
+			t.Errorf("isHTTPSURL(%q) = %v, want %v", in, got, want)
+		}
+	}
 }
