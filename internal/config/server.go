@@ -83,8 +83,43 @@ type ServerConfig struct {
 	// the SSH known_hosts content seeded before `git clone` runs.
 	Git *GitConfig `yaml:"git,omitempty"`
 
+	// Auth configures optional authentication. Default (nil) preserves the
+	// legacy accept-all behavior.
+	Auth *AuthConfig `yaml:"auth,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
+}
+
+// SSHAuth returns the SSH auth config, or nil when unset.
+func (c *ServerConfig) SSHAuth() *SSHAuthConfig {
+	if c.Auth == nil {
+		return nil
+	}
+	return c.Auth.SSH
+}
+
+// validateAuth checks the optional auth config. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateAuth() error {
+	ssh := c.SSHAuth()
+	if ssh == nil {
+		return nil
+	}
+	switch ssh.Mode {
+	case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
+	default:
+		return fmt.Errorf("invalid auth.ssh.mode: %q (must be off, warn, or enforce)", ssh.Mode)
+	}
+	if ssh.MaxAuthTries < 0 {
+		return fmt.Errorf("invalid auth.ssh.max_auth_tries: %d", ssh.MaxAuthTries)
+	}
+	for _, u := range ssh.GitHubUsers {
+		if !ValidGitHubUsername(u) {
+			return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
+		}
+	}
+	return nil
 }
 
 // HTTPListenAddr returns the bind address for the public HTTP listener.
@@ -1349,6 +1384,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateNetworkSurface(); err != nil {
 		return err
 	}
+	if err := c.validateAuth(); err != nil {
+		return err
+	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLogLevels[c.LogLevel] {
@@ -1418,6 +1456,9 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
 	}
 	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateAuth(); err != nil {
 		return err
 	}
 

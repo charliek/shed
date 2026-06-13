@@ -88,8 +88,31 @@ log_level: info
 | `git` | object | - | Git behaviour for in-VM clones (see [Git](#git)) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
+| `auth` | object | - | Optional authentication (see [SSH authentication](#ssh-authentication)) |
 
 **Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
+
+### SSH authentication
+
+`auth.ssh` gates SSH public-key access against an allowlist. The default (omitted, or `mode: off`) accepts all keys — the legacy behavior. Identity comes from the offered key, GitHub-style; the username still selects the shed.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.ssh.mode` | string | `off` | `off` accepts all keys; `warn` logs would-deny attempts but still accepts (use to roll out safely); `enforce` rejects keys not in the allowlist. |
+| `auth.ssh.authorized_keys` | list | `[]` | Inline OpenSSH `authorized_keys` lines. |
+| `auth.ssh.authorized_keys_file` | string | - | Path to an `authorized_keys`-format file. |
+| `auth.ssh.github_users` | list | `[]` | Seed the allowlist from `https://github.com/<user>.keys`. Keys are cached to disk and fail closed to the last-known-good cache if GitHub is unreachable. |
+| `auth.ssh.github_refresh` | duration | `1h` | How often to re-fetch GitHub keys. |
+| `auth.ssh.max_auth_tries` | int | `6` | Public-key attempts allowed per connection. |
+
+With `mode: enforce`, the server refuses to start if no keys resolve (empty inline/file and a failed GitHub fetch with no cache) — use `warn` for first boot, or provide inline keys.
+
+```yaml
+auth:
+  ssh:
+    mode: enforce
+    github_users: [charliek]
+```
 
 ### Mounts
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -111,8 +112,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	defer be.Close()
 
+	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
+	// keys are cached next to the host key. Fails closed (returns an error)
+	// when mode=enforce but no keys resolved.
+	hostKeyPath := defaultHostKeyPath()
+	githubCacheDir := filepath.Join(filepath.Dir(hostKeyPath), "github_keys")
+	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.SSHAuth(), githubCacheDir)
+	if err != nil {
+		return fmt.Errorf("ssh auth: %w", err)
+	}
+	log.Printf("SSH auth mode: %s", sshAllowlist.Mode())
+
+	// Refresh GitHub-seeded keys in the background until shutdown.
+	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
+	defer cancelRefresh()
+	sshAllowlist.StartRefresh(refreshCtx)
+
 	// Initialize SSH server
-	sshServer, err := sshd.NewServer(be, defaultHostKeyPath(), cfg.SSHListenAddr(), cfg.Terminal)
+	sshServer, err := sshd.NewServer(be, hostKeyPath, cfg.SSHListenAddr(), cfg.Terminal, sshAllowlist)
 	if err != nil {
 		return fmt.Errorf("failed to create SSH server: %w", err)
 	}

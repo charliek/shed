@@ -18,6 +18,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/terminal"
 )
 
@@ -30,16 +31,20 @@ type Server struct {
 	hostKey     gossh.Signer
 	listener    net.Listener
 	termConfig  *terminal.Config
+	allowlist   *KeyAllowlist
 }
 
 // NewServer creates a new SSH server. listenAddr is the TCP bind address
 // (e.g. ":2222" for all interfaces, or "127.0.0.1:2222" / "<tailnet-ip>:2222").
-func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config) (*Server, error) {
+// allowlist gates public-key auth; pass an "off"-mode allowlist (or one built
+// from nil config) for the legacy accept-all behavior.
+func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config, allowlist *KeyAllowlist) (*Server, error) {
 	s := &Server{
 		backend:     b,
 		hostKeyPath: hostKeyPath,
 		listenAddr:  listenAddr,
 		termConfig:  termConfig,
+		allowlist:   allowlist,
 	}
 
 	// Load or generate the host key.
@@ -54,6 +59,15 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 		Addr: listenAddr,
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
 			return s.handlePublicKey(ctx, key)
+		},
+		ServerConfigCallback: func(ssh.Context) *gossh.ServerConfig {
+			c := &gossh.ServerConfig{}
+			if s.allowlist != nil {
+				if n := s.allowlist.MaxAuthTries(); n > 0 {
+					c.MaxAuthTries = n
+				}
+			}
+			return c
 		},
 		Handler: func(sess ssh.Session) {
 			s.handleSession(sess)
@@ -170,16 +184,31 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.sshServer.Shutdown(ctx)
 }
 
-// handlePublicKey handles public key authentication.
-// For MVP, we accept all keys and just log the fingerprint.
+// handlePublicKey gates public-key auth through the allowlist. With the
+// allowlist off (default), every key is accepted (legacy). In warn mode an
+// unlisted key is logged but accepted; in enforce mode it is rejected. The
+// username (which selects the shed) is unaffected — identity comes from the
+// key, GitHub-style. Applies uniformly to all users, including `_api`.
 func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	fingerprint := gossh.FingerprintSHA256(key)
 	user := ctx.User()
 
-	log.Printf("SSH auth attempt: user=%s fingerprint=%s", user, fingerprint)
+	if s.allowlist == nil || s.allowlist.Mode() == config.SSHAuthOff {
+		log.Printf("SSH auth attempt: user=%s fingerprint=%s (allowlist off)", user, fingerprint)
+		return true
+	}
 
-	// For MVP, accept all keys.
-	// TODO: Implement proper key verification against stored keys.
+	authorized := s.allowlist.IsAuthorized(key)
+	if s.allowlist.Mode() == config.SSHAuthEnforce && !authorized {
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s", user, fingerprint)
+		return false
+	}
+	// Reaches here only in warn mode, or enforce mode with an authorized key.
+	if authorized {
+		log.Printf("SSH auth allowed: user=%s fingerprint=%s", user, fingerprint)
+	} else {
+		log.Printf("SSH auth WOULD DENY (warn mode): user=%s fingerprint=%s", user, fingerprint)
+	}
 	return true
 }
 
