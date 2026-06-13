@@ -139,6 +139,35 @@ func TestHandlePluginSubscribeSSE(t *testing.T) {
 	}
 }
 
+func TestHandlePluginSubscribeKeepalive(t *testing.T) {
+	// Shorten the keepalive so an idle subscription emits several pings quickly.
+	prev := sseKeepaliveInterval
+	sseKeepaliveInterval = 20 * time.Millisecond
+	defer func() { sseKeepaliveInterval = prev }()
+
+	srv := newTestServerWithPlugins()
+
+	done := make(chan struct{})
+	var recorder *httptest.ResponseRecorder
+	go func() {
+		defer close(done)
+		r := httptest.NewRequest(http.MethodGet, "/api/plugins/listeners/op/messages", nil)
+		r.Header.Set("Accept", "text/event-stream")
+		recorder = httptest.NewRecorder()
+		srv.Router().ServeHTTP(recorder, r)
+	}()
+
+	// Stay idle (publish nothing) long enough for multiple keepalive ticks,
+	// then close the handler by unregistering.
+	time.Sleep(120 * time.Millisecond)
+	srv.plugins.Unregister("op")
+	<-done
+
+	if n := strings.Count(recorder.Body.String(), ": keepalive"); n < 2 {
+		t.Errorf("expected >= 2 idle keepalive pings, got %d in %q", n, recorder.Body.String())
+	}
+}
+
 func TestHandlePluginRespondMissingShed(t *testing.T) {
 	srv := newTestServerWithPlugins()
 	body := `{"namespace":"op","type":"response","payload":{}}`

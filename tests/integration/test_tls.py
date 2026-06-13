@@ -174,6 +174,49 @@ def test_tls_client_pin(vz_server_dev):
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
 
+@pytest.mark.vz
+@pytest.mark.slow
+def test_tls_pin_rotation(vz_server_dev):
+    """Rotating the server cert breaks the old pin until the client re-pins.
+    `server add` pins v1; the cert is regenerated (v2); the v1-pinned client is
+    rejected; `server update --refetch` re-pins v2 and the control plane works."""
+    server = vz_server_dev.name
+    shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
+    DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory() as home:
+            # Round 1: pin v1.
+            with dev_config(_tls_overrides(), server):
+                v1 = _fingerprint(_server_cert_pem("localhost", HTTPS_PORT))
+                r = _shed(["server", "add", "localhost", "--https-port", str(HTTPS_PORT),
+                           "--trust-on-first-use", "--name", "rot"], home)
+                assert r.returncode == 0, f"add v1 failed: {r.stdout!r} {r.stderr!r}"
+                assert _shed(["-s", "rot", "list"], home).returncode == 0
+
+            # Rotate: drop the cert so the server regenerates a fresh one (v2).
+            shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
+            DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Round 2: server now presents v2.
+            with dev_config(_tls_overrides(), server):
+                v2 = _fingerprint(_server_cert_pem("localhost", HTTPS_PORT))
+                assert v2 != v1, "expected a fresh cert after rotation"
+
+                # The client still pins v1 → control plane is rejected.
+                assert _shed(["-s", "rot", "list"], home).returncode != 0, \
+                    "stale v1 pin must reject the rotated cert"
+
+                # Re-pin v2 (a rotation of an existing pin needs an explicit trust).
+                r = _shed(["server", "update", "rot", "--refetch", "--trust-on-first-use"], home)
+                assert r.returncode == 0, f"refetch re-pin failed: {r.stdout!r} {r.stderr!r}"
+
+                # Control plane works again on the new pin.
+                assert _shed(["-s", "rot", "list"], home).returncode == 0, \
+                    "control plane must work after re-pinning v2"
+    finally:
+        shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
+
+
 def _https_status(port: int, path: str, ca_pem: str | None, token: str | None) -> int | None:
     # ca_pem trusts exactly the server's cert (the pin); None uses the system
     # CA bundle (which must NOT trust the self-signed cert).

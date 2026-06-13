@@ -4,10 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/go-chi/chi/v5"
 )
+
+// sseKeepaliveInterval is how often an idle SSE subscription emits a comment
+// ping. It keeps an idle NAT mapping / proxy IdleTimeout from evicting a
+// long-lived, quiet bus stream (the Phase-1→Phase-5 keepalive). A package var
+// so tests can shorten it.
+var sseKeepaliveInterval = 25 * time.Second
 
 // handleListListeners returns all active plugin listeners.
 func (s *Server) handleListListeners(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +71,9 @@ func (s *Server) handlePluginSubscribe(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -76,6 +86,14 @@ func (s *Server) handlePluginSubscribe(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		case <-listener.Done:
 			return
+		case <-keepalive.C:
+			// Idle keepalive: an SSE comment line. Clients ignore ":"-prefixed
+			// lines (sdk HostClient and the CLI both skip them), so it's
+			// invisible to the protocol but resets NAT/proxy idle timers.
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		}
 	}
 }
