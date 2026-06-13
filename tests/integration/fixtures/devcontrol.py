@@ -47,6 +47,8 @@ import os
 import signal
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,7 +56,7 @@ from typing import Iterator, Optional
 
 import yaml
 
-from .server import LocalServer, resolve_server_entry
+from .server import resolve_server_entry
 
 # fixtures/ -> integration/ -> tests/ -> repo root
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -216,19 +218,26 @@ def _make_restart(dev_config: Path) -> None:
 
 
 def _wait_reachable(server: str, timeout: float) -> None:
-    """Poll until `server` answers, or raise after `timeout`.
+    """Poll the server's bootstrap `/api/info` endpoint until it answers.
 
-    Reuses `LocalServer.available()` (the suite's canonical probe, which
-    guards `shutil.which` and the subprocess failure modes). `make
-    dev-server-up` returns as soon as it has launched the process (it only
-    warns, not fails, if not reachable within its own 15 s window), so the
-    caller must wait for actual readiness here.
+    `/api/info` is unauthenticated (bootstrap-exempt), so this readiness check
+    works even when the server is restarted with HTTP-auth enforcement on —
+    unlike a `shed list` probe, a control-plane call that would 401 under
+    enforce. `make dev-server-up` returns as soon as it has launched the
+    process, so the caller must wait for actual readiness here.
     """
-    probe = LocalServer(name=server, backend="vz")
+    entry = resolve_server_entry(server)
+    if entry is None:
+        raise AssertionError(f"dev server {server!r} not registered in ~/.shed/config.yaml")
+    url = f"http://{entry.get('host', 'localhost')}:{int(entry['http_port'])}/api/info"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if probe.available():
-            return
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if resp.status == 200:
+                    return
+        except (urllib.error.URLError, OSError):
+            pass
         time.sleep(0.5)
     raise AssertionError(f"dev server {server!r} not reachable within {timeout:.0f}s")
 

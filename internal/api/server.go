@@ -62,6 +62,7 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(ContentTypeJSON)
+	r.Use(s.authMiddleware)
 }
 
 // buildRouter registers routes gated by surface. includePublic covers the
