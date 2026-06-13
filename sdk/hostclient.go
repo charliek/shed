@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,10 +91,15 @@ func WithToken(token string) HostClientOption {
 // fingerprint of its DER ("sha256:<hex>") — the trust model the HTTPS listener
 // expects (no CA). Pass it alongside an https WithServerURL.
 //
+// Fail-closed: a pin only protects an https endpoint, so if the resolved
+// serverURL is not https the client refuses to send (every request errors)
+// rather than silently downgrading to unpinned plaintext.
+//
 // Composition with WithHTTPClient: order-independent. The pin is applied once,
 // after all options, onto the resolved HTTP client — its Timeout and a custom
-// *http.Transport's other settings are preserved (cloned, never mutating the
-// caller's client). If the custom client uses a non-*http.Transport
+// *http.Transport's other settings (including any existing TLS config: client
+// certs, ServerName, NextProtos) are preserved by cloning, never mutating the
+// caller's client. If the custom client uses a non-*http.Transport
 // RoundTripper, it owns its own TLS and the pin is skipped with a warning.
 func WithTLSPin(fingerprint string) HostClientOption {
 	return func(c *HostClient) {
@@ -103,12 +109,19 @@ func WithTLSPin(fingerprint string) HostClientOption {
 
 // applyTLSPin installs cert pinning on the resolved HTTP client's transport.
 // Called once after all options so it composes with WithHTTPClient regardless
-// of option order. A custom *http.Transport is cloned (its other settings kept)
-// rather than mutated; a non-*http.Transport RoundTripper owns its own TLS and
-// is left alone with a warning, so a configured pin is never silently dropped
-// without a trace.
+// of option order.
 func (c *HostClient) applyTLSPin() {
 	if c.tlsPin == "" {
+		return
+	}
+	// A pin only protects an https endpoint; with an http serverURL the TLS
+	// config is never exercised and traffic would go plaintext. Fail closed.
+	if !strings.HasPrefix(strings.ToLower(c.serverURL), "https://") {
+		c.httpClient = &http.Client{
+			Timeout: c.httpClient.Timeout,
+			Transport: errorRoundTripper{fmt.Errorf(
+				"WithTLSPin set but serverURL %q is not https; refusing to send unpinned plaintext", c.serverURL)},
+		}
 		return
 	}
 	var base *http.Transport
@@ -116,12 +129,30 @@ func (c *HostClient) applyTLSPin() {
 	case *http.Transport:
 		base = t.Clone()
 	case nil:
-		base = http.DefaultTransport.(*http.Transport).Clone()
+		// Clone DefaultTransport to keep proxy/HTTP2 defaults; guard the
+		// assertion in case it was globally replaced with another RoundTripper.
+		if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+			base = dt.Clone()
+		} else {
+			base = &http.Transport{}
+		}
 	default:
 		c.logger.Warn("WithTLSPin ignored: custom HTTP client uses a non-*http.Transport RoundTripper that owns its own TLS")
 		return
 	}
-	base.TLSClientConfig = pinTLSConfig(c.tlsPin)
+	// Overlay the pin onto the caller's existing TLS settings rather than
+	// replacing them wholesale, so client certs / ServerName / NextProtos /
+	// a stricter MinVersion survive.
+	tlsCfg := base.TLSClientConfig.Clone()
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{}
+	}
+	if tlsCfg.MinVersion < tls.VersionTLS12 {
+		tlsCfg.MinVersion = tls.VersionTLS12
+	}
+	tlsCfg.InsecureSkipVerify = true
+	tlsCfg.VerifyPeerCertificate = pinVerifier(c.tlsPin)
+	base.TLSClientConfig = tlsCfg
 	c.httpClient = &http.Client{
 		Transport:     base,
 		Timeout:       c.httpClient.Timeout,

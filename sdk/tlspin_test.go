@@ -87,3 +87,15 @@ func TestNoPinLeavesClientUnchanged(t *testing.T) {
 		t.Error("without WithTLSPin the supplied client should be used as-is")
 	}
 }
+
+func TestWithTLSPinFailsClosedOnNonHTTPS(t *testing.T) {
+	// A pin with a plain-http serverURL would otherwise send unpinned
+	// plaintext; the client must fail closed instead.
+	c := NewHostClient(
+		WithServerURL("http://localhost:8080"),
+		WithTLSPin("sha256:"+strings.Repeat("ab", 32)),
+	)
+	if _, err := c.httpClient.Get("http://localhost:8080/"); err == nil {
+		t.Error("a pin over a non-https serverURL must fail closed, not send plaintext")
+	}
+}

@@ -2,11 +2,11 @@ package sdk
 
 import (
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 )
 
 // certFingerprint returns the pin string clients compare against: "sha256:"
@@ -18,22 +18,23 @@ func certFingerprint(der []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// pinTLSConfig returns a tls.Config that trusts the server's self-signed cert
-// by fingerprint instead of a CA chain. InsecureSkipVerify disables the default
-// chain/hostname check precisely because the self-signed cert is its own trust
-// anchor — VerifyPeerCertificate re-imposes trust by comparing the pin.
-func pinTLSConfig(fingerprint string) *tls.Config {
-	return &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, // not insecure: VerifyPeerCertificate pins the cert
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return errors.New("server presented no TLS certificate")
-			}
-			if got := certFingerprint(rawCerts[0]); got != fingerprint {
-				return fmt.Errorf("TLS cert fingerprint mismatch: server presented %s, pinned %s", got, fingerprint)
-			}
-			return nil
-		},
+// pinVerifier returns a tls.Config.VerifyPeerCertificate callback that trusts
+// the server's self-signed cert by fingerprint instead of a CA chain.
+func pinVerifier(fingerprint string) func([][]byte, [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("server presented no TLS certificate")
+		}
+		if got := certFingerprint(rawCerts[0]); got != fingerprint {
+			return fmt.Errorf("TLS cert fingerprint mismatch: server presented %s, pinned %s", got, fingerprint)
+		}
+		return nil
 	}
 }
+
+// errorRoundTripper fails every request with err. It fails a HostClient closed
+// when a TLS pin is configured but the endpoint is not https: rather than
+// silently sending unpinned plaintext, every request errors with a clear cause.
+type errorRoundTripper struct{ err error }
+
+func (e errorRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
