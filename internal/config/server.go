@@ -165,8 +165,21 @@ func (c *ServerConfig) validateAuth() error {
 	return nil
 }
 
-// HTTPListenAddr returns the bind address for the public HTTP listener.
-func (c *ServerConfig) HTTPListenAddr() string { return listenAddr(c.HTTPBind, c.HTTPPort) }
+// HTTPListenAddr returns the bind address for the plain-HTTP listener. Under
+// public_exposure it is forced to loopback so the plaintext control-plane API
+// is never reachable off-box — only the TLS (https_port) listener and the
+// loopback internal bus face the network. Otherwise it honors http_bind
+// (default all interfaces), unchanged.
+func (c *ServerConfig) HTTPListenAddr() string {
+	if c.PublicExposure {
+		return listenAddr(loopbackBind, c.HTTPPort)
+	}
+	return listenAddr(c.HTTPBind, c.HTTPPort)
+}
+
+// loopbackBind is the IPv4 loopback interface used for listeners that must not
+// be reachable off-box (the internal bus, and plain HTTP under public_exposure).
+const loopbackBind = "127.0.0.1"
 
 // HTTPSEnabled reports whether the HTTPS listener is configured.
 func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
@@ -194,8 +207,14 @@ func (c *ServerConfig) InternalHTTPListenAddr() string {
 	if !c.InternalListenerEnabled() {
 		return ""
 	}
-	return listenAddr("127.0.0.1", c.InternalHTTPPort)
+	return listenAddr(loopbackBind, c.InternalHTTPPort)
 }
+
+// minPublicTokenLen is the shortest HTTP bearer token accepted under
+// public_exposure. Generated tokens (shed_<scope>_<base64url of 24 bytes>) are
+// ~45+ chars; this floor rejects an obviously weak hand-set token while
+// admitting every generated one.
+const minPublicTokenLen = 24
 
 // PreflightPublicExposure gates an internet-facing deployment. When
 // public_exposure is set, the server must not bind unless every layer that
@@ -221,6 +240,11 @@ func (c *ServerConfig) PreflightPublicExposure() error {
 	}
 	if len(h.Tokens) == 0 {
 		return errors.New("public_exposure requires at least one auth.http.tokens entry")
+	}
+	for _, tok := range h.Tokens {
+		if len(tok.Token) < minPublicTokenLen {
+			return fmt.Errorf("public_exposure requires strong auth.http.tokens (>= %d chars; mint with `shed-server token new`)", minPublicTokenLen)
+		}
 	}
 	if c.HTTPSPort <= 0 {
 		return errors.New("public_exposure requires https_port (TLS must be on)")

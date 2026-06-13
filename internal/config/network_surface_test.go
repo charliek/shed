@@ -87,6 +87,7 @@ func TestValidateNetworkSurface(t *testing.T) {
 
 func TestPreflightPublicExposure(t *testing.T) {
 	// A complete bundle: SSH enforce + HTTP enforce(+token) + TLS + internal bus.
+	strongToken := "shed_control_" + strings.Repeat("a", 32) // generated-shape, >= minPublicTokenLen
 	full := func() ServerConfig {
 		return ServerConfig{
 			HTTPPort: 8080, SSHPort: 2222,
@@ -94,7 +95,7 @@ func TestPreflightPublicExposure(t *testing.T) {
 			PublicExposure: true,
 			Auth: &AuthConfig{
 				SSH:  &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}},
-				HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: "shed_control_x"}}},
+				HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: strongToken}}},
 			},
 		}
 	}
@@ -113,6 +114,19 @@ func TestPreflightPublicExposure(t *testing.T) {
 			t.Errorf("complete bundle should pass, got %v", err)
 		}
 	})
+	t.Run("plain HTTP forced to loopback under public_exposure", func(t *testing.T) {
+		// Even with an all-interfaces http_bind, the plaintext listener must be
+		// loopback-only so only the TLS listener faces the network.
+		cfg := full()
+		cfg.HTTPBind = "" // default: all interfaces
+		if got := cfg.HTTPListenAddr(); got != "127.0.0.1:8080" {
+			t.Errorf("HTTPListenAddr() under public_exposure = %q, want loopback 127.0.0.1:8080", got)
+		}
+		// HTTPS still faces the network (honors http_bind, default all interfaces).
+		if got := cfg.HTTPSListenAddr(); got != ":8443" {
+			t.Errorf("HTTPSListenAddr() = %q, want :8443 (public)", got)
+		}
+	})
 
 	// Each missing piece is rejected, naming the gap.
 	missing := []struct {
@@ -124,6 +138,7 @@ func TestPreflightPublicExposure(t *testing.T) {
 		{"no ssh auth at all", func(c *ServerConfig) { c.Auth.SSH = nil }, "auth.ssh.mode"},
 		{"no http enforce", func(c *ServerConfig) { c.Auth.HTTP.Mode = HTTPAuthOff }, "auth.http.mode"},
 		{"no http tokens", func(c *ServerConfig) { c.Auth.HTTP.Tokens = nil }, "auth.http.tokens"},
+		{"weak http token", func(c *ServerConfig) { c.Auth.HTTP.Tokens = []HTTPToken{{Scope: TokenScopeControl, Token: "x"}} }, "strong auth.http.tokens"},
 		{"no tls", func(c *ServerConfig) { c.HTTPSPort = 0 }, "https_port"},
 		{"no internal bus", func(c *ServerConfig) { c.InternalHTTPPort = 0 }, "internal_http_port"},
 	}
