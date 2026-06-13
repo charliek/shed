@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/term"
 
 	"github.com/charliek/shed/internal/config"
 )
@@ -53,13 +56,17 @@ var serverSetDefaultCmd = &cobra.Command{
 }
 
 var (
-	serverAddPort int
-	serverAddName string
+	serverAddPort        int
+	serverAddName        string
+	serverAddFingerprint string
+	serverAddTrustTOFU   bool
 )
 
 func init() {
 	serverAddCmd.Flags().IntVarP(&serverAddPort, "port", "p", 8080, "HTTP port of the server")
 	serverAddCmd.Flags().StringVarP(&serverAddName, "name", "n", "", "Name for the server (default: server's hostname)")
+	serverAddCmd.Flags().StringVar(&serverAddFingerprint, "fingerprint", "", "Expected SSH host-key fingerprint (SHA256:...); verified out-of-band, fails on mismatch")
+	serverAddCmd.Flags().BoolVar(&serverAddTrustTOFU, "trust-on-first-use", false, "Trust the server's SSH host key without prompting")
 
 	serverCmd.AddCommand(serverAddCmd)
 	serverCmd.AddCommand(serverListCmd)
@@ -67,6 +74,56 @@ func init() {
 	serverCmd.AddCommand(serverSetDefaultCmd)
 
 	rootCmd.AddCommand(serverCmd)
+}
+
+// isStdinTTY reports whether stdin is an interactive terminal.
+func isStdinTTY() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// confirmHostKey verifies or confirms the server's SSH host key before it is
+// pinned, closing the add-time MITM window. With an expected fingerprint it
+// verifies out-of-band (failing on mismatch). Otherwise: --trust-on-first-use
+// accepts; --json refuses to silently trust (machine mode can't prompt, so it
+// requires an explicit trust flag); an interactive terminal prompts; a
+// non-interactive script trusts on first use so automation isn't blocked.
+func confirmHostKey(hostKey, expectedFingerprint string, trustOnFirstUse, interactive, jsonMode bool) error {
+	pub, _, _, _, err := gossh.ParseAuthorizedKey([]byte(hostKey))
+	if err != nil {
+		return fmt.Errorf("failed to parse server SSH host key: %w", err)
+	}
+	fp := gossh.FingerprintSHA256(pub)
+
+	if expectedFingerprint != "" {
+		want := expectedFingerprint
+		if !strings.HasPrefix(want, "SHA256:") {
+			want = "SHA256:" + want
+		}
+		if fp != want {
+			return fmt.Errorf("SSH host-key fingerprint mismatch: server presented %s, expected %s", fp, want)
+		}
+		return nil
+	}
+	if trustOnFirstUse {
+		fmt.Fprintf(os.Stderr, "Trusting server SSH host key %s\n", fp)
+		return nil
+	}
+	if jsonMode {
+		return fmt.Errorf("refusing to trust SSH host key %s in --json mode; pass --fingerprint or --trust-on-first-use", fp)
+	}
+	if !interactive {
+		// Non-interactive script: trust on first use (preserves automation).
+		fmt.Fprintf(os.Stderr, "Trusting server SSH host key %s\n", fp)
+		return nil
+	}
+	fmt.Printf("Server SSH host key fingerprint:\n  %s\n", fp)
+	fmt.Print("Trust this host key? [y/N]: ")
+	var resp string
+	_, _ = fmt.Scanln(&resp)
+	if r := strings.ToLower(strings.TrimSpace(resp)); r != "y" && r != "yes" {
+		return fmt.Errorf("aborted: server SSH host key not trusted")
+	}
+	return nil
 }
 
 func runServerAdd(cmd *cobra.Command, args []string) error {
@@ -89,6 +146,19 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get SSH host key: %w", err)
 	}
 
+	// Verify / confirm the SSH host key before pinning it (closes the
+	// add-time MITM window the plain-HTTP bootstrap otherwise leaves open).
+	if err := confirmHostKey(hostKeyResp.HostKey, serverAddFingerprint, serverAddTrustTOFU, isStdinTTY(), jsonFlag); err != nil {
+		return err
+	}
+
+	// Pin the host key now, before persisting the server entry. A failure
+	// here is fatal: a server entry without a pinned host key is unusable
+	// under strict host-key checking, and a rerun would hit the duplicate check.
+	if err := config.AddKnownHost(host, info.SSHPort, hostKeyResp.HostKey); err != nil {
+		return fmt.Errorf("failed to save SSH host key: %w", err)
+	}
+
 	// Determine server name
 	name := serverAddName
 	if name == "" {
@@ -108,11 +178,6 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 	}
 	if err := clientConfig.AddServer(name, entry); err != nil {
 		return err
-	}
-
-	// Save known host
-	if err := config.AddKnownHost(host, info.SSHPort, hostKeyResp.HostKey); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to save SSH host key: %v\n", err)
 	}
 
 	// Save config

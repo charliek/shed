@@ -33,13 +33,18 @@ shed server add <host> [flags]
 |------|-------|---------|-------------|
 | `--name` | `-n` | Derived from host | Friendly name for server |
 | `--port` | `-p` | `8080` | HTTP API port |
+| `--fingerprint` | | | Expected SSH host-key fingerprint (`SHA256:...`); verified out-of-band and fails on mismatch |
+| `--trust-on-first-use` | | `false` | Trust the server's SSH host key without prompting |
 
 The SSH port is automatically discovered from the server's `/api/info` endpoint.
+
+The command pins the server's SSH host key (in `~/.shed/known_hosts`). It prints the SHA256 fingerprint and, on an interactive terminal, asks you to confirm it before trusting — closing the add-time MITM window. Supply `--fingerprint SHA256:...` (read from the server's startup log) to verify out-of-band, or `--trust-on-first-use` to accept without a prompt. When stdin is not a terminal (scripts/CI), the key is trusted on first use unless `--fingerprint` is given.
 
 **Example:**
 
 ```bash
 shed server add mini-desktop.tailnet.ts.net --name mini
+shed server add vps.example.com --name vps --fingerprint SHA256:HtYK...j4Y
 ```
 
 ### shed server list
