@@ -175,6 +175,41 @@ func TestRespondNon204Status(t *testing.T) {
 	}
 }
 
+func TestWithTokenSetsBearerHeader(t *testing.T) {
+	// The host-agent authenticates to the credential bus with its scoped bearer
+	// token. WithToken must attach it as `Authorization: Bearer <token>` on
+	// outbound requests; without it, no Authorization header is sent (so the
+	// default-off / tailnet path stays unauthenticated).
+	const token = "shed_credentials_abcdef0123456789"
+	tests := []struct {
+		name     string
+		opts     []HostClientOption
+		wantAuth string
+	}{
+		{"token attached as bearer", []HostClientOption{WithToken(token)}, "Bearer " + token},
+		{"no token, no header", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+
+			opts := append([]HostClientOption{WithServerURL(srv.URL)}, tt.opts...)
+			client := NewHostClient(opts...)
+			if err := client.Respond(context.Background(), "ns", NewResponse("req-1", "ns", nil)); err != nil {
+				t.Fatalf("Respond: %v", err)
+			}
+			if gotAuth != tt.wantAuth {
+				t.Errorf("Authorization = %q, want %q", gotAuth, tt.wantAuth)
+			}
+		})
+	}
+}
+
 func TestNewHostClientDefaults(t *testing.T) {
 	client := NewHostClient()
 
