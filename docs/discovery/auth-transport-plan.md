@@ -1,5 +1,21 @@
 # Auth & Transport: Implementation Plan & Acceptance Criteria
 
+> **✅ Implemented (2026-06).** All phases below shipped on the `feat/auth-transport`
+> branches — shed [#198](https://github.com/charliek/shed/pull/198), shed-desktop
+> [#15](https://github.com/charliek/shed-desktop/pull/15), shed-extensions
+> [#35](https://github.com/charliek/shed-extensions/pull/35). The acceptance suite
+> passes 11/11 on the VZ dev server. The user-facing reference is now
+> [reference/security.md](../reference/security.md) + the
+> [Public VPS Deployment](../guides/vps-deployment.md) guide; this doc is retained
+> as the design/acceptance record. Two corrections vs. the plan as written:
+> (a) the **SSE credential-bus keepalive moved from Phase 1 to Phase 5**, where
+> TLS-over-NAT makes it matter (a `WriteTimeout: 0` already keeps SSE alive on a
+> LAN); (b) the **Phase-6 `public_exposure` preflight does not require
+> `internal_http_port`** — the bus + Connect tunnel are credentials-scope-gated on
+> the public listener under HTTP-enforce (the plan's route matrix), so the loopback
+> internal listener is an optional co-located optimization, not a hard requirement
+> (requiring it would break the remote host-agent / remote `shed forward` model).
+
 The buildable, cross-repo plan that turns the [Auth & Transport Security discovery](auth-and-transport-security.md) into shipped work, **and** the acceptance-criteria document for an autonomous, phase-by-phase build. It supersedes the discovery doc's §6 transport "leaning": after an adversarial design review, the chosen primary is **native pinned self-signed TLS + a bearer token**, not HTTP-over-SSH. The discovery doc remains the rationale/threat-model reference; this doc is the work plan and the definition of done.
 
 > **Decision of record (locked).** For the encrypted posture (office LAN + public VPS), the HTTP transport is **native pinned self-signed TLS** (server self-signs a cert with the same lifecycle as the SSH host key; clients pin its fingerprint at `shed server add`) plus a **deny-by-default bearer token**. No ACME, no domains, no reverse proxy required. HTTP-over-SSH stays in the toolbox as an *optional* Go-client convenience, never the load-bearing primary.
