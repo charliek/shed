@@ -124,6 +124,14 @@ func TestRegistryPublish(t *testing.T) {
 	}
 }
 
+// newTrackingRegistry returns a registry with ownership tracking on, as a
+// server with HTTP auth enforced would configure it.
+func newTrackingRegistry() *Registry {
+	r := NewRegistry()
+	r.EnableOwnershipTracking()
+	return r
+}
+
 // dispatchRequest registers (if needed) and publishes a request to record a
 // pending entry, returning the request ID.
 func dispatchRequest(t *testing.T, r *Registry, namespace, shed string) string {
@@ -137,7 +145,7 @@ func dispatchRequest(t *testing.T, r *Registry, namespace, shed string) string {
 }
 
 func TestConsumeResponseMatchesPending(t *testing.T) {
-	r := NewRegistry()
+	r := newTrackingRegistry()
 	r.Register("op")
 	id := dispatchRequest(t, r, "op", "dev")
 
@@ -151,7 +159,7 @@ func TestConsumeResponseMatchesPending(t *testing.T) {
 }
 
 func TestConsumeResponseRejectsForged(t *testing.T) {
-	r := NewRegistry()
+	r := newTrackingRegistry()
 	r.Register("op")
 	id := dispatchRequest(t, r, "op", "dev")
 
@@ -167,7 +175,7 @@ func TestConsumeResponseRejectsForged(t *testing.T) {
 }
 
 func TestConsumeResponseNonFinalKeepsPending(t *testing.T) {
-	r := NewRegistry()
+	r := newTrackingRegistry()
 	r.Register("op")
 	id := dispatchRequest(t, r, "op", "dev")
 
@@ -183,7 +191,7 @@ func TestConsumeResponseNonFinalKeepsPending(t *testing.T) {
 }
 
 func TestUnregisterSweepsPendingAcrossReconnect(t *testing.T) {
-	r := NewRegistry()
+	r := newTrackingRegistry()
 	r.Register("op")
 	id := dispatchRequest(t, r, "op", "dev")
 
@@ -198,7 +206,7 @@ func TestUnregisterSweepsPendingAcrossReconnect(t *testing.T) {
 }
 
 func TestEventsCreateNoPending(t *testing.T) {
-	r := NewRegistry()
+	r := newTrackingRegistry()
 	r.Register("op")
 	ev := NewEnvelope("op", MessageTypeEvent, nil)
 	ev.Shed = &ShedInfo{Name: "dev"}

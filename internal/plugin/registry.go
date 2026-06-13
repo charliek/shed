@@ -38,6 +38,11 @@ type Registry struct {
 	// hence its unguessable requestID). Entries are added on delivery, removed
 	// on the final response, and swept when the namespace's listener unregisters.
 	pending map[pendingKey]struct{}
+	// ownershipTracking gates whether pending is populated at all. Off by
+	// default, so a server without HTTP auth does zero bookkeeping (the
+	// ownership gate is only consulted when auth is enforced); EnableOwnership-
+	// Tracking turns it on at startup.
+	ownershipTracking bool
 }
 
 // NewRegistry creates a new empty registry.
@@ -152,10 +157,23 @@ func (r *Registry) Publish(env *Envelope) error {
 	}
 }
 
+// EnableOwnershipTracking turns on pending-request tracking so /respond can be
+// validated against it. Off by default — a server without HTTP auth does no
+// bookkeeping. Call once at startup, before the registry handles traffic.
+func (r *Registry) EnableOwnershipTracking() {
+	r.mu.Lock()
+	r.ownershipTracking = true
+	r.mu.Unlock()
+}
+
 // trackPendingLocked records a delivered request as awaiting a response; the
-// caller must hold r.mu. Only requests with a shed + ID are tracked (events and
-// ID-less messages get no response).
+// caller must hold r.mu. No-op unless ownership tracking is enabled. Only
+// requests with a shed + ID are tracked (events and ID-less messages get no
+// response).
 func (r *Registry) trackPendingLocked(env *Envelope) {
+	if !r.ownershipTracking {
+		return
+	}
 	if env.Type != MessageTypeRequest || env.ID == "" || env.Shed == nil || env.Shed.Name == "" {
 		return
 	}

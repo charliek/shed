@@ -232,6 +232,7 @@ func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
 		Mode:   config.HTTPAuthEnforce,
 		Tokens: []config.HTTPToken{{Scope: config.TokenScopeCredentials, Token: creds}},
 	}}
+	srv.plugins.EnableOwnershipTracking() // a server with HTTP auth enforced does this
 	srv.bridge.RegisterShed("dev", &plugin.ShedConn{
 		Name: "dev",
 		Send: func(*plugin.Envelope) error { return nil },

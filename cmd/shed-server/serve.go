@@ -103,6 +103,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize plugin system (before backends, since backends use the bridge)
 	pluginRegistry := plugin.NewRegistry()
+	// Track pending requests only when HTTP auth is enforced — the /respond
+	// ownership gate is consulted only then, so an unauthenticated server does
+	// no bookkeeping.
+	if h := cfg.HTTPAuth(); h != nil && h.Mode == config.HTTPAuthEnforce {
+		pluginRegistry.EnableOwnershipTracking()
+	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
 
 	// Initialize the configured backend
