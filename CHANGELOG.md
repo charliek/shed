@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.6.6 — 2026-06-12
+
+Session env vars for the landing directory, a credential-brokering refresh
+(shed-extensions v0.4.0), and a docs pass (host-agent quickstart + the
+`${shed.version}` token).
+
+### `SHED_WORKSPACE` / `SHED_ADD_DIRS` session env vars (#193)
+
+`shed exec` and interactive logins now **export** the project landing directory
+as `SHED_WORKSPACE` (the `--local-dir`/`--repo` project dir, or `/home/shed`)
+and the colon-joined guest paths of any `--add-dir` mounts as `SHED_ADD_DIRS`.
+The same values are mirrored to provisioning hooks.
+
+### shed-extensions v0.4.0 (#197)
+
+The `extensions`/`full` rootfs images now bundle shed-extensions v0.4.0 guest
+binaries. Host-side, `shed-host-agent` gains an always-on, fixed-path credential
+socket and a live `shed-host-agent status` that reports the config the running
+agent actually loaded, plus opt-in AWS passthrough mode for SSO/SAML. The
+bundled guest binaries' interface is unchanged, so no guest-side migration is
+needed.
+
+### Docs (#193, #195)
+
+- The macOS quickstart drops the `desktop.enabled` / `socket_path` /
+  `timeout_ms` config block — the approval channel is always on — and verifies
+  setup with bare `shed-host-agent status`.
+- Corrected the `${shed.version}` token docs (it expands only in shed config;
+  published image tags and Dockerfile `FROM` lines use a concrete `:vX.Y.Z`),
+  added an "Image references and `${shed.version}`" section, and slimmed the
+  README.
+
 ## v0.6.5 — 2026-06-08
 
 Docker's default `docker0` bridge now works on **both** backends, so plain
