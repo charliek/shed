@@ -1,6 +1,7 @@
 package sshd
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"net/http"
@@ -128,6 +129,27 @@ func TestGitHubSeedAndFailClosedToCache(t *testing.T) {
 	if !a.IsAuthorized(listed) {
 		t.Error("key should survive github outage + missing cache via in-memory snapshot")
 	}
+}
+
+func TestStartRefreshNoOpWhenNothingToRefresh(t *testing.T) {
+	// The refresh loop only exists to re-resolve GitHub keys. With auth off, or
+	// with no GitHub users, StartRefresh must return without spawning a ticker —
+	// calling it has to be safe and non-blocking in those cases.
+	off, err := NewKeyAllowlist(nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	off.StartRefresh(context.Background()) // off mode: no-op
+
+	_, line := genKey(t)
+	inline, err := NewKeyAllowlist(&config.SSHAuthConfig{
+		Mode:           config.SSHAuthEnforce,
+		AuthorizedKeys: []string{line},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inline.StartRefresh(context.Background()) // enforce but no github users: no-op
 }
 
 func TestGitHubInvalidUsernameSkipped(t *testing.T) {

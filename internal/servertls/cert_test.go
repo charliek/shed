@@ -1,6 +1,7 @@
 package servertls
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"os"
 	"path/filepath"
@@ -143,5 +144,52 @@ func TestKeyFilePermissions(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0600 {
 		t.Errorf("key file perms = %o, want 0600", perm)
+	}
+}
+
+// TestPinnedClientConfig exercises the shared trust primitive every in-repo
+// client uses to verify the self-signed server cert. The handshake-time check
+// lives in the VerifyPeerCertificate callback, so the test drives that callback
+// directly with raw DER instead of standing up a TLS server.
+func TestPinnedClientConfig(t *testing.T) {
+	dir := t.TempDir()
+	// Two independently-generated certs: one we pin to, one that stands in for
+	// a MITM / wrong server presenting a different leaf.
+	_, goodDER, err := LoadOrGenerate(filepath.Join(dir, "good_c.pem"), filepath.Join(dir, "good_k.pem"), nil)
+	if err != nil {
+		t.Fatalf("generate good cert: %v", err)
+	}
+	_, otherDER, err := LoadOrGenerate(filepath.Join(dir, "other_c.pem"), filepath.Join(dir, "other_k.pem"), nil)
+	if err != nil {
+		t.Fatalf("generate other cert: %v", err)
+	}
+
+	cfg := PinnedClientConfig(Fingerprint(goodDER))
+
+	// The config must keep the self-signed trust model intact: skip the default
+	// CA/hostname chain check (the cert is its own anchor) but floor the version
+	// at TLS 1.2. A regression to either of these silently weakens every client.
+	if !cfg.InsecureSkipVerify {
+		t.Error("InsecureSkipVerify must be true — the pin replaces chain verification")
+	}
+	if cfg.MinVersion != tls.VersionTLS12 {
+		t.Errorf("MinVersion = %x, want TLS 1.2 (%x)", cfg.MinVersion, tls.VersionTLS12)
+	}
+	if cfg.VerifyPeerCertificate == nil {
+		t.Fatal("VerifyPeerCertificate must be set — it is the entire trust check")
+	}
+
+	// The pinned leaf verifies.
+	if err := cfg.VerifyPeerCertificate([][]byte{goodDER}, nil); err != nil {
+		t.Errorf("pinned cert rejected: %v", err)
+	}
+	// A different leaf (wrong fingerprint) is refused — this is the MITM defense.
+	if err := cfg.VerifyPeerCertificate([][]byte{otherDER}, nil); err == nil {
+		t.Error("expected fingerprint mismatch to be rejected")
+	}
+	// A handshake presenting no certificate at all is refused rather than
+	// passing vacuously.
+	if err := cfg.VerifyPeerCertificate(nil, nil); err == nil {
+		t.Error("expected an empty cert chain to be rejected")
 	}
 }

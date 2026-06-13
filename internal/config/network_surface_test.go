@@ -165,6 +165,52 @@ func TestPreflightPublicExposure(t *testing.T) {
 	}
 }
 
+func TestValidateAuth(t *testing.T) {
+	// validateAuth is the config gate that rejects a malformed auth block before
+	// the server ever binds — an invalid mode, an empty token, a bad scope, or a
+	// malformed GitHub username must fail loudly at load, not silently disable a
+	// control the operator believes is on.
+	tests := []struct {
+		name    string
+		auth    *AuthConfig
+		wantErr string // substring the error must name; "" means expect success
+	}{
+		{"nil auth block is allowed", nil, ""},
+		{"empty ssh mode defaults ok", &AuthConfig{SSH: &SSHAuthConfig{}}, ""},
+		{"ssh off/warn/enforce ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
+		{"invalid ssh mode rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: "enfore"}}, "auth.ssh.mode"},
+		{"negative max_auth_tries rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: -1}}, "max_auth_tries"},
+		{"zero max_auth_tries ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: 0}}, ""},
+		{"valid github user ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
+		{"malformed github user rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
+		{"empty http mode defaults ok", &AuthConfig{HTTP: &HTTPAuthConfig{}}, ""},
+		{"http off/enforce ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: "shed_control_x"}}}}, ""},
+		{"invalid http mode rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: "warn"}}, "auth.http.mode"},
+		{"empty token rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: ""}}}}, "token is empty"},
+		{"invalid scope rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: "root", Token: "shed_root_x"}}}}, "invalid scope"},
+		{"credentials scope ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeCredentials, Token: "shed_credentials_x"}}}}, ""},
+		{"admin scope ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeAdmin, Token: "shed_admin_x"}}}}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: tt.auth}
+			err := cfg.validateAuth()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("validateAuth() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateAuth() = nil, want error naming %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("validateAuth() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestHTTPSListenAddr(t *testing.T) {
 	tests := []struct {
 		name     string
