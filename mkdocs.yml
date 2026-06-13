@@ -104,9 +104,12 @@ nav:
       - Provisioning a Gradle Project: tutorials/gradle-provisioning.md
       - Provisioning a TypeScript Project: tutorials/typescript-provisioning.md
       - Provisioning a Python Project: tutorials/python-provisioning.md
+  - Guides:
+      - Public VPS Deployment: guides/vps-deployment.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
+      - Security: reference/security.md
       - Snapshots: reference/snapshots.md
       - Disk Management: reference/disk-management.md
       - Storage Model: reference/storage-model.md

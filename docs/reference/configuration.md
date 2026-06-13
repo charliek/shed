@@ -42,6 +42,10 @@ sheds:
 | `servers.<name>.host` | string | Server hostname or IP |
 | `servers.<name>.http_port` | int | HTTP API port |
 | `servers.<name>.ssh_port` | int | SSH server port |
+| `servers.<name>.api_url` | string | HTTPS control-plane URL (e.g. `https://host:8443`); overrides scheme+host+port. Set by `shed server add --https-port`. |
+| `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`). |
+| `servers.<name>.control_token` | string | Control-scoped bearer token sent by the CLI/desktop. |
+| `servers.<name>.credentials_token` | string | Credentials-scoped bearer token sent by the host-agent. |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
 | `create_timeout` | duration | Timeout for create/start operations (default: `10m`) |
@@ -113,6 +117,25 @@ auth:
     mode: enforce
     github_users: [charliek]
 ```
+
+### HTTP authentication, TLS, and network surface
+
+These optional fields harden the HTTP API. All default to off, so the legacy
+open-on-a-trusted-network posture is unchanged. See [Security](security.md) for
+the full model and [Public VPS Deployment](../guides/vps-deployment.md) for a
+walkthrough.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.http.mode` | string | `off` | `off` accepts all requests; `enforce` requires a valid bearer token (except `GET /api/info` and `GET /api/ssh-host-key`). |
+| `auth.http.tokens` | list | `[]` | Accepted tokens: `{ name, scope, token }`. Scope is `control`, `credentials`, or `admin`. Mint with `shed-server token new --scope <scope>`. |
+| `https_port` | int | - | Serve HTTPS on this port (in addition to `http_port`) with a self-signed, client-pinned cert. |
+| `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
+| `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
+| `http_bind` / `ssh_bind` | string | all interfaces | Restrict a listener to one interface (e.g. `127.0.0.1`, a tailnet IP). |
+| `internal_http_port` | int | - | Move the credential bus + Connect tunnel to a loopback-only internal listener (co-located host-agent model; see the [route matrix](security.md#route-matrix)). |
+| `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
+| `public_exposure` | bool | `false` | Opt into an internet-facing deployment: refuse to start unless the full bundle (SSH enforce + HTTP enforce + TLS) is present. Inert when unset. |
 
 ### Mounts
 
