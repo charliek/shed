@@ -24,7 +24,7 @@
 
 # Bump this when shed-extensions releases a new version.
 # The extensions and full variants pull binaries from this tag.
-ARG SHED_EXT_VERSION=v0.4.0
+ARG SHED_EXT_VERSION=v0.4.1
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
 # Note: the shed initramfs (overlay-on-the-guest init) is built from
