@@ -219,11 +219,18 @@ const minPublicTokenLen = 24
 // PreflightPublicExposure gates an internet-facing deployment. When
 // public_exposure is set, the server must not bind unless every layer that
 // makes a public bind safe is present — the SSH key allowlist enforced, HTTP
-// bearer-token auth enforced (with at least one token), TLS on, and the
-// credential bus moved to a separate loopback internal listener. It returns a
-// descriptive error naming the FIRST missing piece. When public_exposure is
-// unset (the default) it is inert (returns nil), so the existing tailnet/LAN
-// fleet — including a non-loopback bind or a routine restart — is unaffected.
+// bearer-token auth enforced (with at least one strong token), and TLS on. It
+// returns a descriptive error naming the FIRST missing piece. When
+// public_exposure is unset (the default) it is inert (returns nil), so the
+// existing tailnet/LAN fleet — including a non-loopback bind or a routine
+// restart — is unaffected.
+//
+// The credential bus is automatically "gated" by HTTP-enforce: the auth
+// middleware requires the credentials scope for /api/plugins/* and the Connect
+// tunnel, so a remote host-agent reaches them over TLS+credentials (the plan's
+// route matrix). Moving the bus to a loopback internal listener
+// (internal_http_port) is an optional co-located optimization, not required —
+// requiring it would break the remote-host-agent / remote `shed forward` case.
 //
 // This is a server-start check (called from runServe before anything binds),
 // not part of Validate, so config-only CLI tooling never trips it.
@@ -236,7 +243,7 @@ func (c *ServerConfig) PreflightPublicExposure() error {
 	}
 	h := c.HTTPAuth()
 	if h == nil || h.Mode != HTTPAuthEnforce {
-		return errors.New("public_exposure requires auth.http.mode: enforce (HTTP requests must require a bearer token)")
+		return errors.New("public_exposure requires auth.http.mode: enforce (HTTP requests must require a bearer token; this also gates the credential bus by the credentials scope)")
 	}
 	if len(h.Tokens) == 0 {
 		return errors.New("public_exposure requires at least one auth.http.tokens entry")
@@ -248,9 +255,6 @@ func (c *ServerConfig) PreflightPublicExposure() error {
 	}
 	if c.HTTPSPort <= 0 {
 		return errors.New("public_exposure requires https_port (TLS must be on)")
-	}
-	if c.InternalHTTPPort <= 0 {
-		return errors.New("public_exposure requires internal_http_port (the credential bus must be on a loopback internal listener, off the public interface)")
 	}
 	return nil
 }

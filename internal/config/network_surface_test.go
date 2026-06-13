@@ -114,6 +114,15 @@ func TestPreflightPublicExposure(t *testing.T) {
 			t.Errorf("complete bundle should pass, got %v", err)
 		}
 	})
+	t.Run("internal listener is optional (remote-host-agent model)", func(t *testing.T) {
+		// Without internal_http_port the bus is still gated (HTTP enforce
+		// requires the credentials scope), so a public-gated bus is fine.
+		cfg := full()
+		cfg.InternalHTTPPort = 0
+		if err := cfg.PreflightPublicExposure(); err != nil {
+			t.Errorf("internal_http_port must be optional, got %v", err)
+		}
+	})
 	t.Run("plain HTTP forced to loopback under public_exposure", func(t *testing.T) {
 		// Even with an all-interfaces http_bind, the plaintext listener must be
 		// loopback-only so only the TLS listener faces the network.
@@ -140,7 +149,6 @@ func TestPreflightPublicExposure(t *testing.T) {
 		{"no http tokens", func(c *ServerConfig) { c.Auth.HTTP.Tokens = nil }, "auth.http.tokens"},
 		{"weak http token", func(c *ServerConfig) { c.Auth.HTTP.Tokens = []HTTPToken{{Scope: TokenScopeControl, Token: "x"}} }, "strong auth.http.tokens"},
 		{"no tls", func(c *ServerConfig) { c.HTTPSPort = 0 }, "https_port"},
-		{"no internal bus", func(c *ServerConfig) { c.InternalHTTPPort = 0 }, "internal_http_port"},
 	}
 	for _, tt := range missing {
 		t.Run(tt.name, func(t *testing.T) {

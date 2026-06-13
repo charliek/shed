@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -50,28 +48,13 @@ func (c *APIClient) newHTTPClient(timeout time.Duration) *http.Client {
 
 // pinnedTransport returns a transport that verifies the server's leaf cert
 // against the pinned "sha256:<hex>" fingerprint instead of a CA chain, or nil
-// when there is no pin (plain HTTP). InsecureSkipVerify disables the default
-// chain/hostname check precisely because the self-signed cert is its own trust
-// anchor — VerifyPeerCertificate re-imposes trust by comparing the pin.
+// when there is no pin (plain HTTP). It wraps the shared servertls pin config
+// so the CLI and the Connect tunnel verify identically.
 func pinnedTransport(fingerprint string) http.RoundTripper {
 	if fingerprint == "" {
 		return nil
 	}
-	return &http.Transport{
-		TLSClientConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, // not insecure: VerifyPeerCertificate pins the cert
-			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-				if len(rawCerts) == 0 {
-					return fmt.Errorf("server presented no TLS certificate")
-				}
-				if got := servertls.Fingerprint(rawCerts[0]); got != fingerprint {
-					return fmt.Errorf("TLS cert fingerprint mismatch: server presented %s, pinned %s", got, fingerprint)
-				}
-				return nil
-			},
-		},
-	}
+	return &http.Transport{TLSClientConfig: servertls.PinnedClientConfig(fingerprint)}
 }
 
 // NewAPIClient creates a plain-HTTP API client for the given host and port

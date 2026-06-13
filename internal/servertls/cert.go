@@ -59,6 +59,29 @@ func Fingerprint(der []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+// PinnedClientConfig returns a tls.Config that verifies the server's
+// self-signed cert by the pinned fingerprint ("sha256:<hex>") instead of a CA
+// chain — the shared trust primitive for every in-repo client (the CLI control
+// plane and the Connect tunnel). InsecureSkipVerify disables the default
+// chain/hostname check because the self-signed cert is its own anchor;
+// VerifyPeerCertificate re-imposes trust by comparing the pin, so a mismatched
+// (or absent) cert fails the handshake.
+func PinnedClientConfig(fingerprint string) *tls.Config {
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, // not insecure: VerifyPeerCertificate pins the cert
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("server presented no TLS certificate")
+			}
+			if got := Fingerprint(rawCerts[0]); got != fingerprint {
+				return fmt.Errorf("TLS cert fingerprint mismatch: server presented %s, pinned %s", got, fingerprint)
+			}
+			return nil
+		},
+	}
+}
+
 // loadIfCovers loads the persisted cert+key and returns it only when it parses
 // and its SANs cover every requested DNS name and IP. Any failure (missing
 // files, parse error, stale SANs) returns ok=false so the caller regenerates.
