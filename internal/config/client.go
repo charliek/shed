@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -44,6 +45,22 @@ type ServerEntry struct {
 	// credential bus. Both optional; empty when the server isn't token-gated.
 	ControlToken     string `yaml:"control_token,omitempty"`
 	CredentialsToken string `yaml:"credentials_token,omitempty"`
+	// APIURL, when set, overrides the scheme+host+port for the control plane
+	// (e.g. https://host:8443). Empty = plain http://Host:HTTPPort (legacy).
+	APIURL string `yaml:"api_url,omitempty"`
+	// TLSCertFingerprint pins the server's self-signed TLS cert as
+	// "sha256:<hex>", captured at `shed server add`. When set, the client
+	// verifies the presented cert against it (no CA needed).
+	TLSCertFingerprint string `yaml:"tls_cert_fingerprint,omitempty"`
+}
+
+// BaseURL returns the control-plane base URL for the entry: APIURL when set
+// (it carries scheme+host+port), else the legacy plain http://Host:HTTPPort.
+func (e *ServerEntry) BaseURL() string {
+	if e.APIURL != "" {
+		return strings.TrimRight(e.APIURL, "/")
+	}
+	return fmt.Sprintf("http://%s:%d", e.Host, e.HTTPPort)
 }
 
 // ShedCache caches the location of a shed.

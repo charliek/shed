@@ -1,21 +1,27 @@
-"""Phase 5: native pinned TLS — server side (HTTPS listener + cert).
+"""Phase 5: native pinned TLS — server side + CLI client pin.
 
 Configures the VZ dev server with `https_port` + `tls_names` (via the Phase
-0.5 harness) and verifies live that the server presents a self-signed cert
-whose SANs cover the configured names plus the loopback defaults, that the
-fingerprint a client computes from the presented cert is stable (the pin), and
-that `curl --cacert` trusts it for a `tls_names`/loopback SAN. The plain-HTTP
-listener must keep answering so the legacy path is unaffected.
+0.5 harness) and verifies live:
 
-VZ-only (config mutation restarts the local dev server); the cert-generation
-logic itself is backend-agnostic Go covered by `internal/servertls` unit tests.
-Client-side pin enforcement (Go/Swift/CLI) lands in later Phase 5 sub-steps and
-gets its own coverage.
+  - the server presents a self-signed cert whose SANs cover the configured
+    names plus the loopback defaults, the fingerprint a client computes is
+    stable (the pin), and `curl --cacert` trusts it for a SAN
+    (test_tls_listener_serves_pinnable_cert);
+  - the real `shed` CLI pins the cert at `shed server add --https-port`, drives
+    the control plane over the pinned TLS connection, and rejects a wrong
+    out-of-band `--tls-fingerprint` (test_tls_client_pin).
+
+The plain-HTTP listener must keep answering so the legacy path is unaffected.
+VZ-only (config mutation restarts the local dev server); the cert-generation +
+pin-verify logic is backend-agnostic Go covered by `internal/servertls` +
+`cmd/shed` unit tests. The CLI test runs against a throwaway $HOME so it never
+touches the developer's real ~/.shed/config.yaml.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import ssl
 import subprocess
@@ -24,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import dev_config
+from fixtures.devcontrol import SHED_SERVER_BIN, dev_config
 from fixtures.server import resolve_server_entry
 
 HTTPS_PORT = 18443
@@ -32,6 +38,25 @@ TEST_SAN = "shed-tls-test.example"
 # Persist the cert outside ~/.shed so it never collides with a real server's
 # pinned material; a fresh path per run regenerates with the configured SANs.
 DEV_TLS_DIR = Path.home() / ".shed" / "dev" / "tls-itest"
+SHED_BIN = SHED_SERVER_BIN.parent / "shed"
+
+
+def _tls_overrides() -> dict:
+    return {
+        "https_port": HTTPS_PORT,
+        "tls_names": [TEST_SAN],
+        "tls_cert_file": str(DEV_TLS_DIR / "tls_cert.pem"),
+        "tls_key_file": str(DEV_TLS_DIR / "tls_key.pem"),
+    }
+
+
+def _shed(args: list[str], home: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    # Throwaway $HOME so `shed server add` writes a scratch config + known_hosts,
+    # never the developer's real ~/.shed.
+    env = dict(os.environ, HOME=home)
+    return subprocess.run(
+        [str(SHED_BIN), *args], capture_output=True, text=True, timeout=timeout, env=env
+    )
 
 
 def _server_cert_pem(host: str, port: int) -> str:
@@ -68,14 +93,8 @@ def test_tls_listener_serves_pinnable_cert(vz_server_dev):
 
     shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
     DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
-    overrides = {
-        "https_port": HTTPS_PORT,
-        "tls_names": [TEST_SAN],
-        "tls_cert_file": str(DEV_TLS_DIR / "tls_cert.pem"),
-        "tls_key_file": str(DEV_TLS_DIR / "tls_key.pem"),
-    }
     try:
-        with dev_config(overrides, server):
+        with dev_config(_tls_overrides(), server):
             # The HTTPS listener presents a cert; fetch it the way `server add`
             # would (no trust yet), then confirm its SANs cover the configured
             # name and the always-on loopback defaults.
@@ -112,5 +131,39 @@ def test_tls_listener_serves_pinnable_cert(vz_server_dev):
                 capture_output=True, text=True, timeout=15,
             )
             assert r.stdout.strip() == "200", f"plain HTTP regressed: {r.stdout!r} {r.stderr!r}"
+    finally:
+        shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
+
+
+@pytest.mark.vz
+@pytest.mark.slow
+def test_tls_client_pin(vz_server_dev):
+    server = vz_server_dev.name
+    shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
+    DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with dev_config(_tls_overrides(), server), tempfile.TemporaryDirectory() as home:
+            # `shed server add --https-port` fetches the presented cert, pins it
+            # (TOFU here), and drives /api/info + /api/ssh-host-key over the
+            # pinned TLS connection — all into a throwaway $HOME.
+            r = _shed(
+                ["server", "add", "localhost", "--https-port", str(HTTPS_PORT),
+                 "--trust-on-first-use", "--name", "tlspin"],
+                home,
+            )
+            assert r.returncode == 0, f"server add over TLS failed: {r.stdout!r} {r.stderr!r}"
+
+            # The pinned entry drives the control plane over TLS.
+            r = _shed(["-s", "tlspin", "list"], home)
+            assert r.returncode == 0, f"control plane over pinned TLS failed: {r.stdout!r} {r.stderr!r}"
+
+            # A wrong out-of-band fingerprint is rejected before anything is pinned.
+            r = _shed(
+                ["server", "add", "localhost", "--https-port", str(HTTPS_PORT),
+                 "--tls-fingerprint", "sha256:" + "00" * 32, "--name", "tlsbad"],
+                home,
+            )
+            assert r.returncode != 0, "a wrong --tls-fingerprint must be rejected"
+            assert "mismatch" in (r.stdout + r.stderr).lower(), f"expected a mismatch error: {r.stdout!r} {r.stderr!r}"
     finally:
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)

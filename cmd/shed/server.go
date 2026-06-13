@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -12,6 +16,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/servertls"
 )
 
 var serverCmd = &cobra.Command{
@@ -55,23 +60,48 @@ var serverSetDefaultCmd = &cobra.Command{
 	RunE:  runServerSetDefault,
 }
 
+var serverUpdateCmd = &cobra.Command{
+	Use:   "update <name>",
+	Short: "Update a server's pinned TLS cert fingerprint",
+	Long: `Rotate the pinned TLS certificate fingerprint for a server.
+
+Pass --tls-fingerprint <sha256:...> to pin a new fingerprint verified
+out-of-band, or --refetch to re-fetch the cert from the server's api_url
+and re-pin it (trust-on-first-use or interactive prompt).`,
+	Args: cobra.ExactArgs(1),
+	RunE: runServerUpdate,
+}
+
 var (
-	serverAddPort        int
-	serverAddName        string
-	serverAddFingerprint string
-	serverAddTrustTOFU   bool
+	serverAddPort           int
+	serverAddName           string
+	serverAddFingerprint    string
+	serverAddTrustTOFU      bool
+	serverAddHTTPSPort      int
+	serverAddTLSFingerprint string
+
+	serverUpdateTLSFingerprint string
+	serverUpdateRefetch        bool
+	serverUpdateTrustTOFU      bool
 )
 
 func init() {
-	serverAddCmd.Flags().IntVarP(&serverAddPort, "port", "p", 8080, "HTTP port of the server")
+	serverAddCmd.Flags().IntVarP(&serverAddPort, "port", "p", 8080, "HTTP port of the server (bootstrap; ignored when --https-port is set)")
 	serverAddCmd.Flags().StringVarP(&serverAddName, "name", "n", "", "Name for the server (default: server's hostname)")
 	serverAddCmd.Flags().StringVar(&serverAddFingerprint, "fingerprint", "", "Expected SSH host-key fingerprint (SHA256:...); verified out-of-band, fails on mismatch")
-	serverAddCmd.Flags().BoolVar(&serverAddTrustTOFU, "trust-on-first-use", false, "Trust the server's SSH host key without prompting")
+	serverAddCmd.Flags().BoolVar(&serverAddTrustTOFU, "trust-on-first-use", false, "Trust the server's SSH host key (and TLS cert) without prompting")
+	serverAddCmd.Flags().IntVar(&serverAddHTTPSPort, "https-port", 0, "HTTPS port; when set, bootstrap over TLS and pin the server's self-signed cert")
+	serverAddCmd.Flags().StringVar(&serverAddTLSFingerprint, "tls-fingerprint", "", "Expected TLS cert fingerprint (sha256:...); verified out-of-band, fails on mismatch")
+
+	serverUpdateCmd.Flags().StringVar(&serverUpdateTLSFingerprint, "tls-fingerprint", "", "New pinned TLS cert fingerprint (sha256:...) to rotate to")
+	serverUpdateCmd.Flags().BoolVar(&serverUpdateRefetch, "refetch", false, "Re-fetch the cert from the server's api_url and re-pin it (TOFU/prompt)")
+	serverUpdateCmd.Flags().BoolVar(&serverUpdateTrustTOFU, "trust-on-first-use", false, "With --refetch, trust the re-fetched TLS cert without prompting")
 
 	serverCmd.AddCommand(serverAddCmd)
 	serverCmd.AddCommand(serverListCmd)
 	serverCmd.AddCommand(serverRemoveCmd)
 	serverCmd.AddCommand(serverSetDefaultCmd)
+	serverCmd.AddCommand(serverUpdateCmd)
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -126,15 +156,95 @@ func confirmHostKey(hostKey, expectedFingerprint string, trustOnFirstUse, intera
 	return nil
 }
 
+// fetchTLSCertFingerprint dials host:port over TLS without verifying (to
+// capture the presented self-signed cert), returning its "sha256:<hex>"
+// pin. The cert is not trusted yet — the caller confirms the pin first.
+func fetchTLSCertFingerprint(host string, port int) (string, error) {
+	dialer := &net.Dialer{Timeout: DefaultTimeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, strconv.Itoa(port)), &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, // capturing the cert to pin it, not trusting it yet
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to connect over TLS to %s:%d: %w", host, port, err)
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", fmt.Errorf("server presented no TLS certificate")
+	}
+	return servertls.Fingerprint(certs[0].Raw), nil
+}
+
+// tlsFingerprintEqual compares two "sha256:<hex>" pins, tolerating a missing
+// prefix and case/whitespace differences in the operator-supplied value.
+func tlsFingerprintEqual(got, expected string) bool {
+	return normalizeTLSFingerprint(got) == normalizeTLSFingerprint(expected)
+}
+
+// confirmTLSCert verifies or confirms the server's TLS cert fingerprint before
+// it is pinned, mirroring confirmHostKey's discipline: an expected value is
+// checked out-of-band (fail on mismatch); otherwise --trust-on-first-use
+// accepts, --json refuses to silently trust, an interactive terminal prompts,
+// and a non-interactive script trusts on first use.
+func confirmTLSCert(fingerprint, expected string, trustOnFirstUse, interactive, jsonMode bool) error {
+	if expected != "" {
+		if !tlsFingerprintEqual(fingerprint, expected) {
+			return fmt.Errorf("TLS cert fingerprint mismatch: server presented %s, expected %s", fingerprint, expected)
+		}
+		return nil
+	}
+	if trustOnFirstUse {
+		fmt.Fprintf(os.Stderr, "Trusting server TLS cert %s\n", fingerprint)
+		return nil
+	}
+	if jsonMode {
+		return fmt.Errorf("refusing to trust TLS cert %s in --json mode; pass --tls-fingerprint or --trust-on-first-use", fingerprint)
+	}
+	if !interactive {
+		fmt.Fprintf(os.Stderr, "Trusting server TLS cert %s\n", fingerprint)
+		return nil
+	}
+	fmt.Printf("Server TLS cert fingerprint:\n  %s\n", fingerprint)
+	fmt.Print("Trust this TLS certificate? [y/N]: ")
+	var resp string
+	_, _ = fmt.Scanln(&resp)
+	if r := strings.ToLower(strings.TrimSpace(resp)); r != "y" && r != "yes" {
+		return fmt.Errorf("aborted: server TLS cert not trusted")
+	}
+	return nil
+}
+
 func runServerAdd(cmd *cobra.Command, args []string) error {
 	host := args[0]
 
-	if verboseLevel > 0 {
-		fmt.Printf("Connecting to %s:%d...\n", host, serverAddPort)
+	// When --https-port is set, bootstrap over TLS: fetch the presented cert,
+	// confirm + pin its fingerprint, then drive /api/info + /api/ssh-host-key
+	// over the pinned connection. Otherwise the legacy plain-HTTP path runs.
+	var apiURL, tlsFingerprint string
+	var client *APIClient
+	if serverAddHTTPSPort > 0 {
+		fp, err := fetchTLSCertFingerprint(host, serverAddHTTPSPort)
+		if err != nil {
+			return err
+		}
+		if err := confirmTLSCert(fp, serverAddTLSFingerprint, serverAddTrustTOFU, isStdinTTY(), jsonFlag); err != nil {
+			return err
+		}
+		tlsFingerprint = fp
+		apiURL = fmt.Sprintf("https://%s:%d", host, serverAddHTTPSPort)
+		if verboseLevel > 0 {
+			fmt.Printf("Connecting to %s (TLS, pinned)...\n", apiURL)
+		}
+		client = newAPIClient(apiURL, "", tlsFingerprint, DefaultTimeout)
+	} else {
+		if verboseLevel > 0 {
+			fmt.Printf("Connecting to %s:%d...\n", host, serverAddPort)
+		}
+		client = NewAPIClient(host, serverAddPort, DefaultTimeout)
 	}
 
 	// Connect and get server info
-	client := NewAPIClient(host, serverAddPort, DefaultTimeout)
 	info, err := client.GetInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get server info: %w", err)
@@ -172,9 +282,11 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 
 	// Add to config
 	entry := config.ServerEntry{
-		Host:     host,
-		HTTPPort: info.HTTPPort,
-		SSHPort:  info.SSHPort,
+		Host:               host,
+		HTTPPort:           info.HTTPPort,
+		SSHPort:            info.SSHPort,
+		APIURL:             apiURL,         // empty for the plain-HTTP path
+		TLSCertFingerprint: tlsFingerprint, // empty for the plain-HTTP path
 	}
 	if err := clientConfig.AddServer(name, entry); err != nil {
 		return err
@@ -191,20 +303,28 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 			Action: "added",
 			Name:   name,
 			Details: struct {
-				Host     string `json:"host"`
-				HTTPPort int    `json:"http_port"`
-				SSHPort  int    `json:"ssh_port"`
-				Default  bool   `json:"default"`
+				Host               string `json:"host"`
+				HTTPPort           int    `json:"http_port"`
+				SSHPort            int    `json:"ssh_port"`
+				APIURL             string `json:"api_url,omitempty"`
+				TLSCertFingerprint string `json:"tls_cert_fingerprint,omitempty"`
+				Default            bool   `json:"default"`
 			}{
-				Host:     host,
-				HTTPPort: info.HTTPPort,
-				SSHPort:  info.SSHPort,
-				Default:  clientConfig.DefaultServer == name,
+				Host:               host,
+				HTTPPort:           info.HTTPPort,
+				SSHPort:            info.SSHPort,
+				APIURL:             apiURL,
+				TLSCertFingerprint: tlsFingerprint,
+				Default:            clientConfig.DefaultServer == name,
 			},
 		})
 	}
 
-	printSuccess("Added server %s (%s:%d)", name, host, info.HTTPPort)
+	if apiURL != "" {
+		printSuccess("Added server %s (%s, TLS pinned)", name, apiURL)
+	} else {
+		printSuccess("Added server %s (%s:%d)", name, host, info.HTTPPort)
+	}
 	if clientConfig.DefaultServer == name {
 		fmt.Println("  Set as default server")
 	}
@@ -326,5 +446,65 @@ func runServerSetDefault(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess("Set %s as default server", name)
+	return nil
+}
+
+// normalizeTLSFingerprint canonicalizes an operator-supplied pin to the stored
+// "sha256:<lowercase-hex>" form that servertls.Fingerprint emits, so the exact
+// string compare in the pinning transport matches.
+func normalizeTLSFingerprint(s string) string {
+	s = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(s)), "sha256:")
+	return "sha256:" + s
+}
+
+func runServerUpdate(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	entry, err := clientConfig.GetServer(name)
+	if err != nil {
+		return err
+	}
+
+	var newFingerprint string
+	switch {
+	case serverUpdateTLSFingerprint != "":
+		newFingerprint = normalizeTLSFingerprint(serverUpdateTLSFingerprint)
+	case serverUpdateRefetch:
+		if entry.APIURL == "" {
+			return fmt.Errorf("server %q has no api_url to re-fetch from; re-add it with --https-port", name)
+		}
+		u, err := url.Parse(entry.APIURL)
+		if err != nil {
+			return fmt.Errorf("invalid api_url %q: %w", entry.APIURL, err)
+		}
+		port, err := strconv.Atoi(u.Port())
+		if err != nil || port <= 0 {
+			return fmt.Errorf("api_url %q has no valid port", entry.APIURL)
+		}
+		fp, err := fetchTLSCertFingerprint(u.Hostname(), port)
+		if err != nil {
+			return err
+		}
+		if err := confirmTLSCert(fp, "", serverUpdateTrustTOFU, isStdinTTY(), jsonFlag); err != nil {
+			return err
+		}
+		newFingerprint = fp
+	default:
+		return fmt.Errorf("specify --tls-fingerprint <sha256:...> or --refetch")
+	}
+
+	entry.TLSCertFingerprint = newFingerprint
+	clientConfig.Servers[name] = *entry
+	if err := clientConfig.Save(); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	if jsonFlag {
+		return outputJSON(ActionResult{
+			Status: "ok",
+			Action: "updated",
+			Name:   name,
+		})
+	}
+	printSuccess("Updated server %s TLS pin: %s", name, newFingerprint)
 	return nil
 }
