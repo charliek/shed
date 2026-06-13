@@ -5,6 +5,15 @@ Discovery document for adding authentication and encryption to shed-server — S
 > **Status.** Discovery only — nothing here is decided or built. The current
 > trust model (network perimeter = auth boundary) remains the supported
 > deployment and the default after any of this ships.
+>
+> **Revised by the implementation plan.** After an adversarial design review,
+> the §6 transport "leaning" (HTTP-over-SSH as primary) is **superseded**: the
+> chosen primary is native pinned self-signed TLS + a bearer token, with
+> HTTP-over-SSH demoted to an optional Go-client convenience, and public-internet
+> deployment promoted from "directional only" to a first-class target. See
+> [Auth & Transport Plan](auth-transport-plan.md) for the decisions of record and
+> the buildable, cross-repo phasing. This doc will be reconciled (slimmed to
+> forward-looking rationale, or deleted) as the final plan step.
 
 ## 1. Goals and Constraints
 
