@@ -64,12 +64,42 @@ func TestValidateNetworkSurface(t *testing.T) {
 		{"negative", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: -1}, true},
 		{"collides with http_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8080}, true},
 		{"collides with ssh_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 2222}, true},
+		{"https disabled (0) ok", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 0}, false},
+		{"valid https port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443}, false},
+		{"https out of range", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 70000}, true},
+		{"https negative", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: -1}, true},
+		{"https collides with http_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8080}, true},
+		{"https collides with ssh_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 2222}, true},
+		{"https collides with internal", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8081, HTTPSPort: 8081}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.cfg.validateNetworkSurface()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateNetworkSurface() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHTTPSListenAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      ServerConfig
+		wantOn   bool
+		wantAddr string
+	}{
+		{"disabled by default", ServerConfig{HTTPPort: 8080}, false, ""},
+		{"all interfaces", ServerConfig{HTTPPort: 8080, HTTPSPort: 8443}, true, ":8443"},
+		{"bound to one interface", ServerConfig{HTTPPort: 8080, HTTPSPort: 8443, HTTPBind: "100.64.0.1"}, true, "100.64.0.1:8443"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.HTTPSEnabled(); got != tt.wantOn {
+				t.Errorf("HTTPSEnabled() = %v, want %v", got, tt.wantOn)
+			}
+			if got := tt.cfg.HTTPSListenAddr(); got != tt.wantAddr {
+				t.Errorf("HTTPSListenAddr() = %q, want %q", got, tt.wantAddr)
 			}
 		})
 	}

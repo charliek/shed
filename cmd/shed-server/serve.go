@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/sshd"
 	"github.com/charliek/shed/internal/vz"
 )
@@ -56,6 +58,22 @@ func defaultHostKeyPath() string {
 		return "/etc/shed/host_key"
 	}
 	return config.ExpandPath("~/.shed/host_key")
+}
+
+// tlsCertPaths returns the cert + key file paths for the HTTPS listener,
+// honoring tls_cert_file / tls_key_file and otherwise placing them in stateDir
+// (the directory that holds the SSH host key: /etc/shed as root, ~/.shed
+// otherwise).
+func tlsCertPaths(cfg *config.ServerConfig, stateDir string) (certPath, keyPath string) {
+	certPath = filepath.Join(stateDir, "tls_cert.pem")
+	if cfg.TLSCertFile != "" {
+		certPath = config.ExpandPath(cfg.TLSCertFile)
+	}
+	keyPath = filepath.Join(stateDir, "tls_key.pem")
+	if cfg.TLSKeyFile != "" {
+		keyPath = config.ExpandPath(cfg.TLSKeyFile)
+	}
+	return certPath, keyPath
 }
 
 var serveCmd = &cobra.Command{
@@ -138,9 +156,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
 
-	// Public HTTP listener. When the internal-listener split is enabled,
-	// apiServer.Router() omits the credential bus + Connect tunnel.
-	httpServer := newHTTPServer(cfg.HTTPListenAddr(), apiServer.Router())
+	// Public router (HTTP and, when enabled, HTTPS share one handler). When
+	// the internal-listener split is enabled, it omits the credential bus +
+	// Connect tunnel.
+	publicHandler := apiServer.Router()
+	httpServer := newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
 
 	// Optional internal (loopback) listener carrying the credential bus +
 	// Connect tunnel, kept off the public interface.
@@ -149,8 +169,25 @@ func runServe(cmd *cobra.Command, args []string) error {
 		internalServer = newHTTPServer(addr, apiServer.InternalRouter())
 	}
 
-	// Channel to collect errors from servers (HTTP, SSH, internal HTTP).
-	errChan := make(chan error, 3)
+	// Optional HTTPS listener: same public router over TLS with a self-signed,
+	// client-pinned cert. Off by default (https_port unset).
+	var httpsServer *http.Server
+	if cfg.HTTPSEnabled() {
+		certPath, keyPath := tlsCertPaths(cfg, filepath.Dir(hostKeyPath))
+		cert, der, err := servertls.LoadOrGenerate(certPath, keyPath, cfg.TLSNames)
+		if err != nil {
+			return fmt.Errorf("tls cert: %w", err)
+		}
+		log.Printf("TLS cert fingerprint: %s", servertls.Fingerprint(der))
+		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
+		httpsServer.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+
+	// Channel to collect errors from servers (HTTP, HTTPS, SSH, internal HTTP).
+	errChan := make(chan error, 4)
 
 	// Start HTTP server in goroutine
 	go func() {
@@ -166,6 +203,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 			log.Printf("Internal HTTP server (bus+connect) listening on %s", internalServer.Addr)
 			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				errChan <- fmt.Errorf("internal HTTP server error: %w", err)
+			}
+		}()
+	}
+
+	// Start HTTPS server in goroutine (when https_port set). The cert + key
+	// are already loaded into TLSConfig, so the file args are empty.
+	if httpsServer != nil {
+		go func() {
+			log.Printf("HTTPS server listening on %s", httpsServer.Addr)
+			if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("HTTPS server error: %w", err)
 			}
 		}()
 	}
@@ -207,6 +255,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Shutting down internal HTTP server...")
 		if err := internalServer.Shutdown(ctx); err != nil {
 			log.Printf("internal HTTP server shutdown error: %v", err)
+		}
+	}
+
+	// Shutdown HTTPS server (when enabled)
+	if httpsServer != nil {
+		log.Printf("Shutting down HTTPS server...")
+		if err := httpsServer.Shutdown(ctx); err != nil {
+			log.Printf("HTTPS server shutdown error: %v", err)
 		}
 	}
 

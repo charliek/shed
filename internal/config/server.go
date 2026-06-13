@@ -54,6 +54,20 @@ type ServerConfig struct {
 	// or poison audit logs.
 	TrustedProxy bool `yaml:"trusted_proxy,omitempty"`
 
+	// HTTPSPort, when >0, starts an HTTPS listener (bound to HTTPBind)
+	// serving the same public router as the plain HTTP listener, presenting
+	// a self-signed cert that clients pin by fingerprint. 0 (default) = no
+	// HTTPS; plain HTTP only (legacy, unchanged).
+	HTTPSPort int `yaml:"https_port,omitempty"`
+	// TLSNames are extra hostnames/IPs added as SANs in the generated cert
+	// so hostname verification (curl --cacert, browsers) passes for each
+	// advertised address. localhost + 127.0.0.1 + ::1 are always included.
+	TLSNames []string `yaml:"tls_names,omitempty"`
+	// TLSCertFile / TLSKeyFile override where the cert + key are persisted.
+	// Empty (default) places them next to the SSH host key.
+	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
+
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
 	Mounts map[string]MountConfig `yaml:"mounts"`
@@ -146,6 +160,18 @@ func (c *ServerConfig) validateAuth() error {
 // HTTPListenAddr returns the bind address for the public HTTP listener.
 func (c *ServerConfig) HTTPListenAddr() string { return listenAddr(c.HTTPBind, c.HTTPPort) }
 
+// HTTPSEnabled reports whether the HTTPS listener is configured.
+func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
+
+// HTTPSListenAddr returns the bind address for the HTTPS listener (sharing
+// HTTPBind with the plain listener), or "" when HTTPS is disabled.
+func (c *ServerConfig) HTTPSListenAddr() string {
+	if !c.HTTPSEnabled() {
+		return ""
+	}
+	return listenAddr(c.HTTPBind, c.HTTPSPort)
+}
+
 // SSHListenAddr returns the bind address for the SSH listener.
 func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.SSHBind, c.SSHPort) }
 
@@ -182,6 +208,12 @@ func (c *ServerConfig) validateNetworkSurface() error {
 	}
 	if c.InternalHTTPPort > 0 && (c.InternalHTTPPort == c.HTTPPort || c.InternalHTTPPort == c.SSHPort) {
 		return fmt.Errorf("internal_http_port (%d) must differ from http_port and ssh_port", c.InternalHTTPPort)
+	}
+	if c.HTTPSPort < 0 || c.HTTPSPort > 65535 {
+		return fmt.Errorf("invalid https_port: %d", c.HTTPSPort)
+	}
+	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort || c.HTTPSPort == c.InternalHTTPPort) {
+		return fmt.Errorf("https_port (%d) must differ from http_port, ssh_port, and internal_http_port", c.HTTPSPort)
 	}
 	return nil
 }
