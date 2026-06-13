@@ -46,6 +46,7 @@ type HostClient struct {
 	httpClient *http.Client
 	logger     *slog.Logger
 	token      string
+	tlsPin     string // "sha256:<hex>" pin applied in NewHostClient, or ""
 
 	mu     sync.Mutex
 	states map[string]SubStatus
@@ -85,6 +86,50 @@ func WithToken(token string) HostClientOption {
 	}
 }
 
+// WithTLSPin pins shed-server's self-signed TLS certificate by the SHA-256
+// fingerprint of its DER ("sha256:<hex>") — the trust model the HTTPS listener
+// expects (no CA). Pass it alongside an https WithServerURL.
+//
+// Composition with WithHTTPClient: order-independent. The pin is applied once,
+// after all options, onto the resolved HTTP client — its Timeout and a custom
+// *http.Transport's other settings are preserved (cloned, never mutating the
+// caller's client). If the custom client uses a non-*http.Transport
+// RoundTripper, it owns its own TLS and the pin is skipped with a warning.
+func WithTLSPin(fingerprint string) HostClientOption {
+	return func(c *HostClient) {
+		c.tlsPin = fingerprint
+	}
+}
+
+// applyTLSPin installs cert pinning on the resolved HTTP client's transport.
+// Called once after all options so it composes with WithHTTPClient regardless
+// of option order. A custom *http.Transport is cloned (its other settings kept)
+// rather than mutated; a non-*http.Transport RoundTripper owns its own TLS and
+// is left alone with a warning, so a configured pin is never silently dropped
+// without a trace.
+func (c *HostClient) applyTLSPin() {
+	if c.tlsPin == "" {
+		return
+	}
+	var base *http.Transport
+	switch t := c.httpClient.Transport.(type) {
+	case *http.Transport:
+		base = t.Clone()
+	case nil:
+		base = http.DefaultTransport.(*http.Transport).Clone()
+	default:
+		c.logger.Warn("WithTLSPin ignored: custom HTTP client uses a non-*http.Transport RoundTripper that owns its own TLS")
+		return
+	}
+	base.TLSClientConfig = pinTLSConfig(c.tlsPin)
+	c.httpClient = &http.Client{
+		Transport:     base,
+		Timeout:       c.httpClient.Timeout,
+		CheckRedirect: c.httpClient.CheckRedirect,
+		Jar:           c.httpClient.Jar,
+	}
+}
+
 // setAuth adds the bearer token header when the client is configured with one.
 func (c *HostClient) setAuth(req *http.Request) {
 	if c.token != "" {
@@ -103,6 +148,7 @@ func NewHostClient(opts ...HostClientOption) *HostClient {
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.applyTLSPin()
 	return c
 }
 
