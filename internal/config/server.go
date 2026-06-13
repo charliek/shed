@@ -68,6 +68,14 @@ type ServerConfig struct {
 	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
 	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
 
+	// PublicExposure opts the server into an internet-facing deployment. When
+	// true, the startup preflight (PreflightPublicExposure) refuses to start
+	// unless the full security bundle is present (SSH allowlist enforced, HTTP
+	// auth enforced, TLS on, credential bus on an internal listener). Unset
+	// (default) it is inert — bind behavior is exactly as today, so the
+	// tailnet/LAN fleet (incl. non-loopback binds) is unaffected.
+	PublicExposure bool `yaml:"public_exposure,omitempty"`
+
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
 	Mounts map[string]MountConfig `yaml:"mounts"`
@@ -187,6 +195,40 @@ func (c *ServerConfig) InternalHTTPListenAddr() string {
 		return ""
 	}
 	return listenAddr("127.0.0.1", c.InternalHTTPPort)
+}
+
+// PreflightPublicExposure gates an internet-facing deployment. When
+// public_exposure is set, the server must not bind unless every layer that
+// makes a public bind safe is present — the SSH key allowlist enforced, HTTP
+// bearer-token auth enforced (with at least one token), TLS on, and the
+// credential bus moved to a separate loopback internal listener. It returns a
+// descriptive error naming the FIRST missing piece. When public_exposure is
+// unset (the default) it is inert (returns nil), so the existing tailnet/LAN
+// fleet — including a non-loopback bind or a routine restart — is unaffected.
+//
+// This is a server-start check (called from runServe before anything binds),
+// not part of Validate, so config-only CLI tooling never trips it.
+func (c *ServerConfig) PreflightPublicExposure() error {
+	if !c.PublicExposure {
+		return nil
+	}
+	if ssh := c.SSHAuth(); ssh == nil || ssh.Mode != SSHAuthEnforce {
+		return errors.New("public_exposure requires auth.ssh.mode: enforce (the SSH key allowlist must reject non-allowlisted keys)")
+	}
+	h := c.HTTPAuth()
+	if h == nil || h.Mode != HTTPAuthEnforce {
+		return errors.New("public_exposure requires auth.http.mode: enforce (HTTP requests must require a bearer token)")
+	}
+	if len(h.Tokens) == 0 {
+		return errors.New("public_exposure requires at least one auth.http.tokens entry")
+	}
+	if c.HTTPSPort <= 0 {
+		return errors.New("public_exposure requires https_port (TLS must be on)")
+	}
+	if c.InternalHTTPPort <= 0 {
+		return errors.New("public_exposure requires internal_http_port (the credential bus must be on a loopback internal listener, off the public interface)")
+	}
+	return nil
 }
 
 // listenAddr joins a bind interface and port. An empty bind means all

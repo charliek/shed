@@ -90,6 +90,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
+	// Public-exposure preflight: refuse to start an internet-facing deployment
+	// without the full security bundle. Runs before anything binds; inert
+	// unless public_exposure is set.
+	if err := cfg.PreflightPublicExposure(); err != nil {
+		return fmt.Errorf("public_exposure preflight: %w", err)
+	}
+
 	log.Printf("Starting shed-server...")
 	log.Printf("HTTP listen: %s", cfg.HTTPListenAddr())
 	log.Printf("SSH listen: %s", cfg.SSHListenAddr())

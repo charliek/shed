@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestListenAddrHelpers(t *testing.T) {
 	tests := []struct {
@@ -77,6 +80,63 @@ func TestValidateNetworkSurface(t *testing.T) {
 			err := tt.cfg.validateNetworkSurface()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateNetworkSurface() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPreflightPublicExposure(t *testing.T) {
+	// A complete bundle: SSH enforce + HTTP enforce(+token) + TLS + internal bus.
+	full := func() ServerConfig {
+		return ServerConfig{
+			HTTPPort: 8080, SSHPort: 2222,
+			HTTPSPort: 8443, InternalHTTPPort: 8081,
+			PublicExposure: true,
+			Auth: &AuthConfig{
+				SSH:  &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}},
+				HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: "shed_control_x"}}},
+			},
+		}
+	}
+
+	t.Run("inert when unset, even on a non-loopback bind", func(t *testing.T) {
+		// The tailnet/LAN fleet: public_exposure unset → preflight is a no-op
+		// regardless of bind or missing auth.
+		cfg := ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPBind: "100.64.0.1"}
+		if err := cfg.PreflightPublicExposure(); err != nil {
+			t.Errorf("unset public_exposure must be inert, got %v", err)
+		}
+	})
+	t.Run("complete bundle passes", func(t *testing.T) {
+		cfg := full()
+		if err := cfg.PreflightPublicExposure(); err != nil {
+			t.Errorf("complete bundle should pass, got %v", err)
+		}
+	})
+
+	// Each missing piece is rejected, naming the gap.
+	missing := []struct {
+		name   string
+		mutate func(c *ServerConfig)
+		want   string
+	}{
+		{"no ssh enforce", func(c *ServerConfig) { c.Auth.SSH.Mode = SSHAuthWarn }, "auth.ssh.mode"},
+		{"no ssh auth at all", func(c *ServerConfig) { c.Auth.SSH = nil }, "auth.ssh.mode"},
+		{"no http enforce", func(c *ServerConfig) { c.Auth.HTTP.Mode = HTTPAuthOff }, "auth.http.mode"},
+		{"no http tokens", func(c *ServerConfig) { c.Auth.HTTP.Tokens = nil }, "auth.http.tokens"},
+		{"no tls", func(c *ServerConfig) { c.HTTPSPort = 0 }, "https_port"},
+		{"no internal bus", func(c *ServerConfig) { c.InternalHTTPPort = 0 }, "internal_http_port"},
+	}
+	for _, tt := range missing {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := full()
+			tt.mutate(&cfg)
+			err := cfg.PreflightPublicExposure()
+			if err == nil {
+				t.Fatalf("missing %q must refuse to start", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error should name %q, got %v", tt.want, err)
 			}
 		})
 	}

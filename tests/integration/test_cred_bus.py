@@ -19,7 +19,7 @@ import urllib.request
 
 import pytest
 
-from fixtures.devcontrol import dev_config
+from fixtures.devcontrol import dev_config, run_preflight
 from fixtures.server import resolve_server_entry
 
 CREDS_TOKEN = "shed_credentials_itestcb"
@@ -65,3 +65,15 @@ def test_cred_bus_forged_respond_dropped(vz_server_dev):
             "shed": {"name": "itest-shed"},
         }
         assert _post(port, "/api/plugins/listeners/itest-ns/respond", body, CREDS_TOKEN) == 403
+
+
+@pytest.mark.vz
+def test_public_exposure_preflight_refuses_incomplete_bundle():
+    """public_exposure: true with an incomplete bundle must refuse to start —
+    a non-zero exit with the gap named, and nothing bound. Uses the throwaway
+    subprocess harness (not the running dev server). The dev base config has no
+    auth/TLS/internal listener, so the bundle is incomplete."""
+    result = run_preflight({"public_exposure": True})
+    assert not result.timed_out, "an incomplete public_exposure bundle must exit, not keep running"
+    assert result.returncode != 0, f"expected a non-zero exit, got {result.returncode}"
+    assert "public_exposure" in result.stderr.lower(), f"stderr should name the preflight: {result.stderr!r}"
