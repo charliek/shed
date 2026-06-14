@@ -3,6 +3,7 @@ package plugin
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRegistryRegisterAndGet(t *testing.T) {
@@ -190,18 +191,64 @@ func TestConsumeResponseNonFinalKeepsPending(t *testing.T) {
 	}
 }
 
-func TestUnregisterSweepsPendingAcrossReconnect(t *testing.T) {
+func TestReDeliversPendingOnReconnect(t *testing.T) {
 	r := newTrackingRegistry()
 	r.Register("op")
 	id := dispatchRequest(t, r, "op", "dev")
 
-	// The listener drops; its pending requests are discarded.
+	// The listener's connection drops. Its un-answered request is RETAINED (not
+	// discarded) so a reconnecting listener can still complete the approval.
 	r.Unregister("op")
-	// A new listener reclaims the namespace (reconnect). A late response for the
-	// pre-disconnect request must not be honored by the new listener.
-	r.Register("op")
+
+	// A new listener reclaims the namespace (reconnect) and must be re-delivered
+	// the still-pending request.
+	l2, err := r.Register("op")
+	if err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	select {
+	case got := <-l2.Messages:
+		if got.ID != id {
+			t.Errorf("re-delivered request ID = %q, want %q", got.ID, id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the pending request was not re-delivered on reconnect")
+	}
+
+	// The response is now honored, idempotently: the final response is accepted
+	// once, then consumed so a replay is rejected (no duplicate approval).
+	if !r.ConsumeResponse("op", "dev", id, true) {
+		t.Error("a response to the re-delivered request must be accepted")
+	}
 	if r.ConsumeResponse("op", "dev", id, true) {
-		t.Error("a response for a request dispatched before reconnect must be rejected")
+		t.Error("the replayed response must be rejected after consumption")
+	}
+}
+
+func TestSweepsStaleAbandonedPending(t *testing.T) {
+	defer func(old time.Duration) { pendingRetention = old }(pendingRetention)
+	pendingRetention = time.Millisecond
+
+	r := newTrackingRegistry()
+	r.Register("op")
+	id := dispatchRequest(t, r, "op", "dev")
+	r.Unregister("op") // retained, but now eligible to be swept once stale
+
+	time.Sleep(20 * time.Millisecond) // exceed the shrunk retention
+
+	// Re-subscribing triggers the opportunistic sweep: the abandoned request is
+	// gone, so it is neither re-delivered nor answerable.
+	l2, err := r.Register("op")
+	if err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	select {
+	case <-l2.Messages:
+		t.Fatal("a stale (swept) request must not be re-delivered")
+	default:
+	}
+	if r.ConsumeResponse("op", "dev", id, true) {
+		t.Error("a swept (abandoned) request must not be answerable")
 	}
 }
 

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -27,6 +28,21 @@ type pendingKey struct {
 	requestID string
 }
 
+// pendingReq is an un-answered request, retained both for /respond ownership
+// validation and for re-delivery to a reconnecting listener. The full envelope
+// is kept so Register can re-send it; at bounds the leak via sweepStalePendingLocked.
+type pendingReq struct {
+	env *Envelope
+	at  time.Time
+}
+
+// pendingRetention bounds how long an un-answered request is retained (for
+// re-delivery) before it is swept as abandoned. Generous on purpose — far longer
+// than any credential request's own client-side timeout, so the sweep only
+// reclaims genuine leaks, never a still-valid slow approval. A var so tests can
+// shrink it.
+var pendingRetention = 1 * time.Hour
+
 // Registry tracks active listeners by namespace. One listener per namespace.
 type Registry struct {
 	mu        sync.RWMutex
@@ -36,8 +52,9 @@ type Registry struct {
 	// holder cannot forge a response for a request it did not receive (only the
 	// sole registered listener for a namespace is delivered the request, and
 	// hence its unguessable requestID). Entries are added on delivery, removed
-	// on the final response, and swept when the namespace's listener unregisters.
-	pending map[pendingKey]struct{}
+	// on the final response, RETAINED across a listener disconnect so a
+	// reconnecting listener gets them re-delivered, and swept once stale.
+	pending map[pendingKey]pendingReq
 	// ownershipTracking gates whether pending is populated at all. Off by
 	// default, so a server without HTTP auth does zero bookkeeping (the
 	// ownership gate is only consulted when auth is enforced); EnableOwnership-
@@ -49,7 +66,7 @@ type Registry struct {
 func NewRegistry() *Registry {
 	return &Registry{
 		listeners: make(map[string]*Listener),
-		pending:   make(map[pendingKey]struct{}),
+		pending:   make(map[pendingKey]pendingReq),
 	}
 }
 
@@ -61,9 +78,8 @@ func (r *Registry) Register(namespace string) (*Listener, error) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if _, exists := r.listeners[namespace]; exists {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("namespace %q is already registered", namespace)
 	}
 
@@ -78,12 +94,75 @@ func (r *Registry) Register(namespace string) (*Listener, error) {
 		done:      done,
 	}
 	r.listeners[namespace] = l
+
+	// A reconnecting listener inherits the namespace's still-un-answered
+	// requests, so an approval in flight when the previous connection dropped is
+	// not lost. Sweep stale entries first (bounds the retained set), then collect
+	// this namespace's pending for re-delivery after the lock is released.
+	r.sweepStalePendingLocked()
+	redeliver := r.pendingEnvelopesLocked(namespace)
+	r.mu.Unlock()
+
+	// Re-deliver outside the lock to keep a blocking channel send off the hot
+	// path. The buffer (32) absorbs credential-bus volumes; the done-guard
+	// prevents a stuck send if the listener is torn down mid-redelivery.
+	for _, env := range redeliver {
+		select {
+		case msgs <- env:
+		case <-done:
+			return l, nil
+		}
+	}
 	return l, nil
 }
 
-// Unregister removes the listener for the given namespace and discards any of
-// its still-pending requests, so a response that arrives after the listener is
-// gone (or after a different listener reclaims the namespace) is not honored.
+// pendingEnvelopesLocked returns a namespace's un-answered request envelopes,
+// oldest first (deterministic re-delivery order). The caller must hold r.mu.
+func (r *Registry) pendingEnvelopesLocked(namespace string) []*Envelope {
+	var ps []pendingReq
+	for k, p := range r.pending {
+		if k.namespace == namespace {
+			ps = append(ps, p)
+		}
+	}
+	if len(ps) == 0 {
+		return nil
+	}
+	sort.Slice(ps, func(i, j int) bool { return ps[i].at.Before(ps[j].at) })
+	envs := make([]*Envelope, len(ps))
+	for i, p := range ps {
+		envs[i] = p.env
+	}
+	return envs
+}
+
+// sweepStalePendingLocked drops pending entries older than pendingRetention
+// across all namespaces. The caller must hold r.mu. Called opportunistically on
+// every Register (any namespace), deliberately NOT from a background sweeper
+// (unlike authtoken.StartSweeper): the set only grows via Publish and is
+// reclaimed by the final response, so on a live server with listener churn —
+// each reconnect is a Register — stale entries are collected promptly without a
+// goroutine + ctx the Registry doesn't carry. The only un-swept case is a server
+// that bursts requests then goes permanently idle; that retention is bounded by
+// the last burst (not a leak), so a background sweeper isn't worth its plumbing.
+func (r *Registry) sweepStalePendingLocked() {
+	cutoff := time.Now().Add(-pendingRetention)
+	for k, p := range r.pending {
+		if p.at.Before(cutoff) {
+			delete(r.pending, k)
+		}
+	}
+}
+
+// Unregister removes the listener for the given namespace. Its still-un-answered
+// pending requests are RETAINED (not discarded) so a reconnecting listener has
+// them re-delivered on the next Register; they are bounded by
+// sweepStalePendingLocked and cleared by the final response.
+//
+// Honoring a response after the original listener is gone is safe: ConsumeResponse
+// still matches only the unguessable per-request ID, and one-listener-per-namespace
+// (the 409 on a second Register) means whoever reclaims the namespace already holds
+// its credentials token — i.e. is already authorized to answer its requests.
 func (r *Registry) Unregister(namespace string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -91,13 +170,6 @@ func (r *Registry) Unregister(namespace string) {
 	if l, exists := r.listeners[namespace]; exists {
 		close(l.done)
 		delete(r.listeners, namespace)
-	}
-	// Linear sweep is fine at credential-bus volumes (a handful of in-flight
-	// requests); revisit with a per-namespace index only if pending grows large.
-	for k := range r.pending {
-		if k.namespace == namespace {
-			delete(r.pending, k)
-		}
 	}
 }
 
@@ -170,6 +242,13 @@ func (r *Registry) EnableOwnershipTracking() {
 // caller must hold r.mu. No-op unless ownership tracking is enabled. Only
 // requests with a shed + ID are tracked (events and ID-less messages get no
 // response).
+//
+// Re-delivery on reconnect (Register) rides on this same pending set, so it
+// inherits the ownership gate: an open-mode server (no HTTP auth → no tracking)
+// does not re-deliver in-flight requests on reconnect. That durability gap is an
+// accepted MVP consequence of the deliberate "no bookkeeping without auth"
+// design, not an oversight — decoupling re-delivery from the auth gate is a
+// future revisit.
 func (r *Registry) trackPendingLocked(env *Envelope) {
 	if !r.ownershipTracking {
 		return
@@ -177,7 +256,10 @@ func (r *Registry) trackPendingLocked(env *Envelope) {
 	if env.Type != MessageTypeRequest || env.ID == "" || env.Shed == nil || env.Shed.Name == "" {
 		return
 	}
-	r.pending[pendingKey{namespace: env.Namespace, shed: env.Shed.Name, requestID: env.ID}] = struct{}{}
+	r.pending[pendingKey{namespace: env.Namespace, shed: env.Shed.Name, requestID: env.ID}] = pendingReq{
+		env: env,
+		at:  time.Now().UTC(),
+	}
 }
 
 // ConsumeResponse reports whether (namespace, shed, requestID) matches an
