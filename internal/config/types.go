@@ -714,22 +714,13 @@ type AuthConfig struct {
 	HTTP *HTTPAuthConfig `yaml:"http,omitempty"`
 }
 
-// HTTPAuthConfig configures bearer-token auth on the HTTP API.
+// HTTPAuthConfig is the advanced per-layer override for HTTP bearer-token auth.
+// The headline control is auth.mode (secure enforces HTTP auth automatically);
+// tokens are minted over the SSH bootstrap channel, never configured here.
 type HTTPAuthConfig struct {
-	// Mode is off | enforce (default off). off accepts all requests (legacy);
-	// enforce requires a valid bearer token (except the bootstrap endpoints
-	// GET /api/info and GET /api/ssh-host-key). Enforcement itself lands with
-	// the middleware in a later sub-phase; clients send tokens regardless.
+	// Mode is off | enforce (default off). enforce requires a valid bearer token
+	// (except the bootstrap endpoints GET /api/info and GET /api/ssh-host-key).
 	Mode string `yaml:"mode,omitempty"`
-	// Tokens are the accepted bearer tokens with their scopes.
-	Tokens []HTTPToken `yaml:"tokens,omitempty"`
-}
-
-// HTTPToken is an accepted bearer token and its scope.
-type HTTPToken struct {
-	Name  string `yaml:"name,omitempty"`
-	Scope string `yaml:"scope"`
-	Token string `yaml:"token"`
 }
 
 // SSHAuthConfig configures the SSH public-key allowlist. Identity comes from

@@ -96,12 +96,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Public-exposure preflight: refuse to start an internet-facing deployment
-	// without the full security bundle. Runs before anything binds; inert
-	// unless public_exposure is set.
-	if err := cfg.PreflightPublicExposure(); err != nil {
-		return fmt.Errorf("public_exposure preflight: %w", err)
-	}
+	// Secure-mode preflight: refuse to start `auth.mode: secure` without an SSH
+	// key source (an empty enforced allowlist would lock everyone out). Runs
+	// before anything binds; inert in open mode.
 	if err := cfg.PreflightSecure(); err != nil {
 		return fmt.Errorf("secure-mode preflight: %w", err)
 	}

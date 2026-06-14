@@ -68,14 +68,6 @@ type ServerConfig struct {
 	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
 	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
 
-	// PublicExposure opts the server into an internet-facing deployment. When
-	// true, the startup preflight (PreflightPublicExposure) refuses to start
-	// unless the full security bundle is present (SSH allowlist enforced, HTTP
-	// auth enforced, TLS on, credential bus on an internal listener). Unset
-	// (default) it is inert — bind behavior is exactly as today, so the
-	// tailnet/LAN fleet (incl. non-loopback binds) is unaffected.
-	PublicExposure bool `yaml:"public_exposure,omitempty"`
-
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
 	Mounts map[string]MountConfig `yaml:"mounts"`
@@ -210,32 +202,23 @@ func (c *ServerConfig) validateAuth() error {
 		default:
 			return fmt.Errorf("invalid auth.http.mode: %q (must be off or enforce)", h.Mode)
 		}
-		for i, tok := range h.Tokens {
-			if tok.Token == "" {
-				return fmt.Errorf("auth.http.tokens[%d]: token is empty", i)
-			}
-			if !ValidTokenScope(tok.Scope) {
-				return fmt.Errorf("auth.http.tokens[%d]: invalid scope %q (must be control or credentials)", i, tok.Scope)
-			}
-		}
 	}
 	return nil
 }
 
-// HTTPListenAddr returns the bind address for the plain-HTTP listener. Under
-// public_exposure it is forced to loopback so the plaintext control-plane API
-// is never reachable off-box — only the TLS (https_port) listener and the
-// loopback internal bus face the network. Otherwise it honors http_bind
-// (default all interfaces), unchanged.
+// HTTPListenAddr returns the bind address for the plain-HTTP listener. In secure
+// mode it is forced to loopback so the plaintext control-plane API is never
+// reachable off-box — only the pinned-TLS (https_port) listener faces the
+// network. Otherwise it honors http_bind (default all interfaces).
 func (c *ServerConfig) HTTPListenAddr() string {
-	if c.Secure() || c.PublicExposure {
+	if c.Secure() {
 		return listenAddr(loopbackBind, c.HTTPPort)
 	}
 	return listenAddr(c.HTTPBind, c.HTTPPort)
 }
 
 // loopbackBind is the IPv4 loopback interface used for listeners that must not
-// be reachable off-box (the internal bus, and plain HTTP under public_exposure).
+// be reachable off-box (the internal bus, and plain HTTP in secure mode).
 const loopbackBind = "127.0.0.1"
 
 // HTTPSEnabled reports whether the HTTPS listener is configured.
@@ -265,55 +248,6 @@ func (c *ServerConfig) InternalHTTPListenAddr() string {
 		return ""
 	}
 	return listenAddr(loopbackBind, c.InternalHTTPPort)
-}
-
-// minPublicTokenLen is the shortest HTTP bearer token accepted under
-// public_exposure. Generated tokens (shed_<scope>_<base64url of 24 bytes>) are
-// ~45+ chars; this floor rejects an obviously weak hand-set token while
-// admitting every generated one.
-const minPublicTokenLen = 24
-
-// PreflightPublicExposure gates an internet-facing deployment. When
-// public_exposure is set, the server must not bind unless every layer that
-// makes a public bind safe is present — the SSH key allowlist enforced, HTTP
-// bearer-token auth enforced (with at least one strong token), and TLS on. It
-// returns a descriptive error naming the FIRST missing piece. When
-// public_exposure is unset (the default) it is inert (returns nil), so the
-// existing tailnet/LAN fleet — including a non-loopback bind or a routine
-// restart — is unaffected.
-//
-// The credential bus is automatically "gated" by HTTP-enforce: the auth
-// middleware requires the credentials scope for /api/plugins/* and the Connect
-// tunnel, so a remote host-agent reaches them over TLS+credentials (the plan's
-// route matrix). Moving the bus to a loopback internal listener
-// (internal_http_port) is an optional co-located optimization, not required —
-// requiring it would break the remote-host-agent / remote `shed forward` case.
-//
-// This is a server-start check (called from runServe before anything binds),
-// not part of Validate, so config-only CLI tooling never trips it.
-func (c *ServerConfig) PreflightPublicExposure() error {
-	if !c.PublicExposure {
-		return nil
-	}
-	if ssh := c.SSHAuth(); ssh == nil || ssh.Mode != SSHAuthEnforce {
-		return errors.New("public_exposure requires auth.ssh.mode: enforce (the SSH key allowlist must reject non-allowlisted keys)")
-	}
-	h := c.HTTPAuth()
-	if h == nil || h.Mode != HTTPAuthEnforce {
-		return errors.New("public_exposure requires auth.http.mode: enforce (HTTP requests must require a bearer token; this also gates the credential bus by the credentials scope)")
-	}
-	if len(h.Tokens) == 0 {
-		return errors.New("public_exposure requires at least one auth.http.tokens entry")
-	}
-	for _, tok := range h.Tokens {
-		if len(tok.Token) < minPublicTokenLen {
-			return fmt.Errorf("public_exposure requires strong auth.http.tokens (>= %d chars; mint with `shed-server token new`)", minPublicTokenLen)
-		}
-	}
-	if c.HTTPSPort <= 0 {
-		return errors.New("public_exposure requires https_port (TLS must be on)")
-	}
-	return nil
 }
 
 // PreflightSecure gates secure-mode startup: it refuses to start when
@@ -1345,6 +1279,34 @@ func rejectRemovedImageKeys(data []byte) error {
 	return nil
 }
 
+// rejectRemovedAuthKeys fails loudly if a config still carries auth keys removed
+// in the auth-issuance-v2 redesign. yaml.Unmarshal silently ignores unknown
+// fields, so without this an upgraded operator's stale public_exposure /
+// auth.http.tokens would be accepted while the new binary ignored them — and for
+// public_exposure that silent drop would un-loopback the plaintext listener on
+// an internet-facing box. Mirrors rejectRemovedImageKeys.
+func rejectRemovedAuthKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	if _, present := raw["public_exposure"]; present {
+		return fmt.Errorf("config key %q was removed; use %q instead (see docs/upgrades/v0.7-to-v0.8.md)",
+			"public_exposure", "auth.mode: secure")
+	}
+	auth, ok := raw["auth"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if httpBlock, ok := auth["http"].(map[string]any); ok {
+		if _, present := httpBlock["tokens"]; present {
+			return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7-to-v0.8.md)",
+				"auth.http.tokens", "auth.mode: secure")
+		}
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1403,6 +1365,9 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
 	if err := rejectRemovedImageKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
+	}
+	if err := rejectRemovedAuthKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
@@ -1564,6 +1529,9 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
 	if err := rejectRemovedImageKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
+	}
+	if err := rejectRemovedAuthKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
