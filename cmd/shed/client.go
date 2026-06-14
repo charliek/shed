@@ -20,7 +20,21 @@ import (
 const (
 	// DefaultTimeout for quick API operations (list, stop, delete, etc.)
 	DefaultTimeout = 30 * time.Second
+
+	// tokenRefreshWindow is how long before expiry a bootstrap-minted control
+	// token is proactively re-minted, so a request never races the expiry.
+	tokenRefreshWindow = 2 * time.Hour
 )
+
+// needsRefresh reports whether a bootstrap-minted token (expiresAt non-zero) is
+// expired or within tokenRefreshWindow of expiry and should be re-minted. A zero
+// expiresAt — a static/legacy token or an open server — never refreshes.
+func needsRefresh(expiresAt, now time.Time) bool {
+	if expiresAt.IsZero() {
+		return false
+	}
+	return !now.Before(expiresAt.Add(-tokenRefreshWindow))
+}
 
 // APIClient provides methods for interacting with the shed server API.
 type APIClient struct {
@@ -29,6 +43,10 @@ type APIClient struct {
 	transport     http.RoundTripper // non-nil when TLS-pinned; shared by every client below
 	createTimeout time.Duration
 	token         string // bearer token (control scope), sent when non-empty
+	// refreshFn, when set, re-mints the bearer token (over the SSH bootstrap)
+	// and persists it; doRequest calls it once on a 401 and retries. nil for
+	// static tokens, open servers, and plain-HTTP clients.
+	refreshFn func() (string, error)
 }
 
 // setAuth adds the bearer token header when the client is configured with one.
@@ -82,30 +100,50 @@ func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duratio
 	return newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
 }
 
-// doRequest performs an HTTP request with JSON body and response handling.
-// It handles connection errors, status code validation, and JSON decoding.
-func (c *APIClient) doRequest(method, path string, body, result interface{}, expectedStatus ...int) error {
+// sendRequest builds and sends a single JSON request. It is the per-attempt
+// work factored out of doRequest so the 401 path can retry with a refreshed
+// token.
+func (c *APIClient) sendRequest(method, path string, body interface{}) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		bodyData, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("failed to encode request: %w", err)
+			return nil, fmt.Errorf("failed to encode request: %w", err)
 		}
 		bodyReader = bytes.NewReader(bodyData)
 	}
-
 	req, err := http.NewRequest(method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	c.setAuth(req)
+	return c.httpClient.Do(req)
+}
 
-	resp, err := c.httpClient.Do(req)
+// doRequest performs an HTTP request with JSON body and response handling. It
+// handles connection errors, status validation, and JSON decoding, and
+// transparently re-mints + retries once on a 401 (an expired bootstrap token).
+func (c *APIClient) doRequest(method, path string, body, result interface{}, expectedStatus ...int) error {
+	resp, err := c.sendRequest(method, path, body)
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	// A bootstrap-minted token can expire mid-session: on 401, re-mint once over
+	// SSH and retry the request a single time (panel decision #11).
+	if resp.StatusCode == http.StatusUnauthorized && c.refreshFn != nil {
+		_ = resp.Body.Close()
+		tok, rerr := c.refreshFn()
+		if rerr != nil {
+			return fmt.Errorf("re-authenticating after 401: %w", rerr)
+		}
+		c.token = tok
+		resp, err = c.sendRequest(method, path, body)
+		if err != nil {
+			return fmt.Errorf("failed to connect to server: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 
