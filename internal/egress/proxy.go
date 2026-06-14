@@ -171,7 +171,7 @@ func (h *ConnHandler) Handle(client net.Conn) {
 	defer upstream.Close()
 
 	if target.proto == "https" {
-		io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n")
+		_, _ = io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n")
 	} else {
 		// Strip the proxy-only headers before forwarding so the per-shed proxy
 		// token (and proxy connection-management) never leak to the upstream
@@ -208,16 +208,16 @@ func (h *ConnHandler) emit(rec AuditRecord) {
 func splice(client net.Conn, clientRd io.Reader, upstream net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(upstream, clientRd)
+		_, _ = io.Copy(upstream, clientRd)
 		if c, ok := upstream.(interface{ CloseWrite() error }); ok {
-			c.CloseWrite()
+			_ = c.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(client, upstream)
+		_, _ = io.Copy(client, upstream)
 		if c, ok := client.(interface{ CloseWrite() error }); ok {
-			c.CloseWrite()
+			_ = c.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
