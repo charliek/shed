@@ -57,10 +57,27 @@ type HostClient struct {
 	httpClient *http.Client
 	logger     *slog.Logger
 	token      string
-	tlsPin     string // "sha256:<hex>" pin applied in NewHostClient, or ""
+	// tokenProvider, when set, supplies a refreshing bearer token and takes
+	// precedence over the static token. It is consulted per request (subscribe
+	// reconnect + respond) so a re-minted token is picked up without rebuilding
+	// the client; Invalidate is called after a 401.
+	tokenProvider TokenProvider
+	tlsPin        string // "sha256:<hex>" pin applied in NewHostClient, or ""
 
 	mu     sync.Mutex
 	states map[string]SubStatus
+}
+
+// TokenProvider supplies the bearer token for the bus client and refreshes it as
+// needed. Implementations must be safe for concurrent use: the subscribe and
+// respond paths call Token from different goroutines.
+type TokenProvider interface {
+	// Token returns the current bearer token, re-minting if it has expired. An
+	// error means no token is currently available; the client sends unauthenticated.
+	Token() (string, error)
+	// Invalidate marks the current token stale so the next Token re-mints. The
+	// client calls it after a 401 — the server rejected the cached token.
+	Invalidate()
 }
 
 // HostClientOption configures a HostClient.
@@ -86,6 +103,16 @@ func WithHTTPClient(hc *http.Client) HostClientOption {
 func WithLogger(logger *slog.Logger) HostClientOption {
 	return func(c *HostClient) {
 		c.logger = logger
+	}
+}
+
+// WithTokenProvider sets a refreshing token source, used in preference to a
+// static WithToken. The host-agent passes one backed by its SSH credential
+// minter so the bus token is re-minted near expiry / on a 401 without rebuilding
+// the client.
+func WithTokenProvider(tp TokenProvider) HostClientOption {
+	return func(c *HostClient) {
+		c.tokenProvider = tp
 	}
 }
 
@@ -171,10 +198,20 @@ func (c *HostClient) applyTLSPin() {
 	}
 }
 
-// setAuth adds the bearer token header when the client is configured with one.
+// setAuth adds the bearer token header. With a tokenProvider it uses the current
+// (possibly just-refreshed) token; otherwise the static token. Both no-op when
+// empty (an open-mode, un-gated server).
 func (c *HostClient) setAuth(req *http.Request) {
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	tok := c.token
+	if c.tokenProvider != nil {
+		t, err := c.tokenProvider.Token()
+		if err != nil {
+			c.logger.Warn("token provider returned no token; sending unauthenticated", "error", err)
+		}
+		tok = t
+	}
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 }
 
@@ -312,6 +349,10 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 		if resp.StatusCode == http.StatusConflict {
 			return fmt.Errorf("%w: %s", errSubscribeConflict, strings.TrimSpace(string(body)))
 		}
+		if resp.StatusCode == http.StatusUnauthorized && c.tokenProvider != nil {
+			// Token rejected — re-mint so the backoff-reconnect authenticates fresh.
+			c.tokenProvider.Invalidate()
+		}
 		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -370,16 +411,29 @@ func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelop
 		return fmt.Errorf("marshaling response: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+	send := func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("creating request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		c.setAuth(req)
+		return c.httpClient.Do(req)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	c.setAuth(req)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := send()
 	if err != nil {
 		return fmt.Errorf("sending response: %w", err)
+	}
+	// A credentials token can expire mid-session: on 401 re-mint once via the
+	// provider and retry the response a single time (mirrors the CLI client).
+	if resp.StatusCode == http.StatusUnauthorized && c.tokenProvider != nil {
+		_ = resp.Body.Close()
+		c.tokenProvider.Invalidate()
+		resp, err = send()
+		if err != nil {
+			return fmt.Errorf("sending response: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -356,5 +357,85 @@ func TestNewHostClientOptionOverrides(t *testing.T) {
 	}
 	if client.logger != customLogger {
 		t.Error("expected custom logger")
+	}
+}
+
+// fakeTokenProvider returns tokens in sequence; Invalidate advances to the next
+// (simulating a re-mint) and counts how many times it was called.
+type fakeTokenProvider struct {
+	mu          sync.Mutex
+	tokens      []string
+	idx         int
+	invalidated int
+}
+
+func (f *fakeTokenProvider) Token() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tokens[f.idx], nil
+}
+
+func (f *fakeTokenProvider) Invalidate() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invalidated++
+	if f.idx < len(f.tokens)-1 {
+		f.idx++
+	}
+}
+
+func quietHostClient(url string, tp TokenProvider) *HostClient {
+	return NewHostClient(
+		WithServerURL(url),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		WithTokenProvider(tp),
+	)
+}
+
+func TestRespondRefreshesOn401(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.Header.Get("Authorization") == "Bearer fresh" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	tp := &fakeTokenProvider{tokens: []string{"stale", "fresh"}}
+	client := quietHostClient(srv.URL, tp)
+
+	if err := client.Respond(context.Background(), "ns", NewEnvelope("ns", MessageTypeResponse, nil)); err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+	if tp.invalidated != 1 {
+		t.Errorf("Invalidate called %d times, want 1", tp.invalidated)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("server hits = %d, want 2 (401 then 204)", got)
+	}
+}
+
+func TestRespondRetriesAtMostOnceOn401(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusUnauthorized) // always 401
+	}))
+	defer srv.Close()
+
+	tp := &fakeTokenProvider{tokens: []string{"a", "b", "c"}}
+	client := quietHostClient(srv.URL, tp)
+
+	if err := client.Respond(context.Background(), "ns", NewEnvelope("ns", MessageTypeResponse, nil)); err == nil {
+		t.Error("expected an error when the 401 persists")
+	}
+	if tp.invalidated != 1 {
+		t.Errorf("Invalidate called %d times, want exactly 1 (at-most-once retry)", tp.invalidated)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("server hits = %d, want 2 (initial + one retry)", got)
 	}
 }

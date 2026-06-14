@@ -58,10 +58,11 @@ func Bootstrap(ctx context.Context, target string, signer ssh.Signer, hostKeyPin
 		return Bundle{}, errors.New("sdk: bootstrap requires a scope")
 	}
 
+	var pinMismatch error
 	cfg := &ssh.ClientConfig{
 		User:            bootstrapUser,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: pinnedHostKey(hostKeyPin),
+		HostKeyCallback: pinnedHostKey(hostKeyPin, &pinMismatch),
 	}
 
 	// Bound the WHOLE exchange, including the dial. DialContext gates the connect
@@ -87,6 +88,9 @@ func Bootstrap(ctx context.Context, target string, signer ssh.Signer, hostKeyPin
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, target, cfg)
 	if err != nil {
 		_ = conn.Close()
+		if pinMismatch != nil {
+			return Bundle{}, pinMismatch // typed so callers can errors.Is(ErrHostKeyMismatch)
+		}
 		return Bundle{}, fmt.Errorf("sdk: bootstrap handshake: %w", err)
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
@@ -117,13 +121,23 @@ func Bootstrap(ctx context.Context, target string, signer ssh.Signer, hostKeyPin
 	return b, nil
 }
 
+// ErrHostKeyMismatch is returned (wrapped) by Bootstrap when the server's SSH
+// host key does not match the pin — a hard, fail-closed trust failure (a possible
+// MITM). Callers can errors.Is on it to refuse any fallback to a weaker
+// credential, distinguishing it from a transient/unreachable failure.
+var ErrHostKeyMismatch = errors.New("sdk: host key pin mismatch")
+
 // pinnedHostKey returns a HostKeyCallback that accepts only a host key whose
 // SHA-256 fingerprint equals pin, failing closed otherwise. The fingerprint is
-// public, so a plain compare is sufficient (no secret to leak via timing).
-func pinnedHostKey(pin string) ssh.HostKeyCallback {
+// public, so a plain compare is sufficient (no secret to leak via timing). On a
+// mismatch it records the typed error into *mismatch so Bootstrap can surface it
+// reliably even though ssh.NewClientConn does not %w-wrap the callback error.
+func pinnedHostKey(pin string, mismatch *error) ssh.HostKeyCallback {
 	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
 		if got := ssh.FingerprintSHA256(key); got != pin {
-			return fmt.Errorf("sdk: host key pin mismatch: got %s, want %s", got, pin)
+			err := fmt.Errorf("%w: got %s, want %s", ErrHostKeyMismatch, got, pin)
+			*mismatch = err
+			return err
 		}
 		return nil
 	}

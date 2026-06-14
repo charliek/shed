@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -122,10 +123,15 @@ func TestBootstrapHostKeyMismatchFailsClosed(t *testing.T) {
 	hostKey := newTestSigner(t)
 	ln := startBootstrapSSHServer(t, hostKey, `{"token":"x"}`)
 
-	// Pin a DIFFERENT key's fingerprint — the handshake must fail closed.
+	// Pin a DIFFERENT key's fingerprint — the handshake must fail closed with the
+	// typed sentinel so callers can refuse any weaker-credential fallback.
 	wrongPin := ssh.FingerprintSHA256(newTestSigner(t).PublicKey())
-	if _, err := Bootstrap(context.Background(), ln.Addr().String(), newTestSigner(t), wrongPin, "control", "cli"); err == nil {
+	_, err := Bootstrap(context.Background(), ln.Addr().String(), newTestSigner(t), wrongPin, "control", "cli")
+	if err == nil {
 		t.Fatal("expected a host key pin mismatch error")
+	}
+	if !errors.Is(err, ErrHostKeyMismatch) {
+		t.Errorf("error %v is not ErrHostKeyMismatch", err)
 	}
 }
 
