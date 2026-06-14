@@ -95,9 +95,63 @@ func newAPIClient(baseURL, token, tlsFingerprint string, createTimeout time.Dura
 }
 
 // NewAPIClientFromEntry creates an API client from a server entry, honoring its
-// api_url/TLS pin and control token.
+// api_url/TLS pin and control token. When the entry carries a bootstrap-minted
+// control token (ControlTokenExpiresAt non-zero), the client transparently
+// re-mints it over SSH — proactively before expiry and reactively on a 401 —
+// persisting it back to the config entry it came from.
 func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
-	return newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
+	c := newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
+	if entry.ControlTokenExpiresAt.IsZero() {
+		return c
+	}
+	host, sshPort := entry.Host, entry.SSHPort
+	// Resolve which config entry this is, so a refreshed token can be persisted.
+	// "" means a one-off entry not in the config — the refresh still works for
+	// this client's lifetime, it just isn't saved.
+	name := serverNameForEntry(entry)
+	c.refreshFn = func() (string, error) {
+		bundle, err := bootstrapFn(host, sshPort, "control", "cli")
+		if err != nil {
+			return "", err
+		}
+		if name != "" {
+			e := clientConfig.Servers[name]
+			e.ControlToken = bundle.Token
+			e.ControlTokenExpiresAt = bundle.ExpiresAt
+			clientConfig.Servers[name] = e
+			if err := clientConfig.Save(); err != nil {
+				return "", fmt.Errorf("saving refreshed token: %w", err)
+			}
+		}
+		return bundle.Token, nil
+	}
+	// Proactively re-mint a near-expiry token so a request never races expiry.
+	// A failure here is non-fatal: the stale token is kept and the reactive
+	// 401-retry surfaces any error on the next request.
+	if needsRefresh(entry.ControlTokenExpiresAt, time.Now()) {
+		if tok, err := c.refreshFn(); err == nil {
+			c.token = tok
+		}
+	}
+	return c
+}
+
+// serverNameForEntry returns the config name whose stored entry matches e (by
+// host + ssh port + api_url), or "" when e is a one-off entry not present in
+// the config. Used so a refreshed token can be written back to the right entry
+// without threading the name through every call site.
+//
+// ControlToken is deliberately NOT part of the key: the refresh path rewrites
+// it, so matching on it would make an entry stop matching its own config row
+// after the first re-mint. Host + ssh port + api_url already uniquely identify
+// a configured server.
+func serverNameForEntry(e *config.ServerEntry) string {
+	for n, se := range clientConfig.Servers {
+		if se.Host == e.Host && se.SSHPort == e.SSHPort && se.APIURL == e.APIURL {
+			return n
+		}
+	}
+	return ""
 }
 
 // sendRequest builds and sends a single JSON request. It is the per-attempt

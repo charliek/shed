@@ -17,6 +17,10 @@ import (
 // reservedBootstrapUser): connecting as it mints + returns an HTTP token bundle.
 const bootstrapSSHUser = "_bootstrap"
 
+// bootstrapFn is the bootstrap entry point used by the token-refresh path,
+// overridable in tests to avoid spawning a real ssh subprocess.
+var bootstrapFn = bootstrapServer
+
 // bootstrapSSHArgs builds the `ssh` argv for a bootstrap exchange: connect as
 // the reserved _bootstrap user against the already-pinned known_hosts (strict,
 // non-interactive), and run "<scope> [<clientKind>]" so the server mints and

@@ -3,8 +3,12 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/sdk"
 )
 
 func TestNeedsRefresh(t *testing.T) {
@@ -34,7 +38,6 @@ func TestDoRequest401RefreshAndRetry(t *testing.T) {
 	refreshed := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		// The stale token gets a 401; after refresh, the new token gets a 200.
 		if r.Header.Get("Authorization") == "Bearer new" {
 			_, _ = w.Write([]byte(`{"ok":true}`))
 			return
@@ -67,7 +70,7 @@ func TestDoRequest401RetryAtMostOnce(t *testing.T) {
 	var hits, refreshes int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++
-		w.WriteHeader(http.StatusUnauthorized) // always 401
+		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()
 
@@ -82,5 +85,85 @@ func TestDoRequest401RetryAtMostOnce(t *testing.T) {
 	}
 	if hits != 2 {
 		t.Errorf("want 2 requests (initial + one retry), got %d", hits)
+	}
+}
+
+func TestServerNameForEntry(t *testing.T) {
+	orig := clientConfig
+	defer func() { clientConfig = orig }()
+	clientConfig = &config.ClientConfig{Servers: map[string]config.ServerEntry{
+		"alpha": {Host: "a", SSHPort: 2222, APIURL: "https://a:8443", ControlToken: "tok-a"},
+		"beta":  {Host: "b", SSHPort: 2222, APIURL: "https://b:8443", ControlToken: "tok-b"},
+	}}
+	a := clientConfig.Servers["alpha"]
+	if got := serverNameForEntry(&a); got != "alpha" {
+		t.Errorf("serverNameForEntry = %q, want alpha", got)
+	}
+	oneOff := config.ServerEntry{Host: "z", SSHPort: 1, ControlToken: "tok-z"}
+	if got := serverNameForEntry(&oneOff); got != "" {
+		t.Errorf("a one-off entry should map to \"\", got %q", got)
+	}
+}
+
+func TestProactiveRefreshOnNearExpiry(t *testing.T) {
+	origCfg, origBF := clientConfig, bootstrapFn
+	defer func() { clientConfig, bootstrapFn = origCfg, origBF }()
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg, err := config.LoadClientConfigFromPath(cfgPath) // empty, but with its path set so Save works
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConfig = cfg
+	nearExpiry := time.Now().Add(30 * time.Minute) // inside the 2h window
+	clientConfig.Servers["s"] = config.ServerEntry{
+		Host: "h", SSHPort: 2222, APIURL: "https://h:8443",
+		ControlToken: "old", ControlTokenExpiresAt: nearExpiry,
+	}
+
+	newExpiry := time.Now().Add(24 * time.Hour)
+	bootstrapFn = func(string, int, string, string) (sdk.Bundle, error) {
+		return sdk.Bundle{Token: "fresh", ExpiresAt: newExpiry, Scope: "control"}, nil
+	}
+
+	entry := clientConfig.Servers["s"]
+	c := NewAPIClientFromEntry(&entry, DefaultTimeout)
+	if c.token != "fresh" {
+		t.Errorf("client token = %q, want fresh (proactively refreshed)", c.token)
+	}
+	if got := clientConfig.Servers["s"].ControlToken; got != "fresh" {
+		t.Errorf("in-memory token = %q, want fresh", got)
+	}
+	// And it persisted to disk.
+	reloaded, err := config.LoadClientConfigFromPath(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Servers["s"].ControlToken != "fresh" {
+		t.Error("the refreshed token was not persisted to disk")
+	}
+}
+
+func TestNoRefreshForStaticToken(t *testing.T) {
+	origCfg, origBF := clientConfig, bootstrapFn
+	defer func() { clientConfig, bootstrapFn = origCfg, origBF }()
+	called := false
+	bootstrapFn = func(string, int, string, string) (sdk.Bundle, error) {
+		called = true
+		return sdk.Bundle{Token: "x"}, nil
+	}
+	clientConfig = &config.ClientConfig{Servers: map[string]config.ServerEntry{}}
+
+	// A static/legacy token has a zero ControlTokenExpiresAt → no refresh wiring.
+	entry := config.ServerEntry{Host: "h", ControlToken: "static"}
+	c := NewAPIClientFromEntry(&entry, DefaultTimeout)
+	if called {
+		t.Error("a static token (zero expiry) must not bootstrap")
+	}
+	if c.refreshFn != nil {
+		t.Error("a static token must not get a refreshFn")
+	}
+	if c.token != "static" {
+		t.Errorf("token = %q, want static", c.token)
 	}
 }
