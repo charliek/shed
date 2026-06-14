@@ -419,6 +419,14 @@ func (b *fcCreator) SetupCredentials(ctx context.Context, req config.CreateShedR
 	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name))
 }
 
+// ConfigureEgressProxy opens this shed's egress proxy listener and injects
+// the proxy env when egress control is enabled. Placeholder pending the
+// egress manager + guest injection (returns nil ⇒ no effect when egress is
+// disabled, which is the default).
+func (b *fcCreator) ConfigureEgressProxy(_ context.Context, _ config.CreateShedRequest, _ orchestrator.MetadataHandle, _ orchestrator.VMHandle, _ *backend.Cleanup) error {
+	return nil
+}
+
 // CloneRepo runs `git clone` inside the guest when --repo is set.
 // Best-effort; mirrors VZ's hook.
 func (b *fcCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
@@ -617,6 +625,12 @@ func (b *fcStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.M
 	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
 	agent := b.c.newAgentClient(meta.Name)
 	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name))
+}
+
+// ConfigureEgressProxy re-opens this shed's egress proxy listener on start.
+// Placeholder pending the egress manager + guest injection.
+func (b *fcStarter) ConfigureEgressProxy(_ context.Context, _ orchestrator.MetadataHandle, _ orchestrator.VMHandle, _ *backend.Cleanup) error {
+	return nil
 }
 
 // RunStartupHook runs ONLY the `startup` hook from provision.yaml
