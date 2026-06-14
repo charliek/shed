@@ -42,6 +42,23 @@ builds:
       - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
       - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
 
+  - id: shed-egress-proxy
+    binary: shed-egress-proxy
+    main: ./cmd/shed-egress-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
   - id: shed-agent
     binary: shed-agent
     main: ./cmd/shed-agent
@@ -90,6 +107,7 @@ archives:
     ids:
       - shed
       - shed-server
+      - shed-egress-proxy
     formats:
       - tar.gz
     name_template: "shed-homebrew_{{ .Os }}_{{ .Arch }}"
@@ -311,6 +329,7 @@ nfpms:
     ids:
       - shed
       - shed-server
+      - shed-egress-proxy
     # v0.5.2 moved mkfs.erofs into the publisher-side
     # shed-build-tools container. Hosts no longer need erofs-utils
     # — the rootfs erofs ships as a content-addressed OCI blob.
