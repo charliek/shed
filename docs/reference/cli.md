@@ -118,6 +118,7 @@ shed create <name> [flags]
 | `--upper-size` | | Server default (`5G`) | Logical size of the per-shed writable overlay upper layer (e.g. `1G`, `5G`, `10G`, `100G`). Validated range: 1–100 GiB. The overlay grows copy-on-write, so this is the maximum, not the on-disk physical bytes. |
 | `--local-dir` | | None | Mount a local host directory into the guest at `~/<basename>`. The login lands there. Mutually exclusive with `--repo`. |
 | `--add-dir` | | None | Mount an additional local host directory at `~/<basename>` as a reference sibling. Repeatable. Requires `--local-dir`. |
+| `--egress` | | Server default | Egress-control profiles to apply (comma-separated, e.g. `base,github`; `off` to disable). Requires egress enabled on the server. See [Egress Control](egress.md). |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
@@ -212,6 +213,40 @@ shed delete <name> [flags]
 | `--force` | `-f` | `false` | Skip confirmation |
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
+
+## Egress Control
+
+Inspect and control a shed's network egress (opt-in; requires egress enabled on
+the server). See [Egress Control](egress.md) for the full model and the honest
+security posture.
+
+### shed egress show
+
+Shows a shed's active egress profiles, listener port, resolved rules, and recent
+allow/deny decisions.
+
+```bash
+shed egress show <name> [--json]
+```
+
+### shed egress set
+
+Sets a shed's egress profiles. On a running shed the change applies live (the
+policy is re-pushed and the guest env re-injected); on a stopped shed it
+persists and applies on next start. An empty selection or `off` disables egress.
+
+```bash
+shed egress set <name> --profile base,github
+shed egress set <name> --profile off
+```
+
+### shed egress off
+
+Turns egress control off for a shed.
+
+```bash
+shed egress off <name>
+```
 
 ## Snapshots
 

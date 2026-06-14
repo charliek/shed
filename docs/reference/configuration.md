@@ -276,6 +276,29 @@ server instead of drifting on upgrade.
     build the token has nothing to resolve to, so set concrete refs (or leave them
     unset and pass `--image` on each `create`).
 
+## Egress Control
+
+Opt-in, audit-first egress filtering (off unless `enabled: true`). A bad glob or
+CEL rule fails server start. See [Egress Control](egress.md) for the full model,
+the policy language, and the (important) honest security posture.
+
+```yaml
+egress:
+  enabled: true
+  port_range: "20000-30000"   # per-shed listener allocation (default)
+  default: []                 # profiles for sheds created without --egress ([] = none)
+  profiles:
+    github:   { allow: ["*.github.com", "github.com"] }
+    internal: { rule: 'host.endsWith(".corp.internal") && port == 443' }
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Master switch. When off, the proxy child is never started and sheds get no egress control. |
+| `port_range` | `20000-30000` | Per-shed listener port allocation range. |
+| `default` | `[]` | Profiles applied to sheds created without `--egress`. `[]`/absent = no egress for those sheds. |
+| `profiles` | `{}` | Named policy fragments (`allow`/`deny` globs, `mode: audit`, or a CEL `rule`). Names `off`/`none`/`default` are reserved. |
+
 ## Firecracker Configuration
 
 When enabling Firecracker, configure the Firecracker-specific settings:

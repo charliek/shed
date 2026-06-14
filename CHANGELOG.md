@@ -25,6 +25,26 @@ there is no penalty for the common no-VPN case.
 - **Requires a rebuilt rootfs image** (the guest-side change ships in the image)
   — published with this release.
 
+### Opt-in egress control (audit-first, Level 1) (#203)
+
+See and optionally control what a shed's sandbox reaches on the network, for a
+trusted team. **Off by default**; works on both backends.
+
+- A new `shed-egress-proxy` child of shed-server (shipped in brew + deb)
+  evaluates **composable named CEL profiles** (with `allow:`/`deny:` domain-glob
+  sugar) per shed. Always-on deny-CIDR guards (IMDS/private/gateway, IPv6) are
+  checked against **every** resolved address; the proxy resolves and **pins**
+  the upstream IP (DNS-rebinding/metadata defense); CEL errors **fail closed**.
+- `shed create --egress base,github`, plus `shed egress show|set|off` (live
+  re-push + re-inject on a running shed). Per-shed listener port + token
+  attribution; guest gets `HTTP(S)_PROXY` + an in-guest dockerd proxy drop-in.
+- Durable JSONL audit + a recent-decision ring (`shed egress show`) + an SSE
+  stream consumed by shed-host-agent → shed-desktop's view-only Egress feed.
+- Configure with `egress.enabled` + `egress.profiles` in the server config; an
+  invalid glob/CEL fails server start. **Honest posture:** Level 1 is
+  cooperative (`HTTP_PROXY`-based), **not** a security boundary — see
+  [Egress Control](docs/reference/egress.md) for the full bypass inventory.
+
 ## v0.7.0 — 2026-06-13
 
 Optional, default-off authentication and transport encryption so a shed server
