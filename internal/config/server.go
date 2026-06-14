@@ -1540,6 +1540,11 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
 	}
+	// Secure mode turns TLS on; default the HTTPS port here too so config-validate
+	// sees the same effective TLS surface the serve loader derives.
+	if cfg.Secure() && cfg.HTTPSPort == 0 {
+		cfg.HTTPSPort = 8443
+	}
 	if cfg.SSHPort == 0 {
 		cfg.SSHPort = 2222
 	}
