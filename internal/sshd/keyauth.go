@@ -48,7 +48,12 @@ type KeyAllowlist struct {
 	lastGitHub map[string][]byte
 
 	mu   sync.RWMutex
-	keys map[string]struct{} // set of marshaled public keys
+	keys map[string]string // marshaled public key -> SHA-256 fingerprint
+
+	// onRemove, when set, is called (outside the lock) with the fingerprints of
+	// keys that left the allowlist on a rebuild, so a caller can revoke their
+	// HTTP tokens. Set once at startup before StartRefresh; nil on the off path.
+	onRemove func(subjects []string)
 }
 
 // NewKeyAllowlist builds the allowlist from config and does the initial GitHub
@@ -60,7 +65,7 @@ type KeyAllowlist struct {
 func NewKeyAllowlist(cfg *config.SSHAuthConfig, cacheDir string) (*KeyAllowlist, error) {
 	a := &KeyAllowlist{
 		mode:       config.SSHAuthOff,
-		keys:       map[string]struct{}{},
+		keys:       map[string]string{},
 		lastGitHub: map[string][]byte{},
 	}
 	if cfg == nil || cfg.Mode == "" || cfg.Mode == config.SSHAuthOff {
@@ -96,6 +101,11 @@ func (a *KeyAllowlist) Mode() string { return a.mode }
 
 // MaxAuthTries returns the per-connection public-key attempt cap (0 = default).
 func (a *KeyAllowlist) MaxAuthTries() int { return a.maxAuthTries }
+
+// SetRevokeHook installs a callback invoked (outside the lock) with the
+// fingerprints of keys that leave the allowlist on a rebuild, so the caller can
+// revoke their HTTP tokens. Set once at startup, before StartRefresh.
+func (a *KeyAllowlist) SetRevokeHook(fn func(subjects []string)) { a.onRemove = fn }
 
 // IsAuthorized reports whether key is in the allowlist.
 func (a *KeyAllowlist) IsAuthorized(key gossh.PublicKey) bool {
@@ -137,7 +147,7 @@ func (a *KeyAllowlist) StartRefresh(ctx context.Context) {
 // rebuild re-resolves the full key set from all sources. Only a keys-file read
 // error is fatal (a config error); GitHub fetch failures fall back to cache.
 func (a *KeyAllowlist) rebuild() error {
-	set := make(map[string]struct{})
+	set := make(map[string]string)
 	addAuthorizedKeys(set, []byte(strings.Join(a.inline, "\n")))
 
 	if a.file != "" {
@@ -153,13 +163,31 @@ func (a *KeyAllowlist) rebuild() error {
 	}
 
 	a.mu.Lock()
+	old := a.keys
 	a.keys = set
 	a.mu.Unlock()
+
+	// Authoritative diff: a key in the old set but absent from the new one was
+	// genuinely removed. A failed GitHub fetch falls back to last-known-good (so
+	// the set never shrinks on a transient outage), which makes this diff safe —
+	// a transient failure produces no removals. The initial build has an empty
+	// old set, so nothing fires at startup.
+	if a.onRemove != nil {
+		var removed []string
+		for marshaled, fingerprint := range old {
+			if _, present := set[marshaled]; !present {
+				removed = append(removed, fingerprint)
+			}
+		}
+		if len(removed) > 0 {
+			a.onRemove(removed)
+		}
+	}
 	return nil
 }
 
 // addGitHubUser fetches a user's keys (failing closed to cache) and adds them.
-func (a *KeyAllowlist) addGitHubUser(set map[string]struct{}, user string) {
+func (a *KeyAllowlist) addGitHubUser(set map[string]string, user string) {
 	if !config.ValidGitHubUsername(user) {
 		log.Printf("auth.ssh: skipping invalid github username %q", user)
 		return
@@ -217,14 +245,14 @@ func (a *KeyAllowlist) writeCache(user string, data []byte) error {
 // addAuthorizedKeys parses authorized_keys-format data and adds each key's
 // marshaled form to set. Best-effort: stops at the first unparseable trailing
 // content (the enforce+empty startup check catches an all-garbage source).
-func addAuthorizedKeys(set map[string]struct{}, data []byte) {
+func addAuthorizedKeys(set map[string]string, data []byte) {
 	rest := data
 	for len(rest) > 0 {
 		key, _, _, next, err := gossh.ParseAuthorizedKey(rest)
 		if err != nil {
 			return
 		}
-		set[string(key.Marshal())] = struct{}{}
+		set[string(key.Marshal())] = gossh.FingerprintSHA256(key)
 		rest = next
 	}
 }

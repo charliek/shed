@@ -220,6 +220,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	log.Printf("SSH auth mode: %s", sshAllowlist.Mode())
 
+	// Revoke a key's HTTP tokens when it leaves the allowlist (removed from
+	// github_users or the user's GitHub keys). Authoritative diff only — a failed
+	// refetch falls back to last-known-good, so a transient outage never revokes.
+	sshAllowlist.SetRevokeHook(func(subjects []string) {
+		for _, s := range subjects {
+			if n := tokenStore.RevokeBySubject(s); n > 0 {
+				log.Printf("auth: revoked %d HTTP token(s) for removed key %s", n, s)
+			}
+		}
+	})
+
 	// Refresh GitHub-seeded keys in the background until shutdown.
 	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
 	defer cancelRefresh()
