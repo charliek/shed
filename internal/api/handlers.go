@@ -13,6 +13,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/go-chi/chi/v5"
@@ -362,6 +363,49 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, shed)
+}
+
+// handleEgressStream streams egress decisions as Server-Sent Events for the
+// host-agent subscriber (shed-extensions). GET /api/egress/stream
+func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
+	if s.egressAudit == nil {
+		writeError(w, http.StatusNotImplemented, "not_supported", "egress control is not enabled")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
+		return
+	}
+
+	events := make(chan egress.AuditRecord, 256)
+	unsub := s.egressAudit.Subscribe(func(rec egress.AuditRecord) {
+		select {
+		case events <- rec:
+		default: // drop on overflow; never block the data path
+		}
+	})
+	defer unsub()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rec := <-events:
+			data, err := json.Marshal(rec)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
 }
 
 // handleEgressOff turns egress off for a shed.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -62,6 +63,33 @@ func TestAuditLog_RingWrap(t *testing.T) {
 	got := a.Recent("web", 0)
 	if len(got) != 10 {
 		t.Errorf("ring retained %d records, want 10 (capacity)", len(got))
+	}
+}
+
+func TestAuditLog_Subscribe(t *testing.T) {
+	a, err := OpenAuditLog(filepath.Join(t.TempDir(), "a.jsonl"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	var mu sync.Mutex
+	var got []string
+	unsub := a.Subscribe(func(rec AuditRecord) {
+		mu.Lock()
+		got = append(got, rec.Host)
+		mu.Unlock()
+	})
+
+	a.Record(AuditRecord{Host: "a.com"})
+	a.Record(AuditRecord{Host: "b.com"})
+	unsub()
+	a.Record(AuditRecord{Host: "c.com"}) // after unsub — must NOT be delivered
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 || got[0] != "a.com" || got[1] != "b.com" {
+		t.Errorf("subscriber got %v, want [a.com b.com]", got)
 	}
 }
 

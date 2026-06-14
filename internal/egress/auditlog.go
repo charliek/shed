@@ -15,13 +15,15 @@ const defaultAuditRing = 1000
 // `shed egress show`. Safe for concurrent Record calls. A write error never
 // breaks the data path (audit is best-effort on disk; the ring still updates).
 type AuditLog struct {
-	mu   sync.Mutex
-	f    *os.File
-	enc  *json.Encoder
-	ring []AuditRecord
-	pos  int  // next write index into ring
-	full bool // ring has wrapped at least once
-	max  int
+	mu     sync.Mutex
+	f      *os.File
+	enc    *json.Encoder
+	ring   []AuditRecord
+	pos    int  // next write index into ring
+	full   bool // ring has wrapped at least once
+	max    int
+	subs   map[int]func(AuditRecord) // live subscribers (e.g. the SSE stream)
+	nextID int
 }
 
 // OpenAuditLog opens (creating + appending) the JSONL file and sizes the ring.
@@ -36,11 +38,11 @@ func OpenAuditLog(path string, ringSize int) (*AuditLog, error) {
 	return &AuditLog{f: f, enc: json.NewEncoder(f), ring: make([]AuditRecord, ringSize), max: ringSize}, nil
 }
 
-// Record appends one decision to the JSONL file and the in-memory ring. This is
-// the onAudit callback handed to StartManager.
+// Record appends one decision to the JSONL file and the in-memory ring, then
+// fans it out to live subscribers. This is the onAudit callback handed to
+// StartManager.
 func (a *AuditLog) Record(rec AuditRecord) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.enc != nil {
 		_ = a.enc.Encode(rec) // best-effort; never fail the data path
 	}
@@ -49,6 +51,35 @@ func (a *AuditLog) Record(rec AuditRecord) {
 	if a.pos == a.max {
 		a.pos = 0
 		a.full = true
+	}
+	// Snapshot subscribers and notify after releasing the lock, so a slow
+	// subscriber can't stall the file write or another Record.
+	var fns []func(AuditRecord)
+	for _, fn := range a.subs {
+		fns = append(fns, fn)
+	}
+	a.mu.Unlock()
+	for _, fn := range fns {
+		fn(rec)
+	}
+}
+
+// Subscribe registers fn to receive every subsequent record; the returned
+// function unsubscribes. fn must not block — the SSE handler pushes to a
+// buffered channel and drops on overflow.
+func (a *AuditLog) Subscribe(fn func(AuditRecord)) func() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.subs == nil {
+		a.subs = map[int]func(AuditRecord){}
+	}
+	id := a.nextID
+	a.nextID++
+	a.subs[id] = fn
+	return func() {
+		a.mu.Lock()
+		delete(a.subs, id)
+		a.mu.Unlock()
 	}
 }
 

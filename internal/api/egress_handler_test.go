@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
@@ -132,4 +134,58 @@ func TestHandleEgressOff(t *testing.T) {
 	if !be.cleared {
 		t.Error("ClearShedEgress was not called")
 	}
+}
+
+func TestHandleEgressStream(t *testing.T) {
+	a, err := egress.OpenAuditLog(filepath.Join(t.TempDir(), "a.jsonl"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	be := &egressFakeBackend{shed: &config.Shed{Name: "web"}}
+	srv := NewServer(be, &config.ServerConfig{Name: "t", Egress: &config.EgressConfig{Enabled: true}}, "", nil, nil)
+	srv.SetEgressAudit(a)
+
+	ts := httptest.NewServer(srv.Router())
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/egress/stream", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	// Record repeatedly so the read can't lose a race with subscription setup.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				a.Record(egress.AuditRecord{Shed: "web", Host: "evil.com", Verdict: "deny"})
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	}()
+
+	br := bufio.NewReader(resp.Body)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading SSE stream: %v", err)
+		}
+		if strings.HasPrefix(line, "data: ") && strings.Contains(line, "evil.com") {
+			return // got the streamed decision
+		}
+	}
+	t.Fatal("did not receive an egress decision over the SSE stream")
 }

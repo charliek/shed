@@ -129,11 +129,16 @@ func (s *Server) buildRouter(includePublic, includeBus bool) chi.Router {
 				})
 			})
 
-			// Egress control: per-shed status + live set/off.
+			// Egress control: the audit SSE stream (literal), plus per-shed
+			// status + live set/off. The /{name} routes are wrapped so the
+			// literal /stream sibling isn't shadowed at the chi trie level.
 			r.Route("/egress", func(r chi.Router) {
-				r.Get("/{name}", s.handleEgressShow)
-				r.Post("/{name}", s.handleEgressSet)
-				r.Delete("/{name}", s.handleEgressOff)
+				r.Get("/stream", s.handleEgressStream)
+				r.Route("/{name}", func(r chi.Router) {
+					r.Get("/", s.handleEgressShow)
+					r.Post("/", s.handleEgressSet)
+					r.Delete("/", s.handleEgressOff)
+				})
 			})
 		}
 
