@@ -26,6 +26,10 @@ func ValidTokenScope(s string) bool {
 }
 
 // GenerateToken mints a token of the given scope: shed_<scope>_<random>.
+//
+// Superseded by internal/authtoken (the live token store) in the
+// auth-issuance-v2 migration: this config-side minter has no production caller
+// and is removed in sub-step 1d together with the static auth.http.tokens path.
 func GenerateToken(scope string) (string, error) {
 	if !ValidTokenScope(scope) {
 		return "", fmt.Errorf("invalid token scope: %q (must be control or credentials)", scope)

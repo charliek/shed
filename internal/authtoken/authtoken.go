@@ -170,22 +170,28 @@ func (s *Store) Validate(plaintext string) (PublicRecord, bool) {
 	return rec.public(), true
 }
 
+// deleteWhere removes every record matching pred and returns the count removed.
+// It holds the write lock for the scan.
+func (s *Store) deleteWhere(pred func(*record) bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for hash, rec := range s.byHash {
+		if pred(rec) {
+			delete(s.byHash, hash)
+			n++
+		}
+	}
+	return n
+}
+
 // RevokeBySubject deletes every token minted for the given subject and returns
 // the number removed. Called when a key leaves the allowlist.
 func (s *Store) RevokeBySubject(subject string) int {
 	if subject == "" {
 		return 0
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	n := 0
-	for hash, rec := range s.byHash {
-		if rec.subject == subject {
-			delete(s.byHash, hash)
-			n++
-		}
-	}
-	return n
+	return s.deleteWhere(func(r *record) bool { return r.subject == subject })
 }
 
 // RevokeByID deletes the token with the given non-secret id and reports whether
@@ -226,16 +232,7 @@ func (s *Store) List() []PublicRecord {
 // Sweep deletes expired records and returns the number removed.
 func (s *Store) Sweep() int {
 	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	n := 0
-	for hash, rec := range s.byHash {
-		if !now.Before(rec.expiresAt) {
-			delete(s.byHash, hash)
-			n++
-		}
-	}
-	return n
+	return s.deleteWhere(func(r *record) bool { return !now.Before(r.expiresAt) })
 }
 
 // Len returns the number of records currently held, including expired records
