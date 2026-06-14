@@ -219,6 +219,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
+	apiServer.SetEgressAudit(egressAudit) // nil-safe: no-op when egress disabled
 
 	// Public router (HTTP and, when enabled, HTTPS share one handler). When
 	// the internal-listener split is enabled, it omits the credential bus +

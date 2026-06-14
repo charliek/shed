@@ -39,6 +39,17 @@ type EgressProfile struct {
 	Rule  string   `yaml:"rule,omitempty"`
 }
 
+// EgressStatus is the `shed egress show` response: a shed's active egress
+// assignment, the resolved definitions of its profiles, and recent decisions.
+type EgressStatus struct {
+	Shed     string                   `json:"shed"`
+	Enabled  bool                     `json:"enabled"`            // server-level egress master switch
+	Profiles []string                 `json:"profiles,omitempty"` // effective profiles for this shed
+	Port     int                      `json:"port,omitempty"`     // assigned listener port
+	Rules    map[string]EgressProfile `json:"rules,omitempty"`    // definitions of the active profiles
+	Recent   []egress.AuditRecord     `json:"recent,omitempty"`   // recent egress decisions for this shed
+}
+
 var egressReservedNames = map[string]bool{"off": true, "none": true, "default": true}
 
 func (p EgressProfile) spec() egress.ProfileSpec {

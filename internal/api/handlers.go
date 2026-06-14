@@ -296,6 +296,43 @@ func (s *Server) handleGetShed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, shed)
 }
 
+// handleEgressShow returns a shed's egress status: effective profiles, assigned
+// listener port, the resolved profile definitions, and recent decisions.
+// GET /api/egress/{name}
+func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	shed, err := s.backend.GetShed(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	status := config.EgressStatus{
+		Shed:     name,
+		Enabled:  s.cfg.Egress != nil && s.cfg.Egress.Enabled,
+		Profiles: shed.EgressProfiles,
+		Port:     shed.EgressPort,
+	}
+	// A shed created with the server default has no explicit profiles but does
+	// have a listener — show the effective default selection.
+	if len(status.Profiles) == 0 && shed.EgressPort != 0 && s.cfg.Egress != nil {
+		status.Profiles = s.cfg.Egress.Default
+	}
+	if s.cfg.Egress != nil {
+		status.Rules = map[string]config.EgressProfile{}
+		for _, p := range status.Profiles {
+			if def, ok := s.cfg.Egress.Profiles[p]; ok {
+				status.Rules[p] = def
+			}
+		}
+	}
+	if s.egressAudit != nil {
+		status.Recent = s.egressAudit.Recent(name, 50)
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
 // handleDeleteShed deletes a shed.
 // DELETE /api/sheds/{name}?keep_volume=bool
 func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {

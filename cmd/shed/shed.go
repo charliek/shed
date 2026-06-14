@@ -76,6 +76,7 @@ var (
 	createMemory       int
 	createLocalDir     string
 	createAddDirs      []string
+	createEgress       []string
 	createFromSnapshot string
 	createUpperSize    string
 	startTimeout       time.Duration
@@ -96,6 +97,7 @@ func init() {
 	createCmd.Flags().IntVar(&createMemory, "memory", 0, "Memory in MB (firecracker/vz only)")
 	createCmd.Flags().StringVar(&createLocalDir, "local-dir", "", "Mount a host directory under the home directory (at ~/<name>) and land there; mutually exclusive with --repo")
 	createCmd.Flags().StringArrayVar(&createAddDirs, "add-dir", nil, "Mount an additional host directory under the home directory (repeatable; requires --local-dir)")
+	createCmd.Flags().StringSliceVar(&createEgress, "egress", nil, "Egress profiles to apply (comma-separated, e.g. base,github; 'off' to disable; default: server default)")
 	createCmd.Flags().StringVar(&createFromSnapshot, "from-snapshot", "", "Spawn from a snapshot's rootfs (mutually exclusive with --image and --repo)")
 	createCmd.Flags().StringVar(&createUpperSize, "upper-size", "", "Logical size of the per-shed writable upper layer (e.g. 5G, 20G; default: server config)")
 
@@ -242,6 +244,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		MemoryMB:       createMemory,
 		LocalDir:       createLocalDir,
 		AddDirs:        createAddDirs,
+		Egress:         createEgress,
 		FromSnapshot:   createFromSnapshot,
 		UpperSizeBytes: upperSizeBytes,
 	}
