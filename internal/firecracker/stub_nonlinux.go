@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 )
 
@@ -32,6 +33,9 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, _ 
 func (c *Client) Close() error {
 	return nil
 }
+
+// SetEgressManager is a no-op for the stub client.
+func (c *Client) SetEgressManager(_ *egress.Manager) {}
 
 // FirecrackerBackend is a stub for non-linux builds.
 type FirecrackerBackend struct{}

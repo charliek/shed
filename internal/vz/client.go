@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/retry"
@@ -54,7 +55,15 @@ type Client struct {
 	snapshotLocks lockmap.NamedMutexMap
 
 	credMgr *vmutil.CredentialManager
+
+	// egressMgr drives the optional egress-control proxy. nil ⇒ egress
+	// disabled, in which case the ConfigureEgressProxy hook is a no-op.
+	egressMgr *egress.Manager
 }
+
+// SetEgressManager attaches the egress-control proxy manager, called by
+// shed-server at startup when egress is enabled. nil leaves egress off.
+func (c *Client) SetEgressManager(m *egress.Manager) { c.egressMgr = m }
 
 // NewClient creates a new VZ client.
 func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
