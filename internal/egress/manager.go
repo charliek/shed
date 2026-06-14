@@ -23,10 +23,10 @@ type Manager struct {
 	socket string
 
 	portLo, portHi int
-	used           map[int]bool   // set of allocated ports
+	used           map[int]string // port -> owning shed (ownership, not just membership)
 	sheds          map[string]int // shed -> port (so Remove need not be told the port)
 
-	tokenGen func() string // injectable for deterministic tests
+	tokenGen func() (string, error) // injectable for deterministic tests
 }
 
 // StartManager spawns the shed-egress-proxy child, waits for its control
@@ -63,7 +63,7 @@ func newManager(client *Client, proc *exec.Cmd, socket string, portLo, portHi in
 		socket:   socket,
 		portLo:   portLo,
 		portHi:   portHi,
-		used:     map[int]bool{},
+		used:     map[int]string{},
 		sheds:    map[string]int{},
 		tokenGen: randToken,
 	}
@@ -84,32 +84,55 @@ func (m *Manager) Configure(shed string, port int, token, gateway string, specs 
 			return 0, "", err
 		}
 		port = p
+	} else if owner, taken := m.used[port]; taken && owner != shed {
+		// Reusing a persisted port that another shed already owns (e.g.
+		// hand-edited metadata) would corrupt allocation — reject it.
+		m.mu.Unlock()
+		return 0, "", fmt.Errorf("egress: port %d already reserved by shed %q", port, owner)
 	} else {
-		m.used[port] = true
+		m.used[port] = shed
 		m.sheds[shed] = port
 	}
 	if token == "" {
-		token = m.tokenGen()
+		t, err := m.tokenGen()
+		if err != nil {
+			m.releaseLocked(shed, port)
+			m.mu.Unlock()
+			return 0, "", fmt.Errorf("egress: mint token for %s: %w", shed, err)
+		}
+		token = t
 	}
 	m.mu.Unlock()
 
 	if err := m.client.Configure(shed, port, token, gateway, specs); err != nil {
 		m.mu.Lock()
-		// Release only the reservation we just made for this shed.
-		if m.sheds[shed] == port {
-			delete(m.used, port)
-			delete(m.sheds, shed)
-		}
+		m.releaseLocked(shed, port)
 		m.mu.Unlock()
 		return 0, "", err
 	}
 	return port, token, nil
 }
 
-// Remove closes a shed's listener and frees its port. Idempotent; the proxy's
-// Remove is a no-op for an unknown shed, so this is safe even if the Manager
-// has no record (e.g. a delete arriving before a post-restart re-push).
+// releaseLocked frees a port reservation iff this shed actually owns it (so a
+// failed reuse never frees another shed's live reservation). Caller holds m.mu.
+func (m *Manager) releaseLocked(shed string, port int) {
+	if m.used[port] == shed {
+		delete(m.used, port)
+		delete(m.sheds, shed)
+	}
+}
+
+// Remove closes a shed's listener but KEEPS its per-shed port reserved, so a
+// stopped shed reopens on the same port at restart and no other shed can be
+// allocated that port in the meantime. Idempotent. Used on shed STOP.
 func (m *Manager) Remove(shed string) error {
+	return m.client.Remove(shed)
+}
+
+// Release closes a shed's listener AND frees its port reservation. Idempotent
+// (the proxy's Remove is a no-op for an unknown shed). Used on shed DELETE and
+// on `egress off` — the shed no longer needs the port.
+func (m *Manager) Release(shed string) error {
 	m.mu.Lock()
 	if port, ok := m.sheds[shed]; ok {
 		delete(m.used, port)
@@ -121,8 +144,8 @@ func (m *Manager) Remove(shed string) error {
 
 func (m *Manager) allocPortLocked(shed string) (int, error) {
 	for p := m.portLo; p <= m.portHi; p++ {
-		if !m.used[p] {
-			m.used[p] = true
+		if _, taken := m.used[p]; !taken {
+			m.used[p] = shed
 			m.sheds[shed] = p
 			return p, nil
 		}
@@ -165,12 +188,13 @@ func dialControlRetry(path string, onAudit func(AuditRecord), timeout time.Durat
 	}
 }
 
-func randToken() string {
+func randToken() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		// crypto/rand should never fail; fall back to a time-seeded value so we
-		// never hand out an empty (auth-disabling) token.
-		return fmt.Sprintf("t%d", time.Now().UnixNano())
+		// Fail closed: a guessable (e.g. time-seeded) token would weaken the
+		// only thing binding the listener port to this shed. crypto/rand
+		// failing is near-impossible, so aborting the configure is acceptable.
+		return "", err
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }

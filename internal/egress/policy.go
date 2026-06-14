@@ -190,16 +190,32 @@ func CanonicalizeHost(host string) (string, error) {
 	return ascii, nil
 }
 
-// globMatch reports whether a canonicalized host matches a domain glob.
-// "*.example.com" matches any subdomain of example.com (not example.com itself);
-// "example.com" matches exactly. The glob's literal part is canonicalized too.
+// globMatch reports whether a canonicalized host matches a (compile-time
+// canonicalized — see canonicalizeGlob) domain glob. "*.example.com" matches
+// any subdomain of example.com (not example.com itself); "example.com" matches
+// exactly.
 func globMatch(host, glob string) bool {
-	glob = strings.ToLower(strings.TrimSpace(glob))
 	if strings.HasPrefix(glob, "*.") {
 		suffix := glob[1:] // ".example.com"
 		return strings.HasSuffix(host, suffix)
 	}
 	return host == glob
+}
+
+// canonicalizeGlob IDNA-canonicalizes a domain glob's literal part so a unicode
+// rule (e.g. "*.☃.com") matches the punycode-canonicalized host (xn--n3h.com).
+// Best-effort: an un-encodable literal is only lowercased/trimmed, so it simply
+// won't match — fail-safe (over-deny, never over-allow).
+func canonicalizeGlob(glob string) string {
+	g := strings.ToLower(strings.TrimSpace(glob))
+	prefix := ""
+	if strings.HasPrefix(g, "*.") {
+		prefix, g = "*.", g[2:]
+	}
+	if ascii, err := idna.Lookup.ToASCII(g); err == nil {
+		g = ascii
+	}
+	return prefix + g
 }
 
 // CompilePolicy composes an ordered list of profile specs into a Policy. Order
@@ -221,14 +237,14 @@ func CompilePolicy(specs []ProfileSpec, gatewayIP string) (*Policy, error) {
 			p.mode = ModeAudit
 		}
 		for _, g := range spec.Deny {
-			g := g
+			g := canonicalizeGlob(g)
 			p.rules = append(p.rules, rule{
 				verdict: VerdictDeny, reason: "deny:" + g,
 				match: func(c ConnContext) (bool, error) { return globMatch(c.Host, g), nil },
 			})
 		}
 		for _, g := range spec.Allow {
-			g := g
+			g := canonicalizeGlob(g)
 			p.rules = append(p.rules, rule{
 				verdict: VerdictAllow, reason: "allow:" + g,
 				match: func(c ConnContext) (bool, error) { return globMatch(c.Host, g), nil },

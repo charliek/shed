@@ -158,7 +158,10 @@ type Shed struct {
 	// guest's injected HTTP_PROXY is baked into the persistent upper.
 	EgressProfiles []string `json:"egress_profiles,omitempty" yaml:"egress_profiles,omitempty"`
 	EgressPort     int      `json:"egress_port,omitempty" yaml:"egress_port,omitempty"`
-	EgressToken    string   `json:"egress_token,omitempty" yaml:"egress_token,omitempty"` // per-shed proxy-auth token binding the port to this shed
+	// EgressToken is the per-shed proxy-auth token binding the port to this
+	// shed. It is a secret: never serialized to API/CLI responses (json:"-").
+	// It lives durably in the per-backend on-disk metadata, not here.
+	EgressToken string `json:"-" yaml:"-"`
 }
 
 // ExtensionHealthInfo is the API-facing extension health for a shed.

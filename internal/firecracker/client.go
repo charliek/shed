@@ -454,7 +454,7 @@ func (c *Client) clearShedEgressLocked(ctx context.Context, meta *Metadata) (*co
 		agent := c.newAgentClient(meta.Name)
 		_ = vmutil.ClearEgressLive(ctx, c.egressMgr, agent, meta.Name)
 	} else {
-		_ = c.egressMgr.Remove(meta.Name) // free any in-memory port reservation
+		_ = c.egressMgr.Release(meta.Name) // egress off → free the port reservation
 	}
 	meta.EgressProfiles = nil
 	meta.EgressPort = 0
@@ -652,6 +652,13 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 	}
 
 	c.UnregisterInstance(name, meta.CID, meta.IPAddress)
+
+	// Free this shed's egress port reservation. Stop only closes the listener
+	// and keeps the port reserved (for restart); delete frees it. No-op when
+	// egress is disabled or this shed had none.
+	if c.egressMgr != nil {
+		_ = c.egressMgr.Release(name)
+	}
 
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)

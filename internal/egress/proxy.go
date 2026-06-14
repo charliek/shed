@@ -173,12 +173,16 @@ func (h *ConnHandler) Handle(client net.Conn) {
 	if target.proto == "https" {
 		io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n")
 	} else {
-		// Forward the already-read plain-HTTP request to the pinned upstream.
+		// Strip the proxy-only headers before forwarding so the per-shed proxy
+		// token (and proxy connection-management) never leak to the upstream
+		// HTTP server. (CONNECT/https is unaffected — it splices raw bytes.)
+		target.req.Header.Del("Proxy-Authorization")
+		target.req.Header.Del("Proxy-Connection")
 		if err := target.req.Write(upstream); err != nil {
 			return
 		}
 	}
-	splice(client, upstream)
+	splice(client, br, upstream)
 }
 
 func (h *ConnHandler) dial(ctx context.Context, addr string) (net.Conn, error) {
@@ -196,18 +200,27 @@ func (h *ConnHandler) emit(rec AuditRecord) {
 	}
 }
 
-// splice copies bytes both directions until either side closes.
-func splice(a, b net.Conn) {
+// splice copies bytes both directions until either side closes. The client read
+// side comes from clientRd (a bufio.Reader over client) so any bytes already
+// buffered past the proxied request — a POST body, a pipelined request, or a TLS
+// ClientHello from a client that didn't wait for the CONNECT 200 — are not
+// stranded.
+func splice(client net.Conn, clientRd io.Reader, upstream net.Conn) {
 	done := make(chan struct{}, 2)
-	cp := func(dst, src net.Conn) {
-		io.Copy(dst, src)
-		if c, ok := dst.(interface{ CloseWrite() error }); ok {
+	go func() {
+		io.Copy(upstream, clientRd)
+		if c, ok := upstream.(interface{ CloseWrite() error }); ok {
 			c.CloseWrite()
 		}
 		done <- struct{}{}
-	}
-	go cp(a, b)
-	go cp(b, a)
+	}()
+	go func() {
+		io.Copy(client, upstream)
+		if c, ok := client.(interface{ CloseWrite() error }); ok {
+			c.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
 	<-done
 	<-done
 }

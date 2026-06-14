@@ -65,7 +65,11 @@ func main() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				return // listener closed on shutdown
+				// Expected on shutdown (ln.Close); logged so an unexpected
+				// error (e.g. fd exhaustion) that stops accepting control
+				// connections is visible rather than silent.
+				log.Printf("control accept loop exiting: %v", err)
+				return
 			}
 			go func(c net.Conn) {
 				if err := ps.Serve(c); err != nil {

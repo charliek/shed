@@ -667,8 +667,18 @@ func (b *vzStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrat
 	}
 	agent := b.c.newAgentClient(meta.Name)
 	gateway, subnet := b.c.egressGatewaySubnet()
-	if _, _, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup); err != nil {
+	port, token, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
+	if err != nil {
 		return fmt.Errorf("egress: %w", err)
+	}
+	// Persist a port/token freshly allocated on start (e.g. after `egress set`
+	// on a stopped shed left EgressPort=0) so it stays stable across restarts.
+	if port != meta.EgressPort || token != meta.EgressToken {
+		meta.EgressPort = port
+		meta.EgressToken = token
+		if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
+			return fmt.Errorf("egress: save metadata: %w", err)
+		}
 	}
 	return nil
 }

@@ -74,7 +74,7 @@ func TestManager_ConfigureReusesProvidedPortAndToken(t *testing.T) {
 	}
 }
 
-func TestManager_RemoveFreesPort(t *testing.T) {
+func TestManager_ReleaseFreesPort(t *testing.T) {
 	lo := freePort(t)
 	m := managerWithProxy(t, lo, lo)
 
@@ -82,22 +82,76 @@ func TestManager_RemoveFreesPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	if err := m.Remove("web"); err != nil {
-		t.Fatalf("Remove: %v", err)
+	if err := m.Release("web"); err != nil {
+		t.Fatalf("Release: %v", err)
 	}
 	m.mu.Lock()
 	_, stillTracked := m.sheds["web"]
 	m.mu.Unlock()
 	if stillTracked {
-		t.Error("shed still tracked after Remove")
+		t.Error("shed still tracked after Release")
 	}
-	// A second Configure (range is the single freed port) must reuse it.
+	// Release freed the port; a second Configure (single-port range) reuses it.
 	port2, _, err := m.Configure("web2", 0, "", "", []ProfileSpec{{}})
 	if err != nil {
-		t.Fatalf("re-Configure after Remove: %v", err)
+		t.Fatalf("re-Configure after Release: %v", err)
 	}
 	if port2 != port {
 		t.Errorf("re-allocated port = %d, want freed %d", port2, port)
+	}
+}
+
+func TestManager_RemoveKeepsPort(t *testing.T) {
+	lo := freePort(t)
+	m := managerWithProxy(t, lo, lo+1) // two-port range
+
+	port, _, err := m.Configure("web", 0, "", "", []ProfileSpec{{}})
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	// Stop: Remove closes the listener but keeps the port reserved.
+	if err := m.Remove("web"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	m.mu.Lock()
+	_, stillReserved := m.sheds["web"]
+	m.mu.Unlock()
+	if !stillReserved {
+		t.Error("Remove (stop) should KEEP the port reserved for restart")
+	}
+	// Another shed must NOT be allocated web's reserved port while web is stopped.
+	port2, _, err := m.Configure("web2", 0, "", "", []ProfileSpec{{}})
+	if err != nil {
+		t.Fatalf("Configure web2: %v", err)
+	}
+	if port2 == port {
+		t.Errorf("web2 got web's reserved port %d while web is only stopped", port)
+	}
+	// web restarts on the SAME reserved port.
+	port3, _, err := m.Configure("web", port, "", "", []ProfileSpec{{}})
+	if err != nil {
+		t.Fatalf("restart Configure web: %v", err)
+	}
+	if port3 != port {
+		t.Errorf("web restarted on port %d, want its reserved %d", port3, port)
+	}
+}
+
+func TestManager_RejectsPortOwnedByAnother(t *testing.T) {
+	m := managerWithProxy(t, 1, 65535)
+	p := freePort(t)
+	if _, _, err := m.Configure("a", p, "", "", []ProfileSpec{{}}); err != nil {
+		t.Fatalf("Configure a: %v", err)
+	}
+	// b claims a's port (e.g. hand-edited metadata) → rejected, not corrupting.
+	if _, _, err := m.Configure("b", p, "", "", []ProfileSpec{{}}); err == nil {
+		t.Error("expected Configure to reject a port owned by another shed")
+	}
+	m.mu.Lock()
+	owner := m.used[p]
+	m.mu.Unlock()
+	if owner != "a" {
+		t.Errorf("port %d owner = %q, want a (a's reservation must survive the rejected reuse)", p, owner)
 	}
 }
 

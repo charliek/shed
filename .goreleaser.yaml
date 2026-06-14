@@ -135,6 +135,7 @@ brews:
     install: |
       bin.install "shed"
       bin.install "shed-server"
+      bin.install "shed-egress-proxy"
       (etc/"shed").mkpath
       unless (etc/"shed/server.yaml").exist?
         if OS.mac?

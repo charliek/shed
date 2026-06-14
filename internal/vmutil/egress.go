@@ -121,10 +121,10 @@ func ApplyEgressLive(ctx context.Context, mgr *egress.Manager, agent *AgentClien
 	return port, token, nil
 }
 
-// ClearEgressLive removes a running shed's listener and its injected guest files
-// — the live `shed egress off` path.
+// ClearEgressLive removes a running shed's listener + its injected guest files
+// and frees the per-shed port — the live `shed egress off` path.
 func ClearEgressLive(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string) error {
-	_ = mgr.Remove(name)
+	_ = mgr.Release(name)
 	return RemoveEgressProxy(ctx, agent)
 }
 

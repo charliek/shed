@@ -72,20 +72,30 @@ func (s *ProxyServer) Configure(msg ControlMsg) error {
 	if err != nil {
 		return fmt.Errorf("egress configure %s: %w", msg.Shed, err)
 	}
-	bind := net.JoinHostPort(bindHost(msg.Gateway), strconv.Itoa(msg.Port))
-	ln, err := net.Listen("tcp", bind)
-	if err != nil {
-		return fmt.Errorf("egress configure %s: listen %s: %w", msg.Shed, bind, err)
-	}
 	resolve := s.Resolve
 	if resolve == nil {
 		resolve = defaultResolver
 	}
 	h := &ConnHandler{Shed: msg.Shed, Token: msg.Token, Policy: pol, Resolve: resolve, Dial: s.Dial, Audit: s.audit}
+
+	// Close any existing listener for this shed BEFORE binding, so a live
+	// re-Configure (e.g. `egress set` changing profiles) that reuses the same
+	// persisted port does not fail with "address already in use". Configure
+	// calls are serialized by the control decode loop, so there is no
+	// concurrent Configure for the same shed racing this close→listen.
 	s.mu.Lock()
 	if old := s.listeners[msg.Shed]; old != nil {
 		old.Close()
+		delete(s.listeners, msg.Shed)
 	}
+	s.mu.Unlock()
+
+	bind := net.JoinHostPort(bindHost(msg.Gateway), strconv.Itoa(msg.Port))
+	ln, err := net.Listen("tcp", bind)
+	if err != nil {
+		return fmt.Errorf("egress configure %s: listen %s: %w", msg.Shed, bind, err)
+	}
+	s.mu.Lock()
 	s.listeners[msg.Shed] = ln
 	s.mu.Unlock()
 	go s.acceptLoop(ln, h)
