@@ -43,6 +43,10 @@ const (
 	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
 	// from the in-memory store (expired tokens are also dropped on validate).
 	tokenSweepInterval = 10 * time.Minute
+
+	// defaultTokenTTL is the lifetime of a bootstrap-minted HTTP token until
+	// auth.token_ttl is wired in (sub-step 1d).
+	defaultTokenTTL = 24 * time.Hour
 )
 
 // newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
@@ -253,19 +257,31 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Optional HTTPS listener: same public router over TLS with a self-signed,
 	// client-pinned cert. Off by default (https_port unset).
 	var httpsServer *http.Server
+	var tlsFingerprint string
 	if cfg.HTTPSEnabled() {
 		certPath, keyPath := tlsCertPaths(cfg, filepath.Dir(hostKeyPath))
 		cert, der, err := servertls.LoadOrGenerate(certPath, keyPath, cfg.TLSNames)
 		if err != nil {
 			return fmt.Errorf("tls cert: %w", err)
 		}
-		log.Printf("TLS cert fingerprint: %s", servertls.Fingerprint(der))
+		tlsFingerprint = servertls.Fingerprint(der)
+		log.Printf("TLS cert fingerprint: %s", tlsFingerprint)
 		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
 		httpsServer.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
 	}
+
+	// Wire the SSH bootstrap handler: it mints HTTP tokens into the shared
+	// store and returns them (with the TLS pin + ports) over the authenticated
+	// SSH channel, so `shed server add` needs no manual token/pin step.
+	sshServer.SetBootstrap(tokenStore, sshd.BootstrapInfo{
+		HTTPPort:       cfg.HTTPPort,
+		HTTPSPort:      cfg.HTTPSPort,
+		TLSFingerprint: tlsFingerprint,
+		TokenTTL:       defaultTokenTTL,
+	})
 
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH, internal HTTP).
 	errChan := make(chan error, 4)

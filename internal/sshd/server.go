@@ -17,6 +17,7 @@ import (
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/terminal"
@@ -32,6 +33,8 @@ type Server struct {
 	listener    net.Listener
 	termConfig  *terminal.Config
 	allowlist   *KeyAllowlist
+	tokens      *authtoken.Store // shared HTTP token store; nil until SetBootstrap
+	bootstrap   *BootstrapInfo   // static bundle metadata; nil until SetBootstrap
 }
 
 // NewServer creates a new SSH server. listenAddr is the TCP bind address
