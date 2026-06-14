@@ -3,6 +3,8 @@ package egress
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -210,13 +212,33 @@ func splice(a, b net.Conn) {
 	<-done
 }
 
+// proxyAuthOK validates the per-shed token in the Proxy-Authorization header.
+// The injected proxy URL is http://<token>@<gateway>:<port>, so cooperating
+// clients (curl/git/dockerd) send Basic auth with the token as the username
+// (empty password) — i.e. "Basic base64(<token>:)". We decode and compare the
+// username in constant time. A raw bearer-style value is also accepted.
 func proxyAuthOK(req *http.Request, token string) bool {
 	if req == nil {
 		return false
 	}
-	h := req.Header.Get("Proxy-Authorization")
-	// Accept the token either as a raw bearer-style value or basic-auth password.
-	return strings.Contains(h, token)
+	h := strings.TrimSpace(req.Header.Get("Proxy-Authorization"))
+	if h == "" {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(h, "Basic "); ok {
+		if dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(rest)); err == nil {
+			user, _, _ := strings.Cut(string(dec), ":")
+			if ctEqual(user, token) {
+				return true
+			}
+		}
+	}
+	return ctEqual(h, token)
+}
+
+// ctEqual is a constant-time string compare (avoids a token-timing oracle).
+func ctEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func writeStatus(w io.Writer, proto string, code int, msg string) {

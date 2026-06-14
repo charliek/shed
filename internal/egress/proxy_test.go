@@ -3,10 +3,40 @@ package egress
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 )
+
+func TestProxyAuthOK(t *testing.T) {
+	mk := func(authValue string) *http.Request {
+		r, _ := http.NewRequest(http.MethodConnect, "//x:443", nil)
+		if authValue != "" {
+			r.Header.Set("Proxy-Authorization", authValue)
+		}
+		return r
+	}
+	// The injected URL http://<token>@host puts the token in the basic-auth
+	// username (empty password): "Basic base64(token:)".
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("tok-abc:"))
+	if !proxyAuthOK(mk(basic), "tok-abc") {
+		t.Error("basic-auth token (username) should pass")
+	}
+	if proxyAuthOK(mk(basic), "tok-wrong") {
+		t.Error("wrong token must fail")
+	}
+	if !proxyAuthOK(mk("tok-abc"), "tok-abc") {
+		t.Error("raw bearer token should pass")
+	}
+	if proxyAuthOK(mk(""), "tok-abc") {
+		t.Error("missing header must fail")
+	}
+	if proxyAuthOK(nil, "tok-abc") {
+		t.Error("nil request must fail")
+	}
+}
 
 func parse(t *testing.T, raw string) proxyTarget {
 	t.Helper()
