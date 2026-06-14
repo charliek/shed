@@ -194,19 +194,24 @@ func (a *KeyAllowlist) addGitHubUser(set map[string]string, user string) {
 	}
 	data, err := a.fetchGitHub(user)
 	if err != nil {
-		// Fail closed to last-known-good: prefer the disk cache, then the
-		// in-memory snapshot, so a refresh that hits both a GitHub outage and
-		// an unreadable cache still keeps the keys that were valid before.
-		switch cached, cerr := os.ReadFile(a.cachePath(user)); {
-		case cerr == nil:
-			log.Printf("auth.ssh: github fetch for %q failed (%v); using disk-cached keys", user, err)
-			data = cached
+		// Fail closed to last-known-good. Prefer the in-memory snapshot (the
+		// freshest keys this process actually resolved) over the disk cache: a
+		// previous writeCache failure can leave the disk staler than memory, and
+		// with token revocation wired in, falling back to a stale disk would
+		// shrink the set and revoke a still-valid key. Disk is only the
+		// cold-start fallback, before this process has resolved the user.
+		switch {
 		case a.lastGitHub[user] != nil:
-			log.Printf("auth.ssh: github fetch+cache for %q failed (%v); using last-known-good keys", user, err)
+			log.Printf("auth.ssh: github fetch for %q failed (%v); using in-memory last-known-good keys", user, err)
 			data = a.lastGitHub[user]
 		default:
-			log.Printf("auth.ssh: github fetch for %q failed (%v) and no cache; keys unavailable", user, err)
-			return
+			cached, cerr := os.ReadFile(a.cachePath(user))
+			if cerr != nil {
+				log.Printf("auth.ssh: github fetch for %q failed (%v) and no cache; keys unavailable", user, err)
+				return
+			}
+			log.Printf("auth.ssh: github fetch for %q failed (%v); using disk-cached keys", user, err)
+			data = cached
 		}
 	} else if werr := a.writeCache(user, data); werr != nil {
 		log.Printf("auth.ssh: failed to cache github keys for %q: %v", user, werr)
