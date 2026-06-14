@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -185,11 +184,13 @@ func TestServerNameForEntryAmbiguous(t *testing.T) {
 	}
 }
 
-// TestConcurrentRefreshNoRace mirrors the `shed system df --all` fan-out
-// (forEachServer spawns a goroutine per server, each constructing a client). It
-// must run clean under `go test -race`: the proactive refresh writes
-// clientConfig.Servers + Save()s, so without configMu serialization this races
-// the map (a fatal "concurrent map writes") and the shared config save.
+// TestConcurrentRefreshNoRace drives the REAL `shed system df --all` fan-out:
+// forEachServer reads clientConfig.Servers while the goroutines it spawns
+// refresh + persist (write that same map). It must run clean under
+// `go test -race` — exercising both configMu (the refresh-path writes) and
+// forEachServer's snapshot-before-spawn (the launcher's reads). Calling
+// forEachServer directly (rather than snapshotting in the test) is deliberate:
+// it covers the launcher's own map reads, which a hand-rolled snapshot misses.
 func TestConcurrentRefreshNoRace(t *testing.T) {
 	origCfg, origBF := clientConfig, bootstrapFn
 	defer func() { clientConfig, bootstrapFn = origCfg, origBF }()
@@ -201,7 +202,7 @@ func TestConcurrentRefreshNoRace(t *testing.T) {
 	}
 	clientConfig = cfg
 	nearExpiry := time.Now().Add(30 * time.Minute) // inside the 2h window → all refresh
-	for _, n := range []string{"s1", "s2", "s3", "s4", "s5"} {
+	for _, n := range []string{"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"} {
 		clientConfig.Servers[n] = config.ServerEntry{
 			Host: n + ".example", SSHPort: 2222, APIURL: "https://" + n + ".example:8443",
 			ControlToken: "old", ControlTokenExpiresAt: nearExpiry,
@@ -212,19 +213,8 @@ func TestConcurrentRefreshNoRace(t *testing.T) {
 		return sdk.Bundle{Token: "fresh-" + host, ExpiresAt: newExpiry, Scope: "control"}, nil
 	}
 
-	// Snapshot entries first so the spawning goroutine isn't itself racing the
-	// map against the refresh writes.
-	var entries []config.ServerEntry
-	for _, se := range clientConfig.Servers {
-		entries = append(entries, se)
-	}
-	var wg sync.WaitGroup
-	for _, e := range entries {
-		wg.Add(1)
-		go func(e config.ServerEntry) {
-			defer wg.Done()
-			_ = NewAPIClientFromEntry(&e, DefaultTimeout)
-		}(e)
-	}
-	wg.Wait()
+	_ = forEachServer(clientConfig.Servers, func(_ string, entry config.ServerEntry) (struct{}, error) {
+		_ = NewAPIClientFromEntry(&entry, DefaultTimeout)
+		return struct{}{}, nil
+	})
 }
