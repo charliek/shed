@@ -15,8 +15,9 @@ import (
 // and return an HTTP token bundle (see internal/sshd reservedBootstrapUser).
 const bootstrapUser = "_bootstrap"
 
-// bootstrapHandshakeTimeout bounds the SSH dial + handshake.
-const bootstrapHandshakeTimeout = 15 * time.Second
+// bootstrapTimeout bounds the whole exchange (dial + handshake + command) when
+// the caller's ctx has no earlier deadline.
+const bootstrapTimeout = 15 * time.Second
 
 // Bundle is the result of an SSH bootstrap exchange: a freshly-minted HTTP
 // bearer token plus the metadata a client needs to reach the HTTP API.
@@ -51,12 +52,16 @@ func Bootstrap(ctx context.Context, target string, signer ssh.Signer, hostKeyPin
 	if signer == nil {
 		return Bundle{}, errors.New("sdk: bootstrap requires a signer")
 	}
+	if scope == "" {
+		// A bare client-kind would be parsed as the scope by the server's
+		// strings.Fields("<scope> [<kind>]") — require an explicit scope.
+		return Bundle{}, errors.New("sdk: bootstrap requires a scope")
+	}
 
 	cfg := &ssh.ClientConfig{
 		User:            bootstrapUser,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: pinnedHostKey(hostKeyPin),
-		Timeout:         bootstrapHandshakeTimeout,
 	}
 
 	var d net.Dialer
@@ -64,6 +69,15 @@ func Bootstrap(ctx context.Context, target string, signer ssh.Signer, hostKeyPin
 	if err != nil {
 		return Bundle{}, fmt.Errorf("sdk: bootstrap dial %s: %w", target, err)
 	}
+	// Make the whole exchange cancellable and bounded: closing the raw conn
+	// unblocks both the SSH handshake (NewClientConn does NOT honor
+	// ClientConfig.Timeout) and the later session command. The deadline bounds
+	// it even with no ctx deadline; stop() cancels the AfterFunc on a normal
+	// return so it can't fire (or leak) afterward.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	_ = conn.SetDeadline(time.Now().Add(bootstrapTimeout))
+
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, target, cfg)
 	if err != nil {
 		_ = conn.Close()
@@ -71,9 +85,6 @@ func Bootstrap(ctx context.Context, target string, signer ssh.Signer, hostKeyPin
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 	defer client.Close()
-	// Closing the client when ctx is cancelled unblocks the session command.
-	stop := context.AfterFunc(ctx, func() { _ = client.Close() })
-	defer stop()
 
 	sess, err := client.NewSession()
 	if err != nil {

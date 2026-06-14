@@ -128,12 +128,15 @@ func TestBootstrapHostKeyMismatchFailsClosed(t *testing.T) {
 	}
 }
 
-func TestBootstrapRequiresPinAndSigner(t *testing.T) {
+func TestBootstrapValidatesArgs(t *testing.T) {
 	if _, err := Bootstrap(context.Background(), "127.0.0.1:1", newTestSigner(t), "", "control", "cli"); err == nil {
 		t.Error("empty host key pin must error")
 	}
 	if _, err := Bootstrap(context.Background(), "127.0.0.1:1", nil, "SHA256:x", "control", "cli"); err == nil {
 		t.Error("nil signer must error")
+	}
+	if _, err := Bootstrap(context.Background(), "127.0.0.1:1", newTestSigner(t), "SHA256:x", "", "cli"); err == nil {
+		t.Error("empty scope must error (a bare client-kind would be parsed as the scope)")
 	}
 }
 
