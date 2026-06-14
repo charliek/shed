@@ -15,9 +15,29 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/charliek/shed/internal/egress"
 )
+
+// exitWhenOrphaned terminates the proxy when its parent (shed-server) dies, so
+// an ungracefully-killed/crashed shed-server never leaves an orphaned proxy
+// holding listener ports (which would also block the next shed-server's proxy
+// from binding them). getppid() changing means we were reparented — the parent
+// is gone. Cross-platform; on Linux the child also gets Pdeathsig (see the
+// manager) for immediate teardown, with this poll as the fallback.
+func exitWhenOrphaned() {
+	orig := os.Getppid()
+	go func() {
+		for {
+			time.Sleep(3 * time.Second)
+			if os.Getppid() != orig {
+				log.Printf("shed-egress-proxy: parent %d exited; shutting down", orig)
+				os.Exit(0)
+			}
+		}
+	}()
+}
 
 func main() {
 	socket := flag.String("control-socket", "", "path to the shed-server control UDS (required)")
@@ -33,6 +53,7 @@ func main() {
 		log.Fatalf("shed-egress-proxy: listen control socket %s: %v", *socket, err)
 	}
 	log.Printf("shed-egress-proxy listening on %s", *socket)
+	exitWhenOrphaned()
 
 	ps := egress.NewProxyServer()
 

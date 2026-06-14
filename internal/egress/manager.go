@@ -41,6 +41,7 @@ func StartManager(socketPath, proxyBin string, portLo, portHi int, onAudit func(
 	cmd := exec.Command(proxyBin, "--control-socket", socketPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	setPdeathsig(cmd) // Linux: die with shed-server; macOS relies on the proxy's getppid poll
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("egress: start proxy %s: %w", proxyBin, err)
 	}
