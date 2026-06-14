@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,4 +167,64 @@ func TestNoRefreshForStaticToken(t *testing.T) {
 	if c.token != "static" {
 		t.Errorf("token = %q, want static", c.token)
 	}
+}
+
+func TestServerNameForEntryAmbiguous(t *testing.T) {
+	orig := clientConfig
+	defer func() { clientConfig = orig }()
+	// Two names aliasing the same endpoint: the lookup must refuse to guess
+	// rather than return an arbitrary one, so a refresh never persists to the
+	// wrong alias.
+	clientConfig = &config.ClientConfig{Servers: map[string]config.ServerEntry{
+		"primary": {Host: "h", SSHPort: 2222, APIURL: "https://h:8443", ControlToken: "tok1"},
+		"alias":   {Host: "h", SSHPort: 2222, APIURL: "https://h:8443", ControlToken: "tok2"},
+	}}
+	e := config.ServerEntry{Host: "h", SSHPort: 2222, APIURL: "https://h:8443"}
+	if got := serverNameForEntry(&e); got != "" {
+		t.Errorf("ambiguous match must return \"\" (refuse to persist), got %q", got)
+	}
+}
+
+// TestConcurrentRefreshNoRace mirrors the `shed system df --all` fan-out
+// (forEachServer spawns a goroutine per server, each constructing a client). It
+// must run clean under `go test -race`: the proactive refresh writes
+// clientConfig.Servers + Save()s, so without configMu serialization this races
+// the map (a fatal "concurrent map writes") and the shared config save.
+func TestConcurrentRefreshNoRace(t *testing.T) {
+	origCfg, origBF := clientConfig, bootstrapFn
+	defer func() { clientConfig, bootstrapFn = origCfg, origBF }()
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg, err := config.LoadClientConfigFromPath(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConfig = cfg
+	nearExpiry := time.Now().Add(30 * time.Minute) // inside the 2h window → all refresh
+	for _, n := range []string{"s1", "s2", "s3", "s4", "s5"} {
+		clientConfig.Servers[n] = config.ServerEntry{
+			Host: n + ".example", SSHPort: 2222, APIURL: "https://" + n + ".example:8443",
+			ControlToken: "old", ControlTokenExpiresAt: nearExpiry,
+		}
+	}
+	newExpiry := time.Now().Add(24 * time.Hour)
+	bootstrapFn = func(host string, _ int, _, _ string) (sdk.Bundle, error) {
+		return sdk.Bundle{Token: "fresh-" + host, ExpiresAt: newExpiry, Scope: "control"}, nil
+	}
+
+	// Snapshot entries first so the spawning goroutine isn't itself racing the
+	// map against the refresh writes.
+	var entries []config.ServerEntry
+	for _, se := range clientConfig.Servers {
+		entries = append(entries, se)
+	}
+	var wg sync.WaitGroup
+	for _, e := range entries {
+		wg.Add(1)
+		go func(e config.ServerEntry) {
+			defer wg.Done()
+			_ = NewAPIClientFromEntry(&e, DefaultTimeout)
+		}(e)
+	}
+	wg.Wait()
 }

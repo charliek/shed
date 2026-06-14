@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
@@ -106,27 +108,23 @@ func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duratio
 	}
 	host, sshPort := entry.Host, entry.SSHPort
 	// Resolve which config entry this is, so a refreshed token can be persisted.
-	// "" means a one-off entry not in the config — the refresh still works for
-	// this client's lifetime, it just isn't saved.
+	// "" means no unambiguous match (a one-off entry, or duplicate aliases to the
+	// same endpoint) — the refresh still works for this client's lifetime, it
+	// just isn't saved.
 	name := serverNameForEntry(entry)
 	c.refreshFn = func() (string, error) {
 		bundle, err := bootstrapFn(host, sshPort, "control", "cli")
 		if err != nil {
 			return "", err
 		}
-		if name != "" {
-			e := clientConfig.Servers[name]
-			e.ControlToken = bundle.Token
-			e.ControlTokenExpiresAt = bundle.ExpiresAt
-			clientConfig.Servers[name] = e
-			if err := clientConfig.Save(); err != nil {
-				return "", fmt.Errorf("saving refreshed token: %w", err)
-			}
-		}
+		// The token is valid the moment it is minted; persisting it is
+		// best-effort so a Save failure never wastes the mint or fails the
+		// request (the next process just re-mints).
+		persistControlToken(name, bundle.Token, bundle.ExpiresAt)
 		return bundle.Token, nil
 	}
 	// Proactively re-mint a near-expiry token so a request never races expiry.
-	// A failure here is non-fatal: the stale token is kept and the reactive
+	// A mint failure here is non-fatal: the stale token is kept and the reactive
 	// 401-retry surfaces any error on the next request.
 	if needsRefresh(entry.ControlTokenExpiresAt, time.Now()) {
 		if tok, err := c.refreshFn(); err == nil {
@@ -136,22 +134,59 @@ func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duratio
 	return c
 }
 
-// serverNameForEntry returns the config name whose stored entry matches e (by
-// host + ssh port + api_url), or "" when e is a one-off entry not present in
-// the config. Used so a refreshed token can be written back to the right entry
-// without threading the name through every call site.
+// configMu serializes refresh-path access to the shared clientConfig global —
+// the serverNameForEntry lookup and the token persist (map write + Save). The
+// `--all` fan-out (forEachServer) constructs clients, and thus refreshes,
+// concurrently across goroutines; without this, two near-expiry refreshes would
+// race on the Servers map (a fatal "concurrent map writes") and clobber each
+// other's config.yaml save.
+var configMu sync.Mutex
+
+// persistControlToken writes a freshly re-minted control token back to the named
+// config entry and saves. It is best-effort: name == "" (no unambiguous config
+// entry) is a no-op, and a Save failure is warned-but-not-fatal — the token is
+// already valid in memory, so the command proceeds and the next process re-mints
+// rather than the request failing. configMu serializes the map write + Save
+// against concurrent refreshes from the `--all` fan-out.
+func persistControlToken(name, token string, expiresAt time.Time) {
+	if name == "" {
+		return
+	}
+	configMu.Lock()
+	defer configMu.Unlock()
+	e := clientConfig.Servers[name]
+	e.ControlToken = token
+	e.ControlTokenExpiresAt = expiresAt
+	clientConfig.Servers[name] = e
+	if err := clientConfig.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not persist refreshed token for %q: %v\n", name, err)
+	}
+}
+
+// serverNameForEntry returns the config name whose stored entry UNIQUELY matches
+// e by its stable identity (host + ssh port + api_url), or "" when there is no
+// match (a one-off entry) or more than one (duplicate aliases to the same
+// endpoint). Returning "" on ambiguity is deliberate: a refreshed token is only
+// persisted when the target entry is unambiguous, so it can never be written to
+// the wrong alias. Used so a refreshed token can be written back without
+// threading the name through every call site.
 //
 // ControlToken is deliberately NOT part of the key: the refresh path rewrites
 // it, so matching on it would make an entry stop matching its own config row
-// after the first re-mint. Host + ssh port + api_url already uniquely identify
-// a configured server.
+// after the first re-mint.
 func serverNameForEntry(e *config.ServerEntry) string {
+	configMu.Lock()
+	defer configMu.Unlock()
+	match := ""
 	for n, se := range clientConfig.Servers {
 		if se.Host == e.Host && se.SSHPort == e.SSHPort && se.APIURL == e.APIURL {
-			return n
+			if match != "" {
+				return "" // ambiguous — refuse to persist to the wrong alias
+			}
+			match = n
 		}
 	}
-	return ""
+	return match
 }
 
 // sendRequest builds and sends a single JSON request. It is the per-attempt
