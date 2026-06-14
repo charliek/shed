@@ -4,18 +4,31 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 )
 
-func authTestServer(mode string) *Server {
-	return &Server{cfg: &config.ServerConfig{Auth: &config.AuthConfig{HTTP: &config.HTTPAuthConfig{
-		Mode: mode,
-		Tokens: []config.HTTPToken{
-			{Scope: config.TokenScopeControl, Token: "shed_control_ctl"},
-			{Scope: config.TokenScopeCredentials, Token: "shed_credentials_cred"},
-		},
-	}}}}
+// authTestServer builds a server in the given http-auth mode whose token store
+// holds one control and one credentials token; it returns those plaintext
+// tokens for the table to exercise.
+func authTestServer(t *testing.T, mode string) (s *Server, control, credentials string) {
+	t.Helper()
+	store := authtoken.NewStore()
+	control, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
+	if err != nil {
+		t.Fatalf("mint control: %v", err)
+	}
+	credentials, _, err = store.Mint("SHA256:test", authtoken.ScopeCredentials, authtoken.ClientHostAgent, time.Hour)
+	if err != nil {
+		t.Fatalf("mint credentials: %v", err)
+	}
+	s = &Server{
+		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{HTTP: &config.HTTPAuthConfig{Mode: mode}}},
+		tokens: store,
+	}
+	return s, control, credentials
 }
 
 func doAuth(s *Server, method, path, token string) int {
@@ -32,7 +45,7 @@ func doAuth(s *Server, method, path, token string) int {
 }
 
 func TestAuthMiddlewareEnforce(t *testing.T) {
-	s := authTestServer(config.HTTPAuthEnforce)
+	s, ctl, cred := authTestServer(t, config.HTTPAuthEnforce)
 	tests := []struct {
 		name, method, path, token string
 		want                      int
@@ -41,13 +54,13 @@ func TestAuthMiddlewareEnforce(t *testing.T) {
 		{"bootstrap host-key, no token", "GET", "/api/ssh-host-key", "", 200},
 		{"control plane, no token", "GET", "/api/sheds", "", 401},
 		{"control plane, unknown token", "GET", "/api/sheds", "shed_control_nope", 401},
-		{"control plane, control token", "GET", "/api/sheds", "shed_control_ctl", 200},
-		{"control plane, credentials token forbidden", "GET", "/api/sheds", "shed_credentials_cred", 403},
-		{"bus, credentials token", "GET", "/api/plugins/listeners", "shed_credentials_cred", 200},
-		{"bus, control token forbidden", "GET", "/api/plugins/listeners", "shed_control_ctl", 403},
-		{"connect, credentials token", "GET", "/api/sheds/x/connect/22", "shed_credentials_cred", 200},
-		{"connect, control token forbidden", "GET", "/api/sheds/x/connect/22", "shed_control_ctl", 403},
-		{"create, control token", "POST", "/api/sheds", "shed_control_ctl", 200},
+		{"control plane, control token", "GET", "/api/sheds", ctl, 200},
+		{"control plane, credentials token forbidden", "GET", "/api/sheds", cred, 403},
+		{"bus, credentials token", "GET", "/api/plugins/listeners", cred, 200},
+		{"bus, control token forbidden", "GET", "/api/plugins/listeners", ctl, 403},
+		{"connect, credentials token", "GET", "/api/sheds/x/connect/22", cred, 200},
+		{"connect, control token forbidden", "GET", "/api/sheds/x/connect/22", ctl, 403},
+		{"create, control token", "POST", "/api/sheds", ctl, 200},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -59,11 +72,30 @@ func TestAuthMiddlewareEnforce(t *testing.T) {
 }
 
 func TestAuthMiddlewareOffIsPassthrough(t *testing.T) {
-	if got := doAuth(authTestServer(config.HTTPAuthOff), "GET", "/api/sheds", ""); got != 200 {
+	s, _, _ := authTestServer(t, config.HTTPAuthOff)
+	if got := doAuth(s, "GET", "/api/sheds", ""); got != 200 {
 		t.Errorf("off mode should pass through, got %d", got)
 	}
-	// No auth config at all also passes through.
+	// No auth config (and no token store) also passes through.
 	if got := doAuth(&Server{cfg: &config.ServerConfig{}}, "GET", "/api/sheds", ""); got != 200 {
 		t.Errorf("nil auth should pass through, got %d", got)
+	}
+}
+
+// TestAuthMiddlewareExpiredToken: an expired token fails closed (401), proving
+// the middleware honors the store's TTL rather than the token string alone.
+func TestAuthMiddlewareExpiredToken(t *testing.T) {
+	store := authtoken.NewStore()
+	tok, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	s := &Server{
+		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{HTTP: &config.HTTPAuthConfig{Mode: config.HTTPAuthEnforce}}},
+		tokens: store,
+	}
+	if got := doAuth(s, "GET", "/api/sheds", tok); got != 401 {
+		t.Errorf("expired token: got %d, want 401", got)
 	}
 }

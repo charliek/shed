@@ -8,18 +8,18 @@ import (
 )
 
 // HTTP bearer-token scopes. The scope is encoded in the token itself
-// (shed_<scope>_<random>) so the server can authorize from the token alone,
-// and the credential/admin grants can split out later without re-issuing.
+// (shed_<scope>_<random>) for fast rejection and readable logs. The legacy
+// "admin" scope was removed in the auth-issuance-v2 redesign: minting and
+// revocation are gated by SSH access, so there is no separate HTTP admin grant.
 const (
 	TokenScopeControl     = "control"     // shed lifecycle / control plane (CLI, desktop)
 	TokenScopeCredentials = "credentials" // the credential bus (host-agent)
-	TokenScopeAdmin       = "admin"       // destructive/admin operations
 )
 
 // ValidTokenScope reports whether s is a known token scope.
 func ValidTokenScope(s string) bool {
 	switch s {
-	case TokenScopeControl, TokenScopeCredentials, TokenScopeAdmin:
+	case TokenScopeControl, TokenScopeCredentials:
 		return true
 	}
 	return false
@@ -28,7 +28,7 @@ func ValidTokenScope(s string) bool {
 // GenerateToken mints a token of the given scope: shed_<scope>_<random>.
 func GenerateToken(scope string) (string, error) {
 	if !ValidTokenScope(scope) {
-		return "", fmt.Errorf("invalid token scope: %q (must be control, credentials, or admin)", scope)
+		return "", fmt.Errorf("invalid token scope: %q (must be control or credentials)", scope)
 	}
 	b := make([]byte, 24)
 	if _, err := rand.Read(b); err != nil {

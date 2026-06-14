@@ -3,7 +3,7 @@ package config
 import "testing"
 
 func TestGenerateAndScopeToken(t *testing.T) {
-	for _, scope := range []string{TokenScopeControl, TokenScopeCredentials, TokenScopeAdmin} {
+	for _, scope := range []string{TokenScopeControl, TokenScopeCredentials} {
 		tok, err := GenerateToken(scope)
 		if err != nil {
 			t.Fatalf("GenerateToken(%q): %v", scope, err)
@@ -18,8 +18,10 @@ func TestGenerateAndScopeToken(t *testing.T) {
 		}
 	}
 
-	if _, err := GenerateToken("bogus"); err == nil {
-		t.Error("GenerateToken with an invalid scope should error")
+	for _, bad := range []string{"bogus", "admin"} {
+		if _, err := GenerateToken(bad); err == nil {
+			t.Errorf("GenerateToken(%q) should error (invalid scope)", bad)
+		}
 	}
 
 	for _, bad := range []string{"", "nope", "shed_", "shed_control", "shed_bogus_abc", "token_control_abc"} {

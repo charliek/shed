@@ -162,7 +162,7 @@ func (c *ServerConfig) validateAuth() error {
 				return fmt.Errorf("auth.http.tokens[%d]: token is empty", i)
 			}
 			if !ValidTokenScope(tok.Scope) {
-				return fmt.Errorf("auth.http.tokens[%d]: invalid scope %q (must be control, credentials, or admin)", i, tok.Scope)
+				return fmt.Errorf("auth.http.tokens[%d]: invalid scope %q (must be control or credentials)", i, tok.Scope)
 			}
 		}
 	}

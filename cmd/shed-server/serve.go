@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/api"
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
@@ -38,6 +39,10 @@ const (
 	httpReadHeaderTimeout = 10 * time.Second
 	httpReadTimeout       = 60 * time.Second
 	httpIdleTimeout       = 120 * time.Second
+
+	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
+	// from the in-memory store (expired tokens are also dropped on validate).
+	tokenSweepInterval = 10 * time.Minute
 )
 
 // newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
@@ -111,6 +116,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 		pluginRegistry.EnableOwnershipTracking()
 	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
+
+	// HTTP bearer-token store: short-lived, scoped tokens minted over the SSH
+	// bootstrap channel and validated by the auth middleware. In-memory by
+	// design — a restart drops tokens and clients transparently re-mint over
+	// SSH. Shared with the SSH server (bootstrap mint) and the API server
+	// (validate).
+	tokenStore := authtoken.NewStore()
+	tokenCtx, cancelTokens := context.WithCancel(context.Background())
+	defer cancelTokens()
+	tokenStore.StartSweeper(tokenCtx, tokenSweepInterval)
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -220,6 +235,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
 	apiServer.SetEgressAudit(egressAudit) // nil-safe: no-op when egress disabled
+	apiServer.SetTokenStore(tokenStore)   // shared with the SSH bootstrap handler (1c)
 
 	// Public router (HTTP and, when enabled, HTTPS share one handler). When
 	// the internal-listener split is enabled, it omits the credential bus +
