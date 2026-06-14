@@ -16,8 +16,8 @@ import (
 const bootstrapUser = "_bootstrap"
 
 // bootstrapTimeout bounds the whole exchange (dial + handshake + command) when
-// the caller's ctx has no earlier deadline.
-const bootstrapTimeout = 15 * time.Second
+// the caller's ctx has no earlier deadline. A var so tests can shorten it.
+var bootstrapTimeout = 15 * time.Second
 
 // Bundle is the result of an SSH bootstrap exchange: a freshly-minted HTTP
 // bearer token plus the metadata a client needs to reach the HTTP API.
@@ -64,16 +64,22 @@ func Bootstrap(ctx context.Context, target string, signer ssh.Signer, hostKeyPin
 		HostKeyCallback: pinnedHostKey(hostKeyPin),
 	}
 
+	// Bound the WHOLE exchange, including the dial. DialContext gates the connect
+	// on this ctx, so a caller with no deadline (e.g. the host-agent's cancel-only
+	// group ctx) can't block on the OS TCP timeout against a blackholed endpoint.
+	// A shorter caller deadline still wins.
+	ctx, cancel := context.WithTimeout(ctx, bootstrapTimeout)
+	defer cancel()
+
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
 		return Bundle{}, fmt.Errorf("sdk: bootstrap dial %s: %w", target, err)
 	}
-	// Make the whole exchange cancellable and bounded: closing the raw conn
-	// unblocks both the SSH handshake (NewClientConn does NOT honor
-	// ClientConfig.Timeout) and the later session command. The deadline bounds
-	// it even with no ctx deadline; stop() cancels the AfterFunc on a normal
-	// return so it can't fire (or leak) afterward.
+	// Make the post-dial phase cancellable too: closing the raw conn unblocks both
+	// the SSH handshake (NewClientConn does NOT honor ClientConfig.Timeout) and the
+	// later session command when ctx fires (its deadline or a caller cancel). stop()
+	// cancels the AfterFunc on a normal return so it can't fire (or leak) afterward.
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	_ = conn.SetDeadline(time.Now().Add(bootstrapTimeout))

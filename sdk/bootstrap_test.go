@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -151,5 +152,32 @@ func TestBundleJSONTagsMatchServer(t *testing.T) {
 	if b.HTTPPort != 80 || b.HTTPSPort != 443 || b.TLSCertFingerprint != "sha256:f" ||
 		b.Token != "t" || b.Scope != "credentials" || b.TokenID != "id" || b.ExpiresAt.IsZero() {
 		t.Errorf("decoded bundle mismatch: %+v", b)
+	}
+}
+
+func TestBootstrapDialTimeoutBounded(t *testing.T) {
+	// A caller with NO deadline must still be bounded by bootstrapTimeout on the
+	// DIAL — otherwise a blackholed endpoint blocks on the (much longer) OS TCP
+	// connect timeout while a caller holds e.g. the host-agent supervisor lock.
+	// 192.0.2.1 is TEST-NET-1 (RFC 5737): reserved, typically unrouted → blackhole.
+	orig := bootstrapTimeout
+	bootstrapTimeout = 300 * time.Millisecond
+	defer func() { bootstrapTimeout = orig }()
+
+	signer := newTestSigner(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := Bootstrap(context.Background(), "192.0.2.1:22", signer, "SHA256:x", "control", "cli")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error dialing a blackholed endpoint")
+		}
+	case <-time.After(5 * time.Second):
+		// 5s >> the 300ms bound: reaching here means the dial ignored the timeout
+		// (the bug) and is blocking on the OS connect timeout.
+		t.Fatalf("Bootstrap did not honor the dial timeout (bootstrapTimeout=%v); a no-deadline caller blocked on the OS connect timeout", bootstrapTimeout)
 	}
 }
