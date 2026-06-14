@@ -31,13 +31,6 @@ type ControlMsg struct {
 	Audit    *AuditRecord  `json:"audit,omitempty"`
 }
 
-// auditSink is one control connection's outbound audit buffer. It is never
-// closed (the writer goroutine exits via a quit signal instead), so the data
-// path can always send into it without risking a send-on-closed-channel panic.
-type auditSink struct {
-	ch chan AuditRecord
-}
-
 // ProxyServer is the data plane: it manages one forward-proxy listener per shed,
 // driven by configure/remove from shed-server, and streams audit back. Listeners
 // persist across control-connection drops (a server restart re-pushes; guests
@@ -49,7 +42,11 @@ type ProxyServer struct {
 
 	mu        sync.Mutex
 	listeners map[string]net.Listener
-	sink      *auditSink // current control connection's audit sink (nil if none)
+	// sink is the current control connection's outbound audit buffer. It is
+	// never closed (the writer goroutine exits via a quit signal instead), so
+	// the data path can always send into it without a send-on-closed panic. nil
+	// when no control connection is attached.
+	sink chan AuditRecord
 }
 
 func NewProxyServer() *ProxyServer {
@@ -125,7 +122,7 @@ func (s *ProxyServer) audit(rec AuditRecord) {
 		return
 	}
 	select {
-	case sink.ch <- rec:
+	case sink <- rec:
 	default: // drop, never block the data path
 	}
 }
@@ -137,7 +134,7 @@ func (s *ProxyServer) audit(rec AuditRecord) {
 func (s *ProxyServer) Serve(conn net.Conn) error {
 	defer conn.Close()
 	enc := json.NewEncoder(conn)
-	sink := &auditSink{ch: make(chan AuditRecord, 1024)}
+	sink := make(chan AuditRecord, 1024)
 	replyCh := make(chan ControlMsg, 16)
 	quit := make(chan struct{})
 
@@ -160,7 +157,7 @@ func (s *ProxyServer) Serve(conn net.Conn) error {
 	go func() {
 		for {
 			select {
-			case rec := <-sink.ch:
+			case rec := <-sink:
 				r := rec
 				_ = enc.Encode(ControlMsg{Type: "audit", Audit: &r})
 			case m := <-replyCh:

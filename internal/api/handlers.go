@@ -348,12 +348,12 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	ec, ok := s.backend.(egressController)
 	if !ok {
-		writeError(w, http.StatusNotImplemented, "not_supported", "egress control is not supported by this backend")
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
 		return
 	}
 	var req config.EgressSetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body")
 		return
 	}
 	shed, err := ec.SetShedEgress(r.Context(), name, req.Profiles)
@@ -369,7 +369,7 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 // host-agent subscriber (shed-extensions). GET /api/egress/stream
 func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 	if s.egressAudit == nil {
-		writeError(w, http.StatusNotImplemented, "not_supported", "egress control is not enabled")
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not enabled")
 		return
 	}
 	flusher, ok := w.(http.Flusher)
@@ -398,11 +398,7 @@ func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case rec := <-events:
-			data, err := json.Marshal(rec)
-			if err != nil {
-				continue
-			}
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			writeSSEEvent(w, "egress", rec)
 			flusher.Flush()
 		}
 	}
@@ -414,7 +410,7 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 	ec, ok := s.backend.(egressController)
 	if !ok {
-		writeError(w, http.StatusNotImplemented, "not_supported", "egress control is not supported by this backend")
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
 		return
 	}
 	shed, err := ec.ClearShedEgress(r.Context(), name)

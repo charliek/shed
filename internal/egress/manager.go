@@ -23,7 +23,7 @@ type Manager struct {
 	socket string
 
 	portLo, portHi int
-	used           map[int]string // port -> shed (allocation tracking)
+	used           map[int]bool   // set of allocated ports
 	sheds          map[string]int // shed -> port (so Remove need not be told the port)
 
 	tokenGen func() string // injectable for deterministic tests
@@ -63,7 +63,7 @@ func newManager(client *Client, proc *exec.Cmd, socket string, portLo, portHi in
 		socket:   socket,
 		portLo:   portLo,
 		portHi:   portHi,
-		used:     map[int]string{},
+		used:     map[int]bool{},
 		sheds:    map[string]int{},
 		tokenGen: randToken,
 	}
@@ -77,16 +77,15 @@ func newManager(client *Client, proc *exec.Cmd, socket string, portLo, portHi in
 // for the caller to persist in shed metadata.
 func (m *Manager) Configure(shed string, port int, token, gateway string, specs []ProfileSpec) (int, string, error) {
 	m.mu.Lock()
-	allocated := false
 	if port == 0 {
 		p, err := m.allocPortLocked(shed)
 		if err != nil {
 			m.mu.Unlock()
 			return 0, "", err
 		}
-		port, allocated = p, true
+		port = p
 	} else {
-		m.used[port] = shed
+		m.used[port] = true
 		m.sheds[shed] = port
 	}
 	if token == "" {
@@ -102,7 +101,6 @@ func (m *Manager) Configure(shed string, port int, token, gateway string, specs 
 			delete(m.sheds, shed)
 		}
 		m.mu.Unlock()
-		_ = allocated
 		return 0, "", err
 	}
 	return port, token, nil
@@ -123,8 +121,8 @@ func (m *Manager) Remove(shed string) error {
 
 func (m *Manager) allocPortLocked(shed string) (int, error) {
 	for p := m.portLo; p <= m.portHi; p++ {
-		if _, taken := m.used[p]; !taken {
-			m.used[p] = shed
+		if !m.used[p] {
+			m.used[p] = true
 			m.sheds[shed] = p
 			return p, nil
 		}
