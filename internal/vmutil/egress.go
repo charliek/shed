@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/egress"
 )
 
 // Guest paths for the injected egress-proxy configuration. Both live in the
@@ -81,6 +82,26 @@ func renderDockerProxyDropIn(e EgressProxyEnv) string {
 	u := e.ProxyURL()
 	return fmt.Sprintf("%s\n[Service]\nEnvironment=\"HTTP_PROXY=%s\"\nEnvironment=\"HTTPS_PROXY=%s\"\nEnvironment=\"NO_PROXY=%s\"\n",
 		egressManagedComment, u, u, e.NoProxy)
+}
+
+// SetupEgress is the shared body of the per-backend ConfigureEgressProxy hook:
+// it opens (or reuses) this shed's proxy listener, registers its teardown on
+// cleanup so a later failure tears it back down, and injects the proxy env into
+// the guest. existingPort/Token are the persisted assignment (0/"" on first
+// create). Returns the effective port + token (for the caller to persist in
+// backend metadata) and the env pairs to thread into the clone exec. A failure
+// returns a non-nil error so the orchestrator aborts + unwinds.
+func SetupEgress(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string, existingPort int, existingToken, gateway, subnet string, specs []egress.ProfileSpec, cleanup *backend.Cleanup) (port int, token string, env []string, err error) {
+	port, token, err = mgr.Configure(name, existingPort, existingToken, gateway, specs)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	cleanup.Register("close egress listener", func() error { return mgr.Remove(name) })
+	pe := EgressProxyEnv{Gateway: gateway, Port: port, Token: token, NoProxy: BuildNoProxy(gateway, subnet)}
+	if err := InjectEgressProxy(ctx, agent, pe); err != nil {
+		return 0, "", nil, err
+	}
+	return port, token, pe.EnvPairs(), nil
 }
 
 // InjectEgressProxy writes the proxy env into the guest's persistent upper (a

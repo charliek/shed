@@ -18,7 +18,9 @@ import (
 // ~/.ssh/known_hosts is seeded first so OpenSSH can verify the remote host
 // key. Built-in defaults cover GitHub; extras come from
 // ServerConfig.Git.ExtraKnownHosts.
-func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.ServerConfig, repo string) error {
+// extraEnv (e.g. egress proxy variables) is appended to the git environment so
+// the clone is routed through (and audited by) anything those vars configure.
+func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.ServerConfig, repo string, extraEnv []string) error {
 	backend.Phase(ctx, "clone")
 	backend.Status(ctx, "Cloning repository...")
 
@@ -33,7 +35,7 @@ func CloneRepo(ctx context.Context, agent *AgentClient, serverCfg *config.Server
 		}
 	}
 
-	env := BuildEnvForGit(serverCfg)
+	env := append(BuildEnvForGit(serverCfg), extraEnv...)
 
 	var output strings.Builder
 	opts := backend.ExecOptions{

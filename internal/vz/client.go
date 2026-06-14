@@ -340,6 +340,14 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	// Stop notification listener before shutting down
 	c.credMgr.StopListener(meta.Name)
 
+	// Close this shed's egress proxy listener (frees the per-shed port). No-op
+	// when egress is disabled or this shed has none. Never touches host docker.
+	if c.egressMgr != nil {
+		if err := c.egressMgr.Remove(meta.Name); err != nil {
+			log.Printf("Warning: failed to remove egress listener for %s: %v", meta.Name, err)
+		}
+	}
+
 	agent := c.newAgentClient(meta.Name)
 
 	// Run shutdown hook before stopping the VM
