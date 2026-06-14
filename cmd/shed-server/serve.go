@@ -117,7 +117,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// place its control socket next to the active backend's sockets and hand
 	// the manager to the right client.
 	var be backend.Backend
-	var egressSocketDir string
+	var egressSocketDir string // runtime dir for the control socket
+	var egressStateDir string  // persistent dir for the durable audit log
 	var attachEgress func(*egress.Manager)
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
@@ -132,6 +133,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Initialized Firecracker backend (default_image=%q, pull_policy=%s)", fcCfg.DefaultImage, fcCfg.PullPolicy)
 		be = firecracker.NewBackend(fcClient)
 		egressSocketDir = fcCfg.SocketDir
+		egressStateDir = filepath.Dir(fcCfg.InstanceDir)
 		attachEgress = fcClient.SetEgressManager
 
 	case config.BackendVZ:
@@ -146,6 +148,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Initialized VZ backend (default_image=%q, pull_policy=%s)", vzCfg.DefaultImage, vzCfg.PullPolicy)
 		be = vz.NewBackend(vzClient)
 		egressSocketDir = vzCfg.SocketDir
+		egressStateDir = filepath.Dir(vzCfg.InstanceDir)
 		attachEgress = vzClient.SetEgressManager
 
 	default:
@@ -156,6 +159,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Optional egress-control proxy child, started only when enabled. A start
 	// failure is a hard startup error — never a silent disable (AC-11).
 	var egressMgr *egress.Manager
+	var egressAudit *egress.AuditLog
 	if cfg.Egress != nil && cfg.Egress.Enabled {
 		lo, hi := cfg.Egress.PortRangeBounds()
 		sockPath := filepath.Join(egressSocketDir, "egress-proxy.sock")
@@ -163,16 +167,30 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("egress enabled: %w", err)
 		}
-		egressMgr, err = egress.StartManager(sockPath, proxyBin, lo, hi, logEgressAudit)
+		auditPath := filepath.Join(egressStateDir, "egress-audit.jsonl")
+		egressAudit, err = egress.OpenAuditLog(auditPath, 0)
+		if err != nil {
+			return fmt.Errorf("egress: open audit log %s: %w", auditPath, err)
+		}
+		// Durable JSONL + recent-ring for `shed egress show`, plus a denial line
+		// in the server log for at-a-glance observability.
+		onAudit := func(rec egress.AuditRecord) {
+			egressAudit.Record(rec)
+			logEgressAudit(rec)
+		}
+		egressMgr, err = egress.StartManager(sockPath, proxyBin, lo, hi, onAudit)
 		if err != nil {
 			return fmt.Errorf("egress: start proxy: %w", err)
 		}
 		attachEgress(egressMgr)
-		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s)", lo, hi, sockPath)
+		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s, audit %s)", lo, hi, sockPath, auditPath)
 	}
 	defer func() {
 		if egressMgr != nil {
 			_ = egressMgr.Close()
+		}
+		if egressAudit != nil {
+			_ = egressAudit.Close()
 		}
 	}()
 
