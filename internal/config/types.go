@@ -152,6 +152,16 @@ type Shed struct {
 	LastHealthy  *time.Time                     `json:"last_healthy,omitempty" yaml:"last_healthy,omitempty"` // last heartbeat from agent (VM backends only)
 	StartedAt    *time.Time                     `json:"started_at,omitempty" yaml:"started_at,omitempty"`     // agent boot time from heartbeat (VM backends only)
 	Extensions   map[string]ExtensionHealthInfo `json:"extensions,omitempty" yaml:"extensions,omitempty"`     // per-extension health (VM backends only)
+	// Egress* track Level-1 egress-control state (set when egress is enabled
+	// and the shed is assigned a non-empty profile list). EgressPort is the
+	// per-shed proxy listener port — stable across stop/start because the
+	// guest's injected HTTP_PROXY is baked into the persistent upper.
+	EgressProfiles []string `json:"egress_profiles,omitempty" yaml:"egress_profiles,omitempty"`
+	EgressPort     int      `json:"egress_port,omitempty" yaml:"egress_port,omitempty"`
+	// EgressToken is the per-shed proxy-auth token binding the port to this
+	// shed. It is a secret: never serialized to API/CLI responses (json:"-").
+	// It lives durably in the per-backend on-disk metadata, not here.
+	EgressToken string `json:"-" yaml:"-"`
 }
 
 // ExtensionHealthInfo is the API-facing extension health for a shed.
@@ -515,6 +525,11 @@ type CreateShedRequest struct {
 	// (each at /home/shed/<basename>) as reference siblings of LocalDir.
 	// Only valid together with LocalDir.
 	AddDirs []string `json:"add_dirs,omitempty"`
+
+	// Egress assigns Level-1 egress-control profiles to this shed (composed,
+	// first-match). Empty inherits the server `egress.default`; ["off"]
+	// disables egress for this shed even when a default is set.
+	Egress []string `json:"egress,omitempty"`
 
 	// FromSnapshot spawns the shed from a snapshot's rootfs instead of a base image.
 	// Mutually exclusive with Image and Repo. Provisioning steps (repo clone, install

@@ -31,7 +31,13 @@ import (
 // per-create resolved values (cpus / memory / upper-size, image
 // source) inside `fcPreFlight` so subsequent hooks don't re-derive
 // them.
-type fcCreator struct{ c *Client }
+type fcCreator struct {
+	c *Client
+	// egressEnv is the proxy env injected by ConfigureEgressProxy, threaded
+	// into the subsequent CloneRepo exec so the clone is audited. nil ⇒ egress
+	// off for this shed.
+	egressEnv []string
+}
 
 // fcPreFlight is the per-create resolved-input bundle handed from
 // PreFlight to the rest of the lifecycle.
@@ -419,6 +425,39 @@ func (b *fcCreator) SetupCredentials(ctx context.Context, req config.CreateShedR
 	b.c.credMgr.SetupCredentials(ctx, agent, req.Name, dirCreds, b.c.mount9PCredentialFunc(req.Name))
 }
 
+// ConfigureEgressProxy opens this shed's egress proxy listener and injects the
+// proxy env when egress control is enabled and profiles resolve to a non-empty
+// policy. Failable: a configure/inject error aborts the create (the listener
+// teardown is registered on cleanup). No-op when egress is disabled or off for
+// this shed. The FC bridge gateway/CIDR are real (unlike VZ's vmnet defaults).
+func (b *fcCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle, cleanup *backend.Cleanup) error {
+	if b.c.egressMgr == nil {
+		return nil
+	}
+	specs, err := b.c.serverCfg.Egress.ResolveProfiles(req.Egress)
+	if err != nil {
+		return fmt.Errorf("egress: resolve profiles: %w", err)
+	}
+	if len(specs) == 0 {
+		return nil // egress off for this shed
+	}
+	meta := metaRaw.(*fcMetaHandle).meta
+	agent := b.c.newAgentClient(meta.Name)
+	gateway, subnet := b.c.egressGatewaySubnet()
+	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
+	if err != nil {
+		return fmt.Errorf("egress: %w", err)
+	}
+	meta.EgressProfiles = req.Egress
+	meta.EgressPort = port
+	meta.EgressToken = token
+	if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
+		return fmt.Errorf("egress: save metadata: %w", err)
+	}
+	b.egressEnv = env
+	return nil
+}
+
 // CloneRepo runs `git clone` inside the guest when --repo is set.
 // Best-effort; mirrors VZ's hook.
 func (b *fcCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) {
@@ -429,7 +468,7 @@ func (b *fcCreator) CloneRepo(ctx context.Context, req config.CreateShedRequest,
 	agent := b.c.newAgentClient(meta.Name)
 	backend.Phase(ctx, "repo")
 	backend.Status(ctx, "Cloning repository...")
-	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo); err != nil {
+	if err := vmutil.CloneRepo(ctx, agent, b.c.serverCfg, req.Repo, b.egressEnv); err != nil {
 		log.Printf("Warning: failed to clone repo %s: %v", config.SanitizeRepoURL(req.Repo), err)
 		backend.StatusWarning(ctx, "Failed to clone repository (see server logs for details)")
 	} else {
@@ -617,6 +656,43 @@ func (b *fcStarter) SetupCredentials(ctx context.Context, metaRaw orchestrator.M
 	dirCreds := vmutil.FilterExistingCredentials(b.c.serverCfg)
 	agent := b.c.newAgentClient(meta.Name)
 	b.c.credMgr.SetupCredentials(ctx, agent, meta.Name, dirCreds, b.c.mount9PCredentialFunc(meta.Name))
+}
+
+// ConfigureEgressProxy re-opens this shed's egress proxy listener on the
+// per-shed port persisted at create time and re-injects the proxy env.
+// Failable + unwinds via cleanup. No-op when egress is disabled or was off for
+// this shed.
+func (b *fcStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle, cleanup *backend.Cleanup) error {
+	if b.c.egressMgr == nil {
+		return nil
+	}
+	meta := metaRaw.(*fcMetaHandle).meta
+	if meta.EgressPort == 0 && len(meta.EgressProfiles) == 0 {
+		return nil // egress was off for this shed
+	}
+	specs, err := b.c.serverCfg.Egress.ResolveProfiles(meta.EgressProfiles)
+	if err != nil {
+		return fmt.Errorf("egress: resolve profiles: %w", err)
+	}
+	if len(specs) == 0 {
+		return nil
+	}
+	agent := b.c.newAgentClient(meta.Name)
+	gateway, subnet := b.c.egressGatewaySubnet()
+	port, token, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
+	if err != nil {
+		return fmt.Errorf("egress: %w", err)
+	}
+	// Persist a port/token freshly allocated on start (e.g. after `egress set`
+	// on a stopped shed left EgressPort=0) so it stays stable across restarts.
+	if port != meta.EgressPort || token != meta.EgressToken {
+		meta.EgressPort = port
+		meta.EgressToken = token
+		if err := meta.Save(b.c.cfg.InstanceDir); err != nil {
+			return fmt.Errorf("egress: save metadata: %w", err)
+		}
+	}
+	return nil
 }
 
 // RunStartupHook runs ONLY the `startup` hook from provision.yaml

@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/retry"
@@ -54,7 +55,15 @@ type Client struct {
 	snapshotLocks lockmap.NamedMutexMap
 
 	credMgr *vmutil.CredentialManager
+
+	// egressMgr drives the optional egress-control proxy. nil ⇒ egress
+	// disabled, in which case the ConfigureEgressProxy hook is a no-op.
+	egressMgr *egress.Manager
 }
+
+// SetEgressManager attaches the egress-control proxy manager, called by
+// shed-server at startup when egress is enabled. nil leaves egress off.
+func (c *Client) SetEgressManager(m *egress.Manager) { c.egressMgr = m }
 
 // NewClient creates a new VZ client.
 func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
@@ -283,6 +292,13 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		}
 	}
 
+	// Free this shed's egress port reservation. Stop only closes the listener
+	// and keeps the port reserved (for restart); delete frees it. No-op when
+	// egress is disabled or this shed had none.
+	if c.egressMgr != nil {
+		_ = c.egressMgr.Release(name)
+	}
+
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
 	}
@@ -330,6 +346,14 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 
 	// Stop notification listener before shutting down
 	c.credMgr.StopListener(meta.Name)
+
+	// Close this shed's egress proxy listener (frees the per-shed port). No-op
+	// when egress is disabled or this shed has none. Never touches host docker.
+	if c.egressMgr != nil {
+		if err := c.egressMgr.Remove(meta.Name); err != nil {
+			log.Printf("Warning: failed to remove egress listener for %s: %v", meta.Name, err)
+		}
+	}
 
 	agent := c.newAgentClient(meta.Name)
 
@@ -395,25 +419,104 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 	return dialer.DialService(ctx, c.cfg.TCPProxyPort, port)
 }
 
+// SetShedEgress applies a new egress profile selection to a shed. On a running
+// shed the listener is re-pushed and the guest env re-injected live; on a
+// stopped shed it persists and applies on next start. A selection that resolves
+// to nothing (e.g. "off") clears egress.
+func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error) {
+	if c.egressMgr == nil {
+		return nil, fmt.Errorf("egress control is not enabled on this server")
+	}
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+
+	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles)
+	if err != nil {
+		return nil, fmt.Errorf("egress: resolve profiles: %w", err)
+	}
+	if len(specs) == 0 {
+		return c.clearShedEgressLocked(ctx, meta)
+	}
+
+	if meta.Status == config.StatusRunning {
+		gateway, subnet := c.egressGatewaySubnet()
+		agent := c.newAgentClient(name)
+		port, token, err := vmutil.ApplyEgressLive(ctx, c.egressMgr, agent, name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs)
+		if err != nil {
+			return nil, fmt.Errorf("egress: apply: %w", err)
+		}
+		meta.EgressPort = port
+		meta.EgressToken = token
+	}
+	meta.EgressProfiles = profiles
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("egress: save metadata: %w", err)
+	}
+	return c.GetShed(ctx, name)
+}
+
+// ClearShedEgress turns egress off for a shed (live on a running shed).
+func (c *Client) ClearShedEgress(ctx context.Context, name string) (*config.Shed, error) {
+	if c.egressMgr == nil {
+		return nil, fmt.Errorf("egress control is not enabled on this server")
+	}
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	return c.clearShedEgressLocked(ctx, meta)
+}
+
+func (c *Client) clearShedEgressLocked(ctx context.Context, meta *Metadata) (*config.Shed, error) {
+	if meta.Status == config.StatusRunning {
+		agent := c.newAgentClient(meta.Name)
+		_ = vmutil.ClearEgressLive(ctx, c.egressMgr, agent, meta.Name)
+	} else {
+		_ = c.egressMgr.Release(meta.Name) // egress off → free the port reservation
+	}
+	meta.EgressProfiles = nil
+	meta.EgressPort = 0
+	meta.EgressToken = ""
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("egress: save metadata: %w", err)
+	}
+	return c.GetShed(ctx, meta.Name)
+}
+
 // metadataToShed converts VZ metadata to a config.Shed response.
 func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 	return &config.Shed{
-		Name:          meta.Name,
-		Status:        meta.Status,
-		CreatedAt:     meta.CreatedAt,
-		Repo:          meta.Repo,
-		ContainerID:   fmt.Sprintf("vz-%s", meta.Name),
-		Backend:       meta.Backend,
-		IPAddress:     ipAddress,
-		CPUs:          meta.CPUs,
-		MemoryMB:      meta.MemoryMB,
-		PID:           meta.PID,
-		RootfsPath:    meta.RootfsPath,
-		ProjectMounts: meta.ProjectMounts,
-		LandingDir:    meta.LandingDir,
-		Image:         meta.Image,
-		ImageDigest:   meta.LowerDigest,
-		FromSnapshot:  meta.FromSnapshot,
+		Name:           meta.Name,
+		Status:         meta.Status,
+		CreatedAt:      meta.CreatedAt,
+		Repo:           meta.Repo,
+		ContainerID:    fmt.Sprintf("vz-%s", meta.Name),
+		Backend:        meta.Backend,
+		IPAddress:      ipAddress,
+		CPUs:           meta.CPUs,
+		MemoryMB:       meta.MemoryMB,
+		PID:            meta.PID,
+		RootfsPath:     meta.RootfsPath,
+		ProjectMounts:  meta.ProjectMounts,
+		LandingDir:     meta.LandingDir,
+		Image:          meta.Image,
+		ImageDigest:    meta.LowerDigest,
+		FromSnapshot:   meta.FromSnapshot,
+		EgressProfiles: meta.EgressProfiles,
+		EgressPort:     meta.EgressPort,
+		EgressToken:    meta.EgressToken,
 	}
 }
 

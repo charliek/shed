@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/go-chi/chi/v5"
@@ -293,6 +295,130 @@ func (s *Server) handleGetShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, shed)
+}
+
+// handleEgressShow returns a shed's egress status: effective profiles, assigned
+// listener port, the resolved profile definitions, and recent decisions.
+// GET /api/egress/{name}
+func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	shed, err := s.backend.GetShed(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	status := config.EgressStatus{
+		Shed:     name,
+		Enabled:  s.cfg.Egress != nil && s.cfg.Egress.Enabled,
+		Profiles: shed.EgressProfiles,
+		Port:     shed.EgressPort,
+	}
+	// A shed created with the server default has no explicit profiles but does
+	// have a listener — show the effective default selection.
+	if len(status.Profiles) == 0 && shed.EgressPort != 0 && s.cfg.Egress != nil {
+		status.Profiles = s.cfg.Egress.Default
+	}
+	if s.cfg.Egress != nil {
+		status.Rules = map[string]config.EgressProfile{}
+		for _, p := range status.Profiles {
+			if def, ok := s.cfg.Egress.Profiles[p]; ok {
+				status.Rules[p] = def
+			}
+		}
+	}
+	if s.egressAudit != nil {
+		status.Recent = s.egressAudit.Recent(name, 50)
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// egressController is the optional backend capability for live egress changes.
+// The native vz/fc backends implement it; a backend that doesn't yields a 501.
+type egressController interface {
+	SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error)
+	ClearShedEgress(ctx context.Context, name string) (*config.Shed, error)
+}
+
+// handleEgressSet applies a profile selection to a shed (live on a running one).
+// POST /api/egress/{name}  body: {"profiles":["base","github"]}
+func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	ec, ok := s.backend.(egressController)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
+		return
+	}
+	var req config.EgressSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body")
+		return
+	}
+	shed, err := ec.SetShedEgress(r.Context(), name, req.Profiles)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, shed)
+}
+
+// handleEgressStream streams egress decisions as Server-Sent Events for the
+// host-agent subscriber (shed-extensions). GET /api/egress/stream
+func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
+	if s.egressAudit == nil {
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not enabled")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
+		return
+	}
+
+	events := make(chan egress.AuditRecord, 256)
+	unsub := s.egressAudit.Subscribe(func(rec egress.AuditRecord) {
+		select {
+		case events <- rec:
+		default: // drop on overflow; never block the data path
+		}
+	})
+	defer unsub()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rec := <-events:
+			writeSSEEvent(w, "egress", rec)
+			flusher.Flush()
+		}
+	}
+}
+
+// handleEgressOff turns egress off for a shed.
+// DELETE /api/egress/{name}
+func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	ec, ok := s.backend.(egressController)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
+		return
+	}
+	shed, err := ec.ClearShedEgress(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
 	writeJSON(w, http.StatusOK, shed)
 }
 

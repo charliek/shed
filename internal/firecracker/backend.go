@@ -48,6 +48,15 @@ func (b *FirecrackerBackend) GetShed(ctx context.Context, name string) (*config.
 	return b.client.GetShed(ctx, name)
 }
 
+// SetShedEgress / ClearShedEgress implement the api egressController capability.
+func (b *FirecrackerBackend) SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error) {
+	return b.client.SetShedEgress(ctx, name, profiles)
+}
+
+func (b *FirecrackerBackend) ClearShedEgress(ctx context.Context, name string) (*config.Shed, error) {
+	return b.client.ClearShedEgress(ctx, name)
+}
+
 // ListSheds returns all sheds managed by this backend.
 func (b *FirecrackerBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 	return b.client.ListSheds(ctx)

@@ -397,6 +397,34 @@ func (c *APIClient) GetShed(name string) (*config.Shed, error) {
 	return &shed, nil
 }
 
+// EgressShow returns a shed's egress status (active profiles + recent decisions).
+func (c *APIClient) EgressShow(name string) (*config.EgressStatus, error) {
+	var status config.EgressStatus
+	if err := c.doRequest(http.MethodGet, "/api/egress/"+name, nil, &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// EgressSet applies a profile selection to a shed (live on a running shed).
+func (c *APIClient) EgressSet(name string, profiles []string) (*config.Shed, error) {
+	var shed config.Shed
+	req := config.EgressSetRequest{Profiles: profiles}
+	if err := c.doRequest(http.MethodPost, "/api/egress/"+name, req, &shed); err != nil {
+		return nil, err
+	}
+	return &shed, nil
+}
+
+// EgressOff turns egress control off for a shed.
+func (c *APIClient) EgressOff(name string) (*config.Shed, error) {
+	var shed config.Shed
+	if err := c.doRequest(http.MethodDelete, "/api/egress/"+name, nil, &shed); err != nil {
+		return nil, err
+	}
+	return &shed, nil
+}
+
 // DeleteShed deletes a shed.
 func (c *APIClient) DeleteShed(name string, keepVolume bool) error {
 	path := "/api/sheds/" + name

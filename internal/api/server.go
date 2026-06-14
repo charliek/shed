@@ -4,6 +4,7 @@ package api
 import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -11,12 +12,18 @@ import (
 
 // Server is the HTTP API server for shed.
 type Server struct {
-	backend    backend.Backend
-	cfg        *config.ServerConfig
-	sshHostKey string
-	plugins    *plugin.Registry
-	bridge     *plugin.Bridge
+	backend     backend.Backend
+	cfg         *config.ServerConfig
+	sshHostKey  string
+	plugins     *plugin.Registry
+	bridge      *plugin.Bridge
+	egressAudit *egress.AuditLog // nil when egress is disabled
 }
+
+// SetEgressAudit attaches the durable egress audit log so `shed egress show`
+// can return recent decisions. Called by shed-server at startup when egress is
+// enabled; nil leaves the egress routes reporting no recent activity.
+func (s *Server) SetEgressAudit(a *egress.AuditLog) { s.egressAudit = a }
 
 // NewServer creates a new API server.
 func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, plugins *plugin.Registry, bridge *plugin.Bridge) *Server {
@@ -119,6 +126,18 @@ func (s *Server) buildRouter(includePublic, includeBus bool) chi.Router {
 				r.Route("/{name}", func(r chi.Router) {
 					r.Get("/", s.handleGetSnapshot)
 					r.Delete("/", s.handleDeleteSnapshot)
+				})
+			})
+
+			// Egress control: the audit SSE stream (literal), plus per-shed
+			// status + live set/off. The /{name} routes are wrapped so the
+			// literal /stream sibling isn't shadowed at the chi trie level.
+			r.Route("/egress", func(r chi.Router) {
+				r.Get("/stream", s.handleEgressStream)
+				r.Route("/{name}", func(r chi.Router) {
+					r.Get("/", s.handleEgressShow)
+					r.Post("/", s.handleEgressSet)
+					r.Delete("/", s.handleEgressOff)
 				})
 			})
 		}

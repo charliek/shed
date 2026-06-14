@@ -122,6 +122,13 @@ type Metadata struct {
 
 	// FromSnapshot records the snapshot this instance was spawned from (if any).
 	FromSnapshot string `json:"from_snapshot,omitempty"`
+
+	// Egress* persist this shed's egress-control assignment so restart/stop
+	// reuse the same listener port + auth token (allocated at create time by
+	// the ConfigureEgressProxy hook). Absent when egress is disabled.
+	EgressProfiles []string `json:"egress_profiles,omitempty"`
+	EgressPort     int      `json:"egress_port,omitempty"`
+	EgressToken    string   `json:"egress_token,omitempty"`
 }
 
 const metadataFilename = "metadata.json"

@@ -105,6 +105,10 @@ type ServerConfig struct {
 	// the SSH known_hosts content seeded before `git clone` runs.
 	Git *GitConfig `yaml:"git,omitempty"`
 
+	// Egress configures optional Level-1 (audit-first) egress control.
+	// Default (nil / enabled:false) preserves unrestricted networking.
+	Egress *EgressConfig `yaml:"egress,omitempty"`
+
 	// Auth configures optional authentication. Default (nil) preserves the
 	// legacy accept-all behavior.
 	Auth *AuthConfig `yaml:"auth,omitempty"`
@@ -1680,6 +1684,11 @@ func (c *ServerConfig) Validate() error {
 		if err := c.Git.Validate(); err != nil {
 			return fmt.Errorf("git config: %w", err)
 		}
+	}
+
+	// Validate egress config if present (compiles profiles/CEL, fails fast).
+	if err := c.Egress.Validate(); err != nil {
+		return fmt.Errorf("egress config: %w", err)
 	}
 
 	return nil

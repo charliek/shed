@@ -17,6 +17,7 @@ import (
 	"github.com/charliek/shed/internal/api"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/firecracker"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/servertls"
@@ -111,8 +112,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
 
-	// Initialize the configured backend
+	// Initialize the configured backend. egressSocketDir + attachEgress are
+	// captured per-backend so the egress proxy (constructed once, below) can
+	// place its control socket next to the active backend's sockets and hand
+	// the manager to the right client.
 	var be backend.Backend
+	var egressSocketDir string // runtime dir for the control socket
+	var egressStateDir string  // persistent dir for the durable audit log
+	var attachEgress func(*egress.Manager)
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -125,6 +132,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		log.Printf("Initialized Firecracker backend (default_image=%q, pull_policy=%s)", fcCfg.DefaultImage, fcCfg.PullPolicy)
 		be = firecracker.NewBackend(fcClient)
+		egressSocketDir = fcCfg.SocketDir
+		egressStateDir = filepath.Dir(fcCfg.InstanceDir)
+		attachEgress = fcClient.SetEgressManager
 
 	case config.BackendVZ:
 		vzCfg := cfg.VZ
@@ -137,11 +147,52 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		log.Printf("Initialized VZ backend (default_image=%q, pull_policy=%s)", vzCfg.DefaultImage, vzCfg.PullPolicy)
 		be = vz.NewBackend(vzClient)
+		egressSocketDir = vzCfg.SocketDir
+		egressStateDir = filepath.Dir(vzCfg.InstanceDir)
+		attachEgress = vzClient.SetEgressManager
 
 	default:
 		return fmt.Errorf("unsupported backend type: %s", cfg.DefaultBackend)
 	}
 	defer be.Close()
+
+	// Optional egress-control proxy child, started only when enabled. A start
+	// failure is a hard startup error — never a silent disable (AC-11).
+	var egressMgr *egress.Manager
+	var egressAudit *egress.AuditLog
+	if cfg.Egress != nil && cfg.Egress.Enabled {
+		lo, hi := cfg.Egress.PortRangeBounds()
+		sockPath := filepath.Join(egressSocketDir, "egress-proxy.sock")
+		proxyBin, err := resolveEgressProxyBin(egressProxyBinDir())
+		if err != nil {
+			return fmt.Errorf("egress enabled: %w", err)
+		}
+		auditPath := filepath.Join(egressStateDir, "egress-audit.jsonl")
+		egressAudit, err = egress.OpenAuditLog(auditPath, 0)
+		if err != nil {
+			return fmt.Errorf("egress: open audit log %s: %w", auditPath, err)
+		}
+		// Durable JSONL + recent-ring for `shed egress show`, plus a denial line
+		// in the server log for at-a-glance observability.
+		onAudit := func(rec egress.AuditRecord) {
+			egressAudit.Record(rec)
+			logEgressAudit(rec)
+		}
+		egressMgr, err = egress.StartManager(sockPath, proxyBin, lo, hi, onAudit)
+		if err != nil {
+			return fmt.Errorf("egress: start proxy: %w", err)
+		}
+		attachEgress(egressMgr)
+		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s, audit %s)", lo, hi, sockPath, auditPath)
+	}
+	defer func() {
+		if egressMgr != nil {
+			_ = egressMgr.Close()
+		}
+		if egressAudit != nil {
+			_ = egressAudit.Close()
+		}
+	}()
 
 	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
 	// keys are cached next to the host key. Fails closed (returns an error)
@@ -168,6 +219,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
+	apiServer.SetEgressAudit(egressAudit) // nil-safe: no-op when egress disabled
 
 	// Public router (HTTP and, when enabled, HTTPS share one handler). When
 	// the internal-listener split is enabled, it omits the credential bus +
