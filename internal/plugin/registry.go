@@ -103,17 +103,31 @@ func (r *Registry) Register(namespace string) (*Listener, error) {
 	redeliver := r.pendingEnvelopesLocked(namespace)
 	r.mu.Unlock()
 
-	// Re-deliver outside the lock to keep a blocking channel send off the hot
-	// path. The buffer (32) absorbs credential-bus volumes; the done-guard
-	// prevents a stuck send if the listener is torn down mid-redelivery.
-	for _, env := range redeliver {
+	// Re-deliver ASYNCHRONOUSLY. The caller (handlePluginSubscribe) only starts
+	// reading l.Messages after Register returns, so sending inline here would
+	// block once the 32-buffer fills — and a backlog larger than the buffer would
+	// wedge forever, because nothing closes done until the handler installs its
+	// deferred Unregister. The goroutine instead drains into the live stream as
+	// the handler reads, and bails if the listener is torn down (done) — which the
+	// handler's deferred Unregister guarantees on any exit, so it cannot leak.
+	if len(redeliver) > 0 {
+		go redeliverPending(msgs, done, redeliver)
+	}
+	return l, nil
+}
+
+// redeliverPending streams a freshly (re)registered listener's retained requests
+// into its channel, stopping early if the listener disconnects (done). Run in its
+// own goroutine so Register never blocks on a backlog the handler hasn't begun
+// reading yet.
+func redeliverPending(msgs chan<- *Envelope, done <-chan struct{}, envs []*Envelope) {
+	for _, env := range envs {
 		select {
 		case msgs <- env:
 		case <-done:
-			return l, nil
+			return
 		}
 	}
-	return l, nil
 }
 
 // pendingEnvelopesLocked returns a namespace's un-answered request envelopes,
@@ -137,14 +151,15 @@ func (r *Registry) pendingEnvelopesLocked(namespace string) []*Envelope {
 }
 
 // sweepStalePendingLocked drops pending entries older than pendingRetention
-// across all namespaces. The caller must hold r.mu. Called opportunistically on
-// every Register (any namespace), deliberately NOT from a background sweeper
-// (unlike authtoken.StartSweeper): the set only grows via Publish and is
-// reclaimed by the final response, so on a live server with listener churn —
-// each reconnect is a Register — stale entries are collected promptly without a
-// goroutine + ctx the Registry doesn't carry. The only un-swept case is a server
-// that bursts requests then goes permanently idle; that retention is bounded by
-// the last burst (not a leak), so a background sweeper isn't worth its plumbing.
+// across all namespaces. The caller must hold r.mu. Called on every Publish AND
+// every Register — i.e. on every pending mutation — deliberately NOT from a
+// background sweeper (unlike authtoken.StartSweeper): so any ongoing request
+// traffic OR listener churn keeps the set bounded and the effective
+// response-acceptance window at ~pendingRetention, without the goroutine + ctx
+// the Registry doesn't carry. The only un-swept case is a namespace gone fully
+// idle (no further Publish anywhere, no Register anywhere); that retention is
+// frozen and bounded by its last burst (not a growing leak), so a background
+// sweeper isn't warranted.
 func (r *Registry) sweepStalePendingLocked() {
 	cutoff := time.Now().Add(-pendingRetention)
 	for k, p := range r.pending {
@@ -162,7 +177,10 @@ func (r *Registry) sweepStalePendingLocked() {
 // Honoring a response after the original listener is gone is safe: ConsumeResponse
 // still matches only the unguessable per-request ID, and one-listener-per-namespace
 // (the 409 on a second Register) means whoever reclaims the namespace already holds
-// its credentials token — i.e. is already authorized to answer its requests.
+// its credentials token — i.e. is already authorized to answer its requests. This
+// is an intentional relaxation of the prior discard-on-disconnect behavior (a
+// reconnecting credentials holder can now complete an approval that was in flight
+// when its connection dropped), surfaced for the PR review.
 func (r *Registry) Unregister(namespace string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -202,8 +220,12 @@ func (r *Registry) Publish(env *Envelope) error {
 	// Look up the listener and record the pending request under one lock, so an
 	// Unregister can't interleave between them and orphan a pending entry that a
 	// reconnecting listener could then answer. The blocking channel send happens
-	// after the lock is released.
+	// after the lock is released. Sweep here too (not only on Register): request
+	// traffic is the most frequent pending mutation, so it keeps the retained set
+	// (and the effective response-acceptance TTL) bounded even for a long-lived
+	// listener that never reconnects.
 	r.mu.Lock()
+	r.sweepStalePendingLocked()
 	l, ok := r.listeners[env.Namespace]
 	if ok {
 		r.trackPendingLocked(env)

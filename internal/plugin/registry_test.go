@@ -252,6 +252,62 @@ func TestSweepsStaleAbandonedPending(t *testing.T) {
 	}
 }
 
+// TestReDeliversLargeBacklogWithoutWedging guards the wedge fix: a retained
+// backlog larger than the listener's channel buffer (32) must not block Register
+// (which would hang the HTTP handler and wedge the namespace at 409 on every
+// reconnect). Register must return promptly and every request must still be
+// re-delivered.
+func TestReDeliversLargeBacklogWithoutWedging(t *testing.T) {
+	r := newTrackingRegistry()
+	l1, _ := r.Register("op")
+
+	const n = 50 // > the 32-element listener buffer
+	ids := make(map[string]bool, n)
+	for range n {
+		ids[dispatchRequest(t, r, "op", "dev")] = true
+		<-l1.Messages // drain so Publish's own send doesn't block on the buffer
+	}
+	r.Unregister("op")
+
+	// Reconnect in a goroutine so a (buggy) blocking Register surfaces as a clean
+	// timeout failure rather than hanging the whole test.
+	type regResult struct {
+		l   *Listener
+		err error
+	}
+	resCh := make(chan regResult, 1)
+	go func() {
+		l2, err := r.Register("op")
+		resCh <- regResult{l2, err}
+	}()
+	var res regResult
+	select {
+	case res = <-resCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Register blocked on a backlog larger than the channel buffer (wedge)")
+	}
+	if res.err != nil {
+		t.Fatalf("re-register: %v", res.err)
+	}
+
+	// Every retained request is eventually re-delivered, none lost.
+	got := make(map[string]bool, n)
+	deadline := time.After(3 * time.Second)
+	for len(got) < n {
+		select {
+		case env := <-res.l.Messages:
+			got[env.ID] = true
+		case <-deadline:
+			t.Fatalf("only %d/%d backlog requests re-delivered", len(got), n)
+		}
+	}
+	for id := range ids {
+		if !got[id] {
+			t.Errorf("request %s was not re-delivered", id)
+		}
+	}
+}
+
 func TestEventsCreateNoPending(t *testing.T) {
 	r := newTrackingRegistry()
 	r.Register("op")
