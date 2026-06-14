@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -84,6 +85,55 @@ func TestSubscribeReceivesEnvelopes(t *testing.T) {
 	}
 	if received[1].ID != env2.ID {
 		t.Errorf("second envelope ID = %q, want %q", received[1].ID, env2.ID)
+	}
+}
+
+// TestSubscribeTerminatesOn409 proves a 409 (another listener already owns the
+// namespace) is terminal: the channel closes on its own, the server is hit
+// exactly once (no hot-loop retry), and Status reports ConnRejected. Guards the
+// "second broker is observably rejected" acceptance criterion.
+func TestSubscribeTerminatesOn409(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`namespace "ns1" is already registered`))
+	}))
+	defer srv.Close()
+
+	client := NewHostClient(
+		WithServerURL(srv.URL),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+
+	// No ctx cancel: the loop must terminate itself on the 409.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ch := client.Subscribe(ctx, "ns1")
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected no envelopes on a 409-rejected subscription")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("subscribe did not terminate on 409 — it is hot-looping the retry")
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("server hits = %d, want 1 (a 409 must be terminal, not retried)", got)
+	}
+
+	st, ok := nsState(client, "ns1")
+	if !ok {
+		t.Fatal("no status recorded for ns1")
+	}
+	if st.State != ConnRejected {
+		t.Errorf("state = %q, want %q", st.State, ConnRejected)
+	}
+	if st.LastError == "" {
+		t.Error("expected LastError to carry the 409 reason")
 	}
 }
 

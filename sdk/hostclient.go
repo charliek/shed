@@ -28,7 +28,17 @@ const (
 	ConnConnected    = "connected"
 	ConnReconnecting = "reconnecting"
 	ConnStopped      = "stopped"
+	// ConnRejected is terminal: the server refused the subscription with 409
+	// (another listener already owns the namespace), so the loop stops instead
+	// of hot-looping a retry. Distinct from ConnStopped (a clean ctx cancel).
+	ConnRejected = "rejected"
 )
+
+// errSubscribeConflict is returned by streamMessages when the server answers the
+// subscribe with 409 Conflict — the namespace already has an active listener.
+// subscribeLoop treats it as terminal: a second broker must be observably
+// rejected, not silently retry forever.
+var errSubscribeConflict = errors.New("namespace already has an active subscriber")
 
 // SubStatus is a snapshot of one namespace subscription's connection state, so
 // callers can report health (e.g. `shed-host-agent status --live`) without
@@ -225,7 +235,10 @@ func (c *HostClient) setState(namespace, state string, cause error) {
 
 func (c *HostClient) subscribeLoop(ctx context.Context, namespace string, ch chan<- *Envelope) {
 	defer close(ch)
-	defer c.setState(namespace, ConnStopped, nil)
+	// Terminal state defaults to a clean stop (ctx cancel); a 409 rejection
+	// overrides it to ConnRejected below so Status() reports it observably.
+	stopState, stopCause := ConnStopped, error(nil)
+	defer func() { c.setState(namespace, stopState, stopCause) }()
 	c.setState(namespace, ConnReconnecting, nil) // "connecting" until the first attempt resolves
 
 	backoff := initialBackoff
@@ -240,6 +253,15 @@ func (c *HostClient) subscribeLoop(ctx context.Context, namespace string, ch cha
 			c.logger.Info("SSE connected", "namespace", namespace)
 		})
 		if ctx.Err() != nil {
+			return
+		}
+		// A 409 means another listener already owns this namespace. Retrying
+		// would be a silent double-broker hot-loop, so stop terminally and let
+		// Status() surface the rejection.
+		if errors.Is(err, errSubscribeConflict) {
+			stopState, stopCause = ConnRejected, err
+			c.logger.Error("SSE subscription rejected; another listener owns this namespace — not retrying",
+				"namespace", namespace, "error", err)
 			return
 		}
 		c.setState(namespace, ConnReconnecting, err)
@@ -287,6 +309,9 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: %s", errSubscribeConflict, strings.TrimSpace(string(body)))
+		}
 		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 	}
 
