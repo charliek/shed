@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/charliek/shed/internal/authtoken"
-	"github.com/charliek/shed/internal/config"
 )
 
 // authMiddleware enforces bearer-token auth when auth.http.mode == enforce.
@@ -26,8 +25,7 @@ import (
 // /api route requires a control-scoped token. So a leaked control token can't
 // reach the bus, and a credentials token is bus-only.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	h := s.cfg.HTTPAuth()
-	if h == nil || h.Mode != config.HTTPAuthEnforce {
+	if !s.cfg.HTTPAuthEnforced() {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -66,8 +64,7 @@ func (s *Server) validateToken(tok string) (authtoken.PublicRecord, bool) {
 // validated against the registry's pending set. It is gated on HTTP auth being
 // on, so the default token-less fleet keeps today's bus behavior.
 func (s *Server) busOwnershipEnforced() bool {
-	h := s.cfg.HTTPAuth()
-	return h != nil && h.Mode == config.HTTPAuthEnforce
+	return s.cfg.HTTPAuthEnforced()
 }
 
 // isBootstrapExempt reports whether r targets an endpoint reachable without a

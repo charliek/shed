@@ -692,11 +692,25 @@ const (
 	HTTPAuthEnforce = "enforce" // require a valid bearer token (except bootstrap endpoints)
 )
 
-// AuthConfig configures optional authentication layers (all default-off).
+// Auth modes for AuthConfig.Mode — the binary secure-by-default switch.
+const (
+	AuthModeOpen   = "open"   // default: no enforcement (tailnet/LAN posture)
+	AuthModeSecure = "secure" // SSH allowlist + HTTP tokens + TLS, all enforced
+)
+
+// AuthConfig configures authentication. The headline control is Mode (the
+// binary open|secure switch). The SSH/HTTP sub-blocks carry key sources and
+// advanced per-layer overrides.
 type AuthConfig struct {
-	// SSH configures the SSH public-key allowlist.
+	// Mode is open | secure (default open). secure derives: SSH allowlist
+	// enforce, HTTP bearer-token enforce, TLS on, and a loopback-bound plain
+	// HTTP listener; it requires at least one SSH key source.
+	Mode string `yaml:"mode,omitempty"`
+	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
+	TokenTTL Duration `yaml:"token_ttl,omitempty"`
+	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
-	// HTTP configures bearer-token auth on the HTTP API.
+	// HTTP configures bearer-token auth on the HTTP API (advanced mode override).
 	HTTP *HTTPAuthConfig `yaml:"http,omitempty"`
 }
 

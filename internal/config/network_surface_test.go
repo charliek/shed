@@ -190,6 +190,8 @@ func TestValidateAuth(t *testing.T) {
 		{"invalid scope rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: "root", Token: "shed_root_x"}}}}, "invalid scope"},
 		{"credentials scope ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeCredentials, Token: "shed_credentials_x"}}}}, ""},
 		{"admin scope rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: "admin", Token: "shed_admin_x"}}}}, "invalid scope"},
+		{"invalid auth.mode rejected", &AuthConfig{Mode: "secur"}, "auth.mode"},
+		{"secure auth.mode ok", &AuthConfig{Mode: AuthModeSecure}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

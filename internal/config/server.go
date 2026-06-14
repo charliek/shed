@@ -133,9 +133,62 @@ func (c *ServerConfig) HTTPAuth() *HTTPAuthConfig {
 	return c.Auth.HTTP
 }
 
+// DefaultTokenTTL is the lifetime of a bootstrap-minted HTTP token when
+// auth.token_ttl is unset.
+const DefaultTokenTTL = 24 * time.Hour
+
+// Secure reports whether the server runs in secure mode (auth.mode: secure):
+// SSH allowlist enforce + HTTP bearer-token enforce + TLS + a loopback-bound
+// plain HTTP listener. The default (open) preserves the legacy accept-all
+// tailnet/LAN posture.
+func (c *ServerConfig) Secure() bool {
+	return c.Auth != nil && c.Auth.Mode == AuthModeSecure
+}
+
+// HTTPAuthEnforced reports whether the HTTP API requires a bearer token: true in
+// secure mode, or when the advanced auth.http.mode override is set to enforce.
+func (c *ServerConfig) HTTPAuthEnforced() bool {
+	if c.Secure() {
+		return true
+	}
+	h := c.HTTPAuth()
+	return h != nil && h.Mode == HTTPAuthEnforce
+}
+
+// EffectiveSSHAuth returns the SSH auth config to build the allowlist from. In
+// secure mode the mode is forced to enforce (key sources still come from the
+// configured auth.ssh block); otherwise the configured block is used verbatim.
+func (c *ServerConfig) EffectiveSSHAuth() *SSHAuthConfig {
+	if !c.Secure() {
+		return c.SSHAuth()
+	}
+	eff := SSHAuthConfig{}
+	if s := c.SSHAuth(); s != nil {
+		eff = *s
+	}
+	eff.Mode = SSHAuthEnforce
+	return &eff
+}
+
+// TokenTTL is the lifetime of a bootstrap-minted HTTP token (auth.token_ttl),
+// defaulting to DefaultTokenTTL when unset.
+func (c *ServerConfig) TokenTTL() time.Duration {
+	if c.Auth != nil && c.Auth.TokenTTL > 0 {
+		return c.Auth.TokenTTL.Duration()
+	}
+	return DefaultTokenTTL
+}
+
 // validateAuth checks the optional auth config. Shared by Validate and
 // ValidateNoHostCoupling.
 func (c *ServerConfig) validateAuth() error {
+	if c.Auth != nil {
+		switch c.Auth.Mode {
+		case "", AuthModeOpen, AuthModeSecure:
+		default:
+			return fmt.Errorf("invalid auth.mode: %q (must be open or secure)", c.Auth.Mode)
+		}
+	}
 	if ssh := c.SSHAuth(); ssh != nil {
 		switch ssh.Mode {
 		case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
@@ -175,7 +228,7 @@ func (c *ServerConfig) validateAuth() error {
 // loopback internal bus face the network. Otherwise it honors http_bind
 // (default all interfaces), unchanged.
 func (c *ServerConfig) HTTPListenAddr() string {
-	if c.PublicExposure {
+	if c.Secure() || c.PublicExposure {
 		return listenAddr(loopbackBind, c.HTTPPort)
 	}
 	return listenAddr(c.HTTPBind, c.HTTPPort)
@@ -259,6 +312,21 @@ func (c *ServerConfig) PreflightPublicExposure() error {
 	}
 	if c.HTTPSPort <= 0 {
 		return errors.New("public_exposure requires https_port (TLS must be on)")
+	}
+	return nil
+}
+
+// PreflightSecure gates secure-mode startup: it refuses to start when
+// auth.mode: secure is set without any SSH key source (github_users /
+// authorized_keys / authorized_keys_file). Secure mode enforces the SSH
+// allowlist, so an empty allowlist would lock everyone out. Inert in open mode.
+func (c *ServerConfig) PreflightSecure() error {
+	if !c.Secure() {
+		return nil
+	}
+	ssh := c.SSHAuth()
+	if ssh == nil || (len(ssh.GitHubUsers) == 0 && len(ssh.AuthorizedKeys) == 0 && ssh.AuthorizedKeysFile == "") {
+		return errors.New("auth.mode: secure requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)")
 	}
 	return nil
 }
@@ -1343,6 +1411,11 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	// Apply defaults for zero values
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
+	}
+	// Secure mode turns TLS on; default the HTTPS port if the operator didn't
+	// set one, so `auth.mode: secure` needs no extra TLS config.
+	if cfg.Secure() && cfg.HTTPSPort == 0 {
+		cfg.HTTPSPort = 8443
 	}
 	if cfg.SSHPort == 0 {
 		cfg.SSHPort = 2222

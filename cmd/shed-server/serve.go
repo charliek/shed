@@ -43,10 +43,6 @@ const (
 	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
 	// from the in-memory store (expired tokens are also dropped on validate).
 	tokenSweepInterval = 10 * time.Minute
-
-	// defaultTokenTTL is the lifetime of a bootstrap-minted HTTP token until
-	// auth.token_ttl is wired in (sub-step 1d).
-	defaultTokenTTL = 24 * time.Hour
 )
 
 // newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
@@ -106,6 +102,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := cfg.PreflightPublicExposure(); err != nil {
 		return fmt.Errorf("public_exposure preflight: %w", err)
 	}
+	if err := cfg.PreflightSecure(); err != nil {
+		return fmt.Errorf("secure-mode preflight: %w", err)
+	}
 
 	log.Printf("Starting shed-server...")
 	log.Printf("HTTP listen: %s", cfg.HTTPListenAddr())
@@ -116,7 +115,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Track pending requests only when HTTP auth is enforced — the /respond
 	// ownership gate is consulted only then, so an unauthenticated server does
 	// no bookkeeping.
-	if h := cfg.HTTPAuth(); h != nil && h.Mode == config.HTTPAuthEnforce {
+	if cfg.HTTPAuthEnforced() {
 		pluginRegistry.EnableOwnershipTracking()
 	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
@@ -218,7 +217,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// when mode=enforce but no keys resolved.
 	hostKeyPath := defaultHostKeyPath()
 	githubCacheDir := filepath.Join(filepath.Dir(hostKeyPath), "github_keys")
-	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.SSHAuth(), githubCacheDir)
+	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.EffectiveSSHAuth(), githubCacheDir)
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
 	}
@@ -280,7 +279,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		HTTPPort:       cfg.HTTPPort,
 		HTTPSPort:      cfg.HTTPSPort,
 		TLSFingerprint: tlsFingerprint,
-		TokenTTL:       defaultTokenTTL,
+		TokenTTL:       cfg.TokenTTL(),
 	})
 
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH, internal HTTP).
