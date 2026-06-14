@@ -33,9 +33,72 @@ Examples:
 	RunE: runEgressShow,
 }
 
+var egressSetProfiles []string
+
+var egressSetCmd = &cobra.Command{
+	Use:   "set <shed-name>",
+	Short: "Set a shed's egress profiles (live on a running shed)",
+	Long: `Set a shed's egress profiles. On a running shed the change applies
+live (listener re-pushed, guest env re-injected); on a stopped shed it persists
+and applies on next start. An empty selection or 'off' disables egress.
+
+Examples:
+  shed egress set web --profile base,github
+  shed egress set web --profile off`,
+	Args: cobra.ExactArgs(1),
+	RunE: runEgressSet,
+}
+
+var egressOffCmd = &cobra.Command{
+	Use:   "off <shed-name>",
+	Short: "Turn egress control off for a shed",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runEgressOff,
+}
+
 func init() {
-	egressCmd.AddCommand(egressShowCmd)
+	egressSetCmd.Flags().StringSliceVar(&egressSetProfiles, "profile", nil, "Egress profiles to apply (comma-separated; empty or 'off' disables)")
+	egressCmd.AddCommand(egressShowCmd, egressSetCmd, egressOffCmd)
 	rootCmd.AddCommand(egressCmd)
+}
+
+func runEgressSet(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	entry, _, err := getServerEntry()
+	if err != nil {
+		return err
+	}
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	shed, err := client.EgressSet(name, egressSetProfiles)
+	if err != nil {
+		return fmt.Errorf("failed to set egress for %s: %w", name, err)
+	}
+	if jsonFlag {
+		return outputJSON(shed)
+	}
+	if len(shed.EgressProfiles) == 0 && shed.EgressPort == 0 {
+		fmt.Printf("Egress turned off for %s.\n", name)
+	} else {
+		fmt.Printf("Egress updated for %s (profiles: %s).\n", name, strings.Join(shed.EgressProfiles, ", "))
+	}
+	return nil
+}
+
+func runEgressOff(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	entry, _, err := getServerEntry()
+	if err != nil {
+		return err
+	}
+	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	if _, err := client.EgressOff(name); err != nil {
+		return fmt.Errorf("failed to turn egress off for %s: %w", name, err)
+	}
+	if jsonFlag {
+		return outputJSON(map[string]string{"status": "ok", "shed": name})
+	}
+	fmt.Printf("Egress turned off for %s.\n", name)
+	return nil
 }
 
 func runEgressShow(cmd *cobra.Command, args []string) error {

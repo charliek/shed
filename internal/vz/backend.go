@@ -48,6 +48,15 @@ func (b *VZBackend) GetShed(ctx context.Context, name string) (*config.Shed, err
 	return b.client.GetShed(ctx, name)
 }
 
+// SetShedEgress / ClearShedEgress implement the api egressController capability.
+func (b *VZBackend) SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error) {
+	return b.client.SetShedEgress(ctx, name, profiles)
+}
+
+func (b *VZBackend) ClearShedEgress(ctx context.Context, name string) (*config.Shed, error) {
+	return b.client.ClearShedEgress(ctx, name)
+}
+
 // ListSheds returns all sheds managed by this backend.
 func (b *VZBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 	return b.client.ListSheds(ctx)

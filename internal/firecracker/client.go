@@ -383,6 +383,88 @@ func (c *Client) mount9PCredentialFunc(shedName string) vmutil.DirMountFunc {
 	}
 }
 
+// egressGatewaySubnet returns the gateway IP + subnet CIDR the guest reaches the
+// host (proxy) on. For FC these come from the bridge network manager.
+func (c *Client) egressGatewaySubnet() (gateway, subnet string) {
+	return c.netMgr.Gateway(), c.cfg.BridgeCIDR
+}
+
+// SetShedEgress applies a new egress profile selection to a shed. On a running
+// shed the listener is re-pushed and the guest env re-injected live; on a
+// stopped shed it persists and applies on next start. A selection that resolves
+// to nothing (e.g. "off") clears egress.
+func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error) {
+	if c.egressMgr == nil {
+		return nil, fmt.Errorf("egress control is not enabled on this server")
+	}
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+
+	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles)
+	if err != nil {
+		return nil, fmt.Errorf("egress: resolve profiles: %w", err)
+	}
+	if len(specs) == 0 {
+		return c.clearShedEgressLocked(ctx, meta)
+	}
+
+	if meta.Status == config.StatusRunning {
+		gateway, subnet := c.egressGatewaySubnet()
+		agent := c.newAgentClient(name)
+		port, token, err := vmutil.ApplyEgressLive(ctx, c.egressMgr, agent, name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs)
+		if err != nil {
+			return nil, fmt.Errorf("egress: apply: %w", err)
+		}
+		meta.EgressPort = port
+		meta.EgressToken = token
+	}
+	meta.EgressProfiles = profiles
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("egress: save metadata: %w", err)
+	}
+	return c.GetShed(ctx, name)
+}
+
+// ClearShedEgress turns egress off for a shed (live on a running shed).
+func (c *Client) ClearShedEgress(ctx context.Context, name string) (*config.Shed, error) {
+	if c.egressMgr == nil {
+		return nil, fmt.Errorf("egress control is not enabled on this server")
+	}
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	return c.clearShedEgressLocked(ctx, meta)
+}
+
+func (c *Client) clearShedEgressLocked(ctx context.Context, meta *Metadata) (*config.Shed, error) {
+	if meta.Status == config.StatusRunning {
+		agent := c.newAgentClient(meta.Name)
+		_ = vmutil.ClearEgressLive(ctx, c.egressMgr, agent, meta.Name)
+	} else {
+		_ = c.egressMgr.Remove(meta.Name) // free any in-memory port reservation
+	}
+	meta.EgressProfiles = nil
+	meta.EgressPort = 0
+	meta.EgressToken = ""
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("egress: save metadata: %w", err)
+	}
+	return c.GetShed(ctx, meta.Name)
+}
+
 func metadataToShed(meta *Metadata) *config.Shed {
 	return &config.Shed{
 		Name:           meta.Name,

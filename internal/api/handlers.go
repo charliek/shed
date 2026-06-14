@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -331,6 +332,54 @@ func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
 		status.Recent = s.egressAudit.Recent(name, 50)
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+// egressController is the optional backend capability for live egress changes.
+// The native vz/fc backends implement it; a backend that doesn't yields a 501.
+type egressController interface {
+	SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error)
+	ClearShedEgress(ctx context.Context, name string) (*config.Shed, error)
+}
+
+// handleEgressSet applies a profile selection to a shed (live on a running one).
+// POST /api/egress/{name}  body: {"profiles":["base","github"]}
+func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	ec, ok := s.backend.(egressController)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "not_supported", "egress control is not supported by this backend")
+		return
+	}
+	var req config.EgressSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	shed, err := ec.SetShedEgress(r.Context(), name, req.Profiles)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, shed)
+}
+
+// handleEgressOff turns egress off for a shed.
+// DELETE /api/egress/{name}
+func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	ec, ok := s.backend.(egressController)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "not_supported", "egress control is not supported by this backend")
+		return
+	}
+	shed, err := ec.ClearShedEgress(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, shed)
 }
 
 // handleDeleteShed deletes a shed.

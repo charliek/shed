@@ -129,9 +129,11 @@ func (s *Server) buildRouter(includePublic, includeBus bool) chi.Router {
 				})
 			})
 
-			// Egress control: per-shed status (set/off added later).
+			// Egress control: per-shed status + live set/off.
 			r.Route("/egress", func(r chi.Router) {
 				r.Get("/{name}", s.handleEgressShow)
+				r.Post("/{name}", s.handleEgressSet)
+				r.Delete("/{name}", s.handleEgressOff)
 			})
 		}
 

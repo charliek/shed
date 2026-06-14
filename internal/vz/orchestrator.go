@@ -38,6 +38,12 @@ const (
 	vzEgressSubnet  = "192.168.64.0/24"
 )
 
+// egressGatewaySubnet returns the gateway IP + subnet CIDR the guest reaches the
+// host (proxy) on. For VZ these are the vmnet shared-mode defaults.
+func (c *Client) egressGatewaySubnet() (gateway, subnet string) {
+	return vzEgressGateway, vzEgressSubnet
+}
+
 type vzCreator struct {
 	c *Client
 	// egressEnv is the proxy env injected by ConfigureEgressProxy, threaded
@@ -418,7 +424,8 @@ func (b *vzCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	}
 	meta := metaRaw.(*vzMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
-	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, vzEgressGateway, vzEgressSubnet, specs, cleanup)
+	gateway, subnet := b.c.egressGatewaySubnet()
+	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
 	if err != nil {
 		return fmt.Errorf("egress: %w", err)
 	}
@@ -659,7 +666,8 @@ func (b *vzStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrat
 		return nil
 	}
 	agent := b.c.newAgentClient(meta.Name)
-	if _, _, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, vzEgressGateway, vzEgressSubnet, specs, cleanup); err != nil {
+	gateway, subnet := b.c.egressGatewaySubnet()
+	if _, _, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup); err != nil {
 		return fmt.Errorf("egress: %w", err)
 	}
 	return nil

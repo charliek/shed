@@ -104,6 +104,30 @@ func SetupEgress(ctx context.Context, mgr *egress.Manager, agent *AgentClient, n
 	return port, token, pe.EnvPairs(), nil
 }
 
+// ApplyEgressLive (re)configures a running shed's listener and re-injects the
+// guest env — the live `shed egress set` path (no create-transaction cleanup).
+// On an inject failure it rolls back the listener it just opened. Returns the
+// effective port + token to persist.
+func ApplyEgressLive(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string, existingPort int, existingToken, gateway, subnet string, specs []egress.ProfileSpec) (int, string, error) {
+	port, token, err := mgr.Configure(name, existingPort, existingToken, gateway, specs)
+	if err != nil {
+		return 0, "", err
+	}
+	pe := EgressProxyEnv{Gateway: gateway, Port: port, Token: token, NoProxy: BuildNoProxy(gateway, subnet)}
+	if err := InjectEgressProxy(ctx, agent, pe); err != nil {
+		_ = mgr.Remove(name) // roll back the listener we just opened
+		return 0, "", err
+	}
+	return port, token, nil
+}
+
+// ClearEgressLive removes a running shed's listener and its injected guest files
+// — the live `shed egress off` path.
+func ClearEgressLive(ctx context.Context, mgr *egress.Manager, agent *AgentClient, name string) error {
+	_ = mgr.Remove(name)
+	return RemoveEgressProxy(ctx, agent)
+}
+
 // InjectEgressProxy writes the proxy env into the guest's persistent upper (a
 // login-shell profile + an in-GUEST dockerd drop-in) and reloads the guest
 // docker so it picks up the change (best-effort; no-op if docker is absent).

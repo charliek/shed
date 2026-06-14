@@ -6,21 +6,35 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
 )
 
-// egressFakeBackend reuses the system-test fakeBackend (all methods panic) and
-// overrides only GetShed, which is all handleEgressShow needs.
+// egressFakeBackend reuses the system-test fakeBackend (all methods panic),
+// overrides GetShed, and implements the egressController capability so the
+// set/off handlers can be exercised.
 type egressFakeBackend struct {
 	fakeBackend
-	shed *config.Shed
+	shed          *config.Shed
+	setCalledWith []string
+	cleared       bool
 }
 
 func (f *egressFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, error) {
 	return f.shed, nil
+}
+
+func (f *egressFakeBackend) SetShedEgress(_ context.Context, name string, profiles []string) (*config.Shed, error) {
+	f.setCalledWith = profiles
+	return &config.Shed{Name: name, EgressProfiles: profiles, EgressPort: 20002}, nil
+}
+
+func (f *egressFakeBackend) ClearShedEgress(_ context.Context, name string) (*config.Shed, error) {
+	f.cleared = true
+	return &config.Shed{Name: name}, nil
 }
 
 func TestHandleEgressShow(t *testing.T) {
@@ -85,5 +99,37 @@ func TestHandleEgressShow_DisabledServer(t *testing.T) {
 	}
 	if got.Enabled {
 		t.Errorf("expected Enabled=false when server has no egress config")
+	}
+}
+
+func TestHandleEgressSet(t *testing.T) {
+	be := &egressFakeBackend{shed: &config.Shed{Name: "web"}}
+	srv := NewServer(be, &config.ServerConfig{Name: "t", Egress: &config.EgressConfig{Enabled: true}}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/egress/web", strings.NewReader(`{"profiles":["base","github"]}`))
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if len(be.setCalledWith) != 2 || be.setCalledWith[0] != "base" || be.setCalledWith[1] != "github" {
+		t.Errorf("SetShedEgress called with %v, want [base github]", be.setCalledWith)
+	}
+}
+
+func TestHandleEgressOff(t *testing.T) {
+	be := &egressFakeBackend{shed: &config.Shed{Name: "web"}}
+	srv := NewServer(be, &config.ServerConfig{Name: "t"}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodDelete, "/api/egress/web", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if !be.cleared {
+		t.Error("ClearShedEgress was not called")
 	}
 }

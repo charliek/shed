@@ -50,6 +50,11 @@ type EgressStatus struct {
 	Recent   []egress.AuditRecord     `json:"recent,omitempty"`   // recent egress decisions for this shed
 }
 
+// EgressSetRequest is the `POST /api/egress/{name}` body (live `shed egress set`).
+type EgressSetRequest struct {
+	Profiles []string `json:"profiles"`
+}
+
 var egressReservedNames = map[string]bool{"off": true, "none": true, "default": true}
 
 func (p EgressProfile) spec() egress.ProfileSpec {

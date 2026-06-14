@@ -443,7 +443,8 @@ func (b *fcCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	}
 	meta := metaRaw.(*fcMetaHandle).meta
 	agent := b.c.newAgentClient(meta.Name)
-	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, b.c.netMgr.Gateway(), b.c.cfg.BridgeCIDR, specs, cleanup)
+	gateway, subnet := b.c.egressGatewaySubnet()
+	port, token, env, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup)
 	if err != nil {
 		return fmt.Errorf("egress: %w", err)
 	}
@@ -677,7 +678,8 @@ func (b *fcStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrat
 		return nil
 	}
 	agent := b.c.newAgentClient(meta.Name)
-	if _, _, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, b.c.netMgr.Gateway(), b.c.cfg.BridgeCIDR, specs, cleanup); err != nil {
+	gateway, subnet := b.c.egressGatewaySubnet()
+	if _, _, _, err := vmutil.SetupEgress(ctx, b.c.egressMgr, agent, meta.Name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs, cleanup); err != nil {
 		return fmt.Errorf("egress: %w", err)
 	}
 	return nil
