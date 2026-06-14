@@ -22,12 +22,17 @@ import (
 // handleGetInfo returns server information.
 // GET /api/info
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
+	authMode := config.AuthModeOpen
+	if s.cfg.Secure() {
+		authMode = config.AuthModeSecure
+	}
 	info := config.ServerInfo{
 		Name:         s.cfg.Name,
 		Version:      version.Info(),
 		SSHPort:      s.cfg.SSHPort,
 		HTTPPort:     s.cfg.HTTPPort,
 		Backend:      s.cfg.DefaultBackend,
+		AuthMode:     authMode,
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 	}
 

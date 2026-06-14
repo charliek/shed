@@ -223,6 +223,10 @@ type ServerInfo struct {
 	SSHPort  int    `json:"ssh_port"`
 	HTTPPort int    `json:"http_port"`
 	Backend  string `json:"backend"`
+	// AuthMode is the server's auth.mode ("secure" or "open"), so `shed server
+	// add` knows whether to bootstrap an HTTP token over SSH. Reported on the
+	// unauthenticated /api/info — the mode is observable from behavior anyway.
+	AuthMode string `json:"auth_mode,omitempty"`
 	// DefaultImage is the resolved default_image for the active backend
 	// (after ${shed.version} expansion / version synthesis at load). Exposed
 	// so clients can see which image a `shed create` without --image will

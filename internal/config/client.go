@@ -45,6 +45,10 @@ type ServerEntry struct {
 	// credential bus. Both optional; empty when the server isn't token-gated.
 	ControlToken     string `yaml:"control_token,omitempty"`
 	CredentialsToken string `yaml:"credentials_token,omitempty"`
+	// ControlTokenExpiresAt is when ControlToken (bootstrap-minted, short-TTL)
+	// expires, so the CLI can transparently re-mint before/after expiry. Zero
+	// for a legacy static token or an open server.
+	ControlTokenExpiresAt time.Time `yaml:"control_token_expires_at,omitempty"`
 	// APIURL, when set, overrides the scheme+host+port for the control plane
 	// (e.g. https://host:8443). Empty = plain http://Host:HTTPPort (legacy).
 	APIURL string `yaml:"api_url,omitempty"`

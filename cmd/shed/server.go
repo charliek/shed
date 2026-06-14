@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	gossh "golang.org/x/crypto/ssh"
@@ -275,6 +276,26 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to save SSH host key: %w", err)
 	}
 
+	// Secure servers mint a short-TTL control token over the now-pinned SSH
+	// channel, so there is no manual token to paste. The host key is pinned just
+	// above, so the bootstrap ssh runs under StrictHostKeyChecking=yes.
+	var controlToken string
+	var controlTokenExpiresAt time.Time
+	if info.AuthMode == config.AuthModeSecure {
+		bundle, err := bootstrapServer(host, info.SSHPort, "control", "cli")
+		if err != nil {
+			return fmt.Errorf("bootstrap control token from %s: %w", host, err)
+		}
+		controlToken = bundle.Token
+		controlTokenExpiresAt = bundle.ExpiresAt
+		// If the operator reached a secure server without --https-port, take the
+		// TLS pin + https port from the bundle (the server returns them).
+		if apiURL == "" && bundle.HTTPSPort > 0 {
+			apiURL = "https://" + net.JoinHostPort(host, strconv.Itoa(bundle.HTTPSPort))
+			tlsFingerprint = bundle.TLSCertFingerprint
+		}
+	}
+
 	// Determine server name
 	name := serverAddName
 	if name == "" {
@@ -288,11 +309,13 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 
 	// Add to config
 	entry := config.ServerEntry{
-		Host:               host,
-		HTTPPort:           info.HTTPPort,
-		SSHPort:            info.SSHPort,
-		APIURL:             apiURL,         // empty for the plain-HTTP path
-		TLSCertFingerprint: tlsFingerprint, // empty for the plain-HTTP path
+		Host:                  host,
+		HTTPPort:              info.HTTPPort,
+		SSHPort:               info.SSHPort,
+		APIURL:                apiURL,         // empty for the plain-HTTP path
+		TLSCertFingerprint:    tlsFingerprint, // empty for the plain-HTTP path
+		ControlToken:          controlToken,   // bootstrap-minted in secure mode
+		ControlTokenExpiresAt: controlTokenExpiresAt,
 	}
 	if err := clientConfig.AddServer(name, entry); err != nil {
 		return err
@@ -330,6 +353,9 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		printSuccess("Added server %s (%s, TLS pinned)", name, apiURL)
 	} else {
 		printSuccess("Added server %s (%s:%d)", name, host, info.HTTPPort)
+	}
+	if controlToken != "" {
+		fmt.Println("  Bootstrapped a control token over SSH (secure mode)")
 	}
 	if clientConfig.DefaultServer == name {
 		fmt.Println("  Set as default server")
