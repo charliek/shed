@@ -46,6 +46,7 @@ import copy
 import json
 import os
 import signal
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -220,7 +221,9 @@ def _make_restart(dev_config: Path) -> None:
         )
 
 
-def _wait_reachable(server: str, timeout: float) -> None:
+def _wait_reachable(
+    server: str, timeout: float, *, secure: bool = False, https_port: Optional[int] = None
+) -> None:
     """Poll the server's bootstrap `/api/info` endpoint until it answers.
 
     `/api/info` is unauthenticated (bootstrap-exempt), so this readiness check
@@ -228,21 +231,34 @@ def _wait_reachable(server: str, timeout: float) -> None:
     unlike a `shed list` probe, a control-plane call that would 401 under
     enforce. `make dev-server-up` returns as soon as it has launched the
     process, so the caller must wait for actual readiness here.
+
+    In secure mode the server serves NO plain-HTTP listener (TLS-only), so the
+    probe targets `https://<host>:<https_port>/api/info`. The cert is the
+    server's self-signed one; this readiness probe skips verification — it only
+    needs a 200 from a bootstrap-exempt endpoint, and the real tests pin the
+    cert for their actual assertions.
     """
     entry = resolve_server_entry(server)
     if entry is None:
         raise AssertionError(f"dev server {server!r} not registered in ~/.shed/config.yaml")
-    url = f"http://{entry.get('host', 'localhost')}:{int(entry['http_port'])}/api/info"
+    host = entry.get("host", "localhost")
+    ctx = None
+    if secure:
+        port = int(https_port or 8443)  # secure mode defaults https_port to 8443
+        url = f"https://{host}:{port}/api/info"
+        ctx = ssl._create_unverified_context()
+    else:
+        url = f"http://{host}:{int(entry['http_port'])}/api/info"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
+            with urllib.request.urlopen(url, timeout=5, context=ctx) as resp:
                 if resp.status == 200:
                     return
         except (urllib.error.URLError, OSError):
             pass
         time.sleep(0.5)
-    raise AssertionError(f"dev server {server!r} not reachable within {timeout:.0f}s")
+    raise AssertionError(f"dev server {server!r} not reachable within {timeout:.0f}s (url={url})")
 
 
 @contextmanager
@@ -267,10 +283,15 @@ def dev_config(
     assert_dev_target(server)
     merged = _merge_config(overrides)
     _assert_config_ports_safe(merged)
+    # In secure mode the server is TLS-only (no plain-HTTP listener), so the
+    # readiness probe must use https. The base config (restored in finally) is
+    # open, so its probe stays plain-http.
+    secure = (merged.get("auth") or {}).get("mode") == "secure"
+    https_port = merged.get("https_port")
     temp = _write_config(merged, DEV_CONFIG_TMP)
     try:
         _make_restart(temp)
-        _wait_reachable(server, ready_timeout)
+        _wait_reachable(server, ready_timeout, secure=secure, https_port=https_port)
         yield server
     finally:
         try:

@@ -9,6 +9,13 @@ The auth decision happens during the SSH handshake, before any shed session,
 so these probes don't need a real shed — `ssh -v` reports `Authenticated to`
 on success and `Permission denied (publickey)` on rejection. VZ-only (config
 mutation via the Phase 0.5 harness restarts the local VZ dev server).
+
+SSH enforce is now a secure-mode-only posture: `auth.ssh.mode: enforce` on an
+open-mode server is rejected at startup, so the enforce test drives secure mode
+(which itself forces SSH enforce). Secure mode is TLS-only, so it carries an
+explicitly-set `https_port` for the dev_config readiness probe — the SSH probes
+themselves hit the SSH port and are unaffected by the HTTP transport. The warn
+test stays open-mode (secure forbids an explicit warn override).
 """
 
 from __future__ import annotations
@@ -20,6 +27,11 @@ import pytest
 
 from fixtures.devcontrol import dev_config
 from fixtures.server import resolve_server_entry
+
+# Secure mode is TLS-only; the enforce test pins this explicitly-set https_port
+# (the port-safety guard allows 18443) so dev_config's readiness probe hits the
+# actual listener rather than the 8443 default.
+HTTPS_PORT = 18443
 
 
 def _keygen(dir_: pathlib.Path, name: str) -> tuple[str, str]:
@@ -63,8 +75,15 @@ def test_enforce_denies_offlist_admits_onlist(vz_server_dev, tmp_path):
     on_key, on_pub = _keygen(tmp_path, "onlist")
     off_key, _ = _keygen(tmp_path, "offlist")
 
+    # SSH enforce is a secure-mode-only posture; secure forces auth.ssh.mode to
+    # enforce, so this exercises the same allowlist gate (off-list denied,
+    # on-list admitted) the explicit enforce mode used to.
     with dev_config(
-        {"auth": {"ssh": {"mode": "enforce", "authorized_keys": [on_pub]}}}, server
+        {
+            "https_port": HTTPS_PORT,
+            "auth": {"mode": "secure", "ssh": {"authorized_keys": [on_pub]}},
+        },
+        server,
     ):
         off = _ssh_auth_stderr(ssh_port, off_key)
         assert "Permission denied" in off, f"off-list key should be denied; stderr={off!r}"

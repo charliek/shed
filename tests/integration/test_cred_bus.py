@@ -9,46 +9,37 @@ this is the below-the-handler ownership defense (response-injection /
 listener-squat). A second test asserts the removed `public_exposure` /
 `auth.http.tokens` keys hard-fail at startup.
 
-VZ-only (config mutation restarts the local dev server); the ownership logic is
-backend-agnostic Go covered by internal/plugin + internal/api unit tests.
+Secure mode is TLS-only (no plain-HTTP listener), so the forged-`/respond` POST
+goes over the pinned HTTPS listener. VZ-only (config mutation restarts the local
+dev server); the ownership logic is backend-agnostic Go covered by
+internal/plugin + internal/api unit tests.
 """
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import pytest
 
 from fixtures.devcontrol import bootstrap_mint, dev_config, run_preflight
-from fixtures.server import resolve_server_entry
+from fixtures.tlsclient import https_status, server_cert_pem
 
-
-def _post(port: int, path: str, body: dict, token: str | None) -> int | None:
-    req = urllib.request.Request(
-        f"http://localhost:{port}{path}", data=json.dumps(body).encode(), method="POST"
-    )
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status
-    except urllib.error.HTTPError as e:
-        e.close()  # warnings-as-errors: don't leak the response body
-        return e.code
+# Secure mode is TLS-only; pin the explicitly-set https_port (the port-safety
+# guard allows 18443) so the POST reaches the only listener facing clients.
+HTTPS_PORT = 18443
 
 
 @pytest.mark.vz
 @pytest.mark.slow
 def test_cred_bus_forged_respond_dropped(vz_server_dev):
     server = vz_server_dev.name
-    port = int(resolve_server_entry(server)["http_port"])
     pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
-    overrides = {"auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}}}
+    overrides = {
+        "https_port": HTTPS_PORT,
+        "auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}},
+    }
     with dev_config(overrides, server):
+        pin = server_cert_pem("localhost", HTTPS_PORT)
         creds = bootstrap_mint(server, "credentials")
         # A /respond that names no pending request is dropped (403) even with a
         # valid credentials token: the requestID was never dispatched to any
@@ -60,7 +51,10 @@ def test_cred_bus_forged_respond_dropped(vz_server_dev):
             "final": True,
             "shed": {"name": "itest-shed"},
         }
-        assert _post(port, "/api/plugins/listeners/itest-ns/respond", body, creds) == 403
+        assert https_status(
+            HTTPS_PORT, "/api/plugins/listeners/itest-ns/respond", pin, creds,
+            method="POST", body=body,
+        ) == 403
 
 
 @pytest.mark.vz

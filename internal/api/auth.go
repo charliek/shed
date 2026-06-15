@@ -7,9 +7,9 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 )
 
-// authMiddleware enforces bearer-token auth when auth.http.mode == enforce.
-// When auth is off (the default), it is a pass-through, so existing
-// deployments are unaffected.
+// authMiddleware enforces bearer-token auth in secure mode (auth.mode: secure).
+// In open mode (the default) it is a pass-through, so existing deployments are
+// unaffected.
 //
 // Exemptions: the bootstrap endpoints GET /api/info and GET /api/ssh-host-key
 // are always reachable without a token, so `shed server add` can fetch server

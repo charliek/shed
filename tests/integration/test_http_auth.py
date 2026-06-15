@@ -4,48 +4,45 @@ Puts the VZ dev server in `auth.mode: secure` with the local SSH key allowlisted
 mints scoped tokens over the `_bootstrap` SSH channel (no static token list — that
 was removed), and verifies live: bootstrap endpoints stay open, the control plane
 and bus require a token, and the credentials vs control scopes are enforced per
-route. VZ-only (config mutation restarts the local dev server); the middleware
-logic itself is backend-agnostic Go covered by unit tests.
+route. Secure mode is TLS-only (no plain-HTTP listener), so the requests go over
+the pinned HTTPS listener. VZ-only (config mutation restarts the local dev
+server); the middleware logic itself is backend-agnostic Go covered by unit
+tests.
 """
 
 from __future__ import annotations
 
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import pytest
 
 from fixtures.devcontrol import bootstrap_mint, dev_config
-from fixtures.server import resolve_server_entry
+from fixtures.tlsclient import https_status as _status
+from fixtures.tlsclient import server_cert_pem
 
-
-def _status(port: int, path: str, token: str | None = None) -> int | None:
-    req = urllib.request.Request(f"http://localhost:{port}{path}")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status
-    except urllib.error.HTTPError as e:
-        e.close()  # warnings-as-errors: don't leak the response body
-        return e.code
-    except urllib.error.URLError:
-        return None
+# Secure mode is TLS-only; pin the explicitly-set https_port (the port-safety
+# guard allows 18443) so requests reach the only listener facing clients.
+HTTPS_PORT = 18443
 
 
 @pytest.mark.vz
 @pytest.mark.slow
 def test_secure_mode_enforces_scoped_tokens(vz_server_dev):
     server = vz_server_dev.name
-    port = int(resolve_server_entry(server)["http_port"])
     # Allowlist the local SSH key so the bootstrap channel mints for it.
     pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
-    overrides = {"auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}}}
+    overrides = {
+        "https_port": HTTPS_PORT,
+        "auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}},
+    }
     with dev_config(overrides, server):
+        # Fetch the server's self-signed cert and pin it for every request
+        # (the TLS-only listener presents no CA-chain trust).
+        pin = server_cert_pem("localhost", HTTPS_PORT)
+
         # Bootstrap endpoints stay reachable without a token (shed server add).
-        assert _status(port, "/api/info") == 200
-        assert _status(port, "/api/ssh-host-key") == 200
+        assert _status(HTTPS_PORT, "/api/info", pin) == 200
+        assert _status(HTTPS_PORT, "/api/ssh-host-key", pin) == 200
 
         # Mint scoped tokens over the _bootstrap SSH channel — no static list.
         control = bootstrap_mint(server, "control")
@@ -54,12 +51,12 @@ def test_secure_mode_enforces_scoped_tokens(vz_server_dev):
         assert creds.startswith("shed_credentials_")
 
         # Control plane requires a control token.
-        assert _status(port, "/api/sheds") == 401
-        assert _status(port, "/api/sheds", token="shed_control_bogus") == 401
-        assert _status(port, "/api/sheds", token=control) == 200
-        assert _status(port, "/api/sheds", token=creds) == 403  # wrong scope
+        assert _status(HTTPS_PORT, "/api/sheds", pin) == 401
+        assert _status(HTTPS_PORT, "/api/sheds", pin, token="shed_control_bogus") == 401
+        assert _status(HTTPS_PORT, "/api/sheds", pin, token=control) == 200
+        assert _status(HTTPS_PORT, "/api/sheds", pin, token=creds) == 403  # wrong scope
 
         # The credential bus requires the credentials scope.
-        assert _status(port, "/api/plugins/listeners") == 401
-        assert _status(port, "/api/plugins/listeners", token=creds) == 200
-        assert _status(port, "/api/plugins/listeners", token=control) == 403
+        assert _status(HTTPS_PORT, "/api/plugins/listeners", pin) == 401
+        assert _status(HTTPS_PORT, "/api/plugins/listeners", pin, token=creds) == 200
+        assert _status(HTTPS_PORT, "/api/plugins/listeners", pin, token=control) == 403

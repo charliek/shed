@@ -19,7 +19,7 @@ type Server struct {
 	plugins     *plugin.Registry
 	bridge      *plugin.Bridge
 	egressAudit *egress.AuditLog // nil when egress is disabled
-	tokens      *authtoken.Store // nil until SetTokenStore; consulted only when auth.http.mode=enforce
+	tokens      *authtoken.Store // nil until SetTokenStore; consulted only in secure mode (auth.mode: secure)
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
