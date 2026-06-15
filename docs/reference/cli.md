@@ -44,12 +44,14 @@ The command pins the server's SSH host key (in `~/.shed/known_hosts`). It prints
 
 With `--https-port`, the command also pins the server's TLS certificate (over a connection it verifies before trusting), shows its fingerprint, and writes `api_url` + `tls_cert_fingerprint` into the server entry so the control plane runs over TLS. See [Security](security.md#native-pinned-tls).
 
+When the server runs in `auth.mode: secure`, `server add` also **mints a control token automatically** — there is no `shed-server token new` and no token to paste. After pinning the host key it reads `GET /api/info` to detect secure mode, then connects over the reserved `_bootstrap` SSH channel (the same pinned key); the server re-verifies your key against its allowlist and returns a scoped, short-TTL token, which the CLI writes as `control_token` + `control_token_expires_at` in the server entry. The token is never printed. Your SSH key must therefore be on the server's allowlist (`auth.ssh.github_users` / `authorized_keys`). From then on the CLI refreshes the token transparently — near expiry and on a `401` — so you never run a token command. See [HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh).
+
 **Example:**
 
 ```bash
 shed server add mini-desktop.tailnet.ts.net --name mini
 shed server add vps.example.com --name vps --fingerprint SHA256:HtYK...j4Y
-shed server add vps.example.com --https-port 8443 --name vps   # pin TLS
+shed server add vps.example.com --https-port 8443 --name vps   # secure: pin TLS + mint a control token
 ```
 
 ### shed server update
