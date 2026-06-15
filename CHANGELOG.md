@@ -2,7 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.7.1 — 2026-06-15
+
+Secure-by-default authentication that makes a public-VPS shed server safe to
+deploy with a single `shed server add` — no token paste, no manual pinning.
+Plus a guest-MTU fix for reduced-MTU / VPN paths and opt-in (off-by-default)
+egress control. **One breaking change** — two removed config keys now hard-fail
+at startup — but most LAN / Tailscale deployments are unaffected.
+
+### Secure-by-default authentication (#207)
+
+A redesign of how the server issues and tracks API tokens. A new binary
+`auth.mode: open | secure` (default `open`) replaces the per-layer opt-in knobs.
+
+- **Tokens are minted over SSH, not configured.** In `secure` mode `shed server
+  add` opens a reserved `_bootstrap` SSH channel (authenticated by your
+  allowlisted key against the pinned host key) and mints a scoped **control**
+  token automatically — written to client config, never printed. The host-agent
+  self-mints a **credentials** token the same way; the desktop is issued a
+  control token over the host-agent socket. No `shed-server token new`, no static
+  token list, no copy-paste.
+- **Opaque, server-tracked tokens.** Tokens are random opaque strings stored
+  server-side as SHA-256 hashes with a scope + 24h TTL; clients refresh
+  transparently near expiry and retry once on a 401. Revocation is automatic —
+  removing a key from the allowlist invalidates the tokens minted for it.
+- **`secure` derives the hardened posture** (SSH-allowlist enforce + HTTP-token
+  enforce + pinned TLS on `:8443`) from one switch; `open` mode is byte-identical
+  to v0.7.0's default for LAN / Tailscale.
+- **Scopes narrowed to `control` + `credentials`** (the `admin` scope is gone).
+
+  **⚠️ Breaking (removed config keys hard-fail).** `public_exposure` and
+  `auth.http.tokens` were removed; a config that still sets either is **rejected
+  at startup** with a migration message. Token issuance is now automatic, so
+  `shed-server token` has no subcommands. See the
+  [v0.7.0 → v0.7.1 upgrade guide](upgrades/v0.7.0-to-v0.7.1.md) — most users
+  (no `auth` block, or `auth.mode` unset) need no change.
+
+### shed-extensions v0.4.2 (#207)
+
+The `extensions`/`full` rootfs images bundle shed-extensions v0.4.2, whose
+host-agent self-mints its `credentials` token over SSH (replacing the static
+`credentials_token`) and serves the desktop's `token.get` request. Guest
+binaries are unchanged, so no guest-side migration is needed.
 
 ### Guest MTU auto-detection for VPNs / reduced-MTU paths (#196)
 
