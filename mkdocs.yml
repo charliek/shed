@@ -100,6 +100,7 @@ nav:
           - v0.5.1 → v0.5.2: upgrades/v0.5.1-to-v0.5.2.md
           - v0.5.7 → v0.5.8: upgrades/v0.5.7-to-v0.5.8.md
           - v0.6 → v0.7: upgrades/v0.6-to-v0.7.md
+          - v0.7 → v0.8: upgrades/v0.7-to-v0.8.md
   - Tutorials:
       - Build Your Own Image: tutorials/build-your-own-image.md
       - Provisioning a Gradle Project: tutorials/gradle-provisioning.md
