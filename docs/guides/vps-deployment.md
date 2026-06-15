@@ -27,9 +27,10 @@ tls_names:
 ```
 
 `secure` mode forces `auth.ssh.mode: enforce`, enforces HTTP bearer tokens, turns
-on pinned TLS (`https_port` defaults to `8443`), and binds the plain-HTTP
-listener to loopback — so the only network-facing API is HTTPS on `8443`, with
-the credential bus and Connect tunnel gated by the `credentials` scope.
+on pinned TLS (`https_port` defaults to `8443`), and serves **no plain-HTTP
+listener** (TLS-only) — so the only API is HTTPS on `8443`, with the credential
+bus and Connect tunnel gated by the `credentials` scope. (`shed server add`
+against a secure server therefore needs `--https-port`, as below.)
 
 Start (or restart) the server. If a required piece is missing it exits
 immediately, naming the gap:

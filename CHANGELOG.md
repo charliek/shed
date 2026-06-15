@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+Auth-surface simplification: the `auth.mode: open | secure` headline is
+unchanged, but the intermediate states beneath it are removed so two invariants
+always hold — **tokens ⟺ TLS ⟺ secure** and **https ⟺ secure**. **Breaking** (a
+`0.7.x` patch; the auth interface is still settling) — but most LAN / Tailscale
+deployments, and plain `auth.mode: secure` + `github_users` configs, are
+unaffected.
+
+### Changed
+
+- **Secure mode is now TLS-only.** It no longer serves a plain-HTTP listener
+  (not even on loopback) — only the pinned-TLS `https_port` listener faces
+  clients. On-box tooling uses the HTTPS endpoint; `shed server add` against a
+  secure server needs `--https-port`. A loopback credential-bus channel remains
+  available only via the explicit, opt-in `internal_http_port` (unchanged).
+
+### Removed (rejected at startup)
+
+- **`auth.http.mode`** (and the whole `auth.http` block) — HTTP token
+  enforcement now derives purely from `auth.mode: secure`.
+- **`https_port` under `auth.mode: open`** — `https_port` requires secure mode
+  (this is what lets a client treat an `https` `api_url` as proof of secure).
+- **`auth.ssh.mode: enforce` under `auth.mode: open`** — use `secure`, or `warn`
+  to stage an allowlist on a trusted network.
+- An explicit **`auth.ssh.mode: off`/`warn` under `auth.mode: secure`** — secure
+  forces `enforce`.
+
+See [Upgrading v0.7.1 → v0.7.2](docs/upgrades/v0.7.1-to-v0.7.2.md).
+
 ## v0.7.1 — 2026-06-15
 
 Secure-by-default authentication that makes a public-VPS shed server safe to
