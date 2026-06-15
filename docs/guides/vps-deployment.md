@@ -8,9 +8,9 @@ credentials token over TLS**.
 The default shed posture is open-on-a-trusted-network (Tailscale/LAN). This
 guide is the opposite end: a hardened, internet-facing server. One switch —
 [`auth.mode: secure`](../reference/security.md#secure-mode) — derives the whole
-hardening bundle (SSH allowlist enforced + HTTP tokens enforced + TLS + loopback
-plain-HTTP) and **refuses to start** if any piece is missing. There are no tokens
-to mint or paste: clients get them automatically over SSH.
+hardening bundle (SSH allowlist enforced + HTTP tokens enforced + TLS-only, with
+no plain-HTTP listener) and **refuses to start** if any piece is missing. There
+are no tokens to mint or paste: clients get them automatically over SSH.
 
 ## 1. Server config
 

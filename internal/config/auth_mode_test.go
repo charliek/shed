@@ -92,13 +92,20 @@ func TestPreflightSecure(t *testing.T) {
 func TestPlainHTTPEnabled(t *testing.T) {
 	// Secure mode is TLS-only: the plain-HTTP listener is not served (only the
 	// pinned-TLS listener faces clients). Open mode serves plain HTTP.
-	secure := &ServerConfig{HTTPPort: 8080, Auth: &AuthConfig{Mode: AuthModeSecure}}
-	if secure.PlainHTTPEnabled() {
-		t.Error("secure mode should not serve the plain-HTTP listener")
+	tests := []struct {
+		name string
+		cfg  ServerConfig
+		want bool
+	}{
+		{"open serves plain HTTP", ServerConfig{HTTPPort: 8080}, true},
+		{"secure is TLS-only", ServerConfig{HTTPPort: 8080, Auth: &AuthConfig{Mode: AuthModeSecure}}, false},
 	}
-	open := &ServerConfig{HTTPPort: 8080}
-	if !open.PlainHTTPEnabled() {
-		t.Error("open mode should serve the plain-HTTP listener")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.PlainHTTPEnabled(); got != tt.want {
+				t.Errorf("PlainHTTPEnabled() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

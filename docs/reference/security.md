@@ -154,7 +154,7 @@ exactly the trust model SSH host keys use. `auth.mode: secure` turns this on by
 default (`https_port` defaults to `8443`).
 
 ```yaml
-https_port: 8443                 # serve HTTPS here (in addition to http_port)
+https_port: 8443                 # the pinned-TLS listener (secure mode serves HTTPS only)
 tls_names:                       # extra SANs so hostname verification passes
   - shed.example.com
   - 203.0.113.10
