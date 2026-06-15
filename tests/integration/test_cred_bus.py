@@ -1,11 +1,13 @@
-"""Phase 6: credential-bus registry-identity hardening (live).
+"""Credential-bus registry-identity hardening + v0.8 removed-key rejection (live).
 
-Configures the VZ dev server with http-auth enforce + a credentials token (via
-the Phase 0.5 harness) and verifies that a forged `/respond` — one that does not
-correspond to a pending request the listener was dispatched — is dropped at the
-registry even when presented with a valid credentials token. The per-route
-scope gate is covered by test_http_auth.py / test_tls.py; this is the
-below-the-handler ownership defense (response-injection / listener-squat).
+Puts the VZ dev server in `auth.mode: secure` (the local SSH key allowlisted),
+mints a credentials token over the `_bootstrap` SSH channel, and verifies that a
+forged `/respond` — one that does not correspond to a pending request the
+listener was dispatched — is dropped at the registry even with a valid
+credentials token. The per-route scope gate is covered by test_http_auth.py;
+this is the below-the-handler ownership defense (response-injection /
+listener-squat). A second test asserts the removed `public_exposure` /
+`auth.http.tokens` keys hard-fail at startup.
 
 VZ-only (config mutation restarts the local dev server); the ownership logic is
 backend-agnostic Go covered by internal/plugin + internal/api unit tests.
@@ -16,13 +18,12 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import dev_config, run_preflight
+from fixtures.devcontrol import bootstrap_mint, dev_config, run_preflight
 from fixtures.server import resolve_server_entry
-
-CREDS_TOKEN = "shed_credentials_itestcb"
 
 
 def _post(port: int, path: str, body: dict, token: str | None) -> int | None:
@@ -45,15 +46,10 @@ def _post(port: int, path: str, body: dict, token: str | None) -> int | None:
 def test_cred_bus_forged_respond_dropped(vz_server_dev):
     server = vz_server_dev.name
     port = int(resolve_server_entry(server)["http_port"])
-    overrides = {
-        "auth": {
-            "http": {
-                "mode": "enforce",
-                "tokens": [{"scope": "credentials", "token": CREDS_TOKEN}],
-            }
-        }
-    }
+    pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
+    overrides = {"auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}}}
     with dev_config(overrides, server):
+        creds = bootstrap_mint(server, "credentials")
         # A /respond that names no pending request is dropped (403) even with a
         # valid credentials token: the requestID was never dispatched to any
         # listener, so it can't be answered. Forged response-injection defense.
@@ -64,7 +60,7 @@ def test_cred_bus_forged_respond_dropped(vz_server_dev):
             "final": True,
             "shed": {"name": "itest-shed"},
         }
-        assert _post(port, "/api/plugins/listeners/itest-ns/respond", body, CREDS_TOKEN) == 403
+        assert _post(port, "/api/plugins/listeners/itest-ns/respond", body, creds) == 403
 
 
 @pytest.mark.vz
