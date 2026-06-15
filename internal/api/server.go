@@ -2,6 +2,7 @@
 package api
 
 import (
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
@@ -18,12 +19,18 @@ type Server struct {
 	plugins     *plugin.Registry
 	bridge      *plugin.Bridge
 	egressAudit *egress.AuditLog // nil when egress is disabled
+	tokens      *authtoken.Store // nil until SetTokenStore; consulted only when auth.http.mode=enforce
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
 // can return recent decisions. Called by shed-server at startup when egress is
 // enabled; nil leaves the egress routes reporting no recent activity.
 func (s *Server) SetEgressAudit(a *egress.AuditLog) { s.egressAudit = a }
+
+// SetTokenStore attaches the HTTP bearer-token store. The same store is shared
+// with the SSH bootstrap handler (which mints into it); the auth middleware
+// validates against it. Constructed once in shed-server.
+func (s *Server) SetTokenStore(t *authtoken.Store) { s.tokens = t }
 
 // NewServer creates a new API server.
 func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, plugins *plugin.Registry, bridge *plugin.Bridge) *Server {

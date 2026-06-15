@@ -6,103 +6,96 @@ token-authenticated**, and the **credential bus is reachable only with a
 credentials token over TLS**.
 
 The default shed posture is open-on-a-trusted-network (Tailscale/LAN). This
-guide is the opposite end: a hardened, internet-facing server. The
-[`public_exposure`](../reference/security.md#public-exposure-preflight) flag
-makes the hardening an all-or-nothing bundle — the server refuses to start if
-any piece is missing.
+guide is the opposite end: a hardened, internet-facing server. One switch —
+[`auth.mode: secure`](../reference/security.md#secure-mode) — derives the whole
+hardening bundle (SSH allowlist enforced + HTTP tokens enforced + TLS + loopback
+plain-HTTP) and **refuses to start** if any piece is missing. There are no tokens
+to mint or paste: clients get them automatically over SSH.
 
-## 1. Mint tokens
+## 1. Server config
 
-On the VPS, generate one token per scope:
-
-```bash
-shed-server token new --scope control       # for your CLI / desktop
-shed-server token new --scope credentials   # for the host-agent (credential bus)
-```
-
-Keep the output — you'll paste it into both the server config and your client
-config.
-
-## 2. Server config
-
-Write `/etc/shed/server.yaml` with the full bundle:
+Write `/etc/shed/server.yaml`. The only thing `secure` requires from you is an
+SSH key source:
 
 ```yaml
-public_exposure: true            # refuse to start without the bundle below
-
 auth:
+  mode: secure                   # derives the full bundle; refuses to start without a key source
   ssh:
-    mode: enforce                # only allowlisted keys may SSH in
-    github_users: [charliek]     # seeded from https://github.com/charliek.keys
-  http:
-    mode: enforce                # every HTTP request needs a bearer token
-    tokens:
-      - { name: cli,        scope: control,     token: shed_control_xxxxx }
-      - { name: host-agent, scope: credentials, token: shed_credentials_xxxxx }
-
-https_port: 8443                 # TLS on the public interface
+    github_users: [charliek]     # only these GitHub keys may SSH in (and mint tokens)
 tls_names:
-  - shed.example.com             # your VPS hostname / public IP (cert SANs)
+  - shed.example.com             # your VPS hostname / public IP (extra cert SANs)
 ```
 
-With `public_exposure: true`, shed-server forces the plain-HTTP listener to
-loopback, so the only network-facing API is HTTPS on `8443`. The credential bus
-and Connect tunnel stay on that listener, gated by the `credentials` scope.
+`secure` mode forces `auth.ssh.mode: enforce`, enforces HTTP bearer tokens, turns
+on pinned TLS (`https_port` defaults to `8443`), and binds the plain-HTTP
+listener to loopback — so the only network-facing API is HTTPS on `8443`, with
+the credential bus and Connect tunnel gated by the `credentials` scope.
 
-Start (or restart) the server. If anything in the bundle is missing it exits
+Start (or restart) the server. If a required piece is missing it exits
 immediately, naming the gap:
 
 ```text
-public_exposure preflight: public_exposure requires https_port (TLS must be on)
+auth.mode: secure requires at least one SSH key source (github_users, authorized_keys, or authorized_keys_file)
 ```
 
-## 3. Add the server from your client
+## 2. Add the server from your client
 
-From your laptop, pin the server's TLS cert and SSH host key:
+From your laptop, one command pins the server and mints your token:
 
 ```bash
 shed server add shed.example.com --https-port 8443
 ```
 
-This fetches the TLS certificate, shows its fingerprint alongside the SSH
-host-key fingerprint, prompts you to trust them, and writes the pinned entry to
-`~/.shed/config.yaml`. Add your tokens to that entry:
+This fetches the TLS certificate and SSH host key, shows both fingerprints,
+prompts you to trust them, then connects over the reserved `_bootstrap` SSH
+channel (using one of your allowlisted keys) and mints a `control` token. The
+pinned entry — `api_url`, `tls_cert_fingerprint`, `control_token`, and
+`control_token_expires_at` — is written to `~/.shed/config.yaml`:
 
 ```yaml
 servers:
   shed.example.com:
     api_url: https://shed.example.com:8443
     tls_cert_fingerprint: sha256:<pinned at add time>
-    control_token:     shed_control_xxxxx
-    credentials_token: shed_credentials_xxxxx
+    control_token:            shed_control_xxxxx     # minted over SSH, never printed
+    control_token_expires_at: 2026-06-15T00:00:00Z   # refreshed automatically
 ```
 
-Verify the control plane works over the pinned TLS connection:
+Your SSH key must be on the server's allowlist for the mint to succeed (it is —
+you listed it in `github_users`). Verify the control plane over the pinned TLS
+connection:
 
 ```bash
 shed -s shed.example.com list
 ```
 
-To verify out-of-band (e.g. from a CI runner), pass the expected fingerprints:
+To verify the fingerprints out-of-band (e.g. from a CI runner with a key in the
+allowlist), pass them explicitly:
 
 ```bash
 shed server add shed.example.com --https-port 8443 \
   --tls-fingerprint sha256:<hex> --fingerprint SHA256:<ssh>
 ```
 
-## 4. Credential brokering over TLS
+## 3. Credential brokering over TLS
 
-Point the host-agent (running on your laptop) at the server's `api_url` with the
-`credentials` token. It subscribes to the credential bus over the pinned TLS
-connection and brokers SSH signatures / cloud credentials to your remote shed —
-the host-agent config picks up `api_url`, `tls_cert_fingerprint`, and
-`credentials_token` from the same `~/.shed/config.yaml` entry.
+Point the host-agent (running on your laptop) at the server. It **mints its own
+`credentials` token** over the same SSH bootstrap channel — there is no token to
+paste — and subscribes to the credential bus over the pinned TLS connection,
+brokering SSH signatures / cloud credentials to your remote shed. It picks up
+`api_url` and `tls_cert_fingerprint` from the same `~/.shed/config.yaml` entry.
 
-The bus stream is long-lived and often idle; shed-server sends a periodic
-SSE keepalive comment so an idle NAT or proxy does not evict the connection. No
-client configuration is needed.
+The bus stream is long-lived and often idle; shed-server sends a periodic SSE
+keepalive comment so an idle NAT or proxy does not evict the connection. If the
+agent reconnects across a blip, any un-acked credential request is re-delivered.
 
-## 5. Rotation
+## 4. Rotation and expiry
+
+Tokens are short-lived (`auth.token_ttl`, default 24h) and refresh themselves:
+the CLI re-bootstraps near expiry and on a `401`, and the host-agent refreshes on
+a timer. You never rotate a token by hand. To **revoke** access, remove the key
+from the allowlist (drop it from `github_users`, or from the GitHub account); the
+server purges that key's tokens on the next allowlist refresh.
 
 Rotate the TLS cert (e.g. after changing `tls_names`) and re-pin clients:
 
@@ -110,8 +103,13 @@ Rotate the TLS cert (e.g. after changing `tls_names`) and re-pin clients:
 shed server update shed.example.com --refetch   # fetch the new cert + re-pin
 ```
 
-Rotate a token by minting a new one, updating both the server `tokens` list and
-the client entry, and restarting the server.
+## Hardening the add-time trust
+
+`shed server add` closes the add-time MITM window by prompting you to confirm the
+SSH and TLS fingerprints. Tighten it further by verifying out-of-band
+(`--fingerprint` / `--tls-fingerprint`, read from the server's startup log), or
+bring your own TLS certificate instead of the self-signed one with
+`tls_cert_file` / `tls_key_file` in the server config.
 
 ## Co-located alternative
 

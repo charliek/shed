@@ -176,3 +176,169 @@ func TestMaxAuthTriesPassthrough(t *testing.T) {
 		t.Errorf("MaxAuthTries() = %d, want 3", a.MaxAuthTries())
 	}
 }
+
+func TestRevokeHookFiresOnRemovedKey(t *testing.T) {
+	k1, line1 := genKey(t)
+	k2, line2 := genKey(t)
+	a, err := NewKeyAllowlist(&config.SSHAuthConfig{
+		Mode:           config.SSHAuthEnforce,
+		AuthorizedKeys: []string{line1, line2},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var revoked []string
+	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
+
+	// Drop k2 from the inline source and rebuild → only k2's tokens are revoked.
+	a.inline = []string{line1}
+	if err := a.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	wantFP := gossh.FingerprintSHA256(k2)
+	if len(revoked) != 1 || revoked[0] != wantFP {
+		t.Errorf("revoked = %v, want [%s]", revoked, wantFP)
+	}
+	if !a.IsAuthorized(k1) {
+		t.Error("k1 should still be authorized")
+	}
+	if a.IsAuthorized(k2) {
+		t.Error("k2 should no longer be authorized")
+	}
+}
+
+func TestRevokeHookNotFiredOnFailedRefetch(t *testing.T) {
+	// The panel invariant: a transient GitHub outage must NEVER revoke. The
+	// fail-closed fallback keeps the key set unchanged, so the diff is empty.
+	listed, listedLine := genKey(t)
+	var failFetch atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failFetch.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(listedLine))
+	}))
+	defer srv.Close()
+	orig := githubKeysBaseURL
+	githubKeysBaseURL = srv.URL
+	defer func() { githubKeysBaseURL = orig }()
+
+	a, err := NewKeyAllowlist(&config.SSHAuthConfig{
+		Mode:        config.SSHAuthEnforce,
+		GitHubUsers: []string{"octocat"},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var revoked []string
+	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
+
+	failFetch.Store(true)
+	if err := a.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	if len(revoked) != 0 {
+		t.Errorf("a transient fetch failure must NOT revoke, got %v", revoked)
+	}
+	if !a.IsAuthorized(listed) {
+		t.Error("key should be retained via last-known-good")
+	}
+}
+
+func TestRevokeHookFiresWhenGitHubDropsAKey(t *testing.T) {
+	// The realistic rotation: the user removes a key from their GitHub account;
+	// the next successful fetch returns fewer keys → the dropped key is revoked.
+	k1, line1 := genKey(t)
+	k2, line2 := genKey(t)
+	var served atomic.Pointer[string]
+	both := line1 + line2
+	served.Store(&both)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(*served.Load()))
+	}))
+	defer srv.Close()
+	orig := githubKeysBaseURL
+	githubKeysBaseURL = srv.URL
+	defer func() { githubKeysBaseURL = orig }()
+
+	a, err := NewKeyAllowlist(&config.SSHAuthConfig{
+		Mode:        config.SSHAuthEnforce,
+		GitHubUsers: []string{"octocat"},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.IsAuthorized(k1) || !a.IsAuthorized(k2) {
+		t.Fatal("both keys should be authorized initially")
+	}
+	var revoked []string
+	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
+
+	only1 := line1
+	served.Store(&only1)
+	if err := a.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	wantFP := gossh.FingerprintSHA256(k2)
+	if len(revoked) != 1 || revoked[0] != wantFP {
+		t.Errorf("revoked = %v, want [%s] (k2 dropped from github)", revoked, wantFP)
+	}
+	if a.IsAuthorized(k2) {
+		t.Error("k2 should be revoked from the allowlist")
+	}
+}
+
+func TestRevokeHookPrefersInMemoryOverStaleDiskCache(t *testing.T) {
+	// Regression (Codex 1e): when writeCache fails and the disk cache is staler
+	// than the in-memory snapshot, a transient fetch failure must fall back to
+	// the in-memory last-known-good, NOT the stale disk — otherwise it would
+	// falsely shrink the set and revoke a still-valid key.
+	k1, line1 := genKey(t)
+	k2, line2 := genKey(t)
+
+	cacheDir := t.TempDir()
+	cachePath := filepath.Join(cacheDir, "octocat.keys")
+	// Stale on-disk cache: only k1, and read-only so writeCache can't refresh it.
+	if err := os.WriteFile(cachePath, []byte(line1), 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	var failFetch atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failFetch.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(line1 + line2)) // fresh: k1 + k2
+	}))
+	defer srv.Close()
+	orig := githubKeysBaseURL
+	githubKeysBaseURL = srv.URL
+	defer func() { githubKeysBaseURL = orig }()
+
+	a, err := NewKeyAllowlist(&config.SSHAuthConfig{Mode: config.SSHAuthEnforce, GitHubUsers: []string{"octocat"}}, cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First fetch resolved k1+k2 into the in-memory snapshot; writeCache failed
+	// (0400 file), so disk is still the stale k1-only.
+	if !a.IsAuthorized(k1) || !a.IsAuthorized(k2) {
+		t.Fatal("both keys should be authorized after the successful fetch")
+	}
+	var revoked []string
+	a.SetRevokeHook(func(subjects []string) { revoked = append(revoked, subjects...) })
+
+	// Transient failure: must use the in-memory last-known-good (k1+k2), not the
+	// stale disk cache (k1 only).
+	failFetch.Store(true)
+	if err := a.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	if len(revoked) != 0 {
+		t.Errorf("transient failure with a stale disk cache must NOT revoke, got %v", revoked)
+	}
+	if !a.IsAuthorized(k2) {
+		t.Error("k2 must be retained via the in-memory snapshot")
+	}
+}

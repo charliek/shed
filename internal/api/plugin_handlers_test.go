@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/plugin"
 )
@@ -227,11 +228,13 @@ func TestHandlePluginRespondSuccess(t *testing.T) {
 
 func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
 	srv := newTestServerWithPlugins()
-	creds := "shed_credentials_itest"
-	srv.cfg.Auth = &config.AuthConfig{HTTP: &config.HTTPAuthConfig{
-		Mode:   config.HTTPAuthEnforce,
-		Tokens: []config.HTTPToken{{Scope: config.TokenScopeCredentials, Token: creds}},
-	}}
+	store := authtoken.NewStore()
+	creds, _, err := store.Mint("SHA256:test", authtoken.ScopeCredentials, authtoken.ClientHostAgent, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.tokens = store
+	srv.cfg.Auth = &config.AuthConfig{HTTP: &config.HTTPAuthConfig{Mode: config.HTTPAuthEnforce}}
 	srv.plugins.EnableOwnershipTracking() // a server with HTTP auth enforced does this
 	srv.bridge.RegisterShed("dev", &plugin.ShedConn{
 		Name: "dev",

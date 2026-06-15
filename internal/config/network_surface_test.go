@@ -85,80 +85,34 @@ func TestValidateNetworkSurface(t *testing.T) {
 	}
 }
 
-func TestPreflightPublicExposure(t *testing.T) {
-	// A complete bundle: SSH enforce + HTTP enforce(+token) + TLS + internal bus.
-	strongToken := "shed_control_" + strings.Repeat("a", 32) // generated-shape, >= minPublicTokenLen
-	full := func() ServerConfig {
-		return ServerConfig{
-			HTTPPort: 8080, SSHPort: 2222,
-			HTTPSPort: 8443, InternalHTTPPort: 8081,
-			PublicExposure: true,
-			Auth: &AuthConfig{
-				SSH:  &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}},
-				HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: strongToken}}},
-			},
-		}
-	}
-
-	t.Run("inert when unset, even on a non-loopback bind", func(t *testing.T) {
-		// The tailnet/LAN fleet: public_exposure unset → preflight is a no-op
-		// regardless of bind or missing auth.
-		cfg := ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPBind: "100.64.0.1"}
-		if err := cfg.PreflightPublicExposure(); err != nil {
-			t.Errorf("unset public_exposure must be inert, got %v", err)
-		}
-	})
-	t.Run("complete bundle passes", func(t *testing.T) {
-		cfg := full()
-		if err := cfg.PreflightPublicExposure(); err != nil {
-			t.Errorf("complete bundle should pass, got %v", err)
-		}
-	})
-	t.Run("internal listener is optional (remote-host-agent model)", func(t *testing.T) {
-		// Without internal_http_port the bus is still gated (HTTP enforce
-		// requires the credentials scope), so a public-gated bus is fine.
-		cfg := full()
-		cfg.InternalHTTPPort = 0
-		if err := cfg.PreflightPublicExposure(); err != nil {
-			t.Errorf("internal_http_port must be optional, got %v", err)
-		}
-	})
-	t.Run("plain HTTP forced to loopback under public_exposure", func(t *testing.T) {
-		// Even with an all-interfaces http_bind, the plaintext listener must be
-		// loopback-only so only the TLS listener faces the network.
-		cfg := full()
-		cfg.HTTPBind = "" // default: all interfaces
-		if got := cfg.HTTPListenAddr(); got != "127.0.0.1:8080" {
-			t.Errorf("HTTPListenAddr() under public_exposure = %q, want loopback 127.0.0.1:8080", got)
-		}
-		// HTTPS still faces the network (honors http_bind, default all interfaces).
-		if got := cfg.HTTPSListenAddr(); got != ":8443" {
-			t.Errorf("HTTPSListenAddr() = %q, want :8443 (public)", got)
-		}
-	})
-
-	// Each missing piece is rejected, naming the gap.
-	missing := []struct {
-		name   string
-		mutate func(c *ServerConfig)
-		want   string
+func TestRejectRemovedAuthKeys(t *testing.T) {
+	// The removed-key scan must fail loudly on a stale public_exposure /
+	// auth.http.tokens — silently ignoring public_exposure would un-loopback an
+	// internet-facing plaintext listener (the v0.6.0 image-key silent-drift bug
+	// this pattern exists to prevent).
+	tests := []struct {
+		name string
+		yaml string
+		want string // substring the error must contain; "" means expect no error
 	}{
-		{"no ssh enforce", func(c *ServerConfig) { c.Auth.SSH.Mode = SSHAuthWarn }, "auth.ssh.mode"},
-		{"no ssh auth at all", func(c *ServerConfig) { c.Auth.SSH = nil }, "auth.ssh.mode"},
-		{"no http enforce", func(c *ServerConfig) { c.Auth.HTTP.Mode = HTTPAuthOff }, "auth.http.mode"},
-		{"no http tokens", func(c *ServerConfig) { c.Auth.HTTP.Tokens = nil }, "auth.http.tokens"},
-		{"weak http token", func(c *ServerConfig) { c.Auth.HTTP.Tokens = []HTTPToken{{Scope: TokenScopeControl, Token: "x"}} }, "strong auth.http.tokens"},
-		{"no tls", func(c *ServerConfig) { c.HTTPSPort = 0 }, "https_port"},
+		{"clean secure config ok", "name: x\nauth:\n  mode: secure\n", ""},
+		{"open config ok", "name: x\nauth:\n  mode: open\n", ""},
+		{"no auth block ok", "name: x\n", ""},
+		{"public_exposure rejected", "name: x\npublic_exposure: true\n", "public_exposure"},
+		{"auth.http.tokens rejected", "name: x\nauth:\n  http:\n    tokens:\n      - {scope: control, token: abc}\n", "auth.http.tokens"},
+		{"auth.http without tokens ok", "name: x\nauth:\n  http:\n    mode: enforce\n", ""},
+		{"malformed yaml deferred to typed unmarshal", "name: [unterminated", ""},
 	}
-	for _, tt := range missing {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := full()
-			tt.mutate(&cfg)
-			err := cfg.PreflightPublicExposure()
-			if err == nil {
-				t.Fatalf("missing %q must refuse to start", tt.name)
+			err := rejectRemovedAuthKeys([]byte(tt.yaml))
+			if tt.want == "" {
+				if err != nil {
+					t.Errorf("expected no error, got %v", err)
+				}
+				return
 			}
-			if !strings.Contains(err.Error(), tt.want) {
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("error should name %q, got %v", tt.want, err)
 			}
 		})
@@ -184,12 +138,10 @@ func TestValidateAuth(t *testing.T) {
 		{"valid github user ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
 		{"malformed github user rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
 		{"empty http mode defaults ok", &AuthConfig{HTTP: &HTTPAuthConfig{}}, ""},
-		{"http off/enforce ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: "shed_control_x"}}}}, ""},
+		{"http enforce ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce}}, ""},
 		{"invalid http mode rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: "warn"}}, "auth.http.mode"},
-		{"empty token rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeControl, Token: ""}}}}, "token is empty"},
-		{"invalid scope rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: "root", Token: "shed_root_x"}}}}, "invalid scope"},
-		{"credentials scope ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeCredentials, Token: "shed_credentials_x"}}}}, ""},
-		{"admin scope ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce, Tokens: []HTTPToken{{Scope: TokenScopeAdmin, Token: "shed_admin_x"}}}}, ""},
+		{"invalid auth.mode rejected", &AuthConfig{Mode: "secur"}, "auth.mode"},
+		{"secure auth.mode ok", &AuthConfig{Mode: AuthModeSecure}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

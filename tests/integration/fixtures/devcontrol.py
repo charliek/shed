@@ -43,6 +43,7 @@ tests plus a manual pass.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import signal
 import subprocess
@@ -65,6 +66,8 @@ SHED_SERVER_BIN = REPO_ROOT / "bin" / "shed-server"
 DEV_SCRATCH_DIR = Path.home() / ".shed" / "dev"
 DEV_CONFIG_TMP = DEV_SCRATCH_DIR / "test-dev-config.yaml"
 PREFLIGHT_CONFIG_TMP = DEV_SCRATCH_DIR / "test-preflight-config.yaml"
+# The pinned known_hosts the CLI bootstrap reads (config.GetKnownHostsPath()).
+KNOWN_HOSTS_PATH = Path.home() / ".shed" / "known_hosts"
 
 # The brew/deb production ports. A target/config is only safe if it is
 # NOT on these — the structural guarantee of a parallel-dev server (see
@@ -338,3 +341,39 @@ def run_preflight(overrides: dict, *, timeout: float = 20.0) -> PreflightResult:
             temp.unlink()
         except OSError:
             pass
+
+
+def bootstrap_mint(server: str, scope: str, client_kind: str = "cli", *, timeout: float = 25.0) -> str:
+    """Mint a scoped HTTP token over the reserved `_bootstrap` SSH channel,
+    exactly as `shed server add` does (cmd/shed/bootstrap.go): `ssh -T` as
+    `_bootstrap@host` against the pinned known_hosts (BatchMode, strict), run
+    "<scope> <client_kind>", and parse the JSON bundle for its `token`.
+
+    Dev-only — `assert_dev_target` gates the target so this can only ever reach a
+    `*-dev` server on offset ports. The local SSH key (default identity) must be
+    in the server's allowlist for the mint to succeed; the server must be in
+    `auth.mode: secure` (the bootstrap channel requires `auth.ssh.mode: enforce`).
+    """
+    entry = assert_dev_target(server)
+    host = entry.get("host", "localhost")
+    ssh_port = int(entry["ssh_port"])
+    args = [
+        "ssh", "-T", "-p", str(ssh_port),
+        "-o", "BatchMode=yes",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
+        "-o", "StrictHostKeyChecking=yes",
+        f"_bootstrap@{host}", scope, client_kind,
+    ]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise AssertionError(
+            f"bootstrap mint (scope={scope!r}) failed (exit {r.returncode}): "
+            f"stderr={r.stderr[-1000:]!r}"
+        )
+    try:
+        bundle = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"bootstrap returned invalid JSON: {e}; stdout={r.stdout[-500:]!r}")
+    token = bundle.get("token", "")
+    assert token, f"bootstrap (scope={scope!r}) returned no token: {bundle!r}"
+    return token

@@ -223,6 +223,10 @@ type ServerInfo struct {
 	SSHPort  int    `json:"ssh_port"`
 	HTTPPort int    `json:"http_port"`
 	Backend  string `json:"backend"`
+	// AuthMode is the server's auth.mode ("secure" or "open"), so `shed server
+	// add` knows whether to bootstrap an HTTP token over SSH. Reported on the
+	// unauthenticated /api/info — the mode is observable from behavior anyway.
+	AuthMode string `json:"auth_mode,omitempty"`
 	// DefaultImage is the resolved default_image for the active backend
 	// (after ${shed.version} expansion / version synthesis at load). Exposed
 	// so clients can see which image a `shed create` without --image will
@@ -692,30 +696,35 @@ const (
 	HTTPAuthEnforce = "enforce" // require a valid bearer token (except bootstrap endpoints)
 )
 
-// AuthConfig configures optional authentication layers (all default-off).
+// Auth modes for AuthConfig.Mode — the binary secure-by-default switch.
+const (
+	AuthModeOpen   = "open"   // default: no enforcement (tailnet/LAN posture)
+	AuthModeSecure = "secure" // SSH allowlist + HTTP tokens + TLS, all enforced
+)
+
+// AuthConfig configures authentication. The headline control is Mode (the
+// binary open|secure switch). The SSH/HTTP sub-blocks carry key sources and
+// advanced per-layer overrides.
 type AuthConfig struct {
-	// SSH configures the SSH public-key allowlist.
+	// Mode is open | secure (default open). secure derives: SSH allowlist
+	// enforce, HTTP bearer-token enforce, TLS on, and a loopback-bound plain
+	// HTTP listener; it requires at least one SSH key source.
+	Mode string `yaml:"mode,omitempty"`
+	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
+	TokenTTL Duration `yaml:"token_ttl,omitempty"`
+	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
-	// HTTP configures bearer-token auth on the HTTP API.
+	// HTTP configures bearer-token auth on the HTTP API (advanced mode override).
 	HTTP *HTTPAuthConfig `yaml:"http,omitempty"`
 }
 
-// HTTPAuthConfig configures bearer-token auth on the HTTP API.
+// HTTPAuthConfig is the advanced per-layer override for HTTP bearer-token auth.
+// The headline control is auth.mode (secure enforces HTTP auth automatically);
+// tokens are minted over the SSH bootstrap channel, never configured here.
 type HTTPAuthConfig struct {
-	// Mode is off | enforce (default off). off accepts all requests (legacy);
-	// enforce requires a valid bearer token (except the bootstrap endpoints
-	// GET /api/info and GET /api/ssh-host-key). Enforcement itself lands with
-	// the middleware in a later sub-phase; clients send tokens regardless.
+	// Mode is off | enforce (default off). enforce requires a valid bearer token
+	// (except the bootstrap endpoints GET /api/info and GET /api/ssh-host-key).
 	Mode string `yaml:"mode,omitempty"`
-	// Tokens are the accepted bearer tokens with their scopes.
-	Tokens []HTTPToken `yaml:"tokens,omitempty"`
-}
-
-// HTTPToken is an accepted bearer token and its scope.
-type HTTPToken struct {
-	Name  string `yaml:"name,omitempty"`
-	Scope string `yaml:"scope"`
-	Token string `yaml:"token"`
 }
 
 // SSHAuthConfig configures the SSH public-key allowlist. Identity comes from

@@ -44,8 +44,8 @@ sheds:
 | `servers.<name>.ssh_port` | int | SSH server port |
 | `servers.<name>.api_url` | string | HTTPS control-plane URL (e.g. `https://host:8443`); overrides scheme+host+port. Set by `shed server add --https-port`. |
 | `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`). |
-| `servers.<name>.control_token` | string | Control-scoped bearer token sent by the CLI/desktop. |
-| `servers.<name>.credentials_token` | string | Credentials-scoped bearer token sent by the host-agent. |
+| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop. Auto-written and refreshed by `shed server add` in secure mode. |
+| `servers.<name>.control_token_expires_at` | timestamp | Expiry of `control_token`; the CLI refreshes near this and on a 401. Auto-managed. |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
 | `create_timeout` | duration | Timeout for create/start operations (default: `10m`) |
@@ -96,6 +96,23 @@ log_level: info
 
 **Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
 
+### Authentication mode
+
+`auth.mode` is the headline switch. The default `open` posture is unchanged —
+ideal on a tailnet or trusted LAN — with the per-layer fields below (`auth.ssh`,
+`auth.http`, TLS) staying individually opt-in. `secure` is the internet-facing
+posture: it derives the full bundle and refuses to start without an SSH key
+source. See [Security](security.md) for the model.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.mode` | string | `open` | `open` enforces nothing by default; `secure` derives SSH-allowlist enforce + HTTP-token enforce + TLS (`https_port` defaults to `8443`) + a loopback-bound plain-HTTP listener, and **fails to start without a key source**. |
+| `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token. Clients refresh transparently near expiry / on a 401. |
+
+The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
+**rejected at startup** — set `auth.mode: secure` and let `shed server add` mint
+tokens over SSH. See [Upgrading v0.7.0 → v0.7.1](../upgrades/v0.7.0-to-v0.7.1.md).
+
 ### SSH authentication
 
 `auth.ssh` gates SSH public-key access against an allowlist. The default (omitted, or `mode: off`) accepts all keys — the legacy behavior. Identity comes from the offered key, GitHub-style; the username still selects the shed.
@@ -113,29 +130,27 @@ With `mode: enforce`, the server refuses to start if no keys resolve (empty inli
 
 ```yaml
 auth:
+  mode: secure               # open (default) | secure — secure forces ssh enforce
   ssh:
-    mode: enforce
-    github_users: [charliek]
+    github_users: [charliek]  # a key source is required in secure mode
 ```
 
 ### HTTP authentication, TLS, and network surface
 
-These optional fields harden the HTTP API. All default to off, so the legacy
-open-on-a-trusted-network posture is unchanged. See [Security](security.md) for
-the full model and [Public VPS Deployment](../guides/vps-deployment.md) for a
-walkthrough.
+These per-layer fields harden the HTTP API. In `open` mode they default to off
+(the trusted-network posture); `auth.mode: secure` turns the bundle on for you.
+See [Security](security.md) for the full model and
+[Public VPS Deployment](../guides/vps-deployment.md) for a walkthrough.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth.http.mode` | string | `off` | `off` accepts all requests; `enforce` requires a valid bearer token (except `GET /api/info` and `GET /api/ssh-host-key`). |
-| `auth.http.tokens` | list | `[]` | Accepted tokens: `{ name, scope, token }`. Scope is `control`, `credentials`, or `admin`. Mint with `shed-server token new --scope <scope>`. |
+| `auth.http.mode` | string | `off` | Advanced per-layer override: `off` accepts all requests, `enforce` requires a valid bearer token (except the bootstrap endpoints `GET /api/info` and `GET /api/ssh-host-key`). `auth.mode: secure` forces `enforce`. Tokens are minted over SSH by `shed server add` — there is no static token list. |
 | `https_port` | int | - | Serve HTTPS on this port (in addition to `http_port`) with a self-signed, client-pinned cert. |
 | `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
 | `http_bind` / `ssh_bind` | string | all interfaces | Restrict a listener to one interface (e.g. `127.0.0.1`, a tailnet IP). |
 | `internal_http_port` | int | - | Move the credential bus + Connect tunnel to a loopback-only internal listener (co-located host-agent model; see the [route matrix](security.md#route-matrix)). |
 | `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
-| `public_exposure` | bool | `false` | Opt into an internet-facing deployment: refuse to start unless the full bundle (SSH enforce + HTTP enforce + TLS) is present. Inert when unset. |
 
 ### Mounts
 

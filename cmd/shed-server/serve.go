@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/api"
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/egress"
@@ -38,6 +39,10 @@ const (
 	httpReadHeaderTimeout = 10 * time.Second
 	httpReadTimeout       = 60 * time.Second
 	httpIdleTimeout       = 120 * time.Second
+
+	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
+	// from the in-memory store (expired tokens are also dropped on validate).
+	tokenSweepInterval = 10 * time.Minute
 )
 
 // newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
@@ -91,11 +96,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Public-exposure preflight: refuse to start an internet-facing deployment
-	// without the full security bundle. Runs before anything binds; inert
-	// unless public_exposure is set.
-	if err := cfg.PreflightPublicExposure(); err != nil {
-		return fmt.Errorf("public_exposure preflight: %w", err)
+	// Secure-mode preflight: refuse to start `auth.mode: secure` without an SSH
+	// key source (an empty enforced allowlist would lock everyone out). Runs
+	// before anything binds; inert in open mode.
+	if err := cfg.PreflightSecure(); err != nil {
+		return fmt.Errorf("secure-mode preflight: %w", err)
 	}
 
 	log.Printf("Starting shed-server...")
@@ -107,10 +112,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Track pending requests only when HTTP auth is enforced — the /respond
 	// ownership gate is consulted only then, so an unauthenticated server does
 	// no bookkeeping.
-	if h := cfg.HTTPAuth(); h != nil && h.Mode == config.HTTPAuthEnforce {
+	if cfg.HTTPAuthEnforced() {
 		pluginRegistry.EnableOwnershipTracking()
 	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
+
+	// HTTP bearer-token store: short-lived, scoped tokens minted over the SSH
+	// bootstrap channel and validated by the auth middleware. In-memory by
+	// design — a restart drops tokens and clients transparently re-mint over
+	// SSH. Shared with the SSH server (bootstrap mint) and the API server
+	// (validate).
+	tokenStore := authtoken.NewStore()
+	tokenCtx, cancelTokens := context.WithCancel(context.Background())
+	defer cancelTokens()
+	tokenStore.StartSweeper(tokenCtx, tokenSweepInterval)
 
 	// Initialize the configured backend. egressSocketDir + attachEgress are
 	// captured per-backend so the egress proxy (constructed once, below) can
@@ -199,11 +214,22 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// when mode=enforce but no keys resolved.
 	hostKeyPath := defaultHostKeyPath()
 	githubCacheDir := filepath.Join(filepath.Dir(hostKeyPath), "github_keys")
-	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.SSHAuth(), githubCacheDir)
+	sshAllowlist, err := sshd.NewKeyAllowlist(cfg.EffectiveSSHAuth(), githubCacheDir)
 	if err != nil {
 		return fmt.Errorf("ssh auth: %w", err)
 	}
 	log.Printf("SSH auth mode: %s", sshAllowlist.Mode())
+
+	// Revoke a key's HTTP tokens when it leaves the allowlist (removed from
+	// github_users or the user's GitHub keys). Authoritative diff only — a failed
+	// refetch falls back to last-known-good, so a transient outage never revokes.
+	sshAllowlist.SetRevokeHook(func(subjects []string) {
+		for _, s := range subjects {
+			if n := tokenStore.RevokeBySubject(s); n > 0 {
+				log.Printf("auth: revoked %d HTTP token(s) for removed key %s", n, s)
+			}
+		}
+	})
 
 	// Refresh GitHub-seeded keys in the background until shutdown.
 	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
@@ -220,6 +246,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
 	apiServer.SetEgressAudit(egressAudit) // nil-safe: no-op when egress disabled
+	apiServer.SetTokenStore(tokenStore)   // shared with the SSH bootstrap handler (1c)
 
 	// Public router (HTTP and, when enabled, HTTPS share one handler). When
 	// the internal-listener split is enabled, it omits the credential bus +
@@ -237,19 +264,31 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Optional HTTPS listener: same public router over TLS with a self-signed,
 	// client-pinned cert. Off by default (https_port unset).
 	var httpsServer *http.Server
+	var tlsFingerprint string
 	if cfg.HTTPSEnabled() {
 		certPath, keyPath := tlsCertPaths(cfg, filepath.Dir(hostKeyPath))
 		cert, der, err := servertls.LoadOrGenerate(certPath, keyPath, cfg.TLSNames)
 		if err != nil {
 			return fmt.Errorf("tls cert: %w", err)
 		}
-		log.Printf("TLS cert fingerprint: %s", servertls.Fingerprint(der))
+		tlsFingerprint = servertls.Fingerprint(der)
+		log.Printf("TLS cert fingerprint: %s", tlsFingerprint)
 		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
 		httpsServer.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
 	}
+
+	// Wire the SSH bootstrap handler: it mints HTTP tokens into the shared
+	// store and returns them (with the TLS pin + ports) over the authenticated
+	// SSH channel, so `shed server add` needs no manual token/pin step.
+	sshServer.SetBootstrap(tokenStore, sshd.BootstrapInfo{
+		HTTPPort:       cfg.HTTPPort,
+		HTTPSPort:      cfg.HTTPSPort,
+		TLSFingerprint: tlsFingerprint,
+		TokenTTL:       cfg.TokenTTL(),
+	})
 
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH, internal HTTP).
 	errChan := make(chan error, 4)
