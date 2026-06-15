@@ -32,14 +32,11 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import SHED_SERVER_BIN, dev_config
+from fixtures.devcontrol import SHED_SERVER_BIN, bootstrap_mint, dev_config
 from fixtures.server import resolve_server_entry
 
 HTTPS_PORT = 18443
 TEST_SAN = "shed-tls-test.example"
-# Hermetic scoped tokens for the bus-over-TLS lockstep (the host-agent posture).
-CREDS_TOKEN = "shed_credentials_itesttls"
-CONTROL_TOKEN = "shed_control_itesttls0"
 # Persist the cert outside ~/.shed so it never collides with a real server's
 # pinned material; a fresh path per run regenerates with the configured SANs.
 DEV_TLS_DIR = Path.home() / ".shed" / "dev" / "tls-itest"
@@ -247,28 +244,26 @@ def test_tls_bus_over_tls_with_token(vz_server_dev):
     authed host-agent (sdk WithTLSPin + WithToken) presents, and rejects the
     negatives — wrong scope, no token, and an untrusted (mis-pinned) cert."""
     server = vz_server_dev.name
+    pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
     shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
     DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
+    # secure mode enforces HTTP tokens and keeps an explicitly-set https_port
+    # (18443 here, not the 8443 default), so the pinned-TLS shape is unchanged.
+    # Tokens are minted over SSH — the static auth.http.tokens list was removed.
     overrides = {
         **_tls_overrides(),
-        "auth": {
-            "http": {
-                "mode": "enforce",
-                "tokens": [
-                    {"scope": "credentials", "token": CREDS_TOKEN},
-                    {"scope": "control", "token": CONTROL_TOKEN},
-                ],
-            }
-        },
+        "auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}},
     }
     try:
         with dev_config(overrides, server):
+            creds = bootstrap_mint(server, "credentials")
+            control = bootstrap_mint(server, "control")
             pin = _server_cert_pem("localhost", HTTPS_PORT)
 
             # Pinned cert + credentials token → the bus is reachable.
-            assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, CREDS_TOKEN) == 200
+            assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, creds) == 200
             # Pinned cert but wrong scope / no token → rejected by auth.
-            assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, CONTROL_TOKEN) == 403
+            assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, control) == 403
             assert _https_status(HTTPS_PORT, "/api/plugins/listeners", pin, None) == 401
             # Bootstrap stays open over TLS (no token needed).
             assert _https_status(HTTPS_PORT, "/api/info", pin, None) == 200
