@@ -1,4 +1,4 @@
-"""Credential-bus registry-identity hardening + v0.8 removed-key rejection (live).
+"""Credential-bus registry-identity hardening + v0.7.1 removed-key rejection (live).
 
 Puts the VZ dev server in `auth.mode: secure` (the local SSH key allowlisted),
 mints a credentials token over the `_bootstrap` SSH channel, and verifies that a
@@ -65,7 +65,7 @@ def test_cred_bus_forged_respond_dropped(vz_server_dev):
 
 @pytest.mark.vz
 def test_removed_auth_keys_hard_fail():
-    """v0.8 removed `public_exposure` and `auth.http.tokens`. A config that still
+    """v0.7.1 removed `public_exposure` and `auth.http.tokens`. A config that still
     carries either must be **rejected at startup** — a non-zero exit naming the
     removed key — never silently ignored: a dropped `public_exposure: true` would
     un-loopback the plaintext listener, and a dropped token list would leave a

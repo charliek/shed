@@ -1,4 +1,4 @@
-"""HTTP bearer-token enforcement under v0.8 secure mode (live).
+"""HTTP bearer-token enforcement under v0.7.1 secure mode (live).
 
 Puts the VZ dev server in `auth.mode: secure` with the local SSH key allowlisted,
 mints scoped tokens over the `_bootstrap` SSH channel (no static token list — that

@@ -1291,7 +1291,7 @@ func rejectRemovedAuthKeys(data []byte) error {
 		return nil // malformed YAML — let the typed unmarshal surface the parse error
 	}
 	if _, present := raw["public_exposure"]; present {
-		return fmt.Errorf("config key %q was removed; use %q instead (see docs/upgrades/v0.7-to-v0.8.md)",
+		return fmt.Errorf("config key %q was removed; use %q instead (see docs/upgrades/v0.7.0-to-v0.7.1.md)",
 			"public_exposure", "auth.mode: secure")
 	}
 	auth, ok := raw["auth"].(map[string]any)
@@ -1300,7 +1300,7 @@ func rejectRemovedAuthKeys(data []byte) error {
 	}
 	if httpBlock, ok := auth["http"].(map[string]any); ok {
 		if _, present := httpBlock["tokens"]; present {
-			return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7-to-v0.8.md)",
+			return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7.0-to-v0.7.1.md)",
 				"auth.http.tokens", "auth.mode: secure")
 		}
 	}

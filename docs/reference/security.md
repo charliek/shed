@@ -92,7 +92,7 @@ the scope, and an expiry.
 | `control` | The control plane: lifecycle, images, sessions, snapshots, and the Connect tunnel for `shed forward`. |
 | `credentials` | The credential bus (`/api/plugins/*`) and the Connect tunnel — vends live SSH signatures and cloud credentials. |
 
-(The pre-v0.8 `admin` scope is removed.) Under `secure` mode every request needs
+(The pre-v0.7.1 `admin` scope is removed.) Under `secure` mode every request needs
 a matching `Authorization: Bearer` token of the required scope; the bus and
 Connect tunnel specifically require `credentials`, so a leaked `control` token
 cannot reach them. `GET /api/info` stays reachable without a token so
@@ -260,9 +260,9 @@ client runs one `shed server add` to pin TLS and mint its token. See the
 [Public VPS Deployment](../guides/vps-deployment.md) guide for a complete
 walkthrough.
 
-### Removed in v0.8
+### Removed in v0.7.1
 
-These pre-v0.8 keys are **rejected at startup** (the server names them and
+These pre-v0.7.1 keys are **rejected at startup** (the server names them and
 exits) so an old config can't silently weaken a deployment:
 
 | Removed | Replacement |
@@ -272,11 +272,11 @@ exits) so an old config can't silently weaken a deployment:
 | `admin` scope | `control` + `credentials` only. |
 | client `credentials_token` | The host-agent mints its own `credentials` token. |
 
-See [Upgrading v0.7 → v0.8](../upgrades/v0.7-to-v0.8.md) for the migration.
+See [Upgrading v0.7.0 → v0.7.1](../upgrades/v0.7.0-to-v0.7.1.md) for the migration.
 
 ## Deferred
 
-Two hardening layers are intentionally out of scope for v0.8 and tracked
+Two hardening layers are intentionally out of scope for v0.7.1 and tracked
 separately: an **enrollment secret** (a transport-layer HMAC over the bootstrap
 handshake, to gate token issuance even tighter than the SSH allowlist) and
 **mutual TLS** / a **broker handoff** for the credential bus. The current

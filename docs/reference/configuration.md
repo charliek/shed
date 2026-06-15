@@ -109,9 +109,9 @@ source. See [Security](security.md) for the model.
 | `auth.mode` | string | `open` | `open` enforces nothing by default; `secure` derives SSH-allowlist enforce + HTTP-token enforce + TLS (`https_port` defaults to `8443`) + a loopback-bound plain-HTTP listener, and **fails to start without a key source**. |
 | `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token. Clients refresh transparently near expiry / on a 401. |
 
-The pre-v0.8 `public_exposure` flag and `auth.http.tokens` list are removed and
+The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
 **rejected at startup** — set `auth.mode: secure` and let `shed server add` mint
-tokens over SSH. See [Upgrading v0.7 → v0.8](../upgrades/v0.7-to-v0.8.md).
+tokens over SSH. See [Upgrading v0.7.0 → v0.7.1](../upgrades/v0.7.0-to-v0.7.1.md).
 
 ### SSH authentication
 
