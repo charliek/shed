@@ -68,12 +68,22 @@ def test_cred_bus_forged_respond_dropped(vz_server_dev):
 
 
 @pytest.mark.vz
-def test_public_exposure_preflight_refuses_incomplete_bundle():
-    """public_exposure: true with an incomplete bundle must refuse to start —
-    a non-zero exit with the gap named, and nothing bound. Uses the throwaway
-    subprocess harness (not the running dev server). The dev base config has no
-    auth/TLS/internal listener, so the bundle is incomplete."""
-    result = run_preflight({"public_exposure": True})
-    assert not result.timed_out, "an incomplete public_exposure bundle must exit, not keep running"
-    assert result.returncode != 0, f"expected a non-zero exit, got {result.returncode}"
-    assert "public_exposure" in result.stderr.lower(), f"stderr should name the preflight: {result.stderr!r}"
+def test_removed_auth_keys_hard_fail():
+    """v0.8 removed `public_exposure` and `auth.http.tokens`. A config that still
+    carries either must be **rejected at startup** — a non-zero exit naming the
+    removed key — never silently ignored: a dropped `public_exposure: true` would
+    un-loopback the plaintext listener, and a dropped token list would leave a
+    server the operator believes is gated wide open. Uses the throwaway subprocess
+    harness (not the running dev server); the server exits at config load, before
+    any backend init, so no VM is needed."""
+    pe = run_preflight({"public_exposure": True})
+    assert not pe.timed_out, "a removed public_exposure key must exit, not keep running"
+    assert pe.returncode != 0, f"expected a non-zero exit, got {pe.returncode}"
+    assert "public_exposure" in pe.stderr.lower(), f"stderr should name the removed key: {pe.stderr!r}"
+    assert "removed" in pe.stderr.lower(), f"stderr should say the key was removed: {pe.stderr!r}"
+
+    tok = run_preflight({"auth": {"http": {"tokens": [{"scope": "control", "token": "shed_control_x"}]}}})
+    assert not tok.timed_out, "a removed auth.http.tokens key must exit, not keep running"
+    assert tok.returncode != 0, f"expected a non-zero exit, got {tok.returncode}"
+    assert "tokens" in tok.stderr.lower(), f"stderr should name the removed key: {tok.stderr!r}"
+    assert "removed" in tok.stderr.lower(), f"stderr should say the key was removed: {tok.stderr!r}"
