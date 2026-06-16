@@ -117,34 +117,22 @@ func (c *ServerConfig) SSHAuth() *SSHAuthConfig {
 	return c.Auth.SSH
 }
 
-// HTTPAuth returns the HTTP auth config, or nil when unset.
-func (c *ServerConfig) HTTPAuth() *HTTPAuthConfig {
-	if c.Auth == nil {
-		return nil
-	}
-	return c.Auth.HTTP
-}
-
 // DefaultTokenTTL is the lifetime of a bootstrap-minted HTTP token when
 // auth.token_ttl is unset.
 const DefaultTokenTTL = 24 * time.Hour
 
 // Secure reports whether the server runs in secure mode (auth.mode: secure):
-// SSH allowlist enforce + HTTP bearer-token enforce + TLS + a loopback-bound
-// plain HTTP listener. The default (open) preserves the legacy accept-all
+// SSH allowlist enforce + HTTP bearer-token enforce + TLS-only (no plain HTTP
+// listener faces clients). The default (open) preserves the legacy accept-all
 // tailnet/LAN posture.
 func (c *ServerConfig) Secure() bool {
 	return c.Auth != nil && c.Auth.Mode == AuthModeSecure
 }
 
-// HTTPAuthEnforced reports whether the HTTP API requires a bearer token: true in
-// secure mode, or when the advanced auth.http.mode override is set to enforce.
+// HTTPAuthEnforced reports whether the HTTP API requires a bearer token. HTTP
+// token enforcement is derived purely from secure mode: enforced iff secure.
 func (c *ServerConfig) HTTPAuthEnforced() bool {
-	if c.Secure() {
-		return true
-	}
-	h := c.HTTPAuth()
-	return h != nil && h.Mode == HTTPAuthEnforce
+	return c.Secure()
 }
 
 // EffectiveSSHAuth returns the SSH auth config to build the allowlist from. In
@@ -181,6 +169,7 @@ func (c *ServerConfig) validateAuth() error {
 			return fmt.Errorf("invalid auth.mode: %q (must be open or secure)", c.Auth.Mode)
 		}
 	}
+	secure := c.Secure()
 	if ssh := c.SSHAuth(); ssh != nil {
 		switch ssh.Mode {
 		case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
@@ -195,30 +184,41 @@ func (c *ServerConfig) validateAuth() error {
 				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
 			}
 		}
-	}
-	if h := c.HTTPAuth(); h != nil {
-		switch h.Mode {
-		case "", HTTPAuthOff, HTTPAuthEnforce:
-		default:
-			return fmt.Errorf("invalid auth.http.mode: %q (must be off or enforce)", h.Mode)
+		// tokens ⟺ TLS ⟺ secure: SSH enforce is the secure-mode posture. An
+		// explicit enforce on an open-mode server is rejected (warn stages an
+		// allowlist on a trusted network); secure forces enforce itself, so an
+		// explicit off/warn under secure contradicts the mode. An unset ssh.Mode
+		// under secure stays valid (EffectiveSSHAuth derives enforce).
+		if ssh.Mode == SSHAuthEnforce && !secure {
+			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: secure (use warn to stage an allowlist on a trusted network)")
 		}
+		if secure && (ssh.Mode == SSHAuthOff || ssh.Mode == SSHAuthWarn) {
+			return fmt.Errorf("auth.mode: secure forces auth.ssh.mode: enforce; remove the explicit auth.ssh.mode: %s", ssh.Mode)
+		}
+	}
+	// https_port is a secure-mode-only surface: an open-mode server serves plain
+	// http only. Checked outside the ssh block so it fires even when auth.ssh is
+	// unset.
+	if c.HTTPSPort > 0 && !secure {
+		return fmt.Errorf("https_port requires auth.mode: secure (an open-mode server serves plain http only)")
 	}
 	return nil
 }
 
-// HTTPListenAddr returns the bind address for the plain-HTTP listener. In secure
-// mode it is forced to loopback so the plaintext control-plane API is never
-// reachable off-box — only the pinned-TLS (https_port) listener faces the
-// network. Otherwise it honors http_bind (default all interfaces).
+// HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
+// http_bind (default all interfaces). The plain-HTTP listener is served only in
+// open mode (see PlainHTTPEnabled); secure mode is TLS-only and starts no
+// plain-HTTP listener, so this is not consulted there.
 func (c *ServerConfig) HTTPListenAddr() string {
-	if c.Secure() {
-		return listenAddr(loopbackBind, c.HTTPPort)
-	}
 	return listenAddr(c.HTTPBind, c.HTTPPort)
 }
 
+// PlainHTTPEnabled reports whether the main plain-HTTP listener should be
+// served. False in secure mode (TLS-only; the plain listener is not started).
+func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.Secure() }
+
 // loopbackBind is the IPv4 loopback interface used for listeners that must not
-// be reachable off-box (the internal bus, and plain HTTP in secure mode).
+// be reachable off-box (the internal bus).
 const loopbackBind = "127.0.0.1"
 
 // HTTPSEnabled reports whether the HTTPS listener is configured.
@@ -1280,9 +1280,9 @@ func rejectRemovedImageKeys(data []byte) error {
 }
 
 // rejectRemovedAuthKeys fails loudly if a config still carries auth keys removed
-// in the auth-issuance-v2 redesign. yaml.Unmarshal silently ignores unknown
-// fields, so without this an upgraded operator's stale public_exposure /
-// auth.http.tokens would be accepted while the new binary ignored them — and for
+// in the secure-by-default redesign. yaml.Unmarshal silently ignores unknown
+// fields, so without this an upgraded operator's stale public_exposure / auth.http
+// block would be accepted while the new binary ignored them — and for
 // public_exposure that silent drop would un-loopback the plaintext listener on
 // an internet-facing box. Mirrors rejectRemovedImageKeys.
 func rejectRemovedAuthKeys(data []byte) error {
@@ -1298,11 +1298,19 @@ func rejectRemovedAuthKeys(data []byte) error {
 	if !ok {
 		return nil
 	}
-	if httpBlock, ok := auth["http"].(map[string]any); ok {
-		if _, present := httpBlock["tokens"]; present {
-			return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7.0-to-v0.7.1.md)",
-				"auth.http.tokens", "auth.mode: secure")
+	// The entire auth.http subtree was removed: HTTP token enforcement is now
+	// derived from auth.mode: secure (the auth.http.mode knob is gone), and
+	// tokens are minted over the SSH bootstrap channel (auth.http.tokens is
+	// gone). Reject the block wholesale, with a tokens-specific hint when present.
+	if httpBlock, present := auth["http"]; present {
+		if hb, ok := httpBlock.(map[string]any); ok {
+			if _, hasTokens := hb["tokens"]; hasTokens {
+				return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
+					"auth.http.tokens", "auth.mode: secure")
+			}
 		}
+		return fmt.Errorf("config key %q was removed; HTTP token enforcement is now derived from %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
+			"auth.http", "auth.mode: secure")
 	}
 	return nil
 }

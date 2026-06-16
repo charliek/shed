@@ -10,10 +10,11 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// authTestServer builds a server in the given http-auth mode whose token store
-// holds one control and one credentials token; it returns those plaintext
-// tokens for the table to exercise.
-func authTestServer(t *testing.T, mode string) (s *Server, control, credentials string) {
+// authTestServer builds a server whose HTTP auth enforcement matches secure
+// (secure mode enforces bearer tokens; open mode is pass-through). Its token
+// store holds one control and one credentials token, returned as plaintext for
+// the table to exercise.
+func authTestServer(t *testing.T, secure bool) (s *Server, control, credentials string) {
 	t.Helper()
 	store := authtoken.NewStore()
 	control, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
@@ -24,8 +25,12 @@ func authTestServer(t *testing.T, mode string) (s *Server, control, credentials 
 	if err != nil {
 		t.Fatalf("mint credentials: %v", err)
 	}
+	mode := config.AuthModeOpen
+	if secure {
+		mode = config.AuthModeSecure
+	}
 	s = &Server{
-		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{HTTP: &config.HTTPAuthConfig{Mode: mode}}},
+		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{Mode: mode}},
 		tokens: store,
 	}
 	return s, control, credentials
@@ -45,7 +50,7 @@ func doAuth(s *Server, method, path, token string) int {
 }
 
 func TestAuthMiddlewareEnforce(t *testing.T) {
-	s, ctl, cred := authTestServer(t, config.HTTPAuthEnforce)
+	s, ctl, cred := authTestServer(t, true)
 	tests := []struct {
 		name, method, path, token string
 		want                      int
@@ -72,7 +77,7 @@ func TestAuthMiddlewareEnforce(t *testing.T) {
 }
 
 func TestAuthMiddlewareOffIsPassthrough(t *testing.T) {
-	s, _, _ := authTestServer(t, config.HTTPAuthOff)
+	s, _, _ := authTestServer(t, false)
 	if got := doAuth(s, "GET", "/api/sheds", ""); got != 200 {
 		t.Errorf("off mode should pass through, got %d", got)
 	}
@@ -92,7 +97,7 @@ func TestAuthMiddlewareExpiredToken(t *testing.T) {
 	}
 	time.Sleep(time.Millisecond)
 	s := &Server{
-		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{HTTP: &config.HTTPAuthConfig{Mode: config.HTTPAuthEnforce}}},
+		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeSecure}},
 		tokens: store,
 	}
 	if got := doAuth(s, "GET", "/api/sheds", tok); got != 401 {

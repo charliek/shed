@@ -11,7 +11,9 @@ Configures the VZ dev server with `https_port` + `tls_names` (via the Phase
     the control plane over the pinned TLS connection, and rejects a wrong
     out-of-band `--tls-fingerprint` (test_tls_client_pin).
 
-The plain-HTTP listener must keep answering so the legacy path is unaffected.
+Secure mode is TLS-only — the server serves no plain-HTTP listener, only the
+pinned-TLS (https_port) listener faces clients — so `_tls_overrides()` carries a
+secure auth block (https_port is a secure-mode-only surface).
 VZ-only (config mutation restarts the local dev server); the cert-generation +
 pin-verify logic is backend-agnostic Go covered by `internal/servertls` +
 `cmd/shed` unit tests. The CLI test runs against a throwaway $HOME so it never
@@ -20,20 +22,20 @@ touches the developer's real ~/.shed/config.yaml.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
-import ssl
 import subprocess
 import tempfile
 import urllib.error
-import urllib.request
 from pathlib import Path
 
 import pytest
 
 from fixtures.devcontrol import SHED_SERVER_BIN, bootstrap_mint, dev_config
 from fixtures.server import resolve_server_entry
+from fixtures.tlsclient import fingerprint as _fingerprint
+from fixtures.tlsclient import https_status as _https_status
+from fixtures.tlsclient import server_cert_pem as _server_cert_pem
 
 HTTPS_PORT = 18443
 TEST_SAN = "shed-tls-test.example"
@@ -42,6 +44,12 @@ TEST_SAN = "shed-tls-test.example"
 DEV_TLS_DIR = Path.home() / ".shed" / "dev" / "tls-itest"
 SHED_BIN = SHED_SERVER_BIN.parent / "shed"
 
+# https_port is a secure-mode-only surface (an open-mode server serves plain
+# http only and is rejected at startup with https_port set), so the TLS
+# overrides carry a secure auth block with the local key allowlisted — the same
+# allowlisting the other secure-mode tests use.
+_LOCAL_PUBKEY = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
+
 
 def _tls_overrides() -> dict:
     return {
@@ -49,6 +57,7 @@ def _tls_overrides() -> dict:
         "tls_names": [TEST_SAN],
         "tls_cert_file": str(DEV_TLS_DIR / "tls_cert.pem"),
         "tls_key_file": str(DEV_TLS_DIR / "tls_key.pem"),
+        "auth": {"mode": "secure", "ssh": {"authorized_keys": [_LOCAL_PUBKEY]}},
     }
 
 
@@ -59,17 +68,6 @@ def _shed(args: list[str], home: str, timeout: float = 30) -> subprocess.Complet
     return subprocess.run(
         [str(SHED_BIN), *args], capture_output=True, text=True, timeout=timeout, env=env
     )
-
-
-def _server_cert_pem(host: str, port: int) -> str:
-    # get_server_certificate retrieves the presented cert without trusting it,
-    # which is exactly what `shed server add` does before pinning.
-    return ssl.get_server_certificate((host, port))
-
-
-def _fingerprint(pem: str) -> str:
-    der = ssl.PEM_cert_to_DER_cert(pem)
-    return "sha256:" + hashlib.sha256(der).hexdigest()
 
 
 def _sans(pem: str) -> str:
@@ -126,13 +124,22 @@ def test_tls_listener_serves_pinnable_cert(vz_server_dev):
             finally:
                 Path(ca_path).unlink(missing_ok=True)
 
-            # The plain-HTTP listener is unaffected (legacy path).
+            # Secure mode is TLS-only: the plain-HTTP listener is NOT served, so
+            # nothing answers on http_port. curl gets a connection failure
+            # (non-zero exit, no HTTP status), confirming the plaintext surface
+            # is gone — only the pinned-TLS listener faces clients.
             r = subprocess.run(
                 ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
                  f"http://localhost:{http_port}/api/info"],
                 capture_output=True, text=True, timeout=15,
             )
-            assert r.stdout.strip() == "200", f"plain HTTP regressed: {r.stdout!r} {r.stderr!r}"
+            assert r.returncode != 0, (
+                f"plain HTTP must not be served in secure mode, got exit 0: "
+                f"{r.stdout!r} {r.stderr!r}"
+            )
+            assert r.stdout.strip() != "200", (
+                f"plain HTTP must not answer in secure mode: {r.stdout!r} {r.stderr!r}"
+            )
     finally:
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
@@ -217,25 +224,6 @@ def test_tls_pin_rotation(vz_server_dev):
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
 
-def _https_status(port: int, path: str, ca_pem: str | None, token: str | None) -> int | None:
-    # ca_pem trusts exactly the server's cert (the pin); None uses the system
-    # CA bundle (which must NOT trust the self-signed cert).
-    if ca_pem:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.load_verify_locations(cadata=ca_pem)
-    else:
-        ctx = ssl.create_default_context()
-    req = urllib.request.Request(f"https://localhost:{port}{path}")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-            return resp.status
-    except urllib.error.HTTPError as e:
-        e.close()  # warnings-as-errors: don't leak the response body
-        return e.code
-
-
 @pytest.mark.vz
 @pytest.mark.slow
 def test_tls_bus_over_tls_with_token(vz_server_dev):
@@ -244,18 +232,16 @@ def test_tls_bus_over_tls_with_token(vz_server_dev):
     authed host-agent (sdk WithTLSPin + WithToken) presents, and rejects the
     negatives — wrong scope, no token, and an untrusted (mis-pinned) cert."""
     server = vz_server_dev.name
-    pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
     shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
     DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
-    # secure mode enforces HTTP tokens and keeps an explicitly-set https_port
-    # (18443 here, not the 8443 default), so the pinned-TLS shape is unchanged.
-    # Tokens are minted over SSH — the static auth.http.tokens list was removed.
-    overrides = {
-        **_tls_overrides(),
-        "auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}},
-    }
+    # _tls_overrides() already carries auth.mode: secure with the local key
+    # allowlisted (https_port is a secure-mode-only surface), so the pinned-TLS
+    # shape here is the same as the other secure-mode tests. secure enforces HTTP
+    # tokens and keeps the explicitly-set https_port (18443, not the 8443
+    # default); tokens are minted over SSH (the static auth.http.tokens list was
+    # removed).
     try:
-        with dev_config(overrides, server):
+        with dev_config(_tls_overrides(), server):
             creds = bootstrap_mint(server, "credentials")
             control = bootstrap_mint(server, "control")
             pin = _server_cert_pem("localhost", HTTPS_PORT)

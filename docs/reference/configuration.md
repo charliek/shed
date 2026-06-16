@@ -99,19 +99,24 @@ log_level: info
 ### Authentication mode
 
 `auth.mode` is the headline switch. The default `open` posture is unchanged —
-ideal on a tailnet or trusted LAN — with the per-layer fields below (`auth.ssh`,
-`auth.http`, TLS) staying individually opt-in. `secure` is the internet-facing
-posture: it derives the full bundle and refuses to start without an SSH key
-source. See [Security](security.md) for the model.
+ideal on a tailnet or trusted LAN (plain HTTP, no tokens, no TLS); the SSH
+allowlist (`auth.ssh`) is the one independently-tunable layer there. `secure` is
+the internet-facing posture: it derives the full bundle (SSH enforce + HTTP
+tokens + TLS-only) and refuses to start without an SSH key source. Two invariants
+hold: **tokens ⟺ TLS ⟺ secure** and **https ⟺ secure**. See [Security](security.md)
+and the [Security Configuration guide](../guides/security-configuration.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth.mode` | string | `open` | `open` enforces nothing by default; `secure` derives SSH-allowlist enforce + HTTP-token enforce + TLS (`https_port` defaults to `8443`) + a loopback-bound plain-HTTP listener, and **fails to start without a key source**. |
+| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `secure` derives SSH-allowlist enforce + HTTP-token enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fails to start without a key source**. |
 | `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token. Clients refresh transparently near expiry / on a 401. |
 
 The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
 **rejected at startup** — set `auth.mode: secure` and let `shed server add` mint
-tokens over SSH. See [Upgrading v0.7.0 → v0.7.1](../upgrades/v0.7.0-to-v0.7.1.md).
+tokens over SSH. As of v0.7.2 the whole `auth.http` block is gone (HTTP
+enforcement derives from `auth.mode: secure`), and `https_port` /
+`auth.ssh.mode: enforce` are valid only in secure mode — see
+[Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md).
 
 ### SSH authentication
 
@@ -135,17 +140,17 @@ auth:
     github_users: [charliek]  # a key source is required in secure mode
 ```
 
-### HTTP authentication, TLS, and network surface
+### TLS and network surface
 
-These per-layer fields harden the HTTP API. In `open` mode they default to off
-(the trusted-network posture); `auth.mode: secure` turns the bundle on for you.
-See [Security](security.md) for the full model and
-[Public VPS Deployment](../guides/vps-deployment.md) for a walkthrough.
+TLS and network-surface fields. HTTP token enforcement is **not** an independent
+field — it is derived from `auth.mode: secure` (there is no `auth.http` block).
+`secure` turns on TLS for you, and `https_port` is valid only in secure mode. See
+[Security](security.md) and the
+[Security Configuration guide](../guides/security-configuration.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth.http.mode` | string | `off` | Advanced per-layer override: `off` accepts all requests, `enforce` requires a valid bearer token (except the bootstrap endpoints `GET /api/info` and `GET /api/ssh-host-key`). `auth.mode: secure` forces `enforce`. Tokens are minted over SSH by `shed server add` — there is no static token list. |
-| `https_port` | int | - | Serve HTTPS on this port (in addition to `http_port`) with a self-signed, client-pinned cert. |
+| `https_port` | int | `8443` in secure | Serve HTTPS with a self-signed, client-pinned cert. **Requires `auth.mode: secure`** (rejected in open mode); defaults to `8443` there. In secure mode this is the *only* listener — no plain HTTP is served. |
 | `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
 | `http_bind` / `ssh_bind` | string | all interfaces | Restrict a listener to one interface (e.g. `127.0.0.1`, a tailnet IP). |

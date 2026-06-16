@@ -254,6 +254,12 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 	// Connect and get server info
 	info, err := client.GetInfo()
 	if err != nil {
+		// A secure server serves no plain-HTTP listener, so an unauthenticated
+		// /api/info probe over http fails. Point the operator at --https-port
+		// rather than leaving them with a bare connection error.
+		if serverAddHTTPSPort == 0 {
+			return fmt.Errorf("failed to get server info over plain HTTP: %w\n\nIf this is a secure server, it serves only HTTPS — re-run with --https-port (e.g. --https-port 8443)", err)
+		}
 		return fmt.Errorf("failed to get server info: %w", err)
 	}
 
@@ -288,12 +294,6 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		}
 		controlToken = bundle.Token
 		controlTokenExpiresAt = bundle.ExpiresAt
-		// If the operator reached a secure server without --https-port, take the
-		// TLS pin + https port from the bundle (the server returns them).
-		if apiURL == "" && bundle.HTTPSPort > 0 {
-			apiURL = "https://" + net.JoinHostPort(host, strconv.Itoa(bundle.HTTPSPort))
-			tlsFingerprint = bundle.TLSCertFingerprint
-		}
 	}
 
 	// Determine server name

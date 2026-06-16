@@ -690,12 +690,6 @@ const (
 	SSHAuthEnforce = "enforce" // reject keys not in the allowlist
 )
 
-// HTTP auth modes for HTTPAuthConfig.Mode.
-const (
-	HTTPAuthOff     = "off"     // accept all requests (legacy default)
-	HTTPAuthEnforce = "enforce" // require a valid bearer token (except bootstrap endpoints)
-)
-
 // Auth modes for AuthConfig.Mode — the binary secure-by-default switch.
 const (
 	AuthModeOpen   = "open"   // default: no enforcement (tailnet/LAN posture)
@@ -703,28 +697,18 @@ const (
 )
 
 // AuthConfig configures authentication. The headline control is Mode (the
-// binary open|secure switch). The SSH/HTTP sub-blocks carry key sources and
-// advanced per-layer overrides.
+// binary open|secure switch). The SSH sub-block carries key sources and the
+// advanced SSH mode override. HTTP bearer-token enforcement is derived purely
+// from secure mode — there is no HTTP sub-block.
 type AuthConfig struct {
 	// Mode is open | secure (default open). secure derives: SSH allowlist
-	// enforce, HTTP bearer-token enforce, TLS on, and a loopback-bound plain
-	// HTTP listener; it requires at least one SSH key source.
+	// enforce, HTTP bearer-token enforce, and TLS on (the server serves the
+	// TLS listener only); it requires at least one SSH key source.
 	Mode string `yaml:"mode,omitempty"`
 	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`
 	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
 	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
-	// HTTP configures bearer-token auth on the HTTP API (advanced mode override).
-	HTTP *HTTPAuthConfig `yaml:"http,omitempty"`
-}
-
-// HTTPAuthConfig is the advanced per-layer override for HTTP bearer-token auth.
-// The headline control is auth.mode (secure enforces HTTP auth automatically);
-// tokens are minted over the SSH bootstrap channel, never configured here.
-type HTTPAuthConfig struct {
-	// Mode is off | enforce (default off). enforce requires a valid bearer token
-	// (except the bootstrap endpoints GET /api/info and GET /api/ssh-host-key).
-	Mode string `yaml:"mode,omitempty"`
 }
 
 // SSHAuthConfig configures the SSH public-key allowlist. Identity comes from

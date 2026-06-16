@@ -100,7 +100,7 @@ func TestRejectRemovedAuthKeys(t *testing.T) {
 		{"no auth block ok", "name: x\n", ""},
 		{"public_exposure rejected", "name: x\npublic_exposure: true\n", "public_exposure"},
 		{"auth.http.tokens rejected", "name: x\nauth:\n  http:\n    tokens:\n      - {scope: control, token: abc}\n", "auth.http.tokens"},
-		{"auth.http without tokens ok", "name: x\nauth:\n  http:\n    mode: enforce\n", ""},
+		{"auth.http.mode rejected", "name: x\nauth:\n  http:\n    mode: enforce\n", "auth.http"},
 		{"malformed yaml deferred to typed unmarshal", "name: [unterminated", ""},
 	}
 	for _, tt := range tests {
@@ -131,15 +131,14 @@ func TestValidateAuth(t *testing.T) {
 	}{
 		{"nil auth block is allowed", nil, ""},
 		{"empty ssh mode defaults ok", &AuthConfig{SSH: &SSHAuthConfig{}}, ""},
-		{"ssh off/warn/enforce ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
+		{"ssh off ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthOff}}, ""},
+		{"ssh warn ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthWarn}}, ""},
+		{"secure + ssh enforce ok", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
 		{"invalid ssh mode rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: "enfore"}}, "auth.ssh.mode"},
-		{"negative max_auth_tries rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: -1}}, "max_auth_tries"},
-		{"zero max_auth_tries ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: 0}}, ""},
-		{"valid github user ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
-		{"malformed github user rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
-		{"empty http mode defaults ok", &AuthConfig{HTTP: &HTTPAuthConfig{}}, ""},
-		{"http enforce ok", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce}}, ""},
-		{"invalid http mode rejected", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: "warn"}}, "auth.http.mode"},
+		{"negative max_auth_tries rejected", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: -1}}, "max_auth_tries"},
+		{"zero max_auth_tries ok", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: 0}}, ""},
+		{"valid github user ok", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
+		{"malformed github user rejected", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
 		{"invalid auth.mode rejected", &AuthConfig{Mode: "secur"}, "auth.mode"},
 		{"secure auth.mode ok", &AuthConfig{Mode: AuthModeSecure}, ""},
 	}

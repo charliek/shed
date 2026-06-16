@@ -22,14 +22,31 @@ from fixtures.server import resolve_server_entry
 
 KNOWN_HOSTS = Path.home() / ".shed" / "known_hosts"
 
+# Secure mode is TLS-only (no plain-HTTP listener), so the dev_config readiness
+# probe targets https. Pin the explicitly-set https_port (the port-safety guard
+# allows 18443) so the probe hits the actual listener rather than the 8443
+# default. The mint itself is over SSH, unaffected by the HTTP transport.
+HTTPS_PORT = 18443
+
 
 def _bootstrap_with_key(ssh_port: int, key_path: Path, scope: str = "control") -> subprocess.CompletedProcess:
-    """Attempt a `_bootstrap` exchange offering ONLY `key_path` (IdentitiesOnly).
-    A non-zero returncode means the mint was refused at SSH auth."""
+    """Attempt a `_bootstrap` exchange offering ONLY `key_path`.
+    A non-zero returncode means the mint was refused at SSH auth.
+
+    `IdentitiesOnly=yes` alone is NOT enough to isolate `key_path`: a user
+    `~/.ssh/config` with `Host * IdentityFile ~/.ssh/id_ed25519` (the macOS
+    default) makes that key an explicit identity, and a key loaded in the agent
+    that matches a configured IdentityFile is then offered too — so an
+    allowlisted local key would be tried first and authenticate, masking the
+    off-list rejection this probe exists to assert. `-F /dev/null` ignores the
+    user/system ssh_config and `IdentityAgent=none` ignores the agent, so the
+    only key offered is `key_path`."""
     args = [
         "ssh", "-T", "-p", str(ssh_port),
+        "-F", "/dev/null",
         "-i", str(key_path),
         "-o", "IdentitiesOnly=yes",
+        "-o", "IdentityAgent=none",
         "-o", "BatchMode=yes",
         "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
         "-o", "StrictHostKeyChecking=yes",
@@ -44,7 +61,10 @@ def test_bootstrap_mint_is_allowlist_gated(vz_server_dev):
     server = vz_server_dev.name
     ssh_port = int(resolve_server_entry(server)["ssh_port"])
     pubkey = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
-    overrides = {"auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}}}
+    overrides = {
+        "https_port": HTTPS_PORT,
+        "auth": {"mode": "secure", "ssh": {"authorized_keys": [pubkey]}},
+    }
     with dev_config(overrides, server):
         # Positive control: the allowlisted local key mints a control token.
         assert bootstrap_mint(server, "control").startswith("shed_control_")

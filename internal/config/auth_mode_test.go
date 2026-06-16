@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,8 +17,6 @@ func TestSecureAndEnforcement(t *testing.T) {
 		{"open default", &AuthConfig{}, false, false},
 		{"explicit open", &AuthConfig{Mode: AuthModeOpen}, false, false},
 		{"secure", &AuthConfig{Mode: AuthModeSecure}, true, true},
-		{"open + http enforce override", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthEnforce}}, false, true},
-		{"open + http off", &AuthConfig{HTTP: &HTTPAuthConfig{Mode: HTTPAuthOff}}, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -90,16 +89,96 @@ func TestPreflightSecure(t *testing.T) {
 	}
 }
 
-func TestSecureModeLoopbackBind(t *testing.T) {
-	// Secure mode forces the plain-HTTP listener to loopback (the same property
-	// public_exposure provided), so the cleartext control plane is never
-	// reachable off-box — only the pinned-TLS listener faces the network.
-	secure := &ServerConfig{HTTPPort: 8080, Auth: &AuthConfig{Mode: AuthModeSecure}}
-	if got := secure.HTTPListenAddr(); got != "127.0.0.1:8080" {
-		t.Errorf("secure HTTPListenAddr=%q, want loopback", got)
+func TestPlainHTTPEnabled(t *testing.T) {
+	// Secure mode is TLS-only: the plain-HTTP listener is not served (only the
+	// pinned-TLS listener faces clients). Open mode serves plain HTTP.
+	tests := []struct {
+		name string
+		cfg  ServerConfig
+		want bool
+	}{
+		{"open serves plain HTTP", ServerConfig{HTTPPort: 8080}, true},
+		{"secure is TLS-only", ServerConfig{HTTPPort: 8080, Auth: &AuthConfig{Mode: AuthModeSecure}}, false},
 	}
-	open := &ServerConfig{HTTPPort: 8080}
-	if got := open.HTTPListenAddr(); got != ":8080" {
-		t.Errorf("open HTTPListenAddr=%q, want all-interfaces", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.PlainHTTPEnabled(); got != tt.want {
+				t.Errorf("PlainHTTPEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCrossFieldAuthValidation exercises the secure⟺tokens⟺TLS coupling: SSH
+// enforce and https_port are secure-mode-only surfaces, and secure forbids an
+// explicit ssh off/warn override.
+func TestCrossFieldAuthValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     ServerConfig
+		wantErr string // substring the error must name; "" means expect success
+	}{
+		{
+			name:    "open + ssh enforce rejected",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeOpen, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}},
+			wantErr: "auth.ssh.mode: enforce requires auth.mode: secure",
+		},
+		{
+			name:    "open + https_port rejected",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443, Auth: &AuthConfig{Mode: AuthModeOpen}},
+			wantErr: "https_port requires auth.mode: secure",
+		},
+		{
+			name:    "https_port with no auth block rejected",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443},
+			wantErr: "https_port requires auth.mode: secure",
+		},
+		{
+			name:    "secure + ssh warn rejected",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthWarn}}},
+			wantErr: "auth.mode: secure forces auth.ssh.mode: enforce",
+		},
+		{
+			name:    "secure + ssh off rejected",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthOff}}},
+			wantErr: "auth.mode: secure forces auth.ssh.mode: enforce",
+		},
+		{
+			name:    "open + ssh warn ok (staging)",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeOpen, SSH: &SSHAuthConfig{Mode: SSHAuthWarn}}},
+			wantErr: "",
+		},
+		{
+			name:    "secure + ssh enforce ok",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}},
+			wantErr: "",
+		},
+		{
+			name:    "secure + ssh unset ok (derives enforce)",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, Auth: &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}},
+			wantErr: "",
+		},
+		{
+			name:    "secure + https_port ok",
+			cfg:     ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443, Auth: &AuthConfig{Mode: AuthModeSecure}},
+			wantErr: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.validateAuth()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("validateAuth() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateAuth() = nil, want error naming %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("validateAuth() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
 	}
 }

@@ -104,7 +104,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Printf("Starting shed-server...")
-	log.Printf("HTTP listen: %s", cfg.HTTPListenAddr())
+	if cfg.PlainHTTPEnabled() {
+		log.Printf("HTTP listen: %s", cfg.HTTPListenAddr())
+	}
 	log.Printf("SSH listen: %s", cfg.SSHListenAddr())
 
 	// Initialize plugin system (before backends, since backends use the bridge)
@@ -252,7 +254,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// the internal-listener split is enabled, it omits the credential bus +
 	// Connect tunnel.
 	publicHandler := apiServer.Router()
-	httpServer := newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
+
+	// Plain-HTTP listener. In secure mode it is not started — only the pinned-TLS
+	// (https_port) listener faces clients (TLS-only). The internal loopback
+	// listener below is a separate listener and is unaffected.
+	var httpServer *http.Server
+	if cfg.PlainHTTPEnabled() {
+		httpServer = newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
+	}
 
 	// Optional internal (loopback) listener carrying the credential bus +
 	// Connect tunnel, kept off the public interface.
@@ -293,13 +302,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH, internal HTTP).
 	errChan := make(chan error, 4)
 
-	// Start HTTP server in goroutine
-	go func() {
-		log.Printf("HTTP server listening on %s", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errChan <- fmt.Errorf("HTTP server error: %w", err)
-		}
-	}()
+	// Start HTTP server in goroutine (skipped in secure mode — TLS-only)
+	if httpServer != nil {
+		go func() {
+			log.Printf("HTTP server listening on %s", httpServer.Addr)
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("HTTP server error: %w", err)
+			}
+		}()
+	}
 
 	// Start internal HTTP server in goroutine (when split enabled)
 	if internalServer != nil {
@@ -348,10 +359,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// Shutdown HTTP server
-	log.Printf("Shutting down HTTP server...")
-	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+	// Shutdown HTTP server (when serving — skipped in secure mode)
+	if httpServer != nil {
+		log.Printf("Shutting down HTTP server...")
+		if err := httpServer.Shutdown(ctx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
 	}
 
 	// Shutdown internal HTTP server (when enabled)

@@ -107,6 +107,7 @@ nav:
       - Provisioning a TypeScript Project: tutorials/typescript-provisioning.md
       - Provisioning a Python Project: tutorials/python-provisioning.md
   - Guides:
+      - Security Configuration: guides/security-configuration.md
       - Public VPS Deployment: guides/vps-deployment.md
   - Reference:
       - CLI: reference/cli.md
