@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -230,6 +231,15 @@ func confirmTLSCert(fingerprint, expected string, trustOnFirstUse, interactive, 
 // fallback at a test server.
 var defaultAddHTTPSPort = 8443
 
+// isUnreachableErr reports whether err is a transport-level failure to reach the
+// server (connection refused, no route, DNS failure, timeout) rather than the
+// server responding with an error — only the former should trigger the TLS
+// fallback in selectAddTransport.
+func isUnreachableErr(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 // bootstrapTLSClient sets up a pinned-TLS client for host:httpsPort: it fetches
 // the presented cert, confirms + pins its fingerprint (interactive prompt, or
 // --tls-fingerprint / --trust-on-first-use; never silent-trust under --json),
@@ -272,6 +282,11 @@ func selectAddTransport(host string) (client *APIClient, apiURL, fingerprint str
 		pinfo, perr := plain.GetInfo()
 		if perr == nil {
 			return plain, "", "", pinfo, nil
+		}
+		// Only fall back to TLS when plain HTTP was unreachable; a server that
+		// responded with an error is surfaced as-is, not masked by a TLS retry.
+		if !isUnreachableErr(perr) {
+			return nil, "", "", nil, fmt.Errorf("failed to get server info over plain HTTP: %w", perr)
 		}
 		// Plain HTTP is unreachable — likely a TLS-only secure server. Auto-retry
 		// pinned TLS on the default secure port before surfacing an error.

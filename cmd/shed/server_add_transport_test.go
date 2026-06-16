@@ -147,4 +147,24 @@ func TestSelectAddTransport(t *testing.T) {
 			t.Errorf("expected TLS bootstrap on default port: apiURL=%q fp=%q info=%v", apiURL, fp, info)
 		}
 	})
+
+	t.Run("plain server error is surfaced, no TLS fallback", func(t *testing.T) {
+		errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer errSrv.Close()
+		_, errPort := hostPort(t, errSrv.URL)
+
+		withCleanAddFlags(t)
+		serverAddPort = errPort       // reachable, but responds 500 (not unreachable)
+		defaultAddHTTPSPort = tlsPort // a working TLS server: a wrong fallback would succeed
+		serverAddTrustTOFU = true
+		_, apiURL, _, _, err := selectAddTransport("127.0.0.1")
+		if err == nil {
+			t.Fatal("expected the plain 500 to surface, not a silent TLS fallback")
+		}
+		if apiURL != "" {
+			t.Errorf("must not fall back to TLS on a server error; apiURL=%q", apiURL)
+		}
+	})
 }
