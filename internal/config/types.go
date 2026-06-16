@@ -232,6 +232,11 @@ type ServerInfo struct {
 	// so clients can see which image a `shed create` without --image will
 	// use — useful when the ref is synthesized and never written in config.
 	DefaultImage string `json:"default_image,omitempty"`
+
+	// HTTPSPort is the pinned-TLS listener port in secure mode (auth.mode:
+	// secure), so a client adding a secure server can learn the TLS endpoint.
+	// 0/omitted in open mode (no HTTPS listener).
+	HTTPSPort int `json:"https_port,omitempty"`
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.
