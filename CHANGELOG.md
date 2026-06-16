@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.7.2 — 2026-06-16
 
 Auth-surface simplification: the `auth.mode: open | secure` headline is
 unchanged, but the intermediate states beneath it are removed so two invariants
@@ -18,6 +18,10 @@ unaffected.
   clients. On-box tooling uses the HTTPS endpoint; `shed server add` against a
   secure server needs `--https-port`. A loopback credential-bus channel remains
   available only via the explicit, opt-in `internal_http_port` (unchanged).
+- **Bundled shed-extensions bumped to v0.4.3** — the in-VM host-agent now mints a
+  credentials token only for secure (`https`) servers, so the `extensions`/`full`
+  image variants no longer log the spurious "token provider returned no token"
+  WARN against open-mode servers.
 
 ### Removed (rejected at startup)
 
