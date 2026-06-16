@@ -374,12 +374,17 @@ func runServerList(cmd *cobra.Command, args []string) error {
 
 	if jsonFlag {
 		type serverJSON struct {
-			Name     string `json:"name"`
-			Host     string `json:"host"`
-			HTTPPort int    `json:"http_port"`
-			SSHPort  int    `json:"ssh_port"`
-			Status   string `json:"status"`
-			Default  bool   `json:"default"`
+			Name               string `json:"name"`
+			Host               string `json:"host"`
+			Endpoint           string `json:"endpoint"`
+			HTTPPort           int    `json:"http_port"`
+			SSHPort            int    `json:"ssh_port"`
+			HTTPSPort          int    `json:"https_port,omitempty"`
+			Security           string `json:"security"`
+			TLSPinned          bool   `json:"tls_pinned"`
+			TLSCertFingerprint string `json:"tls_cert_fingerprint,omitempty"`
+			Status             string `json:"status"`
+			Default            bool   `json:"default"`
 		}
 		result := make([]serverJSON, 0, len(names))
 		for _, name := range names {
@@ -390,12 +395,17 @@ func runServerList(cmd *cobra.Command, args []string) error {
 				status = "online"
 			}
 			result = append(result, serverJSON{
-				Name:     name,
-				Host:     entry.Host,
-				HTTPPort: entry.HTTPPort,
-				SSHPort:  entry.SSHPort,
-				Status:   status,
-				Default:  name == clientConfig.DefaultServer,
+				Name:               name,
+				Host:               entry.Host,
+				Endpoint:           entry.BaseURL(),
+				HTTPPort:           entry.HTTPPort,
+				SSHPort:            entry.SSHPort,
+				HTTPSPort:          httpsPortFromAPIURL(entry.APIURL),
+				Security:           securityLabel(entry),
+				TLSPinned:          entry.TLSCertFingerprint != "",
+				TLSCertFingerprint: entry.TLSCertFingerprint,
+				Status:             status,
+				Default:            name == clientConfig.DefaultServer,
 			})
 		}
 		return outputJSON(result)
@@ -409,30 +419,66 @@ func runServerList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tHOST\tHTTP\tSSH\tSTATUS\tDEFAULT")
+	fmt.Fprintln(w, "NAME\tENDPOINT\tSSH\tSECURITY\tSTATUS\tDEFAULT")
 
 	for _, name := range names {
 		entry := clientConfig.Servers[name]
 
-		// Check if server is online
+		// Reachability is probed over the entry's real endpoint (BaseURL +
+		// pinned cert), so STATUS is correct for secure servers too.
 		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
 		status := "offline"
 		if client.Ping() {
 			status = "online"
 		}
 
-		// Check if default
 		defaultMark := ""
 		if name == clientConfig.DefaultServer {
 			defaultMark = "*"
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n",
-			name, entry.Host, entry.HTTPPort, entry.SSHPort, status, defaultMark)
+		sshAddr := fmt.Sprintf("%s:%d", entry.Host, entry.SSHPort)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			name, entry.BaseURL(), sshAddr, securityLabel(entry), status, defaultMark)
 	}
 
 	w.Flush()
 	return nil
+}
+
+// securityLabel classifies a server entry's control-plane transport for the
+// `shed server list` SECURITY column, derived purely from local config (no
+// network call, so the list stays fast and works offline):
+//
+//	secure   — pinned TLS (https api_url + a pinned cert fingerprint)
+//	unpinned — https api_url with no pinned fingerprint (the client can't
+//	           verify the cert, so requests fail closed — misconfigured)
+//	open     — plain http (the trusted-network LAN/tailnet default)
+func securityLabel(entry config.ServerEntry) string {
+	if isHTTPSURL(entry.APIURL) {
+		if entry.TLSCertFingerprint != "" {
+			return "secure"
+		}
+		return "unpinned"
+	}
+	return "open"
+}
+
+// httpsPortFromAPIURL returns the TLS port from an https api_url (443 when the
+// url omits one), or 0 when the entry isn't https. Derived from the pinned
+// api_url rather than a live /api/info call.
+func httpsPortFromAPIURL(apiURL string) int {
+	if !isHTTPSURL(apiURL) {
+		return 0
+	}
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return 0
+	}
+	if port, err := strconv.Atoi(u.Port()); err == nil && port > 0 {
+		return port
+	}
+	return 443
 }
 
 func runServerRemove(cmd *cobra.Command, args []string) error {
