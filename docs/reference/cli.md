@@ -34,6 +34,7 @@ shed server add <host> [flags]
 | `--name` | `-n` | Derived from host | Friendly name for server |
 | `--port` | `-p` | `8080` | HTTP API port (bootstrap; ignored when `--https-port` is set) |
 | `--https-port` | | | HTTPS port; when set, bootstrap over TLS and pin the server's self-signed cert |
+| `--secure` | | `false` | Bootstrap over TLS on the default secure port (8443) without probing plain HTTP first |
 | `--fingerprint` | | | Expected SSH host-key fingerprint (`SHA256:...`); verified out-of-band and fails on mismatch |
 | `--tls-fingerprint` | | | Expected TLS cert fingerprint (`sha256:...`); verified out-of-band and fails on mismatch |
 | `--trust-on-first-use` | | `false` | Trust the server's SSH host key (and TLS cert) without prompting |
@@ -44,6 +45,8 @@ The command pins the server's SSH host key (in `~/.shed/known_hosts`). It prints
 
 With `--https-port`, the command also pins the server's TLS certificate (over a connection it verifies before trusting), shows its fingerprint, and writes `api_url` + `tls_cert_fingerprint` into the server entry so the control plane runs over TLS. See [Security](security.md#native-pinned-tls).
 
+If you omit `--https-port`, `server add` first tries plain HTTP and, when that is refused — a TLS-only `auth.mode: secure` server serves no plain-HTTP listener — automatically retries the pinned-TLS bootstrap on the default secure port (`8443`). Pass `--secure` to skip the plain-HTTP probe and go straight to TLS, or `--https-port` for a non-default TLS port.
+
 When the server runs in `auth.mode: secure`, `server add` also **mints a control token automatically** — there is no `shed-server token new` and no token to paste. After pinning the host key it reads `GET /api/info` to detect secure mode, then connects over the reserved `_bootstrap` SSH channel (the same pinned key); the server re-verifies your key against its allowlist and returns a scoped, short-TTL token, which the CLI writes as `control_token` + `control_token_expires_at` in the server entry. The token is never printed. Your SSH key must therefore be on the server's allowlist (`auth.ssh.github_users` / `authorized_keys`). From then on the CLI refreshes the token transparently — near expiry and on a `401` — so you never run a token command. See [HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh).
 
 **Example:**
@@ -52,6 +55,8 @@ When the server runs in `auth.mode: secure`, `server add` also **mints a control
 shed server add mini-desktop.tailnet.ts.net --name mini
 shed server add vps.example.com --name vps --fingerprint SHA256:HtYK...j4Y
 shed server add vps.example.com --https-port 8443 --name vps   # secure: pin TLS + mint a control token
+shed server add secure.example.com --secure --name sec         # secure on the default TLS port (8443)
+shed server add secure.example.com --name sec                  # same: plain HTTP refused → auto-retry TLS:8443
 ```
 
 ### shed server update
@@ -78,10 +83,12 @@ shed server list
 **Output:**
 
 ```
-NAME            HOST                              HTTP    SSH     STATUS     DEFAULT
-mini-desktop    mini-desktop.tailnet.ts.net       8080    2222    online     *
-cloud-vps       vps.tailnet.ts.net                8080    2222    offline
+NAME            ENDPOINT                                 SSH                               SECURITY  STATUS   DEFAULT
+mini-desktop    http://mini-desktop.tailnet.ts.net:8080  mini-desktop.tailnet.ts.net:2222  open      online   *
+cloud-vps       https://vps.tailnet.ts.net:8443          vps.tailnet.ts.net:2222           secure    offline
 ```
+
+The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured). Add `--json` for the full record, including `https_port`, `tls_pinned`, and the pinned fingerprint.
 
 ### shed server remove
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -80,6 +81,7 @@ var (
 	serverAddTrustTOFU      bool
 	serverAddHTTPSPort      int
 	serverAddTLSFingerprint string
+	serverAddSecure         bool
 
 	serverUpdateTLSFingerprint string
 	serverUpdateRefetch        bool
@@ -93,6 +95,7 @@ func init() {
 	serverAddCmd.Flags().BoolVar(&serverAddTrustTOFU, "trust-on-first-use", false, "Trust the server's SSH host key (and TLS cert) without prompting")
 	serverAddCmd.Flags().IntVar(&serverAddHTTPSPort, "https-port", 0, "HTTPS port; when set, bootstrap over TLS and pin the server's self-signed cert")
 	serverAddCmd.Flags().StringVar(&serverAddTLSFingerprint, "tls-fingerprint", "", "Expected TLS cert fingerprint (sha256:...); verified out-of-band, fails on mismatch")
+	serverAddCmd.Flags().BoolVar(&serverAddSecure, "secure", false, "Bootstrap over TLS on the default secure port instead of probing plain HTTP first")
 
 	serverUpdateCmd.Flags().StringVar(&serverUpdateTLSFingerprint, "tls-fingerprint", "", "New pinned TLS cert fingerprint (sha256:...) to rotate to")
 	serverUpdateCmd.Flags().BoolVar(&serverUpdateRefetch, "refetch", false, "Re-fetch the cert from the server's api_url and re-pin it (TOFU/prompt)")
@@ -222,45 +225,97 @@ func confirmTLSCert(fingerprint, expected string, trustOnFirstUse, interactive, 
 	return nil
 }
 
-func runServerAdd(cmd *cobra.Command, args []string) error {
-	host := args[0]
+// defaultAddHTTPSPort is the TLS port `shed server add` falls back to — and the
+// port `--secure` bootstraps against — when no --https-port is given. It mirrors
+// the server's secure-mode default; kept as a var so tests can point the
+// fallback at a test server.
+var defaultAddHTTPSPort = 8443
 
-	// When --https-port is set, bootstrap over TLS: fetch the presented cert,
-	// confirm + pin its fingerprint, then drive /api/info + /api/ssh-host-key
-	// over the pinned connection. Otherwise the legacy plain-HTTP path runs.
-	var apiURL, tlsFingerprint string
-	var client *APIClient
-	if serverAddHTTPSPort > 0 {
-		fp, err := fetchTLSCertFingerprint(host, serverAddHTTPSPort)
-		if err != nil {
-			return err
-		}
-		if err := confirmTLSCert(fp, serverAddTLSFingerprint, serverAddTrustTOFU, isStdinTTY(), jsonFlag, true); err != nil {
-			return err
-		}
-		tlsFingerprint = fp
-		apiURL = "https://" + net.JoinHostPort(host, strconv.Itoa(serverAddHTTPSPort))
-		if verboseLevel > 0 {
-			fmt.Printf("Connecting to %s (TLS, pinned)...\n", apiURL)
-		}
-		client = newAPIClient(apiURL, "", tlsFingerprint, DefaultTimeout)
-	} else {
+// isUnreachableErr reports whether err is a transport-level failure to reach the
+// server (connection refused, no route, DNS failure, timeout) rather than the
+// server responding with an error — only the former should trigger the TLS
+// fallback in selectAddTransport.
+func isUnreachableErr(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// bootstrapTLSClient sets up a pinned-TLS client for host:httpsPort: it fetches
+// the presented cert, confirms + pins its fingerprint (interactive prompt, or
+// --tls-fingerprint / --trust-on-first-use; never silent-trust under --json),
+// and returns a client bound to the resulting https api_url.
+func bootstrapTLSClient(host string, httpsPort int) (client *APIClient, apiURL, fingerprint string, err error) {
+	fp, err := fetchTLSCertFingerprint(host, httpsPort)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if err := confirmTLSCert(fp, serverAddTLSFingerprint, serverAddTrustTOFU, isStdinTTY(), jsonFlag, true); err != nil {
+		return nil, "", "", err
+	}
+	apiURL = "https://" + net.JoinHostPort(host, strconv.Itoa(httpsPort))
+	if verboseLevel > 0 {
+		fmt.Printf("Connecting to %s (TLS, pinned)...\n", apiURL)
+	}
+	return newAPIClient(apiURL, "", fp, DefaultTimeout), apiURL, fp, nil
+}
+
+// selectAddTransport chooses how `shed server add` reaches the server and
+// returns a ready client, the pinned TLS api_url + fingerprint (empty for a
+// plain-HTTP server), and the fetched /api/info:
+//
+//   - --https-port N  → pinned TLS on N.
+//   - --secure        → pinned TLS on the default secure port.
+//   - (default)       → try plain HTTP; if it is refused (a TLS-only secure
+//     server serves no plain-HTTP listener), auto-retry pinned TLS on the
+//     default secure port before giving up.
+func selectAddTransport(host string) (client *APIClient, apiURL, fingerprint string, info *config.ServerInfo, err error) {
+	switch {
+	case serverAddHTTPSPort > 0:
+		client, apiURL, fingerprint, err = bootstrapTLSClient(host, serverAddHTTPSPort)
+	case serverAddSecure:
+		client, apiURL, fingerprint, err = bootstrapTLSClient(host, defaultAddHTTPSPort)
+	default:
 		if verboseLevel > 0 {
 			fmt.Printf("Connecting to %s:%d...\n", host, serverAddPort)
 		}
-		client = NewAPIClient(host, serverAddPort, DefaultTimeout)
-	}
-
-	// Connect and get server info
-	info, err := client.GetInfo()
-	if err != nil {
-		// A secure server serves no plain-HTTP listener, so an unauthenticated
-		// /api/info probe over http fails. Point the operator at --https-port
-		// rather than leaving them with a bare connection error.
-		if serverAddHTTPSPort == 0 {
-			return fmt.Errorf("failed to get server info over plain HTTP: %w\n\nIf this is a secure server, it serves only HTTPS — re-run with --https-port (e.g. --https-port 8443)", err)
+		plain := NewAPIClient(host, serverAddPort, DefaultTimeout)
+		pinfo, perr := plain.GetInfo()
+		if perr == nil {
+			return plain, "", "", pinfo, nil
 		}
-		return fmt.Errorf("failed to get server info: %w", err)
+		// Only fall back to TLS when plain HTTP was unreachable; a server that
+		// responded with an error is surfaced as-is, not masked by a TLS retry.
+		if !isUnreachableErr(perr) {
+			return nil, "", "", nil, fmt.Errorf("failed to get server info over plain HTTP: %w", perr)
+		}
+		// Plain HTTP is unreachable — likely a TLS-only secure server. Auto-retry
+		// pinned TLS on the default secure port before surfacing an error.
+		if !jsonFlag {
+			fmt.Fprintf(os.Stderr, "Plain HTTP on %s:%d is unreachable; trying secure TLS on :%d...\n", host, serverAddPort, defaultAddHTTPSPort)
+		}
+		client, apiURL, fingerprint, err = bootstrapTLSClient(host, defaultAddHTTPSPort)
+		if err != nil {
+			return nil, "", "", nil, fmt.Errorf("could not reach %s: plain HTTP on :%d failed (%v) and secure TLS on :%d failed (%w) — pass --https-port if the server uses a non-default TLS port", host, serverAddPort, perr, defaultAddHTTPSPort, err)
+		}
+	}
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	info, err = client.GetInfo()
+	if err != nil {
+		return nil, "", "", nil, fmt.Errorf("failed to get server info: %w", err)
+	}
+	return client, apiURL, fingerprint, info, nil
+}
+
+func runServerAdd(cmd *cobra.Command, args []string) error {
+	host := args[0]
+
+	// Pick the transport (explicit --https-port, --secure, or plain-HTTP with an
+	// automatic pinned-TLS fallback) and fetch /api/info over it.
+	client, apiURL, tlsFingerprint, info, err := selectAddTransport(host)
+	if err != nil {
+		return err
 	}
 
 	// Get SSH host key
@@ -374,12 +429,17 @@ func runServerList(cmd *cobra.Command, args []string) error {
 
 	if jsonFlag {
 		type serverJSON struct {
-			Name     string `json:"name"`
-			Host     string `json:"host"`
-			HTTPPort int    `json:"http_port"`
-			SSHPort  int    `json:"ssh_port"`
-			Status   string `json:"status"`
-			Default  bool   `json:"default"`
+			Name               string `json:"name"`
+			Host               string `json:"host"`
+			Endpoint           string `json:"endpoint"`
+			HTTPPort           int    `json:"http_port"`
+			SSHPort            int    `json:"ssh_port"`
+			HTTPSPort          int    `json:"https_port,omitempty"`
+			Security           string `json:"security"`
+			TLSPinned          bool   `json:"tls_pinned"`
+			TLSCertFingerprint string `json:"tls_cert_fingerprint,omitempty"`
+			Status             string `json:"status"`
+			Default            bool   `json:"default"`
 		}
 		result := make([]serverJSON, 0, len(names))
 		for _, name := range names {
@@ -390,12 +450,17 @@ func runServerList(cmd *cobra.Command, args []string) error {
 				status = "online"
 			}
 			result = append(result, serverJSON{
-				Name:     name,
-				Host:     entry.Host,
-				HTTPPort: entry.HTTPPort,
-				SSHPort:  entry.SSHPort,
-				Status:   status,
-				Default:  name == clientConfig.DefaultServer,
+				Name:               name,
+				Host:               entry.Host,
+				Endpoint:           entry.BaseURL(),
+				HTTPPort:           entry.HTTPPort,
+				SSHPort:            entry.SSHPort,
+				HTTPSPort:          httpsPortFromAPIURL(entry.APIURL),
+				Security:           securityLabel(entry),
+				TLSPinned:          entry.TLSCertFingerprint != "",
+				TLSCertFingerprint: entry.TLSCertFingerprint,
+				Status:             status,
+				Default:            name == clientConfig.DefaultServer,
 			})
 		}
 		return outputJSON(result)
@@ -409,30 +474,66 @@ func runServerList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tHOST\tHTTP\tSSH\tSTATUS\tDEFAULT")
+	fmt.Fprintln(w, "NAME\tENDPOINT\tSSH\tSECURITY\tSTATUS\tDEFAULT")
 
 	for _, name := range names {
 		entry := clientConfig.Servers[name]
 
-		// Check if server is online
+		// Reachability is probed over the entry's real endpoint (BaseURL +
+		// pinned cert), so STATUS is correct for secure servers too.
 		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
 		status := "offline"
 		if client.Ping() {
 			status = "online"
 		}
 
-		// Check if default
 		defaultMark := ""
 		if name == clientConfig.DefaultServer {
 			defaultMark = "*"
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n",
-			name, entry.Host, entry.HTTPPort, entry.SSHPort, status, defaultMark)
+		sshAddr := fmt.Sprintf("%s:%d", entry.Host, entry.SSHPort)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			name, entry.BaseURL(), sshAddr, securityLabel(entry), status, defaultMark)
 	}
 
 	w.Flush()
 	return nil
+}
+
+// securityLabel classifies a server entry's control-plane transport for the
+// `shed server list` SECURITY column, derived purely from local config (no
+// network call, so the list stays fast and works offline):
+//
+//	secure   — pinned TLS (https api_url + a pinned cert fingerprint)
+//	unpinned — https api_url with no pinned fingerprint (the client can't
+//	           verify the cert, so requests fail closed — misconfigured)
+//	open     — plain http (the trusted-network LAN/tailnet default)
+func securityLabel(entry config.ServerEntry) string {
+	if isHTTPSURL(entry.APIURL) {
+		if entry.TLSCertFingerprint != "" {
+			return "secure"
+		}
+		return "unpinned"
+	}
+	return "open"
+}
+
+// httpsPortFromAPIURL returns the TLS port from an https api_url (443 when the
+// url omits one), or 0 when the entry isn't https. Derived from the pinned
+// api_url rather than a live /api/info call.
+func httpsPortFromAPIURL(apiURL string) int {
+	if !isHTTPSURL(apiURL) {
+		return 0
+	}
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return 0
+	}
+	if port, err := strconv.Atoi(u.Port()); err == nil && port > 0 {
+		return port
+	}
+	return 443
 }
 
 func runServerRemove(cmd *cobra.Command, args []string) error {
