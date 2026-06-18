@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.7.3 — 2026-06-18
+
+CLI/API polish so `auth.mode: secure` (TLS-only) servers are first-class in the
+`shed` client. Additive and backward-compatible — no config or behavior change
+for existing deployments.
+
+### Added
+
+- **`/api/info` reports `https_port`** so a client can discover a secure server's
+  TLS endpoint (omitted in open mode; older clients decode it as zero — no break).
+- **`shed server list` shows the real control-plane `ENDPOINT` + a `SECURITY`
+  column** (`secure` / `open` / `unpinned`) instead of the stale `HTTP`/`8080`
+  column that a TLS-only secure server never serves. `--json` gains `endpoint`,
+  `https_port`, `security`, `tls_pinned`, and the pinned cert fingerprint (never
+  tokens). Derived from local config — no live probe, so STATUS is unchanged.
+- **`shed server add` auto-discovers a secure server's TLS port.** With no
+  `--https-port`, a refused plain-HTTP probe auto-retries the pinned-TLS
+  bootstrap on the default secure port (`8443`); a new `--secure` flag skips the
+  plain probe entirely. The trust gate (interactive prompt / `--trust-on-first-use`
+  / `--tls-fingerprint`; never silent-trust under `--json`) is unchanged.
+
+See [#209](https://github.com/charliek/shed/pull/209).
+
 ## v0.7.2 — 2026-06-16
 
 Auth-surface simplification: the `auth.mode: open | secure` headline is
