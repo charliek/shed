@@ -6,6 +6,13 @@ name: my-server
 http_port: 8080
 ssh_port: 2222
 
+# bind_address: which interface every listener (HTTP/SSH) uses. Default
+# loopback (127.0.0.1) = reachable on this machine only. To reach it from
+# other hosts, prefer secure mode (auth.mode: secure) with bind_address:
+# 0.0.0.0; or, for an OPEN server on a trusted private network, set
+# bind_address: 0.0.0.0 and allow_insecure_exposure: true.
+bind_address: 127.0.0.1
+
 default_backend: firecracker
 log_level: info
 

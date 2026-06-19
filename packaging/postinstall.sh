@@ -34,20 +34,40 @@ if [ -n "${2:-}" ]; then
     # rejects the old keys — so a blind restart would crash the service.
     # Preflight the config and SKIP the restart (pointing at the upgrade
     # guide) when it no longer validates, rather than take the service down.
-    if ! shed-server --config /etc/shed/server.yaml config-validate >/dev/null 2>&1; then
+    if ! validate_err="$(shed-server --config /etc/shed/server.yaml config-validate 2>&1)"; then
         echo ""
         echo "shed-server was upgraded, but /etc/shed/server.yaml did not validate"
         echo "against the new binary, so the service was NOT restarted (the old"
-        echo "process keeps running)."
+        echo "process keeps running). The error was:"
         echo ""
-        echo "This usually means the config still uses keys removed in v0.6.0"
-        echo "(base_rootfs / images). Migrate to default_image + image_aliases +"
-        echo "pull_policy, then restart:"
+        echo "  ${validate_err}"
+        echo ""
+        echo "This usually means the config uses keys removed in a breaking release"
+        echo "(e.g. base_rootfs/images in v0.6.0, or http_bind/ssh_bind/"
+        echo "internal_http_port in v0.7.4). Migrate per the upgrade guides, then:"
         echo "  sudo shed-server --config /etc/shed/server.yaml config-validate"
         echo "  sudo systemctl restart shed-server"
         echo ""
-        echo "Upgrade guide: https://github.com/charliek/shed/blob/main/docs/upgrades/v0.5.9-to-v0.6.0.md"
+        echo "Upgrade guides: https://github.com/charliek/shed/tree/main/docs/upgrades"
         exit 0
+    fi
+
+    # v0.7.4: with no bind_address, shed-server now binds 127.0.0.1 only (it was
+    # all-interfaces before). config-validate still passes — the config is valid,
+    # it just changed meaning — so warn explicitly that a networked server has
+    # become local-only. (Loose grep: a commented "# bind_address" won't match.)
+    if ! grep -Eq '^[[:space:]]*bind_address:' /etc/shed/server.yaml; then
+        echo ""
+        echo "NOTE (v0.7.4): /etc/shed/server.yaml sets no 'bind_address', so"
+        echo "shed-server now binds 127.0.0.1 only (was all-interfaces). If you"
+        echo "reach this server from other machines it is now LOCAL-ONLY. To"
+        echo "restore network access, add to /etc/shed/server.yaml:"
+        echo "    bind_address: 0.0.0.0"
+        echo "  (open mode also requires allow_insecure_exposure: true; prefer"
+        echo "   auth.mode: secure for anything exposed on a network)"
+        echo "then: sudo systemctl restart shed-server"
+        echo "Guide: https://github.com/charliek/shed/blob/main/docs/upgrades/v0.7.3-to-v0.7.4.md"
+        echo ""
     fi
 
     # `try-restart` is the Debian-standard primitive for "restart only if

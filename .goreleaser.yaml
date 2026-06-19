@@ -148,6 +148,14 @@ brews:
             http_port: 8080
             ssh_port: 2222
 
+            # bind_address: which interface every listener (HTTP/SSH) uses.
+            # Default loopback (127.0.0.1) = reachable on this machine only. To
+            # reach it from other hosts, prefer secure mode (auth.mode: secure;
+            # see the reference above) with bind_address: 0.0.0.0; or, for an
+            # OPEN server on a trusted private network, set bind_address: 0.0.0.0
+            # and allow_insecure_exposure: true.
+            bind_address: 127.0.0.1
+
             default_backend: vz
             log_level: info
 
@@ -216,6 +224,14 @@ brews:
 
             http_port: 8080
             ssh_port: 2222
+
+            # bind_address: which interface every listener (HTTP/SSH) uses.
+            # Default loopback (127.0.0.1) = reachable on this machine only. To
+            # reach it from other hosts, prefer secure mode (auth.mode: secure;
+            # see the reference above) with bind_address: 0.0.0.0; or, for an
+            # OPEN server on a trusted private network, set bind_address: 0.0.0.0
+            # and allow_insecure_exposure: true.
+            bind_address: 127.0.0.1
 
             default_backend: firecracker
             log_level: info
@@ -304,6 +320,10 @@ brews:
       Edit the config to enable credential mounts and extensions,
       then start shed-server as a background service:
         brew services start shed
+
+      By default shed-server listens on 127.0.0.1 only (the local-development
+      default). To reach it from other machines set bind_address in the config —
+      prefer auth.mode: secure for anything exposed on a network.
 
       To enable extensions (SSH agent forwarding, AWS credentials,
       Docker credentials), also install the host agent:
