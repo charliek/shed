@@ -57,33 +57,64 @@ bridge network, IP forwarding + NAT, and capabilities:
 sudo shed-server setup
 ```
 
-## 3. Configure the server (optional)
+## 3. Configure the server for network access
 
-The default config at `/etc/shed/server.yaml` works out of the box. A minimal
-config looks like:
+The default config at `/etc/shed/server.yaml` binds **loopback only**
+(`bind_address` defaults to `127.0.0.1` since v0.7.4), so a fresh install is
+reachable only on the box itself. Since you reach this host from a workstation,
+edit the config so it faces the network.
+
+**Recommended — secure mode** (pinned TLS + minted bearer tokens + an SSH key
+allowlist; the preferred posture for anything networked):
 
 ```yaml
 # /etc/shed/server.yaml
 # Full reference: https://charliek.github.io/shed/reference/configuration/
 name: my-linux-host
-http_port: 8080
 ssh_port: 2222
 default_backend: firecracker
+
+auth:
+  mode: secure                   # forces SSH enforce + HTTP tokens + TLS-only
+  ssh:
+    github_users: [your-github-username]   # only these keys may SSH in (and mint tokens)
+bind_address: 0.0.0.0            # face the network (or a specific tailnet/LAN IP)
+# https_port defaults to 8443; http_port is optional in secure mode.
 
 firecracker:
   pull_policy: missing
   # default_image / image_aliases omitted -> synthesized from the server version.
 ```
 
-See [Configuration](../reference/configuration.md) for the Firecracker-specific
-fields (bridge name/CIDR, vsock, resource defaults).
+**Alternative — open on a trusted private network** (plaintext; Tailscale / LAN
+only, where the network is the trust boundary):
+
+```yaml
+# /etc/shed/server.yaml
+name: my-linux-host
+http_port: 8080
+ssh_port: 2222
+default_backend: firecracker
+
+bind_address: 0.0.0.0            # or a specific tailnet/LAN IP
+allow_insecure_exposure: true    # required: acknowledge a non-loopback bind with no TLS
+
+firecracker:
+  pull_policy: missing
+```
+
+See the [Security Configuration guide](../guides/security-configuration.md) for
+the full posture walkthrough and [Configuration](../reference/configuration.md)
+for the Firecracker-specific fields (bridge name/CIDR, vsock, resource defaults).
 
 ## 4. Start it
 
 ```bash
 sudo systemctl start shed-server
-systemctl status shed-server            # should be active (running)
-curl -s http://localhost:8080/api/info  # name, version, backend: firecracker
+systemctl status shed-server                  # should be active (running)
+# secure mode (TLS-only) — check over HTTPS on the box:
+curl -sk https://localhost:8443/api/info      # name, version, backend: firecracker
+# open mode instead? use: curl -s http://localhost:8080/api/info
 ```
 
 The first `shed create` pulls the matching `shed-fc-full` image automatically
@@ -91,13 +122,18 @@ The first `shed create` pulls the matching `shed-fc-full` image automatically
 
 ## 5. Connect from your workstation
 
-From the Mac/Linux box that has the `shed` CLI (over Tailscale/LAN):
+From the Mac/Linux box that has the `shed` CLI (over Tailscale/LAN). For a secure
+server, `shed server add --https-port` pins the TLS cert + SSH host key and mints
+your token over SSH (your key must be in the `github_users` allowlist):
 
 ```bash
-shed server add my-linux-host.tailnet.ts.net --name my-linux-host
+shed server add my-linux-host.tailnet.ts.net --https-port 8443 --name my-linux-host
 shed create demo --repo charliek/your-repo
 shed attach demo
 ```
+
+For an **open** server (the LAN alternative above), drop `--https-port`:
+`shed server add my-linux-host.tailnet.ts.net --name my-linux-host`.
 
 ## Upgrading
 

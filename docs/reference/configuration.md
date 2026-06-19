@@ -78,11 +78,10 @@ log_level: info
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | `shed-server` | Server identifier |
-| `http_port` | int | `8080` | HTTP API port |
+| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in secure mode** (secure serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
 | `ssh_port` | int | `2222` | SSH server port |
-| `http_bind` | string | `""` | Interface to bind the HTTP listener to (e.g. `127.0.0.1`, or a tailnet IP). Empty binds all interfaces. |
-| `ssh_bind` | string | `""` | Interface to bind the SSH listener to. Empty binds all interfaces. |
-| `internal_http_port` | int | `0` | When greater than 0, moves the credential bus (`/api/plugins/*`) and the Connect tunnel (`/api/sheds/*/connect/*`) onto a loopback-only listener on this port, keeping them off the public interface. `0` keeps every route on the public listener (default). |
+| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in both modes** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; secure mode needs no acknowledgment. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge binding a **non-loopback** `bind_address` in **open** mode (no transport security). Required there, ignored in secure mode and for loopback binds. |
 | `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
@@ -116,7 +115,10 @@ The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed an
 tokens over SSH. As of v0.7.2 the whole `auth.http` block is gone (HTTP
 enforcement derives from `auth.mode: secure`), and `https_port` /
 `auth.ssh.mode: enforce` are valid only in secure mode — see
-[Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md).
+[Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
+`http_bind`/`ssh_bind`/`internal_http_port` are removed in favour of a single
+`bind_address` (loopback by default), and `http_port` is optional in secure mode
+— see [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
 
 ### SSH authentication
 
@@ -150,11 +152,11 @@ field — it is derived from `auth.mode: secure` (there is no `auth.http` block)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `https_port` | int | `8443` in secure | Serve HTTPS with a self-signed, client-pinned cert. **Requires `auth.mode: secure`** (rejected in open mode); defaults to `8443` there. In secure mode this is the *only* listener — no plain HTTP is served. |
+| `https_port` | int | `8443` in secure | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: secure`** (rejected in open mode); defaults to `8443` there. In secure mode this is the *only* listener — no plain HTTP is served. |
 | `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
-| `http_bind` / `ssh_bind` | string | all interfaces | Restrict a listener to one interface (e.g. `127.0.0.1`, a tailnet IP). |
-| `internal_http_port` | int | - | Move the credential bus + Connect tunnel to a loopback-only internal listener (co-located host-agent model; see the [route matrix](security.md#route-matrix)). |
+| `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in both modes). Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in secure mode. |
 | `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
 
 ### Mounts

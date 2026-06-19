@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.7.4 — 2026-06-19
+
+Local-first, zero-plaintext-secure network surface — finishes the `0.7` auth
+line: the credential bus loses its plaintext escape hatch, binding is one knob
+that defaults to loopback, and `http_port` is no longer required in secure mode.
+A `0.7.x` patch that carries **breaking config changes** — see the
+[upgrade guide](docs/upgrades/v0.7.3-to-v0.7.4.md).
+
+### Changed
+
+- **One listener per mode — `internal_http_port` removed.** The credential bus
+  (`/api/plugins/*`) and Connect tunnel (`/api/sheds/*/connect/*`) now ride the
+  single listener (pinned TLS in secure mode, plain HTTP in open), gated by the
+  `credentials` scope — so secure mode has no plaintext listener anywhere. Remote
+  `shed forward` works uniformly again (the old split forced Connect to loopback).
+- **`http_bind`/`ssh_bind` unified into `bind_address`, defaulting to loopback.**
+  One interface governs every listener (HTTP, HTTPS, SSH) and **defaults to
+  127.0.0.1 in both modes** — shed is local-development-first. Bind a routable
+  address (`0.0.0.0`/`*`, `::`, or a LAN/tailnet IP) to expose it; in open mode a
+  non-loopback bind also requires the new `allow_insecure_exposure: true` ack
+  (secure mode needs none). A startup `WARNING` flags the new loopback default.
+- **`http_port` is optional in secure mode** (no plain HTTP served there); it is
+  omitted from `/api/info` and the written client entry. Open mode still requires it.
+
+### Breaking
+
+- `internal_http_port`, `http_bind`, and `ssh_bind` are **rejected at startup**
+  (the first removed; the binds renamed to `bind_address`).
+- With no `bind_address` set, every listener now binds **loopback only** (was all
+  interfaces) — a networked server becomes local-only until you set `bind_address`.
+  The deb postinstall warns on upgrade; other channels surface it via a startup
+  `WARNING`. Migration + recovery: [upgrade guide](docs/upgrades/v0.7.3-to-v0.7.4.md).
+
+### Packaging
+
+- Fresh brew/apt configs ship `bind_address: 127.0.0.1` with inline guidance for
+  exposing off-box (secure mode, or open + `allow_insecure_exposure`).
+
 ## v0.7.3 — 2026-06-18
 
 CLI/API polish so `auth.mode: secure` (TLS-only) servers are first-class in the

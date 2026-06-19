@@ -49,6 +49,10 @@ http_port: 8080
 ssh_port: 2222
 default_backend: vz
 
+# Local-only by default: bind_address defaults to loopback (127.0.0.1), so the
+# server is reachable only on this Mac. You reach it as `shed server add localhost`.
+# To reach it from another machine, see the Security Configuration guide.
+
 # Host directories shared into every shed (VirtioFS). Add only what you need.
 mounts:
   claude:

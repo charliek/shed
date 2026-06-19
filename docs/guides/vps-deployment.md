@@ -5,17 +5,19 @@ This guide deploys shed-server on an internet-facing VPS, locked down so that
 token-authenticated**, and the **credential bus is reachable only with a
 credentials token over TLS**.
 
-The default shed posture is open-on-a-trusted-network (Tailscale/LAN). This
-guide is the opposite end: a hardened, internet-facing server. One switch —
+The default shed posture is local-only (open, bound to loopback). This guide is
+the opposite end: a hardened, internet-facing server. One switch —
 [`auth.mode: secure`](../reference/security.md#secure-mode) — derives the whole
 hardening bundle (SSH allowlist enforced + HTTP tokens enforced + TLS-only, with
-no plain-HTTP listener) and **refuses to start** if any piece is missing. There
-are no tokens to mint or paste: clients get them automatically over SSH.
+no plain-HTTP listener) and **refuses to start** if any piece is missing; one
+`bind_address` faces it at the network. There are no tokens to mint or paste:
+clients get them automatically over SSH.
 
 ## 1. Server config
 
-Write `/etc/shed/server.yaml`. The only thing `secure` requires from you is an
-SSH key source:
+Write `/etc/shed/server.yaml`. `secure` requires an SSH key source, and — since
+v0.7.4 every posture defaults to loopback — a `bind_address` so the VPS is
+reachable from off-box:
 
 ```yaml
 auth:
@@ -24,6 +26,7 @@ auth:
     github_users: [charliek]     # only these GitHub keys may SSH in (and mint tokens)
 tls_names:
   - shed.example.com             # your VPS hostname / public IP (extra cert SANs)
+bind_address: 0.0.0.0            # face the network (loopback is the default) — or a specific public IP
 ```
 
 `secure` mode forces `auth.ssh.mode: enforce`, enforces HTTP bearer tokens, turns
@@ -31,6 +34,12 @@ on pinned TLS (`https_port` defaults to `8443`), and serves **no plain-HTTP
 listener** (TLS-only) — so the only API is HTTPS on `8443`, with the credential
 bus and Connect tunnel gated by the `credentials` scope. (`shed server add`
 against a secure server therefore needs `--https-port`, as below.)
+
+!!! warning "`bind_address` is required for a remote server"
+    Since v0.7.4 `bind_address` **defaults to loopback (`127.0.0.1`) in secure
+    mode too**, so without the `bind_address: 0.0.0.0` line above the VPS binds
+    loopback only and is unreachable from your laptop. Secure mode needs no
+    `allow_insecure_exposure` ack — TLS + tokens make the network bind safe.
 
 Start (or restart) the server. If a required piece is missing it exits
 immediately, naming the gap:
@@ -112,11 +121,11 @@ SSH and TLS fingerprints. Tighten it further by verifying out-of-band
 bring your own TLS certificate instead of the self-signed one with
 `tls_cert_file` / `tls_key_file` in the server config.
 
-## Co-located alternative
+## Co-located host-agent
 
-If you instead run the host-agent **on the VPS itself**, set
-`internal_http_port: 8081` to move the credential bus to a loopback-only
-listener. Note this also moves the Connect tunnel to loopback, so remote
-`shed forward` is no longer available — use the co-located split only when the
-host-agent is on the same box. See the
-[route matrix](../reference/security.md#route-matrix).
+If you instead run the host-agent **on the VPS itself**, no extra config is
+needed: the credential bus and Connect tunnel ride the single pinned-TLS listener
+(gated by the `credentials` scope), and the on-box host-agent reaches them over
+`https://127.0.0.1:8443` with the pinned cert. Remote `shed forward` keeps
+working at the same time, because there is no longer a separate loopback-only
+listener. See the [network surface](../reference/security.md#network-surface).
