@@ -1,18 +1,14 @@
-"""Phase 1: network-surface route split.
+"""Network surface: the credential bus + Connect tunnel ride the single listener.
 
-Verifies (on the live VZ dev server, via the Phase 0.5 `dev_config` harness):
+Verifies (on the live VZ dev server) that the credential bus (`/api/plugins/*`)
+and the Connect tunnel (`/api/sheds/*/connect/*`) are served on the same
+listener as the control plane. v0.7.4 removed `internal_http_port`, so there is
+no separate loopback listener: in open mode everything is on the plain-HTTP
+port; in secure mode everything is on the pinned-TLS port, with the bus +
+Connect gated by the credentials scope (covered by `internal/api` unit tests).
 
-  - Default (no `internal_http_port`): the credential bus is reachable on
-    the public HTTP listener — legacy behavior, unchanged.
-  - With `internal_http_port` set: the bus (`/api/plugins/*`) and the
-    Connect tunnel (`/api/sheds/*/connect/*`) move to the loopback-only
-    internal listener and are gone from the public listener, while the
-    control plane (info, sheds, …) stays on the public listener.
-
-Config mutation is VZ-only (the harness restarts the local VZ dev server);
-the route-registration logic itself is backend-agnostic Go covered by
-`internal/config` + `internal/api` unit tests, so FC needs no separate
-live case here.
+The route-registration logic is backend-agnostic Go covered by `internal/config`
++ `internal/api` unit tests, so FC needs no separate live case here.
 """
 
 from __future__ import annotations
@@ -22,7 +18,6 @@ import urllib.request
 
 import pytest
 
-from fixtures.devcontrol import dev_config
 from fixtures.server import resolve_server_entry
 
 
@@ -44,35 +39,17 @@ def _status(port: int, path: str) -> int | None:
 
 
 @pytest.mark.vz
-def test_bus_on_public_listener_by_default(vz_server_dev):
-    """Default config (split off): the bus is served on the public port."""
+def test_bus_and_connect_on_single_listener(vz_server_dev):
+    """The credential bus and the Connect tunnel are served on the single
+    public listener (open dev server) alongside the control plane — there is no
+    separate internal listener after v0.7.4."""
     public = int(resolve_server_entry(vz_server_dev.name)["http_port"])
+    # Control plane.
+    assert _status(public, "/api/info") == 200
+    assert _status(public, "/api/sheds") == 200
+    # Credential bus.
     assert _status(public, "/api/plugins/listeners") == 200
-
-
-@pytest.mark.vz
-@pytest.mark.slow
-def test_split_moves_bus_and_connect_to_internal(vz_server_dev):
-    """With internal_http_port set, bus + Connect are loopback-only and the
-    control plane stays on the public listener."""
-    server = vz_server_dev.name
-    public = int(resolve_server_entry(server)["http_port"])
-    internal = public + 1  # e.g. 18081 alongside the dev server's 18080
-
-    with dev_config({"internal_http_port": internal}, server):
-        # Control plane + bootstrap endpoints stay on the public listener.
-        assert _status(public, "/api/info") == 200
-        assert _status(public, "/api/sheds") == 200
-        # Bus + Connect are removed from the public listener. Using port 0:
-        # if the Connect route were still registered here, handleConnect would
-        # run and return 400 (INVALID_PORT); a 404 proves the route itself is
-        # absent (not merely a missing shed, which also 404s on a live route).
-        assert _status(public, "/api/plugins/listeners") == 404
-        assert _status(public, "/api/sheds/nope/connect/0") == 404
-        # ...and present on the internal loopback listener: the bus answers,
-        # and the Connect handler runs and rejects port 0 with 400 (proving the
-        # route is registered here, not 404'd away).
-        assert _status(internal, "/api/plugins/listeners") == 200
-        assert _status(internal, "/api/sheds/nope/connect/0") == 400
-        # The internal listener does NOT serve the control plane.
-        assert _status(internal, "/api/info") == 404
+    # Connect tunnel: the route is registered on this listener — handleConnect
+    # runs and rejects port 0 with 400 (INVALID_PORT). A 404 would mean the
+    # route is absent; 400 proves it is present here.
+    assert _status(public, "/api/sheds/nope/connect/0") == 400

@@ -7,37 +7,27 @@ import (
 
 func TestListenAddrHelpers(t *testing.T) {
 	tests := []struct {
-		name                            string
-		cfg                             ServerConfig
-		wantHTTP, wantSSH, wantInternal string
+		name              string
+		cfg               ServerConfig
+		wantHTTP, wantSSH string
 	}{
 		{
-			name:         "defaults bind all interfaces",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222},
-			wantHTTP:     ":8080",
-			wantSSH:      ":2222",
-			wantInternal: "",
+			name:     "defaults bind all interfaces",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222},
+			wantHTTP: ":8080",
+			wantSSH:  ":2222",
 		},
 		{
-			name:         "http_bind restricts to loopback",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPBind: "127.0.0.1"},
-			wantHTTP:     "127.0.0.1:8080",
-			wantSSH:      ":2222",
-			wantInternal: "",
+			name:     "http_bind restricts to loopback",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPBind: "127.0.0.1"},
+			wantHTTP: "127.0.0.1:8080",
+			wantSSH:  ":2222",
 		},
 		{
-			name:         "ssh_bind restricts to a tailnet ip",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222, SSHBind: "100.64.0.1"},
-			wantHTTP:     ":8080",
-			wantSSH:      "100.64.0.1:2222",
-			wantInternal: "",
-		},
-		{
-			name:         "internal_http_port enables loopback internal listener",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8081},
-			wantHTTP:     ":8080",
-			wantSSH:      ":2222",
-			wantInternal: "127.0.0.1:8081",
+			name:     "ssh_bind restricts to a tailnet ip",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222, SSHBind: "100.64.0.1"},
+			wantHTTP: ":8080",
+			wantSSH:  "100.64.0.1:2222",
 		},
 	}
 	for _, tt := range tests {
@@ -47,9 +37,6 @@ func TestListenAddrHelpers(t *testing.T) {
 			}
 			if got := tt.cfg.SSHListenAddr(); got != tt.wantSSH {
 				t.Errorf("SSHListenAddr() = %q, want %q", got, tt.wantSSH)
-			}
-			if got := tt.cfg.InternalHTTPListenAddr(); got != tt.wantInternal {
-				t.Errorf("InternalHTTPListenAddr() = %q, want %q", got, tt.wantInternal)
 			}
 		})
 	}
@@ -61,19 +48,12 @@ func TestValidateNetworkSurface(t *testing.T) {
 		cfg     ServerConfig
 		wantErr bool
 	}{
-		{"split disabled (0) ok", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 0}, false},
-		{"valid offset port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8081}, false},
-		{"out of range", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 70000}, true},
-		{"negative", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: -1}, true},
-		{"collides with http_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8080}, true},
-		{"collides with ssh_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 2222}, true},
 		{"https disabled (0) ok", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 0}, false},
 		{"valid https port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443}, false},
 		{"https out of range", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 70000}, true},
 		{"https negative", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: -1}, true},
 		{"https collides with http_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8080}, true},
 		{"https collides with ssh_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 2222}, true},
-		{"https collides with internal", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8081, HTTPSPort: 8081}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,6 +86,36 @@ func TestRejectRemovedAuthKeys(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := rejectRemovedAuthKeys([]byte(tt.yaml))
+			if tt.want == "" {
+				if err != nil {
+					t.Errorf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error should name %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
+func TestRejectRemovedNetworkKeys(t *testing.T) {
+	// internal_http_port was removed in v0.7.4 — a config still carrying it must
+	// fail loudly rather than be silently ignored (it would otherwise imply a
+	// loopback bus listener the new binary never starts).
+	tests := []struct {
+		name string
+		yaml string
+		want string // substring the error must contain; "" means expect no error
+	}{
+		{"clean config ok", "name: x\nhttp_port: 8080\n", ""},
+		{"no network keys ok", "name: x\n", ""},
+		{"internal_http_port rejected", "name: x\ninternal_http_port: 8081\n", "internal_http_port"},
+		{"malformed yaml deferred to typed unmarshal", "name: [unterminated", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := rejectRemovedNetworkKeys([]byte(tt.yaml))
 			if tt.want == "" {
 				if err != nil {
 					t.Errorf("expected no error, got %v", err)

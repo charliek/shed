@@ -41,12 +41,6 @@ type ServerConfig struct {
 	// "127.0.0.1" or a tailnet IP). Empty = all interfaces (":port").
 	HTTPBind string `yaml:"http_bind,omitempty"`
 	SSHBind  string `yaml:"ssh_bind,omitempty"`
-	// InternalHTTPPort, when >0, splits the HTTP surface: the credential
-	// bus (/api/plugins/*) and the Connect tunnel (/api/sheds/*/connect/*)
-	// move to a loopback-only listener on this port, and the public
-	// listener omits them. 0 (default) keeps every route on the public
-	// listener (legacy behavior), so existing clients are unaffected.
-	InternalHTTPPort int `yaml:"internal_http_port,omitempty"`
 	// TrustedProxy enables chi's RealIP middleware, which trusts the
 	// client-supplied X-Forwarded-For. Only safe behind a proxy that
 	// overwrites that header; the default (false) uses the real TCP peer
@@ -217,10 +211,6 @@ func (c *ServerConfig) HTTPListenAddr() string {
 // served. False in secure mode (TLS-only; the plain listener is not started).
 func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.Secure() }
 
-// loopbackBind is the IPv4 loopback interface used for listeners that must not
-// be reachable off-box (the internal bus).
-const loopbackBind = "127.0.0.1"
-
 // HTTPSEnabled reports whether the HTTPS listener is configured.
 func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
 
@@ -235,20 +225,6 @@ func (c *ServerConfig) HTTPSListenAddr() string {
 
 // SSHListenAddr returns the bind address for the SSH listener.
 func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.SSHBind, c.SSHPort) }
-
-// InternalListenerEnabled reports whether the HTTP surface is split onto a
-// separate loopback internal listener (credential bus + Connect). This is
-// the single definition of "split on" consulted by the router and serve.
-func (c *ServerConfig) InternalListenerEnabled() bool { return c.InternalHTTPPort > 0 }
-
-// InternalHTTPListenAddr returns the loopback address for the internal
-// HTTP listener, or "" when the split is disabled.
-func (c *ServerConfig) InternalHTTPListenAddr() string {
-	if !c.InternalListenerEnabled() {
-		return ""
-	}
-	return listenAddr(loopbackBind, c.InternalHTTPPort)
-}
 
 // PreflightSecure gates secure-mode startup: it refuses to start when
 // auth.mode: secure is set without any SSH key source (github_users /
@@ -274,22 +250,16 @@ func listenAddr(bind string, port int) string {
 	return net.JoinHostPort(bind, strconv.Itoa(port))
 }
 
-// validateNetworkSurface checks the optional internal-listener port. Shared
-// by Validate and ValidateNoHostCoupling, both of which range-check
-// HTTPPort/SSHPort immediately before calling this (the collision check
-// below assumes those are already valid).
+// validateNetworkSurface checks the optional HTTPS listener port. Shared by
+// Validate and ValidateNoHostCoupling, both of which range-check
+// HTTPPort/SSHPort immediately before calling this (the collision check below
+// assumes those are already valid).
 func (c *ServerConfig) validateNetworkSurface() error {
-	if c.InternalHTTPPort < 0 || c.InternalHTTPPort > 65535 {
-		return fmt.Errorf("invalid internal_http_port: %d", c.InternalHTTPPort)
-	}
-	if c.InternalHTTPPort > 0 && (c.InternalHTTPPort == c.HTTPPort || c.InternalHTTPPort == c.SSHPort) {
-		return fmt.Errorf("internal_http_port (%d) must differ from http_port and ssh_port", c.InternalHTTPPort)
-	}
 	if c.HTTPSPort < 0 || c.HTTPSPort > 65535 {
 		return fmt.Errorf("invalid https_port: %d", c.HTTPSPort)
 	}
-	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort || c.HTTPSPort == c.InternalHTTPPort) {
-		return fmt.Errorf("https_port (%d) must differ from http_port, ssh_port, and internal_http_port", c.HTTPSPort)
+	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort) {
+		return fmt.Errorf("https_port (%d) must differ from http_port and ssh_port", c.HTTPSPort)
 	}
 	return nil
 }
@@ -1315,6 +1285,22 @@ func rejectRemovedAuthKeys(data []byte) error {
 	return nil
 }
 
+// rejectRemovedNetworkKeys fails loudly if a config still carries network-surface
+// keys removed in v0.7.4. yaml.Unmarshal silently ignores unknown fields, so
+// without this an upgraded operator's stale internal_http_port would be accepted
+// while the new binary ignored it. Mirrors rejectRemovedAuthKeys.
+func rejectRemovedNetworkKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	if _, present := raw["internal_http_port"]; present {
+		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in secure mode), gated by the credentials scope (see docs/upgrades/v0.7.3-to-v0.7.4.md)",
+			"internal_http_port")
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1376,6 +1362,9 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 	if err := rejectRemovedAuthKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
+	}
+	if err := rejectRemovedNetworkKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
@@ -1540,6 +1529,9 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 	if err := rejectRemovedAuthKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
+	}
+	if err := rejectRemovedNetworkKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 

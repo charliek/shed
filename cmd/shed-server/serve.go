@@ -250,24 +250,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetEgressAudit(egressAudit) // nil-safe: no-op when egress disabled
 	apiServer.SetTokenStore(tokenStore)   // shared with the SSH bootstrap handler (1c)
 
-	// Public router (HTTP and, when enabled, HTTPS share one handler). When
-	// the internal-listener split is enabled, it omits the credential bus +
-	// Connect tunnel.
+	// One router carries every route; the HTTP and (when enabled) HTTPS
+	// listeners share this single handler.
 	publicHandler := apiServer.Router()
 
 	// Plain-HTTP listener. In secure mode it is not started — only the pinned-TLS
-	// (https_port) listener faces clients (TLS-only). The internal loopback
-	// listener below is a separate listener and is unaffected.
+	// (https_port) listener faces clients (TLS-only).
 	var httpServer *http.Server
 	if cfg.PlainHTTPEnabled() {
 		httpServer = newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
-	}
-
-	// Optional internal (loopback) listener carrying the credential bus +
-	// Connect tunnel, kept off the public interface.
-	var internalServer *http.Server
-	if addr := cfg.InternalHTTPListenAddr(); addr != "" {
-		internalServer = newHTTPServer(addr, apiServer.InternalRouter())
 	}
 
 	// Optional HTTPS listener: same public router over TLS with a self-signed,
@@ -299,8 +290,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		TokenTTL:       cfg.TokenTTL(),
 	})
 
-	// Channel to collect errors from servers (HTTP, HTTPS, SSH, internal HTTP).
-	errChan := make(chan error, 4)
+	// Channel to collect errors from servers (HTTP, HTTPS, SSH).
+	errChan := make(chan error, 3)
 
 	// Start HTTP server in goroutine (skipped in secure mode — TLS-only)
 	if httpServer != nil {
@@ -308,16 +299,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 			log.Printf("HTTP server listening on %s", httpServer.Addr)
 			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				errChan <- fmt.Errorf("HTTP server error: %w", err)
-			}
-		}()
-	}
-
-	// Start internal HTTP server in goroutine (when split enabled)
-	if internalServer != nil {
-		go func() {
-			log.Printf("Internal HTTP server (bus+connect) listening on %s", internalServer.Addr)
-			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				errChan <- fmt.Errorf("internal HTTP server error: %w", err)
 			}
 		}()
 	}
@@ -364,14 +345,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("Shutting down HTTP server...")
 		if err := httpServer.Shutdown(ctx); err != nil {
 			log.Printf("HTTP server shutdown error: %v", err)
-		}
-	}
-
-	// Shutdown internal HTTP server (when enabled)
-	if internalServer != nil {
-		log.Printf("Shutting down internal HTTP server...")
-		if err := internalServer.Shutdown(ctx); err != nil {
-			log.Printf("internal HTTP server shutdown error: %v", err)
 		}
 	}
 
