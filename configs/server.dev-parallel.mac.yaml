@@ -24,6 +24,10 @@ name: my-server-dev
 http_port: 18080
 ssh_port: 12222
 
+# Loopback (also the v0.7.4 default) — the suite drives this dev server over
+# localhost, so it stays on-box. Set explicitly to document intent.
+bind_address: 127.0.0.1
+
 default_backend: vz
 log_level: debug
 
