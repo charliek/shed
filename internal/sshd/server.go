@@ -38,7 +38,8 @@ type Server struct {
 }
 
 // NewServer creates a new SSH server. listenAddr is the TCP bind address
-// (e.g. ":2222" for all interfaces, or "127.0.0.1:2222" / "<tailnet-ip>:2222").
+// (e.g. "127.0.0.1:2222" for loopback (the default), "<tailnet-ip>:2222", or
+// ":2222" for all interfaces).
 // allowlist gates public-key auth; pass an "off"-mode allowlist (or one built
 // from nil config) for the legacy accept-all behavior.
 func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config, allowlist *KeyAllowlist) (*Server, error) {

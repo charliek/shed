@@ -250,6 +250,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 	apiServer.SetEgressAudit(egressAudit) // nil-safe: no-op when egress disabled
 	apiServer.SetTokenStore(tokenStore)   // shared with the SSH bootstrap handler (1c)
 
+	// Warn when bind_address is unset: as of v0.7.4 that defaults to loopback
+	// (was all-interfaces), so a server that relied on the old default is now
+	// local-only. This startup line is the only migration signal that reaches
+	// every install channel (brew has no upgrade hook); the listeners log their
+	// resolved addresses separately below.
+	if cfg.BindAddress == "" {
+		if cfg.PlainHTTPEnabled() {
+			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: secure.")
+		} else {
+			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this secure server off-box.")
+		}
+	}
+
 	// One router carries every route; the HTTP and (when enabled) HTTPS
 	// listeners share this single handler.
 	publicHandler := apiServer.Router()

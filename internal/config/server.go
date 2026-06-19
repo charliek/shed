@@ -32,15 +32,21 @@ type ServerConfig struct {
 	HTTPPort int    `yaml:"http_port"`
 	SSHPort  int    `yaml:"ssh_port"`
 
-	// Network surface. All optional. The bind/port zero values preserve the
-	// legacy all-interfaces, single-listener behavior. TrustedProxy defaults
-	// to false, which disables RealIP (see below) — the intended security
-	// default, not the legacy always-on RealIP.
+	// Network surface. All optional. TrustedProxy defaults to false, which
+	// disables RealIP (see below) — the intended security default, not the
+	// legacy always-on RealIP.
 	//
-	// HTTPBind / SSHBind restrict a listener to one interface (e.g.
-	// "127.0.0.1" or a tailnet IP). Empty = all interfaces (":port").
-	HTTPBind string `yaml:"http_bind,omitempty"`
-	SSHBind  string `yaml:"ssh_bind,omitempty"`
+	// BindAddress is the interface every listener (HTTP, HTTPS, SSH) binds. It
+	// defaults to loopback (127.0.0.1) — shed is a local-development tool by
+	// default. Set a routable address (a LAN/tailnet IP, "0.0.0.0"/"*" for all
+	// IPv4, or "::" for all interfaces) to reach it off-box. In open mode that
+	// also requires AllowInsecureExposure, since open mode has no transport
+	// security; secure mode (TLS + tokens) needs no acknowledgment.
+	BindAddress string `yaml:"bind_address,omitempty"`
+	// AllowInsecureExposure acknowledges binding an open-mode (plaintext,
+	// possibly unauthenticated) server to a non-loopback interface. Required to
+	// start such a server; ignored in secure mode. Prefer auth.mode: secure.
+	AllowInsecureExposure bool `yaml:"allow_insecure_exposure,omitempty"`
 	// TrustedProxy enables chi's RealIP middleware, which trusts the
 	// client-supplied X-Forwarded-For. Only safe behind a proxy that
 	// overwrites that header; the default (false) uses the real TCP peer
@@ -48,7 +54,7 @@ type ServerConfig struct {
 	// or poison audit logs.
 	TrustedProxy bool `yaml:"trusted_proxy,omitempty"`
 
-	// HTTPSPort, when >0, starts an HTTPS listener (bound to HTTPBind)
+	// HTTPSPort, when >0, starts an HTTPS listener (bound to bind_address)
 	// serving the same public router as the plain HTTP listener, presenting
 	// a self-signed cert that clients pin by fingerprint. 0 (default) = no
 	// HTTPS; plain HTTP only (legacy, unchanged).
@@ -200,11 +206,11 @@ func (c *ServerConfig) validateAuth() error {
 }
 
 // HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
-// http_bind (default all interfaces). The plain-HTTP listener is served only in
+// bind_address (default loopback). The plain-HTTP listener is served only in
 // open mode (see PlainHTTPEnabled); secure mode is TLS-only and starts no
 // plain-HTTP listener, so this is not consulted there.
 func (c *ServerConfig) HTTPListenAddr() string {
-	return listenAddr(c.HTTPBind, c.HTTPPort)
+	return listenAddr(c.BindAddress, c.HTTPPort)
 }
 
 // PlainHTTPEnabled reports whether the main plain-HTTP listener should be
@@ -215,16 +221,16 @@ func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.Secure() }
 func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
 
 // HTTPSListenAddr returns the bind address for the HTTPS listener (sharing
-// HTTPBind with the plain listener), or "" when HTTPS is disabled.
+// bind_address with the other listeners), or "" when HTTPS is disabled.
 func (c *ServerConfig) HTTPSListenAddr() string {
 	if !c.HTTPSEnabled() {
 		return ""
 	}
-	return listenAddr(c.HTTPBind, c.HTTPSPort)
+	return listenAddr(c.BindAddress, c.HTTPSPort)
 }
 
 // SSHListenAddr returns the bind address for the SSH listener.
-func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.SSHBind, c.SSHPort) }
+func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.BindAddress, c.SSHPort) }
 
 // PreflightSecure gates secure-mode startup: it refuses to start when
 // auth.mode: secure is set without any SSH key source (github_users /
@@ -241,11 +247,34 @@ func (c *ServerConfig) PreflightSecure() error {
 	return nil
 }
 
-// listenAddr joins a bind interface and port. An empty bind means all
-// interfaces (":port").
+// loopbackBind is the IPv4 loopback interface — the default bind for every
+// listener, so shed is a local-development tool unless explicitly exposed.
+const loopbackBind = "127.0.0.1"
+
+// isLoopbackBind reports whether bind keeps the listener on the local host
+// (loopback) rather than exposing it to the network. Unset ("") counts as
+// loopback because that is the effective default (see listenAddr), as does the
+// "localhost" hostname; any address in 127.0.0.0/8 or ::1 is loopback via the
+// stdlib. Mirrors isLoopbackRef in internal/vmimage.
+func isLoopbackBind(bind string) bool {
+	if bind == "" || bind == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(bind); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// listenAddr joins a bind interface and port. An empty bind defaults to
+// loopback (local-only); "*" is accepted as an alias for all IPv4 interfaces
+// ("0.0.0.0"), and "::" binds all interfaces.
 func listenAddr(bind string, port int) string {
-	if bind == "" {
-		return fmt.Sprintf(":%d", port)
+	switch bind {
+	case "":
+		bind = loopbackBind
+	case "*":
+		bind = "0.0.0.0"
 	}
 	return net.JoinHostPort(bind, strconv.Itoa(port))
 }
@@ -276,6 +305,18 @@ func (c *ServerConfig) validateHTTPPort() error {
 		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
 	}
 	return nil
+}
+
+// validateBindAddress gates non-loopback exposure of an open-mode server. Open
+// mode has no transport security (and may not enforce the SSH allowlist), so
+// binding a routable interface requires an explicit allow_insecure_exposure
+// acknowledgment. Secure mode (TLS + tokens) needs none; unset/loopback binds
+// are always allowed. Shared by Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateBindAddress() error {
+	if c.Secure() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
+		return nil
+	}
+	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: secure", c.BindAddress)
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -1312,6 +1353,12 @@ func rejectRemovedNetworkKeys(data []byte) error {
 		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in secure mode), gated by the credentials scope (see docs/upgrades/v0.7.3-to-v0.7.4.md)",
 			"internal_http_port")
 	}
+	for _, removed := range []string{"http_bind", "ssh_bind"} {
+		if _, present := raw[removed]; present {
+			return fmt.Errorf("config key %q was unified into %q in v0.7.4 (one interface for all listeners; defaults to loopback). Use %q (and allow_insecure_exposure for non-loopback open-mode exposure) — see docs/upgrades/v0.7.3-to-v0.7.4.md",
+				removed, "bind_address", "bind_address")
+		}
+	}
 	return nil
 }
 
@@ -1610,6 +1657,9 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if err := c.validateNetworkSurface(); err != nil {
 		return err
 	}
+	if err := c.validateBindAddress(); err != nil {
+		return err
+	}
 	if err := c.validateAuth(); err != nil {
 		return err
 	}
@@ -1682,6 +1732,9 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
 	}
 	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateBindAddress(); err != nil {
 		return err
 	}
 	if err := c.validateAuth(); err != nil {
