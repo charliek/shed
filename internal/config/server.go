@@ -1383,6 +1383,33 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 	cfg.Credentials = nil
 }
 
+// applyModeAndCommonDefaults fills in the mode-derived and common zero-value
+// defaults shared by both loaders (serve + config-validate), so the two paths
+// can't drift. http_port drives the open-mode plain-HTTP listener; secure mode
+// serves no plain HTTP, so any value there is dropped (set or constructor
+// default) and /api/info + the written client entry omit a vestigial port.
+// Secure mode also defaults https_port so `auth.mode: secure` needs no extra
+// TLS config.
+func applyModeAndCommonDefaults(cfg *ServerConfig) {
+	if cfg.Secure() {
+		cfg.HTTPPort = 0
+	} else if cfg.HTTPPort == 0 {
+		cfg.HTTPPort = 8080
+	}
+	if cfg.Secure() && cfg.HTTPSPort == 0 {
+		cfg.HTTPSPort = 8443
+	}
+	if cfg.SSHPort == 0 {
+		cfg.SSHPort = 2222
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	if cfg.Terminal == nil {
+		cfg.Terminal = terminal.DefaultConfig()
+	}
+}
+
 // LoadServerConfigFromPath loads server configuration from a specific path.
 // If path is empty, it searches standard locations.
 func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
@@ -1431,29 +1458,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 	normalizeMounts(cfg, configPath)
 
-	// Apply defaults for zero values. http_port drives the open-mode plain-HTTP
-	// listener; secure mode serves no plain HTTP, so drop any value there (set or
-	// constructor default) — /api/info and the written client entry then omit a
-	// vestigial port. Default it in open mode.
-	if cfg.Secure() {
-		cfg.HTTPPort = 0
-	} else if cfg.HTTPPort == 0 {
-		cfg.HTTPPort = 8080
-	}
-	// Secure mode turns TLS on; default the HTTPS port if the operator didn't
-	// set one, so `auth.mode: secure` needs no extra TLS config.
-	if cfg.Secure() && cfg.HTTPSPort == 0 {
-		cfg.HTTPSPort = 8443
-	}
-	if cfg.SSHPort == 0 {
-		cfg.SSHPort = 2222
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.Terminal == nil {
-		cfg.Terminal = terminal.DefaultConfig()
-	}
+	applyModeAndCommonDefaults(cfg)
 
 	cfg.normalizeBackends()
 
@@ -1603,27 +1608,7 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 
 	normalizeMounts(cfg, configPath)
 
-	// http_port: drop in secure (no plain HTTP served), default in open. Mirrors
-	// the serve loader so config-validate sees the same effective surface.
-	if cfg.Secure() {
-		cfg.HTTPPort = 0
-	} else if cfg.HTTPPort == 0 {
-		cfg.HTTPPort = 8080
-	}
-	// Secure mode turns TLS on; default the HTTPS port here too so config-validate
-	// sees the same effective TLS surface the serve loader derives.
-	if cfg.Secure() && cfg.HTTPSPort == 0 {
-		cfg.HTTPSPort = 8443
-	}
-	if cfg.SSHPort == 0 {
-		cfg.SSHPort = 2222
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.Terminal == nil {
-		cfg.Terminal = terminal.DefaultConfig()
-	}
+	applyModeAndCommonDefaults(cfg)
 
 	cfg.normalizeBackends()
 
