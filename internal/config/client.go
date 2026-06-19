@@ -37,7 +37,7 @@ func (c *ClientConfig) GetCreateTimeout() time.Duration {
 // ServerEntry represents a configured server.
 type ServerEntry struct {
 	Host     string    `yaml:"host"`
-	HTTPPort int       `yaml:"http_port"`
+	HTTPPort int       `yaml:"http_port,omitempty"`
 	SSHPort  int       `yaml:"ssh_port"`
 	AddedAt  time.Time `yaml:"added_at"`
 	// ControlToken is the bearer token sent on control-plane HTTP requests

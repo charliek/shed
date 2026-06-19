@@ -28,7 +28,7 @@ var bootstrapTimeout = 15 * time.Second
 // URL from the host it dialed plus HTTPSPort (preferred, pinned via
 // TLSCertFingerprint) or HTTPPort.
 type Bundle struct {
-	HTTPPort           int       `json:"http_port"`
+	HTTPPort           int       `json:"http_port,omitempty"`
 	HTTPSPort          int       `json:"https_port"`
 	TLSCertFingerprint string    `json:"tls_cert_fingerprint"`
 	Token              string    `json:"token"`

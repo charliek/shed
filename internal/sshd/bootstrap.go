@@ -31,7 +31,7 @@ type BootstrapInfo struct {
 // own external hostname). The SDK/CLI decoders MUST keep these json tags in
 // sync.
 type bootstrapBundle struct {
-	HTTPPort           int       `json:"http_port"`
+	HTTPPort           int       `json:"http_port,omitempty"`
 	HTTPSPort          int       `json:"https_port"`
 	TLSCertFingerprint string    `json:"tls_cert_fingerprint"`
 	Token              string    `json:"token"`

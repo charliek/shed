@@ -264,6 +264,20 @@ func (c *ServerConfig) validateNetworkSurface() error {
 	return nil
 }
 
+// validateHTTPPort range-checks http_port: required (1..65535) in open mode,
+// where it drives the plain-HTTP listener; optional (0 = unset) in secure mode,
+// which serves no plain HTTP. Shared by Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateHTTPPort() error {
+	minPort := 1
+	if c.Secure() {
+		minPort = 0
+	}
+	if c.HTTPPort < minPort || c.HTTPPort > 65535 {
+		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	}
+	return nil
+}
+
 // ExtensionsConfig configures which extensions the agent should enable.
 type ExtensionsConfig struct {
 	// Enabled lists the extension namespaces to activate in VMs
@@ -1370,8 +1384,13 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 
 	normalizeMounts(cfg, configPath)
 
-	// Apply defaults for zero values
-	if cfg.HTTPPort == 0 {
+	// Apply defaults for zero values. http_port drives the open-mode plain-HTTP
+	// listener; secure mode serves no plain HTTP, so drop any value there (set or
+	// constructor default) — /api/info and the written client entry then omit a
+	// vestigial port. Default it in open mode.
+	if cfg.Secure() {
+		cfg.HTTPPort = 0
+	} else if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
 	}
 	// Secure mode turns TLS on; default the HTTPS port if the operator didn't
@@ -1537,7 +1556,11 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 
 	normalizeMounts(cfg, configPath)
 
-	if cfg.HTTPPort == 0 {
+	// http_port: drop in secure (no plain HTTP served), default in open. Mirrors
+	// the serve loader so config-validate sees the same effective surface.
+	if cfg.Secure() {
+		cfg.HTTPPort = 0
+	} else if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
 	}
 	// Secure mode turns TLS on; default the HTTPS port here too so config-validate
@@ -1578,8 +1601,8 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if c.Name == "" {
 		return fmt.Errorf("server name is required")
 	}
-	if c.HTTPPort < 0 || c.HTTPPort > 65535 {
-		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	if err := c.validateHTTPPort(); err != nil {
+		return err
 	}
 	if c.SSHPort < 0 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
@@ -1652,8 +1675,8 @@ func (c *ServerConfig) Validate() error {
 	if c.Name == "" {
 		return fmt.Errorf("server name is required")
 	}
-	if c.HTTPPort < 1 || c.HTTPPort > 65535 {
-		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	if err := c.validateHTTPPort(); err != nil {
+		return err
 	}
 	if c.SSHPort < 1 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
