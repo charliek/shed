@@ -76,6 +76,12 @@ func TestValidateBindAddress(t *testing.T) {
 		{"open tailnet ip with ack ok", ServerConfig{BindAddress: "100.64.0.1", AllowInsecureExposure: true}, false},
 		{"secure 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: secure}, false},
 		{"secure tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: secure}, false},
+		// Format validation runs before the mode/ack gate, so a malformed bind is
+		// rejected in every mode (it would otherwise fail cryptically at net.Listen).
+		{"malformed ip rejected", ServerConfig{BindAddress: "127.0.0.l"}, true},
+		{"hostname rejected", ServerConfig{BindAddress: "box.example"}, true},
+		{"over-long ipv4 rejected", ServerConfig{BindAddress: "0.0.0.0.0"}, true},
+		{"malformed rejected even in secure", ServerConfig{BindAddress: "nope", Auth: secure}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
