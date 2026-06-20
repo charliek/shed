@@ -24,7 +24,7 @@
 
 # Bump this when shed-extensions releases a new version.
 # The extensions and full variants pull binaries from this tag.
-ARG SHED_EXT_VERSION=v0.4.3
+ARG SHED_EXT_VERSION=v0.4.6
 FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
 
 # Note: the shed initramfs (overlay-on-the-guest init) is built from
@@ -235,6 +235,7 @@ RUN --mount=type=bind,from=shed-extensions,source=/,target=/ext \
     install -m 0755 /ext/usr/local/bin/shed-ext-ssh-agent       /usr/local/bin/shed-ext-ssh-agent && \
     install -m 0755 /ext/usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials && \
     install -m 0755 /ext/usr/local/bin/docker-credential-shed   /usr/local/bin/docker-credential-shed && \
+    install -m 0755 /ext/usr/local/bin/shed-ext-rc              /usr/local/bin/shed-ext-rc && \
     install -m 0644 /ext/etc/systemd/system/shed-ext-ssh-agent.service       /etc/systemd/system/shed-ext-ssh-agent.service && \
     install -m 0644 /ext/etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/shed-ext-aws-credentials.service && \
     install -m 0644 /ext/etc/environment.d/shed-extensions.conf              /etc/environment.d/shed-extensions.conf && \
