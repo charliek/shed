@@ -2,8 +2,11 @@ package config
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func mkEgress() *EgressConfig {
@@ -160,5 +163,29 @@ func TestEgressStatusJSONKeys(t *testing.T) {
 	}
 	if strings.Contains(s, `"Allow"`) || strings.Contains(s, `"Mode"`) {
 		t.Errorf("PascalCase profile key leaked: %s", s)
+	}
+}
+
+// TestExampleConfigEgressValidates guards configs/server.example.yaml from
+// rotting: its starter egress profiles must compile (globs/CEL) so copy-paste
+// users get a config that loads. The example ships enabled:false, so validate a
+// force-enabled copy to actually exercise profile compilation (Validate is a
+// no-op when disabled).
+func TestExampleConfigEgressValidates(t *testing.T) {
+	data, err := os.ReadFile("../../configs/server.example.yaml")
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	var cfg ServerConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("parse example config: %v", err)
+	}
+	if cfg.Egress == nil {
+		t.Fatal("example config has no egress block (expected the documented starter profiles)")
+	}
+	e := *cfg.Egress
+	e.Enabled = true
+	if err := e.Validate(); err != nil {
+		t.Errorf("example egress profiles do not validate: %v", err)
 	}
 }
