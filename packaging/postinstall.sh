@@ -34,7 +34,13 @@ if [ -n "${2:-}" ]; then
     # rejects the old keys — so a blind restart would crash the service.
     # Preflight the config and SKIP the restart (pointing at the upgrade
     # guide) when it no longer validates, rather than take the service down.
-    if ! validate_err="$(shed-server --config /etc/shed/server.yaml config-validate 2>&1)"; then
+    #
+    # Use the ABSOLUTE binary path: dpkg runs maintainer scripts with a minimal
+    # PATH (/usr/sbin:/usr/bin:/sbin:/bin) that excludes /usr/local/bin, so a bare
+    # `shed-server` is "command not found" here. That made the preflight *always*
+    # fail (validation never ran), so every upgrade skipped the restart and left
+    # the old binary serving. The path matches the unit's ExecStart.
+    if ! validate_err="$(/usr/local/bin/shed-server --config /etc/shed/server.yaml config-validate 2>&1)"; then
         echo ""
         echo "shed-server was upgraded, but /etc/shed/server.yaml did not validate"
         echo "against the new binary, so the service was NOT restarted (the old"
@@ -45,7 +51,7 @@ if [ -n "${2:-}" ]; then
         echo "This usually means the config uses keys removed in a breaking release"
         echo "(e.g. base_rootfs/images in v0.6.0, or http_bind/ssh_bind/"
         echo "internal_http_port in v0.7.4). Migrate per the upgrade guides, then:"
-        echo "  sudo shed-server --config /etc/shed/server.yaml config-validate"
+        echo "  sudo /usr/local/bin/shed-server --config /etc/shed/server.yaml config-validate"
         echo "  sudo systemctl restart shed-server"
         echo ""
         echo "Upgrade guides: https://github.com/charliek/shed/tree/main/docs/upgrades"
