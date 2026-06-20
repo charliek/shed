@@ -25,6 +25,9 @@ A `0.7.x` patch that carries **breaking config changes** — see the
   (secure mode needs none). A startup `WARNING` flags the new loopback default.
 - **`http_port` is optional in secure mode** (no plain HTTP served there); it is
   omitted from `/api/info` and the written client entry. Open mode still requires it.
+- **`bind_address` is format-validated** — a malformed value (hostname, typo,
+  zoned IPv6) is rejected at `config-validate` time with a clear message rather
+  than failing cryptically at `net.Listen` on startup.
 
 ### Breaking
 
@@ -39,6 +42,8 @@ A `0.7.x` patch that carries **breaking config changes** — see the
 
 - Fresh brew/apt configs ship `bind_address: 127.0.0.1` with inline guidance for
   exposing off-box (secure mode, or open + `allow_insecure_exposure`).
+- The `full` rootfs image now bundles the `shed-ext-rc` guest binary
+  (shed-extensions v0.4.6).
 
 ## v0.7.3 — 2026-06-18
 
