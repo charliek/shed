@@ -307,12 +307,18 @@ func (c *ServerConfig) validateHTTPPort() error {
 	return nil
 }
 
-// validateBindAddress gates non-loopback exposure of an open-mode server. Open
-// mode has no transport security (and may not enforce the SSH allowlist), so
-// binding a routable interface requires an explicit allow_insecure_exposure
-// acknowledgment. Secure mode (TLS + tokens) needs none; unset/loopback binds
-// are always allowed. Shared by Validate and ValidateNoHostCoupling.
+// validateBindAddress validates the bind_address format and gates non-loopback
+// exposure of an open-mode server. The format check accepts the special tokens
+// ("" = loopback default, "*" = all IPv4) plus "localhost" and any IP literal;
+// a hostname or typo is rejected here rather than failing cryptically at
+// net.Listen on startup. Open mode has no transport security, so binding a
+// routable interface also requires an explicit allow_insecure_exposure
+// acknowledgment; secure mode (TLS + tokens) needs none. Shared by Validate and
+// ValidateNoHostCoupling.
 func (c *ServerConfig) validateBindAddress() error {
+	if b := c.BindAddress; b != "" && b != "*" && b != "localhost" && net.ParseIP(b) == nil {
+		return fmt.Errorf("invalid bind_address %q (want an IP address, \"0.0.0.0\"/\"*\" for all IPv4, \"::\" for all interfaces, \"localhost\", or empty for loopback)", b)
+	}
 	if c.Secure() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
 		return nil
 	}
@@ -1383,6 +1389,20 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 	cfg.Credentials = nil
 }
 
+// rejectRemovedKeys runs every removed-key scan in one place so the two loaders
+// can't drift on which checks they apply. Each scan re-parses data and returns
+// nil on malformed YAML (deferring the parse error to the typed unmarshal).
+func rejectRemovedKeys(data []byte) error {
+	for _, check := range []func([]byte) error{
+		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
+	} {
+		if err := check(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // applyModeAndCommonDefaults fills in the mode-derived and common zero-value
 // defaults shared by both loaders (serve + config-validate), so the two paths
 // can't drift. http_port drives the open-mode plain-HTTP listener; secure mode
@@ -1446,13 +1466,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
-	if err := rejectRemovedImageKeys(data); err != nil {
-		return nil, fmt.Errorf("%s: %w", configPath, err)
-	}
-	if err := rejectRemovedAuthKeys(data); err != nil {
-		return nil, fmt.Errorf("%s: %w", configPath, err)
-	}
-	if err := rejectRemovedNetworkKeys(data); err != nil {
+	if err := rejectRemovedKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
@@ -1596,13 +1610,7 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
-	if err := rejectRemovedImageKeys(data); err != nil {
-		return nil, fmt.Errorf("%s: %w", configPath, err)
-	}
-	if err := rejectRemovedAuthKeys(data); err != nil {
-		return nil, fmt.Errorf("%s: %w", configPath, err)
-	}
-	if err := rejectRemovedNetworkKeys(data); err != nil {
+	if err := rejectRemovedKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
