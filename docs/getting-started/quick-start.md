@@ -24,13 +24,29 @@ running.
 
 ## Add a Server
 
-Register a server that has `shed-server` running:
+Register a server that has `shed-server` running. For a **local** server (the
+installed default — open, bound to loopback):
 
 ```bash
-shed server add my-server.tailnet.ts.net --name my-server
+shed server add localhost --name my-server
 ```
 
-This connects to the server, retrieves its SSH host key, and saves the configuration.
+For a server you reach **over the network**, the server must bind a non-loopback
+`bind_address` (since v0.7.4 the default is loopback-only). Secure mode is the
+preferred networked posture — pin its TLS cert and mint a token over SSH:
+
+```bash
+shed server add my-server.tailnet.ts.net --https-port 8443 --name my-server
+```
+
+For an open server on a trusted private network (configured with
+`allow_insecure_exposure: true`), drop `--https-port`:
+`shed server add my-server.tailnet.ts.net --name my-server`. See the
+[Security Configuration guide](../guides/security-configuration.md) for the
+server-side posture setup.
+
+This connects to the server, retrieves its SSH host key (and, in secure mode,
+pins the TLS cert and mints your token), and saves the configuration.
 
 ## Create a Shed
 

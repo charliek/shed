@@ -12,6 +12,14 @@ name: my-server
 http_port: 8080
 ssh_port: 2222
 
+# bind_address — the interface every listener (HTTP, HTTPS, SSH) binds.
+# Defaults to loopback (127.0.0.1): shed is a local-development tool unless
+# explicitly exposed. Set a routable address ("0.0.0.0"/"*" = all IPv4,
+# "::" = all interfaces, or a specific LAN/tailnet IP) to reach it off-box.
+# In OPEN mode (no TLS) a non-loopback bind also requires
+# allow_insecure_exposure: true; secure mode (auth.mode: secure) needs no ack.
+bind_address: 127.0.0.1
+
 # Backend configuration
 # Valid values: vz (macOS/arm64), firecracker (Linux), detect (auto-select)
 # "detect" picks vz on macOS Apple Silicon and firecracker on Linux.

@@ -218,10 +218,12 @@ func ValidateSessionName(name string) error {
 
 // ServerInfo is returned by GET /api/info.
 type ServerInfo struct {
-	Name     string `json:"name"`
-	Version  string `json:"version"`
-	SSHPort  int    `json:"ssh_port"`
-	HTTPPort int    `json:"http_port"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	SSHPort int    `json:"ssh_port"`
+	// HTTPPort is the plain-HTTP port (open mode). Omitted in secure mode, which
+	// serves no plain HTTP — clients use the HTTPS endpoint there.
+	HTTPPort int    `json:"http_port,omitempty"`
 	Backend  string `json:"backend"`
 	// AuthMode is the server's auth.mode ("secure" or "open"), so `shed server
 	// add` knows whether to bootstrap an HTTP token over SSH. Reported on the

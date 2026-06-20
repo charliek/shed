@@ -388,7 +388,7 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 			Name:   name,
 			Details: struct {
 				Host               string `json:"host"`
-				HTTPPort           int    `json:"http_port"`
+				HTTPPort           int    `json:"http_port,omitempty"`
 				SSHPort            int    `json:"ssh_port"`
 				APIURL             string `json:"api_url,omitempty"`
 				TLSCertFingerprint string `json:"tls_cert_fingerprint,omitempty"`
@@ -432,7 +432,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 			Name               string `json:"name"`
 			Host               string `json:"host"`
 			Endpoint           string `json:"endpoint"`
-			HTTPPort           int    `json:"http_port"`
+			HTTPPort           int    `json:"http_port,omitempty"`
 			SSHPort            int    `json:"ssh_port"`
 			HTTPSPort          int    `json:"https_port,omitempty"`
 			Security           string `json:"security"`

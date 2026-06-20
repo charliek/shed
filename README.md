@@ -70,11 +70,15 @@ pulled registry-direct from `ghcr.io`. See
 
 ## Security model
 
-Shed targets single-user setups where every machine is on a private network
-(e.g. Tailscale), the developer controls all of them, and network access implies
-trust. Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo.
-It is **not** built for multi-tenant use, public-internet exposure, or untrusted
-networks.
+Shed is local-development-first: out of the box `bind_address` defaults to
+loopback (`127.0.0.1`), so the server is reachable only on the machine it runs
+on. Facing the network is opt-in, and **secure mode** (pinned TLS + minted
+bearer tokens + an SSH key allowlist) is the preferred posture for anything
+networked — it works locally too. Open mode (plain HTTP, no tokens) stays
+available for a trusted private network (e.g. Tailscale), but exposing it
+off-loopback is explicit. Workloads run as a non-root `shed` user (UID 1000) with
+passwordless sudo. Shed targets single-user setups and is **not** built for
+multi-tenant use.
 
 ## Development
 

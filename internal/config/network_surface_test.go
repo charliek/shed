@@ -6,38 +6,41 @@ import (
 )
 
 func TestListenAddrHelpers(t *testing.T) {
+	// bind_address is shared by every listener and defaults to loopback.
 	tests := []struct {
-		name                            string
-		cfg                             ServerConfig
-		wantHTTP, wantSSH, wantInternal string
+		name              string
+		cfg               ServerConfig
+		wantHTTP, wantSSH string
 	}{
 		{
-			name:         "defaults bind all interfaces",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222},
-			wantHTTP:     ":8080",
-			wantSSH:      ":2222",
-			wantInternal: "",
+			name:     "unset binds loopback on both listeners",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222},
+			wantHTTP: "127.0.0.1:8080",
+			wantSSH:  "127.0.0.1:2222",
 		},
 		{
-			name:         "http_bind restricts to loopback",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPBind: "127.0.0.1"},
-			wantHTTP:     "127.0.0.1:8080",
-			wantSSH:      ":2222",
-			wantInternal: "",
+			name:     "explicit loopback",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222, BindAddress: "127.0.0.1"},
+			wantHTTP: "127.0.0.1:8080",
+			wantSSH:  "127.0.0.1:2222",
 		},
 		{
-			name:         "ssh_bind restricts to a tailnet ip",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222, SSHBind: "100.64.0.1"},
-			wantHTTP:     ":8080",
-			wantSSH:      "100.64.0.1:2222",
-			wantInternal: "",
+			name:     "tailnet ip binds both listeners",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222, BindAddress: "100.64.0.1"},
+			wantHTTP: "100.64.0.1:8080",
+			wantSSH:  "100.64.0.1:2222",
 		},
 		{
-			name:         "internal_http_port enables loopback internal listener",
-			cfg:          ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8081},
-			wantHTTP:     ":8080",
-			wantSSH:      ":2222",
-			wantInternal: "127.0.0.1:8081",
+			name:     "star is all IPv4",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222, BindAddress: "*"},
+			wantHTTP: "0.0.0.0:8080",
+			wantSSH:  "0.0.0.0:2222",
+		},
+		{
+			name:     "double-colon is all interfaces",
+			cfg:      ServerConfig{HTTPPort: 8080, SSHPort: 2222, BindAddress: "::"},
+			wantHTTP: "[::]:8080",
+			wantSSH:  "[::]:2222",
 		},
 	}
 	for _, tt := range tests {
@@ -48,8 +51,36 @@ func TestListenAddrHelpers(t *testing.T) {
 			if got := tt.cfg.SSHListenAddr(); got != tt.wantSSH {
 				t.Errorf("SSHListenAddr() = %q, want %q", got, tt.wantSSH)
 			}
-			if got := tt.cfg.InternalHTTPListenAddr(); got != tt.wantInternal {
-				t.Errorf("InternalHTTPListenAddr() = %q, want %q", got, tt.wantInternal)
+		})
+	}
+}
+
+func TestValidateBindAddress(t *testing.T) {
+	// Open mode requires allow_insecure_exposure to bind a non-loopback
+	// interface; secure mode (TLS + tokens) needs no acknowledgment.
+	secure := &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
+	tests := []struct {
+		name    string
+		cfg     ServerConfig
+		wantErr bool
+	}{
+		{"open unset is loopback (ok)", ServerConfig{}, false},
+		{"open explicit loopback ok", ServerConfig{BindAddress: "127.0.0.1"}, false},
+		{"open localhost ok", ServerConfig{BindAddress: "localhost"}, false},
+		{"open ::1 ok", ServerConfig{BindAddress: "::1"}, false},
+		{"open 0.0.0.0 without ack rejected", ServerConfig{BindAddress: "0.0.0.0"}, true},
+		{"open star without ack rejected", ServerConfig{BindAddress: "*"}, true},
+		{"open :: without ack rejected", ServerConfig{BindAddress: "::"}, true},
+		{"open tailnet ip without ack rejected", ServerConfig{BindAddress: "100.64.0.1"}, true},
+		{"open 0.0.0.0 with ack ok", ServerConfig{BindAddress: "0.0.0.0", AllowInsecureExposure: true}, false},
+		{"open tailnet ip with ack ok", ServerConfig{BindAddress: "100.64.0.1", AllowInsecureExposure: true}, false},
+		{"secure 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: secure}, false},
+		{"secure tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: secure}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.cfg.validateBindAddress(); (err != nil) != tt.wantErr {
+				t.Errorf("validateBindAddress() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -61,19 +92,12 @@ func TestValidateNetworkSurface(t *testing.T) {
 		cfg     ServerConfig
 		wantErr bool
 	}{
-		{"split disabled (0) ok", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 0}, false},
-		{"valid offset port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8081}, false},
-		{"out of range", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 70000}, true},
-		{"negative", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: -1}, true},
-		{"collides with http_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8080}, true},
-		{"collides with ssh_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 2222}, true},
 		{"https disabled (0) ok", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 0}, false},
 		{"valid https port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8443}, false},
 		{"https out of range", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 70000}, true},
 		{"https negative", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: -1}, true},
 		{"https collides with http_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 8080}, true},
 		{"https collides with ssh_port", ServerConfig{HTTPPort: 8080, SSHPort: 2222, HTTPSPort: 2222}, true},
-		{"https collides with internal", ServerConfig{HTTPPort: 8080, SSHPort: 2222, InternalHTTPPort: 8081, HTTPSPort: 8081}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,6 +130,38 @@ func TestRejectRemovedAuthKeys(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := rejectRemovedAuthKeys([]byte(tt.yaml))
+			if tt.want == "" {
+				if err != nil {
+					t.Errorf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error should name %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
+func TestRejectRemovedNetworkKeys(t *testing.T) {
+	// internal_http_port was removed in v0.7.4 — a config still carrying it must
+	// fail loudly rather than be silently ignored (it would otherwise imply a
+	// loopback bus listener the new binary never starts).
+	tests := []struct {
+		name string
+		yaml string
+		want string // substring the error must contain; "" means expect no error
+	}{
+		{"clean config ok", "name: x\nhttp_port: 8080\n", ""},
+		{"no network keys ok", "name: x\n", ""},
+		{"internal_http_port rejected", "name: x\ninternal_http_port: 8081\n", "internal_http_port"},
+		{"http_bind rejected (renamed to bind_address)", "name: x\nhttp_bind: 0.0.0.0\n", "bind_address"},
+		{"ssh_bind rejected (renamed to bind_address)", "name: x\nssh_bind: 0.0.0.0\n", "bind_address"},
+		{"malformed yaml deferred to typed unmarshal", "name: [unterminated", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := rejectRemovedNetworkKeys([]byte(tt.yaml))
 			if tt.want == "" {
 				if err != nil {
 					t.Errorf("expected no error, got %v", err)
@@ -170,8 +226,8 @@ func TestHTTPSListenAddr(t *testing.T) {
 		wantAddr string
 	}{
 		{"disabled by default", ServerConfig{HTTPPort: 8080}, false, ""},
-		{"all interfaces", ServerConfig{HTTPPort: 8080, HTTPSPort: 8443}, true, ":8443"},
-		{"bound to one interface", ServerConfig{HTTPPort: 8080, HTTPSPort: 8443, HTTPBind: "100.64.0.1"}, true, "100.64.0.1:8443"},
+		{"loopback by default", ServerConfig{HTTPPort: 8080, HTTPSPort: 8443}, true, "127.0.0.1:8443"},
+		{"bound to one interface", ServerConfig{HTTPPort: 8080, HTTPSPort: 8443, BindAddress: "100.64.0.1"}, true, "100.64.0.1:8443"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

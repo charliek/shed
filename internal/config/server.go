@@ -32,21 +32,21 @@ type ServerConfig struct {
 	HTTPPort int    `yaml:"http_port"`
 	SSHPort  int    `yaml:"ssh_port"`
 
-	// Network surface. All optional. The bind/port zero values preserve the
-	// legacy all-interfaces, single-listener behavior. TrustedProxy defaults
-	// to false, which disables RealIP (see below) — the intended security
-	// default, not the legacy always-on RealIP.
+	// Network surface. All optional. TrustedProxy defaults to false, which
+	// disables RealIP (see below) — the intended security default, not the
+	// legacy always-on RealIP.
 	//
-	// HTTPBind / SSHBind restrict a listener to one interface (e.g.
-	// "127.0.0.1" or a tailnet IP). Empty = all interfaces (":port").
-	HTTPBind string `yaml:"http_bind,omitempty"`
-	SSHBind  string `yaml:"ssh_bind,omitempty"`
-	// InternalHTTPPort, when >0, splits the HTTP surface: the credential
-	// bus (/api/plugins/*) and the Connect tunnel (/api/sheds/*/connect/*)
-	// move to a loopback-only listener on this port, and the public
-	// listener omits them. 0 (default) keeps every route on the public
-	// listener (legacy behavior), so existing clients are unaffected.
-	InternalHTTPPort int `yaml:"internal_http_port,omitempty"`
+	// BindAddress is the interface every listener (HTTP, HTTPS, SSH) binds. It
+	// defaults to loopback (127.0.0.1) — shed is a local-development tool by
+	// default. Set a routable address (a LAN/tailnet IP, "0.0.0.0"/"*" for all
+	// IPv4, or "::" for all interfaces) to reach it off-box. In open mode that
+	// also requires AllowInsecureExposure, since open mode has no transport
+	// security; secure mode (TLS + tokens) needs no acknowledgment.
+	BindAddress string `yaml:"bind_address,omitempty"`
+	// AllowInsecureExposure acknowledges binding an open-mode (plaintext,
+	// possibly unauthenticated) server to a non-loopback interface. Required to
+	// start such a server; ignored in secure mode. Prefer auth.mode: secure.
+	AllowInsecureExposure bool `yaml:"allow_insecure_exposure,omitempty"`
 	// TrustedProxy enables chi's RealIP middleware, which trusts the
 	// client-supplied X-Forwarded-For. Only safe behind a proxy that
 	// overwrites that header; the default (false) uses the real TCP peer
@@ -54,7 +54,7 @@ type ServerConfig struct {
 	// or poison audit logs.
 	TrustedProxy bool `yaml:"trusted_proxy,omitempty"`
 
-	// HTTPSPort, when >0, starts an HTTPS listener (bound to HTTPBind)
+	// HTTPSPort, when >0, starts an HTTPS listener (bound to bind_address)
 	// serving the same public router as the plain HTTP listener, presenting
 	// a self-signed cert that clients pin by fingerprint. 0 (default) = no
 	// HTTPS; plain HTTP only (legacy, unchanged).
@@ -206,49 +206,31 @@ func (c *ServerConfig) validateAuth() error {
 }
 
 // HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
-// http_bind (default all interfaces). The plain-HTTP listener is served only in
+// bind_address (default loopback). The plain-HTTP listener is served only in
 // open mode (see PlainHTTPEnabled); secure mode is TLS-only and starts no
 // plain-HTTP listener, so this is not consulted there.
 func (c *ServerConfig) HTTPListenAddr() string {
-	return listenAddr(c.HTTPBind, c.HTTPPort)
+	return listenAddr(c.BindAddress, c.HTTPPort)
 }
 
 // PlainHTTPEnabled reports whether the main plain-HTTP listener should be
 // served. False in secure mode (TLS-only; the plain listener is not started).
 func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.Secure() }
 
-// loopbackBind is the IPv4 loopback interface used for listeners that must not
-// be reachable off-box (the internal bus).
-const loopbackBind = "127.0.0.1"
-
 // HTTPSEnabled reports whether the HTTPS listener is configured.
 func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
 
 // HTTPSListenAddr returns the bind address for the HTTPS listener (sharing
-// HTTPBind with the plain listener), or "" when HTTPS is disabled.
+// bind_address with the other listeners), or "" when HTTPS is disabled.
 func (c *ServerConfig) HTTPSListenAddr() string {
 	if !c.HTTPSEnabled() {
 		return ""
 	}
-	return listenAddr(c.HTTPBind, c.HTTPSPort)
+	return listenAddr(c.BindAddress, c.HTTPSPort)
 }
 
 // SSHListenAddr returns the bind address for the SSH listener.
-func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.SSHBind, c.SSHPort) }
-
-// InternalListenerEnabled reports whether the HTTP surface is split onto a
-// separate loopback internal listener (credential bus + Connect). This is
-// the single definition of "split on" consulted by the router and serve.
-func (c *ServerConfig) InternalListenerEnabled() bool { return c.InternalHTTPPort > 0 }
-
-// InternalHTTPListenAddr returns the loopback address for the internal
-// HTTP listener, or "" when the split is disabled.
-func (c *ServerConfig) InternalHTTPListenAddr() string {
-	if !c.InternalListenerEnabled() {
-		return ""
-	}
-	return listenAddr(loopbackBind, c.InternalHTTPPort)
-}
+func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.BindAddress, c.SSHPort) }
 
 // PreflightSecure gates secure-mode startup: it refuses to start when
 // auth.mode: secure is set without any SSH key source (github_users /
@@ -265,33 +247,76 @@ func (c *ServerConfig) PreflightSecure() error {
 	return nil
 }
 
-// listenAddr joins a bind interface and port. An empty bind means all
-// interfaces (":port").
+// loopbackBind is the IPv4 loopback interface — the default bind for every
+// listener, so shed is a local-development tool unless explicitly exposed.
+const loopbackBind = "127.0.0.1"
+
+// isLoopbackBind reports whether bind keeps the listener on the local host
+// (loopback) rather than exposing it to the network. Unset ("") counts as
+// loopback because that is the effective default (see listenAddr), as does the
+// "localhost" hostname; any address in 127.0.0.0/8 or ::1 is loopback via the
+// stdlib. Mirrors isLoopbackRef in internal/vmimage.
+func isLoopbackBind(bind string) bool {
+	if bind == "" || bind == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(bind); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// listenAddr joins a bind interface and port. An empty bind defaults to
+// loopback (local-only); "*" is accepted as an alias for all IPv4 interfaces
+// ("0.0.0.0"), and "::" binds all interfaces.
 func listenAddr(bind string, port int) string {
-	if bind == "" {
-		return fmt.Sprintf(":%d", port)
+	switch bind {
+	case "":
+		bind = loopbackBind
+	case "*":
+		bind = "0.0.0.0"
 	}
 	return net.JoinHostPort(bind, strconv.Itoa(port))
 }
 
-// validateNetworkSurface checks the optional internal-listener port. Shared
-// by Validate and ValidateNoHostCoupling, both of which range-check
-// HTTPPort/SSHPort immediately before calling this (the collision check
-// below assumes those are already valid).
+// validateNetworkSurface checks the optional HTTPS listener port. Shared by
+// Validate and ValidateNoHostCoupling, both of which range-check
+// HTTPPort/SSHPort immediately before calling this (the collision check below
+// assumes those are already valid).
 func (c *ServerConfig) validateNetworkSurface() error {
-	if c.InternalHTTPPort < 0 || c.InternalHTTPPort > 65535 {
-		return fmt.Errorf("invalid internal_http_port: %d", c.InternalHTTPPort)
-	}
-	if c.InternalHTTPPort > 0 && (c.InternalHTTPPort == c.HTTPPort || c.InternalHTTPPort == c.SSHPort) {
-		return fmt.Errorf("internal_http_port (%d) must differ from http_port and ssh_port", c.InternalHTTPPort)
-	}
 	if c.HTTPSPort < 0 || c.HTTPSPort > 65535 {
 		return fmt.Errorf("invalid https_port: %d", c.HTTPSPort)
 	}
-	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort || c.HTTPSPort == c.InternalHTTPPort) {
-		return fmt.Errorf("https_port (%d) must differ from http_port, ssh_port, and internal_http_port", c.HTTPSPort)
+	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort) {
+		return fmt.Errorf("https_port (%d) must differ from http_port and ssh_port", c.HTTPSPort)
 	}
 	return nil
+}
+
+// validateHTTPPort range-checks http_port: required (1..65535) in open mode,
+// where it drives the plain-HTTP listener; optional (0 = unset) in secure mode,
+// which serves no plain HTTP. Shared by Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateHTTPPort() error {
+	minPort := 1
+	if c.Secure() {
+		minPort = 0
+	}
+	if c.HTTPPort < minPort || c.HTTPPort > 65535 {
+		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	}
+	return nil
+}
+
+// validateBindAddress gates non-loopback exposure of an open-mode server. Open
+// mode has no transport security (and may not enforce the SSH allowlist), so
+// binding a routable interface requires an explicit allow_insecure_exposure
+// acknowledgment. Secure mode (TLS + tokens) needs none; unset/loopback binds
+// are always allowed. Shared by Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateBindAddress() error {
+	if c.Secure() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
+		return nil
+	}
+	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: secure", c.BindAddress)
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -1315,6 +1340,28 @@ func rejectRemovedAuthKeys(data []byte) error {
 	return nil
 }
 
+// rejectRemovedNetworkKeys fails loudly if a config still carries network-surface
+// keys removed in v0.7.4. yaml.Unmarshal silently ignores unknown fields, so
+// without this an upgraded operator's stale internal_http_port would be accepted
+// while the new binary ignored it. Mirrors rejectRemovedAuthKeys.
+func rejectRemovedNetworkKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	if _, present := raw["internal_http_port"]; present {
+		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in secure mode), gated by the credentials scope (see docs/upgrades/v0.7.3-to-v0.7.4.md)",
+			"internal_http_port")
+	}
+	for _, removed := range []string{"http_bind", "ssh_bind"} {
+		if _, present := raw[removed]; present {
+			return fmt.Errorf("config key %q was unified into %q in v0.7.4 (one interface for all listeners; defaults to loopback). Use %q (and allow_insecure_exposure for non-loopback open-mode exposure) — see docs/upgrades/v0.7.3-to-v0.7.4.md",
+				removed, "bind_address", "bind_address")
+		}
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1334,6 +1381,33 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 		fmt.Fprintf(os.Stderr, "Warning: both \"mounts\" and the deprecated \"credentials\" are set in %s; ignoring \"credentials\"\n", configPath)
 	}
 	cfg.Credentials = nil
+}
+
+// applyModeAndCommonDefaults fills in the mode-derived and common zero-value
+// defaults shared by both loaders (serve + config-validate), so the two paths
+// can't drift. http_port drives the open-mode plain-HTTP listener; secure mode
+// serves no plain HTTP, so any value there is dropped (set or constructor
+// default) and /api/info + the written client entry omit a vestigial port.
+// Secure mode also defaults https_port so `auth.mode: secure` needs no extra
+// TLS config.
+func applyModeAndCommonDefaults(cfg *ServerConfig) {
+	if cfg.Secure() {
+		cfg.HTTPPort = 0
+	} else if cfg.HTTPPort == 0 {
+		cfg.HTTPPort = 8080
+	}
+	if cfg.Secure() && cfg.HTTPSPort == 0 {
+		cfg.HTTPSPort = 8443
+	}
+	if cfg.SSHPort == 0 {
+		cfg.SSHPort = 2222
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	if cfg.Terminal == nil {
+		cfg.Terminal = terminal.DefaultConfig()
+	}
 }
 
 // LoadServerConfigFromPath loads server configuration from a specific path.
@@ -1378,27 +1452,13 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if err := rejectRemovedAuthKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
+	if err := rejectRemovedNetworkKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
+	}
 
 	normalizeMounts(cfg, configPath)
 
-	// Apply defaults for zero values
-	if cfg.HTTPPort == 0 {
-		cfg.HTTPPort = 8080
-	}
-	// Secure mode turns TLS on; default the HTTPS port if the operator didn't
-	// set one, so `auth.mode: secure` needs no extra TLS config.
-	if cfg.Secure() && cfg.HTTPSPort == 0 {
-		cfg.HTTPSPort = 8443
-	}
-	if cfg.SSHPort == 0 {
-		cfg.SSHPort = 2222
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.Terminal == nil {
-		cfg.Terminal = terminal.DefaultConfig()
-	}
+	applyModeAndCommonDefaults(cfg)
 
 	cfg.normalizeBackends()
 
@@ -1542,26 +1602,13 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	if err := rejectRemovedAuthKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
+	if err := rejectRemovedNetworkKeys(data); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath, err)
+	}
 
 	normalizeMounts(cfg, configPath)
 
-	if cfg.HTTPPort == 0 {
-		cfg.HTTPPort = 8080
-	}
-	// Secure mode turns TLS on; default the HTTPS port here too so config-validate
-	// sees the same effective TLS surface the serve loader derives.
-	if cfg.Secure() && cfg.HTTPSPort == 0 {
-		cfg.HTTPSPort = 8443
-	}
-	if cfg.SSHPort == 0 {
-		cfg.SSHPort = 2222
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.Terminal == nil {
-		cfg.Terminal = terminal.DefaultConfig()
-	}
+	applyModeAndCommonDefaults(cfg)
 
 	cfg.normalizeBackends()
 
@@ -1586,13 +1633,16 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if c.Name == "" {
 		return fmt.Errorf("server name is required")
 	}
-	if c.HTTPPort < 0 || c.HTTPPort > 65535 {
-		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	if err := c.validateHTTPPort(); err != nil {
+		return err
 	}
 	if c.SSHPort < 0 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
 	}
 	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateBindAddress(); err != nil {
 		return err
 	}
 	if err := c.validateAuth(); err != nil {
@@ -1660,13 +1710,16 @@ func (c *ServerConfig) Validate() error {
 	if c.Name == "" {
 		return fmt.Errorf("server name is required")
 	}
-	if c.HTTPPort < 1 || c.HTTPPort > 65535 {
-		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	if err := c.validateHTTPPort(); err != nil {
+		return err
 	}
 	if c.SSHPort < 1 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
 	}
 	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateBindAddress(); err != nil {
 		return err
 	}
 	if err := c.validateAuth(); err != nil {
