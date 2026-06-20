@@ -106,13 +106,15 @@ func TestEgressProfileJSONContract(t *testing.T) {
 		{"deny+allow", EgressProfile{Deny: []string{"evil.com"}, Allow: []string{"good.com"}}, `{"allow":["good.com"],"deny":["evil.com"]}`},
 	}
 	for _, c := range cases {
-		b, err := json.Marshal(c.p)
-		if err != nil {
-			t.Fatalf("%s: marshal: %v", c.name, err)
-		}
-		if string(b) != c.want {
-			t.Errorf("%s: marshal = %s, want %s", c.name, b, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			b, err := json.Marshal(c.p)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(b) != c.want {
+				t.Errorf("marshal = %s, want %s", b, c.want)
+			}
+		})
 	}
 
 	// No PascalCase key leaks (this is what the json tags actually fix).
@@ -157,9 +159,11 @@ func TestEgressStatusJSONKeys(t *testing.T) {
 	}
 	s := string(b)
 	for _, want := range []string{`"shed":"web"`, `"rules":{"github":{"allow":["github.com"]}}`} {
-		if !strings.Contains(s, want) {
-			t.Errorf("EgressStatus json missing %s in %s", want, s)
-		}
+		t.Run("contains "+want, func(t *testing.T) {
+			if !strings.Contains(s, want) {
+				t.Errorf("EgressStatus json missing %s in %s", want, s)
+			}
+		})
 	}
 	if strings.Contains(s, `"Allow"`) || strings.Contains(s, `"Mode"`) {
 		t.Errorf("PascalCase profile key leaked: %s", s)
