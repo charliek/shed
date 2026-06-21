@@ -407,7 +407,7 @@ func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []stri
 		return nil, err
 	}
 
-	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles)
+	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles, c.userProfiles())
 	if err != nil {
 		return nil, fmt.Errorf("egress: resolve profiles: %w", err)
 	}
