@@ -137,6 +137,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	var egressSocketDir string // runtime dir for the control socket
 	var egressStateDir string  // persistent dir for the durable audit log
 	var attachEgress func(*egress.Manager)
+	var attachEgressStore func(*config.UserProfileStore)
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -152,6 +153,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		egressSocketDir = fcCfg.SocketDir
 		egressStateDir = filepath.Dir(fcCfg.InstanceDir)
 		attachEgress = fcClient.SetEgressManager
+		attachEgressStore = fcClient.SetEgressUserStore
 
 	case config.BackendVZ:
 		vzCfg := cfg.VZ
@@ -167,6 +169,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		egressSocketDir = vzCfg.SocketDir
 		egressStateDir = filepath.Dir(vzCfg.InstanceDir)
 		attachEgress = vzClient.SetEgressManager
+		attachEgressStore = vzClient.SetEgressUserStore
 
 	default:
 		return fmt.Errorf("unsupported backend type: %s", cfg.DefaultBackend)
@@ -177,6 +180,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// failure is a hard startup error — never a silent disable (AC-11).
 	var egressMgr *egress.Manager
 	var egressAudit *egress.AuditLog
+	var egressUserStore *config.UserProfileStore
 	if cfg.Egress != nil && cfg.Egress.Enabled {
 		lo, hi := cfg.Egress.PortRangeBounds()
 		sockPath := filepath.Join(egressSocketDir, "egress-proxy.sock")
@@ -200,7 +204,25 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("egress: start proxy: %w", err)
 		}
 		attachEgress(egressMgr)
-		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s, audit %s)", lo, hi, sockPath, auditPath)
+
+		// Runtime user-editable profile store (`shed egress profile ...`), in the
+		// state dir next to the audit log. Fails startup on a malformed file.
+		storeDir := filepath.Join(egressStateDir, "egress-profiles")
+		egressUserStore, err = config.OpenUserProfileStore(storeDir)
+		if err != nil {
+			return fmt.Errorf("egress: open user profile store: %w", err)
+		}
+		// Config profiles are the read-only baseline: a user profile shadowed by a
+		// same-named config profile resolves to config. Warn so the dead user file
+		// is visible (the API rejects new colliding PUTs; this catches a config edit
+		// that collides with a pre-existing user profile).
+		for name := range cfg.Egress.Profiles {
+			if _, ok := egressUserStore.Get(name); ok {
+				log.Printf("egress: user profile %q is shadowed by a server-config profile of the same name (config wins)", name)
+			}
+		}
+		attachEgressStore(egressUserStore)
+		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s, audit %s, profiles %s)", lo, hi, sockPath, auditPath, storeDir)
 	}
 	defer func() {
 		if egressMgr != nil {
@@ -247,8 +269,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
-	apiServer.SetEgressAudit(egressAudit) // nil-safe: no-op when egress disabled
-	apiServer.SetTokenStore(tokenStore)   // shared with the SSH bootstrap handler (1c)
+	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
+	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
+	apiServer.SetTokenStore(tokenStore)           // shared with the SSH bootstrap handler (1c)
 
 	// Warn when bind_address is unset: as of v0.7.4 that defaults to loopback
 	// (was all-interfaces), so a server that relied on the old default is now

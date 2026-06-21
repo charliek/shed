@@ -21,7 +21,9 @@ import (
 type egressFakeBackend struct {
 	fakeBackend
 	shed          *config.Shed
+	sheds         []config.Shed // returned by ListSheds (re-push fan-out / referenced-by)
 	setCalledWith []string
+	rePushed      []string // shed names passed to SetShedEgress
 	cleared       bool
 }
 
@@ -29,8 +31,13 @@ func (f *egressFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, 
 	return f.shed, nil
 }
 
+func (f *egressFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
+	return f.sheds, nil
+}
+
 func (f *egressFakeBackend) SetShedEgress(_ context.Context, name string, profiles []string) (*config.Shed, error) {
 	f.setCalledWith = profiles
+	f.rePushed = append(f.rePushed, name)
 	return &config.Shed{Name: name, EgressProfiles: profiles, EgressPort: 20002}, nil
 }
 

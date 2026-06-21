@@ -50,6 +50,9 @@ func OpenUserProfileStore(dir string) (*UserProfileStore, error) {
 		if !userProfileNameRe.MatchString(name) {
 			return nil, fmt.Errorf("egress profile file %q: name must match %s", e.Name(), userProfileNameRe.String())
 		}
+		if IsReservedEgressName(name) {
+			return nil, fmt.Errorf("egress profile file %q: %q is a reserved name", e.Name(), name)
+		}
 		p, err := loadUserProfile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			return nil, fmt.Errorf("egress profile %q: %w", name, err)
@@ -126,7 +129,7 @@ func (s *UserProfileStore) Put(name string, p EgressProfile) error {
 	if !userProfileNameRe.MatchString(name) {
 		return fmt.Errorf("profile name %q must match %s", name, userProfileNameRe.String())
 	}
-	if egressReservedNames[name] {
+	if IsReservedEgressName(name) {
 		return fmt.Errorf("profile name %q is reserved", name)
 	}
 	if err := egress.ValidateProfile(p.spec()); err != nil {

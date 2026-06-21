@@ -135,6 +135,16 @@ func TestUserProfileStoreFailHardOnBadFile(t *testing.T) {
 	if _, err := OpenUserProfileStore(dir3); err == nil {
 		t.Fatal("Open must reject an illegal profile filename")
 	}
+
+	// reserved filename (off/none/default) — would otherwise load as a real
+	// profile and shadow the off/none sentinel.
+	dir4 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir4, "off.yaml"), []byte("allow: [a.com]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenUserProfileStore(dir4); err == nil {
+		t.Fatal("Open must reject a reserved profile filename (off.yaml)")
+	}
 }
 
 func TestUserProfileStoreNilSafe(t *testing.T) {

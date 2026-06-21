@@ -18,14 +18,21 @@ type Server struct {
 	sshHostKey  string
 	plugins     *plugin.Registry
 	bridge      *plugin.Bridge
-	egressAudit *egress.AuditLog // nil when egress is disabled
-	tokens      *authtoken.Store // nil until SetTokenStore; consulted only in secure mode (auth.mode: secure)
+	egressAudit *egress.AuditLog         // nil when egress is disabled
+	egressStore *config.UserProfileStore // nil when egress is disabled
+	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in secure mode (auth.mode: secure)
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
 // can return recent decisions. Called by shed-server at startup when egress is
 // enabled; nil leaves the egress routes reporting no recent activity.
 func (s *Server) SetEgressAudit(a *egress.AuditLog) { s.egressAudit = a }
+
+// SetEgressUserStore attaches the runtime user-profile store backing the
+// `/api/egress/profiles` routes and merged into `shed egress show`. Called at
+// startup when egress is enabled; nil leaves the profile routes reporting only
+// config profiles (and PUT/DELETE returning 501).
+func (s *Server) SetEgressUserStore(st *config.UserProfileStore) { s.egressStore = st }
 
 // SetTokenStore attaches the HTTP bearer-token store. The same store is shared
 // with the SSH bootstrap handler (which mints into it); the auth middleware
@@ -117,11 +124,19 @@ func (s *Server) Router() chi.Router {
 			})
 		})
 
-		// Egress control: the audit SSE stream (literal), plus per-shed
-		// status + live set/off. The /{name} routes are wrapped so the
-		// literal /stream sibling isn't shadowed at the chi trie level.
+		// Egress control: the audit SSE stream (literal), user-profile CRUD
+		// (literal /profiles), plus per-shed status + live set/off. The literal
+		// /stream and /profiles siblings are registered before the /{name} wrap
+		// so they aren't shadowed at the chi trie level — which also makes
+		// "stream" and "profiles" reserved shed names on these routes.
 		r.Route("/egress", func(r chi.Router) {
 			r.Get("/stream", s.handleEgressStream)
+			r.Get("/profiles", s.handleListProfiles)
+			r.Route("/profiles/{name}", func(r chi.Router) {
+				r.Get("/", s.handleGetProfile)
+				r.Put("/", s.handlePutProfile)
+				r.Delete("/", s.handleDeleteProfile)
+			})
 			r.Route("/{name}", func(r chi.Router) {
 				r.Get("/", s.handleEgressShow)
 				r.Post("/", s.handleEgressSet)

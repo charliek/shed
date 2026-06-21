@@ -681,6 +681,10 @@ const (
 	ErrSnapshotSourceRunning   = "SNAPSHOT_SOURCE_RUNNING"
 	ErrSnapshotBackendMismatch = "SNAPSHOT_BACKEND_MISMATCH"
 	ErrInvalidSnapshotName     = "INVALID_SNAPSHOT_NAME"
+
+	ErrProfileNotFound = "PROFILE_NOT_FOUND"
+	ErrProfileReserved = "PROFILE_RESERVED" // name collides with a config/reserved profile
+	ErrProfileInUse    = "PROFILE_IN_USE"   // referenced by one or more sheds
 )
 
 // Backend type constants for Shed.Backend field.

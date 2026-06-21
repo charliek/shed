@@ -60,7 +60,20 @@ type EgressSetRequest struct {
 	Profiles []string `json:"profiles"`
 }
 
+// EgressProfileInfo is one entry in the `GET /api/egress/profiles` response: a
+// named profile plus whether it comes from the server config (read-only baseline)
+// or the runtime user store.
+type EgressProfileInfo struct {
+	Name    string        `json:"name"`
+	Source  string        `json:"source"` // "config" | "user"
+	Profile EgressProfile `json:"profile"`
+}
+
 var egressReservedNames = map[string]bool{"off": true, "none": true, "default": true}
+
+// IsReservedEgressName reports whether name is reserved (cannot be a user/config
+// profile name): "off", "none", "default" (case-insensitive).
+func IsReservedEgressName(name string) bool { return egressReservedNames[strings.ToLower(name)] }
 
 func (p EgressProfile) spec() egress.ProfileSpec {
 	return egress.ProfileSpec{Mode: p.Mode, Allow: p.Allow, Deny: p.Deny, Rule: p.Rule}
