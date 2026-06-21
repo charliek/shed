@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- **`shed egress show --json` emits snake_case keys.** The `rules` map's profile
+  definitions serialized with Go field names (`Mode`/`Allow`/`Deny`/`Rule`, plus a
+  noisy `"Deny":null`) because `config.EgressProfile` lacked JSON tags —
+  inconsistent with the rest of the API (`shed`, `resolved_ip`, …) and the YAML
+  config keys. They are now `mode`/`allow`/`deny`/`rule` with `omitempty`. A minor
+  `--json` **output-shape change**: no first-party consumer parsed the old shape,
+  and Go clients interop across it (`encoding/json` matches field names
+  case-insensitively).
+
+### Docs
+
+- **Egress: quickstart + recommended starter profiles.** `docs/reference/egress.md`
+  gains a 3-step quickstart and a "Recommended starter profiles" section
+  (`ai-agents`, `github`, `package-registries`, `os-updates`, `containers`, sourced
+  from real-world sandbox allowlists) with apex-vs-wildcard guidance; a matching
+  commented `egress:` block lands in `configs/server.example.yaml` (guarded by a
+  validation test). The "plain HTTP is deny-by-default" caveat is corrected — plain
+  HTTP uses the same allow/deny/rule chain as HTTPS.
+
 ## v0.7.4 — 2026-06-19
 
 Local-first, zero-plaintext-secure network surface — finishes the `0.7` auth

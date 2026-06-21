@@ -33,6 +33,35 @@ proxy drop-in, so `docker pull` is covered too). The proxy:
 Attribution is by **per-shed listener port + a per-shed token** injected into the
 proxy URL — a shed that guesses another shed's port still lacks its token.
 
+## Quickstart
+
+Three steps from off to a filtered shed:
+
+```yaml
+# 1. Enable egress and define profiles in the server config (server.yaml), then
+#    restart shed-server. default: [] keeps existing sheds unaffected.
+egress:
+  enabled: true
+  default: []
+  profiles:
+    audit:  { mode: audit }
+    github: { allow: ["github.com", "*.github.com"] }
+```
+
+```bash
+# 2. Create a shed that composes one or more profiles.
+shed create web --egress github
+```
+
+```bash
+# 3. See its policy and live allow/deny decisions.
+shed egress show web
+```
+
+A good rollout is to start a shed in `audit` to *see* what it reaches, then
+tighten to an allowlist. The [recommended starter profiles](#recommended-starter-profiles)
+below are a sensible base to copy from.
+
 ## Enabling it
 
 Egress is configured in the shed-server config (`server.yaml`). It is **off**
@@ -94,6 +123,99 @@ host == "registry.internal" && protocol == "https"
 
 A CEL evaluation error **fails closed** (the connection is denied). For the full
 language see the [cel-go spec](https://github.com/google/cel-spec/blob/master/doc/langdef.md).
+
+## Recommended starter profiles
+
+These are a **starting point, not guaranteed-complete "safe defaults."** They are
+copied from public sandbox allowlists — Anthropic's Claude Code devcontainer
+firewall, OpenAI's Codex "common dependencies" preset, GitHub/StepSecurity
+Harden-Runner, and each ecosystem's registry docs. Upstream domains drift, so
+treat these as a base you **own and tighten**: run a shed in `audit` first to
+confirm what it actually needs, then pin an allowlist.
+
+!!! note "Apex vs. wildcard"
+    A `*.example.com` glob matches subdomains **only**, never the apex
+    `example.com`. When a service answers at both (e.g. `github.com` *and*
+    `api.github.com`), list **both** — the profiles below already do this where
+    it's needed.
+
+Paste the ones you need into `egress.profiles` and compose them per shed, e.g.
+`shed create web --egress github,package-registries,os-updates`.
+
+```yaml
+profiles:
+  # Visibility-first: allow + log everything (guards still deny). Best first
+  # step — run a shed in audit to SEE what it reaches, then tighten.
+  audit: { mode: audit }
+
+  # AI coding agents: Anthropic + OpenAI APIs and the telemetry/config
+  # endpoints Claude Code and Codex actually dial.
+  ai-agents:
+    allow:
+      - api.anthropic.com          # Claude API
+      - statsig.anthropic.com      # Claude Code feature flags
+      - statsig.com
+      - sentry.io                  # error telemetry
+      - api.openai.com             # OpenAI / Codex API
+      - auth.openai.com
+      - chatgpt.com                # Codex CLI sign-in
+
+  # GitHub: clone/checkout + API + action/source/raw downloads + GHCR.
+  github:
+    allow:
+      - github.com                           # apex (clone/checkout/releases)
+      - api.github.com
+      - codeload.github.com                  # tarball/zipball + action downloads
+      - objects.githubusercontent.com        # release assets / LFS
+      - raw.githubusercontent.com
+      - "*.actions.githubusercontent.com"    # Actions runtime/artifacts
+      - pkg-containers.githubusercontent.com # GHCR layer blobs
+      - ghcr.io
+
+  # Language package managers: npm, PyPI, Go, Rust, RubyGems, Maven.
+  package-registries:
+    allow:
+      - registry.npmjs.org
+      - pypi.org                   # apex (index)
+      - files.pythonhosted.org     # package files
+      - proxy.golang.org
+      - sum.golang.org
+      - index.golang.org
+      - crates.io                  # apex (API)
+      - index.crates.io            # sparse index
+      - static.crates.io           # downloads
+      - rubygems.org               # apex
+      - index.rubygems.org
+      - repo.maven.apache.org
+      - repo1.maven.org
+
+  # OS package updates (Debian/Ubuntu apt).
+  os-updates:
+    allow:
+      - deb.debian.org
+      - security.debian.org
+      - archive.ubuntu.com
+      - security.ubuntu.com
+      - ports.ubuntu.com           # arm64/ports — REQUIRED on Apple-Silicon VZ
+      - keyserver.ubuntu.com
+
+  # Container image pulls: Docker Hub + GHCR + Quay + MCR.
+  containers:
+    allow:
+      - registry-1.docker.io               # Docker Hub registry API
+      - auth.docker.io                     # Docker Hub token auth
+      - production.cloudflare.docker.com   # Docker Hub blob CDN
+      - production.cloudfront.docker.com   # Docker Hub blob CDN (alt)
+      - ghcr.io
+      - pkg-containers.githubusercontent.com
+      - quay.io                            # apex
+      - cdn.quay.io
+      - mcr.microsoft.com
+```
+
+!!! warning "Apple-Silicon VZ guests need `ports.ubuntu.com`"
+    `archive.ubuntu.com` carries amd64 only; arm64 packages come from
+    `ports.ubuntu.com`. Omit it and `apt-get` breaks on the VZ backend.
 
 ## CLI
 
@@ -171,8 +293,10 @@ netns/pf or a userspace netstack) is tracked as future work
 - **Audit is best-effort under load** — records are dropped (not blocked) at
   each buffer if a consumer can't keep up. The data path is never stalled by
   auditing.
-- **Plain HTTP** is deny-by-default (allow `protocol == "http"` explicitly if
-  you need it); only the first request on a kept-alive plain-HTTP proxy
+- **Plain HTTP** is evaluated by the *same* allow/deny/rule chain as HTTPS — an
+  `allow:` host glob matches regardless of protocol, so `http://<allowed-host>`
+  is allowed too (write a CEL `rule` on `protocol` if you must treat `http` and
+  `https` differently). Only the first request on a kept-alive plain-HTTP proxy
   connection is policy-checked.
 - **shed-server restart**: a running shed's egress listener is re-established
   when the shed itself is next started; after a shed-server restart, restart an

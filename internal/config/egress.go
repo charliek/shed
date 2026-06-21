@@ -32,11 +32,16 @@ type EgressConfig struct {
 // EgressProfile is one named policy fragment. Allow/Deny are domain globs
 // ("*.github.com" suffix, "github.com" exact); Rule is a CEL expression (the
 // power path); Mode "audit" makes the fall-through allow+log instead of deny.
+//
+// The json tags are the wire contract for the `rules` map in
+// `shed egress show --json` (GET /api/egress/{name}). They are snake_case to
+// match the rest of the API (egress.AuditRecord, EgressStatus); omitempty keeps
+// the output to the fields a profile actually sets.
 type EgressProfile struct {
-	Mode  string   `yaml:"mode,omitempty"`
-	Allow []string `yaml:"allow,omitempty"`
-	Deny  []string `yaml:"deny,omitempty"`
-	Rule  string   `yaml:"rule,omitempty"`
+	Mode  string   `json:"mode,omitempty" yaml:"mode,omitempty"`
+	Allow []string `json:"allow,omitempty" yaml:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty" yaml:"deny,omitempty"`
+	Rule  string   `json:"rule,omitempty" yaml:"rule,omitempty"`
 }
 
 // EgressStatus is the `shed egress show` response: a shed's active egress

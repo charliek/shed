@@ -114,3 +114,45 @@ log_level: info
 #   # version (see "Images and the server version" above).
 #   pull_policy: missing   # missing (default) | always | never
 #   images_dir: /var/lib/shed/firecracker/images
+
+# --- Egress control (opt-in; Level-1 cooperative HTTP(S)_PROXY) ---
+# Off by default. Set enabled: true to start a shed-egress-proxy child; sheds
+# then opt in with `--egress <profiles>`. default: [] means existing sheds are
+# unaffected. Level 1 is cooperative, NOT a security boundary — see
+# docs/reference/egress.md for the policy language and the bypass inventory.
+# The profiles below are starter examples (real-world sandbox allowlists), not
+# guaranteed-complete safe defaults; run a shed in `audit` first, then tighten.
+# Compose per shed, e.g. `shed create web --egress github,package-registries`.
+egress:
+  enabled: false
+  port_range: "20000-30000"
+  default: []
+  profiles:
+    audit: { mode: audit }                 # allow + log everything (guards still deny)
+
+    ai-agents:                             # Anthropic + OpenAI API & telemetry
+      allow: [api.anthropic.com, statsig.anthropic.com, statsig.com, sentry.io,
+              api.openai.com, auth.openai.com, chatgpt.com]
+
+    github:                                # clone + API + actions + GHCR (apex AND wildcard)
+      allow: [github.com, api.github.com, codeload.github.com,
+              objects.githubusercontent.com, raw.githubusercontent.com,
+              "*.actions.githubusercontent.com", pkg-containers.githubusercontent.com,
+              ghcr.io]
+
+    package-registries:                    # npm, PyPI, Go, Rust, RubyGems, Maven
+      allow: [registry.npmjs.org, pypi.org, files.pythonhosted.org,
+              proxy.golang.org, sum.golang.org, index.golang.org,
+              crates.io, index.crates.io, static.crates.io,
+              rubygems.org, index.rubygems.org,
+              repo.maven.apache.org, repo1.maven.org]
+
+    os-updates:                            # Debian/Ubuntu apt (ports.ubuntu.com = Apple-Silicon arm64)
+      allow: [deb.debian.org, security.debian.org, archive.ubuntu.com,
+              security.ubuntu.com, ports.ubuntu.com, keyserver.ubuntu.com]
+
+    containers:                            # Docker Hub + GHCR + Quay + MCR
+      allow: [registry-1.docker.io, auth.docker.io,
+              production.cloudflare.docker.com, production.cloudfront.docker.com,
+              ghcr.io, pkg-containers.githubusercontent.com,
+              quay.io, cdn.quay.io, mcr.microsoft.com]
