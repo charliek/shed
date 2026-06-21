@@ -257,6 +257,20 @@ Turns egress control off for a shed.
 shed egress off <name>
 ```
 
+### shed egress profile
+
+Manage runtime **user profiles** — named rule sets authored as whole documents,
+without a server-config edit. They compose with config profiles by name. See
+[Egress Control](egress.md#user-managed-profiles).
+
+```bash
+shed egress profile ls [--json]              # list (config + user, with source)
+shed egress profile show <name> [--json]
+shed egress profile set <name> --file <path> # create/replace from a YAML document
+shed egress profile edit <name>              # edit in $EDITOR
+shed egress profile rm <name>
+```
+
 ## Snapshots
 
 A snapshot captures a stopped shed's rootfs as a named, immutable artifact.

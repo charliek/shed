@@ -37,6 +37,9 @@ func (c *Client) Close() error {
 // SetEgressManager is a no-op for the stub client.
 func (c *Client) SetEgressManager(_ *egress.Manager) {}
 
+// SetEgressUserStore is a no-op for the stub client.
+func (c *Client) SetEgressUserStore(_ *config.UserProfileStore) {}
+
 // FirecrackerBackend is a stub for non-linux builds.
 type FirecrackerBackend struct{}
 

@@ -552,6 +552,39 @@ func (c *APIClient) EgressOff(name string) (*config.Shed, error) {
 	return &shed, nil
 }
 
+// EgressProfilesList returns all egress profiles (config baseline + user store),
+// each tagged with its source.
+func (c *APIClient) EgressProfilesList() ([]config.EgressProfileInfo, error) {
+	var infos []config.EgressProfileInfo
+	if err := c.doRequest(http.MethodGet, "/api/egress/profiles", nil, &infos); err != nil {
+		return nil, err
+	}
+	return infos, nil
+}
+
+// EgressProfileGet returns one egress profile by name.
+func (c *APIClient) EgressProfileGet(name string) (*config.EgressProfileInfo, error) {
+	var info config.EgressProfileInfo
+	if err := c.doRequest(http.MethodGet, "/api/egress/profiles/"+name, nil, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// EgressProfilePut creates or replaces a user profile (whole document).
+func (c *APIClient) EgressProfilePut(name string, p config.EgressProfile) (*config.EgressProfileInfo, error) {
+	var info config.EgressProfileInfo
+	if err := c.doRequest(http.MethodPut, "/api/egress/profiles/"+name, p, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// EgressProfileDelete removes a user profile.
+func (c *APIClient) EgressProfileDelete(name string) error {
+	return c.doRequest(http.MethodDelete, "/api/egress/profiles/"+name, nil, nil)
+}
+
 // DeleteShed deletes a shed.
 func (c *APIClient) DeleteShed(name string, keepVolume bool) error {
 	path := "/api/sheds/" + name

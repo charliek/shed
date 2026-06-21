@@ -60,10 +60,36 @@ type EgressSetRequest struct {
 	Profiles []string `json:"profiles"`
 }
 
+// EgressProfileInfo is one entry in the `GET /api/egress/profiles` response: a
+// named profile plus whether it comes from the server config (read-only baseline)
+// or the runtime user store.
+type EgressProfileInfo struct {
+	Name    string        `json:"name"`
+	Source  string        `json:"source"` // "config" | "user"
+	Profile EgressProfile `json:"profile"`
+}
+
 var egressReservedNames = map[string]bool{"off": true, "none": true, "default": true}
+
+// IsReservedEgressName reports whether name is reserved (cannot be a user/config
+// profile name): "off", "none", "default" (case-insensitive).
+func IsReservedEgressName(name string) bool { return egressReservedNames[strings.ToLower(name)] }
 
 func (p EgressProfile) spec() egress.ProfileSpec {
 	return egress.ProfileSpec{Mode: p.Mode, Allow: p.Allow, Deny: p.Deny, Rule: p.Rule}
+}
+
+// clone returns a deep copy (Allow/Deny slices duplicated) so a profile handed
+// out of the user store can't be mutated by — or race — the store.
+func (p EgressProfile) clone() EgressProfile {
+	cp := p
+	if p.Allow != nil {
+		cp.Allow = append([]string(nil), p.Allow...)
+	}
+	if p.Deny != nil {
+		cp.Deny = append([]string(nil), p.Deny...)
+	}
+	return cp
 }
 
 // Validate fails fast at config load on a bad port range, a reserved/dangling
@@ -108,10 +134,14 @@ func (c *EgressConfig) PortRangeBounds() (int, int) {
 }
 
 // ResolveProfiles returns the composed profile specs for a shed's requested
-// profile list (empty inherits Default). It returns (nil, nil) when egress is
-// disabled or the effective list is empty / "off" / "none" — meaning this shed
-// gets no egress proxy at all.
-func (c *EgressConfig) ResolveProfiles(req []string) ([]egress.ProfileSpec, error) {
+// profile list (empty inherits Default), resolving names from the config
+// profiles MERGED with the caller-supplied runtime user profiles. It returns
+// (nil, nil) when egress is disabled or the effective list is empty / "off" /
+// "none" — meaning this shed gets no egress proxy at all.
+//
+// user is the UserProfileStore snapshot (pass store.List(), nil-safe); a nil/empty
+// map makes resolution byte-identical to the config-only behavior.
+func (c *EgressConfig) ResolveProfiles(req []string, user map[string]EgressProfile) ([]egress.ProfileSpec, error) {
 	if c == nil || !c.Enabled {
 		return nil, nil
 	}
@@ -125,15 +155,32 @@ func (c *EgressConfig) ResolveProfiles(req []string) ([]egress.ProfileSpec, erro
 	if len(list) == 0 {
 		return nil, nil
 	}
+	effective := c.effectiveProfiles(user)
 	specs := make([]egress.ProfileSpec, 0, len(list))
 	for _, name := range list {
-		p, ok := c.Profiles[name]
+		p, ok := effective[name]
 		if !ok {
 			return nil, fmt.Errorf("unknown egress profile %q", name)
 		}
 		specs = append(specs, p.spec())
 	}
 	return specs, nil
+}
+
+// effectiveProfiles merges runtime user profiles with the server-config profiles.
+// Config WINS on a name collision: the server-config baseline is the authoritative,
+// read-only layer (the API rejects user PUTs that collide, but a config file edited
+// to add a colliding name after a user profile exists must resolve deterministically
+// to config). Centralized here so every ResolveProfiles call site gets one rule.
+func (c *EgressConfig) effectiveProfiles(user map[string]EgressProfile) map[string]EgressProfile {
+	eff := make(map[string]EgressProfile, len(user)+len(c.Profiles))
+	for k, v := range user {
+		eff[k] = v
+	}
+	for k, v := range c.Profiles {
+		eff[k] = v // config wins
+	}
+	return eff
 }
 
 func parseEgressPortRange(s string) (int, int, error) {

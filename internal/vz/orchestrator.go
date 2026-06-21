@@ -415,7 +415,7 @@ func (b *vzCreator) ConfigureEgressProxy(ctx context.Context, req config.CreateS
 	if b.c.egressMgr == nil {
 		return nil
 	}
-	specs, err := b.c.serverCfg.Egress.ResolveProfiles(req.Egress)
+	specs, err := b.c.serverCfg.Egress.ResolveProfiles(req.Egress, b.c.userProfiles())
 	if err != nil {
 		return fmt.Errorf("egress: resolve profiles: %w", err)
 	}
@@ -658,7 +658,7 @@ func (b *vzStarter) ConfigureEgressProxy(ctx context.Context, metaRaw orchestrat
 	if meta.EgressPort == 0 && len(meta.EgressProfiles) == 0 {
 		return nil // egress was off for this shed
 	}
-	specs, err := b.c.serverCfg.Egress.ResolveProfiles(meta.EgressProfiles)
+	specs, err := b.c.serverCfg.Egress.ResolveProfiles(meta.EgressProfiles, b.c.userProfiles())
 	if err != nil {
 		return fmt.Errorf("egress: resolve profiles: %w", err)
 	}

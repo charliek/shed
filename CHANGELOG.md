@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **User-managed egress profiles (runtime, no server-config edit).** A second,
+  runtime-editable profile store alongside `server.yaml`: `shed egress profile
+  set <name> --file <doc>` / `edit` / `ls` / `show` / `rm`, backed by
+  `GET/PUT/DELETE /api/egress/profiles[/{name}]` (control-scoped). User profiles
+  are referenced by name exactly like config profiles (`--egress
+  github,my-stack`). Server-config profiles stay a **read-only baseline** (a
+  collision is rejected; `ls` tags each `source: config|user`); **editing a
+  profile live-re-pushes every running shed that references it**; deleting a
+  referenced profile is rejected. Profiles persist under
+  `{state}/egress-profiles/`. See
+  [Egress Control](docs/reference/egress.md#user-managed-profiles) (shed #214).
+
 ### Fixed
 
 - **`shed egress show --json` emits snake_case keys.** The `rules` map's profile

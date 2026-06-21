@@ -253,6 +253,50 @@ Recent decisions (most recent last):
   14:22:32  deny     pypi.org        443   default-deny
 ```
 
+## User-managed profiles
+
+Server-config `egress.profiles` are the **read-only baseline** (changing them
+needs a `server.yaml` edit + restart). For day-to-day work you can also define
+**user profiles** at runtime — same schema, authored as a whole document, no
+server-config access — and reference them by name exactly like config profiles.
+
+```bash
+# Author a profile from a file (the whole document), or edit it in $EDITOR
+shed egress profile set my-stack --file ./my-stack.yaml
+shed egress profile edit my-stack
+
+# List (shows source: config|user), inspect, remove
+shed egress profile ls
+shed egress profile show my-stack
+shed egress profile rm my-stack
+
+# Reference it like any profile
+shed create web --egress github,my-stack
+shed egress set web --profile github,my-stack
+```
+
+The file is a profile fragment — the same shape as an `egress.profiles` entry:
+
+```yaml
+allow: [example.com, "*.internal.corp"]
+deny:  [tracker.io]
+rule:  'port == 443'   # optional CEL
+# mode: audit          # optional
+```
+
+- **Config is authoritative.** A server-config profile and a user profile can't
+  share a name — a `set` to a config-owned (or reserved `off`/`none`/`default`)
+  name is rejected. `ls`/`show` tag each profile `source: config|user`.
+- **Edits apply live.** Saving a profile **re-pushes every running shed that
+  references it**, so the change takes effect without restarting the shed.
+  Deleting a profile a shed still references is rejected (remove it from the shed
+  first).
+- **Storage.** User profiles live on the server under `{state}/egress-profiles/`
+  (one `<name>.yaml` per profile) and survive restarts, read/written via
+  `GET/PUT/DELETE /api/egress/profiles[/{name}]` (control-scoped). The same
+  honest posture applies: a self-served `allow` is convenience/visibility, not a
+  sandbox boundary.
+
 ## Auditing
 
 Every decision is appended as one JSON line to `{state}/egress-audit.jsonl`

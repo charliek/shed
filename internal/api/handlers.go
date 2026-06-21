@@ -331,6 +331,8 @@ func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
 		status.Rules = map[string]config.EgressProfile{}
 		for _, p := range status.Profiles {
 			if def, ok := s.cfg.Egress.Profiles[p]; ok {
+				status.Rules[p] = def // config wins on a name collision
+			} else if def, ok := s.egressStore.Get(p); ok { // nil-safe; runtime user profile
 				status.Rules[p] = def
 			}
 		}

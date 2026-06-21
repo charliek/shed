@@ -52,30 +52,65 @@ func TestEgressConfigValidate(t *testing.T) {
 func TestEgressResolveProfiles(t *testing.T) {
 	c := mkEgress()
 	// disabled → nil
-	if specs, _ := (&EgressConfig{Enabled: false}).ResolveProfiles(nil); specs != nil {
+	if specs, _ := (&EgressConfig{Enabled: false}).ResolveProfiles(nil, nil); specs != nil {
 		t.Error("disabled should resolve to nil")
 	}
 	// empty req → default ([audit])
-	specs, err := c.ResolveProfiles(nil)
+	specs, err := c.ResolveProfiles(nil, nil)
 	if err != nil || len(specs) != 1 || specs[0].Mode != "audit" {
 		t.Errorf("default resolve = %v, %v", specs, err)
 	}
 	// explicit list composes
-	specs, err = c.ResolveProfiles([]string{"github", "corp"})
+	specs, err = c.ResolveProfiles([]string{"github", "corp"}, nil)
 	if err != nil || len(specs) != 2 {
 		t.Errorf("compose resolve = %v, %v", specs, err)
 	}
 	// "off" disables
-	if specs, _ := c.ResolveProfiles([]string{"off"}); specs != nil {
+	if specs, _ := c.ResolveProfiles([]string{"off"}, nil); specs != nil {
 		t.Error(`["off"] should resolve to nil`)
 	}
 	// unknown profile errors
-	if _, err := c.ResolveProfiles([]string{"ghost"}); err == nil {
+	if _, err := c.ResolveProfiles([]string{"ghost"}, nil); err == nil {
 		t.Error("unknown profile should error")
 	}
 	// absent default (empty) → nil
-	if specs, _ := (&EgressConfig{Enabled: true}).ResolveProfiles(nil); specs != nil {
+	if specs, _ := (&EgressConfig{Enabled: true}).ResolveProfiles(nil, nil); specs != nil {
 		t.Error("empty default should resolve to nil (no egress)")
+	}
+}
+
+// TestEgressResolveProfilesUserMerge covers the config+user merge: user profiles
+// resolve, compose with config, and config WINS on a name collision (the
+// read-only baseline is authoritative). AC1: a nil user map is byte-identical to
+// the config-only behavior.
+func TestEgressResolveProfilesUserMerge(t *testing.T) {
+	c := &EgressConfig{
+		Enabled:  true,
+		Profiles: map[string]EgressProfile{"github": {Allow: []string{"*.github.com"}}},
+	}
+	user := map[string]EgressProfile{
+		"mine":   {Allow: []string{"example.com"}},
+		"github": {Allow: []string{"evil.com"}}, // collides with config — config must win
+	}
+	// a user-only profile resolves
+	specs, err := c.ResolveProfiles([]string{"mine"}, user)
+	if err != nil || len(specs) != 1 || len(specs[0].Allow) != 1 || specs[0].Allow[0] != "example.com" {
+		t.Fatalf("user profile resolve = %v, %v", specs, err)
+	}
+	// compose config + user
+	if specs, err := c.ResolveProfiles([]string{"github", "mine"}, user); err != nil || len(specs) != 2 {
+		t.Fatalf("compose config+user = %v, %v", specs, err)
+	}
+	// config WINS on a name collision
+	specs, err = c.ResolveProfiles([]string{"github"}, user)
+	if err != nil || len(specs) != 1 || specs[0].Allow[0] != "*.github.com" {
+		t.Errorf("config should win collision, got %v", specs)
+	}
+	// AC1: nil user map == empty user map == config-only behavior
+	a, _ := c.ResolveProfiles([]string{"github"}, nil)
+	b, _ := c.ResolveProfiles([]string{"github"}, map[string]EgressProfile{})
+	if len(a) != 1 || len(b) != 1 || a[0].Allow[0] != b[0].Allow[0] {
+		t.Errorf("nil vs empty user should be identical: %v vs %v", a, b)
 	}
 }
 

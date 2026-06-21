@@ -59,11 +59,22 @@ type Client struct {
 	// egressMgr drives the optional egress-control proxy. nil ⇒ egress
 	// disabled, in which case the ConfigureEgressProxy hook is a no-op.
 	egressMgr *egress.Manager
+
+	// egressUserStore is the runtime user-profile store; nil ⇒ config profiles
+	// only. Merged into resolution via userProfiles().
+	egressUserStore *config.UserProfileStore
 }
 
 // SetEgressManager attaches the egress-control proxy manager, called by
 // shed-server at startup when egress is enabled. nil leaves egress off.
 func (c *Client) SetEgressManager(m *egress.Manager) { c.egressMgr = m }
+
+// SetEgressUserStore attaches the runtime user-profile store (mirrors
+// SetEgressManager). nil ⇒ config profiles only.
+func (c *Client) SetEgressUserStore(s *config.UserProfileStore) { c.egressUserStore = s }
+
+// userProfiles snapshots the user-profile store for resolution (nil-safe).
+func (c *Client) userProfiles() map[string]config.EgressProfile { return c.egressUserStore.List() }
 
 // NewClient creates a new VZ client.
 func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
@@ -437,7 +448,7 @@ func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []stri
 		return nil, err
 	}
 
-	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles)
+	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles, c.userProfiles())
 	if err != nil {
 		return nil, fmt.Errorf("egress: resolve profiles: %w", err)
 	}
