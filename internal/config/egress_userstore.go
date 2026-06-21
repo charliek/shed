@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,7 +69,11 @@ func loadUserProfile(path string) (EgressProfile, error) {
 		return EgressProfile{}, err
 	}
 	var p EgressProfile
-	if err := yaml.Unmarshal(data, &p); err != nil {
+	// Strict decode: a typo'd key (e.g. "allowed:") fails the load rather than
+	// silently dropping the rule.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&p); err != nil {
 		return EgressProfile{}, err
 	}
 	if err := egress.ValidateProfile(p.spec()); err != nil {

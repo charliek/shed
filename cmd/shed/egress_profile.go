@@ -138,8 +138,8 @@ func runEgressProfileSet(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", egressProfileFile, err)
 	}
-	var p config.EgressProfile
-	if err := yaml.Unmarshal(data, &p); err != nil {
+	p, err := decodeEgressProfileYAML(data)
+	if err != nil {
 		return fmt.Errorf("parse %s: %w", egressProfileFile, err)
 	}
 	client, err := egressProfileClient()
@@ -200,6 +200,10 @@ func runEgressProfileEdit(cmd *cobra.Command, args []string) error {
 		if out, mErr := yaml.Marshal(info.Profile); mErr == nil {
 			seed = out
 		}
+	} else if !strings.Contains(err.Error(), config.ErrProfileNotFound) {
+		// Only a genuine not-found falls back to the template (create-on-save);
+		// surface any other error rather than risk overwriting on save.
+		return fmt.Errorf("failed to read egress profile %s: %w", name, err)
 	}
 	edited, err := editInEditor(name, seed)
 	if err != nil {
@@ -209,8 +213,8 @@ func runEgressProfileEdit(cmd *cobra.Command, args []string) error {
 		fmt.Println("No changes; aborted.")
 		return nil
 	}
-	var p config.EgressProfile
-	if err := yaml.Unmarshal(edited, &p); err != nil {
+	p, err := decodeEgressProfileYAML(edited)
+	if err != nil {
 		return fmt.Errorf("parse edited profile: %w", err)
 	}
 	info, err := client.EgressProfilePut(name, p)
@@ -268,4 +272,16 @@ func egressProfileSummary(p config.EgressProfile) string {
 		return "(empty)"
 	}
 	return strings.Join(parts, " ")
+}
+
+// decodeEgressProfileYAML strict-decodes a profile document so a typo'd key
+// (e.g. "allowed:") is rejected rather than silently dropped.
+func decodeEgressProfileYAML(data []byte) (config.EgressProfile, error) {
+	var p config.EgressProfile
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&p); err != nil {
+		return config.EgressProfile{}, err
+	}
+	return p, nil
 }

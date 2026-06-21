@@ -145,6 +145,15 @@ func TestUserProfileStoreFailHardOnBadFile(t *testing.T) {
 	if _, err := OpenUserProfileStore(dir4); err == nil {
 		t.Fatal("Open must reject a reserved profile filename (off.yaml)")
 	}
+
+	// unknown key (typo) — strict decode must reject it, not silently drop it.
+	dir5 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir5, "typo.yaml"), []byte("allowed: [a.com]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenUserProfileStore(dir5); err == nil {
+		t.Fatal("Open must reject a profile file with an unknown key (allowed:)")
+	}
 }
 
 func TestUserProfileStoreNilSafe(t *testing.T) {

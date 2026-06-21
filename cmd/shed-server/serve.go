@@ -204,6 +204,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("egress: start proxy: %w", err)
 		}
 		attachEgress(egressMgr)
+		// Register cleanup now — before the user-profile-store open below can
+		// early-return, which would otherwise leak the proxy child + audit log.
+		defer func() {
+			if egressMgr != nil {
+				_ = egressMgr.Close()
+			}
+			if egressAudit != nil {
+				_ = egressAudit.Close()
+			}
+		}()
 
 		// Runtime user-editable profile store (`shed egress profile ...`), in the
 		// state dir next to the audit log. Fails startup on a malformed file.
@@ -224,14 +234,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 		attachEgressStore(egressUserStore)
 		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s, audit %s, profiles %s)", lo, hi, sockPath, auditPath, storeDir)
 	}
-	defer func() {
-		if egressMgr != nil {
-			_ = egressMgr.Close()
-		}
-		if egressAudit != nil {
-			_ = egressAudit.Close()
-		}
-	}()
 
 	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
 	// keys are cached next to the host key. Fails closed (returns an error)

@@ -137,6 +137,10 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, config.ErrProfileReserved, fmt.Sprintf("%q is a server-config profile (read-only)", name))
 		return
 	}
+	if _, ok := s.egressStore.Get(name); !ok {
+		writeError(w, http.StatusNotFound, config.ErrProfileNotFound, fmt.Sprintf("egress profile %q not found", name))
+		return
+	}
 	refs, err := s.profileReferencedBy(r.Context(), name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, config.ErrInternalError, err.Error())
@@ -147,7 +151,8 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.egressStore.Delete(name); err != nil {
-		writeError(w, http.StatusNotFound, config.ErrProfileNotFound, err.Error())
+		// Existence was checked above, so an error here is a storage failure.
+		writeError(w, http.StatusInternalServerError, config.ErrInternalError, err.Error())
 		return
 	}
 	log.Printf("egress: profile %q deleted", name)
