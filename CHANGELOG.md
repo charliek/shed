@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Run a plan autonomously on a shed (`shed attach` Remote Control mode + the
+  `shed-plan` skill).** `shed attach <shed> --plan <file> -d` ships a plan into a shed
+  and starts a Claude Remote Control session that executes it unattended, printing a
+  `claude.ai/code` URL to watch/steer (the laptop can close). `--kind`/`--prompt`/
+  `--prompt-file`/`--edit`/`--plan-edit` cover session kind and kickoff-prompt sources;
+  `--permission-mode` (default `auto`) and `--skip` (full bypass) set the autonomy
+  posture; `--slug` connects to an existing `rc-<slug>`. Plain `shed attach` is
+  unchanged. Requires Claude to be logged in inside the shed. The new `shed-plan`
+  skill drives the end-to-end author → fresh shed → run → report flow. Supersedes the
+  HTTP-enumeration approach in #199 (the same metadata is surfaced over SSH).
+- **`shed sessions` surfaces RC metadata.** `rc-*` sessions show `KIND` and `RC-STATE`
+  columns (and an `rc` object in `--json`), read from the in-shed `shed-ext-rc` binary;
+  degrades silently when a shed is unreachable or lacks the binary.
 - **User-managed egress profiles (runtime, no server-config edit).** A second,
   runtime-editable profile store alongside `server.yaml`: `shed egress profile
   set <name> --file <doc>` / `edit` / `ls` / `show` / `rm`, backed by

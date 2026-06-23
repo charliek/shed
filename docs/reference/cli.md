@@ -832,7 +832,7 @@ shed attach <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--session` | `-S` | `default` | Session name |
+| `--session` | `-S` | `default` | Session name (plain mode) |
 | `--new` | | `false` | Force create new session |
 
 **Examples:**
@@ -844,6 +844,41 @@ shed attach codelens --new --session experiment
 ```
 
 Detach with `Ctrl-B D`.
+
+#### Remote Control sessions (autonomous agents)
+
+With `--kind` (or `--plan`/`--prompt`), `attach` instead creates a **Remote Control**
+`rc-<slug>` session via the in-shed `shed-ext-rc` binary: it starts Claude connected to
+`claude.ai/code`, ships an optional plan, and types a single-line kickoff prompt. With
+`-d/--detach` it prints the session URL and returns (the laptop can close); otherwise it
+attaches. Use `--slug` to connect to an existing `rc-<slug>` session.
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--kind` | | `claude-rc` | RC kind: `claude-rc`, `claude-broker`, `shell` (triggers RC create) |
+| `--plan` | | | Ship a plan file into the shed and execute it (`-` = stdin) |
+| `--plan-edit` | | `false` | Compose the plan in `$EDITOR` |
+| `--prompt` | `-p` | | Single-line kickoff prompt |
+| `--prompt-file` | | | Read the kickoff prompt from a file (`-` = stdin) |
+| `--edit` | | `false` | Compose the kickoff prompt in `$EDITOR` |
+| `--permission-mode` | | `auto` | `auto`, `acceptEdits`, `plan`, `dontAsk`, `default`, `bypassPermissions` |
+| `--skip` | | `false` | Shorthand for `--permission-mode bypassPermissions` (full bypass) |
+| `--name` | | `<shed>/<slug>` | Session display name |
+| `--slug` | | generated | Connect to `rc-<slug>`, or set the slug for a new session |
+| `--detach` | `-d` | `false` | Create the RC session, print its URL, and return without attaching |
+
+```bash
+shed attach myproj --kind claude-rc -d            # start an agent, print the URL, return
+shed attach myproj --plan plan.md -d              # ship a plan and run it autonomously (auto)
+shed attach myproj --plan plan.md --skip -d       # ...with full permission bypass
+shed attach myproj --slug abc234                  # attach to an existing rc-abc234 session
+```
+
+The kickoff **prompt** is a single line; put multi-step detail in the **plan** file
+(shipped to `<workdir>/.shed/plan-<slug>.md`). Claude must be logged in inside the shed
+(see the `shed-plan` skill). Defaults to `auto`; `--skip` is safe because a shed is an
+isolated VM. For the end-to-end "author a plan and run it on a fresh shed" workflow, use
+the `shed-plan` skill.
 
 ## Session Management
 
@@ -865,6 +900,7 @@ shed sessions [shed-name] [flags]
 shed sessions                  # All sessions on default server
 shed sessions myproj           # Sessions in specific shed
 shed sessions --all            # Across all servers
+shed sessions --json           # Structured output (includes the rc block)
 ```
 
 **Output:**
@@ -873,6 +909,16 @@ shed sessions --all            # Across all servers
 SHED        SESSION      STATUS      CREATED      WINDOWS
 codelens    default      attached    2h ago       1
 codelens    debug        detached    30m ago      2
+```
+
+Remote Control (`rc-*`) sessions are enriched with metadata read from the in-shed
+`shed-ext-rc` binary, adding `KIND` and `RC-STATE` columns (and an `rc` object in
+`--json`). Enrichment degrades silently to the plain tmux row if a shed is unreachable
+or lacks the binary.
+
+```
+SHED     SESSION    STATUS    CREATED   WINDOWS  KIND       RC-STATE
+myproj   rc-abc234  detached  5m ago    1        claude-rc  ready
 ```
 
 ### shed sessions kill
