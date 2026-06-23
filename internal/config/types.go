@@ -186,6 +186,23 @@ type Session struct {
 	CreatedAt   time.Time `json:"created_at"`
 	Attached    bool      `json:"attached"`
 	WindowCount int       `json:"window_count,omitempty"`
+	// RC carries Remote Control Session Convention metadata for "rc-*" sessions,
+	// sourced client-side from the in-shed shed-ext-rc binary over SSH. It is nil
+	// for non-RC sessions and when enrichment was unavailable; server API
+	// responses never populate it.
+	RC *SessionRC `json:"rc,omitempty"`
+}
+
+// SessionRC holds the RC Session Convention fields surfaced for an "rc-*"
+// session (a subset of shed-ext-rc's neutral DTO, for display). Managed is
+// false for legacy/unmanaged rc-* sessions.
+type SessionRC struct {
+	Kind        string `json:"kind,omitempty"`
+	State       string `json:"state,omitempty"`
+	Managed     bool   `json:"managed"`
+	DisplayName string `json:"display_name,omitempty"`
+	URL         string `json:"url,omitempty"`
+	CreatedBy   string `json:"created_by,omitempty"`
 }
 
 // Session constants.

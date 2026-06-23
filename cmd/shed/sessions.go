@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -108,6 +109,11 @@ func runSessions(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Enrich rc-* sessions with RC Session Convention metadata in one pass over
+	// the assembled list, so every code path above benefits and new branches
+	// can't forget it. No-op (no dial) when there are no rc-* sessions.
+	enrichSessionsRC(allSessions)
+
 	if jsonFlag {
 		if allSessions == nil {
 			allSessions = make([]config.Session, 0)
@@ -153,8 +159,22 @@ func printSessionsTable(sessions []config.Session) error {
 		return nil
 	}
 
+	// Only widen the table with RC columns when at least one rc-* session is
+	// present, so the common (non-RC) listing stays compact.
+	showRC := false
+	for _, s := range sessions {
+		if strings.HasPrefix(s.Name, rcTmuxPrefix) {
+			showRC = true
+			break
+		}
+	}
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SHED\tSESSION\tSTATUS\tCREATED\tWINDOWS")
+	if showRC {
+		fmt.Fprintln(w, "SHED\tSESSION\tSTATUS\tCREATED\tWINDOWS\tKIND\tRC-STATE")
+	} else {
+		fmt.Fprintln(w, "SHED\tSESSION\tSTATUS\tCREATED\tWINDOWS")
+	}
 
 	for _, s := range sessions {
 		status := "detached"
@@ -164,16 +184,37 @@ func printSessionsTable(sessions []config.Session) error {
 
 		created := formatTimeAgo(s.CreatedAt)
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\n",
-			s.ShedName,
-			s.Name,
-			status,
-			created,
-			s.WindowCount,
-		)
+		if showRC {
+			kind, rcState := rcColumns(s)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+				s.ShedName, s.Name, status, created, s.WindowCount, kind, rcState)
+		} else {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\n",
+				s.ShedName, s.Name, status, created, s.WindowCount)
+		}
 	}
 
 	return w.Flush()
+}
+
+// rcColumns renders the KIND and RC-STATE cells for a session. Non-RC sessions
+// render blank; rc-* sessions whose metadata couldn't be read render "-"; legacy
+// (unmanaged) RC sessions are labelled.
+func rcColumns(s config.Session) (kind, state string) {
+	if s.RC == nil {
+		if strings.HasPrefix(s.Name, rcTmuxPrefix) {
+			return "-", "-"
+		}
+		return "", ""
+	}
+	kind = s.RC.Kind
+	if kind == "" {
+		kind = "?"
+	}
+	if !s.RC.Managed {
+		kind += " (legacy)"
+	}
+	return kind, s.RC.State
 }
 
 func formatTimeAgo(t time.Time) string {
