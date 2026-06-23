@@ -142,6 +142,76 @@ func TestRCColumns(t *testing.T) {
 	}
 }
 
+func TestResolveRCInputs(t *testing.T) {
+	t.Run("multiple prompt sources error", func(t *testing.T) {
+		_, _, _, err := resolveRCInputs(rcInputs{prompt: "x", edit: true})
+		if err == nil {
+			t.Fatal("want error for >1 prompt source")
+		}
+	})
+	t.Run("multiple plan sources error", func(t *testing.T) {
+		_, _, _, err := resolveRCInputs(rcInputs{plan: "p.md", planEdit: true})
+		if err == nil {
+			t.Fatal("want error for >1 plan source")
+		}
+	})
+	t.Run("both stdin error", func(t *testing.T) {
+		_, _, _, err := resolveRCInputs(rcInputs{promptFile: "-", plan: "-"})
+		if err == nil {
+			t.Fatal("want error when prompt and plan both read stdin")
+		}
+	})
+	t.Run("multiline prompt rejected", func(t *testing.T) {
+		_, _, _, err := resolveRCInputs(rcInputs{prompt: "line one\nline two"})
+		if err == nil {
+			t.Fatal("want error for a multi-line kickoff prompt")
+		}
+	})
+	t.Run("prompt flag passes through", func(t *testing.T) {
+		p, _, havePlan, err := resolveRCInputs(rcInputs{prompt: "do the thing"})
+		if err != nil || p != "do the thing" || havePlan {
+			t.Fatalf("got (%q,%v,%v)", p, havePlan, err)
+		}
+	})
+	t.Run("plan file read; markdown headers preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		path := dir + "/plan.md"
+		body := "# Goal\n\nDo step 1\nDo step 2\n"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, plan, havePlan, err := resolveRCInputs(rcInputs{plan: path})
+		if err != nil || !havePlan {
+			t.Fatalf("got havePlan=%v err=%v", havePlan, err)
+		}
+		if !strings.Contains(plan, "# Goal") {
+			t.Fatalf("markdown header stripped: %q", plan)
+		}
+	})
+}
+
+func TestGenRCSlug(t *testing.T) {
+	seen := map[string]bool{}
+	for range 50 {
+		s, err := genRCSlug()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(s) != 6 {
+			t.Fatalf("slug len = %d, want 6 (%q)", len(s), s)
+		}
+		for _, r := range s {
+			if !strings.ContainsRune(rcSlugAlphabet, r) {
+				t.Fatalf("slug %q has char outside alphabet", s)
+			}
+		}
+		seen[s] = true
+	}
+	if len(seen) < 40 {
+		t.Fatalf("slugs not random enough: %d unique of 50", len(seen))
+	}
+}
+
 // TestEnrichSessionsRCNoOp guards the no-op fast path: a listing with no rc-*
 // sessions must return before any config lookup or SSH dial (the test would hang
 // or panic on an unreachable/absent server if it didn't).
