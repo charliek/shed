@@ -35,7 +35,7 @@ already authed. If a run reports `needs-auth`, tell the user to
    - Pick a short, recognizable shed name (e.g. `plan-<topic>`).
 
 3. **Ship the plan and start the run (detached):**
-   ```
+   ```bash
    shed attach <shed> --plan ./plan.md -d
    ```
    - Defaults to `auto` permission mode (autonomous with safety checks).

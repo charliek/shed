@@ -916,7 +916,7 @@ Remote Control (`rc-*`) sessions are enriched with metadata read from the in-she
 `--json`). Enrichment degrades silently to the plain tmux row if a shed is unreachable
 or lacks the binary.
 
-```
+```text
 SHED     SESSION    STATUS    CREATED   WINDOWS  KIND       RC-STATE
 myproj   rc-abc234  detached  5m ago    1        claude-rc  ready
 ```

@@ -355,7 +355,11 @@ func editorInput(template, suffix, commentPrefix string) (string, error) {
 }
 
 const promptEditTemplate = "# Write the single-line kickoff prompt for the agent.\n# Lines starting with '#' are ignored.\n"
-const planEditTemplate = "<!-- Write the plan (markdown) for the agent to execute below.\n     Lines starting with '<!--' are ignored. Markdown '#' headers are kept. -->\n\n"
+
+// Single-line so the whole template is one stripped comment (a wrapped second line
+// would not start with the prefix and would leak into the plan); markdown '#'
+// headers in the body are preserved because the prefix is "<!--", not "#".
+const planEditTemplate = "<!-- Write the plan (markdown) below and delete this line; markdown '#' headers are kept. -->\n\n"
 
 // rcInputs holds the raw prompt/plan flag values for resolveRCInputs.
 type rcInputs struct {
@@ -395,6 +399,9 @@ func resolveRCInputs(in rcInputs) (prompt, planContent string, havePlan bool, er
 				return "", "", false, fmt.Errorf("reading plan file: %w", e)
 			}
 			planContent = string(b)
+		}
+		if strings.TrimSpace(planContent) == "" {
+			return "", "", false, fmt.Errorf("plan is empty; nothing to execute")
 		}
 		havePlan = true
 	case in.planEdit:

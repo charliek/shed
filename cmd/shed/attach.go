@@ -87,9 +87,12 @@ func init() {
 	rootCmd.AddCommand(attachCmd)
 }
 
-// rcCreateRequested reports whether any flag that should create an RC session is set.
+// rcCreateRequested reports whether any RC-only flag is set — so posture/presentation
+// modifiers (--skip, --permission-mode, --name, -d/--detach) also trigger RC create
+// rather than silently routing to plain attach and discarding the user's intent.
 func rcCreateRequested() bool {
-	return attachKindFlag != "" || rcInputRequested()
+	return attachKindFlag != "" || rcInputRequested() ||
+		attachSkipFlag || attachPermModeFlag != "" || attachNameFlag != "" || attachDetachFlag
 }
 
 // rcInputRequested reports whether any prompt/plan input flag is set.

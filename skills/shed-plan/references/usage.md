@@ -5,7 +5,7 @@ version-matched source.
 
 ## Create a fresh shed (default path)
 
-```
+```bash
 shed create <name> --repo <owner/repo> -s <server>
 ```
 
@@ -16,7 +16,7 @@ shed create <name> --repo <owner/repo> -s <server>
 
 ## Start an autonomous Remote Control run
 
-```
+```bash
 shed attach <shed> --plan <file> -d [--skip] [-p "<single-line kickoff>"]
 ```
 
@@ -41,7 +41,7 @@ Notes:
 
 ## Watch, list, stop
 
-```
+```bash
 shed attach <shed> --slug <slug>     # attach a terminal to rc-<slug>
 shed sessions [<shed>] [--all] [--json]   # list (rc-* rows show KIND + RC-STATE)
 shed sessions kill <shed> rc-<slug>  # stop the session
@@ -51,7 +51,7 @@ shed sessions kill <shed> rc-<slug>  # stop the session
 
 Claude must be logged in **inside the shed VM**. If a run reports `needs-auth`:
 
-```
+```bash
 shed attach <shed>     # then run `claude`, do /login once, exit
 ```
 
