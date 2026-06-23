@@ -123,6 +123,21 @@ claude
 shed attach myproj
 ```
 
+### Run a plan autonomously
+
+Hand a plan to a shed and let Claude execute it unattended — you get a `claude.ai/code`
+URL to watch/steer from your phone, and your laptop can close. Requires the `full` image
+with Claude logged in inside the shed.
+
+```bash
+# Write a self-contained plan (goal, steps, how to verify), then:
+shed attach myproj --plan ./plan.md -d      # ships the plan, starts an agent, prints the URL
+```
+
+Defaults to `auto` permission mode; add `--skip` for full bypass (safe in a disposable
+shed). For the end-to-end author → fresh shed → run → report flow, use the **`shed-plan`**
+skill. See [`shed attach` Remote Control sessions](../reference/cli.md#remote-control-sessions-autonomous-agents).
+
 ### Port forwarding
 
 ```bash
