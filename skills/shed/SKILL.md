@@ -67,7 +67,7 @@ Usage notes that matter:
 - **One-off vs interactive:** `shed exec <name> <command...>` runs a single command over SSH with the argv passed through verbatim (it is not a shell), e.g. `shed exec myproj git status`. For pipes, `&&`, redirection, or `cd`, wrap it yourself: `shed exec myproj bash -lc "cd /workspace && npm test"`. Reserve `attach`/`console` for interactive work.
 - **Multi-server:** target one with `-s <server>`; sweep all with `--all` (on `list`, `sessions`, `system`).
 - **Scripting:** `--json` emits structured output. Destructive commands require `--force` when combined with `--json` (no interactive prompt).
-- **Autonomous agents:** to hand a plan to a shed and have Claude run it unattended (`shed attach --kind/--plan` creates a Remote Control `rc-*` session and returns a `claude.ai/code` URL), use the **`shed-plan`** skill — it covers authoring the plan, picking/creating the shed, and launching the run.
+- **Autonomous agents:** to hand a plan to a shed and have Claude run it unattended (`shed attach --kind/--plan` creates a Remote Control `rc-*` session; with `-d/--detach` it prints a `claude.ai/code` URL and returns instead of attaching), use the **`shed-plan`** skill — it covers authoring the plan, picking/creating the shed, and launching the run.
 
 ## Reaching services inside a shed (tunnels)
 
