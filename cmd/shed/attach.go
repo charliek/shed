@@ -75,7 +75,7 @@ func init() {
 	attachCmd.Flags().StringVar(&attachKindFlag, "kind", "", "RC session kind: claude-rc|claude-broker|shell (triggers RC create)")
 	attachCmd.Flags().StringVar(&attachNameFlag, "name", "", "RC session display name (default <shed>/<slug>)")
 	attachCmd.Flags().StringVar(&attachSlugFlag, "slug", "", "RC slug: connect to rc-<slug>, or set the slug for a new session")
-	attachCmd.Flags().StringVarP(&attachPromptFlag, "prompt", "p", "", "Kickoff prompt line (single line)")
+	attachCmd.Flags().StringVarP(&attachPromptFlag, "prompt", "p", "", "Kickoff prompt (use --prompt-file/--edit for multi-line)")
 	attachCmd.Flags().StringVar(&attachPromptFileFlag, "prompt-file", "", "Read the kickoff prompt from a file (- for stdin)")
 	attachCmd.Flags().BoolVar(&attachEditFlag, "edit", false, "Compose the kickoff prompt in $EDITOR")
 	attachCmd.Flags().StringVar(&attachPlanFlag, "plan", "", "Ship a plan file to the shed and execute it (- for stdin)")

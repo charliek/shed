@@ -161,10 +161,10 @@ func TestResolveRCInputs(t *testing.T) {
 			t.Fatal("want error when prompt and plan both read stdin")
 		}
 	})
-	t.Run("multiline prompt rejected", func(t *testing.T) {
-		_, _, _, err := resolveRCInputs(rcInputs{prompt: "line one\nline two"})
-		if err == nil {
-			t.Fatal("want error for a multi-line kickoff prompt")
+	t.Run("multiline prompt allowed", func(t *testing.T) {
+		p, _, _, err := resolveRCInputs(rcInputs{prompt: "line one\nline two"})
+		if err != nil || p != "line one\nline two" {
+			t.Fatalf("multi-line prompt should pass through, got (%q,%v)", p, err)
 		}
 	})
 	t.Run("prompt flag passes through", func(t *testing.T) {

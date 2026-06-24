@@ -19,6 +19,9 @@ All notable changes to this project will be documented in this file.
 - **`shed sessions` surfaces RC metadata.** `rc-*` sessions show `KIND` and `RC-STATE`
   columns (and an `rc` object in `--json`), read from the in-shed `shed-ext-rc` binary;
   degrades silently when a shed is unreachable or lacks the binary.
+- **Multi-line kickoff prompts.** `shed attach --prompt-file`/`--edit` may now be
+  multi-line; `shed-ext-rc` delivers them as one input via a bracketed paste (prefer a
+  plan file for large/multi-step work).
 - **User-managed egress profiles (runtime, no server-config edit).** A second,
   runtime-editable profile store alongside `server.yaml`: `shed egress profile
   set <name> --file <doc>` / `edit` / `ls` / `show` / `rm`, backed by

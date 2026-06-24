@@ -874,7 +874,8 @@ shed attach myproj --plan plan.md --skip -d       # ...with full permission bypa
 shed attach myproj --slug abc234                  # attach to an existing rc-abc234 session
 ```
 
-The kickoff **prompt** is a single line; put multi-step detail in the **plan** file
+The kickoff **prompt** may be multi-line (`--prompt-file`/`--edit`; delivered as one
+input via a bracketed paste), but large/multi-step work belongs in the **plan** file
 (shipped to `<workdir>/.shed/plan-<slug>.md`). Claude must be logged in inside the shed
 (see the `shed-plan` skill). Defaults to `auto`; `--skip` is safe because a shed is an
 isolated VM. For the end-to-end "author a plan and run it on a fresh shed" workflow, use

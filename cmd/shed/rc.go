@@ -104,7 +104,10 @@ func baseSSHArgs(shedName string, entry *config.ServerEntry, extraOpts ...string
 // element must shell-quote it first (see createRCSession); literal tokens like
 // "shed-ext-rc","list" need no quoting.
 func sshCaptureArgs(shedName string, entry *config.ServerEntry, remoteArgv ...string) []string {
-	args := baseSSHArgs(shedName, entry, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
+	// -T disables PTY allocation so ssh doesn't print "Pseudo-terminal will not be
+	// allocated…" to our captured stderr (the shed's sshd folds the remote command's
+	// stderr into the stdout channel, so command diagnostics arrive on stdout anyway).
+	args := baseSSHArgs(shedName, entry, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 	args = append(args, "--")
 	return append(args, remoteArgv...)
 }
@@ -219,9 +222,15 @@ func sshShell(ctx context.Context, shedName string, entry *config.ServerEntry, s
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(errb.String())
-		if msg != "" {
-			return out.Bytes(), fmt.Errorf("%w: %s", err, msg)
+		// The shed's sshd folds the remote command's stderr into stdout, so prefer
+		// stderr but fall back to stdout for the diagnostic (e.g. a guest binary's
+		// "flag provided but not defined: …" arrives on stdout).
+		detail := strings.TrimSpace(errb.String())
+		if detail == "" {
+			detail = strings.TrimSpace(out.String())
+		}
+		if detail != "" {
+			return out.Bytes(), fmt.Errorf("%w: %s", err, detail)
 		}
 		return out.Bytes(), err
 	}
@@ -372,7 +381,9 @@ type rcInputs struct {
 
 // resolveRCInputs resolves the kickoff prompt and (optional) plan content from the
 // flags, enforcing: at most one prompt source, at most one plan source, at most one
-// stdin (`-`) reader, a single-line prompt, and non-empty editor results.
+// stdin (`-`) reader, and non-empty editor results. The prompt may be multi-line
+// (shed-ext-rc delivers it as one input via a bracketed paste); prefer a plan file
+// for large/multi-step work.
 func resolveRCInputs(in rcInputs) (prompt, planContent string, havePlan bool, err error) {
 	if n := boolCount(in.prompt != "", in.promptFile != "", in.edit); n > 1 {
 		return "", "", false, fmt.Errorf("choose at most one of --prompt/--prompt-file/--edit")
@@ -437,9 +448,6 @@ func resolveRCInputs(in rcInputs) (prompt, planContent string, havePlan bool, er
 		if prompt == "" {
 			return "", "", false, fmt.Errorf("empty prompt; aborting")
 		}
-	}
-	if strings.ContainsAny(prompt, "\n\r") {
-		return "", "", false, fmt.Errorf("the kickoff prompt must be a single line; put multi-step detail in --plan")
 	}
 	return prompt, planContent, havePlan, nil
 }
