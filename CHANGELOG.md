@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v0.7.5 — 2026-06-26
 
 ### Added
 
@@ -37,8 +37,19 @@ All notable changes to this project will be documented in this file.
   `{state}/egress-profiles/`. See
   [Egress Control](docs/reference/egress.md#user-managed-profiles) (shed #214).
 
+### Changed
+
+- **Base images bump shed-extensions to v0.4.7.** `vz/Dockerfile` +
+  `firecracker/Dockerfile` pin `SHED_EXT_VERSION=v0.4.7`, so the `extensions`/`full`
+  rootfs images ship the `shed-ext-rc` with `--permission-mode`/`--skip`, onboarding +
+  interstitial pre-seeding, and multi-line prompt delivery — i.e. `shed attach --plan`
+  runs autonomously on these images (older images feature-detect and degrade).
+
 ### Fixed
 
+- **`shed-server` postinstall uses an absolute path for config-validate.** The deb
+  postinst invoked `shed-server config-validate` by bare name; it now uses the absolute
+  install path so validation runs regardless of `PATH` at install time (shed #213).
 - **`shed egress show --json` emits snake_case keys.** The `rules` map's profile
   definitions serialized with Go field names (`Mode`/`Allow`/`Deny`/`Rule`, plus a
   noisy `"Deny":null`) because `config.EgressProfile` lacked JSON tags —
