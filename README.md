@@ -14,6 +14,7 @@ Firecracker microVMs on Linux or Apple Virtualization VMs on macOS Apple Silicon
 - **Multi-server** — manage sheds across home servers and cloud VPS instances.
 - **IDE integration** — native Cursor / VS Code Remote-SSH support.
 - **AI-ready** — pre-configured for Claude Code and OpenCode workflows.
+- **Autonomous agents** — hand a plan to a shed with `shed attach --plan`; Claude executes it unattended while you watch from `claude.ai/code` (laptop can close).
 - **VM backends** — Firecracker microVMs (Linux) or Apple VZ (macOS Apple Silicon).
 
 ## Quick start
