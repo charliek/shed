@@ -874,9 +874,14 @@ shed attach myproj --plan plan.md --skip -d       # ...with full permission bypa
 shed attach myproj --slug abc234                  # attach to an existing rc-abc234 session
 ```
 
-The kickoff **prompt** may be multi-line (`--prompt-file`/`--edit`; delivered as one
-input via a bracketed paste), but large/multi-step work belongs in the **plan** file
-(shipped to `<workdir>/.shed/plan-<slug>.md`). Claude must be logged in inside the shed
+A **plan** (`--plan`) is shipped to Claude's plans directory in the shed
+(`~/.claude/plans/plan-<slug>.md`, outside the workspace so it never touches the repo)
+and the kickoff prompt references it. You can pass a **prompt** and a **plan** together:
+with no prompt, a generic "read the plan at `<path>` and implement it" kickoff is the
+default; with your own `-p`/`--prompt-file`/`--edit`, your prompt leads and the plan's
+location is appended so the agent still finds it. The kickoff **prompt** may be
+multi-line (`--prompt-file`/`--edit`; delivered as one input via a bracketed paste), but
+large/multi-step work belongs in the **plan** file. Claude must be logged in inside the shed
 (see the `shed-plan` skill). Defaults to `auto`; `--skip` is safe because a shed is an
 isolated VM. For the end-to-end "author a plan and run it on a fresh shed" workflow, use
 the `shed-plan` skill.

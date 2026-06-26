@@ -262,17 +262,23 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		displayName = name + "/" + slug
 	}
 
-	// Ship the plan and default the kickoff prompt to reference it.
+	// Ship the plan into claude's plans dir and, unless the caller gave a prompt,
+	// kick off with a natural "here's a plan, implement it" line referencing the file
+	// — what you'd type starting a fresh session against a saved plan.
 	if havePlan {
-		relPath, perr := streamPlanToShed(name, entry, slug, planContent)
+		planPath, perr := streamPlanToShed(name, entry, slug, planContent)
 		if perr != nil {
 			return perr
 		}
 		if verboseLevel > 0 {
-			fmt.Printf("Shipped plan to %s in %s\n", relPath, name)
+			fmt.Printf("Shipped plan to %s in %s\n", planPath, name)
 		}
 		if prompt == "" {
-			prompt = "Read and execute the plan at " + relPath + " autonomously to completion. Do not ask for confirmation; make reasonable decisions and keep going until the plan is done."
+			prompt = "Read the plan at " + planPath + " and implement it. Work through it to completion autonomously — don't stop to ask for confirmation; make reasonable decisions and keep going until the plan is done."
+		} else {
+			// Caller supplied their own kickoff. They can't know the generated plan
+			// path, so append it — their prompt leads, the plan is still findable.
+			prompt += "\n\nThe plan to follow is at " + planPath + "."
 		}
 	}
 

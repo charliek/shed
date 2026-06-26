@@ -32,8 +32,12 @@ shed attach <shed> --plan <file> -d [--skip] [-p "<single-line kickoff>"]
 | `--slug <slug>` | Set the session slug (otherwise generated). |
 
 Notes:
-- The plan is written to `<workdir>/.shed/plan-<slug>.md` inside the shed and the
-  default kickoff prompt references it. The kickoff prompt must be a single line.
+- The plan is shipped to Claude's plans directory in the shed
+  (`~/.claude/plans/plan-<slug>.md`, outside the workspace so it never touches the repo);
+  the kickoff prompt references its absolute path.
+- `--plan` and `-p` can be combined: with no `-p`, a generic "read the plan and implement
+  it" kickoff is the default; with `-p`, your prompt leads and the plan location is
+  appended. Prompts may be multi-line (`--prompt-file`/`--edit`).
 - Do **not** use `--edit` / `--plan-edit` in the autonomous flow (they open `$EDITOR`).
 - On an old shed image whose `shed-ext-rc` predates `--permission-mode`: an explicit
   `--skip`/`--permission-mode` errors with an upgrade hint; the default `auto` falls

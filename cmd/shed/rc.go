@@ -251,21 +251,28 @@ func isOldBinaryPermModeErr(err error) bool {
 		(strings.Contains(s, "not defined") || strings.Contains(s, "flag provided"))
 }
 
-// streamPlanToShed writes plan content to `<workdir>/.shed/plan-<slug>.md` inside the
-// shed (workdir = $SHED_WORKSPACE, falling back to $HOME — matching how shed-ext-rc
-// resolves its own workdir) and returns the workdir-relative path for the kickoff
-// prompt (claude runs with cwd = workdir).
+// streamPlanToShed writes the plan into claude's native plans directory inside the
+// shed — `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plans/plan-<slug>.md` — and returns its
+// absolute path for the kickoff prompt. Keeping it out of the workspace means it never
+// pollutes the repo (or a --local-dir host copy); claude reads it fine in auto and
+// bypass modes when the kickoff references the absolute path (verified live). The path
+// is echoed back behind a sentinel so any login-shell output can't be mistaken for it.
 func streamPlanToShed(shedName string, entry *config.ServerEntry, slug, content string) (string, error) {
-	rel := ".shed/plan-" + slug + ".md"
 	ctx, cancel := context.WithTimeout(context.Background(), rcEnrichTimeout)
 	defer cancel()
-	// The server's bash -lc expands the shed's login env; mirror shed-ext-rc's
-	// SHED_WORKSPACE-or-HOME workdir resolution so the plan lands in the session cwd.
-	cmd := `wd="${SHED_WORKSPACE:-$HOME}"; mkdir -p "$wd/.shed" && cat > "$wd/` + rel + `"`
-	if _, err := sshShell(ctx, shedName, entry, content, cmd); err != nil {
+	file := "plan-" + slug + ".md"
+	cmd := `d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plans"; mkdir -p "$d" && cat > "$d/` + file +
+		`" && printf 'SHED_PLAN_PATH=%s\n' "$d/` + file + `"`
+	out, err := sshShell(ctx, shedName, entry, content, cmd)
+	if err != nil {
 		return "", fmt.Errorf("shipping plan to shed: %w", err)
 	}
-	return rel, nil
+	for _, line := range strings.Split(string(out), "\n") {
+		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "SHED_PLAN_PATH="); ok && p != "" {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("shipping plan to shed: could not determine the plan path")
 }
 
 // rcCreateOptions configures createRCSession.

@@ -9,7 +9,10 @@ All notable changes to this project will be documented in this file.
 - **Run a plan autonomously on a shed (`shed attach` Remote Control mode + the
   `shed-plan` skill).** `shed attach <shed> --plan <file> -d` ships a plan into a shed
   and starts a Claude Remote Control session that executes it unattended, printing a
-  `claude.ai/code` URL to watch/steer (the laptop can close). `--kind`/`--prompt`/
+  `claude.ai/code` URL to watch/steer (the laptop can close). The plan is shipped to
+  Claude's plans directory (`~/.claude/plans/plan-<slug>.md`, outside the workspace) and
+  the kickoff references it; `--plan` and `-p` combine (generic kickoff by default, your
+  prompt + appended plan path when given). `--kind`/`--prompt`/
   `--prompt-file`/`--edit`/`--plan-edit` cover session kind and kickoff-prompt sources;
   `--permission-mode` (default `auto`) and `--skip` (full bypass) set the autonomy
   posture; `--slug` connects to an existing `rc-<slug>`. Plain `shed attach` is

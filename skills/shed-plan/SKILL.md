@@ -41,8 +41,10 @@ already authed. If a run reports `needs-auth`, tell the user to
    - Defaults to `auto` permission mode (autonomous with safety checks).
    - Pass `--skip` **only if the user explicitly asks for full bypass** (no permission
      prompts at all) — confirm first; it is safe because the shed is an isolated VM.
-   - To override the default kickoff prompt, add `-p "..."` (a single line); otherwise
-     a default prompt that references the shipped plan is used.
+   - The plan is shipped to Claude's plans dir (`~/.claude/plans/plan-<slug>.md`), and a
+     generic "read the plan and implement it" kickoff is the default. To lead with your
+     own framing, add `-p "..."` (or `--prompt-file`) — your prompt runs and the plan
+     location is appended automatically, so you can send both.
 
 4. **Report back.** Surface the shed name, the `rc-<slug>` session, the
    `claude.ai/code/session_…` URL, and how to follow along:
@@ -55,7 +57,8 @@ already authed. If a run reports `needs-auth`, tell the user to
 - **Never use `--edit` / `--plan-edit`** here — they open `$EDITOR` and can't run
   unattended. Always pass the plan via `--plan <file>` and any prompt via `-p`.
 - **Default to `auto`.** Only use `--skip` on explicit user request, and say so.
-- Keep the kickoff **prompt** a single line; put all multi-step detail in the **plan**.
+- Put the multi-step detail in the **plan** file; keep any `-p` prompt to high-level
+  framing (prompts may be multi-line, but the plan is the place for the steps).
 - If `shed attach` reports `needs-auth`/`needs-trust`, relay the one-time fix rather
   than retrying blindly.
 - For the underlying shed operations (create, list, delete, servers), defer to the
