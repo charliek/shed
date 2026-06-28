@@ -202,6 +202,21 @@ RUN set -euo pipefail && \
     # multi-user.target so shed-agent can start. systemd-firstboot is
     # for human-driven OS setup, irrelevant for an automated shed VM.
     ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service && \
+    # Sane tmux defaults. shed sessions run inside tmux, which owns ALL
+    # scrollback via the alternate screen — without `mouse on` there's no
+    # way to scroll it. Larger history for build/agent output; focus-events
+    # so TUIs get focus/blur (Claude Code warns when off); a short
+    # escape-time so neovim's ESC isn't laggy; truecolor passthrough.
+    # shed-ext-rc uses the default tmux server (no -f/-L), which reads
+    # /etc/tmux.conf on start. See issue #220.
+    printf '%s\n' \
+        'set -g mouse on' \
+        'set -g history-limit 50000' \
+        'set -g focus-events on' \
+        'set -sg escape-time 10' \
+        'set -g default-terminal "tmux-256color"' \
+        'set -ga terminal-overrides ",*256col*:Tc"' \
+        > /etc/tmux.conf && \
     # Colored shell prompt with shed name + cwd + git branch + dirty marker.
     cat >> /home/shed/.bashrc <<'PROMPT_EOF'
 __git_prompt() {
