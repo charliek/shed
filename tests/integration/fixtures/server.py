@@ -308,7 +308,7 @@ class LocalServer:
             timeout=timeout,
         )
 
-    def ssh_argv(self, name: str, raw_command: str) -> list[str]:
+    def ssh_argv(self, name: str, raw_command: str, pty: bool = False) -> list[str]:
         """Build the raw `ssh` argv for `name`'s shed running `raw_command`.
 
         Shared by `ssh_exec` (text) and `ssh_exec_binary` (bytes), and
@@ -322,16 +322,16 @@ class LocalServer:
         for fresh test environments. The integration suite only ever talks
         to known-good test sheds, so the fallback is safe.
 
-        Passes `-T` to force the non-PTY exec path regardless of the
-        client's `RequestTTY` config. These helpers drive `ssh host cmd`,
-        which is the channel shape Zed/VS Code/rsync use and the one issue
-        #222 concerns; a stray PTY would apply line-discipline translation
-        and corrupt a binary round-trip.
+        Forces the channel type regardless of the client's `RequestTTY`
+        config: `-T` (default) drives the non-PTY exec path — the channel
+        shape Zed/VS Code/rsync use and the one issue #222 concerns (a stray
+        PTY would line-discipline-mangle a binary round-trip) — while
+        `pty=True` passes `-tt` to force the interactive PTY path.
         """
         host, port, known_hosts = self._ssh_connect_params()
         argv = [
             "ssh",
-            "-T",
+            "-tt" if pty else "-T",
             "-p", str(port),
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",

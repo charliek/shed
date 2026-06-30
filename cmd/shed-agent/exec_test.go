@@ -261,4 +261,34 @@ func TestPumpClientMessages(t *testing.T) {
 			t.Fatal("unknown message type was routed to onData")
 		}
 	})
+
+	// Host disconnect (the peer closes the connection) fires onDisconnect so the
+	// caller can terminate the command instead of orphaning it.
+	t.Run("onDisconnectOnConnClose", func(t *testing.T) {
+		called := make(chan struct{}, 1)
+		client, stop := startTestPump(t, messageHandlers{
+			onDisconnect: func() { called <- struct{}{} },
+		})
+		_ = client.Close() // peer closes → non-timeout read error (io.EOF)
+		select {
+		case <-called:
+		case <-time.After(2 * time.Second):
+			t.Fatal("onDisconnect was not called when the host closed the connection")
+		}
+		stop()
+	})
+
+	// The teardown read deadline (a timeout) must NOT be treated as a disconnect:
+	// the process has already exited and the command must not be re-signaled.
+	// stop() drives the real clientPump teardown (SetReadDeadline now).
+	t.Run("noDisconnectOnTeardownDeadline", func(t *testing.T) {
+		disconnected := false
+		_, stop := startTestPump(t, messageHandlers{
+			onDisconnect: func() { disconnected = true },
+		})
+		stop() // teardown deadline → timeout, not a disconnect
+		if disconnected {
+			t.Fatal("onDisconnect fired on the teardown read deadline (should only fire on host close)")
+		}
+	})
 }

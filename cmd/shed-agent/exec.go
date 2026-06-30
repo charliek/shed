@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -17,6 +18,11 @@ import (
 
 	"github.com/creack/pty"
 )
+
+// connKeepaliveInterval is how often the non-PTY exec path probes the host
+// connection with a zero-length frame to detect a disconnect for commands that
+// otherwise neither read stdin nor write output (see runWithoutPTY).
+const connKeepaliveInterval = 15 * time.Second
 
 // handleExecConnection handles a connection on the console port.
 func handleExecConnection(conn net.Conn, user *userInfo) {
@@ -168,6 +174,16 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	// WaitGroup to ensure output is flushed before sending exit code
 	var outputWg sync.WaitGroup
 
+	// On host disconnect, SIGHUP the command's process group (pty.Start put it in
+	// its own session) so it terminates instead of orphaning. Detected via the
+	// output-write path below, the pump's read error, and the keepalive probe —
+	// so even a perfectly idle PTY session is cleaned up on a lost host.
+	disconnect := onHostDisconnect(cmd)
+
+	// connMu serializes the output copier and the keepalive probe, which both
+	// write to conn.
+	var connMu sync.Mutex
+
 	// Forward client→process messages (stdin data, resize, signals) using
 	// blocking reads. The pump is unblocked and awaited at teardown via
 	// pump.stop() before the exit code is sent.
@@ -183,6 +199,7 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 			}
 		},
 		onSignal:       signalProcess(cmd),
+		onDisconnect:   disconnect,
 		stopOnStdinEOF: false, // a PTY has no separate stdin pipe
 	}, nil)
 
@@ -200,13 +217,21 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 				return
 			}
 			if n > 0 {
-				if err := writeData(conn, buf[:n]); err != nil {
-					log.Printf("Warning: failed to write data to connection: %v", err)
+				connMu.Lock()
+				werr := writeData(conn, buf[:n])
+				connMu.Unlock()
+				if werr != nil {
+					log.Printf("Warning: failed to write data to connection: %v", werr)
+					disconnect()
 					return
 				}
 			}
 		}
 	}()
+
+	// Probe for a host disconnect even when the PTY session is idle (no output);
+	// stopped after the command exits (see startKeepalive).
+	keepaliveStop := startKeepalive(conn, &connMu, disconnect)
 
 	// Wait for command to exit
 	go func() {
@@ -214,22 +239,23 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 	}()
 
 	err = <-exitCh
-	exitCode := 0
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			exitCode = exitError.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	}
+	exitCode := exitCodeFromWait(err)
 
 	// Close the PTY master to unblock the output goroutine. Without this,
 	// ptmx.Read() can block indefinitely after the process exits because
-	// the PTY master doesn't always deliver EOF promptly on Linux.
+	// the PTY master doesn't always deliver EOF promptly on Linux. This may
+	// discard a small unread tail still buffered in the line discipline — a
+	// truncation-vs-hang tradeoff accepted for interactive PTY sessions. Do NOT
+	// switch this to "drain before close" like the non-PTY path: the master's
+	// lack of a prompt EOF would reintroduce the indefinite hang.
 	ptmx.Close()
 
 	// Wait for output to be flushed before sending exit code
 	outputWg.Wait()
+
+	// Stop the keepalive (it probed until the command exited) so it can't write
+	// conn concurrently with writeExitCode below.
+	keepaliveStop()
 
 	// Unblock and await the input pump now that the process has exited, before
 	// sending the exit code. (stop() sets a read deadline, which affects reads
@@ -272,6 +298,14 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 		return
 	}
 
+	// Run the command in its own process group so a host disconnect can SIGHUP
+	// the whole tree (the command plus anything it spawned) instead of orphaning
+	// it. Any Credential set by the caller (for the shed user) is preserved.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+
 	// Start command
 	if err := cmd.Start(); err != nil {
 		log.Printf("Failed to start command: %v", err)
@@ -283,6 +317,10 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 
 	// WaitGroup to ensure output is flushed before sending exit code
 	var outputWg sync.WaitGroup
+
+	// On host disconnect, SIGHUP the command's process group so it terminates
+	// instead of orphaning (and leaking this handler at cmd.Wait below).
+	disconnect := onHostDisconnect(cmd)
 
 	// Forward client→process stdin using blocking reads. stdin is closed when the
 	// pump returns (the cleanup arg) so the command sees EOF (e.g. `tar xzpf -`
@@ -296,6 +334,7 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 			}
 		},
 		onSignal:       signalProcess(cmd),
+		onDisconnect:   disconnect,
 		stopOnStdinEOF: true,
 	}, func() { _ = stdin.Close() })
 
@@ -318,6 +357,7 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 				connMu.Unlock()
 				if err != nil {
 					log.Printf("Warning: failed to write stdout to connection: %v", err)
+					disconnect()
 					return
 				}
 			}
@@ -340,37 +380,62 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 				connMu.Unlock()
 				if err != nil {
 					log.Printf("Warning: failed to write stderr to connection: %v", err)
+					disconnect()
 					return
 				}
 			}
 		}
 	}()
 
-	// Wait for command
-	err = cmd.Wait()
-	exitCode := 0
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			exitCode = exitError.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	}
+	// Probe for a host disconnect even when the command produces no output and
+	// reads no stdin (see startKeepalive). Stopped after cmd.Wait below so it
+	// keeps probing until the process actually exits.
+	keepaliveStop := startKeepalive(conn, &connMu, disconnect)
 
-	// Wait for output to be flushed before sending exit code
+	// Drain stdout/stderr to EOF BEFORE reaping the process. cmd.Wait closes the
+	// StdoutPipe/StderrPipe read ends, discarding any output still buffered in
+	// the OS pipe; calling it before the copy goroutines finish truncates large
+	// outputs under back-pressure (the pipes hit EOF on their own when the
+	// process exits and closes its write ends). Per the os/exec StdoutPipe docs:
+	// "It is thus incorrect to call Wait before all reads from the pipe have
+	// completed."
 	outputWg.Wait()
 
-	// Unblock and await the input pump now that the process has exited, before
-	// sending the exit code.
+	// Reap the process. The keepalive keeps probing the conn until the process
+	// actually EXITS — not merely until output drains — so a disconnect is still
+	// caught for a command that closed its own stdout/stderr but kept running
+	// (e.g. `exec >/dev/null 2>&1; sleep 600`), where outputWg.Wait returns early.
+	// (For commands that hold their output pipes open, outputWg.Wait already
+	// blocks until exit.)
+	err = cmd.Wait()
+	exitCode := exitCodeFromWait(err)
+
+	// Now that the process has exited, stop the keepalive and the input pump,
+	// waiting for the keepalive to return, so neither can write conn concurrently
+	// with writeExitCode below.
+	keepaliveStop()
 	pump.stop()
 
-	connMu.Lock()
-	err = writeExitCode(conn, exitCode)
-	connMu.Unlock()
-	if err != nil {
+	// No connMu needed: outputWg.Wait + keepaliveWg.Wait + pump.stop above
+	// guarantee every other conn writer has returned, and the input pump only
+	// ever reads conn, so writeExitCode is the sole remaining writer (matching
+	// the PTY path).
+	if err := writeExitCode(conn, exitCode); err != nil {
 		log.Printf("Warning: failed to write exit code: %v", err)
 	}
 	log.Printf("Command exited with code %d", exitCode)
+}
+
+// exitCodeFromWait maps a cmd.Wait() error to a process exit code: 0 for nil,
+// the process's real code for an *exec.ExitError, and 1 for any other failure.
+func exitCodeFromWait(err error) int {
+	if err == nil {
+		return 0
+	}
+	if exitError, ok := err.(*exec.ExitError); ok {
+		return exitError.ExitCode()
+	}
+	return 1
 }
 
 // messageHandlers customizes how pumpClientMessages dispatches each frame from
@@ -385,6 +450,10 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 //   - onResize handles a PTY window-resize request (left nil for the non-PTY path,
 //     where resize frames are ignored).
 //   - onSignal forwards an already-validated signal number to the process.
+//   - onDisconnect fires once when the read loop ends because the host closed the
+//     connection (a non-timeout read error), so the caller can terminate the
+//     command rather than orphaning it. It is NOT called for the teardown read
+//     deadline (a timeout) the caller sets after the process has already exited.
 //
 // stopOnStdinEOF is true for the non-PTY path (closing the stdin pipe lets the
 // process see EOF) and false for the PTY path (a PTY has no separate stdin pipe,
@@ -393,6 +462,7 @@ type messageHandlers struct {
 	onData         func([]byte)
 	onResize       func(rows, cols uint16)
 	onSignal       func(sig int)
+	onDisconnect   func()
 	stopOnStdinEOF bool
 }
 
@@ -417,6 +487,13 @@ func pumpClientMessages(conn net.Conn, h messageHandlers) {
 	for {
 		msgType, data, err := readMessage(conn)
 		if err != nil {
+			// A non-timeout read error means the host closed the connection
+			// mid-session. The teardown path (clientPump.stop) instead sets a
+			// read DEADLINE, which surfaces as a timeout and must NOT be treated
+			// as a disconnect — the process has already exited in that case.
+			if h.onDisconnect != nil && !isTimeoutError(err) {
+				h.onDisconnect()
+			}
 			return
 		}
 		switch msgType {
@@ -462,6 +539,87 @@ func signalProcess(cmd *exec.Cmd) func(int) {
 		if err := cmd.Process.Signal(syscall.Signal(sig)); err != nil {
 			log.Printf("Warning: failed to send signal %d: %v", sig, err)
 		}
+	}
+}
+
+// isTimeoutError reports whether err is a deadline timeout (as opposed to a
+// connection-closed or other read error). Used to distinguish the teardown read
+// deadline from a host disconnect.
+func isTimeoutError(err error) bool {
+	var nerr net.Error
+	return errors.As(err, &nerr) && nerr.Timeout()
+}
+
+// terminateGroup sends sig to the command's entire process group. The child runs
+// in its own process group (Setpgid on the non-PTY path; Setsid via pty.Start on
+// the PTY path), so the negative PID reaches the command and everything it
+// spawned. No-op if the process never started.
+func terminateGroup(cmd *exec.Cmd, sig syscall.Signal) {
+	if cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, sig)
+}
+
+// onHostDisconnect returns a func that, once, SIGHUPs the command's process
+// group so a host disconnect terminates the command (and its children) instead
+// of orphaning it and leaking this handler's goroutine — matching standard SSH
+// "connection hung up" semantics. Use tmux/nohup to intentionally survive a
+// disconnect.
+//
+// Callers stop the disconnect sources (pump, keepalive) immediately after
+// cmd.Wait, so a call after reap is a tiny race rather than fully safe:
+// kill(-pid) on a freed process group is normally a no-op (ESRCH), but in the
+// microscopic window before those sources stop, a reused PID that became a group
+// leader could in theory be signaled. The window is negligible in practice.
+func onHostDisconnect(cmd *exec.Cmd) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if cmd.Process == nil {
+				return
+			}
+			log.Printf("Host disconnected; sending SIGHUP to command group (pid %d)", cmd.Process.Pid)
+			terminateGroup(cmd, syscall.SIGHUP)
+		})
+	}
+}
+
+// startKeepalive periodically probes conn with a zero-length frame so a host
+// disconnect is detected even for a command that produces no output and reads no
+// stdin: the guest's vsock read never delivers EOF on the host's close, and the
+// output-write path only fires for commands that emit something. The host treats
+// a zero-length frame as an empty stdout write — harmless to the byte stream. mu
+// serializes the probe with the path's output writer(s); a failed probe means
+// the host is gone → disconnect(). Returns stop(), which ends the probe and
+// waits for it to exit so it can't write conn concurrently with a later
+// writeExitCode. Used by both the PTY and non-PTY paths.
+func startKeepalive(conn net.Conn, mu *sync.Mutex, disconnect func()) (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(connKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				err := writeData(conn, nil)
+				mu.Unlock()
+				if err != nil {
+					disconnect()
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		wg.Wait()
 	}
 }
 
