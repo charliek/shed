@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.7.6 — 2026-06-30
+
+### Added
+
+- **Bootstrap secure-mode tokens via the system `ssh` client (`sdk/bootstrap`).**
+  The host-agent now mints its `_bootstrap` token by invoking the system `ssh`
+  instead of an in-process client, so the exchange honors the user's SSH agent,
+  macOS Keychain, `IdentityAgent`, hardware keys, and `~/.ssh/config` — fixing
+  bootstrap when the developer's key is passphrase-protected or agent-only
+  (1Password, Secretive, hardware keys). The shed `known_hosts` stays the sole
+  host-key trust root. (#226)
+- **Sane tmux defaults baked into the VZ + Firecracker base images.**
+
+### Changed
+
+- **Bump the baked `shed-extensions` to v0.4.9** in both base images, so the
+  `extensions`/`full` variants layer the latest published guest binaries. (#229)
+
+### Fixed
+
+- **Zed Remote-SSH (and other raw-SSH clients) can connect again.** The in-VM
+  agent now uses blocking stdin reads on the exec channel, ending the
+  binary-protocol desync that broke Zed; exec-channel teardown is also reliable
+  on host disconnect (process-group SIGHUP, no orphaned commands or leaked
+  handler goroutines). (#222, #225)
+- **`shed tunnels start -d` truly daemonizes**, returning the terminal, and
+  Ctrl+C / SIGTERM now stops tunnels gracefully instead of hanging on open
+  tunneled connections. (#223, #224)
+- **`shed image build` records the ref-index**, so `shed create --image <ref>`
+  resolves a freshly built image instead of a stale pull; and the agent install
+  layer is content-hash cache-busted (`SHED_INSTALL_SHA`) so a rebuilt agent
+  can't be silently served stale from BuildKit's bind-mount cache. Fixes the
+  dev-image rebuild loop — no more manual `docker buildx prune` or ref-index
+  edits. (#227, #228)
+
 ## v0.7.5 — 2026-06-26
 
 ### Added
