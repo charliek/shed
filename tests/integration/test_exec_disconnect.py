@@ -37,7 +37,10 @@ def test_disconnect_terminates_command(shed_server, test_shed_name, pty):
     shed_server.create(test_shed_name, image="base")
 
     label = "pty" if pty else "nopty"
-    pid_file = f"/tmp/shed-disconnect-{label}.pid"
+    # Unique per shed + mode so a run can never read a stale PID file (the shed
+    # is fresh per test, but this is cheap insurance against future test reuse).
+    pid_file = f"/tmp/shed-disconnect-{test_shed_name}-{label}.pid"
+    shed_server.exec(test_shed_name, ["rm", "-f", pid_file])  # clear any stale file
     # `exec sleep` replaces the shell, so $$ (recorded before exec) is the
     # sleep's PID. The command holds the channel open until we disconnect.
     raw = f"echo $$ > {pid_file}; exec sleep 600"
