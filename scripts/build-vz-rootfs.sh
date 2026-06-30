@@ -227,9 +227,7 @@ build_variant() {
     else
         local version
         version="$("$PROJECT_ROOT/bin/shed" version 2>/dev/null | awk '{print $2}')"
-        if [ -z "$version" ] || [ "$version" = "dev" ]; then
-            version="dev"
-        fi
+        version="${version:-dev}"
         source_ref="ghcr.io/charliek/shed-vz-${variant}:${version}"
     fi
     echo "Source-ref: $source_ref"

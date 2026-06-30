@@ -381,7 +381,7 @@ func runImageBuildFromOCIArchive(ctx context.Context, outputDir, prefix, platfor
 	if err != nil {
 		return err
 	}
-	finishImageBuild(outputDir, sourceRef, digest)
+	finishImageBuild(digest)
 	return nil
 }
 
@@ -459,20 +459,23 @@ func runImageBuildFromDockerfile(ctx context.Context, args []string, outputDir, 
 	if err != nil {
 		return err
 	}
-	finishImageBuild(outputDir, sourceRef, digest)
+	finishImageBuild(digest)
 	return nil
 }
 
 // convertAndInstall runs the OCI Convert flow against `imagesDir`,
 // which writes the manifest+config+layer+kernel+initrd blobs into the
-// OCI layout and materializes a derived ext4 in the cache, then
-// advances the imageBuildName tag to the new manifest digest.
+// OCI layout and materializes a derived ext4 in the cache, then records
+// the result via recordBuiltImage — advancing both the imageBuildName
+// tag AND the ref-index entry for sourceRef.
 //
 // sourceRef is recorded verbatim in the manifest's io.shed.source-ref
 // annotation; pass the final registry ref here when this image will be
 // pushed, otherwise the server's resolveImage cache check (which
 // compares `manifest.ShedSourceRef() == cfg.ref`) will miss on every
-// subsequent pull. Returns the manifest digest.
+// subsequent pull. It is also the key under which the ref-index is
+// written, so `shed create --image <sourceRef>` resolves to this build
+// (#227). Returns the manifest digest.
 func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir, platform string, extractKernel, needsInitrd bool) (string, error) {
 	if err := vmimage.ValidateImageName(imageBuildName); err != nil {
 		return "", fmt.Errorf("invalid image name %q: %w", imageBuildName, err)
@@ -493,16 +496,44 @@ func convertAndInstall(ctx context.Context, sourceRef, ociArchivePath, imagesDir
 	if err != nil {
 		return "", fmt.Errorf("conversion failed: %w", err)
 	}
-	if err := vmimage.SetTag(imagesDir, imageBuildName, result.ManifestDigest); err != nil {
-		return "", fmt.Errorf("advancing tag %q: %w", imageBuildName, err)
+	if err := recordBuiltImage(imagesDir, imageBuildName, sourceRef, result.ManifestDigest); err != nil {
+		return "", err
 	}
 	return result.ManifestDigest, nil
 }
 
-// finishImageBuild prints success output. Tag advancement happens inside
-// convertAndInstall.
-func finishImageBuild(_ /*outputDir*/, sourceRef, digest string) {
-	_ = sourceRef
+// recordBuiltImage records a freshly converted image so `shed create --image
+// <ref>` — which resolves through the ref-index (RefIndexGet) — sees this
+// manifest instead of a stale digest left by an earlier pull. The build path
+// previously wrote only the cosmetic tag, so a `--source-ref` build was
+// invisible to create (#227).
+//
+// The ref-index is committed BEFORE the cosmetic tag deliberately: it is the
+// load-bearing resolution artifact, so if the tag write fails afterward, create
+// still resolves correctly and only the cosmetic label lags — strictly better
+// than the reverse, where a failed ref-index write would leave create broken
+// while the tag had already advanced. RefIndexPut is the documented "final
+// commit" step and is safe here: Convert has already made the manifest, blobs,
+// and index.json durable by the time this is called.
+//
+// Unlike the pull-path callers (manager.go EnsureImage/PullImage), which log and
+// continue on a RefIndexPut error, this hard-errors: an explicit local build
+// that silently failed to record the ref-index is exactly the staleness #227
+// fixes, and must be visible. Both writes overwrite unconditionally, so the
+// partial state a hard error leaves is idempotent and clears on retry.
+func recordBuiltImage(imagesDir, name, sourceRef, digest string) error {
+	if err := vmimage.RefIndexPut(imagesDir, sourceRef, digest); err != nil {
+		return fmt.Errorf("recording ref-index entry for %q: %w", sourceRef, err)
+	}
+	if err := vmimage.SetTag(imagesDir, name, digest); err != nil {
+		return fmt.Errorf("advancing tag %q: %w", name, err)
+	}
+	return nil
+}
+
+// finishImageBuild prints success output. Tag + ref-index advancement happens
+// inside convertAndInstall via recordBuiltImage.
+func finishImageBuild(digest string) {
 	printSuccess("Built image %q (%s)", imageBuildName, vmimage.ShortDigest(digest))
 	fmt.Printf("\nUse it with: shed create mydev --image %s\n", imageBuildName)
 }
