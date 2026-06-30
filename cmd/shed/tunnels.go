@@ -332,8 +332,16 @@ func startBackgroundTunnel(mgr *tunnels.Manager, shedName, serverName string, ta
 	for _, t := range activeTunnels {
 		t.Stop()
 	}
-	mgr.State().RemoveTunnel(shedName)
-	_ = mgr.State().Save()
+	// Remove our own entry transactionally, and only if we still own it, so a
+	// tunnel started for another shed (or a --replace that swapped in a new
+	// daemon) isn't clobbered by this shutdown.
+	if err := mgr.State().Update(func(entries map[string]tunnels.TunnelEntry) {
+		if e, ok := entries[shedName]; ok && e.PID == os.Getpid() {
+			delete(entries, shedName)
+		}
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to clear tunnel state: %v\n", err)
+	}
 
 	return nil
 }
