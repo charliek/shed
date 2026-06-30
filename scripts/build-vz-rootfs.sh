@@ -199,17 +199,16 @@ build_variant() {
         extra_args+=(--build-tools-version "$BUILD_TOOLS_VERSION")
     fi
     if [ -n "$SHED_EXT_VERSION" ]; then
-        # shed image build passes --build-arg through to buildx via the
-        # builder. Encode as KEY=VALUE so the existing flag plumbing
-        # forwards verbatim.
-        echo "Note: SHED_EXT_VERSION=$SHED_EXT_VERSION (forward via docker build cache)"
-        # The Dockerfile reads SHED_EXT_VERSION from ARG; passing via
-        # `DOCKER_BUILDKIT_ARGS` keeps the shell invocation simple.
-        export BUILDX_BUILDER="${BUILDX_BUILDER:-default}"
-        # No direct --build-arg pass-through on shed image build yet;
-        # operators who pin shed-ext should edit the ARG line in
-        # vz/Dockerfile or run docker buildx manually before this step.
+        # Forward the shed-extensions pin to the Dockerfile's top-level
+        # ARG SHED_EXT_VERSION (used by the extensions/full variants) via
+        # the now-supported --build-arg passthrough on `shed image build`.
+        extra_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
     fi
+
+    # SHED_INSTALL_SHA busts BuildKit's bind-mount stat cache when the staged
+    # agent/service files change (see vz/Dockerfile + #227). Computed once into
+    # $INSTALL_SHA after build_prereqs staged the inputs (below the loop).
+    extra_args+=(--build-arg "SHED_INSTALL_SHA=$INSTALL_SHA")
 
     # Bake the source-ref to match the server config's `images.<variant>`
     # entry so server-side resolveCachedTag finds our locally-built
@@ -257,6 +256,13 @@ echo "Output directory: $OUTPUT_DIR"
 # Build host prerequisites + shared shed-overlay initramfs once.
 build_prereqs
 build_shed_initrd
+
+# Content hash of the build context, computed ONCE after build_prereqs staged
+# the agent/service binaries. Injected as --build-arg SHED_INSTALL_SHA per
+# variant to bust BuildKit's content-blind bind-mount cache (#227). Identical
+# across variants (the base stage installs them), so compute it here.
+INSTALL_SHA="$("$SCRIPT_DIR/install-input-sha.sh" "$VZ_DIR")"
+echo "Install-SHA: $INSTALL_SHA"
 
 if [ "$BUILD_ALL" = true ]; then
     echo ""

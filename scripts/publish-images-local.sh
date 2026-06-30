@@ -231,6 +231,12 @@ rm -rf "${STORE_DIR}"
 mkdir -p "${STORE_DIR}"
 write_server_yaml "${SERVER_CFG}" "${STORE_DIR}"
 
+# SHED_INSTALL_SHA busts BuildKit's content-blind bind-mount cache when the
+# staged agent/service files change (#227). The base stage installs them, so
+# the value is identical across variants — compute once.
+install_sha="$("${WORK_DIR}/scripts/install-input-sha.sh" "${WORK_DIR}/${BACKEND_DIR}/")"
+log "install-sha=${install_sha}"
+
 for variant in ${VARIANTS}; do
   target="${BACKEND_PREFIX}-${variant}"
   source_ref="${REGISTRY_HOST}/charliek/${target}:${VERSION}"
@@ -243,6 +249,7 @@ for variant in ${VARIANTS}; do
     -n "${variant}" \
     --initramfs "${INITRAMFS}" \
     --output-dir "${STORE_DIR}" \
+    --build-arg "SHED_INSTALL_SHA=${install_sha}" \
     -f "${WORK_DIR}/${BACKEND_DIR}/Dockerfile" \
     "${WORK_DIR}/${BACKEND_DIR}/"
 

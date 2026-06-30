@@ -178,3 +178,60 @@ func TestRecordBuiltImage(t *testing.T) {
 		t.Errorf("tag digest = %q, want %q", tag.Digest, digest)
 	}
 }
+
+// TestBuildxBuildArgs locks in the `docker buildx build` argv assembly — most
+// importantly the #227 --build-arg passthrough (used to inject SHED_INSTALL_SHA)
+// and the invariant that the build context is the LAST positional arg, which
+// buildx requires.
+func TestBuildxBuildArgs(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    string
+		buildArgs []string
+		want      []string
+	}{
+		{
+			name:      "no target, no build-args",
+			target:    "",
+			buildArgs: nil,
+			want: []string{
+				"buildx", "build", "--platform", "linux/arm64",
+				"--output", "type=oci,dest=/tmp/out.tar",
+				"-f", "vz/Dockerfile",
+				"ctx",
+			},
+		},
+		{
+			name:      "target + multiple build-args, context stays last",
+			target:    "shed-vz-base",
+			buildArgs: []string{"SHED_INSTALL_SHA=abc123", "FOO=bar"},
+			want: []string{
+				"buildx", "build", "--platform", "linux/arm64",
+				"--output", "type=oci,dest=/tmp/out.tar",
+				"-f", "vz/Dockerfile",
+				"--target", "shed-vz-base",
+				"--build-arg", "SHED_INSTALL_SHA=abc123",
+				"--build-arg", "FOO=bar",
+				"ctx",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildxBuildArgs("linux/arm64", "/tmp/out.tar", "vz/Dockerfile", tt.target, "ctx", tt.buildArgs)
+			if len(got) != len(tt.want) {
+				t.Fatalf("argv = %v (len %d), want %v (len %d)", got, len(got), tt.want, len(tt.want))
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("argv[%d] = %q, want %q (full: %v)", i, got[i], tt.want[i], got)
+				}
+			}
+			// The build context must always be the final element.
+			if got[len(got)-1] != "ctx" {
+				t.Errorf("build context not last: %v", got)
+			}
+		})
+	}
+}

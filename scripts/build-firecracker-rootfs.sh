@@ -180,6 +180,17 @@ build_variant() {
     if [ -n "$BUILD_TOOLS_VERSION" ]; then
         extra_args+=(--build-tools-version "$BUILD_TOOLS_VERSION")
     fi
+    if [ -n "$SHED_EXT_VERSION" ]; then
+        # Forward the shed-extensions pin to the Dockerfile's top-level
+        # ARG SHED_EXT_VERSION (used by the extensions/full variants) via
+        # the now-supported --build-arg passthrough on `shed image build`.
+        extra_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
+    fi
+
+    # SHED_INSTALL_SHA busts BuildKit's bind-mount stat cache when the staged
+    # agent/service files change (see firecracker/Dockerfile + #227). Computed
+    # once into $INSTALL_SHA after build_prereqs staged the inputs (below).
+    extra_args+=(--build-arg "SHED_INSTALL_SHA=$INSTALL_SHA")
 
     # The ref-index resolves `shed create --image <ref>` to a manifest, so the
     # built image MUST be recorded under the ref the server is configured for.
@@ -222,6 +233,13 @@ echo "Output directory: $OUTPUT_DIR"
 # Build host prerequisites + shared shed-overlay initramfs once.
 build_prereqs
 build_shed_initrd
+
+# Content hash of the build context, computed ONCE after build_prereqs staged
+# the agent/service binaries. Injected as --build-arg SHED_INSTALL_SHA per
+# variant to bust BuildKit's content-blind bind-mount cache (#227). Identical
+# across variants (the base stage installs them), so compute it here.
+INSTALL_SHA="$("$SCRIPT_DIR/install-input-sha.sh" "$FIRECRACKER_DIR")"
+echo "Install-SHA: $INSTALL_SHA"
 
 if [ "$BUILD_ALL" = true ]; then
     echo ""

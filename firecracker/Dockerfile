@@ -113,12 +113,24 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# SHED_INSTALL_SHA is a content hash of the files installed by the bind-mount
+# RUN below (shed-agent + shed-firstboot + the .service/.sh/.json staged from
+# the context). BuildKit's bind-mount cache keys on (path, size, mtime), NOT
+# content, so a rebuilt binary that collides on size+mtime would otherwise be
+# silently reused from cache — baking a stale agent (#227). Referencing the ARG
+# in the RUN makes a changed hash bust this layer. Declared AFTER the apt layer
+# so it never invalidates the expensive package install. The build scripts pass
+# the real value; `unknown` is the cache-busting-disabled default for ad-hoc
+# `docker build` invocations.
+ARG SHED_INSTALL_SHA=unknown
+
 # Layer 2: stage shed-built binaries + service files from the build
 # context via a bind mount so we get a single layer for the placements
 # + chmods + configs (instead of 1 layer per COPY). daemon.json is
 # staged but placed by the `full` stage where docker is actually
 # installed.
 RUN --mount=type=bind,source=.,target=/ctx \
+    echo "SHED_INSTALL_SHA=${SHED_INSTALL_SHA}" && \
     install -m 0755 /ctx/shed-agent       /usr/local/bin/shed-agent && \
     install -m 0755 /ctx/shed-firstboot   /usr/local/bin/shed-firstboot && \
     install -m 0755 /ctx/network-setup.sh /usr/local/bin/network-setup.sh && \
