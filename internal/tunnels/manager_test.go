@@ -2,9 +2,40 @@ package tunnels
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestRemoveOwnedTunnel(t *testing.T) {
+	cfg := &TunnelConfig{Sheds: make(map[string]ShedConfig)}
+	state := &TunnelState{
+		Tunnels: make(map[string]TunnelEntry),
+		path:    filepath.Join(t.TempDir(), "state.json"),
+	}
+	mgr := NewManagerWithConfig(cfg, state)
+
+	// A replacement daemon (PID 222) owns the entry.
+	if err := mgr.SaveBackground("web", "srv", "default", 222, []PortMapping{{Local: 3000, Remote: 3000}}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// A stale daemon (PID 111) must not remove the replacement's entry.
+	if err := mgr.RemoveOwnedTunnel("web", 111); err != nil {
+		t.Fatalf("remove (non-owner): %v", err)
+	}
+	if _, ok := mgr.State().GetTunnel("web"); !ok {
+		t.Error("entry was removed by a non-owner PID")
+	}
+
+	// The owner removes it.
+	if err := mgr.RemoveOwnedTunnel("web", 222); err != nil {
+		t.Fatalf("remove (owner): %v", err)
+	}
+	if _, ok := mgr.State().GetTunnel("web"); ok {
+		t.Error("owner failed to remove its entry")
+	}
+}
 
 func TestCheckPortConflict(t *testing.T) {
 	cfg := &TunnelConfig{

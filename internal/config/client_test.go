@@ -1,6 +1,20 @@
 package config
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
+
+func TestTunnelLogPaths(t *testing.T) {
+	wantDir := filepath.Join(GetClientConfigDir(), "logs")
+	if got := GetTunnelLogDir(); got != wantDir {
+		t.Errorf("GetTunnelLogDir() = %q, want %q", got, wantDir)
+	}
+	wantPath := filepath.Join(wantDir, "tunnel-myproj.log")
+	if got := GetTunnelLogPath("myproj"); got != wantPath {
+		t.Errorf("GetTunnelLogPath(myproj) = %q, want %q", got, wantPath)
+	}
+}
 
 func TestServerEntryBaseURL(t *testing.T) {
 	tests := []struct {

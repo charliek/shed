@@ -127,6 +127,17 @@ func (m *Manager) StopAllTunnelsForShed(shedName string) error {
 	return err
 }
 
+// RemoveOwnedTunnel removes a shed's tunnel entry only if it is still owned by
+// the given PID. A background daemon calls this on shutdown (with its own PID)
+// so it never deletes an entry that a --replace swapped in for a newer daemon.
+func (m *Manager) RemoveOwnedTunnel(shedName string, pid int) error {
+	return m.state.Update(func(tunnels map[string]TunnelEntry) {
+		if e, ok := tunnels[shedName]; ok && e.PID == pid {
+			delete(tunnels, shedName)
+		}
+	})
+}
+
 // StopAll stops all tunnels.
 func (m *Manager) StopAll() error {
 	var pids []int

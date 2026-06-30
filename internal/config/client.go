@@ -99,6 +99,16 @@ func GetTunnelStatePath() string {
 	return filepath.Join(GetClientConfigDir(), "tunnel-state.json")
 }
 
+// GetTunnelLogDir returns the directory holding background tunnel daemon logs.
+func GetTunnelLogDir() string {
+	return filepath.Join(GetClientConfigDir(), "logs")
+}
+
+// GetTunnelLogPath returns the log path for a shed's background tunnel daemon.
+func GetTunnelLogPath(shedName string) string {
+	return filepath.Join(GetTunnelLogDir(), "tunnel-"+shedName+".log")
+}
+
 // GetSyncConfigPath returns the path to the sync config file.
 func GetSyncConfigPath() string {
 	return filepath.Join(GetClientConfigDir(), "sync.yaml")
