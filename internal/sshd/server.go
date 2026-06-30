@@ -65,13 +65,24 @@ func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termCon
 			return s.handlePublicKey(ctx, key)
 		},
 		ServerConfigCallback: func(ssh.Context) *gossh.ServerConfig {
-			c := &gossh.ServerConfig{}
-			if s.allowlist != nil {
-				if n := s.allowlist.MaxAuthTries(); n > 0 {
-					c.MaxAuthTries = n
+			maxTries := s.effectiveMaxAuthTries()
+			cfg := &gossh.ServerConfig{MaxAuthTries: maxTries}
+			// Best-effort diagnostic from the transport's authoritative per-attempt
+			// log (one closure per connection): warn once when a connection exhausts
+			// the public-key attempt cap — usually a many-key agent (1Password,
+			// Secretive) offering more keys than the cap before its allowlisted key
+			// is reached. Kept here, not in handlePublicKey, so the per-key handler
+			// stays a pure decision and the count comes from gossh, not a shadow.
+			var pubkeyFails int
+			cfg.AuthLogCallback = func(conn gossh.ConnMetadata, method string, err error) {
+				if method != "publickey" || err == nil {
+					return
+				}
+				if pubkeyFails++; pubkeyFails == maxTries {
+					log.Printf("SSH auth: public-key attempt cap (%d) reached for user=%s — the client may be offering more keys than the cap allows, so its allowlisted key may never be tried. Raise auth.ssh.max_auth_tries, or use a per-host IdentityFile + IdentitiesOnly on the client.", maxTries, conn.User())
 				}
 			}
-			return c
+			return cfg
 		},
 		Handler: func(sess ssh.Session) {
 			s.handleSession(sess)
@@ -186,6 +197,26 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	log.Printf("Shutting down SSH server...")
 	return s.sshServer.Shutdown(ctx)
+}
+
+// defaultMaxAuthTries is the per-connection public-key attempt cap applied when
+// auth.ssh.max_auth_tries is unset. It is deliberately higher than OpenSSH's
+// default of 6 so a developer whose agent holds many keys (1Password, Secretive,
+// hardware) can still have the one allowlisted key tried before the server gives
+// up — which is exactly the path the host-agent bootstrap and `shed server add`
+// take. This is a mild loosening of a DoS cap; public-key auth is not guessable,
+// so the risk is low. Operators can override it via auth.ssh.max_auth_tries.
+const defaultMaxAuthTries = 10
+
+// effectiveMaxAuthTries is the configured per-connection attempt cap, or
+// defaultMaxAuthTries when unset.
+func (s *Server) effectiveMaxAuthTries() int {
+	if s.allowlist != nil {
+		if n := s.allowlist.MaxAuthTries(); n > 0 {
+			return n
+		}
+	}
+	return defaultMaxAuthTries
 }
 
 // handlePublicKey gates public-key auth through the allowlist. With the

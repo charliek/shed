@@ -755,7 +755,9 @@ type SSHAuthConfig struct {
 	GitHubUsers []string `yaml:"github_users,omitempty"`
 	// GitHubRefresh is how often to re-fetch GitHub keys (default 1h).
 	GitHubRefresh Duration `yaml:"github_refresh,omitempty"`
-	// MaxAuthTries caps public-key attempts per connection (0 = SSH default 6).
+	// MaxAuthTries caps public-key attempts per connection (0 = shed default 10).
+	// Raise it for clients whose agent holds many keys (1Password, Secretive) so
+	// the allowlisted key is tried before the server gives up.
 	MaxAuthTries int `yaml:"max_auth_tries,omitempty"`
 }
 

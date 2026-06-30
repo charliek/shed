@@ -99,7 +99,8 @@ func NewKeyAllowlist(cfg *config.SSHAuthConfig, cacheDir string) (*KeyAllowlist,
 // Mode returns the allowlist mode (off/warn/enforce).
 func (a *KeyAllowlist) Mode() string { return a.mode }
 
-// MaxAuthTries returns the per-connection public-key attempt cap (0 = default).
+// MaxAuthTries returns the configured per-connection public-key attempt cap, or
+// 0 when unset (the server then applies its own default — see effectiveMaxAuthTries).
 func (a *KeyAllowlist) MaxAuthTries() int { return a.maxAuthTries }
 
 // SetRevokeHook installs a callback invoked (outside the lock) with the
