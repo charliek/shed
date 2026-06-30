@@ -442,6 +442,29 @@ class LocalServer:
         resp = json.loads(r.stdout)
         return resp.get("images") or []
 
+    def list_tunnels(self) -> dict:
+        """Return active tunnels keyed by shed name.
+
+        `shed --json tunnels list` emits a bare JSON object mapping shed
+        name -> tunnel entry (see `cmd/shed/tunnels.go:runTunnelsList`).
+        Raises on a failed call so a misconfigured client surfaces loudly;
+        callers assert on the entry's fields (e.g. `pid`). Note: tunnel
+        state is client-side (~/.shed/tunnel-state.json) and not actually
+        per-server, but we key off the same CLI the suite uses everywhere.
+        """
+        r = subprocess.run(
+            ["shed", "--json", "-s", self.name, "tunnels", "list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            raise AssertionError(
+                f"shed tunnels list failed (exit {r.returncode}) on {self.name}: "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+        return json.loads(r.stdout or "{}")
+
     # ------------------------------------------------------------------
     # Log handling (overridden in RemoteServer)
     # ------------------------------------------------------------------
