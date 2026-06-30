@@ -173,4 +173,6 @@ Comment-only edits don't change the binary, so they don't need a rebuild.
 
 Add it here. This file exists because the agent-in-image split and the
 build/cache/ref-index resolution have several non-obvious traps; capturing each
-one saves the next session an hour.
+one saves the next session an hour. The stale-ref-index and BuildKit-cache traps
+in step 3 are tracked for a proper fix in **issue #227** — drop the workarounds
+here once it lands.

@@ -38,13 +38,11 @@ func send(t *testing.T, c net.Conn, msgType byte, data []byte) {
 // client end (the test writes framed messages into it) plus a stop() that drives
 // the real teardown (clientPump.stop) and closes the pipe. net.Pipe is
 // synchronous and supports deadlines (Go 1.10+), which is what the teardown
-// relies on.
+// relies on. stop()'s wg.Wait establishes happens-before for reading whatever
+// the handlers recorded.
 func startTestPump(t *testing.T, h messageHandlers) (client net.Conn, stop func()) {
 	t.Helper()
 	c, s := net.Pipe()
-	// Fail fast (rather than hang to the package timeout) if a regression makes
-	// the pump stop reading while a test is still writing raw frames into c.
-	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	pump := startClientPump(s, h, nil)
 	return c, func() {
 		pump.stop()
@@ -63,8 +61,7 @@ func TestPumpClientMessages(t *testing.T) {
 	t.Run("splitFrameDeliveredIntact", func(t *testing.T) {
 		var got []byte
 		client, stop := startTestPump(t, messageHandlers{
-			onData:         func(b []byte) { got = append(got, b...) },
-			stopOnStdinEOF: true,
+			onData: func(b []byte) { got = append(got, b...) },
 		})
 
 		payload := make([]byte, 9000) // larger than a single pipe read chunk
@@ -86,8 +83,7 @@ func TestPumpClientMessages(t *testing.T) {
 		if _, err := client.Write(payload[4000:]); err != nil {
 			t.Fatalf("write payload part 2: %v", err)
 		}
-		send(t, client, MsgTypeStdinEOF, nil) // stop the pump
-		stop()                                // wg.Wait inside establishes happens-before for got
+		stop() // wg.Wait inside establishes happens-before for got
 
 		if !bytes.Equal(got, payload) {
 			t.Fatalf("payload corrupted/lost: got %d bytes, want %d", len(got), len(payload))
@@ -98,13 +94,11 @@ func TestPumpClientMessages(t *testing.T) {
 	// per-read deadline. A frame whose payload arrives after a pause longer than
 	// the removed 500ms poll interval must still be delivered intact. A
 	// regression to deadline-based polling would time out mid-frame and discard
-	// the bytes consumed so far (the pre-fix behavior, demonstrated against the
-	// old code in the PR). This is the only intentionally slow subtest (~600ms).
+	// the bytes consumed so far. This is the only intentionally slow subtest.
 	t.Run("slowPayloadNotTimedOut", func(t *testing.T) {
 		var got []byte
 		client, stop := startTestPump(t, messageHandlers{
-			onData:         func(b []byte) { got = append(got, b...) },
-			stopOnStdinEOF: true,
+			onData: func(b []byte) { got = append(got, b...) },
 		})
 		payload := []byte("payload-after-a-long-pause")
 		hdr := make([]byte, 5)
@@ -120,7 +114,6 @@ func TestPumpClientMessages(t *testing.T) {
 		if _, err := client.Write(payload); err != nil {
 			t.Fatalf("write payload: %v", err)
 		}
-		send(t, client, MsgTypeStdinEOF, nil)
 		stop()
 
 		if string(got) != string(payload) {
@@ -145,29 +138,39 @@ func TestPumpClientMessages(t *testing.T) {
 		}
 	})
 
-	// Non-PTY semantics: MsgTypeStdinEOF stops the pump on its own. The cleanup
-	// callback fires when the pump returns, so closing it signals "stopped".
-	t.Run("stdinEOFStopsNonPTY", func(t *testing.T) {
-		c, s := net.Pipe()
-		defer c.Close()
-		defer s.Close()
-		done := make(chan struct{})
-		startClientPump(s, messageHandlers{stopOnStdinEOF: true}, func() { close(done) })
-		send(t, c, MsgTypeStdinEOF, nil)
+	// MsgTypeStdinEOF closes stdin (fires onStdinEOF) but does NOT stop the pump:
+	// a command can keep running after stdin closes and must still receive later
+	// signal frames. Pins the resolved review finding (close-once, keep pumping).
+	t.Run("stdinEOFClosesStdinKeepsPumping", func(t *testing.T) {
+		eofCount := 0
+		sigCh := make(chan int, 2)
+		client, stop := startTestPump(t, messageHandlers{
+			onStdinEOF: func() { eofCount++ },
+			onSignal:   func(sig int) { sigCh <- sig },
+		})
+		send(t, client, MsgTypeStdinEOF, nil)
+		// Pump must still be alive to forward this signal after stdin EOF.
+		send(t, client, MsgTypeSignal, mustJSON(t, SignalMessage{Signal: 2}))
+		stop()
+		if eofCount != 1 {
+			t.Fatalf("onStdinEOF fired %d times, want 1", eofCount)
+		}
 		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("pump did not stop on MsgTypeStdinEOF")
+		case got := <-sigCh:
+			if got != 2 {
+				t.Fatalf("signal after stdin EOF = %d, want 2", got)
+			}
+		default:
+			t.Fatal("signal after stdin EOF was not forwarded (pump stopped too early)")
 		}
 	})
 
-	// PTY semantics: MsgTypeStdinEOF is ignored (no separate stdin pipe), so the
-	// pump keeps running and still delivers later data frames.
+	// PTY semantics: onStdinEOF is nil, so MsgTypeStdinEOF is a no-op and the pump
+	// keeps delivering later data frames.
 	t.Run("stdinEOFIgnoredPTY", func(t *testing.T) {
 		var got []byte
 		client, stop := startTestPump(t, messageHandlers{
-			onData:         func(b []byte) { got = append(got, b...) },
-			stopOnStdinEOF: false,
+			onData: func(b []byte) { got = append(got, b...) },
 		})
 		send(t, client, MsgTypeStdinEOF, nil)
 		send(t, client, MsgTypeData, []byte("after-eof"))
@@ -179,17 +182,14 @@ func TestPumpClientMessages(t *testing.T) {
 
 	// onData failing/continuing must NOT stop the pump: a process that closed its
 	// own stdin can still be running and must keep receiving forwarded signals.
-	// This pins the resolved review contradiction (log-and-continue, not stop).
 	t.Run("dataFrameDoesNotStopSignalForwarding", func(t *testing.T) {
 		sigCh := make(chan int, 4)
 		client, stop := startTestPump(t, messageHandlers{
-			onData:         func(b []byte) { /* simulate a process that ignores stdin */ },
-			onSignal:       func(sig int) { sigCh <- sig },
-			stopOnStdinEOF: true,
+			onData:   func(b []byte) { /* simulate a process that ignores stdin */ },
+			onSignal: func(sig int) { sigCh <- sig },
 		})
 		send(t, client, MsgTypeData, []byte("ignored"))
 		send(t, client, MsgTypeSignal, mustJSON(t, SignalMessage{Signal: 2}))
-		send(t, client, MsgTypeStdinEOF, nil)
 		stop()
 		close(sigCh)
 		var sigs []int
@@ -206,13 +206,11 @@ func TestPumpClientMessages(t *testing.T) {
 	t.Run("signalDispatchAndValidation", func(t *testing.T) {
 		sigCh := make(chan int, 8)
 		client, stop := startTestPump(t, messageHandlers{
-			onSignal:       func(sig int) { sigCh <- sig },
-			stopOnStdinEOF: true,
+			onSignal: func(sig int) { sigCh <- sig },
 		})
 		for _, n := range []int{15, 0, 65, 9} { // 0 and 65 are invalid
 			send(t, client, MsgTypeSignal, mustJSON(t, SignalMessage{Signal: n}))
 		}
-		send(t, client, MsgTypeStdinEOF, nil)
 		stop()
 		close(sigCh)
 		var sigs []int
@@ -230,11 +228,9 @@ func TestPumpClientMessages(t *testing.T) {
 		type size struct{ rows, cols uint16 }
 		szCh := make(chan size, 2)
 		client, stop := startTestPump(t, messageHandlers{
-			onResize:       func(rows, cols uint16) { szCh <- size{rows, cols} },
-			stopOnStdinEOF: true,
+			onResize: func(rows, cols uint16) { szCh <- size{rows, cols} },
 		})
 		send(t, client, MsgTypeResize, mustJSON(t, ResizeMessage{Rows: 40, Cols: 120}))
-		send(t, client, MsgTypeStdinEOF, nil)
 		stop()
 		select {
 		case got := <-szCh:
@@ -251,11 +247,9 @@ func TestPumpClientMessages(t *testing.T) {
 	t.Run("unknownTypeIgnored", func(t *testing.T) {
 		dataCalled := false
 		client, stop := startTestPump(t, messageHandlers{
-			onData:         func(b []byte) { dataCalled = true },
-			stopOnStdinEOF: true,
+			onData: func(b []byte) { dataCalled = true },
 		})
 		send(t, client, 0x7F, []byte("mystery"))
-		send(t, client, MsgTypeStdinEOF, nil)
 		stop()
 		if dataCalled {
 			t.Fatal("unknown message type was routed to onData")
