@@ -131,7 +131,7 @@ enforcement derives from `auth.mode: secure`), and `https_port` /
 | `auth.ssh.authorized_keys_file` | string | - | Path to an `authorized_keys`-format file. |
 | `auth.ssh.github_users` | list | `[]` | Seed the allowlist from `https://github.com/<user>.keys`. Keys are cached to disk and fail closed to the last-known-good cache if GitHub is unreachable. |
 | `auth.ssh.github_refresh` | duration | `1h` | How often to re-fetch GitHub keys. |
-| `auth.ssh.max_auth_tries` | int | `6` | Public-key attempts allowed per connection. |
+| `auth.ssh.max_auth_tries` | int | `10` | Public-key attempts allowed per connection. Raise it when a client's agent (1Password, Secretive) holds many keys, so the allowlisted key is tried before the server gives up. |
 
 With `mode: enforce`, the server refuses to start if no keys resolve (empty inline/file and a failed GitHub fetch with no cache) — use `warn` for first boot, or provide inline keys.
 
