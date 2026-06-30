@@ -111,14 +111,29 @@ shed tunnels config <shed> [flags]
 
 Shows the port mappings and server address that would be used, without starting tunnels.
 
+## Foreground Mode
+
+Without `-d`, `shed tunnels start` runs in the foreground and prints the active
+forwards. Press `Ctrl+C` to stop — open connections are torn down and the
+command exits promptly. (A second `Ctrl+C` force-quits if a connection is slow
+to close.)
+
 ## Background Mode
 
-When running with `-d`, the tunnel process stays alive in the background:
+With `-d`, `shed tunnels start` detaches: it starts the tunnels in a separate
+daemon process, prints the forwards, and returns your shell. The daemon keeps
+running after the launching terminal is closed.
 
-- The process PID is saved to `~/.shed/tunnels.state`
-- Use `shed tunnels list` to see active tunnels
-- Use `shed tunnels stop <shed>` to terminate
-- Dead tunnel processes are automatically cleaned up on next `list` or `start`
+- `shed tunnels start <shed> -d` returns once the tunnels are listening (it
+  reports a real error if startup fails, rather than hanging).
+- The daemon's PID is recorded in `~/.shed/tunnel-state.json`.
+- Use `shed tunnels list` to see active tunnels and `shed tunnels stop <shed>`
+  to terminate one (it signals the daemon).
+- Dead tunnel daemons are cleaned out of the state file on the next `list` or
+  `start`.
+- Each daemon writes connection errors to `~/.shed/logs/tunnel-<shed>.log`. The
+  file is truncated on each start and is not rotated (it only records errors, so
+  it stays small in normal use).
 
 ## Port Conflicts
 
