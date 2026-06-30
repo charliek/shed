@@ -35,9 +35,10 @@ func startTunnel(t *testing.T, srv *httptest.Server) (*Tunnel, net.Conn) {
 	if err := tun.Start(); err != nil {
 		t.Fatalf("start tunnel: %v", err)
 	}
+	// Stop the tunnel even if a later assertion fails, so the goroutines don't leak.
+	t.Cleanup(tun.Stop)
 	c, err := net.Dial("tcp", tun.LocalAddr().String())
 	if err != nil {
-		tun.Stop()
 		t.Fatalf("dial local listener: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,8 +106,10 @@ func GetTunnelLogDir() string {
 }
 
 // GetTunnelLogPath returns the log path for a shed's background tunnel daemon.
+// shedName is escaped so a name containing path separators can't traverse out
+// of the log directory (the daemon opens this path with O_TRUNC).
 func GetTunnelLogPath(shedName string) string {
-	return filepath.Join(GetTunnelLogDir(), "tunnel-"+shedName+".log")
+	return filepath.Join(GetTunnelLogDir(), "tunnel-"+url.PathEscape(shedName)+".log")
 }
 
 // GetSyncConfigPath returns the path to the sync config file.

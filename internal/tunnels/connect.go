@@ -61,6 +61,9 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	req.WriteString("\r\n")
 	if _, err := conn.Write([]byte(req.String())); err != nil {
 		conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr // watcher closed conn on cancel; report cancellation, not a write error
+		}
 		return nil, fmt.Errorf("send upgrade request: %w", err)
 	}
 
@@ -69,6 +72,9 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
 		conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr // watcher closed conn on cancel; report cancellation, not a read error
+		}
 		return nil, fmt.Errorf("read upgrade response: %w", err)
 	}
 

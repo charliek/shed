@@ -32,6 +32,11 @@ func TestDaemonChildArgs(t *testing.T) {
 			in:   []string{"tunnels", "start", "myshed", "-d", "--", "extra"},
 			want: []string{"tunnels", "start", "myshed", "-d", "--daemon", "--", "extra"},
 		},
+		{
+			name: "keeps a positional --daemon after the terminator",
+			in:   []string{"tunnels", "start", "myshed", "--", "--daemon"},
+			want: []string{"tunnels", "start", "myshed", "--daemon", "--", "--daemon"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -267,7 +267,10 @@ func TestUpdatePIDGuardedRemoval(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("old-daemon update: %v", err)
 	}
-	loaded, _ := LoadTunnelStateFromPath(path)
+	loaded, err := LoadTunnelStateFromPath(path)
+	if err != nil {
+		t.Fatalf("reload after non-owner update: %v", err)
+	}
 	if e, ok := loaded.GetTunnel("web"); !ok || e.PID != 222 {
 		t.Fatal("replacement entry should survive removal attempt by stale old daemon")
 	}
@@ -280,7 +283,10 @@ func TestUpdatePIDGuardedRemoval(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("owner update: %v", err)
 	}
-	loaded, _ = LoadTunnelStateFromPath(path)
+	loaded, err = LoadTunnelStateFromPath(path)
+	if err != nil {
+		t.Fatalf("reload after owner update: %v", err)
+	}
 	if _, ok := loaded.GetTunnel("web"); ok {
 		t.Fatal("owning daemon should have removed its own entry")
 	}

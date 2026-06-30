@@ -102,10 +102,19 @@ func spawnTunnelDaemon(shedName string, ports []tunnels.PortMapping) error {
 // terminator if present so cobra parses it as a flag, not a positional.
 func daemonChildArgs(args []string) []string {
 	filtered := make([]string, 0, len(args)+1)
+	afterTerminator := false
 	for _, a := range args {
-		if a != "--daemon" {
+		if a == "--" {
+			afterTerminator = true
 			filtered = append(filtered, a)
+			continue
 		}
+		// Only dedupe the hidden flag among real flags; after "--" it's a
+		// positional value Cobra must keep verbatim.
+		if !afterTerminator && a == "--daemon" {
+			continue
+		}
+		filtered = append(filtered, a)
 	}
 	for i, a := range filtered {
 		if a == "--" {
