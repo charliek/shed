@@ -106,30 +106,26 @@ OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
   ./scripts/build-vz-rootfs.sh --variant base --build-tools-version <BT_TAG>
 ```
 
-### 3. Make the dev server resolve to your new manifest
+### 3. Resolution is automatic (since #227)
 
-Two gremlins routinely make the freshly-built agent NOT reach the VM. Always
-**verify** (step 4) before trusting a run.
+The rebuild "just works" now — **no `docker buildx prune`, no hand-edited
+`refs/<hash>.json`.** Two mechanisms make it reliable (both fixed the gremlins
+that used to live here):
 
-- **BuildKit caches the agent install layer** (`RUN --mount=type=bind … install
-  /ctx/shed-agent`). A changed binary can be silently reused from cache. If the
-  baked agent is stale, bust it and rebuild:
-  ```bash
-  docker buildx prune -af && docker builder prune -af
-  ```
-- **The ref-index can point at a stale manifest** after an `OUTPUT_DIR` build
-  (the running dev server + repeated builds leave `refs/<hash>.json` pointing at
-  an older digest than the one you just built). Force it to your build, then
-  restart the server:
-  ```bash
-  cd "$HOME/Library/Application Support/shed-dev/vz"
-  REF="ghcr.io/charliek/shed-vz-base:<TAG>"   # the same image_aliases.base value as above
-  REFHASH=$(printf '%s' "$REF" | shasum -a 256 | awk '{print $1}')
-  cat "refs/$REFHASH.json"          # what it points at now
-  # <DIGEST> = your build's manifest digest from its "Built image (sha256:...)" line:
-  printf '{"ref":"%s","digest":"sha256:<DIGEST>"}\n' "$REF" > "refs/$REFHASH.json"
-  # then restart the dev server (kill the PID in ~/.shed/dev/server.pid, relaunch as in step 1)
-  ```
+- **The install layer busts on content change.** `build-vz-rootfs.sh` computes a
+  content hash of the build context and passes `--build-arg SHED_INSTALL_SHA=…`,
+  which the Dockerfile's bind-mount install RUN references. A changed agent
+  re-runs that layer — the build log prints `SHED_INSTALL_SHA=<hash>` and the
+  step is **not** `CACHED` — while the expensive apt layer stays cached. An
+  unchanged agent leaves the install layer `CACHED`.
+- **The ref-index is written by the build.** `shed image build` records
+  `refs/<sha256(source-ref)>.json` → the new manifest digest, so
+  `shed create --image base` resolves your build immediately. `SHED_SOURCE_REF`
+  (step 2) **must** equal the dev config's `image_aliases.base` so the build
+  writes the ref create reads. The dev server reads the ref-index per-create, so
+  no restart is needed.
+
+Still **verify** (step 4) before trusting a run — it's cheap insurance.
 
 ### 4. VERIFY the VM is running YOUR agent (do not skip)
 
@@ -140,7 +136,9 @@ change adds (function names survive in the Go binary):
 shed -s my-server-dev create dbg --image base
 shed -s my-server-dev exec dbg -- bash -c \
   "strings /usr/local/bin/shed-agent | grep -c '<your-new-symbol-or-log-string>'"
-# >0 means your agent is baked in; 0 means a stale layer/manifest — go back to step 3.
+# >0 means your agent is baked in; 0 means a stale layer/manifest — check the
+# build log shows the install RUN ran (`SHED_INSTALL_SHA=…`, not `CACHED`) and
+# that SHED_SOURCE_REF (step 2) matched the dev config's image_aliases.base.
 ```
 
 To extract+inspect the agent from a manifest without booting a VM (useful to
@@ -165,14 +163,13 @@ SHED_VZ_DEV_SERVER=my-server-dev SHED_VZ_DEV_LOG_PATH="$HOME/.shed/dev/server.lo
 
 ## Per-iteration loop
 
-Edit agent → unit tests (Docker) → rebuild rootfs (step 2) → if stale, bust
-cache + force ref-index (step 3) → verify (step 4) → integration (step 5).
-Comment-only edits don't change the binary, so they don't need a rebuild.
+Edit agent → unit tests (Docker) → rebuild rootfs (step 2) → verify (step 4) →
+integration (step 5). Comment-only edits don't change the binary, so they don't
+need a rebuild.
 
 ## When you hit a NEW rough edge
 
-Add it here. This file exists because the agent-in-image split and the
-build/cache/ref-index resolution have several non-obvious traps; capturing each
-one saves the next session an hour. The stale-ref-index and BuildKit-cache traps
-in step 3 are tracked for a proper fix in **issue #227** — drop the workarounds
-here once it lands.
+Add it here. This file exists because the agent-in-image split has non-obvious
+traps; capturing each one saves the next session an hour. (The stale-ref-index
+and BuildKit-cache traps that used to live in step 3 were fixed in **#227** —
+the rebuild now busts the install layer and writes the ref-index on its own.)

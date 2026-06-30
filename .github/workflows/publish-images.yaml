@@ -168,6 +168,12 @@ jobs:
           # the remote server's resolveImage cache-hit check matches
           # on subsequent `shed create` pulls.
           mkdir -p /tmp/oci-store-vz
+          # SHED_INSTALL_SHA busts BuildKit's content-blind bind-mount cache
+          # when the staged agent/service files change (#227). Belt-and-
+          # suspenders on a cold CI runner, but keeps the published layer's
+          # cache key honest and matters if a shared buildx cache is enabled.
+          install_sha="$(./scripts/install-input-sha.sh vz/)"
+          echo "SHED_INSTALL_SHA=${install_sha}"
           for variant in base extensions full; do
             echo "=== building shed-vz-${variant} ==="
             ./bin/shed image build \
@@ -177,6 +183,7 @@ jobs:
               --source-ref "ghcr.io/charliek/shed-vz-${variant}:${{ steps.version.outputs.tag }}" \
               --initramfs /tmp/shed-initrd-vz.img \
               --output-dir /tmp/oci-store-vz \
+              --build-arg "SHED_INSTALL_SHA=${install_sha}" \
               -f vz/Dockerfile \
               vz/
           done
@@ -277,8 +284,11 @@ jobs:
 
       - name: Build OCI images (base, extensions, full)
         run: |
-          # See VZ job for rationale on --platform and --source-ref.
+          # See VZ job for rationale on --platform, --source-ref, and
+          # SHED_INSTALL_SHA (#227 bind-mount cache-bust).
           mkdir -p /tmp/oci-store-fc
+          install_sha="$(./scripts/install-input-sha.sh firecracker/)"
+          echo "SHED_INSTALL_SHA=${install_sha}"
           for variant in base extensions full; do
             echo "=== building shed-fc-${variant} ==="
             ./bin/shed image build \
@@ -288,6 +298,7 @@ jobs:
               --source-ref "ghcr.io/charliek/shed-fc-${variant}:${{ steps.version.outputs.tag }}" \
               --initramfs /tmp/shed-initrd-fc.img \
               --output-dir /tmp/oci-store-fc \
+              --build-arg "SHED_INSTALL_SHA=${install_sha}" \
               -f firecracker/Dockerfile \
               firecracker/
           done

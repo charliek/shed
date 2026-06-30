@@ -180,15 +180,49 @@ build_variant() {
     if [ -n "$BUILD_TOOLS_VERSION" ]; then
         extra_args+=(--build-tools-version "$BUILD_TOOLS_VERSION")
     fi
+    if [ -n "$SHED_EXT_VERSION" ]; then
+        # Forward the shed-extensions pin to the Dockerfile's top-level
+        # ARG SHED_EXT_VERSION (used by the extensions/full variants) via
+        # the now-supported --build-arg passthrough on `shed image build`.
+        extra_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
+    fi
+
+    # SHED_INSTALL_SHA busts BuildKit's bind-mount stat cache when the staged
+    # agent/service files change (see firecracker/Dockerfile + #227). Computed
+    # once into $INSTALL_SHA after build_prereqs staged the inputs (below).
+    extra_args+=(--build-arg "SHED_INSTALL_SHA=$INSTALL_SHA")
+
+    # The ref-index resolves `shed create --image <ref>` to a manifest, so the
+    # built image MUST be recorded under the ref the server is configured for.
+    # Honor SHED_SOURCE_REF (parallel-dev points it at image_aliases.base);
+    # otherwise derive the release ref from `shed version`. Without this the FC
+    # build records `shed-fc-<variant>:latest`, which `--image base` can't
+    # resolve (mirrors build-vz-rootfs.sh).
+    local source_ref
+    if [ -n "${SHED_SOURCE_REF:-}" ]; then
+        source_ref="$SHED_SOURCE_REF"
+    else
+        local version
+        version="$("$PROJECT_ROOT/bin/shed" version 2>/dev/null | awk '{print $2}')"
+        version="${version:-dev}"
+        source_ref="ghcr.io/charliek/shed-fc-${variant}:${version}"
+    fi
 
     "$PROJECT_ROOT/bin/shed" image build \
         --target "$docker_target" \
         -n "$variant" \
         --initramfs "$SHED_INITRD" \
         --output-dir "$OUTPUT_DIR" \
+        --source-ref "$source_ref" \
         -f "$FIRECRACKER_DIR/Dockerfile" \
         "${extra_args[@]}" \
-        "$FIRECRACKER_DIR"
+        "$FIRECRACKER_DIR" || return $?
+
+    # Helpful pointer so server config can be aligned. Important: if
+    # server.yaml's images.<variant> doesn't match this source-ref,
+    # `shed create --image <variant>` will fall through to a registry
+    # pull and OVERWRITE this manifest. (Mirrors build-vz-rootfs.sh.)
+    echo "Tip: ensure ~/.config/shed/server.yaml has 'images.${variant}: $source_ref'"
 }
 
 # Main execution
@@ -199,6 +233,13 @@ echo "Output directory: $OUTPUT_DIR"
 # Build host prerequisites + shared shed-overlay initramfs once.
 build_prereqs
 build_shed_initrd
+
+# Content hash of the build context, computed ONCE after build_prereqs staged
+# the agent/service binaries. Injected as --build-arg SHED_INSTALL_SHA per
+# variant to bust BuildKit's content-blind bind-mount cache (#227). Identical
+# across variants (the base stage installs them), so compute it here.
+INSTALL_SHA="$("$SCRIPT_DIR/install-input-sha.sh" "$FIRECRACKER_DIR")"
+echo "Install-SHA: $INSTALL_SHA"
 
 if [ "$BUILD_ALL" = true ]; then
     echo ""

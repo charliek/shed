@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
@@ -125,6 +128,109 @@ func TestImageBackendContextForHost(t *testing.T) {
 			}
 			if bc.NeedsInitrd != tt.wantInitrd {
 				t.Errorf("NeedsInitrd = %v, want %v", bc.NeedsInitrd, tt.wantInitrd)
+			}
+		})
+	}
+}
+
+// TestRecordBuiltImage is the #227 regression guard: a local `shed image build`
+// must populate the ref-index (not just the cosmetic tag), so a subsequent
+// `shed create --image <sourceRef>` — which resolves through RefIndexGet — sees
+// the freshly built manifest instead of a stale digest left by an earlier pull.
+// Before the fix, convertAndInstall called SetTag only, so the build was
+// invisible to create and the dev loop required a hand-edited refs/<hash>.json.
+func TestRecordBuiltImage(t *testing.T) {
+	imagesDir := t.TempDir()
+	const sourceRef = "ghcr.io/charliek/shed-vz-base:v9.9.9"
+	// recordBuiltImage doesn't hash blob bytes; RefIndexGet only requires the
+	// referenced blob to exist on disk, so stand in a dummy blob at the path for
+	// an arbitrary valid-hex digest.
+	digest := "sha256:" + strings.Repeat("a", 64)
+	blobPath, err := vmimage.BlobPath(imagesDir, digest)
+	if err != nil {
+		t.Fatalf("BlobPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
+		t.Fatalf("mkdir blobs: %v", err)
+	}
+	if err := os.WriteFile(blobPath, []byte("manifest"), 0o644); err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+
+	if err := recordBuiltImage(imagesDir, "base", sourceRef, digest); err != nil {
+		t.Fatalf("recordBuiltImage: %v", err)
+	}
+
+	got, ok := vmimage.RefIndexGet(imagesDir, sourceRef)
+	if !ok {
+		t.Fatal("RefIndexGet missed after recordBuiltImage — build did not write the ref-index (#227)")
+	}
+	if got != digest {
+		t.Errorf("RefIndexGet = %q, want %q", got, digest)
+	}
+
+	// The cosmetic tag must still advance (pre-existing behavior preserved).
+	tag, err := vmimage.GetTag(imagesDir, "base")
+	if err != nil {
+		t.Fatalf("GetTag: %v", err)
+	}
+	if tag.Digest != digest {
+		t.Errorf("tag digest = %q, want %q", tag.Digest, digest)
+	}
+}
+
+// TestBuildxBuildArgs locks in the `docker buildx build` argv assembly — most
+// importantly the #227 --build-arg passthrough (used to inject SHED_INSTALL_SHA)
+// and the invariant that the build context is the LAST positional arg, which
+// buildx requires.
+func TestBuildxBuildArgs(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    string
+		buildArgs []string
+		want      []string
+	}{
+		{
+			name:      "no target, no build-args",
+			target:    "",
+			buildArgs: nil,
+			want: []string{
+				"buildx", "build", "--platform", "linux/arm64",
+				"--output", "type=oci,dest=/tmp/out.tar",
+				"-f", "vz/Dockerfile",
+				"ctx",
+			},
+		},
+		{
+			name:      "target + multiple build-args, context stays last",
+			target:    "shed-vz-base",
+			buildArgs: []string{"SHED_INSTALL_SHA=abc123", "FOO=bar"},
+			want: []string{
+				"buildx", "build", "--platform", "linux/arm64",
+				"--output", "type=oci,dest=/tmp/out.tar",
+				"-f", "vz/Dockerfile",
+				"--target", "shed-vz-base",
+				"--build-arg", "SHED_INSTALL_SHA=abc123",
+				"--build-arg", "FOO=bar",
+				"ctx",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildxBuildArgs("linux/arm64", "/tmp/out.tar", "vz/Dockerfile", tt.target, "ctx", tt.buildArgs)
+			if len(got) != len(tt.want) {
+				t.Fatalf("argv = %v (len %d), want %v (len %d)", got, len(got), tt.want, len(tt.want))
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("argv[%d] = %q, want %q (full: %v)", i, got[i], tt.want[i], got)
+				}
+			}
+			// The build context must always be the final element.
+			if got[len(got)-1] != "ctx" {
+				t.Errorf("build context not last: %v", got)
 			}
 		})
 	}
