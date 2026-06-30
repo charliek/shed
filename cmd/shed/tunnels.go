@@ -292,6 +292,10 @@ func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.C
 	defer stop()
 	<-ctx.Done()
 
+	// Restore default signal handling before draining, so a second Ctrl+C
+	// force-quits instead of being swallowed if a connection is slow to close.
+	stop()
+
 	fmt.Println("\nStopping tunnels...")
 	for _, t := range activeTunnels {
 		t.Stop()

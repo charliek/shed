@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/charliek/shed/internal/vmutil"
 )
@@ -76,16 +77,82 @@ func (t *Tunnel) handleConn(clientConn net.Conn) {
 	}
 	defer vmConn.Close()
 
+	// If Stop() raced this dial and already cancelled, don't start copying.
+	if t.ctx.Err() != nil {
+		return
+	}
+
+	// Stop() only cancels the context; BidirectionalCopy blocks on io.Copy and
+	// never watches it, so without help an idle-but-open connection would wedge
+	// Stop()'s wg.Wait() forever. Close both conns when the tunnel is stopping
+	// so both copies return. net.Conn.Close is idempotent, so the deferred
+	// closes above are safe to run again.
+	defer closeConnsOnCancel(t.ctx, clientConn, vmConn)()
+
 	vmutil.BidirectionalCopy(clientConn, vmConn)
 }
 
-// Stop stops the tunnel, closing the listener and waiting for connections to drain.
+// closeConnsOnCancel closes conns if ctx is cancelled before the returned stop
+// func runs, so a blocking read/write (which doesn't watch the context) is
+// unblocked on teardown. The caller defers stop() to end the watcher once the
+// operation it guards completes.
+//
+// stop is idempotent and synchronous: it returns only after the watcher has
+// exited, and the watcher prefers the stop signal when both fire at once, so
+// once stop() returns the conns are guaranteed safe from this watcher (e.g. a
+// conn handed back by Dial can't be closed out from under the caller).
+func closeConnsOnCancel(ctx context.Context, conns ...net.Conn) (stop func()) {
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			// stop() may have raced the cancellation; if so, don't close conns
+			// the caller has already reclaimed.
+			select {
+			case <-done:
+				return
+			default:
+			}
+			for _, c := range conns {
+				_ = c.Close()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-exited
+	}
+}
+
+// stopDrainTimeout bounds how long Stop() waits for in-flight connections to
+// drain before giving up. Closing the conns (see handleConn) normally unblocks
+// the copies immediately; this is a backstop so a latent edge case can never
+// reintroduce the hang this fix removes.
+const stopDrainTimeout = 5 * time.Second
+
+// Stop stops the tunnel, closing the listener and waiting for connections to
+// drain (bounded by stopDrainTimeout).
 func (t *Tunnel) Stop() {
 	t.cancel()
 	if t.listener != nil {
 		t.listener.Close()
 	}
-	t.wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(stopDrainTimeout):
+		log.Printf("tunnel %d: timed out waiting for connections to drain", t.port.Local)
+	}
 }
 
 // LocalAddr returns the local listener address, or nil if not started.
