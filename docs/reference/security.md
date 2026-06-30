@@ -50,7 +50,7 @@ auth:
       - ssh-ed25519 AAAA... laptop
     authorized_keys_file: ~/.shed/authorized_keys
     github_refresh: 1h       # re-fetch GitHub keys on this interval
-    max_auth_tries: 6        # public-key attempts per connection
+    max_auth_tries: 10       # public-key attempts per connection (raise for many-key agents)
 ```
 
 | Mode | Behavior |
