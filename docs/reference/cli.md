@@ -791,6 +791,17 @@ This is the same model Docker, devcontainers, Codespaces, and Coder follow on th
 
 **Raw SSH gets the full shell.** If you connect with raw `ssh shed-name 'cmd | pipe'` (the path Zed Remote-SSH, VS Code Remote-SSH, JetBrains Gateway, and `rsync` take), the SSH server runs your command string through `bash -lc <raw>` — so the pipe runs as a shell pipeline on the shed, exactly like a normal dev VM. The `shed exec` CLI is the path that preserves argv literally; raw SSH is the path that runs a shell.
 
+**Disconnect behavior.** When the connection drops (you Ctrl-C the client, the network drops, your laptop sleeps), the command is terminated — the agent sends `SIGHUP` to the command's process group, matching standard SSH/terminal "connection hung up" semantics. To keep a long task running across disconnects, detach it from the session with **`tmux`** (baked into the shed image) or **`nohup`**:
+
+```bash
+# Survives a disconnect — runs in a detached tmux session
+shed exec codelens -- tmux new-session -d -s build './build.sh'
+# …or with nohup
+shed exec codelens -- bash -c 'nohup ./build.sh >build.log 2>&1 &'
+```
+
+These detach the work into its own session/process group, so the `SIGHUP` to the foreground command never reaches it. Reattach later with `shed attach codelens --session build` (tmux) or just re-read the log.
+
 **Examples:**
 
 ```bash

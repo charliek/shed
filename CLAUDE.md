@@ -38,6 +38,8 @@ The suite is **parameterized over `["vz", "fc"]`** and skips cleanly when a back
 
 **FC live tests require the remote `shed-server` to emit `PhaseTimer` log lines** (added in v0.5.4 via PR #118). Two tests (`test_phase_timer_emitted[fc]`, `test_create_agent_p50[fc]`) skip cleanly with a clear message if the remote is older — the other tests work against any shed-server version. Once the remote upgrades to v0.5.4+, the suite picks up the FC tests automatically with no config change.
 
+> **In-VM agent (`cmd/shed-agent`) changes have an extra trap:** the agent is baked into the rootfs **image**, not the host `shed-server`, so `make test-integration-dev` (which only restarts the dev *server*) does **not** pick up agent changes — you must rebuild the rootfs into the dev image store. The in-repo skill **`.claude/skills/testing-vm-agent-changes`** documents that loop end-to-end (codesign, build-tools/BuildKit-cache/ref-index gremlins, running the linux-only agent unit tests via Docker, and verifying the VM is running *your* agent). Read it before validating an agent change, and **update it whenever you hit a new rough edge**.
+
 #### Server-side changes — parallel dev server
 
 `make test-integration` runs against whatever `shed-server` binary is currently **installed** on the host (brew on Mac, deb on Linux), not the source tree you're editing. A server-side-only change (orchestrator, lifecycle internals, backend handlers with no CLI-visible signature change) can pass `make test-integration` without ever executing the new code path — the installed binary is still the OLD one.
