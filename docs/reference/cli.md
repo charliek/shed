@@ -949,8 +949,13 @@ shed tunnels start <shed> [flags]
 |------|-------|---------|-------------|
 | `--profile` | `-p` | None | Use tunnel profile |
 | `--tunnel` | `-t` | None | Port mapping (local:remote) |
-| `--background` | `-d` | `false` | Run in background |
+| `--background` | `-d` | `false` | Detach and run as a background daemon |
 | `--replace` | | `false` | Replace existing tunnel without prompting |
+
+Without `-d`, runs in the foreground (`Ctrl+C` to stop). With `-d`, detaches
+into a daemon that outlives the terminal and returns your shell once the tunnels
+are listening; manage it with `shed tunnels list` / `shed tunnels stop`. See
+[Tunnels › Background Mode](tunnels.md#background-mode) for details.
 
 **Examples:**
 

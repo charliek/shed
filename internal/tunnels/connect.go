@@ -44,6 +44,13 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 		return nil, err
 	}
 
+	// The upgrade write + http.ReadResponse below don't honor ctx on their own,
+	// so a server that accepts the connection but never sends 101 would block
+	// forever — wedging Tunnel.Stop(). Close the conn if ctx is cancelled during
+	// the handshake.
+	stopWatch := closeConnsOnCancel(ctx, conn)
+	defer stopWatch()
+
 	// Send the HTTP upgrade request (over TLS when c.dial wrapped the conn).
 	path := fmt.Sprintf("/api/sheds/%s/connect/%d", shedName, port)
 	var req strings.Builder
@@ -54,6 +61,9 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	req.WriteString("\r\n")
 	if _, err := conn.Write([]byte(req.String())); err != nil {
 		conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr // watcher closed conn on cancel; report cancellation, not a write error
+		}
 		return nil, fmt.Errorf("send upgrade request: %w", err)
 	}
 
@@ -62,6 +72,9 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
 		conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr // watcher closed conn on cancel; report cancellation, not a read error
+		}
 		return nil, fmt.Errorf("read upgrade response: %w", err)
 	}
 
@@ -71,6 +84,15 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 		}
 		conn.Close()
 		return nil, fmt.Errorf("connect API returned HTTP %d (expected 101)", resp.StatusCode)
+	}
+
+	// Stop the cancel-watcher before handing the conn back so it can't close the
+	// conn we return; if ctx was cancelled mid-handshake, fail instead of
+	// returning a conn the watcher may already have closed.
+	stopWatch()
+	if ctx.Err() != nil {
+		conn.Close()
+		return nil, ctx.Err()
 	}
 
 	return &vmutil.BufferedConn{Conn: conn, Reader: reader}, nil

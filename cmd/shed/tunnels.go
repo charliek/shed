@@ -52,6 +52,7 @@ var (
 	tunnelProfiles   []string
 	tunnelPorts      []string
 	tunnelBackground bool
+	tunnelDaemon     bool
 	tunnelReplace    bool
 	tunnelStopAll    bool
 )
@@ -131,6 +132,11 @@ func init() {
 	tunnelsStartCmd.Flags().StringArrayVarP(&tunnelPorts, "tunnel", "t", nil, "Explicit tunnel - \"3000\" or \"3001:3000\" (repeatable)")
 	tunnelsStartCmd.Flags().BoolVarP(&tunnelBackground, "background", "d", false, "Run as background daemon")
 	tunnelsStartCmd.Flags().BoolVar(&tunnelReplace, "replace", false, "Replace existing tunnel without prompting")
+	// --daemon is the internal re-exec marker: the detached worker spawned by -d.
+	// Users never set it directly; it tells runTunnelsStart to be the worker
+	// rather than fork another one.
+	tunnelsStartCmd.Flags().BoolVar(&tunnelDaemon, "daemon", false, "internal: run as the detached daemon worker")
+	_ = tunnelsStartCmd.Flags().MarkHidden("daemon")
 
 	tunnelsStopCmd.Flags().BoolVar(&tunnelStopAll, "all", false, "Stop all tunnels")
 
@@ -215,32 +221,35 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to clean up dead tunnels: %v\n", err)
 	}
 
-	// Check for existing tunnel
-	if existingEntry, ok := mgr.State().GetTunnel(shedName); ok {
-		alive, err := mgr.CheckHealth(shedName)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to check tunnel health: %v\n", err)
-		}
-		if alive {
-			if !tunnelReplace {
-				if jsonFlag {
-					return fmt.Errorf("tunnel already running for %s; use --replace with --json", shedName)
-				}
-				fmt.Printf("Tunnel already running for %s (profile: %s, PID %d).\n",
-					shedName, existingEntry.Profile, existingEntry.PID)
-				if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
-					return fmt.Errorf("tunnel already running for %s; use --replace in non-interactive mode", shedName)
-				}
-				if !confirmAction("Replace? [y/N] ") {
-					fmt.Println("Cancelled.")
-					return nil
-				}
+	// Check for existing tunnel. Skipped for the detached worker: the parent
+	// already handled replacement, and the worker has no stdin to prompt on.
+	if !tunnelDaemon {
+		if existingEntry, ok := mgr.State().GetTunnel(shedName); ok {
+			alive, err := mgr.CheckHealth(shedName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to check tunnel health: %v\n", err)
 			}
-			if !jsonFlag {
-				fmt.Println("Stopping existing tunnel...")
-			}
-			if err := mgr.Stop(shedName); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to stop existing tunnel: %v\n", err)
+			if alive {
+				if !tunnelReplace {
+					if jsonFlag {
+						return fmt.Errorf("tunnel already running for %s; use --replace with --json", shedName)
+					}
+					fmt.Printf("Tunnel already running for %s (profile: %s, PID %d).\n",
+						shedName, existingEntry.Profile, existingEntry.PID)
+					if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+						return fmt.Errorf("tunnel already running for %s; use --replace in non-interactive mode", shedName)
+					}
+					if !confirmAction("Replace? [y/N] ") {
+						fmt.Println("Cancelled.")
+						return nil
+					}
+				}
+				if !jsonFlag {
+					fmt.Println("Stopping existing tunnel...")
+				}
+				if err := mgr.Stop(shedName); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to stop existing tunnel: %v\n", err)
+				}
 			}
 		}
 	}
@@ -258,20 +267,26 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Resolve how to reach the Connect API: pinned TLS + credentials token when
-	// the entry has an https api_url, else the legacy plain-TCP dial.
+	// the entry has an https api_url, else the legacy plain-TCP dial. Done here
+	// (before the daemon fork) so a misconfigured target fails in the user's
+	// terminal; the detached worker re-resolves it from config itself, keeping
+	// the credentials token off its command line.
 	target, err := connectTargetFromEntry(entry)
 	if err != nil {
 		return err
 	}
 
-	if tunnelBackground {
-		// Start tunnels, save state, and stay alive as a daemon process.
-		// Re-exec ourselves with a --daemon flag to detach from the terminal.
-		return startBackgroundTunnel(mgr, shedName, serverName, target, allPorts, profileName)
+	switch {
+	case tunnelBackground && !tunnelDaemon:
+		// Parent: re-exec a detached worker, wait for it to start, then return.
+		return spawnTunnelDaemon(shedName, allPorts)
+	case tunnelDaemon:
+		// Detached worker: start tunnels, report readiness, block on signal.
+		return runDaemonWorker(mgr, shedName, serverName, target, allPorts, profileName)
+	default:
+		// Foreground mode: start tunnels and block on signal.
+		return runForegroundTunnel(mgr, shedName, target, allPorts, profileName)
 	}
-
-	// Foreground mode: start tunnels and block on signal.
-	return runForegroundTunnel(mgr, shedName, target, allPorts, profileName)
 }
 
 func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, ports []tunnels.PortMapping, profile string) error {
@@ -292,48 +307,14 @@ func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.C
 	defer stop()
 	<-ctx.Done()
 
+	// Restore default signal handling before draining, so a second Ctrl+C
+	// force-quits instead of being swallowed if a connection is slow to close.
+	stop()
+
 	fmt.Println("\nStopping tunnels...")
 	for _, t := range activeTunnels {
 		t.Stop()
 	}
-
-	return nil
-}
-
-func startBackgroundTunnel(mgr *tunnels.Manager, shedName, serverName string, target tunnels.ConnectTarget, ports []tunnels.PortMapping, profile string) error {
-	// Start the tunnels in this process.
-	activeTunnels, err := mgr.StartTunnels(target, shedName, ports)
-	if err != nil {
-		return fmt.Errorf("failed to start tunnels: %w", err)
-	}
-
-	// Save state with our own PID so stop/list can find us.
-	if err := mgr.SaveBackground(shedName, serverName, profile, os.Getpid(), ports); err != nil {
-		for _, t := range activeTunnels {
-			t.Stop()
-		}
-		return fmt.Errorf("failed to save tunnel state: %w", err)
-	}
-
-	// The tunnel daemon keeps this process alive. The PID is saved to state
-	// so `shed tunnels stop` can send SIGTERM to tear it down.
-	// A future version could fork/detach for true daemonization.
-	printSuccess("Tunnel started for %s (profile: %s, PID %d)", shedName, profile, os.Getpid())
-	fmt.Println("Forwarding:")
-	for _, pm := range ports {
-		fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
-	}
-
-	// Block until signal (daemon behavior)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	<-ctx.Done()
-
-	for _, t := range activeTunnels {
-		t.Stop()
-	}
-	mgr.State().RemoveTunnel(shedName)
-	_ = mgr.State().Save()
 
 	return nil
 }
