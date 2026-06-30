@@ -299,36 +299,74 @@ class LocalServer:
         Gateway take. The `shed exec` CLI path is covered by
         `exec(...)` above; use *this* helper when you want to assert
         that shell metacharacters in the raw command actually fire on
-        the server side.
+        the server side. Connection params are resolved by `ssh_argv`.
+        """
+        return subprocess.run(
+            self.ssh_argv(name, raw_command),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
-        Resolves connection params (host, SSH port, known-hosts file)
-        via `shed --json server list` so we line up with whatever the
-        CLI would have used. Uses `~/.shed/known_hosts` with
-        StrictHostKeyChecking=yes when it exists (the file the CLI
-        populates at create-time); falls back to
-        StrictHostKeyChecking=no for fresh test environments. The
-        integration suite only ever talks to known-good test sheds, so
-        the fallback is safe.
+    def ssh_argv(self, name: str, raw_command: str) -> list[str]:
+        """Build the raw `ssh` argv for `name`'s shed running `raw_command`.
+
+        Shared by `ssh_exec` (text) and `ssh_exec_binary` (bytes), and
+        exposed so a test that drives the channel directly lines up with
+        the same connection params the CLI would have used.
+
+        Resolves connection params (host, SSH port, known-hosts file) via
+        the server entry (`_ssh_connect_params`). Uses `~/.shed/known_hosts`
+        with StrictHostKeyChecking=yes when it exists (the file the CLI
+        populates at create-time); falls back to StrictHostKeyChecking=no
+        for fresh test environments. The integration suite only ever talks
+        to known-good test sheds, so the fallback is safe.
+
+        Passes `-T` to force the non-PTY exec path regardless of the
+        client's `RequestTTY` config. These helpers drive `ssh host cmd`,
+        which is the channel shape Zed/VS Code/rsync use and the one issue
+        #222 concerns; a stray PTY would apply line-discipline translation
+        and corrupt a binary round-trip.
         """
         host, port, known_hosts = self._ssh_connect_params()
-        ssh_argv = [
+        argv = [
             "ssh",
+            "-T",
             "-p", str(port),
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
         ]
         if known_hosts is not None:
-            ssh_argv += [
+            argv += [
                 "-o", f"UserKnownHostsFile={known_hosts}",
                 "-o", "StrictHostKeyChecking=yes",
             ]
         else:
-            ssh_argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
-        ssh_argv += [f"{name}@{host}", raw_command]
+            argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+        argv += [f"{name}@{host}", raw_command]
+        return argv
+
+    def ssh_exec_binary(
+        self,
+        name: str,
+        raw_command: str,
+        input: bytes,
+        timeout: int = 60,
+    ) -> "subprocess.CompletedProcess[bytes]":
+        """Like `ssh_exec`, but pipes binary `input` to the remote command
+        and captures raw stdout BYTES (no text-mode newline translation).
+
+        This drives the non-PTY exec channel as an 8-bit-clean binary pipe
+        — the channel shape Zed Remote-SSH uses — so a test can assert
+        byte-perfect round-trips through the agent's framed protocol
+        (issue #222). `subprocess.run(input=...)` uses `communicate()`
+        under the hood, so it writes stdin, drains stdout/stderr, and
+        closes cleanly without deadlock; `timeout` bounds the whole call.
+        """
         return subprocess.run(
-            ssh_argv,
+            self.ssh_argv(name, raw_command),
+            input=input,
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
 
