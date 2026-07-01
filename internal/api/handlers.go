@@ -457,8 +457,11 @@ func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Detach the teardown from client cancellation (as the SSE path does): a
+	// non-streaming client or proxy must not be able to abort a destroy
+	// mid-cleanup — the backend kills the VM then does multi-step host cleanup.
 	timer := s.deleteTimer(name)
-	ctx := backend.ContextWithProgress(r.Context(), timer.Track)
+	ctx := backend.ContextWithProgress(context.WithoutCancel(r.Context()), timer.Track)
 	err := s.backend.DeleteShed(ctx, name)
 	log.Printf("timing: %s", timer.Finish(err))
 	if err != nil {

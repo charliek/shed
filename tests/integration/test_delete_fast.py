@@ -54,6 +54,10 @@ def test_delete_running_shed_is_fast(shed_server, test_shed_name):
         text=True,
         timeout=30,
     )
+    assert listing.returncode == 0, (
+        f"list failed (exit {listing.returncode}): "
+        f"stdout={listing.stdout!r} stderr={listing.stderr!r}"
+    )
     assert test_shed_name not in listing.stdout, (
         f"shed {test_shed_name} still present after delete:\n{listing.stdout}"
     )

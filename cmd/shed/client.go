@@ -594,20 +594,43 @@ func (c *APIClient) DeleteShedWithProgress(name string, onProgress func(backend.
 	ctx, cancel := context.WithTimeout(context.Background(), c.createTimeout)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/sheds/"+name, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Accept", "text/event-stream")
-	c.setAuth(httpReq)
-
+	// The streaming client (no client-level timeout, context deadline only)
+	// bypasses doRequest, so replicate its send + 401-refresh here. Rebuilding
+	// per send is fine — a DELETE has no body. Delete, unlike create, has no
+	// GetInfo pre-flight to refresh a stale bootstrap token, so this is the only
+	// place a mid-session token expiry gets re-minted.
 	client := c.newHTTPClient(0)
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+	send := func() (*http.Response, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/sheds/"+name, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
-		return fmt.Errorf("failed to connect to server: %w", err)
+		httpReq.Header.Set("Accept", "text/event-stream")
+		c.setAuth(httpReq)
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return nil, fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+			}
+			return nil, fmt.Errorf("failed to connect to server: %w", err)
+		}
+		return resp, nil
+	}
+
+	resp, err := send()
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && c.refreshFn != nil {
+		_ = resp.Body.Close()
+		tok, rerr := c.refreshFn()
+		if rerr != nil {
+			return fmt.Errorf("re-authenticating after 401: %w", rerr)
+		}
+		c.token = tok
+		if resp, err = send(); err != nil {
+			return err
+		}
 	}
 	defer resp.Body.Close()
 
