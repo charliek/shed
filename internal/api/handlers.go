@@ -210,7 +210,8 @@ func newProgressSink(r *http.Request, ch chan<- backend.ProgressEvent) backend.P
 
 // handleCreateShedSSE streams create progress as Server-Sent Events.
 func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req config.CreateShedRequest) {
-	s.streamSSE(w, r, r.Context(), s.createTimer(req), func(ctx context.Context) (any, error) {
+	timer := s.createTimer(req)
+	s.streamSSE(w, r, r.Context(), timer.Track, logTimingFinish(timer), func(ctx context.Context) (any, error) {
 		shed, err := s.backend.CreateShed(ctx, req)
 		if err != nil {
 			log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
@@ -227,9 +228,15 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 // client disconnect can't strand a half-torn-down shed. The progress sink is
 // always tied to the request, so a disconnected client simply stops receiving
 // events. work returns the payload for the terminal "complete" event (ignored
-// on error). (handlePullImageSSE predates this and still inlines the same
-// shape; it can adopt this helper too.)
-func (s *Server) streamSSE(w http.ResponseWriter, r *http.Request, baseCtx context.Context, timer *backend.PhaseTimer, work func(ctx context.Context) (any, error)) {
+// on error).
+//
+// track is an optional extra progress sink teed alongside the client stream
+// (create/delete pass timer.Track to record per-phase durations; pull passes
+// nil). onFinish, if non-nil, runs once with the operation's error after the
+// stream drains (create/delete log the timing summary via logTimingFinish; pull
+// passes nil and logs its own digest+duration inside work). Passing the resolved
+// sink + finalizer rather than a *PhaseTimer keeps this pump backend-agnostic.
+func (s *Server) streamSSE(w http.ResponseWriter, r *http.Request, baseCtx context.Context, track backend.ProgressFunc, onFinish func(error), work func(ctx context.Context) (any, error)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
@@ -244,10 +251,10 @@ func (s *Server) streamSSE(w http.ResponseWriter, r *http.Request, baseCtx conte
 	events := make(chan backend.ProgressEvent, sseProgressBuffer)
 	sseFn := newProgressSink(r, events)
 
-	// Tee the progress stream: the timer records per-phase durations server-side
-	// (logged below); sseFn forwards the human-readable messages to the client.
-	// Timing never goes on the wire.
-	ctx := backend.ContextWithProgress(baseCtx, backend.TeeProgress(timer.Track, sseFn))
+	// Tee the progress stream: track (when non-nil) records per-phase durations
+	// server-side; sseFn forwards the human-readable messages to the client.
+	// Timing never goes on the wire. TeeProgress drops a nil track.
+	ctx := backend.ContextWithProgress(baseCtx, backend.TeeProgress(track, sseFn))
 
 	type result struct {
 		payload any
@@ -282,7 +289,9 @@ drain:
 		}
 	}
 
-	log.Printf("timing: %s", timer.Finish(res.err))
+	if onFinish != nil {
+		onFinish(res.err)
+	}
 
 	if res.err != nil {
 		_, errCode, msg := mapBackendError(res.err)
@@ -291,6 +300,16 @@ drain:
 		writeSSEEvent(w, "complete", res.payload)
 	}
 	flusher.Flush()
+}
+
+// logTimingFinish returns a streamSSE onFinish callback that stops the timer and
+// logs the per-phase timing summary. Create/delete pass it; pull passes nil (it
+// has no PhaseTimer). The timer is captured non-nil at the call site, so no
+// nil-receiver method value ever reaches streamSSE.
+func logTimingFinish(timer *backend.PhaseTimer) func(error) {
+	return func(err error) {
+		log.Printf("timing: %s", timer.Finish(err))
+	}
 }
 
 // writeSSEEvent writes a single Server-Sent Event.
@@ -493,7 +512,8 @@ func (s *Server) handleDeleteShedSSE(w http.ResponseWriter, r *http.Request, nam
 	// lock-acquire wait and could expire before teardown even starts, skipping
 	// the sync.) Progress still flows — the sink unblocks on the request's own
 	// Done, so a disconnected client just stops receiving events.
-	s.streamSSE(w, r, context.WithoutCancel(r.Context()), s.deleteTimer(name), func(ctx context.Context) (any, error) {
+	timer := s.deleteTimer(name)
+	s.streamSSE(w, r, context.WithoutCancel(r.Context()), timer.Track, logTimingFinish(timer), func(ctx context.Context) (any, error) {
 		// Delete has no resource to return; a benign payload keeps the terminal
 		// event shape consistent with create/pull. The client ignores it.
 		return map[string]string{"name": name}, s.backend.DeleteShed(ctx, name)
@@ -880,64 +900,20 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 
 // handlePullImageSSE streams pull progress as Server-Sent Events. The backend
 // already emits per-stage progress into the context via backend.Phase/Status
-// (see internal/vz/image.go, internal/firecracker/image.go), so we only need
-// to install a progress sink and forward the human-readable messages.
+// (see internal/vz/image.go, internal/firecracker/image.go); this delegates the
+// streaming to streamSSE with no timing tee/finalizer (nil, nil) — pull has no
+// PhaseTimer and times itself, keeping its own digest+duration log lines.
 func (s *Server) handlePullImageSSE(w http.ResponseWriter, r *http.Request, req config.ImagePullRequest) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	start := time.Now()
-	events := make(chan backend.ProgressEvent, sseProgressBuffer)
-	sseFn := newProgressSink(r, events)
-	ctx := backend.ContextWithProgress(r.Context(), sseFn)
-
-	type pullResult struct {
-		digest string
-		err    error
-	}
-	done := make(chan pullResult, 1)
-	go func() {
+	s.streamSSE(w, r, r.Context(), nil, nil, func(ctx context.Context) (any, error) {
+		start := time.Now()
 		digest, err := s.backend.PullImage(ctx, req.DockerRef, req.Tag, req.Platform, req.WithLayers)
-		done <- pullResult{digest, err}
-	}()
-
-	var res pullResult
-	for streaming := true; streaming; {
-		select {
-		case event := <-events:
-			writeSSEEvent(w, "progress", event)
-			flusher.Flush()
-		case res = <-done:
-			streaming = false
+		if err != nil {
+			log.Printf("PullImage failed for %q after %s: %v", req.DockerRef, time.Since(start).Round(time.Millisecond), err)
+			return nil, err
 		}
-	}
-drain:
-	for {
-		select {
-		case event := <-events:
-			writeSSEEvent(w, "progress", event)
-			flusher.Flush()
-		default:
-			break drain
-		}
-	}
-
-	if res.err != nil {
-		log.Printf("PullImage failed for %q after %s: %v", req.DockerRef, time.Since(start).Round(time.Millisecond), res.err)
-		_, errCode, msg := mapBackendError(res.err)
-		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
-	} else {
-		log.Printf("PullImage %q -> %s in %s", req.DockerRef, vmimage.ShortDigest(res.digest), time.Since(start).Round(time.Millisecond))
-		writeSSEEvent(w, "complete", config.ImagePullResponse{Tag: req.Tag, Digest: res.digest})
-	}
-	flusher.Flush()
+		log.Printf("PullImage %q -> %s in %s", req.DockerRef, vmimage.ShortDigest(digest), time.Since(start).Round(time.Millisecond))
+		return config.ImagePullResponse{Tag: req.Tag, Digest: digest}, nil
+	})
 }
 
 // handlePushImage uploads the manifest held by the named tag (or by a
