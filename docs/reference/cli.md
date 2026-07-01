@@ -791,6 +791,8 @@ This is the same model Docker, devcontainers, Codespaces, and Coder follow on th
 
 **Raw SSH gets the full shell.** If you connect with raw `ssh shed-name 'cmd | pipe'` (the path Zed Remote-SSH, VS Code Remote-SSH, JetBrains Gateway, and `rsync` take), the SSH server runs your command string through `bash -lc <raw>` — so the pipe runs as a shell pipeline on the shed, exactly like a normal dev VM. The `shed exec` CLI is the path that preserves argv literally; raw SSH is the path that runs a shell.
 
+**stdout and stderr.** On a **non-PTY** channel (raw `ssh -T`, Zed Remote-SSH, SFTP/`scp`, `rsync`), the command's stdout and stderr are delivered on **separate** SSH streams, matching OpenSSH — so a binary stdout protocol (Zed's length-prefixed pipe, the SFTP subsystem) is never corrupted by diagnostics written to stderr. On an **interactive PTY** channel — an interactive login, `shed console`, and the `shed exec` CLI (which always passes `ssh -t`, so OpenSSH allocates a PTY whenever your stdin is a terminal) — stdout and stderr are **merged** into the single terminal stream, exactly as a real terminal does. To capture them separately from a script, use raw `ssh -T shed-name 'cmd'`.
+
 **Disconnect behavior.** When the connection drops (you Ctrl-C the client, the network drops, your laptop sleeps), the command is terminated — the agent sends `SIGHUP` to the command's process group, matching standard SSH/terminal "connection hung up" semantics. To keep a long task running across disconnects, detach it from the session with **`tmux`** (baked into the shed image) or **`nohup`**:
 
 ```bash

@@ -77,3 +77,43 @@ def test_binary_roundtrip_all_byte_values(shed_server, test_shed_name):
         f"binary round-trip corrupted across the full byte range: "
         f"got {len(r.stdout)} bytes, sent {len(payload)}"
     )
+
+
+def test_binary_stdout_survives_stderr(shed_server, test_shed_name):
+    """Binary stdout stays byte-perfect when the command also writes to stderr.
+
+    This is the Zed Remote-SSH failure shape: the remote process speaks a binary
+    protocol on stdout (Zed's length-prefixed protobuf) and also emits diagnostic
+    text on stderr (the zed-remote-server's JSON logs). The agent used to FOLD
+    stderr into stdout, injecting those log bytes into the binary stream and
+    desyncing Zed's framing (readiness timed out). With stderr on its own
+    MsgTypeStderr frame, stdout must be byte-identical to the input and the stderr
+    text must arrive on the separate stderr channel. (The command writes stderr
+    before and after the `cat`, not strictly interleaved with stdout, which is
+    still sufficient to catch the fold — any folded byte corrupts stdout.)
+
+    Like test_exec_stderr.py, this asserts the NEW baked agent: run against a
+    rootfs rebuilt with the stderr-separation change, not a bare
+    `make test-integration-dev` (which restarts only the dev server).
+    """
+    shed_server.create(test_shed_name, image="base")
+
+    # Every byte value (incl. '{' 0x7b, the byte Zed misreads as a length) so a
+    # single folded stderr byte would both corrupt and lengthen stdout.
+    payload = bytes(range(256)) * 4096  # 1 MiB
+    # Emit stderr diagnostics around the binary echo; the old folding agent would
+    # have spliced these bytes into stdout.
+    cmd = "printf 'log-before\\n' >&2; cat; printf 'log-after\\n' >&2"
+
+    r = shed_server.ssh_exec_binary(test_shed_name, cmd, input=payload, timeout=60)
+    assert r.returncode == 0, f"exit={r.returncode} stderr={r.stderr[:200]!r}"
+    assert r.stdout == payload, (
+        f"binary stdout corrupted by concurrent stderr (fold regression): "
+        f"got {len(r.stdout)} bytes, sent {len(payload)}"
+    )
+    assert b"log-before" in r.stderr and b"log-after" in r.stderr, (
+        f"stderr diagnostics missing from the stderr channel: {r.stderr[:200]!r}"
+    )
+    # (No need to also assert the log markers are absent from stdout: the exact
+    # `stdout == payload` check above already proves stdout is byte-identical to
+    # the monotonic-mod-256 input, which cannot contain those substrings.)
