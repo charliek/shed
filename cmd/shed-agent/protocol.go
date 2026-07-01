@@ -18,6 +18,7 @@ const (
 	MsgTypeExitCode      = agentproto.MsgTypeExitCode
 	MsgTypeData          = agentproto.MsgTypeData
 	MsgTypeStdinEOF      = agentproto.MsgTypeStdinEOF
+	MsgTypeStderr        = agentproto.MsgTypeStderr
 	MsgTypePluginMessage = agentproto.MsgTypePluginMessage
 )
 

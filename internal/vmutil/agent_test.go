@@ -615,3 +615,69 @@ func TestExecWorkingDir(t *testing.T) {
 		t.Errorf("custom WorkingDir = %q, want %q", receivedReq.WorkingDir, "/tmp")
 	}
 }
+
+// routingHandler (server side) emits a stdout frame, a stderr frame, an
+// unknown/future frame type, another stdout frame, then exit 0. Used to assert
+// AgentClient.Exec's output demux routes MsgTypeData→Stdout, MsgTypeStderr→Stderr,
+// and ignores unknown frames (rather than dumping them onto the stdout stream,
+// which would re-open the issue #222 binary-stdout corruption).
+func routingHandler(conn net.Conn) {
+	defer conn.Close()
+	if mt, _, err := agentproto.ReadMessage(conn); err != nil || mt != agentproto.MsgTypeExecRequest {
+		return
+	}
+	agentproto.ReadMessage(conn) // stdin EOF
+	agentproto.WriteData(conn, []byte("out-1"))
+	agentproto.WriteStderr(conn, []byte("err-1"))
+	agentproto.WriteMessage(conn, 0x08, []byte("UNKNOWN")) // unknown/future type: host must ignore
+	agentproto.WriteData(conn, []byte("out-2"))
+	agentproto.WriteExitCode(conn, 0)
+}
+
+// TestExecRoutesStderrSeparately: with distinct Stdout/Stderr writers, stdout
+// frames land on Stdout, stderr frames on Stderr, and an unknown frame is ignored.
+func TestExecRoutesStderrSeparately(t *testing.T) {
+	client := NewAgentClient(&pipeDialer{handler: routingHandler}, 1024, 1026)
+
+	var stdout, stderr strings.Builder
+	opts := backend.ExecOptions{
+		Cmd:    []string{"cmd"},
+		Stdout: NopWriteCloser(&stdout),
+		Stderr: NopWriteCloser(&stderr),
+	}
+	if err := client.Exec(context.Background(), opts); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	if stdout.String() != "out-1out-2" {
+		t.Errorf("stdout = %q, want %q", stdout.String(), "out-1out-2")
+	}
+	if stderr.String() != "err-1" {
+		t.Errorf("stderr = %q, want %q", stderr.String(), "err-1")
+	}
+	if strings.Contains(stdout.String(), "err-1") {
+		t.Error("stderr leaked into stdout (fold regression)")
+	}
+	if strings.Contains(stdout.String(), "UNKNOWN") || strings.Contains(stderr.String(), "UNKNOWN") {
+		t.Error("unknown frame type must be ignored, not written to stdout/stderr")
+	}
+}
+
+// TestExecFoldsStderrWhenNilStderr: back-compat for callers that set only Stdout
+// (e.g. ListSessions) — stderr folds into Stdout so combined output is preserved.
+func TestExecFoldsStderrWhenNilStderr(t *testing.T) {
+	client := NewAgentClient(&pipeDialer{handler: routingHandler}, 1024, 1026)
+
+	var stdout strings.Builder
+	opts := backend.ExecOptions{
+		Cmd:    []string{"cmd"},
+		Stdout: NopWriteCloser(&stdout),
+		// Stderr nil → fold into Stdout.
+	}
+	if err := client.Exec(context.Background(), opts); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	// Frames arrive in order out-1, err-1(folded), out-2 (unknown ignored).
+	if stdout.String() != "out-1err-1out-2" {
+		t.Errorf("folded stdout = %q, want %q", stdout.String(), "out-1err-1out-2")
+	}
+}

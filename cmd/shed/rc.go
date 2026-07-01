@@ -105,8 +105,9 @@ func baseSSHArgs(shedName string, entry *config.ServerEntry, extraOpts ...string
 // "shed-ext-rc","list" need no quoting.
 func sshCaptureArgs(shedName string, entry *config.ServerEntry, remoteArgv ...string) []string {
 	// -T disables PTY allocation so ssh doesn't print "Pseudo-terminal will not be
-	// allocated…" to our captured stderr (the shed's sshd folds the remote command's
-	// stderr into the stdout channel, so command diagnostics arrive on stdout anyway).
+	// allocated…" to our captured stderr, and so the non-PTY exec channel keeps the
+	// remote command's stdout and stderr on their own SSH streams (guest-binary
+	// diagnostics arrive on stderr; see the fallback in rcListOverSSH).
 	args := baseSSHArgs(shedName, entry, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 	args = append(args, "--")
 	return append(args, remoteArgv...)
@@ -222,9 +223,10 @@ func sshShell(ctx context.Context, shedName string, entry *config.ServerEntry, s
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		// The shed's sshd folds the remote command's stderr into stdout, so prefer
-		// stderr but fall back to stdout for the diagnostic (e.g. a guest binary's
-		// "flag provided but not defined: …" arrives on stdout).
+		// Prefer stderr for the diagnostic (e.g. a guest binary's "flag provided but
+		// not defined: …"), falling back to stdout. The non-PTY exec channel now
+		// keeps stderr on its own stream, but older baked agents still fold it into
+		// stdout, so the fallback covers both.
 		detail := strings.TrimSpace(errb.String())
 		if detail == "" {
 			detail = strings.TrimSpace(out.String())

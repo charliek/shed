@@ -8,6 +8,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"net"
+	"os/exec"
+	"sync"
 	"testing"
 	"time"
 )
@@ -285,4 +287,103 @@ func TestPumpClientMessages(t *testing.T) {
 			t.Fatal("onDisconnect fired on the teardown read deadline (should only fire on host close)")
 		}
 	})
+}
+
+// readOutputFrames reads framed output messages from c, folding MsgTypeData into
+// gotData and MsgTypeStderr into gotStderr, until the exit-code frame (or a read
+// error/EOF for callers that close the conn without one). Unexpected non-output
+// frame types fail the test.
+func readOutputFrames(t *testing.T, c net.Conn) (gotData, gotStderr []byte) {
+	t.Helper()
+	var data, stderr bytes.Buffer
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		mt, payload, err := readMessage(c)
+		if err != nil {
+			break
+		}
+		switch mt {
+		case MsgTypeData:
+			data.Write(payload)
+		case MsgTypeStderr:
+			stderr.Write(payload)
+		case MsgTypeExitCode:
+			return data.Bytes(), stderr.Bytes()
+		default:
+			t.Errorf("unexpected frame type 0x%02x on output channel", mt)
+		}
+	}
+	return data.Bytes(), stderr.Bytes()
+}
+
+// TestCopyToConnTagsStreams is the deterministic guard: the shared output copier
+// frames stdout chunks as MsgTypeData and stderr chunks as MsgTypeStderr, and no
+// stderr byte ever lands in a MsgTypeData frame. This is the separation that
+// keeps a binary stdout protocol (Zed Remote-SSH, SFTP) uncorrupted by
+// interleaved stderr (issue #222 follow-on). It drives the writer directly (no
+// process), so it can't flake on scheduling and asserts by frame type, not order.
+func TestCopyToConnTagsStreams(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+
+	w := &connWriter{conn: s, disconnect: func() {}}
+	stdoutPayload := []byte("stdout-bytes-0123456789")
+	stderrPayload := []byte("STDERR-bytes-abcdefghij")
+
+	// Two concurrent copiers serialized by connWriter, exactly like runWithoutPTY.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); copyToConn(w, bytes.NewReader(stdoutPayload), "stdout", MsgTypeData) }()
+	go func() { defer wg.Done(); copyToConn(w, bytes.NewReader(stderrPayload), "stderr", MsgTypeStderr) }()
+	go func() { wg.Wait(); _ = s.Close() }()
+
+	gotData, gotStderr := readOutputFrames(t, c)
+	if !bytes.Equal(gotData, stdoutPayload) {
+		t.Errorf("MsgTypeData stream = %q, want %q", gotData, stdoutPayload)
+	}
+	if !bytes.Equal(gotStderr, stderrPayload) {
+		t.Errorf("MsgTypeStderr stream = %q, want %q", gotStderr, stderrPayload)
+	}
+	if bytes.Contains(gotData, stderrPayload) {
+		t.Error("stderr bytes leaked into the MsgTypeData (stdout) stream — fold regression")
+	}
+}
+
+// TestRunWithoutPTYSeparatesStderr drives the real non-PTY handler with a command
+// that writes to both streams and asserts stdout arrives as MsgTypeData and
+// stderr as MsgTypeStderr — asserted by frame TYPE (not interleave order), read
+// until the exit-code frame.
+func TestRunWithoutPTYSeparatesStderr(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+
+	cmd := exec.Command("sh", "-c", "printf OUT; printf ERR 1>&2")
+	go runWithoutPTY(s, cmd)
+
+	gotData, gotStderr := readOutputFrames(t, c)
+	if string(gotData) != "OUT" {
+		t.Errorf("stdout (MsgTypeData) = %q, want %q", gotData, "OUT")
+	}
+	if string(gotStderr) != "ERR" {
+		t.Errorf("stderr (MsgTypeStderr) = %q, want %q", gotStderr, "ERR")
+	}
+	if bytes.Contains(gotData, []byte("ERR")) {
+		t.Error("stderr leaked into the stdout stream (fold regression)")
+	}
+}
+
+// TestRunWithPTYNoStderrFrames asserts the PTY path never emits a MsgTypeStderr
+// frame: a pty master is a single merged stream (stdout+stderr), correctly framed
+// as MsgTypeData. Exact PTY text is intentionally not asserted (the path may drop
+// a small tail on close).
+func TestRunWithPTYNoStderrFrames(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+
+	cmd := exec.Command("sh", "-c", "printf OUT; printf ERR 1>&2")
+	go runWithPTY(s, cmd, 24, 80)
+
+	if _, gotStderr := readOutputFrames(t, c); len(gotStderr) > 0 {
+		t.Fatalf("PTY path emitted %d MsgTypeStderr byte(s); PTY output must be a single merged MsgTypeData stream", len(gotStderr))
+	}
 }

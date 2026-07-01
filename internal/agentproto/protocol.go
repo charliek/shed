@@ -17,8 +17,13 @@ const (
 	MsgTypeResize      byte = 0x02
 	MsgTypeSignal      byte = 0x03
 	MsgTypeExitCode    byte = 0x04
-	MsgTypeData        byte = 0x05
+	MsgTypeData        byte = 0x05 // agent→host: process stdout (non-PTY) or merged PTY output; host→agent: stdin
 	MsgTypeStdinEOF    byte = 0x06
+	// MsgTypeStderr carries non-PTY process stderr, framed separately from stdout
+	// (MsgTypeData) so a binary stdout protocol — Zed Remote-SSH, SFTP — is not
+	// corrupted by interleaved diagnostics. PTY output stays merged on MsgTypeData
+	// (a pty master is a single stream).
+	MsgTypeStderr byte = 0x07
 
 	MsgTypePluginMessage byte = 0x20 // Bidirectional: plugin envelope (JSON)
 )

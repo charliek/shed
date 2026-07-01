@@ -146,6 +146,7 @@ func TestReadWriteRoundTrip(t *testing.T) {
 	}{
 		{"empty plugin message", MsgTypePluginMessage, nil},
 		{"data message", MsgTypeData, []byte("some output data")},
+		{"stderr message", MsgTypeStderr, []byte("some error output")},
 		{"exec request", MsgTypeExecRequest, []byte(`{"cmd":["ls","-la"]}`)},
 		{"exit code", MsgTypeExitCode, []byte(`{"code":0}`)},
 		{"resize", MsgTypeResize, []byte(`{"rows":24,"cols":80}`)},
@@ -214,6 +215,8 @@ func TestMessageTypes(t *testing.T) {
 		MsgTypeSignal,
 		MsgTypeExitCode,
 		MsgTypeData,
+		MsgTypeStdinEOF,
+		MsgTypeStderr,
 		MsgTypePluginMessage,
 	}
 
@@ -223,5 +226,11 @@ func TestMessageTypes(t *testing.T) {
 			t.Errorf("duplicate message type: %#x", msgType)
 		}
 		seen[msgType] = true
+	}
+
+	// Pin the stderr frame type's wire value: hosts and agents at different
+	// versions must agree on 0x07, so it must never be renumbered.
+	if MsgTypeStderr != 0x07 {
+		t.Errorf("MsgTypeStderr = %#x, want 0x07 (wire-compatibility constant)", MsgTypeStderr)
 	}
 }
