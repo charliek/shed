@@ -639,17 +639,27 @@ func TestPullImage_SSE_BlobGating(t *testing.T) {
 			},
 		}
 	}
-	if body := servePullSSE(t, newBE(), "").Body.String(); strings.Contains(body, `"kind":"blob"`) {
-		t.Errorf("blob event leaked without ?progress=blob:\n%s", body)
+	tests := []struct {
+		name     string
+		query    string
+		wantBlob bool
+	}{
+		{"gated out by default", "", false},
+		{"included with ?progress=blob", "?progress=blob", true},
 	}
-	if body := servePullSSE(t, newBE(), "?progress=blob").Body.String(); !strings.Contains(body, `"kind":"blob"`) {
-		t.Errorf("blob event missing with ?progress=blob:\n%s", body)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := servePullSSE(t, newBE(), tt.query).Body.String()
+			if got := strings.Contains(body, `"kind":"blob"`); got != tt.wantBlob {
+				t.Errorf("blob event present=%v, want %v:\n%s", got, tt.wantBlob, body)
+			}
+		})
 	}
 }
 
 // TestSSE_TimingLog_OnlyWithTimer guards the refactor's core branch: streamSSE
-// emits a `timing:` log line only for a non-nil timer (create/delete), never for
-// the nil-timer pull path.
+// runs onFinish (which logs the `timing:` line) only when the caller passes one
+// — create/delete do, the nil-onFinish pull path does not.
 func TestSSE_TimingLog_OnlyWithTimer(t *testing.T) {
 	var buf bytes.Buffer
 	oldOut, oldFlags := log.Writer(), log.Flags()
@@ -657,28 +667,43 @@ func TestSSE_TimingLog_OnlyWithTimer(t *testing.T) {
 	log.SetFlags(0)
 	defer func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) }()
 
-	// create SSE (non-nil timer) logs `timing: create ...`.
-	createBE := &createShedFakeBackend{
-		createFn: func(_ context.Context, req config.CreateShedRequest) (*config.Shed, error) {
-			return &config.Shed{Name: req.Name, Status: config.StatusRunning}, nil
-		},
+	// create SSE passes logTimingFinish(timer), so it logs `timing: create …`.
+	serveCreateSSE := func(*testing.T) {
+		be := &createShedFakeBackend{
+			createFn: func(_ context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+				return &config.Shed{Name: req.Name, Status: config.StatusRunning}, nil
+			},
+		}
+		body, _ := json.Marshal(config.CreateShedRequest{Name: "myshed"})
+		r := httptest.NewRequest(http.MethodPost, "/api/sheds", bytes.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Accept", "text/event-stream")
+		NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil).Router().ServeHTTP(httptest.NewRecorder(), r)
 	}
-	cbody, _ := json.Marshal(config.CreateShedRequest{Name: "myshed"})
-	cr := httptest.NewRequest(http.MethodPost, "/api/sheds", bytes.NewReader(cbody))
-	cr.Header.Set("Content-Type", "application/json")
-	cr.Header.Set("Accept", "text/event-stream")
-	NewServer(createBE, &config.ServerConfig{Name: "test-server"}, "", nil, nil).Router().ServeHTTP(httptest.NewRecorder(), cr)
-	if !strings.Contains(buf.String(), "timing: create") {
-		t.Errorf("create SSE did not emit a `timing:` log:\n%s", buf.String())
+	// pull SSE passes a nil onFinish, so it must NOT log a `timing:` line.
+	servePull := func(t *testing.T) {
+		be := &createShedFakeBackend{
+			pullFn: func(context.Context, string, string, string, bool) (string, error) { return "sha256:x", nil },
+		}
+		servePullSSE(t, be, "")
 	}
 
-	// pull SSE (nil timer) must NOT emit a `timing:` line.
-	buf.Reset()
-	pullBE := &createShedFakeBackend{
-		pullFn: func(context.Context, string, string, string, bool) (string, error) { return "sha256:x", nil },
+	tests := []struct {
+		name       string
+		serve      func(*testing.T)
+		needle     string
+		wantTiming bool
+	}{
+		{"create logs timing", serveCreateSSE, "timing: create", true},
+		{"pull logs no timing", servePull, "timing:", false},
 	}
-	servePullSSE(t, pullBE, "")
-	if strings.Contains(buf.String(), "timing:") {
-		t.Errorf("pull SSE emitted a `timing:` log despite a nil timer:\n%s", buf.String())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf.Reset()
+			tt.serve(t)
+			if got := strings.Contains(buf.String(), tt.needle); got != tt.wantTiming {
+				t.Errorf("%q present=%v, want %v:\n%s", tt.needle, got, tt.wantTiming, buf.String())
+			}
+		})
 	}
 }
