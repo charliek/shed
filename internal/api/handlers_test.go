@@ -243,7 +243,7 @@ func (f *createShedFakeBackend) GetShed(_ context.Context, _ string) (*config.Sh
 func (f *createShedFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
 	panic("unexpected")
 }
-func (f *createShedFakeBackend) DeleteShed(_ context.Context, _ string, _ bool) error {
+func (f *createShedFakeBackend) DeleteShed(_ context.Context, _ string) error {
 	panic("unexpected")
 }
 func (f *createShedFakeBackend) StartShed(_ context.Context, _ string) (*config.Shed, error) {

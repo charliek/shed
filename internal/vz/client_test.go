@@ -356,7 +356,7 @@ func TestStopShedLockedDoesNotReacquireLock(t *testing.T) {
 		_, _ = c.stopShedLocked(context.Background(), &Metadata{
 			Name:   "test-shed",
 			Status: config.StatusStopped,
-		})
+		}, stopGraceful)
 		close(done)
 	}()
 

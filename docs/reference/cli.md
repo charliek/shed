@@ -210,7 +210,12 @@ shed stop <name>
 
 ### shed delete
 
-Deletes a shed.
+Deletes a shed. This is a **destroy** operation (like `docker rm -f`): a running
+shed is terminated immediately (SIGKILL — the guest `hooks.shutdown` is **not**
+run) and its writable volume is always discarded. Use [`shed stop`](#shed-stop)
+for a graceful shutdown that keeps the shed restartable. Directories mounted with
+`--local-dir`/`--add-dir` are host data and are preserved (their unsynced guest
+writes are flushed before the shed is killed).
 
 ```bash
 shed delete <name> [flags]
@@ -218,7 +223,6 @@ shed delete <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--keep-volume` | | `false` | Keep the data volume |
 | `--force` | `-f` | `false` | Skip confirmation |
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).

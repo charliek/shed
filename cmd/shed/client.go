@@ -586,12 +586,8 @@ func (c *APIClient) EgressProfileDelete(name string) error {
 }
 
 // DeleteShed deletes a shed.
-func (c *APIClient) DeleteShed(name string, keepVolume bool) error {
-	path := "/api/sheds/" + name
-	if keepVolume {
-		path += "?keep_volume=true"
-	}
-	return c.doRequest(http.MethodDelete, path, nil, nil, http.StatusNoContent, http.StatusOK)
+func (c *APIClient) DeleteShed(name string) error {
+	return c.doRequest(http.MethodDelete, "/api/sheds/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
 }
 
 // StartShed starts a stopped shed.

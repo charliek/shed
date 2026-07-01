@@ -39,8 +39,10 @@ type Backend interface {
 	// ListSheds returns all sheds managed by this backend.
 	ListSheds(ctx context.Context) ([]config.Shed, error)
 
-	// DeleteShed removes a shed. If keepVolume is true, the workspace is preserved.
-	DeleteShed(ctx context.Context, name string, keepVolume bool) error
+	// DeleteShed removes a shed (destroy semantics: the writable volume is
+	// always discarded, and a running shed is SIGKILLed without a graceful
+	// guest shutdown — use StopShed for a graceful stop).
+	DeleteShed(ctx context.Context, name string) error
 
 	// StartShed starts a stopped shed.
 	StartShed(ctx context.Context, name string) (*config.Shed, error)

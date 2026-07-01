@@ -62,10 +62,9 @@ func (b *FirecrackerBackend) ListSheds(ctx context.Context) ([]config.Shed, erro
 	return b.client.ListSheds(ctx)
 }
 
-// DeleteShed removes a shed. If keepVolume is true, the workspace is preserved.
-// Note: For Firecracker, keepVolume is ignored as the rootfs is always part of the instance.
-func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
-	return b.client.DeleteShed(ctx, name, keepVolume)
+// DeleteShed removes a shed (destroy semantics — see backend.DeleteShed).
+func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string) error {
+	return b.client.DeleteShed(ctx, name)
 }
 
 // StartShed starts a stopped shed.

@@ -44,7 +44,7 @@ Client (`shed`) commands only. Server operation (`shed-server setup/serve/instal
 | `shed list [--all] [-s <server>] [-v]` | List sheds (default server, or all servers) |
 | `shed start <name> [--timeout <dur>]` | Start a stopped shed |
 | `shed stop <name>` | Stop a running shed (state kept) |
-| `shed delete <name> [--keep-volume] [--force/-f]` | Delete a shed (`--force` skips confirm; required with `--json`) |
+| `shed delete <name> [--force/-f]` | Delete a shed — destroys the shed and its volume (`--force` skips confirm; required with `--json`) |
 | `shed reset <name> [--force/-f]` | Discard the per-shed writable upper (in-VM changes); keeps the lower image and the workspace. Shed must be stopped |
 
 ```bash

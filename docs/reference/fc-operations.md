@@ -274,7 +274,7 @@ lower image is read-only and shared:
 # Stop, snapshot if you need to keep state, then recreate with a bigger upper
 shed stop myproject
 shed snapshot create myproject pre-resize
-shed delete myproject --keep-volume
+shed delete myproject
 shed create myproject --from-snapshot pre-resize --upper-size 20G
 ```
 

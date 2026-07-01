@@ -74,7 +74,7 @@ func (b *FirecrackerBackend) ListSheds(ctx context.Context) ([]config.Shed, erro
 }
 
 // DeleteShed returns an error on non-linux platforms.
-func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string) error {
 	return errNonLinux()
 }
 

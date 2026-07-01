@@ -29,7 +29,7 @@ func (routesFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed, err
 	return nil, config.ErrShedNotFoundSentinel
 }
 func (routesFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) { return nil, nil }
-func (routesFakeBackend) DeleteShed(_ context.Context, _ string, _ bool) error {
+func (routesFakeBackend) DeleteShed(_ context.Context, _ string) error {
 	return config.ErrShedNotFoundSentinel
 }
 func (routesFakeBackend) StartShed(_ context.Context, _ string) (*config.Shed, error) {

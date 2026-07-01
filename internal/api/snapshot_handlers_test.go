@@ -47,7 +47,7 @@ func (f *snapshotFakeBackend) GetShed(_ context.Context, _ string) (*config.Shed
 func (f *snapshotFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
 	panic("unexpected")
 }
-func (f *snapshotFakeBackend) DeleteShed(_ context.Context, _ string, _ bool) error {
+func (f *snapshotFakeBackend) DeleteShed(_ context.Context, _ string) error {
 	panic("unexpected")
 }
 func (f *snapshotFakeBackend) StartShed(_ context.Context, _ string) (*config.Shed, error) {
