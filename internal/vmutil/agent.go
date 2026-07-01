@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -256,13 +257,33 @@ func (c *AgentClient) Exec(ctx context.Context, opts backend.ExecOptions) error 
 					done <- nil
 				}
 				return
-			default:
+			case agentproto.MsgTypeData:
 				if opts.Stdout != nil {
 					if _, err := opts.Stdout.Write(data); err != nil {
 						done <- err
 						return
 					}
 				}
+			case agentproto.MsgTypeStderr:
+				// Route process stderr to its own writer. When the caller didn't
+				// set Stderr, fold into Stdout to preserve the combined-output
+				// behavior internal callers (e.g. ListSessions) rely on.
+				w := opts.Stderr
+				if w == nil {
+					w = opts.Stdout
+				}
+				if w != nil {
+					if _, err := w.Write(data); err != nil {
+						done <- err
+						return
+					}
+				}
+			default:
+				// Don't write unknown frames to stdout — this channel may carry a
+				// binary stdout protocol (Zed, SFTP), and injecting unexpected bytes
+				// is the corruption MsgTypeStderr separation fixes. Log for parity
+				// with the agent-side pump's unknown-frame handling.
+				log.Printf("Ignoring unknown message type on exec output channel: 0x%02x", msgType)
 			}
 		}
 	}()

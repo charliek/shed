@@ -207,9 +207,11 @@ func runWithPTY(conn net.Conn, cmd *exec.Cmd, rows, cols uint16) {
 		// onStdinEOF left nil: a PTY has no separate stdin pipe.
 	}, nil)
 
-	// Copy PTY output to connection.
+	// Copy PTY output to connection. A pty master is a single stream (stdout and
+	// stderr are merged by the terminal), so it is always MsgTypeData — matching
+	// standard SSH PTY semantics.
 	outputWg.Add(1)
-	go func() { defer outputWg.Done(); copyToConn(w, ptmx, "PTY") }()
+	go func() { defer outputWg.Done(); copyToConn(w, ptmx, "PTY", MsgTypeData) }()
 
 	// Probe for a host disconnect even when the PTY session is idle (no output);
 	// stopped after the command exits.
@@ -329,10 +331,17 @@ func runWithoutPTY(conn net.Conn, cmd *exec.Cmd) {
 	// conn) and SIGHUPs the command on a write failure.
 	w := &connWriter{conn: conn, disconnect: disconnect}
 
-	// Copy stdout and stderr to the connection (folded into one stream).
+	// Copy stdout and stderr to the connection as SEPARATE framed streams (stdout
+	// MsgTypeData, stderr MsgTypeStderr; see MsgTypeStderr): folding them would
+	// inject stderr into a binary stdout protocol like Zed or SFTP. The host
+	// demuxes them back onto the SSH channel's stdout and extended-data stderr;
+	// connWriter serializes both copiers so each frame is written whole. Ordering
+	// WITHIN each stream is preserved; relative ordering BETWEEN stdout and stderr
+	// is best-effort (two OS pipes, two goroutines) — same as real SSH's separate
+	// stdout/stderr channels, not a protocol guarantee.
 	outputWg.Add(2)
-	go func() { defer outputWg.Done(); copyToConn(w, stdout, "stdout") }()
-	go func() { defer outputWg.Done(); copyToConn(w, stderr, "stderr") }()
+	go func() { defer outputWg.Done(); copyToConn(w, stdout, "stdout", MsgTypeData) }()
+	go func() { defer outputWg.Done(); copyToConn(w, stderr, "stderr", MsgTypeStderr) }()
 
 	// Probe for a host disconnect even when the command produces no output and
 	// reads no stdin (see startKeepalive). Stopped after cmd.Wait below so it
@@ -547,10 +556,11 @@ type connWriter struct {
 	disconnect func()
 }
 
-// write sends data to the host, firing disconnect on a write error.
-func (w *connWriter) write(data []byte) error {
+// write sends a framed message of the given type to the host, firing disconnect
+// on a write error.
+func (w *connWriter) write(msgType byte, data []byte) error {
 	w.mu.Lock()
-	err := writeData(w.conn, data)
+	err := writeMessage(w.conn, msgType, data)
 	w.mu.Unlock()
 	if err != nil {
 		w.disconnect()
@@ -576,14 +586,15 @@ func (w *connWriter) writeProbe(timeout time.Duration) error {
 }
 
 // copyToConn copies r to the host connection via w until EOF or a write failure,
-// labeling read/write errors with name. Used for the process stdout/stderr pipes
-// (non-PTY) and the PTY master.
-func copyToConn(w *connWriter, r io.Reader, name string) {
+// framing each chunk as msgType and labeling read/write errors with name. Used
+// for the process stdout pipe (MsgTypeData) and stderr pipe (MsgTypeStderr) on
+// the non-PTY path, and the PTY master (MsgTypeData, merged).
+func copyToConn(w *connWriter, r io.Reader, name string, msgType byte) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			if werr := w.write(buf[:n]); werr != nil {
+			if werr := w.write(msgType, buf[:n]); werr != nil {
 				log.Printf("Warning: failed to write %s to connection: %v", name, werr)
 				return
 			}
