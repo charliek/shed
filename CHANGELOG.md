@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.7.7 — 2026-07-01
+
+### Fixed
+
+- **Zed Remote-SSH connects cleanly over the non-PTY exec channel.** The in-VM
+  agent no longer folds the command's stderr into stdout, so Zed's
+  length-prefixed protobuf readiness frame on stdout stays byte-clean while its
+  JSON logs stay on stderr — completing the Zed fix started in #222/#225. (#230)
+- **`shed exec` output stays 8-bit-clean when captured or piped.** `shed exec`
+  now auto-detects whether stdin is a TTY instead of always requesting a remote
+  PTY, so the PTY's `ONLCR` line discipline can't rewrite `\n`→`\r\n` or mangle
+  control bytes when you pull binary data out of a shed. Interactive
+  `shed console` still gets a PTY. (#233)
+- **`shed delete` of a running shed is fast and streams progress.** Delete now
+  takes a destroy path that SIGKILLs the VM immediately (it always discards the
+  writable upper anyway) instead of running a ~30 s graceful guest shutdown, so
+  a running-shed delete drops from ~30 s to ~1–2 s and no longer times out the
+  client. Progress streams over SSE (`Terminating virtual machine… → Removing
+  volume…`), and writable host-backed mounts (`--local-dir`/`--add-dir` and
+  configured server `mounts:`) are still synced before the kill. Use `shed stop`
+  for a graceful, restartable stop. Removes the no-op `--keep-volume` flag. (#234)
+
+### Changed
+
+- **Internal: the SSE streaming machinery is shared across create, delete, and
+  image pull.** `handlePullImageSSE` now delegates to the same `streamSSE`
+  pump/drain/terminal helper as create and delete (no wire-behavior change), so a
+  future SSE fix lands in one place instead of three. (#235)
+
 ## v0.7.6 — 2026-06-30
 
 ### Added
