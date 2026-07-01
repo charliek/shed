@@ -1242,6 +1242,28 @@ func (m MountConfig) MatchesExclude(relPath string) bool {
 	return MatchesExcludePatterns(relPath, m.Exclude)
 }
 
+// HasWritableHostMount reports whether a shed with the given project mounts
+// (--local-dir/--add-dir), running under serverCfg, has any writable
+// host-backed directory. A destroy/delete SIGKILLs the guest without a graceful
+// shutdown; if any such mount exists the guest must be synced first, or unsynced
+// writes to that host data are lost. (The discarded upper needs no sync — only
+// host-backed mounts, which outlive the shed, do.) serverCfg may be nil.
+func HasWritableHostMount(projectMounts []MountConfig, serverCfg *ServerConfig) bool {
+	for _, m := range projectMounts {
+		if !m.ReadOnly {
+			return true
+		}
+	}
+	if serverCfg != nil {
+		for _, m := range serverCfg.Mounts {
+			if !m.ReadOnly {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // MatchesExcludePatterns reports whether relPath matches any of the given glob
 // patterns. Patterns like "dir/*" also match the directory itself and deeply
 // nested paths (e.g., "dir/sub/deep/file").

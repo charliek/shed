@@ -62,9 +62,9 @@ func (b *VZBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 	return b.client.ListSheds(ctx)
 }
 
-// DeleteShed removes a shed.
-func (b *VZBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
-	return b.client.DeleteShed(ctx, name, keepVolume)
+// DeleteShed removes a shed (destroy semantics — see backend.DeleteShed).
+func (b *VZBackend) DeleteShed(ctx context.Context, name string) error {
+	return b.client.DeleteShed(ctx, name)
 }
 
 // StartShed starts a stopped shed.

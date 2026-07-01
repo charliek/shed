@@ -81,7 +81,6 @@ var (
 	createUpperSize    string
 	startTimeout       time.Duration
 	listAll            bool
-	deleteKeep         bool
 	deleteForce        bool
 )
 
@@ -105,7 +104,6 @@ func init() {
 
 	listCmd.Flags().BoolVarP(&listAll, "all", "a", false, "List sheds from all servers")
 
-	deleteCmd.Flags().BoolVar(&deleteKeep, "keep-volume", false, "Keep the data volume")
 	deleteCmd.Flags().BoolVarP(&deleteForce, "force", "f", false, "Delete without confirmation")
 
 	rootCmd.AddCommand(createCmd)
@@ -693,11 +691,7 @@ func runDelete(cmd *cobra.Command, args []string) error {
 
 	// Confirm deletion unless --force
 	if !deleteForce {
-		prompt := fmt.Sprintf("Delete shed %q on %s? ", name, serverName)
-		if !deleteKeep {
-			prompt += "This will also delete the data volume. "
-		}
-		prompt += "[y/N] "
+		prompt := fmt.Sprintf("Delete shed %q on %s? This will also delete the data volume. [y/N] ", name, serverName)
 		if !confirmAction(prompt) {
 			fmt.Println("Cancelled.")
 			return nil
@@ -707,9 +701,16 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// Stop any associated tunnels first
 	stopTunnelsForShed(name)
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
-	if err := client.DeleteShed(name, deleteKeep); err != nil {
-		return fmt.Errorf("failed to delete shed: %w", err)
+	// Delete streams teardown progress via SSE; use the configured create
+	// timeout (not the 30s quick-op default) so a slow teardown isn't cut off,
+	// and stream phases through the shared renderer (plain lines under --json /
+	// non-TTY / old server).
+	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
+	onProgress, finish, _ := progressSink(jsonFlag)
+	delErr := client.DeleteShedWithProgress(name, onProgress)
+	finish()
+	if delErr != nil {
+		return fmt.Errorf("failed to delete shed: %w", delErr)
 	}
 
 	// Remove from cache

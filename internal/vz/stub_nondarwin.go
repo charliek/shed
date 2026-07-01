@@ -72,7 +72,7 @@ func (b *VZBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 }
 
 // DeleteShed returns an error on non-darwin platforms.
-func (b *VZBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+func (b *VZBackend) DeleteShed(ctx context.Context, name string) error {
 	return errNonDarwin
 }
 

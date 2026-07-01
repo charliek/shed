@@ -585,13 +585,72 @@ func (c *APIClient) EgressProfileDelete(name string) error {
 	return c.doRequest(http.MethodDelete, "/api/egress/profiles/"+name, nil, nil)
 }
 
-// DeleteShed deletes a shed.
-func (c *APIClient) DeleteShed(name string, keepVolume bool) error {
-	path := "/api/sheds/" + name
-	if keepVolume {
-		path += "?keep_volume=true"
+// DeleteShedWithProgress deletes a shed and streams teardown progress via SSE.
+// It uses no client-level timeout (context deadline only, like create), so an
+// active event stream never trips the 30s quick-op timeout while a delete runs.
+// It falls back cleanly to a plain delete when the server predates delete-SSE: a
+// 204 No Content means the delete succeeded and there is no stream to read.
+func (c *APIClient) DeleteShedWithProgress(name string, onProgress func(backend.ProgressEvent)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.createTimeout)
+	defer cancel()
+
+	// The streaming client (no client-level timeout, context deadline only)
+	// bypasses doRequest, so replicate its send + 401-refresh here. Rebuilding
+	// per send is fine — a DELETE has no body. Delete, unlike create, has no
+	// GetInfo pre-flight to refresh a stale bootstrap token, so this is the only
+	// place a mid-session token expiry gets re-minted.
+	client := c.newHTTPClient(0)
+	send := func() (*http.Response, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/sheds/"+name, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		httpReq.Header.Set("Accept", "text/event-stream")
+		c.setAuth(httpReq)
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return nil, fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+			}
+			return nil, fmt.Errorf("failed to connect to server: %w", err)
+		}
+		return resp, nil
 	}
-	return c.doRequest(http.MethodDelete, path, nil, nil, http.StatusNoContent, http.StatusOK)
+
+	resp, err := send()
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && c.refreshFn != nil {
+		_ = resp.Body.Close()
+		tok, rerr := c.refreshFn()
+		if rerr != nil {
+			return fmt.Errorf("re-authenticating after 401: %w", rerr)
+		}
+		c.token = tok
+		if resp, err = send(); err != nil {
+			return err
+		}
+	}
+	defer resp.Body.Close()
+
+	// Old server (no delete-SSE) returns a plain 204 — the delete succeeded and
+	// there is no stream to read.
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return c.parseError(resp)
+	}
+	// A 200 without the SSE content type is a non-streaming responder (an old or
+	// proxied plain delete that the pre-SSE client also accepted) — the delete
+	// succeeded; don't feed a non-SSE body to the stream reader. Otherwise read
+	// the SSE stream, ignoring the benign terminal "complete" payload.
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return nil
+	}
+	_, err = c.readSSEStream(resp.Body, onProgress)
+	return err
 }
 
 // StartShed starts a stopped shed.

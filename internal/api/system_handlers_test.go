@@ -35,7 +35,7 @@ func (f *fakeBackend) GetShed(ctx context.Context, name string) (*config.Shed, e
 	panic("unexpected")
 }
 func (f *fakeBackend) ListSheds(ctx context.Context) ([]config.Shed, error) { panic("unexpected") }
-func (f *fakeBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+func (f *fakeBackend) DeleteShed(ctx context.Context, name string) error {
 	panic("unexpected")
 }
 func (f *fakeBackend) StartShed(ctx context.Context, name string) (*config.Shed, error) {

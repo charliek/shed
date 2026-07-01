@@ -623,7 +623,7 @@ func (c *Client) ListSheds(ctx context.Context) ([]config.Shed, error) {
 }
 
 // DeleteShed removes a shed.
-func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+func (c *Client) DeleteShed(ctx context.Context, name string) error {
 	defer c.acquireCreateLock(name)()
 
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
@@ -635,9 +635,10 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 	}
 
 	if meta.Status == config.StatusRunning {
+		backend.Status(ctx, "Terminating virtual machine...")
 		// Use the lock-aware variant so we don't deadlock on the per-shed
 		// mutex we already hold (sync.Mutex is non-reentrant).
-		if _, err := c.stopShedLocked(ctx, meta); err != nil {
+		if _, err := c.stopShedLocked(ctx, meta, stopDestroy); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
 			// stopShedLocked failed — clean up resources it would have released
 			c.credMgr.StopListener(name)
@@ -658,6 +659,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		}
 	}
 
+	backend.Status(ctx, "Releasing network...")
 	if err := c.netMgr.DeleteTAPDevice(meta.TAPDevice); err != nil {
 		log.Printf("Warning: failed to delete TAP device %s: %v", meta.TAPDevice, err)
 	}
@@ -671,6 +673,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		_ = c.egressMgr.Release(name)
 	}
 
+	backend.Status(ctx, "Removing volume...")
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
 	}
@@ -693,6 +696,17 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 }
 
 // StopShed stops a running shed.
+// stopMode selects stopShedLocked's teardown: stopGraceful is StopShed's clean,
+// restartable path; stopDestroy is delete's fast SIGKILL path (see the
+// stopDestroy case for the project-mount sync exception). stopGraceful is the
+// zero value, so a forgotten mode defaults to the safe graceful path.
+type stopMode int
+
+const (
+	stopGraceful stopMode = iota
+	stopDestroy
+)
+
 func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
 
@@ -704,14 +718,14 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		return nil, err
 	}
 
-	return c.stopShedLocked(ctx, meta)
+	return c.stopShedLocked(ctx, meta, stopGraceful)
 }
 
 // stopShedLocked performs the stop logic assuming the caller already holds
 // acquireCreateLock(meta.Name). This split exists so DeleteShed can stop a
 // running shed without re-entering the non-reentrant per-shed mutex it is
 // already holding. The public StopShed acquires the lock and delegates here.
-func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Shed, error) {
+func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMode) (*config.Shed, error) {
 	if meta.Status != config.StatusRunning {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, meta.Name)
 	}
@@ -730,16 +744,6 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	// Stop P9 servers before shutting down
 	c.stopP9Servers(meta.Name)
 
-	agent := c.newAgentClient(meta.Name)
-
-	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, agent, meta.Name, meta.LandingDir, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
-
-	// Ask the guest to flush dirty buffers to the virtio-blk devices
-	// before firecracker terminates. Without this, post-stop snapshots
-	// and any host-side read of upper.ext4 see a stale pre-sync state.
-	vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
-
 	// Get or create VM handle
 	c.mu.Lock()
 	vm := c.vms[meta.Name]
@@ -749,15 +753,39 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 		vm = &VM{meta: meta, cfg: c.cfg}
 	}
 
-	if err := vm.Stop(ctx); err != nil {
-		return nil, fmt.Errorf("failed to stop VM: %w", err)
+	switch mode {
+	case stopGraceful:
+		agent := c.newAgentClient(meta.Name)
+		// Run the shutdown hook, then ask the guest to flush dirty buffers to
+		// the virtio-blk devices before firecracker terminates. Without this,
+		// post-stop snapshots and any host-side read of upper.ext4 see a stale
+		// pre-sync state.
+		vmutil.RunShutdownSequence(ctx, agent, meta.Name, meta.LandingDir, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+		vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
+		if err := vm.Stop(ctx); err != nil {
+			return nil, fmt.Errorf("failed to stop VM: %w", err)
+		}
+	case stopDestroy:
+		// Delete discards the upper, so the shutdown hook and the graceful VM
+		// shutdown are wasted work — SIGKILL immediately. EXCEPTION: if the shed
+		// has any WRITABLE host-backed mount (--local-dir/--add-dir OR a
+		// configured server `mounts:` entry), flush the guest (bounded) first so
+		// a raw kill doesn't lose unsynced writes to that host data. A shed with
+		// no writable host mount skips the agent entirely (the fast path).
+		if config.HasWritableHostMount(meta.ProjectMounts, c.serverCfg) {
+			agent := c.newAgentClient(meta.Name)
+			vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
+		}
+		if err := vm.Kill(ctx); err != nil {
+			return nil, fmt.Errorf("failed to kill VM: %w", err)
+		}
 	}
 
-	// vm.Stop's post-SIGKILL waitForProcessExit swallows its timeout
-	// and returns nil even when firecracker refused to die. Verify
-	// before flipping status — otherwise the next StartShed would find
-	// PID=0 in metadata and silently spawn a second firecracker under
-	// the same name.
+	// The VM teardown above (vm.Stop or vm.Kill) swallows its post-SIGKILL
+	// waitForProcessExit timeout and returns nil even when firecracker refused
+	// to die. Verify before flipping status — otherwise the next StartShed
+	// would find PID=0 in metadata and silently spawn a second firecracker
+	// under the same name.
 	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
 		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrStopIncompleteSentinel, meta.Name, meta.PID)
 	}
