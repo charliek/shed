@@ -281,6 +281,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 	}
 
 	if meta.Status == config.StatusRunning {
+		backend.Status(ctx, "Terminating virtual machine...")
 		// Use the lock-aware variant so we don't deadlock on the per-shed
 		// mutex we already hold (sync.Mutex is non-reentrant).
 		if _, err := c.stopShedLocked(ctx, meta, stopDestroy); err != nil {
@@ -310,6 +311,7 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 		_ = c.egressMgr.Release(name)
 	}
 
+	backend.Status(ctx, "Removing volume...")
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
 	}

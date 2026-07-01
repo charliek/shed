@@ -701,9 +701,16 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// Stop any associated tunnels first
 	stopTunnelsForShed(name)
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
-	if err := client.DeleteShed(name); err != nil {
-		return fmt.Errorf("failed to delete shed: %w", err)
+	// Delete streams teardown progress via SSE; use the configured create
+	// timeout (not the 30s quick-op default) so a slow teardown isn't cut off,
+	// and stream phases through the shared renderer (plain lines under --json /
+	// non-TTY / old server).
+	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
+	onProgress, finish, _ := progressSink(jsonFlag)
+	delErr := client.DeleteShedWithProgress(name, onProgress)
+	finish()
+	if delErr != nil {
+		return fmt.Errorf("failed to delete shed: %w", delErr)
 	}
 
 	// Remove from cache

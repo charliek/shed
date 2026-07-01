@@ -225,11 +225,12 @@ func TestMapBackendError_SentinelErrors(t *testing.T) {
 	}
 }
 
-// createShedFakeBackend stubs only what handleCreateShedSSE touches.
-// CreateShed runs the configured fn so tests can emit progress/warning events
-// before returning a result.
+// createShedFakeBackend stubs only what the create/delete SSE handlers touch.
+// CreateShed / DeleteShed run the configured fn so tests can emit
+// progress/warning events before returning.
 type createShedFakeBackend struct {
 	createFn func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error)
+	deleteFn func(ctx context.Context, name string) error
 }
 
 func (f *createShedFakeBackend) Type() backend.Type { return backend.TypeVZ }
@@ -243,7 +244,10 @@ func (f *createShedFakeBackend) GetShed(_ context.Context, _ string) (*config.Sh
 func (f *createShedFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
 	panic("unexpected")
 }
-func (f *createShedFakeBackend) DeleteShed(_ context.Context, _ string) error {
+func (f *createShedFakeBackend) DeleteShed(ctx context.Context, name string) error {
+	if f.deleteFn != nil {
+		return f.deleteFn(ctx, name)
+	}
 	panic("unexpected")
 }
 func (f *createShedFakeBackend) StartShed(_ context.Context, _ string) (*config.Shed, error) {
@@ -444,5 +448,91 @@ func TestCreateShed_SSE_PhaseOnlyEventsNotStreamed(t *testing.T) {
 	if progressEvents != 1 {
 		t.Errorf("got %d progress events, want exactly 1 (the Status call); "+
 			"phase-only events must not be streamed", progressEvents)
+	}
+}
+
+// TestDeleteShed_SSE_StreamsProgressAndComplete verifies that a delete requested
+// with Accept: text/event-stream streams the backend's Status phases as progress
+// events and finishes with a terminal `complete` event (#232).
+func TestDeleteShed_SSE_StreamsProgressAndComplete(t *testing.T) {
+	be := &createShedFakeBackend{
+		deleteFn: func(ctx context.Context, _ string) error {
+			backend.Status(ctx, "Terminating virtual machine...")
+			backend.Status(ctx, "Removing volume...")
+			return nil
+		},
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodDelete, "/api/sheds/myshed", nil)
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var progress, complete int
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		switch e.Event {
+		case "progress":
+			progress++
+		case "complete":
+			complete++
+		}
+	}
+	if progress < 1 {
+		t.Errorf("expected >=1 progress event, got %d:\n%s", progress, w.Body.String())
+	}
+	if complete != 1 {
+		t.Errorf("expected exactly 1 complete event, got %d:\n%s", complete, w.Body.String())
+	}
+}
+
+// TestDeleteShed_PlainReturns204 verifies that a delete WITHOUT the SSE Accept
+// header keeps the plain 204 No Content behavior (back-compat for non-streaming
+// clients and old CLIs).
+func TestDeleteShed_PlainReturns204(t *testing.T) {
+	be := &createShedFakeBackend{
+		deleteFn: func(context.Context, string) error { return nil },
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodDelete, "/api/sheds/myshed", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want 204 (body: %s)", w.Code, w.Body.String())
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("expected empty 204 body, got: %s", w.Body.String())
+	}
+}
+
+// TestDeleteShed_SSE_SurfacesError verifies a backend delete failure is surfaced
+// as a terminal SSE `error` event (the stream still opens with 200 first).
+func TestDeleteShed_SSE_SurfacesError(t *testing.T) {
+	be := &createShedFakeBackend{
+		deleteFn: func(context.Context, string) error { return config.ErrShedNotFoundSentinel },
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodDelete, "/api/sheds/ghost", nil)
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (SSE opens before the error), body: %s", w.Code, w.Body.String())
+	}
+	var sawError bool
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		if e.Event == "error" {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Errorf("no error event in stream:\n%s", w.Body.String())
 	}
 }

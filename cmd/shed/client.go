@@ -585,9 +585,49 @@ func (c *APIClient) EgressProfileDelete(name string) error {
 	return c.doRequest(http.MethodDelete, "/api/egress/profiles/"+name, nil, nil)
 }
 
-// DeleteShed deletes a shed.
-func (c *APIClient) DeleteShed(name string) error {
-	return c.doRequest(http.MethodDelete, "/api/sheds/"+name, nil, nil, http.StatusNoContent, http.StatusOK)
+// DeleteShedWithProgress deletes a shed and streams teardown progress via SSE.
+// It uses no client-level timeout (context deadline only, like create), so an
+// active event stream never trips the 30s quick-op timeout while a delete runs.
+// It falls back cleanly to a plain delete when the server predates delete-SSE: a
+// 204 No Content means the delete succeeded and there is no stream to read.
+func (c *APIClient) DeleteShedWithProgress(name string, onProgress func(backend.ProgressEvent)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.createTimeout)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/sheds/"+name, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Accept", "text/event-stream")
+	c.setAuth(httpReq)
+
+	client := c.newHTTPClient(0)
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+		}
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Old server (no delete-SSE) returns a plain 204 — the delete succeeded and
+	// there is no stream to read.
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return c.parseError(resp)
+	}
+	// A 200 without the SSE content type is a non-streaming responder (an old or
+	// proxied plain delete that the pre-SSE client also accepted) — the delete
+	// succeeded; don't feed a non-SSE body to the stream reader. Otherwise read
+	// the SSE stream, ignoring the benign terminal "complete" payload.
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return nil
+	}
+	_, err = c.readSSEStream(resp.Body, onProgress)
+	return err
 }
 
 // StartShed starts a stopped shed.
