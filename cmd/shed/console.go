@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -129,6 +128,35 @@ func validateAndQuoteArgs(args []string) ([]string, error) {
 	return shellQuoteArgs(args), nil
 }
 
+// ttyFlag returns the ssh PTY flag for a shed session. An interactive shell
+// (no command) always requests a PTY. A command exec requests one only when the
+// local stdin AND stdout are both terminals, so captured or piped output stays
+// 8-bit-clean — a remote PTY's ONLCR line discipline corrupts binary output
+// (e.g. `shed exec box -- cat bin > f`). The AND-condition also suppresses the
+// "Pseudo-terminal will not be allocated" warning a bare `-t` emits for a
+// non-tty stdin. Escape hatch: raw `ssh -tt`/`ssh -T`.
+func ttyFlag(hasCommand, stdinTTY, stdoutTTY bool) string {
+	if hasCommand && (!stdinTTY || !stdoutTTY) {
+		return "-T"
+	}
+	return "-t"
+}
+
+// sshSessionArgs assembles the ssh argv for a shed session: ["ssh", flag], the
+// shared connection options (baseSSHArgs, reused from rc.go so options can't
+// drift), then the already-quoted remote command (empty for an interactive
+// shell). Kept pure so a test can assert flag placement and option reuse; the
+// syscall.Exec that consumes it can't be unit-tested.
+//
+// Unlike rc.go's capture path, no "--" precedes the command: this preserves the
+// pre-existing console/exec behavior (ssh treats everything after the
+// destination as the command, and the argv is already single-quoted), so adding
+// a "--" would change what the server's bash -lc receives.
+func sshSessionArgs(flag, name string, entry *config.ServerEntry, quotedCmd []string) []string {
+	args := append([]string{"ssh", flag}, baseSSHArgs(name, entry)...)
+	return append(args, quotedCmd...)
+}
+
 // sshToShed establishes an SSH connection to a shed.
 // If command is nil, an interactive shell is opened.
 // If command is provided, it is executed on the shed.
@@ -149,29 +177,21 @@ func sshToShed(name string, command []string) error {
 		fmt.Printf("Connecting to %s on %s...\n", name, serverName)
 	}
 
-	// Build SSH command
-	knownHostsPath := config.GetKnownHostsPath()
-
-	sshArgs := []string{
-		"ssh",
-		"-t", // Force pseudo-terminal allocation
-		"-p", strconv.Itoa(entry.SSHPort),
-		"-o", "UserKnownHostsFile=" + knownHostsPath,
-		"-o", "StrictHostKeyChecking=yes",
-		name + "@" + entry.Host,
-	}
-
-	// Add command if provided. validateAndQuoteArgs single-quotes each argv
-	// element so pipes, redirects, semicolons, spaces, and nested quotes
-	// survive the SSH wire (issues #44 and #48) and rejects empty elements
-	// the posix-mode server-side shlex would silently drop.
+	// Quote the command (if any). validateAndQuoteArgs single-quotes each argv
+	// element so pipes, redirects, semicolons, spaces, and nested quotes survive
+	// the SSH wire (issues #44 and #48) and rejects empty elements the posix-mode
+	// server-side shlex would silently drop.
+	var quoted []string
 	if len(command) > 0 {
-		quoted, err := validateAndQuoteArgs(command)
+		quoted, err = validateAndQuoteArgs(command)
 		if err != nil {
 			return err
 		}
-		sshArgs = append(sshArgs, quoted...)
 	}
+
+	// Pick -t (PTY) vs -T (clean 8-bit) by terminal detection — see ttyFlag.
+	flag := ttyFlag(len(command) > 0, isStdinTTY(), isStdoutTTY())
+	sshArgs := sshSessionArgs(flag, name, entry, quoted)
 
 	// Find ssh binary
 	sshPath, err := exec.LookPath("ssh")

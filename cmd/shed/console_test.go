@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/anmitsu/go-shlex"
+
+	"github.com/charliek/shed/internal/config"
 )
 
 // TestShellQuoteRoundTrip verifies that every element of argv survives a
@@ -269,4 +271,77 @@ func TestShellQuoteBashRoundTrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTTYFlag pins the PTY-flag decision: an interactive shell (no command)
+// always requests a PTY; a command exec requests one only when stdin AND stdout
+// are terminals, so captured/piped output stays 8-bit-clean (a remote PTY's
+// ONLCR line discipline corrupts binary output).
+func TestTTYFlag(t *testing.T) {
+	tests := []struct {
+		name                            string
+		hasCommand, stdinTTY, stdoutTTY bool
+		want                            string
+	}{
+		{"interactive, both tty", false, true, true, "-t"},
+		{"interactive, stdout redirected", false, true, false, "-t"},
+		{"interactive, stdin piped", false, false, true, "-t"},
+		{"interactive, neither tty", false, false, false, "-t"},
+		{"exec, both tty (vim)", true, true, true, "-t"},
+		{"exec, stdout redirected (cat bin > f)", true, true, false, "-T"},
+		{"exec, stdin piped (echo | cmd)", true, false, true, "-T"},
+		{"exec, neither tty (scripted)", true, false, false, "-T"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ttyFlag(tt.hasCommand, tt.stdinTTY, tt.stdoutTTY); got != tt.want {
+				t.Errorf("ttyFlag(hasCommand=%v, stdinTTY=%v, stdoutTTY=%v) = %q, want %q",
+					tt.hasCommand, tt.stdinTTY, tt.stdoutTTY, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSSHSessionArgs covers the call-site wiring that ttyFlag alone can't: the
+// flag lands immediately after "ssh", the shared baseSSHArgs connection options
+// are reused (so they can't drift), and the quoted command is appended after the
+// host. The real syscall.Exec that consumes this argv is untestable.
+func TestSSHSessionArgs(t *testing.T) {
+	entry := &config.ServerEntry{Host: "example.com", SSHPort: 2222}
+
+	t.Run("exec places flag after ssh and appends all command args in order", func(t *testing.T) {
+		// A multi-element quoted command: it must be appended verbatim, in order,
+		// after the host — no reordering and no "--" inserted.
+		cmd := []string{"'bash'", "'-c'", "'echo hi'"}
+		got := sshSessionArgs("-T", "box", entry, cmd)
+		if len(got) < 3 || got[0] != "ssh" || got[1] != "-T" {
+			t.Fatalf("expected argv to start with [ssh -T ...], got %v", got)
+		}
+		joined := strings.Join(got, " ")
+		for _, want := range []string{"-p 2222", "UserKnownHostsFile=", "StrictHostKeyChecking=yes", "box@example.com"} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("argv missing shared option %q: %v", want, got)
+			}
+		}
+		// The command occupies exactly the final len(cmd) elements, preceded by the host.
+		tail := got[len(got)-len(cmd):]
+		for i := range cmd {
+			if tail[i] != cmd[i] {
+				t.Errorf("command arg[%d] = %q, want %q (full argv %v)", i, tail[i], cmd[i], got)
+			}
+		}
+		if got[len(got)-len(cmd)-1] != "box@example.com" {
+			t.Errorf("host must immediately precede the command args: %v", got)
+		}
+	})
+
+	t.Run("interactive omits the command and ends at the host", func(t *testing.T) {
+		got := sshSessionArgs("-t", "box", entry, nil)
+		if got[0] != "ssh" || got[1] != "-t" {
+			t.Fatalf("expected [ssh -t ...], got %v", got)
+		}
+		if got[len(got)-1] != "box@example.com" {
+			t.Errorf("interactive argv should end at the host, got %v", got)
+		}
+	})
 }
