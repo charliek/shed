@@ -217,10 +217,10 @@ the host key pinned in `known_hosts`. The only trust-on-first-use moment is
 `--tls-fingerprint` / `--fingerprint` to verify out-of-band). See the
 [connection-flow table](../reference/security.md#connection-flow-whats-encrypted-where).
 
-The credential bus and Connect tunnel ride that same TLS listener, gated by the
-`credentials` scope — so a co-located host-agent reaches them over
-`https://127.0.0.1:8443` with the pinned cert. There is no plaintext channel,
-implicit or opt-in.
+The credential bus (`credentials` scope) and Connect tunnel (`control` or
+`credentials`) ride that same TLS listener — so a co-located host-agent reaches
+them over `https://127.0.0.1:8443` with the pinned cert. There is no plaintext
+channel, implicit or opt-in.
 
 ## Troubleshooting startup rejections
 

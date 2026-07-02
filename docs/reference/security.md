@@ -99,15 +99,16 @@ the scope, and an expiry.
 
 | Scope | Grants |
 |-------|--------|
-| `control` | The control plane: lifecycle, images, sessions, snapshots, and the Connect tunnel for `shed forward`. |
-| `credentials` | The credential bus (`/api/plugins/*`) and the Connect tunnel — vends live SSH signatures and cloud credentials. |
+| `control` | The control plane (lifecycle, images, sessions, snapshots) and the Connect tunnel for `shed forward`. |
+| `credentials` | The credential bus (`/api/plugins/*`) — live SSH signatures and cloud credentials — and the Connect tunnel (used by the host-agent's reverse proxy). |
 
 (The pre-v0.7.1 `admin` scope is removed.) Under `secure` mode every request needs
-a matching `Authorization: Bearer` token of the required scope; the bus and
-Connect tunnel specifically require `credentials`, so a leaked `control` token
-cannot reach them. `GET /api/info` stays reachable without a token so
-`shed server add` can read the auth mode and ports before the operator holds
-one.
+a matching `Authorization: Bearer` token of the required scope. The bus requires
+`credentials`, so a leaked `control` token cannot reach the live-secret bus; the
+Connect tunnel accepts **either** scope (the CLI dials it with `control`, the
+host-agent's proxy with `credentials`). `GET /api/info` stays reachable without a
+token so `shed server add` can read the auth mode and ports before the operator
+holds one.
 
 ### Short TTL, transparent refresh
 
@@ -193,9 +194,10 @@ There is **one HTTP listener per mode** (SSH always listens separately on
 (`https_port`) listener in `secure` mode — in secure mode there is **no
 plain-HTTP listener at all**. The credential bus (`/api/plugins/*`)
 and the Connect tunnel (`/api/sheds/*/connect/*`) ride that same listener; in
-secure mode they are gated by the `credentials` scope (so a leaked `control`
-token can't reach them) and travel over TLS. A co-located host-agent reaches the
-bus over `https://127.0.0.1:8443` with the pinned cert. There is no separate
+secure mode the bus is gated by the `credentials` scope (so a leaked `control`
+token can't reach it) while the Connect tunnel accepts control or credentials,
+and both travel over TLS. A co-located host-agent reaches the bus over
+`https://127.0.0.1:8443` with the pinned cert. There is no separate
 internal/loopback listener. These knobs shape what is reachable where:
 
 | Field | Effect |
@@ -311,7 +313,7 @@ are **rejected at startup**:
 
 | Removed / renamed | Replacement |
 |-------------------|-------------|
-| `internal_http_port` | Removed — the credential bus + Connect tunnel ride the single listener (gated by the `credentials` scope in secure mode); a co-located host-agent reaches them over `https://127.0.0.1:8443`. |
+| `internal_http_port` | Removed — the credential bus (credentials scope) and Connect tunnel (control or credentials) ride the single listener in secure mode; a co-located host-agent reaches them over `https://127.0.0.1:8443`. |
 | `http_bind` / `ssh_bind` | A single `bind_address` governs every listener (HTTP, HTTPS, SSH). |
 
 Plus a behavior change: **`bind_address` defaults to loopback (`127.0.0.1`) in

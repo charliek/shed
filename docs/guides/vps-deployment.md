@@ -32,8 +32,9 @@ bind_address: 0.0.0.0            # face the network (loopback is the default) â€
 `secure` mode forces `auth.ssh.mode: enforce`, enforces HTTP bearer tokens, turns
 on pinned TLS (`https_port` defaults to `8443`), and serves **no plain-HTTP
 listener** (TLS-only) â€” so the only API is HTTPS on `8443`, with the credential
-bus and Connect tunnel gated by the `credentials` scope. (`shed server add`
-against a secure server therefore needs `--https-port`, as below.)
+bus gated by the `credentials` scope and the Connect tunnel accepting `control`
+or `credentials`. (`shed server add` against a secure server therefore needs
+`--https-port`, as below.)
 
 !!! warning "`bind_address` is required for a remote server"
     Since v0.7.4 `bind_address` **defaults to loopback (`127.0.0.1`) in secure
@@ -124,8 +125,8 @@ bring your own TLS certificate instead of the self-signed one with
 ## Co-located host-agent
 
 If you instead run the host-agent **on the VPS itself**, no extra config is
-needed: the credential bus and Connect tunnel ride the single pinned-TLS listener
-(gated by the `credentials` scope), and the on-box host-agent reaches them over
+needed: the credential bus (`credentials` scope) and Connect tunnel (`control` or
+`credentials`) ride the single pinned-TLS listener, and the on-box host-agent reaches them over
 `https://127.0.0.1:8443` with the pinned cert. Remote `shed forward` keeps
 working at the same time, because there is no longer a separate loopback-only
 listener. See the [network surface](../reference/security.md#network-surface).
