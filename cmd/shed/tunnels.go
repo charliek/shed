@@ -299,6 +299,12 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 }
 
 func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, ports []tunnels.PortMapping, profile string) error {
+	// Fail loudly if the tunnel can't authenticate, before binding any listener
+	// (so we never leave a listener up that resets every connection).
+	if err := probeConnectAuth(target, shedName); err != nil {
+		return err
+	}
+
 	activeTunnels, err := mgr.StartTunnels(target, shedName, ports)
 	if err != nil {
 		return fmt.Errorf("failed to start tunnels: %w", err)

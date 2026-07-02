@@ -23,9 +23,26 @@ const readyFDEnv = "SHED_TUNNEL_READY_FD"
 
 // daemonReadyTimeout bounds how long the parent waits for the worker to report
 // it is listening. It must cover the worker's config load + findShedServer +
-// ensureRunningShed + listener bind; the parent already started the shed, so
-// those are fast, but be generous.
+// ensureRunningShed + the startup Connect auth probe (tunnelProbeTimeout) +
+// listener bind; the parent already started the shed, so those are fast, but be
+// generous.
 const daemonReadyTimeout = 15 * time.Second
+
+// tunnelProbeTimeout bounds the startup Connect auth probe. It stays well under
+// daemonReadyTimeout so a failing probe can report ERR: to the parent before the
+// parent gives up and kills the worker with a generic readiness timeout.
+const tunnelProbeTimeout = 5 * time.Second
+
+// probeConnectAuth checks that the tunnel target can authenticate to the Connect
+// API (see tunnels.ConnectClient.Probe), bounded by tunnelProbeTimeout. Both the
+// foreground and detached-worker start paths run it before binding listeners, so
+// an auth/transport failure fails `shed tunnels start` loudly instead of
+// surfacing later as a per-connection reset.
+func probeConnectAuth(target tunnels.ConnectTarget, shedName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), tunnelProbeTimeout)
+	defer cancel()
+	return tunnels.NewConnectClient(target).Probe(ctx, shedName)
+}
 
 // spawnTunnelDaemon re-execs this binary as a detached background worker for the
 // given shed, waits for it to report that the tunnels are listening, then
@@ -173,6 +190,15 @@ func runDaemonWorker(mgr *tunnels.Manager, shedName, serverName string, target t
 	ready, err := openReadyPipe()
 	if err != nil {
 		return err
+	}
+
+	// Validate Connect auth before binding listeners or reporting readiness, so a
+	// broken tunnel fails `shed tunnels start` in the user's terminal (via the
+	// ERR: channel) rather than looking healthy and resetting every connection.
+	if probeErr := probeConnectAuth(target, shedName); probeErr != nil {
+		fmt.Fprintf(ready, "ERR:%s\n", probeErr)
+		_ = ready.Close()
+		return probeErr
 	}
 
 	// Bind listeners, then record state under our own (detached) PID.

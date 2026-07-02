@@ -79,13 +79,11 @@ func (c *APIClient) newHTTPClient(timeout time.Duration) *http.Client {
 
 // pinnedTransport returns a transport that verifies the server's leaf cert
 // against the pinned "sha256:<hex>" fingerprint instead of a CA chain, or nil
-// when there is no pin (plain HTTP). It wraps the shared servertls pin config
-// so the CLI and the Connect tunnel verify identically.
+// when there is no pin (plain HTTP). It delegates to servertls.PinnedTransport
+// so the CLI, the Connect tunnel, and the startup probe build the pinned
+// transport identically from one place.
 func pinnedTransport(fingerprint string) http.RoundTripper {
-	if fingerprint == "" {
-		return nil
-	}
-	return &http.Transport{TLSClientConfig: servertls.PinnedClientConfig(fingerprint)}
+	return servertls.PinnedTransport(fingerprint)
 }
 
 // NewAPIClient creates a plain-HTTP API client for the given host and port
