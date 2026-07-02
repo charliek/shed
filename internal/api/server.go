@@ -153,8 +153,8 @@ func (s *Server) Router() chi.Router {
 			r.Get("/sheds", s.handleListPluginSheds)
 		})
 
-		// Sheds: lifecycle routes plus the Connect tunnel leaf (credentials
-		// scope) — all on the single listener.
+		// Sheds: lifecycle routes (control scope) plus the Connect tunnel leaf
+		// (control or credentials) — all on the single listener.
 		r.Route("/sheds", func(r chi.Router) {
 			r.Get("/", s.handleListSheds)
 			r.Post("/", s.handleCreateShed)
