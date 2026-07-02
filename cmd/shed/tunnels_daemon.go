@@ -30,8 +30,8 @@ const daemonReadyTimeout = 15 * time.Second
 // spawnTunnelDaemon re-execs this binary as a detached background worker for the
 // given shed, waits for it to report that the tunnels are listening, then
 // returns — handing the terminal back while the worker keeps running. The
-// worker re-resolves its connect target from config, so the credentials token
-// never appears on its command line.
+// worker re-resolves its connect target from config, so the bearer token never
+// appears on its command line.
 func spawnTunnelDaemon(shedName string, ports []tunnels.PortMapping) error {
 	exe, err := os.Executable()
 	if err != nil {

@@ -21,10 +21,16 @@ import (
 
 // connectTargetFromEntry resolves how `shed forward` dials the Connect API for a
 // server entry. When the entry pins a TLS cert on an https api_url, the tunnel
-// dials that host:port over pinned TLS and sends the credentials-scoped token
-// (the Connect route requires the credentials scope when auth is enforced).
-// Otherwise it is the legacy plain-TCP dial to host:http_port, byte-identical.
-func connectTargetFromEntry(entry *config.ServerEntry) (tunnels.ConnectTarget, error) {
+// dials that host:port over pinned TLS and sends token as the bearer credential
+// (the Connect route accepts a control or credentials token when auth is
+// enforced; the CLI passes its live control token). Otherwise it is the legacy
+// plain-TCP dial to host:http_port, byte-identical, and token is unused.
+//
+// token is supplied by the caller rather than read from entry so tunnel dials
+// use the client's freshest in-memory control token — which may have been
+// re-minted since the entry was loaded without that refresh being persisted
+// back to config. Callers that only inspect the target without dialing pass "".
+func connectTargetFromEntry(entry *config.ServerEntry, token string) (tunnels.ConnectTarget, error) {
 	if entry.APIURL != "" {
 		u, err := url.Parse(entry.APIURL)
 		if err != nil {
@@ -41,7 +47,7 @@ func connectTargetFromEntry(entry *config.ServerEntry) (tunnels.ConnectTarget, e
 			return tunnels.ConnectTarget{
 				Addr:   u.Host,
 				TLSPin: entry.TLSCertFingerprint,
-				Token:  entry.CredentialsToken,
+				Token:  token,
 			}, nil
 		}
 	}
@@ -266,12 +272,15 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Resolve how to reach the Connect API: pinned TLS + credentials token when
-	// the entry has an https api_url, else the legacy plain-TCP dial. Done here
+	// Resolve how to reach the Connect API: pinned TLS + control token when the
+	// entry has an https api_url, else the legacy plain-TCP dial. Done here
 	// (before the daemon fork) so a misconfigured target fails in the user's
 	// terminal; the detached worker re-resolves it from config itself, keeping
-	// the credentials token off its command line.
-	target, err := connectTargetFromEntry(entry)
+	// the token off its command line. Pass the client's live token —
+	// ensureRunningShed above may have re-minted it in-memory (proactively near
+	// expiry, or reactively on a 401) even when persisting it back to config was
+	// skipped or failed, so the entry's stored copy can be stale.
+	target, err := connectTargetFromEntry(entry, client.currentToken())
 	if err != nil {
 		return err
 	}
@@ -452,8 +461,9 @@ func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 	}
 
 	// Show the address the tunnel would actually dial (the https api_url
-	// endpoint when the entry is TLS-pinned, else host:http_port).
-	target, err := connectTargetFromEntry(entry)
+	// endpoint when the entry is TLS-pinned, else host:http_port). This is a
+	// preview that never dials, so no token is needed.
+	target, err := connectTargetFromEntry(entry, "")
 	if err != nil {
 		return err
 	}

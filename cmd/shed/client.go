@@ -58,6 +58,17 @@ func (c *APIClient) setAuth(req *http.Request) {
 	}
 }
 
+// currentToken returns the client's current in-memory bearer (control) token.
+// It may have been re-minted since construction — proactively near expiry or
+// reactively on a 401 retry — even when persisting the refresh back to config
+// was skipped (ambiguous alias) or failed. The tunnel path reads it so a
+// forwarded connection dials the Connect API with the freshest token rather
+// than the possibly-stale one in the config entry. Safe to call after a
+// synchronous request (e.g. ensureRunningShed) with no request in flight.
+func (c *APIClient) currentToken() string {
+	return c.token
+}
+
 // newHTTPClient builds an *http.Client carrying the pinning transport (if any),
 // so every request path — including the long-running, ad-hoc clients used for
 // SSE and timeouts — verifies the pinned TLS cert. timeout 0 means no
