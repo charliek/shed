@@ -69,8 +69,9 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 // secure mode, plain HTTP in open mode. It registers the full route surface on
 // a single listener: the control plane (info, lifecycle, images, system,
 // snapshots, sessions, egress) plus the credential bus (/api/plugins/*) and the
-// Connect tunnel (/api/sheds/*/connect/*), which require a credentials-scoped
-// token in secure mode (see authMiddleware).
+// Connect tunnel (/api/sheds/*/connect/*). In secure mode the bus requires a
+// credentials-scoped token, the Connect tunnel accepts control or credentials,
+// and everything else requires control (see authMiddleware).
 func (s *Server) Router() chi.Router {
 	r := chi.NewRouter()
 	s.useCommonMiddleware(r)

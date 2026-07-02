@@ -63,8 +63,17 @@ func TestAuthMiddlewareEnforce(t *testing.T) {
 		{"control plane, credentials token forbidden", "GET", "/api/sheds", cred, 403},
 		{"bus, credentials token", "GET", "/api/plugins/listeners", cred, 200},
 		{"bus, control token forbidden", "GET", "/api/plugins/listeners", ctl, 403},
+		{"connect, control token", "GET", "/api/sheds/x/connect/22", ctl, 200},
 		{"connect, credentials token", "GET", "/api/sheds/x/connect/22", cred, 200},
-		{"connect, control token forbidden", "GET", "/api/sheds/x/connect/22", ctl, 403},
+		{"connect, no token", "GET", "/api/sheds/x/connect/22", "", 401},
+		// A shed literally named "connect" must NOT slip a credentials token onto
+		// a control-only lifecycle route via a loose "/connect/" substring match.
+		{"shed named connect, control token", "POST", "/api/sheds/connect/start", ctl, 200},
+		{"shed named connect, credentials token forbidden", "POST", "/api/sheds/connect/start", cred, 403},
+		// Connect classification is route-shape exact, not a substring: neither a
+		// missing port nor an extra segment counts as the tunnel (→ control-only).
+		{"connect prefix without port, credentials forbidden", "GET", "/api/sheds/x/connect", cred, 403},
+		{"connect with trailing segment, credentials forbidden", "GET", "/api/sheds/x/connect/22/extra", cred, 403},
 		{"create, control token", "POST", "/api/sheds", ctl, 200},
 	}
 	for _, tt := range tests {

@@ -33,8 +33,8 @@ import (
 // intentionally absent: minting and revocation are gated by SSH access, so there
 // is no separate HTTP admin capability.
 const (
-	ScopeControl     = "control"     // shed lifecycle / control plane (CLI, desktop)
-	ScopeCredentials = "credentials" // credential bus + Connect tunnel + egress stream
+	ScopeControl     = "control"     // shed lifecycle / control plane (CLI, desktop); also accepted on the Connect tunnel
+	ScopeCredentials = "credentials" // credential bus (/api/plugins/*); also accepted on the Connect tunnel (host-agent reverse proxy)
 )
 
 // Client kinds are advisory metadata, recorded for audit (token ls) only.
