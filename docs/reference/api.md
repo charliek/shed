@@ -9,9 +9,10 @@ The `shed-server` exposes a REST API for managing sheds.
     relies on a trusted network (Tailscale, firewall rules). In `auth.mode:
     secure` every request needs an `Authorization: Bearer <token>` header of the
     required scope, except the bootstrap endpoints `GET /api/info` and
-    `GET /api/ssh-host-key`. The credential bus (`/api/plugins/*`) and the
-    Connect tunnel (`/api/sheds/{name}/connect/{port}`) require the `credentials`
-    scope; everything else needs `control`. Tokens are **not** issued over HTTP —
+    `GET /api/ssh-host-key`. The credential bus (`/api/plugins/*`) requires the
+    `credentials` scope; the Connect tunnel
+    (`/api/sheds/{name}/connect/{port}`) accepts **either** `control` or
+    `credentials`; everything else needs `control`. Tokens are **not** issued over HTTP —
     they are minted over the SSH `_bootstrap` channel (see
     [Authentication](#authentication)). See [Security](security.md) for the full
     model and pinned TLS.
@@ -924,7 +925,7 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 | 502 | `CONNECT_FAILED` | Could not connect to the port (service not running) |
 | 503 | `SHED_NOT_RUNNING` | Shed is not running |
 
-**Security:** The Connect API has the same access control as other API endpoints — network-level only (Tailscale, firewall). It connects to the VM's loopback interface and does not support arbitrary destinations.
+**Security:** In `open` mode the Connect API relies on network-level trust (Tailscale, firewall) like the rest of the API; in `secure` mode it requires a bearer token of the `control` **or** `credentials` scope over pinned TLS. It connects to the VM's loopback interface and does not support arbitrary destinations.
 
 **Consumers:**
 

@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/vmutil"
 )
@@ -16,13 +19,13 @@ import (
 // ConnectTarget describes how to reach a shed-server's Connect API. Addr is the
 // host:port to dial. When TLSPin is set, the connection is wrapped in TLS
 // verified against that pinned cert fingerprint; when Token is set, it is sent
-// as the credentials-scoped bearer token on the upgrade request. An empty
-// TLSPin and Token reproduce the legacy plain-TCP, unauthenticated dial
-// byte-for-byte.
+// as the bearer token on the upgrade request (the Connect route accepts a
+// control or credentials token). An empty TLSPin and Token reproduce the legacy
+// plain-TCP, unauthenticated dial byte-for-byte.
 type ConnectTarget struct {
 	Addr   string // host:port to dial
 	TLSPin string // "sha256:<hex>"; empty = plain TCP
-	Token  string // credentials bearer token; empty = no Authorization header
+	Token  string // bearer token (control or credentials); empty = no Authorization header
 }
 
 // ConnectClient dials shed VMs via the shed-server Connect API.
@@ -96,6 +99,69 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	}
 
 	return &vmutil.BufferedConn{Conn: conn, Reader: reader}, nil
+}
+
+// Probe verifies the tunnel can authenticate to the Connect API without
+// contacting any guest, so a broken tunnel fails loudly at startup instead of
+// resetting every connection. It issues a plain GET to the real Connect route
+// with port 0: the auth middleware runs first, then handleConnect rejects
+// port 0 with 400 INVALID_PORT *before* dialing the guest. So:
+//
+//   - 400 → authenticated and the Connect route is reachable (regardless of
+//     whether any guest port is listening yet)
+//   - 401 → the token is missing/invalid/expired
+//   - 403 → the token's scope isn't accepted on the Connect route (e.g. an
+//     older shed-server that still gates Connect on the credentials scope)
+//   - anything else / a transport or TLS-pin error → also a failure
+//
+// The caller bounds the probe with ctx's deadline (there is no internal
+// timeout), so a stalled server can't wedge startup.
+func (c *ConnectClient) Probe(ctx context.Context, shedName string) error {
+	scheme := "http"
+	if c.target.TLSPin != "" {
+		scheme = "https"
+	}
+	transport := servertls.PinnedTransport(c.target.TLSPin) // nil ⇒ DefaultTransport (plain HTTP)
+	reqURL := fmt.Sprintf("%s://%s/api/sheds/%s/connect/0", scheme, c.target.Addr, url.PathEscape(shedName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("build connect probe request: %w", err)
+	}
+	if c.target.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.target.Token)
+	}
+
+	client := &http.Client{Transport: transport}
+	if transport != nil {
+		// One-shot probe: close our own pinned transport's idle keep-alive conn so
+		// it doesn't linger for the (long-lived) daemon worker's lifetime. Guarded
+		// so we never touch the shared DefaultTransport used by the plain path.
+		defer client.CloseIdleConnections()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connect probe to %s: %w", c.target.Addr, err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusBadRequest:
+		// The only 400 handleConnect returns on this route is INVALID_PORT (for
+		// port 0), emitted *after* auth passes. Confirm the shed error code so a
+		// generic 400 from a proxy, wrong service, or TLS-terminating middlebox
+		// doesn't false-pass as "authenticated" (see internal/api/connect.go).
+		var apiErr config.APIError
+		if json.NewDecoder(resp.Body).Decode(&apiErr) == nil && apiErr.Error.Code == "INVALID_PORT" {
+			return nil // authenticated, Connect route reachable
+		}
+		return fmt.Errorf("connect probe: unexpected 400 from %s — not the shed Connect API (INVALID_PORT); check the endpoint", c.target.Addr)
+	case http.StatusUnauthorized:
+		return fmt.Errorf("connect probe: shed-server rejected the tunnel token (401); it may be missing or expired")
+	case http.StatusForbidden:
+		return fmt.Errorf("connect probe: tunnel token scope not accepted on the Connect route (403); the shed-server may be too old to accept a control token — upgrade it")
+	default:
+		return fmt.Errorf("connect probe: unexpected HTTP %d from the Connect route", resp.StatusCode)
+	}
 }
 
 // dial opens the transport to the Connect API: a raw TCP conn (byte-identical

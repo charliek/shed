@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -80,6 +81,21 @@ func PinnedClientConfig(fingerprint string) *tls.Config {
 			return nil
 		},
 	}
+}
+
+// PinnedTransport returns an *http.Transport (as http.RoundTripper) whose TLS
+// config pins the server's self-signed cert by fingerprint, or a genuinely-nil
+// http.RoundTripper when fingerprint is empty (so an http.Client falls back to
+// DefaultTransport for the plain-HTTP path). It is the shared constructor for
+// pinned HTTP clients — the CLI control plane and the Connect tunnel/probe — so
+// they all verify identically. The nil return is untyped on purpose: returning
+// a typed (*http.Transport)(nil) would make a non-nil http.RoundTripper wrapping
+// a nil pointer, which http.Client would use instead of DefaultTransport.
+func PinnedTransport(fingerprint string) http.RoundTripper {
+	if fingerprint == "" {
+		return nil
+	}
+	return &http.Transport{TLSClientConfig: PinnedClientConfig(fingerprint)}
 }
 
 // loadIfCovers loads the persisted cert+key and returns it only when it parses
