@@ -172,8 +172,9 @@ Verify inside a shed:
 
 ```bash
 timedatectl                                  # "NTP service: active"
-# After a host sleep, the agent logs the correction:
 sudo journalctl -u shed-agent | grep clock-sync
+# clock-sync: started (checking the host RTC every 30s, stepping when drift > 30s)
+# ...and after a host sleep, the correction:
 # clock-sync: stepped clock forward 2h3m0s (system ... -> RTC ...)
 ```
 

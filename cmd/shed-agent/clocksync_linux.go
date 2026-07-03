@@ -59,6 +59,12 @@ func stepClock(t time.Time) error {
 // (rare — only after a sleep) are always logged; repeated step errors are
 // deduplicated by message.
 func (s *Server) runClockSync(ctx context.Context) {
+	// One startup line so an operator can confirm the loop is live: with
+	// transition-only logging below, a healthy VZ that hasn't slept would
+	// otherwise log nothing until the first correction.
+	log.Printf("clock-sync: started (checking the host RTC every %s, stepping when drift > %s)",
+		defaultClockSyncInterval, defaultClockSyncThreshold)
+
 	rtcWasPresent := true // VZ's normal state; flips + logs once if absent (FC)
 	var lastErr string
 
