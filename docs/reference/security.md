@@ -99,14 +99,15 @@ the scope, and an expiry.
 
 | Scope | Grants |
 |-------|--------|
-| `control` | The control plane (lifecycle, images, sessions, snapshots) and the Connect tunnel for `shed forward`. |
-| `credentials` | The credential bus (`/api/plugins/*`) — live SSH signatures and cloud credentials — and the Connect tunnel (used by the host-agent's reverse proxy). |
+| `control` | The control plane (lifecycle, images, sessions, snapshots), the Connect tunnel for `shed forward`, and the egress audit stream. |
+| `credentials` | The credential bus (`/api/plugins/*`) — live SSH signatures and cloud credentials — plus the Connect tunnel and the egress audit stream (used by the host-agent's reverse proxy / egress subscriber). |
 
 (The pre-v0.7.1 `admin` scope is removed.) Under `secure` mode every request needs
 a matching `Authorization: Bearer` token of the required scope. The bus requires
 `credentials`, so a leaked `control` token cannot reach the live-secret bus; the
-Connect tunnel accepts **either** scope (the CLI dials it with `control`, the
-host-agent's proxy with `credentials`). `GET /api/info` stays reachable without a
+Connect tunnel and the egress audit stream accept **either** scope (the CLI uses
+`control`, the host-agent's proxy / egress subscriber uses `credentials`).
+`GET /api/info` stays reachable without a
 token so `shed server add` can read the auth mode and ports before the operator
 holds one.
 

@@ -408,6 +408,10 @@ func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
 
 // handleEgressStream streams egress decisions as Server-Sent Events for the
 // host-agent subscriber (shed-extensions). GET /api/egress/stream
+//
+// In secure mode this route accepts a control OR credentials token (the
+// host-agent holds credentials; a control token may tail it) — see
+// authMiddleware. It is fleet-global: a subscriber sees every shed's decisions.
 func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
 	if s.egressAudit == nil {
 		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not enabled")

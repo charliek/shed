@@ -21,11 +21,12 @@ import (
 // bootstrap handler via SetTokenStore.
 //
 // Scope: the credential bus (/api/plugins/*) requires a credentials-scoped
-// token; the Connect tunnel (/api/sheds/*/connect/*) accepts either a control
-// or a credentials token (the `shed forward` CLI holds control; the host-agent's
-// reverse proxy holds credentials); every other /api route requires a
-// control-scoped token. So a leaked control token can't reach the bus, and a
-// credentials token can't manage the fleet.
+// token; the Connect tunnel (/api/sheds/*/connect/*) and the egress audit stream
+// (/api/egress/stream) accept either a control or a credentials token (the CLI
+// holds control; the host-agent's reverse proxy / egress subscriber holds
+// credentials); every other /api route requires a control-scoped token. So a
+// leaked control token can't reach the bus, and a credentials token can't manage
+// the fleet.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	if !s.cfg.HTTPAuthEnforced() {
 		return next
@@ -46,10 +47,12 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				writeError(w, http.StatusForbidden, "FORBIDDEN", "credentials scope required")
 				return
 			}
-		case isConnectRoute(r.URL.Path):
-			// The Connect tunnel is a data-plane port-forward, not the credential
-			// bus: `shed forward` reaches it with a control token and the
-			// host-agent's reverse proxy with a credentials token, so accept either.
+		case isConnectRoute(r.URL.Path) || isEgressStreamPath(r.Method, r.URL.Path):
+			// Neither is the credential bus. The Connect tunnel is a data-plane
+			// port-forward (`shed forward` uses control; the host-agent's reverse
+			// proxy uses credentials); the egress stream is fleet-global audit
+			// metadata (host-agent subscriber uses credentials; a control token may
+			// tail it too). Both accept either scope.
 			if rec.Scope != authtoken.ScopeControl && rec.Scope != authtoken.ScopeCredentials {
 				writeError(w, http.StatusForbidden, "FORBIDDEN", "control or credentials scope required")
 				return
@@ -107,6 +110,17 @@ func isConnectRoute(path string) bool {
 	}
 	parts := strings.Split(rest, "/")
 	return len(parts) == 3 && parts[1] == "connect" && parts[0] != "" && parts[2] != ""
+}
+
+// isEgressStreamPath reports whether r targets the fleet-global egress audit SSE
+// stream (GET /api/egress/stream), consumed by the host-agent (credentials) and
+// tailable by the CLI (control). It is method-scoped to GET on purpose: the
+// sibling POST/DELETE /api/egress/{name} mutators (handleEgressSet/Off) are
+// control-only, so a shed named "stream" must not let a credentials token onto
+// POST/DELETE /api/egress/stream. Only this exact GET is dual-scope; every other
+// /api/egress/* route (profiles, per-shed show/set/off) stays control-only.
+func isEgressStreamPath(method, path string) bool {
+	return method == http.MethodGet && path == "/api/egress/stream"
 }
 
 // bearerToken extracts the token from an "Authorization: Bearer <token>"
