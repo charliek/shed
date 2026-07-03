@@ -156,8 +156,9 @@ RUN set -euo pipefail && \
           /lib/systemd/system/systemd-update-utmp* && \
     # Enable services shipped by base. systemd-timesyncd is included for
     # parity with VZ and general clock discipline (best-effort on FC, which
-    # needs outbound DNS + NTP; kvmclock is FC's real safety net and it has
-    # no RTC — see #236); the explicit enable is load-bearing because the
+    # needs outbound DNS + NTP; FC's paravirtualized clock (kvm-clock/TSC) is
+    # its real safety net and it has no RTC — see #236); the explicit enable
+    # is load-bearing because the
     # *.wants/* cleanup above nukes the symlink dpkg created. docker is
     # enabled in the `full` stage where it's actually installed.
     SYSTEMD_OFFLINE=1 systemctl enable ssh shed-agent shed-firstboot network-setup systemd-timesyncd && \
