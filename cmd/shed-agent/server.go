@@ -183,6 +183,15 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
 
+	// Periodically re-sync the guest clock from the host-backed RTC. The VZ
+	// guest wall clock freezes across host sleep and is never corrected on wake
+	// (see runClockSync); no-ops where no RTC exists (Firecracker).
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runClockSync(s.ctx)
+	}()
+
 	log.Printf("Listening on vsock ports: console=%d, message=%d, tcp_proxy=%d; HTTP on 127.0.0.1:%d",
 		s.consolePort, s.notifyPort, s.tcpProxyPort, s.httpPort)
 	return nil
