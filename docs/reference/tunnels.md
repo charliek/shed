@@ -135,6 +135,30 @@ running after the launching terminal is closed.
   file is truncated on each start and is not rotated (it only records errors, so
   it stays small in normal use).
 
+## Secure mode
+
+On a server running `auth.mode: secure`, the tunnel authenticates to the Connect
+API with a bearer token over pinned TLS (the Connect route accepts a `control` or
+`credentials` scope; the CLI uses its control token). Two behaviors matter:
+
+- **Startup probe.** `shed tunnels start` validates that it can authenticate
+  *before* binding any local listener, so a scope/token/TLS-pin problem fails the
+  command in your terminal instead of silently resetting every connection. The
+  probe does not touch the guest, so starting a tunnel before the in-VM service is
+  up still succeeds.
+- **Transparent token refresh.** The short-lived control token (`auth.token_ttl`,
+  default 24h) is re-minted automatically so a long-running background tunnel
+  keeps working across expiry — proactively just before expiry and reactively if a
+  connection is rejected — over the same SSH `_bootstrap` channel `shed server add`
+  uses. Because the background daemon is detached, it re-mints **non-interactively**:
+  it needs your SSH key available without a prompt (an `ssh-agent` that outlives
+  the launching terminal, or an agent-loaded / unencrypted key). If neither is
+  available when the token expires, new connections through a multi-day tunnel fail
+  until you restart it, and the reason is logged to `~/.shed/logs/tunnel-<shed>.log`.
+  Once running, the daemon re-mints its tunnel token **in memory only**, so a
+  long-lived daemon won't rewrite `~/.shed/config.yaml` and clobber a concurrent
+  foreground edit. (Open-mode servers use no token and are unaffected.)
+
 ## Port Conflicts
 
 If a local port is already in use, the tunnel will fail to start with a descriptive error. Use a different local port:

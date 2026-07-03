@@ -131,6 +131,13 @@ Every client refreshes transparently, so the TTL is invisible in normal use:
   the TTL. It no longer reads a static `credentials_token` from config.
 - **shed-desktop** — requests a `control` token from the local host-agent (over
   the host-agent's Unix socket) and refreshes near expiry / on `401`.
+- **background tunnels** (`shed tunnels start -d`) — the detached daemon re-mints
+  its `control` token the same way (proactively near expiry, reactively on a
+  `401`); once running those re-mints are **in memory only**, so a multi-day daemon
+  never rewrites `~/.shed/config.yaml` and can't clobber a concurrent foreground
+  edit. It re-mints non-interactively (SSH `BatchMode`), so it needs SSH access
+  without a prompt — an agent that outlives the launching terminal, or a
+  passphrase-less / agent-loaded key.
 
 ### Revocation follows the allowlist
 
