@@ -74,6 +74,20 @@ func TestAuthMiddlewareEnforce(t *testing.T) {
 		// missing port nor an extra segment counts as the tunnel (→ control-only).
 		{"connect prefix without port, credentials forbidden", "GET", "/api/sheds/x/connect", cred, 403},
 		{"connect with trailing segment, credentials forbidden", "GET", "/api/sheds/x/connect/22/extra", cred, 403},
+		// The fleet-global egress audit stream accepts either scope (host-agent
+		// subscriber holds credentials; a control token may tail it).
+		{"egress stream, control token", "GET", "/api/egress/stream", ctl, 200},
+		{"egress stream, credentials token", "GET", "/api/egress/stream", cred, 200},
+		{"egress stream, no token", "GET", "/api/egress/stream", "", 401},
+		// Only GET /stream is dual-scope; other egress routes stay control-only.
+		{"egress profiles, control token", "GET", "/api/egress/profiles", ctl, 200},
+		{"egress profiles, credentials token forbidden", "GET", "/api/egress/profiles", cred, 403},
+		{"egress per-shed, credentials token forbidden", "GET", "/api/egress/myshed", cred, 403},
+		// A shed named "stream" must NOT let a credentials token onto the
+		// control-only POST/DELETE egress mutators via the /stream path.
+		{"egress stream POST, credentials forbidden", "POST", "/api/egress/stream", cred, 403},
+		{"egress stream DELETE, credentials forbidden", "DELETE", "/api/egress/stream", cred, 403},
+		{"egress stream POST, control token", "POST", "/api/egress/stream", ctl, 200},
 		{"create, control token", "POST", "/api/sheds", ctl, 200},
 	}
 	for _, tt := range tests {

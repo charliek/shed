@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/tunnels"
 )
@@ -284,6 +285,10 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// A self-refreshing token source so a long-lived tunnel survives the control
+	// token's TTL. Built here for foreground and (re-)built by the detached worker
+	// when it re-runs; the parent -d process starts no tunnels itself.
+	tokenSrc := tunnelTokenSource(client, entry, target)
 
 	switch {
 	case tunnelBackground && !tunnelDaemon:
@@ -291,21 +296,35 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		return spawnTunnelDaemon(shedName, allPorts)
 	case tunnelDaemon:
 		// Detached worker: start tunnels, report readiness, block on signal.
-		return runDaemonWorker(mgr, shedName, serverName, target, allPorts, profileName)
+		return runDaemonWorker(mgr, shedName, serverName, target, tokenSrc, allPorts, profileName)
 	default:
 		// Foreground mode: start tunnels and block on signal.
-		return runForegroundTunnel(mgr, shedName, target, allPorts, profileName)
+		return runForegroundTunnel(mgr, shedName, target, tokenSrc, allPorts, profileName)
 	}
 }
 
-func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, ports []tunnels.PortMapping, profile string) error {
+// tunnelTokenSource returns a self-refreshing token source for a secure tunnel,
+// seeded from the client's freshly-minted token+expiry (post ensureRunningShed).
+// It re-mints over SSH but NEVER persists to config: a background daemon may run
+// for days, and writing its stale in-memory config back would clobber unrelated
+// foreground edits (e.g. a `shed server add`). Returns nil for the plain/legacy
+// path (no token, no refresh).
+func tunnelTokenSource(client *APIClient, entry *config.ServerEntry, target tunnels.ConnectTarget) *clienttoken.Source {
+	if target.TLSPin == "" {
+		return nil
+	}
+	return clienttoken.New(client.currentToken(), client.TokenSource().ExpiresAt(),
+		controlTokenRefresh(entry.Host, entry.SSHPort, "")) // "" persistName ⇒ mint-only
+}
+
+func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, source *clienttoken.Source, ports []tunnels.PortMapping, profile string) error {
 	// Fail loudly if the tunnel can't authenticate, before binding any listener
 	// (so we never leave a listener up that resets every connection).
-	if err := probeConnectAuth(target, shedName); err != nil {
+	if err := probeConnectAuth(target, source, shedName); err != nil {
 		return err
 	}
 
-	activeTunnels, err := mgr.StartTunnels(target, shedName, ports)
+	activeTunnels, err := mgr.StartTunnels(target, source, shedName, ports)
 	if err != nil {
 		return fmt.Errorf("failed to start tunnels: %w", err)
 	}

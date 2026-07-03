@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/vmutil"
@@ -31,20 +32,74 @@ type ConnectTarget struct {
 // ConnectClient dials shed VMs via the shed-server Connect API.
 type ConnectClient struct {
 	target ConnectTarget
+	// source, when non-nil, supplies the bearer token and transparently re-mints
+	// it (proactively before expiry, reactively on a 401) so a long-lived tunnel
+	// survives the token TTL. nil ⇒ the static target.Token (legacy/plain path).
+	source *clienttoken.Source
 }
 
-// NewConnectClient creates a new Connect API client for the given target.
-func NewConnectClient(target ConnectTarget) *ConnectClient {
-	return &ConnectClient{target: target}
+// NewConnectClient creates a Connect API client for the given target. A non-nil
+// source makes the client self-refreshing; nil uses the static target.Token
+// (and no token at all for the plain/legacy path).
+func NewConnectClient(target ConnectTarget, source *clienttoken.Source) *ConnectClient {
+	return &ConnectClient{target: target, source: source}
+}
+
+// authToken returns the bearer token to send: the live token from the refreshing
+// source when present, else the static target.Token. It never returns a token for
+// an unpinned (plain-TCP) target — a bearer token must only travel over the
+// pinned-TLS connection, never plaintext — so a misconfigured source can't leak
+// one over the legacy path.
+func (c *ConnectClient) authToken() string {
+	if c.target.TLSPin == "" {
+		return ""
+	}
+	if c.source != nil {
+		return c.source.Token()
+	}
+	return c.target.Token
 }
 
 // Dial opens a TCP tunnel to a shed VM port via the Connect API. It performs an
 // HTTP upgrade handshake and returns the underlying connection (over pinned TLS
-// when the target is pinned).
+// when the target is pinned). When the client has a refreshing source, it
+// re-mints the token proactively before dialing and, on a 401, once reactively
+// before re-dialing — so a tunnel outlives the control-token TTL.
 func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
-	conn, err := c.dial(ctx)
+	if c.source != nil {
+		c.source.EnsureFresh() // proactive: re-mint if within the expiry window
+	}
+	sent := c.authToken()
+	conn, status, err := c.attemptDial(ctx, shedName, port, sent)
 	if err != nil {
 		return nil, err
+	}
+	// A control token can expire mid-tunnel: on a 401, re-mint once and re-dial
+	// from scratch (the raw upgrade connection can't be reused for a retry).
+	if status == http.StatusUnauthorized && c.source != nil && c.source.Refreshable() {
+		if _, rerr := c.source.Refresh(sent); rerr != nil {
+			return nil, fmt.Errorf("connect API returned 401 and token re-mint failed: %w", rerr)
+		}
+		// Re-read through authToken so the retry re-applies the plaintext guard
+		// (never a bearer over an unpinned connection) rather than the raw token.
+		if conn, status, err = c.attemptDial(ctx, shedName, port, c.authToken()); err != nil {
+			return nil, err
+		}
+	}
+	if status != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("connect API returned HTTP %d (expected 101)", status)
+	}
+	return conn, nil
+}
+
+// attemptDial performs a single dial + Connect upgrade with the given bearer
+// token. On a 101 it returns the established connection and status 101; on any
+// other HTTP status it closes the connection and returns (nil, status, nil); a
+// transport/handshake/cancellation error returns (nil, 0, err).
+func (c *ConnectClient) attemptDial(ctx context.Context, shedName string, port uint16, token string) (net.Conn, int, error) {
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	// The upgrade write + http.ReadResponse below don't honor ctx on their own,
@@ -58,16 +113,16 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	path := fmt.Sprintf("/api/sheds/%s/connect/%d", shedName, port)
 	var req strings.Builder
 	fmt.Fprintf(&req, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: shed-tcp\r\n", path, c.target.Addr)
-	if c.target.Token != "" {
-		fmt.Fprintf(&req, "Authorization: Bearer %s\r\n", c.target.Token)
+	if token != "" {
+		fmt.Fprintf(&req, "Authorization: Bearer %s\r\n", token)
 	}
 	req.WriteString("\r\n")
 	if _, err := conn.Write([]byte(req.String())); err != nil {
 		conn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr // watcher closed conn on cancel; report cancellation, not a write error
+			return nil, 0, ctxErr // watcher closed conn on cancel; report cancellation, not a write error
 		}
-		return nil, fmt.Errorf("send upgrade request: %w", err)
+		return nil, 0, fmt.Errorf("send upgrade request: %w", err)
 	}
 
 	// Read the response.
@@ -76,9 +131,9 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	if err != nil {
 		conn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr // watcher closed conn on cancel; report cancellation, not a read error
+			return nil, 0, ctxErr // watcher closed conn on cancel; report cancellation, not a read error
 		}
-		return nil, fmt.Errorf("read upgrade response: %w", err)
+		return nil, 0, fmt.Errorf("read upgrade response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
@@ -86,7 +141,7 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 			resp.Body.Close()
 		}
 		conn.Close()
-		return nil, fmt.Errorf("connect API returned HTTP %d (expected 101)", resp.StatusCode)
+		return nil, resp.StatusCode, nil
 	}
 
 	// Stop the cancel-watcher before handing the conn back so it can't close the
@@ -95,10 +150,10 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	stopWatch()
 	if ctx.Err() != nil {
 		conn.Close()
-		return nil, ctx.Err()
+		return nil, 0, ctx.Err()
 	}
 
-	return &vmutil.BufferedConn{Conn: conn, Reader: reader}, nil
+	return &vmutil.BufferedConn{Conn: conn, Reader: reader}, http.StatusSwitchingProtocols, nil
 }
 
 // Probe verifies the tunnel can authenticate to the Connect API without
@@ -117,6 +172,9 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 // The caller bounds the probe with ctx's deadline (there is no internal
 // timeout), so a stalled server can't wedge startup.
 func (c *ConnectClient) Probe(ctx context.Context, shedName string) error {
+	if c.source != nil {
+		c.source.EnsureFresh() // probe with a fresh token so a near-expiry one doesn't fail startup
+	}
 	scheme := "http"
 	if c.target.TLSPin != "" {
 		scheme = "https"
@@ -127,8 +185,8 @@ func (c *ConnectClient) Probe(ctx context.Context, shedName string) error {
 	if err != nil {
 		return fmt.Errorf("build connect probe request: %w", err)
 	}
-	if c.target.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.target.Token)
+	if tok := c.authToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	client := &http.Client{Transport: transport}

@@ -31,7 +31,7 @@ func assertStopReturns(t *testing.T, tun *Tunnel) {
 // conn is returned for the caller to exercise and is closed via t.Cleanup.
 func startTunnel(t *testing.T, srv *httptest.Server) (*Tunnel, net.Conn) {
 	t.Helper()
-	tun := NewTunnel(NewConnectClient(ConnectTarget{Addr: addrOf(srv)}), "myshed", PortMapping{Local: 0, Remote: 8080})
+	tun := NewTunnel(NewConnectClient(ConnectTarget{Addr: addrOf(srv)}, nil), "myshed", PortMapping{Local: 0, Remote: 8080})
 	if err := tun.Start(); err != nil {
 		t.Fatalf("start tunnel: %v", err)
 	}

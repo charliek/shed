@@ -11,8 +11,9 @@ The `shed-server` exposes a REST API for managing sheds.
     required scope, except the bootstrap endpoints `GET /api/info` and
     `GET /api/ssh-host-key`. The credential bus (`/api/plugins/*`) requires the
     `credentials` scope; the Connect tunnel
-    (`/api/sheds/{name}/connect/{port}`) accepts **either** `control` or
-    `credentials`; everything else needs `control`. Tokens are **not** issued over HTTP —
+    (`/api/sheds/{name}/connect/{port}`) and the egress audit stream
+    (`/api/egress/stream`) accept **either** `control` or `credentials`;
+    everything else needs `control`. Tokens are **not** issued over HTTP —
     they are minted over the SSH `_bootstrap` channel (see
     [Authentication](#authentication)). See [Security](security.md) for the full
     model and pinned TLS.

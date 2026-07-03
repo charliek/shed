@@ -6,6 +6,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/charliek/shed/internal/clienttoken"
 )
 
 // Manager handles tunnel lifecycle operations.
@@ -52,8 +54,10 @@ func (m *Manager) State() *TunnelState {
 
 // StartTunnels starts tunnels for all port mappings using the Connect API.
 // Returns the active tunnels that the caller should manage (stop on shutdown).
-func (m *Manager) StartTunnels(target ConnectTarget, shedName string, ports []PortMapping) ([]*Tunnel, error) {
-	client := NewConnectClient(target)
+// A non-nil source makes every tunnel self-refresh its token (all ports share
+// the one client/source, so concurrent re-mints coalesce).
+func (m *Manager) StartTunnels(target ConnectTarget, source *clienttoken.Source, shedName string, ports []PortMapping) ([]*Tunnel, error) {
+	client := NewConnectClient(target, source)
 	var tunnels []*Tunnel
 
 	for _, pm := range ports {
