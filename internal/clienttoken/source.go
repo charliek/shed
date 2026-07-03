@@ -16,7 +16,11 @@ import (
 )
 
 // tokenRefreshWindow is how long before expiry a token is proactively re-minted
-// by EnsureFresh, so a request never races the expiry.
+// by EnsureFresh, so a request never races the expiry. It is a fixed threshold,
+// not derived from the token's TTL: a token_ttl at or below it makes EnsureFresh
+// re-mint eagerly (up to once per call) — still correct, and reactive Refresh
+// covers expiry regardless — but the default token_ttl (24h) sits far above it,
+// so in normal operation a token is re-minted at most once, within its final 2h.
 const tokenRefreshWindow = 2 * time.Hour
 
 // ErrStatic is returned by Refresh when the Source has no refresh callback (a
