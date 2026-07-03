@@ -99,7 +99,7 @@ RUN printf '%s\n' \
 # `apt install` inside a shed).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       systemd systemd-sysv dbus \
+       systemd systemd-sysv systemd-timesyncd dbus \
        sudo zip unzip ca-certificates hostname \
        tmux git curl wget neovim jq ncurses-term ripgrep tree \
        openssh-server \
@@ -154,9 +154,13 @@ RUN set -euo pipefail && \
           /lib/systemd/system/sockets.target.wants/*initctl* \
           /lib/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup* \
           /lib/systemd/system/systemd-update-utmp* && \
-    # Enable services shipped by base. docker is enabled in the `full`
-    # stage where it's actually installed.
-    SYSTEMD_OFFLINE=1 systemctl enable ssh shed-agent shed-firstboot network-setup && \
+    # Enable services shipped by base. systemd-timesyncd is included for
+    # parity with VZ and general clock discipline (best-effort on FC, which
+    # needs outbound DNS + NTP; kvmclock is FC's real safety net and it has
+    # no RTC — see #236); the explicit enable is load-bearing because the
+    # *.wants/* cleanup above nukes the symlink dpkg created. docker is
+    # enabled in the `full` stage where it's actually installed.
+    SYSTEMD_OFFLINE=1 systemctl enable ssh shed-agent shed-firstboot network-setup systemd-timesyncd && \
     # SSH server policy.
     mkdir -p /run/sshd /etc/ssh/sshd_config.d && \
     printf '%s\n' \
