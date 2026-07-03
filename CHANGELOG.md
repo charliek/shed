@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.7.8 — 2026-07-03
+
+### Fixed
+
+- **Guest clock stays correct across host sleep.** A long-running guest shipped no
+  time synchronization, so when the host slept the VZ guest's wall clock froze
+  behind real time and was never re-synced on wake — breaking AWS SigV4/STS
+  signing, TLS validity windows, and token expiry (observed ~3 h behind). Guest
+  images now ship `systemd-timesyncd`, and `shed-agent` periodically steps the
+  clock forward from the host-backed RTC (VZ; forward-only, gated on a large gap,
+  bounded to a plausible window, and a clean no-op where no RTC exists).
+  Firecracker has no RTC and its host doesn't sleep, so `timesyncd` covers it.
+  Takes effect once you pull a rebuilt image. (#240)
+- **`shed forward` works against secure-mode servers.** In secure mode the Connect
+  route required the credentials scope, so the CLI's control token was rejected
+  (403) and every `shed forward` connection reset. The route now accepts either
+  the control scope (CLI) or credentials (host-agent reverse proxy); the credential
+  bus stays credentials-only. (#238)
+- **Background tunnels survive the token TTL on secure-mode servers.** The egress
+  audit stream (`GET /api/egress/stream`) now accepts control or credentials
+  (GET-only), and the CLI + tunnels share a self-refreshing bearer-token source
+  that re-mints before expiry — so long-lived background tunnels no longer drop
+  when the token TTL lapses. (#239)
+
 ## v0.7.7 — 2026-07-01
 
 ### Fixed
