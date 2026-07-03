@@ -27,8 +27,8 @@ const (
 
 	// rtcSinceEpochPath is the sysfs node exposing the RTC as UTC epoch seconds.
 	// Present on the VZ PL031 RTC; absent on Firecracker x86 (which emulates no
-	// RTC — its time is held by kvmclock), where readRTCFrom returns ok=false and
-	// the loop no-ops.
+	// RTC — its time comes from a paravirtualized clock, kvm-clock/TSC), where
+	// readRTCFrom returns ok=false and the loop no-ops.
 	rtcSinceEpochPath = "/sys/class/rtc/rtc0/since_epoch"
 )
 
