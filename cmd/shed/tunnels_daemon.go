@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/tunnels"
 )
@@ -38,10 +39,10 @@ const tunnelProbeTimeout = 5 * time.Second
 // foreground and detached-worker start paths run it before binding listeners, so
 // an auth/transport failure fails `shed tunnels start` loudly instead of
 // surfacing later as a per-connection reset.
-func probeConnectAuth(target tunnels.ConnectTarget, shedName string) error {
+func probeConnectAuth(target tunnels.ConnectTarget, source *clienttoken.Source, shedName string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), tunnelProbeTimeout)
 	defer cancel()
-	return tunnels.NewConnectClient(target).Probe(ctx, shedName)
+	return tunnels.NewConnectClient(target, source).Probe(ctx, shedName)
 }
 
 // spawnTunnelDaemon re-execs this binary as a detached background worker for the
@@ -186,7 +187,7 @@ func parseReadyMessage(line string) error {
 // parent over the inherited pipe, then blocks until signalled and tears down.
 // The ordering is load-bearing: listeners bound -> state saved -> "OK" written,
 // so `shed tunnels list` immediately after the parent returns sees the entry.
-func runDaemonWorker(mgr *tunnels.Manager, shedName, serverName string, target tunnels.ConnectTarget, ports []tunnels.PortMapping, profile string) error {
+func runDaemonWorker(mgr *tunnels.Manager, shedName, serverName string, target tunnels.ConnectTarget, source *clienttoken.Source, ports []tunnels.PortMapping, profile string) error {
 	ready, err := openReadyPipe()
 	if err != nil {
 		return err
@@ -195,14 +196,14 @@ func runDaemonWorker(mgr *tunnels.Manager, shedName, serverName string, target t
 	// Validate Connect auth before binding listeners or reporting readiness, so a
 	// broken tunnel fails `shed tunnels start` in the user's terminal (via the
 	// ERR: channel) rather than looking healthy and resetting every connection.
-	if probeErr := probeConnectAuth(target, shedName); probeErr != nil {
+	if probeErr := probeConnectAuth(target, source, shedName); probeErr != nil {
 		fmt.Fprintf(ready, "ERR:%s\n", probeErr)
 		_ = ready.Close()
 		return probeErr
 	}
 
 	// Bind listeners, then record state under our own (detached) PID.
-	activeTunnels, startErr := mgr.StartTunnels(target, shedName, ports)
+	activeTunnels, startErr := mgr.StartTunnels(target, source, shedName, ports)
 	if startErr != nil {
 		startErr = fmt.Errorf("failed to start tunnels: %w", startErr)
 	} else if saveErr := mgr.SaveBackground(shedName, serverName, profile, os.Getpid(), ports); saveErr != nil {
