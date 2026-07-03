@@ -7,30 +7,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/sdk"
 )
 
-func TestNeedsRefresh(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0)
-	tests := []struct {
-		name      string
-		expiresAt time.Time
-		want      bool
-	}{
-		{"zero expiry (static token / open server) never refreshes", time.Time{}, false},
-		{"far-future expiry does not refresh", now.Add(24 * time.Hour), false},
-		{"within the refresh window refreshes", now.Add(time.Hour), true},
-		{"exactly at the window edge refreshes", now.Add(tokenRefreshWindow), true},
-		{"expired refreshes", now.Add(-time.Minute), true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := needsRefresh(tt.expiresAt, now); got != tt.want {
-				t.Errorf("needsRefresh = %v, want %v", got, tt.want)
-			}
-		})
-	}
+// refreshingSource builds a Source seeded with tok that mints newTok on refresh
+// (recording whether it fired), with far-future expiries so only the reactive
+// path is exercised.
+func refreshingSource(tok, newTok string, fired *bool) *clienttoken.Source {
+	return clienttoken.New(tok, time.Now().Add(24*time.Hour), func() (string, time.Time, error) {
+		if fired != nil {
+			*fired = true
+		}
+		return newTok, time.Now().Add(24 * time.Hour), nil
+	})
 }
 
 func TestDoRequest401RefreshAndRetry(t *testing.T) {
@@ -47,7 +38,7 @@ func TestDoRequest401RefreshAndRetry(t *testing.T) {
 	defer srv.Close()
 
 	c := newAPIClient(srv.URL, "stale", "", DefaultTimeout)
-	c.refreshFn = func() (string, error) { refreshed = true; return "new", nil }
+	c.tokens = refreshingSource("stale", "new", &refreshed)
 
 	var out struct {
 		OK bool `json:"ok"`
@@ -56,7 +47,7 @@ func TestDoRequest401RefreshAndRetry(t *testing.T) {
 		t.Fatalf("doRequest: %v", err)
 	}
 	if !refreshed {
-		t.Error("refreshFn should have been called on the 401")
+		t.Error("refresh should have been called on the 401")
 	}
 	if !out.OK {
 		t.Error("the retry should have succeeded with the refreshed token")
@@ -75,7 +66,10 @@ func TestDoRequest401RetryAtMostOnce(t *testing.T) {
 	defer srv.Close()
 
 	c := newAPIClient(srv.URL, "stale", "", DefaultTimeout)
-	c.refreshFn = func() (string, error) { refreshes++; return "new", nil }
+	c.tokens = clienttoken.New("stale", time.Now().Add(24*time.Hour), func() (string, time.Time, error) {
+		refreshes++
+		return "new", time.Now().Add(24 * time.Hour), nil
+	})
 
 	if err := c.doRequest("GET", "/x", nil, nil); err == nil {
 		t.Error("expected an error when the 401 persists after refresh")
@@ -85,6 +79,54 @@ func TestDoRequest401RetryAtMostOnce(t *testing.T) {
 	}
 	if hits != 2 {
 		t.Errorf("want 2 requests (initial + one retry), got %d", hits)
+	}
+}
+
+// TestDoRequest401StaticNoRetry: a static token (not Refreshable) must NOT retry
+// on a 401 — behavior preserved from the pre-Source client.
+func TestDoRequest401StaticNoRetry(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := newAPIClient(srv.URL, "static", "", DefaultTimeout) // static Source, no refresh
+	if err := c.doRequest("GET", "/x", nil, nil); err == nil {
+		t.Error("expected an error on 401")
+	}
+	if hits != 1 {
+		t.Errorf("a static token must not retry; want 1 request, got %d", hits)
+	}
+}
+
+// TestDeleteShedWithProgress401RefreshAndRetry exercises the streaming delete
+// path's own on-401 refresh (it bypasses doRequest): 401 → re-mint → 204 (done).
+func TestDeleteShedWithProgress401RefreshAndRetry(t *testing.T) {
+	var hits int
+	refreshed := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Header.Get("Authorization") == "Bearer new" {
+			w.WriteHeader(http.StatusNoContent) // delete OK, no stream
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	c := newAPIClient(srv.URL, "stale", "", DefaultTimeout)
+	c.tokens = refreshingSource("stale", "new", &refreshed)
+
+	if err := c.DeleteShedWithProgress("myshed", nil); err != nil {
+		t.Fatalf("DeleteShedWithProgress: %v", err)
+	}
+	if !refreshed {
+		t.Error("refresh should have been called on the 401")
+	}
+	if hits != 2 {
+		t.Errorf("want 2 requests (401 then 204), got %d", hits)
 	}
 }
 
@@ -128,8 +170,8 @@ func TestProactiveRefreshOnNearExpiry(t *testing.T) {
 
 	entry := clientConfig.Servers["s"]
 	c := NewAPIClientFromEntry(&entry, DefaultTimeout)
-	if c.token != "fresh" {
-		t.Errorf("client token = %q, want fresh (proactively refreshed)", c.token)
+	if c.tokens.Token() != "fresh" {
+		t.Errorf("client token = %q, want fresh (proactively refreshed)", c.tokens.Token())
 	}
 	if got := clientConfig.Servers["s"].ControlToken; got != "fresh" {
 		t.Errorf("in-memory token = %q, want fresh", got)
@@ -160,11 +202,11 @@ func TestNoRefreshForStaticToken(t *testing.T) {
 	if called {
 		t.Error("a static token (zero expiry) must not bootstrap")
 	}
-	if c.refreshFn != nil {
-		t.Error("a static token must not get a refreshFn")
+	if c.tokens.Refreshable() {
+		t.Error("a static token must not be refreshable")
 	}
-	if c.token != "static" {
-		t.Errorf("token = %q, want static", c.token)
+	if c.tokens.Token() != "static" {
+		t.Errorf("token = %q, want static", c.tokens.Token())
 	}
 }
 

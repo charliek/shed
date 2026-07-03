@@ -15,28 +15,13 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
 )
 
-const (
-	// DefaultTimeout for quick API operations (list, stop, delete, etc.)
-	DefaultTimeout = 30 * time.Second
-
-	// tokenRefreshWindow is how long before expiry a bootstrap-minted control
-	// token is proactively re-minted, so a request never races the expiry.
-	tokenRefreshWindow = 2 * time.Hour
-)
-
-// needsRefresh reports whether a bootstrap-minted token (expiresAt non-zero) is
-// expired or within tokenRefreshWindow of expiry and should be re-minted. A zero
-// expiresAt — a static/legacy token or an open server — never refreshes.
-func needsRefresh(expiresAt, now time.Time) bool {
-	if expiresAt.IsZero() {
-		return false
-	}
-	return !now.Before(expiresAt.Add(-tokenRefreshWindow))
-}
+// DefaultTimeout for quick API operations (list, stop, delete, etc.)
+const DefaultTimeout = 30 * time.Second
 
 // APIClient provides methods for interacting with the shed server API.
 type APIClient struct {
@@ -44,29 +29,34 @@ type APIClient struct {
 	httpClient    *http.Client
 	transport     http.RoundTripper // non-nil when TLS-pinned; shared by every client below
 	createTimeout time.Duration
-	token         string // bearer token (control scope), sent when non-empty
-	// refreshFn, when set, re-mints the bearer token (over the SSH bootstrap)
-	// and persists it; doRequest calls it once on a 401 and retries. nil for
-	// static tokens, open servers, and plain-HTTP clients.
-	refreshFn func() (string, error)
+	// tokens holds the bearer token and, in secure mode, transparently re-mints
+	// it (proactively near expiry, reactively on a 401). Static for open servers,
+	// plain-HTTP clients, and legacy fixed tokens. Never nil.
+	tokens *clienttoken.Source
 }
 
-// setAuth adds the bearer token header when the client is configured with one.
+// setAuth adds the bearer token header when the client has a non-empty token.
 func (c *APIClient) setAuth(req *http.Request) {
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if tok := c.tokens.Token(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 }
 
-// currentToken returns the client's current in-memory bearer (control) token.
-// It may have been re-minted since construction — proactively near expiry or
-// reactively on a 401 retry — even when persisting the refresh back to config
-// was skipped (ambiguous alias) or failed. The tunnel path reads it so a
-// forwarded connection dials the Connect API with the freshest token rather
-// than the possibly-stale one in the config entry. Safe to call after a
-// synchronous request (e.g. ensureRunningShed) with no request in flight.
+// currentToken returns the client's current in-memory bearer (control) token. It
+// may have been re-minted since construction — proactively near expiry or
+// reactively on a 401 — even when persisting the refresh back to config was
+// skipped (ambiguous alias) or failed. The tunnel path reads it so a forwarded
+// connection dials with the freshest token rather than the possibly-stale one in
+// the config entry.
 func (c *APIClient) currentToken() string {
-	return c.token
+	return c.tokens.Token()
+}
+
+// TokenSource returns the client's token source, so a long-lived consumer (the
+// tunnel daemon) can seed its own Source from the freshly-refreshed token+expiry
+// this client obtained during setup.
+func (c *APIClient) TokenSource() *clienttoken.Source {
+	return c.tokens
 }
 
 // newHTTPClient builds an *http.Client carrying the pinning transport (if any),
@@ -99,7 +89,7 @@ func newAPIClient(baseURL, token, tlsFingerprint string, createTimeout time.Dura
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		transport:     pinnedTransport(tlsFingerprint),
 		createTimeout: createTimeout,
-		token:         token,
+		tokens:        clienttoken.Static(token),
 	}
 	c.httpClient = c.newHTTPClient(DefaultTimeout)
 	return c
@@ -113,34 +103,40 @@ func newAPIClient(baseURL, token, tlsFingerprint string, createTimeout time.Dura
 func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
 	c := newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
 	if entry.ControlTokenExpiresAt.IsZero() {
-		return c
+		return c // static/legacy token or open server — no refresh
 	}
-	host, sshPort := entry.Host, entry.SSHPort
 	// Resolve which config entry this is, so a refreshed token can be persisted.
 	// "" means no unambiguous match (a one-off entry, or duplicate aliases to the
 	// same endpoint) — the refresh still works for this client's lifetime, it
 	// just isn't saved.
 	name := serverNameForEntry(entry)
-	c.refreshFn = func() (string, error) {
+	c.tokens = clienttoken.New(entry.ControlToken, entry.ControlTokenExpiresAt,
+		controlTokenRefresh(entry.Host, entry.SSHPort, name))
+	// Proactively re-mint a near-expiry token so a request never races expiry. A
+	// mint failure here is non-fatal (EnsureFresh keeps the stale token); the
+	// reactive 401-retry surfaces any error on the next request.
+	c.tokens.EnsureFresh()
+	return c
+}
+
+// controlTokenRefresh returns a refresh callback that mints a control token over
+// the SSH bootstrap channel and, when persistName != "", best-effort persists it
+// to that config entry. It is shared by NewAPIClientFromEntry (persisting) and
+// the tunnel daemon (persistName "" — mint-only, so a long-lived daemon never
+// rewrites the user's config from its own stale in-memory copy).
+func controlTokenRefresh(host string, sshPort int, persistName string) func() (string, time.Time, error) {
+	return func() (string, time.Time, error) {
 		bundle, err := bootstrapFn(host, sshPort, "control", "cli")
 		if err != nil {
-			return "", err
+			return "", time.Time{}, err
 		}
-		// The token is valid the moment it is minted; persisting it is
-		// best-effort so a Save failure never wastes the mint or fails the
-		// request (the next process just re-mints).
-		persistControlToken(name, bundle.Token, bundle.ExpiresAt)
-		return bundle.Token, nil
-	}
-	// Proactively re-mint a near-expiry token so a request never races expiry.
-	// A mint failure here is non-fatal: the stale token is kept and the reactive
-	// 401-retry surfaces any error on the next request.
-	if needsRefresh(entry.ControlTokenExpiresAt, time.Now()) {
-		if tok, err := c.refreshFn(); err == nil {
-			c.token = tok
+		if persistName != "" {
+			// Best-effort: a Save failure never wastes the mint or fails the
+			// request (the next process just re-mints).
+			persistControlToken(persistName, bundle.Token, bundle.ExpiresAt)
 		}
+		return bundle.Token, bundle.ExpiresAt, nil
 	}
-	return c
 }
 
 // configMu serializes refresh-path access to the shared clientConfig global —
@@ -221,23 +217,38 @@ func (c *APIClient) sendRequest(method, path string, body interface{}) (*http.Re
 	return c.httpClient.Do(req)
 }
 
+// refreshedOn401 is the shared on-401 re-mint for the request paths. When resp is
+// a 401 and the token source can refresh, it closes resp.Body, re-mints the token
+// that failed (sentToken — the generation the caller sent, so a concurrent
+// refresh isn't double-minted), and returns retry=true so the caller re-runs its
+// request exactly once (panel decision #11). A static token (not Refreshable) or
+// a non-401 returns retry=false. Only a failed re-mint returns an error; each
+// caller wraps its own resend error as it sees fit.
+func (c *APIClient) refreshedOn401(resp *http.Response, sentToken string) (retry bool, err error) {
+	if resp.StatusCode != http.StatusUnauthorized || !c.tokens.Refreshable() {
+		return false, nil
+	}
+	_ = resp.Body.Close()
+	if _, rerr := c.tokens.Refresh(sentToken); rerr != nil {
+		return false, fmt.Errorf("re-authenticating after 401: %w", rerr)
+	}
+	return true, nil
+}
+
 // doRequest performs an HTTP request with JSON body and response handling. It
 // handles connection errors, status validation, and JSON decoding, and
 // transparently re-mints + retries once on a 401 (an expired bootstrap token).
 func (c *APIClient) doRequest(method, path string, body, result interface{}, expectedStatus ...int) error {
+	sent := c.tokens.Token()
 	resp, err := c.sendRequest(method, path, body)
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
-	// A bootstrap-minted token can expire mid-session: on 401, re-mint once over
-	// SSH and retry the request a single time (panel decision #11).
-	if resp.StatusCode == http.StatusUnauthorized && c.refreshFn != nil {
-		_ = resp.Body.Close()
-		tok, rerr := c.refreshFn()
-		if rerr != nil {
-			return fmt.Errorf("re-authenticating after 401: %w", rerr)
-		}
-		c.token = tok
+	retry, rerr := c.refreshedOn401(resp, sent)
+	if rerr != nil {
+		return rerr
+	}
+	if retry {
 		resp, err = c.sendRequest(method, path, body)
 		if err != nil {
 			return fmt.Errorf("failed to connect to server: %w", err)
@@ -626,17 +637,16 @@ func (c *APIClient) DeleteShedWithProgress(name string, onProgress func(backend.
 		return resp, nil
 	}
 
+	sent := c.tokens.Token()
 	resp, err := send()
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode == http.StatusUnauthorized && c.refreshFn != nil {
-		_ = resp.Body.Close()
-		tok, rerr := c.refreshFn()
-		if rerr != nil {
-			return fmt.Errorf("re-authenticating after 401: %w", rerr)
-		}
-		c.token = tok
+	retry, rerr := c.refreshedOn401(resp, sent)
+	if rerr != nil {
+		return rerr
+	}
+	if retry {
 		if resp, err = send(); err != nil {
 			return err
 		}
