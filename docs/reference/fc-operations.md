@@ -78,7 +78,7 @@ Read-only mounts (`readonly: true`) are enforced as read-only at the mount level
 # Check mount directories were bound
 shed exec myproject -- ls -la /home/shed/.claude/
 
-# Test SSH access to GitHub (with shed-extensions SSH agent forwarding)
+# Test SSH access to GitHub (with the SSH agent forwarding extension)
 shed exec myproject -- ssh -T git@github.com
 ```
 

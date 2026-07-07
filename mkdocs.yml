@@ -126,7 +126,20 @@ nav:
       - Build Tools: reference/build-tools.md
       - Extensions: reference/extensions.md
       - HTTP API: reference/api.md
+  - Extensions:
+      - Architecture: extensions/architecture.md
+      - Configuration: extensions/configuration.md
+      - SSH Agent: extensions/ssh-agent.md
+      - AWS Credentials: extensions/aws-credentials.md
+      - Docker Credentials: extensions/docker-credentials.md
+      - Host Agent IPC: extensions/host-agent-ipc.md
+      - shed-desktop Approval: extensions/desktop-approval.md
+      - Status CLI: extensions/status-cli.md
+      - RC Session Helper: extensions/rc-helper.md
+      - shed-machine-rc: extensions/shed-machine-rc.md
+      - Security Posture: extensions/security-posture.md
   - Discovery:
+      - Monorepo Consolidation: discovery/monorepo-consolidation.md
       - Lazy Rootfs Streaming: discovery/lazy-rootfs-streaming.md
       - Proxy Integration: discovery/proxy_integration_design.md
       - Runtime Optimization Backlog: discovery/runtime-optimization-backlog.md

@@ -179,7 +179,7 @@ mounts:
     readonly: true           # Optional, default false
 ```
 
-**Mount sources must be directories.** Single-file mounts are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the shed-extensions SSH agent forwarding instead of mounting `~/.ssh`.
+**Mount sources must be directories.** Single-file mounts are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the SSH agent forwarding extension instead of mounting `~/.ssh`.
 
 **Missing sources:** If a mount's source path does not exist on the host, it is skipped with a log warning. Create the source directory on the host before starting the shed.
 
@@ -288,7 +288,7 @@ vz:
 ```
 
 **Why this is version-coupled:** the base images bundle the in-VM `shed-agent`
-and the shed-extensions guest binaries, which are versioned in lockstep with
+and the guest extension binaries, which are versioned in lockstep with
 `shed`. Pinning the image to the server version — via the default synthesis or
 the `${shed.version}` token — keeps the guest components compatible with the
 server instead of drifting on upgrade.

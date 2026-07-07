@@ -1,0 +1,154 @@
+# shed-host-agent configuration
+#
+# Installed to ~/.config/shed/extensions.yaml (or, via Homebrew,
+# $(brew --prefix)/etc/shed/extensions.yaml). Override the path with:
+#   shed-host-agent -config /path/to/config.yaml
+#
+# This file ships working defaults: SSH is gated by native Touch ID, Docker
+# brokers Docker Hub + GitHub registry creds, and AWS is OFF until you add a
+# role. Edit the `approval.policy` of each extension to change how requests are
+# approved (see "Approval model" below), then restart the agent.
+
+# ---------------------------------------------------------------------------
+# shed server
+# ---------------------------------------------------------------------------
+# The shed-server this agent brokers credentials for (single-server mode).
+server: http://localhost:8080
+
+# Multi-server mode (optional): broker for many shed servers from one process,
+# discovered from shed's own CLI config. Uncomment to enable; `server:` above is
+# then ignored. See docs/reference/configuration.md.
+# discovery:
+#   servers: all          # "all" (default) or a list: [mini2, mini3]
+#   watch: fsnotify        # fsnotify (default) | poll | off
+
+# ---------------------------------------------------------------------------
+# Approval model
+# ---------------------------------------------------------------------------
+# Each extension below has an `approval.policy`. It is REQUIRED — an omitted or
+# empty policy means `deny-all` (fail closed). Values:
+#
+#   deny-all               Reject every request. The safe default / kill-switch.
+#   approve-all            Allow every request. (Any allowlist/role configured
+#                          below still applies — this only removes the approval
+#                          prompt.)
+#   shed-desktop           Decide each request in the shed-desktop app. The app
+#                          connects to the agent's always-on approval socket; its
+#                          Preferences own the method/scope/TTL. If the app isn't
+#                          running, requests fail closed (deny).
+#
+#   SSH only — native macOS Touch ID (works with no app running):
+#   biometrics             Touch ID only. Fails when no biometric is available.
+#   biometrics-or-password Touch ID, Apple Watch, OR account password. Works in
+#                          clamshell mode and on Macs without a sensor.
+#
+# How long the agent waits for the app to decide a shed-desktop approval before
+# failing closed (Go duration; default 25s):
+# approval_timeout: 25s
+
+# ---------------------------------------------------------------------------
+# SSH agent
+# ---------------------------------------------------------------------------
+ssh:
+  # Backend: "agent-forward" (forward the host SSH agent), "local-keys" (use
+  # local key files), or "" to auto-detect.
+  mode: ""
+
+  approval:
+    # Native Touch ID with password fallback — prompts in macOS, no app needed.
+    # Switch to `shed-desktop` to approve in the app instead (enable desktop:).
+    policy: biometrics-or-password
+
+    # scope + session_ttl apply ONLY to the native biometric policies (they
+    # cache an approval so you aren't prompted on every signature):
+    #   per-request  Prompt on every SSH signature.
+    #   per-session  Prompt once, then cache for session_ttl (default).
+    #   per-shed     Prompt once per shed, cached for session_ttl.
+    scope: per-session
+    session_ttl: 1h
+
+# ---------------------------------------------------------------------------
+# AWS credential vending
+# ---------------------------------------------------------------------------
+aws:
+  # Local AWS profile the agent uses: the AssumeRole source, or (in passthrough
+  # mode) the profile whose session credentials are vended directly.
+  source_profile: default
+
+  # mode selects how credentials are obtained:
+  #   assume-role (default) — sts:AssumeRole from source_profile into default_role.
+  #   passthrough           — vend source_profile's existing SSO/SAML session creds
+  #                           directly, no AssumeRole (no role needed). Re-run your
+  #                           SSO login to refresh; the agent re-reads the file.
+  # mode: assume-role
+
+  # The IAM role to assume (assume-role mode). REQUIRED for assume-role to work —
+  # there is no Preferences UI for this, so set it here.
+  # default_role: arn:aws:iam::123456789012:role/acmeco-dev
+  # session_duration: 1h
+  # cache_refresh_before: 5m
+
+  approval:
+    # AWS is OFF by default. To turn it on: set default_role (assume-role) or
+    # mode: passthrough above, then change this to `approve-all` (vend without a
+    # prompt) or `shed-desktop` (toggle Allow/Deny live in the app).
+    policy: deny-all
+
+  # Per-server / per-shed role and mode overrides (most specific wins). See docs.
+  # servers:
+  #   mini2:
+  #     default_role: arn:aws:iam::123456789012:role/acmeco-mini2
+  #     sheds:
+  #       web:
+  #         role: arn:aws:iam::123456789012:role/acmeco-web
+  #       sso-app:
+  #         mode: passthrough
+
+# ---------------------------------------------------------------------------
+# Docker registry credential brokering
+# ---------------------------------------------------------------------------
+docker:
+  # Registries the agent will broker credentials for. REQUIRED for Docker to
+  # work (no Preferences UI for this). Defaults to Docker Hub + GitHub.
+  # NOTE: list Docker Hub as `index.docker.io` — Docker requests Hub creds for
+  # `https://index.docker.io/v1/`, which normalizes to `index.docker.io`. A bare
+  # `docker.io` entry will NOT match and pulls fail with REGISTRY_NOT_ALLOWED.
+  registries:
+    - index.docker.io
+    - ghcr.io
+
+  # Set true to broker for ANY registry (bypasses the allowlist above).
+  allow_all: false
+
+  # config_path: ~/.docker/config.json   # override Docker config location
+
+  approval:
+    # Vend creds for the registries above without a prompt. Set `deny-all` to
+    # disable Docker, or `shed-desktop` to toggle Allow/Deny live in the app.
+    policy: approve-all
+
+  # Per-server / per-shed registry overrides (most specific wins). See docs.
+  # servers:
+  #   mini2:
+  #     allow_all: true
+  #     sheds:
+  #       web:
+  #         registries: [ghcr.io, us-central1-docker.pkg.dev]
+
+# ---------------------------------------------------------------------------
+# Audit logging (durable, independent of shed-desktop)
+# ---------------------------------------------------------------------------
+# Every credential operation is appended here as JSON, whether or not the
+# shed-desktop app is connected. This is the authoritative record.
+logging:
+  enabled: true
+  path: ~/.local/share/shed/extensions-audit.log
+
+# ---------------------------------------------------------------------------
+# shed-desktop integration
+# ---------------------------------------------------------------------------
+# No configuration needed: the agent always serves a local approval socket at a
+# fixed path that the shed-desktop app connects to (it receives the audit/event
+# stream and decides any extension whose policy is `shed-desktop`). See
+# docs/reference/host-agent-ipc.md. Tune the approval budget with the top-level
+# `approval_timeout` above.

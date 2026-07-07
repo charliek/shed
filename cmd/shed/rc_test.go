@@ -9,7 +9,7 @@ import (
 )
 
 // TestParseRcListGolden decodes the cross-repo golden DTO fixture (byte-identical
-// to shed-extensions internal/rc/testdata/rcSessionDto.golden.json and
+// to internal/ext/rc/testdata/rcSessionDto.golden.json and
 // shed-remote-agent's). Keeping a copy here makes the shed CLI a participant in
 // the shed-ext-rc stdout contract guard.
 func TestParseRcListGolden(t *testing.T) {

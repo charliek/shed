@@ -6,6 +6,19 @@ dist/
 /shed-agent
 firecracker/shed-agent
 vz/shed-agent
+# Guest extension binaries + /etc overlay staged into the rootfs build
+# context by scripts/stage-guest-binaries.sh (SIGKILL'd builds can leave
+# them behind; the build scripts' cleanup traps normally remove them).
+vz/shed-ext-ssh-agent
+vz/shed-ext-aws-credentials
+vz/docker-credential-shed
+vz/shed-ext-rc
+vz/ext-etc/
+firecracker/shed-ext-ssh-agent
+firecracker/shed-ext-aws-credentials
+firecracker/docker-credential-shed
+firecracker/shed-ext-rc
+firecracker/ext-etc/
 *.exe
 *.exe~
 *.dll

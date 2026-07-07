@@ -126,14 +126,19 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `cmd/shed/` — CLI binary (command handlers split across `shed.go`, `console.go`, `attach.go`, `sessions.go`, `tunnels.go`, `sync.go`, `ssh_config.go`, etc.)
 - `cmd/shed-server/` — Server daemon binary
 - `cmd/shed-agent/` — In-VM agent binary (Firecracker/VZ)
+- `cmd/shed-host-agent/` — Host-side credential broker (imported from shed-extensions). **CGO on darwin** for the Touch ID / LocalAuthentication approval gate (`touchid_{darwin,stub}.go` build tags); linux build is CGO-free. Its release job runs on **macos-latest** to build the darwin CGO half.
+- `cmd/shed-machine-rc/` — Host-side RC-session helper (native machine sibling of `shed-ext-rc`)
+- `cmd/shed-ext-ssh-agent/`, `cmd/shed-ext-aws-credentials/`, `cmd/docker-credential-shed/`, `cmd/shed-ext-rc/` — In-VM guest extension binaries (imported from shed-extensions). Cross-compiled for linux and staged into the rootfs build context by `scripts/stage-guest-binaries.sh`; not shipped as host `bin/` artifacts.
 - `internal/api/` — HTTP API handlers (Chi router)
 - `internal/config/` — Configuration types and validation
+- `internal/ext/` — Extensions internals (imported from shed-extensions: `protocol`, `sshagent`, `awsproxy`, `dockercred`, `rc`, `clirc`, `testutil`); no crates/Rust, all Go
 - `internal/firecracker/` — Firecracker backend (Linux only, `//go:build linux`)
 - `internal/vz/` — VZ backend (macOS only, `//go:build darwin`)
 - `internal/vmutil/` — Shared VM agent communication (no build tags)
 - `internal/agentproto/` — Binary protocol for vsock communication
 - `internal/sshd/` — SSH server implementation
 - `internal/backend/` — Backend interface all backends implement
+- `guest/extensions/etc/` — Guest overlay (systemd units, `environment.d`, `shed-extensions.d` manifests) staged into the rootfs alongside the guest binaries
 - `docs/` — MkDocs documentation site
 
 ## Key Conventions
@@ -174,12 +179,12 @@ The server config `default_backend` supports `vz`, `firecracker`, or `detect` (a
 
 ## VM Images
 
-VZ and Firecracker use multi-stage Dockerfiles (`vz/Dockerfile`, `firecracker/Dockerfile`) to build rootfs OCI images. Variants: `base`, `extensions`, `full`. The `extensions` and `full` variants layer [shed-extensions](https://github.com/charliek/shed-extensions) guest binaries via `COPY --from=` a published multi-arch Docker image, pinned by `ARG SHED_EXT_VERSION`.
+VZ and Firecracker use multi-stage Dockerfiles (`vz/Dockerfile`, `firecracker/Dockerfile`) to build rootfs OCI images. Variants: `base`, `extensions`, `full`. The `extensions` and `full` variants install the four guest extension binaries (`shed-ext-ssh-agent`, `shed-ext-aws-credentials`, `docker-credential-shed`, `shed-ext-rc`) plus the `guest/extensions/etc/` overlay (systemd units, `environment.d`, `shed-extensions.d` manifests). These are **built in-tree** from `cmd/shed-ext-*` and cross-compiled + staged into the build context by `scripts/stage-guest-binaries.sh` (the single producer shared by the local rootfs scripts and the `publish-images.yaml` CI jobs) — there is no separate `ghcr.io/charliek/shed-extensions` image and no per-image version build-arg any more.
 
 Since v0.5.2 the read-only rootfs **erofs is built at image-publish time** by `mkfs.erofs` running inside the `ghcr.io/charliek/shed-build-tools:vX.Y.Z` container (pinned `erofs-utils` version, tagged in lockstep with shed releases). The resulting erofs ships as a content-addressed OCI blob referenced by the `io.shed.rootfs.erofs.digest` manifest annotation. Hosts pull the blob and mount it directly — no on-host `mkfs.erofs` invocation. Pre-v0.5.2 images lack the annotation and are rejected at boot with a clear "rebuild against current tooling" error (see `internal/vmimage/manager.go:resolveManifestLower`).
 
 - Build locally: `./scripts/build-vz-rootfs.sh --variant extensions`
-- Local dev with shed-extensions changes: `--shed-ext-version dev` (after building the shed-extensions Docker image locally)
+- Local dev with guest-extension changes: edit `cmd/shed-ext-*` or `guest/extensions/etc/` and rebuild the `extensions` (or `full`) variant — `scripts/stage-guest-binaries.sh` recompiles them in-tree automatically (no image ref to bump)
 - Local dev iterating on the build-tools image: `make build-tools && ./scripts/build-{vz,firecracker}-rootfs.sh --build-tools-version dev`
 - See `docs/reference/images.md`, `docs/reference/build-tools.md`, and `docs/upgrades/v0.5.1-to-v0.5.2.md` for full docs.
 
