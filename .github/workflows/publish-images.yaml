@@ -133,6 +133,8 @@ jobs:
           # In-VM binaries staged into the Dockerfile build context.
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-firstboot ./cmd/shed-firstboot
+          # Guest extension binaries + /etc overlay staged into the same context.
+          ./scripts/stage-guest-binaries.sh vz arm64
           # Host-side CLI used to drive OCI conversion + push.
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
@@ -262,6 +264,8 @@ jobs:
             -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}"
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-firstboot ./cmd/shed-firstboot
+          # Guest extension binaries + /etc overlay staged into the same context.
+          ./scripts/stage-guest-binaries.sh firecracker amd64
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
 

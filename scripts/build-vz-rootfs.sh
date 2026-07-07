@@ -34,7 +34,6 @@ KNOWN_VARIANTS="base extensions full"
 VARIANT="full"
 BUILD_ALL=false
 FORCE_KERNEL=false
-SHED_EXT_VERSION=""
 BUILD_TOOLS_VERSION=""
 
 # Parse arguments
@@ -57,15 +56,6 @@ while [[ $# -gt 0 ]]; do
             FORCE_KERNEL=true
             shift
             ;;
-        --shed-ext-version)
-            if [[ $# -lt 2 || "$2" == --* ]]; then
-                echo "ERROR: --shed-ext-version requires a value"
-                echo "Run '$0 --help' for usage."
-                exit 1
-            fi
-            SHED_EXT_VERSION="$2"
-            shift 2
-            ;;
         --build-tools-version)
             # Forwarded to `shed image build`. Pins the
             # shed-build-tools image used to mint the rootfs erofs.
@@ -87,8 +77,6 @@ while [[ $# -gt 0 ]]; do
             echo "                     Available variants: $KNOWN_VARIANTS"
             echo "  --all              Build all variants"
             echo "  --force-kernel     Force kernel/initrd re-extraction even if files exist"
-            echo "  --shed-ext-version Override shed-extensions image version for extensions/full variants"
-            echo "                     (e.g., 'dev' to use a locally-built image)"
             echo "  --build-tools-version  Override the shed-build-tools image tag used to mint the rootfs erofs"
             echo "                         (e.g., 'dev' to use a locally-built shed-build-tools:dev image)"
             echo "  --help, -h         Show this help message"
@@ -128,8 +116,12 @@ cleanup() {
     fi
     # Remove the staged binaries from the build context so the working
     # tree stays clean after the script exits (Dockerfile COPYs them
-    # via relative paths during the build).
-    rm -f "$VZ_DIR/shed-agent" "$VZ_DIR/shed-firstboot"
+    # via relative paths during the build). Includes the guest extension
+    # binaries + /etc overlay staged by stage-guest-binaries.sh.
+    rm -f "$VZ_DIR/shed-agent" "$VZ_DIR/shed-firstboot" \
+          "$VZ_DIR/shed-ext-ssh-agent" "$VZ_DIR/shed-ext-aws-credentials" \
+          "$VZ_DIR/docker-credential-shed" "$VZ_DIR/shed-ext-rc"
+    rm -rf "$VZ_DIR/ext-etc"
 }
 
 trap cleanup EXIT
@@ -155,6 +147,9 @@ build_prereqs() {
 
     echo "=== Building shed-firstboot binary (linux/arm64) ==="
     GOOS=linux GOARCH=arm64 go build -o "$VZ_DIR/shed-firstboot" ./cmd/shed-firstboot
+
+    echo "=== Staging guest extension binaries + /etc overlay (linux/arm64) ==="
+    "$SCRIPT_DIR/stage-guest-binaries.sh" "$VZ_DIR" arm64
 
     echo "=== Building host shed CLI ==="
     mkdir -p "$PROJECT_ROOT/bin"
@@ -197,12 +192,6 @@ build_variant() {
     local extra_args=()
     if [ -n "$BUILD_TOOLS_VERSION" ]; then
         extra_args+=(--build-tools-version "$BUILD_TOOLS_VERSION")
-    fi
-    if [ -n "$SHED_EXT_VERSION" ]; then
-        # Forward the shed-extensions pin to the Dockerfile's top-level
-        # ARG SHED_EXT_VERSION (used by the extensions/full variants) via
-        # the now-supported --build-arg passthrough on `shed image build`.
-        extra_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
     fi
 
     # SHED_INSTALL_SHA busts BuildKit's bind-mount stat cache when the staged

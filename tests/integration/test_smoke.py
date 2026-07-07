@@ -338,11 +338,12 @@ def test_shed_exec_smoke(shed_server, test_shed_name):
 # ---------------------------------------------------------------------------
 
 
-# Binaries shipped by the upstream ghcr.io/charliek/shed-extensions image
-# and copied into the `extensions` (and transitively `full`) rootfs layer
-# by the Dockerfile's COPY-via-bind RUN. If a bump regresses any of them
-# (missing binary, wrong path, lost +x bit, arch mismatch), this test
-# catches it before the bump ships.
+# Guest extension binaries built in-tree (from cmd/shed-ext-*, cmd/docker-
+# credential-shed) and staged into the rootfs build context by
+# scripts/stage-guest-binaries.sh, then installed into the `extensions` (and
+# transitively `full`) rootfs layer by the Dockerfile's COPY-via-bind RUN. If
+# a change regresses any of them (missing binary, wrong path, lost +x bit,
+# arch mismatch, stale-cache bake), this test catches it before it ships.
 #
 # Keep this list aligned with the install statements in
 # vz/Dockerfile + firecracker/Dockerfile's `shed-vz-extensions` /
@@ -351,20 +352,34 @@ _SHED_EXTENSIONS_BINARIES = (
     "/usr/local/bin/shed-ext-ssh-agent",
     "/usr/local/bin/shed-ext-aws-credentials",
     "/usr/local/bin/docker-credential-shed",
+    "/usr/local/bin/shed-ext-rc",
+)
+
+# systemd units + config files staged from guest/extensions/etc/ (via
+# stage-guest-binaries.sh -> ext-etc/) and installed by the extensions stage.
+_SHED_EXTENSIONS_UNITS = (
+    "/etc/systemd/system/shed-ext-ssh-agent.service",
+    "/etc/systemd/system/shed-ext-aws-credentials.service",
+)
+_SHED_EXTENSIONS_CONFIGS = (
+    "/etc/environment.d/shed-extensions.conf",
+    "/etc/shed-extensions.d/ssh-agent.yaml",
+    "/etc/shed-extensions.d/aws-credentials.yaml",
+    "/etc/shed-extensions.d/docker-credentials.yaml",
 )
 
 
 def test_extensions_image_smoke(shed_server, test_shed_name):
-    """The `extensions` image variant carries the shed-extensions binaries.
+    """The `extensions` image variant carries the shed-extensions payload.
 
     Smoke test for the `extensions` (and transitively `full`) image
-    variants — verifies that the Dockerfile's
-    `COPY --from=ghcr.io/charliek/shed-extensions:vX.Y.Z` resolved
-    cleanly at image-build time, every documented binary is present in
-    the booted rootfs at the documented path, and each binary has the
-    executable bit. This is the gate future shed-extensions bumps need
-    to survive — added with the v0.3.1 → v0.3.2 bump so the existing
-    `image="base"` tests don't carry the burden.
+    variants — verifies that the in-tree guest binaries + /etc overlay,
+    staged into the build context by scripts/stage-guest-binaries.sh and
+    installed by the Dockerfile's COPY-via-bind RUN, are all present in the
+    booted rootfs: every binary at its documented path with the executable
+    bit, the two systemd units, the environment.d + shed-extensions.d config
+    files, and the docker credsStore config. This is the gate future changes
+    to the guest extension payload need to survive.
 
     Skips with a clear message if the server has no `extensions` tag
     configured (e.g. a dev box pulling only `base`); the test isn't a
@@ -390,7 +405,40 @@ def test_extensions_image_smoke(shed_server, test_shed_name):
         assert r.returncode == 0, (
             f"{binary!r} missing or not executable in the booted shed: "
             f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
-            f"The Dockerfile's `COPY --from=shed-extensions` likely failed "
-            f"to install this binary (check the COPY RUN in "
-            f"vz/Dockerfile / firecracker/Dockerfile's extensions stage)."
+            f"stage-guest-binaries.sh likely failed to stage this binary, or "
+            f"the extensions-stage install RUN in vz/Dockerfile / "
+            f"firecracker/Dockerfile regressed."
         )
+
+    for unit in _SHED_EXTENSIONS_UNITS:
+        r = shed_server.exec(test_shed_name, ["test", "-f", unit])
+        assert r.returncode == 0, (
+            f"{unit!r} missing in the booted shed: "
+            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+            f"Staged from guest/extensions/etc/systemd/system via "
+            f"stage-guest-binaries.sh (ext-etc/); check the extensions-stage "
+            f"install RUN in vz/Dockerfile / firecracker/Dockerfile."
+        )
+
+    for cfg in _SHED_EXTENSIONS_CONFIGS:
+        r = shed_server.exec(test_shed_name, ["test", "-f", cfg])
+        assert r.returncode == 0, (
+            f"{cfg!r} missing in the booted shed: "
+            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+            f"Staged from guest/extensions/etc via stage-guest-binaries.sh "
+            f"(ext-etc/); check the extensions-stage install RUN in "
+            f"vz/Dockerfile / firecracker/Dockerfile."
+        )
+
+    r = shed_server.exec(
+        test_shed_name, ["cat", "/home/shed/.docker/config.json"]
+    )
+    assert r.returncode == 0, (
+        f"~/.docker/config.json missing in the booted shed: "
+        f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}."
+    )
+    assert '"credsStore": "shed"' in r.stdout, (
+        f"~/.docker/config.json does not declare the shed credsStore: "
+        f"got {r.stdout!r}. Written by the extensions-stage RUN in "
+        f"vz/Dockerfile / firecracker/Dockerfile."
+    )

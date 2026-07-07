@@ -268,12 +268,15 @@ OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
 OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
   ./scripts/build-vz-rootfs.sh --variant base --build-tools-version dev
 
-# Note on shed-extensions changes: pass --shed-ext-version <tag> to
-# the build script to validate a shed-extensions bump. It forwards the
-# pin to the Dockerfile's `ARG SHED_EXT_VERSION` via `shed image build
-# --build-arg` (#227), so no manual Dockerfile edit is needed:
+# Note on guest extension changes: the four guest binaries
+# (shed-ext-ssh-agent, shed-ext-aws-credentials, docker-credential-shed,
+# shed-ext-rc) and the guest/extensions/etc/ overlay are built in-tree and
+# staged into the build context by scripts/stage-guest-binaries.sh, which
+# the build script calls automatically. There is no SHED_EXT_VERSION /
+# --shed-ext-version any more — edit cmd/shed-ext-* or guest/extensions/etc/
+# and rebuild the extensions (or full) variant to pick the change up:
 OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
-  ./scripts/build-vz-rootfs.sh --variant extensions --shed-ext-version <tag>
+  ./scripts/build-vz-rootfs.sh --variant extensions
 
 # 2. Restart the dev server (it picks up the new blobs automatically
 #    — the OCI store is content-addressed so a `shed image ls` will

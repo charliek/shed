@@ -30,7 +30,6 @@ KNOWN_VARIANTS="base extensions full"
 # Defaults
 VARIANT="full"
 BUILD_ALL=false
-SHED_EXT_VERSION=""
 BUILD_TOOLS_VERSION=""
 
 # Parse arguments
@@ -48,15 +47,6 @@ while [[ $# -gt 0 ]]; do
         --all)
             BUILD_ALL=true
             shift
-            ;;
-        --shed-ext-version)
-            if [[ $# -lt 2 || "$2" == --* ]]; then
-                echo "ERROR: --shed-ext-version requires a value"
-                echo "Run '$0 --help' for usage."
-                exit 1
-            fi
-            SHED_EXT_VERSION="$2"
-            shift 2
             ;;
         --build-tools-version)
             # Forwarded to `shed image build`. Pins the
@@ -81,8 +71,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --variant <name>   Build a specific variant (default: full)"
             echo "                     Available variants: $KNOWN_VARIANTS"
             echo "  --all              Build all variants"
-            echo "  --shed-ext-version Override shed-extensions image version for extensions/full variants"
-            echo "                     (e.g., 'dev' to use a locally-built image)"
             echo "  --build-tools-version  Override the shed-build-tools image tag used to mint the rootfs erofs"
             echo "                         (e.g., 'dev' to use a locally-built shed-build-tools:dev image)"
             echo "  --help, -h         Show this help message"
@@ -120,7 +108,12 @@ cleanup() {
     if [ -n "$SHED_INITRD" ] && [ -f "$SHED_INITRD" ]; then
         rm -f "$SHED_INITRD"
     fi
-    rm -f "$FIRECRACKER_DIR/shed-agent" "$FIRECRACKER_DIR/shed-firstboot"
+    # Includes the guest extension binaries + /etc overlay staged by
+    # stage-guest-binaries.sh.
+    rm -f "$FIRECRACKER_DIR/shed-agent" "$FIRECRACKER_DIR/shed-firstboot" \
+          "$FIRECRACKER_DIR/shed-ext-ssh-agent" "$FIRECRACKER_DIR/shed-ext-aws-credentials" \
+          "$FIRECRACKER_DIR/docker-credential-shed" "$FIRECRACKER_DIR/shed-ext-rc"
+    rm -rf "$FIRECRACKER_DIR/ext-etc"
 }
 
 trap cleanup EXIT
@@ -139,6 +132,9 @@ build_prereqs() {
 
     echo "=== Building shed-firstboot binary (linux/amd64) ==="
     GOOS=linux GOARCH=amd64 go build -o "$FIRECRACKER_DIR/shed-firstboot" ./cmd/shed-firstboot
+
+    echo "=== Staging guest extension binaries + /etc overlay (linux/amd64) ==="
+    "$SCRIPT_DIR/stage-guest-binaries.sh" "$FIRECRACKER_DIR" amd64
 
     echo "=== Building host shed CLI ==="
     mkdir -p "$PROJECT_ROOT/bin"
@@ -179,12 +175,6 @@ build_variant() {
     local extra_args=()
     if [ -n "$BUILD_TOOLS_VERSION" ]; then
         extra_args+=(--build-tools-version "$BUILD_TOOLS_VERSION")
-    fi
-    if [ -n "$SHED_EXT_VERSION" ]; then
-        # Forward the shed-extensions pin to the Dockerfile's top-level
-        # ARG SHED_EXT_VERSION (used by the extensions/full variants) via
-        # the now-supported --build-arg passthrough on `shed image build`.
-        extra_args+=(--build-arg "SHED_EXT_VERSION=$SHED_EXT_VERSION")
     fi
 
     # SHED_INSTALL_SHA busts BuildKit's bind-mount stat cache when the staged
