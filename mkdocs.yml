@@ -127,6 +127,7 @@ nav:
       - Extensions: reference/extensions.md
       - HTTP API: reference/api.md
   - Discovery:
+      - Monorepo Consolidation: discovery/monorepo-consolidation.md
       - Lazy Rootfs Streaming: discovery/lazy-rootfs-streaming.md
       - Proxy Integration: discovery/proxy_integration_design.md
       - Runtime Optimization Backlog: discovery/runtime-optimization-backlog.md
