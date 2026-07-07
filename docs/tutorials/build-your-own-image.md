@@ -15,7 +15,7 @@ The three published variants are:
 | Variant | Contents | Recommended use |
 |---|---|---|
 | `base` | OS layer only. systemd, SSH, git, build tools, the shed-agent. No Docker. | Tiny images. You'll wire up coding agents and credentials yourself. |
-| `extensions` | `base` + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering. No Docker daemon, no coding agents pinned. | **Custom images.** Credentials work out of the box; you choose the runtime/agent set. |
+| `extensions` | `base` + [credential brokering](../reference/extensions.md). No Docker daemon, no coding agents pinned. | **Custom images.** Credentials work out of the box; you choose the runtime/agent set. |
 | `full` | `extensions` + Docker CE (with `docker compose`), mise, bun, and coding agents (Claude Code, OpenCode, Codex CLI). | Default for `shed create`. |
 
 `extensions` is the right starting point because:
@@ -226,7 +226,7 @@ shed image pull ghcr.io/myorg/my-shed-image:v1 -t my-image
 `shed image pull` is registry-direct — no Docker daemon required on
 the shed server. Authentication uses
 `~/.docker/config.json` and any installed credential helpers (including
-the shed-extensions Docker credential proxy when an `extensions`-based
+the Docker credential proxy extension when an `extensions`-based
 shed is running).
 
 The pull is **boot-only** by default: the host boots from the prebuilt

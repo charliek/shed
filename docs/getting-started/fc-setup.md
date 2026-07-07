@@ -185,7 +185,7 @@ automatically.
 
 ### Private Repo Access
 
-Private Git authentication is handled via shed-extensions SSH agent forwarding. For Git configuration inside the VM (e.g., `.gitconfig`), use `shed sync` to push it as a dotfile rather than mounting single files as credentials.
+Private Git authentication is handled via the SSH agent forwarding extension. For Git configuration inside the VM (e.g., `.gitconfig`), use `shed sync` to push it as a dotfile rather than mounting single files as credentials.
 
 ## 5. Start the Server
 

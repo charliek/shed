@@ -41,7 +41,7 @@ steps.
 | Variant | Description |
 |---------|-------------|
 | `base` | Minimal OS layer: systemd, SSH, git, gh, build-essential, jq, ripgrep, neovim, tmux, and the shed-agent. No Docker, no coding agents, no language runtimes. |
-| `extensions` | `base` + [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering (SSH agent forwarding, AWS STS proxy, Docker credential helper) and the `shed-ext-rc` Remote Control helper. No Docker daemon, no coding agents pinned — start here for custom images. |
+| `extensions` | `base` + [credential brokering](extensions.md) (SSH agent forwarding, AWS STS proxy, Docker credential helper) and the `shed-ext-rc` Remote Control helper. No Docker daemon, no coding agents pinned — start here for custom images. |
 | `full` | `extensions` + Docker CE (with `docker compose`), [mise](https://mise.jdx.dev/), [bun](https://bun.sh/), and coding agents (Claude Code, OpenCode, Codex CLI). The batteries-included default. |
 
 Each variant inherits from the one above it as a discrete OCI layer, so
@@ -65,7 +65,7 @@ already cached locally.
 
 ### `extensions` variant
 
-The `extensions` variant adds [shed-extensions](https://charliek.github.io/shed-extensions/) credential brokering on top of `base`. It includes:
+The `extensions` variant adds [credential brokering](extensions.md) on top of `base`. It includes:
 
 - **`shed-ssh-agent`** — SSH agent proxy that forwards key operations to your Mac (private keys never enter the VM).
 - **`shed-aws-proxy`** — AWS credential proxy that vends short-lived STS tokens via the host.
@@ -77,7 +77,8 @@ The `extensions` variant adds [shed-extensions](https://charliek.github.io/shed-
 want credential brokering without the full coding-agent set.
 
 **Prerequisite:** the `shed-host-agent` binary must be running on your host.
-See the [shed-extensions quick start](https://charliek.github.io/shed-extensions/getting-started/quick-start/).
+See the [macOS quickstart](../getting-started/macos-quickstart.md) for host-agent
+setup and the [Extensions configuration reference](../extensions/configuration.md).
 
 ```bash
 shed create mydev --image extensions
@@ -183,7 +184,7 @@ shed image history shed-vz-full
 LAYER  DIGEST                                                                   SIZE      CREATED         CREATED BY
 9      sha256:6214c050b2d46d711a9878da53f2ae1f1c2cc2644d1d30f9116d346c59d06ab2   493.4 MB  2 hours ago     RUN runuser -l shed -c '… mise use -g node@lts; uv python install 3.13; …'
 8      sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1     32 B    2 hours ago     ENV CLAUDE_CONFIG_DIR=/home/shed/.claude
-7      sha256:5c61939d1edf11daa570fcfe8ea24b56a60a89403f5ce91c4354cd400cad2591   6.92 MB   2 hours ago     RUN --mount=type=bind,from=shed-extensions … (extensions binaries)
+7      sha256:5c61939d1edf11daa570fcfe8ea24b56a60a89403f5ce91c4354cd400cad2591   6.92 MB   2 hours ago     RUN --mount=type=bind,target=/ctx … (install staged extension binaries)
 …
 2      sha256:a3e89a578b079f684c28e09084737b3ff22914ab234c60ae0064c6f4d218be54   1.18 GB   2 hours ago     RUN apt-get install systemd docker-ce …
 1      sha256:818154cda96df8bbb276b4f4339124da55756620a1037af15570bc95312850fa     28 MB   2 hours ago     ubuntu:24.04 base
@@ -258,7 +259,7 @@ host and pulled by another resolves to the same digest, and `shed image
 inspect` shows identical manifest annotations on both sides.
 
 Registry authentication uses your Docker credential helper (e.g. the
-shed-extensions Docker credential proxy when the `extensions` variant is
+Docker credential proxy extension when the `extensions` variant is
 running). For host-side `shed image push` invocations, the regular
 `~/.docker/config.json` credential resolution applies.
 

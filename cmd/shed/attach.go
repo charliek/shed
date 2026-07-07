@@ -34,7 +34,7 @@ var (
 
 // validRCKinds / validRCPermModes mirror shed-ext-rc's accepted values so the CLI
 // can reject a bad flag before the SSH round-trip; shed-ext-rc re-validates as the
-// source of truth. Keep in sync with shed-extensions internal/rc.
+// source of truth. Keep in sync with internal/ext/rc.
 var validRCKinds = map[string]bool{"claude-rc": true, "claude-broker": true, "shell": true}
 var validRCPermModes = map[string]bool{
 	"default": true, "acceptEdits": true, "plan": true,

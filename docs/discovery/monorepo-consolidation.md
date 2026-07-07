@@ -2,9 +2,14 @@
 
 Design document for consolidating the shed family of repos into a single monorepo with a shared Rust client core, a simplified install/update story, and selective per-component releases.
 
-> **Status (as of v0.7.8).** Discovery only — **nothing implemented**. The
-> decisions in §3 were settled in discussion on 2026-07-06/07; §10 lists the
-> small implementation details that remain open. Prerequisite in flight: shed-desktop's Tauri Phase C (and the
+> **Status (as of v0.7.8).** **Phase 1 (shed-extensions import) implementation
+> is in flight** on branch `feature/monorepo-extensions-import` (PR TBD): the
+> shed-extensions Go source now lives in `cmd/` + `internal/ext/`, the guest
+> binaries build in-tree, and the release pipeline is consolidated. Phase 1
+> *completion* (first monorepo release, apt repoint, archive) follows post-merge.
+> The rest is discovery only. The decisions in §3 were settled in discussion on
+> 2026-07-06/07; §10 lists the small implementation details that remain open.
+> Prerequisite in flight: shed-desktop's Tauri Phase C (and the
 > Swift-app-on-Rust-core cutover) lands in the *old* repo before the desktop
 > import (Phase 2). The shed-mobile Rust spike (§7 Phase 0) runs in parallel
 > and does not gate any phase here.

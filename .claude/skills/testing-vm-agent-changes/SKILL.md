@@ -113,11 +113,16 @@ The rebuild "just works" now — **no `docker buildx prune`, no hand-edited
 that used to live here):
 
 - **The install layer busts on content change.** `build-vz-rootfs.sh` computes a
-  content hash of the build context and passes `--build-arg SHED_INSTALL_SHA=…`,
-  which the Dockerfile's bind-mount install RUN references. A changed agent
-  re-runs that layer — the build log prints `SHED_INSTALL_SHA=<hash>` and the
-  step is **not** `CACHED` — while the expensive apt layer stays cached. An
-  unchanged agent leaves the install layer `CACHED`.
+  content hash of the **whole build context** and passes
+  `--build-arg SHED_INSTALL_SHA=…`, which the Dockerfile's bind-mount install RUN
+  references. A changed agent re-runs that layer — the build log prints
+  `SHED_INSTALL_SHA=<hash>` and the step is **not** `CACHED` — while the expensive
+  apt layer stays cached. An unchanged agent leaves the install layer `CACHED`.
+  Docker `ARG`s are **stage-scoped**, so the **extensions stage redeclares
+  `ARG SHED_INSTALL_SHA` and echoes it** in its install RUN too — that guards the
+  in-tree guest-binary install the same way (a changed `shed-ext-*` binary re-runs
+  the extensions install layer instead of reusing a stale BuildKit bind-mount
+  cache).
 - **The ref-index is written by the build.** `shed image build` records
   `refs/<sha256(source-ref)>.json` → the new manifest digest, so
   `shed create --image base` resolves your build immediately. `SHED_SOURCE_REF`
@@ -139,6 +144,21 @@ shed -s my-server-dev exec dbg -- bash -c \
 # >0 means your agent is baked in; 0 means a stale layer/manifest — check the
 # build log shows the install RUN ran (`SHED_INSTALL_SHA=…`, not `CACHED`) and
 # that SHED_SOURCE_REF (step 2) matched the dev config's image_aliases.base.
+```
+
+**The same verify applies to the guest extension binaries.** Since the monorepo
+import, the `extensions` / `full` variants bake the four guest binaries
+(`shed-ext-ssh-agent`, `shed-ext-aws-credentials`, `docker-credential-shed`,
+`shed-ext-rc`) **in-tree** — cross-compiled from `cmd/shed-ext-*` and staged into
+the build context by `scripts/stage-guest-binaries.sh` (called by the rootfs
+scripts). There is no `ghcr.io/charliek/shed-extensions` image to `COPY --from`.
+If you changed a guest binary, build the `extensions` (or `full`) variant and
+confirm the VM runs **your** build — the dev-build convention is no ldflags, so
+the version is a dev string, not the last extensions release (`v0.4.9`):
+
+```bash
+shed -s my-server-dev create dbg --image extensions
+shed -s my-server-dev exec dbg -- shed-ext-rc version   # must NOT report v0.4.9
 ```
 
 To extract+inspect the agent from a manifest without booting a VM (useful to

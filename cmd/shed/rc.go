@@ -34,7 +34,7 @@ const rcEnrichConcurrency = 6
 // rcSessionDTO mirrors shed-ext-rc's neutral `list` DTO (one entry of the
 // `{"rc_sessions":[...]}` payload). It is decoded verbatim from the binary's
 // stdout so the shed CLI stays aligned with the cross-repo golden fixture
-// (shed-extensions internal/rc + shed-remote-agent); fields beyond those we
+// (internal/ext/rc + shed-remote-agent); fields beyond those we
 // display are accepted and ignored.
 type rcSessionDTO struct {
 	Slug        string `json:"slug"`
