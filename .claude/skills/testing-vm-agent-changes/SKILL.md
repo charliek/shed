@@ -187,6 +187,31 @@ Edit agent → unit tests (Docker) → rebuild rootfs (step 2) → verify (step 
 integration (step 5). Comment-only edits don't change the binary, so they don't
 need a rebuild.
 
+## Gremlin: FC remote rootfs build + mise + sudo
+
+The FC dev image is built on the remote (`mini3`), and the dev image store
+(`/var/lib/shed-dev/firecracker/images`) is root-owned, so the instinct is to
+run `build-firecracker-rootfs.sh` under `sudo`. That fails at the first
+`go build`: the script resolves `go` through the mise shim, and mise refuses an
+**untrusted** `.mise.toml` — worse under `sudo`, where mise trust lives in
+root's state, `secure_path` overrides your `PATH`, and the shim wins anyway.
+`sudo mise trust` doesn't stick (HOME mismatch). Remedy that sidesteps it
+entirely: make the store user-writable and build as the normal user (no sudo,
+mise works):
+
+```sh
+ssh mini3 'sudo chown -R $USER:$USER /var/lib/shed-dev/firecracker'
+ssh mini3 'cd ~/projects/shed && export PATH="$HOME/.local/share/mise/shims:$PATH" && \
+  OUTPUT_DIR=/var/lib/shed-dev/firecracker/images \
+  ./scripts/build-firecracker-rootfs.sh --variant extensions --build-tools-version <ref>'
+```
+
+The root-run FC dev server (sudo nohup) still reads the user-owned blobs fine.
+(Guest **extension** binaries — `extensions`/`full` variants — are now built
+in-tree by `scripts/stage-guest-binaries.sh`, staged into the context like
+shed-agent; verify `shed-ext-rc version` reports a non-release version in the
+booted shed, same as the shed-agent check.)
+
 ## When you hit a NEW rough edge
 
 Add it here. This file exists because the agent-in-image split has non-obvious
