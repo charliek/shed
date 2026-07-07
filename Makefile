@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -8,7 +8,7 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X github.com/charliek/shed/internal/version.Version=$(VERSION) -X github.com/charliek/shed/internal/version.GitCommit=$(GIT_COMMIT) -X github.com/charliek/shed/internal/version.BuildDate=$(BUILD_DATE)"
 
 # Build all binaries
-build: build-cli build-server build-egress-proxy build-agent build-firstboot
+build: build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc
 
 # Build CLI only
 build-cli:
@@ -29,6 +29,14 @@ build-agent:
 # Build shed-firstboot only (in-VM oneshot for identity regen)
 build-firstboot:
 	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-firstboot ./cmd/shed-firstboot
+
+# Build shed-host-agent only (host-side agent; darwin CGO/Touch ID via build tags)
+build-host-agent:
+	go build $(LDFLAGS) -o bin/shed-host-agent ./cmd/shed-host-agent
+
+# Build shed-machine-rc only (host-side machine rc helper)
+build-machine-rc:
+	go build $(LDFLAGS) -o bin/shed-machine-rc ./cmd/shed-machine-rc
 
 # Run all unit tests (including SDK submodule)
 test:
