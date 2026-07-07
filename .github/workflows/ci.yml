@@ -14,7 +14,10 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
-      - run: go test -v ./...
+      # make test runs the root module AND the nested sdk module (cd sdk && go
+      # test) — plain `go test ./...` skips sdk, which the imported extensions
+      # code depends on directly.
+      - run: make test
 
   lint:
     runs-on: ubuntu-latest
@@ -33,3 +36,52 @@ jobs:
       - uses: actions/checkout@v6
       - name: Validate Claude Code plugin manifest and skills
         run: scripts/validate-plugin.sh
+
+  release-snapshot:
+    name: GoReleaser snapshot (artifact sanity)
+    # macos-latest matches the real release runner: shed-host-agent's darwin build
+    # needs CGO (Touch ID), which can't cross-compile from linux. goreleaser's
+    # snapshot cross-builds the linux ids fine (CGO off for those).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      # First-ever CI exercise of the darwin build-tag half (shed-host-agent's
+      # touchid_darwin.go, CGO) — de-risks the macos release job before a tag.
+      - name: Run tests
+        run: go test ./...
+      - name: GoReleaser snapshot build
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.2
+          args: release --snapshot --clean
+      - name: Assert release artifacts
+        run: |
+          set -euo pipefail
+          # (i) shed-machine-rc archives: darwin+linux × amd64+arm64, each containing
+          # EXACTLY the one binary (ids: selectors must keep other builds out).
+          for tgz in dist/shed-machine-rc_*.tar.gz; do
+            entries=$(tar tzf "$tgz" | grep -c .)
+            bins=$(tar tzf "$tgz" | grep -c '^shed-machine-rc$')
+            { [ "$entries" = "1" ] && [ "$bins" = "1" ]; } || { echo "::error::$tgz must contain exactly the shed-machine-rc binary and nothing else"; tar tzf "$tgz"; exit 1; }
+          done
+          for os in darwin linux; do
+            for arch in amd64 arm64; do
+              ls "dist/shed-machine-rc_${os}_${arch}.tar.gz" >/dev/null || { echo "::error::missing dist/shed-machine-rc_${os}_${arch}.tar.gz"; exit 1; }
+            done
+          done
+          # (ii) per-arch shed-machine-rc .debs, named to match apt-charliek's glob.
+          ls dist/shed-machine-rc_*_amd64.deb dist/shed-machine-rc_*_arm64.deb
+          # (iii) shed-host-agent darwin archives carry the binary AND the example config.
+          for arch in amd64 arm64; do
+            tgz="dist/shed-host-agent_darwin_${arch}.tar.gz"
+            ls "$tgz" >/dev/null || { echo "::error::missing $tgz"; exit 1; }
+            tar tzf "$tgz" | grep -qx 'shed-host-agent' || { echo "::error::$tgz missing shed-host-agent binary"; tar tzf "$tgz"; exit 1; }
+            tar tzf "$tgz" | grep -qx 'extensions.example.yaml' || { echo "::error::$tgz missing extensions.example.yaml"; tar tzf "$tgz"; exit 1; }
+          done
+          echo "release snapshot artifacts OK"
