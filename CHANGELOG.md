@@ -12,6 +12,20 @@ All notable changes to this project will be documented in this file.
   pre-monorepo changelog stays in the archived charliek/shed-desktop repo.
 -->
 
+## v0.7.10 — 2026-07-08
+
+**Ships:** server/CLI, desktop
+
+### Added
+- **Shed Desktop now ships from the monorepo.** The macOS menu-bar app and the
+  Tauri Linux client (built on the shared `crates/` Rust core) are released from
+  `charliek/shed` on the shared version line for the first time, jumping from the
+  standalone repo's `v0.0.x` track to `v0.7.10`. macOS updates flow through Sparkle
+  at the new feed (`https://charliek.github.io/shed/appcast.xml`); Linux installs via
+  `apt install shed-desktop`. Existing `v0.0.13` installs migrate automatically via
+  the final `charliek/shed-desktop` `v0.0.14` release, which repointed the update
+  feed. (#248)
+
 ## v0.7.9 — 2026-07-08
 
 ### Changed
