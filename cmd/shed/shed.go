@@ -948,3 +948,5 @@ func autoSyncAfterCreate(ctx context.Context, shedName string, entry *config.Ser
 	}
 	return syncer.SyncProfile(ctx, profile, shedName, entry, false)
 }
+
+// p2-selectivity scratch marker (delete me)
