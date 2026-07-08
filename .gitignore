@@ -90,6 +90,8 @@ crates/target/
 desktop/artifacts/
 # …but the Go `bin/` ignore above must not swallow Rust `src/bin/` crates:
 !crates/**/src/bin/
+# desktop app launcher-script resources (also swallowed by the unanchored bin/ rule)
+!desktop/Resources/bin/
 
 # Documentation build
 site-build/

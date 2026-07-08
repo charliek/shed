@@ -1,0 +1,56 @@
+#!/bin/bash
+# Open the given command in Ghostty.
+#
+# Usage: shed-open-ghostty <shed> <cmd>
+#
+# Warm (Ghostty already running): AppleScript opens a new tab in the front
+# window (or a new window if none are open). Ghostty runs a surface `command`
+# via `/bin/sh -c`, so the shell-quoted ssh line is re-parsed correctly.
+# Note: Ghostty's scripting API force-enables "wait after command", so the tab
+# stays on a "[Process exited]" screen after the command exits.
+#
+# Cold (not running): launch Ghostty with `-e` so the command IS the initial
+# window. `activate` + `new tab` on a cold start would otherwise leave a stray
+# default `~ $` window in front.
+#
+# Linux: Ghostty's GTK apprt takes `-e <program> [args...]` as the surface's
+# initial command (a warm instance opens a new window itself); no AppleScript/
+# `open`, so short-circuit before the macOS path.
+set -euo pipefail
+
+shed="${1:-}"
+cmd="${2:-}"
+[ -n "$cmd" ] || { echo "usage: shed-open-ghostty <shed> <cmd>" >&2; exit 2; }
+
+if [ "$(uname -s)" = "Linux" ]; then
+  exec ghostty -e /bin/sh -lc "$cmd"
+fi
+
+# --- macOS ---
+app="$(/usr/bin/osascript -e 'POSIX path of (path to application id "com.mitchellh.ghostty")' 2>/dev/null || true)"
+[ -n "$app" ] || app="/Applications/Ghostty.app"
+
+# Case-insensitive: the bundle executable is `ghostty`, but match `Ghostty`
+# too in case a build names the process with a capital G.
+if pgrep -ix ghostty >/dev/null 2>&1; then
+  # Escape for an AppleScript double-quoted string literal.
+  esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+  cmd_as="$(esc "$cmd")"
+  /usr/bin/osascript >/dev/null <<APPLESCRIPT
+tell application id "com.mitchellh.ghostty"
+  activate
+  set cfg to new surface configuration
+  set command of cfg to "$cmd_as"
+  if (count of windows) > 0 then
+    new tab in front window with configuration cfg
+  else
+    new window with configuration cfg
+  end if
+end tell
+APPLESCRIPT
+  exit $?
+fi
+
+# Cold start: `-e` takes the rest of argv as the command; run it through a
+# shell so the already shell-quoted line parses.
+exec /usr/bin/open -a "$app" --args -e /bin/sh -lc "$cmd"

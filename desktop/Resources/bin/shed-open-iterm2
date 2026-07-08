@@ -1,0 +1,28 @@
+#!/bin/bash
+# Open a new iTerm2 tab running the given command.
+#
+# Usage: shed-open-iterm2 <shed> <cmd>
+#
+# Uses iTerm2's AppleScript: a new tab in the current window (or a new window
+# if none), then `write text "exec <cmd>"` so the tab closes when the command
+# exits.
+set -euo pipefail
+
+shed="${1:-}"
+cmd="${2:-}"
+[ -n "$cmd" ] || { echo "usage: shed-open-iterm2 <shed> <cmd>" >&2; exit 2; }
+
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+cmd_as="$(esc "exec $cmd")"
+
+/usr/bin/osascript <<APPLESCRIPT
+tell application "iTerm"
+  activate
+  if (count of windows) = 0 then
+    create window with default profile
+  else
+    tell current window to create tab with default profile
+  end if
+  tell current session of current window to write text "$cmd_as"
+end tell
+APPLESCRIPT
