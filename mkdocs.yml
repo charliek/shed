@@ -140,6 +140,8 @@ nav:
       - Security Posture: extensions/security-posture.md
   - Discovery:
       - Monorepo Consolidation: discovery/monorepo-consolidation.md
+      - Auth & Transport Security: discovery/auth-and-transport-security.md
+      - Auth & Transport Plan: discovery/auth-transport-plan.md
       - Lazy Rootfs Streaming: discovery/lazy-rootfs-streaming.md
       - Proxy Integration: discovery/proxy_integration_design.md
       - Runtime Optimization Backlog: discovery/runtime-optimization-backlog.md
