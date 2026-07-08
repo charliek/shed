@@ -1,0 +1,25 @@
+# Local Linux build/test image for the shared Rust core (shed-core).
+#
+# ubuntu:24.04 matches the bare ubuntu-latest CI runner so a container repro
+# behaves like CI. `build-essential` is the C toolchain `ring` (rustls' crypto
+# backend) needs. The Linux desktop client is the Tauri app, which builds in its
+# own WebKitGTK image (Dockerfile.tauri-linux) — this image is deliberately slim,
+# just for `cargo test -p shed-core` (the `make core-linux` target).
+#
+# Rust is installed via rustup (Ubuntu's packaged rustc lags the workspace's
+# rust-version).
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential pkg-config curl ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust stable — matches core/rust-toolchain.toml (channel = "stable").
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain stable \
+          --component clippy --component rustfmt \
+    && rustc --version && cargo --version

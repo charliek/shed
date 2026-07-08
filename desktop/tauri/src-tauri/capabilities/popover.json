@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "popover",
+  "description": "The macOS menu-bar popover webview (B1b): it may call our app commands (list_sheds / approvals_list / gate_namespaces / approval_decide / ui_report + open_dashboard / open_preferences / app_exit) and listen for Rust-emitted events (approvals-changed / connected-changed / refresh / popover-refresh). App-defined commands need no extra ACL; only core + event access is granted, scoped to the `popover` window (least privilege — it does NOT share `main`'s capability).",
+  "windows": ["popover"],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}

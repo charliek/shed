@@ -2,17 +2,21 @@
 
 Design document for consolidating the shed family of repos into a single monorepo with a shared Rust client core, a simplified install/update story, and selective per-component releases.
 
-> **Status (as of v0.7.8).** **Phase 1 (shed-extensions import) implementation
-> is in flight** on branch `feature/monorepo-extensions-import` (PR TBD): the
-> shed-extensions Go source now lives in `cmd/` + `internal/ext/`, the guest
-> binaries build in-tree, and the release pipeline is consolidated. Phase 1
-> *completion* (first monorepo release, apt repoint, archive) follows post-merge.
-> The rest is discovery only. The decisions in §3 were settled in discussion on
-> 2026-07-06/07; §10 lists the small implementation details that remain open.
-> Prerequisite in flight: shed-desktop's Tauri Phase C (and the
-> Swift-app-on-Rust-core cutover) lands in the *old* repo before the desktop
-> import (Phase 2). The shed-mobile Rust spike (§7 Phase 0) runs in parallel
-> and does not gate any phase here.
+> **Status (as of v0.7.8).** **Phase 1 (shed-extensions import) is merged**
+> (`b9a7dbc`, PR #243): the shed-extensions Go source lives in `cmd/` +
+> `internal/ext/`, the guest binaries build in-tree, and the release pipeline is
+> consolidated. **Phase 2 (shed-desktop import) implementation is in flight** on
+> branch `feature/monorepo-desktop-import` (PR TBD): the Rust core is imported at
+> top-level `crates/`, the Swift/Tauri app + packaging + `shedtest` harness at
+> `desktop/`, and the manifest-selected release model + Sparkle continuity are
+> wired. Phase 2 *completion* (final old-repo Sparkle release, first combined
+> release, archive shed-desktop) follows post-merge. Note: **`shed-gtk` was
+> retired in the old repo pre-import** — Tauri is the shipped Linux client, so the
+> §5.3 rows mentioning `shed-gtk` are void (no such crate/target is imported). The
+> rest is discovery only. The decisions in §3 were settled in discussion on
+> 2026-07-06/07; §10 lists the small implementation details that remain open. The
+> shed-mobile Rust spike (§7 Phase 0) runs in parallel and does not gate any phase
+> here.
 
 ## 1. Current State Summary
 
@@ -240,7 +244,7 @@ Deliberate non-goal at import time: extensions' `internal/protocol` stays a *sep
 
 | From (shed-desktop) | To (monorepo) | Notes |
 |---|---|---|
-| `core/{shed-core,shed-app,shed-core-ffi,shedctl,shed-gtk}` | `crates/…` | workspace root becomes `crates/Cargo.toml`; `shed-gtk` stays a non-default member |
+| `core/{shed-core,shed-app,shed-core-ffi,shedctl}` | `crates/…` | workspace root becomes `crates/Cargo.toml`. (`shed-gtk` was retired in the old repo pre-import — not imported.) |
 | `core/artifacts/`, `core/fixtures/` | `crates/…` | UniFFI-generated Swift bindings + parity fixtures |
 | `Sources/`, `Tests/`, `Package.swift` | `desktop/` | `Package.swift` path refs to the FFI xcframework updated |
 | `tauri/` (UI + `src-tauri/` workspace) | `desktop/tauri/` | its `Cargo.toml` path-deps repointed `../core/…` → `../../crates/…`; keeps its own lockfile/workspace |

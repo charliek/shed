@@ -38,6 +38,12 @@ build-host-agent:
 build-machine-rc:
 	go build $(LDFLAGS) -o bin/shed-machine-rc ./cmd/shed-machine-rc
 
+# Desktop app targets live in desktop/Makefile; `make desktop-<target>` forwards
+# (e.g. `make desktop-build`, `make desktop-test`). `desktop-` is a reserved
+# target prefix. The root build/test/check targets stay Go-only.
+desktop-%:
+	$(MAKE) -C desktop $*
+
 # Run all unit tests (including SDK submodule)
 test:
 	go test -v ./...

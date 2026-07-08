@@ -36,7 +36,7 @@ Three binaries:
 
 - **`shed`** — the CLI on your developer machine.
 - **`shed-server`** — the daemon on each host (HTTP API + SSH server) that runs VMs via the VZ (macOS) or Firecracker (Linux) backend.
-- **`shed-host-agent`** — optional host-side credential broker (built in-tree from `cmd/shed-host-agent`); on macOS it pairs with the [shed-desktop](https://github.com/charliek/shed-desktop) approval app.
+- **`shed-host-agent`** — optional host-side credential broker (built in-tree from `cmd/shed-host-agent`); on macOS it pairs with the [shed-desktop](https://charliek.github.io/shed/desktop/) approval app (in this monorepo under `desktop/`, with its shared Rust client core under `crates/`).
 
 ```text
 Developer Machine                Remote Server / Local Mac
@@ -60,7 +60,7 @@ pulled registry-direct from `ghcr.io`. See
 - [Images](https://charliek.github.io/shed/reference/images/) · [Storage Model](https://charliek.github.io/shed/reference/storage-model/)
 - [Extensions](https://charliek.github.io/shed/reference/extensions/) — credential brokering
 - [Provisioning](https://charliek.github.io/shed/reference/provisioning/) — `.shed/` install/startup hooks + tutorials
-- Related projects: [shed-desktop](https://charliek.github.io/shed-desktop/) — the macOS menu-bar approval app
+- [Desktop app](https://charliek.github.io/shed/desktop/) — the macOS menu-bar + Tauri Linux approval app (`desktop/`, on the shared Rust core in `crates/`)
 
 ## Requirements
 

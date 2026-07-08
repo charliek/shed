@@ -6,8 +6,94 @@ on:
   pull_request:
     branches: [main, 'feature/*']
 
+# Least privilege: the Go jobs only checkout + build + test, the desktop legs
+# only build/test, and docs only builds the site — no writes. The `changes`
+# job additionally reads pull-requests (dorny needs the PR base to diff).
+permissions:
+  contents: read
+
 jobs:
+  # Path-filter so Go-only, desktop-only, and docs-only PRs skip the legs that
+  # don't apply (imported from shed-desktop's ci.yml, rescoped for the monorepo:
+  # crates/ + desktop/ prefixes). The `go` filter is a conservative negative-glob
+  # (everything except the desktop/docs subtrees); the `ci` filter forces every
+  # leg to run when the workflow / release scripts / Makefiles change. On
+  # pull_request dorny diffs against the PR base; on push it uses the pushed
+  # range (github.event.before) — the same default the old repo relied on.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      go: ${{ steps.filter-go.outputs.go }}
+      rust: ${{ steps.filter.outputs.rust }}
+      desktop: ${{ steps.filter.outputs.desktop }}
+      tauri: ${{ steps.filter.outputs.tauri }}
+      packaging: ${{ steps.filter.outputs.packaging }}
+      harness: ${{ steps.filter.outputs.harness }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - uses: actions/checkout@v6
+      # The go filter uses negations ("everything except desktop/crates/docs"),
+      # which requires predicate-quantifier: every (a changed file counts only if
+      # it matches ALL patterns). That quantifier is step-global and would break
+      # the positive multi-pattern filters below (a file cannot match two
+      # different globs at once), so the go filter gets its own step.
+      - uses: dorny/paths-filter@v4
+        id: filter-go
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            go:
+              - '**'
+              - '!desktop/**'
+              - '!crates/**'
+              - '!docs/**'
+              - '!mkdocs.yml'
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+            desktop:
+              - 'desktop/**'
+              - 'crates/**'
+            tauri:
+              - 'desktop/tauri/**'
+              - 'crates/**'
+              - 'desktop/packaging/polkit/**'
+              # tauri.conf.json bundles launcher scripts from Resources/bin,
+              # and the Linux legs run inside this Dockerfile's image
+              - 'desktop/Resources/**'
+              - 'desktop/Dockerfile.tauri-linux'
+            packaging:
+              - 'desktop/packaging/**'
+              - 'desktop/linux/**'
+            harness:
+              - 'desktop/tools/**'
+              # the shedtest harness env
+              - 'desktop/pyproject.toml'
+              - 'desktop/uv.lock'
+            docs:
+              - 'docs/**'
+              - 'mkdocs.yml'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/workflows/docs.yml'
+            ci:
+              - '.github/workflows/**'
+              - '.goreleaser.yaml'
+              - 'scripts/release/**'
+              - 'Makefile'
+              - 'desktop/Makefile'
+
   test:
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -24,6 +110,8 @@ jobs:
       - run: go test -v ./...
 
   lint:
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -35,14 +123,27 @@ jobs:
           version: v2.10.1
 
   plugin:
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Validate Claude Code plugin manifest and skills
         run: scripts/validate-plugin.sh
+      - name: Rust toolchain
+        # release-scripts-test.sh exercises update-version.sh's desktop bump,
+        # which regenerates both Cargo locks (crates/ + the Tauri workspace).
+        run: rustup toolchain install stable --profile minimal
+      - name: Release scripts self-test (release-plan.sh + update-version.sh)
+        # Runs in a temp copy — never dirties the checkout. Gated go||ci like
+        # the rest of this job; the `ci` filter includes scripts/release/**,
+        # so any edit to the release scripts always runs this.
+        run: scripts/release/release-scripts-test.sh
 
   release-snapshot:
     name: GoReleaser snapshot (artifact sanity)
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true' }}
     # macos-latest matches the real release runner: shed-host-agent's darwin build
     # needs CGO (Touch ID), which can't cross-compile from linux. goreleaser's
     # snapshot cross-builds the linux ids fine (CGO off for those).
@@ -89,3 +190,236 @@ jobs:
             tar tzf "$tgz" | grep -qx 'extensions.example.yaml' || { echo "::error::$tgz missing extensions.example.yaml"; tar tzf "$tgz"; exit 1; }
           done
           echo "release snapshot artifacts OK"
+
+  # ---- desktop / crates legs (imported from shed-desktop's ci.yml) ----------
+
+  swift:
+    name: swift · build · test · e2e
+    needs: changes
+    if: ${{ needs.changes.outputs.desktop == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v6
+      - name: Swift toolchain
+        run: swift --version
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustc --version && cargo --version
+      - name: Build (Rust core + Swift)
+        # `make build` runs scripts/build-core.sh (staticlib + UniFFI bindings +
+        # xcframework) before `swift build` — the .binaryTarget path must exist.
+        run: make build
+      - name: Rust core — test + clippy
+        run: make core-test core-lint
+      - name: Swift unit tests
+        run: make test
+      - name: Bundle
+        run: ./scripts/bundle.sh debug
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Hermetic E2E (Rust core — default)
+        # Default-on since M0: with no flag the Rust shed-core backs reads/
+        # lifecycle/create. Headless GUI launch via `open`; the screenshot op
+        # renders in-process so no screen-recording TCC grant is needed.
+        # wait_alive asserts identify.core=rust, and a Rust-adapter construction
+        # failure now fails the host loudly (no silent Swift fallback), so a
+        # false-green can't slip through. Slower CI gets a wider wait budget.
+        run: SHED_DESKTOP_TEST_TIMEOUT_SCALE=4 uv run --group test pytest tools/shedtest -q
+      - name: Hermetic E2E (Swift fallback — SHED_DESKTOP_RUST_CORE=0)
+        # The rollback escape hatch (kept ≥2 releases): the legacy Swift URLSession
+        # path. wait_alive asserts identify.core=swift, so the fallback stays
+        # reachable and green.
+        run: SHED_DESKTOP_RUST_CORE=0 SHED_DESKTOP_TEST_TIMEOUT_SCALE=4 uv run --group test pytest tools/shedtest -q
+      - name: M0 ship-gates (arm64 + cold-launch + golden cross-backend byte-diff)
+        # The deferred Phase-1 safety nets for the default flip: arm64-only Mach-Os,
+        # a cold-launch budget, and a BYTE-IDENTICAL Rust-vs-Swift IPC payload diff
+        # (the cross-backend parity guard). Runs against the debug bundle here for a
+        # continuous per-PR guard; `make m0-gates` runs the same checks on a release
+        # bundle for the pre-ship size budget. A slower CI runner gets a wider
+        # cold-launch budget.
+        run: >
+          SHED_DESKTOP_TEST_TIMEOUT_SCALE=4
+          SHED_DESKTOP_COLD_LAUNCH_BUDGET_S=30
+          uv run --group test python tools/shedtest/m0_ship_gates.py
+      - name: Real-launch smoke
+        # Non-test launch on a fresh runner (undetermined notification auth) —
+        # exercises the real SystemNotificationPresenter path the hermetic suite
+        # can't reach. Regression guard for the v0.0.2 SIGTRAP (issue #2).
+        run: ./scripts/smoke-real-launch.sh
+      - name: Launch/reopen window smoke
+        # Real launch path the hermetic suite gates off: a user launch opens the
+        # dashboard and reopening the running app reaches it. Guards issue #4.
+        run: ./scripts/smoke-launch-window.sh
+
+  core-linux:
+    name: core-linux (${{ matrix.arch }})
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
+    # Both arches on CI: ubuntu-latest was already x86_64; the arm64 leg (free on
+    # public repos) covers the .deb's other target. Runs cargo directly on the
+    # runner (not Docker) — same as the old repo, and faster.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustc --version && cargo --version
+      - name: C toolchain (ring's crypto backend needs build-essential)
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: shed-core — test + clippy (Linux)
+        # Scoped to -p shed-core so the macOS-only shed-core-ffi (uniffi) is never
+        # dragged in. --all-targets runs the pinned-TLS verifier + redirect/
+        # non-https fail-closed tests here; the e2e's plain-HTTP mock never
+        # exercises the pin/token paths, so they stay cargo-only on Linux.
+        run: |
+          cargo test -p shed-core --all-targets --locked
+          cargo clippy -p shed-core --all-targets --locked -- -D warnings
+
+  deb:
+    name: deb
+    needs: changes
+    # The shipped .deb builds from the Tauri client, so a desktop/tauri/**-only
+    # change must rebuild + revalidate it (alongside crates/packaging/linux).
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.packaging == 'true' || needs.changes.outputs.tauri == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc --version && cargo --version
+      - name: Tauri (WebKitGTK) build deps + nfpm
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update && sudo apt-get install -y nfpm
+      - name: Node (the Vite/React frontend bundle)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop/tauri/ui/package-lock.json
+      - name: Frontend bundle (generate_context! needs tauri/ui/dist)
+        run: cd tauri/ui && npm ci && npm run build
+      - name: Build the Tauri .deb
+        # build-deb.sh cargo-builds directly on the runner (not Docker) — same as
+        # the old repo. Its SCRIPT_DIR is absolute, so `desktop` working-dir +
+        # a relative invocation resolve REPO_ROOT=desktop, CRATES_DIR=crates.
+        run: ./linux/scripts/build-deb.sh 0.0.1-ci
+      - name: Install-validate in a clean container
+        # apt-installs the .deb (resolving its runtime deps) in a fresh ubuntu:24.04
+        # and asserts the binary launches under Xvfb + answers identify, the bundled
+        # shedctl drives it, and the polkit action is present.
+        run: |
+          # shellcheck disable=SC2012  # controlled out/ dir, glob is safe
+          ./linux/scripts/validate-deb.sh "$(ls -t out/shed-desktop_*.deb | head -1)"
+
+  tauri-linux:
+    name: tauri-linux
+    needs: changes
+    if: ${{ needs.changes.outputs.tauri == 'true' || needs.changes.outputs.harness == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # The Docker legs' Make prereq (tauri-ui-build) runs `npm run build` on the
+      # HOST, so the frontend deps must be installed here first (same as old repo).
+      - name: Node (the Vite/React frontend bundle)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop/tauri/ui/package-lock.json
+      - name: Frontend deps
+        run: cd desktop/tauri/ui && npm ci
+      # The Tauri crate's Linux-only approval-seam tests (polkit/libnotify gate is
+      # fail-closed: never Approved without a real auth). Docker (ubuntu:24.04),
+      # same image as the render gate below; no display needed.
+      - name: Tauri crate tests (Linux)
+        run: make -C desktop tauri-test-linux
+      # The render gate: builds the frontend + the Tauri app and runs the
+      # --target tauri hermetic e2e on WebKitGTK 2.44 under Xvfb (the pinned
+      # WebView = the real CSS/render gate). GitHub runners allow privileged
+      # docker run for the WebKitGTK web-process sandbox.
+      - name: Tauri render gate + hermetic E2E (WebKitGTK)
+        run: make -C desktop tauri-build-linux
+
+  tauri-mac:
+    name: tauri-mac
+    needs: changes
+    if: ${{ needs.changes.outputs.tauri == 'true' || needs.changes.outputs.harness == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustc --version && cargo --version
+      - name: Node (the Vite/React frontend bundle)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop/tauri/ui/package-lock.json
+      - name: Frontend deps
+        run: cd desktop/tauri/ui && npm ci
+      - name: Tauri clippy (standalone workspace)
+        run: make -C desktop tauri-lint
+      - uses: astral-sh/setup-uv@v6
+      - name: Hermetic Tauri E2E (macOS WKWebView)
+        # A wider timeout scale buys headroom on a shared CI runner (as the swift
+        # + tauri-linux legs do). WKWebView needs no Xvfb; the mac screenshot op is
+        # TCC-gated so it's skipped here (the WebKitGTK leg is the screenshot gate).
+        run: SHED_TAURI_TEST_TIMEOUT_SCALE=4 make -C desktop e2e-tauri
+
+  docs-build:
+    name: docs build
+    needs: changes
+    if: ${{ needs.changes.outputs.docs == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.13
+      - run: uv sync --group docs
+      - run: uv run mkdocs build
+
+  # Single required check for the `main` ruleset. `if: always()` + an explicit
+  # per-job result scan is load-bearing: with the path-filter above, a leg that
+  # doesn't apply is `skipped`, and a plain `needs:` gate would itself skip —
+  # leaving the required check unreported and the PR unmergeable forever. Here
+  # skipped counts as pass; only failure/cancelled fails the gate.
+  ci-success:
+    name: ci-success
+    if: always()
+    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, deb, tauri-linux, tauri-mac, docs-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require no job failed (skipped-by-filter counts as pass)
+        run: |
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          echo "job results: ${results}"
+          for r in ${results}; do
+            case "${r}" in
+              success|skipped) ;;
+              *) echo "::error::a required CI job did not pass (${results})"; exit 1 ;;
+            esac
+          done
+          echo "all required jobs passed (success or skipped-by-filter)"

@@ -10,13 +10,52 @@ the most complex consumer).
 
 Everything else is automatic.
 
+## Component selection (the manifest-selected release model)
+
+The monorepo carries multiple release components on ONE `vX.Y.Z` tag
+family. A component ships in a release **iff its version manifest
+equals the tag**:
+
+| Component | Ship selector (version manifest) | Artifacts |
+|---|---|---|
+| `go` | `.claude-plugin/plugin.json` `.version` | Go binaries, brew formulas, `shed-server`/`shed-machine-rc` debs, ghcr rootfs images |
+| `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG + Sparkle appcast, `shed-desktop` debs |
+
+- **Bumping**: `scripts/release/update-version.sh X.Y.Z
+  [--components go,desktop]`. The default is `go` (preserves the
+  historical one-arg behavior); the release skill computes the
+  component set for the release being cut and passes `--components`
+  explicitly. Unknown components hard-error.
+- **CI-side selection**: `publish-images.yaml`'s first job runs
+  `scripts/release/release-plan.sh`, which maps the tag to
+  `ship_go`/`ship_desktop` outputs. Every downstream job gates on
+  those.
+- **No-manifest-matches guard**: if a tag matches NEITHER manifest
+  (a forgotten `update-version.sh` run), `release-plan.sh` exits 1 and
+  the whole workflow fails loudly — a silent no-op release is
+  impossible. Fix by bumping the right manifest(s) and cutting a fresh
+  tag.
+- **Interleaved component versions**: component versions advance
+  independently — each component's "current version" is **the most
+  recent tag that shipped it**, not the most recent tag overall. The
+  server may sit at a newer tag than desktop (or vice versa),
+  legitimately. Never reuse a version for a different component set.
+  Corollary: a desktop-only tag publishes **no**
+  `ghcr.io/charliek/shed-{vz,fc}-*` rootfs images — pin servers to the
+  last Go-shipping tag.
+- Both scripts are covered by `scripts/release/release-scripts-test.sh`
+  (run in CI by `ci.yml`'s `plugin` job).
+
+The desktop leg's recurring specifics (secrets, DMG/notarize, Sparkle
+appcast, debs, apt dispatch, rc-tag rehearsals) live in
+[`desktop/RELEASING.md`](desktop/RELEASING.md).
+
 ## What happens
 
 1. **`release-workflows:release`** (LLM, local):
-   - Verifies branch (`main`) + clean tree + CI green on HEAD (shed
-     has no `ci-success` aggregator; the skill reports "missing" for
-     that check, which is expected — treat as non-blocking; ci.yml's
-     test/lint/plugin jobs run on every PR and serve as the gate)
+   - Verifies branch (`main`) + clean tree + CI green on HEAD. ci.yml
+     has a `ci-success` aggregator (skipped-by-path-filter counts as
+     pass) — the skill's ci-success check is a real gate now.
    - Asks/confirms version
    - Drafts a CHANGELOG entry from `git log v<previous>..HEAD`, commits
      as `docs(changelog): vX.Y.Z entry`
@@ -30,8 +69,11 @@ Everything else is automatic.
    - Tags `vX.Y.Z` (annotated) on the version commit
    - `git push --follow-tags` (admin bypasses the ruleset)
 
-2. **`publish-images.yaml`** (CI, on tag push `v*`) — six jobs in
-   a strict dependency chain:
+2. **`publish-images.yaml`** (CI, on tag push `v*`) — a `release-plan`
+   job first (component selection, see above), then the Go chain below
+   (gated on `ship_go`) plus the desktop jobs (gated on `ship_desktop`;
+   documented in `desktop/RELEASING.md`). The Go chain keeps its strict
+   dependency ordering:
 
    **`publish-build-tools`** (`ubuntu-latest`, multi-arch):
    - Builds + pushes `ghcr.io/charliek/shed-build-tools:vX.Y.Z` (and
@@ -53,11 +95,10 @@ Everything else is automatic.
      responsibility (see `scripts/smoke-test-linux.sh --from-local`
      for the matching local script).
 
-   **`release`** (`ubuntu-latest`, needs all four above; tag-push only):
-   - **Verifies plugin.json matches the tag** (inline `jq` check —
-     guards against a developer tagging the wrong commit; the release
-     skill should have bumped plugin.json before tagging, this is the
-     cross-check).
+   **`release`** (needs all four above; tag-push only, `ship_go` only):
+   - The old inline "plugin.json matches the tag" check moved to the
+     `release-plan` job (see "Component selection" above), which gates
+     this entire chain.
    - Runs `go test ./...` + golangci-lint
    - Mints a release-bot App token scoped to `charliek/homebrew-tap`
    - Runs `goreleaser release --clean`:
@@ -86,8 +127,13 @@ The maintainer runs step 1; everything else is automated.
 
 `scripts/release/update-version.sh` bumps:
 
-- `.claude-plugin/plugin.json` `.version` (via `scripts/set-version.sh`,
-  with a jq-verify safety net)
+- `--components go` (default): `.claude-plugin/plugin.json` `.version`
+  (via `scripts/set-version.sh`, with a jq-verify safety net)
+- `--components desktop`: `desktop/VERSION`, `crates/Cargo.toml`
+  (`[workspace.package].version`) + `crates/Cargo.lock` regen,
+  `desktop/tauri/src-tauri/Cargo.toml` + `tauri.conf.json` +
+  `desktop/tauri/src-tauri/Cargo.lock` regen (with a path-dep
+  lock-entry verify for `shed-core`/`shed-app`)
 
 The Go binaries' version comes from a build-time `-X` ldflag injected
 by GoReleaser via `.goreleaser.yaml`'s `builds[].ldflags`. The Docker
@@ -116,9 +162,10 @@ release-time concern.
 
 | Secret | Purpose | Required? |
 |---|---|---|
-| `RELEASE_BOT_APP_ID` | `charliek-release-bot` GitHub App ID | required |
+| `RELEASE_BOT_CLIENT_ID` | `charliek-release-bot` GitHub App client ID (used by `actions/create-github-app-token`) | required |
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required |
 | `GITHUB_TOKEN` (workflow-provided) | All 3 Docker push jobs (build-tools, VZ, FC) to ghcr.io as `${{ github.actor }}` | provided automatically; do not set |
+| Desktop secrets (six `CAN_NOTARIZE` + `SPARKLE_ED_PRIVATE_KEY`) | Desktop release leg — see [`desktop/RELEASING.md`](desktop/RELEASING.md) | required before the first desktop-shipping tag |
 
 Retired (deleted from `gh secret list -R charliek/shed` during the
 convention adoption):
@@ -130,19 +177,21 @@ convention adoption):
 - `APT_DISPATCH_TOKEN` — replaced by the App-minted apt-charliek
   token used for the `repository_dispatch` call.
 
-Confirm with `gh secret list -R charliek/shed` that only the
-`RELEASE_BOT_APP_*` pair remains.
+Confirm with `gh secret list -R charliek/shed` that the
+`RELEASE_BOT_CLIENT_ID`/`RELEASE_BOT_APP_KEY` pair (plus the desktop
+secrets, once added) are present and the retired tokens are gone.
 
 ## Branch protection
 
 `main` is protected by a ruleset (created during the convention
-adoption) with rules `deletion` + `non_fast_forward` (no
-`required_status_checks` — shed's `ci.yml` runs separate jobs
-(test/lint/plugin) with no aggregator). Bypass actors:
+adoption) with rules `deletion` + `non_fast_forward`. ci.yml now has a
+`ci-success` aggregator (skipped-by-filter counts as pass) — the single
+job suited to a `required_status_checks` rule; adding it is the
+recommended follow-up. Bypass actors:
 
-- `charliek-release-bot` (App, type `Integration`) — listed for future
-  flexibility (no workflow step pushes back to shed's main today now
-  that `sync-version` is gone)
+- `charliek-release-bot` (App, type `Integration`) — **load-bearing**:
+  the desktop release leg's appcast step commits `docs/appcast.xml`
+  back to `main` as the bot (see `publish-images.yaml` `desktop-macos`)
 - Admin role (id `5`, type `RepositoryRole`) — lets
   `/release-workflows:release`'s push of the changelog + version
   commits + tag land
@@ -174,7 +223,7 @@ Run workflow). Each block must print the expected repo name.
 |---|---|---|
 | `git push` rejected from local | Pusher not in ruleset bypass | Confirm App + admin role in `main`'s ruleset `bypass_actors` |
 | `release` job fails at "Verify plugin.json matches tag" | Plugin.json wasn't bumped before tagging; tag was created against the wrong commit; or developer ran `git tag` manually without using `/release-workflows:release` | Don't force-fix in CI — re-run `/release-workflows:release` against a corrected tag |
-| GoReleaser fails at `brews` with `Bad credentials` | `RELEASE_BOT_APP_ID` unset OR App not installed on `homebrew-tap` | Verify via `sanity-check-app.yml`'s homebrew-tap block; install the App on the tap |
+| GoReleaser fails at `brews` with `Bad credentials` | `RELEASE_BOT_CLIENT_ID` unset OR App not installed on `homebrew-tap` | Verify via `sanity-check-app.yml`'s homebrew-tap block; install the App on the tap |
 | apt-charliek dispatch fails after 3 retries | App not installed on `charliek/apt-charliek` OR scope mismatch | Verify via `sanity-check-app.yml`'s apt-charliek block; check `RELEASE_BOT_APP_KEY` is the current `.pem` |
 | `publish-vz` / `publish-fc` fails on `FROM ghcr.io/charliek/shed-build-tools:vX.Y.Z` (image not found) | The build-tools push hadn't propagated yet, OR a previous `workflow_dispatch` failed to publish the new tag | Re-run the failed image-publish job; it'll pick up the now-existent build-tools image |
 | Docker push fails at "Log in to ghcr.io" | `packages: write` permission missing on the job | Confirm `permissions.packages: write` at workflow + job level |

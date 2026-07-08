@@ -1,24 +1,67 @@
 name: Publish Images and Release
 
-# Single source-of-truth for tag-driven publishing. Each tag push
-# walks through:
+# Single source-of-truth for tag-driven publishing, for BOTH release
+# components (the manifest-selected release model — see RELEASING.md):
 #
-#   1. publish-build-tools         (~2 min)   shed-build-tools image
-#   2. publish-vz, publish-fc      (~10 min)  runtime images, need (1)
-#   3. smoke                       (~1 min)   reusable smoke-linux gate
-#   4. release                     (~5 min)   goreleaser + apt-charliek dispatch
-#                                              — fires only on tag-push, gated on (1)-(3)
+#   release-plan                    (~10 s)   which components does this tag
+#                                             ship? (ship_go / ship_desktop)
 #
-# Strict ordering eliminates the v0.5.2-era race where the
-# apt-charliek dispatch could publish a binary before its referenced
-# ghcr images existed (the binary's hard-fail on missing
-# io.shed.rootfs.erofs.digest then surfaced as a confusing "image
-# was built with pre-v0.5.2 tooling" message during the few-minute
-# window between deb-published and image-published).
+#   Go component (ship_go):
+#   1. publish-build-tools          (~2 min)  shed-build-tools image
+#   2. publish-vz, publish-fc       (~10 min) runtime images, need (1)
+#   3. smoke                        (~1 min)  reusable smoke-linux gate
+#                                             (no needs — runs in parallel
+#                                             with the image chain)
+#   4. release                      (~5 min)  goreleaser + apt-charliek
+#                                             dispatches — fires only on
+#                                             tag-push, gated on (1)-(3)
 #
-# workflow_dispatch republishes only re-run the image-publish chain;
-# the `release` job is gated on tag-push events so manual republishes
-# don't accidentally cut a new GitHub Release.
+#   Desktop component (ship_desktop):
+#   5. desktop-release-create                 gh release create — desktop-only
+#                                             tags only (goreleaser owns
+#                                             release creation when ship_go)
+#   6. desktop-macos                          DMG + notarize + Sparkle appcast
+#   7. desktop-linux (matrix)                 shed-desktop .deb per arch
+#   8. desktop-apt-dispatch                   apt-charliek dispatch (skips
+#                                             prerelease *-* tags)
+#
+# The Go chain keeps its strict ordering (the v0.5.2-era race fix: the
+# apt-charliek dispatch must not publish a deb before its referenced
+# ghcr images exist). The desktop chain orders uploads strictly AFTER
+# goreleaser on combined tags (goreleaser `mode: replace` recreates the
+# release — desktop assets uploaded before it would be clobbered).
+#
+# Skipped-needs audit (every desktop job needs skippable jobs, so each
+# carries an explicit `always() && …` guard — a skipped upstream must
+# not block, a FAILED upstream must). Traced per scenario (tag push):
+#
+#   job                    | go-only tag | desktop-only tag | combined tag
+#   -----------------------|-------------|------------------|---------------------
+#   release-plan           | run         | run              | run
+#   publish-build-tools    | run         | skip (ship_go)   | run
+#   publish-vz/publish-fc  | run         | skip (needs)     | run
+#   smoke                  | run         | skip (ship_go)   | run
+#   release                | run         | skip (needs+if)  | run
+#   desktop-release-create | skip (ship) | run              | skip (ship_go=true)
+#   desktop-macos          | skip (ship) | run, after       | run, after
+#   desktop-linux          |             |   create ok      |   goreleaser ok
+#   desktop-apt-dispatch   | skip (needs)| run              | run
+#
+#   Failure propagation: release-plan fails → everything skips (loud, by
+#   design — includes the no-manifest-matches tag). On a combined tag, a
+#   failed image job skips `release` (needs), which leaves
+#   desktop-release-create skipped (ship_go=true) — desktop-macos/linux
+#   then run but fail fast at `gh release upload` (no release exists);
+#   re-run the failed Go job and the rerun restores the full chain. A
+#   FAILED `release` or `desktop-release-create` skips desktop-macos /
+#   desktop-linux via the `!= 'failure'` guards.
+#
+# workflow_dispatch republishes re-run the image-publish chain and (for
+# desktop-shipping tags) the desktop asset jobs, which are idempotent
+# (--clobber uploads, appcast dedupe); the `release` job stays gated on
+# tag-push events so manual republishes don't accidentally cut a new
+# GitHub Release. A dispatch of a combined tag re-runs only the Go image
+# chain (desktop jobs skip: release is skipped, not success).
 
 on:
   push:
@@ -39,8 +82,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Which components does this tag ship? A component ships iff its version
+  # manifest equals the tag (go: .claude-plugin/plugin.json; desktop:
+  # desktop/VERSION, with the crates/tauri surfaces lockstep-verified).
+  # scripts/release/release-plan.sh fails loudly when NO manifest matches
+  # (forgotten update-version.sh run), which fails this job and skips the
+  # entire workflow — a silent no-op release is impossible.
+  release-plan:
+    name: Release plan
+    runs-on: ubuntu-latest
+    outputs:
+      ship_go: ${{ steps.plan.outputs.ship_go }}
+      ship_desktop: ${{ steps.plan.outputs.ship_desktop }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.version || github.ref_name }}
+
+      - name: Compute the release plan
+        id: plan
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          if [[ ! "$VERSION" =~ ^v ]]; then
+            echo "::error::Version must start with 'v' (example: v1.2.3)"
+            exit 1
+          fi
+          # stdout is exactly the two ship_* key=value lines; diagnostics go
+          # to stderr (still visible in the log).
+          scripts/release/release-plan.sh "$VERSION" | tee -a "$GITHUB_OUTPUT"
+
   publish-build-tools:
     name: Publish shed-build-tools
+    needs: release-plan
+    if: needs.release-plan.outputs.ship_go == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -90,6 +165,8 @@ jobs:
 
   publish-vz:
     name: Publish VZ Images
+    # Transitively gated on ship_go: when publish-build-tools skips, this
+    # skips too (plain `needs` semantics — no `always()` here on purpose).
     needs: publish-build-tools
     runs-on: ubuntu-24.04-arm
 
@@ -222,6 +299,7 @@ jobs:
 
   publish-fc:
     name: Publish FC Images
+    # Transitively gated on ship_go via publish-build-tools (see publish-vz).
     needs: publish-build-tools
     runs-on: ubuntu-latest
 
@@ -339,19 +417,24 @@ jobs:
 
   # Install-only smoke against the same commit. Gate the release on
   # this so a binary that can't even run cleanly on a fresh runner
-  # doesn't ship — same regression class that broke v0.5.1.
+  # doesn't ship — same regression class that broke v0.5.1. Note it
+  # deliberately has no `needs` beyond release-plan: it runs in
+  # parallel with the image chain (its gate on `release` is via that
+  # job's needs).
   smoke:
+    needs: release-plan
+    if: needs.release-plan.outputs.ship_go == 'true'
     uses: ./.github/workflows/smoke-linux.yml
 
-  # goreleaser + apt-charliek dispatch. Only fires on tag-push
+  # goreleaser + apt-charliek dispatches. Only fires on tag-push
   # events (not manual workflow_dispatch republishes), and only
   # after the build-tools image, runtime images, and smoke have all
   # gone green. By that point apt-charliek pulling down the new
   # deb finds every referenced ghcr image already published.
   release:
     name: Build and Release
-    needs: [publish-build-tools, publish-vz, publish-fc, smoke]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [release-plan, publish-build-tools, publish-vz, publish-fc, smoke]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-plan.outputs.ship_go == 'true'
     # macos-latest: shed-host-agent's darwin build needs CGO (Touch ID), which
     # can't cross-compile from linux. The shed-extensions release pipeline ran on
     # macos-latest — this is the proven shape. The image-publish jobs above keep
@@ -372,27 +455,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Tag/manifest invariant check — the local-bump flow's safety net.
-      # Replaces the deleted sync-version job's contract: instead of
-      # fixing plugin.json drift after the fact in CI, fail the release
-      # if the tagged commit's plugin.json doesn't match the tag. Cheap
-      # server-side check; the maintainer reruns
-      # /release-workflows:release against a corrected tag rather than
-      # shipping mismatched bytes.
-      - name: Verify plugin.json matches tag
-        run: |
-          set -euo pipefail
-          expect="${GITHUB_REF_NAME#v}"
-          # Use jq to anchor to the top-level .version field; a regex
-          # would also (incorrectly) match a future nested "version"
-          # field (e.g. in a future "dependencies" block). jq is
-          # preinstalled on ubuntu-latest and fails loudly on malformed
-          # JSON.
-          got="$(jq -r '.version' .claude-plugin/plugin.json)"
-          if [ "${got}" != "${expect}" ]; then
-            echo "::error::plugin.json .version=${got} != tag=${expect}. Re-run /release-workflows:release after correcting."
-            exit 1
-          fi
+      # The old inline "Verify plugin.json matches tag" step is gone: the
+      # release-plan job owns that gate now (this job only runs when
+      # release-plan already proved plugin.json == tag, i.e. ship_go).
 
       - name: Run Tests
         run: go test ./...
@@ -510,6 +575,413 @@ jobs:
             sleep $((attempt * 5))
           done
 
+  # ---- Desktop component (ported from shed-desktop's release.yml) -----------
+
+  # Desktop-only tags need a GitHub Release to upload into; goreleaser owns
+  # release creation whenever the Go side ships (Decision 6: mode:replace
+  # would clobber a pre-created release's assets), so this job runs ONLY when
+  # ship_desktop && !ship_go. Idempotent: reuses an existing release (e.g. a
+  # workflow_dispatch republish of a desktop-only tag).
+  desktop-release-create:
+    name: Create desktop-only release
+    needs: [release-plan, release]
+    if: >-
+      always() &&
+      needs.release-plan.result == 'success' &&
+      needs.release-plan.outputs.ship_desktop == 'true' &&
+      needs.release-plan.outputs.ship_go != 'true' &&
+      needs.release.result == 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.version || github.ref_name }}
+          # No git push here (gh uses GH_TOKEN from env); don't leave the
+          # checkout credential available to later steps.
+          persist-credentials: false
+      # The old repo's tag==VERSION==Cargo gate lived here; release-plan owns
+      # that gate now (ship_desktop implies the lockstep check passed).
+      - name: Create the release if absent (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — reusing it"
+          else
+            gh release create "$TAG" --title "$TAG" \
+              --notes "Release $TAG — assets are uploading."
+          fi
+
+  # macOS: bundle (Sparkle.framework embedded), drag-install DMG, notarize +
+  # staple when the six Apple secrets exist (CAN_NOTARIZE), EdDSA-sign for the
+  # Sparkle appcast, and bot-push docs/appcast.xml to main. Skip-safe gating:
+  # a skipped `release` (desktop-only tag) or skipped `desktop-release-create`
+  # (combined tag) must not block; a FAILED one must.
+  desktop-macos:
+    name: Desktop macOS DMG + appcast
+    needs: [release-plan, release, desktop-release-create]
+    if: >-
+      always() &&
+      needs.release-plan.result == 'success' &&
+      needs.release-plan.outputs.ship_desktop == 'true' &&
+      needs.release.result != 'failure' &&
+      needs.release.result != 'cancelled' &&
+      needs.desktop-release-create.result != 'failure' &&
+      needs.desktop-release-create.result != 'cancelled'
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.inputs.version || github.ref_name }}
+      # Sign + notarize only when the FULL prerequisite set is present. Any
+      # missing secret → ad-hoc fallback: a Developer-ID-signed but un-notarized
+      # DMG is still Gatekeeper-blocked, so signing without notarizing has no
+      # value, and a partial secret set must not break the build or silently
+      # drop the first-launch note. The identity is handed to the bundle/DMG
+      # steps (below) only when this is true.
+      CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.version || github.ref_name }}
+          # Don't persist GITHUB_TOKEN creds: otherwise the appcast bot push
+          # authenticates as GITHUB_TOKEN (via the http.extraheader) instead of
+          # the App token, and GitHub suppresses the downstream docs.yml that
+          # republishes Pages. The repo is public, so the unauthenticated
+          # `git fetch origin main` below still works.
+          persist-credentials: false
+
+      - name: Rust toolchain
+        # bundle.sh builds the Rust core (staticlib + UniFFI bindings) before
+        # swift build — same explicit install as ci.yml's swift leg.
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc --version && cargo --version
+
+      # Inert until all six Apple secrets exist. When present, imports the
+      # Developer ID Application cert into a throwaway keychain so codesign (in
+      # bundle.sh) and notarization can use it.
+      - name: Import Developer ID certificate
+        if: env.CAN_NOTARIZE == 'true'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # The decoded cert must never outlive this step, even on early failure.
+          # (The keychain itself must persist — later steps sign against it.)
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+          kc="$RUNNER_TEMP/shed-desktop-signing.keychain-db"
+          kp="$(openssl rand -base64 24)"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
+          # Prepend our keychain to the user search list, keeping the existing
+          # ones; the command substitution must word-split into separate paths.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      # The identity reaches bundle.sh / make-dmg.sh only when CAN_NOTARIZE —
+      # otherwise empty, so they take the ad-hoc path (and make-dmg keeps the
+      # FIRST-LAUNCH note).
+      - name: Build + bundle
+        working-directory: desktop
+        env:
+          SHED_DESKTOP_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY || '' }}
+        run: ./scripts/bundle.sh release
+      - name: Unit tests
+        working-directory: desktop
+        run: make test
+      - name: Package DMG
+        working-directory: desktop
+        env:
+          SHED_DESKTOP_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY || '' }}
+        run: ./scripts/make-dmg.sh
+
+      # Notarize + staple BEFORE the upload + appcast signing: stapling rewrites
+      # the DMG bytes, so the EdDSA sign_update below must run against the
+      # stapled file. Gated on CAN_NOTARIZE so it never tries to notarize an
+      # ad-hoc DMG (notarize.sh also self-guards on the APPLE_* creds).
+      - name: Notarize + staple (skipped without credentials)
+        if: env.CAN_NOTARIZE == 'true'
+        working-directory: desktop
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./scripts/notarize.sh "build/ShedDesktop-${TAG#v}.dmg"
+
+      # What governs Gatekeeper on a downloaded DMG is whether it's *notarized*
+      # (a stapled ticket), not whether a signing cert exists — a Developer-ID-
+      # signed but un-notarized DMG is still blocked. Gate the release-note
+      # guidance on the real artifact state via `stapler validate`.
+      - name: Detect DMG notarization status
+        id: dmg_notarized
+        working-directory: desktop
+        run: |
+          if xcrun stapler validate "build/ShedDesktop-${TAG#v}.dmg" >/dev/null 2>&1; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload the DMG (+ notarization notes on desktop-only releases)
+        # The release exists by now (goreleaser on combined tags,
+        # desktop-release-create on desktop-only tags). Notes handling per
+        # Decision 6: when the Go side ships, goreleaser owns the release
+        # notes — never touch them; on a desktop-only release, APPEND the
+        # notarization guidance rather than overwrite (the old repo's job
+        # overwrote, which would clobber goreleaser's notes on combined tags).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTARIZED: ${{ steps.dmg_notarized.outputs.value }}
+          SHIP_GO: ${{ needs.release-plan.outputs.ship_go }}
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"
+          gh release upload "$TAG" "desktop/build/ShedDesktop-${VER}.dmg" --clobber
+          if [ "${SHIP_GO}" = "true" ]; then
+            echo "combined release — goreleaser owns the notes; skipping the notes edit."
+            exit 0
+          fi
+          if [ "${NOTARIZED}" = "true" ]; then
+            NOTES="Notarized Developer ID build (auto-updates via Sparkle). Drag to /Applications and open normally."
+          else
+            NOTES="Ad-hoc signed build (auto-updates via Sparkle). Not notarized yet — see FIRST-LAUNCH.txt in the DMG for the one-time Gatekeeper step."
+          fi
+          BODY="$(gh release view "$TAG" --json body --jq '.body')"
+          if printf '%s' "${BODY}" | grep -qF "${NOTES}"; then
+            echo "notes already carry the notarization line — leaving them as-is."
+          else
+            printf '%s\n\n%s\n' "${BODY}" "${NOTES}" | gh release edit "$TAG" --notes-file -
+          fi
+
+      # ---- Sparkle appcast: sign the DMG + publish the feed as the release bot ----
+      - name: Mint release-bot token (self-repo, appcast push)
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:    ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key:  ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner:        charliek
+          repositories: shed
+          # The appcast bot-push floor: push docs/appcast.xml to main.
+          # Verified by sanity-check-app.yml's self-repo contents:write block.
+          permission-contents: write
+
+      - name: Sign DMG + append appcast entry
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SPARKLE_ED_PRIVATE_KEY}" ]; then
+            echo "::error::SPARKLE_ED_PRIVATE_KEY is unset — can't sign the appcast entry."
+            exit 1
+          fi
+          VER="${TAG#v}"
+          DMG="desktop/build/ShedDesktop-${VER}.dmg"
+          test -s "${DMG}" || { echo "::error::${DMG} missing — the DMG step must run first."; exit 1; }
+          SIGN_UPDATE="$(find desktop/.build/artifacts -path '*/bin/sign_update' -type f -not -path '*old_dsa*' | head -1)"
+          [ -n "${SIGN_UPDATE}" ] || { echo "::error::sign_update not found under desktop/.build/artifacts."; exit 1; }
+          W="$(mktemp -d)"; chmod 700 "$W"; trap 'rm -rf "$W"' EXIT
+          printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" | base64 --decode > "${W}/key"
+          "${SIGN_UPDATE}" --ed-key-file "${W}/key" "${DMG}" > "${W}/sign.txt"
+          rm -f "${W}/key"
+          cat "${W}/sign.txt"
+          # The appcast lives on main (the tag was cut from main, so the
+          # untracked desktop/build/ + desktop/.build/ artifacts survive the
+          # checkout). update-appcast.py runs FROM THE REPO ROOT — its
+          # SHED_DESKTOP_APPCAST default is cwd-relative.
+          git fetch origin main
+          git checkout main
+          SHED_DESKTOP_VERSION="${VER}" SHED_DESKTOP_TAG="${TAG}" \
+            SHED_DESKTOP_SIGN_FILE="${W}/sign.txt" \
+            SHED_DESKTOP_APPCAST="docs/appcast.xml" \
+            SHED_DESKTOP_REPO="charliek/shed" \
+            python3 desktop/scripts/update-appcast.py
+          xmllint --noout docs/appcast.xml
+
+      - name: Push signed appcast to main as release-bot
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          BOT_SLUG: ${{ steps.bot-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet docs/appcast.xml; then
+            echo "::notice::docs/appcast.xml unchanged for ${TAG} — nothing to push."
+            exit 0
+          fi
+          bot_id="$(gh api "/users/${BOT_SLUG}[bot]" --jq '.id')"
+          git config user.name  "${BOT_SLUG}[bot]"
+          git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
+          git add docs/appcast.xml
+          staged="$(git diff --cached --name-only)"
+          if [ "${staged}" != "docs/appcast.xml" ]; then
+            echo "::error::unexpected staged paths beyond docs/appcast.xml:"; echo "${staged}"; exit 1
+          fi
+          git commit -m "chore(appcast): publish ${TAG}"
+          # Token embedded in the push URL (stays in argv, never written to disk).
+          TOKEN_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3; do
+            if git push "${TOKEN_URL}" HEAD:main; then
+              echo "::notice::Appcast pushed — docs.yml redeploys Pages → feed live."
+              exit 0
+            fi
+            echo "::warning::push attempt ${attempt} failed; rebasing onto origin/main"
+            git fetch "${TOKEN_URL}" main
+            git rebase FETCH_HEAD || { echo "::error::rebase conflict on docs/appcast.xml"; exit 1; }
+          done
+          echo "::error::push failed after 3 attempts."; exit 1
+
+  # ---- Linux: the shed-desktop .deb, per native arch, → the same Release ----
+  desktop-linux:
+    name: Desktop Linux .deb (${{ matrix.arch }})
+    needs: [release-plan, release, desktop-release-create]
+    # Same skip-safe composition as desktop-macos (see that job's comment).
+    if: >-
+      always() &&
+      needs.release-plan.result == 'success' &&
+      needs.release-plan.outputs.ship_desktop == 'true' &&
+      needs.release.result != 'failure' &&
+      needs.release.result != 'cancelled' &&
+      needs.desktop-release-create.result != 'failure' &&
+      needs.desktop-release-create.result != 'cancelled'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ github.event.inputs.version || github.ref_name }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.version || github.ref_name }}
+          # This job runs npm ci + cargo build (untrusted dependency code) before
+          # `gh release upload` (GH_TOKEN from env, not the git credential) — don't
+          # leave the checkout credential available for those steps to exfiltrate.
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Tauri (WebKitGTK) build deps
+        # The shipped .deb is built from the Tauri client (React/WebKitGTK) on
+        # the shared shed-core — so its build deps, not GTK4/libadwaita.
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev
+      - name: Node (the Vite/React frontend bundle)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop/tauri/ui/package-lock.json
+      - name: Frontend bundle (generate_context! needs tauri/ui/dist)
+        run: cd tauri/ui && npm ci && npm run build
+      - name: Install nfpm (pinned)
+        run: |
+          NFPM_VERSION=2.46.3
+          case "${{ matrix.arch }}" in
+            amd64) NA=x86_64 ;;
+            arm64) NA=arm64 ;;
+            *) echo "::error::unsupported arch ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NA}.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+      - name: Assert the runner arch matches the matrix
+        # Runner-label availability isn't provable by actionlint; fail loudly here
+        # rather than silently ship an amd64 .deb labelled arm64.
+        run: |
+          HAVE="$(dpkg --print-architecture)"
+          if [ "$HAVE" != "${{ matrix.arch }}" ]; then
+            echo "::error::runner arch $HAVE != matrix ${{ matrix.arch }}" >&2
+            exit 1
+          fi
+      - name: Build the .deb
+        run: ./linux/scripts/build-deb.sh "${TAG#v}"
+      - name: Install-validate the .deb (per arch)
+        # The release matrix is where the arm64 .deb is built AND
+        # install-validated in a clean container (launch on WebKitGTK →
+        # identify=tauri, bundled shedctl drives it, polkit action present) —
+        # the arm64 runtime-dep proof. Docker is available on the GitHub
+        # ubuntu runners.
+        run: |
+          # shellcheck disable=SC2012  # controlled out/ dir, glob is safe
+          ./linux/scripts/validate-deb.sh "$(ls -t out/shed-desktop_*.deb | head -1)"
+      - name: Upload the .deb to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" out/*.deb --clobber
+
+  # ---- Tell charliek/apt-charliek to pull the new shed-desktop .deb ----
+  # Skips prereleases (X.Y.Z-suffix tags — the rc-rehearsal path). Plain
+  # `needs: desktop-linux` is deliberate: a skipped desktop-linux (go-only
+  # tag) or a failed one both mean there's nothing new to index, so default
+  # needs semantics (skip) are exactly right — no `always()` here.
+  desktop-apt-dispatch:
+    name: Dispatch apt-charliek (shed-desktop)
+    needs: desktop-linux
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - name: Decide whether to dispatch
+        id: guard
+        run: |
+          case "${TAG}" in
+            *-*) echo "::notice::${TAG} is a prerelease — skipping apt-charliek dispatch."
+                 echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: Mint an apt-charliek App token
+        if: steps.guard.outputs.skip == 'false'
+        id: apt
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner: charliek
+          repositories: apt-charliek
+          # POST /repos/.../dispatches requires contents:write.
+          permission-contents: write
+      - name: Trigger apt-charliek publish (shed-desktop)
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.apt.outputs.token }}
+        run: |
+          # Same idempotent-with-retry pattern as the release job's dispatches.
+          for attempt in 1 2 3; do
+            if gh api repos/charliek/apt-charliek/dispatches \
+              --method POST \
+              -f event_type=publish \
+              -F "client_payload[package]=shed-desktop" \
+              -F "client_payload[tag]=${TAG}" 2>&1; then
+              echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
+              exit 0
+            fi
+            echo "::warning::dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-charliek dispatch failed after 3 attempts — check the stderr above for the API error"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
 # The earlier sync-version job that checked out main, ran
 # scripts/set-version.sh, and pushed the bumped
 # .claude-plugin/plugin.json back to main is REMOVED in this
@@ -518,5 +990,5 @@ jobs:
 # convention's source-tree-bump-local rule). The release skill runs
 # update-version.sh before tagging, so main always has plugin.json at
 # the released tag's version before the workflow even fires. The
-# inline "Verify plugin.json matches tag" step above is the cross-check
-# that replaces sync-version's after-the-fact bump.
+# release-plan job's manifest check is the cross-check that replaces
+# sync-version's after-the-fact bump.

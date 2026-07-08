@@ -138,8 +138,22 @@ nav:
       - RC Session Helper: extensions/rc-helper.md
       - shed-machine-rc: extensions/shed-machine-rc.md
       - Security Posture: extensions/security-posture.md
+  - Desktop:
+      - Overview: desktop/index.md
+      - Installation: desktop/installation.md
+      - First Run: desktop/first-run.md
+      - Architecture: desktop/architecture.md
+      - Rust core: desktop/rust-core.md
+      - Configuration: desktop/configuration.md
+      - Approvals: desktop/approvals.md
+      - RC sessions: desktop/rc-sessions.md
+      - IPC: desktop/ipc.md
+      - shedctl CLI: desktop/cli.md
+      - Development setup: desktop/development-setup.md
+      - Test automation: desktop/test-automation.md
   - Discovery:
       - Monorepo Consolidation: discovery/monorepo-consolidation.md
+      - Monorepo Phase 2 Validation: discovery/monorepo-phase2-validation.md
       - Auth & Transport Security: discovery/auth-and-transport-security.md
       - Auth & Transport Plan: discovery/auth-transport-plan.md
       - Lazy Rootfs Streaming: discovery/lazy-rootfs-streaming.md

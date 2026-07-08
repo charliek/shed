@@ -56,6 +56,16 @@ vendor/
 *.pem
 *.key
 
+# Desktop app local secrets (Sparkle private key, notarization creds)
+desktop/.secrets/
+
+# Files below are git-ignored AND synced across machines via envsecrets
+# (age-encrypted to GCS). Do not remove or modify the "# envsecrets" marker line;
+# everything between it and the next blank line is the tracked-file list.
+# envsecrets
+desktop/.secrets/cert.p12
+desktop/.secrets/apple.env
+
 # Local configuration (keep examples)
 server.yaml
 !configs/server.example.yaml
@@ -75,12 +85,22 @@ ehthumbs.db
 # Packaging build artifacts
 packaging/server.yaml.generated
 
+# Rust / desktop build artifacts (imported workspaces)
+crates/target/
+desktop/artifacts/
+# …but the Go `bin/` ignore above must not swallow Rust `src/bin/` crates:
+!crates/**/src/bin/
+# desktop app launcher-script resources (also swallowed by the unanchored bin/ rule)
+!desktop/Resources/bin/
+
 # Documentation build
 site-build/
 .venv/
 uv.lock
 # … but the integration test suite's lockfile is committed for reproducibility:
 !tests/integration/uv.lock
+# … and the desktop workspace's lockfile is committed too:
+!desktop/uv.lock
 # Python tooling caches for the integration suite
 tests/integration/.pytest_cache/
 **/__pycache__/

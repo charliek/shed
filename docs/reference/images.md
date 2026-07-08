@@ -422,6 +422,13 @@ does not synthesize a default, and a `${shed.version}` token is rejected at
 load with an actionable error — pin an explicit ref on such builds (see
 [Using local images](#using-local-images)).
 
+!!! note "Desktop-only release tags publish no rootfs images"
+    The monorepo ships multiple components on one `vX.Y.Z` tag family, and a
+    **desktop-only** tag (one that bumps only `desktop/VERSION`) publishes **no**
+    `ghcr.io/charliek/shed-{vz,fc}-*:vX.Y.Z` rootfs images. If you track the
+    version automatically or use `${shed.version}`, pin `default_image` to the
+    last **Go-shipping** tag rather than such a desktop-only tag.
+
 ### Using local images
 
 If you build images locally, point `default_image` (and any aliases) at a

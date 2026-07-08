@@ -1,0 +1,1 @@
+[{"name":"default","source":"config","profile":{"mode":"audit","allow":["*.github.com"],"deny":["evil.example.com"],"rule":"true"}},{"name":"custom","source":"user","profile":{"allow":["api.example.com"]}}]

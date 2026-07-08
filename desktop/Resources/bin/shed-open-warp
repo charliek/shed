@@ -1,0 +1,40 @@
+#!/bin/bash
+# Best-effort Warp opener: write a one-tab Launch Configuration that runs the
+# command, then open it via the warp:// URI.
+#
+# Usage: shed-open-warp <shed> <cmd>
+#
+# Warp can't open a new TAB with a command from outside, by design:
+#   - Launch Configs (used here) always open a new WINDOW (warp#8833, closed).
+#   - Tab Configs open as a tab but aren't launchable via URI/CLI yet
+#     (warp#9083, warp#12343 — both open). No AppleScript, no CLI either.
+# So new-window is the best available; revisit (switch to a Tab Config) once
+# warp#9083 ships. Verify the YAML schema against your Warp version.
+set -euo pipefail
+
+shed="${1:-}"
+cmd="${2:-}"
+[ -n "$cmd" ] || { echo "usage: shed-open-warp <shed> <cmd>" >&2; exit 2; }
+
+cfg_dir="$HOME/.warp/launch_configurations"
+mkdir -p "$cfg_dir"
+name="shed-desktop"
+
+# Escape for a YAML double-quoted scalar.
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+cmd_yaml="$(esc "$cmd")"
+shed_yaml="$(esc "$shed")"
+
+cat > "$cfg_dir/$name.yaml" <<YAML
+---
+name: $name
+windows:
+  - tabs:
+      - title: "$shed_yaml"
+        layout:
+          cwd: "~"
+          commands:
+            - exec: "$cmd_yaml"
+YAML
+
+exec /usr/bin/open "warp://launch/$name"

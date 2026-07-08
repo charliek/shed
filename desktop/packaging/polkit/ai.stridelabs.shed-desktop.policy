@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  The polkit action the Tauri client's AuthGate authenticates against (B6). Install
+  to /usr/share/polkit-1/actions/ (shipped with the Tauri package; installed by hand
+  for the B6 real-desktop smoke). The id MUST match POLKIT_ACTION_ID in
+  tauri/src-tauri/src/approval.rs — an unregistered action makes pkcheck error, which
+  the gate maps to Unavailable (fail-closed).
+
+  allow_active=auth_self: at the active local seat, the invoking user must
+  authenticate AS THEMSELVES (password / whatever PAM is configured, e.g.
+  pam_fprintd) every time. We deliberately do NOT use *_keep (no polkit-side
+  caching) — the app's own session-grant logic owns "don't ask again", so each
+  ungranted approval re-authenticates.
+
+  allow_inactive/allow_any=no: releasing a credential from an INACTIVE local seat
+  or a NO-session / remote context is denied outright (not merely challenged) —
+  this is the last line of defense on a secret, so it's active-seat-only.
+
+  SECURITY: this action must NEVER be blanket-authorized. A local polkit `.rules`
+  / `.pkla` granting it `yes` (or via a wildcard) would make pkcheck exit 0 with
+  no password — i.e. disable the gate. Ship ONLY this file; add no allow rules.
+-->
+<policyconfig>
+  <vendor>Stride Labs</vendor>
+  <vendor_url>https://github.com/charliek/shed-desktop</vendor_url>
+
+  <action id="ai.stridelabs.shed-desktop.approve-credential">
+    <description>Approve a credential request from shed-desktop</description>
+    <message>Authenticate to approve a credential request from shed-desktop</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

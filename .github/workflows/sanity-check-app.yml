@@ -3,6 +3,10 @@ name: sanity-check-app
 # Manual verification that the release-bot App is installed on every
 # repo shed's release pipeline touches:
 #   1. charliek/shed itself (the running repo's secrets must resolve)
+#   1b. charliek/shed with contents:write — the desktop release leg's
+#       appcast bot-push floor (publish-images.yaml pushes
+#       docs/appcast.xml to main with a token minted at this exact
+#       permission)
 #   2. charliek/homebrew-tap (GoReleaser's brews step pushes Formula/shed.rb)
 #   3. charliek/apt-charliek (publish dispatch sent at end of release)
 #
@@ -60,6 +64,32 @@ jobs:
           echo "::group::Bot identity (should end with [bot])"
           echo "${BOT_SLUG}[bot]"
           echo "::endgroup::"
+
+      # ── 1b. self (charliek/shed) at contents:write — the appcast-push floor ──
+      # The desktop-macos release job pushes docs/appcast.xml to main with a
+      # token minted exactly like this (owner charliek, repositories shed,
+      # permission-contents: write). The MINT itself is the permission proof:
+      # create-github-app-token fails if the installation's grant doesn't
+      # cover the requested floor. The reach check below is the trivial
+      # verification that the scoped token resolves the repo.
+      - id: self-write-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id:      ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_KEY }}
+          owner:        charliek
+          repositories: shed
+          permission-contents: write
+
+      - name: Self-repo contents:write token can reach charliek/shed
+        env:
+          GH_TOKEN: ${{ steps.self-write-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::group::Scoped contents:write token can reach charliek/shed"
+          gh api /repos/charliek/shed --jq '.full_name'
+          echo "::endgroup::"
+          echo "::notice::minting at permission-contents:write succeeded — the appcast bot-push permission floor holds (branch-protection bypass for the App is a separate, manual check)."
 
       # ── 2. charliek/homebrew-tap (GoReleaser brews push target) ──
       - id: tap-token
