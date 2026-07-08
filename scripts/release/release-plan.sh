@@ -39,6 +39,10 @@ V="${TAG#v}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# The [package]/[workspace.package] version from a Cargo.toml: the only
+# line-anchored `version = "..."` (deps are inline `{ version = "..." }`).
+toml_version() { grep -m1 '^version[[:space:]]*=' "$1" | sed -E 's/.*"([^"]+)".*/\1/'; }
+
 GO_V="$(jq -r '.version' "${REPO_ROOT}/.claude-plugin/plugin.json")"
 DESKTOP_V="$(tr -d '[:space:]' < "${REPO_ROOT}/desktop/VERSION")"
 
@@ -60,10 +64,10 @@ if [ "${SHIP_DESKTOP}" = "true" ]; then
     exit 1
   }
 
-  CRATES_V="$(grep -m1 '^version[[:space:]]*=' "${REPO_ROOT}/crates/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+  CRATES_V="$(toml_version "${REPO_ROOT}/crates/Cargo.toml")"
   [ "${CRATES_V}" = "${DESKTOP_V}" ] || fail_lockstep "crates/Cargo.toml [workspace.package].version" "${CRATES_V}"
 
-  TAURI_CARGO_V="$(grep -m1 '^version[[:space:]]*=' "${REPO_ROOT}/desktop/tauri/src-tauri/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+  TAURI_CARGO_V="$(toml_version "${REPO_ROOT}/desktop/tauri/src-tauri/Cargo.toml")"
   [ "${TAURI_CARGO_V}" = "${DESKTOP_V}" ] || fail_lockstep "desktop/tauri/src-tauri/Cargo.toml [package].version" "${TAURI_CARGO_V}"
 
   TAURI_CONF_V="$(jq -r '.version' "${REPO_ROOT}/desktop/tauri/src-tauri/tauri.conf.json")"
