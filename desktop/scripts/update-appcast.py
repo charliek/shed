@@ -13,8 +13,11 @@ Inputs (environment):
   SHED_DESKTOP_VERSION    required   e.g. "0.2.0" or "0.2.0-beta1"
   SHED_DESKTOP_TAG        optional   git tag; default "v$SHED_DESKTOP_VERSION"
   SHED_DESKTOP_APPCAST    optional   appcast path; default "docs/appcast.xml"
+                                     (cwd-relative — run this script from the
+                                     MONOREPO ROOT, where the feed lives at
+                                     docs/appcast.xml, not from desktop/)
   SHED_DESKTOP_SIGN_FILE  optional   sign_update output file; default "sign_update.txt"
-  SHED_DESKTOP_REPO       optional   "owner/repo"; default "charliek/shed-desktop"
+  SHED_DESKTOP_REPO       optional   "owner/repo"; default "charliek/shed"
   SHED_DESKTOP_MIN_MACOS  optional   minimum system version; default "14.0.0"
 
 `sign_update.txt` must hold the line Sparkle's `sign_update` prints for the
@@ -61,9 +64,12 @@ def main():
     except KeyError:
         sys.exit("error: SHED_DESKTOP_VERSION is required")
     tag = os.environ.get("SHED_DESKTOP_TAG", f"v{version}")
+    # NOTE: the appcast default is cwd-relative. In the monorepo the feed is
+    # docs/appcast.xml at the REPO ROOT — run this script from there (the
+    # release workflow does), or set SHED_DESKTOP_APPCAST explicitly.
     appcast_path = os.environ.get("SHED_DESKTOP_APPCAST", "docs/appcast.xml")
     sign_file = os.environ.get("SHED_DESKTOP_SIGN_FILE", "sign_update.txt")
-    repo = os.environ.get("SHED_DESKTOP_REPO", "charliek/shed-desktop")
+    repo = os.environ.get("SHED_DESKTOP_REPO", "charliek/shed")
     min_macos = os.environ.get("SHED_DESKTOP_MIN_MACOS", "14.0.0")
     is_prerelease = "-" in tag
 

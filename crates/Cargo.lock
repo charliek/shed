@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "shed-app"
-version = "0.0.1"
+version = "0.0.13"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "shed-core"
-version = "0.0.1"
+version = "0.0.13"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "shed-core-ffi"
-version = "0.0.1"
+version = "0.0.13"
 dependencies = [
  "async-trait",
  "shed-core",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "shedctl"
-version = "0.0.1"
+version = "0.0.13"
 dependencies = [
  "base64 0.22.1",
  "libc",

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+<!--
+  `**Ships:**` convention (debuts with the next entry; earlier entries
+  predate it): each release entry opens with a `**Ships:** …` line naming
+  the components that tag actually shipped — `server/CLI`, `desktop`, or
+  both. A component ships iff its version manifest equals the tag (go:
+  .claude-plugin/plugin.json; desktop: desktop/VERSION) — see RELEASING.md
+  "Component selection". Convention only, unenforced; shed-desktop's
+  pre-monorepo changelog stays in the archived charliek/shed-desktop repo.
+-->
+
 ## v0.7.8 — 2026-07-03
 
 ### Fixed

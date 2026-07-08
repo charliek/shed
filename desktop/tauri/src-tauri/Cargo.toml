@@ -6,7 +6,7 @@
 # core's workspace). See plans/tauri-phase-a.md.
 [package]
 name = "shed-desktop-tauri"
-version = "0.0.1"
+version = "0.0.13"
 edition = "2021"
 publish = false
 

@@ -56,7 +56,7 @@
   <key>LSUIElement</key>
   <true/>
   <key>SUFeedURL</key>
-  <string>https://charliek.github.io/shed-desktop/appcast.xml</string>
+  <string>https://charliek.github.io/shed/appcast.xml</string>
   <key>SUPublicEDKey</key>
   <string>ROs7kN5cyTTVpMUriF1B/RZ/BaV/HJeOC8gMbBjDw+4=</string>
   <key>SUEnableAutomaticChecks</key>
