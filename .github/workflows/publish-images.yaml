@@ -930,12 +930,20 @@ jobs:
 
   # ---- Tell charliek/apt-charliek to pull the new shed-desktop .deb ----
   # Skips prereleases (X.Y.Z-suffix tags — the rc-rehearsal path). Plain
-  # `needs: desktop-linux` is deliberate: a skipped desktop-linux (go-only
-  # tag) or a failed one both mean there's nothing new to index, so default
-  # needs semantics (skip) are exactly right — no `always()` here.
+  # Runs after the shed-desktop .deb is uploaded (desktop-linux), so the
+  # re-collect it triggers actually finds the asset — the Go-side release job
+  # dispatches apt earlier, before this deb exists, so that collect can't index
+  # shed-desktop. Needs the explicit `always()`-composition because desktop-linux
+  # runs via `if: always()` over a (correctly) skipped desktop-release-create on
+  # combined tags; a plain `success()` gate gets poisoned by that transitive skip
+  # and the job wrongly skips. Runs iff desktop shipped AND its .deb built.
   desktop-apt-dispatch:
     name: Dispatch apt-charliek (shed-desktop)
-    needs: desktop-linux
+    needs: [release-plan, desktop-linux]
+    if: >-
+      always() &&
+      needs.release-plan.outputs.ship_desktop == 'true' &&
+      needs.desktop-linux.result == 'success'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.inputs.version || github.ref_name }}
