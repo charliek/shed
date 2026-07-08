@@ -53,10 +53,9 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
 ## What happens
 
 1. **`release-workflows:release`** (LLM, local):
-   - Verifies branch (`main`) + clean tree + CI green on HEAD (shed
-     has no `ci-success` aggregator; the skill reports "missing" for
-     that check, which is expected — treat as non-blocking; ci.yml's
-     test/lint/plugin jobs run on every PR and serve as the gate)
+   - Verifies branch (`main`) + clean tree + CI green on HEAD. ci.yml
+     has a `ci-success` aggregator (skipped-by-path-filter counts as
+     pass) — the skill's ci-success check is a real gate now.
    - Asks/confirms version
    - Drafts a CHANGELOG entry from `git log v<previous>..HEAD`, commits
      as `docs(changelog): vX.Y.Z entry`
@@ -163,9 +162,10 @@ release-time concern.
 
 | Secret | Purpose | Required? |
 |---|---|---|
-| `RELEASE_BOT_APP_ID` | `charliek-release-bot` GitHub App ID | required |
+| `RELEASE_BOT_CLIENT_ID` | `charliek-release-bot` GitHub App client ID (used by `actions/create-github-app-token`) | required |
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required |
 | `GITHUB_TOKEN` (workflow-provided) | All 3 Docker push jobs (build-tools, VZ, FC) to ghcr.io as `${{ github.actor }}` | provided automatically; do not set |
+| Desktop secrets (six `CAN_NOTARIZE` + `SPARKLE_ED_PRIVATE_KEY`) | Desktop release leg — see [`desktop/RELEASING.md`](desktop/RELEASING.md) | required before the first desktop-shipping tag |
 
 Retired (deleted from `gh secret list -R charliek/shed` during the
 convention adoption):
@@ -177,19 +177,21 @@ convention adoption):
 - `APT_DISPATCH_TOKEN` — replaced by the App-minted apt-charliek
   token used for the `repository_dispatch` call.
 
-Confirm with `gh secret list -R charliek/shed` that only the
-`RELEASE_BOT_APP_*` pair remains.
+Confirm with `gh secret list -R charliek/shed` that the
+`RELEASE_BOT_CLIENT_ID`/`RELEASE_BOT_APP_KEY` pair (plus the desktop
+secrets, once added) are present and the retired tokens are gone.
 
 ## Branch protection
 
 `main` is protected by a ruleset (created during the convention
-adoption) with rules `deletion` + `non_fast_forward` (no
-`required_status_checks` — shed's `ci.yml` runs separate jobs
-(test/lint/plugin) with no aggregator). Bypass actors:
+adoption) with rules `deletion` + `non_fast_forward`. ci.yml now has a
+`ci-success` aggregator (skipped-by-filter counts as pass) — the single
+job suited to a `required_status_checks` rule; adding it is the
+recommended follow-up. Bypass actors:
 
-- `charliek-release-bot` (App, type `Integration`) — listed for future
-  flexibility (no workflow step pushes back to shed's main today now
-  that `sync-version` is gone)
+- `charliek-release-bot` (App, type `Integration`) — **load-bearing**:
+  the desktop release leg's appcast step commits `docs/appcast.xml`
+  back to `main` as the bot (see `publish-images.yaml` `desktop-macos`)
 - Admin role (id `5`, type `RepositoryRole`) — lets
   `/release-workflows:release`'s push of the changelog + version
   commits + tag land
@@ -221,7 +223,7 @@ Run workflow). Each block must print the expected repo name.
 |---|---|---|
 | `git push` rejected from local | Pusher not in ruleset bypass | Confirm App + admin role in `main`'s ruleset `bypass_actors` |
 | `release` job fails at "Verify plugin.json matches tag" | Plugin.json wasn't bumped before tagging; tag was created against the wrong commit; or developer ran `git tag` manually without using `/release-workflows:release` | Don't force-fix in CI — re-run `/release-workflows:release` against a corrected tag |
-| GoReleaser fails at `brews` with `Bad credentials` | `RELEASE_BOT_APP_ID` unset OR App not installed on `homebrew-tap` | Verify via `sanity-check-app.yml`'s homebrew-tap block; install the App on the tap |
+| GoReleaser fails at `brews` with `Bad credentials` | `RELEASE_BOT_CLIENT_ID` unset OR App not installed on `homebrew-tap` | Verify via `sanity-check-app.yml`'s homebrew-tap block; install the App on the tap |
 | apt-charliek dispatch fails after 3 retries | App not installed on `charliek/apt-charliek` OR scope mismatch | Verify via `sanity-check-app.yml`'s apt-charliek block; check `RELEASE_BOT_APP_KEY` is the current `.pem` |
 | `publish-vz` / `publish-fc` fails on `FROM ghcr.io/charliek/shed-build-tools:vX.Y.Z` (image not found) | The build-tools push hadn't propagated yet, OR a previous `workflow_dispatch` failed to publish the new tag | Re-run the failed image-publish job; it'll pick up the now-existent build-tools image |
 | Docker push fails at "Log in to ghcr.io" | `packages: write` permission missing on the job | Confirm `permissions.packages: write` at workflow + job level |

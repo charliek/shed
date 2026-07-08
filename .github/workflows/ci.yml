@@ -66,11 +66,18 @@ jobs:
               - 'desktop/tauri/**'
               - 'crates/**'
               - 'desktop/packaging/polkit/**'
+              # tauri.conf.json bundles launcher scripts from Resources/bin,
+              # and the Linux legs run inside this Dockerfile's image
+              - 'desktop/Resources/**'
+              - 'desktop/Dockerfile.tauri-linux'
             packaging:
               - 'desktop/packaging/**'
               - 'desktop/linux/**'
             harness:
               - 'desktop/tools/**'
+              # the shedtest harness env
+              - 'desktop/pyproject.toml'
+              - 'desktop/uv.lock'
             docs:
               - 'docs/**'
               - 'mkdocs.yml'
