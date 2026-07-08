@@ -121,3 +121,5 @@ rough edge): `.claude/skills/shedtest-mac` (the macOS app loop) and
 `.claude/skills/shedtest-linux` (the Tauri/Linux loop). The user-facing docs live under
 `docs/desktop/` — the [Test automation](../docs/desktop/test-automation.md) page mirrors the
 harness. Recurring release steps: `desktop/RELEASING.md`.
+
+# p2-selectivity scratch marker (delete me)
