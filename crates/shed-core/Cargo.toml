@@ -1,0 +1,27 @@
+[package]
+name = "shed-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true }
+# Pane classifier + claude.ai URL extraction for the RC module (rc.rs). Already
+# in the workspace lock tree (via httpmock), so no new crates are pulled.
+regex = "1"
+
+[dev-dependencies]
+httpmock = { workspace = true }

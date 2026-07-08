@@ -1,0 +1,6 @@
+# channel = "stable" (not an exact version) so the already-installed stable
+# toolchain is used without rustup re-downloading a pinned identity.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

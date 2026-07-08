@@ -1,0 +1,43 @@
+[package]
+name = "shed-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-app — the display-free app-logic layer (the shed-core-backed Backend + pull create store) shared by the GTK and Tauri clients (and, later, the Swift app via FFI). No UI or env-prefix coupling; depends only on the pure shed-core protocol crate."
+
+[lib]
+name = "shed_app"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+shed-core = { path = "../shed-core" }
+# `net` (UnixStream) + `io-util` (buffered line reader) for the host-agent UDS
+# client, on top of the workspace's rt/macros/sync/time.
+tokio = { workspace = true, features = ["net", "io-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+# Concurrent per-host list_sheds via futures::future::join_all.
+futures = "0.3"
+# Flexible ISO-8601 parse/format for approval expiry + wire `ts` (Swift's
+# DateFormatting). `clock` disabled — "now" comes from the injectable Clock seam,
+# not chrono, so no iana-time-zone/libc pull.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# getpeereid(2) for the host-agent socket peer-UID check (A1 — the server must
+# run as us). Unix-only; the clients are Unix (Linux + macOS).
+libc = "0.2"
+
+[features]
+# The Remote-Control layer (`rc.rs`): process/SSH spawning via `tokio/process`.
+# NON-default so a featureless consumer of `shed-app` (e.g. the mac FFI build,
+# which has no RC pane) never compiles it; the Tauri client enables it. `make test`
+# must pass `--features rc` or the rc unit tests are cfg'd out.
+rc = ["tokio/process"]
+
+[dev-dependencies]
+httpmock = { workspace = true }

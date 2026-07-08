@@ -1,0 +1,22 @@
+# shed config — shared cross-language parity fixture.
+# The Rust `shed_core::config` parser (config.rs) and the Swift `ShedConfig`
+# parser (ShedConfig.swift) must produce identical results from this file.
+# Exercises: multiple servers (sorted by name), default_server, a control token
+# present + absent, api_url + a mixed-case pin (lowercased), an inline comment,
+# an ignored field (added_at), and an inline empty map `{}` (all-defaults).
+default_server: mini2
+servers:
+    mini2:
+        host: mini2
+        http_port: 8080
+        ssh_port: 2222
+        control_token: shed_control_abc123
+        added_at: 2026-05-09T01:44:44.395385-05:00
+    secure:
+        host: localhost
+        http_port: 8080
+        ssh_port: 2222
+        api_url: https://localhost:8443
+        tls_cert_fingerprint: SHA256:AABBCC   # mixed case -> lowercased
+    minimal: {}
+sheds: {}

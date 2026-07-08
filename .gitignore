@@ -75,12 +75,20 @@ ehthumbs.db
 # Packaging build artifacts
 packaging/server.yaml.generated
 
+# Rust / desktop build artifacts (imported workspaces)
+crates/target/
+desktop/artifacts/
+# …but the Go `bin/` ignore above must not swallow Rust `src/bin/` crates:
+!crates/**/src/bin/
+
 # Documentation build
 site-build/
 .venv/
 uv.lock
 # … but the integration test suite's lockfile is committed for reproducibility:
 !tests/integration/uv.lock
+# … and the desktop workspace's lockfile is committed too:
+!desktop/uv.lock
 # Python tooling caches for the integration suite
 tests/integration/.pytest_cache/
 **/__pycache__/

@@ -1,0 +1,22 @@
+[package]
+name = "shed-core-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# staticlib: linked directly into the ShedDesktop Mach-O (no new dylib to sign
+# or notarize — see plans/phase-1-rust-core.md §6). `lib` keeps it usable as a
+# normal crate for the uniffi-bindgen bin below (default lib name: shed_core_ffi).
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+shed-core = { path = "../shed-core" }
+uniffi = { workspace = true, features = ["cli", "tokio"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
