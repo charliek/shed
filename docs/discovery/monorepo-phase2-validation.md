@@ -52,3 +52,21 @@ These proofs need published releases, the real CI EdDSA key, and notarization cr
 - **`apt install shed-desktop`:** proven after the first combined release ships the `.deb` and apt-charliek repoints `shed-desktop` → `charliek/shed` (then flip `optional: true` → required).
 
 Expected asymmetry to note at release time: the new feed permanently lacks the `0.0.14` entry (appended only to the old feed) — by design, not a bug.
+
+## Release-time outcomes (post-merge, 2026-07-08)
+
+The consolidated release path was exercised for real. Versions used the patch line (maintainer decision) rather than the `0.8.0` marker the plan hypothesised.
+
+- **Phase 1 first monorepo release — `v0.7.9` (Go-only).** `publish-images.yaml` ran end-to-end on `macos-latest`: goreleaser (shed/shed-server/shed-agent/shed-egress-proxy + `shed-host-agent` darwin CGO + `shed-machine-rc`), `shed-build-tools`, six rootfs images with in-tree guest binaries, two apt dispatches. Verified: brew `shed`/`shed-host-agent`/`shed-machine-rc` at 0.7.9; apt `shed-server` + `shed-machine-rc` 0.7.9 on amd64+arm64; ghcr VZ/FC base/extensions/full published. Then: `shed-machine-rc` apt entry flipped back to required (its deb now ships from `charliek/shed`, PR apt-charliek#14); **`charliek/shed-extensions` archived**.
+- **Final old-repo migration release — `charliek/shed-desktop` `v0.0.14`.** Only change: `SUFeedURL` → the monorepo feed. The old repo's pipeline signed the DMG with the unchanged EdDSA key and appended a signed `0.0.14` item to the **old** feed (enclosure → the v0.0.14 DMG on `charliek/shed-desktop`). This is the one-hop migration for existing `0.0.13` installs.
+- **First combined release — `v0.7.10` (`--components go,desktop`).** `release-plan.sh` gated `ship_go=true ship_desktop=true` (lockstep across `plugin.json`, `desktop/VERSION`, `crates/`, tauri Cargo + `tauri.conf.json` verified). One tag shipped: Go artifacts + images, the notarized `ShedDesktop-0.7.10.dmg`, both `shed-desktop_0.7.10_*.deb`, and a signed `0.7.10` appcast entry bot-pushed to `main` (new feed). Desktop jumped `0.0.14` → `0.7.10`. Verified: brew ×3 at 0.7.10; apt `shed-server`/`shed-machine-rc`/`shed-desktop` 0.7.10 (both arches); DMG + debs on the release; new-feed appcast entry present and EdDSA-signed. The `**Ships:**` changelog convention debuted here.
+
+### Release-pipeline bug found and fixed (v0.7.10)
+
+The **`desktop-apt-dispatch`** job skipped on the combined tag, so apt was not re-collected after `shed-desktop_0.7.10.deb` uploaded, and the earlier Go-side dispatch had run before that deb existed — apt briefly kept serving `shed-desktop 0.0.14`. Root cause: the skipped-needs trap — the job used the implicit `success()` gate over `needs: desktop-linux`, which runs via `if: always()` over a (correctly) skipped `desktop-release-create` on combined tags; the transitive skip poisons `success()`. Immediate fix: a manual apt re-collect indexed `shed-desktop 0.7.10` on both arches. Durable fix: `charliek/shed#250` gives the job the explicit `always() && ship_desktop && needs.desktop-linux.result == 'success'` composition, matching the other desktop jobs.
+
+**Decision — `shed-desktop` apt entry stays `optional: true`** (plan had it flipping to required at closeout). On a combined release the Go-side apt dispatch fires before the desktop `.deb` finishes uploading; that collect would hard-fail under `required` (no `shed-desktop` deb in any `charliek/shed` release at that instant). Keeping it optional lets the early collect skip it harmlessly, and the (now-fixed) `desktop-apt-dispatch` re-collects once the deb is up. Making it safely required would require ordering the Go dispatch behind the desktop deb — out of proportion for this project.
+
+### Awaiting maintainer validation (this machine)
+
+The one proof that needs a real install: on a machine running `0.0.13`, Sparkle update → `0.0.14` (old feed) → check-for-updates → `0.7.10` (new feed), no reinstall; plus `apt install shed-desktop`. Note the expected asymmetry — the new feed permanently lacks the `0.0.14` entry (appended only to the old feed), by design.
