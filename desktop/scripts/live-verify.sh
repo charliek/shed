@@ -112,7 +112,11 @@ logging:
 YAML
 
 say "Starting real host-agent (socket: $AGENT_SOCK)"
-"$AGENT_BIN" -config "$CFG" >"$TMP/agent.log" 2>&1 &
+# The host-agent socket path is fixed under its socket dir (the `desktop.socket_path`
+# config key is deprecated/ignored). Point the socket dir at $TMP so the private agent
+# binds $TMP/host-agent.sock (= $AGENT_SOCK) and $TMP/host-agent-status.sock, keeping it
+# fully isolated from the brew host-agent's default ~/Library/Application Support/shed one.
+SHED_HOST_AGENT_SOCKET_DIR="$TMP" "$AGENT_BIN" -config "$CFG" >"$TMP/agent.log" 2>&1 &
 AGENT_PID=$!
 for _ in $(seq 1 50); do [ -S "$AGENT_SOCK" ] && break; sleep 0.1; done
 [ -S "$AGENT_SOCK" ] || { cat "$TMP/agent.log"; die "host-agent socket never appeared"; }
