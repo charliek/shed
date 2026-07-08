@@ -12,6 +12,23 @@ All notable changes to this project will be documented in this file.
   pre-monorepo changelog stays in the archived charliek/shed-desktop repo.
 -->
 
+## v0.7.9 — 2026-07-08
+
+### Changed
+
+- **shed-extensions now builds from this repo (monorepo Phase 1).** The host
+  binaries (`shed-host-agent`, `shed-machine-rc`) and the four guest extension
+  binaries (`shed-ext-ssh-agent`, `shed-ext-aws-credentials`,
+  `docker-credential-shed`, `shed-ext-rc`) are built in-tree; the rootfs image
+  builds stage the guest binaries directly, replacing the
+  `ghcr.io/charliek/shed-extensions` image and the `SHED_EXT_VERSION`
+  Dockerfile pins — a bus-protocol change is now one PR, one tag, no
+  version-skew window. The `shed-host-agent` and `shed-machine-rc` brew
+  formulas and the `shed-machine-rc` deb publish from this repo's releases
+  (version numbers jump from the extensions repo's v0.4.9 to this line), and
+  the release job runs on macOS for the Touch ID CGO build. First release cut
+  from the consolidated pipeline. (#243)
+
 ## v0.7.8 — 2026-07-03
 
 ### Fixed
