@@ -1,0 +1,84 @@
+# Installation
+
+shed-desktop ships two clients from one shared Rust core: a native macOS app (Apple Silicon)
+and a Tauri/WebKitGTK Linux app.
+
+## macOS (DMG)
+
+The macOS app is an Apple Silicon (arm64) menu-bar app and requires macOS 14 or newer.
+
+Grab the latest `ShedDesktop-<version>.dmg` from the
+[releases page](https://github.com/charliek/shed/releases), open it, and drag
+**ShedDesktop.app** to Applications.
+
+Release DMGs are **Developer-ID-signed and notarized**, so they launch without a Gatekeeper
+prompt. After the first launch the app **auto-updates** via Sparkle — menu → **Check for
+Updates…** — verified by an EdDSA signature independent of Apple notarization. See
+[RELEASING.md](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
+
+Locally built DMGs (`make -C desktop dmg`) are **ad-hoc signed**, so Gatekeeper blocks the
+first launch. Clear the quarantine once, after copying it in:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/ShedDesktop.app
+```
+
+(Or double-click it, dismiss the warning, then System Settings → Privacy & Security →
+"Open Anyway".)
+
+> A Homebrew **cask** for the macOS app is planned (a later monorepo phase) but not
+> available yet — install from the DMG for now.
+
+## Linux (apt)
+
+The Linux client is the Tauri app, distributed as the `shed-desktop` `.deb` (amd64 + arm64)
+through `charliek/apt-charliek`:
+
+```bash
+apt install shed-desktop
+```
+
+The binary installs to `/usr/bin/shed-desktop`, with a headless `shedctl` and the polkit
+action alongside. The `.deb` declares its WebKitGTK runtime dependencies
+(`libwebkit2gtk-4.1-0`, `libgtk-3-0`, `libayatana-appindicator3-1`, `librsvg2-2`,
+`libsoup-3.0-0`) and recommends `polkitd`. See the
+[shed apt repo](https://github.com/charliek/apt-charliek) for the repository setup.
+
+## Build from source
+
+The desktop app lives under `desktop/` in the [shed monorepo](https://github.com/charliek/shed);
+its shared Rust core is the sibling `crates/` workspace. Every `make` target below runs from
+the monorepo root via the `desktop-` passthrough (`make desktop-<target>`) or directly with
+`make -C desktop <target>`.
+
+**macOS** — prerequisites: Xcode 16+ (Swift 6 toolchain), Rust stable ≥1.85.
+
+```bash
+git clone https://github.com/charliek/shed
+cd shed
+make -C desktop bundle     # builds desktop/build/ShedDesktop.app (ad-hoc signed)
+open desktop/build/ShedDesktop.app
+```
+
+The bundle embeds the `shedctl` CLI at
+`desktop/build/ShedDesktop.app/Contents/Resources/bin/shedctl`. `make -C desktop dmg` packages
+a release bundle into `desktop/build/ShedDesktop-<version>.dmg`. To produce a notarizable
+build locally, set the signing identity:
+
+```bash
+SHED_DESKTOP_DEVELOPER_ID_IDENTITY="Developer ID Application: …" ./desktop/scripts/bundle.sh release
+```
+
+**Linux** — the `.deb` is built (in Docker, to pin the WebKitGTK toolchain) with:
+
+```bash
+make -C desktop deb            # → desktop/out/shed-desktop_<version>_<arch>.deb
+make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.04 container
+```
+
+## What it needs at runtime
+
+- `~/.shed/config.yaml` — the shed-server host list (created by the `shed` CLI). The app
+  reads this read-only and watches it for changes.
+- A reachable `shed-server` on at least one configured host. Unreachable hosts are shown
+  as a degraded state, never a hard failure.

@@ -6,6 +6,26 @@ Project context for AI assistants working on this codebase.
 
 Shed is a CLI tool for managing persistent, VM-based development environments across multiple servers. It supports Firecracker microVMs (Linux) and Apple VZ virtual machines (macOS).
 
+## Monorepo layout
+
+The Go tree (`cmd/`, `internal/`, the CLI/server/agent) is the primary product. Two imported subtrees live alongside it, each an isolated build world with its own nested `CLAUDE.md` — read that before working in it:
+
+- **`crates/`** — the shared **Rust client core** (`shed-core`, `shed-core-ffi`, `shed-app`, `shedctl`), its own Cargo workspace + committed `Cargo.lock` + `rust-toolchain.toml`. Dependency-clean: WebKitGTK/Tauri deps must never enter it. See `crates/CLAUDE.md`.
+- **`desktop/`** — the desktop app: the **Swift macOS** menu-bar app (transitional — the Tauri client is on track to eventually replace it) + the **Tauri Linux** app + packaging + the `shedtest` harness. A **second, isolated** Cargo workspace (`desktop/tauri/src-tauri`, on purpose so its WebKitGTK deps stay out of `crates/`) and its own `uv` env (`desktop/pyproject.toml`). See `desktop/CLAUDE.md`.
+
+The Go build never traverses `crates/` or `desktop/` (`go list ./...` / `golangci-lint` stay Go-only); root `make build`/`test`/`check` are Go-only. Desktop targets are reached via the reserved `desktop-` passthrough (`make desktop-<target>`, e.g. `make desktop-build`) or `make -C desktop <target>`.
+
+**Two pytest suites, never merged:** `tests/integration/` is the live server-facing create-cycle suite (drives a real `shed-server`); `desktop/tools/shedtest/` is the mock-server UI harness (drives the real app over its IPC socket, hermetic). Different worlds — don't cross-wire them.
+
+## Release model
+
+One `vX.Y.Z` tag family, **manifest-selected** — a component ships iff its version manifest equals the tag:
+
+- **Go** selector = `.claude-plugin/plugin.json`; ships the CLI/server/agent brew + apt + rootfs images.
+- **desktop** selector = `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified **lockstep**); ships the DMG + Sparkle appcast + `shed-desktop` debs.
+
+`scripts/release/update-version.sh X.Y.Z --components go,desktop` bumps the selected manifests (default `go`); `scripts/release/release-plan.sh` maps a tag → `ship_go`/`ship_desktop` and **exits 1 if neither matches** (forgotten-bump guard). Each `CHANGELOG.md` entry opens with a `**Ships:**` line naming the components. A **desktop-only** tag publishes **no** rootfs images. Full detail in `RELEASING.md` (and `desktop/RELEASING.md` for the recurring desktop steps).
+
 ## Build & Test
 
 ```bash
@@ -139,7 +159,13 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `internal/sshd/` — SSH server implementation
 - `internal/backend/` — Backend interface all backends implement
 - `guest/extensions/etc/` — Guest overlay (systemd units, `environment.d`, `shed-extensions.d` manifests) staged into the rootfs alongside the guest binaries
-- `docs/` — MkDocs documentation site
+- `crates/` — shared Rust client core workspace (see `crates/CLAUDE.md` and "Monorepo layout" above)
+- `desktop/` — Swift/Tauri desktop app + `shedtest` harness (see `desktop/CLAUDE.md`)
+- `docs/` — MkDocs documentation site (desktop docs under `docs/desktop/`)
+
+## In-repo skills
+
+In-repo skills under `.claude/skills/` (`testing-vm-agent-changes`, `shedtest-mac`, `shedtest-linux`) are **living docs**. Whenever you use one during a debugging loop and hit a rough edge it doesn't cover, **update the skill in the same PR** — that's what keeps the next session from re-losing the hour. (These are repo-local dev skills, distinct from the plugin skills under `skills/` that `scripts/validate-plugin.sh` gates.)
 
 ## Key Conventions
 
