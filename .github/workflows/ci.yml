@@ -27,7 +27,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      go: ${{ steps.filter.outputs.go }}
+      go: ${{ steps.filter-go.outputs.go }}
       rust: ${{ steps.filter.outputs.rust }}
       desktop: ${{ steps.filter.outputs.desktop }}
       tauri: ${{ steps.filter.outputs.tauri }}
@@ -37,9 +37,15 @@ jobs:
       ci: ${{ steps.filter.outputs.ci }}
     steps:
       - uses: actions/checkout@v6
+      # The go filter uses negations ("everything except desktop/crates/docs"),
+      # which requires predicate-quantifier: every (a changed file counts only if
+      # it matches ALL patterns). That quantifier is step-global and would break
+      # the positive multi-pattern filters below (a file cannot match two
+      # different globs at once), so the go filter gets its own step.
       - uses: dorny/paths-filter@v4
-        id: filter
+        id: filter-go
         with:
+          predicate-quantifier: 'every'
           filters: |
             go:
               - '**'
@@ -47,6 +53,10 @@ jobs:
               - '!crates/**'
               - '!docs/**'
               - '!mkdocs.yml'
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
             rust:
               - 'crates/**'
             desktop:
