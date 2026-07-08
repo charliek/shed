@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -36,9 +38,34 @@ func (c *ClientConfig) GetCreateTimeout() time.Duration {
 // ServerEntry represents a configured server.
 type ServerEntry struct {
 	Host     string    `yaml:"host"`
-	HTTPPort int       `yaml:"http_port"`
+	HTTPPort int       `yaml:"http_port,omitempty"`
 	SSHPort  int       `yaml:"ssh_port"`
 	AddedAt  time.Time `yaml:"added_at"`
+	// ControlToken is the bearer token sent on control-plane HTTP requests
+	// (CLI, desktop). CredentialsToken is sent by the host-agent for the
+	// credential bus. Both optional; empty when the server isn't token-gated.
+	ControlToken     string `yaml:"control_token,omitempty"`
+	CredentialsToken string `yaml:"credentials_token,omitempty"`
+	// ControlTokenExpiresAt is when ControlToken (bootstrap-minted, short-TTL)
+	// expires, so the CLI can transparently re-mint before/after expiry. Zero
+	// for a legacy static token or an open server.
+	ControlTokenExpiresAt time.Time `yaml:"control_token_expires_at,omitempty"`
+	// APIURL, when set, overrides the scheme+host+port for the control plane
+	// (e.g. https://host:8443). Empty = plain http://Host:HTTPPort (legacy).
+	APIURL string `yaml:"api_url,omitempty"`
+	// TLSCertFingerprint pins the server's self-signed TLS cert as
+	// "sha256:<hex>", captured at `shed server add`. When set, the client
+	// verifies the presented cert against it (no CA needed).
+	TLSCertFingerprint string `yaml:"tls_cert_fingerprint,omitempty"`
+}
+
+// BaseURL returns the control-plane base URL for the entry: APIURL when set
+// (it carries scheme+host+port), else the legacy plain http://Host:HTTPPort.
+func (e *ServerEntry) BaseURL() string {
+	if e.APIURL != "" {
+		return strings.TrimRight(e.APIURL, "/")
+	}
+	return fmt.Sprintf("http://%s:%d", e.Host, e.HTTPPort)
 }
 
 // ShedCache caches the location of a shed.
@@ -71,6 +98,18 @@ func GetTunnelsConfigPath() string {
 // GetTunnelStatePath returns the path to the tunnel state file.
 func GetTunnelStatePath() string {
 	return filepath.Join(GetClientConfigDir(), "tunnel-state.json")
+}
+
+// GetTunnelLogDir returns the directory holding background tunnel daemon logs.
+func GetTunnelLogDir() string {
+	return filepath.Join(GetClientConfigDir(), "logs")
+}
+
+// GetTunnelLogPath returns the log path for a shed's background tunnel daemon.
+// shedName is escaped so a name containing path separators can't traverse out
+// of the log directory (the daemon opens this path with O_TRUNC).
+func GetTunnelLogPath(shedName string) string {
+	return filepath.Join(GetTunnelLogDir(), "tunnel-"+url.PathEscape(shedName)+".log")
 }
 
 // GetSyncConfigPath returns the path to the sync config file.

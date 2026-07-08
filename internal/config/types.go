@@ -152,6 +152,16 @@ type Shed struct {
 	LastHealthy  *time.Time                     `json:"last_healthy,omitempty" yaml:"last_healthy,omitempty"` // last heartbeat from agent (VM backends only)
 	StartedAt    *time.Time                     `json:"started_at,omitempty" yaml:"started_at,omitempty"`     // agent boot time from heartbeat (VM backends only)
 	Extensions   map[string]ExtensionHealthInfo `json:"extensions,omitempty" yaml:"extensions,omitempty"`     // per-extension health (VM backends only)
+	// Egress* track Level-1 egress-control state (set when egress is enabled
+	// and the shed is assigned a non-empty profile list). EgressPort is the
+	// per-shed proxy listener port — stable across stop/start because the
+	// guest's injected HTTP_PROXY is baked into the persistent upper.
+	EgressProfiles []string `json:"egress_profiles,omitempty" yaml:"egress_profiles,omitempty"`
+	EgressPort     int      `json:"egress_port,omitempty" yaml:"egress_port,omitempty"`
+	// EgressToken is the per-shed proxy-auth token binding the port to this
+	// shed. It is a secret: never serialized to API/CLI responses (json:"-").
+	// It lives durably in the per-backend on-disk metadata, not here.
+	EgressToken string `json:"-" yaml:"-"`
 }
 
 // ExtensionHealthInfo is the API-facing extension health for a shed.
@@ -176,6 +186,23 @@ type Session struct {
 	CreatedAt   time.Time `json:"created_at"`
 	Attached    bool      `json:"attached"`
 	WindowCount int       `json:"window_count,omitempty"`
+	// RC carries Remote Control Session Convention metadata for "rc-*" sessions,
+	// sourced client-side from the in-shed shed-ext-rc binary over SSH. It is nil
+	// for non-RC sessions and when enrichment was unavailable; server API
+	// responses never populate it.
+	RC *SessionRC `json:"rc,omitempty"`
+}
+
+// SessionRC holds the RC Session Convention fields surfaced for an "rc-*"
+// session (a subset of shed-ext-rc's neutral DTO, for display). Managed is
+// false for legacy/unmanaged rc-* sessions.
+type SessionRC struct {
+	Kind        string `json:"kind,omitempty"`
+	State       string `json:"state,omitempty"`
+	Managed     bool   `json:"managed"`
+	DisplayName string `json:"display_name,omitempty"`
+	URL         string `json:"url,omitempty"`
+	CreatedBy   string `json:"created_by,omitempty"`
 }
 
 // Session constants.
@@ -208,16 +235,27 @@ func ValidateSessionName(name string) error {
 
 // ServerInfo is returned by GET /api/info.
 type ServerInfo struct {
-	Name     string `json:"name"`
-	Version  string `json:"version"`
-	SSHPort  int    `json:"ssh_port"`
-	HTTPPort int    `json:"http_port"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	SSHPort int    `json:"ssh_port"`
+	// HTTPPort is the plain-HTTP port (open mode). Omitted in secure mode, which
+	// serves no plain HTTP — clients use the HTTPS endpoint there.
+	HTTPPort int    `json:"http_port,omitempty"`
 	Backend  string `json:"backend"`
+	// AuthMode is the server's auth.mode ("secure" or "open"), so `shed server
+	// add` knows whether to bootstrap an HTTP token over SSH. Reported on the
+	// unauthenticated /api/info — the mode is observable from behavior anyway.
+	AuthMode string `json:"auth_mode,omitempty"`
 	// DefaultImage is the resolved default_image for the active backend
 	// (after ${shed.version} expansion / version synthesis at load). Exposed
 	// so clients can see which image a `shed create` without --image will
 	// use — useful when the ref is synthesized and never written in config.
 	DefaultImage string `json:"default_image,omitempty"`
+
+	// HTTPSPort is the pinned-TLS listener port in secure mode (auth.mode:
+	// secure), so a client adding a secure server can learn the TLS endpoint.
+	// 0/omitted in open mode (no HTTPS listener).
+	HTTPSPort int `json:"https_port,omitempty"`
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.
@@ -516,6 +554,11 @@ type CreateShedRequest struct {
 	// Only valid together with LocalDir.
 	AddDirs []string `json:"add_dirs,omitempty"`
 
+	// Egress assigns Level-1 egress-control profiles to this shed (composed,
+	// first-match). Empty inherits the server `egress.default`; ["off"]
+	// disables egress for this shed even when a default is set.
+	Egress []string `json:"egress,omitempty"`
+
 	// FromSnapshot spawns the shed from a snapshot's rootfs instead of a base image.
 	// Mutually exclusive with Image and Repo. Provisioning steps (repo clone, install
 	// hook, first-time auto-sync) are skipped because the snapshot is already provisioned.
@@ -655,6 +698,10 @@ const (
 	ErrSnapshotSourceRunning   = "SNAPSHOT_SOURCE_RUNNING"
 	ErrSnapshotBackendMismatch = "SNAPSHOT_BACKEND_MISMATCH"
 	ErrInvalidSnapshotName     = "INVALID_SNAPSHOT_NAME"
+
+	ErrProfileNotFound = "PROFILE_NOT_FOUND"
+	ErrProfileReserved = "PROFILE_RESERVED" // name collides with a config/reserved profile
+	ErrProfileInUse    = "PROFILE_IN_USE"   // referenced by one or more sheds
 )
 
 // Backend type constants for Shed.Backend field.
@@ -663,6 +710,65 @@ const (
 	BackendVZ          = "vz"
 	BackendDetect      = "detect"
 )
+
+// SSH auth modes for SSHAuthConfig.Mode.
+const (
+	SSHAuthOff     = "off"     // accept all keys (legacy default)
+	SSHAuthWarn    = "warn"    // log would-deny attempts, but still accept
+	SSHAuthEnforce = "enforce" // reject keys not in the allowlist
+)
+
+// Auth modes for AuthConfig.Mode — the binary secure-by-default switch.
+const (
+	AuthModeOpen   = "open"   // default: no enforcement (tailnet/LAN posture)
+	AuthModeSecure = "secure" // SSH allowlist + HTTP tokens + TLS, all enforced
+)
+
+// AuthConfig configures authentication. The headline control is Mode (the
+// binary open|secure switch). The SSH sub-block carries key sources and the
+// advanced SSH mode override. HTTP bearer-token enforcement is derived purely
+// from secure mode — there is no HTTP sub-block.
+type AuthConfig struct {
+	// Mode is open | secure (default open). secure derives: SSH allowlist
+	// enforce, HTTP bearer-token enforce, and TLS on (the server serves the
+	// TLS listener only); it requires at least one SSH key source.
+	Mode string `yaml:"mode,omitempty"`
+	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
+	TokenTTL Duration `yaml:"token_ttl,omitempty"`
+	// SSH configures the SSH public-key allowlist (key sources + advanced mode).
+	SSH *SSHAuthConfig `yaml:"ssh,omitempty"`
+}
+
+// SSHAuthConfig configures the SSH public-key allowlist. Identity comes from
+// the offered key (the username still selects the shed), GitHub-style.
+type SSHAuthConfig struct {
+	// Mode is off | warn | enforce (default off). off accepts all keys
+	// (legacy); warn logs would-deny attempts but accepts; enforce rejects
+	// keys not in the allowlist.
+	Mode string `yaml:"mode,omitempty"`
+	// AuthorizedKeys are inline OpenSSH authorized_keys lines.
+	AuthorizedKeys []string `yaml:"authorized_keys,omitempty"`
+	// AuthorizedKeysFile is a path to an authorized_keys-format file.
+	AuthorizedKeysFile string `yaml:"authorized_keys_file,omitempty"`
+	// GitHubUsers seeds the allowlist from https://github.com/<user>.keys,
+	// cached to disk and failing closed to the last-known-good cache.
+	GitHubUsers []string `yaml:"github_users,omitempty"`
+	// GitHubRefresh is how often to re-fetch GitHub keys (default 1h).
+	GitHubRefresh Duration `yaml:"github_refresh,omitempty"`
+	// MaxAuthTries caps public-key attempts per connection (0 = shed default 10).
+	// Raise it for clients whose agent holds many keys (1Password, Secretive) so
+	// the allowlisted key is tried before the server gives up.
+	MaxAuthTries int `yaml:"max_auth_tries,omitempty"`
+}
+
+// githubUsernamePattern guards the URL built from github_users. GitHub
+// usernames are alphanumeric with single internal hyphens, 1–39 chars; this
+// also blocks path traversal (no '/' or '.').
+var githubUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
+
+// ValidGitHubUsername reports whether s is a syntactically valid GitHub
+// username (and, by construction, safe to interpolate into the .keys URL).
+func ValidGitHubUsername(s string) bool { return githubUsernamePattern.MatchString(s) }
 
 // HomePath is the shed user's home directory inside the VM. Repos, --local-dir,
 // and --add-dir mounts all live under here, and interactive logins land here by

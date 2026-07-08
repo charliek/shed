@@ -24,13 +24,29 @@ running.
 
 ## Add a Server
 
-Register a server that has `shed-server` running:
+Register a server that has `shed-server` running. For a **local** server (the
+installed default — open, bound to loopback):
 
 ```bash
-shed server add my-server.tailnet.ts.net --name my-server
+shed server add localhost --name my-server
 ```
 
-This connects to the server, retrieves its SSH host key, and saves the configuration.
+For a server you reach **over the network**, the server must bind a non-loopback
+`bind_address` (since v0.7.4 the default is loopback-only). Secure mode is the
+preferred networked posture — pin its TLS cert and mint a token over SSH:
+
+```bash
+shed server add my-server.tailnet.ts.net --https-port 8443 --name my-server
+```
+
+For an open server on a trusted private network (configured with
+`allow_insecure_exposure: true`), drop `--https-port`:
+`shed server add my-server.tailnet.ts.net --name my-server`. See the
+[Security Configuration guide](../guides/security-configuration.md) for the
+server-side posture setup.
+
+This connects to the server, retrieves its SSH host key (and, in secure mode,
+pins the TLS cert and mints your token), and saves the configuration.
 
 ## Create a Shed
 
@@ -106,6 +122,21 @@ claude
 # Detach with Ctrl-B D - the agent keeps running; reattach later
 shed attach myproj
 ```
+
+### Run a plan autonomously
+
+Hand a plan to a shed and let Claude execute it unattended — you get a `claude.ai/code`
+URL to watch/steer from your phone, and your laptop can close. Requires the `full` image
+with Claude logged in inside the shed.
+
+```bash
+# Write a self-contained plan (goal, steps, how to verify), then:
+shed attach myproj --plan ./plan.md -d      # ships the plan, starts an agent, prints the URL
+```
+
+Defaults to `auto` permission mode; add `--skip` for full bypass (safe in a disposable
+shed). For the end-to-end author → fresh shed → run → report flow, use the **`shed-plan`**
+skill. See [`shed attach` Remote Control sessions](../reference/cli.md#remote-control-sessions-autonomous-agents).
 
 ### Port forwarding
 

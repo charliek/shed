@@ -178,6 +178,13 @@ func (vm *VM) buildVfkitArgs() (args []string, err error) {
 		vm.meta.Name,
 	)
 
+	// Pass the resolved guest MTU so network-setup lowers enp0s1 to match a
+	// reduced host egress path (e.g. a VPN). Omitted entirely when detection
+	// finds no reduction and no override is set — the guest stays at 1500.
+	if mtu, ok := vmutil.ResolveGuestMTU(vm.cfg.GuestMTU); ok {
+		kernelArgs += fmt.Sprintf(" shed.mtu=%d", mtu)
+	}
+
 	// Console log for debugging boot issues (writes guest console to a file)
 	consoleLogPath := filepath.Join(vm.cfg.InstanceDir, vm.meta.Name, "console.log")
 
@@ -236,6 +243,43 @@ func (vm *VM) Stop(ctx context.Context) error {
 		return vm.stopByPID(ctx)
 	}
 
+	return nil
+}
+
+// Kill terminates the VM immediately with SIGKILL, skipping the graceful
+// SIGTERM-then-wait path Stop uses (both the process-handle and stopByPID
+// variants). Used by the destroy/delete path: the writable overlay is
+// discarded, so a clean guest shutdown is pointless and the ~stop_timeout wait
+// is pure latency. Mirrors Stop's force-kill fallback (SIGKILL + reap +
+// socket/handle cleanup).
+func (vm *VM) Kill(_ context.Context) error {
+	defer vm.cleanupSockets()
+	defer vm.clearProcessHandles()
+
+	if vm.meta.PID <= 0 {
+		return nil
+	}
+	if !isVfkitProcess(vm.meta.PID) {
+		// PID is dead or reused by an unrelated process — never SIGKILL it.
+		log.Printf("Warning: PID %d is not a vfkit process, skipping SIGKILL", vm.meta.PID)
+		return nil
+	}
+
+	if vm.cmd != nil && vm.cmd.Process != nil {
+		if err := vm.cmd.Process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("failed to SIGKILL VM %s (pid %d): %w", vm.meta.Name, vm.meta.PID, err)
+		}
+		vm.waitForReap(2 * time.Second)
+		return nil
+	}
+
+	// No live process handle (server-restart case) — kill by PID.
+	if err := syscall.Kill(vm.meta.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("failed to SIGKILL VM %s (pid %d): %w", vm.meta.Name, vm.meta.PID, err)
+	}
+	if !waitForProcessExit(vm.meta.PID, 2*time.Second) {
+		log.Printf("Warning: VM %s PID %d did not exit within timeout after SIGKILL", vm.meta.Name, vm.meta.PID)
+	}
 	return nil
 }
 

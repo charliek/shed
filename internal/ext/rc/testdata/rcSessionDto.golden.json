@@ -1,0 +1,25 @@
+{
+  "rc_sessions": [
+    {
+      "slug": "abc234",
+      "tmux_session": "rc-abc234",
+      "kind": "claude-rc",
+      "state": "ready",
+      "managed": true,
+      "display_name": "charliek/abc234",
+      "workdir": "/home/shed",
+      "url": "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr",
+      "id": "9f1c0e7a-1111-4222-8333-444455556666",
+      "created_by": "shed-remote-agent/0.1.0",
+      "created_at": "2026-06-19T18:53:00Z",
+      "target_label": "shed:t1@localmac-dev"
+    },
+    {
+      "slug": "brk900",
+      "tmux_session": "rc-brk900",
+      "kind": "claude-broker",
+      "state": "starting",
+      "managed": false
+    }
+  ]
+}

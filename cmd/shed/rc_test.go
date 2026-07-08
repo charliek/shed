@@ -1,0 +1,229 @@
+package main
+
+import (
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/charliek/shed/internal/config"
+)
+
+// TestParseRcListGolden decodes the cross-repo golden DTO fixture (byte-identical
+// to internal/ext/rc/testdata/rcSessionDto.golden.json and
+// shed-remote-agent's). Keeping a copy here makes the shed CLI a participant in
+// the shed-ext-rc stdout contract guard.
+func TestParseRcListGolden(t *testing.T) {
+	data, err := os.ReadFile("testdata/rcSessionDto.golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTmux, err := parseRcList(data)
+	if err != nil {
+		t.Fatalf("parseRcList: %v", err)
+	}
+	if len(byTmux) != 2 {
+		t.Fatalf("want 2 sessions, got %d", len(byTmux))
+	}
+
+	full, ok := byTmux["rc-abc234"]
+	if !ok {
+		t.Fatal("missing rc-abc234")
+	}
+	if full.Kind != "claude-rc" || full.State != "ready" || !full.Managed ||
+		full.DisplayName != "charliek/abc234" || !strings.Contains(full.URL, "session_") ||
+		full.CreatedBy != "shed-remote-agent/0.1.0" {
+		t.Fatalf("full session mismatch: %+v", full)
+	}
+
+	minimal, ok := byTmux["rc-brk900"]
+	if !ok {
+		t.Fatal("missing rc-brk900")
+	}
+	if minimal.Kind != "claude-broker" || minimal.Managed ||
+		minimal.DisplayName != "" || minimal.URL != "" {
+		t.Fatalf("minimal session should omit optionals: %+v", minimal)
+	}
+}
+
+func TestParseRcListEmptyAndBad(t *testing.T) {
+	t.Run("empty list", func(t *testing.T) {
+		m, err := parseRcList([]byte(`{"rc_sessions":[]}`))
+		if err != nil || len(m) != 0 {
+			t.Fatalf("want empty map no error, got %v %v", m, err)
+		}
+	})
+	t.Run("malformed json", func(t *testing.T) {
+		if _, err := parseRcList([]byte(`not json`)); err == nil {
+			t.Fatal("want error on malformed json")
+		}
+	})
+	t.Run("entry without tmux_session is skipped", func(t *testing.T) {
+		m, err := parseRcList([]byte(`{"rc_sessions":[{"slug":"x","kind":"shell"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(m) != 0 {
+			t.Fatalf("entry without tmux_session must be skipped, got %v", m)
+		}
+	})
+}
+
+func TestSSHCaptureArgs(t *testing.T) {
+	entry := &config.ServerEntry{Host: "mini3", SSHPort: 2222}
+	args := sshCaptureArgs("myshed", entry, "shed-ext-rc", "list")
+	joined := strings.Join(args, " ")
+
+	for _, want := range []string{
+		"-p 2222",
+		"StrictHostKeyChecking=yes",
+		"BatchMode=yes",
+		"myshed@mini3",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args missing %q: %v", want, args)
+		}
+	}
+	// The remote argv must come after the "--" separator, in order.
+	sep := -1
+	for i, a := range args {
+		if a == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep == -1 || sep+2 >= len(args) || args[sep+1] != "shed-ext-rc" || args[sep+2] != "list" {
+		t.Errorf("remote argv not placed after --: %v", args)
+	}
+}
+
+func TestRCColumns(t *testing.T) {
+	tests := []struct {
+		name      string
+		session   config.Session
+		wantKind  string
+		wantState string
+	}{
+		{
+			name:    "non-rc session renders blank",
+			session: config.Session{Name: "default"},
+		},
+		{
+			name:      "rc session without metadata renders dashes",
+			session:   config.Session{Name: "rc-abc234"},
+			wantKind:  "-",
+			wantState: "-",
+		},
+		{
+			name: "managed rc session",
+			session: config.Session{
+				Name: "rc-abc234",
+				RC:   &config.SessionRC{Kind: "claude-rc", State: "ready", Managed: true},
+			},
+			wantKind:  "claude-rc",
+			wantState: "ready",
+		},
+		{
+			name: "legacy rc session labelled",
+			session: config.Session{
+				Name: "rc-brk900",
+				RC:   &config.SessionRC{Kind: "claude-broker", State: "starting", Managed: false},
+			},
+			wantKind:  "claude-broker (legacy)",
+			wantState: "starting",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, state := rcColumns(tc.session)
+			if kind != tc.wantKind || state != tc.wantState {
+				t.Errorf("rcColumns = (%q,%q), want (%q,%q)", kind, state, tc.wantKind, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestResolveRCInputs(t *testing.T) {
+	t.Run("multiple prompt sources error", func(t *testing.T) {
+		_, _, _, err := resolveRCInputs(rcInputs{prompt: "x", edit: true})
+		if err == nil {
+			t.Fatal("want error for >1 prompt source")
+		}
+	})
+	t.Run("multiple plan sources error", func(t *testing.T) {
+		_, _, _, err := resolveRCInputs(rcInputs{plan: "p.md", planEdit: true})
+		if err == nil {
+			t.Fatal("want error for >1 plan source")
+		}
+	})
+	t.Run("both stdin error", func(t *testing.T) {
+		_, _, _, err := resolveRCInputs(rcInputs{promptFile: "-", plan: "-"})
+		if err == nil {
+			t.Fatal("want error when prompt and plan both read stdin")
+		}
+	})
+	t.Run("multiline prompt allowed", func(t *testing.T) {
+		p, _, _, err := resolveRCInputs(rcInputs{prompt: "line one\nline two"})
+		if err != nil || p != "line one\nline two" {
+			t.Fatalf("multi-line prompt should pass through, got (%q,%v)", p, err)
+		}
+	})
+	t.Run("prompt flag passes through", func(t *testing.T) {
+		p, _, havePlan, err := resolveRCInputs(rcInputs{prompt: "do the thing"})
+		if err != nil || p != "do the thing" || havePlan {
+			t.Fatalf("got (%q,%v,%v)", p, havePlan, err)
+		}
+	})
+	t.Run("plan file read; markdown headers preserved", func(t *testing.T) {
+		dir := t.TempDir()
+		path := dir + "/plan.md"
+		body := "# Goal\n\nDo step 1\nDo step 2\n"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, plan, havePlan, err := resolveRCInputs(rcInputs{plan: path})
+		if err != nil || !havePlan {
+			t.Fatalf("got havePlan=%v err=%v", havePlan, err)
+		}
+		if !strings.Contains(plan, "# Goal") {
+			t.Fatalf("markdown header stripped: %q", plan)
+		}
+	})
+}
+
+func TestGenRCSlug(t *testing.T) {
+	seen := map[string]bool{}
+	for range 50 {
+		s, err := genRCSlug()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(s) != 6 {
+			t.Fatalf("slug len = %d, want 6 (%q)", len(s), s)
+		}
+		for _, r := range s {
+			if !strings.ContainsRune(rcSlugAlphabet, r) {
+				t.Fatalf("slug %q has char outside alphabet", s)
+			}
+		}
+		seen[s] = true
+	}
+	if len(seen) < 40 {
+		t.Fatalf("slugs not random enough: %d unique of 50", len(seen))
+	}
+}
+
+// TestEnrichSessionsRCNoOp guards the no-op fast path: a listing with no rc-*
+// sessions must return before any config lookup or SSH dial (the test would hang
+// or panic on an unreachable/absent server if it didn't).
+func TestEnrichSessionsRCNoOp(t *testing.T) {
+	sessions := []config.Session{
+		{Name: "default", ShedName: "s", ServerName: "srv"},
+		{Name: "work", ShedName: "s", ServerName: "srv"},
+	}
+	enrichSessionsRC(sessions)
+	for i := range sessions {
+		if sessions[i].RC != nil {
+			t.Fatalf("non-rc session %q must not be enriched", sessions[i].Name)
+		}
+	}
+}

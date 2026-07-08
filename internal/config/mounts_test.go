@@ -318,3 +318,35 @@ func TestProjectAddDirTargets(t *testing.T) {
 		})
 	}
 }
+
+// TestHasWritableHostMount guards the #232 fast-delete sync decision: a running
+// shed with ANY writable host-backed mount (project OR configured server
+// `mounts:`) must be flushed before the destroy SIGKILL, or unsynced guest
+// writes to host data are lost. A shed with only readonly / no host mounts takes
+// the no-sync fast path.
+func TestHasWritableHostMount(t *testing.T) {
+	ro := MountConfig{Source: "/h/ro", Target: "/t/ro", ReadOnly: true}
+	rw := MountConfig{Source: "/h/rw", Target: "/t/rw", ReadOnly: false}
+
+	tests := []struct {
+		name          string
+		projectMounts []MountConfig
+		serverCfg     *ServerConfig
+		want          bool
+	}{
+		{"no mounts, nil serverCfg", nil, nil, false},
+		{"only readonly project mount", []MountConfig{ro}, nil, false},
+		{"writable project mount", []MountConfig{ro, rw}, nil, true},
+		{"writable configured mount only", nil, &ServerConfig{Mounts: map[string]MountConfig{"a": rw}}, true},
+		{"readonly configured mount only", nil, &ServerConfig{Mounts: map[string]MountConfig{"a": ro}}, false},
+		{"all readonly across both", []MountConfig{ro}, &ServerConfig{Mounts: map[string]MountConfig{"a": ro}}, false},
+		{"empty serverCfg mounts", nil, &ServerConfig{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := HasWritableHostMount(tt.projectMounts, tt.serverCfg); got != tt.want {
+				t.Errorf("HasWritableHostMount() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

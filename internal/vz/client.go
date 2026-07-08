@@ -20,6 +20,7 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/backend/orchestrator"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/retry"
@@ -54,7 +55,26 @@ type Client struct {
 	snapshotLocks lockmap.NamedMutexMap
 
 	credMgr *vmutil.CredentialManager
+
+	// egressMgr drives the optional egress-control proxy. nil ⇒ egress
+	// disabled, in which case the ConfigureEgressProxy hook is a no-op.
+	egressMgr *egress.Manager
+
+	// egressUserStore is the runtime user-profile store; nil ⇒ config profiles
+	// only. Merged into resolution via userProfiles().
+	egressUserStore *config.UserProfileStore
 }
+
+// SetEgressManager attaches the egress-control proxy manager, called by
+// shed-server at startup when egress is enabled. nil leaves egress off.
+func (c *Client) SetEgressManager(m *egress.Manager) { c.egressMgr = m }
+
+// SetEgressUserStore attaches the runtime user-profile store (mirrors
+// SetEgressManager). nil ⇒ config profiles only.
+func (c *Client) SetEgressUserStore(s *config.UserProfileStore) { c.egressUserStore = s }
+
+// userProfiles snapshots the user-profile store for resolution (nil-safe).
+func (c *Client) userProfiles() map[string]config.EgressProfile { return c.egressUserStore.List() }
 
 // NewClient creates a new VZ client.
 func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plugin.Bridge) (*Client, error) {
@@ -249,7 +269,7 @@ func (c *Client) ListSheds(ctx context.Context) ([]config.Shed, error) {
 }
 
 // DeleteShed removes a shed.
-func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+func (c *Client) DeleteShed(ctx context.Context, name string) error {
 	defer c.acquireCreateLock(name)()
 
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
@@ -261,9 +281,10 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 	}
 
 	if meta.Status == config.StatusRunning {
+		backend.Status(ctx, "Terminating virtual machine...")
 		// Use the lock-aware variant so we don't deadlock on the per-shed
 		// mutex we already hold (sync.Mutex is non-reentrant).
-		if _, err := c.stopShedLocked(ctx, meta); err != nil {
+		if _, err := c.stopShedLocked(ctx, meta, stopDestroy); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
 			// stopShedLocked failed — clean up resources it would have released
 			c.credMgr.StopListener(name)
@@ -283,6 +304,14 @@ func (c *Client) DeleteShed(ctx context.Context, name string, keepVolume bool) e
 		}
 	}
 
+	// Free this shed's egress port reservation. Stop only closes the listener
+	// and keeps the port reserved (for restart); delete frees it. No-op when
+	// egress is disabled or this shed had none.
+	if c.egressMgr != nil {
+		_ = c.egressMgr.Release(name)
+	}
+
+	backend.Status(ctx, "Removing volume...")
 	if err := meta.Delete(c.cfg.InstanceDir); err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
 	}
@@ -304,6 +333,17 @@ func (c *Client) StartShed(ctx context.Context, name string) (*config.Shed, erro
 	return orchestrator.StartShed(ctx, &vzStarter{c: c}, orchestrator.StartRequest{Name: name})
 }
 
+// stopMode selects stopShedLocked's teardown: stopGraceful is StopShed's clean,
+// restartable path; stopDestroy is delete's fast SIGKILL path (see the
+// stopDestroy case for the project-mount sync exception). stopGraceful is the
+// zero value, so a forgotten mode defaults to the safe graceful path.
+type stopMode int
+
+const (
+	stopGraceful stopMode = iota
+	stopDestroy
+)
+
 // StopShed stops a running shed.
 func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error) {
 	defer c.acquireCreateLock(name)()
@@ -316,14 +356,14 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 		return nil, err
 	}
 
-	return c.stopShedLocked(ctx, meta)
+	return c.stopShedLocked(ctx, meta, stopGraceful)
 }
 
 // stopShedLocked performs the stop logic assuming the caller already holds
 // acquireCreateLock(meta.Name). This split exists so DeleteShed can stop a
 // running shed without re-entering the non-reentrant per-shed mutex it is
 // already holding. The public StopShed acquires the lock and delegates here.
-func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Shed, error) {
+func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMode) (*config.Shed, error) {
 	if meta.Status != config.StatusRunning {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, meta.Name)
 	}
@@ -331,16 +371,13 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 	// Stop notification listener before shutting down
 	c.credMgr.StopListener(meta.Name)
 
-	agent := c.newAgentClient(meta.Name)
-
-	// Run shutdown hook before stopping the VM
-	vmutil.RunShutdownSequence(ctx, agent, meta.Name, meta.LandingDir, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
-
-	// Ask the guest to flush its dirty buffers to the virtio-blk
-	// devices before vfkit terminates. Without this, post-stop
-	// snapshots and any host-side read of upper.ext4 see a stale
-	// pre-sync state — vfkit does not synchronously flush on SIGTERM.
-	vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
+	// Close this shed's egress proxy listener (frees the per-shed port). No-op
+	// when egress is disabled or this shed has none. Never touches host docker.
+	if c.egressMgr != nil {
+		if err := c.egressMgr.Remove(meta.Name); err != nil {
+			log.Printf("Warning: failed to remove egress listener for %s: %v", meta.Name, err)
+		}
+	}
 
 	// Get or create VM handle
 	c.mu.Lock()
@@ -351,14 +388,38 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata) (*config.Sh
 		vm = &VM{meta: meta, cfg: c.cfg}
 	}
 
-	if err := vm.Stop(ctx); err != nil {
-		return nil, fmt.Errorf("failed to stop VM: %w", err)
+	switch mode {
+	case stopGraceful:
+		agent := c.newAgentClient(meta.Name)
+		// Run the shutdown hook, then ask the guest to flush its dirty buffers
+		// to the virtio-blk devices before vfkit terminates. Without this,
+		// post-stop snapshots and any host-side read of upper.ext4 see a stale
+		// pre-sync state — vfkit does not synchronously flush on SIGTERM.
+		vmutil.RunShutdownSequence(ctx, agent, meta.Name, meta.LandingDir, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
+		vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
+		if err := vm.Stop(ctx); err != nil {
+			return nil, fmt.Errorf("failed to stop VM: %w", err)
+		}
+	case stopDestroy:
+		// Delete discards the overlay, so the shutdown hook and the graceful VM
+		// shutdown are wasted work — SIGKILL immediately. EXCEPTION: if the shed
+		// has any WRITABLE host-backed mount (--local-dir/--add-dir OR a
+		// configured server `mounts:` entry), flush the guest (bounded) first so
+		// a raw kill doesn't lose unsynced writes to that host data. A shed with
+		// no writable host mount skips the agent entirely (the fast path).
+		if config.HasWritableHostMount(meta.ProjectMounts, c.serverCfg) {
+			agent := c.newAgentClient(meta.Name)
+			vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
+		}
+		if err := vm.Kill(ctx); err != nil {
+			return nil, fmt.Errorf("failed to kill VM: %w", err)
+		}
 	}
 
-	// vm.Stop's post-SIGKILL waitForProcessExit swallows its timeout
-	// and returns nil even when vfkit refused to die (uninterruptible
-	// I/O, kernel hang, etc). Verify before flipping status — otherwise
-	// the next StartShed would find PID=0 in metadata and silently
+	// The VM teardown above (vm.Stop or vm.Kill) swallows its post-SIGKILL
+	// waitForProcessExit timeout and returns nil even when vfkit refused to die
+	// (uninterruptible I/O, kernel hang, etc). Verify before flipping status —
+	// otherwise the next StartShed would find PID=0 in metadata and silently
 	// spawn a second vfkit under the same name.
 	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isVfkitProcess(meta.PID) {
 		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrStopIncompleteSentinel, meta.Name, meta.PID)
@@ -395,25 +456,104 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 	return dialer.DialService(ctx, c.cfg.TCPProxyPort, port)
 }
 
+// SetShedEgress applies a new egress profile selection to a shed. On a running
+// shed the listener is re-pushed and the guest env re-injected live; on a
+// stopped shed it persists and applies on next start. A selection that resolves
+// to nothing (e.g. "off") clears egress.
+func (c *Client) SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error) {
+	if c.egressMgr == nil {
+		return nil, fmt.Errorf("egress control is not enabled on this server")
+	}
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+
+	specs, err := c.serverCfg.Egress.ResolveProfiles(profiles, c.userProfiles())
+	if err != nil {
+		return nil, fmt.Errorf("egress: resolve profiles: %w", err)
+	}
+	if len(specs) == 0 {
+		return c.clearShedEgressLocked(ctx, meta)
+	}
+
+	if meta.Status == config.StatusRunning {
+		gateway, subnet := c.egressGatewaySubnet()
+		agent := c.newAgentClient(name)
+		port, token, err := vmutil.ApplyEgressLive(ctx, c.egressMgr, agent, name, meta.EgressPort, meta.EgressToken, gateway, subnet, specs)
+		if err != nil {
+			return nil, fmt.Errorf("egress: apply: %w", err)
+		}
+		meta.EgressPort = port
+		meta.EgressToken = token
+	}
+	meta.EgressProfiles = profiles
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("egress: save metadata: %w", err)
+	}
+	return c.GetShed(ctx, name)
+}
+
+// ClearShedEgress turns egress off for a shed (live on a running shed).
+func (c *Client) ClearShedEgress(ctx context.Context, name string) (*config.Shed, error) {
+	if c.egressMgr == nil {
+		return nil, fmt.Errorf("egress control is not enabled on this server")
+	}
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		if errors.Is(err, ErrInstanceNotFound) {
+			return nil, fmt.Errorf("%w: %s", config.ErrShedNotFoundSentinel, name)
+		}
+		return nil, err
+	}
+	return c.clearShedEgressLocked(ctx, meta)
+}
+
+func (c *Client) clearShedEgressLocked(ctx context.Context, meta *Metadata) (*config.Shed, error) {
+	if meta.Status == config.StatusRunning {
+		agent := c.newAgentClient(meta.Name)
+		_ = vmutil.ClearEgressLive(ctx, c.egressMgr, agent, meta.Name)
+	} else {
+		_ = c.egressMgr.Release(meta.Name) // egress off → free the port reservation
+	}
+	meta.EgressProfiles = nil
+	meta.EgressPort = 0
+	meta.EgressToken = ""
+	if err := meta.Save(c.cfg.InstanceDir); err != nil {
+		return nil, fmt.Errorf("egress: save metadata: %w", err)
+	}
+	return c.GetShed(ctx, meta.Name)
+}
+
 // metadataToShed converts VZ metadata to a config.Shed response.
 func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 	return &config.Shed{
-		Name:          meta.Name,
-		Status:        meta.Status,
-		CreatedAt:     meta.CreatedAt,
-		Repo:          meta.Repo,
-		ContainerID:   fmt.Sprintf("vz-%s", meta.Name),
-		Backend:       meta.Backend,
-		IPAddress:     ipAddress,
-		CPUs:          meta.CPUs,
-		MemoryMB:      meta.MemoryMB,
-		PID:           meta.PID,
-		RootfsPath:    meta.RootfsPath,
-		ProjectMounts: meta.ProjectMounts,
-		LandingDir:    meta.LandingDir,
-		Image:         meta.Image,
-		ImageDigest:   meta.LowerDigest,
-		FromSnapshot:  meta.FromSnapshot,
+		Name:           meta.Name,
+		Status:         meta.Status,
+		CreatedAt:      meta.CreatedAt,
+		Repo:           meta.Repo,
+		ContainerID:    fmt.Sprintf("vz-%s", meta.Name),
+		Backend:        meta.Backend,
+		IPAddress:      ipAddress,
+		CPUs:           meta.CPUs,
+		MemoryMB:       meta.MemoryMB,
+		PID:            meta.PID,
+		RootfsPath:     meta.RootfsPath,
+		ProjectMounts:  meta.ProjectMounts,
+		LandingDir:     meta.LandingDir,
+		Image:          meta.Image,
+		ImageDigest:    meta.LowerDigest,
+		FromSnapshot:   meta.FromSnapshot,
+		EgressProfiles: meta.EgressProfiles,
+		EgressPort:     meta.EgressPort,
+		EgressToken:    meta.EgressToken,
 	}
 }
 

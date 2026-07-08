@@ -134,6 +134,15 @@ func (b *mockBackend) SetupCredentials(ctx context.Context, req config.CreateShe
 	b.record("SetupCredentials")
 }
 
+func (b *mockBackend) ConfigureEgressProxy(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle, c *backend.Cleanup) error {
+	b.record("ConfigureEgressProxy")
+	// Mirror the real hook: open the listener + register its teardown
+	// BEFORE the fallible injection, so a failure inside the hook unwinds
+	// its own listener along with every earlier cleanup.
+	c.Register("close egress listener", b.makeCleanup("close egress listener"))
+	return b.failAt["ConfigureEgressProxy"]
+}
+
 func (b *mockBackend) CloneRepo(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle) {
 	b.record("CloneRepo")
 }
@@ -172,6 +181,7 @@ func TestCreateShed_HappyPathOrder(t *testing.T) {
 		"FinalizeStartedVM",
 		"MountLocalDir",
 		"SetupCredentials",
+		"ConfigureEgressProxy",
 		"CloneRepo",
 		"RunProvisioning",
 		"ToShedResult",
@@ -239,6 +249,18 @@ func TestCreateShed_FailureUnwindLIFO(t *testing.T) {
 			},
 			wantCleanups: []string{"remove from vms map", "stop VM", "delete instance dir", "delete upper", "release network", "remove creating marker"},
 		},
+		{
+			// Failable egress hook: SetupCredentials (best-effort) ran
+			// first and registered nothing; the egress hook registered its
+			// own "close egress listener" before failing, so it unwinds
+			// FIRST (LIFO), then every earlier resource cleanup.
+			failAt: "ConfigureEgressProxy",
+			wantCalled: []string{
+				"PreFlight", "AllocateNetwork", "AllocateUpper", "BuildAndPersistMetadata",
+				"StartVM", "FinalizeStartedVM", "MountLocalDir", "SetupCredentials", "ConfigureEgressProxy",
+			},
+			wantCleanups: []string{"close egress listener", "remove from vms map", "stop VM", "delete instance dir", "delete upper", "release network", "remove creating marker"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -276,8 +298,10 @@ func TestCreateShed_BestEffortHooksDoNotAbort(t *testing.T) {
 	if got == nil || got.Name != "best-effort" {
 		t.Fatalf("ToShedResult returned %v; want a Shed", got)
 	}
-	// All three best-effort hooks must have been called.
-	wantTail := []string{"SetupCredentials", "CloneRepo", "RunProvisioning", "ToShedResult"}
+	// All three best-effort hooks must have been called (the failable
+	// egress hook sits between SetupCredentials and CloneRepo and is a
+	// happy-path no-op here).
+	wantTail := []string{"SetupCredentials", "ConfigureEgressProxy", "CloneRepo", "RunProvisioning", "ToShedResult"}
 	gotTail := b.calls[len(b.calls)-len(wantTail):]
 	if !sliceEqual(gotTail, wantTail) {
 		t.Errorf("best-effort tail = %v, want %v", gotTail, wantTail)

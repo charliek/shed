@@ -29,6 +29,12 @@ name: mini3-dev
 http_port: 18080
 ssh_port: 12222
 
+# This FC dev server runs on the remote (mini3) and is driven from the dev
+# workstation, so it must face the network. As of v0.7.4 every posture defaults
+# to loopback, so bind explicitly; open mode also requires the exposure ack.
+bind_address: 0.0.0.0
+allow_insecure_exposure: true
+
 default_backend: firecracker
 log_level: debug
 

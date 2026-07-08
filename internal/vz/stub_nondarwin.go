@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 )
 
@@ -30,6 +31,12 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, _ *plugin.B
 func (c *Client) Close() error {
 	return nil
 }
+
+// SetEgressManager is a no-op for the stub client.
+func (c *Client) SetEgressManager(_ *egress.Manager) {}
+
+// SetEgressUserStore is a no-op for the stub client.
+func (c *Client) SetEgressUserStore(_ *config.UserProfileStore) {}
 
 // VZBackend is a stub for non-darwin builds.
 type VZBackend struct{}
@@ -65,7 +72,7 @@ func (b *VZBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 }
 
 // DeleteShed returns an error on non-darwin platforms.
-func (b *VZBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+func (b *VZBackend) DeleteShed(ctx context.Context, name string) error {
 	return errNonDarwin
 }
 

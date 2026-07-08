@@ -49,6 +49,10 @@ http_port: 8080
 ssh_port: 2222
 default_backend: vz
 
+# Local-only by default: bind_address defaults to loopback (127.0.0.1), so the
+# server is reachable only on this Mac. You reach it as `shed server add localhost`.
+# To reach it from another machine, see the Security Configuration guide.
+
 # Host directories shared into every shed (VirtioFS). Add only what you need.
 mounts:
   claude:
@@ -82,7 +86,7 @@ socket the app connects to — there's nothing to enable):
 
 ```yaml
 # /opt/homebrew/etc/shed/extensions.yaml
-# Full reference: https://charliek.github.io/shed-extensions/reference/configuration/
+# Full reference: https://charliek.github.io/shed/extensions/configuration/
 discovery:
   servers: all            # broker for every server in ~/.shed/config.yaml
   watch: fsnotify         # pick up `shed server add/remove` live
@@ -134,7 +138,7 @@ It should report `config: /opt/homebrew/etc/shed/extensions.yaml`, each delegate
 provider's policy reading `shed-desktop`, and the approval channel (its consumer
 shows as connected once shed-desktop is running, next step). Policies, roles, and
 registries are off by default — see the
-[full reference](https://charliek.github.io/shed-extensions/reference/configuration/).
+[full reference](../extensions/configuration.md).
 
 ## 4. Install shed-desktop
 
@@ -207,7 +211,7 @@ Remove the test shed when you're done: `shed delete hello-world`.
 ## Next steps
 
 - [Configuration](../reference/configuration.md) — every server-config field.
-- [Extensions](../reference/extensions.md) · [shed-extensions docs](https://charliek.github.io/shed-extensions/) — the credential bus in full.
+- [Extensions](../reference/extensions.md) · [Extensions Architecture](../extensions/architecture.md) — the credential bus in full.
 - [shed-desktop docs](https://charliek.github.io/shed-desktop/) — the menu-bar app in full.
 - [macOS Developer Setup](vz-setup.md) — build from source, custom images.
 - Provisioning a project: [Gradle](../tutorials/gradle-provisioning.md) · [TypeScript](../tutorials/typescript-provisioning.md) · [Python](../tutorials/python-provisioning.md).

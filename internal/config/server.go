@@ -31,6 +31,43 @@ type ServerConfig struct {
 	Name     string `yaml:"name"`
 	HTTPPort int    `yaml:"http_port"`
 	SSHPort  int    `yaml:"ssh_port"`
+
+	// Network surface. All optional. TrustedProxy defaults to false, which
+	// disables RealIP (see below) — the intended security default, not the
+	// legacy always-on RealIP.
+	//
+	// BindAddress is the interface every listener (HTTP, HTTPS, SSH) binds. It
+	// defaults to loopback (127.0.0.1) — shed is a local-development tool by
+	// default. Set a routable address (a LAN/tailnet IP, "0.0.0.0"/"*" for all
+	// IPv4, or "::" for all interfaces) to reach it off-box. In open mode that
+	// also requires AllowInsecureExposure, since open mode has no transport
+	// security; secure mode (TLS + tokens) needs no acknowledgment.
+	BindAddress string `yaml:"bind_address,omitempty"`
+	// AllowInsecureExposure acknowledges binding an open-mode (plaintext,
+	// possibly unauthenticated) server to a non-loopback interface. Required to
+	// start such a server; ignored in secure mode. Prefer auth.mode: secure.
+	AllowInsecureExposure bool `yaml:"allow_insecure_exposure,omitempty"`
+	// TrustedProxy enables chi's RealIP middleware, which trusts the
+	// client-supplied X-Forwarded-For. Only safe behind a proxy that
+	// overwrites that header; the default (false) uses the real TCP peer
+	// so an attacker can't forge a source IP to evade per-IP rate limits
+	// or poison audit logs.
+	TrustedProxy bool `yaml:"trusted_proxy,omitempty"`
+
+	// HTTPSPort, when >0, starts an HTTPS listener (bound to bind_address)
+	// serving the same public router as the plain HTTP listener, presenting
+	// a self-signed cert that clients pin by fingerprint. 0 (default) = no
+	// HTTPS; plain HTTP only (legacy, unchanged).
+	HTTPSPort int `yaml:"https_port,omitempty"`
+	// TLSNames are extra hostnames/IPs added as SANs in the generated cert
+	// so hostname verification (curl --cacert, browsers) passes for each
+	// advertised address. localhost + 127.0.0.1 + ::1 are always included.
+	TLSNames []string `yaml:"tls_names,omitempty"`
+	// TLSCertFile / TLSKeyFile override where the cert + key are persisted.
+	// Empty (default) places them next to the SSH host key.
+	TLSCertFile string `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile  string `yaml:"tls_key_file,omitempty"`
+
 	// Mounts are host directories mounted into every shed (e.g. ~/.ssh,
 	// ~/.config/gh). This was previously named "credentials".
 	Mounts map[string]MountConfig `yaml:"mounts"`
@@ -60,8 +97,232 @@ type ServerConfig struct {
 	// the SSH known_hosts content seeded before `git clone` runs.
 	Git *GitConfig `yaml:"git,omitempty"`
 
+	// Egress configures optional Level-1 (audit-first) egress control.
+	// Default (nil / enabled:false) preserves unrestricted networking.
+	Egress *EgressConfig `yaml:"egress,omitempty"`
+
+	// Auth configures optional authentication. Default (nil) preserves the
+	// legacy accept-all behavior.
+	Auth *AuthConfig `yaml:"auth,omitempty"`
+
 	// Loaded environment variables (not from YAML)
 	EnvVars map[string]string `yaml:"-"`
+}
+
+// SSHAuth returns the SSH auth config, or nil when unset.
+func (c *ServerConfig) SSHAuth() *SSHAuthConfig {
+	if c.Auth == nil {
+		return nil
+	}
+	return c.Auth.SSH
+}
+
+// DefaultTokenTTL is the lifetime of a bootstrap-minted HTTP token when
+// auth.token_ttl is unset.
+const DefaultTokenTTL = 24 * time.Hour
+
+// Secure reports whether the server runs in secure mode (auth.mode: secure):
+// SSH allowlist enforce + HTTP bearer-token enforce + TLS-only (no plain HTTP
+// listener faces clients). The default (open) preserves the legacy accept-all
+// tailnet/LAN posture.
+func (c *ServerConfig) Secure() bool {
+	return c.Auth != nil && c.Auth.Mode == AuthModeSecure
+}
+
+// HTTPAuthEnforced reports whether the HTTP API requires a bearer token. HTTP
+// token enforcement is derived purely from secure mode: enforced iff secure.
+func (c *ServerConfig) HTTPAuthEnforced() bool {
+	return c.Secure()
+}
+
+// EffectiveSSHAuth returns the SSH auth config to build the allowlist from. In
+// secure mode the mode is forced to enforce (key sources still come from the
+// configured auth.ssh block); otherwise the configured block is used verbatim.
+func (c *ServerConfig) EffectiveSSHAuth() *SSHAuthConfig {
+	if !c.Secure() {
+		return c.SSHAuth()
+	}
+	eff := SSHAuthConfig{}
+	if s := c.SSHAuth(); s != nil {
+		eff = *s
+	}
+	eff.Mode = SSHAuthEnforce
+	return &eff
+}
+
+// TokenTTL is the lifetime of a bootstrap-minted HTTP token (auth.token_ttl),
+// defaulting to DefaultTokenTTL when unset.
+func (c *ServerConfig) TokenTTL() time.Duration {
+	if c.Auth != nil && c.Auth.TokenTTL > 0 {
+		return c.Auth.TokenTTL.Duration()
+	}
+	return DefaultTokenTTL
+}
+
+// validateAuth checks the optional auth config. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateAuth() error {
+	if c.Auth != nil {
+		switch c.Auth.Mode {
+		case "", AuthModeOpen, AuthModeSecure:
+		default:
+			return fmt.Errorf("invalid auth.mode: %q (must be open or secure)", c.Auth.Mode)
+		}
+	}
+	secure := c.Secure()
+	if ssh := c.SSHAuth(); ssh != nil {
+		switch ssh.Mode {
+		case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
+		default:
+			return fmt.Errorf("invalid auth.ssh.mode: %q (must be off, warn, or enforce)", ssh.Mode)
+		}
+		if ssh.MaxAuthTries < 0 {
+			return fmt.Errorf("invalid auth.ssh.max_auth_tries: %d", ssh.MaxAuthTries)
+		}
+		for _, u := range ssh.GitHubUsers {
+			if !ValidGitHubUsername(u) {
+				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
+			}
+		}
+		// tokens ⟺ TLS ⟺ secure: SSH enforce is the secure-mode posture. An
+		// explicit enforce on an open-mode server is rejected (warn stages an
+		// allowlist on a trusted network); secure forces enforce itself, so an
+		// explicit off/warn under secure contradicts the mode. An unset ssh.Mode
+		// under secure stays valid (EffectiveSSHAuth derives enforce).
+		if ssh.Mode == SSHAuthEnforce && !secure {
+			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: secure (use warn to stage an allowlist on a trusted network)")
+		}
+		if secure && (ssh.Mode == SSHAuthOff || ssh.Mode == SSHAuthWarn) {
+			return fmt.Errorf("auth.mode: secure forces auth.ssh.mode: enforce; remove the explicit auth.ssh.mode: %s", ssh.Mode)
+		}
+	}
+	// https_port is a secure-mode-only surface: an open-mode server serves plain
+	// http only. Checked outside the ssh block so it fires even when auth.ssh is
+	// unset.
+	if c.HTTPSPort > 0 && !secure {
+		return fmt.Errorf("https_port requires auth.mode: secure (an open-mode server serves plain http only)")
+	}
+	return nil
+}
+
+// HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
+// bind_address (default loopback). The plain-HTTP listener is served only in
+// open mode (see PlainHTTPEnabled); secure mode is TLS-only and starts no
+// plain-HTTP listener, so this is not consulted there.
+func (c *ServerConfig) HTTPListenAddr() string {
+	return listenAddr(c.BindAddress, c.HTTPPort)
+}
+
+// PlainHTTPEnabled reports whether the main plain-HTTP listener should be
+// served. False in secure mode (TLS-only; the plain listener is not started).
+func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.Secure() }
+
+// HTTPSEnabled reports whether the HTTPS listener is configured.
+func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
+
+// HTTPSListenAddr returns the bind address for the HTTPS listener (sharing
+// bind_address with the other listeners), or "" when HTTPS is disabled.
+func (c *ServerConfig) HTTPSListenAddr() string {
+	if !c.HTTPSEnabled() {
+		return ""
+	}
+	return listenAddr(c.BindAddress, c.HTTPSPort)
+}
+
+// SSHListenAddr returns the bind address for the SSH listener.
+func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.BindAddress, c.SSHPort) }
+
+// PreflightSecure gates secure-mode startup: it refuses to start when
+// auth.mode: secure is set without any SSH key source (github_users /
+// authorized_keys / authorized_keys_file). Secure mode enforces the SSH
+// allowlist, so an empty allowlist would lock everyone out. Inert in open mode.
+func (c *ServerConfig) PreflightSecure() error {
+	if !c.Secure() {
+		return nil
+	}
+	ssh := c.SSHAuth()
+	if ssh == nil || (len(ssh.GitHubUsers) == 0 && len(ssh.AuthorizedKeys) == 0 && ssh.AuthorizedKeysFile == "") {
+		return errors.New("auth.mode: secure requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)")
+	}
+	return nil
+}
+
+// loopbackBind is the IPv4 loopback interface — the default bind for every
+// listener, so shed is a local-development tool unless explicitly exposed.
+const loopbackBind = "127.0.0.1"
+
+// isLoopbackBind reports whether bind keeps the listener on the local host
+// (loopback) rather than exposing it to the network. Unset ("") counts as
+// loopback because that is the effective default (see listenAddr), as does the
+// "localhost" hostname; any address in 127.0.0.0/8 or ::1 is loopback via the
+// stdlib. Mirrors isLoopbackRef in internal/vmimage.
+func isLoopbackBind(bind string) bool {
+	if bind == "" || bind == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(bind); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// listenAddr joins a bind interface and port. An empty bind defaults to
+// loopback (local-only); "*" is accepted as an alias for all IPv4 interfaces
+// ("0.0.0.0"), and "::" binds all interfaces.
+func listenAddr(bind string, port int) string {
+	switch bind {
+	case "":
+		bind = loopbackBind
+	case "*":
+		bind = "0.0.0.0"
+	}
+	return net.JoinHostPort(bind, strconv.Itoa(port))
+}
+
+// validateNetworkSurface checks the optional HTTPS listener port. Shared by
+// Validate and ValidateNoHostCoupling, both of which range-check
+// HTTPPort/SSHPort immediately before calling this (the collision check below
+// assumes those are already valid).
+func (c *ServerConfig) validateNetworkSurface() error {
+	if c.HTTPSPort < 0 || c.HTTPSPort > 65535 {
+		return fmt.Errorf("invalid https_port: %d", c.HTTPSPort)
+	}
+	if c.HTTPSPort > 0 && (c.HTTPSPort == c.HTTPPort || c.HTTPSPort == c.SSHPort) {
+		return fmt.Errorf("https_port (%d) must differ from http_port and ssh_port", c.HTTPSPort)
+	}
+	return nil
+}
+
+// validateHTTPPort range-checks http_port: required (1..65535) in open mode,
+// where it drives the plain-HTTP listener; optional (0 = unset) in secure mode,
+// which serves no plain HTTP. Shared by Validate and ValidateNoHostCoupling.
+func (c *ServerConfig) validateHTTPPort() error {
+	minPort := 1
+	if c.Secure() {
+		minPort = 0
+	}
+	if c.HTTPPort < minPort || c.HTTPPort > 65535 {
+		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	}
+	return nil
+}
+
+// validateBindAddress validates the bind_address format and gates non-loopback
+// exposure of an open-mode server. The format check accepts the special tokens
+// ("" = loopback default, "*" = all IPv4) plus "localhost" and any IP literal;
+// a hostname or typo is rejected here rather than failing cryptically at
+// net.Listen on startup. Open mode has no transport security, so binding a
+// routable interface also requires an explicit allow_insecure_exposure
+// acknowledgment; secure mode (TLS + tokens) needs none. Shared by Validate and
+// ValidateNoHostCoupling.
+func (c *ServerConfig) validateBindAddress() error {
+	if b := c.BindAddress; b != "" && b != "*" && b != "localhost" && net.ParseIP(b) == nil {
+		return fmt.Errorf("invalid bind_address %q (want an IP address, \"0.0.0.0\"/\"*\" for all IPv4, \"::\" for all interfaces, \"localhost\", or empty for loopback)", b)
+	}
+	if c.Secure() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
+		return nil
+	}
+	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: secure", c.BindAddress)
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -223,6 +484,14 @@ type FirecrackerConfig struct {
 	// StopTimeout is the timeout for graceful VM shutdown
 	StopTimeout Duration `yaml:"stop_timeout"`
 
+	// GuestMTU, when non-zero, forces the guest's primary interface MTU
+	// instead of auto-detecting the host's egress path MTU at VM start.
+	// 0 (the default) means auto-detect: behind a reduced-MTU path (e.g. a
+	// VPN/overlay) the guest is lowered to match; otherwise it stays at
+	// 1500. Set this only to pin a value when detection misses. Validated to
+	// [MinGuestMTU, MaxGuestMTU] when non-zero.
+	GuestMTU int `yaml:"guest_mtu,omitempty"`
+
 	// BridgeName is the name of the Linux bridge for VM networking
 	BridgeName string `yaml:"bridge_name"`
 
@@ -309,6 +578,14 @@ type VZConfig struct {
 
 	// StopTimeout is the timeout for graceful VM shutdown
 	StopTimeout Duration `yaml:"stop_timeout"`
+
+	// GuestMTU, when non-zero, forces the guest's primary interface MTU
+	// instead of auto-detecting the host's egress path MTU at VM start.
+	// 0 (the default) means auto-detect: behind a reduced-MTU path (e.g. a
+	// VPN/overlay) the guest is lowered to match; otherwise it stays at
+	// 1500. Set this only to pin a value when detection misses. Validated to
+	// [MinGuestMTU, MaxGuestMTU] when non-zero.
+	GuestMTU int `yaml:"guest_mtu,omitempty"`
 }
 
 // GetDefaultImage implements vmimage.ImageConfig.
@@ -620,6 +897,12 @@ func (c *VZConfig) Validate() error {
 		}
 	}
 
+	// guest_mtu: 0 means auto-detect; an explicit override must be a value
+	// the host vmnet path can actually carry.
+	if c.GuestMTU != 0 && (c.GuestMTU < MinGuestMTU || c.GuestMTU > MaxGuestMTU) {
+		return fmt.Errorf("vz: guest_mtu must be 0 (auto-detect) or in [%d, %d]", MinGuestMTU, MaxGuestMTU)
+	}
+
 	if c.UpperSizeDefault != "" {
 		if _, err := ParseUpperSize(c.UpperSizeDefault); err != nil {
 			return fmt.Errorf("vz: upper_size_default: %w", err)
@@ -792,6 +1075,14 @@ const (
 	MaxVsockPort           uint32 = 65535
 	MinTimeout                    = 1 * time.Second
 	MaxTimeout                    = 30 * time.Minute
+
+	// Guest-MTU bounds, shared by the auto-detection clamp
+	// (vmutil.ClampGuestMTU) and the guest_mtu override validation on both
+	// backends. Floor is the IPv6 minimum link MTU (RFC 8200) — guaranteed
+	// routable on any path; ceiling is the host vmnet/TAP MTU, above which a
+	// guest packet would itself black-hole.
+	MinGuestMTU = 1280
+	MaxGuestMTU = 1500
 )
 
 // DefaultVZImagesDir is the default directory for VZ rootfs images.
@@ -951,6 +1242,28 @@ func (m MountConfig) MatchesExclude(relPath string) bool {
 	return MatchesExcludePatterns(relPath, m.Exclude)
 }
 
+// HasWritableHostMount reports whether a shed with the given project mounts
+// (--local-dir/--add-dir), running under serverCfg, has any writable
+// host-backed directory. A destroy/delete SIGKILLs the guest without a graceful
+// shutdown; if any such mount exists the guest must be synced first, or unsynced
+// writes to that host data are lost. (The discarded upper needs no sync — only
+// host-backed mounts, which outlive the shed, do.) serverCfg may be nil.
+func HasWritableHostMount(projectMounts []MountConfig, serverCfg *ServerConfig) bool {
+	for _, m := range projectMounts {
+		if !m.ReadOnly {
+			return true
+		}
+	}
+	if serverCfg != nil {
+		for _, m := range serverCfg.Mounts {
+			if !m.ReadOnly {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // MatchesExcludePatterns reports whether relPath matches any of the given glob
 // patterns. Patterns like "dir/*" also match the directory itself and deeply
 // nested paths (e.g., "dir/sub/deep/file").
@@ -1019,6 +1332,64 @@ func rejectRemovedImageKeys(data []byte) error {
 	return nil
 }
 
+// rejectRemovedAuthKeys fails loudly if a config still carries auth keys removed
+// in the secure-by-default redesign. yaml.Unmarshal silently ignores unknown
+// fields, so without this an upgraded operator's stale public_exposure / auth.http
+// block would be accepted while the new binary ignored them — and for
+// public_exposure that silent drop would un-loopback the plaintext listener on
+// an internet-facing box. Mirrors rejectRemovedImageKeys.
+func rejectRemovedAuthKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	if _, present := raw["public_exposure"]; present {
+		return fmt.Errorf("config key %q was removed; use %q instead (see docs/upgrades/v0.7.0-to-v0.7.1.md)",
+			"public_exposure", "auth.mode: secure")
+	}
+	auth, ok := raw["auth"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	// The entire auth.http subtree was removed: HTTP token enforcement is now
+	// derived from auth.mode: secure (the auth.http.mode knob is gone), and
+	// tokens are minted over the SSH bootstrap channel (auth.http.tokens is
+	// gone). Reject the block wholesale, with a tokens-specific hint when present.
+	if httpBlock, present := auth["http"]; present {
+		if hb, ok := httpBlock.(map[string]any); ok {
+			if _, hasTokens := hb["tokens"]; hasTokens {
+				return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
+					"auth.http.tokens", "auth.mode: secure")
+			}
+		}
+		return fmt.Errorf("config key %q was removed; HTTP token enforcement is now derived from %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
+			"auth.http", "auth.mode: secure")
+	}
+	return nil
+}
+
+// rejectRemovedNetworkKeys fails loudly if a config still carries network-surface
+// keys removed in v0.7.4. yaml.Unmarshal silently ignores unknown fields, so
+// without this an upgraded operator's stale internal_http_port would be accepted
+// while the new binary ignored it. Mirrors rejectRemovedAuthKeys.
+func rejectRemovedNetworkKeys(data []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil // malformed YAML — let the typed unmarshal surface the parse error
+	}
+	if _, present := raw["internal_http_port"]; present {
+		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in secure mode), gated by the credentials scope (see docs/upgrades/v0.7.3-to-v0.7.4.md)",
+			"internal_http_port")
+	}
+	for _, removed := range []string{"http_bind", "ssh_bind"} {
+		if _, present := raw[removed]; present {
+			return fmt.Errorf("config key %q was unified into %q in v0.7.4 (one interface for all listeners; defaults to loopback). Use %q (and allow_insecure_exposure for non-loopback open-mode exposure) — see docs/upgrades/v0.7.3-to-v0.7.4.md",
+				removed, "bind_address", "bind_address")
+		}
+	}
+	return nil
+}
+
 // LoadServerConfig loads server configuration from standard locations.
 // It checks in order: ./server.yaml, ~/.config/shed/server.yaml, /etc/shed/server.yaml
 func LoadServerConfig() (*ServerConfig, error) {
@@ -1038,6 +1409,47 @@ func normalizeMounts(cfg *ServerConfig, configPath string) {
 		fmt.Fprintf(os.Stderr, "Warning: both \"mounts\" and the deprecated \"credentials\" are set in %s; ignoring \"credentials\"\n", configPath)
 	}
 	cfg.Credentials = nil
+}
+
+// rejectRemovedKeys runs every removed-key scan in one place so the two loaders
+// can't drift on which checks they apply. Each scan re-parses data and returns
+// nil on malformed YAML (deferring the parse error to the typed unmarshal).
+func rejectRemovedKeys(data []byte) error {
+	for _, check := range []func([]byte) error{
+		rejectRemovedImageKeys, rejectRemovedAuthKeys, rejectRemovedNetworkKeys,
+	} {
+		if err := check(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyModeAndCommonDefaults fills in the mode-derived and common zero-value
+// defaults shared by both loaders (serve + config-validate), so the two paths
+// can't drift. http_port drives the open-mode plain-HTTP listener; secure mode
+// serves no plain HTTP, so any value there is dropped (set or constructor
+// default) and /api/info + the written client entry omit a vestigial port.
+// Secure mode also defaults https_port so `auth.mode: secure` needs no extra
+// TLS config.
+func applyModeAndCommonDefaults(cfg *ServerConfig) {
+	if cfg.Secure() {
+		cfg.HTTPPort = 0
+	} else if cfg.HTTPPort == 0 {
+		cfg.HTTPPort = 8080
+	}
+	if cfg.Secure() && cfg.HTTPSPort == 0 {
+		cfg.HTTPSPort = 8443
+	}
+	if cfg.SSHPort == 0 {
+		cfg.SSHPort = 2222
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	if cfg.Terminal == nil {
+		cfg.Terminal = terminal.DefaultConfig()
+	}
 }
 
 // LoadServerConfigFromPath loads server configuration from a specific path.
@@ -1076,25 +1488,13 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
-	if err := rejectRemovedImageKeys(data); err != nil {
+	if err := rejectRemovedKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
 	normalizeMounts(cfg, configPath)
 
-	// Apply defaults for zero values
-	if cfg.HTTPPort == 0 {
-		cfg.HTTPPort = 8080
-	}
-	if cfg.SSHPort == 0 {
-		cfg.SSHPort = 2222
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.Terminal == nil {
-		cfg.Terminal = terminal.DefaultConfig()
-	}
+	applyModeAndCommonDefaults(cfg)
 
 	cfg.normalizeBackends()
 
@@ -1232,24 +1632,13 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", configPath, err)
 	}
-	if err := rejectRemovedImageKeys(data); err != nil {
+	if err := rejectRemovedKeys(data); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
 
 	normalizeMounts(cfg, configPath)
 
-	if cfg.HTTPPort == 0 {
-		cfg.HTTPPort = 8080
-	}
-	if cfg.SSHPort == 0 {
-		cfg.SSHPort = 2222
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.Terminal == nil {
-		cfg.Terminal = terminal.DefaultConfig()
-	}
+	applyModeAndCommonDefaults(cfg)
 
 	cfg.normalizeBackends()
 
@@ -1274,11 +1663,20 @@ func (c *ServerConfig) ValidateNoHostCoupling() error {
 	if c.Name == "" {
 		return fmt.Errorf("server name is required")
 	}
-	if c.HTTPPort < 0 || c.HTTPPort > 65535 {
-		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	if err := c.validateHTTPPort(); err != nil {
+		return err
 	}
 	if c.SSHPort < 0 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
+	}
+	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateBindAddress(); err != nil {
+		return err
+	}
+	if err := c.validateAuth(); err != nil {
+		return err
 	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
@@ -1342,11 +1740,20 @@ func (c *ServerConfig) Validate() error {
 	if c.Name == "" {
 		return fmt.Errorf("server name is required")
 	}
-	if c.HTTPPort < 1 || c.HTTPPort > 65535 {
-		return fmt.Errorf("invalid http_port: %d", c.HTTPPort)
+	if err := c.validateHTTPPort(); err != nil {
+		return err
 	}
 	if c.SSHPort < 1 || c.SSHPort > 65535 {
 		return fmt.Errorf("invalid ssh_port: %d", c.SSHPort)
+	}
+	if err := c.validateNetworkSurface(); err != nil {
+		return err
+	}
+	if err := c.validateBindAddress(); err != nil {
+		return err
+	}
+	if err := c.validateAuth(); err != nil {
+		return err
 	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
@@ -1414,6 +1821,11 @@ func (c *ServerConfig) Validate() error {
 		if err := c.Git.Validate(); err != nil {
 			return fmt.Errorf("git config: %w", err)
 		}
+	}
+
+	// Validate egress config if present (compiles profiles/CEL, fails fast).
+	if err := c.Egress.Validate(); err != nil {
+		return fmt.Errorf("egress config: %w", err)
 	}
 
 	return nil
@@ -1585,6 +1997,12 @@ func (c *FirecrackerConfig) Validate() error {
 		if stopTimeout > MaxTimeout {
 			return fmt.Errorf("stop_timeout must be at most %s", MaxTimeout)
 		}
+	}
+
+	// guest_mtu: 0 means auto-detect; an explicit override must be a value
+	// the host TAP/bridge path can actually carry.
+	if c.GuestMTU != 0 && (c.GuestMTU < MinGuestMTU || c.GuestMTU > MaxGuestMTU) {
+		return fmt.Errorf("guest_mtu must be 0 (auto-detect) or in [%d, %d]", MinGuestMTU, MaxGuestMTU)
 	}
 
 	// Defer kernel/rootfs path validation when every configured source

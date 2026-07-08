@@ -2,8 +2,10 @@
 package api
 
 import (
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -11,12 +13,31 @@ import (
 
 // Server is the HTTP API server for shed.
 type Server struct {
-	backend    backend.Backend
-	cfg        *config.ServerConfig
-	sshHostKey string
-	plugins    *plugin.Registry
-	bridge     *plugin.Bridge
+	backend     backend.Backend
+	cfg         *config.ServerConfig
+	sshHostKey  string
+	plugins     *plugin.Registry
+	bridge      *plugin.Bridge
+	egressAudit *egress.AuditLog         // nil when egress is disabled
+	egressStore *config.UserProfileStore // nil when egress is disabled
+	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in secure mode (auth.mode: secure)
 }
+
+// SetEgressAudit attaches the durable egress audit log so `shed egress show`
+// can return recent decisions. Called by shed-server at startup when egress is
+// enabled; nil leaves the egress routes reporting no recent activity.
+func (s *Server) SetEgressAudit(a *egress.AuditLog) { s.egressAudit = a }
+
+// SetEgressUserStore attaches the runtime user-profile store backing the
+// `/api/egress/profiles` routes and merged into `shed egress show`. Called at
+// startup when egress is enabled; nil leaves the profile routes reporting only
+// config profiles (and PUT/DELETE returning 501).
+func (s *Server) SetEgressUserStore(st *config.UserProfileStore) { s.egressStore = st }
+
+// SetTokenStore attaches the HTTP bearer-token store. The same store is shared
+// with the SSH bootstrap handler (which mints into it); the auth middleware
+// validates against it. Constructed once in shed-server.
+func (s *Server) SetTokenStore(t *authtoken.Store) { s.tokens = t }
 
 // NewServer creates a new API server.
 func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, plugins *plugin.Registry, bridge *plugin.Bridge) *Server {
@@ -29,20 +50,35 @@ func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, p
 	}
 }
 
-// Router returns a configured chi router with all API routes.
-func (s *Server) Router() chi.Router {
-	r := chi.NewRouter()
-
-	// Middleware
+// useCommonMiddleware installs the shared middleware stack. RealIP is
+// applied only behind a trusted proxy (it trusts client X-Forwarded-For);
+// otherwise the real TCP peer address is used so a source IP can't be
+// forged to evade per-IP controls or poison audit logs.
+func (s *Server) useCommonMiddleware(r chi.Router) {
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	if s.cfg.TrustedProxy {
+		r.Use(middleware.RealIP)
+	}
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(ContentTypeJSON)
+	r.Use(s.authMiddleware)
+}
 
-	// API routes
+// Router returns the chi router for the HTTP API — served over pinned TLS in
+// secure mode, plain HTTP in open mode. It registers the full route surface on
+// a single listener: the control plane (info, lifecycle, images, system,
+// snapshots, sessions, egress) plus the credential bus (/api/plugins/*) and the
+// Connect tunnel (/api/sheds/*/connect/*). In secure mode the bus requires a
+// credentials-scoped token, the Connect tunnel accepts control or credentials,
+// and everything else requires control (see authMiddleware).
+func (s *Server) Router() chi.Router {
+	r := chi.NewRouter()
+	s.useCommonMiddleware(r)
+
 	r.Route("/api", func(r chi.Router) {
-		// Server info
+		// Server info (also the unauthenticated bootstrap endpoints
+		// used by `shed server add`).
 		r.Get("/info", s.handleGetInfo)
 		r.Get("/ssh-host-key", s.handleGetSSHHostKey)
 
@@ -77,14 +113,6 @@ func (s *Server) Router() chi.Router {
 			r.Post("/prune", s.handleSystemPrune)
 		})
 
-		// Plugins / Extensions
-		r.Route("/plugins", func(r chi.Router) {
-			r.Get("/listeners", s.handleListListeners)
-			r.Get("/listeners/{namespace}/messages", s.handlePluginSubscribe)
-			r.Post("/listeners/{namespace}/respond", s.handlePluginRespond)
-			r.Get("/sheds", s.handleListPluginSheds)
-		})
-
 		// Snapshots
 		r.Route("/snapshots", func(r chi.Router) {
 			r.Get("/", s.handleListSnapshots)
@@ -97,7 +125,36 @@ func (s *Server) Router() chi.Router {
 			})
 		})
 
-		// Sheds
+		// Egress control: the audit SSE stream (literal), user-profile CRUD
+		// (literal /profiles), plus per-shed status + live set/off. The literal
+		// /stream and /profiles siblings are registered before the /{name} wrap
+		// so they aren't shadowed at the chi trie level — which also makes
+		// "stream" and "profiles" reserved shed names on these routes.
+		r.Route("/egress", func(r chi.Router) {
+			r.Get("/stream", s.handleEgressStream)
+			r.Get("/profiles", s.handleListProfiles)
+			r.Route("/profiles/{name}", func(r chi.Router) {
+				r.Get("/", s.handleGetProfile)
+				r.Put("/", s.handlePutProfile)
+				r.Delete("/", s.handleDeleteProfile)
+			})
+			r.Route("/{name}", func(r chi.Router) {
+				r.Get("/", s.handleEgressShow)
+				r.Post("/", s.handleEgressSet)
+				r.Delete("/", s.handleEgressOff)
+			})
+		})
+
+		// Plugins / Extensions (the credential bus)
+		r.Route("/plugins", func(r chi.Router) {
+			r.Get("/listeners", s.handleListListeners)
+			r.Get("/listeners/{namespace}/messages", s.handlePluginSubscribe)
+			r.Post("/listeners/{namespace}/respond", s.handlePluginRespond)
+			r.Get("/sheds", s.handleListPluginSheds)
+		})
+
+		// Sheds: lifecycle routes (control scope) plus the Connect tunnel leaf
+		// (control or credentials) — all on the single listener.
 		r.Route("/sheds", func(r chi.Router) {
 			r.Get("/", s.handleListSheds)
 			r.Post("/", s.handleCreateShed)

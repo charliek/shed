@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -14,13 +15,51 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/charliek/shed/internal/clienttoken"
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/tunnels"
 )
+
+// connectTargetFromEntry resolves how `shed forward` dials the Connect API for a
+// server entry. When the entry pins a TLS cert on an https api_url, the tunnel
+// dials that host:port over pinned TLS and sends token as the bearer credential
+// (the Connect route accepts a control or credentials token when auth is
+// enforced; the CLI passes its live control token). Otherwise it is the legacy
+// plain-TCP dial to host:http_port, byte-identical, and token is unused.
+//
+// token is supplied by the caller rather than read from entry so tunnel dials
+// use the client's freshest in-memory control token — which may have been
+// re-minted since the entry was loaded without that refresh being persisted
+// back to config. Callers that only inspect the target without dialing pass "".
+func connectTargetFromEntry(entry *config.ServerEntry, token string) (tunnels.ConnectTarget, error) {
+	if entry.APIURL != "" {
+		u, err := url.Parse(entry.APIURL)
+		if err != nil {
+			return tunnels.ConnectTarget{}, fmt.Errorf("invalid api_url %q: %w", entry.APIURL, err)
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			if entry.TLSCertFingerprint == "" {
+				return tunnels.ConnectTarget{}, fmt.Errorf(
+					"server has an https api_url but no tls_cert_fingerprint to pin; re-add with `shed server add --https-port`")
+			}
+			if u.Port() == "" {
+				return tunnels.ConnectTarget{}, fmt.Errorf("api_url %q must include a port (e.g. https://host:8443)", entry.APIURL)
+			}
+			return tunnels.ConnectTarget{
+				Addr:   u.Host,
+				TLSPin: entry.TLSCertFingerprint,
+				Token:  token,
+			}, nil
+		}
+	}
+	return tunnels.ConnectTarget{Addr: fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)}, nil
+}
 
 var (
 	tunnelProfiles   []string
 	tunnelPorts      []string
 	tunnelBackground bool
+	tunnelDaemon     bool
 	tunnelReplace    bool
 	tunnelStopAll    bool
 )
@@ -100,6 +139,11 @@ func init() {
 	tunnelsStartCmd.Flags().StringArrayVarP(&tunnelPorts, "tunnel", "t", nil, "Explicit tunnel - \"3000\" or \"3001:3000\" (repeatable)")
 	tunnelsStartCmd.Flags().BoolVarP(&tunnelBackground, "background", "d", false, "Run as background daemon")
 	tunnelsStartCmd.Flags().BoolVar(&tunnelReplace, "replace", false, "Replace existing tunnel without prompting")
+	// --daemon is the internal re-exec marker: the detached worker spawned by -d.
+	// Users never set it directly; it tells runTunnelsStart to be the worker
+	// rather than fork another one.
+	tunnelsStartCmd.Flags().BoolVar(&tunnelDaemon, "daemon", false, "internal: run as the detached daemon worker")
+	_ = tunnelsStartCmd.Flags().MarkHidden("daemon")
 
 	tunnelsStopCmd.Flags().BoolVar(&tunnelStopAll, "all", false, "Stop all tunnels")
 
@@ -184,32 +228,35 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to clean up dead tunnels: %v\n", err)
 	}
 
-	// Check for existing tunnel
-	if existingEntry, ok := mgr.State().GetTunnel(shedName); ok {
-		alive, err := mgr.CheckHealth(shedName)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to check tunnel health: %v\n", err)
-		}
-		if alive {
-			if !tunnelReplace {
-				if jsonFlag {
-					return fmt.Errorf("tunnel already running for %s; use --replace with --json", shedName)
-				}
-				fmt.Printf("Tunnel already running for %s (profile: %s, PID %d).\n",
-					shedName, existingEntry.Profile, existingEntry.PID)
-				if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
-					return fmt.Errorf("tunnel already running for %s; use --replace in non-interactive mode", shedName)
-				}
-				if !confirmAction("Replace? [y/N] ") {
-					fmt.Println("Cancelled.")
-					return nil
-				}
+	// Check for existing tunnel. Skipped for the detached worker: the parent
+	// already handled replacement, and the worker has no stdin to prompt on.
+	if !tunnelDaemon {
+		if existingEntry, ok := mgr.State().GetTunnel(shedName); ok {
+			alive, err := mgr.CheckHealth(shedName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to check tunnel health: %v\n", err)
 			}
-			if !jsonFlag {
-				fmt.Println("Stopping existing tunnel...")
-			}
-			if err := mgr.Stop(shedName); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to stop existing tunnel: %v\n", err)
+			if alive {
+				if !tunnelReplace {
+					if jsonFlag {
+						return fmt.Errorf("tunnel already running for %s; use --replace with --json", shedName)
+					}
+					fmt.Printf("Tunnel already running for %s (profile: %s, PID %d).\n",
+						shedName, existingEntry.Profile, existingEntry.PID)
+					if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+						return fmt.Errorf("tunnel already running for %s; use --replace in non-interactive mode", shedName)
+					}
+					if !confirmAction("Replace? [y/N] ") {
+						fmt.Println("Cancelled.")
+						return nil
+					}
+				}
+				if !jsonFlag {
+					fmt.Println("Stopping existing tunnel...")
+				}
+				if err := mgr.Stop(shedName); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to stop existing tunnel: %v\n", err)
+				}
 			}
 		}
 	}
@@ -226,21 +273,58 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Resolve shed-server address for the Connect API
-	serverAddr := fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)
-
-	if tunnelBackground {
-		// Start tunnels, save state, and stay alive as a daemon process.
-		// Re-exec ourselves with a --daemon flag to detach from the terminal.
-		return startBackgroundTunnel(mgr, shedName, serverName, serverAddr, allPorts, profileName)
+	// Resolve how to reach the Connect API: pinned TLS + control token when the
+	// entry has an https api_url, else the legacy plain-TCP dial. Done here
+	// (before the daemon fork) so a misconfigured target fails in the user's
+	// terminal; the detached worker re-resolves it from config itself, keeping
+	// the token off its command line. Pass the client's live token —
+	// ensureRunningShed above may have re-minted it in-memory (proactively near
+	// expiry, or reactively on a 401) even when persisting it back to config was
+	// skipped or failed, so the entry's stored copy can be stale.
+	target, err := connectTargetFromEntry(entry, client.currentToken())
+	if err != nil {
+		return err
 	}
+	// A self-refreshing token source so a long-lived tunnel survives the control
+	// token's TTL. Built here for foreground and (re-)built by the detached worker
+	// when it re-runs; the parent -d process starts no tunnels itself.
+	tokenSrc := tunnelTokenSource(client, entry, target)
 
-	// Foreground mode: start tunnels and block on signal.
-	return runForegroundTunnel(mgr, shedName, serverAddr, allPorts, profileName)
+	switch {
+	case tunnelBackground && !tunnelDaemon:
+		// Parent: re-exec a detached worker, wait for it to start, then return.
+		return spawnTunnelDaemon(shedName, allPorts)
+	case tunnelDaemon:
+		// Detached worker: start tunnels, report readiness, block on signal.
+		return runDaemonWorker(mgr, shedName, serverName, target, tokenSrc, allPorts, profileName)
+	default:
+		// Foreground mode: start tunnels and block on signal.
+		return runForegroundTunnel(mgr, shedName, target, tokenSrc, allPorts, profileName)
+	}
 }
 
-func runForegroundTunnel(mgr *tunnels.Manager, shedName, serverAddr string, ports []tunnels.PortMapping, profile string) error {
-	activeTunnels, err := mgr.StartTunnels(serverAddr, shedName, ports)
+// tunnelTokenSource returns a self-refreshing token source for a secure tunnel,
+// seeded from the client's freshly-minted token+expiry (post ensureRunningShed).
+// It re-mints over SSH but NEVER persists to config: a background daemon may run
+// for days, and writing its stale in-memory config back would clobber unrelated
+// foreground edits (e.g. a `shed server add`). Returns nil for the plain/legacy
+// path (no token, no refresh).
+func tunnelTokenSource(client *APIClient, entry *config.ServerEntry, target tunnels.ConnectTarget) *clienttoken.Source {
+	if target.TLSPin == "" {
+		return nil
+	}
+	return clienttoken.New(client.currentToken(), client.TokenSource().ExpiresAt(),
+		controlTokenRefresh(entry.Host, entry.SSHPort, "")) // "" persistName ⇒ mint-only
+}
+
+func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, source *clienttoken.Source, ports []tunnels.PortMapping, profile string) error {
+	// Fail loudly if the tunnel can't authenticate, before binding any listener
+	// (so we never leave a listener up that resets every connection).
+	if err := probeConnectAuth(target, source, shedName); err != nil {
+		return err
+	}
+
+	activeTunnels, err := mgr.StartTunnels(target, source, shedName, ports)
 	if err != nil {
 		return fmt.Errorf("failed to start tunnels: %w", err)
 	}
@@ -257,48 +341,14 @@ func runForegroundTunnel(mgr *tunnels.Manager, shedName, serverAddr string, port
 	defer stop()
 	<-ctx.Done()
 
+	// Restore default signal handling before draining, so a second Ctrl+C
+	// force-quits instead of being swallowed if a connection is slow to close.
+	stop()
+
 	fmt.Println("\nStopping tunnels...")
 	for _, t := range activeTunnels {
 		t.Stop()
 	}
-
-	return nil
-}
-
-func startBackgroundTunnel(mgr *tunnels.Manager, shedName, serverName, serverAddr string, ports []tunnels.PortMapping, profile string) error {
-	// Start the tunnels in this process.
-	activeTunnels, err := mgr.StartTunnels(serverAddr, shedName, ports)
-	if err != nil {
-		return fmt.Errorf("failed to start tunnels: %w", err)
-	}
-
-	// Save state with our own PID so stop/list can find us.
-	if err := mgr.SaveBackground(shedName, serverName, profile, os.Getpid(), ports); err != nil {
-		for _, t := range activeTunnels {
-			t.Stop()
-		}
-		return fmt.Errorf("failed to save tunnel state: %w", err)
-	}
-
-	// The tunnel daemon keeps this process alive. The PID is saved to state
-	// so `shed tunnels stop` can send SIGTERM to tear it down.
-	// A future version could fork/detach for true daemonization.
-	printSuccess("Tunnel started for %s (profile: %s, PID %d)", shedName, profile, os.Getpid())
-	fmt.Println("Forwarding:")
-	for _, pm := range ports {
-		fmt.Printf("  localhost:%d -> %s:%d\n", pm.Local, shedName, pm.Remote)
-	}
-
-	// Block until signal (daemon behavior)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	<-ctx.Done()
-
-	for _, t := range activeTunnels {
-		t.Stop()
-	}
-	mgr.State().RemoveTunnel(shedName)
-	_ = mgr.State().Save()
 
 	return nil
 }
@@ -435,19 +485,28 @@ func runTunnelsConfig(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	serverAddr := fmt.Sprintf("%s:%d", entry.Host, entry.HTTPPort)
+	// Show the address the tunnel would actually dial (the https api_url
+	// endpoint when the entry is TLS-pinned, else host:http_port). This is a
+	// preview that never dials, so no token is needed.
+	target, err := connectTargetFromEntry(entry, "")
+	if err != nil {
+		return err
+	}
+	serverAddr := target.Addr
 
 	if jsonFlag {
 		return outputJSON(struct {
 			Shed       string                `json:"shed"`
 			Server     string                `json:"server"`
 			ServerAddr string                `json:"server_addr"`
+			TLS        bool                  `json:"tls"`
 			Profile    string                `json:"profile"`
 			Ports      []tunnels.PortMapping `json:"ports"`
 		}{
 			Shed:       shedName,
 			Server:     serverName,
 			ServerAddr: serverAddr,
+			TLS:        target.TLSPin != "",
 			Profile:    profileName,
 			Ports:      allPorts,
 		})

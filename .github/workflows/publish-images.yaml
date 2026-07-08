@@ -133,6 +133,8 @@ jobs:
           # In-VM binaries staged into the Dockerfile build context.
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-firstboot ./cmd/shed-firstboot
+          # Guest extension binaries + /etc overlay staged into the same context.
+          ./scripts/stage-guest-binaries.sh vz arm64
           # Host-side CLI used to drive OCI conversion + push.
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
@@ -168,6 +170,12 @@ jobs:
           # the remote server's resolveImage cache-hit check matches
           # on subsequent `shed create` pulls.
           mkdir -p /tmp/oci-store-vz
+          # SHED_INSTALL_SHA busts BuildKit's content-blind bind-mount cache
+          # when the staged agent/service files change (#227). Belt-and-
+          # suspenders on a cold CI runner, but keeps the published layer's
+          # cache key honest and matters if a shared buildx cache is enabled.
+          install_sha="$(./scripts/install-input-sha.sh vz/)"
+          echo "SHED_INSTALL_SHA=${install_sha}"
           for variant in base extensions full; do
             echo "=== building shed-vz-${variant} ==="
             ./bin/shed image build \
@@ -177,6 +185,7 @@ jobs:
               --source-ref "ghcr.io/charliek/shed-vz-${variant}:${{ steps.version.outputs.tag }}" \
               --initramfs /tmp/shed-initrd-vz.img \
               --output-dir /tmp/oci-store-vz \
+              --build-arg "SHED_INSTALL_SHA=${install_sha}" \
               -f vz/Dockerfile \
               vz/
           done
@@ -255,6 +264,8 @@ jobs:
             -X github.com/charliek/shed/internal/version.BuildDate=${{ steps.version.outputs.date }}"
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-firstboot ./cmd/shed-firstboot
+          # Guest extension binaries + /etc overlay staged into the same context.
+          ./scripts/stage-guest-binaries.sh firecracker amd64
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
 
@@ -277,8 +288,11 @@ jobs:
 
       - name: Build OCI images (base, extensions, full)
         run: |
-          # See VZ job for rationale on --platform and --source-ref.
+          # See VZ job for rationale on --platform, --source-ref, and
+          # SHED_INSTALL_SHA (#227 bind-mount cache-bust).
           mkdir -p /tmp/oci-store-fc
+          install_sha="$(./scripts/install-input-sha.sh firecracker/)"
+          echo "SHED_INSTALL_SHA=${install_sha}"
           for variant in base extensions full; do
             echo "=== building shed-fc-${variant} ==="
             ./bin/shed image build \
@@ -288,6 +302,7 @@ jobs:
               --source-ref "ghcr.io/charliek/shed-fc-${variant}:${{ steps.version.outputs.tag }}" \
               --initramfs /tmp/shed-initrd-fc.img \
               --output-dir /tmp/oci-store-fc \
+              --build-arg "SHED_INSTALL_SHA=${install_sha}" \
               -f firecracker/Dockerfile \
               firecracker/
           done
@@ -337,7 +352,11 @@ jobs:
     name: Build and Release
     needs: [publish-build-tools, publish-vz, publish-fc, smoke]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    # macos-latest: shed-host-agent's darwin build needs CGO (Touch ID), which
+    # can't cross-compile from linux. The shed-extensions release pipeline ran on
+    # macos-latest — this is the proven shape. The image-publish jobs above keep
+    # their linux runners (they build the guest binaries with CGO off).
+    runs-on: macos-latest
     permissions:
       contents: write
       packages: write
@@ -407,7 +426,9 @@ jobs:
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: latest
+          # Pinned to match the CI release-snapshot job so the snapshot is a
+          # faithful proof of what the release runs (was `latest`).
+          version: v2.15.2
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -450,6 +471,33 @@ jobs:
               --method POST \
               -f event_type=publish \
               -F "client_payload[package]=shed-server" \
+              -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
+              echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
+              exit 0
+            fi
+            echo "::warning::dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-charliek dispatch failed after 3 attempts — check the stderr above for the API error"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      # Second dispatch for the shed-machine-rc .deb (the monorepo now ships it,
+      # formerly from charliek/shed-extensions). Same minted token, same
+      # idempotent-with-retry pattern; only the client_payload package differs.
+      # NOTE: apt-charliek's packages.yaml must repoint shed-machine-rc to
+      # charliek/shed before the first monorepo tag or this dispatch no-ops.
+      - name: Trigger apt-charliek publish (shed-machine-rc)
+        if: success()
+        env:
+          GH_TOKEN: ${{ steps.apt.outputs.token }}
+        run: |
+          for attempt in 1 2 3; do
+            if gh api repos/charliek/apt-charliek/dispatches \
+              --method POST \
+              -f event_type=publish \
+              -F "client_payload[package]=shed-machine-rc" \
               -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
               echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
               exit 0

@@ -42,6 +42,10 @@ sheds:
 | `servers.<name>.host` | string | Server hostname or IP |
 | `servers.<name>.http_port` | int | HTTP API port |
 | `servers.<name>.ssh_port` | int | SSH server port |
+| `servers.<name>.api_url` | string | HTTPS control-plane URL (e.g. `https://host:8443`); overrides scheme+host+port. Set by `shed server add --https-port`. |
+| `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`). |
+| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop. Auto-written and refreshed by `shed server add` in secure mode. |
+| `servers.<name>.control_token_expires_at` | timestamp | Expiry of `control_token`; the CLI refreshes near this and on a 401. Auto-managed. |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
 | `create_timeout` | duration | Timeout for create/start operations (default: `10m`) |
@@ -74,8 +78,11 @@ log_level: info
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | `shed-server` | Server identifier |
-| `http_port` | int | `8080` | HTTP API port |
+| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in secure mode** (secure serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
 | `ssh_port` | int | `2222` | SSH server port |
+| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in both modes** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; secure mode needs no acknowledgment. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge binding a **non-loopback** `bind_address` in **open** mode (no transport security). Required there, ignored in secure mode and for loopback binds. |
+| `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
 | `env_file` | string | - | Path to environment variables file |
@@ -84,8 +91,73 @@ log_level: info
 | `git` | object | - | Git behaviour for in-VM clones (see [Git](#git)) |
 | `firecracker` | object | - | Firecracker-specific configuration (see below) |
 | `vz` | object | - | VZ-specific configuration (see below) |
+| `auth` | object | - | Optional authentication (see [SSH authentication](#ssh-authentication)) |
 
 **Note:** Only VM backends are supported. Firecracker is available on Linux. VZ is available on macOS Apple Silicon (arm64). The `detect` backend auto-selects based on platform.
+
+### Authentication mode
+
+`auth.mode` is the headline switch. The default `open` posture is unchanged —
+ideal on a tailnet or trusted LAN (plain HTTP, no tokens, no TLS); the SSH
+allowlist (`auth.ssh`) is the one independently-tunable layer there. `secure` is
+the internet-facing posture: it derives the full bundle (SSH enforce + HTTP
+tokens + TLS-only) and refuses to start without an SSH key source. Two invariants
+hold: **tokens ⟺ TLS ⟺ secure** and **https ⟺ secure**. See [Security](security.md)
+and the [Security Configuration guide](../guides/security-configuration.md).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `secure` derives SSH-allowlist enforce + HTTP-token enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fails to start without a key source**. |
+| `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token. Clients refresh transparently near expiry / on a 401. |
+
+The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
+**rejected at startup** — set `auth.mode: secure` and let `shed server add` mint
+tokens over SSH. As of v0.7.2 the whole `auth.http` block is gone (HTTP
+enforcement derives from `auth.mode: secure`), and `https_port` /
+`auth.ssh.mode: enforce` are valid only in secure mode — see
+[Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
+`http_bind`/`ssh_bind`/`internal_http_port` are removed in favour of a single
+`bind_address` (loopback by default), and `http_port` is optional in secure mode
+— see [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
+
+### SSH authentication
+
+`auth.ssh` gates SSH public-key access against an allowlist. The default (omitted, or `mode: off`) accepts all keys — the legacy behavior. Identity comes from the offered key, GitHub-style; the username still selects the shed.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auth.ssh.mode` | string | `off` | `off` accepts all keys; `warn` logs would-deny attempts but still accepts (use to roll out safely); `enforce` rejects keys not in the allowlist. |
+| `auth.ssh.authorized_keys` | list | `[]` | Inline OpenSSH `authorized_keys` lines. |
+| `auth.ssh.authorized_keys_file` | string | - | Path to an `authorized_keys`-format file. |
+| `auth.ssh.github_users` | list | `[]` | Seed the allowlist from `https://github.com/<user>.keys`. Keys are cached to disk and fail closed to the last-known-good cache if GitHub is unreachable. |
+| `auth.ssh.github_refresh` | duration | `1h` | How often to re-fetch GitHub keys. |
+| `auth.ssh.max_auth_tries` | int | `10` | Public-key attempts allowed per connection. Raise it when a client's agent (1Password, Secretive) holds many keys, so the allowlisted key is tried before the server gives up. |
+
+With `mode: enforce`, the server refuses to start if no keys resolve (empty inline/file and a failed GitHub fetch with no cache) — use `warn` for first boot, or provide inline keys.
+
+```yaml
+auth:
+  mode: secure               # open (default) | secure — secure forces ssh enforce
+  ssh:
+    github_users: [charliek]  # a key source is required in secure mode
+```
+
+### TLS and network surface
+
+TLS and network-surface fields. HTTP token enforcement is **not** an independent
+field — it is derived from `auth.mode: secure` (there is no `auth.http` block).
+`secure` turns on TLS for you, and `https_port` is valid only in secure mode. See
+[Security](security.md) and the
+[Security Configuration guide](../guides/security-configuration.md).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `https_port` | int | `8443` in secure | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: secure`** (rejected in open mode); defaults to `8443` there. In secure mode this is the *only* listener — no plain HTTP is served. |
+| `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
+| `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
+| `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in both modes). Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in secure mode. |
+| `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
 
 ### Mounts
 
@@ -107,7 +179,7 @@ mounts:
     readonly: true           # Optional, default false
 ```
 
-**Mount sources must be directories.** Single-file mounts are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the shed-extensions SSH agent forwarding instead of mounting `~/.ssh`.
+**Mount sources must be directories.** Single-file mounts are not supported. For individual config files like `.gitconfig`, use [`shed sync`](sync.md) to push them as dotfiles. For SSH-based git authentication, use the SSH agent forwarding extension instead of mounting `~/.ssh`.
 
 **Missing sources:** If a mount's source path does not exist on the host, it is skipped with a log warning. Create the source directory on the host before starting the shed.
 
@@ -216,7 +288,7 @@ vz:
 ```
 
 **Why this is version-coupled:** the base images bundle the in-VM `shed-agent`
-and the shed-extensions guest binaries, which are versioned in lockstep with
+and the guest extension binaries, which are versioned in lockstep with
 `shed`. Pinning the image to the server version — via the default synthesis or
 the `${shed.version}` token — keeps the guest components compatible with the
 server instead of drifting on upgrade.
@@ -225,6 +297,29 @@ server instead of drifting on upgrade.
     A literal `{version}` or `v{version}` is **not** expanded. On a dev/unreleased
     build the token has nothing to resolve to, so set concrete refs (or leave them
     unset and pass `--image` on each `create`).
+
+## Egress Control
+
+Opt-in, audit-first egress filtering (off unless `enabled: true`). A bad glob or
+CEL rule fails server start. See [Egress Control](egress.md) for the full model,
+the policy language, and the (important) honest security posture.
+
+```yaml
+egress:
+  enabled: true
+  port_range: "20000-30000"   # per-shed listener allocation (default)
+  default: []                 # profiles for sheds created without --egress ([] = none)
+  profiles:
+    github:   { allow: ["*.github.com", "github.com"] }
+    internal: { rule: 'host.endsWith(".corp.internal") && port == 443' }
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Master switch. When off, the proxy child is never started and sheds get no egress control. |
+| `port_range` | `20000-30000` | Per-shed listener port allocation range. |
+| `default` | `[]` | Profiles applied to sheds created without `--egress`. `[]`/absent = no egress for those sheds. |
+| `profiles` | `{}` | Named policy fragments (`allow`/`deny` globs, `mode: audit`, or a CEL `rule`). Names `off`/`none`/`default` are reserved. |
 
 ## Firecracker Configuration
 
@@ -281,6 +376,7 @@ from the server version.
 | `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins) |
 | `start_timeout` | duration | `30s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
+| `guest_mtu` | int | `0` | Guest primary-interface MTU. `0` (default) auto-detects the host egress path MTU at VM start and lowers the guest to match a reduced path (e.g. a VPN/overlay), otherwise leaves it at 1500. Set `1280`–`1500` to pin a value when detection misses. See note below. |
 | `bridge_name` | string | `shed-br0` | Linux bridge name |
 | `bridge_cidr` | string | `172.30.0.1/24` | Bridge network CIDR |
 | `tap_prefix` | string | `shed-tap` | TAP device name prefix |
@@ -347,6 +443,20 @@ vz:
 | `tcp_proxy_port` | int | `1028` | Vsock port for TCP proxy (used by DialService for tunnels and Connect API) |
 | `start_timeout` | duration | `60s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
+| `guest_mtu` | int | `0` | Guest primary-interface MTU. `0` (default) auto-detects the host egress path MTU at VM start and lowers the guest to match a reduced path (e.g. a VPN), otherwise leaves it at 1500. Set `1280`–`1500` to pin a value when detection misses. See note below. |
+
+### Guest MTU and VPNs
+
+Behind a VPN (or any path whose MTU is below 1500), full-size guest packets can
+be silently dropped — most visibly, `docker pull` fails with a TLS handshake
+timeout while `curl` to the same registry works. With `guest_mtu: 0` (the
+default), shed-server detects the host's egress path MTU when a shed starts and
+lowers the guest interface to match; on a normal 1500 path nothing changes.
+
+Detection runs **at VM start**, so if you connect or disconnect the VPN while a
+shed is already running, run `shed restart <name>` to re-detect. Set `guest_mtu`
+explicitly only to override detection (for example, to pin a value for a VPN
+whose tunnel interface still reports 1500).
 
 See [VZ Setup](../getting-started/vz-setup.md) for setup details.
 

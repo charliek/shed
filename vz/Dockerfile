@@ -22,11 +22,6 @@
 # from the build context are folded into a single RUN using
 # `--mount=type=bind,source=.,target=/ctx` (BuildKit 1.4+).
 
-# Bump this when shed-extensions releases a new version.
-# The extensions and full variants pull binaries from this tag.
-ARG SHED_EXT_VERSION=v0.4.0
-FROM ghcr.io/charliek/shed-extensions:${SHED_EXT_VERSION} AS shed-extensions
-
 # Note: the shed initramfs (overlay-on-the-guest init) is built from
 # initramfs/Dockerfile via scripts/build-initramfs.sh. It lives in its
 # own Dockerfile so this file's COPY paths can keep resolving relative
@@ -89,7 +84,7 @@ RUN printf '%s\n' \
 # users who need them can `apt install` inside a shed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       systemd systemd-sysv systemd-resolved dbus \
+       systemd systemd-sysv systemd-resolved systemd-timesyncd dbus \
        sudo zip unzip ca-certificates hostname \
        tmux git gh curl wget neovim jq ncurses-term ripgrep tree \
        openssh-server \
@@ -102,12 +97,24 @@ RUN apt-get update \
        || { echo "ERROR: /lib/modules/${LINUX_IMAGE_VERSION}-generic not present after install — LINUX_IMAGE_VERSION ARG is wrong" >&2; exit 1; } \
     && rm -rf /var/lib/apt/lists/*
 
+# SHED_INSTALL_SHA is a content hash of the files installed by the bind-mount
+# RUN below (shed-agent + shed-firstboot + the .service/.sh/.json staged from
+# the context). BuildKit's bind-mount cache keys on (path, size, mtime), NOT
+# content, so a rebuilt binary that collides on size+mtime would otherwise be
+# silently reused from cache — baking a stale agent (#227). Referencing the ARG
+# in the RUN makes a changed hash bust this layer. Declared AFTER the apt layer
+# so it never invalidates the expensive package install. The build scripts pass
+# the real value; `unknown` is the cache-busting-disabled default for ad-hoc
+# `docker build` invocations.
+ARG SHED_INSTALL_SHA=unknown
+
 # Layer 2: stage shed-built binaries + service files from the build
 # context via a bind mount so we get a single layer for the placements
 # + chmods + configs (instead of 1 layer per COPY). daemon.json is
 # staged but placed by the `full` stage where docker is actually
 # installed.
 RUN --mount=type=bind,source=.,target=/ctx \
+    echo "SHED_INSTALL_SHA=${SHED_INSTALL_SHA}" && \
     install -m 0755 /ctx/shed-agent       /usr/local/bin/shed-agent && \
     install -m 0755 /ctx/shed-firstboot   /usr/local/bin/shed-firstboot && \
     install -m 0755 /ctx/network-setup.sh /usr/local/bin/network-setup.sh && \
@@ -128,10 +135,14 @@ RUN set -euo pipefail && \
           /lib/systemd/system/sockets.target.wants/*initctl* \
           /lib/systemd/system/sysinit.target.wants/systemd-tmpfiles-setup* \
           /lib/systemd/system/systemd-update-utmp* && \
-    # Enable services shipped by base. docker is enabled in the `full`
-    # stage where it's actually installed.
+    # Enable services shipped by base. systemd-timesyncd is included so the
+    # guest keeps wall-clock time (it otherwise ships no time-sync and its
+    # clock drifts behind after host sleep — see #236); the explicit enable
+    # is load-bearing because the *.wants/* cleanup above nukes the symlink
+    # dpkg created. docker is enabled in the `full` stage where it's actually
+    # installed.
     SYSTEMD_OFFLINE=1 systemctl enable ssh shed-agent shed-firstboot \
-        network-setup systemd-networkd systemd-resolved && \
+        network-setup systemd-networkd systemd-resolved systemd-timesyncd && \
     # SSH server policy.
     mkdir -p /run/sshd /etc/ssh/sshd_config.d && \
     printf '%s\n' \
@@ -202,6 +213,21 @@ RUN set -euo pipefail && \
     # multi-user.target so shed-agent can start. systemd-firstboot is
     # for human-driven OS setup, irrelevant for an automated shed VM.
     ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service && \
+    # Sane tmux defaults. shed sessions run inside tmux, which owns ALL
+    # scrollback via the alternate screen — without `mouse on` there's no
+    # way to scroll it. Larger history for build/agent output; focus-events
+    # so TUIs get focus/blur (Claude Code warns when off); a short
+    # escape-time so neovim's ESC isn't laggy; truecolor passthrough.
+    # shed-ext-rc uses the default tmux server (no -f/-L), which reads
+    # /etc/tmux.conf on start. See issue #220.
+    printf '%s\n' \
+        'set -g mouse on' \
+        'set -g history-limit 50000' \
+        'set -g focus-events on' \
+        'set -sg escape-time 10' \
+        'set -g default-terminal "tmux-256color"' \
+        'set -ga terminal-overrides ",*256col*:Tc"' \
+        > /etc/tmux.conf && \
     # Colored shell prompt with shed name + cwd + git branch + dirty marker.
     cat >> /home/shed/.bashrc <<'PROMPT_EOF'
 __git_prompt() {
@@ -223,23 +249,37 @@ ENTRYPOINT ["/sbin/init"]
 # Base + shed-extensions credential brokering (SSH agent, AWS proxy,
 # Docker credentials). No coding agents or language runtimes —
 # recommended starting point for users who customize their own image.
-# See https://github.com/charliek/shed-extensions for details.
+#
+# The guest binaries + /etc overlay are built in-tree and staged into the
+# build context by scripts/stage-guest-binaries.sh (from cmd/shed-ext-* and
+# guest/extensions/etc/) — installed here from /ctx rather than pulled from a
+# published ghcr.io/charliek/shed-extensions image.
 # =============================================================================
 FROM shed-vz-base AS shed-vz-extensions
 
-# Layer: bring in shed-extensions binaries + service units + config + the
-# Docker credentials helper config — all in a single COPY-via-bind RUN
+# SHED_INSTALL_SHA is stage-scoped (ARGs don't cross FROM boundaries), so it
+# must be redeclared here and echoed in the RUN below — otherwise a rebuilt
+# guest binary that collides on size+mtime is silently reused from BuildKit's
+# content-blind bind-mount cache, baking a stale binary (#227). The build
+# scripts pass the real whole-context hash; `unknown` disables the cache-bust
+# for ad-hoc `docker build` invocations.
+ARG SHED_INSTALL_SHA=unknown
+
+# Layer: bring in the staged shed-extensions binaries + service units + config
+# + the Docker credentials helper config — all in a single COPY-via-bind RUN
 # so this stage adds exactly one layer on top of base.
-RUN --mount=type=bind,from=shed-extensions,source=/,target=/ext \
+RUN --mount=type=bind,source=.,target=/ctx \
+    echo "SHED_INSTALL_SHA=${SHED_INSTALL_SHA}" && \
     set -euo pipefail && \
     mkdir -p /etc/environment.d /etc/shed-extensions.d /home/shed/.docker && \
-    install -m 0755 /ext/usr/local/bin/shed-ext-ssh-agent       /usr/local/bin/shed-ext-ssh-agent && \
-    install -m 0755 /ext/usr/local/bin/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials && \
-    install -m 0755 /ext/usr/local/bin/docker-credential-shed   /usr/local/bin/docker-credential-shed && \
-    install -m 0644 /ext/etc/systemd/system/shed-ext-ssh-agent.service       /etc/systemd/system/shed-ext-ssh-agent.service && \
-    install -m 0644 /ext/etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/shed-ext-aws-credentials.service && \
-    install -m 0644 /ext/etc/environment.d/shed-extensions.conf              /etc/environment.d/shed-extensions.conf && \
-    cp -r /ext/etc/shed-extensions.d/. /etc/shed-extensions.d/ && \
+    install -m 0755 /ctx/shed-ext-ssh-agent       /usr/local/bin/shed-ext-ssh-agent && \
+    install -m 0755 /ctx/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials && \
+    install -m 0755 /ctx/docker-credential-shed   /usr/local/bin/docker-credential-shed && \
+    install -m 0755 /ctx/shed-ext-rc              /usr/local/bin/shed-ext-rc && \
+    install -m 0644 /ctx/ext-etc/systemd/system/shed-ext-ssh-agent.service       /etc/systemd/system/shed-ext-ssh-agent.service && \
+    install -m 0644 /ctx/ext-etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/shed-ext-aws-credentials.service && \
+    install -m 0644 /ctx/ext-etc/environment.d/shed-extensions.conf              /etc/environment.d/shed-extensions.conf && \
+    cp -r /ctx/ext-etc/shed-extensions.d/. /etc/shed-extensions.d/ && \
     # Docker creds helper config for the shed user.
     echo '{"credsStore": "shed"}' > /home/shed/.docker/config.json && \
     chown -R shed:shed /home/shed/.docker

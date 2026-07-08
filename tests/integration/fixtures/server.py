@@ -97,6 +97,34 @@ DEFAULT_AGENT_P50_MS = {
 }
 
 
+def resolve_server_entry(name: str, timeout: int = 10) -> Optional[dict]:
+    """Return the `~/.shed/config.yaml` entry for `name`, or None.
+
+    Runs `shed --json server list` and finds the dict whose `name`
+    matches — the single parser both `LocalServer._resolve_ssh_endpoint`
+    and the dev-control primitives (`fixtures/devcontrol.py`) share, so
+    the `shed --json server list` shape (and its failure modes) is
+    decoded in exactly one place.
+    """
+    try:
+        r = subprocess.run(
+            ["shed", "--json", "server", "list"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        entries = json.loads(r.stdout) or []
+    except json.JSONDecodeError:
+        return None
+    for e in entries:
+        if isinstance(e, dict) and e.get("name") == name:
+            return e
+    return None
+
+
 @dataclass
 class ShedHandle:
     """A reference to a successfully-created shed.
@@ -271,36 +299,74 @@ class LocalServer:
         Gateway take. The `shed exec` CLI path is covered by
         `exec(...)` above; use *this* helper when you want to assert
         that shell metacharacters in the raw command actually fire on
-        the server side.
+        the server side. Connection params are resolved by `ssh_argv`.
+        """
+        return subprocess.run(
+            self.ssh_argv(name, raw_command),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
-        Resolves connection params (host, SSH port, known-hosts file)
-        via `shed --json server list` so we line up with whatever the
-        CLI would have used. Uses `~/.shed/known_hosts` with
-        StrictHostKeyChecking=yes when it exists (the file the CLI
-        populates at create-time); falls back to
-        StrictHostKeyChecking=no for fresh test environments. The
-        integration suite only ever talks to known-good test sheds, so
-        the fallback is safe.
+    def ssh_argv(self, name: str, raw_command: str, pty: bool = False) -> list[str]:
+        """Build the raw `ssh` argv for `name`'s shed running `raw_command`.
+
+        Shared by `ssh_exec` (text) and `ssh_exec_binary` (bytes), and
+        exposed so a test that drives the channel directly lines up with
+        the same connection params the CLI would have used.
+
+        Resolves connection params (host, SSH port, known-hosts file) via
+        the server entry (`_ssh_connect_params`). Uses `~/.shed/known_hosts`
+        with StrictHostKeyChecking=yes when it exists (the file the CLI
+        populates at create-time); falls back to StrictHostKeyChecking=no
+        for fresh test environments. The integration suite only ever talks
+        to known-good test sheds, so the fallback is safe.
+
+        Forces the channel type regardless of the client's `RequestTTY`
+        config: `-T` (default) drives the non-PTY exec path — the channel
+        shape Zed/VS Code/rsync use and the one issue #222 concerns (a stray
+        PTY would line-discipline-mangle a binary round-trip) — while
+        `pty=True` passes `-tt` to force the interactive PTY path.
         """
         host, port, known_hosts = self._ssh_connect_params()
-        ssh_argv = [
+        argv = [
             "ssh",
+            "-tt" if pty else "-T",
             "-p", str(port),
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
         ]
         if known_hosts is not None:
-            ssh_argv += [
+            argv += [
                 "-o", f"UserKnownHostsFile={known_hosts}",
                 "-o", "StrictHostKeyChecking=yes",
             ]
         else:
-            ssh_argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
-        ssh_argv += [f"{name}@{host}", raw_command]
+            argv += ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+        argv += [f"{name}@{host}", raw_command]
+        return argv
+
+    def ssh_exec_binary(
+        self,
+        name: str,
+        raw_command: str,
+        input: bytes,
+        timeout: int = 60,
+    ) -> "subprocess.CompletedProcess[bytes]":
+        """Like `ssh_exec`, but pipes binary `input` to the remote command
+        and captures raw stdout BYTES (no text-mode newline translation).
+
+        This drives the non-PTY exec channel as an 8-bit-clean binary pipe
+        — the channel shape Zed Remote-SSH uses — so a test can assert
+        byte-perfect round-trips through the agent's framed protocol
+        (issue #222). `subprocess.run(input=...)` uses `communicate()`
+        under the hood, so it writes stdin, drains stdout/stderr, and
+        closes cleanly without deadlock; `timeout` bounds the whole call.
+        """
         return subprocess.run(
-            ssh_argv,
+            self.ssh_argv(name, raw_command),
+            input=input,
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
 
@@ -329,20 +395,12 @@ class LocalServer:
         CLI's view of the server entry; falls back to 2222 (the brew
         default).
         """
-        try:
-            r = subprocess.run(
-                ["shed", "--json", "server", "list"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                entries = json.loads(r.stdout) or []
-                for e in entries:
-                    if isinstance(e, dict) and e.get("name") == self.name:
-                        host = e.get("host", "localhost")
-                        port = int(e.get("ssh_port", 2222))
-                        return host, port
-        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, ValueError):
-            pass
+        entry = resolve_server_entry(self.name, timeout=5)
+        if entry is not None:
+            try:
+                return entry.get("host", "localhost"), int(entry.get("ssh_port", 2222))
+            except (TypeError, ValueError):
+                pass
         return "localhost", 2222
 
     def delete(self, name: str, ignore_missing: bool = False) -> None:
@@ -421,6 +479,29 @@ class LocalServer:
             )
         resp = json.loads(r.stdout)
         return resp.get("images") or []
+
+    def list_tunnels(self) -> dict:
+        """Return active tunnels keyed by shed name.
+
+        `shed --json tunnels list` emits a bare JSON object mapping shed
+        name -> tunnel entry (see `cmd/shed/tunnels.go:runTunnelsList`).
+        Raises on a failed call so a misconfigured client surfaces loudly;
+        callers assert on the entry's fields (e.g. `pid`). Note: tunnel
+        state is client-side (~/.shed/tunnel-state.json) and not actually
+        per-server, but we key off the same CLI the suite uses everywhere.
+        """
+        r = subprocess.run(
+            ["shed", "--json", "-s", self.name, "tunnels", "list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            raise AssertionError(
+                f"shed tunnels list failed (exit {r.returncode}) on {self.name}: "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+        return json.loads(r.stdout or "{}")
 
     # ------------------------------------------------------------------
     # Log handling (overridden in RemoteServer)

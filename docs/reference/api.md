@@ -2,10 +2,57 @@
 
 The `shed-server` exposes a REST API for managing sheds.
 
-**Base URL:** `http://{host}:8080/api`
+**Base URL:** `http://{host}:8080/api` (or `https://{host}:8443/api` with TLS)
 
-!!! warning "No Authentication"
-    The API has no built-in authentication. Security relies on network-level access control (e.g., Tailscale, firewall rules). Only expose the API on trusted networks.
+!!! note "Authentication"
+    In `auth.mode: open` (the default) the API has no authentication — security
+    relies on a trusted network (Tailscale, firewall rules). In `auth.mode:
+    secure` every request needs an `Authorization: Bearer <token>` header of the
+    required scope, except the bootstrap endpoints `GET /api/info` and
+    `GET /api/ssh-host-key`. The credential bus (`/api/plugins/*`) requires the
+    `credentials` scope; the Connect tunnel
+    (`/api/sheds/{name}/connect/{port}`) and the egress audit stream
+    (`/api/egress/stream`) accept **either** `control` or `credentials`;
+    everything else needs `control`. Tokens are **not** issued over HTTP —
+    they are minted over the SSH `_bootstrap` channel (see
+    [Authentication](#authentication)). See [Security](security.md) for the full
+    model and pinned TLS.
+
+## Authentication
+
+In `secure` mode the HTTP API is token-gated, but tokens are **not** issued over
+HTTP. A client mints one over a reserved **`_bootstrap` SSH channel**:
+
+1. Connect to the SSH port as user `_bootstrap` over the pinned host key.
+2. The server re-verifies the connecting key against the SSH allowlist (the
+   bootstrap channel requires `auth.ssh.mode: enforce`) and mints a scoped,
+   short-TTL token.
+3. The server returns a JSON bundle and closes the channel:
+
+   ```json
+   {
+     "http_port": 8080,
+     "https_port": 8443,
+     "tls_cert_fingerprint": "sha256:…",
+     "token": "shed_control_…",
+     "scope": "control",
+     "token_id": "…",
+     "expires_at": "2026-06-15T00:00:00Z"
+   }
+   ```
+
+`shed server add` performs this exchange automatically; the host-agent mints its
+own `credentials` token the same way. There is no `shed-server token new` and no
+static token list.
+
+**Token properties.** Tokens are opaque (`shed_<scope>_<random>`) and
+server-tracked: the server keeps only a SHA-256 hash, plus the non-secret
+`token_id`, the subject key fingerprint, the scope (`control` or `credentials`),
+and an expiry (`auth.token_ttl`, default 24h). A request with an expired or
+unknown token gets `401`; clients refresh transparently near expiry and retry
+once on a `401`. Removing a key from the SSH allowlist purges every token minted
+for it on the next authoritative refresh. See
+[Security › HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh).
 
 ## Endpoints
 
@@ -55,11 +102,14 @@ Returns server metadata and capabilities.
   "version": "1.0.0",
   "ssh_port": 2222,
   "http_port": 8080,
-  "backend": "vz"
+  "backend": "vz",
+  "auth_mode": "secure"
 }
 ```
 
 The `backend` field reflects the resolved backend for this server (`vz` or `firecracker`). When the server is configured with `default_backend: detect`, this field shows the auto-detected value.
+
+`auth_mode` is `open` or `secure`. This endpoint is reachable without a token (it is bootstrap-exempt) so `shed server add` can read the mode and ports before the client holds one — in `secure` mode it then mints a token over SSH.
 
 ### GET /api/ssh-host-key
 
@@ -876,7 +926,7 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 | 502 | `CONNECT_FAILED` | Could not connect to the port (service not running) |
 | 503 | `SHED_NOT_RUNNING` | Shed is not running |
 
-**Security:** The Connect API has the same access control as other API endpoints — network-level only (Tailscale, firewall). It connects to the VM's loopback interface and does not support arbitrary destinations.
+**Security:** In `open` mode the Connect API relies on network-level trust (Tailscale, firewall) like the rest of the API; in `secure` mode it requires a bearer token of the `control` **or** `credentials` scope over pinned TLS. It connects to the VM's loopback interface and does not support arbitrary destinations.
 
 **Consumers:**
 
@@ -915,9 +965,21 @@ Subscribes to a namespace via SSE. One listener per namespace.
 | `NAMESPACE_RESERVED` | 403 | `system:*` namespaces cannot be registered |
 | `NAMESPACE_ALREADY_REGISTERED` | 409 | Namespace already has a listener |
 
+Only one listener per namespace is allowed, so the `409` is **terminal** — a
+client treats it as "another agent already owns this namespace" and stops
+retrying rather than hot-looping. When HTTP auth is enforced, un-acked requests
+pending for a namespace are **retained across a disconnect and re-delivered**
+when a listener re-subscribes, so a host-agent that reconnects across a blip
+doesn't strand an in-flight credential request; stale pending is swept after a
+retention TTL. (In `open` mode there is no ownership tracking and no re-delivery.)
+
 ### POST /api/plugins/listeners/{namespace}/respond
 
-Sends a response back to a shed. The envelope must include `shed.name`.
+Sends a response back to a shed. The envelope must include `shed.name`. A
+response is honored only if it matches an outstanding pending request for the
+current listener — forged responses (an unknown `requestID`) and replays (an
+already-consumed one) are dropped. See
+[Security › Credential bus](security.md#credential-bus).
 
 **Errors:**
 

@@ -129,6 +129,13 @@ func (vm *VM) Start(ctx context.Context) error {
 		vm.meta.IPAddress, vm.netMgr.Gateway(), netmask, vm.meta.Name,
 	)
 
+	// Pass the resolved guest MTU so network-setup lowers eth0 to match a
+	// reduced host egress path (e.g. a VPN/overlay on the FC host). Omitted
+	// entirely when detection finds no reduction and no override is set.
+	if mtu, ok := vmutil.ResolveGuestMTU(vm.cfg.GuestMTU); ok {
+		kernelArgs += fmt.Sprintf(" shed.mtu=%d", mtu)
+	}
+
 	drives := []models.Drive{
 		// Upper (writable). The initramfs runs mkfs.ext4 on first
 		// boot when no FS signature is present.
@@ -280,6 +287,42 @@ func (vm *VM) Stop(ctx context.Context) error {
 		return shutdownErr
 	}
 	return waitErr
+}
+
+// Kill terminates the VM immediately with SIGKILL, skipping BOTH graceful
+// sub-paths that Stop uses (the firecracker `machine.Shutdown` when a machine
+// handle is live, and the `stopByPID` SIGTERM-then-wait when it isn't — the
+// server-restart case). This is the destroy/delete path: the writable upper is
+// discarded, so a clean guest shutdown is pointless and the ~stop_timeout wait
+// is pure latency. It mirrors Stop's proven force-kill fallback (SIGKILL +
+// waitForProcessExit + socket cleanup), so it leaves no more behind than a
+// graceful stop whose guest ignored the shutdown.
+func (vm *VM) Kill(_ context.Context) error {
+	defer vm.cleanupSockets()
+
+	// SIGKILL by PID when we have a usable one — covers both the in-process case
+	// and the server-restart case (no live machine handle).
+	if vm.meta.PID > 0 && isFirecrackerProcess(vm.meta.PID) {
+		if err := syscall.Kill(vm.meta.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("failed to SIGKILL VM %s (pid %d): %w", vm.meta.Name, vm.meta.PID, err)
+		}
+		if !waitForProcessExit(vm.meta.PID, 2*time.Second) {
+			log.Printf("Warning: VM %s PID %d did not exit within timeout after SIGKILL", vm.meta.Name, vm.meta.PID)
+		}
+		return nil
+	}
+
+	// No usable PID. machine.PID() can fail at Start (logged, non-fatal),
+	// leaving meta.PID unset even though the VMM is live — graceful Stop would
+	// still drive it via the SDK handle, so Kill must too, or a delete could
+	// orphan a running firecracker while removing its metadata/upper. StopVMM
+	// signals the firecracker process and waits for cleanup.
+	if vm.machine != nil {
+		if err := vm.machine.StopVMM(); err != nil {
+			return fmt.Errorf("failed to StopVMM %s: %w", vm.meta.Name, err)
+		}
+	}
+	return nil
 }
 
 // cleanupSockets removes the API and vsock socket files for this VM.

@@ -10,6 +10,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/plugin"
 )
 
@@ -32,6 +33,12 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, _ 
 func (c *Client) Close() error {
 	return nil
 }
+
+// SetEgressManager is a no-op for the stub client.
+func (c *Client) SetEgressManager(_ *egress.Manager) {}
+
+// SetEgressUserStore is a no-op for the stub client.
+func (c *Client) SetEgressUserStore(_ *config.UserProfileStore) {}
 
 // FirecrackerBackend is a stub for non-linux builds.
 type FirecrackerBackend struct{}
@@ -67,7 +74,7 @@ func (b *FirecrackerBackend) ListSheds(ctx context.Context) ([]config.Shed, erro
 }
 
 // DeleteShed returns an error on non-linux platforms.
-func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
+func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string) error {
 	return errNonLinux()
 }
 

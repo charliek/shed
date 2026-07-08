@@ -32,15 +32,45 @@ shed server add <host> [flags]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--name` | `-n` | Derived from host | Friendly name for server |
-| `--port` | `-p` | `8080` | HTTP API port |
+| `--port` | `-p` | `8080` | HTTP API port (bootstrap; ignored when `--https-port` is set) |
+| `--https-port` | | | HTTPS port; when set, bootstrap over TLS and pin the server's self-signed cert |
+| `--secure` | | `false` | Bootstrap over TLS on the default secure port (8443) without probing plain HTTP first |
+| `--fingerprint` | | | Expected SSH host-key fingerprint (`SHA256:...`); verified out-of-band and fails on mismatch |
+| `--tls-fingerprint` | | | Expected TLS cert fingerprint (`sha256:...`); verified out-of-band and fails on mismatch |
+| `--trust-on-first-use` | | `false` | Trust the server's SSH host key (and TLS cert) without prompting |
 
 The SSH port is automatically discovered from the server's `/api/info` endpoint.
+
+The command pins the server's SSH host key (in `~/.shed/known_hosts`). It prints the SHA256 fingerprint and, on an interactive terminal, asks you to confirm it before trusting — closing the add-time MITM window. Supply `--fingerprint SHA256:...` (read from the server's startup log) to verify out-of-band, or `--trust-on-first-use` to accept without a prompt. When stdin is not a terminal (scripts/CI), the key is trusted on first use unless `--fingerprint` is given.
+
+With `--https-port`, the command also pins the server's TLS certificate (over a connection it verifies before trusting), shows its fingerprint, and writes `api_url` + `tls_cert_fingerprint` into the server entry so the control plane runs over TLS. See [Security](security.md#native-pinned-tls).
+
+If you omit `--https-port`, `server add` first tries plain HTTP and, when that is refused — a TLS-only `auth.mode: secure` server serves no plain-HTTP listener — automatically retries the pinned-TLS bootstrap on the default secure port (`8443`). Pass `--secure` to skip the plain-HTTP probe and go straight to TLS, or `--https-port` for a non-default TLS port.
+
+When the server runs in `auth.mode: secure`, `server add` also **mints a control token automatically** — there is no `shed-server token new` and no token to paste. After pinning the host key it reads `GET /api/info` to detect secure mode, then connects over the reserved `_bootstrap` SSH channel (the same pinned key); the server re-verifies your key against its allowlist and returns a scoped, short-TTL token, which the CLI writes as `control_token` + `control_token_expires_at` in the server entry. The token is never printed. Your SSH key must therefore be on the server's allowlist (`auth.ssh.github_users` / `authorized_keys`). From then on the CLI refreshes the token transparently — near expiry and on a `401` — so you never run a token command. See [HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh).
 
 **Example:**
 
 ```bash
 shed server add mini-desktop.tailnet.ts.net --name mini
+shed server add vps.example.com --name vps --fingerprint SHA256:HtYK...j4Y
+shed server add vps.example.com --https-port 8443 --name vps   # secure: pin TLS + mint a control token
+shed server add secure.example.com --secure --name sec         # secure on the default TLS port (8443)
+shed server add secure.example.com --name sec                  # same: plain HTTP refused → auto-retry TLS:8443
 ```
+
+### shed server update
+
+Rotates the pinned TLS certificate fingerprint for a server (after the server
+regenerates its cert).
+
+```bash
+shed server update <name> --tls-fingerprint sha256:<new>   # pin a new value out-of-band
+shed server update <name> --refetch                        # fetch the cert and re-pin
+```
+
+Rotating an existing pin in a non-interactive session requires
+`--trust-on-first-use`.
 
 ### shed server list
 
@@ -53,10 +83,12 @@ shed server list
 **Output:**
 
 ```
-NAME            HOST                              HTTP    SSH     STATUS     DEFAULT
-mini-desktop    mini-desktop.tailnet.ts.net       8080    2222    online     *
-cloud-vps       vps.tailnet.ts.net                8080    2222    offline
+NAME            ENDPOINT                                 SSH                               SECURITY  STATUS   DEFAULT
+mini-desktop    http://mini-desktop.tailnet.ts.net:8080  mini-desktop.tailnet.ts.net:2222  open      online   *
+cloud-vps       https://vps.tailnet.ts.net:8443          vps.tailnet.ts.net:2222           secure    offline
 ```
+
+The `ENDPOINT` is the control-plane URL the CLI actually uses (`https://…` for a pinned-TLS secure server, `http://…` otherwise). `SECURITY` is `secure` (pinned TLS), `open` (plain HTTP), or `unpinned` (an `https` endpoint with no pinned cert — misconfigured). Add `--json` for the full record, including `https_port`, `tls_pinned`, and the pinned fingerprint.
 
 ### shed server remove
 
@@ -95,6 +127,7 @@ shed create <name> [flags]
 | `--upper-size` | | Server default (`5G`) | Logical size of the per-shed writable overlay upper layer (e.g. `1G`, `5G`, `10G`, `100G`). Validated range: 1–100 GiB. The overlay grows copy-on-write, so this is the maximum, not the on-disk physical bytes. |
 | `--local-dir` | | None | Mount a local host directory into the guest at `~/<basename>`. The login lands there. Mutually exclusive with `--repo`. |
 | `--add-dir` | | None | Mount an additional local host directory at `~/<basename>` as a reference sibling. Repeatable. Requires `--local-dir`. |
+| `--egress` | | Server default | Egress-control profiles to apply (comma-separated, e.g. `base,github`; `off` to disable). Requires egress enabled on the server. See [Egress Control](egress.md). |
 | `--no-provision` | | `false` | Skip provisioning hooks |
 | `--sync-profile` | | `default` | Profile to sync after creation |
 | `--no-sync` | | `false` | Skip syncing default profile |
@@ -177,7 +210,12 @@ shed stop <name>
 
 ### shed delete
 
-Deletes a shed.
+Deletes a shed. This is a **destroy** operation (like `docker rm -f`): a running
+shed is terminated immediately (SIGKILL — the guest `hooks.shutdown` is **not**
+run) and its writable volume is always discarded. Use [`shed stop`](#shed-stop)
+for a graceful shutdown that keeps the shed restartable. Directories mounted with
+`--local-dir`/`--add-dir` are host data and are preserved (their unsynced guest
+writes are flushed before the shed is killed).
 
 ```bash
 shed delete <name> [flags]
@@ -185,10 +223,57 @@ shed delete <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--keep-volume` | | `false` | Keep the data volume |
 | `--force` | `-f` | `false` | Skip confirmation |
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
+
+## Egress Control
+
+Inspect and control a shed's network egress (opt-in; requires egress enabled on
+the server). See [Egress Control](egress.md) for the full model and the honest
+security posture.
+
+### shed egress show
+
+Shows a shed's active egress profiles, listener port, resolved rules, and recent
+allow/deny decisions.
+
+```bash
+shed egress show <name> [--json]
+```
+
+### shed egress set
+
+Sets a shed's egress profiles. On a running shed the change applies live (the
+policy is re-pushed and the guest env re-injected); on a stopped shed it
+persists and applies on next start. An empty selection or `off` disables egress.
+
+```bash
+shed egress set <name> --profile base,github
+shed egress set <name> --profile off
+```
+
+### shed egress off
+
+Turns egress control off for a shed.
+
+```bash
+shed egress off <name>
+```
+
+### shed egress profile
+
+Manage runtime **user profiles** — named rule sets authored as whole documents,
+without a server-config edit. They compose with config profiles by name. See
+[Egress Control](egress.md#user-managed-profiles).
+
+```bash
+shed egress profile ls [--json]              # list (config + user, with source)
+shed egress profile show <name> [--json]
+shed egress profile set <name> --file <path> # create/replace from a YAML document
+shed egress profile edit <name>              # edit in $EDITOR
+shed egress profile rm <name>
+```
 
 ## Snapshots
 
@@ -388,7 +473,7 @@ shed image history shed-vz-full
 LAYER  DIGEST                                                                   SIZE      CREATED         CREATED BY
 9      sha256:6214c050b2d46d711a9878da53f2ae1f1c2cc2644d1d30f9116d346c59d06ab2   493.4 MB  2 hours ago     RUN runuser -l shed -c '… mise use -g node@lts; uv python install 3.13; …'
 8      sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1     32 B    2 hours ago     ENV CLAUDE_CONFIG_DIR=/home/shed/.claude
-7      sha256:5c61939d1edf11daa570fcfe8ea24b56a60a89403f5ce91c4354cd400cad2591   6.92 MB   2 hours ago     RUN --mount=type=bind,from=shed-extensions … (extensions binaries)
+7      sha256:5c61939d1edf11daa570fcfe8ea24b56a60a89403f5ce91c4354cd400cad2591   6.92 MB   2 hours ago     RUN --mount=type=bind,target=/ctx … (install staged extension binaries)
 …
 2      sha256:a3e89a578b079f684c28e09084737b3ff22914ab234c60ae0064c6f4d218be54   1.18 GB   2 hours ago     RUN apt-get install systemd docker-ce …
 1      sha256:818154cda96df8bbb276b4f4339124da55756620a1037af15570bc95312850fa     28 MB   2 hours ago     ubuntu:24.04 base
@@ -710,6 +795,21 @@ This is the same model Docker, devcontainers, Codespaces, and Coder follow on th
 
 **Raw SSH gets the full shell.** If you connect with raw `ssh shed-name 'cmd | pipe'` (the path Zed Remote-SSH, VS Code Remote-SSH, JetBrains Gateway, and `rsync` take), the SSH server runs your command string through `bash -lc <raw>` — so the pipe runs as a shell pipeline on the shed, exactly like a normal dev VM. The `shed exec` CLI is the path that preserves argv literally; raw SSH is the path that runs a shell.
 
+**stdout, stderr, and PTYs.** On a **non-PTY** channel, the command's stdout and stderr are delivered on **separate** SSH streams (matching OpenSSH), and stdout is an 8-bit-clean binary pipe — so a binary stdout protocol (Zed Remote-SSH's length-prefixed pipe, the SFTP subsystem, `rsync`, `git`) is never corrupted by a PTY's line discipline or by diagnostics written to stderr. On a **PTY** channel, stdout and stderr are **merged** into the single terminal stream and the line discipline rewrites bytes (e.g. `\n`→`\r\n`), exactly as a real terminal does.
+
+`shed exec` picks the channel automatically: it allocates a PTY only when **both** your stdin and stdout are terminals (so interactive tools like `vim`/`top` work), and uses a clean non-PTY channel whenever output is **captured or piped** (`> file`, `| tool`) or stdin isn't a terminal. So `shed exec box -- cat model.bin > model.bin` and `shed exec box -- pg_dump … > dump.sql` are byte-exact, while `shed exec box -- vim` still gets a terminal. (An interactive login and `shed console` always get a PTY.) One consequence: `shed exec box -- ls`/`git log` piped or redirected won't carry color, just like the tool run locally with a non-terminal stdout. To override the automatic choice, connect with raw SSH — `ssh -tt shed-name 'cmd'` forces a PTY, `ssh -T shed-name 'cmd'` forces a clean non-PTY stream. Raw SSH is a workaround rather than an exact substitute: it runs a shell instead of preserving argv literally and skips `shed exec`'s auto-start, `--session`, and quoting (see "Raw SSH gets the full shell" above).
+
+**Disconnect behavior.** When the connection drops (you Ctrl-C the client, the network drops, your laptop sleeps), the command is terminated — the agent sends `SIGHUP` to the command's process group, matching standard SSH/terminal "connection hung up" semantics. To keep a long task running across disconnects, detach it from the session with **`tmux`** (baked into the shed image) or **`nohup`**:
+
+```bash
+# Survives a disconnect — runs in a detached tmux session
+shed exec codelens -- tmux new-session -d -s build './build.sh'
+# …or with nohup
+shed exec codelens -- bash -c 'nohup ./build.sh >build.log 2>&1 &'
+```
+
+These detach the work into its own session/process group, so the `SIGHUP` to the foreground command never reaches it. Reattach later with `shed attach codelens --session build` (tmux) or just re-read the log.
+
 **Examples:**
 
 ```bash
@@ -751,7 +851,7 @@ shed attach <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--session` | `-S` | `default` | Session name |
+| `--session` | `-S` | `default` | Session name (plain mode) |
 | `--new` | | `false` | Force create new session |
 
 **Examples:**
@@ -763,6 +863,47 @@ shed attach codelens --new --session experiment
 ```
 
 Detach with `Ctrl-B D`.
+
+#### Remote Control sessions (autonomous agents)
+
+With `--kind` (or `--plan`/`--prompt`), `attach` instead creates a **Remote Control**
+`rc-<slug>` session via the in-shed `shed-ext-rc` binary: it starts Claude connected to
+`claude.ai/code`, ships an optional plan, and types a single-line kickoff prompt. With
+`-d/--detach` it prints the session URL and returns (the laptop can close); otherwise it
+attaches. Use `--slug` to connect to an existing `rc-<slug>` session.
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--kind` | | `claude-rc` | RC kind: `claude-rc`, `claude-broker`, `shell` (triggers RC create) |
+| `--plan` | | | Ship a plan file into the shed and execute it (`-` = stdin) |
+| `--plan-edit` | | `false` | Compose the plan in `$EDITOR` |
+| `--prompt` | `-p` | | Single-line kickoff prompt |
+| `--prompt-file` | | | Read the kickoff prompt from a file (`-` = stdin) |
+| `--edit` | | `false` | Compose the kickoff prompt in `$EDITOR` |
+| `--permission-mode` | | `auto` | `auto`, `acceptEdits`, `plan`, `dontAsk`, `default`, `bypassPermissions` |
+| `--skip` | | `false` | Shorthand for `--permission-mode bypassPermissions` (full bypass) |
+| `--name` | | `<shed>/<slug>` | Session display name |
+| `--slug` | | generated | Connect to `rc-<slug>`, or set the slug for a new session |
+| `--detach` | `-d` | `false` | Create the RC session, print its URL, and return without attaching |
+
+```bash
+shed attach myproj --kind claude-rc -d            # start an agent, print the URL, return
+shed attach myproj --plan plan.md -d              # ship a plan and run it autonomously (auto)
+shed attach myproj --plan plan.md --skip -d       # ...with full permission bypass
+shed attach myproj --slug abc234                  # attach to an existing rc-abc234 session
+```
+
+A **plan** (`--plan`) is shipped to Claude's plans directory in the shed
+(`~/.claude/plans/plan-<slug>.md`, outside the workspace so it never touches the repo)
+and the kickoff prompt references it. You can pass a **prompt** and a **plan** together:
+with no prompt, a generic "read the plan at `<path>` and implement it" kickoff is the
+default; with your own `-p`/`--prompt-file`/`--edit`, your prompt leads and the plan's
+location is appended so the agent still finds it. The kickoff **prompt** may be
+multi-line (`--prompt-file`/`--edit`; delivered as one input via a bracketed paste), but
+large/multi-step work belongs in the **plan** file. Claude must be logged in inside the shed
+(see the `shed-plan` skill). Defaults to `auto`; `--skip` is safe because a shed is an
+isolated VM. For the end-to-end "author a plan and run it on a fresh shed" workflow, use
+the `shed-plan` skill.
 
 ## Session Management
 
@@ -784,6 +925,7 @@ shed sessions [shed-name] [flags]
 shed sessions                  # All sessions on default server
 shed sessions myproj           # Sessions in specific shed
 shed sessions --all            # Across all servers
+shed sessions --json           # Structured output (includes the rc block)
 ```
 
 **Output:**
@@ -792,6 +934,16 @@ shed sessions --all            # Across all servers
 SHED        SESSION      STATUS      CREATED      WINDOWS
 codelens    default      attached    2h ago       1
 codelens    debug        detached    30m ago      2
+```
+
+Remote Control (`rc-*`) sessions are enriched with metadata read from the in-shed
+`shed-ext-rc` binary, adding `KIND` and `RC-STATE` columns (and an `rc` object in
+`--json`). Enrichment degrades silently to the plain tmux row if a shed is unreachable
+or lacks the binary.
+
+```text
+SHED     SESSION    STATUS    CREATED   WINDOWS  KIND       RC-STATE
+myproj   rc-abc234  detached  5m ago    1        claude-rc  ready
 ```
 
 ### shed sessions kill
@@ -816,8 +968,13 @@ shed tunnels start <shed> [flags]
 |------|-------|---------|-------------|
 | `--profile` | `-p` | None | Use tunnel profile |
 | `--tunnel` | `-t` | None | Port mapping (local:remote) |
-| `--background` | `-d` | `false` | Run in background |
+| `--background` | `-d` | `false` | Detach and run as a background daemon |
 | `--replace` | | `false` | Replace existing tunnel without prompting |
+
+Without `-d`, runs in the foreground (`Ctrl+C` to stop). With `-d`, detaches
+into a daemon that outlives the terminal and returns your shell once the tunnels
+are listening; manage it with `shed tunnels list` / `shed tunnels stop`. See
+[Tunnels › Background Mode](tunnels.md#background-mode) for details.
 
 **Examples:**
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -225,11 +226,13 @@ func TestMapBackendError_SentinelErrors(t *testing.T) {
 	}
 }
 
-// createShedFakeBackend stubs only what handleCreateShedSSE touches.
-// CreateShed runs the configured fn so tests can emit progress/warning events
-// before returning a result.
+// createShedFakeBackend stubs only what the create/delete SSE handlers touch.
+// CreateShed / DeleteShed run the configured fn so tests can emit
+// progress/warning events before returning.
 type createShedFakeBackend struct {
 	createFn func(ctx context.Context, req config.CreateShedRequest) (*config.Shed, error)
+	deleteFn func(ctx context.Context, name string) error
+	pullFn   func(ctx context.Context, dockerRef, tag, platform string, withLayers bool) (string, error)
 }
 
 func (f *createShedFakeBackend) Type() backend.Type { return backend.TypeVZ }
@@ -243,7 +246,10 @@ func (f *createShedFakeBackend) GetShed(_ context.Context, _ string) (*config.Sh
 func (f *createShedFakeBackend) ListSheds(_ context.Context) ([]config.Shed, error) {
 	panic("unexpected")
 }
-func (f *createShedFakeBackend) DeleteShed(_ context.Context, _ string, _ bool) error {
+func (f *createShedFakeBackend) DeleteShed(ctx context.Context, name string) error {
+	if f.deleteFn != nil {
+		return f.deleteFn(ctx, name)
+	}
 	panic("unexpected")
 }
 func (f *createShedFakeBackend) StartShed(_ context.Context, _ string) (*config.Shed, error) {
@@ -276,7 +282,10 @@ func (f *createShedFakeBackend) InspectImage(_ context.Context, _ string) (confi
 func (f *createShedFakeBackend) TagImage(_ context.Context, _, _ string) error {
 	panic("unexpected")
 }
-func (f *createShedFakeBackend) PullImage(_ context.Context, _, _, _ string, _ bool) (string, error) {
+func (f *createShedFakeBackend) PullImage(ctx context.Context, dockerRef, tag, platform string, withLayers bool) (string, error) {
+	if f.pullFn != nil {
+		return f.pullFn(ctx, dockerRef, tag, platform, withLayers)
+	}
 	panic("unexpected")
 }
 func (f *createShedFakeBackend) PushImage(_ context.Context, _, _ string) error {
@@ -444,5 +453,257 @@ func TestCreateShed_SSE_PhaseOnlyEventsNotStreamed(t *testing.T) {
 	if progressEvents != 1 {
 		t.Errorf("got %d progress events, want exactly 1 (the Status call); "+
 			"phase-only events must not be streamed", progressEvents)
+	}
+}
+
+// TestDeleteShed_SSE_StreamsProgressAndComplete verifies that a delete requested
+// with Accept: text/event-stream streams the backend's Status phases as progress
+// events and finishes with a terminal `complete` event (#232).
+func TestDeleteShed_SSE_StreamsProgressAndComplete(t *testing.T) {
+	be := &createShedFakeBackend{
+		deleteFn: func(ctx context.Context, _ string) error {
+			backend.Status(ctx, "Terminating virtual machine...")
+			backend.Status(ctx, "Removing volume...")
+			return nil
+		},
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodDelete, "/api/sheds/myshed", nil)
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var progress, complete int
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		switch e.Event {
+		case "progress":
+			progress++
+		case "complete":
+			complete++
+		}
+	}
+	if progress < 1 {
+		t.Errorf("expected >=1 progress event, got %d:\n%s", progress, w.Body.String())
+	}
+	if complete != 1 {
+		t.Errorf("expected exactly 1 complete event, got %d:\n%s", complete, w.Body.String())
+	}
+}
+
+// TestDeleteShed_PlainReturns204 verifies that a delete WITHOUT the SSE Accept
+// header keeps the plain 204 No Content behavior (back-compat for non-streaming
+// clients and old CLIs).
+func TestDeleteShed_PlainReturns204(t *testing.T) {
+	be := &createShedFakeBackend{
+		deleteFn: func(context.Context, string) error { return nil },
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodDelete, "/api/sheds/myshed", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want 204 (body: %s)", w.Code, w.Body.String())
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("expected empty 204 body, got: %s", w.Body.String())
+	}
+}
+
+// TestDeleteShed_SSE_SurfacesError verifies a backend delete failure is surfaced
+// as a terminal SSE `error` event (the stream still opens with 200 first).
+func TestDeleteShed_SSE_SurfacesError(t *testing.T) {
+	be := &createShedFakeBackend{
+		deleteFn: func(context.Context, string) error { return config.ErrShedNotFoundSentinel },
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	r := httptest.NewRequest(http.MethodDelete, "/api/sheds/ghost", nil)
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (SSE opens before the error), body: %s", w.Code, w.Body.String())
+	}
+	var sawError bool
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		if e.Event == "error" {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Errorf("no error event in stream:\n%s", w.Body.String())
+	}
+}
+
+// servePullSSE issues an SSE image-pull request against a fake backend and
+// returns the recorder. query (e.g. "?progress=blob") is appended to the URL.
+func servePullSSE(t *testing.T, be backend.Backend, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+	body, _ := json.Marshal(config.ImagePullRequest{DockerRef: "ghcr.io/x/y:v1", Tag: "testtag"})
+	r := httptest.NewRequest(http.MethodPost, "/api/images/pull"+query, bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+	return w
+}
+
+// TestPullImage_SSE_StreamsProgressAndComplete verifies pull streams through the
+// shared streamSSE helper with no timing tee/finalizer (nil track, nil onFinish).
+// The backend.Phase event is a phase-only boundary: it exercises the nil-track
+// tee path (TeeProgress(nil, sseFn) must forward cleanly, not panic) and, having
+// no message, must be dropped from the wire by the sink.
+func TestPullImage_SSE_StreamsProgressAndComplete(t *testing.T) {
+	be := &createShedFakeBackend{
+		pullFn: func(ctx context.Context, _, _, _ string, _ bool) (string, error) {
+			backend.Phase(ctx, "image")             // phase-only: exercises the nil-track tee path; must NOT reach the wire
+			backend.Status(ctx, "Pulling image...") // user-visible
+			return "sha256:deadbeef", nil
+		},
+	}
+	w := servePullSSE(t, be, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var progress int
+	var completeData string
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		switch e.Event {
+		case "progress":
+			progress++
+		case "complete":
+			completeData = e.Data
+		}
+	}
+	// Exactly one progress event — the Status. The phase-only backend.Phase event
+	// must be dropped (proves the nil-track path keeps the sink's Message=="" drop).
+	if progress != 1 {
+		t.Errorf("got %d progress events, want exactly 1 (the Status; phase-only dropped):\n%s", progress, w.Body.String())
+	}
+	var resp config.ImagePullResponse
+	if err := json.Unmarshal([]byte(completeData), &resp); err != nil {
+		t.Fatalf("complete payload is not an ImagePullResponse: %v (data: %q)", err, completeData)
+	}
+	if resp.Tag != "testtag" || resp.Digest != "sha256:deadbeef" {
+		t.Errorf("complete = %+v, want {Tag:testtag Digest:sha256:deadbeef}", resp)
+	}
+}
+
+// TestPullImage_SSE_SurfacesError verifies a pull failure is surfaced as a
+// terminal SSE error event carrying the mapped code.
+func TestPullImage_SSE_SurfacesError(t *testing.T) {
+	be := &createShedFakeBackend{
+		pullFn: func(context.Context, string, string, string, bool) (string, error) {
+			return "", config.ErrImageNotFoundSentinel
+		},
+	}
+	w := servePullSSE(t, be, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (SSE opens before the error), body: %s", w.Code, w.Body.String())
+	}
+	var errData string
+	for _, e := range parseSSEEvents(t, w.Body.String()) {
+		if e.Event == "error" {
+			errData = e.Data
+		}
+	}
+	if errData == "" {
+		t.Fatalf("no error event in stream:\n%s", w.Body.String())
+	}
+	var apiErr config.APIError
+	if err := json.Unmarshal([]byte(errData), &apiErr); err != nil {
+		t.Fatalf("error payload is not an APIError: %v (data: %q)", err, errData)
+	}
+	if apiErr.Error.Code != config.ErrImageNotFound {
+		t.Errorf("error code = %q, want %q", apiErr.Error.Code, config.ErrImageNotFound)
+	}
+}
+
+// TestPullImage_SSE_BlobGating verifies pull still routes structured per-blob
+// byte events through newProgressSink after the refactor: gated out without
+// ?progress=blob, present with it.
+func TestPullImage_SSE_BlobGating(t *testing.T) {
+	newBE := func() *createShedFakeBackend {
+		return &createShedFakeBackend{
+			pullFn: func(ctx context.Context, _, _, _ string, _ bool) (string, error) {
+				backend.BlobProgress(ctx, backend.ProgressEvent{ID: "sha256:layer", Message: "layer", Current: 1, Total: 2})
+				return "sha256:ok", nil
+			},
+		}
+	}
+	tests := []struct {
+		name     string
+		query    string
+		wantBlob bool
+	}{
+		{"gated out by default", "", false},
+		{"included with ?progress=blob", "?progress=blob", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := servePullSSE(t, newBE(), tt.query).Body.String()
+			if got := strings.Contains(body, `"kind":"blob"`); got != tt.wantBlob {
+				t.Errorf("blob event present=%v, want %v:\n%s", got, tt.wantBlob, body)
+			}
+		})
+	}
+}
+
+// TestSSE_TimingLog_OnlyWithTimer guards the refactor's core branch: streamSSE
+// runs onFinish (which logs the `timing:` line) only when the caller passes one
+// — create/delete do, the nil-onFinish pull path does not.
+func TestSSE_TimingLog_OnlyWithTimer(t *testing.T) {
+	var buf bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) }()
+
+	// create SSE passes logTimingFinish(timer), so it logs `timing: create …`.
+	serveCreateSSE := func(*testing.T) {
+		be := &createShedFakeBackend{
+			createFn: func(_ context.Context, req config.CreateShedRequest) (*config.Shed, error) {
+				return &config.Shed{Name: req.Name, Status: config.StatusRunning}, nil
+			},
+		}
+		body, _ := json.Marshal(config.CreateShedRequest{Name: "myshed"})
+		r := httptest.NewRequest(http.MethodPost, "/api/sheds", bytes.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Accept", "text/event-stream")
+		NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil).Router().ServeHTTP(httptest.NewRecorder(), r)
+	}
+	// pull SSE passes a nil onFinish, so it must NOT log a `timing:` line.
+	servePull := func(t *testing.T) {
+		be := &createShedFakeBackend{
+			pullFn: func(context.Context, string, string, string, bool) (string, error) { return "sha256:x", nil },
+		}
+		servePullSSE(t, be, "")
+	}
+
+	tests := []struct {
+		name       string
+		serve      func(*testing.T)
+		needle     string
+		wantTiming bool
+	}{
+		{"create logs timing", serveCreateSSE, "timing: create", true},
+		{"pull logs no timing", servePull, "timing:", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf.Reset()
+			tt.serve(t)
+			if got := strings.Contains(buf.String(), tt.needle); got != tt.wantTiming {
+				t.Errorf("%q present=%v, want %v:\n%s", tt.needle, got, tt.wantTiming, buf.String())
+			}
+		})
 	}
 }

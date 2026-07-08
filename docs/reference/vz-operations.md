@@ -161,6 +161,29 @@ ps aux | grep vfkit
 cat ~/Library/Application\ Support/shed/vz/instances/myproject/metadata.json
 ```
 
+## Time synchronization
+
+VZ guests keep their clock correct two ways:
+
+- **`systemd-timesyncd`** provides standard network time discipline (SNTP).
+- **`shed-agent`** periodically steps the system clock forward to the host-backed RTC. This covers host **sleep/suspend**: while the host sleeps, the paused guest's wall clock (`CLOCK_REALTIME`, derived from a frozen counter) falls behind real time and gets no resume event to correct it. The RTC keeps real time across the pause, so the agent re-syncs from it within ~30 s of a large drift — before `timesyncd`'s next network poll would. Without this, a guest resumed after a long sleep can be hours behind, which breaks AWS SigV4/STS signing, TLS validity windows, and token expiry.
+
+Verify inside a shed:
+
+```bash
+timedatectl                                  # "NTP service: active"
+sudo journalctl -u shed-agent | grep clock-sync
+# clock-sync: started (checking the host RTC every 30s, stepping when drift > 30s)
+# ...and after a host sleep, the correction:
+# clock-sync: stepped clock forward 2h3m0s (system ... -> RTC ...)
+```
+
+On an **older image** built before this shipped (no `systemd-timesyncd`, so `timedatectl` shows `NTP service: n/a`), step the clock from the correct RTC manually, then re-pull a current image:
+
+```bash
+sudo timedatectl set-time "$(cat /sys/class/rtc/rtc0/date) $(cat /sys/class/rtc/rtc0/time)"
+```
+
 ## macOS-Specific Notes
 
 - **Code signing**: The shed-server binary must be signed with the `com.apple.security.virtualization` entitlement.

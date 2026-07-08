@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -8,7 +8,7 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X github.com/charliek/shed/internal/version.Version=$(VERSION) -X github.com/charliek/shed/internal/version.GitCommit=$(GIT_COMMIT) -X github.com/charliek/shed/internal/version.BuildDate=$(BUILD_DATE)"
 
 # Build all binaries
-build: build-cli build-server build-agent build-firstboot
+build: build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc
 
 # Build CLI only
 build-cli:
@@ -18,6 +18,10 @@ build-cli:
 build-server:
 	go build $(LDFLAGS) -o bin/shed-server ./cmd/shed-server
 
+# Build the egress-control proxy (host-side child of shed-server)
+build-egress-proxy:
+	go build $(LDFLAGS) -o bin/shed-egress-proxy ./cmd/shed-egress-proxy
+
 # Build shed-agent only (for Firecracker VMs)
 build-agent:
 	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-agent ./cmd/shed-agent
@@ -25,6 +29,14 @@ build-agent:
 # Build shed-firstboot only (in-VM oneshot for identity regen)
 build-firstboot:
 	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-firstboot ./cmd/shed-firstboot
+
+# Build shed-host-agent only (host-side agent; darwin CGO/Touch ID via build tags)
+build-host-agent:
+	go build $(LDFLAGS) -o bin/shed-host-agent ./cmd/shed-host-agent
+
+# Build shed-machine-rc only (host-side machine rc helper)
+build-machine-rc:
+	go build $(LDFLAGS) -o bin/shed-machine-rc ./cmd/shed-machine-rc
 
 # Run all unit tests (including SDK submodule)
 test:
@@ -304,6 +316,9 @@ FC_DEV_BIN_PATH  ?= /tmp/shed-server-dev
 FC_DEV_CONFIG    ?= /tmp/shed-server-dev.yaml
 FC_DEV_LOG_PATH  ?= /tmp/shed-server-dev.log
 FC_DEV_PID_PATH  ?= /tmp/shed-server-dev.pid
+# The egress proxy must sit next to the running shed-server binary so it
+# resolves as its sibling. The dev server runs from /tmp, so install here.
+FC_DEV_PROXY_PATH ?= /tmp/shed-egress-proxy
 
 # Cross-compile shed-server for the remote host's GOARCH. Detects arch
 # at recipe time via `ssh <host> uname -m`; refuses to silently default
@@ -319,8 +334,9 @@ build-fc-remote-server:
 	   "")  echo "ERROR: could not detect arch on $(FC_REMOTE_HOST); is SSH reachable?"; exit 1 ;; \
 	   *)   echo "ERROR: unsupported remote arch on $(FC_REMOTE_HOST): $$ARCH"; exit 1 ;; \
 	 esac; \
-	 echo "Cross-compiling shed-server for linux/$$GOARCH (remote $(FC_REMOTE_HOST) is $$ARCH)..."; \
-	 GOOS=linux GOARCH=$$GOARCH go build $(LDFLAGS) -o bin/shed-server-fc-remote ./cmd/shed-server
+	 echo "Cross-compiling shed-server + shed-egress-proxy for linux/$$GOARCH (remote $(FC_REMOTE_HOST) is $$ARCH)..."; \
+	 GOOS=linux GOARCH=$$GOARCH go build $(LDFLAGS) -o bin/shed-server-fc-remote ./cmd/shed-server && \
+	 GOOS=linux GOARCH=$$GOARCH go build $(LDFLAGS) -o bin/shed-egress-proxy-fc-remote ./cmd/shed-egress-proxy
 
 # Launch the parallel dev shed-server on the remote via sudo nohup.
 # Refuses to start if a dev server is already running there (PID file
@@ -355,12 +371,15 @@ dev-server-up-fc: build-fc-remote-server
 	@# workstation is single-user).
 	@UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
 	 UPLOAD_CFG=/tmp/shed-server-dev.upload.$$$$.yaml; \
+	 UPLOAD_PROXY=/tmp/shed-egress-proxy-dev.upload.$$$$; \
 	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_BIN && \
+	 scp bin/shed-egress-proxy-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_PROXY && \
 	 scp configs/server.dev-parallel.linux-fc.yaml $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
 	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
 	   sudo install -m 755 $$UPLOAD_BIN $(FC_DEV_BIN_PATH); \
+	   sudo install -m 755 $$UPLOAD_PROXY $(FC_DEV_PROXY_PATH); \
 	   sudo install -m 644 $$UPLOAD_CFG $(FC_DEV_CONFIG); \
-	   rm -f $$UPLOAD_BIN $$UPLOAD_CFG; \
+	   rm -f $$UPLOAD_BIN $$UPLOAD_PROXY $$UPLOAD_CFG; \
 	   sudo install -m 644 /dev/null $(FC_DEV_LOG_PATH); \
 	   sudo bash -c 'SHED_BUILD_TOOLS_REF=\"$(RELEASE_BUILD_TOOLS_REF)\" \
 	     nohup $(FC_DEV_BIN_PATH) serve --config $(FC_DEV_CONFIG) \
@@ -424,7 +443,7 @@ dev-server-down-fc:
 	      sudo -n kill -KILL \$$PID 2>/dev/null; \
 	    fi; \
 	    echo \"Dev FC server (pid \$$PID) stopped on $(FC_REMOTE_HOST).\"; \
-	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
+	    sudo rm -f $(FC_DEV_PID_PATH) $(FC_DEV_BIN_PATH) $(FC_DEV_PROXY_PATH) $(FC_DEV_CONFIG) $(FC_DEV_LOG_PATH); \
 	  fi"
 
 dev-server-status-fc:

@@ -14,6 +14,7 @@ Firecracker microVMs on Linux or Apple Virtualization VMs on macOS Apple Silicon
 - **Multi-server** — manage sheds across home servers and cloud VPS instances.
 - **IDE integration** — native Cursor / VS Code Remote-SSH support.
 - **AI-ready** — pre-configured for Claude Code and OpenCode workflows.
+- **Autonomous agents** — hand a plan to a shed with `shed attach --plan`; Claude executes it unattended while you watch from `claude.ai/code` (laptop can close).
 - **VM backends** — Firecracker microVMs (Linux) or Apple VZ (macOS Apple Silicon).
 
 ## Quick start
@@ -35,7 +36,7 @@ Three binaries:
 
 - **`shed`** — the CLI on your developer machine.
 - **`shed-server`** — the daemon on each host (HTTP API + SSH server) that runs VMs via the VZ (macOS) or Firecracker (Linux) backend.
-- **`shed-host-agent`** — optional host-side credential broker, from [shed-extensions](https://github.com/charliek/shed-extensions); on macOS it pairs with the [shed-desktop](https://github.com/charliek/shed-desktop) approval app.
+- **`shed-host-agent`** — optional host-side credential broker (built in-tree from `cmd/shed-host-agent`); on macOS it pairs with the [shed-desktop](https://github.com/charliek/shed-desktop) approval app.
 
 ```text
 Developer Machine                Remote Server / Local Mac
@@ -59,7 +60,7 @@ pulled registry-direct from `ghcr.io`. See
 - [Images](https://charliek.github.io/shed/reference/images/) · [Storage Model](https://charliek.github.io/shed/reference/storage-model/)
 - [Extensions](https://charliek.github.io/shed/reference/extensions/) — credential brokering
 - [Provisioning](https://charliek.github.io/shed/reference/provisioning/) — `.shed/` install/startup hooks + tutorials
-- Related projects: [shed-extensions](https://charliek.github.io/shed-extensions/) · [shed-desktop](https://charliek.github.io/shed-desktop/)
+- Related projects: [shed-desktop](https://charliek.github.io/shed-desktop/) — the macOS menu-bar approval app
 
 ## Requirements
 
@@ -70,11 +71,15 @@ pulled registry-direct from `ghcr.io`. See
 
 ## Security model
 
-Shed targets single-user setups where every machine is on a private network
-(e.g. Tailscale), the developer controls all of them, and network access implies
-trust. Workloads run as a non-root `shed` user (UID 1000) with passwordless sudo.
-It is **not** built for multi-tenant use, public-internet exposure, or untrusted
-networks.
+Shed is local-development-first: out of the box `bind_address` defaults to
+loopback (`127.0.0.1`), so the server is reachable only on the machine it runs
+on. Facing the network is opt-in, and **secure mode** (pinned TLS + minted
+bearer tokens + an SSH key allowlist) is the preferred posture for anything
+networked — it works locally too. Open mode (plain HTTP, no tokens) stays
+available for a trusted private network (e.g. Tailscale), but exposing it
+off-loopback is explicit. Workloads run as a non-root `shed` user (UID 1000) with
+passwordless sudo. Shed targets single-user setups and is **not** built for
+multi-tenant use.
 
 ## Development
 

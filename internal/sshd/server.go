@@ -17,7 +17,9 @@ import (
 	"github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
 
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
+	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/terminal"
 )
 
@@ -26,19 +28,27 @@ type Server struct {
 	sshServer   *ssh.Server
 	backend     backend.Backend
 	hostKeyPath string
-	port        int
+	listenAddr  string
 	hostKey     gossh.Signer
 	listener    net.Listener
 	termConfig  *terminal.Config
+	allowlist   *KeyAllowlist
+	tokens      *authtoken.Store // shared HTTP token store; nil until SetBootstrap
+	bootstrap   *BootstrapInfo   // static bundle metadata; nil until SetBootstrap
 }
 
-// NewServer creates a new SSH server.
-func NewServer(b backend.Backend, hostKeyPath string, port int, termConfig *terminal.Config) (*Server, error) {
+// NewServer creates a new SSH server. listenAddr is the TCP bind address
+// (e.g. "127.0.0.1:2222" for loopback (the default), "<tailnet-ip>:2222", or
+// ":2222" for all interfaces).
+// allowlist gates public-key auth; pass an "off"-mode allowlist (or one built
+// from nil config) for the legacy accept-all behavior.
+func NewServer(b backend.Backend, hostKeyPath string, listenAddr string, termConfig *terminal.Config, allowlist *KeyAllowlist) (*Server, error) {
 	s := &Server{
 		backend:     b,
 		hostKeyPath: hostKeyPath,
-		port:        port,
+		listenAddr:  listenAddr,
 		termConfig:  termConfig,
+		allowlist:   allowlist,
 	}
 
 	// Load or generate the host key.
@@ -50,9 +60,29 @@ func NewServer(b backend.Backend, hostKeyPath string, port int, termConfig *term
 
 	// Create the SSH server.
 	s.sshServer = &ssh.Server{
-		Addr: fmt.Sprintf(":%d", port),
+		Addr: listenAddr,
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
 			return s.handlePublicKey(ctx, key)
+		},
+		ServerConfigCallback: func(ssh.Context) *gossh.ServerConfig {
+			maxTries := s.effectiveMaxAuthTries()
+			cfg := &gossh.ServerConfig{MaxAuthTries: maxTries}
+			// Best-effort diagnostic from the transport's authoritative per-attempt
+			// log (one closure per connection): warn once when a connection exhausts
+			// the public-key attempt cap — usually a many-key agent (1Password,
+			// Secretive) offering more keys than the cap before its allowlisted key
+			// is reached. Kept here, not in handlePublicKey, so the per-key handler
+			// stays a pure decision and the count comes from gossh, not a shadow.
+			var pubkeyFails int
+			cfg.AuthLogCallback = func(conn gossh.ConnMetadata, method string, err error) {
+				if method != "publickey" || err == nil {
+					return
+				}
+				if pubkeyFails++; pubkeyFails == maxTries {
+					log.Printf("SSH auth: public-key attempt cap (%d) reached for user=%s — the client may be offering more keys than the cap allows, so its allowlisted key may never be tried. Raise auth.ssh.max_auth_tries, or use a per-host IdentityFile + IdentitiesOnly on the client.", maxTries, conn.User())
+				}
+			}
+			return cfg
 		},
 		Handler: func(sess ssh.Session) {
 			s.handleSession(sess)
@@ -150,7 +180,7 @@ func (s *Server) GetHostPublicKey() string {
 
 // Start begins listening for SSH connections.
 func (s *Server) Start() error {
-	addr := fmt.Sprintf(":%d", s.port)
+	addr := s.listenAddr
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
@@ -169,16 +199,51 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.sshServer.Shutdown(ctx)
 }
 
-// handlePublicKey handles public key authentication.
-// For MVP, we accept all keys and just log the fingerprint.
+// defaultMaxAuthTries is the per-connection public-key attempt cap applied when
+// auth.ssh.max_auth_tries is unset. It is deliberately higher than OpenSSH's
+// default of 6 so a developer whose agent holds many keys (1Password, Secretive,
+// hardware) can still have the one allowlisted key tried before the server gives
+// up — which is exactly the path the host-agent bootstrap and `shed server add`
+// take. This is a mild loosening of a DoS cap; public-key auth is not guessable,
+// so the risk is low. Operators can override it via auth.ssh.max_auth_tries.
+const defaultMaxAuthTries = 10
+
+// effectiveMaxAuthTries is the configured per-connection attempt cap, or
+// defaultMaxAuthTries when unset.
+func (s *Server) effectiveMaxAuthTries() int {
+	if s.allowlist != nil {
+		if n := s.allowlist.MaxAuthTries(); n > 0 {
+			return n
+		}
+	}
+	return defaultMaxAuthTries
+}
+
+// handlePublicKey gates public-key auth through the allowlist. With the
+// allowlist off (default), every key is accepted (legacy). In warn mode an
+// unlisted key is logged but accepted; in enforce mode it is rejected. The
+// username (which selects the shed) is unaffected — identity comes from the
+// key, GitHub-style. Applies uniformly to all users, including `_api`.
 func (s *Server) handlePublicKey(ctx ssh.Context, key ssh.PublicKey) bool {
 	fingerprint := gossh.FingerprintSHA256(key)
 	user := ctx.User()
 
-	log.Printf("SSH auth attempt: user=%s fingerprint=%s", user, fingerprint)
+	if s.allowlist == nil || s.allowlist.Mode() == config.SSHAuthOff {
+		log.Printf("SSH auth attempt: user=%s fingerprint=%s (allowlist off)", user, fingerprint)
+		return true
+	}
 
-	// For MVP, accept all keys.
-	// TODO: Implement proper key verification against stored keys.
+	authorized := s.allowlist.IsAuthorized(key)
+	if s.allowlist.Mode() == config.SSHAuthEnforce && !authorized {
+		log.Printf("SSH auth DENIED: user=%s fingerprint=%s", user, fingerprint)
+		return false
+	}
+	// Reaches here only in warn mode, or enforce mode with an authorized key.
+	if authorized {
+		log.Printf("SSH auth allowed: user=%s fingerprint=%s", user, fingerprint)
+	} else {
+		log.Printf("SSH auth WOULD DENY (warn mode): user=%s fingerprint=%s", user, fingerprint)
+	}
 	return true
 }
 

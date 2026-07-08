@@ -78,7 +78,7 @@ Read-only mounts (`readonly: true`) are enforced as read-only at the mount level
 # Check mount directories were bound
 shed exec myproject -- ls -la /home/shed/.claude/
 
-# Test SSH access to GitHub (with shed-extensions SSH agent forwarding)
+# Test SSH access to GitHub (with the SSH agent forwarding extension)
 shed exec myproject -- ssh -T git@github.com
 ```
 
@@ -234,6 +234,10 @@ shed exec myproject -- ip addr show
 shed exec myproject -- curl -I https://google.com
 ```
 
+## Time synchronization
+
+Firecracker guests keep their clock correct via **`systemd-timesyncd`** (network SNTP) — `timedatectl` reports `NTP service: active`. Unlike VZ, there is **no agent-side RTC resync**: Firecracker x86 emulates no RTC (`/sys/class/rtc/` is absent), so `shed-agent` logs a single `clock-sync: no RTC … idle` line at startup and does nothing further. That is by design — the guest clock is served by Firecracker's paravirtualized clock (kvm-clock/TSC), and Firecracker hosts don't sleep, so the host-sleep drift that the [VZ agent corrects from the RTC](vz-operations.md#time-synchronization) doesn't arise here.
+
 ## Storage
 
 ### VM Disk Layout
@@ -274,7 +278,7 @@ lower image is read-only and shared:
 # Stop, snapshot if you need to keep state, then recreate with a bigger upper
 shed stop myproject
 shed snapshot create myproject pre-resize
-shed delete myproject --keep-volume
+shed delete myproject
 shed create myproject --from-snapshot pre-resize --upper-size 20G
 ```
 

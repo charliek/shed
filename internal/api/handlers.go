@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/egress"
 	"github.com/charliek/shed/internal/version"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/go-chi/chi/v5"
@@ -20,13 +22,19 @@ import (
 // handleGetInfo returns server information.
 // GET /api/info
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
+	authMode := config.AuthModeOpen
+	if s.cfg.Secure() {
+		authMode = config.AuthModeSecure
+	}
 	info := config.ServerInfo{
 		Name:         s.cfg.Name,
 		Version:      version.Info(),
 		SSHPort:      s.cfg.SSHPort,
 		HTTPPort:     s.cfg.HTTPPort,
 		Backend:      s.cfg.DefaultBackend,
+		AuthMode:     authMode,
 		DefaultImage: s.cfg.ActiveDefaultImage(),
+		HTTPSPort:    s.cfg.HTTPSPort,
 	}
 
 	writeJSON(w, http.StatusOK, info)
@@ -202,6 +210,33 @@ func newProgressSink(r *http.Request, ch chan<- backend.ProgressEvent) backend.P
 
 // handleCreateShedSSE streams create progress as Server-Sent Events.
 func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req config.CreateShedRequest) {
+	timer := s.createTimer(req)
+	s.streamSSE(w, r, r.Context(), timer.Track, logTimingFinish(timer), func(ctx context.Context) (any, error) {
+		shed, err := s.backend.CreateShed(ctx, req)
+		if err != nil {
+			log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, err)
+		}
+		return shed, err
+	})
+}
+
+// streamSSE runs a backend operation while streaming its progress to the client
+// as Server-Sent Events. It owns the flusher/header preamble, the pump+drain
+// loop (a select rather than closing the channel, which would race sends), and
+// the terminal complete/error event. baseCtx is the context work runs under —
+// create/pull pass r.Context(); delete passes a cancellation-detached one so a
+// client disconnect can't strand a half-torn-down shed. The progress sink is
+// always tied to the request, so a disconnected client simply stops receiving
+// events. work returns the payload for the terminal "complete" event (ignored
+// on error).
+//
+// track is an optional extra progress sink teed alongside the client stream
+// (create/delete pass timer.Track to record per-phase durations; pull passes
+// nil). onFinish, if non-nil, runs once with the operation's error after the
+// stream drains (create/delete log the timing summary via logTimingFinish; pull
+// passes nil and logs its own digest+duration inside work). Passing the resolved
+// sink + finalizer rather than a *PhaseTimer keeps this pump backend-agnostic.
+func (s *Server) streamSSE(w http.ResponseWriter, r *http.Request, baseCtx context.Context, track backend.ProgressFunc, onFinish func(error), work func(ctx context.Context) (any, error)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
@@ -213,31 +248,26 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	timer := s.createTimer(req)
 	events := make(chan backend.ProgressEvent, sseProgressBuffer)
 	sseFn := newProgressSink(r, events)
 
-	// Tee the progress stream: the timer records per-phase durations
-	// server-side (logged below), while sseFn forwards the human-readable
-	// messages to the streaming client. Timing never goes on the wire.
-	ctx := backend.ContextWithProgress(r.Context(), backend.TeeProgress(timer.Track, sseFn))
+	// Tee the progress stream: track (when non-nil) records per-phase durations
+	// server-side; sseFn forwards the human-readable messages to the client.
+	// Timing never goes on the wire. TeeProgress drops a nil track.
+	ctx := backend.ContextWithProgress(baseCtx, backend.TeeProgress(track, sseFn))
 
-	type createResult struct {
-		shed *config.Shed
-		err  error
+	type result struct {
+		payload any
+		err     error
 	}
-	done := make(chan createResult, 1)
-
+	done := make(chan result, 1)
 	go func() {
-		shed, err := s.backend.CreateShed(ctx, req)
-		done <- createResult{shed, err}
+		payload, err := work(ctx)
+		done <- result{payload, err}
 	}()
 
-	// Stream progress events until creation completes.
-	// Uses select to avoid closing the events channel (which would race with sends).
-	var res createResult
-	streaming := true
-	for streaming {
+	var res result
+	for streaming := true; streaming; {
 		select {
 		case event := <-events:
 			writeSSEEvent(w, "progress", event)
@@ -247,7 +277,7 @@ func (s *Server) handleCreateShedSSE(w http.ResponseWriter, r *http.Request, req
 		}
 	}
 
-	// Drain any remaining buffered progress events
+	// Drain any remaining buffered progress events.
 drain:
 	for {
 		select {
@@ -259,16 +289,27 @@ drain:
 		}
 	}
 
-	log.Printf("timing: %s", timer.Finish(res.err))
+	if onFinish != nil {
+		onFinish(res.err)
+	}
 
 	if res.err != nil {
-		log.Printf("CreateShed failed for %q (backend=%s): %v", req.Name, req.Backend, res.err)
 		_, errCode, msg := mapBackendError(res.err)
 		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
 	} else {
-		writeSSEEvent(w, "complete", res.shed)
+		writeSSEEvent(w, "complete", res.payload)
 	}
 	flusher.Flush()
+}
+
+// logTimingFinish returns a streamSSE onFinish callback that stops the timer and
+// logs the per-phase timing summary. Create/delete pass it; pull passes nil (it
+// has no PhaseTimer). The timer is captured non-nil at the call site, so no
+// nil-receiver method value ever reaches streamSSE.
+func logTimingFinish(timer *backend.PhaseTimer) func(error) {
+	return func(err error) {
+		log.Printf("timing: %s", timer.Finish(err))
+	}
 }
 
 // writeSSEEvent writes a single Server-Sent Event.
@@ -296,19 +337,191 @@ func (s *Server) handleGetShed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, shed)
 }
 
-// handleDeleteShed deletes a shed.
-// DELETE /api/sheds/{name}?keep_volume=bool
+// handleEgressShow returns a shed's egress status: effective profiles, assigned
+// listener port, the resolved profile definitions, and recent decisions.
+// GET /api/egress/{name}
+func (s *Server) handleEgressShow(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	shed, err := s.backend.GetShed(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+
+	status := config.EgressStatus{
+		Shed:     name,
+		Enabled:  s.cfg.Egress != nil && s.cfg.Egress.Enabled,
+		Profiles: shed.EgressProfiles,
+		Port:     shed.EgressPort,
+	}
+	// A shed created with the server default has no explicit profiles but does
+	// have a listener — show the effective default selection.
+	if len(status.Profiles) == 0 && shed.EgressPort != 0 && s.cfg.Egress != nil {
+		status.Profiles = s.cfg.Egress.Default
+	}
+	if s.cfg.Egress != nil {
+		status.Rules = map[string]config.EgressProfile{}
+		for _, p := range status.Profiles {
+			if def, ok := s.cfg.Egress.Profiles[p]; ok {
+				status.Rules[p] = def // config wins on a name collision
+			} else if def, ok := s.egressStore.Get(p); ok { // nil-safe; runtime user profile
+				status.Rules[p] = def
+			}
+		}
+	}
+	if s.egressAudit != nil {
+		status.Recent = s.egressAudit.Recent(name, 50)
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// egressController is the optional backend capability for live egress changes.
+// The native vz/fc backends implement it; a backend that doesn't yields a 501.
+type egressController interface {
+	SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error)
+	ClearShedEgress(ctx context.Context, name string) (*config.Shed, error)
+}
+
+// handleEgressSet applies a profile selection to a shed (live on a running one).
+// POST /api/egress/{name}  body: {"profiles":["base","github"]}
+func (s *Server) handleEgressSet(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	ec, ok := s.backend.(egressController)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
+		return
+	}
+	var req config.EgressSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, config.ErrInvalidRequest, "invalid request body")
+		return
+	}
+	shed, err := ec.SetShedEgress(r.Context(), name, req.Profiles)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, shed)
+}
+
+// handleEgressStream streams egress decisions as Server-Sent Events for the
+// host-agent subscriber (shed-extensions). GET /api/egress/stream
+//
+// In secure mode this route accepts a control OR credentials token (the
+// host-agent holds credentials; a control token may tail it) — see
+// authMiddleware. It is fleet-global: a subscriber sees every shed's decisions.
+func (s *Server) handleEgressStream(w http.ResponseWriter, r *http.Request) {
+	if s.egressAudit == nil {
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not enabled")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
+		return
+	}
+
+	events := make(chan egress.AuditRecord, 256)
+	unsub := s.egressAudit.Subscribe(func(rec egress.AuditRecord) {
+		select {
+		case events <- rec:
+		default: // drop on overflow; never block the data path
+		}
+	})
+	defer unsub()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rec := <-events:
+			writeSSEEvent(w, "egress", rec)
+			flusher.Flush()
+		}
+	}
+}
+
+// handleEgressOff turns egress off for a shed.
+// DELETE /api/egress/{name}
+func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	ec, ok := s.backend.(egressController)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, config.ErrBackendError, "egress control is not supported by this backend")
+		return
+	}
+	shed, err := ec.ClearShedEgress(r.Context(), name)
+	if err != nil {
+		code, errCode, msg := mapBackendError(err)
+		writeError(w, code, errCode, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, shed)
+}
+
+// handleDeleteShed deletes a shed. Delete always discards the writable volume;
+// any stray ?keep_volume query is ignored for back-compat with old clients (it
+// was a no-op on both backends).
+// DELETE /api/sheds/{name}
 func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	keepVolume := r.URL.Query().Get("keep_volume") == "true"
 
-	if err := s.backend.DeleteShed(r.Context(), name, keepVolume); err != nil {
+	// Stream teardown progress via SSE if the client requests it.
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		s.handleDeleteShedSSE(w, r, name)
+		return
+	}
+
+	// Detach the teardown from client cancellation (as the SSE path does): a
+	// non-streaming client or proxy must not be able to abort a destroy
+	// mid-cleanup — the backend kills the VM then does multi-step host cleanup.
+	timer := s.deleteTimer(name)
+	ctx := backend.ContextWithProgress(context.WithoutCancel(r.Context()), timer.Track)
+	err := s.backend.DeleteShed(ctx, name)
+	log.Printf("timing: %s", timer.Finish(err))
+	if err != nil {
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteTimer returns a PhaseTimer labelled for a DeleteShed operation. Like
+// createTimer it's installed for every delete (SSE or not) so the per-phase
+// breakdown lands in the server log regardless of streaming.
+func (s *Server) deleteTimer(name string) *backend.PhaseTimer {
+	return backend.NewPhaseTimer(
+		fmt.Sprintf("delete name=%s backend=%s", name, s.backend.Type()), nil)
+}
+
+// handleDeleteShedSSE streams delete/teardown progress as Server-Sent Events.
+func (s *Server) handleDeleteShedSSE(w http.ResponseWriter, r *http.Request, name string) {
+	// Detach the teardown from client cancellation: once delete starts
+	// destroying resources, a client disconnect (or its request timeout) must
+	// NOT strand it half-done — the destroy path may sync host-backed mounts
+	// before SIGKILL, and cancelling that sync could lose host data. Every
+	// internal step is self-bounded (bounded sync, SIGKILL wait, quick fs
+	// removes), so the goroutine still completes without a deadline. (A ceiling
+	// here would be worse than none: it would also cover DeleteShed's unbounded
+	// lock-acquire wait and could expire before teardown even starts, skipping
+	// the sync.) Progress still flows — the sink unblocks on the request's own
+	// Done, so a disconnected client just stops receiving events.
+	timer := s.deleteTimer(name)
+	s.streamSSE(w, r, context.WithoutCancel(r.Context()), timer.Track, logTimingFinish(timer), func(ctx context.Context) (any, error) {
+		// Delete has no resource to return; a benign payload keeps the terminal
+		// event shape consistent with create/pull. The client ignores it.
+		return map[string]string{"name": name}, s.backend.DeleteShed(ctx, name)
+	})
 }
 
 // handleStartShed starts a stopped shed.
@@ -691,64 +904,20 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 
 // handlePullImageSSE streams pull progress as Server-Sent Events. The backend
 // already emits per-stage progress into the context via backend.Phase/Status
-// (see internal/vz/image.go, internal/firecracker/image.go), so we only need
-// to install a progress sink and forward the human-readable messages.
+// (see internal/vz/image.go, internal/firecracker/image.go); this delegates the
+// streaming to streamSSE with no timing tee/finalizer (nil, nil) — pull has no
+// PhaseTimer and times itself, keeping its own digest+duration log lines.
 func (s *Server) handlePullImageSSE(w http.ResponseWriter, r *http.Request, req config.ImagePullRequest) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, config.ErrBackendError, "streaming not supported")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	start := time.Now()
-	events := make(chan backend.ProgressEvent, sseProgressBuffer)
-	sseFn := newProgressSink(r, events)
-	ctx := backend.ContextWithProgress(r.Context(), sseFn)
-
-	type pullResult struct {
-		digest string
-		err    error
-	}
-	done := make(chan pullResult, 1)
-	go func() {
+	s.streamSSE(w, r, r.Context(), nil, nil, func(ctx context.Context) (any, error) {
+		start := time.Now()
 		digest, err := s.backend.PullImage(ctx, req.DockerRef, req.Tag, req.Platform, req.WithLayers)
-		done <- pullResult{digest, err}
-	}()
-
-	var res pullResult
-	for streaming := true; streaming; {
-		select {
-		case event := <-events:
-			writeSSEEvent(w, "progress", event)
-			flusher.Flush()
-		case res = <-done:
-			streaming = false
+		if err != nil {
+			log.Printf("PullImage failed for %q after %s: %v", req.DockerRef, time.Since(start).Round(time.Millisecond), err)
+			return nil, err
 		}
-	}
-drain:
-	for {
-		select {
-		case event := <-events:
-			writeSSEEvent(w, "progress", event)
-			flusher.Flush()
-		default:
-			break drain
-		}
-	}
-
-	if res.err != nil {
-		log.Printf("PullImage failed for %q after %s: %v", req.DockerRef, time.Since(start).Round(time.Millisecond), res.err)
-		_, errCode, msg := mapBackendError(res.err)
-		writeSSEEvent(w, "error", config.NewAPIError(errCode, msg))
-	} else {
-		log.Printf("PullImage %q -> %s in %s", req.DockerRef, vmimage.ShortDigest(res.digest), time.Since(start).Round(time.Millisecond))
-		writeSSEEvent(w, "complete", config.ImagePullResponse{Tag: req.Tag, Digest: res.digest})
-	}
-	flusher.Flush()
+		log.Printf("PullImage %q -> %s in %s", req.DockerRef, vmimage.ShortDigest(digest), time.Since(start).Round(time.Millisecond))
+		return config.ImagePullResponse{Tag: req.Tag, Digest: digest}, nil
+	})
 }
 
 // handlePushImage uploads the manifest held by the named tag (or by a

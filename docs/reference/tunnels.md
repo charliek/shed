@@ -111,14 +111,53 @@ shed tunnels config <shed> [flags]
 
 Shows the port mappings and server address that would be used, without starting tunnels.
 
+## Foreground Mode
+
+Without `-d`, `shed tunnels start` runs in the foreground and prints the active
+forwards. Press `Ctrl+C` to stop — open connections are torn down and the
+command exits promptly. (A second `Ctrl+C` force-quits if a connection is slow
+to close.)
+
 ## Background Mode
 
-When running with `-d`, the tunnel process stays alive in the background:
+With `-d`, `shed tunnels start` detaches: it starts the tunnels in a separate
+daemon process, prints the forwards, and returns your shell. The daemon keeps
+running after the launching terminal is closed.
 
-- The process PID is saved to `~/.shed/tunnels.state`
-- Use `shed tunnels list` to see active tunnels
-- Use `shed tunnels stop <shed>` to terminate
-- Dead tunnel processes are automatically cleaned up on next `list` or `start`
+- `shed tunnels start <shed> -d` returns once the tunnels are listening (it
+  reports a real error if startup fails, rather than hanging).
+- The daemon's PID is recorded in `~/.shed/tunnel-state.json`.
+- Use `shed tunnels list` to see active tunnels and `shed tunnels stop <shed>`
+  to terminate one (it signals the daemon).
+- Dead tunnel daemons are cleaned out of the state file on the next `list` or
+  `start`.
+- Each daemon writes connection errors to `~/.shed/logs/tunnel-<shed>.log`. The
+  file is truncated on each start and is not rotated (it only records errors, so
+  it stays small in normal use).
+
+## Secure mode
+
+On a server running `auth.mode: secure`, the tunnel authenticates to the Connect
+API with a bearer token over pinned TLS (the Connect route accepts a `control` or
+`credentials` scope; the CLI uses its control token). Two behaviors matter:
+
+- **Startup probe.** `shed tunnels start` validates that it can authenticate
+  *before* binding any local listener, so a scope/token/TLS-pin problem fails the
+  command in your terminal instead of silently resetting every connection. The
+  probe does not touch the guest, so starting a tunnel before the in-VM service is
+  up still succeeds.
+- **Transparent token refresh.** The short-lived control token (`auth.token_ttl`,
+  default 24h) is re-minted automatically so a long-running background tunnel
+  keeps working across expiry — proactively just before expiry and reactively if a
+  connection is rejected — over the same SSH `_bootstrap` channel `shed server add`
+  uses. Because the background daemon is detached, it re-mints **non-interactively**:
+  it needs your SSH key available without a prompt (an `ssh-agent` that outlives
+  the launching terminal, or an agent-loaded / unencrypted key). If neither is
+  available when the token expires, new connections through a multi-day tunnel fail
+  until you restart it, and the reason is logged to `~/.shed/logs/tunnel-<shed>.log`.
+  Once running, the daemon re-mints its tunnel token **in memory only**, so a
+  long-lived daemon won't rewrite `~/.shed/config.yaml` and clobber a concurrent
+  foreground edit. (Open-mode servers use no token and are unaffected.)
 
 ## Port Conflicts
 

@@ -9,6 +9,7 @@ Shed is a lightweight tool for managing persistent, VM-based development environ
 - **Multi-Server** - Manage sheds across home servers and cloud VPS instances
 - **IDE Integration** - Native Cursor/VS Code support via SSH Remote
 - **AI-Ready** - Pre-configured for Claude Code and OpenCode workflows
+- **Autonomous Agents** - Ship a plan to a shed with `shed attach --plan`; Claude executes it unattended while you watch from `claude.ai/code`
 - **VM Backends** - Firecracker microVMs (Linux) or Apple VZ virtual machines (macOS Apple Silicon)
 
 ## Architecture

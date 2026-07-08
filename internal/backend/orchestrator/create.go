@@ -193,6 +193,17 @@ type BackendCreator interface {
 	// `vmutil.CredentialManager.SetupCredentials`).
 	SetupCredentials(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle)
 
+	// ConfigureEgressProxy opens (or reuses) this shed's egress-filtering
+	// proxy listener and injects the proxy environment into the persistent
+	// upper, when egress control is enabled in the server config. Unlike
+	// the best-effort credential/clone/provision hooks this is FAILABLE: a
+	// configuration failure aborts the create and unwinds (the hook
+	// registers its listener teardown on `cleanup`, so a failure inside the
+	// hook tears the listener back down). A no-op returning nil when egress
+	// is disabled. Runs AFTER SetupCredentials and BEFORE CloneRepo so the
+	// clone is itself routed through (and audited by) the proxy.
+	ConfigureEgressProxy(ctx context.Context, req config.CreateShedRequest, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
+
 	// CloneRepo clones `req.Repo` into the guest's workspace if
 	// specified. Best-effort: hook implementations log + emit
 	// `backend.StatusWarning` on failure and return nothing — the
@@ -269,6 +280,9 @@ func CreateShed(ctx context.Context, b BackendCreator, req config.CreateShedRequ
 	}
 
 	b.SetupCredentials(ctx, req, meta, vm)
+	if err := b.ConfigureEgressProxy(ctx, req, meta, vm, cleanup); err != nil {
+		return nil, err
+	}
 	b.CloneRepo(ctx, req, meta, vm)
 	b.RunProvisioning(ctx, req, meta, vm)
 

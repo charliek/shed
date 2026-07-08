@@ -87,6 +87,12 @@ func (b *mockStarter) SetupCredentials(ctx context.Context, meta MetadataHandle,
 	b.record("SetupCredentials")
 }
 
+func (b *mockStarter) ConfigureEgressProxy(ctx context.Context, meta MetadataHandle, vm VMHandle, c *backend.Cleanup) error {
+	b.record("ConfigureEgressProxy")
+	c.Register("close egress listener", b.makeCleanup("close egress listener"))
+	return b.failAt["ConfigureEgressProxy"]
+}
+
 func (b *mockStarter) RunStartupHook(ctx context.Context, meta MetadataHandle, vm VMHandle) {
 	b.record("RunStartupHook")
 }
@@ -114,6 +120,7 @@ func TestStartShed_HappyPathOrder(t *testing.T) {
 		"PersistRunningState",
 		"MountLocalDir",
 		"SetupCredentials",
+		"ConfigureEgressProxy",
 		"RunStartupHook",
 		"ToShedResult",
 	}
@@ -169,6 +176,17 @@ func TestStartShed_FailureUnwindLIFO(t *testing.T) {
 			// "stop VM" has actually terminated the VMM, matching
 			// StopShed's verify-before-clear shape.
 			wantCleanups: []string{"remove from vms map", "stop VM", "restore stopped metadata"},
+		},
+		{
+			// Failable egress hook runs after PersistRunningState, so
+			// persistedRunning is true and "restore stopped metadata" IS
+			// in the unwind. Its own "close egress listener" unwinds first.
+			failAt: "ConfigureEgressProxy",
+			wantCalled: []string{
+				"LoadMetadata", "CheckNotRunning", "StartVM", "PersistRunningState",
+				"MountLocalDir", "SetupCredentials", "ConfigureEgressProxy",
+			},
+			wantCleanups: []string{"close egress listener", "remove from vms map", "stop VM", "restore stopped metadata"},
 		},
 	}
 
@@ -232,7 +250,7 @@ func TestStartShed_BestEffortHooksDoNotAbort(t *testing.T) {
 	if got == nil || got.Name != "best-effort" {
 		t.Fatalf("ToShedResult returned %v; want a Shed", got)
 	}
-	wantTail := []string{"SetupCredentials", "RunStartupHook", "ToShedResult"}
+	wantTail := []string{"SetupCredentials", "ConfigureEgressProxy", "RunStartupHook", "ToShedResult"}
 	gotTail := b.calls[len(b.calls)-len(wantTail):]
 	if !sliceEqual(gotTail, wantTail) {
 		t.Errorf("best-effort tail = %v, want %v", gotTail, wantTail)

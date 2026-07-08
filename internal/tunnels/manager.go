@@ -6,6 +6,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/charliek/shed/internal/clienttoken"
 )
 
 // Manager handles tunnel lifecycle operations.
@@ -52,8 +54,10 @@ func (m *Manager) State() *TunnelState {
 
 // StartTunnels starts tunnels for all port mappings using the Connect API.
 // Returns the active tunnels that the caller should manage (stop on shutdown).
-func (m *Manager) StartTunnels(serverAddr, shedName string, ports []PortMapping) ([]*Tunnel, error) {
-	client := NewConnectClient(serverAddr)
+// A non-nil source makes every tunnel self-refresh its token (all ports share
+// the one client/source, so concurrent re-mints coalesce).
+func (m *Manager) StartTunnels(target ConnectTarget, source *clienttoken.Source, shedName string, ports []PortMapping) ([]*Tunnel, error) {
+	client := NewConnectClient(target, source)
 	var tunnels []*Tunnel
 
 	for _, pm := range ports {
@@ -73,47 +77,87 @@ func (m *Manager) StartTunnels(serverAddr, shedName string, ports []PortMapping)
 
 // SaveBackground saves the state for a background tunnel daemon.
 func (m *Manager) SaveBackground(shedName, serverName, profile string, pid int, ports []PortMapping) error {
-	m.state.SetTunnel(shedName, TunnelEntry{
-		ShedName:   shedName,
-		Profile:    profile,
-		PID:        pid,
-		Ports:      ports,
-		StartedAt:  time.Now(),
-		ServerName: serverName,
+	return m.state.Update(func(tunnels map[string]TunnelEntry) {
+		tunnels[shedName] = TunnelEntry{
+			ShedName:   shedName,
+			Profile:    profile,
+			PID:        pid,
+			Ports:      ports,
+			StartedAt:  time.Now(),
+			ServerName: serverName,
+		}
 	})
-	return m.state.Save()
 }
 
-// Stop stops a tunnel for a shed by signaling its daemon process.
+// killAndRemove removes a shed's tunnel entry and signals its daemon. The PID
+// is read and the entry deleted inside one locked read-modify-write, so the
+// process we signal is exactly the entry we remove — a concurrent replacement
+// can't leave us killing the old daemon while deleting the new one's state.
+// Returns whether a tunnel was found.
+func (m *Manager) killAndRemove(shedName string) (bool, error) {
+	var pid int
+	found := false
+	if err := m.state.Update(func(tunnels map[string]TunnelEntry) {
+		if e, ok := tunnels[shedName]; ok {
+			pid, found = e.PID, true
+			delete(tunnels, shedName)
+		}
+	}); err != nil {
+		return false, err
+	}
+	if found {
+		_ = m.killProcess(pid)
+	}
+	return found, nil
+}
+
+// Stop stops a tunnel for a shed by signaling its daemon process and removing
+// its state entry. It errors if no tunnel is recorded for the shed.
 func (m *Manager) Stop(shedName string) error {
-	entry, ok := m.state.GetTunnel(shedName)
-	if !ok {
+	found, err := m.killAndRemove(shedName)
+	if err != nil {
+		return err
+	}
+	if !found {
 		return fmt.Errorf("no tunnel found for shed %q", shedName)
 	}
-
-	_ = m.killProcess(entry.PID)
-	m.state.RemoveTunnel(shedName)
-	return m.state.Save()
+	return nil
 }
 
-// StopAllTunnelsForShed stops any tunnel for a specific shed.
+// StopAllTunnelsForShed stops any tunnel for a specific shed, succeeding even
+// when none is running.
 func (m *Manager) StopAllTunnelsForShed(shedName string) error {
-	entry, ok := m.state.GetTunnel(shedName)
-	if !ok {
-		return nil
-	}
-	_ = m.killProcess(entry.PID)
-	m.state.RemoveTunnel(shedName)
-	return m.state.Save()
+	_, err := m.killAndRemove(shedName)
+	return err
+}
+
+// RemoveOwnedTunnel removes a shed's tunnel entry only if it is still owned by
+// the given PID. A background daemon calls this on shutdown (with its own PID)
+// so it never deletes an entry that a --replace swapped in for a newer daemon.
+func (m *Manager) RemoveOwnedTunnel(shedName string, pid int) error {
+	return m.state.Update(func(tunnels map[string]TunnelEntry) {
+		if e, ok := tunnels[shedName]; ok && e.PID == pid {
+			delete(tunnels, shedName)
+		}
+	})
 }
 
 // StopAll stops all tunnels.
 func (m *Manager) StopAll() error {
-	for shedName, entry := range m.state.GetAllTunnels() {
-		_ = m.killProcess(entry.PID)
-		m.state.RemoveTunnel(shedName)
+	var pids []int
+	err := m.state.Update(func(tunnels map[string]TunnelEntry) {
+		for shedName, entry := range tunnels {
+			pids = append(pids, entry.PID)
+			delete(tunnels, shedName)
+		}
+	})
+	if err != nil {
+		return err
 	}
-	return m.state.Save()
+	for _, pid := range pids {
+		_ = m.killProcess(pid)
+	}
+	return nil
 }
 
 // CheckHealth checks if a tunnel process is still alive.
@@ -125,19 +169,16 @@ func (m *Manager) CheckHealth(shedName string) (bool, error) {
 	return m.isProcessAlive(entry.PID), nil
 }
 
-// CleanupDeadTunnels removes state entries for dead processes.
+// CleanupDeadTunnels removes state entries for dead processes. It re-reads the
+// state under lock so a concurrently-started tunnel is preserved.
 func (m *Manager) CleanupDeadTunnels() error {
-	changed := false
-	for shedName, entry := range m.state.GetAllTunnels() {
-		if !m.isProcessAlive(entry.PID) {
-			m.state.RemoveTunnel(shedName)
-			changed = true
+	return m.state.Update(func(tunnels map[string]TunnelEntry) {
+		for shedName, entry := range tunnels {
+			if !m.isProcessAlive(entry.PID) {
+				delete(tunnels, shedName)
+			}
 		}
-	}
-	if changed {
-		return m.state.Save()
-	}
-	return nil
+	})
 }
 
 // CheckPortConflict checks if a local port is available.

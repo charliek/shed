@@ -115,6 +115,13 @@ type BackendStarter interface {
 	// guest. Best-effort (matches CreateShed's contract).
 	SetupCredentials(ctx context.Context, meta MetadataHandle, vm VMHandle)
 
+	// ConfigureEgressProxy re-opens this shed's egress proxy listener on
+	// the per-shed port persisted at create time and re-injects the proxy
+	// environment when egress control is enabled. FAILABLE and unwinds via
+	// `cleanup`, mirroring CreateShed's contract. A no-op returning nil
+	// when egress is disabled.
+	ConfigureEgressProxy(ctx context.Context, meta MetadataHandle, vm VMHandle, cleanup *backend.Cleanup) error
+
 	// RunStartupHook runs only the `startup` provisioning hook —
 	// NOT `install`, which is create-time only. Loads the per-shed
 	// provision.yaml inside the guest workspace. Best-effort.
@@ -191,6 +198,9 @@ func StartShed(ctx context.Context, b BackendStarter, req StartRequest) (*config
 	}
 
 	b.SetupCredentials(ctx, meta, vm)
+	if err := b.ConfigureEgressProxy(ctx, meta, vm, cleanup); err != nil {
+		return nil, err
+	}
 	b.RunStartupHook(ctx, meta, vm)
 
 	cleanup.Commit()

@@ -48,15 +48,23 @@ func (b *FirecrackerBackend) GetShed(ctx context.Context, name string) (*config.
 	return b.client.GetShed(ctx, name)
 }
 
+// SetShedEgress / ClearShedEgress implement the api egressController capability.
+func (b *FirecrackerBackend) SetShedEgress(ctx context.Context, name string, profiles []string) (*config.Shed, error) {
+	return b.client.SetShedEgress(ctx, name, profiles)
+}
+
+func (b *FirecrackerBackend) ClearShedEgress(ctx context.Context, name string) (*config.Shed, error) {
+	return b.client.ClearShedEgress(ctx, name)
+}
+
 // ListSheds returns all sheds managed by this backend.
 func (b *FirecrackerBackend) ListSheds(ctx context.Context) ([]config.Shed, error) {
 	return b.client.ListSheds(ctx)
 }
 
-// DeleteShed removes a shed. If keepVolume is true, the workspace is preserved.
-// Note: For Firecracker, keepVolume is ignored as the rootfs is always part of the instance.
-func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string, keepVolume bool) error {
-	return b.client.DeleteShed(ctx, name, keepVolume)
+// DeleteShed removes a shed (destroy semantics — see backend.DeleteShed).
+func (b *FirecrackerBackend) DeleteShed(ctx context.Context, name string) error {
+	return b.client.DeleteShed(ctx, name)
 }
 
 // StartShed starts a stopped shed.

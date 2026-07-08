@@ -47,8 +47,10 @@ needs the image to exist on `ghcr.io` first so it can be `FROM`'d /
 `docker run`'d from CI). Once consumers land:
 
 - They will pin the image tag to the current shed version via a
-  `BUILD_TOOLS_VERSION` build arg, mirroring the `SHED_EXT_VERSION`
-  pattern already used for shed-extensions.
+  `BUILD_TOOLS_VERSION` build arg. (The guest extension binaries are
+  built in-tree from `cmd/shed-ext-*` and staged by
+  `scripts/stage-guest-binaries.sh` — there is no image-ref build arg for
+  them.)
 - This README should grow a list of every consumer file so binary
   renames / entrypoint changes here can be traced forward.
 

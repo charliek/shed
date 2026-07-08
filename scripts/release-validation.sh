@@ -169,11 +169,21 @@ docker run -d --rm --name "${REGISTRY_NAME}" -p "${REGISTRY_PORT}:5000" registry
 # Build + push each variant on Mac                                     #
 # -------------------------------------------------------------------- #
 if [[ "${SKIP_BUILDS}" != "1" ]]; then
+    # Stage the guest extension binaries + /etc overlay into the vz/ context so
+    # the extensions/full targets install them from /ctx (they are no longer
+    # pulled from a ghcr shed-extensions image). Must run BEFORE the context
+    # hash below so the staged files are covered by it.
+    "${REPO_ROOT}/scripts/stage-guest-binaries.sh" "${REPO_ROOT}/vz" arm64
+    # Content hash of the build context so a changed agent busts BuildKit's
+    # bind-mount cache (#227); without it this pre-release gate could validate
+    # a stale-cached agent. Same value across variants.
+    vz_install_sha="$("${REPO_ROOT}/scripts/install-input-sha.sh" "${REPO_ROOT}/vz")"
     for variant in "${VARIANTS[@]}"; do
         step "Build shed-vz-${variant}"
         docker buildx build --platform linux/arm64 \
             --target "shed-vz-${variant}" \
             -t "${LOCAL_REGISTRY}/shed-vz-${variant}:test" \
+            --build-arg "SHED_INSTALL_SHA=${vz_install_sha}" \
             --load -f "${REPO_ROOT}/vz/Dockerfile" "${REPO_ROOT}/vz" \
             && ok "build shed-vz-${variant}" \
             || { fail "build shed-vz-${variant}"; continue; }
@@ -244,9 +254,13 @@ if [[ "${SKIP_REMOTE}" != "1" ]]; then
         || fail "remote registry"
 
     if [[ "${SKIP_BUILDS}" != "1" ]]; then
+        step "Stage guest extension binaries into firecracker/ context on mini2"
+        run_remote "cd /tmp/shed-validation && ./scripts/stage-guest-binaries.sh firecracker amd64" \
+            && ok "stage guest binaries (mini2)" \
+            || fail "stage guest binaries (mini2)"
         for variant in "${VARIANTS[@]}"; do
             step "Build shed-fc-${variant} on mini2"
-            run_remote "cd /tmp/shed-validation && docker buildx build --platform linux/amd64 --target shed-fc-${variant} -t ${LOCAL_REGISTRY}/shed-fc-${variant}:test --load -f firecracker/Dockerfile firecracker" \
+            run_remote "cd /tmp/shed-validation && docker buildx build --platform linux/amd64 --target shed-fc-${variant} -t ${LOCAL_REGISTRY}/shed-fc-${variant}:test --build-arg SHED_INSTALL_SHA=\$(./scripts/install-input-sha.sh firecracker) --load -f firecracker/Dockerfile firecracker" \
                 && ok "build shed-fc-${variant}" \
                 || { fail "build shed-fc-${variant}"; continue; }
             run_remote "docker push ${LOCAL_REGISTRY}/shed-fc-${variant}:test >/dev/null" \

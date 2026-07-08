@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -84,6 +86,55 @@ func TestSubscribeReceivesEnvelopes(t *testing.T) {
 	}
 	if received[1].ID != env2.ID {
 		t.Errorf("second envelope ID = %q, want %q", received[1].ID, env2.ID)
+	}
+}
+
+// TestSubscribeTerminatesOn409 proves a 409 (another listener already owns the
+// namespace) is terminal: the channel closes on its own, the server is hit
+// exactly once (no hot-loop retry), and Status reports ConnRejected. Guards the
+// "second broker is observably rejected" acceptance criterion.
+func TestSubscribeTerminatesOn409(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`namespace "ns1" is already registered`))
+	}))
+	defer srv.Close()
+
+	client := NewHostClient(
+		WithServerURL(srv.URL),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+
+	// No ctx cancel: the loop must terminate itself on the 409.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ch := client.Subscribe(ctx, "ns1")
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected no envelopes on a 409-rejected subscription")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("subscribe did not terminate on 409 — it is hot-looping the retry")
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("server hits = %d, want 1 (a 409 must be terminal, not retried)", got)
+	}
+
+	st, ok := nsState(client, "ns1")
+	if !ok {
+		t.Fatal("no status recorded for ns1")
+	}
+	if st.State != ConnRejected {
+		t.Errorf("state = %q, want %q", st.State, ConnRejected)
+	}
+	if st.LastError == "" {
+		t.Error("expected LastError to carry the 409 reason")
 	}
 }
 
@@ -172,6 +223,41 @@ func TestRespondNon204Status(t *testing.T) {
 	err := client.Respond(context.Background(), "test-ns", env)
 	if err == nil {
 		t.Fatal("expected error for non-204 response")
+	}
+}
+
+func TestWithTokenSetsBearerHeader(t *testing.T) {
+	// The host-agent authenticates to the credential bus with its scoped bearer
+	// token. WithToken must attach it as `Authorization: Bearer <token>` on
+	// outbound requests; without it, no Authorization header is sent (so the
+	// default-off / tailnet path stays unauthenticated).
+	const token = "shed_credentials_abcdef0123456789"
+	tests := []struct {
+		name     string
+		opts     []HostClientOption
+		wantAuth string
+	}{
+		{"token attached as bearer", []HostClientOption{WithToken(token)}, "Bearer " + token},
+		{"no token, no header", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+
+			opts := append([]HostClientOption{WithServerURL(srv.URL)}, tt.opts...)
+			client := NewHostClient(opts...)
+			if err := client.Respond(context.Background(), "ns", NewResponse("req-1", "ns", nil)); err != nil {
+				t.Fatalf("Respond: %v", err)
+			}
+			if gotAuth != tt.wantAuth {
+				t.Errorf("Authorization = %q, want %q", gotAuth, tt.wantAuth)
+			}
+		})
 	}
 }
 
@@ -271,5 +357,85 @@ func TestNewHostClientOptionOverrides(t *testing.T) {
 	}
 	if client.logger != customLogger {
 		t.Error("expected custom logger")
+	}
+}
+
+// fakeTokenProvider returns tokens in sequence; Invalidate advances to the next
+// (simulating a re-mint) and counts how many times it was called.
+type fakeTokenProvider struct {
+	mu          sync.Mutex
+	tokens      []string
+	idx         int
+	invalidated int
+}
+
+func (f *fakeTokenProvider) Token() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tokens[f.idx], nil
+}
+
+func (f *fakeTokenProvider) Invalidate() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invalidated++
+	if f.idx < len(f.tokens)-1 {
+		f.idx++
+	}
+}
+
+func quietHostClient(url string, tp TokenProvider) *HostClient {
+	return NewHostClient(
+		WithServerURL(url),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		WithTokenProvider(tp),
+	)
+}
+
+func TestRespondRefreshesOn401(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.Header.Get("Authorization") == "Bearer fresh" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	tp := &fakeTokenProvider{tokens: []string{"stale", "fresh"}}
+	client := quietHostClient(srv.URL, tp)
+
+	if err := client.Respond(context.Background(), "ns", NewEnvelope("ns", MessageTypeResponse, nil)); err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+	if tp.invalidated != 1 {
+		t.Errorf("Invalidate called %d times, want 1", tp.invalidated)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("server hits = %d, want 2 (401 then 204)", got)
+	}
+}
+
+func TestRespondRetriesAtMostOnceOn401(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusUnauthorized) // always 401
+	}))
+	defer srv.Close()
+
+	tp := &fakeTokenProvider{tokens: []string{"a", "b", "c"}}
+	client := quietHostClient(srv.URL, tp)
+
+	if err := client.Respond(context.Background(), "ns", NewEnvelope("ns", MessageTypeResponse, nil)); err == nil {
+		t.Error("expected an error when the 401 persists")
+	}
+	if tp.invalidated != 1 {
+		t.Errorf("Invalidate called %d times, want exactly 1 (at-most-once retry)", tp.invalidated)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("server hits = %d, want 2 (initial + one retry)", got)
 	}
 }

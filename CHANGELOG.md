@@ -2,6 +2,381 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.7.8 — 2026-07-03
+
+### Fixed
+
+- **Guest clock stays correct across host sleep.** A long-running guest shipped no
+  time synchronization, so when the host slept the VZ guest's wall clock froze
+  behind real time and was never re-synced on wake — breaking AWS SigV4/STS
+  signing, TLS validity windows, and token expiry (observed ~3 h behind). Guest
+  images now ship `systemd-timesyncd`, and `shed-agent` periodically steps the
+  clock forward from the host-backed RTC (VZ; forward-only, gated on a large gap,
+  bounded to a plausible window, and a clean no-op where no RTC exists).
+  Firecracker has no RTC and its host doesn't sleep, so `timesyncd` covers it.
+  Takes effect once you pull a rebuilt image. (#240)
+- **`shed forward` works against secure-mode servers.** In secure mode the Connect
+  route required the credentials scope, so the CLI's control token was rejected
+  (403) and every `shed forward` connection reset. The route now accepts either
+  the control scope (CLI) or credentials (host-agent reverse proxy); the credential
+  bus stays credentials-only. (#238)
+- **Background tunnels survive the token TTL on secure-mode servers.** The egress
+  audit stream (`GET /api/egress/stream`) now accepts control or credentials
+  (GET-only), and the CLI + tunnels share a self-refreshing bearer-token source
+  that re-mints before expiry — so long-lived background tunnels no longer drop
+  when the token TTL lapses. (#239)
+
+## v0.7.7 — 2026-07-01
+
+### Fixed
+
+- **Zed Remote-SSH connects cleanly over the non-PTY exec channel.** The in-VM
+  agent no longer folds the command's stderr into stdout, so Zed's
+  length-prefixed protobuf readiness frame on stdout stays byte-clean while its
+  JSON logs stay on stderr — completing the Zed fix started in #222/#225. (#230)
+- **`shed exec` output stays 8-bit-clean when captured or piped.** `shed exec`
+  now auto-detects whether stdin is a TTY instead of always requesting a remote
+  PTY, so the PTY's `ONLCR` line discipline can't rewrite `\n`→`\r\n` or mangle
+  control bytes when you pull binary data out of a shed. Interactive
+  `shed console` still gets a PTY. (#233)
+- **`shed delete` of a running shed is fast and streams progress.** Delete now
+  takes a destroy path that SIGKILLs the VM immediately (it always discards the
+  writable upper anyway) instead of running a ~30 s graceful guest shutdown, so
+  a running-shed delete drops from ~30 s to ~1–2 s and no longer times out the
+  client. Progress streams over SSE (`Terminating virtual machine… → Removing
+  volume…`), and writable host-backed mounts (`--local-dir`/`--add-dir` and
+  configured server `mounts:`) are still synced before the kill. Use `shed stop`
+  for a graceful, restartable stop. Removes the no-op `--keep-volume` flag. (#234)
+
+### Changed
+
+- **Internal: the SSE streaming machinery is shared across create, delete, and
+  image pull.** `handlePullImageSSE` now delegates to the same `streamSSE`
+  pump/drain/terminal helper as create and delete (no wire-behavior change), so a
+  future SSE fix lands in one place instead of three. (#235)
+
+## v0.7.6 — 2026-06-30
+
+### Added
+
+- **Bootstrap secure-mode tokens via the system `ssh` client (`sdk/bootstrap`).**
+  The host-agent now mints its `_bootstrap` token by invoking the system `ssh`
+  instead of an in-process client, so the exchange honors the user's SSH agent,
+  macOS Keychain, `IdentityAgent`, hardware keys, and `~/.ssh/config` — fixing
+  bootstrap when the developer's key is passphrase-protected or agent-only
+  (1Password, Secretive, hardware keys). The shed `known_hosts` stays the sole
+  host-key trust root. (#226)
+- **Sane tmux defaults baked into the VZ + Firecracker base images.**
+
+### Changed
+
+- **Bump the baked `shed-extensions` to v0.4.9** in both base images, so the
+  `extensions`/`full` variants layer the latest published guest binaries. (#229)
+
+### Fixed
+
+- **Zed Remote-SSH (and other raw-SSH clients) can connect again.** The in-VM
+  agent now uses blocking stdin reads on the exec channel, ending the
+  binary-protocol desync that broke Zed; exec-channel teardown is also reliable
+  on host disconnect (process-group SIGHUP, no orphaned commands or leaked
+  handler goroutines). (#222, #225)
+- **`shed tunnels start -d` truly daemonizes**, returning the terminal, and
+  Ctrl+C / SIGTERM now stops tunnels gracefully instead of hanging on open
+  tunneled connections. (#223, #224)
+- **`shed image build` records the ref-index**, so `shed create --image <ref>`
+  resolves a freshly built image instead of a stale pull; and the agent install
+  layer is content-hash cache-busted (`SHED_INSTALL_SHA`) so a rebuilt agent
+  can't be silently served stale from BuildKit's bind-mount cache. Fixes the
+  dev-image rebuild loop — no more manual `docker buildx prune` or ref-index
+  edits. (#227, #228)
+
+## v0.7.5 — 2026-06-26
+
+### Added
+
+- **Run a plan autonomously on a shed (`shed attach` Remote Control mode + the
+  `shed-plan` skill).** `shed attach <shed> --plan <file> -d` ships a plan into a shed
+  and starts a Claude Remote Control session that executes it unattended, printing a
+  `claude.ai/code` URL to watch/steer (the laptop can close). The plan is shipped to
+  Claude's plans directory (`~/.claude/plans/plan-<slug>.md`, outside the workspace) and
+  the kickoff references it; `--plan` and `-p` combine (generic kickoff by default, your
+  prompt + appended plan path when given). `--kind`/`--prompt`/
+  `--prompt-file`/`--edit`/`--plan-edit` cover session kind and kickoff-prompt sources;
+  `--permission-mode` (default `auto`) and `--skip` (full bypass) set the autonomy
+  posture; `--slug` connects to an existing `rc-<slug>`. Plain `shed attach` is
+  unchanged. Requires Claude to be logged in inside the shed. The new `shed-plan`
+  skill drives the end-to-end author → fresh shed → run → report flow. Supersedes the
+  HTTP-enumeration approach in #199 (the same metadata is surfaced over SSH).
+- **`shed sessions` surfaces RC metadata.** `rc-*` sessions show `KIND` and `RC-STATE`
+  columns (and an `rc` object in `--json`), read from the in-shed `shed-ext-rc` binary;
+  degrades silently when a shed is unreachable or lacks the binary.
+- **Multi-line kickoff prompts.** `shed attach --prompt-file`/`--edit` may now be
+  multi-line; `shed-ext-rc` delivers them as one input via a bracketed paste (prefer a
+  plan file for large/multi-step work).
+- **User-managed egress profiles (runtime, no server-config edit).** A second,
+  runtime-editable profile store alongside `server.yaml`: `shed egress profile
+  set <name> --file <doc>` / `edit` / `ls` / `show` / `rm`, backed by
+  `GET/PUT/DELETE /api/egress/profiles[/{name}]` (control-scoped). User profiles
+  are referenced by name exactly like config profiles (`--egress
+  github,my-stack`). Server-config profiles stay a **read-only baseline** (a
+  collision is rejected; `ls` tags each `source: config|user`); **editing a
+  profile live-re-pushes every running shed that references it**; deleting a
+  referenced profile is rejected. Profiles persist under
+  `{state}/egress-profiles/`. See
+  [Egress Control](docs/reference/egress.md#user-managed-profiles) (shed #214).
+
+### Changed
+
+- **Base images bump shed-extensions to v0.4.7.** `vz/Dockerfile` +
+  `firecracker/Dockerfile` pin `SHED_EXT_VERSION=v0.4.7`, so the `extensions`/`full`
+  rootfs images ship the `shed-ext-rc` with `--permission-mode`/`--skip`, onboarding +
+  interstitial pre-seeding, and multi-line prompt delivery — i.e. `shed attach --plan`
+  runs autonomously on these images (older images feature-detect and degrade).
+
+### Fixed
+
+- **`shed-server` postinstall uses an absolute path for config-validate.** The deb
+  postinst invoked `shed-server config-validate` by bare name; it now uses the absolute
+  install path so validation runs regardless of `PATH` at install time (shed #213).
+- **`shed egress show --json` emits snake_case keys.** The `rules` map's profile
+  definitions serialized with Go field names (`Mode`/`Allow`/`Deny`/`Rule`, plus a
+  noisy `"Deny":null`) because `config.EgressProfile` lacked JSON tags —
+  inconsistent with the rest of the API (`shed`, `resolved_ip`, …) and the YAML
+  config keys. They are now `mode`/`allow`/`deny`/`rule` with `omitempty`. A minor
+  `--json` **output-shape change**: no first-party consumer parsed the old shape,
+  and Go clients interop across it (`encoding/json` matches field names
+  case-insensitively).
+
+### Docs
+
+- **Egress: quickstart + recommended starter profiles.** `docs/reference/egress.md`
+  gains a 3-step quickstart and a "Recommended starter profiles" section
+  (`ai-agents`, `github`, `package-registries`, `os-updates`, `containers`, sourced
+  from real-world sandbox allowlists) with apex-vs-wildcard guidance; a matching
+  commented `egress:` block lands in `configs/server.example.yaml` (guarded by a
+  validation test). The "plain HTTP is deny-by-default" caveat is corrected — plain
+  HTTP uses the same allow/deny/rule chain as HTTPS.
+
+## v0.7.4 — 2026-06-19
+
+Local-first, zero-plaintext-secure network surface — finishes the `0.7` auth
+line: the credential bus loses its plaintext escape hatch, binding is one knob
+that defaults to loopback, and `http_port` is no longer required in secure mode.
+A `0.7.x` patch that carries **breaking config changes** — see the
+[upgrade guide](docs/upgrades/v0.7.3-to-v0.7.4.md).
+
+### Changed
+
+- **One listener per mode — `internal_http_port` removed.** The credential bus
+  (`/api/plugins/*`) and Connect tunnel (`/api/sheds/*/connect/*`) now ride the
+  single listener (pinned TLS in secure mode, plain HTTP in open), gated by the
+  `credentials` scope — so secure mode has no plaintext listener anywhere. Remote
+  `shed forward` works uniformly again (the old split forced Connect to loopback).
+- **`http_bind`/`ssh_bind` unified into `bind_address`, defaulting to loopback.**
+  One interface governs every listener (HTTP, HTTPS, SSH) and **defaults to
+  127.0.0.1 in both modes** — shed is local-development-first. Bind a routable
+  address (`0.0.0.0`/`*`, `::`, or a LAN/tailnet IP) to expose it; in open mode a
+  non-loopback bind also requires the new `allow_insecure_exposure: true` ack
+  (secure mode needs none). A startup `WARNING` flags the new loopback default.
+- **`http_port` is optional in secure mode** (no plain HTTP served there); it is
+  omitted from `/api/info` and the written client entry. Open mode still requires it.
+- **`bind_address` is format-validated** — a malformed value (hostname, typo,
+  zoned IPv6) is rejected at `config-validate` time with a clear message rather
+  than failing cryptically at `net.Listen` on startup.
+
+### Breaking
+
+- `internal_http_port`, `http_bind`, and `ssh_bind` are **rejected at startup**
+  (the first removed; the binds renamed to `bind_address`).
+- With no `bind_address` set, every listener now binds **loopback only** (was all
+  interfaces) — a networked server becomes local-only until you set `bind_address`.
+  The deb postinstall warns on upgrade; other channels surface it via a startup
+  `WARNING`. Migration + recovery: [upgrade guide](docs/upgrades/v0.7.3-to-v0.7.4.md).
+
+### Packaging
+
+- Fresh brew/apt configs ship `bind_address: 127.0.0.1` with inline guidance for
+  exposing off-box (secure mode, or open + `allow_insecure_exposure`).
+- The `full` rootfs image now bundles the `shed-ext-rc` guest binary
+  (shed-extensions v0.4.6).
+
+## v0.7.3 — 2026-06-18
+
+CLI/API polish so `auth.mode: secure` (TLS-only) servers are first-class in the
+`shed` client. Additive and backward-compatible — no config or behavior change
+for existing deployments.
+
+### Added
+
+- **`/api/info` reports `https_port`** so a client can discover a secure server's
+  TLS endpoint (omitted in open mode; older clients decode it as zero — no break).
+- **`shed server list` shows the real control-plane `ENDPOINT` + a `SECURITY`
+  column** (`secure` / `open` / `unpinned`) instead of the stale `HTTP`/`8080`
+  column that a TLS-only secure server never serves. `--json` gains `endpoint`,
+  `https_port`, `security`, `tls_pinned`, and the pinned cert fingerprint (never
+  tokens). Derived from local config — no live probe, so STATUS is unchanged.
+- **`shed server add` auto-discovers a secure server's TLS port.** With no
+  `--https-port`, a refused plain-HTTP probe auto-retries the pinned-TLS
+  bootstrap on the default secure port (`8443`); a new `--secure` flag skips the
+  plain probe entirely. The trust gate (interactive prompt / `--trust-on-first-use`
+  / `--tls-fingerprint`; never silent-trust under `--json`) is unchanged.
+
+See [#209](https://github.com/charliek/shed/pull/209).
+
+## v0.7.2 — 2026-06-16
+
+Auth-surface simplification: the `auth.mode: open | secure` headline is
+unchanged, but the intermediate states beneath it are removed so two invariants
+always hold — **tokens ⟺ TLS ⟺ secure** and **https ⟺ secure**. **Breaking** (a
+`0.7.x` patch; the auth interface is still settling) — but most LAN / Tailscale
+deployments, and plain `auth.mode: secure` + `github_users` configs, are
+unaffected.
+
+### Changed
+
+- **Secure mode is now TLS-only.** It no longer serves a plain-HTTP listener
+  (not even on loopback) — only the pinned-TLS `https_port` listener faces
+  clients. On-box tooling uses the HTTPS endpoint; `shed server add` against a
+  secure server needs `--https-port`. A loopback credential-bus channel remains
+  available only via the explicit, opt-in `internal_http_port` (unchanged).
+- **Bundled shed-extensions bumped to v0.4.3** — the in-VM host-agent now mints a
+  credentials token only for secure (`https`) servers, so the `extensions`/`full`
+  image variants no longer log the spurious "token provider returned no token"
+  WARN against open-mode servers.
+
+### Removed (rejected at startup)
+
+- **`auth.http.mode`** (and the whole `auth.http` block) — HTTP token
+  enforcement now derives purely from `auth.mode: secure`.
+- **`https_port` under `auth.mode: open`** — `https_port` requires secure mode
+  (this is what lets a client treat an `https` `api_url` as proof of secure).
+- **`auth.ssh.mode: enforce` under `auth.mode: open`** — use `secure`, or `warn`
+  to stage an allowlist on a trusted network.
+- An explicit **`auth.ssh.mode: off`/`warn` under `auth.mode: secure`** — secure
+  forces `enforce`.
+
+See [Upgrading v0.7.1 → v0.7.2](docs/upgrades/v0.7.1-to-v0.7.2.md).
+
+## v0.7.1 — 2026-06-15
+
+Secure-by-default authentication that makes a public-VPS shed server safe to
+deploy with a single `shed server add` — no token paste, no manual pinning.
+Plus a guest-MTU fix for reduced-MTU / VPN paths and opt-in (off-by-default)
+egress control. **One breaking change** — two removed config keys now hard-fail
+at startup — but most LAN / Tailscale deployments are unaffected.
+
+### Secure-by-default authentication (#207)
+
+A redesign of how the server issues and tracks API tokens. A new binary
+`auth.mode: open | secure` (default `open`) replaces the per-layer opt-in knobs.
+
+- **Tokens are minted over SSH, not configured.** In `secure` mode `shed server
+  add` opens a reserved `_bootstrap` SSH channel (authenticated by your
+  allowlisted key against the pinned host key) and mints a scoped **control**
+  token automatically — written to client config, never printed. The host-agent
+  self-mints a **credentials** token the same way; the desktop is issued a
+  control token over the host-agent socket. No `shed-server token new`, no static
+  token list, no copy-paste.
+- **Opaque, server-tracked tokens.** Tokens are random opaque strings stored
+  server-side as SHA-256 hashes with a scope + 24h TTL; clients refresh
+  transparently near expiry and retry once on a 401. Revocation is automatic —
+  removing a key from the allowlist invalidates the tokens minted for it.
+- **`secure` derives the hardened posture** (SSH-allowlist enforce + HTTP-token
+  enforce + pinned TLS on `:8443`) from one switch; `open` mode is byte-identical
+  to v0.7.0's default for LAN / Tailscale.
+- **Scopes narrowed to `control` + `credentials`** (the `admin` scope is gone).
+
+  **⚠️ Breaking (removed config keys hard-fail).** `public_exposure` and
+  `auth.http.tokens` were removed; a config that still sets either is **rejected
+  at startup** with a migration message. Token issuance is now automatic, so
+  `shed-server token` has no subcommands. See the
+  [v0.7.0 → v0.7.1 upgrade guide](upgrades/v0.7.0-to-v0.7.1.md) — most users
+  (no `auth` block, or `auth.mode` unset) need no change.
+
+### shed-extensions v0.4.2 (#207)
+
+The `extensions`/`full` rootfs images bundle shed-extensions v0.4.2, whose
+host-agent self-mints its `credentials` token over SSH (replacing the static
+`credentials_token`) and serves the desktop's `token.get` request. Guest
+binaries are unchanged, so no guest-side migration is needed.
+
+### Guest MTU auto-detection for VPNs / reduced-MTU paths (#196)
+
+Behind a VPN (or any host path with an MTU below 1500), full-size guest packets
+were silently black-holed — `docker pull` failed with a TLS handshake timeout
+even though `curl` to the same registry worked, because dockerd's larger
+ClientHello exceeded the path MTU. shed-server now **detects the host's egress
+path MTU when a shed starts** and lowers the guest's primary interface to match
+(passed via a `shed.mtu=` kernel arg). On a normal 1500 path nothing changes, so
+there is no penalty for the common no-VPN case.
+
+- **Both backends** lower the guest MTU; on VZ an MSS-clamp rule additionally
+  fixes Docker *container* egress behind a reduced-MTU path. (The Firecracker
+  container-egress clamp is a fast-follow — its custom kernel lacks the
+  `xt_TCPMSS` target.)
+- New optional `vz.guest_mtu` / `firecracker.guest_mtu` config field (`0` =
+  auto-detect; set `1280`–`1500` to pin a value when detection misses).
+- Detection runs at VM start: toggling a VPN under a running shed needs
+  `shed restart <name>` to re-detect.
+- **Requires a rebuilt rootfs image** (the guest-side change ships in the image)
+  — published with this release.
+
+### Opt-in egress control (audit-first, Level 1) (#203)
+
+See and optionally control what a shed's sandbox reaches on the network, for a
+trusted team. **Off by default**; works on both backends.
+
+- A new `shed-egress-proxy` child of shed-server (shipped in brew + deb)
+  evaluates **composable named CEL profiles** (with `allow:`/`deny:` domain-glob
+  sugar) per shed. Always-on deny-CIDR guards (IMDS/private/gateway, IPv6) are
+  checked against **every** resolved address; the proxy resolves and **pins**
+  the upstream IP (DNS-rebinding/metadata defense); CEL errors **fail closed**.
+- `shed create --egress base,github`, plus `shed egress show|set|off` (live
+  re-push + re-inject on a running shed). Per-shed listener port + token
+  attribution; guest gets `HTTP(S)_PROXY` + an in-guest dockerd proxy drop-in.
+- Durable JSONL audit + a recent-decision ring (`shed egress show`) + an SSE
+  stream consumed by shed-host-agent → shed-desktop's view-only Egress feed.
+- Configure with `egress.enabled` + `egress.profiles` in the server config; an
+  invalid glob/CEL fails server start. **Honest posture:** Level 1 is
+  cooperative (`HTTP_PROXY`-based), **not** a security boundary — see
+  [Egress Control](docs/reference/egress.md) for the full bypass inventory.
+
+## v0.7.0 — 2026-06-13
+
+Optional, default-off authentication and transport encryption so a shed server
+can be deployed on a public-internet VPS. Tailscale / LAN remains the unchanged
+primary path — every new control is off by default, and existing deployments
+are byte-identical until opted in.
+
+### Optional auth + pinned TLS for public-VPS deployment (#198)
+
+- **SSH key allowlist** — restrict the SSH control channel to specific public
+  keys, optionally seeded from GitHub (`auth.ssh.github_users`), with a
+  fail-closed last-known-good cache.
+- **Scoped HTTP bearer tokens** — `control` / `credentials` / `admin` scopes
+  minted with `shed-server token new --scope`, enforced deny-by-default when
+  `auth.http.mode=enforce`. Bootstrap endpoints (`/api/info`,
+  `/api/ssh-host-key`) stay exempt.
+- **Native pinned TLS** — the server self-signs an ECDSA P-256 cert; clients
+  pin it by SHA-256 fingerprint (`shed server add --https-port`), the same
+  trust model as the SSH host key. No CA, ACME, or domain required.
+- **Credential-bus hardening** — the plugin bus drops forged `/respond`
+  envelopes and requires the `credentials` scope under enforcement.
+- **`public_exposure` preflight** — refuses to start a public server unless the
+  full bundle is present (SSH enforce + HTTP enforce + a strong token + TLS).
+- **Network-surface controls** — `http_bind` / `ssh_bind` / `internal_http_port`
+  / `trusted_proxy`, and an idle SSE keepalive for NAT survival.
+
+See the new [Security reference](reference/security.md), the
+[Public VPS deployment guide](guides/vps-deployment.md), and the
+[v0.6 → v0.7 upgrade guide](upgrades/v0.6-to-v0.7.md).
+
+### shed-extensions v0.4.1 (#200)
+
+The `extensions`/`full` rootfs images bundle shed-extensions v0.4.1, whose
+host-agent gains pinned-TLS + scoped-token support for the credential bus.
+Guest binaries are unchanged from v0.4.0, so no guest-side migration is needed.
+
 ## v0.6.6 — 2026-06-12
 
 Session env vars for the landing directory, a credential-brokering refresh

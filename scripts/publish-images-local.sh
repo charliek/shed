@@ -30,9 +30,14 @@
 #        echo '{}' > "$HOME/.docker/config.json"
 #
 #   4. Cross-build the in-VM binaries on the host (or get them onto the
-#      shed however you like) and copy the project tree in:
+#      shed however you like) and copy the project tree in. The guest
+#      extension binaries + /etc overlay are staged by the shared
+#      scripts/stage-guest-binaries.sh (into vz/shed-ext-*, vz/docker-
+#      credential-shed, vz/ext-etc/), the same script the rootfs builds
+#      and the publish workflow use:
 #        GOOS=linux GOARCH=arm64 go build -o vz/shed-agent     ./cmd/shed-agent
 #        GOOS=linux GOARCH=arm64 go build -o vz/shed-firstboot ./cmd/shed-firstboot
+#        ./scripts/stage-guest-binaries.sh vz arm64
 #        # On the host, scp the project tree and the linux/arm64 shed CLI:
 #        scp -F /tmp/publish-test-ssh -r . shed-publish-test:/home/shed/work
 #        GOOS=linux GOARCH=arm64 go build -o /tmp/shed ./cmd/shed
@@ -187,6 +192,11 @@ command -v "${SHED_BIN}" >/dev/null || fail "shed binary missing at ${SHED_BIN}"
 [ -x "${WORK_DIR}/scripts/build-initramfs.sh" ]  || fail "build-initramfs.sh missing/not executable"
 [ -f "${WORK_DIR}/${BACKEND_DIR}/shed-agent" ]     || fail "${WORK_DIR}/${BACKEND_DIR}/shed-agent missing; cross-build with GOOS=linux GOARCH=${PLATFORM#linux/}"
 [ -f "${WORK_DIR}/${BACKEND_DIR}/shed-firstboot" ] || fail "${WORK_DIR}/${BACKEND_DIR}/shed-firstboot missing; cross-build with GOOS=linux GOARCH=${PLATFORM#linux/}"
+# Guest extension binaries + /etc overlay staged by scripts/stage-guest-binaries.sh.
+for guest_bin in shed-ext-ssh-agent shed-ext-aws-credentials docker-credential-shed shed-ext-rc; do
+  [ -f "${WORK_DIR}/${BACKEND_DIR}/${guest_bin}" ] || fail "${WORK_DIR}/${BACKEND_DIR}/${guest_bin} missing; run scripts/stage-guest-binaries.sh ${BACKEND_DIR} ${PLATFORM#linux/}"
+done
+[ -d "${WORK_DIR}/${BACKEND_DIR}/ext-etc" ]        || fail "${WORK_DIR}/${BACKEND_DIR}/ext-etc missing; run scripts/stage-guest-binaries.sh ${BACKEND_DIR} ${PLATFORM#linux/}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -231,6 +241,12 @@ rm -rf "${STORE_DIR}"
 mkdir -p "${STORE_DIR}"
 write_server_yaml "${SERVER_CFG}" "${STORE_DIR}"
 
+# SHED_INSTALL_SHA busts BuildKit's content-blind bind-mount cache when the
+# staged agent/service files change (#227). The base stage installs them, so
+# the value is identical across variants — compute once.
+install_sha="$("${WORK_DIR}/scripts/install-input-sha.sh" "${WORK_DIR}/${BACKEND_DIR}/")"
+log "install-sha=${install_sha}"
+
 for variant in ${VARIANTS}; do
   target="${BACKEND_PREFIX}-${variant}"
   source_ref="${REGISTRY_HOST}/charliek/${target}:${VERSION}"
@@ -243,6 +259,7 @@ for variant in ${VARIANTS}; do
     -n "${variant}" \
     --initramfs "${INITRAMFS}" \
     --output-dir "${STORE_DIR}" \
+    --build-arg "SHED_INSTALL_SHA=${install_sha}" \
     -f "${WORK_DIR}/${BACKEND_DIR}/Dockerfile" \
     "${WORK_DIR}/${BACKEND_DIR}/"
 

@@ -393,7 +393,7 @@ func (c *Client) Prune(ctx context.Context, opts backend.PruneOptions) (config.P
 	// 3a: delete candidate instances via DeleteShed (handles TAP/cred
 	// cleanup correctly and re-checks running state under its own lock).
 	for _, ic := range instanceCandidates {
-		if err := c.DeleteShed(ctx, ic.Name, false); err != nil {
+		if err := c.DeleteShed(ctx, ic.Name); err != nil {
 			report.Skipped = append(report.Skipped, config.SkippedItem{
 				Kind: "instance", Name: ic.Name,
 				Reason: fmt.Sprintf("delete failed: %v", err),
