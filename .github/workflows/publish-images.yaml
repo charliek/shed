@@ -992,3 +992,5 @@ jobs:
 # the released tag's version before the workflow even fires. The
 # release-plan job's manifest check is the cross-check that replaces
 # sync-version's after-the-fact bump.
+
+# p2-selectivity scratch marker (delete me)
