@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for ShedDesktop.app.
+
+  `scripts/bundle.sh` copies this file into the .app bundle and
+  substitutes @VERSION@ with the contents of the top-level VERSION file
+  (the single source of truth for a pure-Swift package — there is no
+  Cargo.toml). The release workflow overrides it from the git tag.
+
+  LSUIElement=true makes this a menu-bar / accessory app with no Dock
+  icon (spec FR-1).
+
+  Sparkle auto-update (M8): SUFeedURL is the appcast on GitHub Pages;
+  SUPublicEDKey is the EdDSA public key updates are verified against. The
+  matching private key is the SPARKLE_ED_PRIVATE_KEY repo secret (used by
+  release.yml to sign each DMG). To rotate, run
+  `.build/artifacts/sparkle/Sparkle/bin/generate_keys`, paste the new public
+  key below, and update the secret. SUEnableAutomaticChecks=false so a
+  background check never pops a panel during the hermetic E2E (updates are
+  user-invoked via the menu).
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleIdentifier</key>
+  <string>ai.stridelabs.ShedDesktop</string>
+  <key>CFBundleName</key>
+  <string>ShedDesktop</string>
+  <key>CFBundleDisplayName</key>
+  <string>shed desktop</string>
+  <key>CFBundleExecutable</key>
+  <string>ShedDesktop</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+  <key>LSUIElement</key>
+  <true/>
+  <key>SUFeedURL</key>
+  <string>https://charliek.github.io/shed-desktop/appcast.xml</string>
+  <key>SUPublicEDKey</key>
+  <string>ROs7kN5cyTTVpMUriF1B/RZ/BaV/HJeOC8gMbBjDw+4=</string>
+  <key>SUEnableAutomaticChecks</key>
+  <false/>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 Charlie Knudsen. MIT-licensed.</string>
+</dict>
+</plist>

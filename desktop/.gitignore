@@ -1,0 +1,28 @@
+# Swift / SPM
+.build/
+build/
+*.xcodeproj
+.swiftpm/
+
+# Docs
+site-build/
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Rust core — generated FFI artifacts (the core build output lives under the
+# top-level crates/ workspace, ignored by the root .gitignore as crates/target/).
+artifacts/
+
+# shed-desktop .deb packaging staging + output (linux/scripts/build-deb.sh)
+dist/
+out/
+
+# macOS
+.DS_Store
+
+# Local secrets (Sparkle private key, etc.) — never commit
+.secrets/

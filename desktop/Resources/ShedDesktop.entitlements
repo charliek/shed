@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for ShedDesktop.app.
+
+  The app is NOT sandboxed (so outbound URLSession needs no entitlement),
+  and Touch ID via LAContext + the Unix-domain IPC socket work under ad-hoc
+  signing with no special grant.
+
+  cs.disable-library-validation (M8): required by the embedded ad-hoc
+  Sparkle.framework. Library validation insists every linked library share
+  the main executable's Team ID; ad-hoc has none, so the hardened runtime
+  would refuse to load Sparkle and the app would abort at launch. This
+  lifts the same-team requirement. REMOVE once a Developer ID + notarized
+  build ships (both signed by the same team satisfies validation).
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

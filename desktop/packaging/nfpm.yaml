@@ -1,0 +1,69 @@
+# nfpm config for the shed-desktop Linux .deb.
+#
+# Built by linux/scripts/build-deb.sh, which stages the binaries into ./dist/ and
+# sets SHED_DEB_VERSION + SHED_DEB_ARCH. nfpm expands ${ENV} in this file at
+# package time. Paths are relative to the repo root (build-deb.sh runs there).
+#
+# Output: shed-desktop_${SHED_DEB_VERSION}_${SHED_DEB_ARCH}.deb
+name: shed-desktop
+arch: ${SHED_DEB_ARCH}
+version: ${SHED_DEB_VERSION}
+platform: linux
+section: utils
+priority: optional
+maintainer: Charlie Knudsen <charlie.knudsen@gmail.com>
+vendor: Stride Labs
+homepage: https://github.com/charliek/shed-desktop
+license: MIT
+description: |
+  Tauri/WebKitGTK client for the shed toolchain.
+  shed-desktop is the Linux desktop client for shed-server, built on the shared Rust
+  shed-core (the same protocol layer as the macOS app): a dashboard of sheds with
+  lifecycle + create + a credential-approval gate, drivable + observable over a JSON
+  IPC socket.
+
+# Runtime libs for the Tauri WebKitGTK client (Ubuntu 24.04 baseline). WebKitGTK
+# 2.44 is webkit2gtk-4.1 (GTK 3, not 4); the tray uses libayatana-appindicator3.
+# Derived from the render-image build deps and PROVEN by linux/scripts/validate-deb.sh
+# (a launch in a clean container with only these depends) — not from ldd guesswork.
+# libssl/libxdo are deliberately omitted (not needed at runtime).
+depends:
+  - libwebkit2gtk-4.1-0 (>= 2.44)
+  - libgtk-3-0 (>= 3.24)
+  - libayatana-appindicator3-1
+  - librsvg2-2
+  - libsoup-3.0-0
+  - libc6 (>= 2.31)
+
+# polkit provides /usr/bin/pkcheck, which the credential-approval gate shells out
+# to. Recommends (not Depends): the app launches + fails-closed (approvals show
+# Unavailable) without it, so it must not block install on a headless box.
+recommends:
+  - polkitd
+
+contents:
+  - src: ./dist/shed-desktop
+    dst: /usr/bin/shed-desktop
+  # shedctl: the headless CLI driver for shed-desktop's JSON IPC socket
+  # (mirrors roost shipping roostctl alongside roost).
+  - src: ./dist/shedctl
+    dst: /usr/bin/shedctl
+  - src: ./packaging/shed-desktop.desktop
+    dst: /usr/share/applications/ai.stridelabs.ShedDesktop.desktop
+  - src: ./packaging/icons/hicolor/256x256/apps/shed-desktop.png
+    dst: /usr/share/icons/hicolor/256x256/apps/shed-desktop.png
+  - src: ./packaging/icons/hicolor/512x512/apps/shed-desktop.png
+    dst: /usr/share/icons/hicolor/512x512/apps/shed-desktop.png
+  # Icon aliases under the app id: the Linux approval notifier posts banners with
+  # the app-icon name "ai.stridelabs.shed-desktop" (approval.rs), so the icon must
+  # also resolve under that name, not just "shed-desktop".
+  - src: ./packaging/icons/hicolor/256x256/apps/shed-desktop.png
+    dst: /usr/share/icons/hicolor/256x256/apps/ai.stridelabs.shed-desktop.png
+  - src: ./packaging/icons/hicolor/512x512/apps/shed-desktop.png
+    dst: /usr/share/icons/hicolor/512x512/apps/ai.stridelabs.shed-desktop.png
+  # The polkit action the credential-approval gate authenticates against. The id
+  # MUST match POLKIT_ACTION_ID in tauri/src-tauri/src/approval.rs.
+  - src: ./packaging/polkit/ai.stridelabs.shed-desktop.policy
+    dst: /usr/share/polkit-1/actions/ai.stridelabs.shed-desktop.policy
+  - src: ./packaging/copyright
+    dst: /usr/share/doc/shed-desktop/copyright

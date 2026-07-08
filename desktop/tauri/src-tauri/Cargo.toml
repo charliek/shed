@@ -1,0 +1,84 @@
+# The Tauri desktop client — the shipped Linux client (and a Mac-parity client),
+# on the shared shed-core. Deliberately its OWN cargo workspace (note the empty
+# `[workspace]` table) so WebKitGTK + Tauri deps are NEVER absorbed into ../../../crates'
+# workspace: `make build` / `core-lint --workspace` stay WebKit-free. shed-core /
+# shed-app are pulled in as plain path deps (that does not make this a member of
+# core's workspace). See plans/tauri-phase-a.md.
+[package]
+name = "shed-desktop-tauri"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Standalone workspace root: stops cargo walking up to adopt (or be adopted by)
+# core's workspace. Its Cargo.lock is committed for reproducible CI.
+[workspace]
+
+[lib]
+name = "shed_desktop_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# "tray-icon" backs the menu-bar/tray (B1 — macOS rich popover / Linux native menu).
+tauri = { version = "2", features = ["tray-icon"] }
+# The shared protocol + app-logic crates (cross-workspace path deps — this links
+# them; it does not make this crate a member of core's workspace).
+shed-core = { path = "../../../crates/shed-core" }
+shed-app = { path = "../../../crates/shed-app", features = ["rc"] }
+# "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+libc = "0.2"
+# For the prod FailClosedGate's async AuthGate impl (real polkit gate = B6).
+async-trait = "0.1"
+# Advisory file lock for the single-instance guard (flock, keyed to the socket
+# dir — hermetic, unlike an identifier-scoped plugin).
+fs2 = "0.4"
+# Launch-at-login (B4): the `auto-launch` crate under a Tauri plugin (macOS
+# LaunchAgent / Linux `.desktop` autostart — NOT SMAppService). Cross-platform, so
+# not target-gated. The React toggle drives our own guarded `loginitem_*` commands,
+# NOT the plugin's JS API, so a test-mode write can't slip past the guard.
+tauri-plugin-autostart = "2"
+# Anchors the macOS menu-bar popover window at the tray icon (B1b). The "tray-icon"
+# feature enables the tray-relative `Position::TrayCenter`; it needs a real tray
+# click forwarded to cache the tray rect (the hermetic `tray.show` falls back to a
+# fixed position). Cross-platform crate; the popover itself is macOS-only.
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+
+# The Linux notifier posts + withdraws approval banners over the session bus
+# directly (freedesktop Notifications), so a resolved request's --urgency=critical
+# banner (which never auto-expires) is closed precisely — not left lingering.
+# Linux-only: the mac build posts via osascript, so zbus never enters the mac dep
+# tree. default-features=false + "tokio" routes zbus's I/O through the app's tokio
+# runtime instead of spinning up a second (async-io) reactor.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+# The macOS Touch-ID gate (B3): LAContext.evaluatePolicy via objc2 — pure Rust, no
+# Swift toolchain. Target-gated to macOS ONLY so the Linux/WebKitGTK render gate
+# never pulls LocalAuthentication (objc2 0.6.4 is already transitively in the lock).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
+# macOS-only tauri features, unioned into the base `tauri` features:
+#  - image-png: `Image::from_bytes` for the menu-bar template tray icon (tray.rs).
+#  - macos-private-api: a TRANSPARENT popover window — needed for both its rounded
+#    corners AND the native `Popover` vibrancy material (Swift NSPopover parity).
+#    Private CoreAnimation API — fine for the DMG/Sparkle distribution (would matter
+#    only for the App Store, not a target).
+# Both kept off the Linux build (it uses the colored icon + a native menu, no popover).
+tauri = { version = "2", features = ["image-png", "macos-private-api"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# A debug build is what the harness drives; keep it reasonably snappy.
+[profile.dev]
+opt-level = 1

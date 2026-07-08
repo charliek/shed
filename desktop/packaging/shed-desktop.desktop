@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Shed
+GenericName=Shed Dashboard
+Comment=Desktop client for the shed toolchain
+Exec=shed-desktop
+Icon=shed-desktop
+Terminal=false
+Categories=System;Utility;
+Keywords=shed;vm;dashboard;
+StartupNotify=true
+StartupWMClass=shed-desktop

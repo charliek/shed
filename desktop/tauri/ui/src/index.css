@@ -1,0 +1,164 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* shed desktop — Linen theme (Slate Blue accent), ported from the Design MCP
+   (core/theme.css). Authored in oklch; the shipped target — WebKitGTK 2.44 on
+   Ubuntu 24.04 — supports oklch + color-mix, verified by the tauri-build-linux
+   render smoke + the computed-style IPC probe (plans/tauri-phase-a.md A0b). Light
+   is default; `data-mode="dark"` on <html> switches. */
+:root {
+  --shed-bg: oklch(0.952 0.008 92);
+  --shed-bg-sidebar: oklch(0.937 0.008 92);
+  --shed-surface: oklch(0.989 0.0044 92);
+  --shed-surface-hover: oklch(0.966 0.0056 92);
+  --shed-inset: oklch(0.906 0.0084 92);
+  --shed-border: oklch(0.882 0.0084 92);
+  --shed-border-strong: oklch(0.8 0.0092 92);
+  --shed-text: oklch(0.275 0.0136 92);
+  --shed-text-secondary: oklch(0.505 0.01 92);
+  --shed-text-muted: oklch(0.66 0.008 92);
+  --shed-accent: oklch(0.55 0.072 248);
+  --shed-accent-hover: oklch(0.495 0.072 248);
+  --shed-accent-fg: oklch(0.99 0.012 248);
+  --shed-accent-subtle: oklch(0.928 0.0324 248);
+  --shed-accent-border: oklch(0.85 0.0432 248);
+  --shed-ok: oklch(0.595 0.135 150);
+  --shed-approve: oklch(0.585 0.16 150);
+  --shed-approve-hover: oklch(0.535 0.16 150);
+  --shed-approve-fg: oklch(0.99 0.02 150);
+  --shed-attention: oklch(0.6 0.135 62);
+  --shed-danger: oklch(0.555 0.2 27);
+  --shed-deny-bg: oklch(0.945 0.045 27);
+  --shed-denied: var(--shed-danger);
+  --shed-routine: oklch(0.555 0.028 255);
+  --shed-tag-vz-bg: oklch(0.92 0.05 256);
+  --shed-tag-vz-text: oklch(0.51 0.14 256);
+  --shed-tag-fc-bg: oklch(0.932 0.072 56);
+  --shed-tag-fc-text: oklch(0.53 0.135 50);
+  --shed-agent-pill-bg: oklch(0.93 0.05 305);
+  --shed-agent-pill-text: oklch(0.49 0.16 305);
+  --shed-radius: 14px;
+  --shed-shadow: 0 1px 2px rgba(45, 40, 32, 0.05), 0 2px 6px rgba(45, 40, 32, 0.05);
+  --shed-shadow-sel: 0 1px 2px rgba(45, 40, 32, 0.07), 0 4px 12px rgba(45, 40, 32, 0.07);
+}
+
+[data-mode="dark"] {
+  --shed-bg: oklch(0.168 0.0068 92);
+  --shed-bg-sidebar: oklch(0.147 0.0068 92);
+  --shed-surface: oklch(0.212 0.0068 92);
+  --shed-surface-hover: oklch(0.252 0.0068 92);
+  --shed-inset: oklch(0.285 0.0068 92);
+  --shed-border: oklch(0.305 0.0068 92);
+  --shed-border-strong: oklch(0.4 0.0068 92);
+  --shed-text: oklch(0.935 0.0041 92);
+  --shed-text-secondary: oklch(0.745 0.0048 92);
+  --shed-text-muted: oklch(0.565 0.0048 92);
+  --shed-accent: oklch(0.715 0.0684 248);
+  --shed-accent-hover: oklch(0.77 0.0684 248);
+  --shed-accent-fg: oklch(0.16 0.02 248);
+  --shed-accent-subtle: oklch(0.305 0.0432 248);
+  --shed-accent-border: oklch(0.42 0.0504 248);
+  --shed-ok: oklch(0.72 0.145 150);
+  --shed-approve: oklch(0.66 0.155 150);
+  --shed-approve-hover: oklch(0.71 0.155 150);
+  --shed-approve-fg: oklch(0.14 0.03 150);
+  --shed-attention: oklch(0.77 0.13 72);
+  --shed-danger: oklch(0.665 0.18 27);
+  --shed-deny-bg: oklch(0.305 0.07 27);
+  --shed-denied: var(--shed-danger);
+  --shed-routine: oklch(0.62 0.03 255);
+  --shed-tag-vz-bg: oklch(0.32 0.07 256);
+  --shed-tag-vz-text: oklch(0.79 0.115 256);
+  --shed-tag-fc-bg: oklch(0.34 0.088 56);
+  --shed-tag-fc-text: oklch(0.81 0.115 60);
+  --shed-agent-pill-bg: oklch(0.32 0.065 305);
+  --shed-agent-pill-text: oklch(0.8 0.115 305);
+  --shed-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 8px rgba(0, 0, 0, 0.24);
+  --shed-shadow-sel: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 16px rgba(0, 0, 0, 0.34);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--shed-bg);
+    color: var(--shed-text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* The mac menu-bar popover is a TRANSPARENT window so its rounded card can show
+     rounded corners (Swift NSPopover parity). Keep body/#root transparent there so
+     only the popover's own rounded surface paints — the dashboard (no popover marker)
+     keeps its canvas fill. Scoped via :has() (parsed but never matched on Linux, where
+     the popover window is never created). */
+  body:has([data-tray-popover]),
+  body:has([data-tray-popover]) #root {
+    background: transparent;
+  }
+}
+
+/* interaction + animation helpers (from the mockup) */
+.hbtn {
+  transition: filter 0.12s ease, transform 0.04s ease;
+}
+.hbtn:hover {
+  filter: brightness(0.965);
+}
+.hbtn:active {
+  transform: translateY(0.5px);
+}
+[data-mode="dark"] .hbtn:hover {
+  filter: brightness(1.14);
+}
+.hbtn:disabled,
+.hbtn:disabled:hover {
+  filter: none;
+  transform: none;
+  cursor: default;
+}
+.hlink {
+  transition: background 0.12s ease;
+}
+.hlink:hover {
+  background: var(--shed-surface-hover);
+}
+/* menu-bar popover footer rows — the vivid accent-blue highlight of the Swift
+   MenuActionRow (controlAccentColor + alternateSelectedControlTextColor), using the
+   brand accent tokens directly so it's identical on mac + the Linux/GTK build (no
+   color-mix → can't regress the WebKitGTK render gate). The icon inherits the row's
+   currentColor, so it flips to the accent foreground on hover too. */
+.menu-row {
+  transition: background 0.1s ease, color 0.1s ease;
+}
+.menu-row:hover:not(:disabled) {
+  background: var(--shed-accent);
+  color: var(--shed-accent-fg);
+}
+.nav-item {
+  transition: background 0.1s ease;
+}
+.nav-item:not(.is-active):hover {
+  background: var(--shed-surface-hover);
+}
+.row-hover {
+  transition: background 0.1s;
+}
+.row-hover:hover {
+  background: var(--shed-surface-hover);
+}
+
+@keyframes shed-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

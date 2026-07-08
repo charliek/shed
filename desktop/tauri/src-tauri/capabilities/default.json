@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The webview may call our commands and listen for Rust-emitted events (e.g. `navigate`, and `create-progress` in A1b). All shed data flows over the IPC socket / Tauri events, not the network — the strict CSP forbids web requests.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}

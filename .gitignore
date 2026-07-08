@@ -56,6 +56,16 @@ vendor/
 *.pem
 *.key
 
+# Desktop app local secrets (Sparkle private key, notarization creds)
+desktop/.secrets/
+
+# Files below are git-ignored AND synced across machines via envsecrets
+# (age-encrypted to GCS). Do not remove or modify the "# envsecrets" marker line;
+# everything between it and the next blank line is the tracked-file list.
+# envsecrets
+desktop/.secrets/cert.p12
+desktop/.secrets/apple.env
+
 # Local configuration (keep examples)
 server.yaml
 !configs/server.example.yaml
