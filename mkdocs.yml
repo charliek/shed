@@ -153,6 +153,7 @@ nav:
       - Test automation: desktop/test-automation.md
   - Discovery:
       - Monorepo Consolidation: discovery/monorepo-consolidation.md
+      - Monorepo Phase 2 Validation: discovery/monorepo-phase2-validation.md
       - Auth & Transport Security: discovery/auth-and-transport-security.md
       - Auth & Transport Plan: discovery/auth-transport-plan.md
       - Lazy Rootfs Streaming: discovery/lazy-rootfs-streaming.md
