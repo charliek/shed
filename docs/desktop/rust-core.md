@@ -18,11 +18,11 @@ A cargo workspace under `crates/` (its members `shed-core`, `shed-core-ffi`,
   store — and **`rc.rs`** (pure Remote-Control: the pane classifier, the
   `shed-ext-rc` + non-interactive SSH argv builders, and the wire DTOs). The Linux
   clients (the Tauri app, `shedctl`) link this crate directly (no UniFFI).
-- **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib"]`)
+- **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
   exposing a `ShedCore` object + records to Swift. `desktop/scripts/build-core.sh`
-  builds it, runs `uniffi-bindgen`, and assembles a **static**
-  `ShedCoreFFI.xcframework` linked into the app's Mach-O — no new dylib, so the
-  release signing/notarization path is unaffected.
+  builds the staticlib, runs `uniffi-bindgen` (needs the `lib` crate type), and
+  assembles a **static** `ShedCoreFFI.xcframework` linked into the app's Mach-O —
+  no new dylib, so the release signing/notarization path is unaffected.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`), a workspace
   default-member; consumed by the Tauri client (as a cross-workspace path dep).
   Holds the **`RcRunner` portability seam** (`rc.rs`, behind the
