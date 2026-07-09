@@ -135,6 +135,9 @@ struct ShedRow: View {
             } else if shed.status == .stopped {
                 IntentButton("play.fill", "Start", Theme.ok) { state.onShedAction?(.start, shed) }
                 IntentButton("trash", "Delete", Theme.danger) { confirmingDelete = true }
+            } else if shed.status == .error || shed.status == .unknown {
+                IntentButton("stop.fill", "Stop", Theme.danger) { state.onShedAction?(.stop, shed) }
+                IntentButton("trash", "Delete", Theme.danger) { confirmingDelete = true }
             }
         }
     }

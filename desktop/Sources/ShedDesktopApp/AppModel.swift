@@ -251,13 +251,14 @@ final class AppModel: NSObject, UiBridge {
         // Store the server verbatim ("" = the single/unnamed server) rather than
         // collapsing "" → nil: nil is reserved for an explicit any-server rule,
         // so a single-server grant never silently widens to other servers.
-        extraRules.removeAll { $0.scope == .shed && $0.shed == shed && ($0.server ?? "") == server }
+        // Match Optional equality (nil ≠ "") — same F12 retain as Rust add_shed_rule.
+        extraRules.removeAll { $0.scope == .shed && $0.shed == shed && $0.server == server }
         extraRules.append(PolicyRule(scope: .shed, server: server, shed: shed, action: action.policyAction, gate: .none))
         persistAndRebuild()
     }
 
     private func removeShedRule(server: String, shed: String) {
-        extraRules.removeAll { $0.scope == .shed && $0.shed == shed && ($0.server ?? "") == server }
+        extraRules.removeAll { $0.scope == .shed && $0.shed == shed && $0.server == server }
         persistAndRebuild()
     }
 
@@ -1219,13 +1220,27 @@ final class AppModel: NSObject, UiBridge {
         }
     }
 
+    /// Act path (decide): nil/unparseable expiry ⇒ not live (fail-closed).
+    /// Matches Rust `not_expired`. Do not use for the 1s tick sweep.
+    private func canActOnApproval(_ req: ApprovalRequest, now: Date = Date()) -> Bool {
+        guard let expiresAt = req.expiresAtDate else { return false }
+        return expiresAt > now
+    }
+
+    /// Tick path: nil/unparseable expiry ⇒ do NOT sweep (linger until disconnect).
+    /// Matches Rust `expired_by_tick` / intentional mac `?? now` asymmetry.
+    private func shouldExpireByTick(_ req: ApprovalRequest, now: Date = Date()) -> Bool {
+        guard let expiresAt = req.expiresAtDate else { return false }
+        return expiresAt < now
+    }
+
     func decideApproval(id: String, choice: ApprovalChoice) async throws {
         guard let item = pending[id] else { throw IPCHandlerError.notFound("no pending approval \(id)") }
         let req = item.request
         // Don't act on an already-expired request — the 1s expiry task may not have
         // fired yet, but acting now would persist a rule / create a (possibly sticky)
         // grant and send a late decision for a request the agent has already denied.
-        guard (req.expiresAtDate ?? .distantPast) > Date() else { return }
+        guard canActOnApproval(req) else { return }
         let decision = choice.decision
         var decidedBy: DecidedBy = .user
         if decision == .approve, item.gate.isBiometric, !ShedBackend.shared.testMode {
@@ -1240,8 +1255,7 @@ final class AppModel: NSObject, UiBridge {
             // prompt was up — don't send a late, contradictory decision or grant
             // a session for a dead request. Check both presence AND expiry (the
             // 1s expiry task may not have fired yet).
-            guard pending[id] != nil,
-                  (req.expiresAtDate ?? .distantPast) > Date() else { return }
+            guard pending[id] != nil, canActOnApproval(req) else { return }
             decidedBy = .touchid
         }
 
@@ -1285,7 +1299,8 @@ final class AppModel: NSObject, UiBridge {
 
     private func expirePending() {
         let now = Date()
-        let expired = pending.values.map(\.request).filter { ($0.expiresAtDate ?? now) < now }
+        // Parity with Rust expired_by_tick: unparseable/nil does not sweep.
+        let expired = pending.values.map(\.request).filter { shouldExpireByTick($0, now: now) }
         for req in expired {
             respondAndAudit(req, .deny, decidedBy: .timeout, policy: "expired")
             pending[req.id] = nil
