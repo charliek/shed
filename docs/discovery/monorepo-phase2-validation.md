@@ -70,3 +70,7 @@ The **`desktop-apt-dispatch`** job skipped on the combined tag, so apt was not r
 ### Awaiting maintainer validation (this machine)
 
 The one proof that needs a real install: on a machine running `0.0.13`, Sparkle update → `0.0.14` (old feed) → check-for-updates → `0.7.10` (new feed), no reinstall; plus `apt install shed-desktop`. Note the expected asymmetry — the new feed permanently lacks the `0.0.14` entry (appended only to the old feed), by design.
+
+### Maintainer validation — CONFIRMED (2026-07-09)
+
+The Sparkle feed-move hop was validated on the maintainer's Mac (running the shipped app): the update flowed through the old feed to the migrated version and on to the monorepo release via the new feed, in place, with no reinstall. This closes the one proof that could not run pre-release. Phase 2/3 consolidation complete.
