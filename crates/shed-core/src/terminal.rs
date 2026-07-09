@@ -154,7 +154,11 @@ pub fn resolve_launch(
             if template.is_empty() {
                 return default_terminal(cmd);
             }
-            let expanded = template.replace("{cmd}", &cmd.command).replace("{shed}", shed);
+            // Quote {shed} for /bin/sh -c; leave {cmd} raw — it is a full command line.
+            // Templates must not wrap {shed} in their own quotes; quoting is applied here.
+            let expanded = template
+                .replace("{cmd}", &cmd.command)
+                .replace("{shed}", &shell_quote(shed));
             LaunchInvocation {
                 executable: "/bin/sh".to_string(),
                 arguments: vec!["-c".to_string(), expanded],
@@ -250,6 +254,25 @@ mod tests {
         assert_eq!(inv.arguments[0], "-c");
         assert!(inv.arguments[1].contains(&cmd.command)); // {cmd} substituted
         assert!(inv.arguments[1].contains("# web")); // {shed} substituted
+    }
+
+    #[test]
+    fn resolve_launch_custom_shell_quotes_shed() {
+        // A crafted shed name must not break out of the custom /bin/sh -c template.
+        let cmd = ssh_command("web", "h", 22, "/k", None);
+        let evil = "x'; echo pwned #";
+        let inv = resolve_launch(
+            TerminalPreset::Custom,
+            &cmd,
+            evil,
+            Some("kitty -e {cmd} --title {shed}"),
+            None,
+        );
+        assert_eq!(inv.executable, "/bin/sh");
+        assert_eq!(
+            inv.arguments[1],
+            format!("kitty -e {} --title {}", cmd.command, shell_quote(evil))
+        );
     }
 
     #[test]
