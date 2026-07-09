@@ -272,7 +272,7 @@ The consolidation thesis (§1) is one shared client-side implementation — the 
 **Leg 3a — host-agent → Rust**, in two plans:
 
 - **3a.1 — port.** A standalone Rust host-agent daemon (`crates/shed-host-agent`), **wire-compatible** with the Go server, guest extensions, and desktop client, across the daemon's **two wire surfaces**: (A) the desktop/status **UDS** (approval / `token.get` / status / audit — wire types + client already in Rust), and (B) the shed-server **plugin bus** via `sdk.HostClient` (where the credential backends live — networked HTTP-streaming subscribe/respond, TLS-pinned, green-field in Rust). Shipped opt-in, diffed against the Go daemon via a differential + golden-fixture harness, then default. `objc2-local-authentication` replaces the Go CGO Touch-ID path (removes the CGO-on-darwin dependency). Ships **no user-visible change** — the install win is 3a.2.
-- **3a.2 — absorb into the desktop clients.** Move the daemon in-process into the desktop app (mac Swift + Tauri Linux; the Rust `HostAgentClient` already exists → process-to-in-process). **This is where the install-story win lands**: the standalone brew formula + launchd/systemd unit retire → `brew install shed` + the app, no separate host-agent step.
+- **3a.2 — absorb into the desktop clients.** Move the daemon in-process into the desktop app (mac Swift + Tauri Linux; the Rust `HostAgentClient` already exists → process-to-in-process). **This is where the install-story win lands for desktop users**: the separate host-agent install step disappears (its brew formula + launchd/systemd unit retire for the desktop path) → `brew install shed` + the app. The **headless standalone host-agent** distribution stays available for server / no-desktop environments (see the Headless brokering bullet).
 
 Consequences to design for:
 
@@ -312,7 +312,7 @@ Deliverable: desktop released from the monorepo; an existing install updated acr
 **Phase 3 — client-side Rust unification** (redefined 2026-07-09; supersedes bundle-first — see §6 + Appendix).
 Goal: retire the two remaining Go client-side reimplementations (host-agent, CLI) onto the Rust core. Sequential; each sub-step is its own panel-reviewed plan.
 1. **3a.1 — host-agent port.** Standalone Rust daemon (`crates/shed-host-agent`), wire-compatible over both surfaces (desktop UDS + plugin bus); differential + golden-fixture harness; opt-in → default. No user-visible change (foundation).
-2. **3a.2 — host-agent absorption.** In-process into the desktop clients; retire the standalone formula/launchd → **the install-story win** (`brew install shed` + app). Headless persists as a stripped-down standalone daemon (desktop-forwarding removed). Optional `shed-desktop` cask.
+2. **3a.2 — host-agent absorption.** In-process into the desktop clients; retire the standalone formula/launchd **for the desktop path** → **the install-story win** for desktop users (`brew install shed` + app). Headless server/no-desktop use keeps the stripped-down standalone daemon (desktop-forwarding removed). Optional `shed-desktop` cask.
 3. **3b — CLI port.** Grow `crates/shed-app` + thin `crates/shed-cli`; image/OCI stays Go; opt-in → default.
 Deliverable: the Rust core is the single client implementation; fresh-machine install is `brew install shed` + desktop app, no separate host-agent step.
 
