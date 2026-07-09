@@ -2,21 +2,21 @@
 
 Design document for consolidating the shed family of repos into a single monorepo with a shared Rust client core, a simplified install/update story, and selective per-component releases.
 
-> **Status (as of v0.7.8).** **Phase 1 (shed-extensions import) is merged**
-> (`b9a7dbc`, PR #243): the shed-extensions Go source lives in `cmd/` +
-> `internal/ext/`, the guest binaries build in-tree, and the release pipeline is
-> consolidated. **Phase 2 (shed-desktop import) implementation is in flight** on
-> branch `feature/monorepo-desktop-import` (PR TBD): the Rust core is imported at
-> top-level `crates/`, the Swift/Tauri app + packaging + `shedtest` harness at
-> `desktop/`, and the manifest-selected release model + Sparkle continuity are
-> wired. Phase 2 *completion* (final old-repo Sparkle release, first combined
-> release, archive shed-desktop) follows post-merge. Note: **`shed-gtk` was
-> retired in the old repo pre-import** — Tauri is the shipped Linux client, so the
-> §5.3 rows mentioning `shed-gtk` are void (no such crate/target is imported). The
-> rest is discovery only. The decisions in §3 were settled in discussion on
-> 2026-07-06/07; §10 lists the small implementation details that remain open. The
-> shed-mobile Rust spike (§7 Phase 0) runs in parallel and does not gate any phase
-> here.
+> **Status (2026-07-09).** **Phases 1–2 are complete and released.** Phase 1
+> (shed-extensions import) shipped in **v0.7.9**; Phase 2 (shed-desktop import)
+> shipped desktop on the shared version line in **v0.7.10**, after the final
+> old-repo Sparkle migration release `shed-desktop v0.0.14` (the old→new feed-move
+> was maintainer-validated on a real install). Both old repos are archived. The
+> Rust core lives at `crates/`, the Swift/Tauri app + packaging + `shedtest` at
+> `desktop/`; the manifest-selected release model + Sparkle continuity are live.
+> **`shed-gtk` was retired pre-import** — Tauri is the shipped Linux client, so the
+> §5.3 rows mentioning `shed-gtk` are void. **Phase 3 is redefined (§6/§7):
+> client-side Rust unification** — port the host-agent to Rust, absorb it in-process
+> into the desktop clients, then port the CLI — superseding the original
+> bundle-first plan (see the Appendix for the reversed decision). The leg 3a.1
+> host-agent-port plan is panel-reviewed and pending a go-ahead. The shed-mobile
+> Rust spike (§7 Phase 0) runs in parallel and gates no phase here. §3 decisions
+> were settled 2026-07-06/07; §10 lists remaining implementation details.
 
 ## 1. Current State Summary
 
@@ -64,7 +64,7 @@ Four steps, three update mechanisms (brew, brew-services, Sparkle).
 ### North star
 
 - **One repo** (`charliek/shed`). Go server/CLI at the root (module path unchanged), one shared Rust workspace as the client foundation, Tauri as the single desktop app on macOS + Linux, mobile on the same Rust core (mechanism decided by spike).
-- **Two installables**: `shed` (CLI + server; brew/apt) and `shed-desktop` (DMG+Sparkle / .deb; absorbs shed-host-agent). Everything else is an internal artifact.
+- **Two installables**: `shed` (CLI + server; brew/apt) and `shed-desktop` (DMG+Sparkle / .deb; absorbs shed-host-agent via a Rust rewrite + in-process absorption — Phase 3, not a bundled Go binary). Everything else is an internal artifact.
 - **Selective releases on one version line**: a single `vX.Y.Z` tag family; each release includes only the components whose version manifests were bumped to match the tag (§4). `v0.1.8` may ship shed + desktop; `v0.1.9` may ship only the server. Mobile keeps its ad hoc flow.
 - **shed-remote-agent stays out** — its RC-orchestration features migrate into desktop/CLI over time; the repo itself is not merged.
 
@@ -116,7 +116,7 @@ Desktop bundles/absorbs the host-agent (§7 Phase 3), so the separate brew formu
 5. **Sparkle survives the move** via a final old-repo release that repoints `SUFeedURL` at the monorepo feed (§4.5). Cost is near zero; uninstall/reinstall remains the accepted fallback.
 6. **One MkDocs site.** Desktop and extensions docs fold in as sections, page-by-page evaluation during the merge (some pages will be stale or redundant with shed's existing `docs/reference/extensions.md`).
 7. **Mobile: parallel spike now, import later.** flutter_rust_bridge-on-`shed-core` vs Tauri-mobile is evaluated with path deps across sibling repos *before* any import; shed-mobile keeps its ad hoc release flow throughout and after import.
-8. **Host-agent absorption is bundle-first, rewrite-second** (§7 Phase 3). The install-story win does not wait for the Rust rewrite.
+8. **Host-agent absorption is rewrite-first, absorb-second** (§7 Phase 3; *reversed 2026-07-09* — this originally read "bundle-first, rewrite-second," where the install-story win did not wait for the Rust rewrite). The host-agent is ported to a standalone Rust daemon first, then absorbed in-process into the desktop clients; the install-story win now lands with the absorption (3a.2), not before. See §6 and the Appendix for the tradeoff.
 9. **shed-remote-agent is a feature donor, not a merge target.**
 
 Settled 2026-07-07 (resolving the original open questions):
@@ -263,15 +263,24 @@ Deliberate non-goal at import time: extensions' `internal/protocol` stays a *sep
 
 Root `ci.yml` adds a `changes` path-filter job (desktop repo pattern) gating: Go test/lint (existing), `crates/` cargo test + clippy (macOS + Linux), Swift build/test + e2e (macos-15), Tauri legs, deb-build smoke. A shed-server-only PR runs only the Go legs; a desktop-only PR skips them. Rough runner-cost note: the macOS legs are the expensive ones and run only when `desktop/**` or `crates/**` change.
 
-## 6. What Phase 3 (host-agent absorption) looks like
+## 6. What Phase 3 (client-side Rust unification) looks like
 
-Interim (cheap, immediate install-story win): the desktop app bundles the Go `shed-host-agent` binary inside `Shed Desktop.app` (and the .deb) and supervises it as a child process — launch at app start, restart on crash, shut down on quit. The UDS handshake between app and agent is unchanged (the app already fails closed when no consumer is connected, and the agent already serves exactly one consumer). The standalone brew formula + launchd service are then retired from the install docs (formula can linger one release with a caveat, then be tombstoned).
+> **Redefined 2026-07-09.** Phase 3 was originally "bundle the Go host-agent inside the desktop app (bundle-first)." It is now **client-side Rust unification**: rewrite the host-agent in Rust (a standalone daemon), absorb it in-process into the desktop clients, then port the CLI. This **reverses** the earlier bundle-first decision — see the Appendix for the tradeoff. The executable leg-3a.1 plan (host-agent port) is panel-reviewed.
 
-Consequences to design for in the detailed plan:
+The consolidation thesis (§1) is one shared client-side implementation — the Rust core — replacing per-language reimplementations. The desktop app already rides `crates/shed-core`/`shed-app`; the two clients still on their own Go implementations are the **host-agent** and the **CLI**. Phase 3 retires both onto the core. The Go **server stays Go** (the other end of the wire; heavier/more complex; stronger libraries — the same reason `shed image`'s OCI work stays Go).
 
-- The agent currently runs headless even when the desktop app isn't running (background token minting for tunnels, egress audit). Bundling means **no desktop app running ⇒ no host-agent**. For the current usage (desktop is always running when shed is in use) this is acceptable and is in fact the simplification goal — but the plan should state it as a behavior change.
-- `shed-machine-rc` is *not* absorbed — it stays a standalone CLI for orchestrators (shed-remote-agent, mobile) to drive over SSH.
-- End-state (later): broker backends (SSH agent, STS, docker helpers, Touch ID, audit) are ported into `crates/shed-app` behind the same policy model, and the Go binary is deleted. This is incremental and user-invisible once bundling has landed.
+**Leg 3a — host-agent → Rust**, in two plans:
+
+- **3a.1 — port.** A standalone Rust host-agent daemon (`crates/shed-host-agent`), **wire-compatible** with the Go server, guest extensions, and desktop client, across the daemon's **two wire surfaces**: (A) the desktop/status **UDS** (approval / `token.get` / status / audit — wire types + client already in Rust), and (B) the shed-server **plugin bus** via `sdk.HostClient` (where the credential backends live — networked HTTP-streaming subscribe/respond, TLS-pinned, green-field in Rust). Shipped opt-in, diffed against the Go daemon via a differential + golden-fixture harness, then default. `objc2-local-authentication` replaces the Go CGO Touch-ID path (removes the CGO-on-darwin dependency). Ships **no user-visible change** — the install win is 3a.2.
+- **3a.2 — absorb into the desktop clients.** Move the daemon in-process into the desktop app (mac Swift + Tauri Linux; the Rust `HostAgentClient` already exists → process-to-in-process). **This is where the install-story win lands**: the standalone brew formula + launchd/systemd unit retire → `brew install shed` + the app, no separate host-agent step.
+
+Consequences to design for:
+
+- **Headless brokering.** Most clients run the desktop app continuously (the assumed common case), where the app owns brokering in-process. For **headless** environments (Linux server, no desktop) the 3a.1 standalone daemon **persists as a stripped-down headless host-agent CLI** — brokering over the plugin bus with policy/native approval, with the **desktop-forwarding surface (A) removed** (redundant/broken once the desktop owns brokering; 3a.1 gates surface A behind a feature so this is a clean omission). So the standalone binary is *not* deleted — it becomes the headless variant.
+- **Behavior change:** on a desktop machine, app-not-running ⇒ background token minting for tunnels + egress audit stop. Acceptable / the simplification goal.
+- `shed-machine-rc` is **not** absorbed — it stays a standalone Go CLI for orchestrators (shed-remote-agent, mobile) to drive over SSH.
+
+**Leg 3b — CLI → Rust** (after 3a.1 + a CLI-hard-cores spike). Grow `crates/shed-app` + a thin `crates/shed-cli`, differential-harness against the Go CLI, opt-in then default. **The image/OCI subsystem stays Go** — `shed image` is client-side OCI work today; server-delegate it or ship a small Go helper the Rust CLI dispatches to. Same "heavy/strong-Go-libs stays Go" principle as the server.
 
 ## 7. Implementation Phases
 
@@ -300,18 +309,19 @@ Goal: desktop builds, tests, and releases from the monorepo; Sparkle continuity.
 5. Archive shed-desktop.
 Deliverable: desktop released from the monorepo; an existing install updated across the feed move without reinstall.
 
-**Phase 3 — host-agent absorption (bundle-first).**
-Goal: two-installable story.
-1. Bundle + supervise the Go host-agent in the app (mac .app + linux .deb); config/socket paths reconciled.
-2. Retire the standalone formula/launchd flow from docs; optional `shed-desktop` cask.
-Deliverable: fresh-machine install is `brew install shed` + desktop app; no separate host-agent step.
+**Phase 3 — client-side Rust unification** (redefined 2026-07-09; supersedes bundle-first — see §6 + Appendix).
+Goal: retire the two remaining Go client-side reimplementations (host-agent, CLI) onto the Rust core. Sequential; each sub-step is its own panel-reviewed plan.
+1. **3a.1 — host-agent port.** Standalone Rust daemon (`crates/shed-host-agent`), wire-compatible over both surfaces (desktop UDS + plugin bus); differential + golden-fixture harness; opt-in → default. No user-visible change (foundation).
+2. **3a.2 — host-agent absorption.** In-process into the desktop clients; retire the standalone formula/launchd → **the install-story win** (`brew install shed` + app). Headless persists as a stripped-down standalone daemon (desktop-forwarding removed). Optional `shed-desktop` cask.
+3. **3b — CLI port.** Grow `crates/shed-app` + thin `crates/shed-cli`; image/OCI stays Go; opt-in → default.
+Deliverable: the Rust core is the single client implementation; fresh-machine install is `brew install shed` + desktop app, no separate host-agent step.
 
 **Phase 4 — import shed-mobile.**
 Goal: mobile in-tree on the shared core, per the Phase 0 decision.
 1. Import under `mobile/` (history preserved); wire path deps to `crates/`; CI legs path-filtered; keep the ad hoc release flow.
 Deliverable: mobile builds in-tree against `crates/shed-core`.
 
-**Future bucket (explicitly not scheduled):** Swift app retirement at Tauri parity (+ updater re-decision, the accepted breaking point); GTK crate retirement; Rust rewrite of host-agent backends; machine-RC/"run a plan on a machine" UX in desktop + CLI (absorbing the `shed-plan` skill's coordination and shed-remote-agent's features; decides whether the target-side binary merges into the shed CLI); possible Rust port of `shed-machine-rc` (no urgency); **the protocol-unification pass** — (a) Go-internal: collapse `internal/ext/protocol` into a single canonical bus-wire package shared by server and extension binaries (the copies exist only because the repos were separate), promoting/rehoming `internal/ext/*` packages as part of it, and (b) cross-language: one source of truth for the host-agent UDS protocol, RC DTO, and client config schema (plausibly defined in `shed-core` or a JSON schema) with other languages generated or fixture-validated against it, replacing today's hand-maintained parity copies; CLI-in-Rust evaluation; reconcile `shed-ext-rc` vs `shed-machine-rc` naming.
+**Future bucket (explicitly not scheduled):** Swift app retirement at Tauri parity (+ updater re-decision, the accepted breaking point); GTK crate retirement; machine-RC/"run a plan on a machine" UX in desktop + CLI (absorbing the `shed-plan` skill's coordination and shed-remote-agent's features; decides whether the target-side binary merges into the shed CLI); possible Rust port of `shed-machine-rc` (no urgency); **the protocol-unification pass** — (a) Go-internal: collapse `internal/ext/protocol` into a single canonical bus-wire package shared by server and extension binaries (the copies exist only because the repos were separate), promoting/rehoming `internal/ext/*` packages as part of it, and (b) cross-language: one source of truth for the host-agent UDS protocol, RC DTO, and client config schema (plausibly defined in `shed-core` or a JSON schema) with other languages generated or fixture-validated against it, replacing today's hand-maintained parity copies (Phase 3's host-agent differential + golden-fixture harness is a first instance of this fixture-validation, and porting the daemon adds the Rust copy it should validate); reconcile `shed-ext-rc` vs `shed-machine-rc` naming.
 
 ## 8. Key Files Reference
 
@@ -363,4 +373,5 @@ The original six open questions were resolved 2026-07-07 (§3 items 10–15). Wh
 | Merge shed-remote-agent | Rejected — it's the feature donor; its capabilities migrate, the repo doesn't |
 | Merge shed-mobile now | Deferred — direction (FRB vs Tauri-mobile) must be picked by the Phase 0 spike first |
 | Switch desktop updates to tauri-plugin-updater during the move | Deferred — keep Sparkle through the transition; re-decide at Swift retirement, the one accepted breaking point |
-| Rust-rewrite host-agent before absorbing it | Rejected — bundling the Go binary gets the install win immediately; rewrite proceeds invisibly afterward |
+| Rust-rewrite host-agent before absorbing it (vs bundle-first) | **Adopted 2026-07-09, reversing the earlier verdict.** Bundle-first ships a Go binary *inside* the Swift/Tauri apps that we would delete anyway; the desktop client is already Rust, so in-process absorption is clean rather than throwaway. Accepted cost: the host-agent port (leg 3a.1) ships no user-visible improvement — the install win moves to 3a.2 — and there is a two-daemon transition period. See §6/§7. |
+| Plan the whole Rust-unification arc cold / big-bang both legs | Rejected — the `sdk.HostClient` plugin-bus transport and the CLI's hard cores (in-process OCI, SSH/PTY) are unsized until the host-agent port ships and proves the differential-harness methodology; each sub-step is its own panel-reviewed plan |
