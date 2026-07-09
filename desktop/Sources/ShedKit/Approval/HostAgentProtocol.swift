@@ -31,6 +31,15 @@ public struct HelloAck: Sendable, Decodable {
         case requestTimeoutMs = "request_timeout_ms"
         case accepted
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Match Rust #[serde(default)] — older agents may omit these keys.
+        namespaces = try c.decodeIfPresent([String].self, forKey: .namespaces) ?? []
+        gateNamespaces = try c.decodeIfPresent([String].self, forKey: .gateNamespaces) ?? []
+        requestTimeoutMs = try c.decodeIfPresent(Int.self, forKey: .requestTimeoutMs) ?? 0
+        accepted = try c.decodeIfPresent(Bool.self, forKey: .accepted) ?? false
+    }
 }
 
 /// The `event` frame — a superset of the host agent's audit row, covering
@@ -70,6 +79,16 @@ public struct TokenResponse: Sendable, Decodable {
         case server, token, error
         case inReplyTo = "in_reply_to"
         case expiresAt = "expires_at"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        inReplyTo = try c.decode(String.self, forKey: .inReplyTo)
+        // Match Rust #[serde(default)] on server.
+        server = try c.decodeIfPresent(String.self, forKey: .server) ?? ""
+        token = try c.decodeIfPresent(String.self, forKey: .token)
+        expiresAt = try c.decodeIfPresent(String.self, forKey: .expiresAt)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
     }
 }
 

@@ -84,7 +84,12 @@ public final class HostAgentClient: @unchecked Sendable {
         running = false
         let task = loopTask
         loopTask = nil
-        if currentFD >= 0 { Darwin.close(currentFD); currentFD = -1 }
+        // Wake a blocked readLine without closing here — closeCurrentIf owns the
+        // single Darwin.close (avoids fd-reuse double-close).
+        if currentFD >= 0 {
+            _ = Darwin.shutdown(currentFD, SHUT_RDWR)
+            currentFD = -1
+        }
         lock.unlock()
         task?.cancel()
         failAllPending(error: HostAgentClientError.disconnected)

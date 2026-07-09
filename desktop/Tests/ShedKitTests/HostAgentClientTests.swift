@@ -126,6 +126,23 @@ final class HostAgentClientTokenTests: XCTestCase {
             XCTAssertEqual(err, .notConnected)
         }
     }
+
+    func testStopMidReadWakesWithoutDoubleClose() async throws {
+        let path = tempSocketPath()
+        let fake = FakeHostAgent(path: path, mode: .silent)
+        try fake.start()
+        defer { fake.stop() }
+
+        let client = HostAgentClient(socketPath: path)
+        let drain = startDraining(client)
+        defer { drain.cancel() }
+        try await waitConnected(client)
+
+        client.stop()
+        try await Task.sleep(for: .milliseconds(150))
+        client.stop()
+        XCTAssertFalse(client.isConnected)
+    }
 }
 
 /// Minimal in-test UDS server mimicking shed-host-agent's framing: accepts one
