@@ -21,6 +21,7 @@ public enum ScreenshotError: Error, CustomStringConvertible {
     case allocFailed
     case pngFailed
     case tooLarge(bytes: Int)
+    case invalidScale(Int)
 
     public var description: String {
         switch self {
@@ -32,6 +33,8 @@ public enum ScreenshotError: Error, CustomStringConvertible {
         case .pngFailed: return "PNG encoding failed"
         case .tooLarge(let b):
             return "screenshot too large: \(b) base64 bytes exceeds the \(ipcMaxFrameBytes) byte IPC frame cap (try scale 1)"
+        case .invalidScale(let s):
+            return "invalid screenshot scale \(s); expected 1 or 2"
         }
     }
 }
@@ -47,6 +50,7 @@ public struct CapturedImage: Sendable {
 /// would reject.
 @MainActor
 public func captureWindowPNG(_ window: NSWindow?, scale: Int) throws -> CapturedImage {
+    guard scale == 1 || scale == 2 else { throw ScreenshotError.invalidScale(scale) }
     guard let window else { throw ScreenshotError.noWindow }
     if window.isMiniaturized { throw ScreenshotError.minimized }
     guard let contentView = window.contentView else { throw ScreenshotError.noContentView }
