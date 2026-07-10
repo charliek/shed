@@ -27,6 +27,7 @@ MASK_TS = "<ts>"
 MASK_PID = "<pid>"
 MASK_VERSION = "<version>"
 MASK_CONFIG_PATH = "<config_path>"
+MASK_ID = "<id>"
 
 # RFC3339 with second precision and either a `Z` or a numeric offset. Both daemons
 # emit `...Z` (Go `time.RFC3339` on a UTC time; Rust's std-only formatter), but accept
@@ -126,6 +127,61 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
         sv["namespaces"] = namespaces
         masked_servers.append(sv)
     out["servers"] = masked_servers
+
+    return out
+
+
+def mask_hello_ack(obj: dict) -> dict:
+    """Mask the volatile fields of a desktop `hello_ack` frame, leaving everything
+    else to be diffed (D3 normalization for surface A).
+
+    Masked (volatile): `id` (a UUID — v7 in Go, v4 in Rust, so never diffable) and
+    `ts` (RFC3339, shape-asserted first). On an **accepted** ack `agent.version` is
+    also masked (the build string, shape-asserted **nonempty** first — same discipline
+    as `mask_live_status`).
+
+    Diffed (stable): `v`, `type`, `accepted`, `reason`, `agent.approval_method`,
+    `namespaces`, `gate_namespaces`, `request_timeout_ms` — and, on a **superseded**
+    (`accepted:false`) ack, `agent.version` too: that ack carries the ZERO-value agent
+    `{"version":"","approval_method":""}` (Go `desktop_server.go:355` sends a bare
+    `helloAckMsg{}`; the Rust `hello_ack` builder emits an empty agent whenever
+    `accepted` is false). An empty `version` there is a stable constant, not a volatile
+    build string, so it is diffed as-is rather than masked (and masking it would trip
+    the nonempty shape-assert).
+
+    Returns a new object; the input is not mutated.
+    """
+    assert obj.get("type") == "hello_ack", f"not a hello_ack frame: {obj!r}"
+    out = dict(obj)
+
+    # id: a nonempty string (UUID). Masked — the two impls use different UUID
+    # versions, and it varies per-frame regardless.
+    _id = out.get("id")
+    assert isinstance(_id, str) and _id, f"hello_ack.id missing/empty: {_id!r}"
+    out["id"] = MASK_ID
+
+    # ts: RFC3339 shape asserted BEFORE masking (so the mask can't hide a bad value).
+    assert_rfc3339(out.get("ts"), "hello_ack.ts")
+    out["ts"] = MASK_TS
+
+    accepted = out.get("accepted")
+    assert isinstance(accepted, bool), f"hello_ack.accepted not a bool: {accepted!r}"
+
+    agent = dict(out.get("agent", {}))
+    if accepted:
+        # An accepted ack carries the live build version — volatile, so mask it
+        # (shape-asserted nonempty first). approval_method stays diffed ("shed-desktop").
+        version = agent.get("version")
+        assert isinstance(version, str) and version.strip(), (
+            f"accepted hello_ack agent.version not a nonempty string: {version!r}"
+        )
+        agent["version"] = MASK_VERSION
+    else:
+        # A superseded ack's agent is the zero value; leave version ("") to be diffed.
+        assert agent.get("version") == "", (
+            f"superseded hello_ack agent.version should be zero-value \"\": {agent!r}"
+        )
+    out["agent"] = agent
 
     return out
 

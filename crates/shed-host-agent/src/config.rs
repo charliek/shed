@@ -10,6 +10,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// The three credential namespaces, in the fixed status/gate order.
 pub const NS_SSH_AGENT: &str = "ssh-agent";
@@ -53,7 +54,76 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// The slice-0 view of the host-agent config: exactly the fields LiveStatus needs.
+/// Resolve `approval_timeout`'s raw string to a `Duration`, defaulting an
+/// absent/invalid/non-positive value to 25s (fail-safe). Always called by `parse`.
+fn parse_approval_timeout(raw: &str) -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(25);
+    match parse_go_duration_nanos(raw) {
+        Some(nanos) if nanos > 0 => Duration::from_nanos(nanos as u64),
+        _ => DEFAULT,
+    }
+}
+
+/// Parse a Go `time.ParseDuration` string (`"25s"`, `"40s"`, `"1h30m"`,
+/// `"300ms"`, `"1.5h"`, optional leading sign) into signed total nanoseconds.
+/// Units: `ns`, `us`/`µs`/`μs`, `ms`, `s`, `m`, `h`. `None` on an empty or
+/// malformed string (unknown unit, missing number, etc.). A faithful subset — the
+/// caller only needs positivity + magnitude, so the signed result lets it detect a
+/// non-positive value and fall back to the default.
+fn parse_go_duration_nanos(s: &str) -> Option<i128> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, mut rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, s)
+    };
+    // Go accepts a bare "0" (and "+0"/"-0") with no unit.
+    if rest == "0" {
+        return Some(0);
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total: i128 = 0;
+    while !rest.is_empty() {
+        // Number: digits and at most one '.'.
+        let num_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        if num_len == 0 {
+            return None;
+        }
+        let value: f64 = rest[..num_len].parse().ok()?;
+        rest = &rest[num_len..];
+        // Unit: run of non-number characters.
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.' || c == '+' || c == '-')
+            .unwrap_or(rest.len());
+        if unit_len == 0 {
+            return None;
+        }
+        let unit_nanos: f64 = match &rest[..unit_len] {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1_000.0,
+            "ms" => 1_000_000.0,
+            "s" => 1_000_000_000.0,
+            "m" => 60.0 * 1_000_000_000.0,
+            "h" => 3_600.0 * 1_000_000_000.0,
+            _ => return None,
+        };
+        rest = &rest[unit_len..];
+        total += (value * unit_nanos) as i128;
+    }
+    Some(if neg { -total } else { total })
+}
+
+/// The slice-0/1 view of the host-agent config: the fields LiveStatus needs plus
+/// `approval_timeout` (the delegated-approval budget the desktop server enforces).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostAgentConfig {
     ssh_policy: String,
@@ -61,6 +131,9 @@ pub struct HostAgentConfig {
     docker_policy: String,
     pub logging_enabled: bool,
     pub logging_path: String,
+    // Read only by `approval_timeout()`, which only the desktop server calls.
+    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
+    approval_timeout: Duration,
 }
 
 impl HostAgentConfig {
@@ -103,7 +176,21 @@ impl HostAgentConfig {
             docker_policy: policy("docker"),
             logging_enabled,
             logging_path,
+            approval_timeout: parse_approval_timeout(
+                root.get_path(&["approval_timeout"]).unwrap_or_default(),
+            ),
         }
+    }
+
+    /// The delegated-approval budget the desktop server enforces per request, and
+    /// which drives the `hello_ack.request_timeout_ms` it advertises. Mirrors Go's
+    /// `ApprovalTimeoutDuration` + `NewDesktopServer`'s guard: an absent, invalid,
+    /// or non-positive `approval_timeout` falls back to 25s. (The full config's
+    /// `Validate()` hard-rejects an invalid value at startup; this minimal reader
+    /// does no validation, so it fails safe to the default instead — a later slice.)
+    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
+    pub fn approval_timeout(&self) -> Duration {
+        self.approval_timeout
     }
 
     /// `effective_policy` returns the configured policy for a namespace, defaulting
@@ -321,6 +408,48 @@ aws:
     #[test]
     fn load_missing_file_is_error() {
         assert!(HostAgentConfig::load("/nonexistent/does-not-exist-xyz.yaml").is_err());
+    }
+
+    #[test]
+    fn approval_timeout_parses_and_defaults() {
+        // Absent -> 25s default (matches Go's config default).
+        assert_eq!(
+            HostAgentConfig::parse("").approval_timeout(),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            HostAgentConfig::parse("approval_timeout: 40s").approval_timeout(),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            HostAgentConfig::parse("approval_timeout: 1h30m").approval_timeout(),
+            Duration::from_secs(5400)
+        );
+        assert_eq!(
+            HostAgentConfig::parse("approval_timeout: 300ms").approval_timeout(),
+            Duration::from_millis(300)
+        );
+        // Invalid / non-positive -> fail-safe 25s (the full config's Validate() would
+        // hard-reject these; this minimal reader falls back instead).
+        for bad in ["nonsense", "0s", "-5s", "10"] {
+            assert_eq!(
+                HostAgentConfig::parse(&format!("approval_timeout: {bad}")).approval_timeout(),
+                Duration::from_secs(25),
+                "approval_timeout: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_duration_parser_units() {
+        assert_eq!(parse_go_duration_nanos("25s"), Some(25_000_000_000));
+        assert_eq!(parse_go_duration_nanos("1.5h"), Some(5_400_000_000_000));
+        assert_eq!(parse_go_duration_nanos("1h30m"), Some(5_400_000_000_000));
+        assert_eq!(parse_go_duration_nanos("0"), Some(0));
+        assert_eq!(parse_go_duration_nanos("-5s"), Some(-5_000_000_000));
+        assert_eq!(parse_go_duration_nanos(""), None);
+        assert_eq!(parse_go_duration_nanos("10"), None); // no unit
+        assert_eq!(parse_go_duration_nanos("abc"), None);
     }
 
     #[test]

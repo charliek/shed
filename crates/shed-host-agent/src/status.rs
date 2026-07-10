@@ -3,8 +3,7 @@
 //! wire-compatible, field-for-field, with the Go `status_server.go` / `status.go`
 //! (§4 of the wire catalog).
 
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{HostAgentConfig, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
 use crate::sockets::desktop_socket_path;
-use crate::Log;
 
 /// The version of the LiveStatus JSON contract. Bumped only on a breaking change;
 /// additive fields do not bump it. A mismatch is a hard reject in the client.
@@ -70,14 +68,17 @@ pub struct NamespaceHealth {
     pub since: String,
 }
 
-/// `build_live_status` snapshots the daemon's live self-report. In slice 0 there
-/// is no desktop server yet (so the approval channel reports no consumer) and no
-/// supervisor (so `servers` is empty).
+/// `build_live_status` snapshots the daemon's live self-report. `consumer` is the
+/// desktop approval channel's current consumer identity (`Some((name, version))`
+/// when an app is connected, `None` otherwise) — the desktop server's
+/// `consumer_info()` in slice 1, or always `None` in the headless build with no
+/// desktop server. There is still no supervisor, so `servers` is empty.
 pub fn build_live_status(
     cfg: &HostAgentConfig,
     config_path: &str,
     started_at: &str,
     version: &str,
+    consumer: Option<(String, String)>,
 ) -> LiveStatus {
     // Keyed by the fixed status/gate namespace order; the BTreeMap re-sorts on
     // insert, so the emitted JSON key order is identical regardless.
@@ -85,6 +86,12 @@ pub fn build_live_status(
         .iter()
         .map(|&ns| (ns.to_string(), cfg.effective_policy(ns)))
         .collect();
+    // Destructure the optional consumer identity once (clone-free) rather than
+    // re-inspecting it per approval-channel field.
+    let (consumer_connected, client_name, client_version) = match consumer {
+        Some((name, version)) => (true, name, version),
+        None => (false, String::new(), String::new()),
+    };
     LiveStatus {
         schema: STATUS_SCHEMA_VERSION,
         version: version.to_string(),
@@ -96,9 +103,9 @@ pub fn build_live_status(
         gate_namespaces: cfg.gate_namespaces(),
         approval_channel: ApprovalChannelStatus {
             socket_path: desktop_socket_path().to_string_lossy().into_owned(),
-            consumer_connected: false,
-            client_name: String::new(),
-            client_version: String::new(),
+            consumer_connected,
+            client_name,
+            client_version,
         },
         servers: Vec::new(),
     }
@@ -114,16 +121,23 @@ fn current_pid() -> i64 {
 /// `time.Now().UTC().Format(time.RFC3339)`. No chrono dependency — a std-only
 /// civil-date conversion.
 pub fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
+    rfc3339_utc(now_unix())
+}
+
+/// Current wall-clock time as whole Unix seconds (UTC). `pub(crate)` so the
+/// desktop server can compute `now + approval_timeout` for `expires_at`.
+pub(crate) fn now_unix() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    rfc3339_utc(secs)
+        .unwrap_or(0)
 }
 
 /// Convert a Unix timestamp (seconds) to an RFC3339 UTC string using Howard
-/// Hinnant's days-from-civil inverse (epoch 1970-01-01).
-fn rfc3339_utc(unix_secs: i64) -> String {
+/// Hinnant's days-from-civil inverse (epoch 1970-01-01). `pub(crate)` so the
+/// desktop server can stamp `approval_request.expires_at` (= now + timeout) with
+/// the same formatter.
+pub(crate) fn rfc3339_utc(unix_secs: i64) -> String {
     let days = unix_secs.div_euclid(86_400);
     let sod = unix_secs.rem_euclid(86_400);
     let (hour, minute, second) = (sod / 3600, (sod % 3600) / 60, sod % 60);
@@ -149,101 +163,10 @@ fn rfc3339_utc(unix_secs: i64) -> String {
 // ---------------------------------------------------------------------------
 // Status socket server (channel 4)
 // ---------------------------------------------------------------------------
-
-/// `bind_status_listener` performs the socket ceremony (owner-only `0700` parent
-/// dir, refuse-to-clobber-live prepare, `0600` socket) and returns a bound
-/// **blocking** std listener, or `None` if the bind is refused/fails (logged).
-/// Mirrors the Go `bindUnixSocket`. The std listener is later handed to tokio via
-/// `UnixListener::from_std`, so the filesystem ceremony (and its logging) runs
-/// synchronously before the runtime starts.
-pub(crate) fn bind_status_listener(
-    path: &Path,
-    log: &mut Log,
-) -> Option<std::os::unix::net::UnixListener> {
-    if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-        {
-            log.warn(&format!(
-                "status socket: could not create socket dir {}: {e}",
-                dir.display()
-            ));
-        }
-        // Owner-only parent dir is the real protection; enforce it even if the dir
-        // already existed.
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            log.warn(&format!(
-                "status socket: could not restrict socket dir perms {}: {e}",
-                dir.display()
-            ));
-        }
-    }
-    if let Err(e) = prepare_socket_path(path) {
-        log.error(&format!(
-            "status socket: refusing to bind {}: {e}",
-            path.display()
-        ));
-        return None;
-    }
-    let listener = match std::os::unix::net::UnixListener::bind(path) {
-        Ok(l) => l,
-        Err(e) => {
-            log.error(&format!(
-                "status socket: failed to listen {}: {e}",
-                path.display()
-            ));
-            return None;
-        }
-    };
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        log.warn(&format!(
-            "status socket: could not set socket perms 0600 {}: {e}",
-            path.display()
-        ));
-    }
-    log.info(&format!(
-        "status socket: socket listening {}",
-        path.display()
-    ));
-    Some(listener)
-}
-
-/// Make `path` bindable for a fresh listener. Errors when the path is a non-socket
-/// file (a misconfigured path must never delete an unrelated file) or when another
-/// process is still accepting on it (clobbering a live socket would break the
-/// running agent). A truly stale socket (nothing accepting) is removed. Mirrors
-/// the Go `prepareSocketPath`.
-fn prepare_socket_path(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-        Ok(meta) => {
-            if !meta.file_type().is_socket() {
-                return Err(io::Error::other(format!(
-                    "path exists but is not a socket: {}",
-                    path.display()
-                )));
-            }
-            if socket_is_live(path) {
-                return Err(io::Error::other(format!(
-                    "socket already in use by another process: {}",
-                    path.display()
-                )));
-            }
-            std::fs::remove_file(path)
-        }
-    }
-}
-
-/// Whether a Unix socket at `path` currently has a process accepting connections
-/// (vs. a stale leftover file). A connect to a Unix stream socket resolves
-/// immediately: it succeeds if a listener is bound, else fails fast (ECONNREFUSED
-/// / ENOENT).
-fn socket_is_live(path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
-}
+//
+// The bind ceremony (owner-only `0700` dir, refuse-to-clobber-live prepare,
+// `0600` socket) is shared with the desktop socket in `crate::sockets`
+// (`bind_unix_socket`) — the daemon calls it with `"status socket"` here.
 
 /// Serve a read-only status UDS: on each connection, write the current LiveStatus
 /// JSON (5s write deadline) and close. `health` is called per connection to

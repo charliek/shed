@@ -9,6 +9,8 @@
 //! a valid config simply serves its status socket and waits for SIGTERM/SIGINT.
 
 mod config;
+#[cfg(feature = "desktop-forwarding")]
+mod desktop;
 mod sockets;
 mod status;
 mod version;
@@ -19,7 +21,7 @@ use std::process;
 use std::sync::Arc;
 
 use config::HostAgentConfig;
-use sockets::status_socket_path;
+use sockets::{bind_unix_socket, status_socket_path};
 use status::{build_live_status, now_rfc3339, run_status, serve_status_socket, LiveStatus};
 use version::full_info;
 
@@ -208,15 +210,41 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
     let version = full_info();
     let status_path = status_socket_path();
-    let listener = status::bind_status_listener(&status_path, &mut log);
+    let status_listener = bind_unix_socket("status socket", &status_path, &mut log);
 
-    // The status snapshot is recomputed per connection (fresh written_at/pid).
+    // The desktop approval channel (feature-gated). Bind its socket + build the
+    // server here so the status snapshot can report its live consumer info. The
+    // real control-token minter is a later slice — a stub keeps `token.get`
+    // answerable end-to-end for now.
+    #[cfg(feature = "desktop-forwarding")]
+    let (desktop_server, desktop_listener, desktop_path) = {
+        let server = desktop::DesktopServer::new(
+            version.clone(),
+            cfg.gate_namespaces(),
+            cfg.approval_timeout(),
+            Some(Arc::new(desktop::StubControlMinter)),
+        );
+        let path = sockets::desktop_socket_path();
+        let listener = bind_unix_socket("desktop", &path, &mut log);
+        (server, listener, path)
+    };
+
+    // The status snapshot is recomputed per connection (fresh written_at/pid). It
+    // reports the desktop consumer identity when the feature is on, else no consumer.
     let health: Arc<dyn Fn() -> LiveStatus + Send + Sync> = {
         let cfg = cfg.clone();
         let config_path = resolved_config_path;
         let started_at = started_at.clone();
         let version = version.clone();
-        Arc::new(move || build_live_status(&cfg, &config_path, &started_at, &version))
+        #[cfg(feature = "desktop-forwarding")]
+        let desktop_server = desktop_server.clone();
+        Arc::new(move || {
+            #[cfg(feature = "desktop-forwarding")]
+            let consumer = desktop_server.consumer_info();
+            #[cfg(not(feature = "desktop-forwarding"))]
+            let consumer = None;
+            build_live_status(&cfg, &config_path, &started_at, &version, consumer)
+        })
     };
 
     // Build the tokio runtime only for the daemon; the version/status subcommands
@@ -233,25 +261,61 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     };
 
     runtime.block_on(async move {
-        match listener {
-            Some(std_listener) => {
-                let _ = std_listener.set_nonblocking(true);
-                match tokio::net::UnixListener::from_std(std_listener) {
-                    Ok(listener) => {
-                        serve_status_socket(listener, status_path, health, wait_for_shutdown())
-                            .await;
-                    }
-                    // Conversion failure (should not happen): just wait for a signal.
-                    Err(_) => wait_for_shutdown().await,
-                }
+        // One shutdown signal shared by every socket server: a task flips the watch
+        // on SIGTERM/SIGINT; each server's shutdown future resolves when it flips.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            wait_for_shutdown().await;
+            let _ = shutdown_tx.send(true);
+        });
+
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        if let Some(listener) = status_listener.and_then(into_tokio_listener) {
+            let rx = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                serve_status_socket(listener, status_path, health, wait_shutdown(rx)).await;
+            }));
+        }
+
+        #[cfg(feature = "desktop-forwarding")]
+        if let Some(listener) = desktop_listener.and_then(into_tokio_listener) {
+            let rx = shutdown_rx.clone();
+            let server = desktop_server.clone();
+            tasks.push(tokio::spawn(async move {
+                server
+                    .serve(listener, desktop_path, wait_shutdown(rx))
+                    .await;
+            }));
+        }
+
+        if tasks.is_empty() {
+            // No sockets bound: still behave like a daemon (wait for a signal).
+            wait_shutdown(shutdown_rx).await;
+        } else {
+            for task in tasks {
+                let _ = task.await;
             }
-            // Status socket unavailable: still behave like a daemon (wait for signal).
-            None => wait_for_shutdown().await,
         }
     });
 
     log.info("stopped");
     0
+}
+
+/// Resolve when the shared shutdown watch is flipped (or its sender is dropped).
+async fn wait_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|flagged| *flagged).await;
+}
+
+/// Flip a bound blocking std listener to non-blocking and adopt it into the tokio
+/// runtime. `None` on the (should-not-happen) conversion failure, so the caller
+/// skips that socket. Shared by the status + desktop socket setup.
+fn into_tokio_listener(
+    std_listener: std::os::unix::net::UnixListener,
+) -> Option<tokio::net::UnixListener> {
+    let _ = std_listener.set_nonblocking(true);
+    tokio::net::UnixListener::from_std(std_listener).ok()
 }
 
 /// Resolve the absolute config path the daemon loaded, surfaced verbatim in

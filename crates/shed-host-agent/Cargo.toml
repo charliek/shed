@@ -13,14 +13,27 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# The desktop approval channel (the async UDS server in `desktop.rs`). On by
+# default; a headless build (`--no-default-features`) drops it — and its shed-core /
+# async-trait / uuid deps — so the daemon serves only the status socket.
+default = ["desktop-forwarding"]
+desktop-forwarding = ["dep:shed-core", "dep:async-trait", "dep:uuid"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-# net (UnixListener/UnixStream) + io-util (AsyncWriteExt) + signal (SIGTERM/SIGINT)
-# on top of the workspace's rt-multi-thread/macros/sync/time.
-tokio = { workspace = true, features = ["net", "io-util", "signal", "rt-multi-thread", "macros", "time"] }
+# net (UnixListener/UnixStream) + io-util (AsyncWriteExt/BufReader) + sync
+# (mpsc/oneshot) + signal (SIGTERM/SIGINT) on top of rt-multi-thread/macros/time.
+tokio = { workspace = true, features = ["net", "io-util", "sync", "signal", "rt-multi-thread", "macros", "time"] }
 # getpid() for the LiveStatus `pid` field (matches the Go daemon's os.Getpid()).
 libc = "0.2"
+# The shared wire codec (server-direction builders/decoders) + uuid + async-trait
+# for the ControlTokenMinter seam — all only needed by the desktop server, so they
+# are optional and pulled in by the `desktop-forwarding` feature.
+shed-core = { path = "../shed-core", optional = true }
+async-trait = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Throwaway socket dirs for the status "not running" exit-code test.

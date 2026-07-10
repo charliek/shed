@@ -58,6 +58,13 @@ backend. Daemons write their operational log to a per-test `-log-file` (that log
   kept), and each `servers[].namespaces[].since`. Every masked timestamp has its
   **RFC3339 shape asserted before** masking. Everything else (`schema`, `policies`,
   `gate_namespaces`, `approval_channel.consumer_connected`, `servers[]`) is diffed.
+  The surface-A desktop tests use `normalize.mask_hello_ack()` in the same spirit — it
+  masks a `hello_ack` frame's volatile `id`/`ts` (and, on an **accepted** ack, the
+  build `agent.version`, shape-asserted nonempty first) while diffing the rest
+  (`v`, `type`, `accepted`, `reason`, `agent.approval_method`, `namespaces`,
+  `gate_namespaces`, `request_timeout_ms`). A **superseded** (`accepted:false`) ack's
+  `agent` is the zero value `{"version":"","approval_method":""}`, so its empty
+  `version` is diffed as a stable constant, not masked.
 
 ## Golden fixtures
 
@@ -92,6 +99,17 @@ expected-output` vectors carrying `"protocol_version": 2`. Both the Go runner
   normal path resolves immediately either way; a pathological full-backlog peer could hang
   the Rust side longer. Low severity, tracked for the config/lifecycle slice.
 
+- **Desktop `token.get` + event fan-out / approval correlation.** The surface-A handshake
+  (`hello`→`hello_ack`), the non-hello drop, and single-consumer supersede are now
+  differentially enforced with a fake desktop client (`desktop_client.py`,
+  `test_desktop_*.py`). Three surface-A cells stay `xfail`: **`token.get`** is
+  differential-gated in the MINTER slice (Go answers it with the real SSH-bootstrap
+  minter; the Rust side has only a `StubControlMinter` — making the two agree needs the
+  ssh-shim seam), and **event fan-out + replay** and **approval request/response
+  correlation** need a gated bus/backend op to inject an audit entry or drive a `sign`
+  approval (slice 1c) — neither impl has a caller for its `publish_audit` /
+  `request_approval` path until then.
+
 ## Per-cell status table
 
 `enforced` = asserted equal (or smoke-asserted) now; `xfail` = a real port surface not
@@ -113,8 +131,11 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | decision | `EffectivePolicy` (`""→deny-all`, echoes) | **enforced** | golden (Go + Rust runners) |
 | decision | `desktopGateNamespaces` ordered gate list | **enforced** | golden (Go + Rust runners) |
 | config-parse | inline-flow-style YAML (`{ ... }`) parity | **xfail** | live — Rust `yaml_lite` block-only (see "Known contract gaps") |
-| desktop UDS server | hello/hello_ack, last-writer-wins, replay ring, event fan-out, `token.get` | **xfail** | live surface A (slice 1) |
-| approval | gated `sign` delegated approve/deny/timeout | **xfail** | live (slice 1) |
+| desktop UDS server | hello/hello_ack handshake (masked canonical-equal) + non-hello first line dropped | **enforced** | live surface A (`test_desktop_handshake.py`, `test_desktop_first_non_hello_drops.py`) |
+| desktop UDS server | single-consumer last-writer-wins supersede (`accepted:false, reason:"superseded"`, old closed) | **enforced** | live surface A (`test_desktop_supersede.py`) |
+| desktop UDS server | `token.get` → `token.response` | **xfail** | live — token.get is differential-gated in the MINTER slice (Go uses the real SSH-bootstrap minter; the Rust side has only a stub — making them agree needs the ssh-shim seam) |
+| desktop UDS server | event fan-out + replay ring, approval request/response correlation | **xfail** | live — event fan-out + approval correlation need a gated bus op (slice 1c) |
+| approval | gated `sign` delegated approve/deny/timeout | **xfail** | live (slice 1c — needs a gated bus op to drive the `sign` path) |
 | approval | native Touch-ID (biometrics) | **out-of-scope** | separate manual sign-off (needs live biometric) |
 | bus | subscribe/respond, open + secure(TLS-pin), 401/409, reconnect | **xfail** | live surface B (slice 1) |
 | egress | events / 401 / 404-501, 5m vs 30s backoff | **xfail** | live ("no reconnect in window") + unit (consts) |

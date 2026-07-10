@@ -2010,11 +2010,14 @@ dependencies = [
 name = "shed-host-agent"
 version = "0.7.10"
 dependencies = [
+ "async-trait",
  "libc",
  "serde",
  "serde_json",
+ "shed-core",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
