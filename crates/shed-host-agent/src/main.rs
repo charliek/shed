@@ -256,16 +256,46 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
 /// Resolve the absolute config path the daemon loaded, surfaced verbatim in
 /// `status`. Best-effort, lexical (no symlink resolution) — mirrors Go's
-/// `filepath.Abs(expandTilde(path))`.
+/// `filepath.Abs(expandTilde(path))`, which cleans `.`/`..` components.
 fn resolve_config_path(config_path: &str) -> String {
     let expanded = config::expand_tilde(config_path);
-    if Path::new(&expanded).is_absolute() {
-        return expanded;
+    let p = Path::new(&expanded);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p),
+            Err(_) => p.to_path_buf(),
+        }
+    };
+    lexical_clean(&abs).to_string_lossy().into_owned()
+}
+
+/// Lexically clean a path (resolve `.`/`..` without touching the filesystem),
+/// matching Go's `filepath.Clean` for the cases `filepath.Abs` produces: `.` is
+/// dropped, `..` pops a preceding normal component, and `..` at the root is
+/// discarded (`/..` => `/`). No symlink resolution (Go's `Abs` doesn't either).
+fn lexical_clean(p: &Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut stack: Vec<Component> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match stack.last() {
+                Some(Component::Normal(_)) => {
+                    stack.pop();
+                }
+                // `/..` collapses to `/`; a leading `..` in a relative path is kept.
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => stack.push(comp),
+            },
+            c => stack.push(c),
+        }
     }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(&expanded).to_string_lossy().into_owned(),
-        Err(_) => expanded,
+    if stack.is_empty() {
+        return PathBuf::from(".");
     }
+    stack.iter().collect()
 }
 
 /// Resolve when either SIGTERM or SIGINT is received.
@@ -367,6 +397,20 @@ mod tests {
         let err = parse_args(&owned(&["status", "--live"])).unwrap_err();
         assert_eq!(err.code, 2);
         assert!(err.message.contains("--live was removed"));
+    }
+
+    #[test]
+    fn lexical_clean_resolves_dot_and_dotdot() {
+        use std::path::PathBuf;
+        let clean = |p: &str| lexical_clean(Path::new(p)).to_string_lossy().into_owned();
+        assert_eq!(clean("/a/b/../c"), "/a/c");
+        assert_eq!(clean("/a/./b"), "/a/b");
+        assert_eq!(clean("/a/b/.."), "/a");
+        // `..` at the root collapses to the root (matches Go filepath.Clean).
+        assert_eq!(clean("/.."), "/");
+        assert_eq!(clean("/../.."), "/");
+        // A relative leading `..` is preserved (no cwd to pop into lexically).
+        assert_eq!(lexical_clean(Path::new("../x")), PathBuf::from("../x"));
     }
 
     #[test]

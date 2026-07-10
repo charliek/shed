@@ -79,6 +79,19 @@ expected-output` vectors carrying `"protocol_version": 2`. Both the Go runner
   and this divergence is tracked as an `xfail`/out-of-scope cell below (`config-parse ·
   inline-flow`) — a later slice brings the Rust parser to parity.
 
+- **Config validation.** The Rust slice-0 config reader is `LiveStatus`-scoped: it does
+  **not** yet reject the things Go `LoadConfig`/`Validate` rejects (unknown policy strings,
+  the AWS/Docker biometric policies, `aws.mode`/`aws.sheds` errors, a non-positive
+  `approval_timeout`, malformed YAML). So e.g. `aws.approval.policy: biometrics` exits 1 in
+  Go but currently starts in Rust and echoes `biometrics`. The full config **port +
+  validation-parity differential** is its own later slice (config.go's `Validate` is ~120
+  lines); tracked as `config-validate` below.
+
+- **Bounded connect timeout.** The Rust `status` client and the daemon's live-socket
+  stale-probe use blocking Unix `connect()`; Go uses `net.DialTimeout` (2s / 500ms). The
+  normal path resolves immediately either way; a pathological full-backlog peer could hang
+  the Rust side longer. Low severity, tracked for the config/lifecycle slice.
+
 ## Per-cell status table
 
 `enforced` = asserted equal (or smoke-asserted) now; `xfail` = a real port surface not
@@ -94,7 +107,9 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | CLI | `status` text render running (masked equal) | **enforced** | live (`test_status_running.py`) |
 | lifecycle | config-load error → exit 1 (exit code only) | **enforced** | live (`test_config_error.py`) |
 | lifecycle | SIGTERM → exit 0 + both sockets unlinked | **enforced** | live (`test_lifecycle.py`) |
-| socket | status socket bind / `0700` dir / `0600` file / stale-vs-live | **enforced** (bind + unlink) | live (`conftest` daemon) |
+| socket | status socket bind + `0600` file perms | **enforced** | live (`conftest` daemon + `test_socket_perms.py`) |
+| socket | socket-dir `0700` + stale-vs-live rebinding | **xfail** | live (config/lifecycle slice) |
+| config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML (parity) | **xfail** | live (config-port slice; see "Known contract gaps") |
 | decision | `EffectivePolicy` (`""→deny-all`, echoes) | **enforced** | golden (Go + Rust runners) |
 | decision | `desktopGateNamespaces` ordered gate list | **enforced** | golden (Go + Rust runners) |
 | config-parse | inline-flow-style YAML (`{ ... }`) parity | **xfail** | live — Rust `yaml_lite` block-only (see "Known contract gaps") |

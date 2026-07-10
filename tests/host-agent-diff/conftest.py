@@ -242,9 +242,16 @@ def daemon(binaries, tmp_path_factory):
 
 
 def _shutdown(impl, proc, status_sock, desktop_sock) -> None:
-    """SIGTERM the daemon, assert a clean exit 0, and assert both sockets unlinked."""
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGTERM)
+    """SIGTERM the daemon, assert a clean exit 0, and assert both sockets unlinked.
+
+    The daemon MUST still be running at teardown: an early exit (a crash after
+    serving a request, say) would otherwise false-pass this "clean SIGTERM
+    shutdown" check, since `proc.wait()` would just return the prior code."""
+    assert proc.poll() is None, (
+        f"{impl} daemon already exited (rc={proc.returncode}) before SIGTERM — "
+        "a daemon must stay up until teardown; an early exit is a bug"
+    )
+    proc.send_signal(signal.SIGTERM)
     try:
         rc = proc.wait(timeout=5)
     except subprocess.TimeoutExpired:

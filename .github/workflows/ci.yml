@@ -81,13 +81,19 @@ jobs:
               - 'desktop/uv.lock'
             hostagent:
               # The Go-vs-Rust host-agent differential leg: both daemons, their
-              # shared wire contract (sdk envelope + ext/protocol payloads), and
-              # the harness itself.
+              # shared wire contract (sdk envelope + ext/protocol payloads), the
+              # harness, the committed wire reference, and the shared build
+              # manifests/locks/toolchain a dependency bump would ride in on.
               - 'crates/shed-host-agent/**'
+              - 'crates/Cargo.toml'
+              - 'crates/Cargo.lock'
               - 'cmd/shed-host-agent/**'
               - 'sdk/**'
               - 'internal/ext/protocol/**'
               - 'tests/host-agent-diff/**'
+              - 'docs/development/host-agent-wire-catalog.md'
+              - 'go.mod'
+              - 'go.sum'
             docs:
               - 'docs/**'
               - 'mkdocs.yml'

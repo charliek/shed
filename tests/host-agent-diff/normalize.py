@@ -71,8 +71,29 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
     """
     out = dict(obj)
 
-    out["version"] = MASK_VERSION
+    # Assert shape/value BEFORE masking so the mask can't paper over a real
+    # regression (a Rust `"pid":"123"` string, a blank version, or a relative /
+    # wrong config_path would otherwise compare equal to Go once blanked).
+    pid = out.get("pid")
+    assert isinstance(pid, int) and not isinstance(pid, bool) and pid > 0, (
+        f"pid not a positive int: {pid!r}"
+    )
     out["pid"] = MASK_PID
+
+    version = out.get("version")
+    assert isinstance(version, str) and version.strip(), (
+        f"version not a non-empty string: {version!r}"
+    )
+    out["version"] = MASK_VERSION
+
+    cp = out.get("config_path")
+    assert isinstance(cp, str) and cp, f"config_path missing/empty: {cp!r}"
+    if config_path:
+        # The daemon must echo back the exact config path it was given (each impl
+        # resolves it the same way — Go filepath.Abs, Rust lexical clean).
+        assert cp == config_path, f"config_path {cp!r} != expected {config_path!r}"
+    else:
+        assert os.path.isabs(cp), f"config_path not absolute: {cp!r}"
     out["config_path"] = MASK_CONFIG_PATH
 
     for ts_field in ("started_at", "written_at"):
