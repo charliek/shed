@@ -21,6 +21,7 @@ type Server struct {
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
 	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in secure mode (auth.mode: secure)
+	rcCaps      *rcCapsCache             // per-shed rc capabilities cache (session enrichment + overview)
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
@@ -47,6 +48,7 @@ func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, p
 		sshHostKey: sshHostKey,
 		plugins:    plugins,
 		bridge:     bridge,
+		rcCaps:     newRCCapsCache(),
 	}
 }
 

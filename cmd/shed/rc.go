@@ -13,10 +13,10 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/ext/rc"
 	"github.com/charliek/shed/internal/version"
 )
 
@@ -24,64 +24,11 @@ import (
 // under the RC Session Convention (e.g. "rc-abc234").
 const rcTmuxPrefix = "rc-"
 
-// rcEnrichTimeout bounds a single `shed-ext-rc list` SSH round-trip so a slow or
-// unreachable shed never stalls `shed sessions`.
-const rcEnrichTimeout = 6 * time.Second
-
-// rcEnrichConcurrency caps concurrent SSH enrichment calls so `sessions --all`
-// across many sheds doesn't fan out unbounded.
-const rcEnrichConcurrency = 6
-
-// rcSessionDTO mirrors shed-ext-rc's neutral `list` DTO (one entry of the
-// `{"rc_sessions":[...]}` payload). It is decoded verbatim from the binary's
-// stdout so the shed CLI stays aligned with the cross-repo golden fixture
-// (internal/ext/rc + shed-remote-agent); fields beyond those we
-// display are accepted and ignored.
-type rcSessionDTO struct {
-	Slug        string `json:"slug"`
-	TmuxSession string `json:"tmux_session"`
-	Kind        string `json:"kind"`
-	State       string `json:"state"`
-	Managed     bool   `json:"managed"`
-	DisplayName string `json:"display_name"`
-	URL         string `json:"url"`
-	CreatedBy   string `json:"created_by"`
-}
-
-// rcListResponse is the `shed-ext-rc list` stdout shape.
-type rcListResponse struct {
-	RCSessions []rcSessionDTO `json:"rc_sessions"`
-}
-
-// toSessionRC projects the decoded DTO onto the display type carried on
-// config.Session (the decode type is kept separate so it stays aligned with the
-// shed-ext-rc golden contract independent of presentation).
-func (d rcSessionDTO) toSessionRC() *config.SessionRC {
-	return &config.SessionRC{
-		Kind:        d.Kind,
-		State:       d.State,
-		Managed:     d.Managed,
-		DisplayName: d.DisplayName,
-		URL:         d.URL,
-		CreatedBy:   d.CreatedBy,
-	}
-}
-
-// parseRcList decodes `shed-ext-rc list` stdout into a map keyed by tmux session
-// name (e.g. "rc-abc234") for O(1) merge onto enumerated tmux sessions.
-func parseRcList(stdout []byte) (map[string]rcSessionDTO, error) {
-	var resp rcListResponse
-	if err := json.Unmarshal(stdout, &resp); err != nil {
-		return nil, fmt.Errorf("decoding shed-ext-rc list: %w", err)
-	}
-	out := make(map[string]rcSessionDTO, len(resp.RCSessions))
-	for _, s := range resp.RCSessions {
-		if s.TmuxSession != "" {
-			out[s.TmuxSession] = s
-		}
-	}
-	return out, nil
-}
+// Session-listing RC enrichment now lives entirely server-side: the server execs
+// `shed-ext-rc list` over the guest agent channel and populates Session.RC on GET
+// /api/sessions (see internal/api/rcenrich.go). The CLI just renders whatever the
+// server returns — it opens no SSH connection to enrich a listing. The canonical
+// `list` DTO is internal/ext/rc.Session; createRCSession below decodes into it.
 
 // baseSSHArgs returns the SSH args common to every shed connection: port, pinned
 // known_hosts, strict host-key check, any extra -o options, then <shed>@<host>.
@@ -103,89 +50,15 @@ func baseSSHArgs(shedName string, entry *config.ServerEntry, extraOpts ...string
 // of hanging). remoteArgv elements are sent to the server as-is (joined by ssh and
 // re-parsed by the server's `bash -lc`), so a caller passing user data as a single
 // element must shell-quote it first (see createRCSession); literal tokens like
-// "shed-ext-rc","list" need no quoting.
+// "shed-ext-rc","create" need no quoting.
 func sshCaptureArgs(shedName string, entry *config.ServerEntry, remoteArgv ...string) []string {
 	// -T disables PTY allocation so ssh doesn't print "Pseudo-terminal will not be
 	// allocated…" to our captured stderr, and so the non-PTY exec channel keeps the
 	// remote command's stdout and stderr on their own SSH streams (guest-binary
-	// diagnostics arrive on stderr; see the fallback in rcListOverSSH).
+	// diagnostics arrive on stderr; see the sshShell stderr fallback).
 	args := baseSSHArgs(shedName, entry, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 	args = append(args, "--")
 	return append(args, remoteArgv...)
-}
-
-// rcListOverSSH runs `shed-ext-rc list` in the shed and returns the parsed
-// sessions keyed by tmux name. A missing binary, transport failure, or non-zero
-// exit is reported as an error for the caller to treat as "no RC data".
-func rcListOverSSH(ctx context.Context, shedName string, entry *config.ServerEntry) (map[string]rcSessionDTO, error) {
-	args := sshCaptureArgs(shedName, entry, "shed-ext-rc", "list")
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("shed-ext-rc list on %s: %w", shedName, err)
-	}
-	return parseRcList(out)
-}
-
-// rcShedKey identifies a shed by server + name (a shed name is unique only
-// within a server, so the aggregated `--all` listing must key by both).
-type rcShedKey struct{ server, shed string }
-
-// enrichSessionsRC fills the RC field of every "rc-*" session in sessions by
-// querying the in-shed shed-ext-rc binary. It runs one `shed-ext-rc list` per
-// distinct (server, shed) that actually has an rc-* session — bounded by
-// rcEnrichConcurrency and time-limited per call — resolving each shed's SSH
-// endpoint from the client config by the session's ServerName. It mutates
-// sessions in place and degrades silently (rows keep their plain tmux data) when
-// a shed is unreachable, lacks the binary, or its server is unknown. Non-RC
-// listings touch nothing and never dial. Call once, after the full session list
-// (with ServerName populated) is assembled.
-func enrichSessionsRC(sessions []config.Session) {
-	if clientConfig == nil {
-		return // config not loaded (e.g. a direct test caller); nothing to resolve
-	}
-	idxByShed := make(map[rcShedKey][]int)
-	for i := range sessions {
-		if strings.HasPrefix(sessions[i].Name, rcTmuxPrefix) {
-			k := rcShedKey{sessions[i].ServerName, sessions[i].ShedName}
-			idxByShed[k] = append(idxByShed[k], i)
-		}
-	}
-	if len(idxByShed) == 0 {
-		return
-	}
-
-	sem := make(chan struct{}, rcEnrichConcurrency)
-	var wg sync.WaitGroup
-	for key, idxs := range idxByShed {
-		entry, ok := clientConfig.Servers[key.server]
-		if !ok {
-			continue // unknown server -> leave rows un-enriched
-		}
-		wg.Add(1)
-		go func(key rcShedKey, idxs []int, entry config.ServerEntry) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			ctx, cancel := context.WithTimeout(context.Background(), rcEnrichTimeout)
-			defer cancel()
-			byTmux, err := rcListOverSSH(ctx, key.shed, &entry)
-			if err != nil {
-				if verboseLevel > 0 {
-					fmt.Fprintf(os.Stderr, "Warning: RC metadata unavailable for %s: %v\n", key.shed, err)
-				}
-				return
-			}
-			// Distinct indices per (server, shed) -> safe concurrent writes.
-			for _, i := range idxs {
-				if dto, ok := byTmux[sessions[i].Name]; ok {
-					sessions[i].RC = dto.toSessionRC()
-				}
-			}
-		}(key, idxs, entry)
-	}
-	wg.Wait()
 }
 
 // --- RC session creation (shed attach --kind ...) ---------------------------
@@ -286,7 +159,7 @@ type rcCreateOptions struct {
 // string (the server re-parses through bash -lc). stdin carries the kickoff prompt
 // (--prompt-stdin) or the plan (--plan-stdin) — never argv, per the convention — with
 // any plan framing base64-encoded onto argv so a single exec ships plan + framing.
-func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
+func createRCSession(opts rcCreateOptions) (rc.Session, error) {
 	argv := []string{
 		"shed-ext-rc", "create",
 		"--kind", opts.kind,
@@ -322,11 +195,11 @@ func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
 	defer cancel()
 	out, err := sshShell(ctx, opts.shedName, opts.entry, stdin, strings.Join(quoted, " "))
 	if err != nil {
-		return rcSessionDTO{}, fmt.Errorf("shed-ext-rc create: %w", err)
+		return rc.Session{}, fmt.Errorf("shed-ext-rc create: %w", err)
 	}
-	var dto rcSessionDTO
+	var dto rc.Session
 	if err := json.Unmarshal(bytes.TrimSpace(out), &dto); err != nil {
-		return rcSessionDTO{}, fmt.Errorf("decoding shed-ext-rc create output: %w (raw: %q)", err, string(out))
+		return rc.Session{}, fmt.Errorf("decoding shed-ext-rc create output: %w (raw: %q)", err, string(out))
 	}
 	return dto, nil
 }

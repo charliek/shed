@@ -150,6 +150,21 @@ type ListResponse struct {
 // TmuxName returns the tmux session name for a slug.
 func TmuxName(slug string) string { return TmuxPrefix + slug }
 
+// IndexByTmux keys sessions by their tmux session name (e.g. "rc-abc234") for an
+// O(1) merge onto a shed's enumerated tmux sessions. Entries with an empty
+// TmuxSession are skipped. This is the canonical merge-by-tmux-name helper shared
+// by every consumer of a `list` envelope (the server enrichment path, the CLI)
+// so the keying convention lives in exactly one place.
+func IndexByTmux(sessions []Session) map[string]Session {
+	out := make(map[string]Session, len(sessions))
+	for _, s := range sessions {
+		if s.TmuxSession != "" {
+			out[s.TmuxSession] = s
+		}
+	}
+	return out
+}
+
 const slugAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
 
 // GenSlug returns a 6-char slug from the confusable-free alphabet (no 0/o, 1/l/i)

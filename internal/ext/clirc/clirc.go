@@ -339,7 +339,7 @@ func doList(cfg Config, d deps, args []string) int {
 	}
 	resp := rc.List(d.runner, nil)
 	// One guest exec feeds both the session list and capability discovery.
-	caps := rc.BuildCapabilities(effectiveProbe(d))
+	caps := rc.BuildCapabilities(effectiveProbe(d), effectiveInstalled(d))
 	resp.Capabilities = &caps
 	return printJSON(cfg, d, resp)
 }
@@ -353,7 +353,7 @@ func doCapabilities(cfg Config, d deps, args []string) int {
 	if code, ok := parseArgs(cfg, d, fs, args); !ok {
 		return code
 	}
-	return printJSON(cfg, d, rc.BuildCapabilities(effectiveProbe(d)))
+	return printJSON(cfg, d, rc.BuildCapabilities(effectiveProbe(d), effectiveInstalled(d)))
 }
 
 // effectiveProbe returns the injected agent probe, or the real command-based probe
@@ -365,17 +365,35 @@ func effectiveProbe(d deps) rc.AgentProbe {
 	return realAgentProbe
 }
 
+// effectiveInstalled returns the fast install-only fallback BuildCapabilities uses
+// when a full probe outruns its budget. With an injected (test) probe there is no
+// real binary to look up, so the fallback is nil — injected probes return promptly
+// and never hit the budget.
+func effectiveInstalled(d deps) rc.InstalledProbe {
+	if d.probe != nil {
+		return nil
+	}
+	return realInstalledProbe
+}
+
 // agentProbeTimeout bounds each `command -v` / `--version` call so an unresponsive or
-// hung agent binary can't stall capability discovery.
+// hung agent binary can't stall capability discovery. (BuildCapabilities additionally
+// enforces a tighter shared budget across all probes.)
 const agentProbeTimeout = 2 * time.Second
 
-// realAgentProbe reports whether an agent binary is installed (via `command -v`) and
-// its version (via `<bin> --version`), each under a short timeout. bin values come
-// from the registry (fixed literals), never user input.
-func realAgentProbe(bin string) rc.AgentInfo {
+// realInstalledProbe reports whether an agent binary is on PATH via `command -v` —
+// a shell builtin, so this is fast even when the binary itself is unresponsive. bin
+// values come from the registry (fixed literals), never user input.
+func realInstalledProbe(bin string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), agentProbeTimeout)
 	defer cancel()
-	if err := exec.CommandContext(ctx, "sh", "-c", "command -v "+shellQuote(bin)).Run(); err != nil {
+	return exec.CommandContext(ctx, "sh", "-c", "command -v "+shellQuote(bin)).Run() == nil
+}
+
+// realAgentProbe reports whether an agent binary is installed (via `command -v`) and
+// its version (via `<bin> --version`), each under a short timeout.
+func realAgentProbe(bin string) rc.AgentInfo {
+	if !realInstalledProbe(bin) {
 		return rc.AgentInfo{Installed: false}
 	}
 	vctx, vcancel := context.WithTimeout(context.Background(), agentProbeTimeout)

@@ -142,7 +142,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 // (nil only when the session is ready + the kickoff was delivered). A needs-auth /
 // needs-trust / not-ready session is left running; the returned error makes the exit
 // non-zero without deleting anything.
-func reportPlanOutcome(shedName string, entry *config.ServerEntry, dto rcSessionDTO, kind string) error {
+func reportPlanOutcome(shedName string, entry *config.ServerEntry, dto rc.Session, kind string) error {
 	switch dto.State {
 	case "ready":
 		printSuccess("Plan shipped to rc-%s and started (%s)", dto.Slug, dto.Kind)

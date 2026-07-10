@@ -84,14 +84,19 @@ func runSessions(cmd *cobra.Command, args []string) error {
 		if len(args) == 1 {
 			// List sessions for a specific shed
 			shedName := args[0]
-			sessions, err := client.ListSessions(shedName)
+			resp, err := client.ListSessions(shedName)
 			if err != nil {
 				return fmt.Errorf("failed to list sessions for %s: %w", shedName, err)
 			}
-			for i := range sessions {
-				sessions[i].ServerName = serverName
+			// Surface warnings (e.g. degraded rc enrichment) exactly like the
+			// aggregate paths do, so a "-/-" RC column is never silent.
+			for _, warning := range resp.Warnings {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 			}
-			allSessions = sessions
+			for i := range resp.Sessions {
+				resp.Sessions[i].ServerName = serverName
+			}
+			allSessions = resp.Sessions
 		} else {
 			// List all sessions on this server
 			resp, err := client.ListAllSessions()
@@ -109,10 +114,8 @@ func runSessions(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Enrich rc-* sessions with RC Session Convention metadata in one pass over
-	// the assembled list, so every code path above benefits and new branches
-	// can't forget it. No-op (no dial) when there are no rc-* sessions.
-	enrichSessionsRC(allSessions)
+	// RC metadata is populated server-side (Session.RC on GET /api/sessions); the
+	// CLI renders whatever the server returned and opens no SSH connection here.
 
 	if jsonFlag {
 		if allSessions == nil {

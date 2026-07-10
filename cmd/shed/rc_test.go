@@ -1,27 +1,32 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/ext/rc"
 )
 
-// TestParseRcListGolden decodes the cross-repo golden DTO fixture (byte-identical
-// to internal/ext/rc/testdata/rcSessionDto.golden.json and
-// shed-remote-agent's). Keeping a copy here makes the shed CLI a participant in
-// the shed-ext-rc stdout contract guard.
-func TestParseRcListGolden(t *testing.T) {
+// TestGoldenFixtureDecodesCanonical decodes the cross-repo golden DTO fixture
+// (byte-identical to internal/ext/rc/testdata/rcSessionDto.golden.json and
+// shed-remote-agent's) through the canonical internal/ext/rc types + the shared
+// rc.IndexByTmux merge helper. Keeping a copy here makes the shed CLI a
+// participant in the shed-ext-rc stdout contract guard even though listing
+// enrichment now happens server-side.
+func TestGoldenFixtureDecodesCanonical(t *testing.T) {
 	data, err := os.ReadFile("testdata/rcSessionDto.golden.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	byTmux, err := parseRcList(data)
-	if err != nil {
-		t.Fatalf("parseRcList: %v", err)
+	var resp rc.ListResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("decoding golden fixture: %v", err)
 	}
+	byTmux := rc.IndexByTmux(resp.RCSessions)
 	if len(byTmux) != 2 {
 		t.Fatalf("want 2 sessions, got %d", len(byTmux))
 	}
@@ -30,7 +35,7 @@ func TestParseRcListGolden(t *testing.T) {
 	if !ok {
 		t.Fatal("missing rc-abc234")
 	}
-	if full.Kind != "claude-rc" || full.State != "ready" || !full.Managed ||
+	if full.Kind != rc.KindClaudeRC || full.State != rc.StateReady || !full.Managed ||
 		full.DisplayName != "charliek/abc234" || !strings.Contains(full.URL, "session_") ||
 		full.CreatedBy != "shed-remote-agent/0.1.0" {
 		t.Fatalf("full session mismatch: %+v", full)
@@ -40,33 +45,10 @@ func TestParseRcListGolden(t *testing.T) {
 	if !ok {
 		t.Fatal("missing rc-brk900")
 	}
-	if minimal.Kind != "claude-broker" || minimal.Managed ||
+	if minimal.Kind != rc.KindClaudeBroker || minimal.Managed ||
 		minimal.DisplayName != "" || minimal.URL != "" {
 		t.Fatalf("minimal session should omit optionals: %+v", minimal)
 	}
-}
-
-func TestParseRcListEmptyAndBad(t *testing.T) {
-	t.Run("empty list", func(t *testing.T) {
-		m, err := parseRcList([]byte(`{"rc_sessions":[]}`))
-		if err != nil || len(m) != 0 {
-			t.Fatalf("want empty map no error, got %v %v", m, err)
-		}
-	})
-	t.Run("malformed json", func(t *testing.T) {
-		if _, err := parseRcList([]byte(`not json`)); err == nil {
-			t.Fatal("want error on malformed json")
-		}
-	})
-	t.Run("entry without tmux_session is skipped", func(t *testing.T) {
-		m, err := parseRcList([]byte(`{"rc_sessions":[{"slug":"x","kind":"shell"}]}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(m) != 0 {
-			t.Fatalf("entry without tmux_session must be skipped, got %v", m)
-		}
-	})
 }
 
 func TestSSHCaptureArgs(t *testing.T) {
@@ -241,21 +223,5 @@ func TestIsOldBinaryRCErr(t *testing.T) {
 	}
 	if isOldBinaryRCErr(nil) {
 		t.Error("nil error must not be detected")
-	}
-}
-
-// TestEnrichSessionsRCNoOp guards the no-op fast path: a listing with no rc-*
-// sessions must return before any config lookup or SSH dial (the test would hang
-// or panic on an unreachable/absent server if it didn't).
-func TestEnrichSessionsRCNoOp(t *testing.T) {
-	sessions := []config.Session{
-		{Name: "default", ShedName: "s", ServerName: "srv"},
-		{Name: "work", ShedName: "s", ServerName: "srv"},
-	}
-	enrichSessionsRC(sessions)
-	for i := range sessions {
-		if sessions[i].RC != nil {
-			t.Fatalf("non-rc session %q must not be enriched", sessions[i].Name)
-		}
 	}
 }

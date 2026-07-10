@@ -3,6 +3,7 @@ package rc
 import (
 	"regexp"
 	"strings"
+	"time"
 )
 
 // CapabilityVersion is the capabilities schema/protocol version advertised by
@@ -54,21 +55,74 @@ type Capabilities struct {
 // probe (which shells out to `command -v` + `--version`) is testable.
 type AgentProbe func(bin string) AgentInfo
 
-// BuildCapabilities assembles the capabilities payload, probing each registered agent
-// binary through probe (shell has no binary and is skipped in agents{}). The kinds
-// list and kind_features are registry-derived so they stay in lockstep with the
-// specs.
-func BuildCapabilities(probe AgentProbe) Capabilities {
-	agents := map[string]AgentInfo{}
-	for _, spec := range agentRegistry {
-		if spec.Bin == "" {
-			continue // shell: nothing to probe
-		}
-		if _, seen := agents[spec.Tool]; seen {
-			continue
-		}
-		agents[spec.Tool] = probe(spec.Bin)
+// InstalledProbe is the fast install-only check (`command -v`, a shell builtin —
+// milliseconds) used to degrade an agent whose full probe outruns probeBudget:
+// installed state is still reported, version is omitted. nil skips the fallback
+// (a budget-exhausted agent then reports not-installed).
+type InstalledProbe func(bin string) bool
+
+// probeBudget is the total wall-clock budget for ALL agent probes during
+// capabilities assembly. The full probe runs `<bin> --version`, which some agent
+// CLIs take seconds to answer; the `list` envelope embeds capabilities and is
+// consumed on the server's session-listing hot path under a ~2s exec timeout, so
+// probing must never come close to that. Probes run concurrently; any still
+// pending at the budget degrade to the fast installed-only result.
+const probeBudget = 750 * time.Millisecond
+
+// BuildCapabilities assembles the capabilities payload, probing each registered
+// agent binary through probe (shell has no binary and is skipped in agents{}).
+// Probes run concurrently under a shared probeBudget; a laggard agent reports
+// installed (via the fast installed check) with version omitted — Version is
+// omitempty, so the wire shape is unchanged — and one slow `--version` can never
+// stall `list`/`capabilities`. The kinds list and kind_features are
+// registry-derived so they stay in lockstep with the specs.
+func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities {
+	type probeSlot struct {
+		tool, bin string
+		done      chan AgentInfo
 	}
+	var slots []probeSlot
+	seen := map[string]bool{}
+	for _, spec := range agentRegistry {
+		if spec.Bin == "" || seen[spec.Tool] {
+			continue // shell: nothing to probe; one probe per tool
+		}
+		seen[spec.Tool] = true
+		s := probeSlot{tool: spec.Tool, bin: spec.Bin, done: make(chan AgentInfo, 1)}
+		slots = append(slots, s)
+		// Buffered channel: a laggard probe finishing after the budget just
+		// parks its result and the goroutine exits — no leak.
+		go func() { s.done <- probe(s.bin) }()
+	}
+
+	deadline := time.NewTimer(probeBudget)
+	defer deadline.Stop()
+	expired := false
+	agents := map[string]AgentInfo{}
+	for _, s := range slots {
+		if !expired {
+			select {
+			case info := <-s.done:
+				agents[s.tool] = info
+				continue
+			case <-deadline.C:
+				expired = true
+			}
+		}
+		// Budget exhausted: take a completed result if it raced in, otherwise
+		// degrade to the fast installed-only check.
+		select {
+		case info := <-s.done:
+			agents[s.tool] = info
+		default:
+			var info AgentInfo
+			if installed != nil {
+				info.Installed = installed(s.bin)
+			}
+			agents[s.tool] = info
+		}
+	}
+
 	return Capabilities{
 		RCVersion:    CapabilityVersion,
 		Kinds:        append([]Kind(nil), allKinds...),

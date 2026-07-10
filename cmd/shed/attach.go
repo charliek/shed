@@ -329,14 +329,14 @@ func modeLabel(mode string) string {
 	return mode
 }
 
-func printRCSummary(shedName string, dto rcSessionDTO) {
+func printRCSummary(shedName string, dto rc.Session) {
 	fmt.Printf("Started %s session rc-%s (%s)\n", dto.Kind, dto.Slug, dto.State)
 	printRCFollowups(shedName, dto)
 }
 
 // printRCFollowups prints the URL (when present) and Watch/Status follow-up lines
 // shared by every "session started" summary (`shed attach` and `shed plan`).
-func printRCFollowups(shedName string, dto rcSessionDTO) {
+func printRCFollowups(shedName string, dto rc.Session) {
 	if dto.URL != "" {
 		fmt.Printf("  URL:    %s\n", dto.URL)
 	}
@@ -345,7 +345,12 @@ func printRCFollowups(shedName string, dto rcSessionDTO) {
 }
 
 // listShedSessions is a thin wrapper so attachPlain can list sessions for the
-// --new guard without reaching for a package-level client.
+// --new guard without reaching for a package-level client. Only the session rows
+// are needed here (a name-existence check); warnings are for `shed sessions`.
 func listShedSessions(entry *config.ServerEntry, name string) ([]config.Session, error) {
-	return NewAPIClientFromEntry(entry, DefaultTimeout).ListSessions(name)
+	resp, err := NewAPIClientFromEntry(entry, DefaultTimeout).ListSessions(name)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Sessions, nil
 }

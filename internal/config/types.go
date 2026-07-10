@@ -186,10 +186,12 @@ type Session struct {
 	CreatedAt   time.Time `json:"created_at"`
 	Attached    bool      `json:"attached"`
 	WindowCount int       `json:"window_count,omitempty"`
-	// RC carries Remote Control Session Convention metadata for "rc-*" sessions,
-	// sourced client-side from the in-shed shed-ext-rc binary over SSH. It is nil
-	// for non-RC sessions and when enrichment was unavailable; server API
-	// responses never populate it.
+	// RC carries Remote Control Session Convention metadata for "rc-*" sessions.
+	// The server populates it by exec'ing the in-shed shed-ext-rc binary over the
+	// guest agent channel and merging by tmux name (GET /api/sessions and
+	// GET /api/sheds/{name}/sessions, unless ?rc=0). It is nil for non-RC sessions
+	// and for rc-* rows on a shed whose enrichment degraded (a warnings entry is
+	// added in that case).
 	RC *SessionRC `json:"rc,omitempty"`
 }
 
