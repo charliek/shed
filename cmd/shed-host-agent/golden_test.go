@@ -83,6 +83,58 @@ func TestGoldenEffectivePolicy(t *testing.T) {
 	}
 }
 
+// goldenTarget is the wire shape the load_discovered_servers golden compares (the same
+// keys the Rust runner emits), so ServerTarget (no json tags) can be checked field-wise.
+type goldenTarget struct {
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	Token          string `json:"token"`
+	TLSFingerprint string `json:"tls_fingerprint"`
+	SSHHost        string `json:"ssh_host"`
+	SSHPort        int    `json:"ssh_port"`
+}
+
+func TestGoldenLoadDiscoveredServers(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name       string         `json:"name"`
+			ConfigYAML string         `json:"config_yaml"`
+			Expected   []goldenTarget `json:"expected"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "load_discovered_servers.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("load_discovered_servers.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("load_discovered_servers.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(v.ConfigYAML), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		targets, err := LoadDiscoveredServers(path)
+		if err != nil {
+			t.Errorf("%s: LoadDiscoveredServers: %v", v.Name, err)
+			continue
+		}
+		got := make([]goldenTarget, 0, len(targets))
+		for _, tgt := range targets {
+			// ServerTarget and goldenTarget share field names+types (only the json
+			// tags differ), so a struct conversion suffices (staticcheck S1016).
+			got = append(got, goldenTarget(tgt))
+		}
+		gj, _ := json.Marshal(got)
+		wj, _ := json.Marshal(v.Expected)
+		if string(gj) != string(wj) {
+			t.Errorf("%s: LoadDiscoveredServers =\n  %s\nwant\n  %s", v.Name, gj, wj)
+		}
+	}
+}
+
 func TestGoldenGateNamespaces(t *testing.T) {
 	var fx struct {
 		ProtocolVersion int `json:"protocol_version"`

@@ -100,6 +100,14 @@ expected-output` vectors carrying `"protocol_version": 2`. Both the Go runner
 `desktopGateNamespaces` (Go) and `effective_policy_from_raw` /
 `HostAgentConfig::gate_namespaces` (Rust) match every vector.
 
+`fixtures/load_discovered_servers.json` (`"protocol_version": 1`) is `config.yaml text →
+expected []ServerTarget`. The Go runner (`TestGoldenLoadDiscoveredServers` in
+`golden_test.go`) and the Rust runner (`golden_load_discovered_servers`, an **in-crate**
+`controltoken.rs` test — the binary crate has no lib, so `tests/golden.rs` can't reach
+`load_discovered_servers`) both parse each vector's YAML and assert equal `ServerTarget`s.
+It pins the load-bearing divergences from `shed-core::ShedConfig`: `ssh_port` defaults to
+**0** (not 22) when omitted, empty-host entries are skipped, targets sort by name.
+
 ## Known contract gaps (slice 0)
 
 - **Inline flow-style YAML config.** The Rust slice-0 `yaml_lite` config parser handles
@@ -137,18 +145,19 @@ expected-output` vectors carrying `"protocol_version": 2`. Both the Go runner
   **ssh-agent response envelope**, never which routes each daemon hit. This flips to a
   full match when the later slices wire the Rust egress + aws/docker paths.
 
-- **Desktop `token.get` + event replay.** The surface-A handshake
-  (`hello`→`hello_ack`), the non-hello drop, and single-consumer supersede are
-  differentially enforced with a fake desktop client (`desktop_client.py`,
-  `test_desktop_*.py`); **event fan-out + approval request/response correlation** are
-  now enforced end-to-end by the gated `sign` flow (`test_bus_sign_gated.py` — a `sign`
-  drives `request_approval` and the resulting audit entry through `publish_audit` to
-  the consumer as an `event`). Two surface-A cells stay `xfail`: **`token.get`** is
-  differential-gated in the MINTER slice (Go answers it with the real SSH-bootstrap
-  minter; the Rust side has only a `StubControlMinter` — making the two agree needs the
-  ssh-shim seam), and the **event replay ring** (`replay_events` on connect) is not
-  exercised by the sign flow (it connects a fresh consumer with `replay_events:0`) — a
-  buffered-then-connect drive is a follow-up.
+- **Event replay ring.** The surface-A handshake (`hello`→`hello_ack`), the non-hello
+  drop, single-consumer supersede, event fan-out + approval correlation (via the gated
+  `sign`), and **`token.get`** (via the real SSH-bootstrap minter + a PATH-shim `ssh`,
+  `test_token_get.py`) are all differentially enforced. One surface-A cell stays `xfail`:
+  the **event replay ring** (`replay_events` on connect) is not exercised by the current
+  flows (they connect a fresh consumer with `replay_events:0`) — a buffered-then-connect
+  drive is a follow-up.
+
+- **Minter — malformed `~/.shed/config.yaml`.** The Rust `load_discovered_servers` reuses
+  the permissive `yaml_lite` reader, which never errors; Go `LoadDiscoveredServers` errors
+  on malformed YAML (→ `reading server config: …` in `token.response.error`). The harness
+  writes a valid block-style config, so the differential doesn't exercise it. Same class as
+  the inline-flow / config-validate gaps; brought to parity by the config-port slice.
 
 ## Per-cell status table
 
@@ -173,7 +182,7 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | config-parse | inline-flow-style YAML (`{ ... }`) parity | **xfail** | live — Rust `yaml_lite` block-only (see "Known contract gaps") |
 | desktop UDS server | hello/hello_ack handshake (masked canonical-equal) + non-hello first line dropped | **enforced** | live surface A (`test_desktop_handshake.py`, `test_desktop_first_non_hello_drops.py`) |
 | desktop UDS server | single-consumer last-writer-wins supersede (`accepted:false, reason:"superseded"`, old closed) | **enforced** | live surface A (`test_desktop_supersede.py`) |
-| desktop UDS server | `token.get` → `token.response` | **xfail** | live — token.get is differential-gated in the MINTER slice (Go uses the real SSH-bootstrap minter; the Rust side has only a stub — making them agree needs the ssh-shim seam) |
+| desktop UDS server | `token.get` → `token.response` (masked; `token`+`expires_at` compared UNMASKED via the PATH-shim mint) | **enforced** | live surface A (`test_token_get.py`) |
 | desktop UDS server | event fan-out + approval request/response correlation (driven by the gated `sign`) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
 | desktop UDS server | event replay ring (`replay_events` on connect) | **xfail** | live — not exercised by the sign flow (fresh consumer, `replay_events:0`); needs a buffered-then-connect drive |
 | approval | gated `sign` delegated approve/deny (deterministic ed25519 blob compared UNMASKED) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
@@ -187,7 +196,11 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | ssh backend | agent-forward / local-keys, list/sign/ping/status | **xfail** | live (transcripts) + golden (payloads) |
 | aws backend | passthrough, cache-hit/expiry | **xfail** (live) | live; assume-role → **out-of-scope** (golden+unit, no Go STS seam) |
 | docker backend | allowlist / allow_all / helper / inline, not-found vs not-allowed | **xfail** | live (helper transcript) + golden (resolution matrix) |
-| minter | control vs credentials scope, host-key-mismatch terminal | **xfail** | live (argv `<scope>`) + unit (single-flight, refresh) |
+| minter | control-scope argv + success `token.response` | **enforced** | live (`test_token_get.py`: `token`/`expires_at` compared + argv == expected vector, `<scope>` == `control`) |
+| minter | host-key-mismatch terminal; single-flight; refresh cadence | **enforced (unit)** | unit parity (`minter.rs` / `bootstrap.rs`, incl. real-runner shell-shim tests) |
+| minter | `load_discovered_servers` shape (ssh_port=0-vs-22, empty-host skip, sort) | **enforced (golden)** | Go + Rust golden runners on `fixtures/load_discovered_servers.json` |
+| minter | credentials-scope live bus drive | **xfail** | supervisor slice (no bus token provider wired yet) |
+| minter | malformed `~/.shed/config.yaml` error parity | **xfail** | config-port slice — Go `LoadDiscoveredServers` errors on bad YAML; the permissive `yaml_lite` reader does not (same class as `config-parse · inline-flow` / `config-validate`) |
 | supervisor | reconcile / restart-on-cred-or-TLS-change | **xfail** | live; `shouldMint` matrix → golden |
 | discovery | off / poll / fsnotify | **xfail** | live (convergence w/ deadline); `LoadDiscoveredServers` shape → golden |
 | concurrency | single-flight mint, drop-on-full fan-out | **out-of-scope** | unit parity |

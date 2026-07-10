@@ -77,7 +77,7 @@ test-host-agent-diff:
 	}
 	cd tests/host-agent-diff && uv sync && uv run pytest -v
 	go test ./cmd/shed-host-agent/... -run Golden
-	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent --test golden
+	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent golden
 
 # Parallel dev shed-server lifecycle (Mac VZ).
 #

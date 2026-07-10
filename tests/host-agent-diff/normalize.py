@@ -217,6 +217,37 @@ def mask_bus_response(obj: dict) -> dict:
     return out
 
 
+def mask_token_response(obj: dict) -> dict:
+    """Mask the volatile fields of a desktop `token.response` frame (surface A), leaving
+    everything else to be diffed (D3 normalization for the minter flow).
+
+    Masked (volatile): `id` (a fresh UUID — v7 in Go's `newID`, v4 in Rust, never
+    diffable) and `ts` (RFC3339 send time, shape-asserted BEFORE masking).
+
+    Diffed (stable — NOT masked): `v`, `type`, `in_reply_to` (the correlation id, which
+    MUST echo the request's `id`), `server`, `token`, and `expires_at`. The `token` +
+    `expires_at` are DETERMINISTIC here — both daemons mint over the SAME PATH-shim `ssh`
+    returning a fixed bundle — so they are compared UNMASKED (same "determinism over
+    blanking" rationale as the sign blob), which pins that both impls carry the minted
+    token through and format the expiry to UTC RFC3339 identically. On a success the
+    `error` key is ABSENT (omitempty on both sides), so a canonical compare pins its
+    absence; the caller asserts it.
+
+    Returns a new object; the input is not mutated.
+    """
+    assert obj.get("type") == "token.response", f"not a token.response: {obj!r}"
+    out = dict(obj)
+
+    _id = out.get("id")
+    assert isinstance(_id, str) and _id, f"token.response.id missing/empty: {_id!r}"
+    out["id"] = MASK_ID
+
+    assert_rfc3339(out.get("ts"), "token.response.ts")
+    out["ts"] = MASK_TS
+
+    return out
+
+
 def mask_approval_request(obj: dict) -> dict:
     """Mask the volatile fields of a desktop `approval_request` frame (surface A),
     leaving everything else to be diffed (D3 normalization).

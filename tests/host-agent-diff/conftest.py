@@ -138,14 +138,18 @@ class CliResult:
     home: str
 
 
-def _clean_env(socket_dir, home) -> dict:
+def _clean_env(socket_dir, home, path_prepend=None) -> dict:
     """A hermetic environment: real PATH (so `go`/system tools resolve) but an
-    isolated HOME + socket dir, and no ambient ssh-agent."""
+    isolated HOME + socket dir, and no ambient ssh-agent. `path_prepend` (a dir)
+    goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved
+    before the real one — both daemons use `exec.LookPath`/`look_ssh` on PATH."""
     env = dict(os.environ)
     env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
     env["HOME"] = str(home)
     env.pop("SSH_AUTH_SOCK", None)
     env.pop("XDG_RUNTIME_DIR", None)
+    if path_prepend is not None:
+        env["PATH"] = str(path_prepend) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -216,7 +220,16 @@ class DaemonHandle:
     """A running daemon under test: query it, inspect its socket dir."""
 
     def __init__(
-        self, impl, binary, proc, socket_dir, home, config_path, log_path, audit_log_path
+        self,
+        impl,
+        binary,
+        proc,
+        socket_dir,
+        home,
+        config_path,
+        log_path,
+        audit_log_path,
+        ssh_argv_file=None,
     ):
         self.impl = impl
         self.binary = binary
@@ -225,6 +238,10 @@ class DaemonHandle:
         self.home = str(home)
         self.config_path = str(config_path)
         self.log_path = Path(log_path)
+        # When the daemon was launched with a shim `ssh` (the minter tests), the shim
+        # appends its argv (one element per line) to this file — the daemon's exact
+        # `ssh` invocation, captured for the differential's argv comparison.
+        self.ssh_argv_file = Path(ssh_argv_file) if ssh_argv_file else None
         # The DURABLE audit JSONL (`logging.path`), distinct from the operational log
         # above. Populated by gated ops (the sign flow); a fan-out `event` is sent
         # AFTER the file line is written on both impls (Rust `JsonlAuditSink::log`,
@@ -240,6 +257,27 @@ class DaemonHandle:
 
     def read_log(self) -> str:
         return _safe_read(self.log_path)
+
+    def read_ssh_argv(self, timeout: float = 5.0) -> list:
+        """Poll the shim's argv-capture file until it is non-empty and return the
+        daemon's `ssh` argv (one element per line). A deadline poll, not a sleep —
+        the shim writes it during the async token.get round-trip."""
+        assert self.ssh_argv_file is not None, "daemon was not launched with a shim ssh"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                raw = self.ssh_argv_file.read_text()
+            except OSError:
+                raw = ""
+            lines = raw.split("\n")
+            # The shim appends each arg + a trailing newline, so a complete capture ends
+            # with an empty final field; require that so we never read a half-written file.
+            if len(lines) >= 2 and lines[-1] == "":
+                return lines[:-1]
+            time.sleep(0.02)
+        raise AssertionError(
+            f"{self.impl}: shim ssh argv file {self.ssh_argv_file} empty within {timeout}s"
+        )
 
     def read_audit_jsonl(self, expect: int = 1, timeout: float = 5.0) -> list:
         """Poll the durable audit file until it holds `expect` non-empty JSONL lines
@@ -276,7 +314,14 @@ def daemon(binaries, tmp_path_factory):
     """
 
     @contextlib.contextmanager
-    def _make(impl, config_text, install_ssh_key: bool = False):
+    def _make(
+        impl,
+        config_text,
+        install_ssh_key: bool = False,
+        shed_config: str | None = None,
+        known_hosts: str | None = None,
+        ssh_shim_bundle: str | None = None,
+    ):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
         home = root / "home"
         home.mkdir()
@@ -298,6 +343,30 @@ def daemon(binaries, tmp_path_factory):
             os.chmod(ssh_dir, 0o700)
             os.chmod(key_dst, 0o600)
 
+        # The minter reads `<HOME>/.shed/{config.yaml,known_hosts}` (the shed CLI
+        # config it resolves servers from + the host-key pin). Both impls read the
+        # SAME isolated HOME.
+        if shed_config is not None or known_hosts is not None:
+            shed_dir = home / ".shed"
+            shed_dir.mkdir(exist_ok=True)
+            if shed_config is not None:
+                (shed_dir / "config.yaml").write_text(shed_config)
+            if known_hosts is not None:
+                (shed_dir / "known_hosts").write_text(known_hosts)
+
+        # Install a shim `ssh` (a PATH-front executable) that appends its argv to a
+        # capture file, then prints the fixed bundle — so BOTH daemons mint
+        # deterministically over the same fake ssh (Go `exec.LookPath` / Rust
+        # `look_ssh` both resolve it from PATH). See `fake_seams` self-test.
+        ssh_argv_file = None
+        path_prepend = None
+        if ssh_shim_bundle is not None:
+            shim_dir = root / "shim-bin"
+            shim_dir.mkdir()
+            ssh_argv_file = root / "ssh-argv.txt"
+            _write_ssh_shim(shim_dir / "ssh", ssh_argv_file, ssh_shim_bundle)
+            path_prepend = shim_dir
+
         # The socket dir must be SHORT: an AF_UNIX bind path caps at ~104 bytes
         # (macOS) / ~108 (Linux), and pytest's nested tmp tree blows past that. A
         # shallow mkdtemp under $TMPDIR keeps `<dir>/host-agent-status.sock` well
@@ -313,7 +382,7 @@ def daemon(binaries, tmp_path_factory):
         # (which would trip the suite's warnings-as-errors as ResourceWarnings).
         proc = subprocess.Popen(
             [binaries[impl], "-config", str(config_path), "-log-file", str(log_path)],
-            env=_clean_env(socket_dir, home),
+            env=_clean_env(socket_dir, home, path_prepend=path_prepend),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -338,7 +407,15 @@ def daemon(binaries, tmp_path_factory):
             )
 
         handle = DaemonHandle(
-            impl, binaries[impl], proc, socket_dir, home, config_path, log_path, audit_log
+            impl,
+            binaries[impl],
+            proc,
+            socket_dir,
+            home,
+            config_path,
+            log_path,
+            audit_log,
+            ssh_argv_file=ssh_argv_file,
         )
         try:
             yield handle
@@ -373,6 +450,21 @@ def _shutdown(impl, proc, status_sock, desktop_sock) -> None:
     assert not desktop_sock.exists(), (
         f"{impl}: desktop socket not unlinked on shutdown: {desktop_sock}"
     )
+
+
+def _write_ssh_shim(path: Path, argv_file: Path, bundle_json: str) -> None:
+    """Write an executable `#!/bin/sh` shim `ssh` that records its argv (one element
+    per line, so a multi-arg invocation is unambiguous) and prints the fixed bundle to
+    stdout, exit 0 — the deterministic seam both daemons mint over. `printf '%s'` (no
+    trailing newline) keeps stdout a single JSON object (trailing whitespace is fine)."""
+    script = (
+        "#!/bin/sh\n"
+        f'for a in "$@"; do printf \'%s\\n\' "$a" >> "{argv_file}"; done\n'
+        f"printf '%s' '{bundle_json}'\n"
+        "exit 0\n"
+    )
+    path.write_text(script)
+    os.chmod(path, 0o755)
 
 
 def _safe_read(path) -> str:

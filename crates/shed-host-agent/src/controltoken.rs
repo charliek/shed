@@ -278,6 +278,45 @@ servers:
         );
     }
 
+    /// The Rust half of the `load_discovered_servers` golden — reads the SAME shared
+    /// fixture the Go runner reads (`cmd/shed-host-agent/golden_test.go`), so the two
+    /// impls can't drift together on the ssh_port=0/empty-host/sort semantics. Lives
+    /// in-crate (not `tests/golden.rs`) because this is a binary crate with no lib, so
+    /// an integration test can't reach `load_discovered_servers`.
+    #[test]
+    fn golden_load_discovered_servers() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/load_discovered_servers.json");
+        let raw = std::fs::read_to_string(&path).expect("read golden fixture");
+        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(fx["protocol_version"], 1, "version skew");
+        let vectors = fx["vectors"].as_array().unwrap();
+        assert!(!vectors.is_empty(), "fixture has no vectors");
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let (_d, cfg) = write_config(v["config_yaml"].as_str().unwrap());
+            let got = load_discovered_servers(&cfg).unwrap();
+            let got_json: Vec<serde_json::Value> = got
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "url": t.url,
+                        "token": t.token,
+                        "tls_fingerprint": t.tls_fingerprint,
+                        "ssh_host": t.ssh_host,
+                        "ssh_port": t.ssh_port,
+                    })
+                })
+                .collect();
+            assert_eq!(
+                serde_json::Value::from(got_json),
+                v["expected"],
+                "golden vector {name:?}"
+            );
+        }
+    }
+
     #[test]
     fn load_defaults_and_skips_empty_host() {
         let (_d, cfg) = write_config(
