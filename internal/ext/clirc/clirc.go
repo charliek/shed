@@ -13,6 +13,7 @@ package clirc
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,6 +23,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charliek/shed/internal/ext/rc"
 	"github.com/charliek/shed/internal/version"
@@ -114,7 +116,8 @@ func usage(cfg Config, d deps) {
 		b.WriteString("           start a local auto-mode claude remote-control session and print its URL\n")
 	}
 	b.WriteString(`  create   --kind <k> --name <display> [--slug s] [--workdir d] [--created-by t/v]
-           [--target label] [--wait] [--interactive-shell] [--prompt-stdin]
+           [--target label] [--wait] [--interactive-shell]
+           [--prompt-stdin | --plan-stdin [--prompt-b64 <b64>]]
            [--permission-mode <m> | --skip]
   list
   capabilities
@@ -226,6 +229,8 @@ func doCreate(cfg Config, d deps, args []string) int {
 		wait          = fs.Bool("wait", false, "block until ready, accept trust, deliver prompt")
 		interactive   = fs.Bool("interactive-shell", false, "wrap claude kinds in `bash -ic`")
 		promptStdin   = fs.Bool("prompt-stdin", false, "read a kickoff prompt line from stdin")
+		planStdin     = fs.Bool("plan-stdin", false, "read a plan from stdin; write it to a per-kind file and deliver a composed kickoff")
+		promptB64     = fs.String("prompt-b64", "", "base64 caller framing prepended to the composed plan kickoff (only with --plan-stdin)")
 		permMode      = fs.String("permission-mode", "", "permission mode: default|auto|skip (all kinds); claude also accepts acceptEdits|plan|dontAsk|bypassPermissions")
 		skip          = fs.Bool("skip", false, "shorthand for --permission-mode skip (full bypass)")
 	)
@@ -238,8 +243,19 @@ func doCreate(cfg Config, d deps, args []string) int {
 		return fail(cfg, d, err)
 	}
 
-	prompt := ""
-	if *promptStdin {
+	// stdin carries at most one payload: a prompt line (--prompt-stdin) OR a plan
+	// (--plan-stdin). Caller framing for a plan travels out-of-band as base64
+	// (--prompt-b64), never on stdin, so a single guest exec ships plan + framing.
+	if *promptStdin && *planStdin {
+		return fail(cfg, d, fmt.Errorf("%w: --prompt-stdin and --plan-stdin are mutually exclusive", rc.ErrBadArgs))
+	}
+	if *promptB64 != "" && !*planStdin {
+		return fail(cfg, d, fmt.Errorf("%w: --prompt-b64 is only valid with --plan-stdin", rc.ErrBadArgs))
+	}
+
+	prompt, plan, framing := "", "", ""
+	switch {
+	case *promptStdin:
 		p, err := readStdinLine(d)
 		if err != nil {
 			return fail(cfg, d, err)
@@ -248,6 +264,25 @@ func doCreate(cfg Config, d deps, args []string) int {
 			return fail(cfg, d, fmt.Errorf("%w: --prompt-stdin given but stdin is empty", rc.ErrBadArgs))
 		}
 		prompt = p
+	case *planStdin:
+		p, err := readPlanStdin(d)
+		if err != nil {
+			return fail(cfg, d, err)
+		}
+		plan = p
+		if *promptB64 != "" {
+			raw, derr := base64.StdEncoding.DecodeString(*promptB64)
+			if derr != nil {
+				return fail(cfg, d, fmt.Errorf("%w: --prompt-b64 is not valid base64: %v", rc.ErrBadArgs, derr))
+			}
+			// Reject non-UTF-8 payloads BEFORE the []byte→string conversion: an
+			// invalid byte (e.g. a lone C1 0x9b) would otherwise become RuneError in
+			// the rune-based control-char scan and slip past HasUnsafePromptChars.
+			if !utf8.Valid(raw) {
+				return fail(cfg, d, fmt.Errorf("%w: --prompt-b64 does not decode to valid UTF-8", rc.ErrBadArgs))
+			}
+			framing = string(raw)
+		}
 	}
 
 	createdBy := *createdByFlag
@@ -263,6 +298,8 @@ func doCreate(cfg Config, d deps, args []string) int {
 		CreatedBy:        createdBy,
 		Target:           *target,
 		Prompt:           prompt,
+		Plan:             plan,
+		PlanFraming:      framing,
 		Wait:             *wait,
 		InteractiveShell: *interactive,
 		PermissionMode:   mode,
@@ -271,6 +308,27 @@ func doCreate(cfg Config, d deps, args []string) int {
 		return fail(cfg, d, err)
 	}
 	return printJSON(cfg, d, session)
+}
+
+// readPlanStdin reads a plan from stdin, capping it at rc.PlanMaxBytes and rejecting
+// an empty or non-UTF-8 payload at the transport boundary (rc.Create re-validates as
+// the library guarantee). The plan is NOT newline-trimmed — a plan is a document, not
+// a single line, and trailing structure is content.
+func readPlanStdin(d deps) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(d.stdin, rc.PlanMaxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("reading plan from stdin: %w", err)
+	}
+	if len(data) > rc.PlanMaxBytes {
+		return "", fmt.Errorf("%w: plan exceeds %d bytes", rc.ErrBadArgs, rc.PlanMaxBytes)
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("%w: --plan-stdin given but stdin is empty", rc.ErrBadArgs)
+	}
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("%w: plan is not valid UTF-8 (is stdin a binary file?)", rc.ErrBadArgs)
+	}
+	return string(data), nil
 }
 
 func doList(cfg Config, d deps, args []string) int {

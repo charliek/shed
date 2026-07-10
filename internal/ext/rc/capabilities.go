@@ -15,10 +15,13 @@ const CapabilityVersion = 3
 // capabilityFeatures is the feature list (a set of stable tokens) advertised to
 // clients for capability discovery, replacing error-string sniffing. It advertises
 // ONLY what this binary actually supports — a feature token is appended in the same
-// change that ships the feature (planned next: "plan-stdin" and "prompt-b64" with the
-// plan-delivery verbs, "serve" with the rc hub):
+// change that ships the feature (planned next: "serve" with the rc hub):
 //   - generic-perm — the generic default|auto|skip permission tri-state for all kinds.
-var capabilityFeatures = []string{"generic-perm"}
+//   - plan-stdin — `create --plan-stdin` writes a plan to a per-kind HOME-rooted file
+//     and composes+delivers a kickoff referencing it.
+//   - prompt-b64 — `create --plan-stdin --prompt-b64 <base64>` prepends decoded caller
+//     framing to the composed plan kickoff (stdin stays reserved for the plan).
+var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64"}
 
 // AgentInfo is one agent's install probe result under capabilities.agents. Version is
 // omitted when the agent is not installed (or its version could not be read).

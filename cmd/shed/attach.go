@@ -66,7 +66,7 @@ func init() {
 	attachCmd.Flags().StringVarP(&attachSessionFlag, "session", "S", config.DefaultSessionName, "Session name to attach to (plain mode)")
 	attachCmd.Flags().BoolVar(&attachNewFlag, "new", false, "Force create a new session (error if exists)")
 
-	attachCmd.Flags().StringVar(&attachKindFlag, "kind", "", "RC session kind: claude-rc|claude-broker|shell (triggers RC create)")
+	attachCmd.Flags().StringVar(&attachKindFlag, "kind", "", "RC session kind ("+strings.Join(rc.KindStrings(), "|")+"); triggers RC create")
 	attachCmd.Flags().StringVar(&attachNameFlag, "name", "", "RC session display name (default <shed>/<slug>)")
 	attachCmd.Flags().StringVar(&attachSlugFlag, "slug", "", "RC slug: connect to rc-<slug>, or set the slug for a new session")
 	attachCmd.Flags().StringVarP(&attachPromptFlag, "prompt", "p", "", "Kickoff prompt (use --prompt-file/--edit for multi-line)")
@@ -105,10 +105,8 @@ func validateAttachFlags() error {
 		if kind == "" {
 			kind = "claude-rc"
 		}
-		// Reject a bad --kind before the SSH round-trip; shed-ext-rc re-validates as the
-		// source of truth. rc.IsValidKind reads the same registry, so this never drifts.
-		if !rc.IsValidKind(rc.Kind(kind)) {
-			return fmt.Errorf("invalid --kind %q (want %s)", kind, strings.Join(rc.KindStrings(), "|"))
+		if err := validateRCKind(kind); err != nil {
+			return err
 		}
 		if attachSkipFlag && attachPermModeFlag != "" {
 			return fmt.Errorf("--skip and --permission-mode are mutually exclusive")
@@ -217,6 +215,16 @@ func execSSHTmux(name string, entry *config.ServerEntry, tmuxCmd string) error {
 	return nil
 }
 
+// validateRCKind rejects a --kind the current registry doesn't know, before any SSH
+// round-trip; shed-ext-rc re-validates as the source of truth, and rc.IsValidKind reads
+// the same registry so this never drifts. Shared by `shed attach` and `shed plan`.
+func validateRCKind(kind string) error {
+	if !rc.IsValidKind(rc.Kind(kind)) {
+		return fmt.Errorf("invalid --kind %q (want %s)", kind, strings.Join(rc.KindStrings(), "|"))
+	}
+	return nil
+}
+
 // runAttachRCCreate creates an rc-<slug> Remote Control session via shed-ext-rc:
 // resolves prompt/plan, ships the plan, sets the permission posture, starts the
 // session, then prints the URL (--detach) or attaches.
@@ -257,29 +265,14 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		displayName = name + "/" + slug
 	}
 
-	// Ship the plan into claude's plans dir and, unless the caller gave a prompt,
-	// kick off with a natural "here's a plan, implement it" line referencing the file
-	// — what you'd type starting a fresh session against a saved plan.
-	if havePlan {
-		planPath, perr := streamPlanToShed(name, entry, slug, planContent)
-		if perr != nil {
-			return perr
-		}
-		if verboseLevel > 0 {
-			fmt.Printf("Shipped plan to %s in %s\n", planPath, name)
-		}
-		if prompt == "" {
-			prompt = "Read the plan at " + planPath + " and implement it. Work through it to completion autonomously — don't stop to ask for confirmation; make reasonable decisions and keep going until the plan is done."
-		} else {
-			// Caller supplied their own kickoff. They can't know the generated plan
-			// path, so append it — their prompt leads, the plan is still findable.
-			prompt += "\n\nThe plan to follow is at " + planPath + "."
-		}
-	}
-
 	if verboseLevel > 0 {
 		fmt.Printf("Creating %s session rc-%s in %s on %s (mode=%s)...\n", kind, slug, name, serverName, modeLabel(mode))
 	}
+	// A plan is piped to the guest via --plan-stdin: shed-ext-rc writes it to the
+	// per-kind HOME-rooted location and composes the kickoff (any -p/--prompt-file
+	// value becomes the framing prepended to it). Without a plan, a bare prompt is
+	// delivered directly. Delivery + composition now live in the rc core, shared by
+	// every orchestrator — the CLI only routes the inputs.
 	opts := rcCreateOptions{
 		shedName:       name,
 		entry:          entry,
@@ -287,7 +280,12 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		displayName:    displayName,
 		slug:           slug,
 		permissionMode: mode,
-		prompt:         prompt,
+	}
+	if havePlan {
+		opts.plan = planContent
+		opts.planFraming = prompt
+	} else {
+		opts.prompt = prompt
 	}
 	dto, err := createRCSession(opts)
 	if err != nil {
@@ -333,6 +331,12 @@ func modeLabel(mode string) string {
 
 func printRCSummary(shedName string, dto rcSessionDTO) {
 	fmt.Printf("Started %s session rc-%s (%s)\n", dto.Kind, dto.Slug, dto.State)
+	printRCFollowups(shedName, dto)
+}
+
+// printRCFollowups prints the URL (when present) and Watch/Status follow-up lines
+// shared by every "session started" summary (`shed attach` and `shed plan`).
+func printRCFollowups(shedName string, dto rcSessionDTO) {
 	if dto.URL != "" {
 		fmt.Printf("  URL:    %s\n", dto.URL)
 	}

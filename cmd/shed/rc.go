@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -262,30 +263,6 @@ func isOldBinaryRCErr(err error) bool {
 		strings.Contains(s, "flag provided but not defined")
 }
 
-// streamPlanToShed writes the plan into claude's native plans directory inside the
-// shed — `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plans/plan-<slug>.md` — and returns its
-// absolute path for the kickoff prompt. Keeping it out of the workspace means it never
-// pollutes the repo (or a --local-dir host copy); claude reads it fine in auto and
-// bypass modes when the kickoff references the absolute path (verified live). The path
-// is echoed back behind a sentinel so any login-shell output can't be mistaken for it.
-func streamPlanToShed(shedName string, entry *config.ServerEntry, slug, content string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), rcEnrichTimeout)
-	defer cancel()
-	file := "plan-" + slug + ".md"
-	cmd := `d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plans"; mkdir -p "$d" && cat > "$d/` + file +
-		`" && printf 'SHED_PLAN_PATH=%s\n' "$d/` + file + `"`
-	out, err := sshShell(ctx, shedName, entry, content, cmd)
-	if err != nil {
-		return "", fmt.Errorf("shipping plan to shed: %w", err)
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "SHED_PLAN_PATH="); ok && p != "" {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("shipping plan to shed: could not determine the plan path")
-}
-
 // rcCreateOptions configures createRCSession.
 type rcCreateOptions struct {
 	shedName       string
@@ -294,13 +271,21 @@ type rcCreateOptions struct {
 	displayName    string
 	slug           string
 	permissionMode string // "" omits the flag
-	prompt         string // kickoff line (empty -> none)
+	prompt         string // kickoff line delivered via --prompt-stdin (empty -> none)
+	// plan, when set, is delivered via --plan-stdin: the guest writes it to a per-kind
+	// HOME-rooted file and composes+delivers the kickoff, so the plan never touches the
+	// workdir (a --repo clone / --local-dir host dir). Mutually exclusive with prompt.
+	plan string
+	// planFraming is optional caller framing shipped as base64 (--prompt-b64) alongside
+	// the plan, so stdin stays reserved for the plan itself. Only meaningful with plan.
+	planFraming string
 }
 
 // createRCSession invokes `shed-ext-rc create --wait` over SSH and returns the
 // parsed session DTO. Each shed-ext-rc argument is shell-quoted into one command
-// string (the server re-parses through bash -lc), and the kickoff prompt is piped on
-// stdin (never argv) per the convention.
+// string (the server re-parses through bash -lc). stdin carries the kickoff prompt
+// (--prompt-stdin) or the plan (--plan-stdin) — never argv, per the convention — with
+// any plan framing base64-encoded onto argv so a single exec ships plan + framing.
 func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
 	argv := []string{
 		"shed-ext-rc", "create",
@@ -316,8 +301,17 @@ func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
 	if opts.permissionMode != "" {
 		argv = append(argv, "--permission-mode", opts.permissionMode)
 	}
-	if opts.prompt != "" {
+	stdin := ""
+	switch {
+	case opts.plan != "":
+		argv = append(argv, "--plan-stdin")
+		if opts.planFraming != "" {
+			argv = append(argv, "--prompt-b64", base64.StdEncoding.EncodeToString([]byte(opts.planFraming)))
+		}
+		stdin = opts.plan
+	case opts.prompt != "":
 		argv = append(argv, "--prompt-stdin")
+		stdin = opts.prompt
 	}
 	quoted := make([]string, len(argv))
 	for i, a := range argv {
@@ -326,7 +320,7 @@ func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), rcCreateTimeout)
 	defer cancel()
-	out, err := sshShell(ctx, opts.shedName, opts.entry, opts.prompt, strings.Join(quoted, " "))
+	out, err := sshShell(ctx, opts.shedName, opts.entry, stdin, strings.Join(quoted, " "))
 	if err != nil {
 		return rcSessionDTO{}, fmt.Errorf("shed-ext-rc create: %w", err)
 	}

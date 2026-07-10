@@ -2,7 +2,10 @@ package clirc
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -352,5 +355,122 @@ func TestClaudeVerbNeedsAuthSummary(t *testing.T) {
 	}
 	if !strings.Contains(out, "not logged in") {
 		t.Errorf("needs-auth state should surface a login hint:\n%s", out)
+	}
+}
+
+// --- plan delivery (create --plan-stdin) ------------------------------------
+
+// TestCreatePlanStdin is the shed-machine-rc verification in unit form: the shared
+// clirc `create --plan-stdin` reads a plan from stdin, writes it to the per-kind
+// HOME-rooted file (0600), and returns the session DTO. Driven with machineCfg (the
+// shed-machine-rc identity) so it proves the machine binary inherits the verb.
+func TestCreatePlanStdin(t *testing.T) {
+	home := t.TempDir()
+	r := &fakeRunner{pane: "[shed:x] ~ $"} // non-empty → shell reaches ready
+	plan := "# Plan\n\nStep one.\n"
+	code, out, errOut := runCLI(machineCfg, r, map[string]string{"HOME": home}, plan,
+		"create", "--kind", "shell", "--slug", "abc123", "--plan-stdin")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	var dto rc.Session
+	if err := json.Unmarshal([]byte(out), &dto); err != nil {
+		t.Fatalf("decoding create output: %v\n%s", err, out)
+	}
+	if dto.Slug != "abc123" || dto.Kind != rc.KindShell {
+		t.Fatalf("unexpected DTO: %+v", dto)
+	}
+	// shell is not a claude kind → ~/.shed-plans.
+	path := filepath.Join(home, ".shed-plans", "plan-abc123.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("plan not written to %s: %v", path, err)
+	}
+	if string(data) != plan {
+		t.Errorf("plan contents = %q, want %q", data, plan)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Errorf("plan mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+// TestCreatePlanStdinPromptB64 decodes base64 framing and prepends it to the kickoff.
+func TestCreatePlanStdinPromptB64(t *testing.T) {
+	home := t.TempDir()
+	r := &fakeRunner{pane: "[shed:x] ~ $"}
+	framing := base64.StdEncoding.EncodeToString([]byte("focus on X"))
+	code, _, errOut := runCLI(machineCfg, r, map[string]string{"HOME": home}, "plan body",
+		"create", "--kind", "shell", "--slug", "abc123", "--plan-stdin", "--prompt-b64", framing)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	// The delivered kickoff (bracketed paste buffer) leads with the framing.
+	var buf []string
+	for _, c := range r.calls {
+		if len(c) > 0 && c[0] == "set-buffer" {
+			buf = c
+		}
+	}
+	if buf == nil {
+		t.Fatal("no kickoff delivered")
+	}
+	if sent := buf[len(buf)-1]; !strings.HasPrefix(sent, "focus on X\n\n") {
+		t.Errorf("framing not prepended: %q", sent)
+	}
+}
+
+func TestCreatePlanStdinFlagErrors(t *testing.T) {
+	home := t.TempDir()
+	cases := []struct {
+		name    string
+		stdin   string
+		args    []string
+		wantSub string
+	}{
+		{
+			"plan and prompt stdin mutually exclusive", "x",
+			[]string{"create", "--kind", "shell", "--slug", "abc123", "--plan-stdin", "--prompt-stdin"},
+			"mutually exclusive",
+		},
+		{
+			"prompt-b64 requires plan-stdin", "",
+			[]string{"create", "--kind", "shell", "--slug", "abc123", "--prompt-b64", "eA=="},
+			"only valid with --plan-stdin",
+		},
+		{
+			"empty plan stdin", "",
+			[]string{"create", "--kind", "shell", "--slug", "abc123", "--plan-stdin"},
+			"stdin is empty",
+		},
+		{
+			"non-UTF8 plan stdin", "a\xffb",
+			[]string{"create", "--kind", "shell", "--slug", "abc123", "--plan-stdin"},
+			"not valid UTF-8",
+		},
+		{
+			"bad base64 framing", "plan body",
+			[]string{"create", "--kind", "shell", "--slug", "abc123", "--plan-stdin", "--prompt-b64", "not!base64!"},
+			"not valid base64",
+		},
+		{
+			// base64 "mw==" decodes to the lone C1 byte 0x9b — invalid UTF-8 that
+			// would read as RuneError (and slip past the rune-based control-char
+			// scan) if converted to string before the utf8.Valid gate.
+			"non-UTF8 framing bytes rejected", "plan body",
+			[]string{"create", "--kind", "shell", "--slug", "abc123", "--plan-stdin", "--prompt-b64", "mw=="},
+			"not decode to valid UTF-8",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, errOut := runCLI(machineCfg, &fakeRunner{pane: "[shed:x] ~ $"},
+				map[string]string{"HOME": home}, tc.stdin, tc.args...)
+			if code != 2 {
+				t.Fatalf("code=%d, want 2; stderr=%q", code, errOut)
+			}
+			if !strings.Contains(errOut, tc.wantSub) {
+				t.Errorf("stderr=%q, want substring %q", errOut, tc.wantSub)
+			}
+		})
 	}
 }
