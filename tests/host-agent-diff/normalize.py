@@ -28,6 +28,7 @@ MASK_PID = "<pid>"
 MASK_VERSION = "<version>"
 MASK_CONFIG_PATH = "<config_path>"
 MASK_ID = "<id>"
+MASK_EXPIRES = "<expires_at>"
 
 # RFC3339 with second precision and either a `Z` or a numeric offset. Both daemons
 # emit `...Z` (Go `time.RFC3339` on a UTC time; Rust's std-only formatter), but accept
@@ -213,6 +214,89 @@ def mask_bus_response(obj: dict) -> dict:
     assert_rfc3339(out.get("timestamp"), "bus response timestamp")
     out["timestamp"] = MASK_TS
 
+    return out
+
+
+def mask_approval_request(obj: dict) -> dict:
+    """Mask the volatile fields of a desktop `approval_request` frame (surface A),
+    leaving everything else to be diffed (D3 normalization).
+
+    Masked (volatile): `id` (a fresh UUID — v7 in Go's `newID`, v4 in Rust, so never
+    diffable), `ts` (RFC3339 send time), and `expires_at` (`now + approval_timeout`).
+    Both timestamps have their RFC3339 shape asserted BEFORE masking so the mask can't
+    paper over a malformed value; distinct sentinels (`<ts>` vs `<expires_at>`) make a
+    cross-field leak obvious.
+
+    Diffed (stable — NOT masked): `v`, `type`, `namespace`, `op`, `shed`, `detail`
+    (the fixed `"SSH sign request"`), and — in single-server mode — the ABSENCE of
+    `server` (omitempty). The caller asserts those carry the expected values.
+
+    Returns a new object; the input is not mutated.
+    """
+    assert obj.get("type") == "approval_request", f"not an approval_request: {obj!r}"
+    out = dict(obj)
+
+    _id = out.get("id")
+    assert isinstance(_id, str) and _id, f"approval_request.id missing/empty: {_id!r}"
+    out["id"] = MASK_ID
+
+    assert_rfc3339(out.get("ts"), "approval_request.ts")
+    out["ts"] = MASK_TS
+
+    assert_rfc3339(out.get("expires_at"), "approval_request.expires_at")
+    out["expires_at"] = MASK_EXPIRES
+
+    return out
+
+
+def mask_event(obj: dict) -> dict:
+    """Mask the volatile fields of a desktop `event` frame — the 1:1 audit fan-out
+    (surface A, catalog §3.3) — leaving everything else to be diffed.
+
+    Masked (volatile): `id` (a fresh UUID per frame — v7 in Go, v4 in Rust) and `ts`
+    (the underlying audit entry's own timestamp, RFC3339 shape-asserted first).
+
+    Diffed (stable — NOT masked): `v`, `type` (`"event"`), `kind` (`"audit"`), and
+    every carried audit field present after Go's omitempty (`shed`, `ns`, `op`,
+    `result`, `detail`, `code`, `reason`, `approval`, `decided_by`, `scope`, `ttl`,
+    `server`). An empty audit field is OMITTED on both sides (Go omitempty == the Rust
+    `is_empty_str` skip), so a canonical compare pins the exact present-key set — e.g.
+    the deny event carries NO `detail`/`code`, the single-server event carries NO
+    `server`. The caller asserts the stable fields.
+
+    Returns a new object; the input is not mutated.
+    """
+    assert obj.get("type") == "event", f"not an event frame: {obj!r}"
+    out = dict(obj)
+
+    _id = out.get("id")
+    assert isinstance(_id, str) and _id, f"event.id missing/empty: {_id!r}"
+    out["id"] = MASK_ID
+
+    assert_rfc3339(out.get("ts"), "event.ts")
+    out["ts"] = MASK_TS
+
+    return out
+
+
+def mask_audit_entry(obj: dict) -> dict:
+    """Mask the volatile fields of a durable audit JSONL record (channel 2, catalog
+    §3.1), leaving everything else to be diffed.
+
+    Masked (volatile): `ts` only (RFC3339 UTC stamped by the sink, shape-asserted
+    first). Every other field — `server` (omitempty), `shed`, `ns`, `op`, `result`,
+    `detail`, `code`, `reason`, `approval`, `decided_by`, `scope`, `ttl` — is diffed;
+    Go's omitempty set == the Rust `WireEntry` `skip_serializing_if`, so the present-key
+    set is itself pinned by a canonical compare (a missing `detail`/`code` on the deny
+    line, a missing `server` in single-server mode). Field *order* in the file (Go
+    struct order `ts,server,shed,ns,op,result,detail,code,reason,approval,decided_by,
+    scope,ttl`) is normalized away by `canonical()`.
+
+    Returns a new object; the input is not mutated.
+    """
+    out = dict(obj)
+    assert_rfc3339(out.get("ts"), "audit.ts")
+    out["ts"] = MASK_TS
     return out
 
 

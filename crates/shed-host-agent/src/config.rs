@@ -20,6 +20,13 @@ pub const NS_DOCKER_CREDENTIALS: &str = "docker-credentials";
 /// Approval-policy value that fails closed — the effective policy for an empty or
 /// omitted `approval.policy` (matches the Go `EffectivePolicy`).
 pub const POLICY_DENY_ALL: &str = "deny-all";
+/// Approval-policy value that approves every request (the allowlist/role still apply
+/// downstream in the AWS/Docker backends). Matches Go's `PolicyApproveAll`. Consumed
+/// by the gate seam (`approval.rs`) + `main.rs`, not within `config.rs` itself, so
+/// the golden test's isolated `#[path]`-included `config` module (which pulls neither)
+/// would otherwise flag it dead.
+#[allow(dead_code)]
+pub const POLICY_APPROVE_ALL: &str = "approve-all";
 /// Approval-policy value that delegates the decision to the shed-desktop app.
 pub const POLICY_SHED_DESKTOP: &str = "shed-desktop";
 

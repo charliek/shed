@@ -71,6 +71,25 @@ backend. Daemons write their operational log to a per-test `-log-file` (that log
   correlation id — it must echo the request's `id`, so it is asserted, never masked),
   `namespace`, `type`, `final`, `payload`, and the echoed `shed`.
 
+- **The gated cross-surface `sign` flow compares the ed25519 signature UNMASKED.** The
+  capstone `test_bus_sign_gated.py` drives one bus `sign` request → an
+  `approval_request` to the desktop consumer → (approve) a signature + audit `event` +
+  durable JSONL line, or (deny) `{approval denied, SIGN_FAILED}` + a `denied` audit.
+  Because ed25519 signing is **deterministic** (RFC 8032 — the nonce is derived from
+  key+message, not randomness), the Go `x/crypto/ssh` signer and the Rust
+  `ed25519-dalek` backend, loading the SAME committed `~/.ssh/id_ed25519`
+  (`fixtures/test_ed25519`, installed by the `daemon` fixture) and signing the SAME
+  fixed challenge, produce the SAME 64-byte blob — so `mask_bus_response` leaves
+  `payload.blob` to be **diffed** (never masked/normalized-to-"present"), and it is
+  additionally pinned as an absolute golden (`EXPECTED_SIGN_BLOB_B64`). The surface-A
+  frames use `normalize.mask_approval_request()` (masks the volatile `id`/`ts`/
+  `expires_at`; diffs `namespace`/`op`/`shed`/`detail` and the single-server ABSENCE
+  of `server`) and `normalize.mask_event()` (masks `id`/`ts`; diffs `kind` + every
+  audit field, so the omitempty set — e.g. NO `detail`/`code` on a deny — is pinned);
+  the durable line uses `normalize.mask_audit_entry()` (masks `ts` only). Field *order*
+  in every frame is normalized away by `canonical()`; the sign blob is compared, not
+  masked.
+
 ## Golden fixtures
 
 `fixtures/effective_policy.json` and `fixtures/gate_namespaces.json` are `input →
@@ -118,16 +137,18 @@ expected-output` vectors carrying `"protocol_version": 2`. Both the Go runner
   **ssh-agent response envelope**, never which routes each daemon hit. This flips to a
   full match when the later slices wire the Rust egress + aws/docker paths.
 
-- **Desktop `token.get` + event fan-out / approval correlation.** The surface-A handshake
-  (`hello`→`hello_ack`), the non-hello drop, and single-consumer supersede are now
+- **Desktop `token.get` + event replay.** The surface-A handshake
+  (`hello`→`hello_ack`), the non-hello drop, and single-consumer supersede are
   differentially enforced with a fake desktop client (`desktop_client.py`,
-  `test_desktop_*.py`). Three surface-A cells stay `xfail`: **`token.get`** is
+  `test_desktop_*.py`); **event fan-out + approval request/response correlation** are
+  now enforced end-to-end by the gated `sign` flow (`test_bus_sign_gated.py` — a `sign`
+  drives `request_approval` and the resulting audit entry through `publish_audit` to
+  the consumer as an `event`). Two surface-A cells stay `xfail`: **`token.get`** is
   differential-gated in the MINTER slice (Go answers it with the real SSH-bootstrap
   minter; the Rust side has only a `StubControlMinter` — making the two agree needs the
-  ssh-shim seam), and **event fan-out + replay** and **approval request/response
-  correlation** need a gated bus/backend op to inject an audit entry or drive a `sign`
-  approval (slice 1c) — neither impl has a caller for its `publish_audit` /
-  `request_approval` path until then.
+  ssh-shim seam), and the **event replay ring** (`replay_events` on connect) is not
+  exercised by the sign flow (it connects a fresh consumer with `replay_events:0`) — a
+  buffered-then-connect drive is a follow-up.
 
 ## Per-cell status table
 
@@ -153,8 +174,10 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | desktop UDS server | hello/hello_ack handshake (masked canonical-equal) + non-hello first line dropped | **enforced** | live surface A (`test_desktop_handshake.py`, `test_desktop_first_non_hello_drops.py`) |
 | desktop UDS server | single-consumer last-writer-wins supersede (`accepted:false, reason:"superseded"`, old closed) | **enforced** | live surface A (`test_desktop_supersede.py`) |
 | desktop UDS server | `token.get` → `token.response` | **xfail** | live — token.get is differential-gated in the MINTER slice (Go uses the real SSH-bootstrap minter; the Rust side has only a stub — making them agree needs the ssh-shim seam) |
-| desktop UDS server | event fan-out + replay ring, approval request/response correlation | **xfail** | live — event fan-out + approval correlation need a gated bus op (slice 1c) |
-| approval | gated `sign` delegated approve/deny/timeout | **xfail** | live (slice 1c — needs a gated bus op to drive the `sign` path) |
+| desktop UDS server | event fan-out + approval request/response correlation (driven by the gated `sign`) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
+| desktop UDS server | event replay ring (`replay_events` on connect) | **xfail** | live — not exercised by the sign flow (fresh consumer, `replay_events:0`); needs a buffered-then-connect drive |
+| approval | gated `sign` delegated approve/deny (deterministic ed25519 blob compared UNMASKED) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
+| approval | gated `sign` timeout / no-consumer fail-closed | **xfail** | unit-covered (`desktop.rs`); a live differential drive is a follow-up |
 | approval | native Touch-ID (biometrics) | **out-of-scope** | separate manual sign-off (needs live biometric) |
 | bus | subscribe → ping → respond (open) ping/pong (masked canonical-equal) | **enforced** | live surface B (`test_bus_ping_pong.py`) |
 | bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **xfail** | live surface B — secure needs the TLS pin from a `discovery:` config (later slice); the pin/reconnect/401/409 logic is already `bus.rs`-unit-tested |

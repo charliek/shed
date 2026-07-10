@@ -4,12 +4,17 @@
 //! `status` subcommands, the read-only status UDS server, and a minimal
 //! LiveStatus-scoped config reader — all wire-compatible with the Go
 //! `cmd/shed-host-agent` (`main.go` / `status.go` / `status_server.go` /
-//! `sockets.go`). Surface B (the shed-server plugin bus, `bus.rs`) adds the
-//! single-server `ssh-agent` subscribe + ping/pong responder. The credential
-//! minter, the sign/aws/docker backends, multi-server discovery, and audit
-//! logging are later slices; in multi-server (`discovery:`) mode the single-server
-//! bus stays off, matching the Go daemon's `cfg.Discovery == nil` gate.
+//! `sockets.go`). Surface B (the shed-server plugin bus, `bus.rs`) subscribes to
+//! `ssh-agent` and answers `ping` + the cross-surface gated **`sign`** flow: a bus
+//! sign request runs the approval gate (`approval.rs` / the desktop gate), signs
+//! with the minimal ed25519 backend (`ssh_backend.rs`), and records an audit entry
+//! (`audit.rs`) that fans out to the desktop app. The credential minter, the
+//! aws/docker backends, the ssh `list`/`status` ops, and multi-server discovery are
+//! later slices; in multi-server (`discovery:`) mode the single-server bus stays
+//! off, matching the Go daemon's `cfg.Discovery == nil` gate.
 
+mod approval;
+mod audit;
 mod bus;
 mod config;
 #[cfg(feature = "desktop-forwarding")]
@@ -17,6 +22,7 @@ mod desktop;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop_protocol;
 mod sockets;
+mod ssh_backend;
 mod status;
 mod version;
 
@@ -27,6 +33,7 @@ use std::sync::Arc;
 
 use config::HostAgentConfig;
 use sockets::{bind_unix_socket, status_socket_path};
+use ssh_backend::SshBackend;
 use status::{build_live_status, now_rfc3339, run_status, serve_status_socket, LiveStatus};
 use version::full_info;
 
@@ -304,13 +311,62 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         }
 
         // The message bus (surface B). Shares the same shutdown watch, so a
-        // SIGTERM/SIGINT tears the subscribe loop + ping responder down cleanly
-        // alongside the socket servers.
+        // SIGTERM/SIGINT tears the subscribe loop + gated-sign responder down cleanly
+        // alongside the socket servers. The bus's three seams — the ssh approval gate
+        // (selected from `ssh.approval.policy`), the audit sink (durable JSONL +
+        // desktop fan-out), and the ed25519 sign backend (`~/.ssh/id_ed25519`) — are
+        // built here and injected, so the desktop server + bus + audit form one
+        // cross-surface daemon. `server` name is empty in single-server mode (Go).
         if let Some(server_url) = bus_server {
             let rx = shutdown_rx.clone();
             let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
+
+            // Load the ed25519 sign backend (`~/.ssh/id_ed25519`; empty if absent —
+            // never fails, so the daemon still starts) and log what it holds.
+            let local_backend = ssh_backend::LocalEd25519Backend::load();
+            for key in local_backend.list().unwrap_or_default() {
+                bus_log.info(&format!(
+                    "ssh backend loaded key type={} comment={}",
+                    key.format, key.comment
+                ));
+            }
+            bus_log.info(&format!(
+                "ssh backend mode={} keys={}",
+                local_backend.mode(),
+                local_backend.key_count()
+            ));
+            let backend: Arc<dyn ssh_backend::SshBackend> = Arc::new(local_backend);
+
+            // Select the ssh approval gate from the effective policy (empty →
+            // deny-all, fail-closed). shed-desktop delegates to the desktop server;
+            // any policy this slice doesn't implement (deny-all, biometrics) fails
+            // closed to deny-all — the touch-id gates are a later slice.
+            let ssh_policy = cfg.effective_policy(config::NS_SSH_AGENT);
+            let gate: Arc<dyn approval::ApprovalGate> = match ssh_policy.as_str() {
+                config::POLICY_APPROVE_ALL => Arc::new(approval::ApproveAllGate),
+                #[cfg(feature = "desktop-forwarding")]
+                config::POLICY_SHED_DESKTOP => {
+                    Arc::new(desktop::DesktopGate::new(desktop_server.clone()))
+                }
+                _ => Arc::new(approval::DenyAllGate),
+            };
+
+            #[cfg(feature = "desktop-forwarding")]
+            let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(
+                &cfg,
+                Some(desktop_server.clone()),
+            ));
+            #[cfg(not(feature = "desktop-forwarding"))]
+            let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(&cfg));
+
+            let handlers = bus::BusHandlers {
+                gate,
+                audit,
+                backend,
+                server_name: String::new(),
+            };
             tasks.push(tokio::spawn(async move {
-                bus::run_single_server_bus(server_url, rx, bus_log).await;
+                bus::run_single_server_bus(server_url, rx, bus_log, handlers).await;
             }));
         }
 

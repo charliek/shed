@@ -42,6 +42,18 @@ uuid = { workspace = true }
 # unifies one reqwest/rustls build across the workspace.
 reqwest = { workspace = true }
 futures-util = { workspace = true }
+# The ssh-agent `sign` backend (surface B, always-on — the bus is not gated, so
+# these are NOT behind `desktop-forwarding` and the headless build compiles them).
+# ed25519-dalek does RFC-8032 *deterministic* ed25519 signing, byte-identical to
+# Go's `x/crypto/ssh` ed25519 signer (same key + data → same 64-byte blob), so the
+# differential can compare the signature blob directly. ssh-key parses the OpenSSH
+# `~/.ssh/id_ed25519` private key + decodes the SSH public-key wire blob; its
+# ed25519 feature reuses the same ed25519-dalek v2, so cargo unifies one build.
+ed25519-dalek = "2"
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std"] }
+# base64 StdEncoding for the sign req/resp (public_key / data / blob), matching Go's
+# encoding/base64.StdEncoding.
+base64 = "0.22"
 
 [dev-dependencies]
 # Throwaway socket dirs for the status "not running" exit-code test.

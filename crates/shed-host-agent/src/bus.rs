@@ -22,16 +22,18 @@
 //!   * TLS pin: install the pin verifier on an https URL, fail-closed if a pin is
 //!     set but the URL is not https.
 //!
-//! Scope (slice 1b): this is the transport PROOF. The credential backends
-//! (sign/aws/docker) are LATER slices — the daemon subscribes only to `ssh-agent`
-//! and answers a `ping` with a `pong`; any other operation gets an
-//! `INTERNAL_ERROR` envelope so the shed's request doesn't hang (a clear seam for
-//! the real backends).
+//! Scope: the daemon subscribes only to `ssh-agent` and implements the gated
+//! **`sign`** flow (decode → approval gate → ed25519 backend → response + audit,
+//! wire-compatible with the Go `ssh_handler.go`) plus `ping` → `pong`. The other
+//! credential backends (aws/docker) and the ssh `list`/`status` ops are LATER slices
+//! — an unimplemented op still gets an `INTERNAL_ERROR` envelope so the shed's
+//! request doesn't hang (a clear seam for the real backends).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -41,7 +43,15 @@ use tokio::task::JoinHandle;
 use shed_core::sse::SseParser;
 use shed_core::tls::pinned_client_config;
 
+use crate::approval::ApprovalGate;
+use crate::audit::{AuditEntry, AuditSink};
 use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
+use crate::ssh_backend::SshBackend;
+
+/// SSH protocol error codes (`internal/ext/protocol/ssh.go`).
+const SSH_CODE_KEY_NOT_FOUND: &str = "KEY_NOT_FOUND";
+const SSH_CODE_SIGN_FAILED: &str = "SIGN_FAILED";
+const SSH_CODE_INTERNAL: &str = "INTERNAL_ERROR";
 
 // ---------------------------------------------------------------------------
 // Constants (mirrors hostclient.go)
@@ -749,20 +759,36 @@ fn build_http_client(pin: Option<&str>) -> Result<reqwest::Client, BusError> {
 // Single-server daemon entry point + ping responder
 // ---------------------------------------------------------------------------
 
+/// The bus's injected seams for the gated credential flow — built in `main.rs` and
+/// threaded through the subscribe loop into `handle_bus_message`/`handle_sign`: the
+/// approval `gate` (selected from `ssh.approval.policy`), the `audit` sink (durable
+/// JSONL + desktop fan-out), the ed25519 sign `backend`, and the discovery
+/// `server_name` (the audit/approval `server` field — empty in single-server mode).
+/// Grouping the seams keeps the two entry points below the argument-count lint and
+/// gives later slices (aws/docker backends, the credential minter) one place to grow.
+pub struct BusHandlers {
+    pub gate: Arc<dyn ApprovalGate>,
+    pub audit: Arc<dyn AuditSink>,
+    pub backend: Arc<dyn SshBackend>,
+    pub server_name: String,
+}
+
 /// Run the single-server message bus: subscribe to `ssh-agent` (open mode — no
-/// token, no pin) and answer inbound `ping` requests with a `pong`, until
-/// `shutdown` flips. Mirrors the Go daemon's single-server path
-/// (`main.go` → `startWatcherGroup` → `NewSSHHandler(...).Run`), minus the
-/// credential backends (later slices).
+/// token, no pin) and answer inbound requests until `shutdown` flips. `ping` → a
+/// `pong`; `sign` runs the gated ed25519 flow (approval gate → backend → response +
+/// audit). Mirrors the Go daemon's single-server path
+/// (`main.go` → `startWatcherGroup` → `NewSSHHandler(...).Run`). `server_name` is the
+/// audit/approval `server` field — empty in single-server mode (matches Go).
 ///
 /// KNOWN GAP (for the harness): Go's watcher group also subscribes to
-/// `aws-credentials`, `docker-credentials`, and the egress-audit stream. Those
-/// need their backends + the egress route, so they are deliberately NOT wired here
-/// — this slice proves the ssh-agent ping/pong transport only.
+/// `aws-credentials`, `docker-credentials`, and the egress-audit stream, and answers
+/// the ssh `list`/`status` ops. Those need their backends + the egress route, so they
+/// are deliberately NOT wired here — this slice wires the ssh-agent ping + gated sign.
 pub async fn run_single_server_bus(
     server_url: String,
     shutdown: watch::Receiver<bool>,
     log: Arc<dyn BusLog>,
+    handlers: BusHandlers,
 ) {
     // Open mode: the static/empty token provider (no token) and no pin. Open
     // servers don't gate, so they never 401 — the provider-vs-static distinction
@@ -807,7 +833,7 @@ pub async fn run_single_server_bus(
                 None => break, // sender dropped: shutdown or terminal 409
             },
         };
-        handle_bus_message(&client, NS_SSH_AGENT, &env, &shutdown).await;
+        handle_bus_message(&client, NS_SSH_AGENT, &env, &shutdown, &handlers).await;
     }
     let s = sub.status();
     log.info(&format!(
@@ -816,28 +842,42 @@ pub async fn run_single_server_bus(
     ));
 }
 
-/// Answer one inbound bus request. `ping` → `{"status":"ok"}`; any other operation
-/// gets an `INTERNAL_ERROR` envelope so the shed's request doesn't hang.
-///
-/// TODO(later slice): the real `list`/`sign`/`status` (and aws/docker) backends
-/// replace the error path here — this is the seam.
+/// Answer one inbound bus request. `ping` → `{"status":"ok"}`; `sign` → the gated
+/// ed25519 flow (approval gate → backend → response + audit); any other operation
+/// (aws/docker, ssh `list`/`status`) gets an `INTERNAL_ERROR` envelope so the shed's
+/// request doesn't hang — the seam for the later backends. The reply plumbing (mint
+/// response, echo `shed`, POST, warn-on-failure) is shared; the audit is written
+/// AFTER the response, matching `ssh_handler.go` (sendResponse/sendError then
+/// LogEntry).
 async fn handle_bus_message(
     client: &BusClient,
     namespace: &str,
     env: &Envelope,
     shutdown: &watch::Receiver<bool>,
+    handlers: &BusHandlers,
 ) {
-    // Pick the response payload by operation; the reply plumbing (mint response,
-    // echo `shed`, POST, warn-on-failure) is shared. `what` only labels the log.
-    let (payload, what) = match env.operation() {
-        Some("ping") => (serde_json::json!({"status": "ok"}), "ping response"),
+    let shed_name = env.shed.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+    let (payload, audit_entry, what) = match env.operation() {
+        Some("ping") => (serde_json::json!({"status": "ok"}), None, "ping response"),
+        Some("sign") => {
+            let (payload, entry) = handle_sign(
+                env,
+                &handlers.server_name,
+                shed_name,
+                &handlers.gate,
+                &handlers.backend,
+            )
+            .await;
+            (payload, entry, "sign response")
+        }
         other => {
             let op = other.unwrap_or("");
             (
                 serde_json::json!({
                     "error": format!("operation not implemented in this build: {op}"),
-                    "code": "INTERNAL_ERROR",
+                    "code": SSH_CODE_INTERNAL,
                 }),
+                None,
                 "error response",
             )
         }
@@ -847,6 +887,165 @@ async fn handle_bus_message(
                                   // `shutdown` is threaded through so the POST races teardown (see `respond`).
     if let Err(e) = client.respond(namespace, &resp, shutdown).await {
         client.log.warn(&format!("failed to send {what}: {e}"));
+    }
+    // Audit after responding — the durable log + desktop fan-out (ssh_handler.go
+    // order). A non-gated op or a parse-error path leaves `audit_entry` None (Go
+    // emits no audit for those).
+    if let Some(entry) = audit_entry {
+        handlers.audit.log(entry);
+    }
+}
+
+/// The sign request payload (`internal/ext/protocol/ssh.go:SSHSignRequest`).
+/// `operation` is already dispatched on, so it's not needed here. `#[serde(default)]`
+/// on every field so a missing field zero-fills (Go `json.Unmarshal` semantics); a
+/// wrong-typed field still fails the decode (Go too).
+#[derive(Deserialize)]
+struct SignRequestPayload {
+    #[serde(default)]
+    public_key: String,
+    #[serde(default)]
+    data: String,
+    #[serde(default)]
+    flags: u32,
+}
+
+/// An `{error, code}` SSH error payload (`SSHErrorResponse`). Built as a
+/// `serde_json::Value`; shed-server parses it order-insensitively and the
+/// differential compares canonically, so the key order is not load-bearing.
+fn ssh_error(msg: &str, code: &str) -> serde_json::Value {
+    serde_json::json!({ "error": msg, "code": code })
+}
+
+/// An [`AuditEntry`] scaffold for a sign op with the fixed ns/op + the shared
+/// server/shed/approval/outcome fields (Go copies these into every sign audit).
+fn sign_audit(
+    server_name: &str,
+    shed_name: &str,
+    result: &str,
+    detail: &str,
+    approval: String,
+    outcome: &crate::approval::ApprovalOutcome,
+) -> AuditEntry {
+    AuditEntry {
+        server: server_name.to_string(),
+        shed: shed_name.to_string(),
+        ns: NS_SSH_AGENT.to_string(),
+        op: "sign".to_string(),
+        result: result.to_string(),
+        detail: detail.to_string(),
+        approval,
+        decided_by: outcome.decided_by.clone(),
+        scope: outcome.scope.clone().unwrap_or_default(),
+        ttl: outcome.ttl.clone().unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// The gated `sign` flow — a faithful port of `ssh_handler.go:handleSign`. Returns
+/// the response payload (a `SSHSignResponse` on success, else a `SSHErrorResponse`)
+/// plus the audit entry to write (only the gate-deny / backend-error / success paths
+/// audit; the parse-error paths do NOT, matching Go).
+///
+/// ORDER matches Go EXACTLY (catalog §6.1 lists gate-deny first): decode request →
+/// **approval gate** → decode+parse public key → decode challenge → backend sign.
+async fn handle_sign(
+    env: &Envelope,
+    server_name: &str,
+    shed_name: &str,
+    gate: &Arc<dyn ApprovalGate>,
+    backend: &Arc<dyn SshBackend>,
+) -> (serde_json::Value, Option<AuditEntry>) {
+    // 1. Decode the sign request (a wrong-typed field → invalid sign request; no audit).
+    let req: SignRequestPayload = match serde_json::from_value(env.payload.clone()) {
+        Ok(r) => r,
+        Err(_) => return (ssh_error("invalid sign request", SSH_CODE_INTERNAL), None),
+    };
+
+    // 2. Approval gate FIRST (deny-all default fails closed). The reason shown to the
+    //    app is the fixed "SSH sign request" (Go's desktopGate reason) — NOT the key
+    //    type, which isn't parsed until after the gate.
+    let outcome = gate
+        .approve(
+            NS_SSH_AGENT,
+            "sign",
+            server_name,
+            shed_name,
+            "SSH sign request",
+        )
+        .await;
+    let approval = gate.method().to_string();
+    if !outcome.approved {
+        // Deny audit: result=denied, approval + decided_by/scope/ttl; NO detail, NO
+        // code, NO reason (ssh_handler.go's deny path sets none of those).
+        let entry = sign_audit(server_name, shed_name, "denied", "", approval, &outcome);
+        return (
+            ssh_error("approval denied", SSH_CODE_SIGN_FAILED),
+            Some(entry),
+        );
+    }
+
+    // 3. Decode + parse the public key (parse-error paths do NOT audit).
+    let pub_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.public_key) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                ssh_error("invalid public key encoding", SSH_CODE_INTERNAL),
+                None,
+            )
+        }
+    };
+    // ssh_key::PublicKey::from_bytes == Go's ssh.ParsePublicKey (validates + rejects
+    // trailing bytes, so `pub_bytes` is the canonical marshaled form — the same bytes
+    // Go's keysEqual compares against the loaded key).
+    let pubkey = match ssh_key::public::PublicKey::from_bytes(&pub_bytes) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                ssh_error("invalid public key", SSH_CODE_KEY_NOT_FOUND),
+                None,
+            )
+        }
+    };
+    let key_type = pubkey.algorithm().as_str().to_string();
+
+    // 4. Decode the challenge data.
+    let data = match base64::engine::general_purpose::STANDARD.decode(&req.data) {
+        Ok(d) => d,
+        Err(_) => {
+            return (
+                ssh_error("invalid challenge data encoding", SSH_CODE_INTERNAL),
+                None,
+            )
+        }
+    };
+
+    // 5. Sign. Any backend error → {sign operation failed, SIGN_FAILED} + error audit
+    //    (detail = key type). Success → SSHSignResponse + ok audit (detail = key type).
+    match backend.sign(&pub_bytes, &data, req.flags) {
+        Ok(sig) => {
+            let payload = serde_json::json!({
+                "format": sig.format,
+                "blob": base64::engine::general_purpose::STANDARD.encode(&sig.blob),
+                "rest": "",
+            });
+            let entry = sign_audit(server_name, shed_name, "ok", &key_type, approval, &outcome);
+            (payload, Some(entry))
+        }
+        Err(_) => {
+            let entry = sign_audit(
+                server_name,
+                shed_name,
+                "error",
+                &key_type,
+                approval,
+                &outcome,
+            );
+            (
+                ssh_error("sign operation failed", SSH_CODE_SIGN_FAILED),
+                Some(entry),
+            )
+        }
     }
 }
 
@@ -943,6 +1142,125 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         let _ = Box::leak(Box::new(tx));
         rx
+    }
+
+    // ---- sign-flow test doubles ----
+
+    use crate::approval::{ApproveAllGate, DenyAllGate};
+    use crate::ssh_backend::{SshKeyInfo, SshSignature};
+
+    fn approve_gate() -> Arc<dyn ApprovalGate> {
+        Arc::new(ApproveAllGate)
+    }
+    fn deny_gate() -> Arc<dyn ApprovalGate> {
+        Arc::new(DenyAllGate)
+    }
+
+    /// Bundle the three seams into a `BusHandlers` with an empty (single-server)
+    /// `server_name`, for the `handle_bus_message` dispatch tests.
+    fn test_handlers(
+        gate: Arc<dyn ApprovalGate>,
+        audit: Arc<dyn AuditSink>,
+        backend: Arc<dyn SshBackend>,
+    ) -> BusHandlers {
+        BusHandlers {
+            gate,
+            audit,
+            backend,
+            server_name: String::new(),
+        }
+    }
+
+    /// An audit sink that records every entry, for asserting the sign audit shape.
+    #[derive(Default)]
+    struct CollectingAudit {
+        entries: Mutex<Vec<AuditEntry>>,
+    }
+    impl AuditSink for CollectingAudit {
+        fn log(&self, entry: AuditEntry) {
+            self.entries.lock().unwrap().push(entry);
+        }
+    }
+    fn noop_audit() -> Arc<dyn AuditSink> {
+        Arc::new(CollectingAudit::default())
+    }
+
+    /// A backend that signs `data` (returns `canned` bytes) only for the one pubkey it
+    /// was built with; any other pubkey → `key not found` (like the real backend).
+    struct StubBackend {
+        pubkey: Vec<u8>,
+        result: Result<SshSignature, String>,
+    }
+    impl SshBackend for StubBackend {
+        fn list(&self) -> Result<Vec<SshKeyInfo>, String> {
+            Ok(Vec::new())
+        }
+        fn sign(
+            &self,
+            public_key: &[u8],
+            _data: &[u8],
+            _flags: u32,
+        ) -> Result<SshSignature, String> {
+            if public_key == self.pubkey {
+                self.result.clone()
+            } else {
+                Err("key not found".to_string())
+            }
+        }
+        fn mode(&self) -> &str {
+            "local-keys"
+        }
+    }
+    fn empty_backend() -> Arc<dyn SshBackend> {
+        Arc::new(StubBackend {
+            pubkey: Vec::new(),
+            result: Err("key not found".to_string()),
+        })
+    }
+
+    /// A valid ed25519 SSH-wire marshaled public key (Go `ssh.PublicKey.Marshal()`),
+    /// built from a fixed seed so `PublicKey::from_bytes` accepts it.
+    fn fixed_ed25519_pub() -> Vec<u8> {
+        use ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey, KeypairData, PrivateKey};
+        use ssh_key::public::Ed25519PublicKey;
+        let seed = [3u8; 32];
+        let verifying = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let keypair = Ed25519Keypair {
+            public: Ed25519PublicKey(verifying.to_bytes()),
+            private: Ed25519PrivateKey::from_bytes(&seed),
+        };
+        PrivateKey::new(KeypairData::Ed25519(keypair), "t")
+            .unwrap()
+            .public_key()
+            .to_bytes()
+            .unwrap()
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// Build a `sign` request Envelope with the given base64 public_key/data + flags.
+    fn sign_env(public_key: &str, data: &str, flags: u32) -> Envelope {
+        Envelope {
+            id: "sign-1".into(),
+            namespace: "ssh-agent".into(),
+            msg_type: "request".into(),
+            in_reply_to: String::new(),
+            is_final: true,
+            timestamp: "t".into(),
+            payload: serde_json::json!({
+                "operation": "sign",
+                "public_key": public_key,
+                "data": data,
+                "flags": flags,
+            }),
+            shed: Some(ShedInfo {
+                name: "web".into(),
+                backend: "vz".into(),
+                server: "mini2".into(),
+            }),
+        }
     }
 
     // ---- Envelope shape / new_response ----
@@ -1517,12 +1835,21 @@ mod tests {
                 server: "mini2".into(),
             }),
         };
-        handle_bus_message(&client, "ssh-agent", &req, &never_shutdown()).await;
+        handle_bus_message(
+            &client,
+            "ssh-agent",
+            &req,
+            &never_shutdown(),
+            &test_handlers(approve_gate(), noop_audit(), empty_backend()),
+        )
+        .await;
         respond.assert_async().await;
     }
 
     #[tokio::test]
-    async fn non_ping_op_gets_internal_error() {
+    async fn unimplemented_op_gets_internal_error() {
+        // `list`/`status` stay placeholder in this slice — an unimplemented op still
+        // gets an INTERNAL_ERROR envelope so the shed's request doesn't hang.
         let server = MockServer::start_async().await;
         let respond = server
             .mock_async(|w, t| {
@@ -1534,7 +1861,7 @@ mod tests {
                             .as_ref()
                             .map(|b| String::from_utf8_lossy(b).to_string())
                             .unwrap_or_default();
-                        body.contains("\"in_reply_to\":\"sign-req\"")
+                        body.contains("\"in_reply_to\":\"list-req\"")
                             && body.contains("INTERNAL_ERROR")
                     });
                 t.status(204);
@@ -1542,17 +1869,203 @@ mod tests {
             .await;
         let client = open_client(&server.base_url());
         let req = Envelope {
-            id: "sign-req".into(),
+            id: "list-req".into(),
             namespace: "ssh-agent".into(),
             msg_type: "request".into(),
             in_reply_to: String::new(),
             is_final: true,
             timestamp: "t".into(),
-            payload: serde_json::json!({"operation":"sign","public_key":"x"}),
+            payload: serde_json::json!({"operation":"list"}),
             shed: None,
         };
-        handle_bus_message(&client, "ssh-agent", &req, &never_shutdown()).await;
+        handle_bus_message(
+            &client,
+            "ssh-agent",
+            &req,
+            &never_shutdown(),
+            &test_handlers(approve_gate(), noop_audit(), empty_backend()),
+        )
+        .await;
         respond.assert_async().await;
+    }
+
+    // ---- gated sign flow (mirrors ssh_handler.go:handleSign) ----
+
+    #[tokio::test]
+    async fn sign_approve_returns_signresponse_and_ok_audit() {
+        let pub_bytes = fixed_ed25519_pub();
+        let backend: Arc<dyn SshBackend> = Arc::new(StubBackend {
+            pubkey: pub_bytes.clone(),
+            result: Ok(SshSignature {
+                format: "ssh-ed25519".to_string(),
+                blob: vec![0xAB; 64],
+            }),
+        });
+        let env = sign_env(&b64(&pub_bytes), &b64(b"challenge-bytes"), 0);
+        let (payload, entry) = handle_sign(&env, "", "web", &approve_gate(), &backend).await;
+
+        // SSHSignResponse{format, blob(b64 sig), rest:""}.
+        assert_eq!(payload["format"], "ssh-ed25519");
+        assert_eq!(payload["blob"], b64(&[0xAB; 64]));
+        assert_eq!(payload["rest"], "");
+
+        // ok audit: detail=key type, approval=approve-all, decided_by/scope/ttl empty.
+        let entry = entry.expect("ok path audits");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.detail, "ssh-ed25519");
+        assert_eq!(entry.ns, "ssh-agent");
+        assert_eq!(entry.op, "sign");
+        assert_eq!(entry.approval, "approve-all");
+        assert_eq!(entry.server, ""); // single-server mode
+        assert_eq!(entry.shed, "web");
+        assert_eq!(entry.decided_by, "");
+        assert_eq!(entry.code, "");
+        assert_eq!(entry.reason, "");
+    }
+
+    #[tokio::test]
+    async fn sign_deny_returns_error_and_denied_audit() {
+        let env = sign_env(&b64(&fixed_ed25519_pub()), &b64(b"data"), 0);
+        let (payload, entry) = handle_sign(&env, "", "web", &deny_gate(), &empty_backend()).await;
+        // {approval denied, SIGN_FAILED}.
+        assert_eq!(payload["error"], "approval denied");
+        assert_eq!(payload["code"], "SIGN_FAILED");
+        // denied audit: result=denied, approval=deny-all; NO detail, NO code, NO reason.
+        let entry = entry.expect("deny path audits");
+        assert_eq!(entry.result, "denied");
+        assert_eq!(entry.approval, "deny-all");
+        assert_eq!(entry.detail, "");
+        assert_eq!(entry.code, "");
+        assert_eq!(entry.reason, "");
+        assert_eq!(entry.decided_by, ""); // deny-all's empty outcome
+    }
+
+    #[tokio::test]
+    async fn sign_gate_runs_before_pubkey_decode() {
+        // A DENY policy + a BAD public key must return "approval denied" (gate first),
+        // NOT "invalid public key encoding" — this pins the ssh_handler.go ordering.
+        let env = sign_env("!!!not-base64!!!", &b64(b"data"), 0);
+        let (payload, entry) = handle_sign(&env, "", "web", &deny_gate(), &empty_backend()).await;
+        assert_eq!(payload["error"], "approval denied");
+        assert_eq!(payload["code"], "SIGN_FAILED");
+        assert_eq!(entry.expect("deny audits").result, "denied");
+    }
+
+    #[tokio::test]
+    async fn sign_bad_pubkey_b64_internal_error_no_audit() {
+        let env = sign_env("!!!not-base64!!!", &b64(b"data"), 0);
+        let (payload, entry) =
+            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
+        assert_eq!(payload["error"], "invalid public key encoding");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none(), "parse-error paths do NOT audit");
+    }
+
+    #[tokio::test]
+    async fn sign_unparsable_pubkey_key_not_found_no_audit() {
+        // Valid base64, but not a valid SSH public key wire blob.
+        let env = sign_env(&b64(b"definitely not an ssh key"), &b64(b"data"), 0);
+        let (payload, entry) =
+            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
+        assert_eq!(payload["error"], "invalid public key");
+        assert_eq!(payload["code"], "KEY_NOT_FOUND");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_bad_data_b64_internal_error_no_audit() {
+        let env = sign_env(&b64(&fixed_ed25519_pub()), "!!!bad!!!", 0);
+        let (payload, entry) =
+            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
+        assert_eq!(payload["error"], "invalid challenge data encoding");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_backend_error_sign_failed_and_error_audit() {
+        // approve-all + a valid pubkey the (empty) backend doesn't hold -> key not
+        // found -> {sign operation failed, SIGN_FAILED} + error audit (detail=key type).
+        let env = sign_env(&b64(&fixed_ed25519_pub()), &b64(b"data"), 0);
+        let (payload, entry) =
+            handle_sign(&env, "", "web", &approve_gate(), &empty_backend()).await;
+        assert_eq!(payload["error"], "sign operation failed");
+        assert_eq!(payload["code"], "SIGN_FAILED");
+        let entry = entry.expect("backend-error path audits");
+        assert_eq!(entry.result, "error");
+        assert_eq!(entry.detail, "ssh-ed25519");
+        assert_eq!(entry.approval, "approve-all");
+        assert_eq!(entry.code, ""); // ssh_handler.go's error audit sets no code
+    }
+
+    #[tokio::test]
+    async fn sign_invalid_payload_internal_error_no_audit() {
+        // `flags` as a string fails the SSHSignRequest decode -> {invalid sign
+        // request, INTERNAL_ERROR}; the gate is never consulted, no audit.
+        let env = Envelope {
+            id: "sign-1".into(),
+            namespace: "ssh-agent".into(),
+            msg_type: "request".into(),
+            in_reply_to: String::new(),
+            is_final: true,
+            timestamp: "t".into(),
+            payload: serde_json::json!({"operation":"sign","flags":"not-a-number"}),
+            shed: None,
+        };
+        let (payload, entry) = handle_sign(&env, "", "", &approve_gate(), &empty_backend()).await;
+        assert_eq!(payload["error"], "invalid sign request");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_ok_via_handle_bus_message_responds_and_audits() {
+        // End-to-end through the shared dispatch: the response is POSTed AND the ok
+        // entry reaches the audit sink.
+        let server = MockServer::start_async().await;
+        let respond = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/ssh-agent/respond")
+                    .matches(|req| {
+                        let body = req
+                            .body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                            .unwrap_or_default();
+                        body.contains("\"in_reply_to\":\"sign-1\"")
+                            && body.contains("ssh-ed25519")
+                            && body.contains("\"rest\":\"\"")
+                    });
+                t.status(204);
+            })
+            .await;
+        let client = open_client(&server.base_url());
+        let pub_bytes = fixed_ed25519_pub();
+        let backend: Arc<dyn SshBackend> = Arc::new(StubBackend {
+            pubkey: pub_bytes.clone(),
+            result: Ok(SshSignature {
+                format: "ssh-ed25519".to_string(),
+                blob: vec![0x11; 64],
+            }),
+        });
+        let audit_collector = Arc::new(CollectingAudit::default());
+        let audit: Arc<dyn AuditSink> = audit_collector.clone();
+        let gate = approve_gate();
+        let env = sign_env(&b64(&pub_bytes), &b64(b"data"), 0);
+        handle_bus_message(
+            &client,
+            "ssh-agent",
+            &env,
+            &never_shutdown(),
+            &test_handlers(gate, audit, backend),
+        )
+        .await;
+        respond.assert_async().await;
+        let entries = audit_collector.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].result, "ok");
+        assert_eq!(entries[0].shed, "web"); // echoed from the request's shed
     }
 
     #[tokio::test]

@@ -128,6 +128,33 @@ class DesktopClient:
             }
         )
 
+    def send_approval_response(
+        self,
+        request_id: str,
+        decision: str,
+        *,
+        decided_by: str | None = None,
+        scope: str | None = None,
+        ttl: str | None = None,
+    ) -> None:
+        """Answer an `approval_request` (app -> agent). `decision` is `"approve"` or
+        anything else (the agent treats non-`"approve"` as deny). `decided_by`/`scope`/
+        `ttl` are the app's decision detail; omitted (not sent) when None so the audit
+        omits them — matching the `omitempty` on `approvalResponseMsg.{scope,ttl}` and
+        the agent's `decided_by` default of `"user"` when left empty."""
+        frame = {
+            "type": "approval_response",
+            "request_id": request_id,
+            "decision": decision,
+        }
+        if decided_by is not None:
+            frame["decided_by"] = decided_by
+        if scope is not None:
+            frame["scope"] = scope
+        if ttl is not None:
+            frame["ttl"] = ttl
+        self.send(frame)
+
     # -- receiving -----------------------------------------------------------
 
     def _read_loop(self, s: socket.socket) -> None:

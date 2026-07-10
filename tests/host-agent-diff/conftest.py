@@ -30,6 +30,14 @@ import pytest
 # tests/host-agent-diff/conftest.py -> tests -> repo root.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Committed, throwaway, passphrase-less OpenSSH ed25519 test key (see
+# fixtures/test_ed25519). The `daemon` fixture writes it to a daemon's isolated
+# `<HOME>/.ssh/id_ed25519` so BOTH the Go local-keys backend and the Rust
+# `LocalEd25519Backend` load the SAME key — ed25519 is deterministic (RFC 8032), so
+# the two sign the same challenge to the same 64 bytes (compared UNMASKED).
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+TEST_ED25519_KEY = FIXTURES_DIR / "test_ed25519"
+
 # The status/desktop socket basenames (fixed public interface — sockets.go /
 # sockets.rs). The dir is the only configurable part (`$SHED_HOST_AGENT_SOCKET_DIR`).
 STATUS_SOCK_NAME = "host-agent-status.sock"
@@ -89,6 +97,34 @@ def _single_server_config(bus_url: str) -> str:
     fixture. Uses `str.replace` (not `.format`) so the still-unfilled `{audit_log}`
     placeholder survives to the fixture's own `.format(audit_log=..., source=...)`."""
     return SINGLE_SERVER_CONFIG.replace("{server}", bus_url)
+
+
+# The single-server config for the gated cross-surface **sign** differential
+# (`test_bus_sign_gated.py`). Same single-server shape as SINGLE_SERVER_CONFIG (no
+# `discovery:` block → both impls run single-server, subscribe to `ssh-agent`), but
+# with `ssh.mode: local-keys` (so the committed ed25519 key the `daemon` fixture
+# installs is loaded — on BOTH impls) and `ssh.approval.policy: shed-desktop` (so a
+# `sign` is DELEGATED to the connected desktop consumer; Go builds a `desktopGate`,
+# Rust a `DesktopGate`, and both fan the resulting audit out to that consumer as an
+# `event`). BLOCK style on purpose (the Rust `yaml_lite` parser is block-only; see
+# WATCH_NONE_CONFIG / README "Known contract gaps"). `{server}` is filled by
+# `sign_config(bus_url)`; `{audit_log}` survives to the `daemon` fixture's `.format`.
+SIGN_CONFIG = """\
+server: {server}
+ssh:
+  mode: local-keys
+  approval:
+    policy: shed-desktop
+logging:
+  enabled: true
+  path: {audit_log}
+"""
+
+
+def _sign_config(bus_url: str) -> str:
+    """Fill `server:` with `bus_url`, leaving `{audit_log}` for the `daemon` fixture
+    (str.replace, same reason as `_single_server_config`)."""
+    return SIGN_CONFIG.replace("{server}", bus_url)
 
 
 @dataclasses.dataclass
@@ -179,7 +215,9 @@ def run_cli(binaries, tmp_path_factory):
 class DaemonHandle:
     """A running daemon under test: query it, inspect its socket dir."""
 
-    def __init__(self, impl, binary, proc, socket_dir, home, config_path, log_path):
+    def __init__(
+        self, impl, binary, proc, socket_dir, home, config_path, log_path, audit_log_path
+    ):
         self.impl = impl
         self.binary = binary
         self.proc = proc
@@ -187,6 +225,12 @@ class DaemonHandle:
         self.home = str(home)
         self.config_path = str(config_path)
         self.log_path = Path(log_path)
+        # The DURABLE audit JSONL (`logging.path`), distinct from the operational log
+        # above. Populated by gated ops (the sign flow); a fan-out `event` is sent
+        # AFTER the file line is written on both impls (Rust `JsonlAuditSink::log`,
+        # Go `AuditLogger.LogEntry`), so a durable line is readable once the desktop
+        # consumer has seen the matching `event`.
+        self.audit_log_path = Path(audit_log_path)
         self.status_sock = Path(socket_dir) / STATUS_SOCK_NAME
         self.desktop_sock = Path(socket_dir) / DESKTOP_SOCK_NAME
 
@@ -196,6 +240,29 @@ class DaemonHandle:
 
     def read_log(self) -> str:
         return _safe_read(self.log_path)
+
+    def read_audit_jsonl(self, expect: int = 1, timeout: float = 5.0) -> list:
+        """Poll the durable audit file until it holds `expect` non-empty JSONL lines
+        (a deadline poll, never a fixed sleep) and return them parsed. Raises on
+        timeout or on a line that isn't a JSON object. Robust against the small window
+        between the desktop `event` and the file flush landing on disk."""
+        deadline = time.monotonic() + timeout
+        last: list = []
+        while time.monotonic() < deadline:
+            try:
+                raw = self.audit_log_path.read_text()
+            except OSError:
+                raw = ""
+            last = [line for line in raw.splitlines() if line.strip()]
+            if len(last) >= expect:
+                import json as _json
+
+                return [_json.loads(line) for line in last]
+            time.sleep(0.02)
+        raise AssertionError(
+            f"{self.impl}: audit file {self.audit_log_path} held {len(last)} line(s), "
+            f"expected {expect} within {timeout}s; contents={last!r}"
+        )
 
 
 @pytest.fixture
@@ -209,7 +276,7 @@ def daemon(binaries, tmp_path_factory):
     """
 
     @contextlib.contextmanager
-    def _make(impl, config_text):
+    def _make(impl, config_text, install_ssh_key: bool = False):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
         home = root / "home"
         home.mkdir()
@@ -218,6 +285,18 @@ def daemon(binaries, tmp_path_factory):
         config_path = root / "extensions.yaml"
         log_path = root / "op.log"
         config_path.write_text(config_text.format(audit_log=audit_log, source=source))
+
+        # Install the committed ed25519 key into this daemon's isolated
+        # `<HOME>/.ssh/id_ed25519` (dir 0700, file 0600) BEFORE launch, so a
+        # local-keys `sign` finds the SAME key on both impls (Go `os.UserHomeDir()`
+        # + Rust `user_home_dir()` both resolve `$HOME`, set by `_clean_env`).
+        if install_ssh_key:
+            ssh_dir = home / ".ssh"
+            ssh_dir.mkdir(mode=0o700, exist_ok=True)
+            key_dst = ssh_dir / "id_ed25519"
+            key_dst.write_bytes(TEST_ED25519_KEY.read_bytes())
+            os.chmod(ssh_dir, 0o700)
+            os.chmod(key_dst, 0o600)
 
         # The socket dir must be SHORT: an AF_UNIX bind path caps at ~104 bytes
         # (macOS) / ~108 (Linux), and pytest's nested tmp tree blows past that. A
@@ -259,7 +338,7 @@ def daemon(binaries, tmp_path_factory):
             )
 
         handle = DaemonHandle(
-            impl, binaries[impl], proc, socket_dir, home, config_path, log_path
+            impl, binaries[impl], proc, socket_dir, home, config_path, log_path, audit_log
         )
         try:
             yield handle
@@ -316,6 +395,16 @@ def single_server_config():
     returned text still carries the `{audit_log}` placeholder the `daemon` fixture
     fills. See SINGLE_SERVER_CONFIG."""
     return _single_server_config
+
+
+@pytest.fixture
+def sign_config():
+    """Return `make(bus_url) -> config_text`: the block-style single-server config for
+    the gated cross-surface **sign** differential — `ssh.mode: local-keys` +
+    `ssh.approval.policy: shed-desktop`, `server:` pointed at the synthetic bus. Pair
+    with `daemon(..., install_ssh_key=True)` so the committed ed25519 key is loaded.
+    See SIGN_CONFIG."""
+    return _sign_config
 
 
 @pytest.fixture

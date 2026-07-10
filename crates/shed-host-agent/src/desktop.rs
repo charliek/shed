@@ -30,7 +30,8 @@ use crate::desktop_protocol::{
     self as protocol, ApprovalResponseMsg, AuditEntryView, ClientInfo, DesktopInbound, TokenGetMsg,
 };
 
-use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
+use crate::approval::{ApprovalGate, ApprovalOutcome};
+use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT, POLICY_SHED_DESKTOP};
 use crate::status::{now_rfc3339, now_unix, rfc3339_utc};
 
 /// 1 MiB per-line cap on inbound frames — a larger frame is a protocol violation
@@ -103,27 +104,15 @@ impl ControlTokenMinter for StubControlMinter {
 // Approval outcome
 // ---------------------------------------------------------------------------
 
-/// The result of a delegated approval, mirroring the Go `desktopGate.Approve`
-/// outcome. On a received decision (approve OR deny), `decided_by` defaults to
-/// `"user"` when the app left it empty; on a no-decision fail-closed (no consumer,
-/// timeout, disconnect, transport error) `decided_by` is empty (matching Go's
-/// empty `ApprovalOutcome{}` on the error path).
-//
-// `request_approval` (its only producer) has no bus/backend caller until slice
-// 1b/1c, so the outcome type + its mapping helpers read as dead until then.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovalOutcome {
-    pub approved: bool,
-    pub decided_by: String,
-    pub scope: Option<String>,
-    pub ttl: Option<String>,
-}
+// The delegated-approval outcome is the crate-wide `ApprovalOutcome` (imported
+// above) so a single shape flows from `request_approval` through the gate seam to
+// the audit entry. On a received decision (approve OR deny), `decided_by` defaults
+// to `"user"` when the app left it empty; on a no-decision fail-closed (no
+// consumer, timeout, disconnect, transport error) `decided_by` is empty (matching
+// Go's empty `ApprovalOutcome{}` on the error path).
 
 /// The app's decision as delivered internally (raw, before the `decided_by`
-/// default is applied). Mirrors Go's `desktopDecision`. The fields are read by
-/// `decision_to_outcome` (caller-less until slice 1b/1c).
-#[allow(dead_code)]
+/// default is applied). Mirrors Go's `desktopDecision`.
 struct DesktopDecision {
     approved: bool,
     decided_by: String,
@@ -131,7 +120,6 @@ struct DesktopDecision {
     ttl: Option<String>,
 }
 
-#[allow(dead_code)] // via request_approval, wired in slice 1b/1c
 fn decision_to_outcome(dec: DesktopDecision) -> ApprovalOutcome {
     let decided_by = if dec.decided_by.is_empty() {
         "user".to_string()
@@ -143,19 +131,6 @@ fn decision_to_outcome(dec: DesktopDecision) -> ApprovalOutcome {
         decided_by,
         scope: dec.scope,
         ttl: dec.ttl,
-    }
-}
-
-/// The fail-closed outcome when NO decision was made (no consumer, timeout,
-/// disconnect, transport error): denied with an empty `decided_by`, matching the
-/// Go gate's `ApprovalOutcome{}` on the error path.
-#[allow(dead_code)] // via request_approval, wired in slice 1b/1c
-fn deny_no_decision() -> ApprovalOutcome {
-    ApprovalOutcome {
-        approved: false,
-        decided_by: String::new(),
-        scope: None,
-        ttl: None,
     }
 }
 
@@ -263,9 +238,7 @@ impl DesktopServer {
     /// Send an approval request to the connected app and block on the reply within
     /// the timeout. Fail-closed: denies (with an empty `decided_by`) when no app is
     /// connected, on timeout, on disconnect, or on a transport error. Folds the Go
-    /// `DesktopServer.RequestApproval` + `desktopGate.Approve` into one call. No
-    /// bus/backend caller until slice 1b/1c.
-    #[allow(dead_code)]
+    /// `DesktopServer.RequestApproval` + `desktopGate.Approve` into one call.
     pub async fn request_approval(
         &self,
         namespace: &str,
@@ -279,7 +252,7 @@ impl DesktopServer {
         let (owner, writer) = {
             let mut inner = self.inner.lock().unwrap();
             let Some(consumer) = inner.consumer.as_ref() else {
-                return deny_no_decision(); // no consumer -> fail closed
+                return ApprovalOutcome::denied_no_decision(); // no consumer -> fail closed
             };
             let owner = consumer.id;
             let writer = consumer.writer.clone();
@@ -310,15 +283,15 @@ impl DesktopServer {
             // fail-closing every pending owned by it (including this one), matching
             // the Go synchronous send that errors on a full/dead socket.
             self.demote(owner);
-            return deny_no_decision();
+            return ApprovalOutcome::denied_no_decision();
         }
 
         let outcome = tokio::select! {
             res = rx => match res {
                 Ok(dec) => decision_to_outcome(dec),
-                Err(_) => deny_no_decision(), // sender dropped without a decision
+                Err(_) => ApprovalOutcome::denied_no_decision(), // sender dropped without a decision
             },
-            _ = tokio::time::sleep(self.timeout) => deny_no_decision(),
+            _ = tokio::time::sleep(self.timeout) => ApprovalOutcome::denied_no_decision(),
         };
         // Idempotent cleanup (resolve/demote may already have removed it).
         self.inner.lock().unwrap().pending.remove(&id);
@@ -625,6 +598,45 @@ impl DesktopServer {
         for frame in frames {
             let _ = writer.try_send(with_newline(frame));
         }
+    }
+}
+
+/// The shed-desktop approval gate: delegates a credential op's decision to the
+/// connected app over the UDS. A Rust port of Go's `desktopGate` — it holds an
+/// `Arc<DesktopServer>` and forwards `approve` to [`DesktopServer::request_approval`],
+/// which fails closed (denies) when no app is connected, on timeout, on disconnect,
+/// or on a transport error. Lives here (behind `desktop-forwarding`) because it is
+/// the only gate that touches the desktop server; the bus/ssh handler sees only the
+/// `ApprovalGate` trait.
+pub struct DesktopGate {
+    server: Arc<DesktopServer>,
+}
+
+impl DesktopGate {
+    pub fn new(server: Arc<DesktopServer>) -> DesktopGate {
+        DesktopGate { server }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalGate for DesktopGate {
+    async fn approve(
+        &self,
+        ns: &str,
+        op: &str,
+        server: &str,
+        shed: &str,
+        detail: &str,
+    ) -> ApprovalOutcome {
+        // request_approval already applies the `decided_by` default + the
+        // no-consumer/timeout/disconnect fail-closed, returning the outcome on both
+        // approve and deny (so a denied op is audited with its decided_by/scope/ttl).
+        self.server
+            .request_approval(ns, op, server, shed, detail)
+            .await
+    }
+    fn method(&self) -> &str {
+        POLICY_SHED_DESKTOP
     }
 }
 
