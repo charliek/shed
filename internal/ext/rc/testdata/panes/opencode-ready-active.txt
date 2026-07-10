@@ -1,0 +1,50 @@
+
+  ┃                                                                                                                                                             Greeting
+  ┃  hello there
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                8,390 tokens
+     + Thought: 131ms                                                                                                                                           4% used
+                                                                                                                                                                $0.00 spent
+     Hello! How can I help you today?
+                                                                                                                                                                LSP
+     ▣  Build · Big Pickle · 3.6s                                                                                                                               LSPs are disabled
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Big Pickle OpenCode Zen                                                                                                                            /~
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                                                                  8.4K (4%)  ctrl+p commands    • OpenCode 1.17.18
+

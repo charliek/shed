@@ -480,15 +480,22 @@ func TestCreatePermissionModeValidation(t *testing.T) {
 			t.Fatalf("shell inner command should be plain bash -l regardless of mode: %v", ns)
 		}
 	})
-	t.Run("generic auto maps to agent flags (codex full-auto)", func(t *testing.T) {
+	t.Run("generic auto maps to agent flags (codex approval+sandbox)", func(t *testing.T) {
 		f := &fakeTmux{}
 		if _, err := Create(f, func(string) string { return "/home/shed" },
 			CreateOptions{Kind: KindCodex, Slug: "abc123", PermissionMode: "auto"}, noSleep); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
 		ns := f.callWith("new-session")
-		if inner := ns[len(ns)-1]; inner != "codex --full-auto" {
-			t.Fatalf("codex auto should map to --full-auto, got %q", inner)
+		// codex 0.144.1 dropped `--full-auto`; auto now maps to the explicit
+		// approval + sandbox posture. The old flag must never be emitted (it kills
+		// the session with an "unexpected argument" error).
+		inner := ns[len(ns)-1]
+		if inner != "codex --ask-for-approval on-request --sandbox workspace-write" {
+			t.Fatalf("codex auto should map to approval+sandbox flags, got %q", inner)
+		}
+		if strings.Contains(inner, "--full-auto") {
+			t.Fatalf("codex inner command must not use the removed --full-auto flag: %q", inner)
 		}
 	})
 	t.Run("valid mode flows into the inner command", func(t *testing.T) {

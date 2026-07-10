@@ -384,25 +384,56 @@ const agentProbeTimeout = 2 * time.Second
 // realInstalledProbe reports whether an agent binary is on PATH via `command -v` —
 // a shell builtin, so this is fast even when the binary itself is unresponsive. bin
 // values come from the registry (fixed literals), never user input.
+//
+// The probe runs through a LOGIN shell (`bash -lc`) so /etc/profile.d/*.sh (shed's PATH
+// additions — ~/.bun/bin, ~/.local/bin, mise shims) are applied. Both the server's
+// agent-exec channel and a bare sshd exec otherwise inherit only the system PATH, which
+// hides every agent installed under the shed user's home and made capability discovery
+// report installed:false for tools that are in fact present. A login shell fixes both
+// transports (and native machines) with one change.
 func realInstalledProbe(bin string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), agentProbeTimeout)
 	defer cancel()
-	return exec.CommandContext(ctx, "sh", "-c", "command -v "+shellQuote(bin)).Run() == nil
+	return exec.CommandContext(ctx, "bash", "-lc", "command -v "+shellQuote(bin)).Run() == nil
 }
 
 // realAgentProbe reports whether an agent binary is installed (via `command -v`) and
-// its version (via `<bin> --version`), each under a short timeout.
+// its version (via `<bin> --version`), each under a short timeout. The version query
+// goes through the same login shell as realInstalledProbe so PATH resolves the binary —
+// a direct exec of bin would use the bare system PATH and fail for a home-rooted install
+// even though realInstalledProbe just found it.
+//
+// Because the query runs under a login shell, profile activation output (e.g. mise
+// printing its own version) can precede the agent's answer on stdout. Only stdout is
+// captured (stderr noise is dropped), and the version is parsed from the LAST non-empty
+// line — the command's output always follows the profile noise (see
+// parseVersionFromLoginShell).
 func realAgentProbe(bin string) rc.AgentInfo {
 	if !realInstalledProbe(bin) {
 		return rc.AgentInfo{Installed: false}
 	}
 	vctx, vcancel := context.WithTimeout(context.Background(), agentProbeTimeout)
 	defer vcancel()
-	out, _ := exec.CommandContext(vctx, bin, "--version").CombinedOutput()
-	return rc.AgentInfo{Installed: true, Version: rc.ParseAgentVersion(string(out))}
+	out, _ := exec.CommandContext(vctx, "bash", "-lc", shellQuote(bin)+" --version").Output()
+	return rc.AgentInfo{Installed: true, Version: parseVersionFromLoginShell(string(out))}
 }
 
-// shellQuote wraps a token in single quotes for a `sh -c` string (POSIX '\” escape).
+// parseVersionFromLoginShell extracts an agent's version from `bash -lc "<bin>
+// --version"` stdout. Login-shell profiles can emit their own version-shaped noise
+// (e.g. `mise 2026.7.0` activation lines) BEFORE the command runs, and
+// rc.ParseAgentVersion takes the first version-shaped token anywhere — so the parse is
+// anchored to the last non-empty line, which is the command's own output.
+func parseVersionFromLoginShell(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return rc.ParseAgentVersion(line)
+		}
+	}
+	return ""
+}
+
+// shellQuote wraps a token in single quotes for a shell `-c` string (POSIX '\” escape).
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

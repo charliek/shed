@@ -141,8 +141,14 @@ var agentRegistry = []*AgentSpec{
 		Preseed: nil,
 		PermMap: map[string][]string{
 			PermModeDefault: nil,
-			PermModeAuto:    {"--full-auto"},
-			PermModeSkip:    {"--dangerously-bypass-approvals-and-sandbox"},
+			// codex 0.144.1 removed the top-level `--full-auto` convenience flag; the
+			// autonomous-with-approvals posture is now spelled explicitly as
+			// `--ask-for-approval on-request` (model decides when to escalate) +
+			// `--sandbox workspace-write` (write inside the workspace, the VM is the
+			// outer sandbox). Passing the old `--full-auto` makes codex exit immediately
+			// with `error: unexpected argument '--full-auto' found`.
+			PermModeAuto: {"--ask-for-approval", "on-request", "--sandbox", "workspace-write"},
+			PermModeSkip: {"--dangerously-bypass-approvals-and-sandbox"},
 		},
 		AuthHint: "run `codex` and complete login (`codex login`)",
 	},
@@ -358,8 +364,11 @@ var (
 	// core auth, and appears inline on the working ready screen).
 	codexReadyRe = regexp.MustCompile(`>_ OpenAI Codex \(v|Find and fix a bug in @filename`)
 	codexTrustRe = regexp.MustCompile(`(?i)Do you trust the contents of this directory\?`)
-	// codex core-auth failure (only meaningful when the composer is absent).
-	codexAuthRe = regexp.MustCompile(`Provided authentication token is expired|token_expired`)
+	// codex core-auth failure / not-signed-in (only meaningful when the composer is
+	// absent). A fresh, never-authed codex shows the "Sign in with ChatGPT" onboarding
+	// picker (not a token_expired warning), so anchor on both: the sign-in picker for a
+	// logged-out session and the expired-token text for a stale one.
+	codexAuthRe = regexp.MustCompile(`Provided authentication token is expired|token_expired|Sign in with ChatGPT`)
 )
 
 // classifyCodex derives a codex pane's lifecycle state. url/id stay empty (codex has
@@ -378,14 +387,38 @@ func classifyCodex(_ Kind, pane string) PaneResult {
 	return PaneResult{State: StateStarting}
 }
 
-// opencodeReadyRe anchors on the composer placeholder of the ready screen.
-var opencodeReadyRe = regexp.MustCompile(`Ask anything\.\.\.`)
+var (
+	// opencodePlaceholderRe is the composer placeholder of the fresh,
+	// pre-first-prompt screen — an unconditional ready signal. It disappears once a
+	// conversation starts (which used to wobble a live session back to "starting"
+	// after its first prompt).
+	opencodePlaceholderRe = regexp.MustCompile(`Ask anything\.\.\.`)
+	// opencodeFooterRe is the `ctrl+p commands` footer hint, drawn for the whole
+	// life of the TUI (pre- and post-prompt) — the stable ready anchor once the
+	// placeholder is gone.
+	opencodeFooterRe = regexp.MustCompile(`ctrl\+p commands`)
+	// opencodeAuthScreenRe guards the footer-only ready path. opencode's
+	// logged-out/onboarding screen has never been captured live (a real fixture is
+	// still wanted) — if it renders the same footer chrome, a footer-only match
+	// would classify it ready and `create --wait` would deliver a prompt into a
+	// login screen. Until a live fixture pins the exact text, a footer-only pane
+	// that smells like an auth screen stays "starting" (conservative: a recheck
+	// self-corrects, a wrong ready ships a prompt into the void). Kept narrow —
+	// word-bounded phrases, not bare "login" — to avoid tripping on ordinary agent
+	// chatter in a conversation.
+	opencodeAuthScreenRe = regexp.MustCompile(`(?i)\bsign in\b|\blog ?in to\b|\bauthenticate\b|\bopencode auth\b`)
+)
 
 // classifyOpencode derives an opencode pane's lifecycle state. opencode has no trust
 // gate; its logged-out screen was not captured live, so needs-auth is left to the
-// shared signals for now (a future anchor slots in here).
+// shared signals for now (a future anchor slots in here). The composer placeholder is
+// unconditional ready; the persistent footer alone means ready only when the pane does
+// not look like an auth/onboarding screen (opencodeAuthScreenRe).
 func classifyOpencode(_ Kind, pane string) PaneResult {
-	if opencodeReadyRe.MatchString(pane) {
+	if opencodePlaceholderRe.MatchString(pane) {
+		return PaneResult{State: StateReady}
+	}
+	if opencodeFooterRe.MatchString(pane) && !opencodeAuthScreenRe.MatchString(pane) {
 		return PaneResult{State: StateReady}
 	}
 	return PaneResult{State: StateStarting}

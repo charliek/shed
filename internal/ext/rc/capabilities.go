@@ -55,10 +55,13 @@ type Capabilities struct {
 // probe (which shells out to `command -v` + `--version`) is testable.
 type AgentProbe func(bin string) AgentInfo
 
-// InstalledProbe is the fast install-only check (`command -v`, a shell builtin —
-// milliseconds) used to degrade an agent whose full probe outruns probeBudget:
-// installed state is still reported, version is omitted. nil skips the fallback
-// (a budget-exhausted agent then reports not-installed).
+// InstalledProbe is the fast install-only check (`command -v` in a login shell —
+// normally milliseconds) used to degrade an agent whose full probe outruns
+// probeBudget: installed state is still reported, version is omitted. It runs
+// CONCURRENTLY with the full probe inside the same budgeted flight — never
+// synchronously after expiry — so even a slow login shell cannot push assembly
+// past the budget; if it too is still pending at the budget, the agent degrades
+// to installed:false. nil skips the fallback entirely.
 type InstalledProbe func(bin string) bool
 
 // probeBudget is the total wall-clock budget for ALL agent probes during
@@ -80,6 +83,7 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 	type probeSlot struct {
 		tool, bin string
 		done      chan AgentInfo
+		instDone  chan bool
 	}
 	var slots []probeSlot
 	seen := map[string]bool{}
@@ -89,10 +93,19 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 		}
 		seen[spec.Tool] = true
 		s := probeSlot{tool: spec.Tool, bin: spec.Bin, done: make(chan AgentInfo, 1)}
+		if installed != nil {
+			s.instDone = make(chan bool, 1)
+		}
 		slots = append(slots, s)
-		// Buffered channel: a laggard probe finishing after the budget just
-		// parks its result and the goroutine exits — no leak.
+		// Buffered channels: a laggard probe finishing after the budget just
+		// parks its result and the goroutine exits — no leak. The fast
+		// installed-only check launches alongside the full probe so its result
+		// is (almost always) already waiting if the full probe misses the
+		// budget — the fallback never runs synchronously after expiry.
 		go func() { s.done <- probe(s.bin) }()
+		if s.instDone != nil {
+			go func() { s.instDone <- installed(s.bin) }()
+		}
 	}
 
 	deadline := time.NewTimer(probeBudget)
@@ -109,15 +122,22 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 				expired = true
 			}
 		}
-		// Budget exhausted: take a completed result if it raced in, otherwise
-		// degrade to the fast installed-only check.
+		// Budget exhausted: take a completed full result if it raced in,
+		// otherwise the already-flying installed-only result. Both reads are
+		// non-blocking — if even the fast check hasn't finished (a hung login
+		// shell), the agent degrades to installed:false rather than stalling
+		// past the budget.
 		select {
 		case info := <-s.done:
 			agents[s.tool] = info
 		default:
 			var info AgentInfo
-			if installed != nil {
-				info.Installed = installed(s.bin)
+			if s.instDone != nil {
+				select {
+				case ok := <-s.instDone:
+					info.Installed = ok
+				default:
+				}
 			}
 			agents[s.tool] = info
 		}

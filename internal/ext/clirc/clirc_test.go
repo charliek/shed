@@ -474,3 +474,53 @@ func TestCreatePlanStdinFlagErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestParseVersionFromLoginShell pins the login-shell noise handling: profile
+// activation output (e.g. mise printing its own version) precedes the command's
+// answer on stdout, and a whole-output first-token scan would take the noise
+// version. The parse must anchor to the LAST non-empty line.
+func TestParseVersionFromLoginShell(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want string
+	}{
+		{
+			name: "noisy profile before the real version",
+			out:  "mise 2026.7.0 activating\nmise: using node@24.13.1\ncodex-cli 0.144.1\n",
+			want: "0.144.1",
+		},
+		{
+			name: "noise with trailing blank lines",
+			out:  "mise 2026.7.0\n\n1.17.18\n\n\n",
+			want: "1.17.18",
+		},
+		{
+			name: "clean single-line output",
+			out:  "2.1.206 (Claude Code)\n",
+			want: "2.1.206",
+		},
+		{
+			name: "leading v build-suffix form",
+			out:  "profile: PATH updated\nv2026.07.09-a3815c0\n",
+			want: "2026.07.09-a3815c0",
+		},
+		{
+			name: "empty output",
+			out:  "\n\n",
+			want: "",
+		},
+		{
+			name: "last line has no version token falls back to that line",
+			out:  "mise 2026.7.0\nunknown output\n",
+			want: "unknown output",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseVersionFromLoginShell(tc.out); got != tc.want {
+				t.Errorf("parseVersionFromLoginShell(%q) = %q, want %q", tc.out, got, tc.want)
+			}
+		})
+	}
+}

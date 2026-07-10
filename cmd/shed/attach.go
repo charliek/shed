@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -298,21 +299,8 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		return err
 	}
 
-	switch dto.State {
-	case "needs-auth":
-		// Per-agent remediation: the login flow differs per tool (claude's /login,
-		// codex login, opencode auth login, cursor-agent login), so the hint comes
-		// from the agent registry.
-		agent := "the agent"
-		if rc.IsClaudeKind(rc.Kind(kind)) {
-			agent = "Claude"
-		}
-		fmt.Printf("Session rc-%s created but %s is not logged in in this shed.\n", slug, agent)
-		fmt.Printf("Log in once: shed attach %s  →  %s, then retry.\n", name, rc.AuthHintFor(rc.Kind(kind)))
-		return nil
-	case "needs-trust":
-		fmt.Printf("Session rc-%s created but the workspace trust prompt is showing; attach to accept it:\n  shed attach %s --slug %s\n", slug, name, slug)
-		return nil
+	if handled, err := reportRCCreateOutcome(os.Stdout, name, slug, kind, dto); handled {
+		return err
 	}
 
 	if attachDetachFlag || kind == "claude-broker" {
@@ -320,6 +308,40 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		return nil
 	}
 	return attachToRCSlug(name, entry, slug)
+}
+
+// reportRCCreateOutcome prints the guidance for a terminal RC-create state and reports
+// whether the caller is done. handled=true means "return err" (the session is either
+// left running for the user to act on, or dead); handled=false means the session is live
+// (ready/starting) and the caller proceeds to attach or print its summary.
+//
+// This encodes the exit contract: needs-auth / needs-trust leave the session running and
+// exit 0 (the create succeeded; the user just has to log in / accept trust), while a
+// dead-on-create is a session-level FAILURE that must exit non-zero — a bad posture flag
+// or missing runtime that killed the agent must never read as success to a script or the
+// -d path (aligns with `shed plan`'s reportPlanOutcome).
+func reportRCCreateOutcome(w io.Writer, name, slug, kind string, dto rc.Session) (bool, error) {
+	switch dto.State {
+	case rc.StateNeedsAuth:
+		// Per-agent remediation: the login flow differs per tool (claude's /login,
+		// codex login, opencode auth login, cursor-agent login), so the hint comes
+		// from the agent registry.
+		agent := "the agent"
+		if rc.IsClaudeKind(rc.Kind(kind)) {
+			agent = "Claude"
+		}
+		fmt.Fprintf(w, "Session rc-%s created but %s is not logged in in this shed.\n", slug, agent)
+		fmt.Fprintf(w, "Log in once: shed attach %s  →  %s, then retry.\n", name, rc.AuthHintFor(rc.Kind(kind)))
+		return true, nil
+	case rc.StateNeedsTrust:
+		fmt.Fprintf(w, "Session rc-%s created but the workspace trust prompt is showing; attach to accept it:\n  shed attach %s --slug %s\n", slug, name, slug)
+		return true, nil
+	case rc.StateDead:
+		fmt.Fprintf(w, "Session rc-%s was created but its agent process died immediately (state=dead).\n", slug)
+		fmt.Fprintf(w, "  Inspect: shed attach %s --slug %s\n", name, slug)
+		return true, fmt.Errorf("session rc-%s died on create (state=dead)", slug)
+	}
+	return false, nil
 }
 
 func modeLabel(mode string) string {

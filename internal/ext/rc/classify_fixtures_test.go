@@ -158,6 +158,27 @@ func TestClassifyFalsePositives(t *testing.T) {
 		}
 	})
 
+	t.Run("opencode footer-only ready is guarded against auth screens", func(t *testing.T) {
+		// Synthetic: no live logged-out opencode fixture exists yet. If an
+		// auth/onboarding screen renders the persistent footer chrome, footer-only
+		// ready must NOT fire (a wrong ready would deliver a prompt into a login
+		// screen) — it stays starting until a recheck.
+		authPane := "  Sign in to opencode to continue\n\n  ctrl+p commands"
+		if s, _ := ClassifyPane(KindOpencode, authPane); s != StateStarting {
+			t.Errorf("opencode footer + auth screen = %s, want starting (guard must trip)", s)
+		}
+		// Ordinary conversation chatter without auth phrasing keeps footer-only ready.
+		chatPane := "  Hello! How can I help you today?\n\n  8.4K (4%)  ctrl+p commands"
+		if s, _ := ClassifyPane(KindOpencode, chatPane); s != StateReady {
+			t.Errorf("opencode footer + chat = %s, want ready", s)
+		}
+		// The composer placeholder is unconditional ready, even alongside auth-ish text.
+		freshPane := "  Ask anything... \"Fix broken tests\"\n  sign in tips\n  ctrl+p commands"
+		if s, _ := ClassifyPane(KindOpencode, freshPane); s != StateReady {
+			t.Errorf("opencode placeholder = %s, want ready (unconditional)", s)
+		}
+	})
+
 	t.Run("cursor auth-before-delivery is needs-auth", func(t *testing.T) {
 		if s, _ := ClassifyPane(KindCursor, "Cursor Agent\nPress any key to log in..."); s != StateNeedsAuth {
 			t.Errorf("cursor login splash = %s, want needs-auth", s)
