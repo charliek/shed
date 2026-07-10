@@ -1,10 +1,18 @@
 # Remote-control sessions (the Agents pane)
 
-The **Agents** pane drives `claude remote-control` (and REPL / shell) sessions
-inside a shed: detached `tmux` sessions named `rc-<slug>`, created and torn down
-over SSH. The pane lists them with a live state, a "made by … · age" provenance
-line, an **Open console** button (attach a terminal to the session's tmux), an
-**Open in Claude** button (the `claude.ai/code` URL), and a kill button.
+The **Agents** pane drives agent sessions inside a shed — `claude` (REPL and
+remote-control broker), `codex`, `cursor-agent`, `opencode`, and plain shells:
+detached `tmux` sessions named `rc-<slug>`, created and torn down over SSH. The pane
+lists them with a live state, a "made by … · age" provenance line, an **Open console**
+button (attach a terminal to the session's tmux), an **Open in Claude** button (the
+`claude.ai/code` URL — Claude kinds only; the other agents have no browser URL), and a
+kill button.
+
+The create sheet's kind chips are **gated on the shed's capabilities**: the app reads
+`shed-ext-rc capabilities` (kinds + per-agent install/version + features) and only
+offers kinds whose agent is installed on that shed's image. A shed whose baked-in
+`shed-ext-rc` predates multi-agent RC advertises no capabilities block and offers only
+the Claude/shell kinds it supports; recreate the shed to pick up the newer agents.
 
 ## RC Session Convention v2 (`SHED_RC_*`)
 
@@ -27,7 +35,7 @@ byte-compatible sessions. The metadata the binary writes:
 | `SHED_RC_V` | Schema version (a positive integer; `2`). |
 | `SHED_RC_ID` | Stable opaque id (a lowercase UUIDv4), generated once at create. |
 | `SHED_RC_DISPLAY_NAME` | Human name; also `claude --name`. |
-| `SHED_RC_KIND` | `claude-broker` \| `claude-rc` \| `shell` (v2 renamed v1's `agent`/`repl`). |
+| `SHED_RC_KIND` | `claude-broker` \| `claude-rc` \| `codex` \| `cursor` \| `opencode` \| `shell` (v2 renamed v1's `agent`/`repl`). An unrecognized value is preserved verbatim and rendered neutrally (name + state only) — never aliased to `claude-broker`. |
 | `SHED_RC_WORKDIR` | Working directory at create. |
 | `SHED_RC_CREATED_BY` | Provenance `<tool>/<version>`, e.g. `shed-desktop/0.1.0`. |
 | `SHED_RC_CREATED_AT` | Creation time, RFC 3339 UTC with a trailing `Z`. |
@@ -77,5 +85,12 @@ failed: not a terminal", but works when bash reads from stdin. Random per-call
 markers (`@@RC:<nonce>:…`) frame each session's env dump + pane so neither pane
 text nor a metadata value can forge a delimiter.
 
-See also the [shed follow-up](https://github.com/charliek/shed/issues/199) to
-surface this metadata over `GET /api/sessions` for HTTP-only clients.
+As of this release the server enriches session listings with this metadata
+server-side: `GET /api/sessions` and `GET /api/sheds/{n}/sessions` return an `rc`
+object per `rc-*` row (populated by the server execing `shed-ext-rc list` over the agent
+channel). HTTP-only clients no longer fan out one SSH connection per shed to read RC
+state (closing the [shed follow-up](https://github.com/charliek/shed/issues/199)). Pass
+`?rc=0` to skip enrichment on a hot poll path. `GET /api/overview` aggregates the same
+data — server info (with a `features` discovery array), disk usage, and every shed with
+its rc-enriched sessions and per-shed `rc_capabilities` — into one call for
+mobile-style clients.

@@ -867,43 +867,115 @@ Detach with `Ctrl-B D`.
 #### Remote Control sessions (autonomous agents)
 
 With `--kind` (or `--plan`/`--prompt`), `attach` instead creates a **Remote Control**
-`rc-<slug>` session via the in-shed `shed-ext-rc` binary: it starts Claude connected to
-`claude.ai/code`, ships an optional plan, and types a single-line kickoff prompt. With
-`-d/--detach` it prints the session URL and returns (the laptop can close); otherwise it
-attaches. Use `--slug` to connect to an existing `rc-<slug>` session.
+`rc-<slug>` session via the in-shed `shed-ext-rc` binary: it starts the agent, ships an
+optional plan, and types a kickoff prompt. With `-d/--detach` it prints the session
+summary (for Claude, the `claude.ai/code` URL) and returns (the laptop can close);
+otherwise it attaches. Use `--slug` to connect to an existing `rc-<slug>` session.
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--kind` | | `claude-rc` | RC kind: `claude-rc`, `claude-broker`, `shell` (triggers RC create) |
+| `--kind` | | `claude-rc` | RC kind: `claude-rc`, `claude-broker`, `codex`, `cursor`, `opencode`, `shell` (triggers RC create) |
 | `--plan` | | | Ship a plan file into the shed and execute it (`-` = stdin) |
 | `--plan-edit` | | `false` | Compose the plan in `$EDITOR` |
-| `--prompt` | `-p` | | Single-line kickoff prompt |
+| `--prompt` | `-p` | | Kickoff prompt (framing when combined with `--plan`) |
 | `--prompt-file` | | | Read the kickoff prompt from a file (`-` = stdin) |
 | `--edit` | | `false` | Compose the kickoff prompt in `$EDITOR` |
-| `--permission-mode` | | `auto` | `auto`, `acceptEdits`, `plan`, `dontAsk`, `default`, `bypassPermissions` |
-| `--skip` | | `false` | Shorthand for `--permission-mode bypassPermissions` (full bypass) |
+| `--permission-mode` | | `auto` | `default`, `auto`, `skip` (all kinds); Claude also accepts `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` |
+| `--skip` | | `false` | Shorthand for the generic `skip` mode (full permission bypass) |
 | `--name` | | `<shed>/<slug>` | Session display name |
 | `--slug` | | generated | Connect to `rc-<slug>`, or set the slug for a new session |
-| `--detach` | `-d` | `false` | Create the RC session, print its URL, and return without attaching |
+| `--detach` | `-d` | `false` | Create the RC session, print its summary, and return without attaching |
 
 ```bash
 shed attach myproj --kind claude-rc -d            # start an agent, print the URL, return
+shed attach myproj --kind codex -d                # a codex session (no claude.ai URL; watch via --slug)
 shed attach myproj --plan plan.md -d              # ship a plan and run it autonomously (auto)
 shed attach myproj --plan plan.md --skip -d       # ...with full permission bypass
 shed attach myproj --slug abc234                  # attach to an existing rc-abc234 session
 ```
 
-A **plan** (`--plan`) is shipped to Claude's plans directory in the shed
-(`~/.claude/plans/plan-<slug>.md`, outside the workspace so it never touches the repo)
-and the kickoff prompt references it. You can pass a **prompt** and a **plan** together:
-with no prompt, a generic "read the plan at `<path>` and implement it" kickoff is the
-default; with your own `-p`/`--prompt-file`/`--edit`, your prompt leads and the plan's
-location is appended so the agent still finds it. The kickoff **prompt** may be
-multi-line (`--prompt-file`/`--edit`; delivered as one input via a bracketed paste), but
-large/multi-step work belongs in the **plan** file. Claude must be logged in inside the shed
-(see the `shed-plan` skill). Defaults to `auto`; `--skip` is safe because a shed is an
-isolated VM. For the end-to-end "author a plan and run it on a fresh shed" workflow, use
-the `shed-plan` skill.
+**Kinds.** `claude-rc` (default) runs the Claude REPL and yields a `claude.ai/code`
+URL; `claude-broker` runs the Claude remote-control multiplexer; `codex`, `cursor`, and
+`opencode` run those agents' TUIs; `shell` is a plain login shell. Only the Claude kinds
+produce a browser URL — for the others, watch the session with
+`shed attach <shed> --slug <slug>`. An unknown kind (from a newer client) is rendered
+neutrally (name + state only). A shed whose baked-in `shed-ext-rc` predates multi-agent
+RC rejects the new kinds with a "recreate the shed" error; the Claude flows keep working
+on existing sheds.
+
+**Permission modes.** The generic tri-state `default` | `auto` | `skip` is accepted by
+every kind and mapped per agent to real flags (the VM is already the sandbox): `auto`
+is the autonomous default, `skip` is full bypass (`--skip` is its shorthand), `default`
+passes no posture. The Claude kinds additionally accept the historical set
+(`acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`); passing one of those with a
+non-Claude kind is rejected with an error naming the generic set. `--skip` and
+`--permission-mode` are mutually exclusive.
+
+**Plan delivery.** A **plan** (`--plan`) is written to a HOME-rooted location inside the
+shed — Claude: `~/.claude/plans/plan-<slug>.md`; other agents: `~/.shed-plans/plan-<slug>.md`
+— never the workspace, so it can't dirty a `--repo` clone or write through VirtioFS onto
+a host dir. The kickoff references its absolute path. You can pass a **prompt** and a
+**plan** together: with no prompt, a generic "read the plan at `<path>` and implement it"
+kickoff is the default; with your own `-p`/`--prompt-file`/`--edit`, your prompt leads
+and the plan's location is appended so the agent still finds it. The kickoff **prompt**
+may be multi-line (`--prompt-file`/`--edit`; delivered as one input via a bracketed
+paste), but large/multi-step work belongs in the **plan** file.
+
+The agent must be logged in inside the shed. On `needs-auth`, `attach` prints the
+per-agent login remediation and leaves the session running. For the end-to-end "author a
+plan and run it on a fresh shed" workflow, prefer `shed plan` (below) or the `shed-plan`
+skill.
+
+### shed plan
+
+Ships a plan file to a shed and runs it autonomously — the one-command porcelain over
+`shed attach`'s Remote Control mode. It creates the shed if missing (with `--repo`),
+writes the plan HOME-rooted inside the shed, starts an agent session under the `auto`
+posture, and reports the session.
+
+```bash
+shed plan <file> --shed <name> [flags]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--shed` | | | Target shed name (**required**) |
+| `--repo` | | | Create the shed from this repo (`owner/repo` or URL) if it doesn't exist |
+| `--kind` | | `claude-rc` | Agent kind: `claude-rc`, `codex`, `cursor`, `opencode`, `shell` |
+| `--prompt` | `-p` | | Optional framing prepended to the composed plan kickoff |
+| `--detach` | `-d` | `false` | Report the session and return instead of attaching when it's ready |
+| `-s, --server` | | cached/default | Which server hosts (or should create) the shed |
+
+The plan file (`-` for stdin) is validated client-side — non-empty, valid UTF-8, ≤ 1 MiB
+— **before** any shed or session is touched, so a bad plan never creates anything.
+
+**Shed selection:** `--repo` on a **missing** shed creates it (reusing `shed create`);
+`--repo` on an **existing** shed warns and is ignored; a **missing** shed with no
+`--repo` is a hard error.
+
+**Examples:**
+
+```bash
+shed plan ./plan.md --shed my-topic                          # existing shed
+shed plan ./plan.md --shed plan-api --repo owner/repo -s mini3 -d
+shed plan ./plan.md --shed plan-api --repo owner/repo --kind codex -d
+shed plan ./plan.md --shed my-topic -p "focus on the API layer first"
+```
+
+**Exit contract:**
+
+| Outcome | Exit | Behavior |
+|---------|------|----------|
+| Session reached `ready` and the kickoff was delivered | `0` | Detached: reports the session; interactive without `-d`: attaches to watch it |
+| Session created but `needs-auth` | non-zero | Session left running; prints the per-agent login remediation and retry command |
+| Session created but `needs-trust` | non-zero | Session left running; prints the `--slug` attach command to accept the trust prompt |
+| Session created but not ready (other state) | non-zero | Session left running; prints an inspect command |
+| Shed created with `--repo` but the plan then failed to ship | non-zero | The shed is **not** deleted; the error reports both facts and how to retry |
+| Shed image predates multi-agent RC | non-zero | Reports "recreate the shed"; nothing auto-deleted |
+
+Without `-d`, on an interactive terminal a `ready` session drops you straight into it to
+watch; `-d` (or non-interactive stdout) just reports and returns. Only Claude kinds print
+a `claude.ai/code` URL; for the others, watch with `shed attach <shed> --slug <slug>`.
 
 ## Session Management
 
