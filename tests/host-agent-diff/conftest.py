@@ -61,6 +61,35 @@ discovery:
   source: {source}
 """
 
+# The single-server (NO `discovery:` block) launch config for the surface-B bus
+# tests. With no `discovery:` key BOTH impls run in single-server mode (Go
+# `cfg.Discovery == nil`; Rust `is_single_server()`), connect to `server:`, and
+# subscribe to `ssh-agent`. `server:` is filled by `single_server_config(bus_url)`
+# (via a plain string replace, leaving `{audit_log}` for the `daemon` fixture's
+# `.format()` — an unused `{source}` kwarg there is harmless). BLOCK style on
+# purpose (the Rust `yaml_lite` parser is block-only; see WATCH_NONE_CONFIG /
+# README "Known contract gaps"). `ssh.approval.policy: approve-all` is a valid ssh
+# policy on both sides — but ping is NOT gated, so it's irrelevant to the pong; it
+# just exercises a non-empty gate. No `aws:`/`docker:` blocks → those backends stay
+# nil → the daemon subscribes to ssh-agent only (plus, on Go, the always-on egress
+# GET, which the synthetic bus 501s).
+SINGLE_SERVER_CONFIG = """\
+server: {server}
+ssh:
+  approval:
+    policy: approve-all
+logging:
+  enabled: true
+  path: {audit_log}
+"""
+
+
+def _single_server_config(bus_url: str) -> str:
+    """Fill `server:` with `bus_url`, leaving `{audit_log}` for the `daemon`
+    fixture. Uses `str.replace` (not `.format`) so the still-unfilled `{audit_log}`
+    placeholder survives to the fixture's own `.format(audit_log=..., source=...)`."""
+    return SINGLE_SERVER_CONFIG.replace("{server}", bus_url)
+
 
 @dataclasses.dataclass
 class CliResult:
@@ -278,6 +307,15 @@ def _safe_read(path) -> str:
 def watch_none_config() -> str:
     """The block-style 'watch none' launch-config template (see WATCH_NONE_CONFIG)."""
     return WATCH_NONE_CONFIG
+
+
+@pytest.fixture
+def single_server_config():
+    """Return `make(bus_url) -> config_text`: the block-style single-server (no
+    `discovery:`) launch config with `server:` pointed at the synthetic bus. The
+    returned text still carries the `{audit_log}` placeholder the `daemon` fixture
+    fills. See SINGLE_SERVER_CONFIG."""
+    return _single_server_config
 
 
 @pytest.fixture

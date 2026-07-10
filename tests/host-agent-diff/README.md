@@ -64,7 +64,12 @@ backend. Daemons write their operational log to a per-test `-log-file` (that log
   (`v`, `type`, `accepted`, `reason`, `agent.approval_method`, `namespaces`,
   `gate_namespaces`, `request_timeout_ms`). A **superseded** (`accepted:false`) ack's
   `agent` is the zero value `{"version":"","approval_method":""}`, so its empty
-  `version` is diffed as a stable constant, not masked.
+  `version` is diffed as a stable constant, not masked. The surface-B bus test uses
+  `normalize.mask_bus_response()` in the same spirit — it masks a response Envelope's
+  volatile `id` (a fresh UUID: v7 in Go's `NewResponse`, v4 in Rust's `new_response`)
+  and `timestamp` (RFC3339 shape-asserted first) while **diffing** `in_reply_to` (the
+  correlation id — it must echo the request's `id`, so it is asserted, never masked),
+  `namespace`, `type`, `final`, `payload`, and the echoed `shed`.
 
 ## Golden fixtures
 
@@ -98,6 +103,20 @@ expected-output` vectors carrying `"protocol_version": 2`. Both the Go runner
   stale-probe use blocking Unix `connect()`; Go uses `net.DialTimeout` (2s / 500ms). The
   normal path resolves immediately either way; a pathological full-backlog peer could hang
   the Rust side longer. Low severity, tracked for the config/lifecycle slice.
+
+- **Bus subscription set: ssh-agent-only (Rust) vs egress + docker/aws (Go).** In
+  single-server mode (no `discovery:` block) both daemons connect to `server:` and
+  subscribe to `ssh-agent`, so the **ping/pong** differential (`test_bus_ping_pong.py`)
+  compares apples to apples. But the *set of endpoints each impl touches* differs by
+  design this slice: the Go daemon also GETs `/api/egress/stream` (its always-on egress
+  subscriber) and subscribes to `docker-credentials` (its Docker backend is non-nil even
+  unconfigured; `aws-credentials` too when configured), whereas the Rust slice-1b daemon
+  wires **ssh-agent only** (egress + the aws/docker backends are later slices). The
+  synthetic bus tolerates the extra Go subscribes (records them, holds the streams open,
+  never pushes) and 501s the egress GET (Go backs off 5m, DEBUG-quiet) — so the
+  asymmetry is absorbed by the harness, not diffed. The differential asserts only the
+  **ssh-agent response envelope**, never which routes each daemon hit. This flips to a
+  full match when the later slices wire the Rust egress + aws/docker paths.
 
 - **Desktop `token.get` + event fan-out / approval correlation.** The surface-A handshake
   (`hello`→`hello_ack`), the non-hello drop, and single-consumer supersede are now
@@ -137,7 +156,9 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | desktop UDS server | event fan-out + replay ring, approval request/response correlation | **xfail** | live — event fan-out + approval correlation need a gated bus op (slice 1c) |
 | approval | gated `sign` delegated approve/deny/timeout | **xfail** | live (slice 1c — needs a gated bus op to drive the `sign` path) |
 | approval | native Touch-ID (biometrics) | **out-of-scope** | separate manual sign-off (needs live biometric) |
-| bus | subscribe/respond, open + secure(TLS-pin), 401/409, reconnect | **xfail** | live surface B (slice 1) |
+| bus | subscribe → ping → respond (open) ping/pong (masked canonical-equal) | **enforced** | live surface B (`test_bus_ping_pong.py`) |
+| bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **xfail** | live surface B — secure needs the TLS pin from a `discovery:` config (later slice); the pin/reconnect/401/409 logic is already `bus.rs`-unit-tested |
+| bus | aws-credentials / docker-credentials subscription | **xfail** | live surface B — later slices; slice 1b wires **ssh-agent only** (see "Known contract gaps") |
 | egress | events / 401 / 404-501, 5m vs 30s backoff | **xfail** | live ("no reconnect in window") + unit (consts) |
 | ssh backend | agent-forward / local-keys, list/sign/ping/status | **xfail** | live (transcripts) + golden (payloads) |
 | aws backend | passthrough, cache-hit/expiry | **xfail** (live) | live; assume-role → **out-of-scope** (golden+unit, no Go STS seam) |

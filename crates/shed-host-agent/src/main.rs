@@ -4,10 +4,13 @@
 //! `status` subcommands, the read-only status UDS server, and a minimal
 //! LiveStatus-scoped config reader — all wire-compatible with the Go
 //! `cmd/shed-host-agent` (`main.go` / `status.go` / `status_server.go` /
-//! `sockets.go`). The desktop approval channel, the credential minter, the message
-//! bus handlers, discovery, and audit logging are later slices; here a daemon with
-//! a valid config simply serves its status socket and waits for SIGTERM/SIGINT.
+//! `sockets.go`). Surface B (the shed-server plugin bus, `bus.rs`) adds the
+//! single-server `ssh-agent` subscribe + ping/pong responder. The credential
+//! minter, the sign/aws/docker backends, multi-server discovery, and audit
+//! logging are later slices; in multi-server (`discovery:`) mode the single-server
+//! bus stays off, matching the Go daemon's `cfg.Discovery == nil` gate.
 
+mod bus;
 mod config;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop;
@@ -208,6 +211,15 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         cfg.effective_policy(config::NS_DOCKER_CREDENTIALS),
     ));
 
+    // Surface B: in single-server mode (no `discovery:` block) the message-bus
+    // daemon connects to the single `server:` URL and answers ssh-agent pings. In
+    // multi-server (`discovery:`) mode it stays off — matching Go's
+    // `cfg.Discovery == nil` gate — since discovery/backends are later slices.
+    let bus_server = cfg.is_single_server().then(|| cfg.server.clone());
+    if let Some(url) = &bus_server {
+        log.info(&format!("message bus: single-server mode server={url}"));
+    }
+
     let version = full_info();
     let status_path = status_socket_path();
     let status_listener = bind_unix_socket("status socket", &status_path, &mut log);
@@ -286,6 +298,17 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
                 server
                     .serve(listener, desktop_path, wait_shutdown(rx))
                     .await;
+            }));
+        }
+
+        // The message bus (surface B). Shares the same shutdown watch, so a
+        // SIGTERM/SIGINT tears the subscribe loop + ping responder down cleanly
+        // alongside the socket servers.
+        if let Some(server_url) = bus_server {
+            let rx = shutdown_rx.clone();
+            let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
+            tasks.push(tokio::spawn(async move {
+                bus::run_single_server_bus(server_url, rx, bus_log).await;
             }));
         }
 

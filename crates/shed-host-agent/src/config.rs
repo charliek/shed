@@ -23,6 +23,10 @@ pub const POLICY_DENY_ALL: &str = "deny-all";
 /// Approval-policy value that delegates the decision to the shed-desktop app.
 pub const POLICY_SHED_DESKTOP: &str = "shed-desktop";
 
+/// The single-server bus URL default — matches Go's `Config.Server` default
+/// (`config.go:428`). Used only in single-server mode (no `discovery:` block).
+pub const DEFAULT_SERVER_URL: &str = "http://localhost:8080";
+
 /// `effective_policy_from_raw` maps a raw `approval.policy` string to its effective
 /// value: an empty/omitted policy fails closed to deny-all; any other value is
 /// echoed verbatim. This is the namespace-independent core of Go's
@@ -134,6 +138,15 @@ pub struct HostAgentConfig {
     // Read only by `approval_timeout()`, which only the desktop server calls.
     #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     approval_timeout: Duration,
+    /// The single-server bus URL (`server:`), defaulting to `DEFAULT_SERVER_URL`.
+    /// The message-bus daemon connects here in single-server mode. In Go this is
+    /// `Config.Server`, used only when `Discovery` is nil.
+    pub server: String,
+    /// Whether a `discovery:` block is present. When true the agent is in
+    /// multi-server discovery mode (a later slice) and the single-server bus is NOT
+    /// started — mirroring Go's `cfg.Discovery != nil` gate in `main.go`. This
+    /// minimal reader does not yet parse the discovery contents, only its presence.
+    pub has_discovery: bool,
 }
 
 impl HostAgentConfig {
@@ -170,6 +183,10 @@ impl HostAgentConfig {
                 .to_string_lossy()
                 .into_owned(),
         };
+        let server = match root.get_path(&["server"]) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => DEFAULT_SERVER_URL.to_string(),
+        };
         HostAgentConfig {
             ssh_policy: policy("ssh"),
             aws_policy: policy("aws"),
@@ -179,7 +196,17 @@ impl HostAgentConfig {
             approval_timeout: parse_approval_timeout(
                 root.get_path(&["approval_timeout"]).unwrap_or_default(),
             ),
+            server,
+            has_discovery: root.has_key("discovery"),
         }
+    }
+
+    /// True when the agent runs in single-server mode — no `discovery:` block, so
+    /// the message-bus daemon connects to the single `server:` URL. Mirrors Go's
+    /// `cfg.Discovery == nil` branch in `main.go`; multi-server discovery is a later
+    /// slice, so with a `discovery:` block present the single-server bus stays off.
+    pub fn is_single_server(&self) -> bool {
+        !self.has_discovery
     }
 
     /// The delegated-approval budget the desktop server enforces per request, and
@@ -236,6 +263,16 @@ mod yaml_lite {
             match self {
                 Node::Scalar(s) => Some(s),
                 Node::Map(_) => None,
+            }
+        }
+
+        /// Whether this node is a map containing `key` (as a scalar or a nested
+        /// block). Used to detect the presence of a top-level block like
+        /// `discovery:` whose contents this minimal reader doesn't yet parse.
+        pub fn has_key(&self, key: &str) -> bool {
+            match self {
+                Node::Map(m) => m.contains_key(key),
+                Node::Scalar(_) => false,
             }
         }
 
@@ -408,6 +445,33 @@ aws:
     #[test]
     fn load_missing_file_is_error() {
         assert!(HostAgentConfig::load("/nonexistent/does-not-exist-xyz.yaml").is_err());
+    }
+
+    #[test]
+    fn server_defaults_and_single_server_detection() {
+        // No `server:` and no `discovery:` → default URL + single-server mode.
+        let cfg = HostAgentConfig::parse("");
+        assert_eq!(cfg.server, DEFAULT_SERVER_URL);
+        assert!(cfg.is_single_server());
+
+        // An explicit `server:` overrides the default and stays single-server.
+        let cfg = HostAgentConfig::parse("server: http://mini2:8080\n");
+        assert_eq!(cfg.server, "http://mini2:8080");
+        assert!(cfg.is_single_server());
+
+        // A `discovery:` block flips to multi-server mode (bus stays off), and the
+        // `server:` field defaults but is unused. Mirrors the watch-none diff config.
+        let cfg = HostAgentConfig::parse(
+            "\
+discovery:
+  servers: []
+  watch: off
+  source: /tmp/x.yaml
+",
+        );
+        assert!(!cfg.is_single_server());
+        assert!(cfg.has_discovery);
+        assert_eq!(cfg.server, DEFAULT_SERVER_URL);
     }
 
     #[test]

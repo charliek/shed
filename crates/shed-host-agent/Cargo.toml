@@ -15,26 +15,37 @@ workspace = true
 
 [features]
 # The desktop approval channel (the async UDS server in `desktop.rs`). On by
-# default; a headless build (`--no-default-features`) drops it — and its shed-core /
-# async-trait / uuid deps — so the daemon serves only the status socket.
+# default; a headless build (`--no-default-features`) drops that MODULE only. The
+# message bus (`bus.rs`) is the daemon's core job, so it is NOT gated — its deps
+# (shed-core / reqwest / futures-util / uuid / async-trait) are always compiled in,
+# and a headless build still builds the bus. The feature is now a pure code cfg.
 default = ["desktop-forwarding"]
-desktop-forwarding = ["dep:shed-core", "dep:async-trait", "dep:uuid"]
+desktop-forwarding = []
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 # net (UnixListener/UnixStream) + io-util (AsyncWriteExt/BufReader) + sync
-# (mpsc/oneshot) + signal (SIGTERM/SIGINT) on top of rt-multi-thread/macros/time.
+# (mpsc/oneshot/watch) + signal (SIGTERM/SIGINT) on top of rt-multi-thread/macros/time.
 tokio = { workspace = true, features = ["net", "io-util", "sync", "signal", "rt-multi-thread", "macros", "time"] }
 # getpid() for the LiveStatus `pid` field (matches the Go daemon's os.Getpid()).
 libc = "0.2"
-# The shared wire codec (server-direction builders/decoders) + uuid + async-trait
-# for the ControlTokenMinter seam — all only needed by the desktop server, so they
-# are optional and pulled in by the `desktop-forwarding` feature.
-shed-core = { path = "../shed-core", optional = true }
-async-trait = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
+# The shared client core: reused by the bus for the SSE parser (sse.rs) + the
+# leaf-cert TLS pin verifier (tls.rs), and by the desktop server for the wire codec
+# + ControlTokenMinter seam. Always-on because the bus is not feature-gated.
+shed-core = { path = "../shed-core" }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+# The bus HTTP client: reqwest (rustls) for SSE subscribe + respond POST, and
+# futures-util for the bytes-stream adaptor. Match shed-core's stack so cargo
+# unifies one reqwest/rustls build across the workspace.
+reqwest = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # Throwaway socket dirs for the status "not running" exit-code test.
 tempfile = "3"
+# Hermetic mock shed-server for the bus unit tests (subscribe/respond/409/401),
+# mirroring shed-core's http.rs test rig.
+httpmock = { workspace = true }

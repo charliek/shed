@@ -186,6 +186,36 @@ def mask_hello_ack(obj: dict) -> dict:
     return out
 
 
+def mask_bus_response(obj: dict) -> dict:
+    """Mask the volatile fields of a bus **response** Envelope (surface B), leaving
+    everything else to be diffed (D3 normalization).
+
+    Masked (volatile): `id` (a fresh UUID — v7 in Go's `NewResponse`, v4 in Rust's
+    `new_response`, so never diffable) and `timestamp` (the response mint time,
+    RFC3339 shape-asserted first so the mask can't paper over a malformed value).
+
+    Diffed (stable — NOT masked): `in_reply_to` (the correlation id, which MUST echo
+    the request's `id`), `namespace`, `type`, `final`, `payload`, and `shed`. The
+    caller asserts those carry the expected pong values.
+
+    Returns a new object; the input is not mutated.
+    """
+    assert obj.get("type") == "response", f"not a response envelope: {obj!r}"
+    out = dict(obj)
+
+    # id: a nonempty UUID string. Masked — the two impls use different UUID
+    # versions, and it varies per-response regardless.
+    _id = out.get("id")
+    assert isinstance(_id, str) and _id, f"bus response id missing/empty: {_id!r}"
+    out["id"] = MASK_ID
+
+    # timestamp: RFC3339 shape asserted BEFORE masking.
+    assert_rfc3339(out.get("timestamp"), "bus response timestamp")
+    out["timestamp"] = MASK_TS
+
+    return out
+
+
 def mask_not_running(stderr: str, socket_dir: str) -> str:
     """Mask the socket directory in the `status`-not-running stderr so the two
     impls' three lines are byte-equal. Only the first line embeds the path
