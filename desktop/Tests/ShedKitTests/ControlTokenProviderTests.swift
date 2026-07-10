@@ -210,4 +210,29 @@ final class ControlTokenProviderTests: XCTestCase {
             XCTAssertEqual(e, .mintFailed("no ssh_port"))
         }
     }
+
+    func testHostAgentFactoryRejectsWrongServer() async throws {
+        let path = tempSocketPath()
+        let fake = FakeHostAgent(
+            path: path,
+            mode: .reply(
+                token: "ctl-wrong", expiresAt: "2026-06-14T01:00:00Z", error: nil,
+                server: "other-server"))
+        try fake.start()
+        defer { fake.stop() }
+        let client = HostAgentClient(socketPath: path)
+        let stream = client.start(client: Self.info)
+        let drain = Task { for await _ in stream {} }
+        defer { drain.cancel(); client.stop() }
+        try await waitConnected(client)
+
+        let provider = ControlTokenProvider.hostAgent(client, server: "mini3")
+        do {
+            _ = try await provider.token()
+            XCTFail("expected mintFailed for wrong server")
+        } catch let e as ControlTokenError {
+            XCTAssertEqual(
+                e, .mintFailed("host agent returned token for unexpected server other-server"))
+        }
+    }
 }

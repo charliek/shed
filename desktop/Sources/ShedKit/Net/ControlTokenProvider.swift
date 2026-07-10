@@ -101,6 +101,11 @@ extension ControlTokenProvider {
             if let err = resp.error, !err.isEmpty {
                 throw ControlTokenError.mintFailed(err)
             }
+            // Empty server is allowed (serde default); a non-empty mismatch is fail-closed.
+            if !resp.server.isEmpty, resp.server != server {
+                throw ControlTokenError.mintFailed(
+                    "host agent returned token for unexpected server \(resp.server)")
+            }
             guard let tok = resp.token, !tok.isEmpty else {
                 throw ControlTokenError.mintFailed("host agent returned no token for \(server)")
             }

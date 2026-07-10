@@ -211,10 +211,19 @@ final class AppModel: NSObject, UiBridge {
     /// must resolve now rather than linger (and stay actionable) under a
     /// non-prompting policy. Requests the policy still decides to prompt stay put.
     private func reevaluatePending() {
+        let now = Date()
         let grants = validGrants()
         for (id, item) in Array(pending) {
+            // Match Rust: never policy-decide an already tick-expired request —
+            // leave it for expirePending's Timeout deny (intake asymmetry preserved).
+            if shouldExpireByTick(item.request, now: now) { continue }
             let decision = policyEngine.decide(for: item.request, sessionGrants: grants)
-            guard decision.action != .prompt else { continue }
+            if decision.action == .prompt {
+                // Method may have strengthened/weakened — refresh the stored gate
+                // so an already-pending card picks up the new biometric requirement.
+                pending[id] = PendingApproval(request: item.request, gate: decision.gate)
+                continue
+            }
             respondAndAudit(item.request, decision.action == .approve ? .approve : .deny,
                             decidedBy: .policy, policy: decision.appliedScope.rawValue)
             pending[id] = nil
@@ -1196,6 +1205,9 @@ final class AppModel: NSObject, UiBridge {
             // let the user act on — or persist a rule from — a stale prompt.
             for id in pending.keys { notifier?.withdraw(id: id) }
             pending.removeAll()
+            // Match Rust A3: drop ALL session grants — a reconnected agent must
+            // not inherit auto-approves from the previous connection.
+            sessionGrants.removeAll()
             publishApprovals()
         case .frame(let frame):
             switch frame {
@@ -1207,6 +1219,12 @@ final class AppModel: NSObject, UiBridge {
     }
 
     private func handleApprovalRequest(_ req: ApprovalRequest) {
+        // Intake fail-closed: past/absent/unparseable expiry must never policy-
+        // auto-approve or queue. (Tick asymmetry via shouldExpireByTick is unchanged.)
+        guard canActOnApproval(req) else {
+            respondAndAudit(req, .deny, decidedBy: .timeout, policy: "expired")
+            return
+        }
         let decision = policyEngine.decide(for: req, sessionGrants: validGrants())
         switch decision.action {
         case .approve:
@@ -1367,7 +1385,10 @@ final class AppModel: NSObject, UiBridge {
     func auditLogPath() -> String { auditStore?.fileURL.path ?? "" }
 
     func setPolicyRules(_ rules: [PolicyRule]) {
+        // Full-engine replace (not rebuildPolicy / extraRules merge) + reevaluate,
+        // matching Rust SetPolicyRules.
         policyEngine = PolicyEngine(rules: rules)
+        reevaluatePending()
     }
 
     func policyRules() -> [PolicyRule] { policyEngine.rules }

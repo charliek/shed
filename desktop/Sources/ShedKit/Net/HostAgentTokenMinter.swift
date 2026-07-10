@@ -27,6 +27,11 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
         if let err = resp.error, !err.isEmpty {
             throw ShedRustCore.ShedError.Config(message: err)
         }
+        // Empty server is allowed (serde default); a non-empty mismatch is fail-closed.
+        if !resp.server.isEmpty, resp.server != server {
+            throw ShedRustCore.ShedError.Config(
+                message: "host agent returned token for unexpected server \(resp.server)")
+        }
         guard let token = resp.token, !token.isEmpty else {
             throw ShedRustCore.ShedError.Config(message: "host agent returned no token for \(server)")
         }

@@ -156,9 +156,8 @@ pub fn resolve_launch(
             }
             // Quote {shed} for /bin/sh -c; leave {cmd} raw — it is a full command line.
             // Templates must not wrap {shed} in their own quotes; quoting is applied here.
-            let expanded = template
-                .replace("{cmd}", &cmd.command)
-                .replace("{shed}", &shell_quote(shed));
+            // One-pass expansion so a literal `{shed}` inside `{cmd}` is not re-scanned.
+            let expanded = expand_custom_template(template, cmd.command.as_str(), shed);
             LaunchInvocation {
                 executable: "/bin/sh".to_string(),
                 arguments: vec!["-c".to_string(), expanded],
@@ -172,6 +171,31 @@ pub fn resolve_launch(
             _ => default_terminal(cmd),
         },
     }
+}
+
+/// Expand `{cmd}` / `{shed}` placeholders in a custom template in one left-to-right
+/// pass. `{cmd}` is inserted raw; `{shed}` is `shell_quote`d. Inserted text is not
+/// re-scanned (avoids a command containing `{shed}` being mutated by a second pass).
+fn expand_custom_template(template: &str, cmd: &str, shed: &str) -> String {
+    let quoted_shed = shell_quote(shed);
+    let mut out = String::with_capacity(template.len() + cmd.len() + quoted_shed.len());
+    let mut rest = template;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i..];
+        if let Some(tail) = after.strip_prefix("{cmd}") {
+            out.push_str(cmd);
+            rest = tail;
+        } else if let Some(tail) = after.strip_prefix("{shed}") {
+            out.push_str(&quoted_shed);
+            rest = tail;
+        } else {
+            out.push('{');
+            rest = &after[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The platform default terminal running the ssh command — the fallback when a
@@ -272,6 +296,24 @@ mod tests {
         assert_eq!(
             inv.arguments[1],
             format!("kitty -e {} --title {}", cmd.command, shell_quote(evil))
+        );
+    }
+
+    #[test]
+    fn resolve_launch_custom_one_pass_does_not_rescan_cmd() {
+        // A command containing the literal `{shed}` must not be mutated by shed expansion.
+        let mut cmd = ssh_command("web", "h", 22, "/k", None);
+        cmd.command = "echo before-{shed}-after".into();
+        let inv = resolve_launch(
+            TerminalPreset::Custom,
+            &cmd,
+            "my-shed",
+            Some("{cmd} # {shed}"),
+            None,
+        );
+        assert_eq!(
+            inv.arguments[1],
+            format!("echo before-{{shed}}-after # {}", shell_quote("my-shed"))
         );
     }
 
