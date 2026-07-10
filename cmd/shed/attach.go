@@ -5,11 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/ext/rc"
 )
 
 var (
@@ -32,14 +34,6 @@ var (
 	attachDetachFlag     bool
 )
 
-// validRCKinds / validRCPermModes mirror shed-ext-rc's accepted values so the CLI
-// can reject a bad flag before the SSH round-trip; shed-ext-rc re-validates as the
-// source of truth. Keep in sync with internal/ext/rc.
-var validRCKinds = map[string]bool{"claude-rc": true, "claude-broker": true, "shell": true}
-var validRCPermModes = map[string]bool{
-	"default": true, "acceptEdits": true, "plan": true,
-	"auto": true, "dontAsk": true, "bypassPermissions": true,
-}
 var rcSlugRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$`)
 
 var attachCmd = &cobra.Command{
@@ -111,14 +105,16 @@ func validateAttachFlags() error {
 		if kind == "" {
 			kind = "claude-rc"
 		}
-		if !validRCKinds[kind] {
-			return fmt.Errorf("invalid --kind %q (want claude-rc|claude-broker|shell)", kind)
+		// Reject a bad --kind before the SSH round-trip; shed-ext-rc re-validates as the
+		// source of truth. rc.IsValidKind reads the same registry, so this never drifts.
+		if !rc.IsValidKind(rc.Kind(kind)) {
+			return fmt.Errorf("invalid --kind %q (want %s)", kind, strings.Join(rc.KindStrings(), "|"))
 		}
 		if attachSkipFlag && attachPermModeFlag != "" {
 			return fmt.Errorf("--skip and --permission-mode are mutually exclusive")
 		}
-		if attachPermModeFlag != "" && !validRCPermModes[attachPermModeFlag] {
-			return fmt.Errorf("invalid --permission-mode %q", attachPermModeFlag)
+		if attachPermModeFlag != "" && !rc.PermModeAcceptedBy(rc.Kind(kind), attachPermModeFlag) {
+			return fmt.Errorf("invalid --permission-mode %q for --kind %s (all kinds accept default|auto|skip; claude also accepts acceptEdits|plan|dontAsk|bypassPermissions)", attachPermModeFlag, kind)
 		}
 		if kind == "claude-broker" && rcInputRequested() {
 			return fmt.Errorf("claude-broker sessions are driven from claude.ai and take no prompt/plan")
@@ -231,13 +227,12 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 	if kind == "" {
 		kind = "claude-rc"
 	}
-	explicitMode := attachSkipFlag || attachPermModeFlag != ""
 	mode := attachPermModeFlag
 	if attachSkipFlag {
-		mode = "bypassPermissions"
+		mode = rc.PermModeSkip
 	}
 	if mode == "" {
-		mode = "auto"
+		mode = rc.PermModeAuto // default autonomous posture (mapped per agent)
 	}
 
 	prompt, planContent, havePlan, err := resolveRCInputs(rcInputs{
@@ -295,25 +290,27 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		prompt:         prompt,
 	}
 	dto, err := createRCSession(opts)
-	if isOldBinaryPermModeErr(err) {
-		// Image predates --permission-mode. Fail loudly if the user asked for a
-		// posture; otherwise drop the default and retry so the session still comes up.
-		// (create rejects the flag before making the tmux session, so retry is clean.)
-		if explicitMode {
-			return fmt.Errorf("this shed's shed-ext-rc predates --permission-mode/--skip; upgrade the shed image, or omit it to start without an autonomous posture")
-		}
-		fmt.Fprintln(os.Stderr, "Warning: shed-ext-rc predates --permission-mode; starting without an autonomous posture (upgrade the shed image to enable).")
-		opts.permissionMode = ""
-		dto, err = createRCSession(opts)
-	}
 	if err != nil {
+		if isOldBinaryRCErr(err) {
+			// The shed's baked-in shed-ext-rc rejected our create request (an unknown
+			// --kind or flag): its image predates multi-agent RC. One clear message —
+			// recreate the shed to pick up the new agent kinds and permission modes.
+			return fmt.Errorf("this shed's image predates multi-agent RC (its shed-ext-rc rejected --kind %s / permission mode); recreate the shed to use the new agent kinds", kind)
+		}
 		return err
 	}
 
 	switch dto.State {
 	case "needs-auth":
-		fmt.Printf("Session rc-%s created but Claude is not logged in in this shed.\n", slug)
-		fmt.Printf("Log in once: shed attach %s  →  run `claude` →  /login, then retry.\n", name)
+		// Per-agent remediation: the login flow differs per tool (claude's /login,
+		// codex login, opencode auth login, cursor-agent login), so the hint comes
+		// from the agent registry.
+		agent := "the agent"
+		if rc.IsClaudeKind(rc.Kind(kind)) {
+			agent = "Claude"
+		}
+		fmt.Printf("Session rc-%s created but %s is not logged in in this shed.\n", slug, agent)
+		fmt.Printf("Log in once: shed attach %s  →  %s, then retry.\n", name, rc.AuthHintFor(rc.Kind(kind)))
 		return nil
 	case "needs-trust":
 		fmt.Printf("Session rc-%s created but the workspace trust prompt is showing; attach to accept it:\n  shed attach %s --slug %s\n", slug, name, slug)

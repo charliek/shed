@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -209,6 +210,37 @@ func TestGenRCSlug(t *testing.T) {
 	}
 	if len(seen) < 40 {
 		t.Fatalf("slugs not random enough: %d unique of 50", len(seen))
+	}
+}
+
+// TestIsOldBinaryRCErr pins the old-binary detection to the two exact signatures an
+// old shed-ext-rc emits (unknown --kind value, undefined flag). A NEW binary's
+// legitimate input-validation errors must pass through unmapped — they are user
+// errors, not "recreate this shed".
+func TestIsOldBinaryRCErr(t *testing.T) {
+	old := []string{
+		`shed-ext-rc create: exit status 2: shed-ext-rc: invalid arguments: unknown kind "codex"`,
+		`shed-ext-rc create: exit status 2: flag provided but not defined: -permission-mode`,
+	}
+	for _, s := range old {
+		if !isOldBinaryRCErr(errors.New(s)) {
+			t.Errorf("old-binary signature not detected: %q", s)
+		}
+	}
+	notOld := []string{
+		`shed-ext-rc create: exit status 2: shed-ext-rc: invalid arguments: prompt contains an unsupported control character`,
+		`shed-ext-rc create: exit status 2: shed-ext-rc: invalid arguments: invalid slug "UPPER"`,
+		`shed-ext-rc create: exit status 2: shed-ext-rc: invalid arguments: --prompt-stdin given but stdin is empty`,
+		`shed-ext-rc create: exit status 3: shed-ext-rc: rc session already exists: rc-abc123`,
+		`shed-ext-rc create: exit status 255: ssh: connect to host x port 2222: Connection refused`,
+	}
+	for _, s := range notOld {
+		if isOldBinaryRCErr(errors.New(s)) {
+			t.Errorf("new-binary/transport error misdetected as old binary: %q", s)
+		}
+	}
+	if isOldBinaryRCErr(nil) {
+		t.Error("nil error must not be detected")
 	}
 }
 

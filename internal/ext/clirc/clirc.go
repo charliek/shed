@@ -12,12 +12,14 @@
 package clirc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -48,6 +50,10 @@ type deps struct {
 	// sleep is the poll delay used by rc.Create's wait loop. nil → real time.Sleep
 	// (production); tests inject a no-op so a --wait/claude create returns instantly.
 	sleep func(time.Duration)
+	// probe reports an agent binary's installed state + version for the capabilities
+	// payload. nil → the real command-based probe (command -v + --version, 2s budget);
+	// tests inject a fake so no external process is spawned.
+	probe rc.AgentProbe
 }
 
 // Run dispatches args with real process dependencies and returns a process exit code.
@@ -74,6 +80,8 @@ func run(cfg Config, d deps, args []string) int {
 		return doCreate(cfg, d, rest)
 	case "list":
 		return doList(cfg, d, rest)
+	case "capabilities":
+		return doCapabilities(cfg, d, rest)
 	case "probe":
 		return doProbe(cfg, d, rest)
 	case "accept-trust":
@@ -109,6 +117,7 @@ func usage(cfg Config, d deps) {
            [--target label] [--wait] [--interactive-shell] [--prompt-stdin]
            [--permission-mode <m> | --skip]
   list
+  capabilities
   probe    --slug <s>
   accept-trust --slug <s>
   prompt   --slug <s> [--session-id <uuid>]   (text read from stdin)
@@ -176,13 +185,14 @@ const claudeDefaultMode = "auto"
 
 // resolveMode applies the --skip shorthand and the --skip/--permission-mode mutual
 // exclusion, falling back to dflt when neither is given (dflt "" = pass no posture
-// flag, i.e. claude's own default).
+// flag). --skip is the generic full-bypass mode ("skip"), mapped per agent to its real
+// flag by the registry (claude → bypassPermissions, codex → --dangerously-…, etc.).
 func resolveMode(permMode string, skip bool, dflt string) (string, error) {
 	if skip {
 		if permMode != "" {
 			return "", fmt.Errorf("%w: --skip and --permission-mode are mutually exclusive", rc.ErrBadArgs)
 		}
-		return rc.PermissionModeBypass, nil
+		return rc.PermModeSkip, nil
 	}
 	if permMode == "" {
 		return dflt, nil
@@ -207,7 +217,7 @@ func doCreate(cfg Config, d deps, args []string) int {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	var (
-		kind          = fs.String("kind", string(rc.DefaultKind), "session kind: claude-rc|claude-broker|shell")
+		kind          = fs.String("kind", string(rc.DefaultKind), "session kind: "+strings.Join(rc.KindStrings(), "|"))
 		name          = fs.String("name", "", "display name (--name to claude); defaults to the slug")
 		slug          = fs.String("slug", "", "caller-supplied slug (generated when empty)")
 		workdir       = fs.String("workdir", "", "working directory (defaults to $SHED_WORKSPACE)")
@@ -216,8 +226,8 @@ func doCreate(cfg Config, d deps, args []string) int {
 		wait          = fs.Bool("wait", false, "block until ready, accept trust, deliver prompt")
 		interactive   = fs.Bool("interactive-shell", false, "wrap claude kinds in `bash -ic`")
 		promptStdin   = fs.Bool("prompt-stdin", false, "read a kickoff prompt line from stdin")
-		permMode      = fs.String("permission-mode", "", "claude --permission-mode (claude kinds): default|acceptEdits|plan|auto|dontAsk|bypassPermissions")
-		skip          = fs.Bool("skip", false, "shorthand for --permission-mode bypassPermissions")
+		permMode      = fs.String("permission-mode", "", "permission mode: default|auto|skip (all kinds); claude also accepts acceptEdits|plan|dontAsk|bypassPermissions")
+		skip          = fs.Bool("skip", false, "shorthand for --permission-mode skip (full bypass)")
 	)
 	if code, ok := parseArgs(cfg, d, fs, args); !ok {
 		return code
@@ -269,7 +279,56 @@ func doList(cfg Config, d deps, args []string) int {
 	if code, ok := parseArgs(cfg, d, fs, args); !ok {
 		return code
 	}
-	return printJSON(cfg, d, rc.List(d.runner, nil))
+	resp := rc.List(d.runner, nil)
+	// One guest exec feeds both the session list and capability discovery.
+	caps := rc.BuildCapabilities(effectiveProbe(d))
+	resp.Capabilities = &caps
+	return printJSON(cfg, d, resp)
+}
+
+// doCapabilities prints the capabilities payload (kinds, per-agent install/version,
+// features, per-kind UI hints) — the discovery mechanism that replaces error-string
+// sniffing.
+func doCapabilities(cfg Config, d deps, args []string) int {
+	fs := flag.NewFlagSet("capabilities", flag.ContinueOnError)
+	fs.SetOutput(d.stderr)
+	if code, ok := parseArgs(cfg, d, fs, args); !ok {
+		return code
+	}
+	return printJSON(cfg, d, rc.BuildCapabilities(effectiveProbe(d)))
+}
+
+// effectiveProbe returns the injected agent probe, or the real command-based probe
+// when none was injected (production).
+func effectiveProbe(d deps) rc.AgentProbe {
+	if d.probe != nil {
+		return d.probe
+	}
+	return realAgentProbe
+}
+
+// agentProbeTimeout bounds each `command -v` / `--version` call so an unresponsive or
+// hung agent binary can't stall capability discovery.
+const agentProbeTimeout = 2 * time.Second
+
+// realAgentProbe reports whether an agent binary is installed (via `command -v`) and
+// its version (via `<bin> --version`), each under a short timeout. bin values come
+// from the registry (fixed literals), never user input.
+func realAgentProbe(bin string) rc.AgentInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), agentProbeTimeout)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "sh", "-c", "command -v "+shellQuote(bin)).Run(); err != nil {
+		return rc.AgentInfo{Installed: false}
+	}
+	vctx, vcancel := context.WithTimeout(context.Background(), agentProbeTimeout)
+	defer vcancel()
+	out, _ := exec.CommandContext(vctx, bin, "--version").CombinedOutput()
+	return rc.AgentInfo{Installed: true, Version: rc.ParseAgentVersion(string(out))}
+}
+
+// shellQuote wraps a token in single quotes for a `sh -c` string (POSIX '\” escape).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // runSlugCmd parses a slug-only subcommand (probe/accept-trust/kill) and runs fn.

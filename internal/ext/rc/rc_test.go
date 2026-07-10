@@ -96,15 +96,92 @@ func TestInnerCommand(t *testing.T) {
 }
 
 func TestValidPermissionMode(t *testing.T) {
-	for _, m := range []string{"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"} {
+	// claude accepts the generic tri-state (default/auto/skip) plus its historical set.
+	for _, m := range []string{"default", "auto", "skip", "acceptEdits", "plan", "dontAsk", "bypassPermissions"} {
 		if !ValidPermissionMode(m) {
 			t.Errorf("ValidPermissionMode(%q) = false, want true", m)
 		}
 	}
-	for _, m := range []string{"", "yolo", "Auto", "bypass", "skip"} {
+	for _, m := range []string{"", "yolo", "Auto", "bypass"} {
 		if ValidPermissionMode(m) {
 			t.Errorf("ValidPermissionMode(%q) = true, want false", m)
 		}
+	}
+}
+
+func TestAcceptsTypedInput(t *testing.T) {
+	for _, k := range []Kind{KindClaudeRC, KindCodex, KindOpencode, KindCursor, KindShell} {
+		if !AcceptsTypedInput(k) {
+			t.Errorf("AcceptsTypedInput(%s) = false, want true", k)
+		}
+	}
+	// broker takes input via the remote URL; an unknown kind renders neutrally with
+	// no input affordances (unknown-kind policy).
+	for _, k := range []Kind{KindClaudeBroker, Kind("opencode-hub"), Kind("")} {
+		if AcceptsTypedInput(k) {
+			t.Errorf("AcceptsTypedInput(%s) = true, want false", k)
+		}
+	}
+}
+
+func TestPromptOnUnknownManagedKindRejected(t *testing.T) {
+	// A managed session with an unrecognized SHED_RC_KIND (preserved raw) must hit the
+	// existing "does not accept a prompt" ErrBadArgs path, not deliver keys.
+	f := &fakeTmux{handler: func(args []string) Result {
+		switch args[0] {
+		case "capture-pane":
+			return Result{Code: 0, Stdout: "some pane"}
+		case "show-environment":
+			return Result{Code: 0, Stdout: "SHED_RC_V=2\nSHED_RC_KIND=future-kind"}
+		}
+		return Result{Code: 0}
+	}}
+	if err := Prompt(f, PromptOptions{Slug: "abc", Text: "go"}); !errors.Is(err, ErrBadArgs) {
+		t.Fatalf("want ErrBadArgs on unknown kind, got %v", err)
+	}
+	if f.callWith("send-keys") != nil {
+		t.Fatal("must not send keys to an unknown-kind session")
+	}
+}
+
+func TestAuthHintFor(t *testing.T) {
+	cases := map[Kind]string{
+		KindClaudeRC:     "run `claude` → /login",
+		KindClaudeBroker: "run `claude` → /login",
+		KindCodex:        "run `codex` and complete login (`codex login`)",
+		KindOpencode:     "run `opencode auth login`",
+		KindCursor:       "run `cursor-agent login`",
+		// shell has no AuthHint; unknown kinds get the neutral fallback.
+		KindShell:     "log in to the agent in a terminal",
+		Kind("weird"): "log in to the agent in a terminal",
+	}
+	for k, want := range cases {
+		if got := AuthHintFor(k); got != want {
+			t.Errorf("AuthHintFor(%s) = %q, want %q", k, got, want)
+		}
+	}
+}
+
+func TestPermModeAcceptedBy(t *testing.T) {
+	// Generic tri-state is valid for every kind.
+	for _, k := range []Kind{KindClaudeRC, KindCodex, KindOpencode, KindCursor, KindShell} {
+		for _, m := range []string{"default", "auto", "skip"} {
+			if !PermModeAcceptedBy(k, m) {
+				t.Errorf("PermModeAcceptedBy(%s,%q) = false, want true", k, m)
+			}
+		}
+	}
+	// claude's historical modes: claude only.
+	for _, m := range []string{"acceptEdits", "plan", "dontAsk", "bypassPermissions"} {
+		if !PermModeAcceptedBy(KindClaudeRC, m) {
+			t.Errorf("claude should accept %q", m)
+		}
+		if PermModeAcceptedBy(KindCodex, m) {
+			t.Errorf("codex must reject claude-only mode %q", m)
+		}
+	}
+	if PermModeAcceptedBy(KindCodex, "yolo") {
+		t.Error("codex must reject a garbage mode")
 	}
 }
 
@@ -165,10 +242,15 @@ func TestParseKind(t *testing.T) {
 		"claude-broker": KindClaudeBroker,
 		"claude-rc":     KindClaudeRC,
 		"shell":         KindShell,
-		"agent":         KindClaudeBroker, // legacy v1 value → unrecognized → broker default
-		"repl":          KindClaudeBroker,
-		"":              KindClaudeBroker,
-		"opencode-rc":   KindClaudeBroker, // future/foreign → broker default
+		"codex":         KindCodex,
+		"opencode":      KindOpencode,
+		"cursor":        KindCursor,
+		// Unknown-kind policy: unrecognized values are PRESERVED verbatim (rendered
+		// neutrally by readers), no longer defaulted to claude-broker.
+		"agent":       Kind("agent"),
+		"repl":        Kind("repl"),
+		"":            Kind(""),
+		"opencode-rc": Kind("opencode-rc"),
 	}
 	for in, want := range cases {
 		if got := parseKind(in); got != want {
@@ -380,11 +462,33 @@ func TestCreatePermissionModeValidation(t *testing.T) {
 			t.Fatal("should not have touched tmux on a validation failure")
 		}
 	})
-	t.Run("mode on shell kind rejected", func(t *testing.T) {
+	t.Run("claude-only mode on non-claude kind rejected", func(t *testing.T) {
 		_, err := Create(&fakeTmux{}, func(string) string { return "/home/shed" },
-			CreateOptions{Kind: KindShell, PermissionMode: "auto"}, noSleep)
+			CreateOptions{Kind: KindCodex, PermissionMode: "acceptEdits"}, noSleep)
 		if !errors.Is(err, ErrBadArgs) {
 			t.Fatalf("want ErrBadArgs, got %v", err)
+		}
+	})
+	t.Run("generic mode accepted on shell (no flags)", func(t *testing.T) {
+		f := &fakeTmux{}
+		if _, err := Create(f, func(string) string { return "/home/shed" },
+			CreateOptions{Kind: KindShell, Slug: "abc123", PermissionMode: "auto"}, noSleep); err != nil {
+			t.Fatalf("generic auto should be accepted on shell: %v", err)
+		}
+		ns := f.callWith("new-session")
+		if ns == nil || ns[len(ns)-1] != "bash -l" {
+			t.Fatalf("shell inner command should be plain bash -l regardless of mode: %v", ns)
+		}
+	})
+	t.Run("generic auto maps to agent flags (codex full-auto)", func(t *testing.T) {
+		f := &fakeTmux{}
+		if _, err := Create(f, func(string) string { return "/home/shed" },
+			CreateOptions{Kind: KindCodex, Slug: "abc123", PermissionMode: "auto"}, noSleep); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		ns := f.callWith("new-session")
+		if inner := ns[len(ns)-1]; inner != "codex --full-auto" {
+			t.Fatalf("codex auto should map to --full-auto, got %q", inner)
 		}
 	})
 	t.Run("valid mode flows into the inner command", func(t *testing.T) {

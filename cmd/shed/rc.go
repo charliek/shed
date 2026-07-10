@@ -239,18 +239,27 @@ func sshShell(ctx context.Context, shedName string, entry *config.ServerEntry, s
 	return out.Bytes(), nil
 }
 
-// isOldBinaryPermModeErr reports whether a createRCSession error is the shed's
-// shed-ext-rc rejecting --permission-mode as an unknown flag (Go's flag package
-// prints "flag provided but not defined: -permission-mode"), i.e. an image that
-// predates posture support. Matched precisely so a transient or unrelated failure
-// is never mistaken for an old binary.
-func isOldBinaryPermModeErr(err error) bool {
+// isOldBinaryRCErr reports whether a createRCSession error is the shed's baked-in
+// shed-ext-rc rejecting our request because its image predates multi-agent RC. Only
+// the two exact signatures an OLD binary emits for a request it cannot understand are
+// matched:
+//   - `invalid arguments: unknown kind "<k>"` — rc.Create's kind rejection (the CLI
+//     already validated the kind against the current registry, so this can only mean
+//     the guest binary's registry is older);
+//   - `flag provided but not defined: -<flag>` — Go's flag package rejecting a create
+//     flag the old binary doesn't have.
+//
+// Any other guest error — including a NEW binary's legitimate input validation
+// ("invalid arguments: prompt contains an unsupported control character",
+// "invalid arguments: invalid slug", …) — passes through unchanged so it is never
+// misreported as "recreate this shed".
+func isOldBinaryRCErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "permission-mode") &&
-		(strings.Contains(s, "not defined") || strings.Contains(s, "flag provided"))
+	return strings.Contains(s, "unknown kind") ||
+		strings.Contains(s, "flag provided but not defined")
 }
 
 // streamPlanToShed writes the plan into claude's native plans directory inside the

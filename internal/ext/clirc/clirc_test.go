@@ -2,6 +2,7 @@ package clirc
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ type fakeRunner struct {
 	calls      [][]string
 	pane       string     // capture-pane stdout
 	env        string     // show-environment stdout
+	lsOut      string     // `tmux ls` stdout (session names, one per line)
 	newSessErr *rc.Result // returned for new-session when set
 	captErr    *rc.Result // returned for capture-pane when set
 }
@@ -32,6 +34,8 @@ func (f *fakeRunner) Run(args ...string) rc.Result {
 		if f.newSessErr != nil {
 			return *f.newSessErr
 		}
+	case "ls":
+		return rc.Result{Stdout: f.lsOut}
 	case "capture-pane":
 		if f.captErr != nil {
 			return *f.captErr
@@ -43,8 +47,15 @@ func (f *fakeRunner) Run(args ...string) rc.Result {
 	return rc.Result{}
 }
 
-// runCLI dispatches one command with fully-faked deps and returns (exit, stdout, stderr).
+// runCLI dispatches one command with fully-faked deps and returns (exit, stdout,
+// stderr). The agent probe is a no-op fake (nothing installed) so list/capabilities
+// never spawn a real process; use runCLIProbe to inject probe results.
 func runCLI(cfg Config, r rc.Runner, env map[string]string, stdin string, args ...string) (int, string, string) {
+	return runCLIProbe(cfg, r, env, stdin, func(string) rc.AgentInfo { return rc.AgentInfo{} }, args...)
+}
+
+// runCLIProbe is runCLI with an injectable agent probe for the capabilities paths.
+func runCLIProbe(cfg Config, r rc.Runner, env map[string]string, stdin string, probe rc.AgentProbe, args ...string) (int, string, string) {
 	var out, errb bytes.Buffer
 	d := deps{
 		runner:   r,
@@ -54,6 +65,7 @@ func runCLI(cfg Config, r rc.Runner, env map[string]string, stdin string, args .
 		stderr:   &errb,
 		hostname: func() string { return "testhost" },
 		sleep:    func(time.Duration) {},
+		probe:    probe,
 	}
 	return run(cfg, d, args), out.String(), errb.String()
 }
@@ -263,6 +275,71 @@ func TestClaudeVerbSkipUsesBypass(t *testing.T) {
 	ns := newSessionCall(t, r)
 	if inner := ns[len(ns)-1]; !strings.Contains(inner, "--permission-mode bypassPermissions") {
 		t.Errorf("--skip did not produce bypassPermissions:\n%s", inner)
+	}
+}
+
+// fakeProbe returns canned install/version info per binary for the capabilities tests.
+func fakeProbe(installed map[string]string) rc.AgentProbe {
+	return func(bin string) rc.AgentInfo {
+		if v, ok := installed[bin]; ok {
+			return rc.AgentInfo{Installed: true, Version: v}
+		}
+		return rc.AgentInfo{Installed: false}
+	}
+}
+
+func TestCapabilitiesSubcommand(t *testing.T) {
+	probe := fakeProbe(map[string]string{"claude": "2.1.206", "codex": "0.143.0"})
+	code, out, errOut := runCLIProbe(extCfg, &fakeRunner{}, nil, "", probe, "capabilities")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	var caps rc.Capabilities
+	dec := json.NewDecoder(strings.NewReader(out))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&caps); err != nil {
+		t.Fatalf("capabilities output failed to decode: %v\n%s", err, out)
+	}
+	if caps.RCVersion != rc.CapabilityVersion {
+		t.Errorf("rc_version = %d, want %d", caps.RCVersion, rc.CapabilityVersion)
+	}
+	if len(caps.Kinds) != len(rc.KindStrings()) {
+		t.Errorf("kinds = %v, want %d", caps.Kinds, len(rc.KindStrings()))
+	}
+	if info := caps.Agents["codex"]; !info.Installed || info.Version != "0.143.0" {
+		t.Errorf("codex probe wrong: %+v", info)
+	}
+	if info := caps.Agents["cursor"]; info.Installed || info.Version != "" {
+		t.Errorf("uninstalled cursor should have no version: %+v", info)
+	}
+	if _, ok := caps.Agents["shell"]; ok {
+		t.Errorf("shell has no agent binary and must not appear in agents{}")
+	}
+}
+
+func TestListEnvelopeCarriesCapabilities(t *testing.T) {
+	// A running shed with one rc-* session; probe reports codex installed.
+	r := &fakeRunner{
+		pane: "Remote Control active\nhttps://claude.ai/code/session_01\n",
+		env:  "SHED_RC_V=2\nSHED_RC_KIND=claude-rc",
+	}
+	r.lsOut = "rc-aaa\n"
+	probe := fakeProbe(map[string]string{"codex": "0.143.0"})
+	code, out, errOut := runCLIProbe(extCfg, r, nil, "", probe, "list")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	var resp rc.ListResponse
+	dec := json.NewDecoder(strings.NewReader(out))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("list output failed to decode: %v\n%s", err, out)
+	}
+	if resp.Capabilities == nil {
+		t.Fatal("list envelope must carry capabilities")
+	}
+	if resp.Capabilities.RCVersion != rc.CapabilityVersion {
+		t.Errorf("rc_version = %d, want %d", resp.Capabilities.RCVersion, rc.CapabilityVersion)
 	}
 }
 

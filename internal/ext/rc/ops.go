@@ -3,6 +3,7 @@ package rc
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -65,13 +66,8 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 			return Session{}, fmt.Errorf("%w: prompt contains an unsupported control character", ErrBadArgs)
 		}
 	}
-	if opts.PermissionMode != "" {
-		if !IsClaudeKind(opts.Kind) {
-			return Session{}, fmt.Errorf("%w: --permission-mode applies only to claude kinds", ErrBadArgs)
-		}
-		if !ValidPermissionMode(opts.PermissionMode) {
-			return Session{}, fmt.Errorf("%w: invalid permission mode %q", ErrBadArgs, opts.PermissionMode)
-		}
+	if err := validatePermissionMode(opts.Kind, opts.PermissionMode); err != nil {
+		return Session{}, err
 	}
 
 	slug := opts.Slug
@@ -145,7 +141,11 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 	}
 
 	if opts.Wait || opts.Prompt != "" {
-		bypass := opts.PermissionMode == PermissionModeBypass
+		// The one-time bypass-acceptance dialog appears only for a claude session whose
+		// resolved posture is full bypass — true for both "skip" (generic) and
+		// "bypassPermissions" (claude-historical), since both map to the same flag.
+		flags, _ := permFlagsFor(opts.Kind, opts.PermissionMode)
+		bypass := slices.Contains(flags, PermissionModeBypass)
 		state, url := waitUntilReady(r, name, opts.Kind, opts.Prompt, bypass, sleep)
 		session.State, session.URL = state, url
 	}
@@ -186,11 +186,13 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 			continue
 		}
 		state, url = ClassifyPane(kind, capRes.Stdout)
-		if state == StateNeedsTrust && IsClaudeKind(kind) && !trustAccepted {
+		if state == StateNeedsTrust && !trustAccepted {
+			// Every agent's directory-trust gate captured so far pre-selects "yes" and
+			// is accepted with Enter (claude's "Yes, I trust this folder"; codex's
+			// "1. Yes, continue · Press enter to continue"). The classified needs-trust
+			// state is the gate, so a single Enter accepts it for any kind.
 			trustAccepted = true
-			if IsTrustPrompt(capRes.Stdout) {
-				sendEnter(r, name)
-			}
+			sendEnter(r, name)
 			sleep(defaultPollEvery)
 			continue
 		}

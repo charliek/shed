@@ -63,3 +63,30 @@ func TestDefaultKindResolves(t *testing.T) {
 		t.Fatalf("DefaultKind %q does not resolve to a spec", DefaultKind)
 	}
 }
+
+// Every kind accepts the generic permission tri-state (valid for ALL kinds), and
+// every probeable agent declares a Bin.
+func TestEveryKindAcceptsGenericModes(t *testing.T) {
+	for _, k := range allKinds {
+		for _, m := range genericPermModes() {
+			if !PermModeAcceptedBy(k, m) {
+				t.Errorf("kind %q must accept generic mode %q", k, m)
+			}
+		}
+	}
+}
+
+func TestRegistryBinsAndTools(t *testing.T) {
+	for _, spec := range agentRegistry {
+		if spec.Tool == "" {
+			t.Errorf("spec has empty Tool")
+		}
+		if spec.PermMap == nil {
+			t.Errorf("spec %q has nil PermMap", spec.Tool)
+		}
+		// Only shell (the pure login shell) has no agent binary to probe.
+		if spec.Bin == "" && spec.Tool != toolShell {
+			t.Errorf("agent spec %q must declare a Bin to probe", spec.Tool)
+		}
+	}
+}

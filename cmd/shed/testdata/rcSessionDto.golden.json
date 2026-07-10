@@ -21,5 +21,22 @@
       "state": "starting",
       "managed": false
     }
-  ]
+  ],
+  "capabilities": {
+    "rc_version": 3,
+    "kinds": ["claude-broker", "claude-rc", "codex", "opencode", "cursor", "shell"],
+    "agents": {
+      "claude": { "installed": true, "version": "2.1.206" },
+      "codex": { "installed": true, "version": "0.143.0" },
+      "opencode": { "installed": true, "version": "1.17.11" },
+      "cursor": { "installed": false }
+    },
+    "features": ["generic-perm"],
+    "kind_features": {
+      "claude-rc": { "post_input": true, "approvals": "tui" },
+      "codex": { "post_input": true, "approvals": "tui" },
+      "opencode": { "post_input": true, "approvals": "tui" },
+      "cursor": { "post_input": true, "approvals": "tui" }
+    }
+  }
 }

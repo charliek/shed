@@ -1,0 +1,123 @@
+Pane-state golden fixtures — coding-agent TUIs inside a shed VM
+================================================================
+
+Captured 2026-07-10 inside shed `agent-fixtures` (VZ backend, server `localmac-dev`,
+image ghcr.io/charliek/shed-vz-full:v0.7.6). Panes captured with `tmux capture-pane -p`
+at 200x50. Agents launched from ~ (/home/shed) via a persistent `bash -il` tmux session
+so the post-exit shell prompt is observable.
+
+Shed shell prompt = `[shed:agent-fixtures] ~ $`  (format: `[shed:<name>] <cwd> $`).
+This is the reliable "process exited, back to shell" (dead) signal.
+
+ENVIRONMENT / AVAILABILITY
+--------------------------
+  claude       ~/.local/bin/claude   2.1.196 (Claude Code)   launches: yes
+  codex        ~/.bun/bin/codex      codex-cli 0.142.4        launches: NO as shipped (needs node)
+  opencode     ~/.bun/bin/opencode   1.17.11                  launches: yes
+  cursor-agent NOT in image          v2026.07.09-a3815c0      installed manually; launches: yes
+
+- codex is BROKEN in the stock full image. Shim is `#!/usr/bin/env node`
+  (~/.bun/bin/codex -> .../@openai/codex/bin/codex.js) but the image ships only `bun`,
+  no `node`. Running `codex` fails: `/usr/bin/env: 'node': No such file or directory`.
+  Workaround used to capture screens: ~/.local/bin/node = `#!/bin/bash\nexec bun "$@"`.
+  That no-node failure is itself a capturable state (env error line + immediately dead).
+- cursor-agent NOT in the full image. `curl -fsS https://cursor.com/install | bash`
+  SUCCEEDED (network reachable) -> ~/.local/bin/{cursor-agent,agent}.
+- Auth surprise: fresh shed is NOT uniformly logged out (host config dirs mounted per
+  agent). codex + opencode came up ALREADY AUTHED; claude came up "Not logged in";
+  cursor came up logged out. Classifier must handle authed AND needs-auth per agent.
+
+CODEX (codex-cli 0.142.4)
+-------------------------
+Boot: trust prompt first, then (Enter) main/ready UI.
+Trust  [codex-t03/t10/t30.txt] — stays until a key sent:
+  "Do you trust the contents of this directory?"
+  "> 1. Yes, continue"  "  2. No, quit"  "Press enter to continue"
+  top line: "> You are in /home/shed"
+  anchors: /Do you trust the contents of this directory\?/, /1\. Yes, continue/,
+           /2\. No, quit/, /Press enter to continue/
+Ready(authed) [codex-after-trust.txt, codex-ready.txt]:
+  ">_ OpenAI Codex (v0.142.4)", "model: gpt-5.4 high", "directory: ~"
+  "> Find and fix a bug in @filename",  footer "gpt-5.4 high · ~"
+  anchors: />_ OpenAI Codex \(v[\d.]+\)/, /Find and fix a bug in @filename/, /gpt-5\.4 .* · ~/
+  noise banner: /✨ Update available!/
+Stale/partial auth (inline on ready screen):
+  "Provided authentication token is expired. Please try signing in again."
+  '"code": "token_expired"',  "MCP startup incomplete (failed: codex_apps)"
+  anchors: /Provided authentication token is expired/, /"code": "token_expired"/,
+           /MCP startup incomplete/
+Dead [codex-dead.txt = EMPTY]: launched as `bash -ilc codex`, so exit killed the whole
+  tmux session/server. Signal: capture-pane errors / "no server running" / "can't find
+  session". No shell-prompt frame (use persistent bash -il to get one).
+
+OPENCODE (1.17.11)
+------------------
+Launches straight to ready composer (already authed to a GLM-5.1 Z.AI Coding Plan).
+No trust prompt.
+Ready(authed) [opencode-t03/t10/t30.txt]: big "opencode" ASCII wordmark, then
+  "Ask anything... \"Fix broken tests\""
+  "Build · GLM-5.1 Z.AI Coding Plan"
+  "tab agents  ctrl+p commands"   (bottom bar: cwd ~ left, version 1.17.11 right)
+  anchors: /Ask anything\.\.\./, /Build · .* Coding Plan/, /tab agents  ctrl\+p commands/
+  (logged-out opencode screen NOT captured this run)
+Dead [opencode-dead.txt]: first C-c exits to shell:
+  "[shed:agent-fixtures] ~ $ opencode" / "^C" / "[shed:agent-fixtures] ~ $"
+  anchor: /\[shed:[^\]]+\] .* \$/
+
+CLAUDE (Claude Code v2.1.196)
+-----------------------------
+Launches straight to composer but NOT logged in. No trust prompt (home dir).
+Ready-shell / needs-auth [claude-t03/t10/t30.txt]:
+  "Claude Code v2.1.196"
+  "Opus 4.8 (1M context) with high effort · API Usage Billing"   "/home/shed"
+  status line: "Not logged in · Run /login"
+  composer: "> Try \"refactor <filepath>\"",  "? for shortcuts · <- for agents"
+  anchors: identity /Claude Code v[\d.]+/, composer /Try "refactor <filepath>"/,
+           /\? for shortcuts/;  NEEDS-AUTH /Not logged in · Run \/login/  (definitive)
+/login picker [claude-login.txt] (after typing /login):
+  "Login"  "Select login method:"
+  "1. Claude account with subscription · Pro, Max, Team, or Enterprise"
+  "2. Anthropic Console account · API usage billing"
+  "3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI"  "Esc to cancel"
+  anchors: /Select login method:/, /Claude account with subscription/,
+           /Anthropic Console account/, /3rd-party platform/
+Dead [claude-dead.txt]: clears alt-screen; scrollback:
+  "Resume this session with:" / "claude --resume <uuid>" / shell prompt
+  anchors: /Resume this session with:/, /claude --resume [0-9a-f-]+/
+  NOTE: claude ignores a single C-c; needs double C-c fast, or /exit.
+
+CURSOR-AGENT (v2026.07.09-a3815c0, manually installed)
+------------------------------------------------------
+Logged out. Two-stage login.
+Needs-auth splash [cursor-t03/t10/t30.txt]:
+  "Tip: You can start the Cursor CLI with `agent` (same as `cursor-agent`)."
+  "Cursor Agent"  "v2026.07.09-a3815c0"  "Press any key to log in..."
+  anchors: /Cursor Agent/, /v2026\.\d/, /Press any key to log in\.\.\./
+Device/browser login [cursor-login.txt] (after any keypress):
+  "Signing in"
+  "If your browser didn't open, click this link to log in:"
+  "https://cursor.com/loginDeepControl?challenge=...&uuid=...&mode=login&redirectTarget=cli"
+  "Press q to show a QR code to log in from another device"
+  anchors: /Signing in/, /If your browser didn't open, click this link to log in:/,
+           /cursor\.com\/loginDeepControl\?/, /Press q to show a QR code/
+Dead [cursor-dead.txt]: on C-c while unauth, prints reason then shell:
+  "Authentication required to use Cursor Agent. Please run 'agent login' to authenticate."
+  anchors: /Authentication required to use Cursor Agent/, /run 'agent login'/
+
+CROSS-AGENT NOTES / SURPRISES
+-----------------------------
+- `shed exec` emits on stderr: "Pseudo-terminal will not be allocated because stdin is
+  not a terminal." for every non-interactive call. It leaks into output when you cat
+  guest files back over shed exec; strip with `grep -vi pseudo-terminal`. It does NOT
+  appear inside tmux capture-pane output (agent runs under a real PTY there).
+- needs-auth per agent: claude=/Not logged in · Run \/login/; cursor=/Press any key to
+  log in/ or /Authentication required to use Cursor Agent/; codex stale-auth=/token_expired/;
+  opencode logged-out screen not captured.
+- trust/onboarding: only codex showed a folder-trust gate here.
+- ready anchors: codex /Find and fix a bug in @filename/; opencode /Ask anything\.\.\./;
+  claude /Try "refactor <filepath>"/ AND absence of /Not logged in/.
+- dead/exited: common signal shell prompt /\[shed:[^\]]+\] .*\$/; codex may kill the whole
+  session (no frame).
+- timing: all four reached steady state well under 3s; t03/t10/t30 are identical per agent.
+  No slow "starting..." spinner observed at 200x50 — a dedicated "starting" state was NOT
+  captured; poll <1s if that state is needed.
