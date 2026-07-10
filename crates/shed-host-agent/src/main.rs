@@ -14,6 +14,8 @@ mod bus;
 mod config;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop;
+#[cfg(feature = "desktop-forwarding")]
+mod desktop_protocol;
 mod sockets;
 mod status;
 mod version;

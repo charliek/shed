@@ -3,7 +3,8 @@
 //! the all-namespace audit/event stream plus the approval request/response and
 //! `token.get`/`token.response` channels to a single active consumer (normally the
 //! shed-desktop app). Wire shapes + framing/correlation come from
-//! `shed_core::approval::protocol` (the shared codec, server direction).
+//! `crate::desktop_protocol` (the server direction of the shed-host-agent codec;
+//! the client direction lives in `shed_core::approval::protocol`).
 //!
 //! **Single consumer, last-writer-wins.** A second connection supersedes the
 //! first (the old one gets `hello_ack{accepted:false, reason:"superseded"}` then is
@@ -25,8 +26,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use shed_core::approval::protocol::{
-    self, ApprovalResponseMsg, AuditEntryView, ClientInfo, DesktopInbound, TokenGetMsg,
+use crate::desktop_protocol::{
+    self as protocol, ApprovalResponseMsg, AuditEntryView, ClientInfo, DesktopInbound, TokenGetMsg,
 };
 
 use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
