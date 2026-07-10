@@ -35,10 +35,12 @@ from fixtures.server import resolve_server_entry
 # permission regression. Only these get a skip; anything else FAILS the test so a
 # regression can't masquerade as a precondition skip.
 _RC_INCOMPAT_SIGNS = (
+    # Binary missing from the image. Deliberately no bare "not found" entry:
+    # it would also match unrelated failures like "shed not found".
     "command not found",
-    "not found",
     "no such file",
     "executable file not found",
+    # Binary present but predates multi-agent RC.
     "unknown kind",
     "unknown flag",
     "unknown shorthand flag",
@@ -65,16 +67,17 @@ def _require_rc_create(r) -> None:
 
 
 def _poll_rc_row(fetch, *, timeout: float = 10.0, interval: float = 0.5):
-    """Poll `fetch()` -> (row, payload) until `row` is non-None or `timeout`
-    elapses. `--wait=false` skips readiness polling, so the session may not be
-    registered when the first listing is fetched; bound the wait to absorb that
-    create-race without masking a genuinely missing row. Returns the last
-    (row, payload) either way so the caller's assertion reports real diagnostics.
+    """Poll `fetch()` -> (row, payload) until the row exists AND carries its
+    `rc` enrichment block, or `timeout` elapses. `--wait=false` skips readiness
+    polling, so the first listings can race both the tmux registration and the
+    enrichment exec; bound the wait to absorb that without masking a genuinely
+    missing row or a never-enriched one. Returns the last (row, payload) either
+    way so the caller's assertion reports real diagnostics.
     """
     deadline = time.monotonic() + timeout
     while True:
         row, payload = fetch()
-        if row is not None or time.monotonic() >= deadline:
+        if (row is not None and row.get("rc")) or time.monotonic() >= deadline:
             return row, payload
         time.sleep(interval)
 
