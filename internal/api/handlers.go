@@ -35,6 +35,7 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		AuthMode:     authMode,
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
+		Features:     serverFeatures(),
 	}
 
 	writeJSON(w, http.StatusOK, info)

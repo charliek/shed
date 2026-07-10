@@ -59,6 +59,13 @@ def _find_rc_row(sessions: list[dict], shed: str) -> dict | None:
     return None
 
 
+def _find_overview_shed(sheds: list[dict], shed: str) -> dict | None:
+    for s in sheds:
+        if s.get("name") == shed:
+            return s
+    return None
+
+
 def test_rc_enrichment_populates_and_rc0_opts_out(
     shed_server_dev, test_shed_name_dev
 ):
@@ -128,3 +135,75 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
     assert row0.get("rc") is None, (
         f"?rc=0 must omit the rc block, got: {row0.get('rc')!r}"
     )
+
+
+def test_overview_shape(shed_server_dev, test_shed_name_dev):
+    """GET /api/overview is a single-call host snapshot: the server block
+    advertises the `overview` feature, the df block is present, and the shed
+    carries its rc-enriched sessions (a shell-kind session appears under its shed
+    with an `rc` block).
+
+    Like the enrichment test this is a server-side feature, so it targets the
+    dev server via the `shed_server_dev` fixture; a server that advertises a
+    feature list without `overview` predates the endpoint and skips.
+    """
+    server = shed_server_dev
+    shed = test_shed_name_dev
+    base = _api_base(server)
+
+    # Precondition: a features list without "overview" means the server predates
+    # the endpoint. A dev server without any list is asserted directly (regression,
+    # not skip) — the /api/overview call below 404s loudly if the route is absent.
+    info = _get_json(base, "/api/info")
+    features = info.get("features")
+    if isinstance(features, list) and "overview" not in features:
+        pytest.skip(
+            f"server {server.name!r} advertises features={features} without "
+            "overview — it predates the /api/overview endpoint"
+        )
+
+    server.create(shed, image="extensions")
+
+    r = server.exec(
+        shed,
+        ["shed-ext-rc", "create", "--kind", "shell", "--wait=false"],
+    )
+    if r.returncode != 0:
+        pytest.skip(
+            "shed-ext-rc create --kind shell failed (image predates multi-agent "
+            f"RC or omits the binary): exit={r.returncode} stderr={r.stderr!r}"
+        )
+
+    ov = _get_json(base, "/api/overview")
+
+    # server block: version + the overview/rc-enrich feature tokens.
+    srv_block = ov.get("server") or {}
+    assert srv_block.get("version"), f"overview server.version missing: {srv_block!r}"
+    ov_features = srv_block.get("features") or []
+    assert "overview" in ov_features, (
+        f"overview server.features must include 'overview': {ov_features!r}"
+    )
+
+    # df block present (same shape as /api/system/df).
+    df = ov.get("df")
+    assert df is not None, f"overview df block missing (warnings={ov.get('warnings')!r})"
+    assert "totals" in df, f"df block missing totals: {df!r}"
+
+    # sheds present; our shed carries the enriched shell rc session.
+    sheds = ov.get("sheds") or []
+    entry = _find_overview_shed(sheds, shed)
+    assert entry is not None, f"shed {shed!r} not in overview sheds: {[s.get('name') for s in sheds]!r}"
+    sessions = entry.get("sessions")
+    assert isinstance(sessions, list), f"shed sessions must be a list: {entry!r}"
+    row = _find_rc_row(sessions, shed)
+    assert row is not None, (
+        f"no rc-* session under shed {shed!r} in overview: {sessions!r}"
+    )
+    rc = row.get("rc")
+    assert rc is not None, (
+        f"Session.RC missing under overview for {row.get('name')!r} "
+        f"(warnings={ov.get('warnings')!r}); rerun against the dev build via "
+        "make test-integration-dev if targeting a brew/deb server."
+    )
+    assert rc.get("kind") == "shell", f"unexpected rc.kind: {rc!r}"
+    assert rc.get("state"), f"rc.state should be populated: {rc!r}"

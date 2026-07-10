@@ -166,21 +166,36 @@ func (s *Server) execRCList(ctx context.Context, shedName string) (*rc.ListRespo
 // shed can't be probed (no rc binary, exec failure), or (nil, nil) when a binary
 // too old to advertise capabilities responds. Exported so the overview endpoint
 // can reach the cached block without duplicating the exec/cache plumbing.
+//
+// The probe itself is deduplicated cross-request through a per-shed singleflight:
+// M concurrent callers that miss the cache (or force ?fresh=1) share ONE guest
+// exec per shed rather than fanning out M — refresh-heavy overview polling can't
+// stampede a shed. The generation is snapshotted INSIDE the flight, so the shared
+// result still respects a lifecycle invalidation landing mid-exec (the stale put
+// is dropped; every caller still receives the freshly probed block). The flight
+// runs under the leader's ctx; execRCList self-bounds it to rcEnrichTimeout, so a
+// joined caller waits at most that long even if the leader's request is slow.
 func (s *Server) RCCapabilities(ctx context.Context, shedName string, fresh bool) (*rc.Capabilities, error) {
 	if !fresh {
 		if caps, ok := s.rcCaps.get(shedName); ok {
 			return caps, nil
 		}
 	}
-	gen := s.rcCaps.generation(shedName) // snapshot before the probe starts
-	resp, err := s.execRCList(ctx, shedName)
+	v, err, _ := s.rcCapsFlight.Do(shedName, func() (any, error) {
+		gen := s.rcCaps.generation(shedName) // snapshot before the probe starts
+		resp, err := s.execRCList(ctx, shedName)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Capabilities != nil {
+			s.rcCaps.put(shedName, gen, resp.Capabilities)
+		}
+		return resp.Capabilities, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if resp.Capabilities != nil {
-		s.rcCaps.put(shedName, gen, resp.Capabilities)
-	}
-	return resp.Capabilities, nil
+	return v.(*rc.Capabilities), nil
 }
 
 // toSessionRC projects the canonical rc.Session onto the display subset carried on

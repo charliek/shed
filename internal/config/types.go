@@ -258,6 +258,13 @@ type ServerInfo struct {
 	// secure), so a client adding a secure server can learn the TLS endpoint.
 	// 0/omitted in open mode (no HTTPS listener).
 	HTTPSPort int `json:"https_port,omitempty"`
+
+	// Features advertises server capability tokens (e.g. "overview",
+	// "rc-enrich") for endpoint discovery, so a client learns which endpoints
+	// and behaviors this server supports without probing each one. The same set
+	// is mirrored in the GET /api/overview server block. The token list is owned
+	// by internal/api (serverFeatures); older clients decode it as an empty slice.
+	Features []string `json:"features,omitempty"`
 }
 
 // SSHHostKeyResponse is returned by GET /api/ssh-host-key.

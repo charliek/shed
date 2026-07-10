@@ -26,6 +26,13 @@ type rcFakeBackend struct {
 	sessions  map[string][]config.Session // keyed by shed name
 	execFn    func(ctx context.Context, shed string, opts backend.ExecOptions) error
 	execCalls atomic.Int32
+	// dfUsage / dfErr back DiskUsage (used by the overview endpoint's df block);
+	// zero values give an empty usage with no error.
+	dfUsage config.DiskUsage
+	dfErr   error
+	// listErr injects a per-shed ListSessions failure (keyed by shed name) so the
+	// overview session-list-degrade path is testable; nil entries list normally.
+	listErr map[string]error
 }
 
 func (f *rcFakeBackend) Type() backend.Type { return backend.TypeVZ }
@@ -48,6 +55,11 @@ func (f *rcFakeBackend) ResetShed(_ context.Context, name string) (*config.Shed,
 	return &config.Shed{Name: name, Status: config.StatusStopped}, nil
 }
 func (f *rcFakeBackend) ListSessions(_ context.Context, name string) ([]config.Session, error) {
+	if f.listErr != nil {
+		if err := f.listErr[name]; err != nil {
+			return nil, err
+		}
+	}
 	return f.sessions[name], nil
 }
 func (f *rcFakeBackend) KillSession(context.Context, string, string) error { return nil }
@@ -74,7 +86,9 @@ func (f *rcFakeBackend) DeleteImage(context.Context, string) error       { panic
 func (f *rcFakeBackend) PruneImages(context.Context, bool) ([]config.ImageInfo, error) {
 	panic("unexpected")
 }
-func (f *rcFakeBackend) DiskUsage(context.Context) (config.DiskUsage, error) { panic("unexpected") }
+func (f *rcFakeBackend) DiskUsage(context.Context) (config.DiskUsage, error) {
+	return f.dfUsage, f.dfErr
+}
 func (f *rcFakeBackend) Prune(context.Context, backend.PruneOptions) (config.PruneReport, error) {
 	panic("unexpected")
 }
@@ -474,4 +488,95 @@ func TestEnrich_ConcurrentRequests(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestRCCaps_ConcurrentFreshSingleflight: N concurrent fresh=true probes for the
+// same shed collapse into exactly one guest exec (the per-shed singleflight bounds
+// refresh-heavy polling cross-request), and every caller receives the shared block.
+func TestRCCaps_ConcurrentFreshSingleflight(t *testing.T) {
+	const n = 8
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	be := &rcFakeBackend{}
+	be.execFn = func(_ context.Context, _ string, opts backend.ExecOptions) error {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release // hold the flight open so the other callers join it
+		_, err := opts.Stdout.Write([]byte(newEnvelope))
+		return err
+	}
+	srv := newRCServer(be)
+
+	var (
+		wg      sync.WaitGroup
+		results [n]*rc.Capabilities
+		errs    [n]error
+		entered = make(chan struct{}, n)
+	)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			entered <- struct{}{}
+			results[i], errs[i] = srv.RCCapabilities(context.Background(), "proj", true)
+		}()
+	}
+	for range n {
+		<-entered // every caller is at (or inside) the RCCapabilities call
+	}
+	<-started // the leader's exec is in flight
+	// Give the remaining callers time to join the open flight before releasing
+	// it; a caller landing after release would start a second exec and fail the
+	// exact-count assertion below.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := be.execCalls.Load(); got != 1 {
+		t.Fatalf("%d concurrent fresh probes made %d execs, want exactly 1 (singleflight)", n, got)
+	}
+	for i := range n {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+		if results[i] == nil || results[i].RCVersion != 3 {
+			t.Fatalf("caller %d got wrong shared caps: %+v", i, results[i])
+		}
+	}
+}
+
+// TestRCCaps_InvalidateDuringSharedFlight: a lifecycle invalidation landing while
+// a singleflight'd probe is in flight still drops the stale put (the generation is
+// snapshotted inside the flight), while the caller still receives the probed block.
+func TestRCCaps_InvalidateDuringSharedFlight(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	be := &rcFakeBackend{}
+	be.execFn = func(_ context.Context, _ string, opts backend.ExecOptions) error {
+		close(started) // exactly one exec expected; a second close panics loudly
+		<-release
+		_, err := opts.Stdout.Write([]byte(newEnvelope))
+		return err
+	}
+	srv := newRCServer(be)
+
+	done := make(chan error, 1)
+	go func() {
+		caps, err := srv.RCCapabilities(context.Background(), "proj", true)
+		if err == nil && (caps == nil || caps.RCVersion != 3) {
+			err = errors.New("caller must still receive the probed block")
+		}
+		done <- err
+	}()
+	<-started
+	srv.rcCaps.invalidate("proj") // lifecycle transition mid-flight
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := srv.rcCaps.get("proj"); ok {
+		t.Fatal("put from a flight whose generation predates the invalidation must be dropped")
+	}
 }

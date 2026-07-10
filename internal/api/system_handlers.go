@@ -17,7 +17,14 @@ func (s *Server) handleSystemDF(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, config.ErrBackendError, err.Error())
 		return
 	}
-	// Defensive: ensure slices are non-nil so JSON renders `[]` not `null`.
+	normalizeDiskUsage(&usage)
+	writeJSON(w, http.StatusOK, usage)
+}
+
+// normalizeDiskUsage forces the slice fields non-nil so JSON renders `[]` not
+// `null`. Shared by handleSystemDF and the overview endpoint's df block so both
+// emit the identical df shape.
+func normalizeDiskUsage(usage *config.DiskUsage) {
 	if usage.Images == nil {
 		usage.Images = []config.ImageDiskEntry{}
 	}
@@ -27,7 +34,6 @@ func (s *Server) handleSystemDF(w http.ResponseWriter, r *http.Request) {
 	if usage.Orphans == nil {
 		usage.Orphans = []config.FileEntry{}
 	}
-	writeJSON(w, http.StatusOK, usage)
 }
 
 // defaultPruneUntil is applied when the `until` query param is omitted.
