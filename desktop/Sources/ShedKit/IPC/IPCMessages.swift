@@ -18,7 +18,7 @@ public struct IPCRequest: Codable, Sendable {
     public var op: String
     public var params: AnyCodable?
 
-    enum CodingKeys: String, CodingKey { case id, op, params }
+    enum CodingKeys: String, CodingKey, CaseIterable { case id, op, params }
 
     public init(id: Int64, op: String, params: AnyCodable? = nil) {
         self.id = id
@@ -30,7 +30,8 @@ public struct IPCRequest: Codable, Sendable {
         // CodingKeys.self containers do not surface unknown JSON members — use
         // an open key type so extras like "extra":true are rejected.
         let raw = try decoder.container(keyedBy: AnyJSONKey.self)
-        let allowed: Set<String> = ["id", "op", "params"]
+        // Derived from CodingKeys so the check can't drift when a field is added.
+        let allowed = Set(CodingKeys.allCases.map(\.stringValue))
         let present = Set(raw.allKeys.map(\.stringValue))
         let unknown = present.subtracting(allowed)
         if !unknown.isEmpty {

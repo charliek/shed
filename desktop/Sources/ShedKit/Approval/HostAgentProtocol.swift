@@ -92,6 +92,33 @@ public struct TokenResponse: Sendable, Decodable {
     }
 }
 
+/// Outcome of validating a host-agent `token.response`: the validated token, or
+/// a descriptive failure message the caller maps to its own error type.
+public enum TokenValidation: Sendable {
+    case valid(String)
+    case invalid(String)
+}
+
+extension TokenResponse {
+    /// Fail-closed validation shared by the two host-agent token minters
+    /// (`ControlTokenProvider.hostAgent` and `HostAgentTokenMinter`). One copy
+    /// keeps the two paths from diverging — a fail-open drift here would be a
+    /// security regression.
+    public func validatedToken(for server: String) -> TokenValidation {
+        if let error, !error.isEmpty {
+            return .invalid(error)
+        }
+        // Empty server is allowed (serde default); a non-empty mismatch is fail-closed.
+        if !self.server.isEmpty, self.server != server {
+            return .invalid("host agent returned token for unexpected server \(self.server)")
+        }
+        guard let token, !token.isEmpty else {
+            return .invalid("host agent returned no token for \(server)")
+        }
+        return .valid(token)
+    }
+}
+
 public enum HostAgentProtocol {
     /// Decode one newline-JSON line into a typed inbound frame.
     public static func decode(line: Data) throws -> HostAgentInbound {

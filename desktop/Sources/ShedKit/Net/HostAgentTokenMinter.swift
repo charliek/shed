@@ -22,18 +22,13 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
 
     func mint(server: String) async throws -> ShedRustCore.MintedToken {
         let resp = try await hostAgent.requestToken(server: server)
-        // A fail-closed reply (error set, or no token) → throw, so the Rust FSM
-        // surfaces it and the client sends no token.
-        if let err = resp.error, !err.isEmpty {
-            throw ShedRustCore.ShedError.Config(message: err)
-        }
-        // Empty server is allowed (serde default); a non-empty mismatch is fail-closed.
-        if !resp.server.isEmpty, resp.server != server {
-            throw ShedRustCore.ShedError.Config(
-                message: "host agent returned token for unexpected server \(resp.server)")
-        }
-        guard let token = resp.token, !token.isEmpty else {
-            throw ShedRustCore.ShedError.Config(message: "host agent returned no token for \(server)")
+        // A fail-closed reply (error set, mismatched server, or no token) → throw,
+        // so the Rust FSM surfaces it and the client sends no token. Shares the one
+        // validator with `ControlTokenProvider.hostAgent` so the two can't diverge.
+        let token: String
+        switch resp.validatedToken(for: server) {
+        case .valid(let t): token = t
+        case .invalid(let m): throw ShedRustCore.ShedError.Config(message: m)
         }
         // Expiry is carried as unix seconds; Swift owns the flexible ISO-8601
         // parsing (the Rust core never parses timestamps).
