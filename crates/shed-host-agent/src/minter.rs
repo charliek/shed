@@ -547,6 +547,17 @@ mod tests {
     }
 
     #[test]
+    fn known_hosts_pinned_accepts_ecdsa() {
+        // Go's x/crypto ParseKnownHosts accepts ecdsa (and rsa/dsa) host keys, so the
+        // Rust presence check must too (shed treats ecdsa as first-class; a host key
+        // other than ed25519 must not fail the pin pre-check). Regression guard against
+        // an ssh-key ed25519-only build, which would `Err("unknown algorithm")` here.
+        const ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOTs3y4oiuC0EFlPcY3mL1v7XtzII37Vtz9qXbbXlglHDWUbdPnfUZ0Z42cpLHYwAQSy8hOqmzOkD5EGrCXKuh4=";
+        let (_d, path) = write_known_hosts(&format!("[mini3]:2222 {ECDSA}\n"));
+        assert!(known_hosts_pinned(&path, "mini3", 2222).is_ok());
+    }
+
+    #[test]
     fn known_hosts_pinned_errors() {
         // Missing file.
         assert!(known_hosts_pinned("/nonexistent/known_hosts", "mini3", 2222).is_err());

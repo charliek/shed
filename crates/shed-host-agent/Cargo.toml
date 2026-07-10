@@ -50,8 +50,15 @@ futures-util = { workspace = true }
 # differential can compare the signature blob directly. ssh-key parses the OpenSSH
 # `~/.ssh/id_ed25519` private key + decodes the SSH public-key wire blob; its
 # ed25519 feature reuses the same ed25519-dalek v2, so cargo unifies one build.
+#
+# The ecdsa/p256/p384/p521/rsa/dsa features give ssh-key's `known_hosts` parser the
+# SAME host-key-algorithm coverage as Go's `x/crypto/ssh.ParseKnownHosts` (used by the
+# minter's `known_hosts` pin pre-check, `minter.rs`). Without them an ed25519-only
+# build would reject a valid ecdsa/rsa/dsa host-key pin line with "unknown algorithm"
+# where Go accepts it — fail-closed but a compat regression. These are RustCrypto
+# crates (no UI/WebKitGTK deps), so they don't cross the crates/ dependency-clean line.
 ed25519-dalek = "2"
-ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std"] }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "ecdsa", "p256", "p384", "p521", "rsa", "dsa", "std"] }
 # base64 StdEncoding for the sign req/resp (public_key / data / blob), matching Go's
 # encoding/base64.StdEncoding.
 base64 = "0.22"

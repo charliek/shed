@@ -36,9 +36,11 @@ const BOOTSTRAP_USER: &str = "_bootstrap";
 
 /// Bounds the whole ssh exchange (Go `DefaultTimeout = 15s`). A field on
 /// [`SystemSshRunner`] (Go makes it a package `var`) so tests can shorten it. The
-/// bound is real even for a cancel-only caller: on expiry the child is killed and its
-/// pipes dropped (the Rust analog of Go's `cmd.WaitDelay`), so a mint can never hang
-/// on a wedged ProxyCommand, a slow agent, or a touch-required key with no one present.
+/// bound is real even for a cancel-only caller: on expiry the read futures + child are
+/// dropped (killing ssh), so a mint can never hang on a wedged ProxyCommand, a slow
+/// agent, or a touch-required key with no one present. (This is the outer bound; Go
+/// additionally uses `cmd.WaitDelay` to force pipes closed ~3s after ssh exits — see
+/// the `kill_on_drop` note in `run`.)
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Caps captured stdout/stderr (Go `maxOutputBytes = 64<<10`) so a misbehaving ssh /
@@ -519,9 +521,13 @@ impl BootstrapRunner for SystemSshRunner {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        // On drop (including on the timeout branch below) the child is killed — the
-        // Rust analog of Go's `cmd.WaitDelay`: a surviving ProxyCommand can't hold the
-        // exchange open past the deadline.
+        // On drop (including the timeout branch below) the direct `ssh` child is killed.
+        // This is NOT a full `cmd.WaitDelay` analog: Go's WaitDelay force-closes the
+        // pipes ~3s after ssh exits so a pipe-holding ProxyCommand *grandchild* can't
+        // block `Wait`, whereas here the outer `timeout` is the only bound on such a
+        // grandchild — the mint returns `Aborted` at the deadline rather than ~3s after
+        // ssh exits. Both are bounded and retryable (no hang, no wire impact); only the
+        // timing/error-class of that rare case differs from Go.
         cmd.kill_on_drop(true);
 
         let mut child = cmd
