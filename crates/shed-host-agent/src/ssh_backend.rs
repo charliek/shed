@@ -44,6 +44,11 @@ pub struct SshSignature {
     pub blob: Vec<u8>,
 }
 
+/// SSH agent signature flags (x/crypto/ssh/agent `SignatureFlagRsaSha256`/`512`) that
+/// select an rsa-sha2 variant. Reserved (bit 0 = 1) is not one of these.
+const SIG_FLAG_RSA_SHA256: u32 = 2;
+const SIG_FLAG_RSA_SHA512: u32 = 4;
+
 /// The host SSH key backend (Go `ssh_backend.go:SSHBackend`). `Send + Sync` so the
 /// bus can hold it as `Arc<dyn SshBackend>` across the async handler.
 pub trait SshBackend: Send + Sync {
@@ -51,10 +56,11 @@ pub trait SshBackend: Send + Sync {
     fn list(&self) -> Result<Vec<SshKeyInfo>, String>;
     /// Sign `data` with the key whose SSH-wire marshaled public key equals
     /// `public_key` (Go's `keysEqual` = `bytes.Equal(a.Marshal(), b.Marshal())`).
-    /// `flags` are ignored for ed25519 (they select rsa-sha2 variants). No matching
-    /// key → `Err("key not found")` (Go's local-keys backend), which the handler maps
-    /// to `{sign operation failed, SIGN_FAILED}` — NOT `KEY_NOT_FOUND` (that code is
-    /// only for an unparsable public key).
+    /// An **rsa-sha2 `flags` bit on an ed25519 key is a sign error** (Go's
+    /// SignWithAlgorithm rejects it) → `Err` → `{sign operation failed, SIGN_FAILED}`;
+    /// other/reserved flags produce a normal ed25519 signature. No matching key →
+    /// `Err("key not found")`, which the handler also maps to `SIGN_FAILED` — NOT
+    /// `KEY_NOT_FOUND` (that code is only for an unparsable public key).
     fn sign(&self, public_key: &[u8], data: &[u8], flags: u32) -> Result<SshSignature, String>;
     /// The backend mode name (`"agent-forward"` or `"local-keys"`).
     fn mode(&self) -> &str;
@@ -134,9 +140,21 @@ impl SshBackend for LocalEd25519Backend {
             .collect())
     }
 
-    fn sign(&self, public_key: &[u8], data: &[u8], _flags: u32) -> Result<SshSignature, String> {
+    fn sign(&self, public_key: &[u8], data: &[u8], flags: u32) -> Result<SshSignature, String> {
         for k in &self.keys {
             if k.marshaled_pub == public_key {
+                // An rsa-sha2 flag on an ed25519 key is a sign ERROR, not a silent
+                // ed25519 signature: Go's local-keys backend maps these flags to
+                // rsa-sha2-256/512 and calls SignWithAlgorithm, which x/crypto/ssh
+                // rejects for an "ssh-ed25519" key ("unsupported signature algorithm")
+                // — so the handler returns SIGN_FAILED + audits result:error (verified
+                // against x/crypto/ssh). Reserved/other non-rsa flags fall through to a
+                // normal ed25519 signature, matching Go's `algorithm == ""` path.
+                if flags & (SIG_FLAG_RSA_SHA256 | SIG_FLAG_RSA_SHA512) != 0 {
+                    return Err(format!(
+                        "unsupported signature algorithm for key format ssh-ed25519 (flags {flags:#x})"
+                    ));
+                }
                 // Deterministic (RFC 8032) — byte-identical to Go's ssh ed25519 signer.
                 let sig = k.signing.sign(data);
                 return Ok(SshSignature {
@@ -236,8 +254,28 @@ mod tests {
         let backend = LocalEd25519Backend::load_from_ssh_dir(&tmp);
         let pub_blob = backend.list().unwrap()[0].blob.clone();
         let a = backend.sign(&pub_blob, CHALLENGE, 0).unwrap();
-        let b = backend.sign(&pub_blob, CHALLENGE, 7).unwrap(); // flags ignored for ed25519
+        // A reserved/non-rsa flag (bit 0) still produces a normal ed25519 signature
+        // (Go's `algorithm == ""` path), identical to flags=0.
+        let b = backend.sign(&pub_blob, CHALLENGE, 1).unwrap();
         assert_eq!(a.blob, b.blob);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rsa_sha2_flags_on_ed25519_are_a_sign_error() {
+        // flags with the rsa-sha2 bits (2 = sha256, 4 = sha512) → Err (the handler maps
+        // it to SIGN_FAILED), matching Go's SignWithAlgorithm rejecting rsa-sha2 for an
+        // ssh-ed25519 key. flags=7 also has bit 0 set (reserved), which does not rescue it.
+        let tmp = std::env::temp_dir().join(format!("shed-ssh-be-{}", uuid::Uuid::new_v4()));
+        write_fixed_key(&tmp);
+        let backend = LocalEd25519Backend::load_from_ssh_dir(&tmp);
+        let pub_blob = backend.list().unwrap()[0].blob.clone();
+        for flags in [2u32, 4, 6, 7] {
+            assert!(
+                backend.sign(&pub_blob, CHALLENGE, flags).is_err(),
+                "flags={flags:#x} must be a sign error on an ed25519 key"
+            );
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

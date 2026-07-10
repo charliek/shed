@@ -942,6 +942,20 @@ fn sign_audit(
     }
 }
 
+/// Standard-base64 decode that first strips `\r`/`\n`, matching Go's
+/// `base64.StdEncoding.DecodeString` (which silently skips CR/LF anywhere in the input,
+/// e.g. line-wrapped base64). The Rust `base64` engine rejects them, so a wrapped
+/// `public_key`/`data` would spuriously fail encoding vs the Go daemon. Only CR/LF are
+/// stripped — Go does NOT skip spaces/tabs, so neither do we.
+fn decode_b64_lenient(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    if s.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r') {
+        let cleaned: String = s.chars().filter(|&c| c != '\n' && c != '\r').collect();
+        base64::engine::general_purpose::STANDARD.decode(cleaned)
+    } else {
+        base64::engine::general_purpose::STANDARD.decode(s)
+    }
+}
+
 /// The gated `sign` flow — a faithful port of `ssh_handler.go:handleSign`. Returns
 /// the response payload (a `SSHSignResponse` on success, else a `SSHErrorResponse`)
 /// plus the audit entry to write (only the gate-deny / backend-error / success paths
@@ -986,7 +1000,7 @@ async fn handle_sign(
     }
 
     // 3. Decode + parse the public key (parse-error paths do NOT audit).
-    let pub_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.public_key) {
+    let pub_bytes = match decode_b64_lenient(&req.public_key) {
         Ok(b) => b,
         Err(_) => {
             return (
@@ -1010,7 +1024,7 @@ async fn handle_sign(
     let key_type = pubkey.algorithm().as_str().to_string();
 
     // 4. Decode the challenge data.
-    let data = match base64::engine::general_purpose::STANDARD.decode(&req.data) {
+    let data = match decode_b64_lenient(&req.data) {
         Ok(d) => d,
         Err(_) => {
             return (
@@ -1261,6 +1275,20 @@ mod tests {
                 server: "mini2".into(),
             }),
         }
+    }
+
+    // ---- base64 leniency (Go parity) ----
+
+    #[test]
+    fn decode_b64_lenient_skips_crlf_like_go() {
+        let raw = base64::engine::general_purpose::STANDARD.encode(b"hello world data");
+        // Wrap with a bare LF and a CRLF (line-wrapped base64) — Go decodes this fine.
+        let wrapped = format!("{}\n{}\r\n{}", &raw[..8], &raw[8..12], &raw[12..]);
+        assert_eq!(decode_b64_lenient(&wrapped).unwrap(), b"hello world data");
+        // The un-wrapped form still decodes.
+        assert_eq!(decode_b64_lenient(&raw).unwrap(), b"hello world data");
+        // A genuinely invalid char (not CR/LF) is still an error (Go doesn't skip it).
+        assert!(decode_b64_lenient("not valid base64 !!!").is_err());
     }
 
     // ---- Envelope shape / new_response ----
