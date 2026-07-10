@@ -47,6 +47,16 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(2);
 /// `publish_audit`, which has no bus/backend caller until slice 1b/1c.)
 #[allow(dead_code)]
 const RING_MAX: usize = 100;
+/// Bounded outbound-writer queue depth. The Go server has NO app-level queue — it
+/// writes each frame synchronously under a write mutex with the 5s deadline, so a
+/// slow reader applies backpressure at the socket. This Rust port hands frames to
+/// a background writer task, so the channel needs an explicit bound to reproduce
+/// that backpressure: a slow/stuck reader can't let queued events/tokens/approvals
+/// grow without limit. Sized comfortably above `RING_MAX` so a legitimate replay
+/// burst (up to `RING_MAX` buffered events pushed back-to-back) never spuriously
+/// overflows; a genuine overflow means the reader has stalled and is treated as a
+/// transport failure (demote + fail-close pending, same path as a write-deadline).
+const WRITER_QUEUE_CAP: usize = 256;
 /// Fallback when the configured approval timeout is non-positive. Matches
 /// `NewDesktopServer`'s guard.
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(25);
@@ -159,8 +169,9 @@ struct Consumer {
     id: u64,
     /// Self-reported client identity from the hello (surfaced in status).
     client: ClientInfo,
-    /// Send onto this to write a frame to the consumer.
-    writer: mpsc::UnboundedSender<Vec<u8>>,
+    /// Send onto this to write a frame to the consumer. Bounded (`WRITER_QUEUE_CAP`)
+    /// so a stalled reader applies backpressure instead of unbounded queue growth.
+    writer: mpsc::Sender<Vec<u8>>,
     /// Fire to signal this connection's read loop to stop (used on supersede).
     close: oneshot::Sender<()>,
 }
@@ -264,7 +275,7 @@ impl DesktopServer {
     ) -> ApprovalOutcome {
         let id = new_id();
         let (tx, rx) = oneshot::channel();
-        let writer = {
+        let (owner, writer) = {
             let mut inner = self.inner.lock().unwrap();
             let Some(consumer) = inner.consumer.as_ref() else {
                 return deny_no_decision(); // no consumer -> fail closed
@@ -273,7 +284,7 @@ impl DesktopServer {
             let writer = consumer.writer.clone();
             // Register BEFORE writing so a fast reply can't race ahead of registration.
             inner.pending.insert(id.clone(), Pending { tx, owner });
-            writer
+            (owner, writer)
         };
 
         let expires_at = rfc3339_utc(now_unix() + self.timeout.as_secs() as i64);
@@ -292,9 +303,13 @@ impl DesktopServer {
             detail,
             &expires_at,
         );
-        if writer.send(with_newline(frame)).is_err() {
-            self.inner.lock().unwrap().pending.remove(&id);
-            return deny_no_decision(); // transport gone
+        if writer.try_send(with_newline(frame)).is_err() {
+            // Transport gone (closed) or the bounded queue is full (a stalled
+            // reader). Either way fail closed AND demote — clearing the consumer and
+            // fail-closing every pending owned by it (including this one), matching
+            // the Go synchronous send that errors on a full/dead socket.
+            self.demote(owner);
+            return deny_no_decision();
         }
 
         let outcome = tokio::select! {
@@ -315,17 +330,26 @@ impl DesktopServer {
     #[allow(dead_code)]
     pub fn publish_audit(&self, entry: &AuditEntryView) {
         let frame = protocol::event(&new_id(), &entry.ts, entry);
-        let consumer_writer = {
+        // Enqueue under the lock (a bounded `try_send` never awaits). On overflow /
+        // closed the reader has stalled — report the owning conn so we can demote it
+        // (fail-closing its pending) outside the lock.
+        let failed_conn = {
             let mut inner = self.inner.lock().unwrap();
             inner.ring.push(frame.clone());
             let overflow = inner.ring.len().saturating_sub(RING_MAX);
             if overflow > 0 {
                 inner.ring.drain(0..overflow);
             }
-            inner.consumer.as_ref().map(|c| c.writer.clone())
+            match inner.consumer.as_ref() {
+                Some(c) => match c.writer.try_send(with_newline(frame)) {
+                    Ok(()) => None,
+                    Err(_) => Some(c.id), // queue full / closed -> stalled reader
+                },
+                None => None,
+            }
         };
-        if let Some(writer) = consumer_writer {
-            let _ = writer.send(with_newline(frame));
+        if let Some(conn_id) = failed_conn {
+            self.demote(conn_id);
         }
     }
 
@@ -379,8 +403,10 @@ impl DesktopServer {
             return; // hello_ack write failed -> never promote
         }
 
-        // The writer task owns the write half from here (5s per-frame deadline).
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // The writer task owns the write half from here (5s per-frame deadline). The
+        // queue is bounded (`WRITER_QUEUE_CAP`) so a stalled reader applies
+        // backpressure instead of unbounded growth (see the const).
+        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE_CAP);
         let mut writer_task = tokio::spawn(writer_loop(write_half, writer_rx));
 
         let (close_tx, mut close_rx) = oneshot::channel::<()>();
@@ -394,6 +420,12 @@ impl DesktopServer {
             tokio::select! {
                 biased;
                 _ = &mut close_rx => break, // superseded by a newer connection
+                // The writer task only exits here on a transport failure (a write
+                // past the 5s deadline or an io error) — during the read loop the
+                // channel still has live senders, so a clean drain-to-empty can't
+                // happen. Break so cleanup demotes and fail-closes in-flight
+                // approvals now (on the write deadline), not after the full timeout.
+                _ = &mut writer_task => break,
                 res = read_frame_capped(&mut reader, &mut line, MAX_FRAME_BYTES) => {
                     if !matches!(res, Ok(true)) {
                         break; // EOF / over-cap / io error -> disconnect
@@ -411,10 +443,12 @@ impl DesktopServer {
                 }
                 Ok(DesktopInbound::TokenGet(req)) => {
                     // Mint in its own task: a bootstrap is a bounded round-trip and
-                    // must not stall this read loop (and thus approvals).
+                    // must not stall this read loop (and thus approvals). The task is
+                    // bound to THIS connection id (not a captured writer) so a token
+                    // minted after a supersede is dropped, never written to the
+                    // superseded connection (Go closes the old conn on promote).
                     let this = Arc::clone(&self);
-                    let writer = writer_tx.clone();
-                    tokio::spawn(async move { this.handle_token_get(&writer, req).await });
+                    tokio::spawn(async move { this.handle_token_get(conn_id, req).await });
                 }
                 Ok(DesktopInbound::Pong) => {} // liveness only
                 Ok(DesktopInbound::Hello(_)) | Ok(DesktopInbound::Unknown { .. }) => {}
@@ -430,12 +464,17 @@ impl DesktopServer {
         ping_task.abort();
         self.demote(conn_id);
         drop(writer_tx);
-        if tokio::time::timeout(
-            CONSUMER_WRITE_TIMEOUT + Duration::from_secs(1),
-            &mut writer_task,
-        )
-        .await
-        .is_err()
+        // If the loop broke because the writer task already exited (transport
+        // failure), it's done — don't re-await the handle (that would panic). Only a
+        // still-running writer (supersede / EOF path) gets the bounded drain window
+        // to flush a queued frame such as the superseded ack.
+        if !writer_task.is_finished()
+            && tokio::time::timeout(
+                CONSUMER_WRITE_TIMEOUT + Duration::from_secs(1),
+                &mut writer_task,
+            )
+            .await
+            .is_err()
         {
             writer_task.abort();
         }
@@ -444,7 +483,13 @@ impl DesktopServer {
     /// Answer a `token.get`: mint a control token for the requested server and reply
     /// with `token.response`. Fail-closed — on any error `error` is set and
     /// `token`/`expires_at` stay empty (never a partial token).
-    async fn handle_token_get(&self, writer: &mpsc::UnboundedSender<Vec<u8>>, req: TokenGetMsg) {
+    ///
+    /// Bound to `conn_id`: minting is an async round-trip, so a newer connection may
+    /// supersede this one before it completes. The reply is delivered ONLY if this
+    /// connection is still the active consumer at send time (checked + enqueued
+    /// atomically under the lock). Otherwise the minted CONTROL token is dropped — it
+    /// must never reach a superseded connection (Go closes the old conn on promote).
+    async fn handle_token_get(&self, conn_id: u64, req: TokenGetMsg) {
         let (token, expires_at, error): (Option<String>, Option<String>, Option<String>) =
             match &self.minter {
                 None => (
@@ -466,14 +511,25 @@ impl DesktopServer {
             expires_at.as_deref(),
             error.as_deref(),
         );
-        let _ = writer.send(with_newline(frame));
+        // Enqueue under the lock so the "still the active consumer?" check and the
+        // send are atomic w.r.t. `promote`'s swap. `try_send` never awaits.
+        let send_result = {
+            let inner = self.inner.lock().unwrap();
+            match inner.consumer.as_ref() {
+                Some(c) if c.id == conn_id => Some(c.writer.try_send(with_newline(frame))),
+                _ => None, // superseded / gone -> never write a token to a stale conn
+            }
+        };
+        if let Some(Err(_)) = send_result {
+            self.demote(conn_id); // queue full / closed -> stalled reader, fail closed
+        }
     }
 
     fn promote(
         &self,
         conn_id: u64,
         client: ClientInfo,
-        writer: mpsc::UnboundedSender<Vec<u8>>,
+        writer: mpsc::Sender<Vec<u8>>,
         close: oneshot::Sender<()>,
     ) {
         let old = {
@@ -503,7 +559,7 @@ impl DesktopServer {
                     false,
                     Some("superseded"),
                 );
-                let _ = old_writer.send(with_newline(ack));
+                let _ = old_writer.try_send(with_newline(ack));
                 let _ = old_close.send(());
             }
         }
@@ -553,7 +609,7 @@ impl DesktopServer {
         }
     }
 
-    fn replay(&self, writer: &mpsc::UnboundedSender<Vec<u8>>, n: i64) {
+    fn replay(&self, writer: &mpsc::Sender<Vec<u8>>, n: i64) {
         if n <= 0 {
             return;
         }
@@ -562,8 +618,11 @@ impl DesktopServer {
             let start = inner.ring.len().saturating_sub(n as usize);
             inner.ring[start..].to_vec()
         };
+        // Best-effort (matches Go's replay, which ignores per-frame send errors). The
+        // burst is bounded by `RING_MAX` < `WRITER_QUEUE_CAP`, so a freshly-promoted
+        // healthy consumer never overflows on replay alone.
         for frame in frames {
-            let _ = writer.send(with_newline(frame));
+            let _ = writer.try_send(with_newline(frame));
         }
     }
 }
@@ -577,18 +636,20 @@ fn decision_from_response(resp: ApprovalResponseMsg) -> DesktopDecision {
     }
 }
 
-async fn writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>) {
     while let Some(bytes) = rx.recv().await {
         match tokio::time::timeout(CONSUMER_WRITE_TIMEOUT, write_half.write_all(&bytes)).await {
             Ok(Ok(())) => {}
             // A write past the deadline or an io error drops the connection (fail
-            // closed): dropping `rx` here closes the channel so later sends fail fast.
+            // closed): returning drops `rx` + the write half (closing the socket), and
+            // the read loop — which watches this task — then demotes and fail-closes
+            // every in-flight approval owned by this connection.
             _ => return,
         }
     }
 }
 
-async fn ping_loop(writer: mpsc::UnboundedSender<Vec<u8>>) {
+async fn ping_loop(writer: mpsc::Sender<Vec<u8>>) {
     let mut ticker = tokio::time::interval(PING_INTERVAL);
     // tokio's interval fires immediately on the first tick; Go's ticker fires only
     // after the period, so consume the first tick to match (first ping at +10s).
@@ -596,8 +657,8 @@ async fn ping_loop(writer: mpsc::UnboundedSender<Vec<u8>>) {
     loop {
         ticker.tick().await;
         let frame = protocol::ping(&new_id(), &now_rfc3339());
-        if writer.send(with_newline(frame)).is_err() {
-            return; // consumer gone
+        if writer.try_send(with_newline(frame)).is_err() {
+            return; // consumer gone or the queue is backed up (writer will time out)
         }
     }
 }
@@ -657,14 +718,18 @@ async fn read_frame_capped(
             }
         };
         reader.consume(take);
-        if found {
-            return Ok(true);
-        }
+        // Check the cap after EVERY extend, including the newline-found branch: a
+        // final chunk that carries the newline can itself push `buf` over the cap, and
+        // a slightly-over-limit frame must still disconnect (matches Go's `Scanner`
+        // token cap), never be accepted just because it happened to end in '\n'.
         if buf.len() > max {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "desktop frame exceeded the size cap",
             ));
+        }
+        if found {
+            return Ok(true);
         }
     }
 }
@@ -1000,5 +1065,196 @@ mod tests {
         let ev2 = app.recv().await;
         assert_eq!(ev2["op"], "sign");
         assert_eq!(ev2["ts"], "T2");
+    }
+
+    // A minter whose `mint_control` parks until the test hands it a permit, so a
+    // supersede can be forced to land WHILE a token is mid-mint.
+    struct GatedMinter {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlTokenMinter for GatedMinter {
+        async fn mint_control(&self, server: &str) -> Result<MintedControlToken, String> {
+            self.gate.acquire().await.unwrap().forget();
+            Ok(MintedControlToken {
+                token: format!("tok-{server}"),
+                expires_at: None,
+            })
+        }
+    }
+
+    fn big_detail() -> String {
+        // Larger than any socket send buffer, so a single `write_all` to a
+        // non-reading peer blocks and (once queued) trips the 5s write deadline.
+        "x".repeat(4 * 1024 * 1024)
+    }
+
+    /// Bug 1: a stuck reader (connected, never reads) must fail an in-flight approval
+    /// on the ~5s write deadline, NOT after the full (here 60s) approval timeout.
+    #[tokio::test]
+    async fn stuck_reader_fails_approval_on_write_deadline() {
+        let h = Harness::start(None, vec![], Duration::from_secs(60));
+        let mut app = TestApp::connect(&h.path).await;
+        app.handshake(0).await; // reads its hello_ack, then stops reading
+        let ready = h.server.clone();
+        assert!(wait_until(move || ready.consumer_info().is_some()).await);
+
+        // Block the writer task on one oversized frame the stuck reader never drains.
+        h.server.publish_audit(&AuditEntryView {
+            ts: "T".into(),
+            ns: "ssh-agent".into(),
+            op: "sign".into(),
+            result: "ok".into(),
+            detail: big_detail(),
+            ..Default::default()
+        });
+
+        let server = h.server.clone();
+        let started = std::time::Instant::now();
+        let outcome = server
+            .request_approval("ssh-agent", "sign", "", "web", "d")
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            !outcome.approved,
+            "stuck writer must fail the approval closed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "approval must fail on the write deadline (~5s), not the full timeout; took {elapsed:?}"
+        );
+        // The dead transport was demoted.
+        let gone = h.server.clone();
+        assert!(wait_until(move || gone.consumer_info().is_none()).await);
+    }
+
+    /// Bug 2: a `token.get` in flight when the connection is superseded must NOT
+    /// deliver the minted control token to the superseded connection; a later active
+    /// consumer still works.
+    #[tokio::test]
+    async fn superseded_token_get_not_delivered_to_old_connection() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let minter = Arc::new(GatedMinter { gate: gate.clone() });
+        let h = Harness::start(Some(minter), vec![], Duration::from_secs(25));
+
+        let mut a1 = TestApp::connect(&h.path).await;
+        a1.handshake(0).await;
+        let ready = h.server.clone();
+        assert!(wait_until(move || ready.consumer_info().is_some()).await);
+        // a1 requests a token; the minter parks (0 permits) so the token task is
+        // stuck mid-mint holding a reference to a1's connection id.
+        a1.send(json!({"type": "token.get", "id": "q1", "server": "mini2"}))
+            .await;
+
+        // a2 supersedes a1.
+        let mut a2 = TestApp::connect(&h.path).await;
+        a2.handshake(0).await;
+        // a1 receives ONLY the superseded ack (its receipt proves the supersede
+        // completed before we release the mint).
+        let ack = a1.recv().await;
+        assert_eq!(ack["type"], "hello_ack");
+        assert_eq!(ack["accepted"], false);
+        assert_eq!(ack["reason"], "superseded");
+
+        // Release a1's mint: it completes AFTER the supersede, sees a2 is now the
+        // active consumer, and drops the token.
+        gate.add_permits(1);
+        // a1 must receive nothing further — its connection is closed (EOF).
+        let mut line = Vec::new();
+        let n = a1.reader.read_until(b'\n', &mut line).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "a superseded connection must never receive a token.response"
+        );
+
+        // a2 (the active consumer) still mints successfully.
+        a2.send(json!({"type": "token.get", "id": "q2", "server": "mini3"}))
+            .await;
+        gate.add_permits(1);
+        let resp = a2.recv().await;
+        assert_eq!(resp["type"], "token.response");
+        assert_eq!(resp["in_reply_to"], "q2");
+        assert_eq!(resp["server"], "mini3");
+        assert_eq!(resp["token"], "tok-mini3");
+    }
+
+    /// Bug 3: overflowing the bounded writer queue (a stalled reader) is a transport
+    /// failure — it demotes the consumer and fail-closes an in-flight approval.
+    #[tokio::test]
+    async fn queue_overflow_demotes_and_fails_pending() {
+        let h = Harness::start(None, vec![], Duration::from_secs(60));
+        let mut app = TestApp::connect(&h.path).await;
+        app.handshake(0).await; // then stops reading
+        let ready = h.server.clone();
+        assert!(wait_until(move || ready.consumer_info().is_some()).await);
+
+        // Block the writer so nothing drains and the queue can actually fill.
+        h.server.publish_audit(&AuditEntryView {
+            ts: "T".into(),
+            ns: "ssh-agent".into(),
+            op: "sign".into(),
+            result: "ok".into(),
+            detail: big_detail(),
+            ..Default::default()
+        });
+
+        // Register an in-flight approval (pending + one queued frame).
+        let server = h.server.clone();
+        let req = tokio::spawn(async move {
+            server
+                .request_approval("ssh-agent", "sign", "", "web", "d")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Flood past the bounded capacity -> overflow -> demote + fail-close. The
+        // flood is synchronous, so overflow demotes within ~ms.
+        for _ in 0..(WRITER_QUEUE_CAP + 50) {
+            h.server.publish_audit(&AuditEntryView {
+                ts: "t".into(),
+                ns: "ssh-agent".into(),
+                op: "sign".into(),
+                result: "ok".into(),
+                ..Default::default()
+            });
+        }
+
+        // The overflow path must fail-close well before the 5s write-deadline
+        // fallback (which would also demote) — a 3s bound proves it was the overflow,
+        // not the deadline. (Pre-fix, `publish_audit` ignored overflow, so only the
+        // 5s deadline path resolved this, blowing the 3s bound.)
+        let outcome = tokio::time::timeout(Duration::from_secs(3), req)
+            .await
+            .expect("overflow must fail the approval before the 5s write deadline")
+            .unwrap();
+        assert!(!outcome.approved);
+        let gone = h.server.clone();
+        assert!(wait_until(move || gone.consumer_info().is_none()).await);
+    }
+
+    /// Bug 4: a frame one byte over `MAX_FRAME_BYTES` that ends in a newline must
+    /// disconnect (the cap is now re-checked in the newline-found branch), never be
+    /// accepted just because it happened to terminate.
+    #[tokio::test]
+    async fn over_cap_newline_frame_disconnects() {
+        let h = Harness::start(None, vec![], Duration::from_secs(25));
+        let mut app = TestApp::connect(&h.path).await;
+        app.handshake(0).await;
+        let ready = h.server.clone();
+        assert!(wait_until(move || ready.consumer_info().is_some()).await);
+
+        // Exactly MAX_FRAME_BYTES data bytes + '\n' -> buf hits MAX_FRAME_BYTES+1 the
+        // moment the newline is consumed. Pre-fix this returned Ok(true) (accepted);
+        // now it errors and the server drops the connection.
+        let mut over = vec![b'x'; MAX_FRAME_BYTES];
+        over.push(b'\n');
+        app.write_half.write_all(&over).await.unwrap();
+
+        let gone = h.server.clone();
+        assert!(
+            wait_until(move || gone.consumer_info().is_none()).await,
+            "an over-cap newline-terminated frame must disconnect the consumer"
+        );
     }
 }
