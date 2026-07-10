@@ -382,7 +382,10 @@ async fn run(mut state: State, mut rx: mpsc::UnboundedReceiver<Command>) {
                 let _ = reply.send(());
             }
             Command::SetPolicyRules { rules, reply } => {
+                // Full-engine replace for test-mode policy.set — do NOT route through
+                // rebuild_policy() (that prepends SSH/AWS/Docker namespace rules).
                 state.engine = PolicyEngine::new(rules);
+                state.reevaluate_pending();
                 let _ = reply.send(());
             }
             Command::ApprovalsList(reply) => {
@@ -486,6 +489,19 @@ impl State {
     }
 
     fn handle_approval_request(&mut self, req: ApprovalRequest) {
+        // Intake fail-closed: past/absent/unparseable expiry must never policy-
+        // auto-approve or queue. (Tick asymmetry via expired_by_tick is unchanged.)
+        if !self.not_expired(&req) {
+            self.respond_and_audit(
+                &req,
+                ApprovalDecision::Deny,
+                DecidedBy::Timeout,
+                "expired",
+                "",
+                "",
+            );
+            return;
+        }
         let decision = self.engine.decide(&req, &self.valid_grants());
         match decision.action {
             PolicyAction::Approve => self.respond_and_audit(
@@ -884,11 +900,12 @@ impl State {
 
     /// Store the server verbatim — `""` (single/unnamed server) is NOT collapsed
     /// to `None`, so a single-server grant never silently widens (F12).
+    /// Retain matches `Some(server)` only — never collapse `None` with `""`.
     fn add_shed_rule(&mut self, server: &str, shed: &str, action: ApprovalDecision) {
         self.extra_rules.retain(|r| {
             !(r.scope == PolicyScope::Shed
                 && r.shed.as_deref() == Some(shed)
-                && r.server.as_deref().unwrap_or("") == server)
+                && r.server.as_deref() == Some(server))
         });
         self.extra_rules.push(PolicyRule {
             scope: PolicyScope::Shed,
@@ -1454,6 +1471,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_policy_rules_reevaluates_pending() {
+        // Test-mode policy.set must reevaluate queued prompts (not only SSH prefs).
+        let h = Harness::new(1_000);
+        h.coord
+            .set_policy_rules(vec![default_rule(PolicyAction::Prompt, PolicyGate::None)])
+            .await;
+        h.inject(ssh_req("r1", "s", 5_000));
+        assert!(h.wait_queued(1).await);
+        h.coord
+            .set_policy_rules(vec![default_rule(PolicyAction::Deny, PolicyGate::None)])
+            .await;
+        assert!(h.wait_calls(1).await);
+        assert_eq!(h.responder.calls()[0].decision, ApprovalDecision::Deny);
+        assert_eq!(h.responder.calls()[0].decided_by, DecidedBy::Policy);
+        assert!(h.coord.approvals_list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn intake_past_expiry_timeout_denies_before_policy_approve() {
+        let h = Harness::new(1_000);
+        h.coord
+            .set_policy_rules(vec![default_rule(PolicyAction::Approve, PolicyGate::None)])
+            .await;
+        h.inject(ssh_req("r1", "s", 900)); // already past clock=1000
+        assert!(h.wait_calls(1).await);
+        let c = &h.responder.calls()[0];
+        assert_eq!(c.decision, ApprovalDecision::Deny);
+        assert_eq!(c.decided_by, DecidedBy::Timeout);
+        assert!(h.coord.approvals_list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_shed_rule_does_not_remove_any_server_rule() {
+        // F12: persist with server "" must not drop a seeded server:None shed rule
+        // (the old unwrap_or("") retain wrongly treated them as the same key).
+        let (clock, clock_handle) = ClockHandle::new(1_000);
+        let responder = Arc::new(FakeResponder::default());
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let deps = CoordinatorDeps {
+            responder: responder.clone(),
+            notifier: Arc::new(FakeNotifier::new()),
+            gate: Arc::new(AlwaysApprovedGate),
+            clock,
+            sink: Arc::new(NoopEventSink),
+            audit: temp_audit(),
+            ssh: SshPrefs {
+                policy: SshApprovalPolicy::AlwaysAsk,
+                ..SshPrefs::default()
+            },
+            extra_rules: vec![PolicyRule {
+                scope: PolicyScope::Shed,
+                server: None,
+                namespace: None,
+                shed: Some("keep".into()),
+                action: PolicyAction::Approve,
+                gate: PolicyGate::None,
+            }],
+            provider_modes: HashMap::new(),
+        };
+        let coord = Coordinator::spawn(deps, event_rx);
+        let h = Harness {
+            coord,
+            events,
+            responder,
+            clock: clock_handle,
+        };
+        // Replace engine with Prompt so we can queue+persist; extra_rules stay until
+        // add_shed_rule → rebuild_policy re-extends them.
+        h.coord
+            .set_policy_rules(vec![default_rule(PolicyAction::Prompt, PolicyGate::None)])
+            .await;
+        h.inject(ssh_req("r1", "keep", 5_000)); // server ""
+        assert!(h.wait_queued(1).await);
+        h.coord
+            .decide_approval(
+                "r1",
+                ApprovalChoice {
+                    decision: ApprovalDecision::Approve,
+                    scope: None,
+                    ttl: None,
+                    persist: true,
+                },
+            )
+            .await;
+        assert!(h.wait_calls(1).await);
+        let rules = h.coord.policy_list().await;
+        assert!(
+            rules.iter().any(|r| r.scope == PolicyScope::Shed
+                && r.shed.as_deref() == Some("keep")
+                && r.server.is_none()
+                && r.action == PolicyAction::Approve),
+            "any-server shed rule must survive add_shed_rule(\"\", …): {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|r| r.scope == PolicyScope::Shed
+                && r.shed.as_deref() == Some("keep")
+                && r.server.as_deref() == Some("")
+                && r.action == PolicyAction::Approve),
+            "unnamed-server shed rule must be present: {rules:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_drops_all_pending() {
         // F3: a disconnect empties the queue; a late decide is a no-op.
         let h = Harness::new(1_000);
@@ -1513,29 +1633,19 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_expires_at_cannot_be_approved() {
-        // Fail-closed: an unparseable expires_at is treated as already-expired, so
-        // a decide sends no approve.
+        // Fail-closed on intake: unparseable expires_at is Timeout-denied immediately
+        // (never queued, never policy-approved).
         let h = Harness::new(1_000);
         h.coord
-            .set_policy_rules(vec![default_rule(PolicyAction::Prompt, PolicyGate::None)])
+            .set_policy_rules(vec![default_rule(PolicyAction::Approve, PolicyGate::None)])
             .await;
         let mut r = ssh_req("r1", "s", 5_000);
         r.expires_at = "garbage".into();
         h.inject(r);
-        assert!(h.wait_queued(1).await);
-        h.coord
-            .decide_approval(
-                "r1",
-                ApprovalChoice {
-                    decision: ApprovalDecision::Approve,
-                    scope: None,
-                    ttl: None,
-                    persist: false,
-                },
-            )
-            .await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(h.responder.calls().is_empty()); // no late approve
+        assert!(h.wait_calls(1).await);
+        assert_eq!(h.responder.calls()[0].decision, ApprovalDecision::Deny);
+        assert_eq!(h.responder.calls()[0].decided_by, DecidedBy::Timeout);
+        assert!(h.coord.approvals_list().await.is_empty());
     }
 
     #[tokio::test]

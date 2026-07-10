@@ -126,6 +126,23 @@ final class HostAgentClientTokenTests: XCTestCase {
             XCTAssertEqual(err, .notConnected)
         }
     }
+
+    func testStopMidReadWakesWithoutDoubleClose() async throws {
+        let path = tempSocketPath()
+        let fake = FakeHostAgent(path: path, mode: .silent)
+        try fake.start()
+        defer { fake.stop() }
+
+        let client = HostAgentClient(socketPath: path)
+        let drain = startDraining(client)
+        defer { drain.cancel() }
+        try await waitConnected(client)
+
+        client.stop()
+        try await Task.sleep(for: .milliseconds(150))
+        client.stop()
+        XCTAssertFalse(client.isConnected)
+    }
 }
 
 /// Minimal in-test UDS server mimicking shed-host-agent's framing: accepts one
@@ -134,7 +151,8 @@ final class HostAgentClientTokenTests: XCTestCase {
 /// LineFrameReader) so the wire path matches the real agent.
 final class FakeHostAgent: @unchecked Sendable {
     enum Mode {
-        case reply(token: String?, expiresAt: String?, error: String?)
+        /// `server` overrides the echoed `token.get` server when non-nil (wrong-server tests).
+        case reply(token: String?, expiresAt: String?, error: String?, server: String? = nil)
         case silent  // read the token.get, never reply (drives the client timeout)
         case dropOnGet  // close the conn on token.get (drives the disconnect path)
     }
@@ -199,10 +217,10 @@ final class FakeHostAgent: @unchecked Sendable {
             case .dropOnGet:
                 Darwin.close(conn)
                 return
-            case .reply(let token, let expiresAt, let error):
+            case .reply(let token, let expiresAt, let error, let serverOverride):
                 var resp: [String: Any] = [
                     "v": hostAgentProtocolVersion, "type": "token.response",
-                    "in_reply_to": id, "server": server,
+                    "in_reply_to": id, "server": serverOverride ?? server,
                 ]
                 if let token { resp["token"] = token }
                 if let expiresAt { resp["expires_at"] = expiresAt }

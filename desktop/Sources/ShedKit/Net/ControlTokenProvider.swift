@@ -98,11 +98,10 @@ extension ControlTokenProvider {
     ) -> ControlTokenProvider {
         ControlTokenProvider(refreshWindow: refreshWindow, now: now) {
             let resp = try await client.requestToken(server: server)
-            if let err = resp.error, !err.isEmpty {
-                throw ControlTokenError.mintFailed(err)
-            }
-            guard let tok = resp.token, !tok.isEmpty else {
-                throw ControlTokenError.mintFailed("host agent returned no token for \(server)")
+            let tok: String
+            switch resp.validatedToken(for: server) {
+            case .valid(let t): tok = t
+            case .invalid(let m): throw ControlTokenError.mintFailed(m)
             }
             return MintedToken(
                 token: tok, expiresAt: resp.expiresAt.flatMap(DateFormatting.parseFlexibleTimestamp))

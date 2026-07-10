@@ -15,9 +15,10 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `RcRunner` portability seam (`rc.rs`, behind the non-default `rc = ["tokio/process"]`
   feature). A bare `cargo test`/`clippy` skips the `rc` module — cover it with
   `-p shed-app --features rc`.
-- **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib"]`) exposing a
-  `ShedCore` object to Swift. Static, so the macOS release signing/notarization path is
-  unaffected.
+- **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
+  exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
+  unchanged); `lib` is required so `cargo run -p shed-core-ffi --bin uniffi-bindgen` works
+  in `desktop/scripts/build-core.sh`.
 - **`shedctl`** — a headless UDS/IPC client on `shed-core` (no GUI-toolkit dep), shipped in the
   Linux `.deb` and drives the Tauri app's socket. In `default-members`.
 

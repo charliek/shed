@@ -252,11 +252,18 @@ impl Client {
         if let Some(tok) = self.bearer().await {
             rb = rb.bearer_auth(tok);
         }
-        let resp = rb
-            .send()
-            .await
-            .map_err(|e| ShedError::Transport(e.to_string()))?;
+        let resp = match tokio::time::timeout(CREATE_IDLE_TIMEOUT, rb.send()).await {
+            Err(_) => {
+                return Err(ShedError::Create("create stream idle timeout".into()));
+            }
+            Ok(r) => r.map_err(|e| ShedError::Transport(e.to_string()))?,
+        };
         let status = resp.status().as_u16();
+        if status == 401 {
+            if let Some(p) = &self.token_provider {
+                p.invalidate().await;
+            }
+        }
         if !(200..300).contains(&status) {
             return Err(ShedError::BadStatus(status));
         }
@@ -769,6 +776,58 @@ mod tests {
         assert_eq!(
             sink.snapshot().error.as_deref(),
             Some("create failed: stream ended before a complete event")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_401_invalidates_provider_without_retry() {
+        // Create is one-shot (no 401 retry), but must still invalidate a stale
+        // cached token so the next attempt remints.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds")
+                    .header("authorization", "Bearer tok-1");
+                t.status(401);
+            })
+            .await;
+        let minter = Arc::new(SeqMinter {
+            calls: AtomicUsize::new(0),
+        });
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+        // Prime the provider cache with tok-1.
+        let _ = c.bearer().await;
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 1);
+
+        let sink = Arc::new(RecordingSink::default());
+        let req = CreateShedRequest {
+            name: "x".into(),
+            ..Default::default()
+        };
+        c.create_shed(&req, sink.as_ref()).await;
+        assert!(
+            sink.snapshot()
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("401") || e.contains("BadStatus") || e.contains("create")),
+            "create should surface the 401: {:?}",
+            sink.snapshot().error
+        );
+        // Still only one mint so far (no create retry); invalidate forces remint next.
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 1);
+        let _ = c.bearer().await;
+        assert_eq!(
+            minter.calls.load(Ordering::SeqCst),
+            2,
+            "401 on create must invalidate so the next bearer remints"
         );
     }
 }

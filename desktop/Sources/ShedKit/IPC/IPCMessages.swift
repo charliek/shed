@@ -18,7 +18,7 @@ public struct IPCRequest: Codable, Sendable {
     public var op: String
     public var params: AnyCodable?
 
-    enum CodingKeys: String, CodingKey { case id, op, params }
+    enum CodingKeys: String, CodingKey, CaseIterable { case id, op, params }
 
     public init(id: Int64, op: String, params: AnyCodable? = nil) {
         self.id = id
@@ -27,19 +27,20 @@ public struct IPCRequest: Codable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        // Reject unknown top-level keys (matches the strict-typed clients
-        // a future cross-language driver would use). Op-specific params get
-        // the same treatment via decodeParams(expected:).
-        let allowed: Set<String> = ["id", "op", "params"]
-        let present = Set(c.allKeys.map(\.stringValue))
+        // CodingKeys.self containers do not surface unknown JSON members — use
+        // an open key type so extras like "extra":true are rejected.
+        let raw = try decoder.container(keyedBy: AnyJSONKey.self)
+        // Derived from CodingKeys so the check can't drift when a field is added.
+        let allowed = Set(CodingKeys.allCases.map(\.stringValue))
+        let present = Set(raw.allKeys.map(\.stringValue))
         let unknown = present.subtracting(allowed)
         if !unknown.isEmpty {
             throw DecodingError.dataCorrupted(.init(
-                codingPath: c.codingPath,
+                codingPath: raw.codingPath,
                 debugDescription: "unknown request fields: \(unknown.sorted().joined(separator: ", "))"
             ))
         }
+        let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try decodeStringInt64(c, .id)
         self.op = try c.decode(String.self, forKey: .op)
         self.params = try c.decodeIfPresent(AnyCodable.self, forKey: .params)
@@ -203,6 +204,16 @@ public struct AnyCodable: Codable, @unchecked Sendable {
                 codingPath: c.codingPath, debugDescription: "Unsupported JSON value"))
         }
     }
+}
+
+/// Open CodingKey so keyed containers report every JSON object member.
+/// `CodingKeys` containers only enumerate declared cases, which silently
+/// drops unknown fields and defeats the IPCRequest unknown-key check.
+struct AnyJSONKey: CodingKey {
+    var stringValue: String
+    init?(stringValue: String) { self.stringValue = stringValue }
+    var intValue: Int? { nil }
+    init?(intValue: Int) { nil }
 }
 
 /// Protocol version on the wire. M0 ships `1`.

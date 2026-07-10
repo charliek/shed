@@ -151,9 +151,9 @@ public enum TerminalLauncher {
         case .custom:
             let template = (customTemplate ?? "").trimmingCharacters(in: .whitespaces)
             guard !template.isEmpty else { return terminalAppInvocation(cmd) }
-            let expanded = template
-                .replacingOccurrences(of: "{cmd}", with: cmd.command)
-                .replacingOccurrences(of: "{shed}", with: shed)
+            // Quote {shed} for /bin/sh -c; leave {cmd} raw — it is a full command line.
+            // One-pass so a literal `{shed}` inside `{cmd}` is not re-scanned.
+            let expanded = Self.expandCustomTemplate(template, cmd: cmd.command, shed: shed)
             return LaunchInvocation(executable: "/bin/sh", arguments: ["-c", expanded])
         default:
             guard let helper = preset.helper, let dir = scriptsDir else {
@@ -180,6 +180,33 @@ public enum TerminalLauncher {
 
     /// Single-quote a shell argument (delegates to the shared `shellQuote`).
     public static func shellQuote(_ s: String) -> String { ShedKit.shellQuote(s) }
+
+    /// One-pass `{cmd}` / `{shed}` expansion. `{cmd}` is raw; `{shed}` is shell-quoted.
+    /// Inserted text is not re-scanned.
+    static func expandCustomTemplate(_ template: String, cmd: String, shed: String) -> String {
+        let quotedShed = shellQuote(shed)
+        var out = ""
+        out.reserveCapacity(template.count + cmd.count + quotedShed.count)
+        var i = template.startIndex
+        while i < template.endIndex {
+            if template[i] == "{" {
+                let rest = template[i...]
+                if rest.hasPrefix("{cmd}") {
+                    out += cmd
+                    i = template.index(i, offsetBy: 5)
+                    continue
+                }
+                if rest.hasPrefix("{shed}") {
+                    out += quotedShed
+                    i = template.index(i, offsetBy: 6)
+                    continue
+                }
+            }
+            out.append(template[i])
+            i = template.index(after: i)
+        }
+        return out
+    }
 
     private static func terminalAppInvocation(_ cmd: TerminalCommand) -> LaunchInvocation {
         let script = """

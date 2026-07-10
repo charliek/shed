@@ -241,9 +241,16 @@ jobs:
         # continuous per-PR guard; `make m0-gates` runs the same checks on a release
         # bundle for the pre-ship size budget. A slower CI runner gets a wider
         # cold-launch budget.
+        #
+        # Size budget is a wider 70 MB here because this measures the *unstripped
+        # debug* bundle, whose size tracks the CI Swift/Xcode toolchain (the same
+        # branch is ~52 MB locally). The shipped artifact is the *release* bundle,
+        # tightly gated at 20 MB by `make m0-gates` — this coarse debug tripwire only
+        # needs to catch an explosion, not shave megabytes.
         run: >
           SHED_DESKTOP_TEST_TIMEOUT_SCALE=4
           SHED_DESKTOP_COLD_LAUNCH_BUDGET_S=30
+          SHED_DESKTOP_SIZE_BUDGET_MB=70
           uv run --group test python tools/shedtest/m0_ship_gates.py
       - name: Real-launch smoke
         # Non-test launch on a fresh runner (undetermined notification auth) —

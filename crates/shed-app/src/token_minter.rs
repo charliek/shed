@@ -55,6 +55,13 @@ fn map_response(resp: TokenResponse, server: &str) -> Result<MintedToken, ShedEr
     if let Some(err) = resp.error.as_deref().filter(|e| !e.is_empty()) {
         return Err(ShedError::Config(err.to_string()));
     }
+    // Empty server is allowed (serde default); a non-empty mismatch is fail-closed.
+    if !resp.server.is_empty() && resp.server != server {
+        return Err(ShedError::Config(format!(
+            "host agent returned token for unexpected server {}",
+            resp.server
+        )));
+    }
     let token = resp
         .token
         .filter(|t| !t.is_empty())
@@ -131,5 +138,19 @@ mod tests {
         let m = map_response(resp(Some("tok"), Some("garbage"), None), "mini2").unwrap();
         assert_eq!(m.token, "tok");
         assert_eq!(m.expires_at_unix, None);
+    }
+
+    #[test]
+    fn wrong_server_is_fail_closed() {
+        let e = map_response(resp(Some("tok"), None, None), "other").unwrap_err();
+        assert!(matches!(e, ShedError::Config(m) if m.contains("unexpected server")));
+    }
+
+    #[test]
+    fn empty_server_in_reply_is_allowed() {
+        let mut r = resp(Some("tok"), None, None);
+        r.server = String::new();
+        let m = map_response(r, "mini2").unwrap();
+        assert_eq!(m.token, "tok");
     }
 }

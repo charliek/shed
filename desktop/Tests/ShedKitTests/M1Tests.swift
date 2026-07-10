@@ -78,7 +78,26 @@ final class TerminalLauncherTests: XCTestCase {
     func testResolveCustomSubstitutesCmdAndShed() {
         let inv = resolve(.custom, template: "echo {shed}: {cmd}", scriptsDir: scriptsDir)
         XCTAssertEqual(inv.executable, "/bin/sh")
+        // Plain shed names stay unquoted; metachar names are shell-quoted.
         XCTAssertEqual(inv.arguments, ["-c", "echo stbot: \(fixtureCmd.command)"])
+    }
+
+    func testResolveCustomShellQuotesShed() {
+        let evil = "x'; echo pwned #"
+        let inv = TerminalLauncher.resolveLaunch(
+            preset: .custom, cmd: fixtureCmd, shed: evil,
+            customTemplate: "kitty -e {cmd} --title {shed}", scriptsDir: scriptsDir)
+        XCTAssertEqual(
+            inv.arguments[1],
+            "kitty -e \(fixtureCmd.command) --title \(TerminalLauncher.shellQuote(evil))")
+    }
+
+    func testResolveCustomOnePassDoesNotRescanCmd() {
+        let cmd = TerminalCommand(argv: ["echo"], command: "echo before-{shed}-after")
+        let inv = TerminalLauncher.resolveLaunch(
+            preset: .custom, cmd: cmd, shed: "my-shed",
+            customTemplate: "{cmd} # {shed}", scriptsDir: scriptsDir)
+        XCTAssertEqual(inv.arguments[1], "echo before-{shed}-after # my-shed")
     }
 
     func testResolveScriptPresetFallsBackToTerminalAppWithoutScriptsDir() {

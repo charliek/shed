@@ -40,6 +40,29 @@ final class HostAgentProtocolTests: XCTestCase {
         XCTAssertNil(r.expiresAt)
     }
 
+    func testTokenResponseDefaultsOmittedServer() throws {
+        let json = #"{"v":2,"type":"token.response","in_reply_to":"r1","token":"t"}"#
+        guard case .tokenResponse(let r) = try HostAgentProtocol.decode(line: Data(json.utf8)) else {
+            return XCTFail("expected .tokenResponse")
+        }
+        XCTAssertEqual(r.inReplyTo, "r1")
+        XCTAssertEqual(r.server, "")
+        XCTAssertEqual(r.token, "t")
+    }
+
+    // MARK: - hello_ack decode
+
+    func testHelloAckDefaultsOmittedFields() throws {
+        let json = #"{"v":2,"type":"hello_ack","id":"1"}"#
+        guard case .helloAck(let ack) = try HostAgentProtocol.decode(line: Data(json.utf8)) else {
+            return XCTFail("expected .helloAck")
+        }
+        XCTAssertEqual(ack.namespaces, [])
+        XCTAssertEqual(ack.gateNamespaces, [])
+        XCTAssertEqual(ack.requestTimeoutMs, 0)
+        XCTAssertFalse(ack.accepted)
+    }
+
     func testUnknownFrameStillDecodes() throws {
         // Forward-compat: an unrecognized type is surfaced, not thrown.
         let json = #"{"v":2,"type":"some.future.frame","id":"x"}"#

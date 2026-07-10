@@ -309,9 +309,10 @@ impl RcService {
             let _guard = self.op_guard.lock().await;
             // The (host, shed) pairs we're refreshing — used to reconcile without
             // clobbering sessions on sheds we didn't probe.
+            // Use target.server_name (same key as launch/kill), not shed_item.host.
             let probed: HashSet<(String, String)> = targets
                 .iter()
-                .map(|(s, _)| (s.host.clone(), s.name.clone()))
+                .map(|(s, target)| (target.server_name.clone(), s.name.clone()))
                 .collect();
             let bin = binary_name();
             let probes = targets.into_iter().map(|(shed_item, target)| {
@@ -323,7 +324,9 @@ impl RcService {
                         Ok(out) if out.exit_code == 0 => rc::decode_list(&out.stdout)
                             .unwrap_or_default()
                             .into_iter()
-                            .map(|dto| RcSession::from_dto(dto, &shed_item.host, &shed_item.name))
+                            .map(|dto| {
+                                RcSession::from_dto(dto, &target.server_name, &shed_item.name)
+                            })
                             .collect::<Vec<_>>(),
                         // A per-shed failure (transport, missing binary, bad DTO)
                         // yields none — best-effort, mirroring the Swift `listReal`.
