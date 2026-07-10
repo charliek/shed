@@ -15,10 +15,21 @@
 
 mod approval;
 mod audit;
+// The SSH-bootstrap minter (bootstrap exchange + credential source) and the
+// control-token provider. This slice's only consumer is `token.get` on surface A, so
+// they are gated with it; the supervisor slice ungates them for the always-on
+// credentials-scope bus token provider. (Keeps the `--no-default-features` headless
+// build free of dead-code the minter would otherwise be.)
+#[cfg(feature = "desktop-forwarding")]
+mod bootstrap;
 mod bus;
 mod config;
 #[cfg(feature = "desktop-forwarding")]
+mod controltoken;
+#[cfg(feature = "desktop-forwarding")]
 mod desktop;
+#[cfg(feature = "desktop-forwarding")]
+mod minter;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop_protocol;
 mod sockets;
@@ -235,15 +246,25 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
     // The desktop approval channel (feature-gated). Bind its socket + build the
     // server here so the status snapshot can report its live consumer info. The
-    // real control-token minter is a later slice — a stub keeps `token.get`
-    // answerable end-to-end for now.
+    // control-token minter answers `token.get`: it mints CONTROL-scoped tokens over a
+    // server's SSH `_bootstrap` channel (via the system ssh client), resolving servers
+    // from the shed CLI config. The known_hosts pin is `~/.shed/known_hosts` (the same
+    // trust `shed server add` wrote); the SSH identity is resolved by ssh, so no key
+    // file is read here. Mirrors `main.go:136-148`.
     #[cfg(feature = "desktop-forwarding")]
     let (desktop_server, desktop_listener, desktop_path) = {
+        let minter: Arc<dyn minter::Minter> =
+            Arc::new(minter::CredentialMinter::new("~/.shed/known_hosts"));
+        // token.get resolves servers from the shed CLI config. In single-server mode Go
+        // uses DefaultDiscoverySource; the discovery-source override (discovery mode)
+        // lands with the discovery slice (this reader doesn't parse `discovery.source`).
+        let control_source = controltoken::DEFAULT_DISCOVERY_SOURCE;
+        let control_minter = Arc::new(controltoken::ControlTokenProvider::new(minter, control_source));
         let server = desktop::DesktopServer::new(
             version.clone(),
             cfg.gate_namespaces(),
             cfg.approval_timeout(),
-            Some(Arc::new(desktop::StubControlMinter)),
+            Some(control_minter),
         );
         let path = sockets::desktop_socket_path();
         let listener = bind_unix_socket("desktop", &path, &mut log);

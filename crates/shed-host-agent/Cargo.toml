@@ -27,8 +27,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # net (UnixListener/UnixStream) + io-util (AsyncWriteExt/BufReader) + sync
-# (mpsc/oneshot/watch) + signal (SIGTERM/SIGINT) on top of rt-multi-thread/macros/time.
-tokio = { workspace = true, features = ["net", "io-util", "sync", "signal", "rt-multi-thread", "macros", "time"] }
+# (mpsc/oneshot/watch) + signal (SIGTERM/SIGINT) + process (the SSH-bootstrap minter shells
+# `ssh` via tokio::process::Command) on top of rt-multi-thread/macros/time.
+tokio = { workspace = true, features = ["net", "io-util", "sync", "signal", "process", "rt-multi-thread", "macros", "time"] }
 # getpid() for the LiveStatus `pid` field (matches the Go daemon's os.Getpid()).
 libc = "0.2"
 # The shared client core: reused by the bus for the SSE parser (sse.rs) + the

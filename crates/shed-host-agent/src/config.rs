@@ -256,7 +256,7 @@ impl HostAgentConfig {
 /// host-agent config's relevant subset contains: nested maps and scalar leaves.
 /// Inline `{}` is an empty map; comments (`#`) and blank lines are skipped. A port
 /// of shed-core's `yaml_lite` (with a `get_path` map-walk helper added).
-mod yaml_lite {
+pub(crate) mod yaml_lite {
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +270,18 @@ mod yaml_lite {
             match self {
                 Node::Scalar(s) => Some(s),
                 Node::Map(_) => None,
+            }
+        }
+
+        /// The underlying map when this node is a `Map` (used by
+        /// `load_discovered_servers` to iterate the `servers` submap). `allow(dead_code)`
+        /// because its only caller (`controltoken.rs`) is feature-gated AND the golden
+        /// integration test compiles this module standalone via `#[path]`.
+        #[allow(dead_code)]
+        pub fn as_map(&self) -> Option<&HashMap<String, Node>> {
+            match self {
+                Node::Map(m) => Some(m),
+                Node::Scalar(_) => None,
             }
         }
 

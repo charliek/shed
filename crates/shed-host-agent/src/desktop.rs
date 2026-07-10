@@ -72,6 +72,7 @@ const NAMESPACE_EGRESS: &str = "egress";
 
 /// A minted control-scoped token: the token plus an optional RFC3339 expiry
 /// (`None` = non-expiring / unknown, which omits `expires_at` in the reply).
+#[derive(Debug)]
 pub struct MintedControlToken {
     pub token: String,
     pub expires_at: Option<String>,
@@ -86,10 +87,13 @@ pub trait ControlTokenMinter: Send + Sync {
     async fn mint_control(&self, server: &str) -> Result<MintedControlToken, String>;
 }
 
-/// A stand-in minter that returns a canned token — lets the daemon answer
-/// `token.get` end-to-end before the real minter lands. NOT for production use.
+/// A stand-in minter that returns a canned token — used only by this module's tests to
+/// drive `token.get` without the real SSH-bootstrap minter. Production wires the real
+/// `controltoken::ControlTokenProvider` (`main.rs`).
+#[cfg(test)]
 pub struct StubControlMinter;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl ControlTokenMinter for StubControlMinter {
     async fn mint_control(&self, _server: &str) -> Result<MintedControlToken, String> {
