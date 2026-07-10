@@ -114,10 +114,11 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		return Session{}, fmt.Errorf("%w: %v", ErrBadArgs, err)
 	}
 
-	// Best-effort trust pre-seed for claude kinds (the accept-trust fallback covers
-	// any failure, so a preseed error never fails the create).
-	if IsClaudeKind(opts.Kind) {
-		_ = PreseedClaudeConfig(workdir, env)
+	// Best-effort trust/onboarding pre-seed for tools that need one (claude; the
+	// accept-trust fallback covers any failure, so a preseed error never fails the
+	// create). Dispatched through the agent registry — nil Preseed = no-op.
+	if spec, ok := specForKind(opts.Kind); ok && spec.Preseed != nil {
+		_ = spec.Preseed(workdir, env)
 	}
 
 	inner := InnerCommand(opts.Kind, displayName, opts.PermissionMode, opts.InteractiveShell)

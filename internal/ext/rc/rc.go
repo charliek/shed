@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -35,14 +36,22 @@ const (
 // fallback, which is KindClaudeBroker).
 const DefaultKind = KindClaudeRC
 
+// allKinds is every recognized v2 kind. It is the single source of truth shared
+// by IsValidKind and the agent registry (agents_test.go asserts the registry
+// covers exactly this set) — add new kinds here and in a spec's Kinds together.
+var allKinds = []Kind{KindClaudeBroker, KindClaudeRC, KindShell}
+
 // IsValidKind reports whether k is a recognized v2 kind.
 func IsValidKind(k Kind) bool {
-	return k == KindClaudeBroker || k == KindClaudeRC || k == KindShell
+	return slices.Contains(allKinds, k)
 }
 
 // IsClaudeKind reports whether the kind runs claude (and so gates on workspace
-// trust). Everything except shell.
-func IsClaudeKind(k Kind) bool { return k != KindShell }
+// trust): true iff the kind's spec is the claude tool.
+func IsClaudeKind(k Kind) bool {
+	spec, ok := specForKind(k)
+	return ok && spec.Tool == toolClaude
+}
 
 // AcceptsTypedInput reports whether the kind's pane accepts a typed kickoff line
 // (claude-rc → a prompt, shell → a command). claude-broker's input is the remote
@@ -177,24 +186,16 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// validPermissionModes is claude's `--permission-mode` value set. An empty mode
-// means "don't pass the flag" (claude's own default — preserves the pre-flag
-// behavior for callers that don't request a posture).
-var validPermissionModes = map[string]bool{
-	"default":           true,
-	"acceptEdits":       true,
-	"plan":              true,
-	"auto":              true,
-	"dontAsk":           true,
-	"bypassPermissions": true,
-}
-
 // PermissionModeBypass is claude's full-bypass mode (the `--skip` shorthand). Its
 // session shows a one-time acceptance dialog that the create poller auto-confirms.
 const PermissionModeBypass = "bypassPermissions"
 
 // ValidPermissionMode reports whether m is a claude `--permission-mode` value.
-func ValidPermissionMode(m string) bool { return validPermissionModes[m] }
+// Permission modes are claude-only, so this resolves through the claude spec.
+func ValidPermissionMode(m string) bool {
+	spec, ok := specForKind(KindClaudeRC)
+	return ok && spec.validMode(m)
+}
 
 // InnerCommand builds the command the tmux session runs for a kind. interactiveShell
 // wraps the claude kinds in `bash -ic` so a login rc-file loads PATH (nvm/asdf)
@@ -208,57 +209,21 @@ func ValidPermissionMode(m string) bool { return validPermissionModes[m] }
 // verified form that carries the posture into the live session and still yields a
 // `session_*` URL (so the pane classifier treats it identically). With no mode,
 // claude-rc keeps the original `/rc` form for backward compatibility.
+//
+// An unregistered kind falls back to `bash -l`.
 func InnerCommand(kind Kind, displayName, permissionMode string, interactiveShell bool) string {
-	var cmd string
-	switch kind {
-	case KindClaudeBroker:
-		cmd = "claude remote-control --name " + shellQuote(displayName)
-		if permissionMode != "" {
-			cmd += " --permission-mode " + permissionMode
-		}
-		cmd += " --spawn same-dir"
-	case KindClaudeRC:
-		if permissionMode != "" {
-			cmd = "claude --remote-control --name " + shellQuote(displayName) +
-				" --permission-mode " + permissionMode
-		} else {
-			cmd = "claude --name " + shellQuote(displayName) + " /rc"
-		}
-	case KindShell:
-		return "bash -l"
-	default:
+	spec, ok := specForKind(kind)
+	if !ok {
 		return "bash -l"
 	}
-	if interactiveShell {
-		return "bash -ic " + shellQuote(cmd)
-	}
-	return cmd
+	return spec.InnerCommand(kind, displayName, permissionMode, interactiveShell)
 }
 
 var (
-	brokerURLRe = regexp.MustCompile(`https?://claude\.ai/code\?environment=env_[A-Za-z0-9_-]+`)
-	replURLRe   = regexp.MustCompile(`https?://claude\.ai/code/session_[A-Za-z0-9_-]+`)
-
-	notTrustedRe   = regexp.MustCompile(`(?i)Workspace not trusted`)
-	safetyCheckRe  = regexp.MustCompile(`(?i)Quick safety check`)
-	trustFolderRe  = regexp.MustCompile(`(?i)Yes,\s*I trust this folder`)
-	needsAuthRe    = regexp.MustCompile(`(?i)requires a claude\.ai subscription|not logged in|claude auth login`)
-	reconnectingRe = regexp.MustCompile(`\bReconnecting\b`)
-	connectedRe    = regexp.MustCompile(`\bConnected\b`)
-	rcConnectingRe = regexp.MustCompile(`(?i)Remote Control connecting`)
-	rcActiveRe     = regexp.MustCompile(`(?i)Remote Control active`)
+	notTrustedRe  = regexp.MustCompile(`(?i)Workspace not trusted`)
+	safetyCheckRe = regexp.MustCompile(`(?i)Quick safety check`)
+	trustFolderRe = regexp.MustCompile(`(?i)Yes,\s*I trust this folder`)
 )
-
-func extractURL(kind Kind, pane string) string {
-	switch kind {
-	case KindClaudeBroker:
-		return brokerURLRe.FindString(pane)
-	case KindClaudeRC:
-		return replURLRe.FindString(pane)
-	default:
-		return ""
-	}
-}
 
 // IsTrustPrompt reports whether the pane is showing claude's first-run
 // workspace-trust prompt (used by accept-trust to verify before sending Enter).
@@ -281,48 +246,17 @@ func IsBypassAcceptPrompt(pane string) bool {
 }
 
 // ClassifyPane derives (state, url) from a captured pane for a kind. Mirrors
-// shed-remote-agent's classifyPane.
+// shed-remote-agent's classifyPane. An unregistered kind classifies as a plain
+// shell pane (never reached for a valid kind; matches the pre-registry
+// fall-through).
 func ClassifyPane(kind Kind, pane string) (State, string) {
-	if kind != KindShell {
-		if IsTrustPrompt(pane) {
-			return StateNeedsTrust, extractURL(kind, pane)
-		}
-		if needsAuthRe.MatchString(pane) {
-			return StateNeedsAuth, extractURL(kind, pane)
-		}
+	spec, ok := specForKind(kind)
+	if !ok {
+		r := classifyShell(kind, pane)
+		return r.State, r.URL
 	}
-
-	switch kind {
-	case KindClaudeBroker:
-		url := extractURL(KindClaudeBroker, pane)
-		if reconnectingRe.MatchString(pane) {
-			return StateReconnecting, url
-		}
-		if connectedRe.MatchString(pane) && url != "" {
-			return StateReady, url
-		}
-		if url != "" {
-			return StateReady, url
-		}
-		return StateStarting, ""
-	case KindClaudeRC:
-		url := extractURL(KindClaudeRC, pane)
-		if rcConnectingRe.MatchString(pane) && url == "" {
-			return StateStarting, ""
-		}
-		if rcActiveRe.MatchString(pane) && url != "" {
-			return StateReady, url
-		}
-		if url != "" {
-			return StateReady, url
-		}
-		return StateStarting, ""
-	default: // shell
-		if strings.TrimSpace(pane) != "" {
-			return StateReady, ""
-		}
-		return StateStarting, ""
-	}
+	r := spec.Classify(kind, pane)
+	return r.State, r.URL
 }
 
 var canonicalIntRe = regexp.MustCompile(`^\d+$`)
