@@ -56,6 +56,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HELD_RESET: Duration = Duration::from_secs(60);
 /// Envelope channel buffer (`hostclient.go:Subscribe` uses `make(chan, 32)`).
 const ENVELOPE_CHANNEL_CAP: usize = 32;
+/// Max bytes buffered for a single SSE event before the bus tears the connection
+/// down and reconnects (surfaced as a transport read error). Mirrors Go's
+/// `bufio.Scanner` 1 MiB cap (`hostclient.go:streamMessages`) so a hostile /
+/// never-terminating `data:` event can't grow memory unbounded.
+const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
+/// Max bytes read from a non-2xx response body before giving up. Mirrors Go's
+/// `io.LimitReader(resp.Body, 1024)` — a huge error body can't blow up memory or
+/// stall teardown.
+const MAX_ERROR_BODY_BYTES: usize = 1024;
 
 /// `MessageType` values (`envelope.go`). The namespace HTTP API routes on these.
 /// `REQUEST`/`EVENT` are part of the wire vocabulary but not yet emitted by this
@@ -505,8 +514,9 @@ impl BusClient {
 
         let st = resp.status().as_u16();
         if st != 200 {
-            let body = resp.text().await.unwrap_or_default();
-            let body = body.trim().to_string();
+            // Bounded + shutdown-raced error-body read (Go's io.LimitReader 1024):
+            // a hostile/huge non-200 body can't blow up memory or block teardown.
+            let body = read_error_body(resp, &shutdown).await;
             return match st {
                 409 => StreamEnd::Conflict(format!(
                     "namespace already has an active subscriber: {body}"
@@ -523,7 +533,9 @@ impl BusClient {
             .info(&format!("SSE connected namespace={namespace}"));
 
         let mut stream = resp.bytes_stream();
-        let mut parser = SseParser::new();
+        // Cap a single SSE event at 1 MiB (Go's bufio.Scanner cap): an oversized /
+        // never-terminating event surfaces as a read error → disconnect + reconnect.
+        let mut parser = SseParser::new().with_max_event_bytes(MAX_SSE_EVENT_BYTES);
         loop {
             let chunk = tokio::select! {
                 _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
@@ -533,10 +545,21 @@ impl BusClient {
                 None => return StreamEnd::ClosedByServer("stream closed by server".into()),
                 Some(Err(e)) => return StreamEnd::Transport(format!("reading stream: {e}")),
                 Some(Ok(bytes)) => {
-                    for ev in parser.feed(&bytes) {
+                    let events = match parser.try_feed(&bytes) {
+                        Ok(events) => events,
+                        // Over the 1 MiB cap → treat as a read error and reconnect.
+                        Err(e) => return StreamEnd::Transport(format!("reading stream: {e}")),
+                    };
+                    for ev in events {
                         match serde_json::from_str::<Envelope>(&ev.data) {
                             Ok(env) => {
-                                if tx.send(env).await.is_err() {
+                                // Race the channel send against shutdown so a slow /
+                                // stalled consumer (full channel) can't pin teardown.
+                                let sent = tokio::select! {
+                                    _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
+                                    r = tx.send(env) => r,
+                                };
+                                if sent.is_err() {
                                     // The consumer dropped the receiver (shutdown).
                                     return StreamEnd::Shutdown;
                                 }
@@ -552,7 +575,17 @@ impl BusClient {
     /// POST a response envelope back to shed-server for routing to the originating
     /// shed. On a provider-backed 401, invalidate + retry once (at-most-once,
     /// mirroring `hostclient.go:Respond`). Expects 204.
-    pub async fn respond(&self, namespace: &str, env: &Envelope) -> Result<(), BusError> {
+    ///
+    /// `shutdown` is threaded through every network await (mirroring Go's `ctx`): a
+    /// server that accepted the POST but never replies (or a huge error body) can't
+    /// pin the daemon — the send + body-read race the shutdown signal and abort
+    /// promptly when it fires.
+    pub async fn respond(
+        &self,
+        namespace: &str,
+        env: &Envelope,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<(), BusError> {
         let url = format!(
             "{}/api/plugins/listeners/{}/respond",
             self.server_url, namespace
@@ -560,25 +593,31 @@ impl BusClient {
         let body = serde_json::to_vec(env)
             .map_err(|e| BusError::Transport(format!("marshaling response: {e}")))?;
 
-        let mut resp = self.send_respond(&url, &body).await?;
+        let mut resp = self.send_respond(&url, &body, shutdown).await?;
         // A credentials token can expire mid-session: on a provider-backed 401,
         // invalidate + retry once (at-most-once, mirroring hostclient.go:Respond).
         if resp.status().as_u16() == 401 {
             if let Some(p) = &self.token_provider {
                 p.invalidate();
-                resp = self.send_respond(&url, &body).await?;
+                resp = self.send_respond(&url, &body, shutdown).await?;
             }
         }
 
         let st = resp.status().as_u16();
         if st != 204 {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(BusError::BadStatus(st, body.trim().to_string()));
+            // Bounded + shutdown-raced (Go's io.LimitReader 1024).
+            let body = read_error_body(resp, shutdown).await;
+            return Err(BusError::BadStatus(st, body));
         }
         Ok(())
     }
 
-    async fn send_respond(&self, url: &str, body: &[u8]) -> Result<reqwest::Response, BusError> {
+    async fn send_respond(
+        &self,
+        url: &str,
+        body: &[u8],
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<reqwest::Response, BusError> {
         let mut req = self
             .http
             .post(url)
@@ -587,9 +626,16 @@ impl BusClient {
         if let Some(tok) = self.bearer().await {
             req = req.bearer_auth(tok);
         }
-        req.send()
-            .await
-            .map_err(|e| BusError::Transport(format!("sending response: {e}")))
+        // Race the POST against shutdown: a server that accepts the connection and
+        // never replies must not block the daemon's teardown.
+        tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => {
+                Err(BusError::Transport("sending response: shutting down".into()))
+            }
+            r = req.send() => {
+                r.map_err(|e| BusError::Transport(format!("sending response: {e}")))
+            }
+        }
     }
 
     /// The bearer token to send, or `None`. A provider takes precedence (and on a
@@ -649,6 +695,32 @@ impl Drop for Subscription {
 /// `changed()`, which only fires on a fresh change).
 async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|flagged| *flagged).await;
+}
+
+/// Read at most [`MAX_ERROR_BODY_BYTES`] of a (non-2xx) response body, racing each
+/// read against shutdown. Mirrors Go's `io.LimitReader(resp.Body, 1024)`: a hostile
+/// / huge error body can't grow memory unbounded, and a stalled body read can't pin
+/// the daemon's teardown. Returns the (trimmed, lossy-decoded) prefix; on a read
+/// error or shutdown it returns whatever was read so far.
+async fn read_error_body(mut resp: reqwest::Response, shutdown: &watch::Receiver<bool>) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => break,
+            c = resp.chunk() => c,
+        };
+        match chunk {
+            Ok(Some(bytes)) => {
+                let take = (MAX_ERROR_BODY_BYTES - buf.len()).min(bytes.len());
+                buf.extend_from_slice(&bytes[..take]);
+                if buf.len() >= MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
 /// Build the reqwest client. Fail-closed on a plaintext redirect (mirrors Swift's
@@ -723,10 +795,19 @@ pub async fn run_single_server_bus(
 
     // Subscribe + run the ping responder. On shutdown (or a terminal 409) the
     // subscribe loop drops its sender, closing `rx` and ending this loop; the
-    // subscription's Drop then aborts the (already-finished) task.
-    let mut sub = client.subscribe(NS_SSH_AGENT, shutdown);
-    while let Some(env) = sub.rx.recv().await {
-        handle_bus_message(&client, NS_SSH_AGENT, &env).await;
+    // subscription's Drop then aborts the (already-finished) task. The recv is also
+    // raced against shutdown, and `shutdown` is threaded into `handle_bus_message`
+    // so a `respond` to a hung server can't pin this loop past a SIGTERM/SIGINT.
+    let mut sub = client.subscribe(NS_SSH_AGENT, shutdown.clone());
+    loop {
+        let env = tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => break,
+            e = sub.rx.recv() => match e {
+                Some(env) => env,
+                None => break, // sender dropped: shutdown or terminal 409
+            },
+        };
+        handle_bus_message(&client, NS_SSH_AGENT, &env, &shutdown).await;
     }
     let s = sub.status();
     log.info(&format!(
@@ -740,7 +821,12 @@ pub async fn run_single_server_bus(
 ///
 /// TODO(later slice): the real `list`/`sign`/`status` (and aws/docker) backends
 /// replace the error path here — this is the seam.
-async fn handle_bus_message(client: &BusClient, namespace: &str, env: &Envelope) {
+async fn handle_bus_message(
+    client: &BusClient,
+    namespace: &str,
+    env: &Envelope,
+    shutdown: &watch::Receiver<bool>,
+) {
     // Pick the response payload by operation; the reply plumbing (mint response,
     // echo `shed`, POST, warn-on-failure) is shared. `what` only labels the log.
     let (payload, what) = match env.operation() {
@@ -758,7 +844,8 @@ async fn handle_bus_message(client: &BusClient, namespace: &str, env: &Envelope)
     };
     let mut resp = Envelope::new_response(&env.id, namespace, payload);
     resp.shed = env.shed.clone(); // route the reply back (ssh_handler.go: resp.Shed = req.Shed)
-    if let Err(e) = client.respond(namespace, &resp).await {
+                                  // `shutdown` is threaded through so the POST races teardown (see `respond`).
+    if let Err(e) = client.respond(namespace, &resp, shutdown).await {
         client.log.warn(&format!("failed to send {what}: {e}"));
     }
 }
@@ -846,6 +933,16 @@ mod tests {
 
     fn shutdown_pair() -> (watch::Sender<bool>, watch::Receiver<bool>) {
         watch::channel(false)
+    }
+
+    /// A shutdown receiver that never fires. The sender is intentionally leaked so
+    /// `wait_for` blocks forever (a dropped sender would resolve it immediately,
+    /// making the network await abort as if shutdown had fired). For tests whose
+    /// respond/handle path must actually reach the mock server.
+    fn never_shutdown() -> watch::Receiver<bool> {
+        let (tx, rx) = watch::channel(false);
+        let _ = Box::leak(Box::new(tx));
+        rx
     }
 
     // ---- Envelope shape / new_response ----
@@ -1035,7 +1132,7 @@ mod tests {
             .await;
         let env = Envelope::new_response("req-1", "ssh-agent", serde_json::json!({"status":"ok"}));
         open_client(&server.base_url())
-            .respond("ssh-agent", &env)
+            .respond("ssh-agent", &env, &never_shutdown())
             .await
             .unwrap();
         m.assert_async().await;
@@ -1052,7 +1149,7 @@ mod tests {
             .await;
         let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
         let err = open_client(&server.base_url())
-            .respond("ns", &env)
+            .respond("ns", &env, &never_shutdown())
             .await
             .unwrap_err();
         assert!(matches!(err, BusError::BadStatus(400, _)));
@@ -1080,7 +1177,7 @@ mod tests {
             .await;
         let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
         open_client(&server.base_url())
-            .respond("ns", &env)
+            .respond("ns", &env, &never_shutdown())
             .await
             .unwrap();
         m.assert_async().await;
@@ -1117,7 +1214,7 @@ mod tests {
         )
         .unwrap();
         let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
-        client.respond("ns", &env).await.unwrap();
+        client.respond("ns", &env, &never_shutdown()).await.unwrap();
         assert_eq!(tp.invalidated(), 1, "exactly one invalidate on the 401");
         ok.assert_async().await;
     }
@@ -1141,7 +1238,10 @@ mod tests {
         )
         .unwrap();
         let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
-        let err = client.respond("ns", &env).await.unwrap_err();
+        let err = client
+            .respond("ns", &env, &never_shutdown())
+            .await
+            .unwrap_err();
         assert!(matches!(err, BusError::BadStatus(401, _)));
         assert_eq!(
             tp.invalidated(),
@@ -1149,6 +1249,42 @@ mod tests {
             "at-most-once retry → exactly one invalidate"
         );
         m.assert_hits_async(2).await; // initial + one retry
+    }
+
+    /// Bug 1 regression: a server that accepts the POST but never replies must not
+    /// pin the daemon — when the shutdown signal fires, `respond` aborts promptly
+    /// (mirrors Go threading `ctx` through Respond).
+    #[tokio::test]
+    async fn respond_aborts_promptly_on_shutdown_against_hung_server() {
+        // An in-process TCP server that accepts every connection and holds it open,
+        // never sending an HTTP response → `req.send()` stays pending forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // hold open, never respond
+            }
+        });
+
+        let client = open_client(&format!("http://{addr}"));
+        let (tx, rx) = shutdown_pair();
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        let respond = tokio::spawn(async move { client.respond("ns", &env, &rx).await });
+
+        // Let the POST connect + block on the (absent) response, then signal shutdown.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(true);
+
+        // Without the shutdown-race this would hang until the 2s timeout trips.
+        let result = tokio::time::timeout(Duration::from_secs(2), respond)
+            .await
+            .expect("respond did not abort on shutdown — it hung")
+            .unwrap();
+        assert!(
+            matches!(result, Err(BusError::Transport(_))),
+            "respond against a hung server must abort with a transport error on shutdown, got {result:?}"
+        );
     }
 
     // ---- subscribe (mirrors hostclient_test.go) ----
@@ -1381,7 +1517,7 @@ mod tests {
                 server: "mini2".into(),
             }),
         };
-        handle_bus_message(&client, "ssh-agent", &req).await;
+        handle_bus_message(&client, "ssh-agent", &req, &never_shutdown()).await;
         respond.assert_async().await;
     }
 
@@ -1415,7 +1551,7 @@ mod tests {
             payload: serde_json::json!({"operation":"sign","public_key":"x"}),
             shed: None,
         };
-        handle_bus_message(&client, "ssh-agent", &req).await;
+        handle_bus_message(&client, "ssh-agent", &req, &never_shutdown()).await;
         respond.assert_async().await;
     }
 

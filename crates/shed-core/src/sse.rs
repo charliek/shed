@@ -19,11 +19,34 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// The bytes buffered for a single SSE event exceeded the configured cap
+/// ([`SseParser::with_max_event_bytes`]). A caller that opted into a cap treats
+/// this as a read error — disconnect + reconnect — mirroring Go's `bufio.Scanner`
+/// token-too-long, which surfaces as a stream read error rather than growing memory
+/// unboundedly for a hostile / never-terminating `data:` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SseOverflow {
+    /// The cap that was exceeded, in bytes.
+    pub limit: usize,
+}
+
+impl std::fmt::Display for SseOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SSE event exceeded {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for SseOverflow {}
+
 #[derive(Default)]
 pub struct SseParser {
     event: String,
     data: String,
     line_buf: Vec<u8>,
+    /// Optional cap on the bytes buffered for one in-flight event (line buffer +
+    /// accumulated `data`). `None` (the default) is uncapped, so the existing
+    /// consumers (`http.rs`'s create-stream reader) are unaffected.
+    max_event_bytes: Option<usize>,
 }
 
 impl SseParser {
@@ -31,9 +54,44 @@ impl SseParser {
         Self::default()
     }
 
+    /// Cap the bytes buffered for a single SSE event. Once the in-flight line
+    /// buffer plus accumulated `data` would exceed `max`, [`try_feed`] returns an
+    /// [`SseOverflow`] so the caller can disconnect + reconnect instead of buffering
+    /// unboundedly. Default (`new`/`default`) is uncapped — this is opt-in, so
+    /// other consumers keep their current behavior.
+    ///
+    /// [`try_feed`]: Self::try_feed
+    pub fn with_max_event_bytes(mut self, max: usize) -> Self {
+        self.max_event_bytes = Some(max);
+        self
+    }
+
     /// Feed a chunk of bytes; returns any events completed within it. Bytes that
     /// don't complete a line are buffered for the next call.
+    ///
+    /// Infallible framing — the cap ([`with_max_event_bytes`]) is not enforced on
+    /// this path (the `http.rs` create-stream reader sets no cap). Callers that opt
+    /// into a cap should use [`try_feed`], which surfaces the overflow instead of
+    /// silently dropping the in-flight event.
+    ///
+    /// [`with_max_event_bytes`]: Self::with_max_event_bytes
+    /// [`try_feed`]: Self::try_feed
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        // With no cap set, `feed_inner` never errs → identical to the pre-cap `feed`.
+        self.feed_inner(chunk).unwrap_or_default()
+    }
+
+    /// Like [`feed`], but enforces the [`with_max_event_bytes`] cap: if the bytes
+    /// buffered for the in-flight event exceed the cap, returns an [`SseOverflow`]
+    /// (the caller should disconnect + reconnect). With no cap set this never errs.
+    ///
+    /// [`feed`]: Self::feed
+    /// [`with_max_event_bytes`]: Self::with_max_event_bytes
+    pub fn try_feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseOverflow> {
+        self.feed_inner(chunk)
+    }
+
+    fn feed_inner(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseOverflow> {
         let mut out = Vec::new();
         for &b in chunk {
             if b == b'\n' {
@@ -43,8 +101,15 @@ impl SseParser {
             } else {
                 self.line_buf.push(b);
             }
+            if let Some(max) = self.max_event_bytes {
+                // Bound total in-flight memory: the current line plus the data
+                // accumulated across `data:` lines awaiting a dispatching blank line.
+                if self.line_buf.len() + self.data.len() > max {
+                    return Err(SseOverflow { limit: max });
+                }
+            }
         }
-        out
+        Ok(out)
     }
 
     /// Flush a final record that lacked a trailing blank line (EOF).
@@ -203,6 +268,60 @@ mod tests {
             vec![SseEvent {
                 event: "complete".into(),
                 data: "{\"x\":1}".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn uncapped_by_default_buffers_large_events() {
+        // The default parser (the http.rs create-stream path) has no cap: a large
+        // event is buffered and dispatched intact — behavior is unchanged.
+        let mut p = SseParser::new();
+        let big = "x".repeat(4 * 1024 * 1024); // 4 MiB
+        let input = format!("data: {big}\n\n");
+        let events = p.feed(input.as_bytes());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, big);
+    }
+
+    #[test]
+    fn try_feed_caps_a_runaway_data_line() {
+        // A never-terminating `data:` line (no newline) that exceeds the cap must
+        // surface an overflow rather than growing the line buffer unboundedly.
+        let mut p = SseParser::new().with_max_event_bytes(64);
+        let runaway = format!("data: {}", "x".repeat(1024)); // no trailing '\n'
+        let err = p
+            .try_feed(runaway.as_bytes())
+            .expect_err("a >cap data line must overflow");
+        assert_eq!(err.limit, 64);
+        assert_eq!(err.to_string(), "SSE event exceeded 64 bytes");
+    }
+
+    #[test]
+    fn try_feed_caps_across_many_data_lines() {
+        // Many small `data:` lines with no dispatching blank line accumulate in
+        // `data`; the cap covers that accumulation, not just a single long line.
+        let mut p = SseParser::new().with_max_event_bytes(64);
+        let mut hit = false;
+        for _ in 0..100 {
+            if p.try_feed(b"data: aaaaaaaaaa\n").is_err() {
+                hit = true;
+                break;
+            }
+        }
+        assert!(hit, "accumulated data: lines past the cap must overflow");
+    }
+
+    #[test]
+    fn try_feed_under_cap_dispatches_normally() {
+        // Below the cap, try_feed behaves exactly like feed.
+        let mut p = SseParser::new().with_max_event_bytes(1024);
+        let events = p.try_feed(b"event: progress\ndata: hi\n\n").unwrap();
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: "progress".into(),
+                data: "hi".into()
             }]
         );
     }
