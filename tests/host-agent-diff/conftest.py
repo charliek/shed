@@ -1,0 +1,291 @@
+"""Fixtures for the hermetic Go-vs-Rust host-agent differential harness (slice 0).
+
+The session `binaries` fixture builds BOTH daemon binaries (`go build` + `cargo
+build`, with `~/.cargo/bin` on PATH) once and returns their paths. `run_cli` drives
+a one-shot subcommand (`version`, `status`, ...) against a chosen impl in an isolated
+HOME + socket dir. `daemon` is a context manager that launches a daemon with a valid
+config, waits for its status socket, yields a handle that can query `status
+[--json]`, and on exit sends SIGTERM, asserts a clean exit 0, and asserts both sockets
+are unlinked.
+
+Hermetic by construction: every test gets a fresh `$SHED_HOST_AGENT_SOCKET_DIR` and
+`$HOME` (so no real `~/.ssh` / `~/.shed` is read), `SSH_AUTH_SOCK` is stripped (the Go
+daemon falls back to an empty local-keys backend), and there is no network.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import os
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+# tests/host-agent-diff/conftest.py -> tests -> repo root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The status/desktop socket basenames (fixed public interface — sockets.go /
+# sockets.rs). The dir is the only configurable part (`$SHED_HOST_AGENT_SOCKET_DIR`).
+STATUS_SOCK_NAME = "host-agent-status.sock"
+DESKTOP_SOCK_NAME = "host-agent.sock"
+
+# The "watch none" launch config: ssh delegated to shed-desktop, aws approve-all,
+# docker deny-all, logging on, discovery watching zero servers. Chosen so BOTH impls
+# report an EMPTY `servers` list (Go's supervisor watches nothing; Rust has no
+# supervisor yet) while still exercising a non-trivial policy/gate mix. Written in
+# BLOCK style on purpose: the Rust slice-0 `yaml_lite` parser handles block maps only,
+# not inline flow maps like `ssh: { approval: { policy: X } }` — see README "Known
+# contract gaps". `{audit_log}` / `{source}` are filled in with per-test temp paths.
+WATCH_NONE_CONFIG = """\
+ssh:
+  approval:
+    policy: shed-desktop
+aws:
+  approval:
+    policy: approve-all
+docker:
+  approval:
+    policy: deny-all
+logging:
+  enabled: true
+  path: {audit_log}
+discovery:
+  servers: []
+  watch: off
+  source: {source}
+"""
+
+
+@dataclasses.dataclass
+class CliResult:
+    """The outcome of one one-shot subcommand invocation."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    socket_dir: str
+    home: str
+
+
+def _clean_env(socket_dir, home) -> dict:
+    """A hermetic environment: real PATH (so `go`/system tools resolve) but an
+    isolated HOME + socket dir, and no ambient ssh-agent."""
+    env = dict(os.environ)
+    env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
+    env["HOME"] = str(home)
+    env.pop("SSH_AUTH_SOCK", None)
+    env.pop("XDG_RUNTIME_DIR", None)
+    return env
+
+
+def _run_cli(binary: str, args, socket_dir, home) -> CliResult:
+    proc = subprocess.run(
+        [binary, *args],
+        env=_clean_env(socket_dir, home),
+        capture_output=True,
+        timeout=30,
+    )
+    return CliResult(
+        returncode=proc.returncode,
+        stdout=proc.stdout.decode("utf-8"),
+        stderr=proc.stderr.decode("utf-8"),
+        socket_dir=str(socket_dir),
+        home=str(home),
+    )
+
+
+def _build(cmd, cwd, env=None) -> None:
+    proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"build failed: {' '.join(cmd)} (cwd={cwd})\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+
+
+@pytest.fixture(scope="session")
+def binaries(tmp_path_factory) -> dict:
+    """Build both daemon binaries once and return `{"go": path, "rust": path}`."""
+    go_bin = tmp_path_factory.mktemp("go-bin") / "shed-host-agent-go"
+    _build(["go", "build", "-o", str(go_bin), "./cmd/shed-host-agent"], cwd=REPO_ROOT)
+
+    cargo_env = dict(os.environ)
+    cargo_env["PATH"] = (
+        str(Path.home() / ".cargo" / "bin") + os.pathsep + cargo_env.get("PATH", "")
+    )
+    _build(
+        ["cargo", "build", "-p", "shed-host-agent"],
+        cwd=REPO_ROOT / "crates",
+        env=cargo_env,
+    )
+    rust_bin = REPO_ROOT / "crates" / "target" / "debug" / "shed-host-agent"
+
+    assert go_bin.exists(), f"go binary missing: {go_bin}"
+    assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
+    return {"go": str(go_bin), "rust": str(rust_bin)}
+
+
+@pytest.fixture
+def run_cli(binaries, tmp_path_factory):
+    """Return `run(impl, *args, socket_dir=None, home=None) -> CliResult`. Each call
+    gets a fresh isolated socket dir + HOME unless one is passed (to let a scenario
+    point both impls at the same dir)."""
+
+    def _call(impl, *args, socket_dir=None, home=None) -> CliResult:
+        if socket_dir is None:
+            socket_dir = tmp_path_factory.mktemp("sock")
+        if home is None:
+            home = tmp_path_factory.mktemp("home")
+        return _run_cli(binaries[impl], list(args), socket_dir, home)
+
+    return _call
+
+
+class DaemonHandle:
+    """A running daemon under test: query it, inspect its socket dir."""
+
+    def __init__(self, impl, binary, proc, socket_dir, home, config_path, log_path):
+        self.impl = impl
+        self.binary = binary
+        self.proc = proc
+        self.socket_dir = str(socket_dir)
+        self.home = str(home)
+        self.config_path = str(config_path)
+        self.log_path = Path(log_path)
+        self.status_sock = Path(socket_dir) / STATUS_SOCK_NAME
+        self.desktop_sock = Path(socket_dir) / DESKTOP_SOCK_NAME
+
+    def status(self, json: bool = False) -> CliResult:
+        args = ["status"] + (["--json"] if json else [])
+        return _run_cli(self.binary, args, self.socket_dir, self.home)
+
+    def read_log(self) -> str:
+        return _safe_read(self.log_path)
+
+
+@pytest.fixture
+def daemon(binaries, tmp_path_factory):
+    """Return a context-manager factory `make(impl, config_text) -> DaemonHandle`.
+
+    On enter: writes `config_text` (a `.format(audit_log=..., source=...)` template)
+    into an isolated dir, launches the daemon with `-config`/`-log-file`, and waits
+    up to 3s for the status socket to appear. On exit: SIGTERM, assert exit 0, and
+    assert BOTH the status and desktop sockets are unlinked.
+    """
+
+    @contextlib.contextmanager
+    def _make(impl, config_text):
+        root = tmp_path_factory.mktemp(f"daemon-{impl}")
+        home = root / "home"
+        home.mkdir()
+        audit_log = root / "audit.log"
+        source = root / "nonexistent-discovery.yaml"
+        config_path = root / "extensions.yaml"
+        log_path = root / "op.log"
+        config_path.write_text(config_text.format(audit_log=audit_log, source=source))
+
+        # The socket dir must be SHORT: an AF_UNIX bind path caps at ~104 bytes
+        # (macOS) / ~108 (Linux), and pytest's nested tmp tree blows past that. A
+        # shallow mkdtemp under $TMPDIR keeps `<dir>/host-agent-status.sock` well
+        # under the limit. (One-shot subcommands don't bind, so `run_cli` can use the
+        # long pytest tmp dir.) Cleaned up in the finally below.
+        socket_dir = Path(tempfile.mkdtemp(prefix="hadiff-"))
+
+        status_sock = socket_dir / STATUS_SOCK_NAME
+        desktop_sock = socket_dir / DESKTOP_SOCK_NAME
+
+        # The daemon writes its operational log to -log-file, so stdout/stderr carry
+        # nothing worth capturing; DEVNULL avoids leaving un-read pipe file objects
+        # (which would trip the suite's warnings-as-errors as ResourceWarnings).
+        proc = subprocess.Popen(
+            [binaries[impl], "-config", str(config_path), "-log-file", str(log_path)],
+            env=_clean_env(socket_dir, home),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Readiness: the status socket file exists once the daemon has bound it.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if status_sock.exists():
+                break
+            if proc.poll() is not None:
+                raise AssertionError(
+                    f"{impl} daemon exited early rc={proc.returncode}\n"
+                    f"oplog={_safe_read(log_path)}"
+                )
+            time.sleep(0.02)
+        else:
+            proc.kill()
+            proc.wait()
+            raise AssertionError(
+                f"{impl} daemon did not bind {status_sock} within 3s\n"
+                f"oplog={_safe_read(log_path)}"
+            )
+
+        handle = DaemonHandle(
+            impl, binaries[impl], proc, socket_dir, home, config_path, log_path
+        )
+        try:
+            yield handle
+        finally:
+            _shutdown(impl, proc, status_sock, desktop_sock)
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+    return _make
+
+
+def _shutdown(impl, proc, status_sock, desktop_sock) -> None:
+    """SIGTERM the daemon, assert a clean exit 0, and assert both sockets unlinked."""
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGTERM)
+    try:
+        rc = proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise AssertionError(f"{impl} daemon did not exit within 5s of SIGTERM")
+    assert rc == 0, f"{impl} daemon exit={rc} on SIGTERM (want 0)"
+    assert not status_sock.exists(), (
+        f"{impl}: status socket not unlinked on shutdown: {status_sock}"
+    )
+    assert not desktop_sock.exists(), (
+        f"{impl}: desktop socket not unlinked on shutdown: {desktop_sock}"
+    )
+
+
+def _safe_read(path) -> str:
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return "(no operational log)"
+
+
+@pytest.fixture
+def watch_none_config() -> str:
+    """The block-style 'watch none' launch-config template (see WATCH_NONE_CONFIG)."""
+    return WATCH_NONE_CONFIG
+
+
+@pytest.fixture
+def differential():
+    """Return `run(scenario) -> value`, where `scenario(impl) -> normalized value`.
+    Runs the scenario for both `go` and `rust`, asserts the normalized values are
+    equal (with a readable diff on mismatch), and returns the common value."""
+
+    def _run(scenario):
+        go = scenario("go")
+        rust = scenario("rust")
+        assert go == rust, (
+            "differential mismatch (go != rust):\n"
+            f"--- go ---\n{go!r}\n--- rust ---\n{rust!r}"
+        )
+        return go
+
+    return _run

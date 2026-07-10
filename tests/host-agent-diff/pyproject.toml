@@ -1,0 +1,26 @@
+[project]
+name = "host-agent-diff"
+version = "0.1.0"
+description = "Hermetic Go-vs-Rust differential harness for the shed-host-agent Rust port (slice 0). Spawns BOTH daemon binaries and asserts equal wire-visible output under a defined canonicalization."
+requires-python = ">=3.11"
+# Slice 0 needs only pytest — the daemons are driven as black-box subprocesses and
+# the compared payloads are canonicalized with the stdlib `json`. The TLS / ssh-agent
+# fakes (which pull in `cryptography`) arrive in slice 1.
+dependencies = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+    "differential: a scenario asserted equal across the Go and Rust daemons after normalization",
+    "golden: reserved for fixture-backed decision-parity checks (owned by the Go/Rust golden runners)",
+]
+# Hermetic-by-construction: no network, isolated HOME + socket dir per test. Surface
+# any warning as an error so a daemon that starts emitting to stdout/stderr in a way
+# that changes captured output can't slip past silently.
+filterwarnings = [
+    "error",
+    "default::DeprecationWarning",
+]

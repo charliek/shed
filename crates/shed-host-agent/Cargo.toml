@@ -1,0 +1,27 @@
+[package]
+name = "shed-host-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-host-agent — the host-side credential-broker daemon (Rust port). Slice 0: scaffold + CLI surface (version/status subcommands) + the read-only status UDS + a minimal LiveStatus-scoped config reader, wire-compatible with the Go shed-host-agent daemon (status_server.go / status.go / sockets.go / main.go)."
+
+[[bin]]
+name = "shed-host-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# net (UnixListener/UnixStream) + io-util (AsyncWriteExt) + signal (SIGTERM/SIGINT)
+# on top of the workspace's rt-multi-thread/macros/sync/time.
+tokio = { workspace = true, features = ["net", "io-util", "signal", "rt-multi-thread", "macros", "time"] }
+# getpid() for the LiveStatus `pid` field (matches the Go daemon's os.Getpid()).
+libc = "0.2"
+
+[dev-dependencies]
+# Throwaway socket dirs for the status "not running" exit-code test.
+tempfile = "3"

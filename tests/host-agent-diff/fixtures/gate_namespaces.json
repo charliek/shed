@@ -1,0 +1,13 @@
+{
+  "protocol_version": 2,
+  "description": "The three raw approval policies {ssh,aws,docker} -> the ordered gate-namespace list: the namespaces whose EFFECTIVE policy is shed-desktop, always emitted in the fixed order ssh-agent, aws-credentials, docker-credentials. Mirrors Go desktopGateNamespaces and the Rust config's gate_namespaces(). Run by BOTH language runners.",
+  "vectors": [
+    { "ssh": "", "aws": "", "docker": "", "gate": [] },
+    { "ssh": "deny-all", "aws": "approve-all", "docker": "biometrics", "gate": [] },
+    { "ssh": "shed-desktop", "aws": "approve-all", "docker": "deny-all", "gate": ["ssh-agent"] },
+    { "ssh": "deny-all", "aws": "shed-desktop", "docker": "approve-all", "gate": ["aws-credentials"] },
+    { "ssh": "approve-all", "aws": "deny-all", "docker": "shed-desktop", "gate": ["docker-credentials"] },
+    { "ssh": "shed-desktop", "aws": "deny-all", "docker": "shed-desktop", "gate": ["ssh-agent", "docker-credentials"] },
+    { "ssh": "shed-desktop", "aws": "shed-desktop", "docker": "shed-desktop", "gate": ["ssh-agent", "aws-credentials", "docker-credentials"] }
+  ]
+}

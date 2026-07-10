@@ -1,0 +1,12 @@
+{
+  "protocol_version": 2,
+  "description": "Raw approval.policy string -> effective policy. Empty/omitted fails closed to deny-all; every named policy echoes verbatim. Mirrors Go ApprovalConfig.EffectivePolicy and Rust effective_policy_from_raw. Run by BOTH language runners (Go golden_test.go, Rust tests/golden.rs).",
+  "vectors": [
+    { "raw": "", "effective": "deny-all" },
+    { "raw": "deny-all", "effective": "deny-all" },
+    { "raw": "approve-all", "effective": "approve-all" },
+    { "raw": "biometrics", "effective": "biometrics" },
+    { "raw": "biometrics-or-password", "effective": "biometrics-or-password" },
+    { "raw": "shed-desktop", "effective": "shed-desktop" }
+  ]
+}

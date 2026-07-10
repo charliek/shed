@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc build-tools build-fc-remote-server test test-integration test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -62,6 +62,22 @@ test-integration:
 	  exit 1; \
 	}
 	cd tests/integration && uv sync && uv run pytest -v
+
+# Hermetic Go-vs-Rust host-agent differential harness (the THIRD pytest suite —
+# never merged with tests/integration or desktop/tools/shedtest). It spawns BOTH
+# shed-host-agent daemon binaries (Go cmd/shed-host-agent + Rust
+# crates/shed-host-agent) and asserts equal wire-visible output under a defined
+# canonicalization, then runs the language-neutral golden-fixture runners in each
+# language. Needs Go + Rust (cargo on PATH) + uv. See tests/host-agent-diff/README.md.
+test-host-agent-diff:
+	@command -v uv >/dev/null 2>&1 || { \
+	  echo "uv is required for the host-agent differential harness."; \
+	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
+	  exit 1; \
+	}
+	cd tests/host-agent-diff && uv sync && uv run pytest -v
+	go test ./cmd/shed-host-agent/... -run Golden
+	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent --test golden
 
 # Parallel dev shed-server lifecycle (Mac VZ).
 #

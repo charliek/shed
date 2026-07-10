@@ -33,6 +33,7 @@ jobs:
       tauri: ${{ steps.filter.outputs.tauri }}
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
+      hostagent: ${{ steps.filter.outputs.hostagent }}
       docs: ${{ steps.filter.outputs.docs }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -78,6 +79,15 @@ jobs:
               # the shedtest harness env
               - 'desktop/pyproject.toml'
               - 'desktop/uv.lock'
+            hostagent:
+              # The Go-vs-Rust host-agent differential leg: both daemons, their
+              # shared wire contract (sdk envelope + ext/protocol payloads), and
+              # the harness itself.
+              - 'crates/shed-host-agent/**'
+              - 'cmd/shed-host-agent/**'
+              - 'sdk/**'
+              - 'internal/ext/protocol/**'
+              - 'tests/host-agent-diff/**'
             docs:
               - 'docs/**'
               - 'mkdocs.yml'
@@ -296,6 +306,38 @@ jobs:
           cargo test -p shed-core --all-targets --locked
           cargo clippy -p shed-core --all-targets --locked -- -D warnings
 
+  # The Go-vs-Rust host-agent differential leg (Phase 3 leg 3a.1). One Linux job
+  # covers BOTH the standalone Rust daemon's build+test+clippy (so it can't Mac-dev
+  # bit-rot — it persists as the 3a.2 headless fallback) AND the hermetic
+  # differential harness that spawns both daemon binaries and asserts equal
+  # wire-visible output. Go + Rust + Python on one runner (the "third pytest suite").
+  host-agent-diff:
+    name: host-agent-diff (Go vs Rust)
+    needs: changes
+    if: ${{ needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustc --version && cargo --version
+      - name: C toolchain (ring's crypto backend needs build-essential)
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - uses: astral-sh/setup-uv@v6
+      - name: Rust host-agent — test + clippy (Linux)
+        working-directory: crates
+        run: |
+          cargo test -p shed-host-agent --all-targets --locked
+          cargo clippy -p shed-host-agent --all-targets --locked -- -D warnings
+      - name: Go-vs-Rust differential + golden runners
+        # Builds both daemon binaries (conftest) and runs the pytest differential
+        # + the Go and Rust golden-fixture runners.
+        run: make test-host-agent-diff
+
   deb:
     name: deb
     needs: changes
@@ -416,12 +458,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in
