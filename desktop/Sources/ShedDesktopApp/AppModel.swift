@@ -1106,15 +1106,22 @@ final class AppModel: NSObject, UiBridge {
             // listReal is a nonisolated static (captures only Sendable value
             // data) so the per-shed SSH probes fan out without hopping back to
             // the main actor — clean under Swift 6 strict concurrency.
-            let lists = await withTaskGroup(of: [RcSession].self) { group in
+            let lists = await withTaskGroup(of: ShedRCList.self) { group in
                 for (h, shedItem) in targets {
                     group.addTask { await Self.listReal(h: h, serverName: shedItem.host, shed: shedItem.name) }
                 }
-                var all: [RcSession] = []
-                for await s in group { all.append(contentsOf: s) }
+                var all: [ShedRCList] = []
+                for await s in group { all.append(s) }
                 return all
             }
-            rcTable = Dictionary(lists.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+            rcTable = Dictionary(lists.flatMap { $0.sessions }.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+            // For every shed probed in THIS refresh, overwrite-or-remove its cached
+            // capabilities (nil from an old/downgraded binary or failed probe removes
+            // the stale block); un-probed sheds keep theirs. Semantics pinned by
+            // RCTests.testMergeCapabilitiesDowngradeRemovesStaleEntry.
+            RemoteControl.mergeCapabilities(
+                into: &state.rcCapabilities,
+                probes: lists.map { ($0.key, $0.capabilities) })
         }
         publishRcSessions()
         return rcTable.values
@@ -1129,26 +1136,39 @@ final class AppModel: NSObject, UiBridge {
     private func isSafeRCValue(_ s: String) -> Bool { RemoteControl.isSafeRCValue(s) }
 
     private func syntheticURL(kind: RcKind, slug: String) -> String? {
+        // Only the claude kinds have a synthetic remote-control URL; every other
+        // kind — including an unknown `.other` — gets none (no claude affordance).
         switch kind {
         case .claudeBroker: return "https://claude.ai/code?environment=env_\(slug)"
         case .claudeRc: return "https://claude.ai/code/session_\(slug)"
-        case .shell: return nil
+        case .codex, .opencode, .cursor, .shell, .other: return nil
         }
     }
 
     // MARK: - real RC (SSH; never runs under the test harness)
 
-    /// List rc-* sessions on one shed via `shed-ext-rc list`, adapting each DTO.
-    /// `nonisolated static` so it runs off the main actor with no `self` capture.
-    /// Best-effort: any failure (transport, missing binary, bad DTO) yields none.
-    nonisolated private static func listReal(h: ShedHost, serverName: String, shed: String) async -> [RcSession] {
+    /// One shed's RC probe result — sessions plus the optional capabilities block,
+    /// keyed by the `host/name` shed id. Sendable so it crosses the task group.
+    private struct ShedRCList: Sendable {
+        let key: String
+        let sessions: [RcSession]
+        let capabilities: RcCapabilities?
+    }
+
+    /// List rc-* sessions on one shed via `shed-ext-rc list`, adapting each DTO and
+    /// capturing the capabilities block. `nonisolated static` so it runs off the
+    /// main actor with no `self` capture. Best-effort: any failure (transport,
+    /// missing binary, bad DTO) yields no sessions and no capabilities.
+    nonisolated private static func listReal(h: ShedHost, serverName: String, shed: String) async -> ShedRCList {
+        let key = "\(serverName)/\(shed)"
         guard let res = try? await ProcessRunner.run(
             RemoteControl.sshArgv(user: shed, host: h.host, port: h.sshPort, remoteArgv: RemoteControl.listArgv()),
             timeout: .seconds(15)),
             res.ok,
-            let dtos = try? RemoteControl.decodeList(res.stdout)
-        else { return [] }
-        return dtos.map { RemoteControl.rcSession(fromDTO: $0, serverName: serverName, shed: shed) }
+            let parsed = try? RemoteControl.decodeListResponse(res.stdout)
+        else { return ShedRCList(key: key, sessions: [], capabilities: nil) }
+        let sessions = parsed.sessions.map { RemoteControl.rcSession(fromDTO: $0, serverName: serverName, shed: shed) }
+        return ShedRCList(key: key, sessions: sessions, capabilities: parsed.capabilities)
     }
 
     // MARK: - M3: approvals + activity

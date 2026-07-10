@@ -379,9 +379,62 @@ export function useNowTick(intervalMs = 1000): number {
 
 /* ---- remote-control agents (B2.4) ----------------------------------------- */
 
-export type RcKind = "claude-rc" | "claude-broker" | "shell";
+// The known kinds, plus `(string & {})` so an UNKNOWN kind from a newer/other tool
+// keeps its raw string (the unknown-kind policy) instead of failing the type — it
+// renders neutrally and is never offered for creation.
+export type RcKind =
+  | "claude-rc" | "claude-broker" | "codex" | "opencode" | "cursor" | "shell"
+  | (string & {});
 export type RcState =
   | "starting" | "ready" | "reconnecting" | "needs-trust" | "needs-auth" | "dead";
+
+/** One agent's install-probe result (capabilities.agents). */
+export type RcAgentInfo = { installed: boolean; version?: string | null };
+/** Per-kind UI hints (capabilities.kind_features). */
+export type RcKindFeatures = { post_input: boolean; approvals: string };
+/** A shed's RC capabilities — mirrors `shed_core::rc::RcCapabilities`. */
+export type RcCapabilities = {
+  rc_version: number;
+  kinds: RcKind[];
+  agents: Record<string, RcAgentInfo>;
+  features: string[];
+  kind_features: Record<string, RcKindFeatures>;
+};
+
+/** The kinds a create form can offer (broker is URL-driven; unknown never creatable). */
+export const RC_CREATABLE_KINDS: RcKind[] = ["claude-rc", "codex", "opencode", "cursor", "shell"];
+
+/** The tool token a kind's agent maps to under capabilities.agents (undefined = no
+ *  agent, e.g. shell). Mirrors `RcKind::tool`. */
+const RC_KIND_TOOL: Record<string, string | undefined> = {
+  "claude-rc": "claude", "claude-broker": "claude",
+  codex: "codex", opencode: "opencode", cursor: "cursor", shell: undefined,
+};
+
+/** The launch UI's gated kind list: with capabilities, the creatable kinds whose
+ *  backing agent is installed. Only ABSENT capabilities (old binary / not yet
+ *  probed) fall back to claude+shell; present-but-empty capabilities yield an
+ *  EMPTY offer (the shed advertises no usable kinds — the form must not invent
+ *  claude). Mirrors `RcCapabilities::creatable_kinds` / the Swift `availableKinds`. */
+export function offeredKinds(caps?: RcCapabilities): RcKind[] {
+  if (!caps) return ["claude-rc", "shell"];
+  return RC_CREATABLE_KINDS.filter((k) => {
+    if (!caps.kinds.includes(k)) return false;
+    const tool = RC_KIND_TOOL[k];
+    return tool ? (caps.agents[tool]?.installed ?? false) : true;
+  });
+}
+
+/** Per-kind login remediation for a needs-auth session. Mirrors `RcKind::auth_hint`. */
+export function rcAuthHint(kind: RcKind): string {
+  switch (kind) {
+    case "claude-rc": case "claude-broker": return "run `claude` → /login";
+    case "codex": return "run `codex` and complete login (`codex login`)";
+    case "opencode": return "run `opencode auth login`";
+    case "cursor": return "run `cursor-agent login`";
+    default: return "log in to the agent in a terminal";
+  }
+}
 
 /** A remote-control session, as shed-app serializes it (the pane's fields). The
  *  table/wire identity is the computed `host/shed/slug`, not encoded. */
@@ -402,10 +455,15 @@ export type RcSession = {
   managed: boolean;
 };
 
-/** The live RC sessions across running sheds (the same data the `rc.list` op
- *  serves the harness). Best-effort — [] in a browser / on error. */
-export async function fetchRcSessions(host?: string, shed?: string): Promise<RcSession[]> {
-  return (await invoke<{ sessions: RcSession[] }>("rc_list", { host, shed }))?.sessions ?? [];
+/** The `rc.list` result: live sessions plus the per-shed capabilities captured
+ *  during the probe (keyed by `host/shed`). */
+export type RcListResult = { sessions: RcSession[]; capabilities: Record<string, RcCapabilities> };
+
+/** The live RC sessions + capabilities across running sheds (the same data the
+ *  `rc.list` op serves the harness). Best-effort — empty in a browser / on error. */
+export async function fetchRcList(host?: string, shed?: string): Promise<RcListResult> {
+  const r = await invoke<RcListResult>("rc_list", { host, shed });
+  return { sessions: r?.sessions ?? [], capabilities: r?.capabilities ?? {} };
 }
 
 export type RcLaunchFields = {

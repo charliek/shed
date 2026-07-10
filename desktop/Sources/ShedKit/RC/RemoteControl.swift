@@ -10,28 +10,104 @@ import Foundation
 
 /// RC session kind (Convention v2). `<tool>-<mode>` so the model can grow to other
 /// agents later; `shell` is tool-agnostic. v1's `agent`/`repl` were renamed.
-public enum RcKind: String, Codable, Sendable, CaseIterable {
-    case claudeRc = "claude-rc"
-    case claudeBroker = "claude-broker"
+///
+/// The `.other` case is the **unknown-kind policy**: an unrecognized wire value is
+/// PRESERVED verbatim (not coerced to claude-broker), so a session created by a
+/// newer/other tool decodes and renders neutrally — its raw kind string is shown,
+/// and no claude-specific affordance is attached. Mirrors `shed_core::rc::RcKind`
+/// and the guest's `rc.Kind`.
+public enum RcKind: Codable, Sendable, Hashable {
+    case claudeRc
+    case claudeBroker
+    case codex
+    case opencode
+    case cursor
     case shell
+    case other(String)
 
     public static let `default`: RcKind = .claudeRc
 
-    /// Whether this kind accepts a typed kickoff line — an initial prompt for
-    /// `claude-rc`, an initial command for `shell`. Mirrors the guest's
-    /// `AcceptsTypedInput` (the source of truth, `shed-extensions/internal/rc`):
-    /// every kind except `claude-broker`, whose input is a remote URL, not the pane.
-    public var acceptsTypedInput: Bool {
+    /// The kebab-case wire value (an unknown kind's preserved raw string).
+    public var rawValue: String {
         switch self {
-        case .claudeRc, .shell: return true
-        case .claudeBroker: return false
+        case .claudeRc: return "claude-rc"
+        case .claudeBroker: return "claude-broker"
+        case .codex: return "codex"
+        case .opencode: return "opencode"
+        case .cursor: return "cursor"
+        case .shell: return "shell"
+        case .other(let s): return s
         }
     }
 
-    /// Kinds the New session sheet offers for creation. `rc.launch` over IPC
-    /// still accepts any decodable kind (e.g. `.claudeBroker`) so a session
-    /// created elsewhere round-trips and displays; this only governs the toggle.
-    public static let creatable: [RcKind] = [.claudeRc, .shell]
+    /// Parse a wire kind string, preserving an unrecognized value as `.other`.
+    public init(wire: String) {
+        switch wire {
+        case "claude-rc": self = .claudeRc
+        case "claude-broker": self = .claudeBroker
+        case "codex": self = .codex
+        case "opencode": self = .opencode
+        case "cursor": self = .cursor
+        case "shell": self = .shell
+        default: self = .other(wire)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(wire: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(rawValue)
+    }
+
+    /// A recognized kind (not the preserved-raw unknown case).
+    public var isKnown: Bool {
+        if case .other = self { return false }
+        return true
+    }
+
+    /// Whether this kind accepts a typed kickoff line — a prompt for the agent
+    /// REPLs/TUIs, a command for `shell`. Mirrors the guest's `AcceptsTypedInput`:
+    /// every registered kind except `claude-broker` (input is a URL, not the pane);
+    /// an unknown `.other` kind is NOT promptable (no affordances).
+    public var acceptsTypedInput: Bool {
+        switch self {
+        case .claudeBroker, .other: return false
+        case .claudeRc, .codex, .opencode, .cursor, .shell: return true
+        }
+    }
+
+    /// The tool token this kind's agent maps to under `capabilities.agents`, or
+    /// `nil` for a kind with no installable agent (`shell`) or an unknown kind.
+    public var tool: String? {
+        switch self {
+        case .claudeRc, .claudeBroker: return "claude"
+        case .codex: return "codex"
+        case .opencode: return "opencode"
+        case .cursor: return "cursor"
+        case .shell, .other: return nil
+        }
+    }
+
+    /// The per-agent login remediation for this kind's needs-auth state, mirroring
+    /// the guest's `AuthHintFor` (`internal/ext/rc/agents.go`).
+    public var authHint: String {
+        switch self {
+        case .claudeRc, .claudeBroker: return "run `claude` \u{2192} /login"
+        case .codex: return "run `codex` and complete login (`codex login`)"
+        case .opencode: return "run `opencode auth login`"
+        case .cursor: return "run `cursor-agent login`"
+        case .shell, .other: return "log in to the agent in a terminal"
+        }
+    }
+
+    /// Kinds the New session sheet can offer for creation (`claude-broker` is
+    /// URL-driven, `.other` never creatable). Capability gating narrows this per
+    /// shed. `rc.launch` over IPC still accepts any decodable known kind so a
+    /// session created elsewhere round-trips and displays; this only seeds the toggle.
+    public static let creatable: [RcKind] = [.claudeRc, .codex, .opencode, .cursor, .shell]
 }
 
 public enum RcState: String, Codable, Sendable, Equatable {
@@ -83,10 +159,77 @@ public struct RcSessionDTO: Codable, Sendable, Equatable {
     }
 }
 
-/// The `shed-ext-rc list` response shape.
+/// The `shed-ext-rc list` response shape. `capabilities` is tolerant of absence —
+/// an OLD baked-in binary's bare `{"rc_sessions":[…]}` envelope decodes to nil.
 public struct RcSessionListDTO: Codable, Sendable {
     public let rcSessions: [RcSessionDTO]
-    enum CodingKeys: String, CodingKey { case rcSessions = "rc_sessions" }
+    public let capabilities: RcCapabilities?
+    enum CodingKeys: String, CodingKey {
+        case rcSessions = "rc_sessions"
+        case capabilities
+    }
+}
+
+/// One agent's install-probe result under `capabilities.agents`. `version` is
+/// absent when the agent is not installed. Mirrors the guest's `rc.AgentInfo`.
+public struct RcAgentInfo: Codable, Sendable, Equatable {
+    public let installed: Bool
+    public let version: String?
+}
+
+/// Per-kind UI hints from `capabilities.kind_features`. Mirrors `rc.KindFeatures`.
+public struct RcKindFeatures: Codable, Sendable, Equatable {
+    public let postInput: Bool
+    public let approvals: String
+    enum CodingKeys: String, CodingKey {
+        case postInput = "post_input"
+        case approvals
+    }
+}
+
+/// A shed's RC capabilities — `shed-ext-rc capabilities`, also embedded in the
+/// `list` envelope. Tells the client which kinds a shed offers, which agents are
+/// installed (and at what version), the feature set, and per-kind hints. Mirrors
+/// `shed_core::rc::RcCapabilities` / the guest's `rc.Capabilities`. Optional maps/
+/// lists default to empty so a partial payload still decodes.
+public struct RcCapabilities: Codable, Sendable, Equatable {
+    public let rcVersion: Int
+    public let kinds: [RcKind]
+    public let agents: [String: RcAgentInfo]
+    public let features: [String]
+    public let kindFeatures: [String: RcKindFeatures]
+
+    enum CodingKeys: String, CodingKey {
+        case rcVersion = "rc_version"
+        case kinds, agents, features
+        case kindFeatures = "kind_features"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        rcVersion = try c.decode(Int.self, forKey: .rcVersion)
+        kinds = try c.decodeIfPresent([RcKind].self, forKey: .kinds) ?? []
+        agents = try c.decodeIfPresent([String: RcAgentInfo].self, forKey: .agents) ?? [:]
+        features = try c.decodeIfPresent([String].self, forKey: .features) ?? []
+        kindFeatures = try c.decodeIfPresent([String: RcKindFeatures].self, forKey: .kindFeatures) ?? [:]
+    }
+
+    /// Whether the launch UI should OFFER `kind` for creation: it's advertised in
+    /// `kinds` AND its backing agent (if any) is installed. `shell` (no agent) is
+    /// offered whenever advertised. Mirrors `RcCapabilities::offers`.
+    public func offers(_ kind: RcKind) -> Bool {
+        guard kinds.contains(kind) else { return false }
+        guard let tool = kind.tool else { return true }
+        return agents[tool]?.installed ?? false
+    }
+
+    /// The creatable kinds this shed offers, in canonical create-form order.
+    public var creatableKinds: [RcKind] {
+        RcKind.creatable.filter { offers($0) }
+    }
+
+    /// Whether `feature` is advertised (feature discovery, replacing error-sniffing).
+    public func hasFeature(_ feature: String) -> Bool { features.contains(feature) }
 }
 
 /// A binary-domain outcome distinguished from an SSH transport failure by the
@@ -243,6 +386,18 @@ public enum RemoteControl {
             targetLabel: dto.targetLabel, managed: dto.managed)
     }
 
+    /// Reconcile per-shed capability probe results into a cache keyed by shed id:
+    /// for every shed probed in this refresh, overwrite-or-remove — non-nil → set,
+    /// nil (old/downgraded binary, failed probe) → remove, so a stale block can't
+    /// keep gating the launch sheet. Un-probed sheds keep their entries. (Assigning
+    /// nil through the subscript removes the key.)
+    public static func mergeCapabilities(
+        into cache: inout [String: RcCapabilities],
+        probes: [(key: String, capabilities: RcCapabilities?)]
+    ) {
+        for probe in probes { cache[probe.key] = probe.capabilities }
+    }
+
     /// Decode a single-session DTO from the binary's stdout.
     public static func decodeSession(_ stdout: String) throws -> RcSessionDTO {
         guard let data = stdout.data(using: .utf8) else {
@@ -252,18 +407,28 @@ public enum RemoteControl {
         catch { throw RcError.failed("shed-ext-rc returned an invalid session DTO") }
     }
 
-    /// Decode the `list` response from the binary's stdout.
-    public static func decodeList(_ stdout: String) throws -> [RcSessionDTO] {
-        guard let data = stdout.data(using: .utf8) else { return [] }
-        do { return try JSONDecoder().decode(RcSessionListDTO.self, from: data).rcSessions }
-        catch { throw RcError.failed("shed-ext-rc returned an invalid session list") }
+    /// Decode the full `list` envelope — sessions PLUS the optional `capabilities`
+    /// block. An old baked-in binary's bare envelope yields `capabilities: nil`.
+    public static func decodeListResponse(_ stdout: String)
+        throws -> (sessions: [RcSessionDTO], capabilities: RcCapabilities?)
+    {
+        guard let data = stdout.data(using: .utf8) else { return ([], nil) }
+        do {
+            let dto = try JSONDecoder().decode(RcSessionListDTO.self, from: data)
+            return (dto.rcSessions, dto.capabilities)
+        } catch { throw RcError.failed("shed-ext-rc returned an invalid session list") }
     }
 
     // MARK: - Pure pane classifier (backs the `rc.classify` IPC utility)
 
     public static func classifyPane(kind: RcKind, pane: String) -> RcClassification {
-        // Trust + auth heuristics apply to both kinds that run claude.
-        if kind != .shell {
+        // Trust + auth heuristics use claude-specific pane text, so they gate ONLY
+        // the claude kinds. The per-agent pane classifiers for codex/opencode/cursor
+        // are owned by the guest binary (authoritative); the client consumes the
+        // DTO's `state`, so this pure utility renders every non-claude/unknown kind
+        // neutrally.
+        let isClaude = (kind == .claudeRc || kind == .claudeBroker)
+        if isClaude {
             if pane.contains(/Workspace not trusted/.ignoresCase()) {
                 return RcClassification(state: .needsTrust, url: extractURL(kind: kind, pane: pane))
             }
@@ -295,7 +460,9 @@ public enum RemoteControl {
             }
             if url != nil { return RcClassification(state: .ready, url: url) }
             return RcClassification(state: .starting)
-        case .shell:
+        // Shell, the non-claude agent kinds (codex/opencode/cursor), and unknown
+        // kinds: neutral — blank is starting, anything drawn reads ready, no URL.
+        case .codex, .opencode, .cursor, .shell, .other:
             return pane.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? RcClassification(state: .starting)
                 : RcClassification(state: .ready)
@@ -303,7 +470,7 @@ public enum RemoteControl {
     }
 
     /// Extract the claude.ai URL for the given kind (claude-broker uses
-    /// `?environment=env_…`, claude-rc uses `/session_…`).
+    /// `?environment=env_…`, claude-rc uses `/session_…`); no URL for other kinds.
     public static func extractURL(kind: RcKind, pane: String) -> String? {
         switch kind {
         case .claudeBroker:
@@ -314,7 +481,7 @@ public enum RemoteControl {
             if let m = pane.firstMatch(of: /https?:\/\/claude\.ai\/code\/session_[A-Za-z0-9_-]+/) {
                 return String(m.0)
             }
-        case .shell:
+        case .codex, .opencode, .cursor, .shell, .other:
             return nil
         }
         return nil

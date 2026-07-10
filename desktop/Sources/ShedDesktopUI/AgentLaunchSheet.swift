@@ -38,16 +38,23 @@ public struct AgentLaunchSheet: View {
                 SheetField("Session name", hint: "optional") {
                     SheetTextField(placeholder: sessionNamePlaceholder, text: $displayName)
                 }
-                SheetField("Kind", help: kindCopy.toggleHelp) {
-                    Picker("", selection: $kind) {
-                        ForEach(RcKind.creatable, id: \.self) { k in
-                            Text(k.rawValue).tag(k)
-                        }
+                if availableKinds.isEmpty {
+                    SheetField("Kind") {
+                        Text("No agent kinds available in this shed.")
+                            .foregroundStyle(.secondary)
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
+                } else {
+                    SheetField("Kind", help: kindCopy.toggleHelp) {
+                        Picker("", selection: $kind) {
+                            ForEach(availableKinds, id: \.self) { k in
+                                Text(kindLabel(k)).tag(k)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                    }
                 }
-                if kind.acceptsTypedInput {
+                if !availableKinds.isEmpty, kind.acceptsTypedInput {
                     SheetField(kindCopy.promptLabel, hint: "optional", help: kindCopy.promptHelp) {
                         SheetTextField(placeholder: kindCopy.promptPlaceholder, text: $initialPrompt)
                     }
@@ -59,16 +66,50 @@ public struct AgentLaunchSheet: View {
                 SheetCancelButton(action: close)
                 Spacer()
                 SheetPrimaryButton(title: "Create", icon: "plus",
-                                   disabled: target.isEmpty, action: launch)
+                                   disabled: target.isEmpty || availableKinds.isEmpty, action: launch)
             }
             .padding(16)
         }
         .modalCard()
-        .onAppear { if target.isEmpty { target = runningSheds.first?.id ?? "" } }
+        .onAppear {
+            if target.isEmpty { target = runningSheds.first?.id ?? "" }
+            reconcileKind()
+        }
+        // When the shed changes, its capabilities may not offer the current kind.
+        .onChange(of: target) { _ in reconcileKind() }
     }
 
     private var selectedShed: Shed? {
         runningSheds.first(where: { $0.id == target })
+    }
+
+    /// The gated kind list for the selected shed: with capabilities, the creatable
+    /// kinds whose backing agent is installed. Only ABSENT capabilities (old binary
+    /// / not yet probed) fall back to claude+shell; present-but-empty capabilities
+    /// yield an EMPTY list (the shed advertises no usable kinds — the sheet shows
+    /// the unavailable notice, never inventing claude). Mirrors the Tauri
+    /// `offeredKinds`.
+    private var availableKinds: [RcKind] {
+        guard let caps = state.rcCapabilities[target] else { return [.claudeRc, .shell] }
+        return caps.creatableKinds
+    }
+
+    /// Keep the selected kind valid for the current shed's offered set (a no-op
+    /// when the set is empty — the sheet renders the unavailable notice instead).
+    private func reconcileKind() {
+        let kinds = availableKinds
+        if let first = kinds.first, !kinds.contains(kind) { kind = first }
+    }
+
+    private func kindLabel(_ k: RcKind) -> String {
+        switch k {
+        case .claudeRc, .claudeBroker: return "Claude"
+        case .codex: return "Codex"
+        case .opencode: return "opencode"
+        case .cursor: return "Cursor"
+        case .shell: return "Shell"
+        case .other(let s): return s
+        }
     }
 
     private var shedDisplay: String {
@@ -82,8 +123,7 @@ public struct AgentLaunchSheet: View {
     }
 
     /// Per-kind copy for the toggle helper line and the kickoff field, grouped so
-    /// the kind is switched once. Only the creatable kinds (claude-rc, shell) reach
-    /// the sheet, so `default` is the claude-rc case.
+    /// the kind is switched once.
     private struct KindCopy {
         let toggleHelp, promptLabel, promptPlaceholder, promptHelp: String
     }
@@ -96,6 +136,24 @@ public struct AgentLaunchSheet: View {
                 promptLabel: "Initial command",
                 promptPlaceholder: "e.g. npm install && npm test",
                 promptHelp: "Run in the shell once it's ready.")
+        case .codex:
+            return KindCopy(
+                toggleHelp: "OpenAI Codex TUI in the shed",
+                promptLabel: "Initial prompt",
+                promptPlaceholder: "e.g. find and fix the failing test",
+                promptHelp: "Typed into codex once it's ready.")
+        case .opencode:
+            return KindCopy(
+                toggleHelp: "opencode TUI in the shed",
+                promptLabel: "Initial prompt",
+                promptPlaceholder: "e.g. summarize this repo and suggest next steps",
+                promptHelp: "Typed into opencode once it's ready.")
+        case .cursor:
+            return KindCopy(
+                toggleHelp: "cursor-agent TUI in the shed",
+                promptLabel: "Initial prompt",
+                promptPlaceholder: "e.g. add a test for the parser",
+                promptHelp: "Typed into cursor-agent once it's ready.")
         default:
             return KindCopy(
                 toggleHelp: "live claude REPL with /rc",

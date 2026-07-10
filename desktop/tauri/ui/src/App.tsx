@@ -18,11 +18,12 @@ import {
   createStart, createStatus, createCancel, fetchHosts,
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   getSshApproval, setSshApproval,
-  fetchRcSessions, rcLaunch, rcKill, reportAgents,
+  rcLaunch, rcKill, reportAgents,
   useCoordinatorData, useNowTick,
   type Pane, type Shed, type HostDiskUsage, type TerminalPresetInfo,
   type Modal, type CreateProgress, type Approval, type AuditEntry, type SshPrefs,
   type RcSession, type RcKind, type RcState,
+  type RcCapabilities, fetchRcList, offeredKinds, rcAuthHint,
 } from "@/lib/bridge";
 
 /** "server/shed" when multi-server, else the shed name. */
@@ -279,10 +280,12 @@ function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
 }
 
 /* ---- Agents / remote-control (B2.4) --------------------------------------- */
-const RC_KINDS: { id: RcKind; label: string }[] = [
-  { id: "claude-rc", label: "Claude" },
-  { id: "shell", label: "Shell" },
-];
+/** Human labels for the creatable kinds (the gated set is capability-derived). */
+const RC_KIND_LABELS: Record<string, string> = {
+  "claude-rc": "Claude", codex: "Codex", opencode: "opencode",
+  cursor: "Cursor", shell: "Shell",
+};
+const rcKindLabel = (k: RcKind): string => RC_KIND_LABELS[k] ?? k;
 const rcInput =
   "w-full rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 text-[14px] text-shed-text outline-none focus:border-shed-accent";
 
@@ -296,14 +299,15 @@ function rcStateTone(state: RcState): { bg: string; fg: string } {
 
 function AgentsPane({ sheds }: { sheds: Shed[] }) {
   const [sessions, setSessions] = useState<RcSession[]>([]);
+  const [capabilities, setCapabilities] = useState<Record<string, RcCapabilities>>({});
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const gen = useRef(0);
 
   const refresh = useCallback(async () => {
     const mine = ++gen.current;
-    const rows = await fetchRcSessions();
-    if (mine === gen.current) setSessions(rows); // drop a superseded fetch
+    const { sessions: rows, capabilities: caps } = await fetchRcList();
+    if (mine === gen.current) { setSessions(rows); setCapabilities(caps); } // drop a superseded fetch
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
@@ -318,7 +322,7 @@ function AgentsPane({ sheds }: { sheds: Shed[] }) {
         right={<HeadAction icon={Plus} label="New session" onClick={() => { setError(null); setShowForm((v) => !v); }} />}
       />
       {showForm && (
-        <LaunchForm sheds={sheds} onLaunched={() => { setShowForm(false); void refresh(); }} onError={setError} />
+        <LaunchForm sheds={sheds} capabilities={capabilities} onLaunched={() => { setShowForm(false); void refresh(); }} onError={setError} />
       )}
       {error && (
         <div className={cn(card, "mb-3 flex items-start gap-2 p-3.5 text-[13px]")} style={{ borderColor: "var(--shed-danger)", color: "var(--shed-danger)" }}>
@@ -341,7 +345,9 @@ function AgentsPane({ sheds }: { sheds: Shed[] }) {
 function SessionCard({ session: s, onKilled, onError }: { session: RcSession; onKilled: () => void; onError: (e: string) => void }) {
   const [busy, setBusy] = useState(false);
   const tone = rcStateTone(s.state);
-  const sub = [`tmux ${s.tmux_session}`, s.workdir, s.created_by].filter(Boolean).join(" · ");
+  const sub = s.state === "needs-auth"
+    ? rcAuthHint(s.kind)
+    : [`tmux ${s.tmux_session}`, s.workdir, s.created_by].filter(Boolean).join(" · ");
   const kill = async () => {
     setBusy(true);
     try { await rcKill(s.shed, s.slug, s.host); onKilled(); }
@@ -369,13 +375,21 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
   );
 }
 
-function LaunchForm({ sheds, onLaunched, onError }: { sheds: Shed[]; onLaunched: () => void; onError: (e: string) => void }) {
+function LaunchForm({ sheds, capabilities, onLaunched, onError }: { sheds: Shed[]; capabilities: Record<string, RcCapabilities>; onLaunched: () => void; onError: (e: string) => void }) {
   const running = sheds.filter((s) => s.status === "running");
   const [target, setTarget] = useState(running[0] ? `${running[0].host}/${running[0].name}` : "");
   const [kind, setKind] = useState<RcKind>("claude-rc");
   const [displayName, setDisplayName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Gate the kind toggle on the SELECTED shed's advertised capabilities. Absent
+  // capabilities (old binary / not yet probed) degrade to claude+shell; present-
+  // but-empty means the shed offers no usable kinds — the form says so and the
+  // Launch button disables (no claude fallback invented).
+  const kinds = offeredKinds(capabilities[target]);
+  // Keep the selection valid if the shed changes to one that lacks it.
+  useEffect(() => { if (kinds.length && !kinds.includes(kind)) setKind(kinds[0]); }, [target]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const submit = async () => {
     const sel = running.find((s) => `${s.host}/${s.name}` === target);
@@ -411,11 +425,14 @@ function LaunchForm({ sheds, onLaunched, onError }: { sheds: Shed[]; onLaunched:
           </select>
         </Field>
         <Field label="Kind">
-          <div className="flex gap-2">
-            {RC_KINDS.map((k) => {
-              const on = kind === k.id;
+          <div className="flex flex-wrap gap-2">
+            {kinds.length === 0 && (
+              <span className="px-1 py-2 text-[13px] text-shed-text-muted">no agent kinds available in this shed</span>
+            )}
+            {kinds.map((k) => {
+              const on = kind === k;
               return (
-                <button key={k.id} onClick={() => setKind(k.id)} className={cn("hbtn flex-1 rounded-[9px] px-3 py-2 text-[14px] font-semibold", on ? "text-shed-accent" : "text-shed-text-muted")} style={{ background: on ? "color-mix(in srgb, var(--shed-accent) 14%, var(--shed-surface))" : "var(--shed-inset)", border: on ? "1px solid color-mix(in srgb, var(--shed-accent) 34%, var(--shed-border))" : "1px solid var(--shed-border)" }}>{k.label}</button>
+                <button key={k} onClick={() => setKind(k)} className={cn("hbtn flex-1 rounded-[9px] px-3 py-2 text-[14px] font-semibold", on ? "text-shed-accent" : "text-shed-text-muted")} style={{ background: on ? "color-mix(in srgb, var(--shed-accent) 14%, var(--shed-surface))" : "var(--shed-inset)", border: on ? "1px solid color-mix(in srgb, var(--shed-accent) 34%, var(--shed-border))" : "1px solid var(--shed-border)" }}>{rcKindLabel(k)}</button>
               );
             })}
           </div>
@@ -428,7 +445,7 @@ function LaunchForm({ sheds, onLaunched, onError }: { sheds: Shed[]; onLaunched:
         <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={2} placeholder={kind === "shell" ? "npm install && npm test" : "summarize this repo"} className={cn(rcInput, "resize-none")} />
       </Field>
       <div className="flex justify-end">
-        <button onClick={() => void submit()} disabled={busy || !target} className="hbtn inline-flex items-center gap-2 rounded-[10px] px-[22px] py-[11px] text-[15px] font-semibold disabled:opacity-50" style={{ background: "color-mix(in srgb, var(--shed-accent) 14%, var(--shed-surface))", border: "1px solid color-mix(in srgb, var(--shed-accent) 34%, var(--shed-border))", color: "var(--shed-accent)" }}>
+        <button onClick={() => void submit()} disabled={busy || !target || kinds.length === 0} className="hbtn inline-flex items-center gap-2 rounded-[10px] px-[22px] py-[11px] text-[15px] font-semibold disabled:opacity-50" style={{ background: "color-mix(in srgb, var(--shed-accent) 14%, var(--shed-surface))", border: "1px solid color-mix(in srgb, var(--shed-accent) 34%, var(--shed-border))", color: "var(--shed-accent)" }}>
           <Sparkles size={18} /> {busy ? "Launching…" : "Launch"}
         </button>
       </div>

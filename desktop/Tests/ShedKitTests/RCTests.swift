@@ -125,12 +125,44 @@ final class RCBinaryTests: XCTestCase {
     func testAcceptsTypedInput() {
         XCTAssertTrue(RcKind.claudeRc.acceptsTypedInput)
         XCTAssertTrue(RcKind.shell.acceptsTypedInput)
+        XCTAssertTrue(RcKind.codex.acceptsTypedInput)
+        XCTAssertTrue(RcKind.opencode.acceptsTypedInput)
+        XCTAssertTrue(RcKind.cursor.acceptsTypedInput)
         XCTAssertFalse(RcKind.claudeBroker.acceptsTypedInput)
+        // An unknown kind gets no affordances (unknown-kind policy).
+        XCTAssertFalse(RcKind.other("borg").acceptsTypedInput)
     }
 
-    func testCreatableKindsExcludeBroker() {
-        XCTAssertEqual(RcKind.creatable, [.claudeRc, .shell])
+    func testCreatableKindsExcludeBrokerAndUnknown() {
+        XCTAssertEqual(RcKind.creatable, [.claudeRc, .codex, .opencode, .cursor, .shell])
         XCTAssertFalse(RcKind.creatable.contains(.claudeBroker))
+    }
+
+    /// Unknown-kind policy: an unrecognized wire value is preserved verbatim, round-
+    /// trips as its raw string, and gets no claude affordance.
+    func testUnknownKindPreservedAndNeutral() throws {
+        let json = """
+        {"slug":"z","tmux_session":"rc-z","kind":"borg","state":"ready","managed":true}
+        """
+        let dto = try RemoteControl.decodeSession(json)
+        XCTAssertEqual(dto.kind, .other("borg"))
+        XCTAssertFalse(dto.kind.isKnown)
+        XCTAssertNil(dto.kind.tool)
+        // Re-encodes as the raw string.
+        let data = try JSONEncoder().encode(dto)
+        let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        XCTAssertEqual(obj["kind"] as? String, "borg")
+        // A pane never yields a claude URL for an unknown kind.
+        let c = RemoteControl.classifyPane(kind: .other("borg"), pane: "https://claude.ai/code/session_X")
+        XCTAssertEqual(c.state, .ready)
+        XCTAssertNil(c.url)
+    }
+
+    func testAuthHintPerKind() {
+        XCTAssertTrue(RcKind.claudeRc.authHint.contains("/login"))
+        XCTAssertTrue(RcKind.codex.authHint.contains("codex"))
+        XCTAssertTrue(RcKind.cursor.authHint.contains("cursor-agent login"))
+        XCTAssertTrue(RcKind.opencode.authHint.contains("opencode auth login"))
     }
 
     func testNormalizeRcPromptTrimsAndAllows() throws {
@@ -228,8 +260,22 @@ final class RCBinaryTests: XCTestCase {
         let url = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .appendingPathComponent("Fixtures/rcSessionDto.golden.json")
-        let dtos = try RemoteControl.decodeList(String(contentsOf: url, encoding: .utf8))
+        let parsed = try RemoteControl.decodeListResponse(String(contentsOf: url, encoding: .utf8))
+        let dtos = parsed.sessions
         XCTAssertEqual(dtos.count, 2)
+
+        // The golden gained a capabilities block (in lockstep with the Go golden).
+        let caps = try XCTUnwrap(parsed.capabilities)
+        XCTAssertEqual(caps.rcVersion, 3)
+        XCTAssertTrue(caps.hasFeature("generic-perm"))
+        XCTAssertEqual(caps.agents["codex"]?.installed, true)
+        XCTAssertEqual(caps.agents["cursor"]?.installed, false)
+        // Gating: claude/codex/opencode installed + advertised → offered; cursor
+        // advertised but not installed → not offered. broker is advertised (so
+        // `offers` is true) but is excluded from the create form via `creatable`.
+        XCTAssertEqual(caps.creatableKinds, [.claudeRc, .codex, .opencode, .shell])
+        XCTAssertFalse(caps.offers(.cursor))
+        XCTAssertFalse(caps.creatableKinds.contains(.claudeBroker))
 
         let full = dtos[0]
         XCTAssertEqual(full.kind, .claudeRc)
@@ -247,6 +293,53 @@ final class RCBinaryTests: XCTestCase {
         // The adapter fills the <shed>/<slug> display fallback the binary can't know.
         let adapted = RemoteControl.rcSession(fromDTO: minimal, serverName: "h", shed: "demo")
         XCTAssertEqual(adapted.displayName, "demo/brk900")
+    }
+
+    /// An old baked-in binary's bare `{"rc_sessions":[…]}` envelope decodes with
+    /// capabilities == nil (tolerant of absence) — the capability leg degrades.
+    func testOldBinaryEnvelopeHasNoCapabilities() throws {
+        let stdout = #"{"rc_sessions":[{"slug":"a","tmux_session":"rc-a","kind":"shell","state":"ready","managed":true}]}"#
+        let parsed = try RemoteControl.decodeListResponse(stdout)
+        XCTAssertEqual(parsed.sessions.count, 1)
+        XCTAssertNil(parsed.capabilities)
+    }
+
+    /// Present-but-EMPTY capabilities offer nothing: only ABSENT capabilities may
+    /// fall back to claude+shell; a shed that advertises kinds with no installed
+    /// agents yields an empty creatable set (the launch UIs show "unavailable"
+    /// rather than inventing claude).
+    func testPresentButEmptyCapabilitiesOfferNothing() throws {
+        let stdout = #"""
+        {"rc_sessions":[],
+         "capabilities":{"rc_version":3,
+           "kinds":["claude-rc","codex"],
+           "agents":{"claude":{"installed":false},"codex":{"installed":false}},
+           "features":[],"kind_features":{}}}
+        """#
+        let caps = try XCTUnwrap(RemoteControl.decodeListResponse(stdout).capabilities)
+        XCTAssertTrue(caps.creatableKinds.isEmpty)
+        XCTAssertFalse(caps.offers(.claudeRc))
+        XCTAssertFalse(caps.offers(.shell))  // not even advertised
+    }
+
+    /// The downgrade path: a probed shed whose refresh returned nil capabilities
+    /// (old/downgraded image) must LOSE its stale cached entry; un-probed sheds
+    /// keep theirs. Pins the merge AppModel.rcList applies.
+    func testMergeCapabilitiesDowngradeRemovesStaleEntry() throws {
+        let capsJSON = #"""
+        {"rc_sessions":[],
+         "capabilities":{"rc_version":3,"kinds":["shell"],"agents":{},
+           "features":[],"kind_features":{}}}
+        """#
+        let caps = try XCTUnwrap(RemoteControl.decodeListResponse(capsJSON).capabilities)
+        var cache = ["srv/web": caps, "srv/api": caps, "srv/db": caps]
+        // web probed with fresh caps, api probed but downgraded (nil), db un-probed.
+        RemoteControl.mergeCapabilities(
+            into: &cache,
+            probes: [("srv/web", caps), ("srv/api", nil)])
+        XCTAssertNotNil(cache["srv/web"])   // overwritten
+        XCTAssertNil(cache["srv/api"])      // removed — no stale gating
+        XCTAssertNotNil(cache["srv/db"])    // un-probed, kept
     }
 
     private func argvHasPair(_ argv: [String], _ flag: String, _ value: String) -> Bool {
