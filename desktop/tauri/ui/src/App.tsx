@@ -388,8 +388,10 @@ function LaunchForm({ sheds, capabilities, onLaunched, onError }: { sheds: Shed[
   // but-empty means the shed offers no usable kinds — the form says so and the
   // Launch button disables (no claude fallback invented).
   const kinds = offeredKinds(capabilities[target]);
-  // Keep the selection valid if the shed changes to one that lacks it.
-  useEffect(() => { if (kinds.length && !kinds.includes(kind)) setKind(kinds[0]); }, [target]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Keep the selection valid when the shed changes OR its offered kinds change
+  // for the same shed (a background refresh() can shrink capabilities[target]
+  // while the form stays open).
+  useEffect(() => { if (kinds.length && !kinds.includes(kind)) setKind(kinds[0]); }, [target, kinds.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const submit = async () => {
     const sel = running.find((s) => `${s.host}/${s.name}` === target);

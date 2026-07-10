@@ -61,32 +61,32 @@ func TestPaneFixturesClassify(t *testing.T) {
 			continue
 		}
 		name := strings.TrimSuffix(base, ".txt")
-		agent, want, ok := parseFixtureName(name)
-		if !ok {
-			t.Errorf("%s: filename does not encode a known <agent>-<state>", base)
-			continue
-		}
-		kind, ok := fixtureAgentKind[agent]
-		if !ok {
-			t.Errorf("%s: unknown agent prefix %q", base, agent)
-			continue
-		}
-		data, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		state, url := ClassifyPane(kind, string(data))
-		if state != want {
-			t.Errorf("%s: ClassifyPane = %s, want %s", base, state, want)
-		}
-		// Drift guard: a non-starting fixture must never silently fall through.
-		if want != StateStarting && state == StateStarting {
-			t.Errorf("%s: classified to the starting default (broken anchor?)", base)
-		}
-		// url/id stay claude-remote-control-specific — never leak for other agents.
-		if agent != "claude" && url != "" {
-			t.Errorf("%s: non-claude fixture leaked url %q", base, url)
-		}
+		t.Run(name, func(t *testing.T) {
+			agent, want, ok := parseFixtureName(name)
+			if !ok {
+				t.Fatalf("%s: filename does not encode a known <agent>-<state>", base)
+			}
+			kind, ok := fixtureAgentKind[agent]
+			if !ok {
+				t.Fatalf("%s: unknown agent prefix %q", base, agent)
+			}
+			data, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, url := ClassifyPane(kind, string(data))
+			if state != want {
+				t.Errorf("%s: ClassifyPane = %s, want %s", base, state, want)
+			}
+			// Drift guard: a non-starting fixture must never silently fall through.
+			if want != StateStarting && state == StateStarting {
+				t.Errorf("%s: classified to the starting default (broken anchor?)", base)
+			}
+			// url/id stay claude-remote-control-specific — never leak for other agents.
+			if agent != "claude" && url != "" {
+				t.Errorf("%s: non-claude fixture leaked url %q", base, url)
+			}
+		})
 		seen++
 	}
 	if seen == 0 {

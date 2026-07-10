@@ -22,11 +22,61 @@ rc presence is the feature under test.
 from __future__ import annotations
 
 import json
+import time
 import urllib.request
 
 import pytest
 
 from fixtures.server import resolve_server_entry
+
+# Substrings that identify a fixture-environment gap — the guest image's
+# shed-ext-rc predates multi-agent RC (no `--kind` flag / unknown kind) or the
+# binary is absent — as opposed to a real server, guest-agent, argument, or
+# permission regression. Only these get a skip; anything else FAILS the test so a
+# regression can't masquerade as a precondition skip.
+_RC_INCOMPAT_SIGNS = (
+    "command not found",
+    "not found",
+    "no such file",
+    "executable file not found",
+    "unknown kind",
+    "unknown flag",
+    "unknown shorthand flag",
+    "flag provided but not defined",
+)
+
+
+def _require_rc_create(r) -> None:
+    """Gate on a `shed-ext-rc create` result: pass on success, skip only on a
+    known image-compatibility signature, fail on any other non-zero exit."""
+    if r.returncode == 0:
+        return
+    text = (r.stderr or "").lower()
+    if any(sign in text for sign in _RC_INCOMPAT_SIGNS):
+        pytest.skip(
+            "shed-ext-rc create --kind shell failed (image predates multi-agent "
+            f"RC or omits the binary): exit={r.returncode} stderr={r.stderr!r}"
+        )
+    pytest.fail(
+        "shed-ext-rc create --kind shell failed unexpectedly — not a known "
+        "image-compatibility signature, so this is a server/guest-agent/argument "
+        f"regression, not a precondition: exit={r.returncode} stderr={r.stderr!r}"
+    )
+
+
+def _poll_rc_row(fetch, *, timeout: float = 10.0, interval: float = 0.5):
+    """Poll `fetch()` -> (row, payload) until `row` is non-None or `timeout`
+    elapses. `--wait=false` skips readiness polling, so the session may not be
+    registered when the first listing is fetched; bound the wait to absorb that
+    create-race without masking a genuinely missing row. Returns the last
+    (row, payload) either way so the caller's assertion reports real diagnostics.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        row, payload = fetch()
+        if row is not None or time.monotonic() >= deadline:
+            return row, payload
+        time.sleep(interval)
 
 
 def _api_base(server) -> str:
@@ -100,17 +150,17 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
         shed,
         ["shed-ext-rc", "create", "--kind", "shell", "--wait=false"],
     )
-    if r.returncode != 0:
-        pytest.skip(
-            "shed-ext-rc create --kind shell failed (image predates multi-agent "
-            f"RC or omits the binary): exit={r.returncode} stderr={r.stderr!r}"
-        )
+    _require_rc_create(r)
 
     # Default listing: the rc-* row must be present and enriched. rc presence is
     # the feature under test — a missing block here is a FAILURE (if the target
     # is a brew/deb-installed server, rerun via make test-integration-dev).
-    resp = _get_json(base, "/api/sessions")
-    row = _find_rc_row(resp.get("sessions") or [], shed)
+    # --wait=false returned before the session registered, so poll for the row.
+    def _fetch_global():
+        resp = _get_json(base, "/api/sessions")
+        return _find_rc_row(resp.get("sessions") or [], shed), resp
+
+    row, resp = _poll_rc_row(_fetch_global)
     assert row is not None, (
         f"no rc-* session row for shed {shed!r} in GET /api/sessions: "
         f"{resp.get('sessions')!r}"
@@ -134,6 +184,32 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
     )
     assert row0.get("rc") is None, (
         f"?rc=0 must omit the rc block, got: {row0.get('rc')!r}"
+    )
+
+    # Per-shed listing (GET /api/sheds/{name}/sessions) must carry the same
+    # contract as the aggregate: enriched by default, rc omitted under ?rc=0.
+    per_shed = _get_json(base, f"/api/sheds/{shed}/sessions")
+    prow = _find_rc_row(per_shed.get("sessions") or [], shed)
+    assert prow is not None, (
+        f"no rc-* row for shed {shed!r} in GET /api/sheds/{shed}/sessions: "
+        f"{per_shed.get('sessions')!r}"
+    )
+    prc = prow.get("rc")
+    assert prc is not None, (
+        f"Session.RC missing for {prow.get('name')!r} on the per-shed route "
+        f"(warnings={per_shed.get('warnings')!r}); rerun against the dev build via "
+        "make test-integration-dev if targeting a brew/deb server."
+    )
+    assert prc.get("kind") == "shell", f"unexpected per-shed rc.kind: {prc!r}"
+
+    per_shed0 = _get_json(base, f"/api/sheds/{shed}/sessions?rc=0")
+    prow0 = _find_rc_row(per_shed0.get("sessions") or [], shed)
+    assert prow0 is not None, (
+        f"rc-* row disappeared under ?rc=0 on the per-shed route for shed "
+        f"{shed!r}: {per_shed0.get('sessions')!r}"
+    )
+    assert prow0.get("rc") is None, (
+        f"?rc=0 must omit the rc block on the per-shed route, got: {prow0.get('rc')!r}"
     )
 
 
@@ -168,13 +244,17 @@ def test_overview_shape(shed_server_dev, test_shed_name_dev):
         shed,
         ["shed-ext-rc", "create", "--kind", "shell", "--wait=false"],
     )
-    if r.returncode != 0:
-        pytest.skip(
-            "shed-ext-rc create --kind shell failed (image predates multi-agent "
-            f"RC or omits the binary): exit={r.returncode} stderr={r.stderr!r}"
-        )
+    _require_rc_create(r)
 
-    ov = _get_json(base, "/api/overview")
+    # --wait=false returned before the session registered; poll /api/overview for
+    # the enriched shell row under our shed before asserting the payload.
+    def _fetch_overview():
+        payload = _get_json(base, "/api/overview")
+        entry = _find_overview_shed(payload.get("sheds") or [], shed)
+        sessions = (entry or {}).get("sessions") or []
+        return _find_rc_row(sessions, shed), payload
+
+    row, ov = _poll_rc_row(_fetch_overview)
 
     # server block: version + the overview/rc-enrich feature tokens.
     srv_block = ov.get("server") or {}
@@ -195,7 +275,6 @@ def test_overview_shape(shed_server_dev, test_shed_name_dev):
     assert entry is not None, f"shed {shed!r} not in overview sheds: {[s.get('name') for s in sheds]!r}"
     sessions = entry.get("sessions")
     assert isinstance(sessions, list), f"shed sessions must be a list: {entry!r}"
-    row = _find_rc_row(sessions, shed)
     assert row is not None, (
         f"no rc-* session under shed {shed!r} in overview: {sessions!r}"
     )

@@ -77,6 +77,10 @@ public struct AgentLaunchSheet: View {
         }
         // When the shed changes, its capabilities may not offer the current kind.
         .onChange(of: target) { _ in reconcileKind() }
+        // Capabilities can also change for the SAME shed while the sheet stays open
+        // (a background probe/refresh); re-reconcile so a now-unoffered kind can't
+        // stay selected. `availableKinds` is derived from `state.rcCapabilities[target]`.
+        .onChange(of: availableKinds) { _ in reconcileKind() }
     }
 
     private var selectedShed: Shed? {
@@ -167,6 +171,9 @@ public struct AgentLaunchSheet: View {
 
     private func launch() {
         guard let shed = selectedShed else { return }
+        // Defensive: never send a kind the selected shed no longer offers (guards
+        // the window between a capability shrink and the reconcile above).
+        guard availableKinds.contains(kind) else { return }
         let name = displayName.trimmingCharacters(in: .whitespaces)
         let promptRaw = initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = (kind.acceptsTypedInput && !promptRaw.isEmpty) ? promptRaw : nil
