@@ -3,6 +3,7 @@ package rc
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,15 +35,22 @@ type Getenv func(string) string
 
 // CreateOptions configures Create.
 type CreateOptions struct {
-	Kind             Kind
-	DisplayName      string // defaults to the slug
-	Slug             string // optional; generated when empty
-	Workdir          string // optional; defaults to $SHED_WORKSPACE
-	CreatedBy        string // optional; defaults to ToolName
-	Target           string // optional advisory label
-	Prompt           string // optional kickoff line (implies Wait)
-	Wait             bool   // block until ready, accept trust, deliver prompt
-	InteractiveShell bool   // wrap claude kinds in `bash -ic` (native machines)
+	Kind        Kind
+	DisplayName string // defaults to the slug
+	Slug        string // optional; generated when empty
+	Workdir     string // optional; defaults to $SHED_WORKSPACE
+	CreatedBy   string // optional; defaults to ToolName
+	Target      string // optional advisory label
+	Prompt      string // optional kickoff line (implies Wait); mutually exclusive with Plan
+	// Plan is optional plan-delivery content: when set, it is written to a per-kind
+	// HOME-rooted file (see plan.go) and a kickoff referencing that file is composed
+	// and delivered — so Plan also implies Wait. Mutually exclusive with Prompt.
+	Plan string
+	// PlanFraming is optional caller framing prepended to the composed plan kickoff
+	// (only meaningful with Plan). Normalized + control-char-validated like a prompt.
+	PlanFraming      string
+	Wait             bool // block until ready, accept trust, deliver prompt
+	InteractiveShell bool // wrap claude kinds in `bash -ic` (native machines)
 	// PermissionMode sets claude's --permission-mode for claude kinds ("" = omit,
 	// claude's own default). e.g. "auto" or "bypassPermissions" for an unattended
 	// run; with bypassPermissions, Wait also auto-accepts the one-time bypass dialog.
@@ -65,13 +73,20 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 			return Session{}, fmt.Errorf("%w: prompt contains an unsupported control character", ErrBadArgs)
 		}
 	}
-	if opts.PermissionMode != "" {
-		if !IsClaudeKind(opts.Kind) {
-			return Session{}, fmt.Errorf("%w: --permission-mode applies only to claude kinds", ErrBadArgs)
+	// Plan-delivery validation (kind, size, UTF-8, framing, Plan/Prompt exclusion)
+	// runs before any side effect; the file is written and the kickoff composed after
+	// the slug is resolved below.
+	if opts.Plan != "" {
+		framing, err := validatePlanInputs(opts.Kind, opts.Plan, opts.Prompt, opts.PlanFraming)
+		if err != nil {
+			return Session{}, err
 		}
-		if !ValidPermissionMode(opts.PermissionMode) {
-			return Session{}, fmt.Errorf("%w: invalid permission mode %q", ErrBadArgs, opts.PermissionMode)
-		}
+		opts.PlanFraming = framing
+	} else if opts.PlanFraming != "" {
+		return Session{}, fmt.Errorf("%w: plan framing given without a plan", ErrBadArgs)
+	}
+	if err := validatePermissionMode(opts.Kind, opts.PermissionMode); err != nil {
+		return Session{}, err
 	}
 
 	slug := opts.Slug
@@ -114,10 +129,11 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		return Session{}, fmt.Errorf("%w: %v", ErrBadArgs, err)
 	}
 
-	// Best-effort trust pre-seed for claude kinds (the accept-trust fallback covers
-	// any failure, so a preseed error never fails the create).
-	if IsClaudeKind(opts.Kind) {
-		_ = PreseedClaudeConfig(workdir, env)
+	// Best-effort trust/onboarding pre-seed for tools that need one (claude; the
+	// accept-trust fallback covers any failure, so a preseed error never fails the
+	// create). Dispatched through the agent registry — nil Preseed = no-op.
+	if spec, ok := specForKind(opts.Kind); ok && spec.Preseed != nil {
+		_ = spec.Preseed(workdir, env)
 	}
 
 	inner := InnerCommand(opts.Kind, displayName, opts.PermissionMode, opts.InteractiveShell)
@@ -127,6 +143,23 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 			return Session{}, fmt.Errorf("%w: %s", ErrDuplicateSlug, name)
 		}
 		return Session{}, fmt.Errorf("tmux new-session failed: %s", strings.TrimSpace(res.Stderr+res.Stdout))
+	}
+
+	// Plan delivery: write the plan to its per-kind HOME-rooted file (0600) and
+	// compose the kickoff that waitUntilReady types once the session is ready. This
+	// happens AFTER the tmux create so a duplicate --slug never clobbers the live
+	// session's plan file (delivery only occurs below, so the ordering is safe). A
+	// write failure is fatal (unlike the best-effort preseed) — the whole point of a
+	// plan run is that the file is present for the agent to read — and the
+	// just-created session is torn down (best-effort) so a failed plan create leaves
+	// nothing behind, matching the pre-create validation failures.
+	if opts.Plan != "" {
+		planFile, err := writePlan(opts.Kind, slug, opts.Plan, env)
+		if err != nil {
+			_ = killSession(r, name)
+			return Session{}, err
+		}
+		opts.Prompt = composePlanKickoff(planFile, opts.PlanFraming)
 	}
 
 	session := Session{
@@ -144,16 +177,29 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 	}
 
 	if opts.Wait || opts.Prompt != "" {
-		bypass := opts.PermissionMode == PermissionModeBypass
-		state, url := waitUntilReady(r, name, opts.Kind, opts.Prompt, bypass, sleep)
+		// The one-time bypass-acceptance dialog appears only for a claude session whose
+		// resolved posture is full bypass — true for both "skip" (generic) and
+		// "bypassPermissions" (claude-historical), since both map to the same flag.
+		flags, _ := permFlagsFor(opts.Kind, opts.PermissionMode)
+		bypass := slices.Contains(flags, PermissionModeBypass)
+		state, url, derr := waitUntilReady(r, name, opts.Kind, opts.Prompt, bypass, sleep)
 		session.State, session.URL = state, url
+		if derr != nil {
+			// The session reached ready but the kickoff could not be delivered. A
+			// success here would let a plan/prompt run exit 0 with nothing started, so
+			// the delivery failure is the create outcome (the session is left running
+			// for the caller to inspect/retry).
+			return session, derr
+		}
 	}
 	return session, nil
 }
 
 // waitUntilReady polls the pane until a terminal state (or timeout), auto-accepting
-// the trust prompt once, then delivers prompt if the session reached ready.
-func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool, sleep func(time.Duration)) (State, string) {
+// the trust prompt once, then delivers prompt if the session reached ready. The
+// returned error is non-nil only for a kickoff-delivery failure after ready — a
+// classified non-ready state is a result, not an error.
+func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool, sleep func(time.Duration)) (State, string, error) {
 	if sleep == nil {
 		sleep = time.Sleep
 	}
@@ -167,7 +213,7 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 			// The session is gone (the inner command exited immediately) — report
 			// dead now rather than polling empty output until the deadline.
 			if isMissingSession(capRes.Stderr) {
-				return StateDead, ""
+				return StateDead, "", nil
 			}
 			sleep(defaultPollEvery) // transient capture error; keep polling
 			continue
@@ -185,11 +231,13 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 			continue
 		}
 		state, url = ClassifyPane(kind, capRes.Stdout)
-		if state == StateNeedsTrust && IsClaudeKind(kind) && !trustAccepted {
+		if state == StateNeedsTrust && !trustAccepted {
+			// Every agent's directory-trust gate captured so far pre-selects "yes" and
+			// is accepted with Enter (claude's "Yes, I trust this folder"; codex's
+			// "1. Yes, continue · Press enter to continue"). The classified needs-trust
+			// state is the gate, so a single Enter accepts it for any kind.
 			trustAccepted = true
-			if IsTrustPrompt(capRes.Stdout) {
-				sendEnter(r, name)
-			}
+			sendEnter(r, name)
 			sleep(defaultPollEvery)
 			continue
 		}
@@ -200,11 +248,21 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 	}
 	if state == StateReady && prompt != "" {
 		// A session can report ready (URL present) a beat before its REPL accepts
-		// input; settle once more before typing the kickoff line.
+		// input; settle once more before typing the kickoff line. A delivery failure
+		// is surfaced — otherwise a create --wait would report ready with the kickoff
+		// never typed (and a plan run would exit 0 with the plan unstarted).
 		sleep(promptDeliverSettle)
-		sendLine(r, name, prompt)
+		if res := sendLine(r, name, prompt); res.Code != 0 {
+			if isMissingSession(res.Stderr) {
+				// Killed between classification and delivery: that's a dead session,
+				// not a transport failure.
+				return StateDead, "", nil
+			}
+			return state, url, fmt.Errorf("session %s is ready but kickoff delivery failed: %s",
+				name, strings.TrimSpace(res.Stderr))
+		}
 	}
-	return state, url
+	return state, url, nil
 }
 
 // List returns every rc-* session's DTO. displayFallback receives a slug.

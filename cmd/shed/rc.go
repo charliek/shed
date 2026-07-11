@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,10 +13,10 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/ext/rc"
 	"github.com/charliek/shed/internal/version"
 )
 
@@ -23,64 +24,11 @@ import (
 // under the RC Session Convention (e.g. "rc-abc234").
 const rcTmuxPrefix = "rc-"
 
-// rcEnrichTimeout bounds a single `shed-ext-rc list` SSH round-trip so a slow or
-// unreachable shed never stalls `shed sessions`.
-const rcEnrichTimeout = 6 * time.Second
-
-// rcEnrichConcurrency caps concurrent SSH enrichment calls so `sessions --all`
-// across many sheds doesn't fan out unbounded.
-const rcEnrichConcurrency = 6
-
-// rcSessionDTO mirrors shed-ext-rc's neutral `list` DTO (one entry of the
-// `{"rc_sessions":[...]}` payload). It is decoded verbatim from the binary's
-// stdout so the shed CLI stays aligned with the cross-repo golden fixture
-// (internal/ext/rc + shed-remote-agent); fields beyond those we
-// display are accepted and ignored.
-type rcSessionDTO struct {
-	Slug        string `json:"slug"`
-	TmuxSession string `json:"tmux_session"`
-	Kind        string `json:"kind"`
-	State       string `json:"state"`
-	Managed     bool   `json:"managed"`
-	DisplayName string `json:"display_name"`
-	URL         string `json:"url"`
-	CreatedBy   string `json:"created_by"`
-}
-
-// rcListResponse is the `shed-ext-rc list` stdout shape.
-type rcListResponse struct {
-	RCSessions []rcSessionDTO `json:"rc_sessions"`
-}
-
-// toSessionRC projects the decoded DTO onto the display type carried on
-// config.Session (the decode type is kept separate so it stays aligned with the
-// shed-ext-rc golden contract independent of presentation).
-func (d rcSessionDTO) toSessionRC() *config.SessionRC {
-	return &config.SessionRC{
-		Kind:        d.Kind,
-		State:       d.State,
-		Managed:     d.Managed,
-		DisplayName: d.DisplayName,
-		URL:         d.URL,
-		CreatedBy:   d.CreatedBy,
-	}
-}
-
-// parseRcList decodes `shed-ext-rc list` stdout into a map keyed by tmux session
-// name (e.g. "rc-abc234") for O(1) merge onto enumerated tmux sessions.
-func parseRcList(stdout []byte) (map[string]rcSessionDTO, error) {
-	var resp rcListResponse
-	if err := json.Unmarshal(stdout, &resp); err != nil {
-		return nil, fmt.Errorf("decoding shed-ext-rc list: %w", err)
-	}
-	out := make(map[string]rcSessionDTO, len(resp.RCSessions))
-	for _, s := range resp.RCSessions {
-		if s.TmuxSession != "" {
-			out[s.TmuxSession] = s
-		}
-	}
-	return out, nil
-}
+// Session-listing RC enrichment now lives entirely server-side: the server execs
+// `shed-ext-rc list` over the guest agent channel and populates Session.RC on GET
+// /api/sessions (see internal/api/rcenrich.go). The CLI just renders whatever the
+// server returns — it opens no SSH connection to enrich a listing. The canonical
+// `list` DTO is internal/ext/rc.Session; createRCSession below decodes into it.
 
 // baseSSHArgs returns the SSH args common to every shed connection: port, pinned
 // known_hosts, strict host-key check, any extra -o options, then <shed>@<host>.
@@ -102,89 +50,15 @@ func baseSSHArgs(shedName string, entry *config.ServerEntry, extraOpts ...string
 // of hanging). remoteArgv elements are sent to the server as-is (joined by ssh and
 // re-parsed by the server's `bash -lc`), so a caller passing user data as a single
 // element must shell-quote it first (see createRCSession); literal tokens like
-// "shed-ext-rc","list" need no quoting.
+// "shed-ext-rc","create" need no quoting.
 func sshCaptureArgs(shedName string, entry *config.ServerEntry, remoteArgv ...string) []string {
 	// -T disables PTY allocation so ssh doesn't print "Pseudo-terminal will not be
 	// allocated…" to our captured stderr, and so the non-PTY exec channel keeps the
 	// remote command's stdout and stderr on their own SSH streams (guest-binary
-	// diagnostics arrive on stderr; see the fallback in rcListOverSSH).
+	// diagnostics arrive on stderr; see the sshShell stderr fallback).
 	args := baseSSHArgs(shedName, entry, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 	args = append(args, "--")
 	return append(args, remoteArgv...)
-}
-
-// rcListOverSSH runs `shed-ext-rc list` in the shed and returns the parsed
-// sessions keyed by tmux name. A missing binary, transport failure, or non-zero
-// exit is reported as an error for the caller to treat as "no RC data".
-func rcListOverSSH(ctx context.Context, shedName string, entry *config.ServerEntry) (map[string]rcSessionDTO, error) {
-	args := sshCaptureArgs(shedName, entry, "shed-ext-rc", "list")
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("shed-ext-rc list on %s: %w", shedName, err)
-	}
-	return parseRcList(out)
-}
-
-// rcShedKey identifies a shed by server + name (a shed name is unique only
-// within a server, so the aggregated `--all` listing must key by both).
-type rcShedKey struct{ server, shed string }
-
-// enrichSessionsRC fills the RC field of every "rc-*" session in sessions by
-// querying the in-shed shed-ext-rc binary. It runs one `shed-ext-rc list` per
-// distinct (server, shed) that actually has an rc-* session — bounded by
-// rcEnrichConcurrency and time-limited per call — resolving each shed's SSH
-// endpoint from the client config by the session's ServerName. It mutates
-// sessions in place and degrades silently (rows keep their plain tmux data) when
-// a shed is unreachable, lacks the binary, or its server is unknown. Non-RC
-// listings touch nothing and never dial. Call once, after the full session list
-// (with ServerName populated) is assembled.
-func enrichSessionsRC(sessions []config.Session) {
-	if clientConfig == nil {
-		return // config not loaded (e.g. a direct test caller); nothing to resolve
-	}
-	idxByShed := make(map[rcShedKey][]int)
-	for i := range sessions {
-		if strings.HasPrefix(sessions[i].Name, rcTmuxPrefix) {
-			k := rcShedKey{sessions[i].ServerName, sessions[i].ShedName}
-			idxByShed[k] = append(idxByShed[k], i)
-		}
-	}
-	if len(idxByShed) == 0 {
-		return
-	}
-
-	sem := make(chan struct{}, rcEnrichConcurrency)
-	var wg sync.WaitGroup
-	for key, idxs := range idxByShed {
-		entry, ok := clientConfig.Servers[key.server]
-		if !ok {
-			continue // unknown server -> leave rows un-enriched
-		}
-		wg.Add(1)
-		go func(key rcShedKey, idxs []int, entry config.ServerEntry) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			ctx, cancel := context.WithTimeout(context.Background(), rcEnrichTimeout)
-			defer cancel()
-			byTmux, err := rcListOverSSH(ctx, key.shed, &entry)
-			if err != nil {
-				if verboseLevel > 0 {
-					fmt.Fprintf(os.Stderr, "Warning: RC metadata unavailable for %s: %v\n", key.shed, err)
-				}
-				return
-			}
-			// Distinct indices per (server, shed) -> safe concurrent writes.
-			for _, i := range idxs {
-				if dto, ok := byTmux[sessions[i].Name]; ok {
-					sessions[i].RC = dto.toSessionRC()
-				}
-			}
-		}(key, idxs, entry)
-	}
-	wg.Wait()
 }
 
 // --- RC session creation (shed attach --kind ...) ---------------------------
@@ -239,42 +113,27 @@ func sshShell(ctx context.Context, shedName string, entry *config.ServerEntry, s
 	return out.Bytes(), nil
 }
 
-// isOldBinaryPermModeErr reports whether a createRCSession error is the shed's
-// shed-ext-rc rejecting --permission-mode as an unknown flag (Go's flag package
-// prints "flag provided but not defined: -permission-mode"), i.e. an image that
-// predates posture support. Matched precisely so a transient or unrelated failure
-// is never mistaken for an old binary.
-func isOldBinaryPermModeErr(err error) bool {
+// isOldBinaryRCErr reports whether a createRCSession error is the shed's baked-in
+// shed-ext-rc rejecting our request because its image predates multi-agent RC. Only
+// the two exact signatures an OLD binary emits for a request it cannot understand are
+// matched:
+//   - `invalid arguments: unknown kind "<k>"` — rc.Create's kind rejection (the CLI
+//     already validated the kind against the current registry, so this can only mean
+//     the guest binary's registry is older);
+//   - `flag provided but not defined: -<flag>` — Go's flag package rejecting a create
+//     flag the old binary doesn't have.
+//
+// Any other guest error — including a NEW binary's legitimate input validation
+// ("invalid arguments: prompt contains an unsupported control character",
+// "invalid arguments: invalid slug", …) — passes through unchanged so it is never
+// misreported as "recreate this shed".
+func isOldBinaryRCErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "permission-mode") &&
-		(strings.Contains(s, "not defined") || strings.Contains(s, "flag provided"))
-}
-
-// streamPlanToShed writes the plan into claude's native plans directory inside the
-// shed — `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plans/plan-<slug>.md` — and returns its
-// absolute path for the kickoff prompt. Keeping it out of the workspace means it never
-// pollutes the repo (or a --local-dir host copy); claude reads it fine in auto and
-// bypass modes when the kickoff references the absolute path (verified live). The path
-// is echoed back behind a sentinel so any login-shell output can't be mistaken for it.
-func streamPlanToShed(shedName string, entry *config.ServerEntry, slug, content string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), rcEnrichTimeout)
-	defer cancel()
-	file := "plan-" + slug + ".md"
-	cmd := `d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plans"; mkdir -p "$d" && cat > "$d/` + file +
-		`" && printf 'SHED_PLAN_PATH=%s\n' "$d/` + file + `"`
-	out, err := sshShell(ctx, shedName, entry, content, cmd)
-	if err != nil {
-		return "", fmt.Errorf("shipping plan to shed: %w", err)
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "SHED_PLAN_PATH="); ok && p != "" {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("shipping plan to shed: could not determine the plan path")
+	return strings.Contains(s, "unknown kind") ||
+		strings.Contains(s, "flag provided but not defined")
 }
 
 // rcCreateOptions configures createRCSession.
@@ -285,14 +144,22 @@ type rcCreateOptions struct {
 	displayName    string
 	slug           string
 	permissionMode string // "" omits the flag
-	prompt         string // kickoff line (empty -> none)
+	prompt         string // kickoff line delivered via --prompt-stdin (empty -> none)
+	// plan, when set, is delivered via --plan-stdin: the guest writes it to a per-kind
+	// HOME-rooted file and composes+delivers the kickoff, so the plan never touches the
+	// workdir (a --repo clone / --local-dir host dir). Mutually exclusive with prompt.
+	plan string
+	// planFraming is optional caller framing shipped as base64 (--prompt-b64) alongside
+	// the plan, so stdin stays reserved for the plan itself. Only meaningful with plan.
+	planFraming string
 }
 
 // createRCSession invokes `shed-ext-rc create --wait` over SSH and returns the
 // parsed session DTO. Each shed-ext-rc argument is shell-quoted into one command
-// string (the server re-parses through bash -lc), and the kickoff prompt is piped on
-// stdin (never argv) per the convention.
-func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
+// string (the server re-parses through bash -lc). stdin carries the kickoff prompt
+// (--prompt-stdin) or the plan (--plan-stdin) — never argv, per the convention — with
+// any plan framing base64-encoded onto argv so a single exec ships plan + framing.
+func createRCSession(opts rcCreateOptions) (rc.Session, error) {
 	argv := []string{
 		"shed-ext-rc", "create",
 		"--kind", opts.kind,
@@ -307,8 +174,17 @@ func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
 	if opts.permissionMode != "" {
 		argv = append(argv, "--permission-mode", opts.permissionMode)
 	}
-	if opts.prompt != "" {
+	stdin := ""
+	switch {
+	case opts.plan != "":
+		argv = append(argv, "--plan-stdin")
+		if opts.planFraming != "" {
+			argv = append(argv, "--prompt-b64", base64.StdEncoding.EncodeToString([]byte(opts.planFraming)))
+		}
+		stdin = opts.plan
+	case opts.prompt != "":
 		argv = append(argv, "--prompt-stdin")
+		stdin = opts.prompt
 	}
 	quoted := make([]string, len(argv))
 	for i, a := range argv {
@@ -317,13 +193,13 @@ func createRCSession(opts rcCreateOptions) (rcSessionDTO, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), rcCreateTimeout)
 	defer cancel()
-	out, err := sshShell(ctx, opts.shedName, opts.entry, opts.prompt, strings.Join(quoted, " "))
+	out, err := sshShell(ctx, opts.shedName, opts.entry, stdin, strings.Join(quoted, " "))
 	if err != nil {
-		return rcSessionDTO{}, fmt.Errorf("shed-ext-rc create: %w", err)
+		return rc.Session{}, fmt.Errorf("shed-ext-rc create: %w", err)
 	}
-	var dto rcSessionDTO
+	var dto rc.Session
 	if err := json.Unmarshal(bytes.TrimSpace(out), &dto); err != nil {
-		return rcSessionDTO{}, fmt.Errorf("decoding shed-ext-rc create output: %w (raw: %q)", err, string(out))
+		return rc.Session{}, fmt.Errorf("decoding shed-ext-rc create output: %w (raw: %q)", err, string(out))
 	}
 	return dto, nil
 }

@@ -132,7 +132,9 @@ struct AgentRow: View {
     private var fixHint: String {
         switch session.state {
         case .needsTrust: return "attach + trust the folder, then relaunch"
-        case .needsAuth: return "attach + claude auth login, then relaunch"
+        // Per-kind login remediation (claude → /login, codex/cursor/opencode → their
+        // own login), surfaced from the session's kind.
+        case .needsAuth: return "\(session.kind.authHint), then relaunch"
         default: return ""
         }
     }

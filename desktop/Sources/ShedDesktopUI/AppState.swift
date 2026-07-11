@@ -27,6 +27,10 @@ public final class AppState: ObservableObject {
     @Published public var showLaunchSheet: Bool = false
     /// Remote-control sessions across sheds (the Agents pane).
     @Published public var rcSessions: [RcSession] = []
+    /// Per-shed RC capabilities (keyed by the `host/name` shed id) captured during
+    /// the last `rc.list` probe — feeds the launch sheet's kind gating. A shed with
+    /// an old binary (no capabilities) is simply absent (→ sheet shows claude+shell).
+    @Published public var rcCapabilities: [String: RcCapabilities] = [:]
     /// Pending credential-approval requests (the Approvals pane + menu bar),
     /// each with its decided gate + SSH scope/TTL defaults for the card.
     @Published public var approvals: [PendingApprovalItem] = []

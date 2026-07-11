@@ -8,9 +8,12 @@ import (
 )
 
 // The golden fixture is byte-identical to shed-remote-agent's
-// packages/shared/src/schemas/rcSessionDto.golden.json. Both repos assert it decodes
-// in their respective layer (Zod there, encoding/json here) — the single guard that
-// the shed-ext-rc stdout contract stays in lockstep across tools.
+// packages/shared/src/schemas/rcSessionDto.golden.json and cmd/shed's copy. Both repos
+// assert it decodes in their respective layer (Zod there, encoding/json here) — the
+// single guard that the shed-ext-rc stdout contract stays in lockstep across tools.
+// The `capabilities` block was added deliberately here (list envelope + DTO) alongside
+// docs/reference/rc-session-convention.md; keep the three copies and the convention doc
+// in sync when this shape changes.
 func TestGoldenFixtureDecodes(t *testing.T) {
 	data, err := os.ReadFile("testdata/rcSessionDto.golden.json")
 	if err != nil {
@@ -36,6 +39,26 @@ func TestGoldenFixtureDecodes(t *testing.T) {
 	if minimal.Kind != KindClaudeBroker || minimal.Managed ||
 		minimal.DisplayName != "" || minimal.Workdir != "" || minimal.URL != "" || minimal.ID != "" {
 		t.Fatalf("minimal session should have optionals omitted: %+v", minimal)
+	}
+
+	caps := resp.Capabilities
+	if caps == nil {
+		t.Fatal("list envelope must carry the capabilities block")
+	}
+	if caps.RCVersion != CapabilityVersion {
+		t.Errorf("rc_version = %d, want %d", caps.RCVersion, CapabilityVersion)
+	}
+	if len(caps.Kinds) != len(allKinds) {
+		t.Errorf("capabilities.kinds = %d, want %d", len(caps.Kinds), len(allKinds))
+	}
+	if info, ok := caps.Agents["claude"]; !ok || !info.Installed || info.Version == "" {
+		t.Errorf("claude agent info wrong: %+v", caps.Agents["claude"])
+	}
+	if info, ok := caps.Agents["cursor"]; !ok || info.Installed || info.Version != "" {
+		t.Errorf("uninstalled cursor should have no version: %+v", info)
+	}
+	if kf, ok := caps.KindFeatures[KindCodex]; !ok || !kf.PostInput || kf.Approvals != "tui" {
+		t.Errorf("codex kind_features wrong: %+v", kf)
 	}
 }
 

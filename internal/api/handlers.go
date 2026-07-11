@@ -35,6 +35,7 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		AuthMode:     authMode,
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
+		Features:     serverFeatures(),
 	}
 
 	writeJSON(w, http.StatusOK, info)
@@ -474,6 +475,11 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
+	// Drop any cached rc capabilities up front — the shed is being torn down, so
+	// the entry is stale regardless of which teardown path (plain/SSE) runs and
+	// regardless of outcome (a failed delete just re-probes on the next list).
+	s.rcCaps.invalidate(name)
+
 	// Stream teardown progress via SSE if the client requests it.
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		s.handleDeleteShedSSE(w, r, name)
@@ -535,6 +541,8 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
+	// A restart can pick up an in-place agent install; drop any stale caps.
+	s.rcCaps.invalidate(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -550,6 +558,9 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
+	// A stopped shed can't be re-probed; drop its cached caps so a later start
+	// re-probes fresh.
+	s.rcCaps.invalidate(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -567,6 +578,8 @@ func (s *Server) handleResetShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
+	// Recreated upper layer: any cached caps are for the old rootfs state.
+	s.rcCaps.invalidate(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -585,6 +598,9 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 	resp := config.SessionsResponse{
 		Sessions: sessions,
+	}
+	if rcEnrichEnabled(r) {
+		resp.Warnings = s.enrichSessionsRC(r.Context(), sessions)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -637,6 +653,10 @@ func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		allSessions = append(allSessions, sessions...)
+	}
+
+	if rcEnrichEnabled(r) {
+		warnings = append(warnings, s.enrichSessionsRC(r.Context(), allSessions)...)
 	}
 
 	resp := config.SessionsResponse{

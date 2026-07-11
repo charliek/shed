@@ -1,0 +1,55 @@
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue
+
+╭─────────────────────────────────────────────────╮
+│ ✨ Update available! 0.142.4 -> 0.144.1         │
+│ Run bun install -g @openai/codex to update.     │
+│                                                 │
+│ See full release notes:                         │
+│ https://github.com/openai/codex/releases/latest │
+╰─────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.142.4)                 │
+│                                            │
+│ model:     gpt-5.4 high   /model to change │
+│ directory: ~                               │
+╰────────────────────────────────────────────╯
+
+  Tip: GPT-5.5 is now available in Codex. It's our strongest agentic coding model yet, built to reason through large codebases, check assumptions with tools, and keep going until the work is done.
+
+  Learn more: https://openai.com/index/introducing-gpt-5-5/
+
+⚠ MCP client for `codex_apps` failed to start: MCP startup failed: handshaking with MCP server failed: Send message error Transport
+  [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttpClientWorker<codex_rmcp_client::http_client_adapter::StreamableHttpClientAdapter>>] error: unexpected
+  server response: HTTP 401: {
+    "error": {
+      "message": "Provided authentication token is expired. Please try signing in again.",
+      "type": null,
+      "code": "token_expired",
+      "param": null
+    },
+    "status": 401
+  }, when send initialize request
+
+⚠ MCP startup incomplete (failed: codex_apps)
+
+
+› Find and fix a bug in @filename
+
+  gpt-5.4 high · ~
+
+
+
+
+
+
+
+
+
+
+
+
+

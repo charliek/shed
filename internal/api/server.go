@@ -9,6 +9,7 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/sync/singleflight"
 )
 
 // Server is the HTTP API server for shed.
@@ -21,6 +22,12 @@ type Server struct {
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
 	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in secure mode (auth.mode: secure)
+	rcCaps      *rcCapsCache             // per-shed rc capabilities cache (session enrichment + overview)
+	// rcCapsFlight dedupes concurrent capability probes per shed across requests
+	// (singleflight keyed by shed name), so M concurrent overview requests —
+	// ?fresh=1 or a shared cache miss — share one guest exec per shed instead of
+	// fanning out M execs (see RCCapabilities). Zero value is ready to use.
+	rcCapsFlight singleflight.Group
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
@@ -47,6 +54,7 @@ func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, p
 		sshHostKey: sshHostKey,
 		plugins:    plugins,
 		bridge:     bridge,
+		rcCaps:     newRCCapsCache(),
 	}
 }
 
@@ -84,6 +92,11 @@ func (s *Server) Router() chi.Router {
 
 		// Sessions (aggregate across all sheds)
 		r.Get("/sessions", s.handleListAllSessions)
+
+		// Single-call host snapshot: server identity + features, df, and every
+		// shed with its rc-enriched sessions and capabilities (control scope,
+		// GET-only — the auth middleware's default branch requires control).
+		r.Get("/overview", s.handleOverview)
 
 		// Images
 		r.Route("/images", func(r chi.Router) {

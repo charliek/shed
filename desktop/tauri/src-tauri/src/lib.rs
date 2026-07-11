@@ -230,9 +230,11 @@ async fn rc_list(
     shed: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let targets = backend.rc_targets(host.as_deref(), shed.as_deref()).await;
-    Ok(serde_json::json!({
-        "sessions": rc.list(targets, host.as_deref(), shed.as_deref()).await
-    }))
+    let sessions = rc.list(targets, host.as_deref(), shed.as_deref()).await;
+    // Same shape as the socket IPC `rc.list`: the per-shed capabilities captured
+    // during the probe (keyed by `host/shed`) gate the launch form's kind toggle.
+    let capabilities = rc.capabilities(host.as_deref(), shed.as_deref());
+    Ok(serde_json::json!({ "sessions": sessions, "capabilities": capabilities }))
 }
 
 #[tauri::command]
@@ -247,6 +249,9 @@ async fn rc_launch(
     workdir: Option<String>,
     initial_prompt: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    // Serde preserves an unknown kind as `Other(raw)` (the unknown-kind read
+    // policy), so launching must apply the same known-kind gate as the socket IPC.
+    ipc::ensure_known_kind(&kind)?;
     let target = backend
         .resolve_rc_target(host.as_deref())
         .map_err(|e| e.to_string())?;

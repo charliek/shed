@@ -12,6 +12,50 @@ All notable changes to this project will be documented in this file.
   pre-monorepo changelog stays in the archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+**Ships:** server/CLI, desktop
+
+### Added
+
+- **Multi-agent Remote Control sessions.** RC sessions (the detached `rc-<slug>` tmux
+  sessions driven by `shed-ext-rc`) now run **codex**, **cursor**, and **opencode**
+  alongside `claude-rc`/`claude-broker`/`shell`, each with its own pane classifier
+  (`starting`/`ready`/`needs-auth`/`needs-trust`/`dead`). `shed attach --kind` accepts
+  every kind and `--plan` ships a plan to all non-broker kinds. A generic permission
+  tri-state — `default` \| `auto` \| `skip` — is accepted by every kind and mapped per
+  agent to its real flags; the Claude kinds keep their full historical
+  `--permission-mode` set. The `full` image installs all four agents (cursor-agent added;
+  the codex runtime shim fixed so it starts under bun).
+- **Capability discovery replaces error-string sniffing.** `shed-ext-rc capabilities`
+  (also embedded in the `list` envelope) reports `rc_version`, the offered kinds,
+  per-agent install/version, a feature set (`generic-perm`, `plan-stdin`, `prompt-b64`),
+  and per-kind UI hints. `rc_version` (capability/protocol version, now 3) is decoupled
+  from `SHED_RC_V` (metadata schema, still 2). An unrecognized kind is preserved verbatim
+  and rendered neutrally rather than aliased to `claude-broker`.
+- **`shed plan <file> --shed <name>` porcelain.** Ships a plan and runs it autonomously in
+  one command: creates the shed if missing (with `--repo`), writes the plan to a
+  HOME-rooted location inside the shed (never the workspace), starts an agent session
+  under the `auto` posture, and reports it. Exit is `0` only when the session reached
+  `ready` and the kickoff was delivered; `needs-auth`/`needs-trust`/failed-ship cases exit
+  non-zero, print per-agent remediation, and leave the session and shed in place (a shed
+  auto-created for a run is never deleted on failure). Plan delivery moved into the rc
+  core (`create --plan-stdin` / `--prompt-b64`), shared by every orchestrator.
+- **Server-side RC enrichment (`#242`, `#199`).** `GET /api/sessions` and
+  `GET /api/sheds/{n}/sessions` now populate an `rc` object per `rc-*` row server-side (by
+  execing `shed-ext-rc list` over the agent channel, cached per shed with a bounded
+  concurrency/timeout and a `warnings` entry on degradation); `?rc=0` opts out. HTTP-only
+  clients no longer fan out one SSH connection per shed to read RC state.
+- **`GET /api/overview` + feature discovery.** One call returns the server info (with a
+  new `features` array, also on `GET /api/info`), disk usage, and every shed with its
+  rc-enriched sessions and per-shed `rc_capabilities` — a phone renders a host's landing
+  and sessions views from a single HTTPS request. Blocks degrade independently with
+  `warnings`; `?rc=0` and `?fresh=1` control enrichment and capability re-probing.
+- **Desktop multi-agent support.** The shared Rust core and both desktop UIs (Swift
+  macOS, Tauri Linux) gain the new kinds and the generic permission mode, gate the create
+  sheet's kind chips on each shed's capabilities, surface `needs-auth` per agent, and
+  apply the unknown-kind neutral-rendering policy.
+
 ## v0.7.10 — 2026-07-08
 
 **Ships:** server/CLI, desktop

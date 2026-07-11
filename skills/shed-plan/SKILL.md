@@ -1,66 +1,116 @@
 ---
 name: shed-plan
-description: "Use when the user wants to hand a plan or task off to a shed to run autonomously — phrases like 'send this plan to a shed', 'run this plan on a remote shed', 'spin up a shed and have it do X', 'kick off an agent on a shed to work on this while I close my laptop', or 'execute this autonomously on mini2/mini3'. This skill authors a plan file, creates (or reuses) a shed on a server, ships the plan, and starts an autonomous Claude Remote Control session you can watch from claude.ai. For everyday shed usage (create/list/attach/exec/sync without the autonomous-plan flow) use the `shed` skill instead."
+description: "Use when the user wants to hand a plan or task off to a shed to run autonomously — phrases like 'send this plan to a shed', 'run this plan on a remote shed', 'spin up a shed and have it do X', 'kick off an agent on a shed to work on this while I close my laptop', or 'execute this autonomously on mini2/mini3'. This skill authors a plan file and ships it to a shed with a single `shed plan` command, which creates the shed if needed, starts an autonomous agent session (Claude by default; codex/cursor/opencode on request), and reports how to watch it. For everyday shed usage (create/list/attach/exec/sync without the autonomous-plan flow) use the `shed` skill instead."
 ---
 
 # Shed Plan: run a plan autonomously on a remote shed
 
-Hand a multi-step plan to a **shed** (an isolated remote VM) and let a Claude agent
-execute it autonomously. You keep a `claude.ai/code` URL to watch and steer from your
-phone or browser; the laptop can close. Built on `shed attach`'s Remote Control mode,
-which drives the in-shed `shed-ext-rc` binary over SSH.
+Hand a multi-step plan to a **shed** (an isolated remote VM) and let an agent execute
+it autonomously. With **Claude** (the default) you keep a `claude.ai/code` URL to watch
+and steer from your phone or browser; the laptop can close. The whole flow is one
+command — `shed plan` — which creates the shed if it doesn't exist, ships the plan,
+starts the agent under an autonomous permission posture, and reports the session.
 
-Prerequisite: **Claude must be logged in inside the shed.** This is assumed, not set
-up by this skill — host login does not reach the shed VM. On servers that mount a
-persistent Claude config dir into sheds (e.g. the user's local Mac), a fresh shed is
-already authed. If a run reports `needs-auth`, tell the user to
-`shed attach <shed>` → run `claude` → `/login` once, then retry.
+## Prerequisite: the agent must be logged in inside the shed
+
+Authentication lives **inside the shed VM** — host login does not reach it, and this
+skill does not set it up. On servers that mount a persistent agent config dir into
+sheds (e.g. the user's local Mac for Claude; codex/opencode often arrive authed via
+mounted config), a fresh shed is already authed.
+
+If a run reports **`needs-auth`**, `shed plan` exits non-zero, leaves the session
+running, and prints the per-agent remediation. Relay it to the user, then retry:
+
+| Agent (`--kind`) | Log in once inside the shed |
+|------------------|------------------------------|
+| `claude-rc` (default) | `shed attach <shed>` → run `claude` → `/login` |
+| `codex` | `shed attach <shed>` → run `codex` and complete login (`codex login`) |
+| `opencode` | `shed attach <shed>` → run `opencode auth login` |
+| `cursor` | `shed attach <shed>` → run `cursor-agent login` |
+
+`needs-trust` is similar (a workspace-trust prompt is showing) — the fix is
+`shed attach <shed> --slug <slug>` to accept it, then retry.
 
 ## The flow
 
 1. **Author the plan.** Work with the user to produce a concrete, self-contained
    markdown plan (goal, steps, acceptance criteria, how to verify). Save it to a local
-   file (e.g. `./plan.md` or under the scratchpad). The plan is shipped verbatim and
-   the agent is told to execute it to completion, so it must stand on its own — assume
-   no further human input mid-run.
+   file (e.g. `./plan.md` or under the scratchpad). The plan is shipped verbatim and the
+   agent is told to execute it to completion, so it must stand on its own — assume no
+   further human input mid-run.
 
-2. **Choose the target shed.**
-   - **Default: create a fresh, disposable shed per plan** (clean blast radius). Clone
-     the repo the work targets: `shed create <name> --repo <owner/repo> -s <server>`.
-     Use `--repo` (not `--local-dir`) — the value here is remote execution.
+2. **Choose the target shed and server.**
+   - **Default: a fresh, disposable shed per plan** (clean blast radius), created from
+     the repo the work targets. Pick a short, recognizable name (e.g. `plan-<topic>`).
    - **Ask which server** if the user didn't say (e.g. their default, `mini2`, `mini3`).
      Don't guess across servers silently.
-   - **Reuse an existing shed only when the user directs it** ("use my shed X"): skip
-     `create` and target that shed.
-   - Pick a short, recognizable shed name (e.g. `plan-<topic>`).
+   - **Reuse an existing shed only when the user directs it** ("use my shed X"): drop
+     `--repo` and target that shed by name.
 
-3. **Ship the plan and start the run (detached):**
+3. **Ship the plan and start the run — one command:**
    ```bash
-   shed attach <shed> --plan ./plan.md -d
+   shed plan ./plan.md --shed plan-<topic> --repo <owner/repo> -s <server> -d
    ```
-   - Defaults to `auto` permission mode (autonomous with safety checks).
-   - Pass `--skip` **only if the user explicitly asks for full bypass** (no permission
-     prompts at all) — confirm first; it is safe because the shed is an isolated VM.
-   - The plan is shipped to Claude's plans dir (`~/.claude/plans/plan-<slug>.md`), and a
-     generic "read the plan and implement it" kickoff is the default. To lead with your
-     own framing, add `-p "..."` (or `--prompt-file`) — your prompt runs and the plan
-     location is appended automatically, so you can send both.
+   - `--repo` creates the shed if it's missing (uses `--repo`, not `--local-dir` — the
+     value here is remote execution). For an **existing** shed, drop `--repo`; passing it
+     on a shed that already exists warns and is ignored. A missing shed with no `--repo`
+     is a hard error.
+   - `-d/--detach` reports the session and returns instead of dropping you into it. Use
+     it for the autonomous, close-the-laptop workflow.
+   - Runs under the `auto` permission posture (autonomous with safety checks) — you don't
+     pass a mode flag for the default.
+   - The plan is written to a HOME-rooted location inside the shed (Claude:
+     `~/.claude/plans/plan-<slug>.md`; other agents: `~/.shed-plans/plan-<slug>.md`),
+     never the workspace, so it can't dirty a `--repo` clone. The kickoff references its
+     absolute path.
+   - To lead with your own framing, add `-p "..."` — your prompt runs first and the plan
+     location is appended automatically, so you send both in one shot.
 
-4. **Report back.** Surface the shed name, the `rc-<slug>` session, the
-   `claude.ai/code/session_…` URL, and how to follow along:
+4. **Send to a different agent (on request).** Claude is the default. When the user asks
+   for codex, cursor, or opencode, add `--kind`:
+   ```bash
+   shed plan ./plan.md --shed plan-<topic> --repo <owner/repo> -s <server> --kind codex -d
+   ```
+   Kinds: `claude-rc` (default), `codex`, `cursor`, `opencode`, `shell`.
+   **Note:** only Claude sessions have a `claude.ai/code` URL. For codex/cursor/opencode
+   there is no browser URL to hand back — report the shed, the `rc-<slug>`, and the watch
+   command (`shed attach <shed> --slug <slug>`) instead.
+
+5. **Report back.** Surface what the command printed:
+   - Shed name and the `rc-<slug>` session.
+   - **Claude only:** the `claude.ai/code/session_…` URL to watch/steer from a phone.
    - Watch / steer: `shed attach <shed> --slug <slug>`
-   - Status across sheds: `shed sessions` (shows kind + state for `rc-*` sessions)
+   - Status across sheds: `shed sessions` (shows KIND + RC-STATE for `rc-*` sessions)
    - Stop it: `shed sessions kill <shed> rc-<slug>`
+
+## Exit contract (what the non-zero cases mean)
+
+`shed plan` exits **0 only when the session reached `ready` and the kickoff was
+delivered.** Any other outcome exits non-zero and **leaves the session/shed in place**
+so you can fix and retry — nothing is auto-deleted:
+
+- **`needs-auth` / `needs-trust`** — session created, plan not started. Relay the
+  per-agent remediation above and retry.
+- **Shed created but the session failed** — the message reports *both* facts (the shed
+  was created AND the plan couldn't ship) and that the shed was NOT deleted; retry
+  `shed plan ... --shed <name>` after fixing the cause.
+- **Old shed image** — a shed whose baked-in `shed-ext-rc` predates multi-agent RC
+  rejects `--kind codex|cursor|opencode` and plan delivery with a "recreate the shed"
+  message. Recreate it (or use a fresh `--repo` shed).
 
 ## Guardrails
 
-- **Never use `--edit` / `--plan-edit`** here — they open `$EDITOR` and can't run
-  unattended. Always pass the plan via `--plan <file>` and any prompt via `-p`.
-- **Default to `auto`.** Only use `--skip` on explicit user request, and say so.
-- Put the multi-step detail in the **plan** file; keep any `-p` prompt to high-level
-  framing (prompts may be multi-line, but the plan is the place for the steps).
-- If `shed attach` reports `needs-auth`/`needs-trust`, relay the one-time fix rather
-  than retrying blindly.
+- **Prefer `shed plan` over hand-driving `shed attach --plan`.** It is the one-command
+  porcelain; `shed attach --kind/--plan` is the lower-level primitive it builds on.
+- **Never use `--edit` / `--plan-edit`** in any autonomous flow — they open `$EDITOR`
+  and can't run unattended. Always pass the plan as a file (or `-`) and any framing via
+  `-p`.
+- **Default to `auto`.** Only escalate to full bypass on **explicit user request**, and
+  say so. Full bypass is `--skip` on `shed attach` (maps to the generic `skip` mode);
+  it's safe because a shed is an isolated VM. (`shed plan` runs `auto`; if the user wants
+  bypass, drop to `shed attach <shed> --plan ./plan.md --skip -d`.)
+- Put the multi-step detail in the **plan** file; keep any `-p` framing to high-level
+  context (it may be multi-line, but the plan is where the steps live).
 - For the underlying shed operations (create, list, delete, servers), defer to the
   `shed` skill / `shed <cmd> --help`; this skill is the high-level workflow, not a CLI
   manual — see `references/usage.md` for the exact flags it relies on.

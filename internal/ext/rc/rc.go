@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,12 @@ const (
 	KindClaudeBroker Kind = "claude-broker"
 	// KindClaudeRC runs an interactive `claude` REPL with `/rc`.
 	KindClaudeRC Kind = "claude-rc"
+	// KindCodex runs the codex TUI (bare `codex`).
+	KindCodex Kind = "codex"
+	// KindOpencode runs the opencode TUI (bare `opencode`).
+	KindOpencode Kind = "opencode"
+	// KindCursor runs the cursor-agent TUI (bare `cursor-agent`).
+	KindCursor Kind = "cursor"
 	// KindShell runs a plain login bash.
 	KindShell Kind = "shell"
 )
@@ -35,19 +42,44 @@ const (
 // fallback, which is KindClaudeBroker).
 const DefaultKind = KindClaudeRC
 
-// IsValidKind reports whether k is a recognized v2 kind.
+// allKinds is every recognized kind. It is the single source of truth shared by
+// IsValidKind, KindStrings, and the agent registry (agents_test.go asserts the
+// registry covers exactly this set) — add new kinds here and in a spec's Kinds
+// together. Order matches the pinned capabilities wire contract.
+var allKinds = []Kind{KindClaudeBroker, KindClaudeRC, KindCodex, KindOpencode, KindCursor, KindShell}
+
+// IsValidKind reports whether k is a recognized kind.
 func IsValidKind(k Kind) bool {
-	return k == KindClaudeBroker || k == KindClaudeRC || k == KindShell
+	return slices.Contains(allKinds, k)
+}
+
+// KindStrings returns every valid kind as a string slice (registry-sourced), for CLI
+// mirrors that need the accepted --kind values without hand-keeping a second list.
+func KindStrings() []string {
+	out := make([]string, len(allKinds))
+	for i, k := range allKinds {
+		out[i] = string(k)
+	}
+	return out
 }
 
 // IsClaudeKind reports whether the kind runs claude (and so gates on workspace
-// trust). Everything except shell.
-func IsClaudeKind(k Kind) bool { return k != KindShell }
+// trust): true iff the kind's spec is the claude tool.
+func IsClaudeKind(k Kind) bool {
+	spec, ok := specForKind(k)
+	return ok && spec.Tool == toolClaude
+}
 
 // AcceptsTypedInput reports whether the kind's pane accepts a typed kickoff line
-// (claude-rc → a prompt, shell → a command). claude-broker's input is the remote
-// URL, not the pane.
-func AcceptsTypedInput(k Kind) bool { return k != KindClaudeBroker }
+// (claude-rc/codex/opencode/cursor → a prompt, shell → a command). claude-broker's
+// input is the remote URL, not the pane — and an UNKNOWN (unregistered) kind is not
+// promptable either: under the unknown-kind policy a preserved raw kind renders
+// neutrally with no input affordances, so prompt delivery to it is rejected (the
+// existing "does not accept a prompt" error path).
+func AcceptsTypedInput(k Kind) bool {
+	_, ok := specForKind(k)
+	return ok && k != KindClaudeBroker
+}
 
 // State is the pane-derived liveness of a session. Never stored — always classified
 // from a capture-pane on demand.
@@ -106,13 +138,32 @@ type Session struct {
 	TargetLabel string `json:"target_label,omitempty"`
 }
 
-// ListResponse is the `list` subcommand's stdout shape.
+// ListResponse is the `list` subcommand's stdout shape. Capabilities is embedded so a
+// single guest exec feeds both the session list and capability discovery; it is a
+// pointer with omitempty so an old binary's bare `{"rc_sessions":[…]}` envelope still
+// decodes (the server tolerates its absence).
 type ListResponse struct {
-	RCSessions []Session `json:"rc_sessions"`
+	RCSessions   []Session     `json:"rc_sessions"`
+	Capabilities *Capabilities `json:"capabilities,omitempty"`
 }
 
 // TmuxName returns the tmux session name for a slug.
 func TmuxName(slug string) string { return TmuxPrefix + slug }
+
+// IndexByTmux keys sessions by their tmux session name (e.g. "rc-abc234") for an
+// O(1) merge onto a shed's enumerated tmux sessions. Entries with an empty
+// TmuxSession are skipped. This is the canonical merge-by-tmux-name helper shared
+// by every consumer of a `list` envelope (the server enrichment path, the CLI)
+// so the keying convention lives in exactly one place.
+func IndexByTmux(sessions []Session) map[string]Session {
+	out := make(map[string]Session, len(sessions))
+	for _, s := range sessions {
+		if s.TmuxSession != "" {
+			out[s.TmuxSession] = s
+		}
+	}
+	return out
+}
 
 const slugAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
 
@@ -177,24 +228,58 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// validPermissionModes is claude's `--permission-mode` value set. An empty mode
-// means "don't pass the flag" (claude's own default — preserves the pre-flag
-// behavior for callers that don't request a posture).
-var validPermissionModes = map[string]bool{
-	"default":           true,
-	"acceptEdits":       true,
-	"plan":              true,
-	"auto":              true,
-	"dontAsk":           true,
-	"bypassPermissions": true,
-}
+// Generic permission modes: a tri-state accepted by ALL kinds and mapped per agent
+// to real flags in the registry (the VM is already the sandbox). claude additionally
+// accepts its full historical --permission-mode set via the claude spec's ExtraModes.
+const (
+	PermModeDefault = "default"
+	PermModeAuto    = "auto"
+	PermModeSkip    = "skip"
+)
 
-// PermissionModeBypass is claude's full-bypass mode (the `--skip` shorthand). Its
-// session shows a one-time acceptance dialog that the create poller auto-confirms.
+// PermissionModeBypass is claude's full-bypass --permission-mode value (what the
+// generic "skip" maps to for claude). Its session shows a one-time acceptance dialog
+// that the create poller auto-confirms.
 const PermissionModeBypass = "bypassPermissions"
 
-// ValidPermissionMode reports whether m is a claude `--permission-mode` value.
-func ValidPermissionMode(m string) bool { return validPermissionModes[m] }
+// genericPermModes returns the generic tri-state permission modes valid for every
+// kind.
+func genericPermModes() []string {
+	return []string{PermModeDefault, PermModeAuto, PermModeSkip}
+}
+
+// ValidPermissionMode reports whether m is a permission mode the claude kinds accept
+// (the generic tri-state plus claude's historical set). Retained for callers that
+// only care about the claude posture; PermModeAcceptedBy is the kind-aware check.
+func ValidPermissionMode(m string) bool {
+	spec, ok := specForKind(KindClaudeRC)
+	return ok && spec.validMode(m)
+}
+
+// PermModeAcceptedBy reports whether kind accepts permission mode m: the generic
+// tri-state for every kind, plus claude's historical set for the claude kinds. Used
+// by the CLI to fail fast locally before any network round-trip.
+func PermModeAcceptedBy(kind Kind, m string) bool {
+	_, ok := permFlagsFor(kind, m)
+	return ok
+}
+
+// validatePermissionMode returns a domain error when mode is not accepted by kind:
+// a claude-only mode used with a non-claude kind names the generic set; anything else
+// is a plain invalid-mode error. "" (no posture) always validates.
+func validatePermissionMode(kind Kind, mode string) error {
+	if mode == "" {
+		return nil
+	}
+	if PermModeAcceptedBy(kind, mode) {
+		return nil
+	}
+	if ValidPermissionMode(mode) { // claude accepts it → it's a claude-only mode here
+		return fmt.Errorf("%w: permission mode %q is claude-only; %s kinds accept default|auto|skip",
+			ErrBadArgs, mode, kind)
+	}
+	return fmt.Errorf("%w: invalid permission mode %q (want default|auto|skip)", ErrBadArgs, mode)
+}
 
 // InnerCommand builds the command the tmux session runs for a kind. interactiveShell
 // wraps the claude kinds in `bash -ic` so a login rc-file loads PATH (nvm/asdf)
@@ -208,57 +293,21 @@ func ValidPermissionMode(m string) bool { return validPermissionModes[m] }
 // verified form that carries the posture into the live session and still yields a
 // `session_*` URL (so the pane classifier treats it identically). With no mode,
 // claude-rc keeps the original `/rc` form for backward compatibility.
+//
+// An unregistered kind falls back to `bash -l`.
 func InnerCommand(kind Kind, displayName, permissionMode string, interactiveShell bool) string {
-	var cmd string
-	switch kind {
-	case KindClaudeBroker:
-		cmd = "claude remote-control --name " + shellQuote(displayName)
-		if permissionMode != "" {
-			cmd += " --permission-mode " + permissionMode
-		}
-		cmd += " --spawn same-dir"
-	case KindClaudeRC:
-		if permissionMode != "" {
-			cmd = "claude --remote-control --name " + shellQuote(displayName) +
-				" --permission-mode " + permissionMode
-		} else {
-			cmd = "claude --name " + shellQuote(displayName) + " /rc"
-		}
-	case KindShell:
-		return "bash -l"
-	default:
+	spec, ok := specForKind(kind)
+	if !ok {
 		return "bash -l"
 	}
-	if interactiveShell {
-		return "bash -ic " + shellQuote(cmd)
-	}
-	return cmd
+	return spec.InnerCommand(kind, displayName, permissionMode, interactiveShell)
 }
 
 var (
-	brokerURLRe = regexp.MustCompile(`https?://claude\.ai/code\?environment=env_[A-Za-z0-9_-]+`)
-	replURLRe   = regexp.MustCompile(`https?://claude\.ai/code/session_[A-Za-z0-9_-]+`)
-
-	notTrustedRe   = regexp.MustCompile(`(?i)Workspace not trusted`)
-	safetyCheckRe  = regexp.MustCompile(`(?i)Quick safety check`)
-	trustFolderRe  = regexp.MustCompile(`(?i)Yes,\s*I trust this folder`)
-	needsAuthRe    = regexp.MustCompile(`(?i)requires a claude\.ai subscription|not logged in|claude auth login`)
-	reconnectingRe = regexp.MustCompile(`\bReconnecting\b`)
-	connectedRe    = regexp.MustCompile(`\bConnected\b`)
-	rcConnectingRe = regexp.MustCompile(`(?i)Remote Control connecting`)
-	rcActiveRe     = regexp.MustCompile(`(?i)Remote Control active`)
+	notTrustedRe  = regexp.MustCompile(`(?i)Workspace not trusted`)
+	safetyCheckRe = regexp.MustCompile(`(?i)Quick safety check`)
+	trustFolderRe = regexp.MustCompile(`(?i)Yes,\s*I trust this folder`)
 )
-
-func extractURL(kind Kind, pane string) string {
-	switch kind {
-	case KindClaudeBroker:
-		return brokerURLRe.FindString(pane)
-	case KindClaudeRC:
-		return replURLRe.FindString(pane)
-	default:
-		return ""
-	}
-}
 
 // IsTrustPrompt reports whether the pane is showing claude's first-run
 // workspace-trust prompt (used by accept-trust to verify before sending Enter).
@@ -281,48 +330,22 @@ func IsBypassAcceptPrompt(pane string) bool {
 }
 
 // ClassifyPane derives (state, url) from a captured pane for a kind. Mirrors
-// shed-remote-agent's classifyPane.
+// shed-remote-agent's classifyPane. An unregistered (unknown) kind renders neutrally
+// as a plain shell pane — no kind-specific affordances or claude URL (the unknown-kind
+// policy). For agent kinds a shared shed-guest dead check runs first: if the agent has
+// exited back to the login shell, the session is dead regardless of any auth/trust
+// text still in scrollback. Shell is exempt (its prompt is the ready state).
 func ClassifyPane(kind Kind, pane string) (State, string) {
-	if kind != KindShell {
-		if IsTrustPrompt(pane) {
-			return StateNeedsTrust, extractURL(kind, pane)
-		}
-		if needsAuthRe.MatchString(pane) {
-			return StateNeedsAuth, extractURL(kind, pane)
-		}
+	spec, ok := specForKind(kind)
+	if !ok {
+		r := classifyShell(kind, pane)
+		return r.State, r.URL
 	}
-
-	switch kind {
-	case KindClaudeBroker:
-		url := extractURL(KindClaudeBroker, pane)
-		if reconnectingRe.MatchString(pane) {
-			return StateReconnecting, url
-		}
-		if connectedRe.MatchString(pane) && url != "" {
-			return StateReady, url
-		}
-		if url != "" {
-			return StateReady, url
-		}
-		return StateStarting, ""
-	case KindClaudeRC:
-		url := extractURL(KindClaudeRC, pane)
-		if rcConnectingRe.MatchString(pane) && url == "" {
-			return StateStarting, ""
-		}
-		if rcActiveRe.MatchString(pane) && url != "" {
-			return StateReady, url
-		}
-		if url != "" {
-			return StateReady, url
-		}
-		return StateStarting, ""
-	default: // shell
-		if strings.TrimSpace(pane) != "" {
-			return StateReady, ""
-		}
-		return StateStarting, ""
+	if spec.Tool != toolShell && exitedToShell(pane) {
+		return StateDead, ""
 	}
+	r := spec.Classify(kind, pane)
+	return r.State, r.URL
 }
 
 var canonicalIntRe = regexp.MustCompile(`^\d+$`)
@@ -338,13 +361,11 @@ func isManagedVersion(raw string) bool {
 	return err == nil && n >= MinManagedVersion
 }
 
-// parseKind maps a managed session's SHED_RC_KIND to a Kind, defaulting an
-// unrecognized value to claude-broker (the renamed analog of the pre-convention
-// default). Distinct from DefaultKind (the create-time default).
+// parseKind maps a managed session's SHED_RC_KIND to a Kind. An unrecognized value is
+// PRESERVED verbatim (the unknown-kind policy): a reader that doesn't know the kind
+// keeps the raw string and renders it neutrally (name + state only, no claude URL
+// affordances) rather than inheriting claude-broker behavior. ClassifyPane falls back
+// to a neutral shell-style classification for such kinds.
 func parseKind(raw string) Kind {
-	k := Kind(raw)
-	if IsValidKind(k) {
-		return k
-	}
-	return KindClaudeBroker
+	return Kind(raw)
 }

@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use shed_core::models::Shed;
-use shed_core::rc::{self, RcClassification, RcError, RcKind, RcSession, RcState};
+use shed_core::rc::{self, RcCapabilities, RcClassification, RcError, RcKind, RcSession, RcState};
 
 use crate::backend::RcTarget;
 use crate::traits::{system_clock, ClockRef};
@@ -143,6 +143,10 @@ impl RcRunner for TokioProcessRunner {
 /// `AppModel.rcLaunch` test-mode); the real path shells out via the `RcRunner`.
 pub struct RcService {
     store: Mutex<HashMap<String, RcSession>>,
+    /// Per-shed RC capabilities captured from the `list` envelope, keyed by the
+    /// `host/shed` composite. Feeds the launch UI's kind gating (which agents this
+    /// shed has installed). Absent for a shed whose binary predates capabilities.
+    capabilities: Mutex<HashMap<String, RcCapabilities>>,
     runner: RcRunnerRef,
     clock: ClockRef,
     /// Serializes the real (SSH) launch/kill/list so a `list` store-rebuild can't
@@ -175,6 +179,7 @@ impl RcService {
     ) -> Self {
         Self {
             store: Mutex::new(HashMap::new()),
+            capabilities: Mutex::new(HashMap::new()),
             runner,
             clock,
             op_guard: tokio::sync::Mutex::new(()),
@@ -184,7 +189,7 @@ impl RcService {
     }
 
     /// The pure pane classifier (backs the `rc.classify` IPC utility).
-    pub fn classify(&self, kind: RcKind, pane: &str) -> RcClassification {
+    pub fn classify(&self, kind: &RcKind, pane: &str) -> RcClassification {
         rc::classify_pane(kind, pane)
     }
 
@@ -214,11 +219,13 @@ impl RcService {
                 "display name and workdir must not contain newlines or control characters".into(),
             ));
         }
-        let prompt = rc::normalize_rc_prompt(initial_prompt.as_deref(), kind)?;
+        let prompt = rc::normalize_rc_prompt(initial_prompt.as_deref(), &kind)?;
 
         if self.test_mode {
             // No SSH under the harness — synthesize a ready session carrying the
-            // managed metadata the hermetic tests assert.
+            // managed metadata the hermetic tests assert. Compute the (claude-only)
+            // synthetic url before the struct so `kind` can then be moved in.
+            let url = rc::synthetic_url(&kind, &slug);
             let session = RcSession {
                 host: target.server_name.clone(),
                 shed: shed.to_string(),
@@ -228,7 +235,7 @@ impl RcService {
                 workdir: workdir.unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string()),
                 kind,
                 state: RcState::Ready,
-                url: rc::synthetic_url(kind, &slug),
+                url,
                 rc_id: Some(uuid::Uuid::new_v4().to_string()),
                 created_by: Some(created_by),
                 created_at: Some(self.clock.now_iso8601()),
@@ -247,7 +254,7 @@ impl RcService {
         // Build argv + stdin together so `--prompt-stdin` and the payload can't disagree.
         let (argv, stdin) = rc::create_invocation(
             &binary_name(),
-            kind,
+            &kind,
             &name,
             &slug,
             workdir.as_deref(),
@@ -320,42 +327,59 @@ impl RcService {
                 let bin = bin.clone();
                 async move {
                     let argv = ssh_for(&shed_item.name, &target, &rc::list_argv(&bin));
+                    let (server, shed) = (target.server_name.clone(), shed_item.name.clone());
                     match runner.run(argv, None, LIST_TIMEOUT).await {
-                        Ok(out) if out.exit_code == 0 => rc::decode_list(&out.stdout)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|dto| {
-                                RcSession::from_dto(dto, &target.server_name, &shed_item.name)
-                            })
-                            .collect::<Vec<_>>(),
-                        // A per-shed failure (transport, missing binary, bad DTO)
-                        // yields none — best-effort, mirroring the Swift `listReal`.
-                        _ => Vec::new(),
+                        // Decode the envelope once, moving the sessions + capabilities
+                        // straight out. A bad DTO degrades to none — best-effort,
+                        // mirroring the Swift `listReal`.
+                        Ok(out) if out.exit_code == 0 => {
+                            let (sessions, caps) = match rc::decode_list_response(&out.stdout) {
+                                Ok(resp) => (
+                                    resp.rc_sessions
+                                        .into_iter()
+                                        .map(|dto| RcSession::from_dto(dto, &server, &shed))
+                                        .collect::<Vec<_>>(),
+                                    resp.capabilities,
+                                ),
+                                Err(_) => (Vec::new(), None),
+                            };
+                            (server, shed, sessions, caps)
+                        }
+                        // A per-shed transport/exit failure yields none.
+                        _ => (server, shed, Vec::new(), None),
                     }
                 }
             });
-            let fresh: Vec<RcSession> = futures::future::join_all(probes)
-                .await
-                .into_iter()
-                .flatten()
-                .collect();
+            let probe_results = futures::future::join_all(probes).await;
             // Reconcile (gotcha #5) — collected first, so the std Mutex is never held
             // across an await; op_guard already serializes this against launch/kill.
             let mut store = self.store.lock().unwrap();
+            let mut caps = self.capabilities.lock().unwrap();
             if host.is_none() && shed.is_none() {
                 // Unfiltered full refresh: `targets` is every running shed, so the
                 // fresh set IS the whole truth — drop everything else (sessions on
                 // sheds since stopped/deleted), matching Swift's full-table rebuild
                 // (`rcTable = Dictionary(lists…)`).
                 store.clear();
+                caps.clear();
             } else {
                 // Filtered: replace only the probed sheds' prior entries, preserving
                 // other sheds' sessions — a blanket rebuild would wrongly clobber
                 // them (a latent bug in Swift's unconditional rebuild).
                 store.retain(|_, s| !probed.contains(&(s.host.clone(), s.shed.clone())));
+                caps.retain(|k, _| {
+                    !probed.iter().any(|(h, n)| *k == caps_key(h, n))
+                });
             }
-            for s in fresh {
-                store.insert(s.id(), s);
+            for (server, shed, sessions, shed_caps) in probe_results {
+                for s in sessions {
+                    store.insert(s.id(), s);
+                }
+                // Only record capabilities a probe actually returned — an old
+                // binary's bare envelope (None) leaves no stale entry.
+                if let Some(c) = shed_caps {
+                    caps.insert(caps_key(&server, &shed), c);
+                }
             }
         }
         let store = self.store.lock().unwrap();
@@ -366,6 +390,26 @@ impl RcService {
             .collect();
         result.sort_by_key(|s| s.id());
         result
+    }
+
+    /// The RC capabilities captured for the probed sheds during the last `list`,
+    /// keyed by the `host/shed` composite and filtered by the same optional
+    /// host/shed as the sessions. The launch UI reads the selected shed's block to
+    /// gate which kinds it offers; a shed with an old binary (no capabilities in its
+    /// envelope) is simply absent from the map (the UI degrades to claude+shell).
+    pub fn capabilities(
+        &self,
+        host: Option<&str>,
+        shed: Option<&str>,
+    ) -> HashMap<String, RcCapabilities> {
+        let caps = self.capabilities.lock().unwrap();
+        caps.iter()
+            .filter(|(k, _)| {
+                let (h, n) = k.split_once('/').unwrap_or((k.as_str(), ""));
+                host.is_none_or(|want| h == want) && shed.is_none_or(|want| n == want)
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Inject a full session into the store directly — test-only (a legacy/
@@ -391,6 +435,11 @@ fn ssh_for(shed: &str, target: &RcTarget, remote_argv: &[String]) -> Vec<String>
         remote_argv,
         CONNECT_TIMEOUT_SECS,
     )
+}
+
+/// The `host/shed` composite key under which a shed's RC capabilities are stored.
+fn caps_key(host: &str, shed: &str) -> String {
+    format!("{host}/{shed}")
 }
 
 /// Generate a 6-char confusable-free slug. Derived from a v4 UUID's random bytes
@@ -710,5 +759,45 @@ mod tests {
         let api = svc.list(vec![], None, Some("api")).await;
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].shed, "api");
+    }
+
+    // ---- capabilities captured from the list envelope ----
+
+    /// A list envelope carrying a capabilities block (a current shed-ext-rc).
+    const LIST_WITH_CAPS: &str = r#"{
+        "rc_sessions":[{"slug":"s1","tmux_session":"rc-s1","kind":"codex","state":"ready","managed":true}],
+        "capabilities":{
+            "rc_version":3,
+            "kinds":["claude-rc","codex","shell"],
+            "agents":{"claude":{"installed":true},"codex":{"installed":true,"version":"0.143.0"}},
+            "features":["generic-perm"],
+            "kind_features":{"codex":{"post_input":true,"approvals":"tui"}}
+        }
+    }"#;
+
+    #[tokio::test]
+    async fn list_captures_capabilities_and_filters_them() {
+        let svc = test_service(FakeRunner::ok(LIST_WITH_CAPS), false);
+        svc.list(vec![(shed_running("web", "srv"), target())], None, None)
+            .await;
+        // Captured under the host/shed composite key and offered per the gate.
+        let caps = svc.capabilities(Some("srv"), Some("web"));
+        let c = caps.get("srv/web").expect("capabilities captured");
+        assert_eq!(c.rc_version, 3);
+        assert_eq!(
+            c.creatable_kinds(),
+            vec![RcKind::ClaudeRc, RcKind::Codex, RcKind::Shell]
+        );
+        // Filter by a different shed → empty.
+        assert!(svc.capabilities(Some("srv"), Some("api")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn old_binary_list_leaves_no_capabilities() {
+        // LIST_ONE has no capabilities block (an old baked-in binary).
+        let svc = test_service(FakeRunner::ok(LIST_ONE), false);
+        svc.list(vec![(shed_running("web", "srv"), target())], None, None)
+            .await;
+        assert!(svc.capabilities(None, None).is_empty());
     }
 }

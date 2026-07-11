@@ -60,12 +60,28 @@ fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, (String, String)
         .ok_or_else(|| err("bad_request", format!("missing '{key}'")))
 }
 
-/// Parse the `kind` param into an `RcKind` (its kebab-case wire value).
+/// Reject an unknown (preserved-raw) `RcKind` on a launch/classify path. The
+/// unknown-kind policy preserves such a value on READ (list/decode), but you cannot
+/// LAUNCH a kind this build does not understand. Shared by the socket IPC handler
+/// and the `#[tauri::command]` invoke path (`lib.rs::rc_launch`) so the two entry
+/// points cannot drift.
+pub(crate) fn ensure_known_kind(kind: &RcKind) -> Result<(), String> {
+    if kind.is_known() {
+        Ok(())
+    } else {
+        Err(format!("unknown rc kind '{}'", kind.as_str()))
+    }
+}
+
+/// Parse the `kind` param into a KNOWN `RcKind` (its kebab-case wire value).
 fn rc_kind(params: &Value) -> Result<RcKind, (String, String)> {
-    params
+    let raw = params
         .get("kind")
-        .and_then(|v| serde_json::from_value::<RcKind>(v.clone()).ok())
-        .ok_or_else(|| err("bad_request", "missing or invalid 'kind'"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| err("bad_request", "missing or invalid 'kind'"))?;
+    let kind = RcKind::from_wire(raw);
+    ensure_known_kind(&kind).map_err(|m| err("bad_request", m))?;
+    Ok(kind)
 }
 
 /// Map an `RcError` to an IPC `(code, message)`. A validation error surfaces as
@@ -465,7 +481,7 @@ impl Handler {
     /// `rc.classify {kind, pane}` → the pure pane classifier `{state, url?}`.
     fn rc_classify(&self, params: &Value) -> Result<Value, (String, String)> {
         let kind = rc_kind(params)?;
-        Ok(json!(self.rc_service.classify(kind, req_str(params, "pane")?)))
+        Ok(json!(self.rc_service.classify(&kind, req_str(params, "pane")?)))
     }
 
     /// `rc.list {host?, shed?}` → `{sessions}`. The running sheds + their ssh
@@ -475,7 +491,13 @@ impl Handler {
         let host = params.get("host").and_then(Value::as_str);
         let shed = params.get("shed").and_then(Value::as_str);
         let targets = self.backend.rc_targets(host, shed).await;
-        Ok(json!({ "sessions": self.rc_service.list(targets, host, shed).await }))
+        let sessions = self.rc_service.list(targets, host, shed).await;
+        // The per-shed capabilities captured during the probe, keyed by `host/shed`,
+        // let the launch form gate which kinds it offers (unknown/uninstalled
+        // agents are excluded; a shed with an old binary is simply absent → the UI
+        // degrades to claude+shell).
+        let capabilities = self.rc_service.capabilities(host, shed);
+        Ok(json!({ "sessions": sessions, "capabilities": capabilities }))
     }
 
     /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →
@@ -895,6 +917,15 @@ mod tests {
         assert_eq!(rc_kind(&json!({"kind": "shell"})).unwrap(), RcKind::Shell);
         assert_eq!(rc_kind(&json!({"kind": "bogus"})).unwrap_err().0, "bad_request");
         assert_eq!(rc_kind(&json!({})).unwrap_err().0, "bad_request");
+    }
+
+    #[test]
+    fn ensure_known_kind_gates_unknown() {
+        // The shared gate both entry points (socket IPC rc_kind + the tauri
+        // rc_launch command) apply: serde preserves an unknown kind as Other, so
+        // launching must reject it here.
+        assert!(ensure_known_kind(&RcKind::Codex).is_ok());
+        assert!(ensure_known_kind(&RcKind::Other("borg".into())).is_err());
     }
 
     #[test]

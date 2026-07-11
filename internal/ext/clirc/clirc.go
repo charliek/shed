@@ -12,14 +12,18 @@
 package clirc
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charliek/shed/internal/ext/rc"
 	"github.com/charliek/shed/internal/version"
@@ -48,6 +52,10 @@ type deps struct {
 	// sleep is the poll delay used by rc.Create's wait loop. nil → real time.Sleep
 	// (production); tests inject a no-op so a --wait/claude create returns instantly.
 	sleep func(time.Duration)
+	// probe reports an agent binary's installed state + version for the capabilities
+	// payload. nil → the real command-based probe (command -v + --version, 2s budget);
+	// tests inject a fake so no external process is spawned.
+	probe rc.AgentProbe
 }
 
 // Run dispatches args with real process dependencies and returns a process exit code.
@@ -74,6 +82,8 @@ func run(cfg Config, d deps, args []string) int {
 		return doCreate(cfg, d, rest)
 	case "list":
 		return doList(cfg, d, rest)
+	case "capabilities":
+		return doCapabilities(cfg, d, rest)
 	case "probe":
 		return doProbe(cfg, d, rest)
 	case "accept-trust":
@@ -106,9 +116,11 @@ func usage(cfg Config, d deps) {
 		b.WriteString("           start a local auto-mode claude remote-control session and print its URL\n")
 	}
 	b.WriteString(`  create   --kind <k> --name <display> [--slug s] [--workdir d] [--created-by t/v]
-           [--target label] [--wait] [--interactive-shell] [--prompt-stdin]
+           [--target label] [--wait] [--interactive-shell]
+           [--prompt-stdin | --plan-stdin [--prompt-b64 <b64>]]
            [--permission-mode <m> | --skip]
   list
+  capabilities
   probe    --slug <s>
   accept-trust --slug <s>
   prompt   --slug <s> [--session-id <uuid>]   (text read from stdin)
@@ -176,13 +188,14 @@ const claudeDefaultMode = "auto"
 
 // resolveMode applies the --skip shorthand and the --skip/--permission-mode mutual
 // exclusion, falling back to dflt when neither is given (dflt "" = pass no posture
-// flag, i.e. claude's own default).
+// flag). --skip is the generic full-bypass mode ("skip"), mapped per agent to its real
+// flag by the registry (claude → bypassPermissions, codex → --dangerously-…, etc.).
 func resolveMode(permMode string, skip bool, dflt string) (string, error) {
 	if skip {
 		if permMode != "" {
 			return "", fmt.Errorf("%w: --skip and --permission-mode are mutually exclusive", rc.ErrBadArgs)
 		}
-		return rc.PermissionModeBypass, nil
+		return rc.PermModeSkip, nil
 	}
 	if permMode == "" {
 		return dflt, nil
@@ -207,7 +220,7 @@ func doCreate(cfg Config, d deps, args []string) int {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	var (
-		kind          = fs.String("kind", string(rc.DefaultKind), "session kind: claude-rc|claude-broker|shell")
+		kind          = fs.String("kind", string(rc.DefaultKind), "session kind: "+strings.Join(rc.KindStrings(), "|"))
 		name          = fs.String("name", "", "display name (--name to claude); defaults to the slug")
 		slug          = fs.String("slug", "", "caller-supplied slug (generated when empty)")
 		workdir       = fs.String("workdir", "", "working directory (defaults to $SHED_WORKSPACE)")
@@ -216,8 +229,10 @@ func doCreate(cfg Config, d deps, args []string) int {
 		wait          = fs.Bool("wait", false, "block until ready, accept trust, deliver prompt")
 		interactive   = fs.Bool("interactive-shell", false, "wrap claude kinds in `bash -ic`")
 		promptStdin   = fs.Bool("prompt-stdin", false, "read a kickoff prompt line from stdin")
-		permMode      = fs.String("permission-mode", "", "claude --permission-mode (claude kinds): default|acceptEdits|plan|auto|dontAsk|bypassPermissions")
-		skip          = fs.Bool("skip", false, "shorthand for --permission-mode bypassPermissions")
+		planStdin     = fs.Bool("plan-stdin", false, "read a plan from stdin; write it to a per-kind file and deliver a composed kickoff")
+		promptB64     = fs.String("prompt-b64", "", "base64 caller framing prepended to the composed plan kickoff (only with --plan-stdin)")
+		permMode      = fs.String("permission-mode", "", "permission mode: default|auto|skip (all kinds); claude also accepts acceptEdits|plan|dontAsk|bypassPermissions")
+		skip          = fs.Bool("skip", false, "shorthand for --permission-mode skip (full bypass)")
 	)
 	if code, ok := parseArgs(cfg, d, fs, args); !ok {
 		return code
@@ -228,8 +243,19 @@ func doCreate(cfg Config, d deps, args []string) int {
 		return fail(cfg, d, err)
 	}
 
-	prompt := ""
-	if *promptStdin {
+	// stdin carries at most one payload: a prompt line (--prompt-stdin) OR a plan
+	// (--plan-stdin). Caller framing for a plan travels out-of-band as base64
+	// (--prompt-b64), never on stdin, so a single guest exec ships plan + framing.
+	if *promptStdin && *planStdin {
+		return fail(cfg, d, fmt.Errorf("%w: --prompt-stdin and --plan-stdin are mutually exclusive", rc.ErrBadArgs))
+	}
+	if *promptB64 != "" && !*planStdin {
+		return fail(cfg, d, fmt.Errorf("%w: --prompt-b64 is only valid with --plan-stdin", rc.ErrBadArgs))
+	}
+
+	prompt, plan, framing := "", "", ""
+	switch {
+	case *promptStdin:
 		p, err := readStdinLine(d)
 		if err != nil {
 			return fail(cfg, d, err)
@@ -238,6 +264,25 @@ func doCreate(cfg Config, d deps, args []string) int {
 			return fail(cfg, d, fmt.Errorf("%w: --prompt-stdin given but stdin is empty", rc.ErrBadArgs))
 		}
 		prompt = p
+	case *planStdin:
+		p, err := readPlanStdin(d)
+		if err != nil {
+			return fail(cfg, d, err)
+		}
+		plan = p
+		if *promptB64 != "" {
+			raw, derr := base64.StdEncoding.DecodeString(*promptB64)
+			if derr != nil {
+				return fail(cfg, d, fmt.Errorf("%w: --prompt-b64 is not valid base64: %v", rc.ErrBadArgs, derr))
+			}
+			// Reject non-UTF-8 payloads BEFORE the []byte→string conversion: an
+			// invalid byte (e.g. a lone C1 0x9b) would otherwise become RuneError in
+			// the rune-based control-char scan and slip past HasUnsafePromptChars.
+			if !utf8.Valid(raw) {
+				return fail(cfg, d, fmt.Errorf("%w: --prompt-b64 does not decode to valid UTF-8", rc.ErrBadArgs))
+			}
+			framing = string(raw)
+		}
 	}
 
 	createdBy := *createdByFlag
@@ -253,6 +298,8 @@ func doCreate(cfg Config, d deps, args []string) int {
 		CreatedBy:        createdBy,
 		Target:           *target,
 		Prompt:           prompt,
+		Plan:             plan,
+		PlanFraming:      framing,
 		Wait:             *wait,
 		InteractiveShell: *interactive,
 		PermissionMode:   mode,
@@ -263,13 +310,132 @@ func doCreate(cfg Config, d deps, args []string) int {
 	return printJSON(cfg, d, session)
 }
 
+// readPlanStdin reads a plan from stdin, capping it at rc.PlanMaxBytes and rejecting
+// an empty or non-UTF-8 payload at the transport boundary (rc.Create re-validates as
+// the library guarantee). The plan is NOT newline-trimmed — a plan is a document, not
+// a single line, and trailing structure is content.
+func readPlanStdin(d deps) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(d.stdin, rc.PlanMaxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("reading plan from stdin: %w", err)
+	}
+	if len(data) > rc.PlanMaxBytes {
+		return "", fmt.Errorf("%w: plan exceeds %d bytes", rc.ErrBadArgs, rc.PlanMaxBytes)
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("%w: --plan-stdin given but stdin is empty", rc.ErrBadArgs)
+	}
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("%w: plan is not valid UTF-8 (is stdin a binary file?)", rc.ErrBadArgs)
+	}
+	return string(data), nil
+}
+
 func doList(cfg Config, d deps, args []string) int {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	if code, ok := parseArgs(cfg, d, fs, args); !ok {
 		return code
 	}
-	return printJSON(cfg, d, rc.List(d.runner, nil))
+	resp := rc.List(d.runner, nil)
+	// One guest exec feeds both the session list and capability discovery.
+	caps := rc.BuildCapabilities(effectiveProbe(d), effectiveInstalled(d))
+	resp.Capabilities = &caps
+	return printJSON(cfg, d, resp)
+}
+
+// doCapabilities prints the capabilities payload (kinds, per-agent install/version,
+// features, per-kind UI hints) — the discovery mechanism that replaces error-string
+// sniffing.
+func doCapabilities(cfg Config, d deps, args []string) int {
+	fs := flag.NewFlagSet("capabilities", flag.ContinueOnError)
+	fs.SetOutput(d.stderr)
+	if code, ok := parseArgs(cfg, d, fs, args); !ok {
+		return code
+	}
+	return printJSON(cfg, d, rc.BuildCapabilities(effectiveProbe(d), effectiveInstalled(d)))
+}
+
+// effectiveProbe returns the injected agent probe, or the real command-based probe
+// when none was injected (production).
+func effectiveProbe(d deps) rc.AgentProbe {
+	if d.probe != nil {
+		return d.probe
+	}
+	return realAgentProbe
+}
+
+// effectiveInstalled returns the fast install-only fallback BuildCapabilities uses
+// when a full probe outruns its budget. With an injected (test) probe there is no
+// real binary to look up, so the fallback is nil — injected probes return promptly
+// and never hit the budget.
+func effectiveInstalled(d deps) rc.InstalledProbe {
+	if d.probe != nil {
+		return nil
+	}
+	return realInstalledProbe
+}
+
+// agentProbeTimeout bounds each `command -v` / `--version` call so an unresponsive or
+// hung agent binary can't stall capability discovery. (BuildCapabilities additionally
+// enforces a tighter shared budget across all probes.)
+const agentProbeTimeout = 2 * time.Second
+
+// realInstalledProbe reports whether an agent binary is on PATH via `command -v` —
+// a shell builtin, so this is fast even when the binary itself is unresponsive. bin
+// values come from the registry (fixed literals), never user input.
+//
+// The probe runs through a LOGIN shell (`bash -lc`) so /etc/profile.d/*.sh (shed's PATH
+// additions — ~/.bun/bin, ~/.local/bin, mise shims) are applied. Both the server's
+// agent-exec channel and a bare sshd exec otherwise inherit only the system PATH, which
+// hides every agent installed under the shed user's home and made capability discovery
+// report installed:false for tools that are in fact present. A login shell fixes both
+// transports (and native machines) with one change.
+func realInstalledProbe(bin string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), agentProbeTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "bash", "-lc", "command -v "+shellQuote(bin)).Run() == nil
+}
+
+// realAgentProbe reports whether an agent binary is installed (via `command -v`) and
+// its version (via `<bin> --version`), each under a short timeout. The version query
+// goes through the same login shell as realInstalledProbe so PATH resolves the binary —
+// a direct exec of bin would use the bare system PATH and fail for a home-rooted install
+// even though realInstalledProbe just found it.
+//
+// Because the query runs under a login shell, profile activation output (e.g. mise
+// printing its own version) can precede the agent's answer on stdout. Only stdout is
+// captured (stderr noise is dropped), and the version is parsed from the LAST non-empty
+// line — the command's output always follows the profile noise (see
+// parseVersionFromLoginShell).
+func realAgentProbe(bin string) rc.AgentInfo {
+	if !realInstalledProbe(bin) {
+		return rc.AgentInfo{Installed: false}
+	}
+	vctx, vcancel := context.WithTimeout(context.Background(), agentProbeTimeout)
+	defer vcancel()
+	out, _ := exec.CommandContext(vctx, "bash", "-lc", shellQuote(bin)+" --version").Output()
+	return rc.AgentInfo{Installed: true, Version: parseVersionFromLoginShell(string(out))}
+}
+
+// parseVersionFromLoginShell extracts an agent's version from `bash -lc "<bin>
+// --version"` stdout. Login-shell profiles can emit their own version-shaped noise
+// (e.g. `mise 2026.7.0` activation lines) BEFORE the command runs, and
+// rc.ParseAgentVersion takes the first version-shaped token anywhere — so the parse is
+// anchored to the last non-empty line, which is the command's own output.
+func parseVersionFromLoginShell(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return rc.ParseAgentVersion(line)
+		}
+	}
+	return ""
+}
+
+// shellQuote wraps a token in single quotes for a shell `-c` string (POSIX '\” escape).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // runSlugCmd parses a slug-only subcommand (probe/accept-trust/kill) and runs fn.

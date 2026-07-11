@@ -8,6 +8,7 @@
 //! binary; a client invokes it over SSH — process spawning + the session store
 //! live in `shed-app::rc` (feature `rc`) — and decodes this neutral JSON DTO.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -24,29 +25,116 @@ pub const TOOL_NAME: &str = "shed-desktop";
 pub const TMUX_PREFIX: &str = "rc-";
 
 /// RC session kind (Convention v2). `<tool>-<mode>` so the model can grow to
-/// other agents later; `shell` is tool-agnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// other agents later; `shell` is tool-agnostic. Mirrors the guest's `rc.Kind`
+/// (`internal/ext/rc/rc.go`).
+///
+/// The [`RcKind::Other`] case implements the **unknown-kind policy**: an
+/// unrecognized wire value is PRESERVED verbatim (not coerced to claude-broker as
+/// old readers did), so a session created by a newer/other tool renders neutrally
+/// — its raw kind string is shown, and no claude-specific affordance (no synthetic
+/// claude.ai URL, no typed-input prompt) is attached. Because of the owned string
+/// this enum is not `Copy`; it is cheap to `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RcKind {
     ClaudeRc,
     ClaudeBroker,
+    Codex,
+    Opencode,
+    Cursor,
     Shell,
+    /// An unrecognized kind, its raw wire string preserved (unknown-kind policy).
+    Other(String),
 }
 
 impl RcKind {
-    /// Whether this kind accepts a typed kickoff line — an initial prompt for
-    /// `claude-rc`, an initial command for `shell`. Every kind except
-    /// `claude-broker`, whose input is a remote URL, not the pane.
-    pub fn accepts_typed_input(self) -> bool {
-        !matches!(self, RcKind::ClaudeBroker)
+    /// Whether this kind accepts a typed kickoff line — an initial prompt for the
+    /// agent REPLs/TUIs, an initial command for `shell`. Mirrors the guest's
+    /// `AcceptsTypedInput`: every registered kind except `claude-broker` (whose
+    /// input is a remote URL, not the pane); an [`RcKind::Other`] is NOT promptable
+    /// (no affordances under the unknown-kind policy).
+    pub fn accepts_typed_input(&self) -> bool {
+        !matches!(self, RcKind::ClaudeBroker | RcKind::Other(_))
     }
 
-    pub fn as_str(self) -> &'static str {
+    /// A recognized kind (not the preserved-raw unknown case). A `false` here is the
+    /// unknown-kind policy's neutral-render signal.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, RcKind::Other(_))
+    }
+
+    /// The tool token this kind's agent maps to under `capabilities.agents`, or
+    /// `None` for a kind with no installable agent (`shell`) or an unknown kind.
+    pub fn tool(&self) -> Option<&'static str> {
+        match self {
+            RcKind::ClaudeRc | RcKind::ClaudeBroker => Some("claude"),
+            RcKind::Codex => Some("codex"),
+            RcKind::Opencode => Some("opencode"),
+            RcKind::Cursor => Some("cursor"),
+            RcKind::Shell | RcKind::Other(_) => None,
+        }
+    }
+
+    /// The per-agent login remediation surfaced for this kind's `needs-auth` state,
+    /// mirroring the guest's `AuthHintFor` (`internal/ext/rc/agents.go`).
+    pub fn auth_hint(&self) -> &'static str {
+        match self {
+            RcKind::ClaudeRc | RcKind::ClaudeBroker => "run `claude` \u{2192} /login",
+            RcKind::Codex => "run `codex` and complete login (`codex login`)",
+            RcKind::Opencode => "run `opencode auth login`",
+            RcKind::Cursor => "run `cursor-agent login`",
+            RcKind::Shell | RcKind::Other(_) => "log in to the agent in a terminal",
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
         match self {
             RcKind::ClaudeRc => "claude-rc",
             RcKind::ClaudeBroker => "claude-broker",
+            RcKind::Codex => "codex",
+            RcKind::Opencode => "opencode",
+            RcKind::Cursor => "cursor",
             RcKind::Shell => "shell",
+            RcKind::Other(s) => s,
         }
+    }
+
+    /// Parse a wire kind string, preserving an unrecognized value as
+    /// [`RcKind::Other`] (unknown-kind policy) rather than failing or defaulting.
+    pub fn from_wire(s: &str) -> RcKind {
+        match s {
+            "claude-rc" => RcKind::ClaudeRc,
+            "claude-broker" => RcKind::ClaudeBroker,
+            "codex" => RcKind::Codex,
+            "opencode" => RcKind::Opencode,
+            "cursor" => RcKind::Cursor,
+            "shell" => RcKind::Shell,
+            other => RcKind::Other(other.to_string()),
+        }
+    }
+
+    /// The kinds the launch UI can offer for creation (`claude-broker` is
+    /// URL-driven, not create-from-a-form; `Other` is never creatable). Capability
+    /// gating narrows this further per shed.
+    pub fn creatable() -> [RcKind; 5] {
+        [
+            RcKind::ClaudeRc,
+            RcKind::Codex,
+            RcKind::Opencode,
+            RcKind::Cursor,
+            RcKind::Shell,
+        ]
+    }
+}
+
+impl Serialize for RcKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RcKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(RcKind::from_wire(&String::deserialize(d)?))
     }
 }
 
@@ -110,12 +198,84 @@ pub struct RcSessionDto {
     pub target_label: Option<String>,
 }
 
-/// The `shed-ext-rc list` response shape. Strict like Swift's `RcSessionListDTO`:
-/// the binary always emits a `rc_sessions` array (never null/absent), so a
-/// missing/null field is a contract violation the list fan-out drops.
+/// The `shed-ext-rc list` response shape. Strict on `rc_sessions` like Swift's
+/// `RcSessionListDTO` (the binary always emits the array, never null/absent, so a
+/// missing/null value is a contract violation the fan-out drops), but tolerant on
+/// `capabilities`: an OLD baked-in binary's bare `{"rc_sessions":[…]}` envelope has
+/// no block, so it decodes to `None` (the capability-discovery leg degrades, it
+/// does not error).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RcSessionListDto {
     pub rc_sessions: Vec<RcSessionDto>,
+    #[serde(default)]
+    pub capabilities: Option<RcCapabilities>,
+}
+
+/// One agent's install-probe result under [`RcCapabilities::agents`]. `version` is
+/// absent when the agent is not installed (or its version could not be read).
+/// Mirrors the guest's `rc.AgentInfo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RcAgentInfo {
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Per-kind UI hints from [`RcCapabilities::kind_features`]. Mirrors the guest's
+/// `rc.KindFeatures`: `post_input` reports whether a typed line reaches the pane,
+/// `approvals` is where approvals surface (v1 agents are TUI-only → `"tui"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RcKindFeatures {
+    pub post_input: bool,
+    pub approvals: String,
+}
+
+/// The `shed-ext-rc capabilities` payload, also embedded in the `list` envelope.
+/// Tells a client which kinds a shed offers, which agents are installed (and at
+/// what version), the feature set, and per-kind UI hints. Mirrors the guest's
+/// `rc.Capabilities` (`internal/ext/rc/capabilities.go`). Optional maps/lists
+/// default to empty so a partial payload still decodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RcCapabilities {
+    pub rc_version: i64,
+    #[serde(default)]
+    pub kinds: Vec<RcKind>,
+    #[serde(default)]
+    pub agents: HashMap<String, RcAgentInfo>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub kind_features: HashMap<String, RcKindFeatures>,
+}
+
+impl RcCapabilities {
+    /// Whether the launch UI should OFFER `kind` for creation given these
+    /// capabilities: the kind is advertised in `kinds` AND its backing agent (if
+    /// any) is installed. `shell` (no agent) is offered whenever advertised. This is
+    /// the capability gate the desktop/mobile create forms apply per shed.
+    pub fn offers(&self, kind: &RcKind) -> bool {
+        if !self.kinds.contains(kind) {
+            return false;
+        }
+        match kind.tool() {
+            None => true, // shell / unknown — no agent to require
+            Some(tool) => self.agents.get(tool).is_some_and(|a| a.installed),
+        }
+    }
+
+    /// The creatable kinds this shed offers, in the canonical create-form order —
+    /// the gated list a launch UI renders (empty if nothing is installed).
+    pub fn creatable_kinds(&self) -> Vec<RcKind> {
+        RcKind::creatable()
+            .into_iter()
+            .filter(|k| self.offers(k))
+            .collect()
+    }
+
+    /// Whether `feature` is advertised (feature discovery, replacing error-sniffing).
+    pub fn has_feature(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
 }
 
 /// The app's enriched session — the binary DTO with the host/shed injected and
@@ -190,11 +350,13 @@ pub fn tmux_name(slug: &str) -> String {
 
 /// The synthetic claude.ai URL for a slug — the test-mode analog of what the
 /// pane classifier extracts live (broker → `?environment=env_…`, rc → `/session_…`).
-pub fn synthetic_url(kind: RcKind, slug: &str) -> Option<String> {
+/// Only the claude kinds have one; every other kind — including `Other` under the
+/// unknown-kind policy — gets `None` (no synthetic claude affordance).
+pub fn synthetic_url(kind: &RcKind, slug: &str) -> Option<String> {
     match kind {
         RcKind::ClaudeBroker => Some(format!("https://claude.ai/code?environment=env_{slug}")),
         RcKind::ClaudeRc => Some(format!("https://claude.ai/code/session_{slug}")),
-        RcKind::Shell => None,
+        _ => None,
     }
 }
 
@@ -211,7 +373,7 @@ pub fn is_safe_rc_value(s: &str) -> bool {
 /// an empty/blank value → `None` (the caller omits `--prompt-stdin`); else reject
 /// a prompt on a non-typed-input kind, an embedded control char, or an over-long
 /// value (>2000 UTF-8 bytes). Mirrors Swift's `normalizeRcPrompt`.
-pub fn normalize_rc_prompt(raw: Option<&str>, kind: RcKind) -> Result<Option<String>, RcError> {
+pub fn normalize_rc_prompt(raw: Option<&str>, kind: &RcKind) -> Result<Option<String>, RcError> {
     let trimmed = match raw {
         Some(s) => s.trim(),
         None => return Ok(None),
@@ -249,7 +411,7 @@ pub fn normalize_rc_prompt(raw: Option<&str>, kind: RcKind) -> Result<Option<Str
 #[allow(clippy::too_many_arguments)]
 pub fn create_argv(
     bin: &str,
-    kind: RcKind,
+    kind: &RcKind,
     name: &str,
     slug: &str,
     workdir: Option<&str>,
@@ -289,7 +451,7 @@ pub fn create_argv(
 #[allow(clippy::too_many_arguments)]
 pub fn create_invocation(
     bin: &str,
-    kind: RcKind,
+    kind: &RcKind,
     name: &str,
     slug: &str,
     workdir: Option<&str>,
@@ -351,8 +513,15 @@ pub fn decode_session(stdout: &str) -> Result<RcSessionDto, RcError> {
 /// `decodeList`: a malformed/empty/null payload is an error (the list fan-out in
 /// `shed-app::rc` drops it to `[]`), never silently treated as "no sessions".
 pub fn decode_list(stdout: &str) -> Result<Vec<RcSessionDto>, RcError> {
+    decode_list_response(stdout).map(|l| l.rc_sessions)
+}
+
+/// Decode the full `list` envelope — sessions PLUS the optional `capabilities`
+/// block. An old baked-in binary's bare `{"rc_sessions":[…]}` yields
+/// `capabilities: None` (tolerant of absence). Same strictness on `rc_sessions` as
+/// [`decode_list`].
+pub fn decode_list_response(stdout: &str) -> Result<RcSessionListDto, RcError> {
     serde_json::from_str::<RcSessionListDto>(stdout)
-        .map(|l| l.rc_sessions)
         .map_err(|_| RcError::Failed("shed-ext-rc returned an invalid session list".to_string()))
 }
 
@@ -412,10 +581,15 @@ static RE_URL_SESSION: LazyLock<Regex> =
 /// of the banner text), so only the trust/auth heuristics + the broker
 /// `Reconnecting` state gate the outcome. The pane is lowercased once for the
 /// case-insensitive substring checks.
-pub fn classify_pane(kind: RcKind, pane: &str) -> RcClassification {
-    let lower = pane.to_lowercase();
-    // Trust + auth heuristics apply to both kinds that run claude.
-    if kind != RcKind::Shell {
+pub fn classify_pane(kind: &RcKind, pane: &str) -> RcClassification {
+    let is_claude = matches!(kind, RcKind::ClaudeRc | RcKind::ClaudeBroker);
+    // Trust + auth heuristics use claude-specific pane text, so they gate ONLY the
+    // claude kinds. The per-agent pane classifiers for codex/opencode/cursor are
+    // owned by the guest binary (`internal/ext/rc/agents.go`), authoritative over
+    // the client — clients consume the DTO's `state`; this pure classifier stays a
+    // best-effort utility and renders every non-claude/unknown kind neutrally.
+    if is_claude {
+        let lower = pane.to_lowercase();
         if lower.contains("workspace not trusted")
             || lower.contains("quick safety check")
             || RE_TRUST_FOLDER.is_match(pane)
@@ -438,7 +612,7 @@ pub fn classify_pane(kind: RcKind, pane: &str) -> RcClassification {
 
     match kind {
         RcKind::ClaudeBroker => {
-            let url = extract_url(RcKind::ClaudeBroker, pane);
+            let url = extract_url(&RcKind::ClaudeBroker, pane);
             // Reconnecting takes precedence over a (possibly stale) url — Swift parity.
             if RE_RECONNECTING.is_match(pane) {
                 return RcClassification {
@@ -448,8 +622,11 @@ pub fn classify_pane(kind: RcKind, pane: &str) -> RcClassification {
             }
             classify_by_url(url)
         }
-        RcKind::ClaudeRc => classify_by_url(extract_url(RcKind::ClaudeRc, pane)),
-        RcKind::Shell => RcClassification {
+        RcKind::ClaudeRc => classify_by_url(extract_url(&RcKind::ClaudeRc, pane)),
+        // Shell, the non-claude agent kinds (codex/opencode/cursor), and unknown
+        // kinds: neutral — blank pane is still starting, anything drawn reads ready,
+        // and no claude URL is attached (the guest owns the real per-agent states).
+        _ => RcClassification {
             state: if pane.trim().is_empty() {
                 RcState::Starting
             } else {
@@ -476,11 +653,11 @@ fn classify_by_url(url: Option<String>) -> RcClassification {
 
 /// Extract the claude.ai URL for the given kind (broker uses `?environment=env_…`,
 /// claude-rc uses `/session_…`).
-pub fn extract_url(kind: RcKind, pane: &str) -> Option<String> {
+pub fn extract_url(kind: &RcKind, pane: &str) -> Option<String> {
     let re = match kind {
         RcKind::ClaudeBroker => &*RE_URL_BROKER,
         RcKind::ClaudeRc => &*RE_URL_SESSION,
-        RcKind::Shell => return None,
+        _ => return None,
     };
     re.find(pane).map(|m| m.as_str().to_string())
 }
@@ -494,7 +671,7 @@ mod tests {
     #[test]
     fn classify_broker_ready_with_environment_url() {
         let pane = "·✔︎· Connected\nContinue at https://claude.ai/code?environment=env_01ABC";
-        let c = classify_pane(RcKind::ClaudeBroker, pane);
+        let c = classify_pane(&RcKind::ClaudeBroker, pane);
         assert_eq!(c.state, RcState::Ready);
         assert_eq!(
             c.url.as_deref(),
@@ -505,7 +682,7 @@ mod tests {
     #[test]
     fn classify_repl_needs_trust() {
         let c = classify_pane(
-            RcKind::ClaudeRc,
+            &RcKind::ClaudeRc,
             "Quick safety check: Is this a project you trust?",
         );
         assert_eq!(c.state, RcState::NeedsTrust);
@@ -513,20 +690,20 @@ mod tests {
 
     #[test]
     fn classify_trust_folder_button_needs_trust() {
-        let c = classify_pane(RcKind::ClaudeRc, "  Yes,  I trust this folder  ");
+        let c = classify_pane(&RcKind::ClaudeRc, "  Yes,  I trust this folder  ");
         assert_eq!(c.state, RcState::NeedsTrust);
     }
 
     #[test]
     fn classify_needs_auth() {
         for pane in ["not logged in", "run claude auth login", "requires a claude.ai subscription"] {
-            assert_eq!(classify_pane(RcKind::ClaudeRc, pane).state, RcState::NeedsAuth);
+            assert_eq!(classify_pane(&RcKind::ClaudeRc, pane).state, RcState::NeedsAuth);
         }
     }
 
     #[test]
     fn classify_broker_reconnecting_no_url() {
-        let c = classify_pane(RcKind::ClaudeBroker, "·|· Reconnecting · retrying in 2.5s");
+        let c = classify_pane(&RcKind::ClaudeBroker, "·|· Reconnecting · retrying in 2.5s");
         assert_eq!(c.state, RcState::Reconnecting);
         assert!(c.url.is_none());
     }
@@ -534,24 +711,24 @@ mod tests {
     #[test]
     fn classify_rc_ready_with_session_url() {
         let pane = "Remote Control active\nhttps://claude.ai/code/session_XYZ789";
-        let c = classify_pane(RcKind::ClaudeRc, pane);
+        let c = classify_pane(&RcKind::ClaudeRc, pane);
         assert_eq!(c.state, RcState::Ready);
         assert_eq!(c.url.as_deref(), Some("https://claude.ai/code/session_XYZ789"));
     }
 
     #[test]
     fn classify_rc_connecting_is_starting() {
-        let c = classify_pane(RcKind::ClaudeRc, "Remote Control connecting…");
+        let c = classify_pane(&RcKind::ClaudeRc, "Remote Control connecting…");
         assert_eq!(c.state, RcState::Starting);
         assert!(c.url.is_none());
     }
 
     #[test]
     fn classify_shell_empty_vs_content() {
-        assert_eq!(classify_pane(RcKind::Shell, "   \n ").state, RcState::Starting);
-        assert_eq!(classify_pane(RcKind::Shell, "$ ls").state, RcState::Ready);
+        assert_eq!(classify_pane(&RcKind::Shell, "   \n ").state, RcState::Starting);
+        assert_eq!(classify_pane(&RcKind::Shell, "$ ls").state, RcState::Ready);
         // A shell never runs the trust/auth heuristics.
-        assert_eq!(classify_pane(RcKind::Shell, "not logged in").state, RcState::Ready);
+        assert_eq!(classify_pane(&RcKind::Shell, "not logged in").state, RcState::Ready);
     }
 
     #[test]
@@ -570,21 +747,21 @@ mod tests {
     #[test]
     fn normalize_prompt_trims_and_accepts() {
         assert_eq!(
-            normalize_rc_prompt(Some("  summarize this repo\n"), RcKind::ClaudeRc).unwrap(),
+            normalize_rc_prompt(Some("  summarize this repo\n"), &RcKind::ClaudeRc).unwrap(),
             Some("summarize this repo".to_string())
         );
     }
 
     #[test]
     fn normalize_prompt_blank_is_none() {
-        assert_eq!(normalize_rc_prompt(Some("   \n\t"), RcKind::ClaudeRc).unwrap(), None);
-        assert_eq!(normalize_rc_prompt(None, RcKind::Shell).unwrap(), None);
+        assert_eq!(normalize_rc_prompt(Some("   \n\t"), &RcKind::ClaudeRc).unwrap(), None);
+        assert_eq!(normalize_rc_prompt(None, &RcKind::Shell).unwrap(), None);
     }
 
     #[test]
     fn normalize_prompt_rejects_control_char() {
         assert!(matches!(
-            normalize_rc_prompt(Some("bad\nvalue"), RcKind::ClaudeRc),
+            normalize_rc_prompt(Some("bad\nvalue"), &RcKind::ClaudeRc),
             Err(RcError::BadRequest(_))
         ));
     }
@@ -593,17 +770,17 @@ mod tests {
     fn normalize_prompt_rejects_overlong() {
         let big = "a".repeat(2001);
         assert!(matches!(
-            normalize_rc_prompt(Some(&big), RcKind::Shell),
+            normalize_rc_prompt(Some(&big), &RcKind::Shell),
             Err(RcError::BadRequest(_))
         ));
         // Exactly 2000 bytes is fine.
-        assert!(normalize_rc_prompt(Some(&"a".repeat(2000)), RcKind::Shell).unwrap().is_some());
+        assert!(normalize_rc_prompt(Some(&"a".repeat(2000)), &RcKind::Shell).unwrap().is_some());
     }
 
     #[test]
     fn normalize_prompt_rejects_for_broker() {
         assert!(matches!(
-            normalize_rc_prompt(Some("nope"), RcKind::ClaudeBroker),
+            normalize_rc_prompt(Some("nope"), &RcKind::ClaudeBroker),
             Err(RcError::BadRequest(_))
         ));
     }
@@ -640,7 +817,7 @@ mod tests {
     fn create_argv_shape_with_prompt_and_workdir() {
         let a = create_argv(
             "shed-ext-rc",
-            RcKind::ClaudeRc,
+            &RcKind::ClaudeRc,
             "web/abc",
             "abc",
             Some("/work"),
@@ -660,7 +837,7 @@ mod tests {
     #[test]
     fn create_argv_omits_empty_workdir_and_promptless() {
         let a = create_argv(
-            "b", RcKind::Shell, "n", "s", Some(""), "c", "t", false,
+            "b", &RcKind::Shell, "n", "s", Some(""), "c", "t", false,
         );
         assert!(!a.contains(&"--workdir".to_string()));
         assert!(!a.contains(&"--prompt-stdin".to_string()));
@@ -669,7 +846,7 @@ mod tests {
     #[test]
     fn create_invocation_drops_prompt_for_broker() {
         let (argv, stdin) = create_invocation(
-            "b", RcKind::ClaudeBroker, "n", "s", None, "c", "t", Some("hi"),
+            "b", &RcKind::ClaudeBroker, "n", "s", None, "c", "t", Some("hi"),
         );
         assert_eq!(stdin, None);
         assert!(!argv.contains(&"--prompt-stdin".to_string()));
@@ -823,13 +1000,130 @@ mod tests {
     fn synthetic_urls_and_tmux_name() {
         assert_eq!(tmux_name("abc"), "rc-abc");
         assert_eq!(
-            synthetic_url(RcKind::ClaudeRc, "abc").as_deref(),
+            synthetic_url(&RcKind::ClaudeRc, "abc").as_deref(),
             Some("https://claude.ai/code/session_abc")
         );
         assert_eq!(
-            synthetic_url(RcKind::ClaudeBroker, "abc").as_deref(),
+            synthetic_url(&RcKind::ClaudeBroker, "abc").as_deref(),
             Some("https://claude.ai/code?environment=env_abc")
         );
-        assert_eq!(synthetic_url(RcKind::Shell, "abc"), None);
+        assert_eq!(synthetic_url(&RcKind::Shell, "abc"), None);
+    }
+
+    // ---- new kinds + unknown-kind policy ----
+
+    #[test]
+    fn new_kinds_round_trip_and_accept_input() {
+        for (wire, kind) in [
+            ("codex", RcKind::Codex),
+            ("opencode", RcKind::Opencode),
+            ("cursor", RcKind::Cursor),
+        ] {
+            assert_eq!(RcKind::from_wire(wire), kind);
+            assert_eq!(kind.as_str(), wire);
+            assert!(kind.is_known());
+            assert!(kind.accepts_typed_input()); // bare-TUI kinds take a kickoff prompt
+            assert_eq!(serde_json::to_value(&kind).unwrap(), wire);
+            // No claude affordance: none of the new kinds get a synthetic claude URL.
+            assert_eq!(synthetic_url(&kind, "abc"), None);
+        }
+    }
+
+    #[test]
+    fn unknown_kind_is_preserved_and_neutral() {
+        let k = RcKind::from_wire("borg");
+        assert_eq!(k, RcKind::Other("borg".into()));
+        assert!(!k.is_known());
+        assert!(!k.accepts_typed_input()); // no affordances for an unknown kind
+        assert_eq!(k.tool(), None);
+        // Round-trips as its raw string, and gets no synthetic claude URL.
+        assert_eq!(serde_json::to_value(&k).unwrap(), "borg");
+        assert_eq!(synthetic_url(&k, "abc"), None);
+        // A pane classifies neutrally — no claude URL even if the pane contains one.
+        let c = classify_pane(&k, "https://claude.ai/code/session_X");
+        assert_eq!(c.state, RcState::Ready);
+        assert!(c.url.is_none());
+    }
+
+    #[test]
+    fn decode_list_preserves_unknown_and_new_kinds() {
+        // A session created by a newer/other tool must survive decode (not be
+        // dropped or coerced to claude-broker) — the unknown-kind policy.
+        let stdout = r#"{"rc_sessions":[
+            {"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready","managed":true},
+            {"slug":"b","tmux_session":"rc-b","kind":"borg","state":"starting","managed":true}
+        ]}"#;
+        let dtos = decode_list(stdout).unwrap();
+        assert_eq!(dtos.len(), 2);
+        assert_eq!(dtos[0].kind, RcKind::Codex);
+        assert_eq!(dtos[1].kind, RcKind::Other("borg".into()));
+    }
+
+    // ---- capabilities ----
+
+    #[test]
+    fn decode_list_response_carries_capabilities() {
+        let stdout = r#"{
+          "rc_sessions": [],
+          "capabilities": {
+            "rc_version": 3,
+            "kinds": ["claude-rc","codex","opencode","cursor","shell"],
+            "agents": { "claude": {"installed": true, "version": "2.1.206"},
+                        "codex":  {"installed": true, "version": "0.143.0"},
+                        "cursor": {"installed": false} },
+            "features": ["generic-perm","plan-stdin","prompt-b64"],
+            "kind_features": { "codex": {"post_input": true, "approvals": "tui"} }
+          }
+        }"#;
+        let resp = decode_list_response(stdout).unwrap();
+        let caps = resp.capabilities.expect("capabilities present");
+        assert_eq!(caps.rc_version, 3);
+        assert!(caps.has_feature("generic-perm"));
+        assert!(caps.kinds.contains(&RcKind::Codex));
+        assert_eq!(caps.kind_features["codex"].approvals, "tui");
+        // Gating: claude + codex installed, cursor not, opencode absent from agents,
+        // shell always offered when advertised.
+        assert!(caps.offers(&RcKind::ClaudeRc));
+        assert!(caps.offers(&RcKind::Codex));
+        assert!(!caps.offers(&RcKind::Cursor)); // advertised but not installed
+        assert!(!caps.offers(&RcKind::Opencode)); // advertised but no agents entry
+        assert!(caps.offers(&RcKind::Shell));
+        assert!(!caps.offers(&RcKind::ClaudeBroker)); // not advertised (URL-driven)
+        assert_eq!(
+            caps.creatable_kinds(),
+            vec![RcKind::ClaudeRc, RcKind::Codex, RcKind::Shell]
+        );
+    }
+
+    #[test]
+    fn old_binary_envelope_has_no_capabilities() {
+        // An old baked-in binary's bare envelope decodes with capabilities == None
+        // (tolerant of absence) — the capability leg degrades, it does not error.
+        let resp = decode_list_response(
+            r#"{"rc_sessions":[{"slug":"a","tmux_session":"rc-a","kind":"shell","state":"ready","managed":true}]}"#,
+        )
+        .unwrap();
+        assert!(resp.capabilities.is_none());
+        assert_eq!(resp.rc_sessions.len(), 1);
+    }
+
+    #[test]
+    fn present_but_empty_capabilities_offer_nothing() {
+        // Present-but-EMPTY capabilities are NOT the same as absent: a shed that
+        // advertises kinds with no installed agents yields an empty creatable set
+        // (clients show "unavailable"); only an ABSENT block may fall back to
+        // claude+shell.
+        let resp = decode_list_response(
+            r#"{"rc_sessions":[],
+                "capabilities":{"rc_version":3,
+                  "kinds":["claude-rc","codex"],
+                  "agents":{"claude":{"installed":false},"codex":{"installed":false}},
+                  "features":[],"kind_features":{}}}"#,
+        )
+        .unwrap();
+        let caps = resp.capabilities.unwrap();
+        assert!(caps.creatable_kinds().is_empty());
+        assert!(!caps.offers(&RcKind::ClaudeRc));
+        assert!(!caps.offers(&RcKind::Shell)); // not even advertised
     }
 }

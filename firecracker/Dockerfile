@@ -7,7 +7,8 @@
 #   shed-fc-base        - Minimal: shed infrastructure + basic dev tools + kernel.
 #   shed-fc-extensions  - Base + shed-extensions credential brokering (no coding agents).
 #                         Recommended starting point for users who customize their own image.
-#   shed-fc-full        - Extensions + mise/Node/Python/UV + all coding agents.
+#   shed-fc-full        - Extensions + Bun + all coding agents
+#                         (Claude Code, OpenCode, Codex CLI, Cursor CLI).
 #
 # Build a specific variant:
 #   docker buildx build --platform linux/amd64 --target shed-fc-base --output type=oci,dest=base.tar .
@@ -291,7 +292,7 @@ ENTRYPOINT ["/sbin/init"]
 
 # =============================================================================
 # Stage: shed-fc-full
-# Extensions + Bun + coding agents (Claude Code, OpenCode, Codex CLI).
+# Extensions + Bun + coding agents (Claude Code, OpenCode, Codex CLI, Cursor CLI).
 # mise stays for Go-binary tools (prox, envsecrets). Node/Python/uv
 # dropped — Bun is the JS runtime + package manager, and users who
 # need Python can `uv python install 3.13` inside a shed.
@@ -354,9 +355,32 @@ RUN set -euo pipefail && \
         mise use -g github:charliek/prox github:charliek/envsecrets && \
         # OpenCode via Bun. \
         /home/shed/.bun/bin/bun add -g opencode-ai && \
-        # Codex CLI via Bun (npm-compatible). \
-        /home/shed/.bun/bin/bun install -g @openai/codex \
-    '
+        # Codex CLI via Bun. Bun lays down an npm-style shim \
+        # (#!/usr/bin/env node); this image ships bun but no node, so the \
+        # shim is replaced with a bun wrapper right after this block. \
+        /home/shed/.bun/bin/bun install -g @openai/codex && \
+        # Cursor CLI (cursor-agent), installs to ~/.local/bin. The installer \
+        # always serves the latest build and exposes no version-pin env/flag \
+        # (same as Claude Code above), so it is intentionally left unpinned. \
+        curl -fsS https://cursor.com/install | bash && \
+        # Fail the build if the installer stops producing this path. \
+        test -x /home/shed/.local/bin/cursor-agent \
+    ' && \
+    # Codex's npm shim needs node; this image ships bun only. Replace bun's \
+    # broken `codex` symlink with a narrow wrapper that execs codex's JS entry \
+    # under bun. Deliberately codex-specific, NOT a global `node` shim (which \
+    # would mask genuine node-required failures elsewhere). .bun/bin sits ahead \
+    # of .local/bin on PATH, so the fix must replace the resolved \
+    # .bun/bin/codex itself. The test guards the unpinned package's layout: \
+    # if the entry path moves, the image build fails instead of codex at runtime. \
+    test -f /home/shed/.bun/install/global/node_modules/@openai/codex/bin/codex.js && \
+    rm -f /home/shed/.bun/bin/codex && \
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'exec /home/shed/.bun/bin/bun /home/shed/.bun/install/global/node_modules/@openai/codex/bin/codex.js "$@"' \
+        > /home/shed/.bun/bin/codex && \
+    chmod 0755 /home/shed/.bun/bin/codex && \
+    chown shed:shed /home/shed/.bun/bin/codex
 
 WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
