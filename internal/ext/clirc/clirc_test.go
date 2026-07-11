@@ -524,3 +524,37 @@ func TestParseVersionFromLoginShell(t *testing.T) {
 		})
 	}
 }
+
+// TestServeDispatch checks the `serve` subcommand's local validation: --detach and
+// --foreground are mutually exclusive (rejected before any hub side effect), and an
+// unexpected positional argument is rejected. The bind/run paths are covered by the
+// hub package's own tests (they need an injectable address).
+func TestServeDispatch(t *testing.T) {
+	// Mutually-exclusive flags → bad-args exit 2, no hub spawned (ensureHub unset).
+	code, _, errOut := runCLI(extCfg, &fakeRunner{}, nil, "", "serve", "--detach", "--foreground")
+	if code != 2 {
+		t.Fatalf("serve --detach --foreground exit = %d, want 2", code)
+	}
+	if !strings.Contains(errOut, "mutually exclusive") {
+		t.Fatalf("stderr = %q, want mutual-exclusion message", errOut)
+	}
+
+	// Unexpected positional argument → bad-args exit 2.
+	code, _, _ = runCLI(extCfg, &fakeRunner{}, nil, "", "serve", "stray")
+	if code != 2 {
+		t.Fatalf("serve stray exit = %d, want 2", code)
+	}
+}
+
+// TestCreateDoesNotSpawnHubInTests guards the ensureHub gate: dispatch-level create
+// (with no ensureHub wired, as in every test) must not attempt to spawn the daemon.
+func TestCreateDoesNotSpawnHubInTests(t *testing.T) {
+	r := &fakeRunner{}
+	env := map[string]string{"HOME": t.TempDir()}
+	code, _, errOut := runCLI(extCfg, r, env, "", "create", "--kind", "shell", "--slug", "abc123")
+	if code != 0 {
+		t.Fatalf("create exit = %d (stderr %q), want 0", code, errOut)
+	}
+	// A hub spawn would shell out to the real binary; the fake runner only sees tmux
+	// calls, so simply reaching exit 0 with no panic confirms no daemon side effect.
+}

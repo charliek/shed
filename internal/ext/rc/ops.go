@@ -55,6 +55,12 @@ type CreateOptions struct {
 	// claude's own default). e.g. "auto" or "bypassPermissions" for an unattended
 	// run; with bypassPermissions, Wait also auto-accepts the one-time bypass dialog.
 	PermissionMode string
+	// EnsureHub, when non-nil, is invoked (best-effort) once a session has been
+	// created, to make sure the local rc activity hub is running so the new session
+	// is watched. It must never fail or meaningfully delay the create — a spawn
+	// error is the hook's own concern (it logs and swallows). nil in tests and for
+	// any caller that doesn't want the hub; production wires the detached-serve spawn.
+	EnsureHub func()
 }
 
 // Create bootstraps a managed RC session and returns its DTO. With Wait (or a
@@ -160,6 +166,13 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 			return Session{}, err
 		}
 		opts.Prompt = composePlanKickoff(planFile, opts.PlanFraming)
+	}
+
+	// The session now exists in tmux. Best-effort ensure the local hub is running so
+	// it starts watching this session — deferred so it fires on the way out
+	// regardless of the wait/kickoff outcome, and never blocks the create result.
+	if opts.EnsureHub != nil {
+		defer opts.EnsureHub()
 	}
 
 	session := Session{

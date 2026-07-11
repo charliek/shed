@@ -16,13 +16,18 @@ const CapabilityVersion = 3
 // capabilityFeatures is the feature list (a set of stable tokens) advertised to
 // clients for capability discovery, replacing error-string sniffing. It advertises
 // ONLY what this binary actually supports — a feature token is appended in the same
-// change that ships the feature (planned next: "serve" with the rc hub):
+// change that ships the feature:
 //   - generic-perm — the generic default|auto|skip permission tri-state for all kinds.
 //   - plan-stdin — `create --plan-stdin` writes a plan to a per-kind HOME-rooted file
 //     and composes+delivers a kickoff referencing it.
 //   - prompt-b64 — `create --plan-stdin --prompt-b64 <base64>` prepends decoded caller
 //     framing to the composed plan kickoff (stdin stays reserved for the plan).
-var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64"}
+//   - serve — `shed-ext-rc serve` runs the resident rc activity hub (loopback HTTP:
+//     GET /v1/sessions + SSE /v1/events), spawned on demand and self-exiting.
+//   - activity — sessions carry the live activity dimension (activity/activity_at/
+//     last_message inside the rc block) derived by the hub. (The message-feed token
+//     "messages" is withheld until the /messages + /input endpoints ship.)
+var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64", "serve", "activity"}
 
 // AgentInfo is one agent's install probe result under capabilities.agents. Version is
 // omitted when the agent is not installed (or its version could not be read).

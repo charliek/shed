@@ -34,7 +34,7 @@
       "opencode": { "installed": true, "version": "1.17.11" },
       "cursor": { "installed": false }
     },
-    "features": ["generic-perm", "plan-stdin", "prompt-b64"],
+    "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity"],
     "kind_features": {
       "claude-rc": { "post_input": true, "approvals": "tui" },
       "codex": { "post_input": true, "approvals": "tui" },
