@@ -7,9 +7,10 @@
 //! `sockets.go`). Surface B (the shed-server plugin bus, `bus.rs`) subscribes to
 //! `ssh-agent` and answers `ping` + the cross-surface gated **`sign`** flow: a bus
 //! sign request runs the approval gate (`approval.rs` / the desktop gate), signs
-//! with the minimal ed25519 backend (`ssh_backend.rs`), and records an audit entry
-//! (`audit.rs`) that fans out to the desktop app. The credential minter, the
-//! aws/docker backends, the ssh `list`/`status` ops, and multi-server discovery are
+//! with the local-keys SSH backend (`ssh_backend.rs` — ed25519 + rsa + ecdsa,
+//! resolved from `ssh.mode` at startup), and records an audit entry (`audit.rs`)
+//! that fans out to the desktop app. The credential minter, the agent-forward
+//! backend, the aws/docker backends, the ssh `list`/`status` ops, and discovery are
 //! later slices; in multi-server (`discovery:`) mode the single-server bus stays
 //! off, matching the Go daemon's `cfg.Discovery == nil` gate.
 
@@ -44,7 +45,6 @@ use std::sync::Arc;
 
 use config::HostAgentConfig;
 use sockets::{bind_unix_socket, status_socket_path};
-use ssh_backend::SshBackend;
 use status::{build_live_status, now_rfc3339, run_status, serve_status_socket, LiveStatus};
 use version::full_info;
 
@@ -231,6 +231,37 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         cfg.effective_policy(config::NS_DOCKER_CREDENTIALS),
     ));
 
+    // Resolve the SSH backend UNCONDITIONALLY at startup — after config load, BEFORE
+    // any socket binds — mirroring Go's `main.go:114` (`ResolveSSHBackend` runs before
+    // the desktop/status sockets). A resolve error (unknown `ssh.mode`, or an explicit
+    // `agent-forward` before commit 2 wires that backend) is FATAL: log + return 1,
+    // matching Go's `os.Exit(1)`. Resolving here — not inside the single-server bus
+    // block — means a multi-server (`discovery:`) config also validates the mode and
+    // loads keys at startup, even though its bus stays off.
+    let (ssh_backend, ssh_warnings) =
+        match ssh_backend::resolve_ssh_backend_from_env(cfg.ssh_mode()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log.error(&format!("failed to initialize SSH backend error={e}"));
+                return 1;
+            }
+        };
+    for warning in &ssh_warnings {
+        log.warn(warning);
+    }
+    let ssh_keys = ssh_backend.list().unwrap_or_default();
+    for key in &ssh_keys {
+        log.info(&format!(
+            "ssh backend loaded key type={} comment={}",
+            key.format, key.comment
+        ));
+    }
+    log.info(&format!(
+        "ssh backend mode={} keys={}",
+        ssh_backend.mode(),
+        ssh_keys.len()
+    ));
+
     // Surface B: in single-server mode (no `discovery:` block) the message-bus
     // daemon connects to the single `server:` URL and answers ssh-agent pings. In
     // multi-server (`discovery:`) mode it stays off — matching Go's
@@ -335,28 +366,16 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         // SIGTERM/SIGINT tears the subscribe loop + gated-sign responder down cleanly
         // alongside the socket servers. The bus's three seams — the ssh approval gate
         // (selected from `ssh.approval.policy`), the audit sink (durable JSONL +
-        // desktop fan-out), and the ed25519 sign backend (`~/.ssh/id_ed25519`) — are
-        // built here and injected, so the desktop server + bus + audit form one
+        // desktop fan-out), and the SSH sign backend (resolved above from `ssh.mode`)
+        // — are built here and injected, so the desktop server + bus + audit form one
         // cross-surface daemon. `server` name is empty in single-server mode (Go).
         if let Some(server_url) = bus_server {
             let rx = shutdown_rx.clone();
             let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
 
-            // Load the ed25519 sign backend (`~/.ssh/id_ed25519`; empty if absent —
-            // never fails, so the daemon still starts) and log what it holds.
-            let local_backend = ssh_backend::LocalEd25519Backend::load();
-            for key in local_backend.list().unwrap_or_default() {
-                bus_log.info(&format!(
-                    "ssh backend loaded key type={} comment={}",
-                    key.format, key.comment
-                ));
-            }
-            bus_log.info(&format!(
-                "ssh backend mode={} keys={}",
-                local_backend.mode(),
-                local_backend.key_count()
-            ));
-            let backend: Arc<dyn ssh_backend::SshBackend> = Arc::new(local_backend);
+            // The SSH sign backend was resolved unconditionally at startup (above);
+            // hand its `Arc` to the bus.
+            let backend: Arc<dyn ssh_backend::SshBackend> = ssh_backend;
 
             // Select the ssh approval gate from the effective policy (empty →
             // deny-all, fail-closed). shed-desktop delegates to the desktop server;

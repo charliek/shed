@@ -140,6 +140,10 @@ pub struct HostAgentConfig {
     ssh_policy: String,
     aws_policy: String,
     docker_policy: String,
+    /// The SSH backend mode (`ssh.mode`): `"agent-forward"`, `"local-keys"`, or `""`
+    /// (auto-detect). Mirrors Go's `SSHConfig.Mode`; consumed by
+    /// `ssh_backend::resolve_ssh_backend`.
+    ssh_mode: String,
     pub logging_enabled: bool,
     pub logging_path: String,
     // Read only by `approval_timeout()`, which only the desktop server calls.
@@ -198,6 +202,10 @@ impl HostAgentConfig {
             ssh_policy: policy("ssh"),
             aws_policy: policy("aws"),
             docker_policy: policy("docker"),
+            ssh_mode: root
+                .get_path(&["ssh", "mode"])
+                .unwrap_or_default()
+                .to_string(),
             logging_enabled,
             logging_path,
             approval_timeout: parse_approval_timeout(
@@ -225,6 +233,13 @@ impl HostAgentConfig {
     #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     pub fn approval_timeout(&self) -> Duration {
         self.approval_timeout
+    }
+
+    /// The configured SSH backend mode (`ssh.mode`): `"agent-forward"`,
+    /// `"local-keys"`, or `""` (auto-detect). Passed to
+    /// `ssh_backend::resolve_ssh_backend_from_env` at daemon startup.
+    pub fn ssh_mode(&self) -> &str {
+        &self.ssh_mode
     }
 
     /// `effective_policy` returns the configured policy for a namespace, defaulting
@@ -491,6 +506,27 @@ discovery:
         assert!(!cfg.is_single_server());
         assert!(cfg.has_discovery);
         assert_eq!(cfg.server, DEFAULT_SERVER_URL);
+    }
+
+    #[test]
+    fn ssh_mode_reads_or_defaults_empty() {
+        // Absent → "" (auto).
+        assert_eq!(HostAgentConfig::parse("").ssh_mode(), "");
+        // An ssh block with only an approval policy → still "".
+        assert_eq!(
+            HostAgentConfig::parse("ssh:\n  approval:\n    policy: approve-all\n").ssh_mode(),
+            ""
+        );
+        // Explicit modes.
+        assert_eq!(
+            HostAgentConfig::parse("ssh:\n  mode: local-keys\n").ssh_mode(),
+            "local-keys"
+        );
+        assert_eq!(
+            HostAgentConfig::parse("ssh:\n  mode: agent-forward\n  approval:\n    policy: shed-desktop\n")
+                .ssh_mode(),
+            "agent-forward"
+        );
     }
 
     #[test]
