@@ -35,6 +35,7 @@ mod minter;
 mod desktop_protocol;
 mod sockets;
 mod ssh_backend;
+mod ssh_backend_agent;
 mod status;
 mod version;
 
@@ -234,7 +235,7 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     // Resolve the SSH backend UNCONDITIONALLY at startup — after config load, BEFORE
     // any socket binds — mirroring Go's `main.go:114` (`ResolveSSHBackend` runs before
     // the desktop/status sockets). A resolve error (unknown `ssh.mode`, or an explicit
-    // `agent-forward` before commit 2 wires that backend) is FATAL: log + return 1,
+    // `agent-forward` with `$SSH_AUTH_SOCK` unset) is FATAL: log + return 1,
     // matching Go's `os.Exit(1)`. Resolving here — not inside the single-server bus
     // block — means a multi-server (`discovery:`) config also validates the mode and
     // loads keys at startup, even though its bus stays off.

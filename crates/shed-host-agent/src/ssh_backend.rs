@@ -664,32 +664,63 @@ impl SshBackend for LocalKeysBackend {
 /// backend reads (`$HOME/.ssh` in production; a fixture dir in tests).
 ///
 /// - `"local-keys"` → the local-keys backend.
-/// - `""` (auto) → auto-detect. **This commit** selects local-keys unconditionally;
-///   the `SSH_AUTH_SOCK` dial that picks agent-forward lands in commit 2.
-/// - `"agent-forward"` → `Err` (**commit-2 wires this** — until the agent-forward
-///   backend exists, an explicit request is a fatal startup error rather than a
-///   silently-wrong backend).
+/// - `"agent-forward"` → the agent-forward backend (`$SSH_AUTH_SOCK` unset/empty →
+///   `Err("SSH_AUTH_SOCK not set")`, Go's exact string). The path is stored, not
+///   dialed, at construction.
+/// - `""` (auto) → auto-detect (Go `ssh_backend.go:37-45`): `$SSH_AUTH_SOCK` set AND a
+///   live UDS dial succeeds → agent-forward; otherwise (unset, stale path, regular
+///   file, dead socket) local-keys.
 /// - anything else → `Err` with Go's exact string.
 ///
-/// Returns the backend plus any load warnings for the caller to log.
+/// Returns the backend plus any log lines for the caller to emit (load warnings, and —
+/// for the auto path — the `auto-detected SSH backend mode=…` line; Go logs the latter
+/// at Info, the caller here logs the seam at Warn, an op-log-only level difference that
+/// is not wire-compared by the differential).
 pub fn resolve_ssh_backend(
     mode: &str,
     ssh_dir: &Path,
+) -> Result<(Arc<dyn SshBackend>, Vec<String>), String> {
+    resolve_ssh_backend_inner(mode, ssh_dir, std::env::var_os("SSH_AUTH_SOCK"))
+}
+
+/// The resolver core with an **injected** `$SSH_AUTH_SOCK` value. The public wrapper
+/// reads it from the environment; the unit tests pass explicit values so they neither
+/// depend on nor race the ambient developer agent (which, on a dev machine, would make
+/// the `""` auto path pick agent-forward).
+fn resolve_ssh_backend_inner(
+    mode: &str,
+    ssh_dir: &Path,
+    auth_sock: Option<std::ffi::OsString>,
 ) -> Result<(Arc<dyn SshBackend>, Vec<String>), String> {
     match mode {
         "local-keys" => {
             let (backend, warnings) = LocalKeysBackend::load_from_ssh_dir(ssh_dir);
             Ok((Arc::new(backend), warnings))
         }
-        "" => {
-            // Auto-detect. commit-2 wires this: SSH_AUTH_SOCK set AND a live UDS dial
-            // → agent-forward; else local-keys. Until then, always local-keys.
-            let (backend, warnings) = LocalKeysBackend::load_from_ssh_dir(ssh_dir);
-            Ok((Arc::new(backend), warnings))
-        }
         "agent-forward" => {
-            // commit-2 wires this.
-            Err("agent-forward backend not yet implemented".to_string())
+            let backend = crate::ssh_backend_agent::AgentForwardBackend::from_sock(auth_sock)?;
+            Ok((Arc::new(backend), Vec::new()))
+        }
+        "" => {
+            // Auto-detect: SSH_AUTH_SOCK set AND a live UDS dial succeeds → agent-forward.
+            // The probe connection closes on drop (Go `conn.Close()`); a stale path /
+            // regular file / dead socket makes the dial fail → fall through to local-keys.
+            if let Some(sock) = auth_sock.filter(|s| !s.is_empty()) {
+                if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                    let display = Path::new(&sock).display().to_string();
+                    let backend =
+                        crate::ssh_backend_agent::AgentForwardBackend::from_sock(Some(sock))?;
+                    return Ok((
+                        Arc::new(backend),
+                        vec![format!(
+                            "auto-detected SSH backend mode=agent-forward socket={display}"
+                        )],
+                    ));
+                }
+            }
+            let (backend, mut warnings) = LocalKeysBackend::load_from_ssh_dir(ssh_dir);
+            warnings.insert(0, "auto-detected SSH backend mode=local-keys".to_string());
+            Ok((Arc::new(backend), warnings))
         }
         other => Err(format!(
             "unknown ssh mode: \"{other}\" (expected agent-forward, local-keys, or empty)"
@@ -1311,30 +1342,77 @@ thaWnPuu0EWHWhqSQuP3zx/47Kd98x5FMIW92hlf+vZxuURwYr0VwYB/tz9p4s4Z\n\
 
     #[test]
     fn resolve_mode_matrix() {
-        // This commit's resolve subset (the full auto-detect dial matrix lands in
-        // commit 2, with the agent-forward backend). Rust-only (no Go test).
+        // The full resolve matrix, driven through `resolve_ssh_backend_inner` with an
+        // injected `SSH_AUTH_SOCK` so the auto path is deterministic (the public
+        // `resolve_ssh_backend` reads the real env, which on a dev machine has a live
+        // agent). Rust-only (no Go test). `.err()`/`.ok()` because the Ok variant
+        // (`Arc<dyn SshBackend>`) is not `Debug`.
+        use std::ffi::OsString;
+        use std::os::unix::net::UnixListener;
+
         let tmp = temp_dir("resolve");
         write_fixed_ed25519(tmp.path());
+        let some = |p: &Path| Some(OsString::from(p));
 
-        // explicit local-keys → local backend.
-        let (be, _w) = resolve_ssh_backend("local-keys", tmp.path()).unwrap();
+        // explicit local-keys → local backend (ignores the sock).
+        let (be, _w) = resolve_ssh_backend_inner("local-keys", tmp.path(), None).unwrap();
         assert_eq!(be.mode(), "local-keys");
         assert_eq!(be.list().unwrap().len(), 1);
 
-        // auto ("") → local-keys this commit.
-        let (be, _w) = resolve_ssh_backend("", tmp.path()).unwrap();
+        // explicit agent-forward WITH a sock → agent-forward (no dial at construction,
+        // so an unreachable path still constructs).
+        let (be, w) = resolve_ssh_backend_inner(
+            "agent-forward",
+            tmp.path(),
+            some(&tmp.path().join("nope.sock")),
+        )
+        .unwrap();
+        assert_eq!(be.mode(), "agent-forward");
+        assert!(w.is_empty());
+
+        // explicit agent-forward WITHOUT a sock → Go's exact "not set" string.
+        assert_eq!(
+            resolve_ssh_backend_inner("agent-forward", tmp.path(), None)
+                .err()
+                .unwrap(),
+            "SSH_AUTH_SOCK not set"
+        );
+
+        // auto with a LIVE socket → agent-forward (a bound listener makes the dial
+        // succeed even without an explicit accept, via the connection backlog).
+        let live = tmp.path().join("live.sock");
+        let _listener = UnixListener::bind(&live).unwrap();
+        let (be, w) = resolve_ssh_backend_inner("", tmp.path(), some(&live)).unwrap();
+        assert_eq!(be.mode(), "agent-forward");
+        assert_eq!(
+            w,
+            vec![format!(
+                "auto-detected SSH backend mode=agent-forward socket={}",
+                live.display()
+            )]
+        );
+
+        // auto with SSH_AUTH_SOCK unset → local-keys (+ the auto-detect log line first).
+        let (be, w) = resolve_ssh_backend_inner("", tmp.path(), None).unwrap();
+        assert_eq!(be.mode(), "local-keys");
+        assert_eq!(w[0], "auto-detected SSH backend mode=local-keys");
+
+        // auto with SSH_AUTH_SOCK pointing at a REGULAR FILE → dial fails → local-keys.
+        let regular = tmp.path().join("not-a-socket");
+        std::fs::write(&regular, b"x").unwrap();
+        let (be, _w) = resolve_ssh_backend_inner("", tmp.path(), some(&regular)).unwrap();
         assert_eq!(be.mode(), "local-keys");
 
-        // agent-forward → error (commit-2 wires the backend). `.err()` because the
-        // Ok variant (`Arc<dyn SshBackend>`) is not `Debug`.
-        assert_eq!(
-            resolve_ssh_backend("agent-forward", tmp.path()).err().unwrap(),
-            "agent-forward backend not yet implemented"
-        );
+        // auto with a NONEXISTENT path → dial fails → local-keys.
+        let (be, _w) =
+            resolve_ssh_backend_inner("", tmp.path(), some(&tmp.path().join("gone.sock"))).unwrap();
+        assert_eq!(be.mode(), "local-keys");
 
         // unknown mode → Go's exact string.
         assert_eq!(
-            resolve_ssh_backend("bogus", tmp.path()).err().unwrap(),
+            resolve_ssh_backend_inner("bogus", tmp.path(), None)
+                .err()
+                .unwrap(),
             "unknown ssh mode: \"bogus\" (expected agent-forward, local-keys, or empty)"
         );
     }
