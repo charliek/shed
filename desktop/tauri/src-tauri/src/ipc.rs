@@ -246,6 +246,8 @@ impl Handler {
             "create.status" => self.create_status(params),
             "create.cancel" => self.create_cancel(params),
             "system.df" => Ok(json!({ "usage": self.backend.system_df().await })),
+            "egress.profiles" => Ok(self.egress_dump()),
+            "egress.show" => self.egress_show(params),
             "terminal.preview" => self.terminal_preview(params),
             "terminal.open" => self.terminal_open(params),
             "terminal.presets" => Ok(self.terminal_presets()),
@@ -329,7 +331,7 @@ impl Handler {
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
         if !matches!(
             pane,
-            "sheds" | "approvals" | "agents" | "activity" | "system"
+            "sheds" | "approvals" | "agents" | "activity" | "egress" | "system"
         ) {
             return Err(err("bad_request", format!("unknown pane: {pane:?}")));
         }
@@ -343,7 +345,8 @@ impl Handler {
             ));
         }
         let _ = self.app.emit("navigate", json!({ "pane": pane }));
-        Ok(json!({}))
+        // Echo the pane like the mac handler, so both surfaces match ipc.md.
+        Ok(json!({ "pane": pane }))
     }
 
     /// `ui.set_appearance {mode}` → drive the dashboard's light/dark mode (a
@@ -641,6 +644,69 @@ impl Handler {
             json!([])
         };
         json!({ "sessions": sessions })
+    }
+
+    // -- egress (mac parity) — the pane's UI truth + its sub-tab driver --------
+
+    /// `egress.profiles` → the egress state the frontend reported (UI truth, like
+    /// `agents.dump` reads the rendered sessions): `{tab, profiles, errors,
+    /// selected, activity_count}`. The Egress pane reports only while mounted, so
+    /// off-pane this returns `null` rather than a stale snapshot.
+    fn egress_dump(&self) -> Value {
+        let on_egress = self
+            .ui_get("pane")
+            .and_then(|p| p.as_str().map(|s| s == "egress"))
+            .unwrap_or(false);
+        let egress = if on_egress {
+            self.ui_get("egress").unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        json!({ "egress": egress })
+    }
+
+    /// `egress.show {tab?, profile?, host?}` → drive the Egress pane's sub-tab
+    /// and/or selected profile (an `egress-show` event the pane listens for), so the
+    /// harness can render the Profiles list→detail deterministically (the
+    /// `set-appearance` pattern). Validates the tab; the pane resolves `profile` by
+    /// (host, name) when `host` is given, else by name (first match) — so a name
+    /// that collides across hosts (e.g. `default` on every server) is selectable
+    /// deterministically.
+    ///
+    /// Readiness (mirrors `ui.navigate`'s `frontend_not_ready` gate): the pane's
+    /// `egress-show` LISTENER attaches asynchronously after mount, and — like
+    /// `useUiBridge` — the pane publishes its egress snapshot only AFTER that
+    /// listener is live. So a non-null reported `egress` snapshot proves the
+    /// listener is attached; a null/absent one means an emit would be lost to the
+    /// attach race, so fail fast and let the caller retry.
+    fn egress_show(&self, params: &Value) -> Result<Value, (String, String)> {
+        let tab = params.get("tab").and_then(Value::as_str);
+        if let Some(t) = tab {
+            if !matches!(t, "activity" | "profiles") {
+                return Err(err("bad_request", format!("unknown tab: {t:?}")));
+            }
+        }
+        // snapshot non-null ⟹ the pane mounted AND its egress-show listener attached
+        // (see the pane's effect ordering), so the emit below is heard. Null/absent
+        // ⟹ not yet reported → fail fast so the caller retries (the harness waits).
+        if self.ui_get("egress").is_none_or(|v| v.is_null()) {
+            return Err(err(
+                "frontend_not_ready",
+                "egress pane has not reported yet; retry",
+            ));
+        }
+        let mut payload = serde_json::Map::new();
+        if let Some(t) = tab {
+            payload.insert("tab".into(), json!(t));
+        }
+        if let Some(p) = params.get("profile").and_then(Value::as_str) {
+            payload.insert("profile".into(), json!(p));
+        }
+        if let Some(h) = params.get("host").and_then(Value::as_str) {
+            payload.insert("host".into(), json!(h));
+        }
+        let _ = self.app.emit("egress-show", Value::Object(payload));
+        Ok(json!({}))
     }
 
     // -- approvals (the security spine; the harness drives the full matrix) ----

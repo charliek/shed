@@ -66,7 +66,7 @@ def test_tray_popover_drivable(tauri):
     # The window-keyed report did NOT clobber the dashboard's `main` snapshot:
     # current_pane still reflects the shell (B1b.1's per-window keying).
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
-    assert tauri.current_pane() in {"sheds", "approvals", "agents", "activity", "system"}
+    assert tauri.current_pane() in {"sheds", "approvals", "agents", "activity", "egress", "system"}
 
     # Drive the show path (the tray-icon-click analog) → the popover becomes visible;
     # hide → invisible. This is the hermetic stand-in for the (non-drivable) OS click.
@@ -351,6 +351,115 @@ def test_new_shed_dialog_opens(tauri):
     if platform.system() == "Darwin":
         return
     tauri.show_window()
+    png, w, h = tauri.screenshot(scale=1)
+    assert png[:8] == PNG_MAGIC and w > 0 and h > 0
+
+
+def test_navigate_egress_pane(tauri):
+    # The Egress pane (mac parity) is navigable end-to-end: the ipc.rs allowlist,
+    # the bridge PANES set, and the NAV entry all know it — and an unknown pane is
+    # still rejected (the allowlist didn't just open up).
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    tauri.navigate("egress")
+    tauri.wait_until(lambda: tauri.current_pane() == "egress", timeout=15, what="pane=egress")
+    with pytest.raises(ShedError) as e:
+        tauri.navigate("bogus")
+    assert e.value.code == "bad_request"
+
+
+def test_egress_profiles_render(tauri):
+    # The Profiles sub-tab renders the mock's fixture as UI truth (egress.profiles
+    # reads the pane's REPORTED rows, like agents.dump): both profiles appear with
+    # host + source, the auto-selected first profile's detail shows its allow/deny
+    # rules, and selection is drivable by name (egress.show).
+    #
+    # NOTE: a down-host error row can't be simulated here — test mode points every
+    # configured server at the single in-process mock — so the error-row contract
+    # is pinned at the shed-app unit level
+    # (backend.rs::egress_profiles_keeps_error_row_for_down_host).
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    tauri.navigate("egress")
+    tauri.wait_until(lambda: tauri.current_pane() == "egress", timeout=15, what="pane=egress")
+    tauri.egress_show(tab="profiles")
+    tauri.wait_until(lambda: (tauri.egress_dump() or {}).get("tab") == "profiles",
+                     timeout=15, what="profiles sub-tab shown")
+    tauri.wait_until(lambda: len((tauri.egress_dump() or {}).get("profiles") or []) == 2,
+                     timeout=15, what="egress profile rows rendered")
+    d = tauri.egress_dump()
+    rows = {(p["host"], p["name"], p["source"]) for p in d["profiles"]}
+    assert rows == {("mock", "default", "config"), ("mock", "custom", "user")}, f"unexpected rows: {d}"
+    assert d["errors"] == []
+    # list→detail: the first profile auto-selects; its rule lists render.
+    sel = d["selected"]
+    assert sel["name"] == "default" and sel["source"] == "config"
+    assert sel["allow"] == ["*.github.com"]
+    assert sel["deny"] == ["evil.example.com"]
+    assert sel["mode"] == "audit"
+    # selection is drivable: pick the user profile, the detail follows.
+    tauri.egress_show(profile="custom")
+    tauri.wait_until(lambda: ((tauri.egress_dump() or {}).get("selected") or {}).get("name") == "custom",
+                     timeout=15, what="selected profile=custom")
+    sel = tauri.egress_dump()["selected"]
+    assert sel["source"] == "user"
+    assert sel["allow"] == ["api.example.com"]
+    assert sel["deny"] == []
+    # host-qualified selection: (host, name) resolves deterministically even when a
+    # name would collide across hosts. Single-host fixture, so `mock` must match and
+    # a wrong host must NOT (the selection stays put on the non-matching host).
+    tauri.egress_show(profile="default", host="mock")
+    tauri.wait_until(lambda: ((tauri.egress_dump() or {}).get("selected") or {}).get("name") == "default",
+                     timeout=15, what="host-qualified select host=mock profile=default")
+    assert tauri.egress_dump()["selected"]["host"] == "mock"
+    tauri.egress_show(profile="custom", host="nonexistent-host")
+    # No matching (host, name) row → selection is unchanged (still `default`).
+    assert tauri.egress_dump()["selected"]["name"] == "default"
+    # an unknown sub-tab is rejected, not blindly emitted.
+    with pytest.raises(ShedError) as e:
+        tauri.egress_show(tab="bogus")
+    assert e.value.code == "bad_request"
+    # off-pane the dump blanks (UI truth, like agents.dump off the agents pane).
+    tauri.navigate("sheds")
+    tauri.wait_until(lambda: tauri.current_pane() == "sheds", timeout=15, what="pane=sheds")
+    assert tauri.egress_dump() is None
+
+
+def test_egress_activity_filters_ns(tauri, fake):
+    # Mixed-ns injection through the fake host-agent's audit event stream: the
+    # Egress pane's Activity sub-tab renders ONLY the ns=="egress" rows, while the
+    # merged feed (activity.list — the same data the main Activity pane renders)
+    # carries both namespaces.
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    fake.emit_event("ssh-agent", "sign", "egress-mix-shed", result="ok")
+    fake.emit_event("egress", "connect", "egress-mix-shed", result="denied",
+                    detail="evil.example.com:443")
+    tauri.wait_until(
+        lambda: len([e for e in tauri.activity_list() if e["shed"] == "egress-mix-shed"]) == 2,
+        timeout=15, what="both events in the merged feed")
+    egress_total = len([e for e in tauri.activity_list() if e.get("ns") == "egress"])
+    assert egress_total >= 1
+    # ...and strictly fewer than the whole feed (the ssh-agent row exists beside it).
+    assert egress_total < len(tauri.activity_list())
+    tauri.navigate("egress")
+    tauri.wait_until(lambda: (tauri.egress_dump() or {}).get("tab") == "activity",
+                     timeout=15, what="egress activity sub-tab reported")
+    tauri.wait_until(lambda: (tauri.egress_dump() or {}).get("activity_count") == egress_total,
+                     timeout=15, what="only the egress rows rendered")
+
+
+def test_egress_pane_renders(tauri):
+    # Screenshot smoke (the test_system_pane_renders pattern): the Egress pane's
+    # Profiles list→detail paints on the real WebView without crashing (the data
+    # itself is pinned by test_egress_profiles_render above). TCC-gated on macOS,
+    # so Linux/Xvfb is the real gate.
+    if platform.system() == "Darwin":
+        pytest.skip("tauri screenshot on macOS is Screen-Recording-TCC-gated; Linux/Xvfb is the gate")
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    tauri.show_window()
+    tauri.navigate("egress")
+    tauri.wait_until(lambda: tauri.current_pane() == "egress", timeout=15, what="pane=egress")
+    tauri.egress_show(tab="profiles")
+    tauri.wait_until(lambda: (tauri.egress_dump() or {}).get("tab") == "profiles",
+                     timeout=15, what="profiles sub-tab shown")
     png, w, h = tauri.screenshot(scale=1)
     assert png[:8] == PNG_MAGIC and w > 0 and h > 0
 

@@ -15,7 +15,7 @@ use tokio::runtime::Handle;
 use shed_core::config::ShedConfig;
 use shed_core::create::{CreateProgress, CreateStore};
 use shed_core::http::{Client, ShedError};
-use shed_core::models::{CreateShedRequest, Shed, ShedStatus, SystemDiskUsage};
+use shed_core::models::{CreateShedRequest, EgressProfileInfo, Shed, ShedStatus, SystemDiskUsage};
 use shed_core::terminal::{self, TerminalCommand};
 use shed_core::token::TokenMinter;
 
@@ -160,6 +160,24 @@ impl Backend {
             .ok_or_else(|| no_configured_host(host))
     }
 
+    /// Fan `call` out across every configured host concurrently, tagging each
+    /// result with its server name. `join_all` so a slow/down host never
+    /// serializes the others (each bounded by shed-core's per-request timeout).
+    /// The shared plumbing behind `refresh`/`system_df`/`egress_profiles` — each
+    /// caller decides whether a per-host `Err` is rolled up, kept as an error
+    /// row, or dropped.
+    async fn per_host<T>(
+        &self,
+        call: impl AsyncFn(&Client) -> Result<T, ShedError>,
+    ) -> Vec<(String, Result<T, ShedError>)> {
+        let call = &call;
+        let fetches = self
+            .clients
+            .iter()
+            .map(|(name, c)| async move { (name.clone(), call(c).await) });
+        futures::future::join_all(fetches).await.into_iter().collect()
+    }
+
     /// Fetch sheds from every configured host concurrently (host-stamped by
     /// shed-core). `join_all` so a slow/down host doesn't serialize the others —
     /// each is bounded by shed-core's per-request timeout. A per-host failure is
@@ -246,13 +264,9 @@ impl Backend {
     /// `list_sheds` keeps its error-dropping contract (GTK uses it and never
     /// surfaces the rollup); the Tauri client surfaces `last_error`.
     pub async fn refresh(&self) -> Reachability {
-        let fetches = self
-            .clients
-            .iter()
-            .map(|(name, c)| async move { (name.clone(), c.list_sheds().await) });
         let mut sheds = Vec::new();
         let mut errors = Vec::new();
-        for (name, result) in futures::future::join_all(fetches).await {
+        for (name, result) in self.per_host(async |c: &Client| c.list_sheds().await).await {
             match result {
                 Ok(mut s) => sheds.append(&mut s),
                 Err(e) => errors.push(format!("{name}: {e}")),
@@ -270,11 +284,7 @@ impl Backend {
     /// `list_sheds`, a per-host failure is KEPT as an error row (the pane shows
     /// which host is unreachable + why), mirroring the Swift `system.df`. Concurrent.
     pub async fn system_df(&self) -> Vec<HostDiskUsage> {
-        let fetches = self
-            .clients
-            .iter()
-            .map(|(name, c)| async move { (name.clone(), c.system_df().await) });
-        futures::future::join_all(fetches)
+        self.per_host(async |c: &Client| c.system_df().await)
             .await
             .into_iter()
             .map(|(host, result)| match result {
@@ -286,6 +296,29 @@ impl Backend {
                 Err(e) => HostDiskUsage {
                     host,
                     usage: None,
+                    error: Some(e.to_string()),
+                },
+            })
+            .collect()
+    }
+
+    /// Per-host egress profiles (`GET /api/egress/profiles`) for the Egress pane.
+    /// Like [`system_df`](Self::system_df), a per-host failure is KEPT as an error
+    /// row (that host is unreachable or has egress disabled) rather than failing
+    /// the call, mirroring the Swift `doEgressRefresh`. Concurrent.
+    pub async fn egress_profiles(&self) -> Vec<HostEgressProfiles> {
+        self.per_host(async |c: &Client| c.egress_profiles().await)
+            .await
+            .into_iter()
+            .map(|(host, result)| match result {
+                Ok(profiles) => HostEgressProfiles {
+                    host,
+                    profiles,
+                    error: None,
+                },
+                Err(e) => HostEgressProfiles {
+                    host,
+                    profiles: Vec::new(),
                     error: Some(e.to_string()),
                 },
             })
@@ -413,6 +446,16 @@ pub struct Reachability {
 pub struct HostDiskUsage {
     pub host: String,
     pub usage: Option<SystemDiskUsage>,
+    pub error: Option<String>,
+}
+
+/// One host's egress profiles, or the error that host returned — the Egress pane
+/// shows an error row per host (unreachable / egress disabled) rather than
+/// dropping it. Mirrors the Swift `HostEgressProfiles` + the `HostDiskUsage` row shape.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HostEgressProfiles {
+    pub host: String,
+    pub profiles: Vec<EgressProfileInfo>,
     pub error: Option<String>,
 }
 
@@ -622,6 +665,50 @@ mod tests {
         // down host → KEPT as an error row (not dropped), usage absent
         let b = rows.iter().find(|r| r.host == "bad").unwrap();
         assert!(b.usage.is_none());
+        assert!(b.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn egress_profiles_keeps_error_row_for_down_host() {
+        // Mirrors system_df_keeps_error_row_for_down_host: a healthy host's
+        // profiles decode; a down (or egress-disabled) host is KEPT as an error
+        // row, never a failed call or a dropped host.
+        let good = MockServer::start_async().await;
+        good.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(200).body(
+                r#"[{"name":"default","source":"config","profile":{"mode":"audit","allow":["*.github.com"],"deny":["evil.example.com"]}},{"name":"custom","source":"user","profile":{"allow":["api.example.com"]}}]"#,
+            );
+        })
+        .await;
+        let bad = MockServer::start_async().await;
+        bad.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(500);
+        })
+        .await;
+        let rows = backend_with(vec![
+            client_at("good", good.base_url()),
+            client_at("bad", bad.base_url()),
+        ])
+        .egress_profiles()
+        .await;
+        assert_eq!(rows.len(), 2);
+        // healthy host → both profiles present (config baseline + user), no error
+        let g = rows.iter().find(|r| r.host == "good").unwrap();
+        assert!(g.error.is_none());
+        assert_eq!(g.profiles.len(), 2);
+        assert_eq!(g.profiles[0].name, "default");
+        assert_eq!(g.profiles[0].source, "config");
+        assert_eq!(g.profiles[0].profile.mode.as_deref(), Some("audit"));
+        assert_eq!(
+            g.profiles[0].profile.deny.as_deref(),
+            Some(&["evil.example.com".to_string()][..])
+        );
+        assert_eq!(g.profiles[1].source, "user");
+        // down host → KEPT as an error row (not dropped), profiles absent
+        let b = rows.iter().find(|r| r.host == "bad").unwrap();
+        assert!(b.profiles.is_empty());
         assert!(b.error.is_some());
     }
 

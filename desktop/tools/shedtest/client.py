@@ -402,6 +402,40 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         """Per-host disk usage (`[HostDiskUsage]`); each row has host/usage/error."""
         return self.call("system.df")["usage"]
 
+    def egress_dump(self) -> dict | None:
+        """The Egress pane's rendered state (`egress.profiles` UI truth, like
+        agents_dump): `{tab, profiles, errors, selected, activity_count}` — or
+        None unless the UI is on the egress pane and it has reported."""
+        return self.call("egress.profiles").get("egress")
+
+    def egress_show(self, tab: str | None = None, profile: str | None = None,
+                    host: str | None = None) -> None:
+        """Drive the Egress pane's sub-tab ('activity'|'profiles') and/or the
+        selected profile — the `egress.show` op → `egress-show` event. Selection
+        resolves by (host, name) when `host` is given, else by name (first match).
+
+        The pane's `egress-show` listener attaches asynchronously after mount, so the
+        op returns `frontend_not_ready` until the pane has reported (its snapshot is
+        non-null, which implies the listener is live). Retry on that — never on a real
+        error like `bad_request` — so a drive right after navigation can't be lost to
+        the attach race (harness convention: wait, don't sleep-and-hope)."""
+        params: dict = {}
+        if tab is not None:
+            params["tab"] = tab
+        if profile is not None:
+            params["profile"] = profile
+        if host is not None:
+            params["host"] = host
+        deadline = time.monotonic() + scaled_timeout(15.0)
+        while True:
+            try:
+                self.call("egress.show", params)
+                return
+            except ShedError as e:
+                if e.code != "frontend_not_ready" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+
     def terminal_preview(self, shed: str, host: str | None = None, session: str | None = None,
                          preset: str | None = None, template: str | None = None) -> dict:
         """The ssh command + resolved preset/invocation that would open the shed —

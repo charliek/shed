@@ -168,6 +168,18 @@ async fn system_df(backend: tauri::State<'_, Arc<Backend>>) -> Result<serde_json
     Ok(serde_json::json!(backend.system_df().await))
 }
 
+/// The WebView's per-host egress profiles — `invoke("egress_profiles")` when the
+/// Egress pane mounts / on its Refresh. Each row is a host's profiles or the
+/// error it returned (unreachable / egress-disabled hosts are kept as error rows,
+/// not dropped) — the same fan-out shape as `system_df`. The harness reads the
+/// RENDERED rows via the `egress.profiles` IPC op instead (UI truth).
+#[tauri::command]
+async fn egress_profiles(
+    backend: tauri::State<'_, Arc<Backend>>,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!(backend.egress_profiles().await))
+}
+
 // -- terminal + prefs commands (the frontend Preferences view + the shed-card
 //    "Open in Terminal" button; the same TerminalCtl the IPC ops use) -----------
 
@@ -588,6 +600,7 @@ pub fn run() {
             list_hosts,
             shed_action,
             system_df,
+            egress_profiles,
             create_start,
             create_status,
             create_cancel,

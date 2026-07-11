@@ -1,11 +1,11 @@
-/* shed desktop — the app shell (Plex reskin). Sidebar + header + the five panes,
+/* shed desktop — the app shell (Plex reskin). Sidebar + header + the six panes,
    over live shed-core data. Nav is driven by clicks AND by the Rust `ui.navigate`
    op (via the `navigate` Tauri event); the rendered pane + a computed-style sample
    are reported back to Rust (useUiBridge) so the harness can assert them over IPC.
    The shared visual vocabulary lives in components/{primitives,dialog}. */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
-  Boxes, Shield, Sparkles, ScrollText, HardDrive, Box, Plus,
+  Boxes, Shield, Sparkles, ScrollText, Globe, HardDrive, Box, Plus,
   Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key,
   Fingerprint, Moon, Sun, Settings, X,
 } from "lucide-react";
@@ -23,11 +23,13 @@ import {
   getLoginItem, setLoginItem,
   createStart, createStatus, createCancel, fetchHosts,
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
+  fetchEgressProfiles, reportEgress, inTauri,
   getSshApproval, setSshApproval,
   rcLaunch, rcKill, reportAgents, useRcSessions,
   useCoordinatorData, useNowTick,
   type Pane, type Shed, type HostDiskUsage, type TerminalPresetInfo,
   type Modal, type CreateProgress, type Approval, type AuditEntry, type SshPrefs,
+  type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
   type RcSession, type RcKind, type RcState,
   type RcCapabilities, offeredKinds, rcAuthHint,
 } from "@/lib/bridge";
@@ -58,6 +60,7 @@ const NAV: [Pane, string, typeof Box][] = [
   ["approvals", "Approvals", Shield],
   ["agents", "Agents", Sparkles],
   ["activity", "Activity", ScrollText],
+  ["egress", "Egress", Globe],
   ["system", "System", HardDrive],
 ];
 
@@ -314,6 +317,23 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
 }
 
 /* ---- Activity pane -------------------------------------------------------- */
+/** One audit row (mono time + ns pill + detail + outcome) — shared by the
+    Activity pane and the Egress pane's Activity sub-tab. */
+function ActivityRow({ entry: e, divider }: { entry: AuditEntry; divider: boolean }) {
+  const ok = e.result === "ok" || e.result === "approved";
+  return (
+    <div className={cn("row-hover flex items-center gap-3.5 px-[18px] py-[13px]", divider && "border-t border-shed-border")}>
+      <span className="w-[70px] flex-none font-mono text-[13px] text-shed-text-muted">{shortTime(e.ts)}</span>
+      {e.ns && <span className="flex-none rounded-md px-[7px] py-1 font-mono text-[11px] font-semibold leading-none" style={{ background: "var(--shed-agent-pill-bg)", color: "var(--shed-agent-pill-text)" }}>{e.ns}</span>}
+      <span className="min-w-0 flex-1 truncate text-[14px] text-shed-text-secondary">{activityDetail(e)}</span>
+      <span className="flex flex-none items-center gap-2">
+        <span className="text-[13px] font-semibold" style={{ color: ok ? "var(--shed-ok)" : "var(--shed-denied)" }}>{e.result}</span>
+        {e.approval && e.approval !== "none" && <span className="text-[12px] text-shed-text-muted">{e.approval}</span>}
+      </span>
+    </div>
+  );
+}
+
 function ActivityPane() {
   const activity = useCoordinatorData<AuditEntry[]>("activity-changed", fetchActivity, []);
   return (
@@ -326,20 +346,282 @@ function ActivityPane() {
         <Empty icon={ScrollText} title="No activity yet" body="Credential checks and your approval decisions will appear here." />
       ) : (
         <div className={cn(cardCls, "overflow-hidden")}>
-          {activity.map((e, i) => {
-            const ok = e.result === "ok" || e.result === "approved";
-            return (
-              <div key={`${e.id}-${i}`} className={cn("row-hover flex items-center gap-3.5 px-[18px] py-[13px]", i && "border-t border-shed-border")}>
-                <span className="w-[70px] flex-none font-mono text-[13px] text-shed-text-muted">{shortTime(e.ts)}</span>
-                {e.ns && <span className="flex-none rounded-md px-[7px] py-1 font-mono text-[11px] font-semibold leading-none" style={{ background: "var(--shed-agent-pill-bg)", color: "var(--shed-agent-pill-text)" }}>{e.ns}</span>}
-                <span className="min-w-0 flex-1 truncate text-[14px] text-shed-text-secondary">{activityDetail(e)}</span>
-                <span className="flex flex-none items-center gap-2">
-                  <span className="text-[13px] font-semibold" style={{ color: ok ? "var(--shed-ok)" : "var(--shed-denied)" }}>{e.result}</span>
-                  {e.approval && e.approval !== "none" && <span className="text-[12px] text-shed-text-muted">{e.approval}</span>}
-                </span>
-              </div>
+          {activity.map((e, i) => (
+            <ActivityRow key={`${e.id}-${i}`} entry={e} divider={i > 0} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---- Egress pane (mac parity: Activity feed filter + Profiles list→detail) - */
+type EgressTab = "activity" | "profiles";
+type EgressRow = { host: string; info: EgressProfileInfo };
+/** Unique even if a host ever returns a config + user profile of the same name
+    (the mac EgressProfilesView id shape). */
+const egressRowId = (r: EgressRow) => `${r.host}/${r.info.source}/${r.info.name}`;
+
+/** The config|user source badge (user = accent tint, config = neutral). */
+function SourceBadge({ source }: { source: string }) {
+  const user = source === "user";
+  return (
+    <span
+      className="flex-none rounded-full px-2 py-0.5 font-mono text-[10px] font-semibold leading-none"
+      style={{
+        background: user ? "var(--shed-accent-subtle)" : "var(--shed-inset)",
+        color: user ? "var(--shed-accent)" : "var(--shed-text-secondary)",
+      }}
+    >
+      {source}
+    </span>
+  );
+}
+
+/** One-line profile summary for the list rows (mirrors the mac `summary`). */
+function egressSummary(p: EgressProfile): string {
+  const parts: string[] = [];
+  if (p.mode) parts.push(`mode=${p.mode}`);
+  if (p.allow?.length) parts.push(`allow=${p.allow.length}`);
+  if (p.deny?.length) parts.push(`deny=${p.deny.length}`);
+  if (p.rule) parts.push("rule");
+  return parts.length ? parts.join(" ") : "(empty)";
+}
+
+/** A mono uppercase label + mono rows — the detail's allow/deny/mode/rule blocks. */
+function EgressRuleBlock({ label, items }: { label: string; items: string[] }) {
+  if (!items.length) return null;
+  return (
+    <div>
+      <div className="mb-1.5 font-mono text-[10.5px] uppercase leading-none tracking-[.05em] text-shed-text-muted">{label}</div>
+      {items.map((it) => (
+        <div key={it} className="font-mono text-[13px] leading-relaxed text-shed-text">{it}</div>
+      ))}
+    </div>
+  );
+}
+
+function EgressPane() {
+  const [tab, setTab] = useState<EgressTab>("activity");
+  const [hosts, setHosts] = useState<HostEgressProfiles[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+  // Egress decisions = audit entries with ns=="egress" — the same coordinator
+  // feed the Activity pane renders, filtered frontend-side (mac parity).
+  const activity = useCoordinatorData<AuditEntry[]>("activity-changed", fetchActivity, []);
+  const egress = activity.filter((e) => e.ns === "egress");
+
+  // Fetch per-host profiles on mount + Refresh (generation guard as in SystemPane).
+  const gen = useRef(0);
+  const load = useCallback(() => {
+    const g = ++gen.current;
+    void fetchEgressProfiles().then((r) => {
+      if (g === gen.current) {
+        setHosts(r);
+        setLoaded(true);
+      }
+    });
+  }, []);
+  useEffect(() => load(), [load]);
+
+  const rows: EgressRow[] = hosts.flatMap((h) => h.profiles.map((info) => ({ host: h.host, info })));
+  const errorRows = hosts.filter((h) => h.error);
+  const multiHost = hosts.length > 1;
+  const selectedRow = rows.find((r) => egressRowId(r) === selected) ?? null;
+
+  // Auto-select the first profile once rows land (list→detail renders without a
+  // click), and re-select if a refresh dropped the selected one.
+  useEffect(() => {
+    if (rows.length && !rows.some((r) => egressRowId(r) === selected)) {
+      setSelected(egressRowId(rows[0]));
+    }
+  }, [hosts, selected]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The harness's sub-tab/selection driver: `egress.show {tab?, profile?, host?}`
+  // emits `egress-show`; selection resolves by (host, name) when a host is given,
+  // else by name (first match) — so a profile name that collides across hosts
+  // (e.g. `default` on every server) is deterministically selectable.
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  // Build the current rendered snapshot. Held in a ref so the listener effect can
+  // publish the INITIAL report the instant it attaches (before any data-driven
+  // re-report), which keeps the readiness invariant below true.
+  const buildReport = useCallback(
+    (): EgressReport => ({
+      tab,
+      profiles: rows.map((r) => ({ host: r.host, name: r.info.name, source: r.info.source })),
+      errors: errorRows.map((h) => ({ host: h.host, error: h.error ?? "" })),
+      selected: selectedRow
+        ? {
+            host: selectedRow.host,
+            name: selectedRow.info.name,
+            source: selectedRow.info.source,
+            allow: selectedRow.info.profile.allow ?? [],
+            deny: selectedRow.info.profile.deny ?? [],
+            mode: selectedRow.info.profile.mode ?? null,
+            rule: selectedRow.info.profile.rule ?? null,
+          }
+        : null,
+      activity_count: egress.length,
+    }),
+    [tab, rows, errorRows, selectedRow, egress.length],
+  );
+  const reportRef = useRef(buildReport);
+  reportRef.current = buildReport;
+
+  // Readiness invariant (mirrors useUiBridge): the egress-show LISTENER is attached
+  // BEFORE the pane publishes ANY egress snapshot, so a non-null reported snapshot
+  // proves the listener is live — which `egress.show` relies on to fail-fast
+  // (frontend_not_ready) rather than lose an emit to the async attach race. `ready`
+  // gates the data-driven re-report below; this effect owns the initial report.
+  const ready = useRef(false);
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    const uns: Array<() => void> = [];
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      uns.push(
+        await listen<{ tab?: unknown; profile?: unknown; host?: unknown }>("egress-show", (e) => {
+          const t = e.payload?.tab;
+          if (t === "activity" || t === "profiles") setTab(t);
+          const p = e.payload?.profile;
+          if (typeof p === "string") {
+            const h = e.payload?.host;
+            const m = rowsRef.current.find(
+              (r) => r.info.name === p && (typeof h !== "string" || r.host === h),
             );
-          })}
+            if (m) setSelected(egressRowId(m));
+          }
+        }),
+      );
+      if (cancelled) {
+        uns.forEach((u) => u());
+        return;
+      }
+      ready.current = true; // listener live → the snapshot may now publish
+      reportEgress(reportRef.current()); // initial report AFTER the listener attaches
+    });
+    return () => {
+      cancelled = true;
+      ready.current = false;
+      uns.forEach((u) => u());
+      // Clear the reported snapshot on unmount so an off-pane or freshly-remounted-
+      // but-not-yet-reported `egress.profiles` dump returns null, never stale data.
+      reportEgress(null);
+    };
+  }, []);
+
+  // Publish the rendered egress state so the `egress.profiles` op can observe it
+  // (UI truth). Stays IN the pane so it fires only while mounted, like reportAgents;
+  // gated on `ready` so the listener effect owns the initial report.
+  useEffect(() => {
+    if (!inTauri() || !ready.current) return;
+    reportEgress(reportRef.current());
+  }, [tab, hosts, selected, egress.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div>
+      <PageHead
+        title="Egress"
+        sub={tab === "activity"
+          ? "Per-shed network egress decisions (allow/deny), newest first. View-only — egress policy is configured on the server."
+          : "Egress profiles on each server (config baseline + user-managed). View-only — manage them with `shed egress profile`."}
+        right={
+          <div className="flex items-center gap-[18px]">
+            {tab === "profiles" && <HeadAction icon={RefreshCw} label="Refresh" color="var(--shed-accent)" onClick={load} />}
+            <div className="w-[210px]">
+              <Segmented
+                options={[["activity", "Activity"], ["profiles", "Profiles"]]}
+                value={tab}
+                set={(v) => setTab(v as EgressTab)}
+              />
+            </div>
+          </div>
+        }
+      />
+      {tab === "activity" ? (
+        egress.length === 0 ? (
+          <Empty
+            icon={Globe}
+            title="No egress activity yet"
+            body="Enable egress control on a server and create a shed with --egress to see allow/deny decisions here."
+          />
+        ) : (
+          <div className={cn(cardCls, "overflow-hidden")}>
+            {egress.map((e, i) => (
+              <ActivityRow key={`${e.id}-${i}`} entry={e} divider={i > 0} />
+            ))}
+          </div>
+        )
+      ) : !loaded ? (
+        <div className="px-1 py-8 text-center text-[13px] text-shed-text-muted">Loading egress profiles…</div>
+      ) : rows.length === 0 ? (
+        errorRows.length === 0 ? (
+          <Empty
+            icon={Globe}
+            title="No egress profiles"
+            body="Define them in the server config or with `shed egress profile set`. Requires egress enabled on the server."
+          />
+        ) : (
+          // Surface host failures (egress disabled / unreachable) instead of a
+          // misleading "no profiles" when every fetch actually errored.
+          <div className={cn(cardCls, "flex flex-col gap-2 px-6 py-8 text-center")}>
+            <div className="text-[14px] font-semibold text-shed-text">Couldn't load egress profiles</div>
+            {errorRows.map((h) => (
+              <div key={h.host} className="break-words font-mono text-[12px] leading-relaxed" style={{ color: "var(--shed-danger)" }}>
+                {h.host}: {h.error}
+              </div>
+            ))}
+          </div>
+        )
+      ) : (
+        <div className="flex items-start gap-4">
+          {/* list: profile name + source badge (+ host when multi-host, + error rows) */}
+          <div className={cn(cardCls, "w-[280px] flex-none overflow-hidden")}>
+            {rows.map((r, i) => {
+              const id = egressRowId(r);
+              const active = id === selected;
+              return (
+                <button
+                  key={id}
+                  onClick={() => setSelected(id)}
+                  className={cn("row-hover block w-full px-3.5 py-2.5 text-left", i > 0 && "border-t border-shed-border")}
+                  style={{ background: active ? "var(--shed-accent-subtle)" : "transparent" }}
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="min-w-0 truncate text-[13.5px] font-semibold text-shed-text">{r.info.name}</span>
+                    <SourceBadge source={r.info.source} />
+                  </span>
+                  {multiHost && <span className="mt-0.5 block font-mono text-[10.5px] text-shed-text-muted">{r.host}</span>}
+                  <span className="mt-0.5 block truncate font-mono text-[11px] text-shed-text-muted">{egressSummary(r.info.profile)}</span>
+                </button>
+              );
+            })}
+            {errorRows.map((h) => (
+              <div key={h.host} className="break-words border-t border-shed-border px-3.5 py-2.5 font-mono text-[11px] leading-relaxed" style={{ color: "var(--shed-danger)" }}>
+                {h.host}: {h.error}
+              </div>
+            ))}
+          </div>
+          {/* detail: the selected profile's rules */}
+          <div className={cn(cardCls, "min-w-0 flex-1 px-[19px] py-[17px]")}>
+            {selectedRow ? (
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center gap-2.5">
+                  <span className="text-[18px] font-bold text-shed-text">{selectedRow.info.name}</span>
+                  <SourceBadge source={selectedRow.info.source} />
+                  {multiHost && <span className="font-mono text-[12px] text-shed-text-muted">{selectedRow.host}</span>}
+                </div>
+                <EgressRuleBlock label="allow" items={selectedRow.info.profile.allow ?? []} />
+                <EgressRuleBlock label="deny" items={selectedRow.info.profile.deny ?? []} />
+                {selectedRow.info.profile.mode && <EgressRuleBlock label="mode" items={[selectedRow.info.profile.mode]} />}
+                {selectedRow.info.profile.rule && <EgressRuleBlock label="rule" items={[selectedRow.info.profile.rule]} />}
+              </div>
+            ) : (
+              <div className="py-10 text-center text-[13px] text-shed-text-muted">Select a profile</div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -1089,6 +1371,7 @@ export default function App() {
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
             {pane === "agents" && <AgentsPane sessions={rcSessions} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
             {pane === "activity" && <ActivityPane />}
+            {pane === "egress" && <EgressPane />}
             {pane === "system" && <SystemPane sheds={sheds} />}
           </div>
         </main>

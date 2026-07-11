@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export type Pane = "sheds" | "approvals" | "agents" | "activity" | "system";
+export type Pane = "sheds" | "approvals" | "agents" | "activity" | "egress" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it. */
 export type Modal = null | "prefs" | "create" | "launch";
 
-const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "system"];
+const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "egress", "system"];
 
 /** Narrow an untrusted value (an IPC payload) to a known pane. */
 export function isPane(x: unknown): x is Pane {
@@ -198,6 +198,61 @@ export type HostDiskUsage = {
  *  serves the harness). An unreachable host comes back as an error row. */
 export async function fetchSystemDf(): Promise<HostDiskUsage[]> {
   return (await invoke<HostDiskUsage[]>("system_df")) ?? [];
+}
+
+/* ---- egress (mac parity: profiles per host + the ns=="egress" activity) ---- */
+
+/** One egress profile fragment, as shed-core decodes it (shed-server's
+ *  `config.EgressProfile` — all fields optional). */
+export type EgressProfile = {
+  mode?: string | null;
+  allow?: string[] | null;
+  deny?: string[] | null;
+  rule?: string | null;
+};
+/** One entry of `GET /api/egress/profiles` (`source`: "config" | "user"). */
+export type EgressProfileInfo = { name: string; source: string; profile: EgressProfile };
+/** One host's egress profiles, or the error that host returned — unreachable /
+ *  egress-disabled hosts come back as error rows (the system_df row shape). */
+export type HostEgressProfiles = {
+  host: string;
+  profiles: EgressProfileInfo[];
+  error?: string | null;
+};
+
+/** Per-host egress profiles for the Egress pane's Profiles sub-tab. */
+export async function fetchEgressProfiles(): Promise<HostEgressProfiles[]> {
+  return (await invoke<HostEgressProfiles[]>("egress_profiles")) ?? [];
+}
+
+/** The Egress pane's rendered state, reported so the `egress.profiles` op can
+ *  observe it (UI truth, like `reportAgents`): the active sub-tab, the flat
+ *  profile rows + per-host error rows, the selected profile's detail, and how
+ *  many ns=="egress" activity rows the Activity sub-tab renders. Keys are
+ *  additive + stable — the harness asserts them. */
+export type EgressReport = {
+  tab: "activity" | "profiles";
+  profiles: { host: string; name: string; source: string }[];
+  errors: { host: string; error: string }[];
+  selected: {
+    host: string;
+    name: string;
+    source: string;
+    allow: string[];
+    deny: string[];
+    mode?: string | null;
+    rule?: string | null;
+  } | null;
+  activity_count: number;
+};
+
+/** Report the rendered Egress pane state (mounted-only, like `reportAgents` —
+ *  `ui_report` merges this `egress` key with the shell's snapshot). Pass `null` on
+ *  unmount to CLEAR the key (the merge overwrites `egress` with null, not skips it),
+ *  so an off-pane or freshly-remounted-but-not-yet-reported `egress.profiles` dump
+ *  returns null instead of the previous mount's stale snapshot. */
+export function reportEgress(snapshot: EgressReport | null): void {
+  void invoke("ui_report", { snapshot: { egress: snapshot } });
 }
 
 /* ---- terminal + prefs (the Preferences view + the shed-card button) ------- */
