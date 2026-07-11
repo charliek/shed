@@ -362,6 +362,10 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         """Open the New-Shed dialog (raises the window + emits the event)."""
         self.call("ui.show_create")
 
+    def show_launch(self) -> None:
+        """Open the New-session (launch agent) dialog (raises the window + emits the event)."""
+        self.call("ui.show_launch")
+
     def agents_dump(self) -> list[dict]:
         """The RC sessions the Agents pane rendered — the drivable `agents.dump`
         UI truth (empty unless the UI is on the agents pane)."""

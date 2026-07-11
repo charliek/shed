@@ -353,3 +353,18 @@ def test_new_shed_dialog_opens(tauri):
     tauri.show_window()
     png, w, h = tauri.screenshot(scale=1)
     assert png[:8] == PNG_MAGIC and w > 0 and h > 0
+
+
+def test_launch_dialog_opens(tauri):
+    # The New-session (launch agent) dialog opens (ui.show_launch → the frontend
+    # reports modal=="launch") and paints on the real WebView. The launch LOGIC is
+    # covered by the shared test_agents suite — the same rc.launch path the dialog's
+    # rcLaunch command drives. Mirrors test_new_shed_dialog_opens.
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    tauri.show_launch()
+    tauri.wait_until(lambda: tauri.modal() == "launch", timeout=15, what="launch dialog open")
+    if platform.system() == "Darwin":
+        return
+    tauri.show_window()
+    png, w, h = tauri.screenshot(scale=1)
+    assert png[:8] == PNG_MAGIC and w > 0 and h > 0

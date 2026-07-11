@@ -206,7 +206,8 @@ impl Handler {
             "ui.navigate" => self.navigate(params),
             "ui.current_pane" => Ok(json!({ "pane": self.ui_get("pane") })),
             "ui.computed_style" => Ok(json!({ "style": self.ui_get("style") })),
-            // Which modal (if any) the frontend has open: "prefs" | "create" | null.
+            // Which modal (if any) the frontend has open: "prefs" | "create" |
+            // "launch" | null.
             "ui.modal" => Ok(json!({ "modal": self.ui_get("modal") })),
             // The sidebar nav badge counts the shell reported {sheds, agents, hosts,
             // pending}, or null before its first report.
@@ -224,6 +225,11 @@ impl Handler {
             "ui.show_create" => {
                 present_main_window(&self.app);
                 let _ = self.app.emit("show-create", json!({}));
+                Ok(json!({}))
+            }
+            "ui.show_launch" => {
+                present_main_window(&self.app);
+                let _ = self.app.emit("show-launch", json!({}));
                 Ok(json!({}))
             }
             "app.screenshot" => self.screenshot().await,

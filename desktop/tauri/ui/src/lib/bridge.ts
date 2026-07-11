@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export type Pane = "sheds" | "approvals" | "agents" | "activity" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it. */
-export type Modal = null | "prefs" | "create";
+export type Modal = null | "prefs" | "create" | "launch";
 
 const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "system"];
 
@@ -528,22 +528,28 @@ export function reportAgents(sessions: RcSession[]): void {
   void invoke("ui_report", { snapshot: { agents: sessions } });
 }
 
-/** The active RC-session COUNT for the Agents sidebar badge, kept live at the App
- *  level. Derived from a dedicated `rc.list` fetch (NOT `reportAgents`, which the
- *  backend blanks off-pane) — refreshed on mount, on each lifecycle `refresh` event
- *  (sheds coming up/down), and whenever `bump` advances (the Agents pane signals a
- *  launch/kill, which emits no `refresh` event). A no-op count of 0 in a plain
- *  browser / on error. */
-export function useAgentCount(bump: number): number {
-  const [count, setCount] = useState(0);
-  // A generation guard shared across the event- and bump-driven reloads, so a
-  // slower older fetch can't overwrite a newer one's count.
+/** The SINGLE source of truth for RC sessions + per-shed capabilities, lifted to the
+ *  App so the sidebar badge (`sessions.length`), the Agents pane's list, and the
+ *  launch dialog's capability gating all read ONE `rc.list` fetch — no divergence
+ *  between independent fetches with different triggers. Refreshed on mount, on each
+ *  lifecycle `refresh` event (sheds coming up/down), and whenever a caller (the pane
+ *  Refresh button, a launch/kill, the pane/dialog on open) invokes the returned
+ *  `refresh`. Empty in a plain browser / on error. */
+export function useRcSessions(): {
+  sessions: RcSession[];
+  capabilities: Record<string, RcCapabilities>;
+  refresh: () => void;
+} {
+  const [state, setState] = useState<RcListResult>({ sessions: [], capabilities: {} });
+  // A generation guard shared across the mount-, event-, and caller-driven reloads,
+  // so a slower older fetch can't overwrite a newer one (the pane's superseded-fetch
+  // guard, now owned here for the shared state).
   const gen = useRef(0);
-  const reload = useCallback(() => {
+  const refresh = useCallback(() => {
     if (!inTauri()) return;
     const mine = ++gen.current;
     void fetchRcList().then((r) => {
-      if (mine === gen.current) setCount(r.sessions.length);
+      if (mine === gen.current) setState(r);
     });
   }, []);
   useEffect(() => {
@@ -552,22 +558,17 @@ export function useAgentCount(bump: number): number {
     let unlisten: (() => void) | undefined;
     void (async () => {
       const { listen } = await import("@tauri-apps/api/event");
-      const un = await listen("refresh", reload);
+      const un = await listen("refresh", () => refresh());
       if (cancelled) un();
       else unlisten = un;
-      reload(); // initial fetch, after the listener is live
+      refresh(); // initial fetch, after the listener is live
     })();
     return () => {
       cancelled = true;
       unlisten?.();
     };
-  }, [reload]);
-  // Re-fetch when the Agents pane signals a session change (launch/kill); skip the
-  // initial mount value (bump===0) — the effect above already did the first fetch.
-  useEffect(() => {
-    if (bump > 0) reload();
-  }, [bump, reload]);
-  return count;
+  }, [refresh]);
+  return { sessions: state.sessions, capabilities: state.capabilities, refresh };
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */
