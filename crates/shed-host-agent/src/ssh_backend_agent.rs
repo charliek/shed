@@ -262,11 +262,17 @@ fn parse_key_format(blob: &[u8]) -> Result<String, String> {
 
 /// Parse `SSH_AGENT_SIGN_RESPONSE(14)`: `string sigblob` where `sigblob = string
 /// format ‖ string blob ‖ rest` (the `ssh.Signature` encoding). The trailing `rest`
-/// is ignored (Go keeps it in `Signature.Rest`; the bus response pins it to `""`).
+/// INSIDE the sigblob is ignored (Go keeps it in `Signature.Rest` via the `ssh:"rest"`
+/// tag; the bus response pins it to `""`) — but trailing bytes AFTER the sigblob
+/// string are an error, matching Go's `ssh.Unmarshal(signResponseAgentMsg)`, which
+/// rejects top-level trailing data (cursor review finding).
 fn parse_signature(reply: &[u8]) -> Result<SshSignature, String> {
     let mut r = Reader::new(reply);
     r.u8()?; // type byte (already matched).
     let sigblob = r.string()?;
+    if !r.exhausted() {
+        return Err(truncated()); // trailing junk after the sigblob string
+    }
     let mut sr = Reader::new(sigblob);
     let format = String::from_utf8_lossy(sr.string()?).into_owned();
     let blob = sr.string()?.to_vec();
@@ -316,6 +322,12 @@ impl<'a> Reader<'a> {
         let slice = self.buf.get(self.pos..end).ok_or_else(truncated)?;
         self.pos = end;
         Ok(slice)
+    }
+
+    /// True when every byte has been consumed (Go's `ssh.Unmarshal` errors on
+    /// top-level trailing data; callers use this to mirror that).
+    fn exhausted(&self) -> bool {
+        self.pos == self.buf.len()
     }
 }
 
@@ -579,6 +591,33 @@ mod tests {
         assert_eq!(sig.blob, vec![7u8; 64]);
         let (_, _, flags) = decode_sign_request(&fake.requests()[0]);
         assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn sign_response_trailing_data_rejected() {
+        // Go's ssh.Unmarshal(signResponseAgentMsg) rejects top-level trailing bytes
+        // after the sigblob string; trailing bytes INSIDE the sigblob are the
+        // `ssh:"rest"` field and stay accepted.
+        let mut sigblob = Vec::new();
+        write_string(&mut sigblob, b"ssh-ed25519");
+        write_string(&mut sigblob, &[7u8; 64]);
+        let mut ok_reply = vec![SSH_AGENT_SIGN_RESPONSE];
+        write_string(&mut ok_reply, &sigblob);
+        assert!(parse_signature(&ok_reply).is_ok());
+
+        // Trailing junk after the sigblob string → Err (the cursor-review fix).
+        let mut trailing = ok_reply.clone();
+        trailing.extend_from_slice(b"junk");
+        assert_eq!(parse_signature(&trailing).unwrap_err(), truncated());
+
+        // Rest bytes inside the sigblob are still fine (Go Signature.Rest).
+        let mut sigblob_rest = sigblob.clone();
+        sigblob_rest.extend_from_slice(b"rest-bytes");
+        let mut rest_reply = vec![SSH_AGENT_SIGN_RESPONSE];
+        write_string(&mut rest_reply, &sigblob_rest);
+        let sig = parse_signature(&rest_reply).unwrap();
+        assert_eq!(sig.format, "ssh-ed25519");
+        assert_eq!(sig.blob, vec![7u8; 64]);
     }
 
     #[test]

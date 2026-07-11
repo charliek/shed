@@ -440,17 +440,23 @@ fn load_key(path: &Path, comment: &str) -> Result<Option<LoadedKey>, String> {
     // The OpenSSH path keeps its own marshaling (ssh-key's `public_key().to_bytes()`,
     // pinned against the Go RSA/ed25519 goldens); the legacy-PEM paths build the
     // marshaled pubkey by hand from the loaded material (`KeyMaterial::marshaled_pub`).
-    let material = match pem_label(&data).as_deref() {
-        Some("OPENSSH PRIVATE KEY") => return load_openssh_key(&data, path, comment).map(Some),
-        Some("RSA PRIVATE KEY") => load_pkcs1_rsa(&data),
-        Some("PRIVATE KEY") => load_pkcs8(&data),
-        Some("EC PRIVATE KEY") => load_sec1_ec(&data),
-        Some("ENCRYPTED PRIVATE KEY") => {
+    // Go's `pem.Decode` extracts the first PEM block and tolerates leading/trailing
+    // non-PEM text (comments, extra blocks); the RustCrypto/ssh-key decoders reject
+    // surrounding junk, so hand them only the extracted block (cursor review fix).
+    let material = match (pem_label(&data).as_deref(), first_pem_block(&data)) {
+        (Some("OPENSSH PRIVATE KEY"), Some(block)) => {
+            return load_openssh_key(&block, path, comment).map(Some)
+        }
+        (Some("RSA PRIVATE KEY"), Some(block)) => load_pkcs1_rsa(&block),
+        (Some("PRIVATE KEY"), Some(block)) => load_pkcs8(&block),
+        (Some("EC PRIVATE KEY"), Some(block)) => load_sec1_ec(&block),
+        (Some("ENCRYPTED PRIVATE KEY"), Some(_)) => {
             Err("encrypted or invalid: key is passphrase-protected".to_string())
         }
-        Some("DSA PRIVATE KEY") => Err("unsupported key type: DSA/ssh-dss".to_string()),
-        Some(other) => Err(format!("encrypted or invalid: unsupported PEM type {other:?}")),
-        None => Err("encrypted or invalid: not a PEM private key".to_string()),
+        (Some("DSA PRIVATE KEY"), Some(_)) => Err("unsupported key type: DSA/ssh-dss".to_string()),
+        (Some(other), Some(_)) => Err(format!("encrypted or invalid: unsupported PEM type {other:?}")),
+        (Some(_), None) => Err("encrypted or invalid: truncated PEM block".to_string()),
+        (None, _) => Err("encrypted or invalid: not a PEM private key".to_string()),
     }
     .map_err(|reason| skip_warning(path, &reason))?;
     Ok(Some(LoadedKey {
@@ -495,11 +501,52 @@ fn pem_label(data: &str) -> Option<String> {
     })
 }
 
+/// Extract the first PEM block — the `-----BEGIN …-----` line through its
+/// `-----END …-----` line, inclusive — mirroring Go's `pem.Decode`, which skips
+/// leading garbage and ignores anything after the block. `None` when there is a
+/// BEGIN with no END (truncated).
+fn first_pem_block(data: &str) -> Option<String> {
+    let begin = data.find("-----BEGIN ")?;
+    let after = &data[begin..];
+    let end_idx = after.find("-----END ")?;
+    let end_rest = &after[end_idx..];
+    let line_len = end_rest.find('\n').map(|i| i + 1).unwrap_or(end_rest.len());
+    let mut block = after[..end_idx + line_len].to_string();
+    if !block.ends_with('\n') {
+        block.push('\n');
+    }
+    Some(block)
+}
+
 /// A legacy OpenSSL PEM with a `Proc-Type: 4,ENCRYPTED` header is passphrase-encrypted
 /// (`RSA`/`EC`/`DSA PRIVATE KEY` bodies); the RustCrypto decoders don't handle that
 /// encryption, so detect it up front and warn+skip (Go skips encrypted keys too).
+///
+/// Scoped to the FIRST PEM block's RFC 1421 header lines (between the `-----BEGIN`
+/// line and the first blank line / base64 body) — Go's `pem.Decode` +
+/// `x509.IsEncryptedPEMBlock` inspects only the decoded block's headers, so a
+/// whole-file substring scan would false-positive on trailing comments that merely
+/// mention `Proc-Type:`/`ENCRYPTED` (cursor review finding).
 fn is_legacy_encrypted(pem: &str) -> bool {
-    pem.contains("Proc-Type:") && pem.contains("ENCRYPTED")
+    let mut in_block = false;
+    for line in pem.lines() {
+        let line = line.trim();
+        if !in_block {
+            if line.starts_with("-----BEGIN ") {
+                in_block = true;
+            }
+            continue;
+        }
+        // PEM headers are `Key: value` lines directly after BEGIN; the header
+        // section ends at the first blank line or at the base64 body (no ':').
+        if line.is_empty() || !line.contains(':') {
+            return false;
+        }
+        if line.starts_with("Proc-Type:") && line.contains("ENCRYPTED") {
+            return true;
+        }
+    }
+    false
 }
 
 /// PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`).
@@ -1556,6 +1603,26 @@ thaWnPuu0EWHWhqSQuP3zx/47Kd98x5FMIW92hlf+vZxuURwYr0VwYB/tz9p4s4Z\n\
             backend.sign(&ed, CHALLENGE, 4).unwrap_err(),
             r#"ssh: unsupported signature algorithm "rsa-sha2-512" for key format "ssh-ed25519""#
         );
+    }
+
+    #[test]
+    fn legacy_encrypted_scan_scoped_to_first_block_headers() {
+        // Positive: a real Proc-Type header inside the first block's header section.
+        assert!(is_legacy_encrypted(
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,ABCD\n\nabc==\n-----END RSA PRIVATE KEY-----\n"
+        ));
+        // Negative: the strings appearing only OUTSIDE the header section (e.g. a
+        // trailing comment) must not mark the key encrypted (cursor review fix —
+        // Go's pem.Decode inspects only the first block's headers). The valid,
+        // unencrypted key must still load.
+        let tmp = temp_dir("proc-type-comment");
+        write_key(
+            tmp.path(),
+            "id_rsa",
+            &format!("{RSA_KEY}\n# note: Proc-Type: 4,ENCRYPTED appears in this ENCRYPTED comment only\n"),
+        );
+        let (backend, warnings) = LocalKeysBackend::load_from_ssh_dir(tmp.path());
+        assert_eq!(backend.list().unwrap().len(), 1, "{warnings:?}");
     }
 }
 
