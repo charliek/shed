@@ -4,9 +4,10 @@
 //!
 //! The truth op reads the RENDERED UI state, not a backend re-query: each webview
 //! is the source of truth for what IT shows, and Rust relays what it reported.
-//! Snapshots are keyed by the reporting WINDOW's label, so a second webview (the
-//! B1b menu-bar popover, label `popover`) reports under its own key and can't
-//! clobber the dashboard's `main` snapshot (`pane`/`sheds`/`refresh_token`). WITHIN
+//! Snapshots are keyed by the reporting WINDOW's label, so the other webviews (the
+//! B1b menu-bar popover, label `popover`; the Preferences window, label
+//! `preferences`) report under their own keys and can't clobber the dashboard's
+//! `main` snapshot (`pane`/`sheds`/`refresh_token`). WITHIN
 //! a window the object keys are merged, so a partial reporter (the Agents pane
 //! publishing only `agents`) doesn't clobber that window's other keys.
 

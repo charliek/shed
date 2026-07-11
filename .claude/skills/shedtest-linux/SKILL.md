@@ -60,6 +60,17 @@ make -C desktop e2e-tauri       # shared suite + test_tauri at --target tauri (n
 - `e2e-tauri` runs the ONE `tools/shedtest` harness with `--target tauri`; mac-only ops stay
   gated off. On Linux the tray is a native menu (Tauri emits no Linux tray-click events → no
   popover; expected).
+- **Driving the Preferences window.** Preferences is a dedicated native window (mac parity,
+  no longer a dashboard modal), so it has its own IPC surface rather than `ui.modal`:
+  `ui.show_preferences` (open/focus the lazy-created singleton; **it does NOT raise the
+  dashboard**) with `ui.open_preferences` as the mac-named alias op; `prefs.dump` →
+  `{visible, title, prefs}` (the window's UI truth — `visible`/`title` are Rust-side native
+  window state, `prefs` is the React-reported `{sections, values, mode}` snapshot keyed under
+  the **`preferences`** window label); `prefs.close` (hide, close-hides contract);
+  `prefs.provider_modes` / `prefs.set_provider` (AWS/Docker Allow|Deny, ungated); and
+  `prefs.remove_shed_rule {server, shed}` (the per-shed override row's remove button). Note
+  `ui.modal` now only ever reports `create` | `launch` | `null` — Preferences is never a
+  modal value.
 - **Simulating a down (unreachable) host.** The shared session redirects EVERY configured
   server to the one in-process mock, so a per-host error row can't appear there. To exercise
   it, use a DEDICATED fixture config with an extra server plus the
@@ -101,6 +112,13 @@ command for a small Python driver. Same wiring as the target (see the Makefile):
 - Reuse the `shed-tauri-linux-{cargo,target}` cache volumes so the Rust build is
   incremental across runs (`-v shed-tauri-linux-cargo:/usr/local/cargo/registry -v
   shed-tauri-linux-target:/target`), with `-e CARGO_TARGET_DIR=/target`.
+- **Pass `-e UV_PROJECT_ENVIRONMENT=/tmp/uv-venv`** (copy it verbatim from the
+  Makefile's `tauri-build-linux` render-gate block). `uv run` defaults to writing
+  its project venv at `.venv` next to `pyproject.toml` — but that's under the
+  read-only `/repo`→`/work` tree, so without this override `uv run` **wedges
+  silently** in the container (no venv it can write, no error you'll see) and the
+  driver never runs. Every Makefile Docker leg that runs `uv` sets it; the ad-hoc
+  driver run needs it too.
 - `--cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g` and
   `-e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri` (point the harness at the
   binary this run builds). **Note:** `--cap-add SYS_ADMIN --security-opt
@@ -110,7 +128,12 @@ command for a small Python driver. Same wiring as the target (see the Makefile):
   agents, or secrets into a container running with these flags.
 
 Putting it together — the complete invocation (repo/worktree root; expects your
-driver at `$HOST_OUT/driver.py`):
+driver at `$HOST_OUT/driver.py`). **Set `ROOT`/`HOST_OUT` on their OWN line, as
+below — NOT as one-line prefix assignments on the `docker run` itself.** A prefix
+assignment (`HOST_OUT=/tmp/shed-shots docker run … -v "$HOST_OUT:/out"`) does NOT
+apply to that same command's own argument expansion — the shell expands `$HOST_OUT`
+before the assignment takes effect, so `-v ":/out"` binds an empty source and the
+PNGs vanish. Assign first, then run:
 
 ```bash
 make -C desktop tauri-ui-build
@@ -119,6 +142,7 @@ ROOT="$PWD"; HOST_OUT=/tmp/shed-shots; mkdir -p "$HOST_OUT"
 docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
   -v shed-tauri-linux-target:/target -e CARGO_TARGET_DIR=/target \
+  -e UV_PROJECT_ENVIRONMENT=/tmp/uv-venv \
   -e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri \
   --cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g \
   shed-tauri-linux:latest bash -c '
@@ -177,6 +201,27 @@ assertions, the pixels are the eyeball.
   An unrecognized `state` fails to deserialize and falls back to `RcState::Ready` with **no
   error** (`ipc.rs::build_inject_session`), so a fixture with a typo'd/invented state renders
   Ready and you chase a phantom. Send the exact wire value.
+- **WebKitGTK renders a raw `<select>` illegibly in dark mode** → its native button text
+  stays dark-on-dark. In the Preferences window every dropdown (terminal preset, SSH policy)
+  uses the dialog kit's `Select` (`components/dialog`, `appearance-none` + its own caret), NOT
+  a bare `<select>`. Reach for `Select` when adding any picker to the Tauri UI, or the dark
+  screenshot is unreadable (`PreferencesWindow.tsx`).
+- **`policy.set` resets the ENGINE but not the coordinator's `extra_rules`** → the harness's
+  per-test `policy.set` reset replaces the policy *engine's* rules, but the coordinator's
+  persisted per-shed `extra_rules` survive it and get recomposed into the engine on the next
+  `rebuild_policy` (a persisted approval decision from an earlier test resurrects there). So
+  the absolute shed-rule count is NOT yours to pin — write per-shed-rule assertions
+  **engine-relative** (`prefs.dump`'s `shed_rules_count` == `len(policy.list scope=="shed")`,
+  and filter `policy.list` to YOUR shed), never against a fixed number. `test_preferences_shed_rules`
+  is the pattern.
+- **No per-window screenshot capture exists** → `app.screenshot` grabs the whole X display
+  (`screenshot.rs::capture`, `grim`→`scrot`→`import`), not a chosen window, and the Preferences
+  window is fixed-size (520×640, not resizable). Its below-the-fold content can't be
+  photographed, so don't try to prove a lower section by pixels — trim the fixture so the
+  section you care about sits above the fold (e.g. an `always-deny` SSH policy hides both the
+  Duration and Method rows — `usesDuration`/`prompts` are false — collapsing the SSH card), and
+  rely on `prefs.dump`'s reported `sections`/`values` for the logical assertions. Pixels are the
+  eyeball; `prefs.dump` is the truth.
 
 ## Native run on a Mac (quick UI-comparison loop)
 

@@ -150,10 +150,10 @@ fn open_pane(app: &AppHandle, pane: &str) {
     let _ = app.emit("navigate", serde_json::json!({ "pane": pane }));
 }
 
-/// Raise the dashboard + open the Preferences modal (the `ui.show_preferences` path).
+/// Open/focus the dedicated Preferences window (the `ui.show_preferences` path —
+/// the single `show_preferences_window` helper; it does not raise the dashboard).
 fn open_prefs(app: &AppHandle) {
-    show_main(app);
-    let _ = app.emit("show-preferences", serde_json::json!({}));
+    crate::ipc::show_preferences_window(app);
 }
 
 // -- B1b popover show/hide (shared by the mac tray-icon click AND the hermetic
@@ -212,7 +212,7 @@ pub fn open_dashboard(app: &AppHandle) {
     hide_popover(app);
 }
 
-/// The popover footer's "Preferences…": the Preferences menu action + dismiss the
+/// The popover footer's "Preferences…": open the Preferences window + dismiss the
 /// popover.
 pub fn open_preferences(app: &AppHandle) {
     open_prefs(app);

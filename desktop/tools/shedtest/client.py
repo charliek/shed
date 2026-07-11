@@ -355,8 +355,32 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         self.call("ui.show_window")
 
     def show_preferences(self) -> None:
-        """Open the in-app Preferences modal (raises the window + emits the event)."""
+        """Open/focus the dedicated Preferences window (a singleton: created lazily
+        on the first open, fronted if already open; closing it hides it). Does NOT
+        raise the dashboard (mac parity). `ui.open_preferences` is an equivalent
+        alias op (the mac op name)."""
         self.call("ui.show_preferences")
+
+    def open_preferences(self) -> None:
+        """The `ui.open_preferences` alias (the mac op name) for show_preferences."""
+        self.call("ui.open_preferences")
+
+    def prefs_dump(self) -> dict:
+        """The Preferences window's drivable state: `{visible, title, prefs}`.
+        `visible`/`title` are Rust-side native window truth (visible False and
+        prefs None before the first open); `prefs` is the window's reported
+        snapshot `{sections, values, mode}`."""
+        return self.call("prefs.dump")
+
+    def prefs_close(self) -> None:
+        """Close (hide) the Preferences window — the close-hides singleton contract."""
+        self.call("prefs.close")
+
+    def remove_shed_rule(self, server: str, shed: str) -> None:
+        """Remove one per-shed override rule + persist the remaining set (the same
+        path as the Preferences row's remove button). `server` is matched verbatim
+        ('' = the single/unnamed server)."""
+        self.call("prefs.remove_shed_rule", {"server": server, "shed": shed})
 
     def show_create(self) -> None:
         """Open the New-Shed dialog (raises the window + emits the event)."""
@@ -371,6 +395,17 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         UI truth (empty unless the UI is on the agents pane)."""
         return self.call("agents.dump")["sessions"]
 
+    def provider_modes_get(self) -> dict:
+        """The AWS/Docker provider approval modes ({namespace: 'approve'|'deny'}) —
+        the read side of set_provider_mode. A namespace absent from the map is Deny."""
+        return self.call("prefs.provider_modes")
+
+    def set_provider_mode(self, namespace: str, decision: str) -> None:
+        """Set an AWS/Docker provider mode + persist. `namespace` is the full string
+        ('aws-credentials'|'docker-credentials'); `decision` is 'approve'|'deny'. A
+        non-provider namespace is rejected (bad_request)."""
+        self.call("prefs.set_provider", {"namespace": namespace, "decision": decision})
+
     def activate(self) -> None:
         self.call("app.activate")
 
@@ -379,7 +414,8 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         return self.call("ui.current_pane").get("pane")
 
     def modal(self) -> str | None:
-        """Which modal (if any) the frontend has open: 'prefs' | 'create' | None."""
+        """Which modal (if any) the frontend has open: 'create' | 'launch' | None.
+        (Preferences is a dedicated window, not a modal — see prefs_dump.)"""
         return self.call("ui.modal").get("modal")
 
     def computed_style(self) -> dict | None:
