@@ -503,9 +503,14 @@ enum OffsetColon {
 /// Returns unix seconds (offset applied) or `None`.
 fn parse_layout(val: &str, sep: char, offset: OffsetColon) -> Option<i64> {
     let (date, time_zone) = val.split_once(sep)?;
-    // Date: YYYY-MM-DD (2-digit month/day; year is the leading run of digits).
+    // Date: YYYY-MM-DD. Go's `time.Parse` "2006" year is FIXED-WIDTH 4 digits — a
+    // 5-digit year is a parse error, not a big year (CodeRabbit review).
     let mut dparts = date.split('-');
-    let y: i64 = dparts.next()?.parse().ok()?;
+    let ystr = dparts.next()?;
+    if ystr.len() != 4 || !ystr.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = ystr.parse().ok()?;
     let mo: u32 = parse_2(dparts.next()?)?;
     let d: u32 = parse_2(dparts.next()?)?;
     if dparts.next().is_some() {
@@ -531,11 +536,31 @@ fn parse_layout(val: &str, sep: char, offset: OffsetColon) -> Option<i64> {
     if tparts.next().is_some() {
         return None;
     }
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+    // Real calendar validation — Go's `time.Parse` rejects Feb 30 / non-leap Feb 29
+    // ("day out of range") and has no leap-second support (`:60` errors), where the
+    // Hinnant `days_from_civil` math would silently normalize (CodeRabbit review).
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59
+    {
         return None;
     }
     let days = crate::status::days_from_civil(y, mo, d);
     Some(days * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + (se as i64) - offset_secs)
+}
+
+/// Days in a month, Gregorian, with leap-year February (mirrors what Go's
+/// `time.Parse` accepts). `mo` is validated 1..=12 by the caller.
+fn days_in_month(y: i64, mo: u32) -> u32 {
+    match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+    }
 }
 
 /// Split an RFC3339 zone suffix off the time, returning `(time_text, secs_to_subtract)`
