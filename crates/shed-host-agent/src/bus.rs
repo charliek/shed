@@ -139,10 +139,28 @@ pub struct Envelope {
     #[serde(rename = "final")]
     pub is_final: bool,
     pub timestamp: String,
-    #[serde(default)]
-    pub payload: serde_json::Value,
+    /// `None` when the wire frame OMITS `payload` entirely — Go's nil
+    /// `json.RawMessage`, which the handlers' `json.Unmarshal` REJECTS (→
+    /// `invalid payload`), while an explicit `payload: null` parses to a zero
+    /// `operation` (→ `unknown operation: `). The `Option` keeps that
+    /// distinction (cursor review finding); the custom deserializer is needed
+    /// because serde's stock `Option` handling would fold an explicit `null`
+    /// into `None` too. A `None` re-serializes as `null`, matching Go's
+    /// nil-RawMessage marshaling.
+    #[serde(default, deserialize_with = "de_present_payload")]
+    pub payload: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shed: Option<ShedInfo>,
+}
+
+/// Deserialize a PRESENT `payload` field — any JSON value, **including an
+/// explicit `null`** — to `Some(value)`. Only an omitted field takes the
+/// `#[serde(default)]` `None` (Go's nil `json.RawMessage`).
+fn de_present_payload<'de, D>(d: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(d).map(Some)
 }
 
 impl Envelope {
@@ -162,7 +180,7 @@ impl Envelope {
             in_reply_to: in_reply_to.to_string(),
             is_final: true,
             timestamp: crate::status::now_rfc3339(),
-            payload,
+            payload: Some(payload),
             shed: None,
         }
     }
@@ -173,7 +191,10 @@ impl Envelope {
     /// accessor the envelope-shape tests read, so it is dead in non-test builds.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn operation(&self) -> Option<&str> {
-        self.payload.get("operation").and_then(|v| v.as_str())
+        self.payload
+            .as_ref()
+            .and_then(|p| p.get("operation"))
+            .and_then(|v| v.as_str())
     }
 }
 
@@ -996,18 +1017,20 @@ fn ssh_error(msg: &str, code: &str) -> serde_json::Value {
 
 /// Extract the request `operation`, mirroring Go's
 /// `json.Unmarshal(env.Payload, &struct{Operation string})` (`ssh_handler.go:59-66`):
-/// a JSON **object** (absent/`null` `operation` → `""`) or a bare `null` payload parse
-/// cleanly; a non-object/non-null payload, or an `operation` that isn't a string/null,
-/// is an unmarshal error → the caller returns `{invalid payload, INTERNAL_ERROR}`.
-fn parse_operation(payload: &serde_json::Value) -> Result<String, ()> {
+/// a JSON **object** (absent/`null` `operation` → `""`) or an explicit `null` payload
+/// parse cleanly; an OMITTED payload field (Go nil `json.RawMessage` — "unexpected
+/// end of JSON input"), a non-object/non-null payload, or an `operation` that isn't
+/// a string/null, is an unmarshal error → `{invalid payload, INTERNAL_ERROR}`.
+fn parse_operation(payload: &Option<serde_json::Value>) -> Result<String, ()> {
     match payload {
-        serde_json::Value::Null => Ok(String::new()),
-        serde_json::Value::Object(map) => match map.get("operation") {
+        None => Err(()), // omitted field: Go json.Unmarshal(nil, ...) errors
+        Some(serde_json::Value::Null) => Ok(String::new()),
+        Some(serde_json::Value::Object(map)) => match map.get("operation") {
             None | Some(serde_json::Value::Null) => Ok(String::new()),
             Some(serde_json::Value::String(s)) => Ok(s.clone()),
             Some(_) => Err(()),
         },
-        _ => Err(()),
+        Some(_) => Err(()),
     }
 }
 
@@ -1129,7 +1152,7 @@ async fn handle_sign(
     backend: &Arc<dyn SshBackend>,
 ) -> (serde_json::Value, Option<AuditEntry>) {
     // 1. Decode the sign request (a wrong-typed field → invalid sign request; no audit).
-    let req: SignRequestPayload = match serde_json::from_value(env.payload.clone()) {
+    let req: SignRequestPayload = match serde_json::from_value(env.payload.clone().unwrap_or_default()) {
         Ok(r) => r,
         Err(_) => return (ssh_error("invalid sign request", SSH_CODE_INTERNAL), None),
     };
@@ -1422,12 +1445,12 @@ mod tests {
             in_reply_to: String::new(),
             is_final: true,
             timestamp: "t".into(),
-            payload: serde_json::json!({
+            payload: Some(serde_json::json!({
                 "operation": "sign",
                 "public_key": public_key,
                 "data": data,
                 "flags": flags,
-            }),
+            })),
             shed: Some(ShedInfo {
                 name: "web".into(),
                 backend: "vz".into(),
@@ -1519,12 +1542,30 @@ mod tests {
     fn envelope_tolerates_absent_payload_and_shed() {
         let wire = r#"{"id":"x","namespace":"ns","type":"event","final":false,"timestamp":"t"}"#;
         let env: Envelope = serde_json::from_str(wire).unwrap();
-        assert!(env.payload.is_null());
+        // An OMITTED payload is `None` (distinct from an explicit `null` →
+        // `Some(Null)`): Go's nil json.RawMessage fails the handler unmarshal
+        // (`invalid payload`) while explicit null parses to a zero op.
+        assert!(env.payload.is_none());
         assert!(env.shed.is_none());
         assert_eq!(env.operation(), None);
         // Re-serialized, an absent payload marshals as `null` (nil json.RawMessage).
         let v: serde_json::Value = serde_json::to_value(&env).unwrap();
         assert!(v["payload"].is_null());
+
+        let explicit_null = r#"{"id":"x","namespace":"ns","type":"event","final":false,"timestamp":"t","payload":null}"#;
+        let env2: Envelope = serde_json::from_str(explicit_null).unwrap();
+        assert_eq!(env2.payload, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn parse_operation_distinguishes_absent_from_null_payload() {
+        // Omitted payload field → unmarshal error in Go → invalid payload.
+        assert_eq!(parse_operation(&None), Err(()));
+        // Explicit null payload → zero operation → "unknown operation: ".
+        assert_eq!(
+            parse_operation(&Some(serde_json::Value::Null)),
+            Ok(String::new())
+        );
     }
 
     // Extract the top-level object key order from a serialized JSON string.
@@ -2015,7 +2056,7 @@ mod tests {
             in_reply_to: String::new(),
             is_final: true,
             timestamp: "t".into(),
-            payload: serde_json::json!({"operation":"ping"}),
+            payload: Some(serde_json::json!({"operation":"ping"})),
             shed: Some(ShedInfo {
                 name: "folio".into(),
                 backend: "vz".into(),
@@ -2065,7 +2106,7 @@ mod tests {
             in_reply_to: String::new(),
             is_final: true,
             timestamp: "t".into(),
-            payload: serde_json::json!({"operation":"delete"}),
+            payload: Some(serde_json::json!({"operation":"delete"})),
             shed: None,
         };
         handle_bus_message(
@@ -2109,7 +2150,7 @@ mod tests {
             in_reply_to: String::new(),
             is_final: true,
             timestamp: "t".into(),
-            payload: serde_json::json!([1, 2, 3]),
+            payload: Some(serde_json::json!([1, 2, 3])),
             shed: None,
         };
         handle_bus_message(
@@ -2127,17 +2168,17 @@ mod tests {
     fn parse_operation_matches_go_unmarshal() {
         use serde_json::json;
         // Object with a string operation → that op.
-        assert_eq!(parse_operation(&json!({"operation":"list"})), Ok("list".into()));
+        assert_eq!(parse_operation(&Some(json!({"operation":"list"}))), Ok("list".into()));
         // Object without operation, or operation null, or a bare null → "" (Go's zero).
-        assert_eq!(parse_operation(&json!({})), Ok(String::new()));
-        assert_eq!(parse_operation(&json!({"operation":null})), Ok(String::new()));
-        assert_eq!(parse_operation(&serde_json::Value::Null), Ok(String::new()));
+        assert_eq!(parse_operation(&Some(json!({}))), Ok(String::new()));
+        assert_eq!(parse_operation(&Some(json!({"operation":null}))), Ok(String::new()));
+        assert_eq!(parse_operation(&Some(serde_json::Value::Null)), Ok(String::new()));
         // A non-object/non-null payload, or a non-string operation, is Go's unmarshal
         // error → invalid payload.
-        assert_eq!(parse_operation(&json!([1, 2])), Err(()));
-        assert_eq!(parse_operation(&json!("hi")), Err(()));
-        assert_eq!(parse_operation(&json!(123)), Err(()));
-        assert_eq!(parse_operation(&json!({"operation":123})), Err(()));
+        assert_eq!(parse_operation(&Some(json!([1, 2]))), Err(()));
+        assert_eq!(parse_operation(&Some(json!("hi"))), Err(()));
+        assert_eq!(parse_operation(&Some(json!(123))), Err(()));
+        assert_eq!(parse_operation(&Some(json!({"operation":123}))), Err(()));
     }
 
     // ---- list / status ops (mirror ssh_handler.go handleList/handleStatus) ----
@@ -2435,7 +2476,7 @@ mod tests {
             in_reply_to: String::new(),
             is_final: true,
             timestamp: "t".into(),
-            payload: serde_json::json!({"operation":"sign","flags":"not-a-number"}),
+            payload: Some(serde_json::json!({"operation":"sign","flags":"not-a-number"})),
             shed: None,
         };
         let (payload, entry) = handle_sign(&env, "", "", &approve_gate(), &empty_backend()).await;
