@@ -40,8 +40,24 @@ type trackedSession struct {
 	// change detection and the /v1/sessions overlay.
 	activity    Activity
 	activityAt  string // RFC3339 time the displayed activity last changed
-	lastMessage string // populated by the watcher commit; "" here
+	lastMessage string // sanitized preview from the JSONL watcher (or "" from stability)
 	lastState   State
+
+	// watcher is the correlated JSONL tail (codex rollout / claude transcript), lazily
+	// created once the session is pinned to a file (see ensureWatcher). nil for kinds
+	// with no structured signal, or before correlation succeeds. When present and
+	// FRESH, its activity overrides the pane-stability tracker (see reconcile's merge);
+	// when absent/stale, stability drives. Closed when the session disappears/recreates.
+	watcher *fileWatcher
+	// pendingAgentID is an AMBIGUOUS correlation's agent session id, held back until
+	// the watcher's first in-file event confirms the pick — only then is it back-
+	// written to SHED_RC_AGENT_SESSION. Back-writing an unconfirmed ambiguous pick
+	// would make a WRONG pin permanent across hub restarts (the exact-id path would
+	// trust it forever). "" once written or when the match was unambiguous.
+	pendingAgentID string
+	// correlateTried counts correlation attempts so a session whose file never appears
+	// does not re-scan the filesystem on every single tick forever.
+	correlateTried int
 }
 
 // newTrackedSession builds tracker state for a freshly seen session. The tracker
@@ -90,7 +106,12 @@ func (h *Hub) reconcile() {
 		tr, ok := h.tracked[s.Slug]
 		if !ok || !tr.sameIdentity(s) {
 			// New session, or the slug was recreated (id OR created_at changed — the
-			// latter catches legacy sessions with no SHED_RC_ID) → start over.
+			// latter catches legacy sessions with no SHED_RC_ID) → start over. A
+			// recreate must drop the previous session's JSONL watcher (a new session
+			// gets a new file; keeping the old tail would report the dead session).
+			if ok && tr.watcher != nil {
+				tr.watcher.close()
+			}
 			tr = h.newTrackedSession(s)
 			h.tracked[s.Slug] = tr
 			events = append(events, sessionUpdatedEvent(s))
@@ -99,14 +120,43 @@ func (h *Hub) reconcile() {
 		}
 		tr.lastState = s.State
 
-		// Derive activity from the pane-stability tracker. A capture error (e.g. a
-		// transient tmux hiccup) leaves the prior activity untouched rather than
-		// flapping the DTO to unknown.
-		raw, err := tr.tracker.Tick()
-		if err != nil {
-			continue
+		// Lazily correlate the session to its agent JSONL file (codex rollout / claude
+		// transcript). Once correlated, tr.watcher tails it and — when FRESH — overrides
+		// the pane-stability tracker below.
+		h.ensureWatcher(tr, s)
+
+		// Derive activity. The pane-stability tracker is the universal fallback; a fresh,
+		// correlated JSONL watcher overrides it (mergedActivity). A stability capture
+		// error (transient tmux hiccup) with no fresh watcher leaves the prior activity
+		// untouched rather than flapping the DTO to unknown.
+		raw, capErr := tr.tracker.Tick()
+
+		var watcherActivity Activity
+		var watcherMessage string
+		watcherFresh, watcherExpiredWorking := false, false
+		if tr.watcher != nil {
+			tr.watcher.refresh(now)
+			// A deferred (ambiguous-correlation) back-write happens only once the first
+			// in-file event confirms the pick — see trackedSession.pendingAgentID.
+			if tr.pendingAgentID != "" && tr.watcher.hadEvent() {
+				backWriteAgentSession(h.cfg.runner, s.TmuxSession, tr.pendingAgentID)
+				tr.pendingAgentID = ""
+			}
+			watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking = tr.watcher.snapshot(now)
 		}
-		eff := DisplayActivity(s.State, raw)
+		if capErr != nil && !watcherFresh {
+			continue // no signal this tick; retain the prior verdict
+		}
+
+		mergedRaw, mergedMsg := mergedActivity(watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking, raw)
+		eff := DisplayActivity(s.State, mergedRaw)
+		// last_message rides with the activity dimension: a suppressed (blocking
+		// lifecycle) activity drops the message too, per DisplayActivity's contract.
+		effMsg := mergedMsg
+		if eff == "" {
+			effMsg = ""
+		}
+
 		if eff != tr.activity {
 			tr.activity = eff
 			tr.activityAt = now.UTC().Format(time.RFC3339)
@@ -119,11 +169,18 @@ func (h *Hub) reconcile() {
 				events = append(events, activityChangedEvent(s.Slug, eff, tr.activityAt, s.State))
 			}
 		}
+		// Keep the message preview current every tick (the /v1/sessions overlay reads
+		// it) even when the activity value itself did not change.
+		tr.lastMessage = effMsg
 	}
 
-	// Sessions that vanished since the last pass (killed).
-	for slug := range h.tracked {
+	// Sessions that vanished since the last pass (killed). Release the JSONL watcher
+	// (its tail is now pointed at a dead session's file).
+	for slug, tr := range h.tracked {
 		if !present[slug] {
+			if tr.watcher != nil {
+				tr.watcher.close()
+			}
 			delete(h.tracked, slug)
 			events = append(events, sessionGoneEvent(slug))
 		}
@@ -144,4 +201,69 @@ func (h *Hub) reconcile() {
 	for _, e := range events {
 		h.broadcast(e)
 	}
+}
+
+// maxCorrelateTries bounds how many reconcile ticks a session's correlation is
+// re-attempted before giving up (the JSONL file never appeared — an old agent binary,
+// a kind that does not log, or a create that failed to launch). ~40 ticks at the
+// active cadence (2s) is >1min of retry, comfortably longer than the file-appears
+// latency, while a never-appearing file stops re-scanning the filesystem forever.
+const maxCorrelateTries = 40
+
+// ensureWatcher lazily correlates a watchable session (codex/claude) to its JSONL file
+// and attaches a tailing watcher. It is a no-op once a watcher exists, for unwatchable
+// kinds, for sessions in a blocking lifecycle state (no meaningful activity to tail),
+// and once the retry budget is exhausted. On success it back-writes the discovered
+// agent session id into the tmux env so a hub restart re-correlates exactly, and — for
+// an ambiguous window match — follows only new appends (activity stays unknown until an
+// in-file event confirms) rather than trusting a possibly-wrong file's history.
+func (h *Hub) ensureWatcher(tr *trackedSession, s Session) {
+	if tr.watcher != nil || !watchableKind(s.Kind) {
+		return
+	}
+	switch s.State {
+	case StateNeedsTrust, StateNeedsAuth, StateDead:
+		return // no live activity to tail; retry once the session becomes usable
+	}
+	if tr.correlateTried >= maxCorrelateTries {
+		return
+	}
+	tr.correlateTried++
+
+	createdAt, hasCreatedAt := parseJSONLTime(s.CreatedAt)
+	agentID := agentSessionEnv(h.cfg.runner, s.TmuxSession)
+
+	var corr correlation
+	var ok bool
+	var fold activityFold
+	switch {
+	case s.Kind == KindCodex:
+		corr, ok = correlateCodex(h.cfg.getenv, s.Workdir, agentID, createdAt, hasCreatedAt)
+		fold = newCodexFold()
+	case IsClaudeKind(s.Kind):
+		corr, ok = correlateClaude(h.cfg.getenv, s.Workdir, agentID, createdAt, hasCreatedAt)
+		fold = newClaudeFold()
+	default:
+		return
+	}
+	if !ok {
+		return
+	}
+
+	// Unambiguous match → do a bounded catch-up read so the current activity is known
+	// immediately. Ambiguous → follow only new appends (unknown until an event confirms
+	// which file is really this session's).
+	tr.watcher = newFileWatcher(corr.path, !corr.ambiguous, fold)
+	if agentID != "" || corr.sessionID == "" {
+		return
+	}
+	if corr.ambiguous {
+		// NEVER back-write an ambiguous pick immediately: a wrong id stamped into the
+		// tmux env would be trusted by the exact-id path on every future hub restart,
+		// making the mistake permanent. Hold it until the watcher's first in-file event
+		// confirms the pick (see reconcile).
+		tr.pendingAgentID = corr.sessionID
+		return
+	}
+	backWriteAgentSession(h.cfg.runner, s.TmuxSession, corr.sessionID)
 }

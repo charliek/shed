@@ -117,7 +117,14 @@ const (
 	envCreatedBy   = "SHED_RC_CREATED_BY"
 	envCreatedAt   = "SHED_RC_CREATED_AT"
 	envTarget      = "SHED_RC_TARGET"
-	envPrefix      = "SHED_RC_"
+	// envAgentSession is the ADDITIVE, write-once-on-correlate key the hub back-writes
+	// once it has pinned a session to its agent JSONL file (codex rollout id / claude
+	// transcript session id). It is NOT part of the create-time BuildEnvArgs set — the
+	// hub stamps it later via `tmux set-environment` so a hub restart re-correlates
+	// exactly instead of re-running the cwd+window heuristic. It rides the SHED_RC_
+	// prefix so parseEnv/showEnvironment already surface it.
+	envAgentSession = "SHED_RC_AGENT_SESSION"
+	envPrefix       = "SHED_RC_"
 )
 
 // Session is the neutral, target-agnostic DTO the binary prints. Optional fields are

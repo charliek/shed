@@ -364,6 +364,12 @@ func (h *Hub) serveOn(ctx context.Context, ln net.Listener) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
+	// A best-effort fsnotify layer over the codex + claude JSONL trees nudges the loop
+	// to reconcile sub-tick when a watched transcript is appended, so an activity
+	// transition surfaces promptly instead of waiting for the next tick. If it cannot
+	// start (fsnotify unavailable), the tick alone drives — correctness is unchanged.
+	nudge := h.startFSNudger(ctx)
+
 	h.reconcile() // seed the session list + fire appear events before the first tick
 
 	for {
@@ -382,6 +388,9 @@ func (h *Hub) serveOn(ctx context.Context, ln net.Listener) error {
 				return err
 			}
 			return nil
+		case <-nudge:
+			timer.Stop()
+			h.reconcile() // a watched file changed — surface it now, not next tick
 		case <-timer.C:
 			h.reconcile()
 			if h.shouldIdleExit(h.cfg.now()) {
@@ -416,13 +425,51 @@ func (h *Hub) idleExitHandoff(ln net.Listener) {
 	}
 }
 
-// shutdown closes all SSE subscribers and gracefully stops the HTTP server.
+// startFSNudger starts the best-effort fsnotify layer over the codex + claude JSONL
+// roots and returns the channel it nudges on a watched-file change. A nil channel
+// (fsnotify unavailable / HOME unset) is a valid select arm that simply never fires,
+// leaving the reconcile tick as the sole driver. The nudger goroutine stops with ctx.
+func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
+	var roots []string
+	if r := codexSessionsRoot(h.cfg.getenv); r != "" {
+		roots = append(roots, r)
+	}
+	if r := claudeProjectsRoot(h.cfg.getenv); r != "" {
+		roots = append(roots, r)
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	n, err := newFSNudger(roots, h.cfg.logf)
+	if err != nil {
+		h.cfg.logf("rc hub: fsnotify unavailable (%v); tick-only activity", err)
+		return nil
+	}
+	go n.run(ctx)
+	return n.nudge
+}
+
+// shutdown closes all SSE subscribers + JSONL watchers and gracefully stops the HTTP
+// server.
 func (h *Hub) shutdown(srv *http.Server) error {
 	h.closeAllSubscribers()
+	h.closeAllWatchers()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	return nil
+}
+
+// closeAllWatchers releases every tracked session's JSONL watcher (hub shutdown).
+func (h *Hub) closeAllWatchers() {
+	h.trackMu.Lock()
+	defer h.trackMu.Unlock()
+	for _, tr := range h.tracked {
+		if tr.watcher != nil {
+			tr.watcher.close()
+			tr.watcher = nil
+		}
+	}
 }
 
 // shouldIdleExit reports whether the hub has held zero rc sessions for at least the
