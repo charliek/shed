@@ -99,11 +99,28 @@ command for a small Python driver. Same wiring as the target (see the Makefile):
   against a **trusted** source tree, and never mount host Docker sockets, SSH
   agents, or secrets into a container running with these flags.
 
-Inside the container: `tar` the repo-root layout (`crates desktop/tauri
-desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock`) into
-`/work` (the host-built `tauri/ui/dist` rides along in that tar — build it first,
-above), `cd /work/desktop/tauri/src-tauri && cargo build --locked`, then
-`xvfb-run -a --server-args="-screen 0 1400x900x24"` a Python driver that:
+Putting it together — the complete invocation (repo/worktree root; expects your
+driver at `$HOST_OUT/driver.py`):
+
+```bash
+make -C desktop tauri-ui-build
+docker build -t shed-tauri-linux:latest - < desktop/Dockerfile.tauri-linux
+ROOT="$PWD"; HOST_OUT=/tmp/shed-shots; mkdir -p "$HOST_OUT"
+docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
+  -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
+  -v shed-tauri-linux-target:/target -e CARGO_TARGET_DIR=/target \
+  -e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri \
+  --cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g \
+  shed-tauri-linux:latest bash -c '
+    mkdir -p /work && cd /repo && \
+    tar cf - crates desktop/tauri desktop/tools desktop/Resources \
+      desktop/pyproject.toml desktop/uv.lock | tar xf - -C /work && \
+    cd /work/desktop/tauri/src-tauri && cargo build --locked && \
+    cd /work/desktop && xvfb-run -a --server-args="-screen 0 1400x900x24" \
+      uv run --group test python /out/driver.py'
+```
+
+The driver is a Python script that:
 
 - adds `/work/desktop/tools/shedtest` + `/work/desktop/tools/fake-host-agent` to
   `sys.path` and imports `ui`, `client`, `mockserver`, `fake_host_agent`;
