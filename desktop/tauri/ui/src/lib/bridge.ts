@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 export type Pane = "sheds" | "approvals" | "agents" | "activity" | "egress" | "system";
 
-/** Which modal (if any) is open — reported so the harness can drive + assert it. */
-export type Modal = null | "prefs" | "create" | "launch";
+/** Which modal (if any) is open — reported so the harness can drive + assert it.
+ *  (Preferences is a dedicated window, not a modal — see `reportPrefs`.) */
+export type Modal = null | "create" | "launch";
 
 const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "egress", "system"];
 
@@ -467,6 +468,31 @@ export async function getAppearanceState(): Promise<"light" | "dark" | null> {
  *  Invoked from the dashboard's mode effect so every window stays in sync. */
 export async function setAppearanceState(mode: "light" | "dark"): Promise<void> {
   await invoke("set_appearance_state", { mode });
+}
+
+/** The Preferences window's rendered snapshot, reported under its own window label
+ *  ("preferences") so the `prefs.dump` op can observe it (UI truth, like the egress
+ *  report): the visible section ids in mac order, the rendered control values, and
+ *  the active light/dark mode. Keys are additive + stable — the harness asserts them. */
+export type PrefsReport = {
+  sections: string[];
+  values: {
+    preset: string;
+    template: string;
+    policy: string;
+    method: string;
+    ttl: string;
+    login: boolean;
+    provider_modes: ProviderModes;
+    shed_rules_count: number;
+  };
+  mode: string;
+};
+
+/** Report the Preferences window's rendered state (`ui_report` keys it under the
+ *  calling window's label, so it can never clobber the dashboard's `main`). */
+export function reportPrefs(snapshot: PrefsReport): void {
+  void invoke("ui_report", { snapshot: { prefs: snapshot } });
 }
 
 /** Keep a coordinator-backed slice live: fetch on mount, then re-fetch whenever

@@ -16,19 +16,17 @@ import {
   cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, ActBtn,
   PageHead, HeadAction, Empty, agentColor, type Tone,
 } from "@/components/primitives";
-import { Scrim, DialogShell, Field, Select, Segmented, Switch, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
+import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import {
   useUiBridge, shedAction, fetchSystemDf, openTerminal,
-  fetchTerminalPresets, getPrefs, setTerminalPref,
-  getLoginItem, setLoginItem,
   createStart, createStatus, createCancel, fetchHosts,
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
-  getSshApproval, setSshApproval,
+  openPreferences, setAppearanceState,
   rcLaunch, rcKill, reportAgents, useRcSessions,
   useCoordinatorData, useNowTick,
-  type Pane, type Shed, type HostDiskUsage, type TerminalPresetInfo,
-  type Modal, type CreateProgress, type Approval, type AuditEntry, type SshPrefs,
+  type Pane, type Shed, type HostDiskUsage,
+  type Modal, type CreateProgress, type Approval, type AuditEntry,
   type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
   type RcSession, type RcKind, type RcState,
   type RcCapabilities, offeredKinds, rcAuthHint,
@@ -821,247 +819,6 @@ function LaunchAgentDialog({ sheds, capabilities, refresh, onClose, onLaunched }
   );
 }
 
-/* ---- Preferences (in-app modal; the tray is Phase C) ---------------------- */
-// How an SSH-key approval is confirmed. On Linux "Authenticate" routes through
-// polkit; "Prompt only" needs no gate — a plain Approve button.
-const APPROVAL_METHODS: { id: SshPrefs["method"]; label: string; detail: string }[] = [
-  { id: "biometrics-or-password", label: "Authenticate", detail: "Confirm with your login password." },
-  { id: "prompt", label: "Prompt only", detail: "A plain Approve button — no password." },
-];
-
-// The SSH approval policies, most → least permissive (mirrors SshApprovalPolicy in
-// shed-core). `prompts` gates the Method picker and `usesDuration` gates the
-// Duration field — the SAME policy→behavior mapping as the Swift app.
-const SSH_POLICIES: { id: string; label: string; prompts: boolean; usesDuration: boolean }[] = [
-  { id: "always-allow", label: "Always Allow", prompts: false, usesDuration: false },
-  { id: "per-shed-allow", label: "Per Shed Allow", prompts: true, usesDuration: false },
-  { id: "time-based-allow", label: "Time Based Allow", prompts: true, usesDuration: true },
-  { id: "always-ask", label: "Always Ask", prompts: true, usesDuration: false },
-  { id: "always-deny", label: "Always Deny", prompts: false, usesDuration: false },
-];
-
-const PREF_LABEL = "mb-1.5 font-mono text-[11px] font-semibold uppercase tracking-wider text-shed-text-muted";
-const PREF_GROUP = "mb-5 overflow-hidden rounded-[10px] border border-shed-border bg-shed-surface";
-
-function PreferencesModal({ onClose }: { onClose: () => void }) {
-  const [presets, setPresets] = useState<TerminalPresetInfo[]>([]);
-  const [preset, setPreset] = useState("custom");
-  const [template, setTemplate] = useState("");
-  const [method, setMethod] = useState<SshPrefs["method"]>("biometrics-or-password");
-  const [policy, setPolicy] = useState("time-based-allow");
-  const [ttl, setTtl] = useState("2h");
-  const [launchAtLogin, setLaunchAtLogin] = useState(false);
-  const [loginBusy, setLoginBusy] = useState(false);
-  const sshGen = useRef(0);
-  const ttlAtFocus = useRef(""); // the Duration value when the field gained focus
-
-  useEffect(() => {
-    void fetchTerminalPresets().then(setPresets);
-    void getLoginItem().then(setLaunchAtLogin);
-    void getPrefs().then((p) => {
-      setPreset(p.terminal_preset);
-      setTemplate(p.terminal_template);
-    });
-    // Guard the initial load with the same generation ref as applySsh: if the user
-    // edits a pref before this slow first read resolves, the stale load must not
-    // clobber their change (its optimistic set already bumped sshGen).
-    const mine = ++sshGen.current;
-    void getSshApproval().then((p) => {
-      if (mine !== sshGen.current) return;
-      setMethod(p.method);
-      setPolicy(p.policy);
-      setTtl(p.ttl);
-    });
-  }, []);
-
-  useEscClose(onClose);
-
-  const choosePreset = (id: string) => {
-    setPreset(id);
-    void setTerminalPref(id, id === "custom" ? template : undefined);
-  };
-  const editTemplate = (t: string) => {
-    setTemplate(t);
-    if (preset === "custom") void setTerminalPref("custom", t);
-  };
-  // Launch-at-login: set optimistically, persist via the THROWING setter, then
-  // reconcile from loginitem.status — so a failed/guarded write can't leave the
-  // toggle misrepresenting the real state. Guarded by `loginBusy` so a fast
-  // double-toggle can't race enable()/disable() into the wrong final OS state.
-  const toggleLaunchAtLogin = (v: boolean) => {
-    setLaunchAtLogin(v);
-    setLoginBusy(true);
-    void (async () => {
-      try {
-        await setLoginItem(v);
-      } catch {
-        // fall through to reconcile from the backend truth
-      }
-      setLaunchAtLogin(await getLoginItem()); // getLoginItem swallows → never throws
-      setLoginBusy(false);
-    })();
-  };
-  // Apply one SSH-pref delta: set it optimistically, persist only the changed
-  // field, then reconcile ALL three from the backend — so a rejected/failed write
-  // can't leave the method radio misrepresenting the actual gate strength. A
-  // generation guard drops a superseded reload so fast Duration typing can't be
-  // clobbered by an out-of-order confirm.
-  const applySsh = (delta: { method?: SshPrefs["method"]; policy?: string; ttl?: string }) => {
-    if (delta.method !== undefined) setMethod(delta.method);
-    if (delta.policy !== undefined) setPolicy(delta.policy);
-    if (delta.ttl !== undefined) setTtl(delta.ttl);
-    const mine = ++sshGen.current;
-    void (async () => {
-      await setSshApproval(delta.method, delta.policy, delta.ttl);
-      const p = await getSshApproval();
-      if (mine !== sshGen.current) return; // superseded by a newer change
-      setMethod(p.method);
-      setPolicy(p.policy);
-      setTtl(p.ttl);
-    })();
-  };
-  const policyMeta = SSH_POLICIES.find((p) => p.id === policy);
-
-  return (
-    <Scrim onClose={onClose} mark="prefs">
-      <DialogShell icon={Settings} title="Preferences" sub="Terminal, credential approvals, and launch behavior." onClose={onClose} width={480}>
-        <div>
-          <div className={PREF_LABEL}>General</div>
-          <div className={PREF_GROUP}>
-            <label className="flex items-center gap-3 px-3.5 py-2.5">
-              <span className="text-[13px] text-shed-text">Launch at login</span>
-              <span className="flex-1" />
-              <span className="text-[12px] text-shed-text-muted">Open Shed Desktop when you sign in.</span>
-              <Switch on={launchAtLogin} set={toggleLaunchAtLogin} disabled={loginBusy} />
-            </label>
-          </div>
-
-          <div className={PREF_LABEL}>Terminal</div>
-          <p className="mb-2 text-[12px] text-shed-text-muted">Which terminal opens when you click "Open in Terminal" on a shed.</p>
-          <div className={PREF_GROUP}>
-            {presets.map((p, i) => {
-              const active = preset === p.id;
-              return (
-                <label
-                  key={p.id}
-                  className={cn("flex cursor-pointer items-center gap-3 px-3.5 py-2.5", i && "border-t border-shed-border", !p.available && "opacity-50")}
-                  style={{ background: active ? "var(--shed-accent-subtle)" : undefined }}
-                >
-                  <input
-                    type="radio"
-                    name="terminal-preset"
-                    checked={active}
-                    disabled={!p.available}
-                    onChange={() => choosePreset(p.id)}
-                    style={{ accentColor: "var(--shed-accent)" }}
-                  />
-                  <span className="text-[13px] text-shed-text">{p.label}</span>
-                  {!p.available && <span className="text-[12px] text-shed-text-muted">not installed</span>}
-                  <span className="flex-1" />
-                  {p.detail && <span className="truncate text-[12px] text-shed-text-muted">{p.detail}</span>}
-                </label>
-              );
-            })}
-          </div>
-          {preset === "custom" && (
-            <div className="-mt-3 mb-5">
-              <input
-                value={template}
-                onChange={(e) => editTemplate(e.target.value)}
-                placeholder="e.g. kitty -e {cmd}"
-                className="w-full rounded-[9px] border border-shed-border bg-shed-surface px-3 py-2 font-mono text-[13px] text-shed-text outline-none focus:border-shed-accent"
-              />
-              <p className="mt-1.5 text-[12px] text-shed-text-muted">
-                <code className="font-mono">{"{cmd}"}</code> is the ssh command, <code className="font-mono">{"{shed}"}</code> the shed name.
-              </p>
-            </div>
-          )}
-
-          <div className={PREF_LABEL}>Credential approvals</div>
-          <p className="mb-2 text-[12px] text-shed-text-muted">What happens when the host agent routes an SSH-key approval here.</p>
-          <div className="mb-2 overflow-hidden rounded-[10px] border border-shed-border bg-shed-surface">
-            <label className="flex items-center gap-3 px-3.5 py-2.5">
-              <span className="text-[13px] text-shed-text">Approval policy</span>
-              <span className="flex-1" />
-              <select
-                value={policy}
-                onChange={(e) => applySsh({ policy: e.target.value })}
-                className="rounded-md border border-shed-border bg-shed-inset px-2 py-1 text-[13px] text-shed-text outline-none"
-                data-ssh-policy
-              >
-                {SSH_POLICIES.map((p) => (
-                  <option key={p.id} value={p.id}>{p.label}</option>
-                ))}
-              </select>
-            </label>
-
-            {/* Duration — only the time-based policy carries one (policy.usesDuration). */}
-            {policyMeta?.usesDuration && (
-              <label className="flex items-center gap-3 border-t border-shed-border px-3.5 py-2.5">
-                <span className="text-[13px] text-shed-text">Duration</span>
-                <span className="flex-1" />
-                <input
-                  value={ttl}
-                  // Free text → keep each keystroke LOCAL (optimistic) and persist only
-                  // on blur/Enter, and only when it changed. applySsh resets live SSH
-                  // grants + rewrites prefs.json, so a per-keystroke persist would revoke
-                  // active grants and churn disk mid-typing.
-                  onChange={(e) => setTtl(e.target.value)}
-                  onFocus={() => {
-                    ttlAtFocus.current = ttl;
-                  }}
-                  onBlur={() => {
-                    if (ttl !== ttlAtFocus.current) applySsh({ ttl });
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") e.currentTarget.blur();
-                  }}
-                  placeholder="2h"
-                  className="w-[72px] rounded-md border border-shed-border bg-shed-inset px-2 py-1 text-right font-mono text-[13px] text-shed-text outline-none"
-                  data-ssh-ttl
-                />
-              </label>
-            )}
-          </div>
-
-          {/* Method — only the prompting policies confirm an approval (policy.prompts). */}
-          {policyMeta?.prompts && (
-            <>
-              <div className={PREF_LABEL}>Method</div>
-              <div className="mb-2 overflow-hidden rounded-[10px] border border-shed-border bg-shed-surface">
-                {APPROVAL_METHODS.map((m, i) => {
-                  const active = method === m.id;
-                  return (
-                    <label
-                      key={m.id}
-                      className={cn("flex cursor-pointer items-center gap-3 px-3.5 py-2.5", i && "border-t border-shed-border")}
-                      style={{ background: active ? "var(--shed-accent-subtle)" : undefined }}
-                    >
-                      <input
-                        type="radio"
-                        name="approval-method"
-                        checked={active}
-                        onChange={() => applySsh({ method: m.id })}
-                        style={{ accentColor: "var(--shed-accent)" }}
-                      />
-                      <span className="text-[13px] text-shed-text">{m.label}</span>
-                      <span className="flex-1" />
-                      <span className="truncate text-[12px] text-shed-text-muted">{m.detail}</span>
-                    </label>
-                  );
-                })}
-              </div>
-            </>
-          )}
-          <p className="text-[12px] leading-relaxed text-shed-text-muted">
-            Always Allow / Always Deny decide every SSH sign with no prompt. The others prompt, then remember your approval per the policy. Changing the policy clears live grants. Method is how each approval is confirmed.
-          </p>
-        </div>
-      </DialogShell>
-    </Scrim>
-  );
-}
-
 /* ---- New-shed (create dialog with live SSE progress) ---------------------- */
 const BACKEND_OPTS = [
   { value: "", label: "Default" },
@@ -1289,20 +1046,24 @@ export default function App() {
 
   // Apply the appearance to the root BEFORE the bridge's report effect samples it (a
   // layout effect runs ahead of that passive effect), so `ui.computed_style` reflects
-  // the flip.
+  // the flip. Also mirror the mode into the Rust AppearanceState (which broadcasts
+  // `set-appearance` to every window, so the Preferences window follows) — it fires
+  // on both the manual header toggle and IPC-driven changes, and the Rust side
+  // no-ops (no re-emit) when unchanged, so the listener→effect loop can't echo.
   useLayoutEffect(() => {
     document.documentElement.dataset.mode = mode;
+    void setAppearanceState(mode);
   }, [mode]);
 
-  // Open the modals both from the buttons and from the ui.show_preferences /
-  // ui.show_create / ui.show_launch IPC ops (events); drive dark/light from
-  // ui.set_appearance — so the harness can drive + screenshot each deterministically.
+  // Open the modals both from the buttons and from the ui.show_create /
+  // ui.show_launch IPC ops (events); drive dark/light from ui.set_appearance —
+  // so the harness can drive + screenshot each deterministically. (Preferences is
+  // a dedicated window now — opened via the open_preferences command, no event.)
   useEffect(() => {
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
     const uns: Array<() => void> = [];
     let cancelled = false;
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
-      uns.push(await listen("show-preferences", () => setModal("prefs")));
       uns.push(await listen("show-create", () => setModal("create")));
       uns.push(await listen("show-launch", () => setModal("launch")));
       uns.push(
@@ -1403,7 +1164,7 @@ export default function App() {
           <span className="inline-flex items-center gap-2 text-[13px] font-medium text-shed-text-secondary">
             <Dot className="h-2 w-2" style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} /> host agent · {connected ? "connected" : "connecting…"}
           </span>
-          <button onClick={() => setModal("prefs")} title="Preferences" className="hlink flex h-[34px] w-[34px] items-center justify-center rounded-[9px] text-shed-text-muted">
+          <button onClick={() => void openPreferences()} title="Preferences" className="hlink flex h-[34px] w-[34px] items-center justify-center rounded-[9px] text-shed-text-muted">
             <Settings size={18} />
           </button>
           <button onClick={() => setMode(mode === "light" ? "dark" : "light")} title="Toggle appearance" className="hlink flex h-[34px] w-[34px] items-center justify-center rounded-[9px] text-shed-text-muted">
@@ -1421,7 +1182,6 @@ export default function App() {
           </div>
         </main>
       </div>
-      {modal === "prefs" && <PreferencesModal onClose={() => setModal(null)} />}
       {modal === "create" && <NewShedDialog refresh={refresh} onClose={() => setModal(null)} />}
       {modal === "launch" && <LaunchAgentDialog sheds={sheds} capabilities={rcCapabilities} refresh={refreshRc} onClose={() => setModal(null)} onLaunched={onLaunched} />}
     </div>

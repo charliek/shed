@@ -15,13 +15,15 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     target: "safari15",
-    // Two entries: the dashboard shell (index.html) + the macOS menu-bar popover
-    // (popover.html → TrayPopover). The popover is a SEPARATE webview so it never
+    // Three entries: the dashboard shell (index.html), the macOS menu-bar popover
+    // (popover.html → TrayPopover), and the Preferences window (preferences.html →
+    // PreferencesWindow). Each extra window is a SEPARATE webview/root so it never
     // mounts the shell's useUiBridge (which would clobber the `main` snapshot).
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL("./index.html", import.meta.url)),
         popover: fileURLToPath(new URL("./popover.html", import.meta.url)),
+        preferences: fileURLToPath(new URL("./preferences.html", import.meta.url)),
       },
     },
   },

@@ -664,7 +664,8 @@ fn open_dashboard(app: tauri::AppHandle) {
     tray::open_dashboard(&app);
 }
 
-/// The popover footer's "Preferences…" → raise the dashboard + open Preferences.
+/// The popover footer's "Preferences…" + the dashboard header gear → open/focus
+/// the dedicated Preferences window (and dismiss the popover if shown).
 #[tauri::command]
 fn open_preferences(app: tauri::AppHandle) {
     tray::open_preferences(&app);

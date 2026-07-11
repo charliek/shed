@@ -361,20 +361,147 @@ def test_loginitem_probe(tauri):
         tauri.login_item_set(before)
 
 
-def test_preferences_modal_opens(tauri):
-    # A1c-2c(2): ui.show_preferences → the frontend opens the in-app Preferences modal
-    # and reports modal=="prefs", so the harness verifies it ACTUALLY rendered (round-trip:
-    # op → event → React → modal → report), not just that the op acked. The pref LOGIC
-    # is covered by test_terminal_pref_persists above.
-    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+def _prefs_snapshot(tauri) -> dict:
+    """The Preferences window's reported snapshot, or {} before its first report."""
+    return tauri.prefs_dump().get("prefs") or {}
+
+
+def _prefs_values(tauri) -> dict:
+    return _prefs_snapshot(tauri).get("values") or {}
+
+
+def _prefs_sections(tauri) -> list:
+    return _prefs_snapshot(tauri).get("sections") or []
+
+
+def _open_prefs(tauri) -> None:
+    """Open the Preferences window and wait until it's visible AND has reported."""
     tauri.show_preferences()
-    tauri.wait_until(lambda: tauri.modal() == "prefs", timeout=15, what="preferences modal open")
-    # ...and on the real WebView it paints (the screenshot is TCC-gated on macOS).
-    if platform.system() == "Darwin":
-        return
-    tauri.show_window()
-    png, w, h = tauri.screenshot(scale=1)
-    assert png[:8] == PNG_MAGIC and w > 0 and h > 0
+    tauri.wait_until(lambda: tauri.prefs_dump()["visible"] and _prefs_snapshot(tauri),
+                     timeout=20, what="preferences window visible + reported")
+
+
+def test_preferences_window_opens(tauri):
+    # ui.show_preferences → the DEDICATED Preferences window (mac parity, not a
+    # modal): a fixed-size singleton titled "shed desktop — Preferences" whose
+    # rendered snapshot is reported under its own window label (prefs.dump), whose
+    # close HIDES it, and whose reopen re-fronts the same window.
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    ssh = tauri.ssh_prefs_get()
+    prefs = tauri.prefs_get()
+    login = tauri.login_item_status()
+    _open_prefs(tauri)
+    assert tauri.prefs_dump()["title"] == "shed desktop — Preferences"
+    # The reported values converge on the backend truth (the window fetches on mount).
+    tauri.wait_until(lambda: _prefs_values(tauri).get("policy") == ssh["policy"],
+                     timeout=15, what="reported ssh policy matches the coordinator")
+    v = tauri.prefs_dump()["prefs"]["values"]
+    assert v["method"] == ssh["method"] and v["ttl"] == ssh["ttl"]
+    assert v["preset"] == prefs["terminal_preset"]
+    assert v["login"] == login
+    # Sections render in mac order; General + Terminal are always present.
+    assert _prefs_sections(tauri)[:2] == ["general", "terminal"]
+    # Defensive: Preferences is no longer a dashboard modal.
+    assert tauri.modal() != "prefs"
+    # Close hides (never destroys)...
+    tauri.prefs_close()
+    tauri.wait_until(lambda: tauri.prefs_dump()["visible"] is False,
+                     timeout=15, what="preferences window hidden after prefs.close")
+    # ...and a reopen (via the mac-named alias op) re-fronts the same window.
+    tauri.open_preferences()
+    tauri.wait_until(lambda: tauri.prefs_dump()["visible"] is True,
+                     timeout=15, what="preferences window re-shown")
+    # On the real WebView it paints (the screenshot is TCC-gated on macOS).
+    if platform.system() != "Darwin":
+        png, w, h = tauri.screenshot(scale=1)
+        assert png[:8] == PNG_MAGIC and w > 0 and h > 0
+    tauri.prefs_close()
+
+
+def test_preferences_theme_sync(tauri):
+    # The prefs window follows the app-wide appearance: ui.set_appearance updates the
+    # Rust AppearanceState + broadcasts set-appearance to every window, so both the
+    # dashboard AND the Preferences window flip together. Restore light after.
+    _open_prefs(tauri)
+    try:
+        tauri.set_appearance("dark")
+        tauri.wait_until(lambda: _prefs_snapshot(tauri).get("mode") == "dark",
+                         timeout=15, what="prefs window mode=dark")
+        tauri.wait_until(lambda: (tauri.computed_style() or {}).get("mode") == "dark",
+                         timeout=15, what="dashboard mode=dark")
+    finally:
+        tauri.set_appearance("light")
+        tauri.wait_until(lambda: _prefs_snapshot(tauri).get("mode") == "light",
+                         timeout=15, what="prefs window mode=light")
+        tauri.prefs_close()
+
+
+def test_preferences_gated_sections(tauri, fake):
+    # The approval sections are namespace-gated (mac parity): they appear only for
+    # the namespaces the host agent delegates (hello_ack gate_namespaces). Narrowing
+    # the fake's delegation to ssh-only (a reconnect re-handshakes) drops the
+    # aws/docker sections; restoring it brings them back.
+    assert fake.wait_connected()
+    _open_prefs(tauri)
+    # The default fake delegates all three → every approval section shows.
+    tauri.wait_until(lambda: {"ssh", "aws", "docker"} <= set(_prefs_sections(tauri)),
+                     timeout=15, what="all three gated sections visible")
+    assert "approvals-empty" not in _prefs_sections(tauri)
+    hellos = fake.hello_count
+    try:
+        fake.gate_namespaces = ["ssh-agent"]
+        fake.drop_connection()
+        assert fake.wait_hello_count(hellos + 1), "client did not re-handshake"
+        tauri.wait_until(
+            lambda: "ssh" in _prefs_sections(tauri)
+            and not {"aws", "docker"} & set(_prefs_sections(tauri)),
+            timeout=20, what="ssh-only delegation drops the aws/docker sections")
+        # Defensive: the prefs surface never reappears as a dashboard modal.
+        assert tauri.modal() != "prefs"
+    finally:
+        fake.gate_namespaces = ["ssh-agent", "aws-credentials", "docker-credentials"]
+        fake.drop_connection()
+        fake.wait_hello_count(hellos + 2)
+        tauri.wait_until(lambda: {"ssh", "aws", "docker"} <= set(_prefs_sections(tauri)),
+                         timeout=20, what="all three gated sections restored")
+        tauri.prefs_close()
+
+
+def test_preferences_shed_rules(tauri, fake):
+    # Per-shed overrides (mac parity): a persisted approval decision installs a
+    # per-shed rule → the section appears in prefs.dump with the rows counted;
+    # removing the rule (prefs.remove_shed_rule — the row button's path) drops it
+    # again. Asserted against ENGINE truth (policy.list) rather than a fixed count:
+    # extra_rules persisted by earlier tests survive the per-test policy.set reset
+    # and get recomposed into the engine by the next rebuild, so the absolute count
+    # isn't ours to pin — the window must simply mirror the engine's shed-rule set.
+    assert fake.wait_connected()
+
+    def engine_shed_rules() -> list[dict]:
+        return [r for r in tauri.policy_list() if r.get("scope") == "shed"]
+
+    def mine() -> list[dict]:
+        return [r for r in engine_shed_rules() if r.get("shed") == "prefs-rules-shed"]
+
+    _open_prefs(tauri)
+    rid = fake.emit_request("ssh-agent", "sign", "prefs-rules-shed")
+    tauri.wait_until(lambda: any(a["id"] == rid for a in tauri.approvals_list()),
+                     timeout=15, what="approval request queued")
+    tauri.approval_decide(rid, "approve", scope="per-shed", persist=True)
+    # The rule lands in the engine, and the window mirrors the engine's rule set.
+    tauri.wait_until(lambda: mine(), timeout=15, what="persisted rule in policy.list")
+    tauri.wait_until(
+        lambda: _prefs_values(tauri).get("shed_rules_count") == len(engine_shed_rules()),
+        timeout=15, what="prefs.dump mirrors the engine's shed rules")
+    assert "shed-overrides" in _prefs_sections(tauri)
+    tauri.remove_shed_rule(mine()[0].get("server") or "", "prefs-rules-shed")
+    tauri.wait_until(lambda: not mine(), timeout=15, what="rule removed from the engine")
+    tauri.wait_until(
+        lambda: _prefs_values(tauri).get("shed_rules_count") == len(engine_shed_rules()),
+        timeout=15, what="prefs.dump mirrors the removal")
+    if not engine_shed_rules():
+        assert "shed-overrides" not in _prefs_sections(tauri)
+    tauri.prefs_close()
 
 
 def test_new_shed_dialog_opens(tauri):

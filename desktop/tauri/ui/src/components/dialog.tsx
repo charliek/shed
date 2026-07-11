@@ -27,7 +27,7 @@ export function useEscClose(onClose: () => void, enabled = true) {
 }
 
 /** The backdrop scrim. `mark` stamps a `data-<mark>` attr the harness can look for
-    (parity with the old data-prefs/data-create markers). Backdrop mousedown closes. */
+    (e.g. data-create / data-launch). Backdrop mousedown closes. */
 export function Scrim({ onClose, mark, children }: { onClose: () => void; mark?: string; children: React.ReactNode }) {
   const markAttr = mark ? { [`data-${mark}`]: "" } : {};
   return (
