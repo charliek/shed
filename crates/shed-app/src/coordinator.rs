@@ -118,6 +118,17 @@ enum Command {
         rules: Vec<PolicyRule>,
         reply: oneshot::Sender<()>,
     },
+    SetProviderMode {
+        ns: String,
+        decision: ApprovalDecision,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    ProviderModes(oneshot::Sender<HashMap<String, ApprovalDecision>>),
+    RemoveShedRule {
+        server: String,
+        shed: String,
+        reply: oneshot::Sender<()>,
+    },
     ApprovalsList(oneshot::Sender<Vec<PendingApprovalItem>>),
     ActivityList {
         limit: usize,
@@ -250,6 +261,42 @@ impl Coordinator {
         {
             let _ = rx.await;
         }
+    }
+
+    /// Set an AWS/Docker provider approval mode (the Preferences segmented
+    /// Allow|Deny). Rebuilds the namespace policy from the new mode. REJECTS any
+    /// namespace other than `aws-credentials`/`docker-credentials` (only those two
+    /// providers are driven by a persistent mode; SSH has its own prefs path).
+    pub async fn set_provider_mode(
+        &self,
+        ns: impl Into<String>,
+        decision: ApprovalDecision,
+    ) -> Result<(), String> {
+        self.request(|reply| Command::SetProviderMode {
+            ns: ns.into(),
+            decision,
+            reply,
+        })
+        .await
+        .unwrap_or_else(|| Err("coordinator stopped".into()))
+    }
+
+    /// The current provider (AWS/Docker) modes — the single source of truth the
+    /// Preferences getter reads back (a namespace absent from the map is Deny).
+    pub async fn provider_modes(&self) -> HashMap<String, ApprovalDecision> {
+        self.request(Command::ProviderModes).await.unwrap_or_default()
+    }
+
+    /// Remove exactly ONE per-shed rule (the Preferences "Per-shed overrides"
+    /// row's remove button) and rebuild the policy — unlike [`set_policy_rules`],
+    /// which replaces the whole engine (test-mode only).
+    pub async fn remove_shed_rule(&self, server: impl Into<String>, shed: impl Into<String>) {
+        self.request(|reply| Command::RemoveShedRule {
+            server: server.into(),
+            shed: shed.into(),
+            reply,
+        })
+        .await;
     }
 
     pub async fn approvals_list(&self) -> Vec<PendingApprovalItem> {
@@ -386,6 +433,24 @@ async fn run(mut state: State, mut rx: mpsc::UnboundedReceiver<Command>) {
                 // rebuild_policy() (that prepends SSH/AWS/Docker namespace rules).
                 state.engine = PolicyEngine::new(rules);
                 state.reevaluate_pending();
+                let _ = reply.send(());
+            }
+            Command::SetProviderMode {
+                ns,
+                decision,
+                reply,
+            } => {
+                let _ = reply.send(state.set_provider_mode(ns, decision));
+            }
+            Command::ProviderModes(reply) => {
+                let _ = reply.send(state.provider_modes.clone());
+            }
+            Command::RemoveShedRule {
+                server,
+                shed,
+                reply,
+            } => {
+                state.remove_shed_rule(&server, &shed);
                 let _ = reply.send(());
             }
             Command::ApprovalsList(reply) => {
@@ -893,6 +958,39 @@ impl State {
             .unwrap_or(ApprovalDecision::Deny)
     }
 
+    /// Set an AWS/Docker provider mode, then rebuild the policy so the namespace
+    /// rule reflects it (and re-evaluate the pending queue for parity with the SSH
+    /// path). Only the two provider namespaces are accepted — anything else is a
+    /// caller error (SSH has its own prefs path; other namespaces have no mode).
+    fn set_provider_mode(
+        &mut self,
+        ns: String,
+        decision: ApprovalDecision,
+    ) -> Result<(), String> {
+        if ns != namespace::AWS && ns != namespace::DOCKER {
+            return Err(format!("provider mode not settable for namespace {ns:?}"));
+        }
+        self.provider_modes.insert(ns, decision);
+        self.rebuild_policy();
+        self.reevaluate_pending();
+        Ok(())
+    }
+
+    /// Remove the per-shed rule(s) matching (server, shed) from `extra_rules` and
+    /// rebuild the policy. `add_shed_rule` dedupes so there is normally one match,
+    /// but hydrated (hand-edited) prefs may carry duplicates — removal clears them
+    /// all. Mirrors [`add_shed_rule`](Self::add_shed_rule)'s retain predicate
+    /// (server matched verbatim — `""` is not collapsed to `None`).
+    fn remove_shed_rule(&mut self, server: &str, shed: &str) {
+        self.extra_rules.retain(|r| {
+            !(r.scope == PolicyScope::Shed
+                && r.shed.as_deref() == Some(shed)
+                && r.server.as_deref() == Some(server))
+        });
+        self.rebuild_policy();
+        self.reevaluate_pending();
+    }
+
     fn reset_ssh_grants(&mut self) {
         self.session_grants
             .retain(|k, _| k.namespace != namespace::SSH);
@@ -1287,6 +1385,14 @@ mod tests {
             scope: None,
             ttl: None,
             persist: false,
+        }
+    }
+    fn persist_approve() -> ApprovalChoice {
+        ApprovalChoice {
+            decision: ApprovalDecision::Approve,
+            scope: None,
+            ttl: None,
+            persist: true,
         }
     }
 
@@ -1859,5 +1965,91 @@ mod tests {
         let list = h.coord.approvals_list().await;
         assert_eq!(list.len(), 1); // still pending
         assert_eq!(list[0].gate, PolicyGate::BiometricsOrPassword); // gate refreshed
+    }
+
+    #[tokio::test]
+    async fn provider_mode_deny_by_default_then_set_approve_flips_policy() {
+        // Deny-when-unset is fail-closed (pin it): with no provider mode set, a
+        // docker-credentials request is auto-denied by the namespace policy rule.
+        let h = Harness::new(1_000);
+        assert!(
+            h.coord.provider_modes().await.is_empty(),
+            "provider modes start unset (Deny by default)"
+        );
+        h.inject(req("d1", namespace::DOCKER, "s", "", 5_000));
+        assert!(h.wait_calls(1).await);
+        assert_eq!(h.responder.calls()[0].decision, ApprovalDecision::Deny);
+        assert_eq!(h.responder.calls()[0].decided_by, DecidedBy::Policy);
+
+        // Setting docker → Approve flips the namespace rule; the getter reflects it.
+        h.coord
+            .set_provider_mode(namespace::DOCKER, ApprovalDecision::Approve)
+            .await
+            .expect("docker is a settable provider namespace");
+        assert_eq!(
+            h.coord.provider_modes().await.get(namespace::DOCKER).copied(),
+            Some(ApprovalDecision::Approve)
+        );
+        h.inject(req("d2", namespace::DOCKER, "s", "", 5_000));
+        assert!(h.wait_calls(2).await);
+        assert_eq!(h.responder.calls()[1].decision, ApprovalDecision::Approve);
+        assert_eq!(h.responder.calls()[1].decided_by, DecidedBy::Policy);
+    }
+
+    #[tokio::test]
+    async fn provider_mode_rejects_non_provider_namespace() {
+        // Only aws-credentials/docker-credentials are settable; SSH (its own prefs
+        // path) and any other namespace are rejected and leave the map untouched.
+        let h = Harness::new(1_000);
+        assert!(h
+            .coord
+            .set_provider_mode(namespace::SSH, ApprovalDecision::Approve)
+            .await
+            .is_err());
+        assert!(h
+            .coord
+            .set_provider_mode("bogus-namespace", ApprovalDecision::Deny)
+            .await
+            .is_err());
+        assert!(
+            h.coord.provider_modes().await.is_empty(),
+            "a rejected set must not mutate the provider-mode map"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_shed_rule_removes_exactly_one_and_rebuilds() {
+        // Seed two per-shed approve rules (via the approve+persist path), then remove
+        // one: the other survives, the removed one is gone, and rebuild_policy re-
+        // extends the namespace rules (proof the engine was rebuilt, not replaced).
+        let h = Harness::new(1_000); // default SSH policy prompts
+        h.inject(ssh_req("ra", "a", 5_000));
+        assert!(h.wait_queued(1).await);
+        h.coord.decide_approval("ra", persist_approve()).await;
+        assert!(h.wait_calls(1).await);
+        h.inject(ssh_req("rb", "b", 5_000));
+        assert!(h.wait_queued(1).await);
+        h.coord.decide_approval("rb", persist_approve()).await;
+        assert!(h.wait_calls(2).await);
+
+        let has_shed = |rules: &[PolicyRule], shed: &str| {
+            rules
+                .iter()
+                .any(|r| r.scope == PolicyScope::Shed && r.shed.as_deref() == Some(shed))
+        };
+        let rules = h.coord.policy_list().await;
+        assert!(has_shed(&rules, "a") && has_shed(&rules, "b"));
+
+        // Remove shed "a" (server "" — ssh_req uses the unnamed single server).
+        h.coord.remove_shed_rule("", "a").await;
+        let rules = h.coord.policy_list().await;
+        assert!(!has_shed(&rules, "a"), "the removed rule must be gone");
+        assert!(has_shed(&rules, "b"), "the other rule must survive");
+        // The namespace rules are re-extended → the engine was rebuilt, not emptied.
+        assert!(
+            rules.iter().any(|r| r.scope == PolicyScope::Namespace
+                && r.namespace.as_deref() == Some(namespace::SSH)),
+            "rebuild_policy must re-add the SSH namespace rule: {rules:?}"
+        );
     }
 }

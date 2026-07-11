@@ -308,6 +308,40 @@ def test_ssh_prefs_round_trip_and_partial_update(tauri):
         )
 
 
+def test_provider_mode_round_trip_drives_docker_policy(tauri, fake):
+    # D: the AWS/Docker provider mode is drivable + observable AND actually changes
+    # the coordinator's namespace policy. The fake host-agent delegates docker-
+    # credentials, so a set→emit→response round-trip proves the mode governs the
+    # auto-decision (the approvals-matrix pattern). Restore Deny after (the app +
+    # coordinator are session-scoped, so a left-over Approve would leak).
+    assert fake.wait_connected()
+    try:
+        # Approve → a docker request auto-approves by policy (no prompt/queue).
+        tauri.set_provider_mode("docker-credentials", "approve")
+        tauri.wait_until(
+            lambda: tauri.provider_modes_get().get("docker-credentials") == "approve",
+            timeout=15, what="docker mode == approve")
+        rid = fake.emit_request("docker-credentials", "get_credentials", "prov-approve-shed")
+        resp = fake.wait_response(rid)
+        assert resp and resp["decision"] == "approve" and resp["decided_by"] == "policy"
+
+        # Deny → a docker request auto-denies by policy (fail-closed).
+        tauri.set_provider_mode("docker-credentials", "deny")
+        tauri.wait_until(
+            lambda: tauri.provider_modes_get().get("docker-credentials") == "deny",
+            timeout=15, what="docker mode == deny")
+        rid2 = fake.emit_request("docker-credentials", "get_credentials", "prov-deny-shed")
+        resp2 = fake.wait_response(rid2)
+        assert resp2 and resp2["decision"] == "deny" and resp2["decided_by"] == "policy"
+
+        # A non-provider namespace is rejected (SSH has its own prefs path).
+        with pytest.raises(ShedError) as e:
+            tauri.set_provider_mode("ssh-agent", "approve")
+        assert e.value.code == "bad_request"
+    finally:
+        tauri.set_provider_mode("docker-credentials", "deny")
+
+
 def test_loginitem_probe(tauri):
     # B4: launch-at-login is drivable + observable (the Swift PreferencesView
     # "Launch at login" toggle parity). On Linux (the shipped target) `auto-launch`

@@ -371,6 +371,17 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         UI truth (empty unless the UI is on the agents pane)."""
         return self.call("agents.dump")["sessions"]
 
+    def provider_modes_get(self) -> dict:
+        """The AWS/Docker provider approval modes ({namespace: 'approve'|'deny'}) —
+        the read side of set_provider_mode. A namespace absent from the map is Deny."""
+        return self.call("prefs.provider_modes")
+
+    def set_provider_mode(self, namespace: str, decision: str) -> None:
+        """Set an AWS/Docker provider mode + persist. `namespace` is the full string
+        ('aws-credentials'|'docker-credentials'); `decision` is 'approve'|'deny'. A
+        non-provider namespace is rejected (bad_request)."""
+        self.call("prefs.set_provider", {"namespace": namespace, "decision": decision})
+
     def activate(self) -> None:
         self.call("app.activate")
 

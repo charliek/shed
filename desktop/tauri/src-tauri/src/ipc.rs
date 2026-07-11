@@ -259,6 +259,10 @@ impl Handler {
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
             "prefs.set_terminal" => self.prefs_set_terminal(params),
+            // Provider (AWS/Docker) approval modes — the production Preferences
+            // surface (ungated, unlike test-mode `policy.set`).
+            "prefs.provider_modes" => self.provider_modes().await,
+            "prefs.set_provider" => self.set_provider(params).await,
             // -- approvals (the security spine) --
             "approvals.list" => self.approvals_list().await,
             "approval.decide" => self.approval_decide(params).await,
@@ -357,6 +361,14 @@ impl Handler {
         let mode = params.get("mode").and_then(Value::as_str).unwrap_or("");
         if !matches!(mode, "light" | "dark") {
             return Err(err("bad_request", format!("unknown mode: {mode:?}")));
+        }
+        // Update the managed appearance cell DIRECTLY (in Rust) before emitting, so a
+        // window reading `get_appearance_state` sees the new value even if its
+        // `set-appearance` listener hasn't attached yet (kills the attach race).
+        if let Some(cell) = self.app.try_state::<crate::AppearanceState>() {
+            if let Ok(mut cur) = cell.0.lock() {
+                *cur = Some(mode.to_string());
+            }
         }
         let _ = self.app.emit("set-appearance", json!({ "mode": mode }));
         Ok(json!({}))
@@ -731,6 +743,7 @@ impl Handler {
         }
         let p: P = serde_json::from_value(params.clone())
             .map_err(|e| err("bad_request", e.to_string()))?;
+        let persist = p.persist;
         self.coordinator
             .decide_approval(
                 p.id,
@@ -738,10 +751,15 @@ impl Handler {
                     decision: p.decision,
                     scope: p.scope,
                     ttl: p.ttl,
-                    persist: p.persist,
+                    persist,
                 },
             )
             .await;
+        // A persisted decision adds a per-shed rule — mirror it into prefs.json (same
+        // path as the frontend command) so the override survives a restart.
+        if persist {
+            crate::persist_shed_rules(&self.prefs, &self.coordinator).await;
+        }
         Ok(json!({}))
     }
 
@@ -835,6 +853,31 @@ impl Handler {
     /// harness can assert what a set actually applied (the drivability North Star).
     async fn ssh_prefs(&self) -> Result<Value, (String, String)> {
         Ok(json!(self.coordinator.ssh_prefs().await))
+    }
+
+    /// `prefs.provider_modes` → the coordinator's current AWS/Docker approval modes
+    /// (`{namespace: "approve"|"deny"}`) — the read side of `prefs.set_provider`.
+    async fn provider_modes(&self) -> Result<Value, (String, String)> {
+        Ok(json!(self.coordinator.provider_modes().await))
+    }
+
+    /// `prefs.set_provider {namespace, decision}` → set an AWS/Docker provider mode +
+    /// persist (the same path as the frontend `set_provider_mode` command). The
+    /// coordinator rejects a non-provider namespace (surfaced as `bad_request`).
+    async fn set_provider(&self, params: &Value) -> Result<Value, (String, String)> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            namespace: String,
+            decision: ApprovalDecision,
+        }
+        let p: P = serde_json::from_value(params.clone())
+            .map_err(|e| err("bad_request", e.to_string()))?;
+        self.coordinator
+            .set_provider_mode(p.namespace, p.decision)
+            .await
+            .map_err(|e| err("bad_request", e))?;
+        crate::persist_provider_modes(&self.prefs, &self.coordinator).await;
+        Ok(json!({}))
     }
 
     /// `loginitem.set {enabled}` → enable/disable launch-at-login (the Preferences

@@ -419,6 +419,56 @@ export async function setSshApproval(method?: string, policy?: string, ttl?: str
   await invoke("set_ssh_approval", { method, policy, ttl });
 }
 
+/** The AWS/Docker provider approval modes, keyed by the full namespace string
+ *  (`aws-credentials`/`docker-credentials`) → `"approve"` | `"deny"`. A namespace
+ *  absent from the map is Deny (fail-closed default). */
+export type ProviderModes = Record<string, "approve" | "deny">;
+
+export async function getProviderModes(): Promise<ProviderModes> {
+  return (await invoke<ProviderModes>("provider_modes_get")) ?? {};
+}
+
+/** Set an AWS/Docker provider mode. THROWS on a rejected namespace (the coordinator
+ *  only accepts the two providers), unlike the error-swallowing `invoke`. */
+export async function setProviderMode(
+  ns: "aws-credentials" | "docker-credentials",
+  decision: "approve" | "deny",
+): Promise<void> {
+  const core = await import("@tauri-apps/api/core");
+  await core.invoke("set_provider_mode", { ns, decision });
+}
+
+/** A per-shed override rule (the Preferences "Per-shed overrides" list). */
+export type ShedRule = {
+  scope: string;
+  server?: string | null;
+  namespace?: string | null;
+  shed?: string | null;
+  action: "approve" | "deny" | "prompt";
+  gate?: string;
+};
+
+export async function listShedRules(): Promise<ShedRule[]> {
+  return (await invoke<ShedRule[]>("policy_list_shed")) ?? [];
+}
+
+/** Remove one per-shed override rule (its row's remove button). */
+export async function removeShedRule(server: string, shed: string): Promise<void> {
+  await invoke("remove_shed_rule", { server, shed });
+}
+
+/** The app-wide light/dark appearance, read synchronously by the Preferences window
+ *  on mount (`null` = unset → fall back to `prefers-color-scheme`). */
+export async function getAppearanceState(): Promise<"light" | "dark" | null> {
+  return (await invoke<{ mode: "light" | "dark" | null }>("get_appearance_state"))?.mode ?? null;
+}
+
+/** Broadcast a light/dark change app-wide (idempotent — no re-emit when unchanged).
+ *  Invoked from the dashboard's mode effect so every window stays in sync. */
+export async function setAppearanceState(mode: "light" | "dark"): Promise<void> {
+  await invoke("set_appearance_state", { mode });
+}
+
 /** Keep a coordinator-backed slice live: fetch on mount, then re-fetch whenever
  *  the coordinator emits `event` (the TauriEventSink app.emit). `fetch` is held
  *  in a ref so the subscription is set up once (a no-op in a plain browser). */
