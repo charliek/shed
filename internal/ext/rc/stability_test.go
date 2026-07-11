@@ -31,104 +31,154 @@ func mustTick(t *testing.T, tr *StabilityTracker) Activity {
 	return a
 }
 
-func TestStabilityChangingIsWorking(t *testing.T) {
-	tr, pane, clk := scriptedTracker(KindShell, 4*time.Second)
+// stabilityStep scripts one Tick: advance the clock, optionally replace the pane,
+// then Tick and assert the derived Activity.
+type stabilityStep struct {
+	advance time.Duration
+	pane    string
+	setPane bool
+	want    Activity
+}
 
-	*pane = "frame A"
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("first capture = %q, want working", a)
+// TestStabilityScenarios is the table-driven engine behavior suite: each case scripts
+// a pane/clock sequence for a kind and asserts the Activity at every Tick. Focused
+// tests (TestStabilityCaptureError, TestNormalizeDurationTokenSubstitution,
+// TestNormalizeSpinnerChurn) cover error and normalization-specific behavior.
+func TestStabilityScenarios(t *testing.T) {
+	const (
+		cursorPlaceholder = "  Cursor Agent\n\n\n  → Plan, search, build anything\n\n  Auto\n"
+		cursorFollowUp    = "  reply done\n\n  → Add a follow-up\n\n  Auto · 4.9%\n"
+		spinner1          = "⠋ Thinking\nBuild · Big Pickle · 3.6s\n8,390 tokens\n4% used\n$0.00 spent\nresult text here"
+		spinner2          = "⠙ Thinking\nBuild · Big Pickle · 4.1s\n8,450 tokens\n5% used\n$0.01 spent\nresult text here"
+		spinner3          = "⠹ Thinking\nBuild · Big Pickle · 4.9s\n8,510 tokens\n6% used\n$0.02 spent\nresult text here"
+	)
+	cases := []struct {
+		name  string
+		kind  Kind
+		quiet time.Duration
+		steps []stabilityStep
+	}{
+		{
+			name:  "changing pane stays working despite long elapsed time",
+			kind:  KindShell,
+			quiet: 4 * time.Second,
+			steps: []stabilityStep{
+				{pane: "frame A", setPane: true, want: ActivityWorking},
+				// A changed pane keeps reading working even after long elapsed time —
+				// the quiet timer resets on every change.
+				{advance: 30 * time.Second, pane: "frame B — new output", setPane: true, want: ActivityWorking},
+				{advance: 30 * time.Second, pane: "frame C — more output", setPane: true, want: ActivityWorking},
+			},
+		},
+		{
+			// KindShell's anchor is the shed PS1 prompt; a non-prompt pane never matches
+			// it, so a quiet pane reads idle rather than needs_input.
+			name:  "quiet non-prompt pane is idle",
+			kind:  KindShell,
+			quiet: 4 * time.Second,
+			steps: []stabilityStep{
+				{pane: "the agent printed a result and stopped", setPane: true, want: ActivityWorking},
+				{advance: 2 * time.Second, want: ActivityWorking}, // stable, not yet quiet
+				{advance: 3 * time.Second, want: ActivityIdle},    // total 5s >= 4s
+			},
+		},
+		{
+			// A stable pane at cursor's composer placeholder matches cursorReadyRe.
+			name:  "quiet cursor placeholder anchor is needs_input",
+			kind:  KindCursor,
+			quiet: 4 * time.Second,
+			steps: []stabilityStep{
+				{pane: cursorPlaceholder, setPane: true, want: ActivityWorking},
+				{advance: 5 * time.Second, want: ActivityNeedsInput},
+			},
+		},
+		{
+			// The mid-conversation composer ("→ Add a follow-up") is also an anchor.
+			name:  "quiet cursor follow-up anchor is needs_input",
+			kind:  KindCursor,
+			quiet: 4 * time.Second,
+			steps: []stabilityStep{
+				{pane: cursorFollowUp, setPane: true, want: ActivityWorking},
+				{advance: 5 * time.Second, want: ActivityNeedsInput},
+			},
+		},
+		{
+			// A pane whose only churn is a spinner glyph, an elapsed timer, and ticking
+			// token/context/spend readouts normalizes to a stable snapshot and reads idle.
+			name:  "spinner-only churn is idle after quiet",
+			kind:  KindShell,
+			quiet: 4 * time.Second,
+			steps: []stabilityStep{
+				{pane: spinner1, setPane: true, want: ActivityWorking},
+				// raw-different, normalized-identical → still stable, not yet quiet.
+				{advance: 2 * time.Second, pane: spinner2, setPane: true, want: ActivityWorking},
+				{advance: 3 * time.Second, pane: spinner3, setPane: true, want: ActivityIdle},
+			},
+		},
+		{
+			// A quiet session that PRINTS a new line containing a duration must flip back
+			// to working — token substitution keeps the line in the diff.
+			name:  "new duration-bearing line flips back to working",
+			kind:  KindShell,
+			quiet: 4 * time.Second,
+			steps: []stabilityStep{
+				{pane: "agent output", setPane: true, want: ActivityWorking},
+				{advance: 5 * time.Second, want: ActivityIdle},
+				{pane: "agent output\ntest suite took 3s", setPane: true, want: ActivityWorking},
+			},
+		},
+		{
+			name:  "empty pane with no anchor is idle when quiet",
+			kind:  KindOpencode,
+			quiet: 4 * time.Second,
+			steps: []stabilityStep{
+				{pane: "", setPane: true, want: ActivityWorking}, // blank pane (just-started / cleared)
+				{advance: 5 * time.Second, want: ActivityIdle},
+			},
+		},
+		{
+			// quiet <= 0 falls back to DefaultQuietPeriod.
+			name:  "quiet<=0 falls back to DefaultQuietPeriod",
+			kind:  KindShell,
+			quiet: 0,
+			steps: []stabilityStep{
+				{pane: "static", setPane: true, want: ActivityWorking},
+				{advance: DefaultQuietPeriod - time.Millisecond, want: ActivityWorking},
+				{advance: 2 * time.Millisecond, want: ActivityIdle},
+			},
+		},
 	}
-	// A changed pane keeps reading working even after long elapsed time — the quiet
-	// timer resets on every change.
-	clk.advance(30 * time.Second)
-	*pane = "frame B — new output"
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("changed pane = %q, want working", a)
-	}
-	clk.advance(30 * time.Second)
-	*pane = "frame C — more output"
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("still-changing pane = %q, want working", a)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr, pane, clk := scriptedTracker(tc.kind, tc.quiet)
+			for i, s := range tc.steps {
+				if s.advance > 0 {
+					clk.advance(s.advance)
+				}
+				if s.setPane {
+					*pane = s.pane
+				}
+				if a := mustTick(t, tr); a != s.want {
+					t.Fatalf("step %d: activity = %q, want %q", i, a, s.want)
+				}
+			}
+		})
 	}
 }
 
-func TestStabilityQuietIsIdle(t *testing.T) {
-	// KindShell's anchor is the shed PS1 prompt; a non-prompt pane never matches it,
-	// so a quiet pane reads idle rather than needs_input.
-	tr, pane, clk := scriptedTracker(KindShell, 4*time.Second)
-
-	*pane = "the agent printed a result and stopped"
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("first capture = %q, want working", a)
-	}
-	// Unchanged but not yet quiet-long: still working.
-	clk.advance(2 * time.Second)
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("stable <quiet = %q, want working (not yet quiet)", a)
-	}
-	// Crossing the quiet threshold flips to idle.
-	clk.advance(3 * time.Second) // total 5s >= 4s
-	if a := mustTick(t, tr); a != ActivityIdle {
-		t.Fatalf("stable >=quiet = %q, want idle", a)
-	}
-}
-
-func TestStabilityQuietAtPromptIsNeedsInput(t *testing.T) {
-	tr, pane, clk := scriptedTracker(KindCursor, 4*time.Second)
-
-	// A stable pane sitting at cursor's composer placeholder (matches cursorReadyRe).
-	*pane = "  Cursor Agent\n\n\n  → Plan, search, build anything\n\n  Auto\n"
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("first capture = %q, want working", a)
-	}
-	clk.advance(5 * time.Second)
-	if a := mustTick(t, tr); a != ActivityNeedsInput {
-		t.Fatalf("quiet pane at prompt anchor = %q, want needs_input", a)
-	}
-
-	// The mid-conversation composer ("→ Add a follow-up") is also an input anchor.
-	tr2, pane2, clk2 := scriptedTracker(KindCursor, 4*time.Second)
-	*pane2 = "  reply done\n\n  → Add a follow-up\n\n  Auto · 4.9%\n"
-	mustTick(t, tr2)
-	clk2.advance(5 * time.Second)
-	if a := mustTick(t, tr2); a != ActivityNeedsInput {
-		t.Fatalf("quiet pane at follow-up anchor = %q, want needs_input", a)
-	}
-}
-
-func TestStabilitySpinnerOnlyDiffIsIdleAfterQuiet(t *testing.T) {
-	// KindShell so the anchor never matches (these frames are not a shed prompt) —
-	// the interesting property is that a pane whose ONLY churn is a spinner glyph,
-	// an elapsed timer, and ticking token/context/spend readouts still normalizes to
-	// a stable snapshot and reads idle.
-	tr, pane, clk := scriptedTracker(KindShell, 4*time.Second)
-
+// TestNormalizeSpinnerChurn is the focused normalization property behind the
+// spinner-only stability scenario: raw-different spinner/timer/counter frames must
+// normalize identically so the pane reads stable.
+func TestNormalizeSpinnerChurn(t *testing.T) {
 	frame1 := "⠋ Thinking\nBuild · Big Pickle · 3.6s\n8,390 tokens\n4% used\n$0.00 spent\nresult text here"
 	frame2 := "⠙ Thinking\nBuild · Big Pickle · 4.1s\n8,450 tokens\n5% used\n$0.01 spent\nresult text here"
 	frame3 := "⠹ Thinking\nBuild · Big Pickle · 4.9s\n8,510 tokens\n6% used\n$0.02 spent\nresult text here"
-
-	// Sanity: the raw frames genuinely differ, but normalize identically.
 	if frame1 == frame2 {
 		t.Fatal("test frames must differ raw")
 	}
 	if normalizePane(frame1) != normalizePane(frame2) || normalizePane(frame2) != normalizePane(frame3) {
 		t.Fatalf("spinner/timer/counter churn survived normalization:\n%q\n%q",
 			normalizePane(frame1), normalizePane(frame2))
-	}
-
-	*pane = frame1
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("first capture = %q, want working", a)
-	}
-	clk.advance(2 * time.Second)
-	*pane = frame2 // raw-different, normalized-identical → still stable, not yet quiet
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("normalized-stable <quiet = %q, want working", a)
-	}
-	clk.advance(3 * time.Second) // total quiet duration crossed
-	*pane = frame3
-	if a := mustTick(t, tr); a != ActivityIdle {
-		t.Fatalf("spinner-only churn after quiet = %q, want idle", a)
 	}
 }
 
@@ -187,36 +237,6 @@ func TestNormalizeDurationTokenSubstitution(t *testing.T) {
 	})
 }
 
-func TestStabilityNewDurationLineIsWorking(t *testing.T) {
-	// Engine-level version of the new-line case: a quiet session that PRINTS a new
-	// line containing a duration must flip back to working — token substitution keeps
-	// the line in the diff, unlike the old whole-line drop.
-	tr, pane, clk := scriptedTracker(KindShell, 4*time.Second)
-	*pane = "agent output"
-	mustTick(t, tr)
-	clk.advance(5 * time.Second)
-	if a := mustTick(t, tr); a != ActivityIdle {
-		t.Fatalf("stable pane = %q, want idle", a)
-	}
-	*pane = "agent output\ntest suite took 3s"
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("new duration-bearing line = %q, want working", a)
-	}
-}
-
-func TestStabilityEmptyPane(t *testing.T) {
-	tr, pane, clk := scriptedTracker(KindOpencode, 4*time.Second)
-
-	*pane = "" // blank pane (just-started / cleared)
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("first empty capture = %q, want working", a)
-	}
-	clk.advance(5 * time.Second)
-	if a := mustTick(t, tr); a != ActivityIdle {
-		t.Fatalf("stable empty pane = %q, want idle (no anchor match)", a)
-	}
-}
-
 func TestStabilityCaptureError(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	sentinel := errors.New("tmux session gone")
@@ -228,20 +248,5 @@ func TestStabilityCaptureError(t *testing.T) {
 	}
 	if a != ActivityUnknown {
 		t.Fatalf("Tick on capture error = %q, want unknown", a)
-	}
-}
-
-func TestStabilityDefaultQuietPeriod(t *testing.T) {
-	// quiet <= 0 falls back to DefaultQuietPeriod.
-	tr, pane, clk := scriptedTracker(KindShell, 0)
-	*pane = "static"
-	mustTick(t, tr)
-	clk.advance(DefaultQuietPeriod - time.Millisecond)
-	if a := mustTick(t, tr); a != ActivityWorking {
-		t.Fatalf("just under default quiet = %q, want working", a)
-	}
-	clk.advance(2 * time.Millisecond)
-	if a := mustTick(t, tr); a != ActivityIdle {
-		t.Fatalf("past default quiet = %q, want idle", a)
 	}
 }

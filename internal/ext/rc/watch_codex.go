@@ -115,6 +115,10 @@ func (f *codexFold) applyLine(line []byte) bool {
 		case "task_started":
 			f.confirmed = true
 			f.lastBoundary = "start"
+			// New turn: reset the assistant-text de-dup so a turn whose response is
+			// identical to the previous turn's is emitted rather than swallowed as a
+			// mirrored final_answer. The de-dup is only meaningful WITHIN a turn.
+			f.lastAsstText = ""
 			return true
 		case "task_complete":
 			f.confirmed = true
@@ -143,6 +147,8 @@ func (f *codexFold) applyLine(line []byte) bool {
 		case "user_message":
 			f.confirmed = true
 			f.lastBoundary = "start"
+			// New turn boundary: reset the assistant-text de-dup (see task_started).
+			f.lastAsstText = ""
 			f.emit(feedRoleUser, feedTypeText, p.Message, ts, nil)
 			return true
 		default:

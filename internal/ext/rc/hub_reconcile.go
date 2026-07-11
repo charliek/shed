@@ -100,9 +100,15 @@ func (tr *trackedSession) sameIdentity(s Session) bool {
 }
 
 // reconcile runs one enumeration+tick pass and broadcasts the resulting events. It
-// holds trackMu only while mutating tracked state (events are collected into a
-// slice), then broadcasts after unlocking — so a broadcast can never block reconcile
-// against an SSE handler.
+// holds trackMu only while READING/MUTATING handler-visible tracked fields; it RELEASES
+// the lock around each session's tmux/disk work (ensureWatcher's show/set-environment,
+// tracker.Tick's capture-pane, the JSONL watcher's file reads) so a slow tmux call can
+// never block the HTTP handlers that read tracked state. This is sound because reconcile
+// is the SOLE writer of tracked state (no other goroutine mutates it, so tr and the map
+// entry stay valid across the unlock) and the sub-objects touched unlocked are either
+// self-synchronized (fileWatcher, messageRing) or reconcile-only (tracker,
+// correlateTried, pendingAgentID). Events are collected into a slice and broadcast after
+// the final unlock — so a broadcast can never block reconcile against an SSE handler.
 func (h *Hub) reconcile() {
 	// A transient tmux listing failure must NOT read as "every session is gone" —
 	// that would wipe the message rings, close the watchers, and broadcast a storm of
@@ -142,30 +148,38 @@ func (h *Hub) reconcile() {
 		}
 		tr.lastState = s.State
 
+		// --- Heavy tmux/disk work runs WITHOUT trackMu held (see reconcile's doc). ---
+		// tr and the map entry stay valid across the unlock (reconcile is the sole
+		// writer); the sub-objects touched here are self-synchronized (fileWatcher,
+		// ring) or reconcile-only (tracker, correlateTried, pendingAgentID). The one
+		// handler-visible field produced here — the watcher pointer — is returned and
+		// committed under the lock below, never published unlocked.
+		h.trackMu.Unlock()
+
 		// Lazily correlate the session to its agent JSONL file (codex rollout / claude
-		// transcript). Once correlated, tr.watcher tails it and — when FRESH — overrides
-		// the pane-stability tracker below.
-		h.ensureWatcher(tr, s)
+		// transcript). Once correlated, the watcher tails it and — when FRESH — overrides
+		// the pane-stability tracker below. newW is any watcher freshly created this pass.
+		newW := h.ensureWatcher(tr, s)
+		watcher := tr.watcher // existing committed watcher (read: sole writer, safe unlocked)
+		if newW != nil {
+			watcher = newW
+		}
 
 		// Derive activity. The pane-stability tracker is the universal fallback; a fresh,
 		// correlated JSONL watcher overrides it (mergedActivity). A stability capture
 		// error (transient tmux hiccup) with no fresh watcher leaves the prior activity
 		// untouched rather than flapping the DTO to unknown.
 		raw, capErr := tr.tracker.Tick()
-		if capErr == nil {
-			// Remember the raw stability verdict for the input handler's acceptance
-			// re-check (it re-runs the same watcher+stability merge as below).
-			tr.lastStability = raw
-		}
 
 		var watcherActivity Activity
 		var watcherMessage string
 		watcherFresh, watcherExpiredWorking := false, false
-		if tr.watcher != nil {
-			tr.watcher.refresh(now)
+		var msgEvents []hubEvent
+		if watcher != nil {
+			watcher.refresh(now)
 			// A deferred (ambiguous-correlation) back-write happens only once the first
 			// in-file event confirms the pick — see trackedSession.pendingAgentID.
-			if tr.pendingAgentID != "" && tr.watcher.hadEvent() {
+			if tr.pendingAgentID != "" && watcher.hadEvent() {
 				backWriteAgentSession(h.cfg.runner, s.TmuxSession, tr.pendingAgentID)
 				tr.pendingAgentID = ""
 			}
@@ -173,14 +187,29 @@ func (h *Hub) reconcile() {
 			// session ring (codex only; other kinds' watchers produce none). A per-message
 			// message.appended notification lets subscribers know to fetch /messages — the
 			// body is deliberately not on the SSE frame (keeps fan-out tiny + drop-safe).
-			for _, m := range tr.watcher.drainPending() {
+			// The ring is self-synchronized and events is reconcile-local, so this is
+			// safe to do while unlocked.
+			for _, m := range watcher.drainPending() {
 				seq := tr.ring.append(m, now)
-				events = append(events, messageAppendedEvent(s.Slug, seq))
+				msgEvents = append(msgEvents, messageAppendedEvent(s.Slug, seq))
 			}
-			watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking = tr.watcher.snapshot(now)
+			watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking = watcher.snapshot(now)
 		}
+
+		// --- Re-acquire trackMu to commit handler-visible fields. ---
+		h.trackMu.Lock()
+		if newW != nil {
+			tr.watcher = newW
+		}
+		if capErr == nil {
+			// Remember the raw stability verdict for the input handler's acceptance
+			// re-check (it re-runs the same watcher+stability merge as below).
+			tr.lastStability = raw
+		}
+		events = append(events, msgEvents...)
+
 		if capErr != nil && !watcherFresh {
-			continue // no signal this tick; retain the prior verdict
+			continue // no signal this tick; retain the prior verdict (lock stays held)
 		}
 
 		mergedRaw, mergedMsg := mergedActivity(watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking, raw)
@@ -249,22 +278,26 @@ func (h *Hub) reconcile() {
 const maxCorrelateTries = 40
 
 // ensureWatcher lazily correlates a watchable session (codex/claude) to its JSONL file
-// and attaches a tailing watcher. It is a no-op once a watcher exists, for unwatchable
-// kinds, for sessions in a blocking lifecycle state (no meaningful activity to tail),
-// and once the retry budget is exhausted. On success it back-writes the discovered
-// agent session id into the tmux env so a hub restart re-correlates exactly, and — for
-// an ambiguous window match — follows only new appends (activity stays unknown until an
-// in-file event confirms) rather than trusting a possibly-wrong file's history.
-func (h *Hub) ensureWatcher(tr *trackedSession, s Session) {
+// and builds a tailing watcher, RETURNING it (nil when none was created this call: a
+// watcher already exists, the kind is unwatchable, the session is in a blocking
+// lifecycle state, the retry budget is exhausted, or correlation failed). It runs
+// UNLOCKED from reconcile (tmux show-environment / set-environment), so it must NOT
+// publish tr.watcher — handlers read that field under trackMu; the caller commits the
+// returned watcher under the lock. It DOES mutate tr.correlateTried / tr.pendingAgentID,
+// which are reconcile-only (never read by handlers) and thus safe to touch unlocked.
+// On an unambiguous match it back-writes the discovered agent session id into the tmux
+// env so a hub restart re-correlates exactly; an ambiguous window match follows only
+// new appends (activity stays unknown until an in-file event confirms).
+func (h *Hub) ensureWatcher(tr *trackedSession, s Session) *fileWatcher {
 	if tr.watcher != nil || !watchableKind(s.Kind) {
-		return
+		return nil
 	}
 	switch s.State {
 	case StateNeedsTrust, StateNeedsAuth, StateDead:
-		return // no live activity to tail; retry once the session becomes usable
+		return nil // no live activity to tail; retry once the session becomes usable
 	}
 	if tr.correlateTried >= maxCorrelateTries {
-		return
+		return nil
 	}
 	tr.correlateTried++
 
@@ -282,18 +315,18 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) {
 		corr, ok = correlateClaude(h.cfg.getenv, s.Workdir, agentID, createdAt, hasCreatedAt)
 		fold = newClaudeFold()
 	default:
-		return
+		return nil
 	}
 	if !ok {
-		return
+		return nil
 	}
 
 	// Unambiguous match → do a bounded catch-up read so the current activity is known
 	// immediately. Ambiguous → follow only new appends (unknown until an event confirms
 	// which file is really this session's).
-	tr.watcher = newFileWatcher(corr.path, !corr.ambiguous, fold)
+	w := newFileWatcher(corr.path, !corr.ambiguous, fold)
 	if agentID != "" || corr.sessionID == "" {
-		return
+		return w
 	}
 	if corr.ambiguous {
 		// NEVER back-write an ambiguous pick immediately: a wrong id stamped into the
@@ -301,7 +334,8 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) {
 		// making the mistake permanent. Hold it until the watcher's first in-file event
 		// confirms the pick (see reconcile).
 		tr.pendingAgentID = corr.sessionID
-		return
+		return w
 	}
 	backWriteAgentSession(h.cfg.runner, s.TmuxSession, corr.sessionID)
+	return w
 }

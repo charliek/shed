@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,6 +193,15 @@ func (s *Server) ensureHubReachable(ctx context.Context, shedName string) error 
 	// with the start+reprobe+breaker accounting done exactly once inside the
 	// flight so N racing callers make ONE exec and record ONE breaker outcome.
 	v, _, _ := s.rcHubFlight.Do(shedName, func() (any, error) {
+		// Re-probe at the START of the flight: a caller can observe "absent",
+		// block on an in-progress flight that started the hub, then acquire the
+		// flight itself after that flight ended. Without this re-check it would
+		// exec a SECOND daemon over a now-healthy hub, violating "start at most
+		// once". A healthy hub here short-circuits before any exec.
+		if s.probeHubHealth(ctx, shedName) == hubReachOK {
+			s.rcHubBreaker.success(shedName)
+			return true, nil
+		}
 		_ = s.startHub(ctx, shedName) // a start error still falls through to the reprobe (the hub may have raced up)
 		ok := s.probeHubHealth(ctx, shedName) == hubReachOK
 		if ok {
@@ -324,9 +335,21 @@ func (s *Server) handleRCProxy(w http.ResponseWriter, r *http.Request) {
 		ModifyResponse: func(resp *http.Response) error {
 			if isEvents {
 				resp.Body = newLineCapReadCloser(resp.Body, rcHubEventsLineLimit)
-			} else {
-				resp.Body = boundedReadCloser(resp.Body, rcHubRespBodyLimit)
+				return nil
 			}
+			// Non-streaming (sessions/messages): buffer up to the cap so an
+			// oversized upstream body is rejected as an explicit error BEFORE any
+			// bytes reach the client. An io.LimitReader alone would silently
+			// truncate a >limit body and forward it with the upstream 200 as
+			// malformed JSON; a returned error routes to ErrorHandler → 502.
+			body, err := readAtMostRCHub(resp.Body, rcHubRespBodyLimit)
+			resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			resp.ContentLength = int64(len(body))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 			return nil
 		},
 	}
@@ -364,11 +387,21 @@ func allowlistedHubHeaders(in http.Header) http.Header {
 	return out
 }
 
-// boundedReadCloser wraps rc so at most limit bytes are read from the underlying
-// stream (a defensive cap on non-streaming proxied bodies), preserving Close.
-func boundedReadCloser(rc io.ReadCloser, limit int64) io.ReadCloser {
-	return struct {
-		io.Reader
-		io.Closer
-	}{Reader: io.LimitReader(rc, limit), Closer: rc}
+// errRCHubRespTooLarge is returned when a non-streaming hub response body exceeds
+// rcHubRespBodyLimit; the proxy's ErrorHandler maps it to a 502 rather than
+// forwarding a truncated body.
+var errRCHubRespTooLarge = errors.New("rc hub response body exceeds limit")
+
+// readAtMostRCHub reads the whole body but no more than limit bytes, returning
+// errRCHubRespTooLarge if the stream would exceed limit. Reading limit+1 bytes is
+// how the overflow is detected without pulling an unbounded body into memory.
+func readAtMostRCHub(r io.Reader, limit int64) ([]byte, error) {
+	buf, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) > limit {
+		return nil, errRCHubRespTooLarge
+	}
+	return buf, nil
 }

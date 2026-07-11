@@ -484,7 +484,25 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 	}
 	h.trackMu.Unlock()
 
-	if !h.inputAccepted(watcher, stability, fresh.Kind, pane) {
+	// Acceptance→delivery gap: the per-slug mutex serializes concurrent POSTs, but
+	// reconcile or the agent can still flip the session to working between the pane
+	// capture above (used for identity/state) and delivery. Re-capture the pane HERE,
+	// as late as possible, and run the acceptance merge on THAT fresh pane so the gate
+	// reflects the pane immediately before sendLine — a session that resumed working
+	// no longer shows the composer anchor and is rejected. Residual (accepted): the
+	// few syscalls between this capture and sendLine below remain un-gated (tmux offers
+	// no atomic capture-and-send), so a flip landing in that sliver can still deliver
+	// mid-turn; the window is now a couple of calls rather than the whole handler body.
+	deliverPane, err := capturePaneChecked(h.cfg.runner, name)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "capture_failed", "pane re-capture failed")
+		return
+	}
+	if !h.inputAccepted(watcher, stability, fresh.Kind, deliverPane) {
 		writeError(w, http.StatusConflict, "not_accepting", "session is not waiting for input")
 		return
 	}
@@ -592,7 +610,17 @@ func RunHub(cfg HubConfig) error {
 // cadence is fast (activeInterval) while any SSE subscriber is attached, slow
 // (idleInterval) otherwise.
 func (h *Hub) serveOn(ctx context.Context, ln net.Listener) error {
-	srv := &http.Server{Handler: h.handler()}
+	srv := &http.Server{
+		Handler: h.handler(),
+		// Bound how long a (possibly slow/hostile) client may hold header/body reads
+		// open — MaxBytesReader only caps SIZE, not the time to dribble it in, so
+		// without these a Slowloris-style client could pin connections. Deliberately
+		// NO global WriteTimeout: the /v1/events SSE response is long-lived and paces
+		// its own writes with a per-frame SetWriteDeadline (see writeSSE); a global
+		// WriteTimeout would kill the stream mid-flight.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+	}
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 

@@ -605,6 +605,34 @@ func TestLineTailerSameSizeRewriteResets(t *testing.T) {
 	}
 }
 
+// TestLineTailerGrowingRewriteResets covers an in-place rewrite that ends LONGER than
+// the previous offset. Without the size >= offset check this would be mistaken for a
+// plain append and read from the stale offset, mixing old and rewritten records.
+func TestLineTailerGrowingRewriteResets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.jsonl")
+	writeFile(t, path, "aaaa\nbbbb\n")
+	tl := &lineTailer{path: path, catchUp: true}
+	if lines, _, _, _ := tl.poll(); len(lines) != 2 {
+		t.Fatalf("catch-up read = %v, want 2 lines", linesToStrings(lines))
+	}
+	// Rewrite the file to a LARGER size with different leading content (a different
+	// header), simulating a rollout/transcript rewrite that grew past our offset.
+	writeFile(t, path, "cccc\ndddd\neeee\n")
+	if err := os.Chtimes(path, time.Now().Add(2*time.Second), time.Now().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	lines, didReset, _, err := tl.poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !didReset {
+		t.Fatal("a grow-past-offset rewrite with a changed header must reset, not append")
+	}
+	if got := linesToStrings(lines); len(got) != 3 || got[0] != "cccc" || got[2] != "eeee" {
+		t.Fatalf("post-rewrite = %v, want [cccc dddd eeee]", got)
+	}
+}
+
 // ---- catch-up window landing exactly on a line boundary ----
 
 func TestLineTailerCatchUpExactBoundaryKeepsFirstLine(t *testing.T) {
@@ -626,7 +654,11 @@ func TestLineTailerCatchUpExactBoundaryKeepsFirstLine(t *testing.T) {
 	writeFile(t, path, b.String())
 	// Sanity: the catch-up start must land exactly at the prefix/window boundary, i.e.
 	// right after a '\n' — otherwise this test would silently exercise the skip path.
-	if fi, err := os.Stat(path); err != nil || fi.Size()-tailCatchUpWindow != int64(3*100) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if fi.Size()-tailCatchUpWindow != int64(3*100) {
 		t.Fatalf("boundary math broken: size=%v (want window start at byte 300)", fi.Size())
 	}
 

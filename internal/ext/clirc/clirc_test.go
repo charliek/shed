@@ -530,31 +530,60 @@ func TestParseVersionFromLoginShell(t *testing.T) {
 // unexpected positional argument is rejected. The bind/run paths are covered by the
 // hub package's own tests (they need an injectable address).
 func TestServeDispatch(t *testing.T) {
-	// Mutually-exclusive flags → bad-args exit 2, no hub spawned (ensureHub unset).
-	code, _, errOut := runCLI(extCfg, &fakeRunner{}, nil, "", "serve", "--detach", "--foreground")
-	if code != 2 {
-		t.Fatalf("serve --detach --foreground exit = %d, want 2", code)
+	cases := []struct {
+		name       string
+		args       []string
+		wantCode   int
+		wantErrSub string // substring required in stderr ("" = not checked)
+	}{
+		{
+			name:       "mutually exclusive detach and foreground",
+			args:       []string{"serve", "--detach", "--foreground"},
+			wantCode:   2,
+			wantErrSub: "mutually exclusive",
+		},
+		{
+			name:     "unexpected positional argument",
+			args:     []string{"serve", "stray"},
+			wantCode: 2,
+		},
 	}
-	if !strings.Contains(errOut, "mutually exclusive") {
-		t.Fatalf("stderr = %q, want mutual-exclusion message", errOut)
-	}
-
-	// Unexpected positional argument → bad-args exit 2.
-	code, _, _ = runCLI(extCfg, &fakeRunner{}, nil, "", "serve", "stray")
-	if code != 2 {
-		t.Fatalf("serve stray exit = %d, want 2", code)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// No ensureHub wired → a bad-args rejection can have no hub side effect.
+			code, _, errOut := runCLI(extCfg, &fakeRunner{}, nil, "", tc.args...)
+			if code != tc.wantCode {
+				t.Fatalf("%v exit = %d, want %d (stderr %q)", tc.args, code, tc.wantCode, errOut)
+			}
+			if tc.wantErrSub != "" && !strings.Contains(errOut, tc.wantErrSub) {
+				t.Fatalf("stderr = %q, want substring %q", errOut, tc.wantErrSub)
+			}
+		})
 	}
 }
 
 // TestCreateDoesNotSpawnHubInTests guards the ensureHub gate: dispatch-level create
 // (with no ensureHub wired, as in every test) must not attempt to spawn the daemon.
 func TestCreateDoesNotSpawnHubInTests(t *testing.T) {
-	r := &fakeRunner{}
-	env := map[string]string{"HOME": t.TempDir()}
-	code, _, errOut := runCLI(extCfg, r, env, "", "create", "--kind", "shell", "--slug", "abc123")
-	if code != 0 {
-		t.Fatalf("create exit = %d (stderr %q), want 0", code, errOut)
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "create shell session does not spawn hub",
+			args: []string{"create", "--kind", "shell", "--slug", "abc123"},
+		},
 	}
-	// A hub spawn would shell out to the real binary; the fake runner only sees tmux
-	// calls, so simply reaching exit 0 with no panic confirms no daemon side effect.
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &fakeRunner{}
+			env := map[string]string{"HOME": t.TempDir()}
+			code, _, errOut := runCLI(extCfg, r, env, "", tc.args...)
+			if code != 0 {
+				t.Fatalf("create exit = %d (stderr %q), want 0", code, errOut)
+			}
+			// A hub spawn would shell out to the real binary; the fake runner only sees
+			// tmux calls, so reaching exit 0 with no panic confirms no daemon side effect.
+		})
+	}
 }

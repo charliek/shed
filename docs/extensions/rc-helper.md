@@ -184,6 +184,12 @@ not `null`) when unknown; `managed` is always present.
 }
 ```
 
+`target_label` is **opaque metadata** echoed back verbatim from the `--target`
+value the orchestrator (or session creator) supplied at `create` time — the guest
+does not discover it, cannot verify it, and it carries **no routing or
+authorization authority**. It is a label for the creator's own bookkeeping, not a
+guest-attested route; clients must never treat it as an authoritative target.
+
 `state` is one of `starting | ready | reconnecting | needs-trust | needs-auth | dead`,
 derived live from the pane (never stored). A golden fixture of this shape
 (`internal/ext/rc/testdata/rcSessionDto.golden.json`) is byte-identical to the consuming

@@ -324,3 +324,72 @@ func TestRCEvents_Scope(t *testing.T) {
 		t.Errorf("control token: got %d, want 200", got)
 	}
 }
+
+// TestRewriteFrame_UntrustedData exercises rewriteFrame's untrusted-payload
+// handling: only allowlisted events with a JSON OBJECT payload are forwarded (with
+// `shed` injected). The critical case is `data: null` — json.Unmarshal leaves the
+// map nil WITHOUT an error (golang/go#10411), so a guest hub could otherwise crash
+// the server on obj["shed"] = ... ("assignment to entry in nil map").
+func TestRewriteFrame_UntrustedData(t *testing.T) {
+	agg := newTestAgg(nil, nil)
+	cases := []struct {
+		name  string
+		event string
+		data  string
+		want  bool // whether a frame is produced
+	}{
+		{"valid object", "activity.changed", `{"slug":"abc","activity":"working"}`, true},
+		{"null payload (nil-map panic vector)", "activity.changed", `null`, false},
+		{"json number", "session.updated", `123`, false},
+		{"json string", "message.appended", `"hi"`, false},
+		{"json array", "activity.changed", `[1,2,3]`, false},
+		{"invalid json", "activity.changed", `{not json`, false},
+		{"non-allowlisted event", "hub.unavailable", `{"shed":"x"}`, false},
+		{"empty data", "activity.changed", ``, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Must never panic, even on the null/nil-map vector.
+			frame, ok := agg.rewriteFrame("s1", tc.event, tc.data)
+			if ok != tc.want {
+				t.Fatalf("rewriteFrame ok = %v, want %v (frame=%q)", ok, tc.want, frame)
+			}
+			if ok && !strings.Contains(string(frame), `"shed":"s1"`) {
+				t.Fatalf("forwarded frame missing injected shed: %q", frame)
+			}
+		})
+	}
+}
+
+// TestAgg_OversizedEventDropped: a hostile upstream that streams many data: lines
+// without a terminating blank line must not accumulate unboundedly — the cumulative
+// per-event cap drops the partial event. The subsequent well-formed event still
+// makes it through, proving the reader resynced rather than wedging.
+func TestAgg_OversizedEventDropped(t *testing.T) {
+	u := newUpstreamHub()
+	agg := newTestAgg(func(context.Context) []string { return []string{"s1"} }, u.open)
+	c := newTestClient(16)
+	agg.addClient(c)
+	defer agg.removeClient(c)
+
+	waitFor(t, func() bool { return u.openCount.Load() >= 1 }, "upstream reader to open")
+
+	// Stream an event whose data lines together exceed the per-event cap (each line
+	// under the single-line limit), terminated by the blank line per SSE framing.
+	var b strings.Builder
+	b.WriteString("event: activity.changed\n")
+	line := strings.Repeat("x", 60<<10) // 60 KiB per line, several lines > 256 KiB total
+	for i := 0; i < 6; i++ {
+		b.WriteString("data: " + line + "\n")
+	}
+	b.WriteString("\n") // blank line terminates the (oversized, dropped) event
+	u.push("s1", b.String())
+	// Now a clean, small event on the same stream: it must be delivered (proving the
+	// reader resynced past the dropped event rather than wedging).
+	u.push("s1", "event: activity.changed\ndata: {\"slug\":\"ok\",\"activity\":\"idle\"}\n\n")
+
+	frame := readFrame(t, c)
+	if !strings.Contains(frame, `"slug":"ok"`) || !strings.Contains(frame, `"shed":"s1"`) {
+		t.Fatalf("post-overflow resync frame wrong: %q", frame)
+	}
+}

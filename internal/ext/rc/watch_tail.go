@@ -116,12 +116,15 @@ func (t *lineTailer) poll() (lines [][]byte, didReset, gapped bool, err error) {
 			return nil, didReset, t.takeGap(), serr
 		}
 		didReset = true
-	case fi.Size() == t.offset && !fi.ModTime().Equal(t.mtime) && t.headerChanged():
-		// Same-size rewrite: the size alone can't reveal a rewrite that lands on
-		// exactly our offset, so when the mtime moved without the file growing, cheap-
-		// verify the remembered leading bytes. A mismatch means new content → reset and
-		// reread. Residual (accepted): a same-size rewrite whose first tailHeaderLen
-		// bytes are also identical is indistinguishable from no-op and goes undetected.
+	case fi.Size() >= t.offset && !fi.ModTime().Equal(t.mtime) && t.headerChanged():
+		// In-place rewrite at OR past our offset: the size alone can't reveal a
+		// rewrite that lands on exactly our offset, nor one that rewrites the file and
+		// grows past it (which would otherwise be mistaken for a plain append and read
+		// from the stale offset, mixing old and new JSONL records). So whenever the
+		// mtime moved and the file is at least as long as our offset, cheap-verify the
+		// remembered leading bytes; a mismatch means new content → reset and reread.
+		// Residual (accepted): a rewrite whose first tailHeaderLen bytes are also
+		// identical is indistinguishable from an append and goes undetected.
 		if serr := t.resetToStart(); serr != nil {
 			return nil, didReset, t.takeGap(), serr
 		}

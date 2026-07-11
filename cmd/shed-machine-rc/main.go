@@ -16,6 +16,7 @@
 //	shed-machine-rc claude [--name n] [--workdir d] [--skip]   # local auto-mode session
 //	shed-machine-rc create --kind claude-rc --name host/foo [--wait] [--prompt-stdin]
 //	shed-machine-rc list
+//	shed-machine-rc capabilities
 //	shed-machine-rc probe --slug abc123
 //	shed-machine-rc accept-trust --slug abc123
 //	shed-machine-rc prompt --slug abc123 [--session-id <uuid>]   # text on stdin

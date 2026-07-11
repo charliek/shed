@@ -158,7 +158,10 @@ def test_rc_events_streams_on_activity(shed_server_dev, test_shed_name_dev):
 
     # Open the aggregate SSE stream, then drive activity by sending a command into
     # the shell pane; the pane change surfaces as an activity.changed event that
-    # the aggregator fans out. Read (bounded) until we see an `event:` line.
+    # the aggregator fans out. Read (bounded) until we see that specific event —
+    # NOT any `event:` line: the aggregator also emits synthetic
+    # hub.unavailable/shed.stopped frames, and a transient upstream reconnect
+    # would satisfy a bare `event:` check without the pane-driven change.
     got_event = False
     with ep.open("/api/rc/events", timeout=30, accept="text/event-stream") as stream:
         # Give the aggregator a moment to open its upstream reader, then trigger.
@@ -170,8 +173,8 @@ def test_rc_events_streams_on_activity(shed_server_dev, test_shed_name_dev):
             if not raw:
                 break
             line = raw.decode("utf-8", "replace")
-            if line.startswith("event:"):
+            if line.startswith("event: activity.changed"):
                 got_event = True
                 break
 
-    assert got_event, "no SSE event observed on /api/rc/events after driving pane activity"
+    assert got_event, "no activity.changed SSE event observed on /api/rc/events after driving pane activity"

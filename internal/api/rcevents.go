@@ -393,9 +393,11 @@ func (sr *shedReader) pump(ctx context.Context, body io.ReadCloser) {
 
 	var eventName string
 	var dataLines []string
+	var dataSize int // cumulative len of the current event's data lines
+	var dropped bool // this event exceeded the cap: discard it until the terminating blank
 	dispatch := func() {
-		defer func() { eventName = ""; dataLines = nil }()
-		if eventName == "" || len(dataLines) == 0 {
+		defer func() { eventName = ""; dataLines = nil; dataSize = 0; dropped = false }()
+		if dropped || eventName == "" || len(dataLines) == 0 {
 			return
 		}
 		data := strings.Join(dataLines, "\n")
@@ -411,13 +413,28 @@ func (sr *shedReader) pump(ctx context.Context, body io.ReadCloser) {
 		line := scanner.Text()
 		switch {
 		case line == "":
-			dispatch() // blank line terminates an event
+			dispatch() // blank line terminates an event (and clears the drop flag)
 		case strings.HasPrefix(line, ":"):
 			// comment / heartbeat — ignore
 		case strings.HasPrefix(line, "event:"):
 			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		case strings.HasPrefix(line, "data:"):
-			dataLines = append(dataLines, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			// scanner.Buffer caps a SINGLE line at rcAggUpstreamLineLimit, but a
+			// broken/hostile hub could pile up many data lines before the terminating
+			// blank and grow this event unboundedly. Cap the CUMULATIVE data size too:
+			// once over, mark the event dropped and free the buffer, then keep skipping
+			// its lines until the blank line resyncs to a fresh event.
+			if dropped {
+				continue
+			}
+			d := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
+			dataSize += len(d)
+			if dataSize > rcAggUpstreamLineLimit {
+				dropped = true
+				dataLines = nil // release the partial buffer immediately
+				continue
+			}
+			dataLines = append(dataLines, d)
 		default:
 			// unknown SSE field — ignore
 		}
@@ -441,7 +458,12 @@ func (a *rcAggregator) rewriteFrame(shed, event, data string) ([]byte, bool) {
 		return nil, false
 	}
 	var obj map[string]json.RawMessage
-	if json.Unmarshal([]byte(data), &obj) != nil {
+	// json.Unmarshal of the literal `null` sets obj to nil WITHOUT an error
+	// (golang/go#10411); assigning obj["shed"] below would then panic with
+	// "assignment to entry in nil map" and crash the server. The data payload is
+	// guest-controlled, so a `data: null` frame is a reachable crash vector —
+	// reject a nil (or non-object) result before the assignment.
+	if err := json.Unmarshal([]byte(data), &obj); err != nil || obj == nil {
 		return nil, false
 	}
 	shedJSON, _ := json.Marshal(shed)

@@ -14,6 +14,7 @@
 //
 //	shed-ext-rc create --kind claude-rc --name my-shed/foo [--wait] [--prompt-stdin]
 //	shed-ext-rc list
+//	shed-ext-rc capabilities
 //	shed-ext-rc probe --slug abc123
 //	shed-ext-rc accept-trust --slug abc123
 //	shed-ext-rc prompt --slug abc123 [--session-id <uuid>]   # text on stdin

@@ -71,7 +71,7 @@ const maxLastMessageRunes = 200
 // control-char stripping so an escape's intermediate bytes are consumed as a unit
 // rather than left as stray punctuation.
 var ansiEscapeRe = regexp.MustCompile(
-	"\x1b\\[[0-9;?]*[ -/]*[@-~]" + // CSI: ESC [ params intermediates final
+	"\x1b\\[[0-?]*[ -/]*[@-~]" + // CSI: ESC [ params intermediates final
 		"|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\|\\z)" + // OSC: ESC ] ... (BEL | ST | end-of-string)
 		"|\x1b[@-Z\\\\-_]", // single-byte Fe escapes: ESC <0x40-0x5f>
 )
