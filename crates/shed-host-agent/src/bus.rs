@@ -1014,17 +1014,49 @@ async fn handle_bus_message(
             ),
         },
     };
+    // The reply plumbing + audit-after-response tail is shared with the aws (and
+    // later docker) namespaces (`respond_and_audit`). A non-gated op or a
+    // parse-error path leaves `audit_entry` None (Go emits no audit for those).
+    respond_and_audit(
+        client,
+        namespace,
+        env,
+        shutdown,
+        &handlers.audit,
+        payload,
+        audit_entry,
+        what,
+    )
+    .await;
+}
+
+/// The shared reply-plumbing + audit tail for a bus namespace handler, extracted
+/// byte-for-byte from the ssh and aws handlers (the rule-of-three the docker slice
+/// justifies). Mint the response envelope, echo `shed` so shed-server routes the
+/// reply back to the originating shed (`*_handler.go: resp.Shed = req.Shed`), POST it
+/// racing `shutdown` (see [`BusClient::respond`]) and warn on failure with a
+/// namespace-specific `what`, then — matching Go's sendResponse/sendError-then-Log
+/// order — write the audit entry if one is present. `audit` is the SHARED sink taken
+/// by reference; `what` absorbs the ssh-vs-aws warn-message difference.
+#[allow(clippy::too_many_arguments)]
+async fn respond_and_audit(
+    client: &BusClient,
+    namespace: &str,
+    env: &Envelope,
+    shutdown: &watch::Receiver<bool>,
+    audit: &Arc<dyn AuditSink>,
+    payload: serde_json::Value,
+    audit_entry: Option<AuditEntry>,
+    what: &str,
+) {
     let mut resp = Envelope::new_response(&env.id, namespace, payload);
-    resp.shed = env.shed.clone(); // route the reply back (ssh_handler.go: resp.Shed = req.Shed)
-                                  // `shutdown` is threaded through so the POST races teardown (see `respond`).
+    resp.shed = env.shed.clone(); // route the reply back (resp.Shed = req.Shed)
     if let Err(e) = client.respond(namespace, &resp, shutdown).await {
         client.log.warn(&format!("failed to send {what}: {e}"));
     }
-    // Audit after responding — the durable log + desktop fan-out (ssh_handler.go
-    // order). A non-gated op or a parse-error path leaves `audit_entry` None (Go
-    // emits no audit for those).
+    // Audit after responding — the durable log + desktop fan-out.
     if let Some(entry) = audit_entry {
-        handlers.audit.log(entry);
+        audit.log(entry);
     }
 }
 
@@ -1433,16 +1465,20 @@ async fn handle_aws_bus_message(
     server_name: &str,
 ) {
     let (payload, audit_entry) = aws_dispatch(env, aws, server_name).await;
-    let mut resp = Envelope::new_response(&env.id, namespace, payload);
-    resp.shed = env.shed.clone(); // route the reply back (aws_handler.go: resp.Shed = req.Shed)
-    if let Err(e) = client.respond(namespace, &resp, shutdown).await {
-        client.log.warn(&format!("failed to send aws response: {e}"));
-    }
-    // Audit after responding (aws_handler.go order). Only get_credentials audits; ping/
-    // status/unknown/invalid leave `audit_entry` None.
-    if let Some(entry) = audit_entry {
-        audit.log(entry);
-    }
+    // Shared reply-plumbing + audit tail (`respond_and_audit`). Only get_credentials
+    // audits; ping/status/unknown/invalid leave `audit_entry` None. `what` preserves
+    // the aws warn message (`failed to send aws response: ...`).
+    respond_and_audit(
+        client,
+        namespace,
+        env,
+        shutdown,
+        audit,
+        payload,
+        audit_entry,
+        "aws response",
+    )
+    .await;
 }
 
 /// Compute the aws-credentials response payload + optional audit entry for one request,
