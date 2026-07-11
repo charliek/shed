@@ -81,8 +81,8 @@ function report(
  *  Returns the live sheds + a `refresh` callback (a lifecycle button chains it to
  *  re-fetch after its action). A no-op in a plain browser.
  *
- *  This owns the SINGLE report path — the shell's badges (`agentCount`/`pending`
- *  supplied by App, `sheds`/`hosts` derived here) and the active `mode` fold into
+ *  This owns the SINGLE report path — the shell's badges (`agentCount`/`hostCount`/
+ *  `pending` supplied by App, `sheds` derived here) and the active `mode` fold into
  *  one full snapshot, so there are no partial `ui_report`s to race the `main` slot
  *  or drop keys (App must apply `data-mode` before this effect runs — a
  *  useLayoutEffect — so the sampled colors reflect the flip).
@@ -98,6 +98,7 @@ export function useUiBridge(
   modal: Modal,
   mode: "light" | "dark",
   agentCount: number,
+  hostCount: number,
   pending: number,
 ): { sheds: Shed[]; refresh: () => void } {
   const [sheds, setSheds] = useState<Shed[]>([]);
@@ -163,10 +164,11 @@ export function useUiBridge(
   // badges are derived+carried here, never published as a partial `ui_report`.
   useEffect(() => {
     if (!inTauri() || !ready.current) return;
-    const hosts = new Set(sheds.map((s) => s.host)).size;
-    const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts, pending };
+    // `hosts` = the configured-host count (with reachability) the shell supplies —
+    // covers zero-shed hosts, unlike a sheds-derived distinct-host count.
+    const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount, pending };
     report(pane, sheds, refreshToken, modal, badges, mode);
-  }, [pane, sheds, refreshToken, modal, mode, agentCount, pending]);
+  }, [pane, sheds, refreshToken, modal, mode, agentCount, hostCount, pending]);
 
   const refresh = useCallback(() => void fetchSheds(0), [fetchSheds]);
   return { sheds, refresh };

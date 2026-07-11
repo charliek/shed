@@ -3,7 +3,7 @@
    op (via the `navigate` Tauri event); the rendered pane + a computed-style sample
    are reported back to Rust (useUiBridge) so the harness can assert them over IPC.
    The shared visual vocabulary lives in components/{primitives,dialog}. */
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
   Boxes, Shield, Sparkles, ScrollText, Globe, HardDrive, Box, Plus,
   Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key,
@@ -406,6 +406,10 @@ function EgressPane() {
   const [hosts, setHosts] = useState<HostEgressProfiles[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  // A profile selection requested via `egress.show` that arrived before rows loaded
+  // (the listener records it here rather than resolving against an empty list). The
+  // auto-select effect applies it once rows land — see the listener + effect below.
+  const [pendingSelect, setPendingSelect] = useState<{ profile: string; host?: string } | null>(null);
   // Egress decisions = audit entries with ns=="egress" — the same coordinator
   // feed the Activity pane renders, filtered frontend-side (mac parity).
   const activity = useCoordinatorData<AuditEntry[]>("activity-changed", fetchActivity, []);
@@ -430,19 +434,26 @@ function EgressPane() {
   const selectedRow = rows.find((r) => egressRowId(r) === selected) ?? null;
 
   // Auto-select the first profile once rows land (list→detail renders without a
-  // click), and re-select if a refresh dropped the selected one.
+  // click), and re-select if a refresh dropped the selected one. A pending
+  // `egress.show` selection (recorded before rows loaded) takes precedence.
   useEffect(() => {
-    if (rows.length && !rows.some((r) => egressRowId(r) === selected)) {
+    if (!rows.length) return;
+    if (pendingSelect) {
+      const m = rows.find(
+        (r) =>
+          r.info.name === pendingSelect.profile &&
+          (pendingSelect.host === undefined || r.host === pendingSelect.host),
+      );
+      setPendingSelect(null); // applied, or rows loaded without a match — consume it
+      if (m) {
+        setSelected(egressRowId(m));
+        return;
+      }
+    }
+    if (!rows.some((r) => egressRowId(r) === selected)) {
       setSelected(egressRowId(rows[0]));
     }
-  }, [hosts, selected]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // The harness's sub-tab/selection driver: `egress.show {tab?, profile?, host?}`
-  // emits `egress-show`; selection resolves by (host, name) when a host is given,
-  // else by name (first match) — so a profile name that collides across hosts
-  // (e.g. `default` on every server) is deterministically selectable.
-  const rowsRef = useRef(rows);
-  rowsRef.current = rows;
+  }, [hosts, selected, pendingSelect]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Build the current rendered snapshot. Held in a ref so the listener effect can
   // publish the INITIAL report the instant it attaches (before any data-driven
@@ -488,10 +499,10 @@ function EgressPane() {
           const p = e.payload?.profile;
           if (typeof p === "string") {
             const h = e.payload?.host;
-            const m = rowsRef.current.find(
-              (r) => r.info.name === p && (typeof h !== "string" || r.host === h),
-            );
-            if (m) setSelected(egressRowId(m));
+            // Record as pending (never resolve against a possibly-empty rows list
+            // here): the auto-select effect applies it by (host, name) — or by name
+            // (first match) when no host is given — once rows are present.
+            setPendingSelect({ profile: p, host: typeof h === "string" ? h : undefined });
           }
         }),
       );
@@ -704,6 +715,7 @@ function kindHelp(kind: RcKind): string {
 
 function LaunchAgentDialog({ sheds, capabilities, refresh, onClose, onLaunched }:
   { sheds: Shed[]; capabilities: Record<string, RcCapabilities>; refresh: () => void; onClose: () => void; onLaunched: () => void }) {
+  const fid = useId(); // base for per-field control ids (label↔control association)
   const running = sheds.filter((s) => s.status === "running");
   const [target, setTarget] = useState(running[0] ? `${running[0].host}/${running[0].name}` : "");
   const [kind, setKind] = useState<RcKind>("claude-rc");
@@ -716,6 +728,10 @@ function LaunchAgentDialog({ sheds, capabilities, refresh, onClose, onLaunched }
   // feeds the badge + pane). The dialog is App-level (drivable via ui.show_launch
   // from any pane), so refresh on open to gate on current capabilities.
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Close on Escape (like the other dialogs), but not while a launch is in flight
+  // — mirrors NewShedDialog's `!creating` guard (here the in-flight flag is `busy`).
+  useEscClose(onClose, !busy);
 
   const kinds = offeredKinds(capabilities[target]);
   // Keep the selection valid when the shed changes OR its offered kinds change.
@@ -772,15 +788,15 @@ function LaunchAgentDialog({ sheds, capabilities, refresh, onClose, onLaunched }
           </>
         }
       >
-        <Field label="Shed">
+        <Field label="Shed" htmlFor={shedOpts.length ? `${fid}-shed` : undefined}>
           {shedOpts.length ? (
-            <Select value={target} onChange={setTarget} options={shedOpts} />
+            <Select id={`${fid}-shed`} value={target} onChange={setTarget} options={shedOpts} />
           ) : (
             <div className="rounded-lg border border-shed-border bg-shed-bg px-3 py-2.5 text-[13px] leading-snug text-shed-text-muted">No running sheds. Start a shed first.</div>
           )}
         </Field>
-        <Field label="Session name" hint="optional">
-          <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="defaults to shed/slug" className={dialogInput} />
+        <Field label="Session name" hint="optional" htmlFor={`${fid}-name`}>
+          <input id={`${fid}-name`} value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="defaults to shed/slug" className={dialogInput} />
         </Field>
         <Field label="Kind" help={kinds.length ? kindHelp(kind) : undefined}>
           {kinds.length === 0 ? (
@@ -792,9 +808,10 @@ function LaunchAgentDialog({ sheds, capabilities, refresh, onClose, onLaunched }
         <Field
           label={shell ? "Initial command" : "Initial prompt"}
           hint="optional"
+          htmlFor={`${fid}-prompt`}
           help={shell ? "Run in the shell once it's ready." : "Typed into the agent once it's ready."}
         >
-          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={2} placeholder={shell ? "npm install && npm test" : "summarize this repo"} className={cn(dialogInput, "resize-none")} />
+          <textarea id={`${fid}-prompt`} value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={2} placeholder={shell ? "npm install && npm test" : "summarize this repo"} className={cn(dialogInput, "resize-none")} />
         </Field>
         {error && (
           <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
@@ -1053,6 +1070,7 @@ const BACKEND_OPTS = [
 ];
 
 function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () => void }) {
+  const fid = useId(); // base for per-field control ids (label↔control association)
   const [hosts, setHosts] = useState<string[]>([]);
   const [name, setName] = useState("");
   const [host, setHost] = useState("");
@@ -1164,30 +1182,30 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
       <DialogShell icon={Plus} title="New shed" sub="Spin up a dev environment on a host." onClose={cancel} width={540} footer={footer}>
         {!creating ? (
           <>
-            <Field label="Name">
-              <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="my-shed" className={cn(dialogInput, "font-mono")} />
+            <Field label="Name" htmlFor={`${fid}-name`}>
+              <input id={`${fid}-name`} autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="my-shed" className={cn(dialogInput, "font-mono")} />
             </Field>
             <div className="flex gap-4">
               <div className="min-w-0 flex-1">
-                <Field label="Host"><Select value={host} onChange={setHost} options={hostOpts} /></Field>
+                <Field label="Host" htmlFor={`${fid}-host`}><Select id={`${fid}-host`} value={host} onChange={setHost} options={hostOpts} /></Field>
               </div>
               <div className="min-w-0 flex-1">
-                <Field label="Backend"><Select value={vmBackend} onChange={setVmBackend} options={BACKEND_OPTS} /></Field>
+                <Field label="Backend" htmlFor={`${fid}-backend`}><Select id={`${fid}-backend`} value={vmBackend} onChange={setVmBackend} options={BACKEND_OPTS} /></Field>
               </div>
             </div>
-            <Field label="Image">
-              <input value={image} onChange={(e) => setImage(e.target.value)} placeholder="e.g. base" className={cn(dialogInput, "font-mono")} />
+            <Field label="Image" htmlFor={`${fid}-image`}>
+              <input id={`${fid}-image`} value={image} onChange={(e) => setImage(e.target.value)} placeholder="e.g. base" className={cn(dialogInput, "font-mono")} />
             </Field>
             <div className="flex gap-4">
               <div className="flex-1">
-                <Field label="CPUs"><input type="number" min="1" step="1" value={cpus} onChange={(e) => setCpus(e.target.value)} placeholder="2" className={dialogInput} /></Field>
+                <Field label="CPUs" htmlFor={`${fid}-cpus`}><input id={`${fid}-cpus`} type="number" min="1" step="1" value={cpus} onChange={(e) => setCpus(e.target.value)} placeholder="2" className={dialogInput} /></Field>
               </div>
               <div className="flex-1">
-                <Field label="Memory (GB)"><input type="number" min="1" step="1" value={memGb} onChange={(e) => setMemGb(e.target.value)} placeholder="4" className={dialogInput} /></Field>
+                <Field label="Memory (GB)" htmlFor={`${fid}-mem`}><input id={`${fid}-mem`} type="number" min="1" step="1" value={memGb} onChange={(e) => setMemGb(e.target.value)} placeholder="4" className={dialogInput} /></Field>
               </div>
             </div>
-            <Field label="Repo" hint="optional">
-              <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="owner/repo" className={cn(dialogInput, "font-mono")} />
+            <Field label="Repo" hint="optional" htmlFor={`${fid}-repo`}>
+              <input id={`${fid}-repo`} value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="owner/repo" className={cn(dialogInput, "font-mono")} />
             </Field>
             {error && (
               <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
@@ -1239,10 +1257,35 @@ export default function App() {
   // The Agents sidebar badge count is derived from the shared session list — always
   // consistent with what the Agents pane renders.
   const agentCount = rcSessions.length;
-  // The bridge owns the single full `ui_report`; hand it the badge inputs (sheds +
-  // hosts it derives itself, agents/pending from here) and the mode so the report is
-  // one complete snapshot, never a partial that races the `main` slot / tray count.
-  const { sheds, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, pending);
+  // Configured hosts WITH reachability — the System pane's source (`system_df`),
+  // lifted to the shell so the sidebar HOSTS list + the System nav badge cover the
+  // configured hosts (even ones with zero sheds), each with a real reachable/
+  // unreachable dot — instead of deriving from `sheds` (which hides zero-shed hosts,
+  // undercounts the badge, and paints every dot green). Reuses the existing `refresh`
+  // event that drives the shed re-fetch — no extra poll.
+  const [hostRows, setHostRows] = useState<HostDiskUsage[]>([]);
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const reload = () => void fetchSystemDf().then((r) => { if (!cancelled) setHostRows(r); });
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const un = await listen("refresh", reload);
+      if (cancelled) un();
+      else unlisten = un;
+      reload(); // initial fetch, after the listener is live
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+  const hostCount = hostRows.length;
+  // The bridge owns the single full `ui_report`; hand it the badge inputs (sheds
+  // derived there, hosts/agents/pending from here) and the mode so the report is one
+  // complete snapshot, never a partial that races the `main` slot / tray count.
+  const { sheds, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, pending);
 
   // Apply the appearance to the root BEFORE the bridge's report effect samples it (a
   // layout effect runs ahead of that passive effect), so `ui.computed_style` reflects
@@ -1283,8 +1326,10 @@ export default function App() {
     setPane("agents");
   };
 
-  // Sidebar hosts are the distinct hosts of the live sheds.
-  const hosts = [...new Set(sheds.map((s) => s.host))];
+  // Sidebar hosts = the configured hosts with reachability (from system_df), NOT the
+  // sheds-derived set — so zero-shed hosts still appear, the System badge counts
+  // configured hosts, and each dot reflects real reachability.
+  const hosts = hostRows.map((h) => ({ name: h.host, reachable: h.usage != null }));
 
   return (
     <div className="flex h-full">
@@ -1337,9 +1382,9 @@ export default function App() {
           </button>
         </div>
         {hosts.map((h) => (
-          <div key={h} className="flex items-center gap-2.5 px-2.5 py-1.5 text-[13px] font-medium text-shed-text">
-            <Dot className="h-2 w-2" style={{ background: "var(--shed-ok)" }} />
-            <span className="truncate">{h}</span>
+          <div key={h.name} className="flex items-center gap-2.5 px-2.5 py-1.5 text-[13px] font-medium text-shed-text">
+            <Dot className="h-2 w-2" style={{ background: h.reachable ? "var(--shed-ok)" : "var(--shed-text-muted)" }} />
+            <span className="truncate">{h.name}</span>
           </div>
         ))}
       </aside>

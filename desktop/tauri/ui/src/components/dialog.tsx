@@ -106,21 +106,27 @@ export function DialogShell({
   );
 }
 
-/** A labelled field row (label + optional hint/help around the control). */
+/** A labelled field row (label + optional hint/help around the control). Pass
+ *  `htmlFor` (matching an `id` on the wrapped control) to associate the label with
+ *  its control — the control renders as a sibling, so without it the `<label>` isn't
+ *  tied to any input. Omit it for non-control children (e.g. a Segmented button
+ *  group, where a `for` target would be wrong): they keep the visual label only. */
 export function Field({
   label,
   hint,
   help,
+  htmlFor,
   children,
 }: {
   label: string;
   hint?: string;
   help?: string;
+  htmlFor?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-[7px]">
-      <label className="text-[13px] font-medium text-shed-text-secondary">
+      <label htmlFor={htmlFor} className="text-[13px] font-medium text-shed-text-secondary">
         {label}
         {hint && <span className="ml-[7px] font-normal text-shed-text-muted">{hint}</span>}
       </label>
@@ -130,19 +136,23 @@ export function Field({
   );
 }
 
-/** A styled native select with a caret glyph. */
+/** A styled native select with a caret glyph. `id` is forwarded to the underlying
+    `<select>` so a `Field htmlFor` can associate its label. */
 export function Select({
   value,
   onChange,
   options,
+  id,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  id?: string;
 }) {
   return (
     <div className="relative">
       <select
+        id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className="w-full appearance-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 pr-9 text-[14px] text-shed-text outline-none focus:border-shed-accent"

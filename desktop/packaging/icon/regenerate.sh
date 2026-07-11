@@ -26,4 +26,11 @@ fi
 
 # --no-project: run in a throwaway env, ignoring the surrounding desktop/ and
 # repo-root pyproject.toml (otherwise uv would sync one and leave a .venv).
-exec uv run --no-project --with cairosvg --with pillow python3 "${SCRIPT_DIR}/generate_icons.py" "$@"
+#
+# The cairosvg + pillow versions are PINNED so the generated icon bytes are
+# reproducible — an unpinned range could silently change the rasterizer/encoder
+# and re-render byte-different icons on some future run. Bump these deliberately
+# (and re-commit the regenerated assets) when you want a newer toolchain.
+exec uv run --no-project \
+  --with 'cairosvg==2.9.0' --with 'pillow==12.3.0' \
+  python3 "${SCRIPT_DIR}/generate_icons.py" "$@"

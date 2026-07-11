@@ -168,6 +168,11 @@ def main() -> None:
         sys.exit(1)
 
     bg = hex_to_rgb(args.bg)
+    # Validate --color/--eye the same way as --bg. They're spliced into the SVG as
+    # fill strings (not parsed to RGB here), so validate them up front to reject a
+    # malformed hex before it silently produces a broken/blank render.
+    hex_to_rgb(args.color)
+    hex_to_rgb(args.eye)
     owl = render_owl(args.color, args.eye)
 
     print(f"Generating shed-desktop icons (owl={args.color} bg={args.bg} eyes={args.eye})")

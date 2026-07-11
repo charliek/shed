@@ -49,12 +49,16 @@ as committed. This pipeline never touches it.
 
 ## Regenerate
 
+Paths below are relative to the **repo root** (the script resolves its own
+location, so cwd doesn't affect the outputs — from `desktop/` drop the `desktop/`
+prefix):
+
 ```sh
 # Default: white owl on orange (#E8722A), green eyes
-./packaging/icon/regenerate.sh
+./desktop/packaging/icon/regenerate.sh
 
 # Try a different background color (then commit the regenerated assets)
-./packaging/icon/regenerate.sh --bg '#1F6FEB'
+./desktop/packaging/icon/regenerate.sh --bg '#1F6FEB'
 ```
 
 The PNG + `.ico` legs are cross-platform. The **`.icns` legs require `iconutil`,

@@ -77,7 +77,14 @@ pane/appearance (e.g. the Plex reskin, the Egress pane, a dark-mode shot), run a
 **one-off `docker run` that mirrors `tauri-build-linux`** but swaps the pytest
 command for a small Python driver. Same wiring as the target (see the Makefile):
 
-- `docker build -t shed-tauri-linux:latest - < Dockerfile.tauri-linux` first.
+- Build the frontend bundle FIRST — `make -C desktop tauri-ui-build` (or `cd
+  desktop/tauri/ui && npm run build`). The Makefile legs take `tauri-ui-build` as
+  a prereq and the resulting `tauri/ui/dist` is tarred into `/work` (dist is not
+  excluded); on a clean checkout it's absent and the in-container `cargo build`
+  fails closed at `generate_context!` (see the Gremlins note below).
+- `docker build -t shed-tauri-linux:latest - < desktop/Dockerfile.tauri-linux`
+  first (these commands run from the repo/worktree root — the same dir the mounts
+  below are relative to).
 - Mount the **REPO/WORKTREE ROOT** (the dir that holds `crates/` + `desktop/`)
   **read-only** at `/repo` (`-v "$ROOT:/repo:ro"`), and add a **writable** out dir
   for the PNGs (`-v "$HOST_OUT:/out"` — the `deb` target's pattern).
@@ -86,11 +93,16 @@ command for a small Python driver. Same wiring as the target (see the Makefile):
   shed-tauri-linux-target:/target`), with `-e CARGO_TARGET_DIR=/target`.
 - `--cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g` and
   `-e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri` (point the harness at the
-  binary this run builds).
+  binary this run builds). **Note:** `--cap-add SYS_ADMIN --security-opt
+  seccomp=unconfined` materially weakens the container's isolation (it's needed so
+  WebKitGTK's bubblewrap sandbox can create user namespaces) — only run this
+  against a **trusted** source tree, and never mount host Docker sockets, SSH
+  agents, or secrets into a container running with these flags.
 
 Inside the container: `tar` the repo-root layout (`crates desktop/tauri
 desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock`) into
-`/work`, `cd /work/desktop/tauri/src-tauri && cargo build --locked`, then
+`/work` (the host-built `tauri/ui/dist` rides along in that tar — build it first,
+above), `cd /work/desktop/tauri/src-tauri && cargo build --locked`, then
 `xvfb-run -a --server-args="-screen 0 1400x900x24"` a Python driver that:
 
 - adds `/work/desktop/tools/shedtest` + `/work/desktop/tools/fake-host-agent` to
@@ -103,8 +115,11 @@ desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock`) into
   (`egress.show`), calls `ui.set_appearance("dark")` for the dark shot, and captures
   via the `app.screenshot` op, writing each PNG under `/out`.
 
-`app.screenshot` on the Xvfb (X11) leg shells out to `scrot`, so the PNG is the full
-display; the reported truth ops (`dashboard.dump` / `agents.dump` /
+`app.screenshot` on the Xvfb (X11) leg shells out to `scrot`, falling back to
+ImageMagick's `import -window root` if `scrot` is absent or fails (the tool order in
+`src-tauri/src/screenshot.rs::capture` is `grim` → `scrot` → `import`; `grim` is
+skipped without a `WAYLAND_DISPLAY`, so X11/Xvfb tries `scrot` then `import`). Either
+way the PNG is the full display; the reported truth ops (`dashboard.dump` / `agents.dump` /
 `egress.profiles` / `ui.badges` / `ui.computed_style`) stay the deterministic
 assertions, the pixels are the eyeball.
 

@@ -159,11 +159,14 @@ def test_set_appearance_drives_dark_and_light(tauri):
 def test_sidebar_badges_match_fixture(tauri):
     # The sidebar nav badge counts are UI truth, reported over IPC (ui.badges), so
     # they're asserted as logical content, not pixels. The default fixture has 2
-    # sheds on 1 host, no RC sessions, no pending approvals.
-    tauri.wait_until(lambda: (tauri.badges() or {}).get("sheds") == 2,
+    # sheds on 1 configured host, no RC sessions, no pending approvals. `hosts`
+    # counts CONFIGURED hosts (from system_df, an async fetch), so wait on the full
+    # snapshot rather than `sheds` alone — the host count lands independently.
+    want = {"sheds": 2, "agents": 0, "hosts": 1, "pending": 0}
+    tauri.wait_until(lambda: (tauri.badges() or {}) == want,
                      timeout=15, what="sidebar badges reported")
     b = tauri.badges()
-    assert b == {"sheds": 2, "agents": 0, "hosts": 1, "pending": 0}, f"unexpected badges: {b}"
+    assert b == want, f"unexpected badges: {b}"
 
 
 def test_second_launch_hands_off(tauri):
