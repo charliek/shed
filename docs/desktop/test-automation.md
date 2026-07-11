@@ -39,6 +39,14 @@ make -C desktop e2e-swift   # mac: same, Rust core forced off (SHED_DESKTOP_RUST
 make -C desktop e2e-tauri   # tauri: shared suite + test_tauri (needs a display; Xvfb on Linux)
 ```
 
+On the Tauri client, Preferences is a dedicated native window (mac parity), not a dashboard
+modal — `ui.show_preferences` (alias `ui.open_preferences`) opens/focuses the lazy-created
+singleton without raising the dashboard, so `ui.modal` only ever reports `create`, `launch`,
+or `null`. The window's UI truth is `prefs.dump` → `{visible, title, prefs}`: `visible`/`title`
+are the Rust-side native window state, and `prefs` is the window's own reported
+`{sections, values, mode}` snapshot — the surface a test asserts (gated section visibility,
+persisted values, theme) instead of pixels, the same UI-truth pattern as `dashboard.dump`.
+
 ### Simulating a down (unreachable) host
 
 The shared session redirects every configured server to the one in-process mock, so a
