@@ -610,7 +610,7 @@ func TestHubBroadcastDropsOnOverflow(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 100; i++ {
-			h.broadcast(activityChangedEvent("s", ActivityWorking, "t", StateReady))
+			h.broadcast(activityChangedEvent("s", ActivityWorking, "t", StateReady, "preview"))
 		}
 		close(done)
 	}()
@@ -711,7 +711,7 @@ func TestHubHTTPEventsStreamAndHeartbeat(t *testing.T) {
 
 	// Wait until the server has registered the subscriber, then broadcast.
 	waitFor(t, func() bool { return h.subscriberCount() == 1 })
-	h.broadcast(activityChangedEvent("s1", ActivityWorking, "2026-01-01T00:00:00Z", StateReady))
+	h.broadcast(activityChangedEvent("s1", ActivityWorking, "2026-01-01T00:00:00Z", StateReady, ""))
 
 	reader := bufio.NewReader(resp.Body)
 	sawEvent, sawHeartbeat := false, false

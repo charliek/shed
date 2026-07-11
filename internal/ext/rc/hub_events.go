@@ -72,6 +72,10 @@ type activityChangedData struct {
 	Activity   Activity `json:"activity"`
 	ActivityAt string   `json:"activity_at"`
 	State      State    `json:"state"`
+	// LastMessage is the sanitized preview current at the transition, so badge
+	// clients can refresh their subtitle without a /messages round-trip. Omitted
+	// when no watcher feeds the session (stability-only kinds).
+	LastMessage string `json:"last_message,omitempty"`
 }
 
 type sessionUpdatedData struct {
@@ -90,9 +94,9 @@ type messageAppendedData struct {
 	Seq  uint64 `json:"seq"`
 }
 
-func activityChangedEvent(slug string, activity Activity, activityAt string, state State) hubEvent {
+func activityChangedEvent(slug string, activity Activity, activityAt string, state State, lastMessage string) hubEvent {
 	return hubEvent{name: "activity.changed", data: activityChangedData{
-		Slug: slug, Activity: activity, ActivityAt: activityAt, State: state,
+		Slug: slug, Activity: activity, ActivityAt: activityAt, State: state, LastMessage: lastMessage,
 	}}
 }
 

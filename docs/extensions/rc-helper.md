@@ -285,7 +285,7 @@ filled in server-side):
 
 | `event:` | `data:` | Fires when |
 |---|---|---|
-| `activity.changed` | `{shed, slug, activity, activity_at, state}` | a session's *displayed* activity changes to a valid non-empty value |
+| `activity.changed` | `{shed, slug, activity, activity_at, state, last_message?}` | a session's *displayed* activity changes to a valid non-empty value; `last_message` is the sanitized preview at the transition (omitted for stability-only kinds) |
 | `session.updated` | `{shed, slug, session}` (`session:null` on kill) | a session appears, is recreated, or its lifecycle `state` changes |
 | `message.appended` | `{shed, slug, seq}` | a new feed message lands (notification only — the body comes from `/messages`, keeping fan-out tiny and drop-safe) |
 

@@ -230,7 +230,7 @@ func (h *Hub) reconcile() {
 			// state change emitted above — clients drop the activity dimension from
 			// the state, not from a hollow activity event.
 			if eff != "" {
-				events = append(events, activityChangedEvent(s.Slug, eff, tr.activityAt, s.State))
+				events = append(events, activityChangedEvent(s.Slug, eff, tr.activityAt, s.State, effMsg))
 			}
 		}
 		// Keep the message preview current every tick (the /v1/sessions overlay reads
