@@ -198,6 +198,17 @@ string, step 4) → create a fresh shed. `internal/ext/rc/*.go` is **not** `//go
 linux`, so its unit tests run under plain `make test` on macOS (no Docker needed, unlike
 the agent tests).
 
+> **Rebuild BOTH `extensions` AND `full` for the rc-hub integration tests.** The rc-hub
+> integration tests (`tests/integration/test_rc_enrichment.py`,
+> `tests/integration/test_rc_hub_activity.py`) provision their sheds from the
+> **`extensions`** alias (`server.create(shed, image="extensions")`), *not* the dev
+> server's usual `full` `default_image`. So a dev-image rebuild done only as
+> `--variant full` leaves the `extensions` alias pointing at a **stale** image — the rc
+> tests then run old guest code (or skip on an image that predates `shed-ext-rc serve`)
+> while looking green. When validating an rc change, rebuild **both**
+> `./scripts/build-vz-rootfs.sh --variant full …` **and** `--variant extensions …` (FC:
+> the matching `build-firecracker-rootfs.sh` invocations) so both aliases carry your build.
+
 ### Fast loop: copy the binary into a running shed
 
 A full rootfs rebuild is minutes; for a tight edit→test loop on a guest binary you can

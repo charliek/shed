@@ -26,11 +26,10 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
-import urllib.request
 
 import pytest
 
-from fixtures.server import resolve_server_entry
+from fixtures.apiendpoint import resolve_api_endpoint
 
 # See test_rc_enrichment.py — the same image-compatibility signatures gate the
 # `shed-ext-rc create` precondition.
@@ -45,24 +44,8 @@ _RC_INCOMPAT_SIGNS = (
 )
 
 
-def _api_base(server) -> str:
-    entry = resolve_server_entry(server.name)
-    if not entry:
-        pytest.skip(f"no config entry for server {server.name!r}")
-    host = entry.get("host") or "localhost"
-    port = int(entry.get("http_port") or 0)
-    if port <= 0:
-        pytest.skip(f"config entry for {server.name!r} has no http_port")
-    return f"http://{host}:{port}"
-
-
-def _get_json(base: str, path: str) -> dict:
-    with urllib.request.urlopen(f"{base}{path}", timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _require_feature(base: str, token: str) -> None:
-    info = _get_json(base, "/api/info")
+def _require_feature(ep, token: str) -> None:
+    info = ep.get_json("/api/info")
     features = info.get("features")
     if isinstance(features, list) and token not in features:
         pytest.skip(
@@ -86,12 +69,16 @@ def _require_rc_create(r) -> None:
     )
 
 
-def _proxy_sessions_or_skip(base: str, shed: str) -> list[dict]:
+def _proxy_sessions_or_skip(ep, shed: str) -> list[dict]:
     """GET the proxied hub session list. Skip on 503 RC_HUB_UNAVAILABLE (old
-    image without the hub binary, or the FC loopback-unreachable degrade)."""
-    url = f"{base}/api/sheds/{shed}/rc/v1/sessions"
+    image without the hub binary, or the FC loopback-unreachable degrade).
+
+    A 401 (expired control token) is caught earlier by `ep.open` and turned
+    into a clear skip; here we only classify the hub-availability 503 vs. a
+    genuine failure."""
+    path = f"/api/sheds/{shed}/rc/v1/sessions"
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
+        with ep.open(path, timeout=15) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")
@@ -100,7 +87,7 @@ def _proxy_sessions_or_skip(base: str, shed: str) -> list[dict]:
                 "rc hub unavailable (image predates `shed-ext-rc serve`, or the "
                 f"FC loopback-unreachable degrade): {detail!r}"
             )
-        pytest.fail(f"proxy GET {url} -> {e.code}: {detail!r}")
+        pytest.fail(f"proxy GET {ep.base}{path} -> {e.code}: {detail!r}")
     return body.get("sessions") or []
 
 
@@ -118,9 +105,9 @@ def test_rc_proxy_sessions_carry_activity(shed_server_dev, test_shed_name_dev):
     RC_HUB_UNAVAILABLE."""
     server = shed_server_dev
     shed = test_shed_name_dev
-    base = _api_base(server)
+    ep = resolve_api_endpoint(server.name)
 
-    _require_feature(base, "rc-proxy")
+    _require_feature(ep, "rc-proxy")
     server.create(shed, image="extensions")
     r = server.exec(shed, ["shed-ext-rc", "create", "--kind", "shell", "--wait=false"])
     _require_rc_create(r)
@@ -129,7 +116,7 @@ def test_rc_proxy_sessions_carry_activity(shed_server_dev, test_shed_name_dev):
     deadline = time.monotonic() + 15.0
     sess = None
     while time.monotonic() < deadline:
-        sessions = _proxy_sessions_or_skip(base, shed)
+        sessions = _proxy_sessions_or_skip(ep, shed)
         # There is exactly one shell rc session in this shed; take the first rc row.
         for s in sessions:
             if s.get("kind") == "shell":
@@ -152,10 +139,10 @@ def test_rc_events_streams_on_activity(shed_server_dev, test_shed_name_dev):
     RC_HUB_UNAVAILABLE."""
     server = shed_server_dev
     shed = test_shed_name_dev
-    base = _api_base(server)
+    ep = resolve_api_endpoint(server.name)
 
-    _require_feature(base, "rc-events")
-    _require_feature(base, "rc-proxy")
+    _require_feature(ep, "rc-events")
+    _require_feature(ep, "rc-proxy")
     server.create(shed, image="extensions")
     r = server.exec(shed, ["shed-ext-rc", "create", "--kind", "shell", "--wait=false"])
     _require_rc_create(r)
@@ -163,7 +150,7 @@ def test_rc_events_streams_on_activity(shed_server_dev, test_shed_name_dev):
     # Precondition + discover the tmux session name: the proxy must be reachable
     # (else skip), and the aggregator only opens an upstream for a shed that has
     # rc sessions — which this one now does.
-    sessions = _proxy_sessions_or_skip(base, shed)
+    sessions = _proxy_sessions_or_skip(ep, shed)
     shell = next((s for s in sessions if s.get("kind") == "shell"), None)
     assert shell is not None, f"no shell rc session to drive: {sessions!r}"
     tmux = shell.get("tmux_session")
@@ -172,11 +159,8 @@ def test_rc_events_streams_on_activity(shed_server_dev, test_shed_name_dev):
     # Open the aggregate SSE stream, then drive activity by sending a command into
     # the shell pane; the pane change surfaces as an activity.changed event that
     # the aggregator fans out. Read (bounded) until we see an `event:` line.
-    req = urllib.request.Request(
-        f"{base}/api/rc/events", headers={"Accept": "text/event-stream"}
-    )
     got_event = False
-    with urllib.request.urlopen(req, timeout=30) as stream:
+    with ep.open("/api/rc/events", timeout=30, accept="text/event-stream") as stream:
         # Give the aggregator a moment to open its upstream reader, then trigger.
         time.sleep(1.0)
         server.exec(shed, ["tmux", "send-keys", "-t", tmux, "sleep 2", "Enter"])
