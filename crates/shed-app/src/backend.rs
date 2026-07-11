@@ -7,6 +7,7 @@
 //! `(test_mode, mock_base_url, config_path)` rather than a client's `SHED_*_` env
 //! struct, so the GTK + Tauri clients share one implementation.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
@@ -63,18 +64,28 @@ impl Backend {
         mock_base_url: Option<&str>,
         config_path: &Path,
     ) -> Self {
-        Self::from_env_parts_with_minter(test_mode, mock_base_url, config_path, None)
+        Self::from_env_parts_with_minter(
+            test_mode,
+            mock_base_url,
+            config_path,
+            None,
+            &HashSet::new(),
+        )
     }
 
     /// As [`from_env_parts`](Self::from_env_parts), but threads a control-token
     /// `minter` (the host-agent bridge) into every non-mock server's client, so a
     /// secure server mints/refreshes its bearer via `token.get` and fails closed
     /// on a mint failure (F6). GTK passes `None` (static-token only).
+    ///
+    /// `unreachable_hosts` is a TEST-ONLY per-host down simulation consulted only in
+    /// the mock arm (see [`from_config_with_minter`](Self::from_config_with_minter)).
     pub fn from_env_parts_with_minter(
         test_mode: bool,
         mock_base_url: Option<&str>,
         config_path: &Path,
         minter: Option<&Arc<dyn TokenMinter>>,
+        unreachable_hosts: &HashSet<String>,
     ) -> Self {
         if test_mode && mock_base_url.is_none() {
             return Self {
@@ -85,24 +96,31 @@ impl Backend {
             };
         }
         let config = ShedConfig::load(&config_path.to_string_lossy());
-        Self::from_config_with_minter(&config, mock_base_url, minter)
+        Self::from_config_with_minter(&config, mock_base_url, minter, unreachable_hosts)
     }
 
     /// Build clients from an already-parsed config. When `mock_base_url` is set
     /// (test mode) every server is redirected to that single hermetic mock —
     /// plain HTTP, no pin, no token — so no real host is touched.
     pub fn from_config(config: &ShedConfig, mock_base_url: Option<&str>) -> Self {
-        Self::from_config_with_minter(config, mock_base_url, None)
+        Self::from_config_with_minter(config, mock_base_url, None, &HashSet::new())
     }
 
     /// As [`from_config`](Self::from_config), but threads a control-token `minter`
     /// into every non-mock server (see
     /// [`from_env_parts_with_minter`](Self::from_env_parts_with_minter)). The mock
     /// path never gets a minter (hermetic — a static, tokenless mock).
+    ///
+    /// `unreachable_hosts` is a TEST-ONLY per-host down simulation: in the mock arm
+    /// a server whose NAME is in the set is pointed at a closed port
+    /// (`http://127.0.0.1:1`, a fast deterministic ECONNREFUSED) instead of the
+    /// mock, so the harness can exercise the per-host error row end-to-end.
+    /// Mock-mode-only by construction — the production `None` arm never consults it.
     pub fn from_config_with_minter(
         config: &ShedConfig,
         mock_base_url: Option<&str>,
         minter: Option<&Arc<dyn TokenMinter>>,
+        unreachable_hosts: &HashSet<String>,
     ) -> Self {
         let clients = config
             .servers
@@ -110,7 +128,12 @@ impl Backend {
             .filter_map(|s| {
                 let client = match mock_base_url {
                     Some(mock) => {
-                        Client::new(mock.to_string(), s.name.clone(), String::new(), None, None)
+                        let url = if unreachable_hosts.contains(&s.name) {
+                            "http://127.0.0.1:1".to_string()
+                        } else {
+                            mock.to_string()
+                        };
+                        Client::new(url, s.name.clone(), String::new(), None, None)
                     }
                     None => {
                         // A pin on a non-https URL fails closed in Client::new → that
@@ -481,6 +504,18 @@ mod tests {
         (name.to_string(), client)
     }
 
+    fn server_entry(name: &str) -> shed_core::config::ShedServerEntry {
+        shed_core::config::ShedServerEntry {
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            http_port: 8080,
+            ssh_port: 2222,
+            control_token: String::new(),
+            api_url: String::new(),
+            tls_cert_fingerprint: String::new(),
+        }
+    }
+
     #[tokio::test]
     async fn from_env_parts_test_mode_without_mock_builds_no_clients() {
         // Hermeticity: a partial test env must not dial the developer's real hosts.
@@ -710,6 +745,57 @@ mod tests {
         let b = rows.iter().find(|r| r.host == "bad").unwrap();
         assert!(b.profiles.is_empty());
         assert!(b.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn from_config_with_unreachable_host_yields_error_row() {
+        // The mock-arm per-host down override (backs SHED_*_MOCK_UNREACHABLE_HOSTS):
+        // a config-built backend whose `down` server is in the set points that
+        // client at a closed port while `mock` reaches the httpmock — so
+        // egress_profiles / system_df keep `down` as an error row (the e2e
+        // down-host contract, verified at the constructor level rather than only
+        // via hand-built clients).
+        let mock = MockServer::start_async().await;
+        mock.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(200).body(
+                r#"[{"name":"default","source":"config","profile":{"allow":["*.github.com"]}}]"#,
+            );
+        })
+        .await;
+        mock.mock_async(|w, t| {
+            w.method(GET).path("/api/system/df");
+            t.status(200).body(
+                r#"{"server_name":"mock","backend":"vz","totals":{"all":{"logical_bytes":1,"physical_bytes":1}}}"#,
+            );
+        })
+        .await;
+        let config = ShedConfig {
+            servers: vec![server_entry("mock"), server_entry("down")],
+            default_server: Some("mock".into()),
+        };
+        let unreachable: HashSet<String> = ["down".to_string()].into_iter().collect();
+        let backend =
+            Backend::from_config_with_minter(&config, Some(&mock.base_url()), None, &unreachable);
+
+        // egress: `mock` reaches the httpmock (profile decoded); `down` is KEPT as
+        // an error row (redirected to the closed port), never a dropped host.
+        let egress = backend.egress_profiles().await;
+        assert_eq!(egress.len(), 2);
+        let m = egress.iter().find(|r| r.host == "mock").unwrap();
+        assert!(m.error.is_none());
+        assert_eq!(m.profiles.len(), 1);
+        let d = egress.iter().find(|r| r.host == "down").unwrap();
+        assert!(d.profiles.is_empty());
+        assert!(d.error.is_some());
+
+        // system_df: same split — `mock` healthy, `down` an error row with no usage.
+        let df = backend.system_df().await;
+        assert_eq!(df.len(), 2);
+        let m = df.iter().find(|r| r.host == "mock").unwrap();
+        assert!(m.usage.is_some() && m.error.is_none());
+        let d = df.iter().find(|r| r.host == "down").unwrap();
+        assert!(d.usage.is_none() && d.error.is_some());
     }
 
     #[test]

@@ -1031,6 +1031,7 @@ mod tests {
         Env {
             test_mode: true,
             mock_base_url: mock.map(str::to_string),
+            mock_unreachable_hosts: std::collections::HashSet::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),

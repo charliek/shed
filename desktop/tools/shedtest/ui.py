@@ -89,16 +89,22 @@ def socket_path(target: str = "mac") -> Path:
     return runtime / cfg.sock_rel
 
 
-def make_client(target: str) -> IPCClient:
-    """The IPC client for a target — the single source of the target→class map
-    (subprocess targets carry their `client_cls` in `_SUBPROC`)."""
-    sock = socket_path(target)
+def _client_at(target: str, sock: Path) -> IPCClient:
+    """The IPC client class for a target, bound to an EXPLICIT socket path — the
+    single source of the target→class map (subprocess targets carry their
+    `client_cls` in `_SUBPROC`). `make_client` resolves the socket from session
+    state; a self-managed instance (down-host) passes its own."""
     if target == "mac":
         return ShedDesktop(sock)
     cfg = _SUBPROC.get(target)
     if cfg is None:
         raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
     return cfg.client_cls(sock)
+
+
+def make_client(target: str) -> IPCClient:
+    """The IPC client for a target at its session-resolved socket."""
+    return _client_at(target, socket_path(target))
 
 
 def launch_env(target: str) -> dict[str, str]:
@@ -192,14 +198,23 @@ def _quit_mac() -> None:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
+def terminate(proc: "subprocess.Popen[bytes] | None") -> None:
+    """terminate → wait → SIGKILL a subprocess UI child, tolerating one that has
+    already exited. Shared by `_quit_subproc` (the session instance) and a
+    self-managed instance's teardown (down-host)."""
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=scaled_timeout(5))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _quit_subproc(target: str) -> None:
     st = _state[target]
-    if st.proc is not None and st.proc.poll() is None:
-        st.proc.terminate()
-        try:
-            st.proc.wait(timeout=scaled_timeout(5))
-        except subprocess.TimeoutExpired:
-            st.proc.kill()
+    terminate(st.proc)
     if st.log_fh is not None:
         st.log_fh.close()
     if st.runtime_dir is not None:
@@ -208,26 +223,32 @@ def _quit_subproc(target: str) -> None:
 
 
 def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_dir: Path,
-           host_agent_socket: str | None = None) -> None:
+           host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = ()) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
 
     `state_dir` is the throwaway per-session dir: on mac SHED_DESKTOP_STATE_DIR;
     on a subprocess target it doubles as HOME + XDG_RUNTIME_DIR (so ~/.shed and
     the runtime socket are both isolated). `host_agent_socket` backs the approval
-    gate — set for both mac + tauri (the fake host-agent).
+    gate — set for both mac + tauri (the fake host-agent). `unreachable_hosts` are
+    config server NAMES the backend points at a closed port instead of the mock
+    (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host override) so the per-host error
+    row is exercisable e2e; wired for both targets, though only tauri drives it now.
     """
     if target == "mac":
         _launch_mac(mock_base_url=mock_base_url, config_path=config_path,
-                    state_dir=state_dir, host_agent_socket=host_agent_socket)
+                    state_dir=state_dir, host_agent_socket=host_agent_socket,
+                    unreachable_hosts=unreachable_hosts)
     elif target in _SUBPROC:
         _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
-                        runtime_dir=state_dir, host_agent_socket=host_agent_socket)
+                        runtime_dir=state_dir, host_agent_socket=host_agent_socket,
+                        unreachable_hosts=unreachable_hosts)
     else:
         raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
 
 
 def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
-                host_agent_socket: str | None) -> None:
+                host_agent_socket: str | None,
+                unreachable_hosts: tuple[str, ...] = ()) -> None:
     if platform.system() != "Darwin":
         raise RuntimeError("the mac target requires macOS")
     if not APP.is_dir():
@@ -240,6 +261,8 @@ def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
     ]
     if host_agent_socket:
         argv += ["--env", f"SHED_DESKTOP_HOST_AGENT_SOCKET={host_agent_socket}"]
+    if unreachable_hosts:
+        argv += ["--env", f"SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS={','.join(unreachable_hosts)}"]
     # Throwaway UserDefaults suite so preferences never touch the dev's real
     # defaults (the SHED_DESKTOP_STATE_DIR analog for UserDefaults).
     argv += ["--env", f"SHED_DESKTOP_DEFAULTS_SUITE={DEFAULTS_SUITE}"]
@@ -254,21 +277,18 @@ def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
     wait_alive("mac", mock_base_url=mock_base_url)
 
 
-def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
-                    runtime_dir: Path, host_agent_socket: str | None = None) -> None:
-    cfg = _SUBPROC[target]
-    if not cfg.binary.exists():
-        raise RuntimeError(
-            f"{target} binary not found at {cfg.binary}; build it first "
-            f"(tauri: `make tauri-build`).")
-    # HOME/XDG_RUNTIME_DIR redirected to the temp dir (never the dev's ~/.shed or
-    # real runtime socket), config pinned to the fixture, test mode + mock set.
-    # <PREFIX>_SOCKET is cleared so the XDG default (under runtime_dir) is used.
+def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
+                config_path: Path, host_agent_socket: str | None = None,
+                unreachable_hosts: tuple[str, ...] = ()) -> dict[str, str]:
+    """The launch env for a subprocess UI — the single source of the subprocess
+    env-var contract, shared by the session launcher and a self-managed instance
+    (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME are redirected to the
+    throwaway `runtime_dir` (never the dev's ~/.shed, real runtime socket, or real
+    prefs), config is pinned to the fixture, test mode + mock are set, and
+    `<PREFIX>_SOCKET` is cleared so the XDG default (under runtime_dir) is used."""
     env = dict(os.environ)
     env["HOME"] = str(runtime_dir)
     env["XDG_RUNTIME_DIR"] = str(runtime_dir)
-    # Redirect the config dir too so tauri's app_config_dir (persisted prefs) is
-    # hermetic — else a dev's real $XDG_CONFIG_HOME would be written under test.
     env["XDG_CONFIG_HOME"] = str(runtime_dir / "config")
     env[f"{cfg.env_prefix}_TEST_MODE"] = "1"
     env[f"{cfg.env_prefix}_MOCK_BASE_URL"] = mock_base_url
@@ -276,7 +296,29 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
     # The approval gate's host-agent socket (the fake, in tests).
     if host_agent_socket:
         env[f"{cfg.env_prefix}_HOST_AGENT_SOCKET"] = str(host_agent_socket)
+    # Down-host override: server NAMES the backend redirects to a closed port.
+    # Always set-or-clear (like the socket below) so an inherited value from the
+    # parent shell never leaks into a normal (empty) session.
+    unreachable_key = f"{cfg.env_prefix}_MOCK_UNREACHABLE_HOSTS"
+    if unreachable_hosts:
+        env[unreachable_key] = ",".join(unreachable_hosts)
+    else:
+        env.pop(unreachable_key, None)
     env.pop(f"{cfg.env_prefix}_SOCKET", None)
+    return env
+
+
+def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
+                    runtime_dir: Path, host_agent_socket: str | None = None,
+                    unreachable_hosts: tuple[str, ...] = ()) -> None:
+    cfg = _SUBPROC[target]
+    if not cfg.binary.exists():
+        raise RuntimeError(
+            f"{target} binary not found at {cfg.binary}; build it first "
+            f"(tauri: `make tauri-build`).")
+    env = subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
+                      config_path=config_path, host_agent_socket=host_agent_socket,
+                      unreachable_hosts=unreachable_hosts)
     st = _state[target]
     st.env = env
     st.runtime_dir = runtime_dir
@@ -288,15 +330,21 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
     wait_alive(target, mock_base_url=mock_base_url)
 
 
-def wait_alive(target: str = "mac", *, mock_base_url: str, timeout: float = 30.0) -> None:
-    """Block until the app answers `identify` AND confirms it's hermetic (test
-    mode + the expected mock base URL + the target's backend). Failing fast here
-    stops a misconfigured run from silently hitting a real server."""
+def await_hermetic(target: str, *, sock: Path, mock_base_url: str, timeout: float = 30.0,
+                   proc: "subprocess.Popen[bytes] | None" = None,
+                   log: Path | None = None) -> None:
+    """Block until the UI at `sock` answers `identify` AND confirms it's hermetic
+    (test mode + the expected mock base URL + the target's backend). Failing fast
+    here stops a misconfigured run from silently hitting a real server. A
+    subprocess UI passes its `proc`/`log` so a crashed-on-boot child (already
+    exited) is surfaced with its captured log rather than a slow timeout. `_state`-
+    free — shared by the session launcher (via `wait_alive`) and a self-managed
+    instance (down-host)."""
     timeout = scaled_timeout(timeout)
     deadline = time.monotonic() + timeout
     while True:
         try:
-            c = make_client(target)
+            c = _client_at(target, sock)
             try:
                 info = c.identify()
                 if _hermetic(target, info, mock_base_url):
@@ -305,15 +353,22 @@ def wait_alive(target: str = "mac", *, mock_base_url: str, timeout: float = 30.0
                 c.close()
         except (OSError, ShedError):
             pass
-        # A crashed-on-boot subprocess child (already exited) is a hard failure,
-        # not a slow boot — surface it (with the captured log) rather than time out.
-        st = _state.get(target)
-        if st is not None and st.proc is not None and st.proc.poll() is not None:
+        if proc is not None and proc.poll() is not None:
             raise RuntimeError(
-                f"{target} UI exited early (code {st.proc.returncode}); see {st.log}")
+                f"{target} UI exited early (code {proc.returncode}); see {log}")
         if time.monotonic() >= deadline:
             raise TimeoutError(f"{target} UI not hermetically ready within {timeout}s")
         time.sleep(0.25)
+
+
+def wait_alive(target: str = "mac", *, mock_base_url: str, timeout: float = 30.0) -> None:
+    """Session-instance wait: resolve the socket + subprocess bookkeeping from
+    `_state` and block until hermetically ready (see `await_hermetic`)."""
+    st = _state.get(target)
+    await_hermetic(
+        target, sock=socket_path(target), mock_base_url=mock_base_url, timeout=timeout,
+        proc=st.proc if st else None, log=st.log if st else None,
+    )
 
 
 def _hermetic(target: str, info: dict, mock_base_url: str) -> bool:

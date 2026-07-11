@@ -376,10 +376,11 @@ def test_egress_profiles_render(tauri):
     # host + source, the auto-selected first profile's detail shows its allow/deny
     # rules, and selection is drivable by name (egress.show).
     #
-    # NOTE: a down-host error row can't be simulated here — test mode points every
-    # configured server at the single in-process mock — so the error-row contract
-    # is pinned at the shed-app unit level
-    # (backend.rs::egress_profiles_keeps_error_row_for_down_host).
+    # NOTE: this module's shared session instance points every configured server at
+    # the single in-process mock, so the down-host error row is exercised e2e in the
+    # DEDICATED module test_tauri_downhost.py (its own instance + the down-host
+    # fixture + the SHED_TAURI_MOCK_UNREACHABLE_HOSTS override); the shed-app unit
+    # level pins it too (backend.rs::egress_profiles_keeps_error_row_for_down_host).
     tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
     tauri.navigate("egress")
     tauri.wait_until(lambda: tauri.current_pane() == "egress", timeout=15, what="pane=egress")

@@ -60,6 +60,16 @@ make -C desktop e2e-tauri       # shared suite + test_tauri at --target tauri (n
 - `e2e-tauri` runs the ONE `tools/shedtest` harness with `--target tauri`; mac-only ops stay
   gated off. On Linux the tray is a native menu (Tauri emits no Linux tray-click events → no
   popover; expected).
+- **Simulating a down (unreachable) host.** The shared session redirects EVERY configured
+  server to the one in-process mock, so a per-host error row can't appear there. To exercise
+  it, use a DEDICATED fixture config with an extra server plus the
+  `SHED_TAURI_MOCK_UNREACHABLE_HOSTS=<name,...>` override (comma-separated server NAMES, parsed
+  only in test mode) — the backend points those at `http://127.0.0.1:1` (deterministic
+  ECONNREFUSED) while the rest hit the mock. `test_tauri_downhost.py` is the pattern: it
+  launches its OWN throwaway instance (distinct HOME/XDG → distinct socket + single-instance
+  lock, so it coexists with the session app) against `fixtures/config-downhost.yaml`. Keep the
+  down host OUT of the shared `fixtures/config.yaml` (it would break the m0 golden gate + put an
+  error banner in every "healthy" screenshot).
 
 ## How the Docker legs are wired (so failures make sense)
 
