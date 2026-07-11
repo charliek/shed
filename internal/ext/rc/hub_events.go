@@ -80,6 +80,16 @@ type sessionUpdatedData struct {
 	Session *Session `json:"session"` // null on disappear (kill)
 }
 
+// messageAppendedData notifies a new feed message landed for a session. It carries
+// only the identity + seq — the body is fetched from /messages so the fan-out payload
+// stays tiny and a dropped notification is harmless (the client refetches with
+// ?since). `shed` is filled by the server-side aggregator (see the doc above).
+type messageAppendedData struct {
+	Shed string `json:"shed"`
+	Slug string `json:"slug"`
+	Seq  uint64 `json:"seq"`
+}
+
 func activityChangedEvent(slug string, activity Activity, activityAt string, state State) hubEvent {
 	return hubEvent{name: "activity.changed", data: activityChangedData{
 		Slug: slug, Activity: activity, ActivityAt: activityAt, State: state,
@@ -98,6 +108,11 @@ func sessionUpdatedEvent(s Session) hubEvent {
 // null — clients refetch the snapshot.
 func sessionGoneEvent(slug string) hubEvent {
 	return hubEvent{name: "session.updated", data: sessionUpdatedData{Slug: slug, Session: nil}}
+}
+
+// messageAppendedEvent fires when a new feed message lands in a session's ring.
+func messageAppendedEvent(slug string, seq uint64) hubEvent {
+	return hubEvent{name: "message.appended", data: messageAppendedData{Slug: slug, Seq: seq}}
 }
 
 // subscribe registers a new SSE subscriber.

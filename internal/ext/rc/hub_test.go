@@ -3,6 +3,7 @@ package rc
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -40,15 +41,35 @@ func (c *hubClock) advance(d time.Duration) {
 // keyed by tmux session name. Safe for concurrent use (the reconcile goroutine and
 // a test goroutine can both call it).
 type hubTmux struct {
-	mu    sync.Mutex
-	names []string          // rc-* (and other) session names for `ls`
-	panes map[string]string // tmux name → capture-pane stdout
-	envs  map[string]string // tmux name → show-environment stdout
-	gone  map[string]bool   // tmux name → capture-pane reports "can't find pane"
+	mu     sync.Mutex
+	names  []string          // rc-* (and other) session names for `ls`
+	panes  map[string]string // tmux name → capture-pane stdout
+	envs   map[string]string // tmux name → show-environment stdout
+	gone   map[string]bool   // tmux name → capture-pane reports "can't find pane"
+	flaky  map[string]bool   // tmux name → capture-pane fails TRANSIENTLY (not gone)
+	lsFail string            // non-empty → `ls` fails transiently with this stderr
+	sent   []string          // recorded delivery payloads (send-keys -l / set-buffer text)
 }
 
 func newHubTmux() *hubTmux {
-	return &hubTmux{panes: map[string]string{}, envs: map[string]string{}, gone: map[string]bool{}}
+	return &hubTmux{
+		panes: map[string]string{}, envs: map[string]string{},
+		gone: map[string]bool{}, flaky: map[string]bool{},
+	}
+}
+
+// setLsFail makes `ls` fail transiently (stderr must not read as "no server").
+func (f *hubTmux) setLsFail(stderr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lsFail = stderr
+}
+
+// setFlaky makes a session's capture-pane fail transiently (a tmux hiccup, NOT gone).
+func (f *hubTmux) setFlaky(name string, flaky bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flaky[name] = flaky
 }
 
 func (f *hubTmux) set(name, pane, env string) {
@@ -86,18 +107,71 @@ func (f *hubTmux) Run(args ...string) Result {
 	defer f.mu.Unlock()
 	switch args[0] {
 	case "ls":
+		if f.lsFail != "" {
+			return Result{Code: 1, Stderr: f.lsFail}
+		}
 		return Result{Stdout: strings.Join(f.names, "\n")}
 	case "capture-pane":
 		name := targetOf(args)
 		if f.gone[name] {
 			return Result{Code: 1, Stderr: "can't find pane: " + name}
 		}
+		if f.flaky[name] {
+			return Result{Code: 1, Stderr: "lost server connection (transient)"}
+		}
 		return Result{Stdout: f.panes[name]}
 	case "show-environment":
 		name := targetOf(args)
 		return Result{Stdout: f.envs[name]}
+	case "send-keys":
+		// Record the literal text of a `send-keys -t <name> -l -- <text>` delivery
+		// (the single-line paste path); the bare Enter submit is ignored.
+		if payload, ok := literalSendKeys(args); ok {
+			f.sent = append(f.sent, payload)
+		}
+		return Result{}
+	case "set-buffer":
+		// The multi-line bracketed-paste path loads the block into a buffer first.
+		if i := indexOf(args, "--"); i >= 0 && i+1 < len(args) {
+			f.sent = append(f.sent, args[i+1])
+		}
+		return Result{}
+	case "paste-buffer":
+		return Result{}
 	}
 	return Result{}
+}
+
+// literalSendKeys extracts the text of a literal `send-keys -l -- <text>` call.
+func literalSendKeys(args []string) (string, bool) {
+	hasL := false
+	for _, a := range args {
+		if a == "-l" {
+			hasL = true
+		}
+	}
+	if !hasL {
+		return "", false
+	}
+	if i := indexOf(args, "--"); i >= 0 && i+1 < len(args) {
+		return args[i+1], true
+	}
+	return "", false
+}
+
+func indexOf(args []string, want string) int {
+	for i, a := range args {
+		if a == want {
+			return i
+		}
+	}
+	return -1
+}
+
+func (f *hubTmux) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sent...)
 }
 
 func targetOf(args []string) string {
@@ -266,6 +340,68 @@ func TestHubReconcileDisappearEmitsGone(t *testing.T) {
 	h.trackMu.Unlock()
 	if stillTracked {
 		t.Fatal("disappeared session should be dropped from tracked")
+	}
+}
+
+// A transient tmux listing failure must not read as "every session is gone": the
+// reconcile pass is skipped wholesale — tracked state, rings, and watchers survive,
+// no session-gone events fire, and the idle-exit clock does not start. A genuine
+// "no server running" answer (killing the last session stops the tmux server) still
+// reads as everything-gone.
+func TestHubReconcileSkipsOnTransientListFailure(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	f.set("rc-lsf111", "boot >_ OpenAI Codex (v1.0)", managedEnv("id-lsf", KindCodex))
+	h.reconcile()
+	h.trackMu.Lock()
+	tr := h.tracked["lsf111"]
+	h.trackMu.Unlock()
+	if tr == nil {
+		t.Fatal("precondition: session tracked")
+	}
+	tr.ring.append(textMsg("kept"), clk.now())
+
+	sub := h.subscribe()
+	f.setLsFail("error connecting to /tmp/tmux-1000/default (transient)")
+	h.reconcile() // must be a no-op pass
+
+	if evs := drainEvents(sub); len(evs) != 0 {
+		t.Fatalf("a skipped pass must emit no events, got %+v", evs)
+	}
+	h.trackMu.Lock()
+	tr2, still := h.tracked["lsf111"]
+	idleStarted := !h.idleSince.IsZero()
+	h.trackMu.Unlock()
+	if !still || tr2 != tr {
+		t.Fatal("tracked state must survive a transient listing failure")
+	}
+	if msgs, _ := tr2.ring.since(0, 10); len(msgs) != 1 {
+		t.Fatal("the session ring must survive a transient listing failure")
+	}
+	if idleStarted {
+		t.Fatal("a skipped pass must not start the idle-exit clock")
+	}
+
+	// The failure clears → normal reconcile resumes with the same tracked entry.
+	f.setLsFail("")
+	h.reconcile()
+	h.trackMu.Lock()
+	tr3 := h.tracked["lsf111"]
+	h.trackMu.Unlock()
+	if tr3 != tr {
+		t.Fatal("recovery must keep the same tracked entry (no reset)")
+	}
+
+	// Contrast: a genuine "no server running" answer IS everything-gone.
+	f.setLsFail("no server running on /tmp/tmux-1000/default")
+	h.reconcile()
+	h.trackMu.Lock()
+	_, stillTracked := h.tracked["lsf111"]
+	h.trackMu.Unlock()
+	if stillTracked {
+		t.Fatal("a no-server answer must drop the tracked session (genuinely gone)")
 	}
 }
 
@@ -523,7 +659,7 @@ func TestHubHTTPSessions(t *testing.T) {
 	}
 }
 
-func TestHubHTTPStubsAndMethods(t *testing.T) {
+func TestHubHTTPRoutesAndMethods(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	h := newTestHub(f, clk)
@@ -531,16 +667,20 @@ func TestHubHTTPStubsAndMethods(t *testing.T) {
 	defer srv.Close()
 
 	cases := []struct {
-		method, path string
-		want         int
+		method, path, body string
+		want               int
 	}{
-		{"GET", "/v1/sessions/x/messages", http.StatusNotImplemented},
-		{"POST", "/v1/sessions/x/input", http.StatusNotImplemented},
-		{"POST", "/v1/sessions", http.StatusMethodNotAllowed}, // sessions is GET-only
-		{"GET", "/v1/nope", http.StatusNotFound},
+		{"GET", "/v1/sessions/x/messages", "", http.StatusNotFound},            // unknown slug
+		{"POST", "/v1/sessions/x/input", `{"text":"hi"}`, http.StatusNotFound}, // unknown slug (valid body)
+		{"POST", "/v1/sessions", "", http.StatusMethodNotAllowed},              // sessions is GET-only
+		{"GET", "/v1/nope", "", http.StatusNotFound},                           // unknown path
 	}
 	for _, c := range cases {
-		req, _ := http.NewRequest(c.method, srv.URL+c.path, nil)
+		var body io.Reader
+		if c.body != "" {
+			body = strings.NewReader(c.body)
+		}
+		req, _ := http.NewRequest(c.method, srv.URL+c.path, body)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("%s %s: %v", c.method, c.path, err)

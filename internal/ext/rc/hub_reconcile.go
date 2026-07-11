@@ -58,6 +58,17 @@ type trackedSession struct {
 	// correlateTried counts correlation attempts so a session whose file never appears
 	// does not re-scan the filesystem on every single tick forever.
 	correlateTried int
+
+	// ring is the session's message feed (populated only by the codex watcher in this
+	// phase; every tracked session has one so /messages returns 200-empty for a known
+	// slug and 404 only for an unknown one). Its own mutex guards concurrent access.
+	ring *messageRing
+	// lastStability is the raw pane-stability verdict from the most recent successful
+	// tracker Tick (before the watcher merge / DisplayActivity). The input handler
+	// reads it so its acceptance re-check runs the SAME mergedActivity the reconcile
+	// uses — without it, a long-quiet working session (>120s tool call) would fall
+	// to the anchor path and deliver mid-turn.
+	lastStability Activity
 }
 
 // newTrackedSession builds tracker state for a freshly seen session. The tracker
@@ -78,6 +89,7 @@ func (h *Hub) newTrackedSession(s Session) *trackedSession {
 		createdAt: s.CreatedAt,
 		tracker:   NewStabilityTracker(s.Kind, capture, h.cfg.now, h.cfg.quiet),
 		lastState: s.State,
+		ring:      newMessageRing(),
 	}
 }
 
@@ -92,7 +104,17 @@ func (tr *trackedSession) sameIdentity(s Session) bool {
 // slice), then broadcasts after unlocking — so a broadcast can never block reconcile
 // against an SSE handler.
 func (h *Hub) reconcile() {
-	sessions := List(h.cfg.runner, nil).RCSessions
+	// A transient tmux listing failure must NOT read as "every session is gone" —
+	// that would wipe the message rings, close the watchers, and broadcast a storm of
+	// session-gone events over one hiccup. Skip the whole pass and keep state; the
+	// next tick retries. (A genuine "no sessions/no server" answer returns an empty
+	// list with no error and proceeds — that IS everything-gone.)
+	names, err := listSessionNamesChecked(h.cfg.runner)
+	if err != nil {
+		h.cfg.logf("rc hub: session listing failed (%v); keeping state this tick", err)
+		return
+	}
+	sessions := sessionsForNames(h.cfg.runner, names, nil)
 	now := h.cfg.now()
 
 	var events []hubEvent
@@ -130,6 +152,11 @@ func (h *Hub) reconcile() {
 		// error (transient tmux hiccup) with no fresh watcher leaves the prior activity
 		// untouched rather than flapping the DTO to unknown.
 		raw, capErr := tr.tracker.Tick()
+		if capErr == nil {
+			// Remember the raw stability verdict for the input handler's acceptance
+			// re-check (it re-runs the same watcher+stability merge as below).
+			tr.lastStability = raw
+		}
 
 		var watcherActivity Activity
 		var watcherMessage string
@@ -141,6 +168,14 @@ func (h *Hub) reconcile() {
 			if tr.pendingAgentID != "" && tr.watcher.hadEvent() {
 				backWriteAgentSession(h.cfg.runner, s.TmuxSession, tr.pendingAgentID)
 				tr.pendingAgentID = ""
+			}
+			// Drain any normalized feed messages the watcher produced this poll into the
+			// session ring (codex only; other kinds' watchers produce none). A per-message
+			// message.appended notification lets subscribers know to fetch /messages — the
+			// body is deliberately not on the SSE frame (keeps fan-out tiny + drop-safe).
+			for _, m := range tr.watcher.drainPending() {
+				seq := tr.ring.append(m, now)
+				events = append(events, messageAppendedEvent(s.Slug, seq))
 			}
 			watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking = tr.watcher.snapshot(now)
 		}
@@ -175,13 +210,16 @@ func (h *Hub) reconcile() {
 	}
 
 	// Sessions that vanished since the last pass (killed). Release the JSONL watcher
-	// (its tail is now pointed at a dead session's file).
+	// (its tail is now pointed at a dead session's file) and prune the slug's input
+	// lock (a recreate at the same slug later gets a fresh one; an input request
+	// already holding the old lock finishes against a gone pane harmlessly).
 	for slug, tr := range h.tracked {
 		if !present[slug] {
 			if tr.watcher != nil {
 				tr.watcher.close()
 			}
 			delete(h.tracked, slug)
+			h.pruneInputLock(slug)
 			events = append(events, sessionGoneEvent(slug))
 		}
 	}

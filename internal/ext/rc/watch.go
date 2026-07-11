@@ -72,6 +72,20 @@ type activityFold interface {
 	settled() bool
 }
 
+// messageProducer is an activityFold that ALSO produces a normalized message feed
+// (codex only; claude feeds activity only in this phase). The fileWatcher drains it on
+// each refresh; a fold that does not implement it contributes no feed messages.
+//
+// Ambiguous correlation caveat (accepted): a watcher attached on an AMBIGUOUS window
+// match is follow-only and its ACTIVITY stays untrusted (unknown) until an in-file
+// event confirms the pick — but new appends it folds before that confirmation do
+// reach the session's message ring. Worst case the ring briefly carries a few
+// messages from the same user's other same-cwd session; the ring is per-session,
+// same-trust content, and a confirmed-wrong pick is torn down with the watcher.
+type messageProducer interface {
+	drainMessages() []feedMessage
+}
+
 // fileWatcher pairs a tailer with a fold and tracks freshness for the reconcile merge.
 type fileWatcher struct {
 	tailer *lineTailer
@@ -82,6 +96,8 @@ type fileWatcher struct {
 	curActivity Activity
 	curMessage  string
 	curSettled  bool
+	pending     []feedMessage // feed messages produced since the last drainPending
+	closed      bool          // terminal: refresh no-ops after close (see close)
 }
 
 func newFileWatcher(path string, catchUp bool, fold activityFold) *fileWatcher {
@@ -93,10 +109,16 @@ func newFileWatcher(path string, catchUp bool, fold activityFold) *fileWatcher {
 
 // refresh polls the file and folds any new lines. A reset from the tailer clears the
 // fold; a poll error (permission/transient) is swallowed so the prior verdict is
-// retained. now stamps the last-event time used by the freshness decision.
+// retained. now stamps the last-event time used by the freshness decision. A CLOSED
+// watcher no-ops: the tailer released its file handle on close, and a poll would
+// silently reopen the path from offset 0 — a full re-read (and a leaked handle) that
+// refolds a dead incarnation's history into a watcher that is already discarded.
 func (w *fileWatcher) refresh(now time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
 	lines, didReset, gapped, err := w.tailer.poll()
 	if didReset {
 		w.fold.reset()
@@ -117,6 +139,24 @@ func (w *fileWatcher) refresh(now time.Time) {
 	w.curActivity = w.fold.activity()
 	w.curMessage = w.fold.lastMessage()
 	w.curSettled = w.fold.settled()
+	// Drain any feed messages the fold produced this poll into the watcher's pending
+	// queue; reconcile empties it into the session ring (see drainPending).
+	if mp, ok := w.fold.(messageProducer); ok {
+		w.pending = append(w.pending, mp.drainMessages()...)
+	}
+}
+
+// drainPending returns and clears the feed messages produced since the last drain (in
+// stream order). reconcile appends these to the session's message ring.
+func (w *fileWatcher) drainPending() []feedMessage {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) == 0 {
+		return nil
+	}
+	out := w.pending
+	w.pending = nil
+	return out
 }
 
 // snapshot reports the watcher's activity + message and its authority at now:
@@ -157,9 +197,13 @@ func (w *fileWatcher) hadEvent() bool {
 	return !w.lastEventAt.IsZero()
 }
 
+// close releases the tailer's file handle and marks the watcher terminally closed —
+// any later refresh (e.g. an input handler holding a stale pointer) is a no-op rather
+// than a from-zero reopen. Idempotent.
 func (w *fileWatcher) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.closed = true
 	w.tailer.close()
 }
 

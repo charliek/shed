@@ -132,9 +132,9 @@ version (currently **3**), decoupled from `SHED_RC_V` (metadata schema, still **
     "claude": { "installed": true, "version": "2.1.206" },
     "codex":  { "installed": false }
   },
-  "features": ["generic-perm", "plan-stdin", "prompt-b64"],
+  "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"],
   "kind_features": {
-    "codex": { "post_input": true, "approvals": "tui" }
+    "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" }
   }
 }
 ```
@@ -144,8 +144,8 @@ version (currently **3**), decoupled from `SHED_RC_V` (metadata schema, still **
 | `rc_version` | Capability/protocol version. Bumped when the capability shape or a feature contract changes; **not** tied to `SHED_RC_V`. |
 | `kinds` | Every kind this binary offers (order matches the pinned wire contract). |
 | `agents` | Per-tool install probe (`command -v` + `--version`, 2 s budget). `version` omitted when not installed. |
-| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`. A token is appended in the same change that ships its feature. |
-| `kind_features` | Per-kind UI hints. `post_input` = a typed line can be delivered to the pane; `approvals` = where approvals happen (v1 agents are TUI-only → `tui`). `claude-broker` and `shell` are omitted. |
+| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`, `serve` (the on-demand rc activity hub), `activity` (the live activity dimension), `messages` (the codex message feed + gated input endpoints). A token is appended in the same change that ships its feature. |
+| `kind_features` | Per-kind UI hints. `post_input` = a typed line can be delivered to the pane; `approvals` = where approvals happen (v1 agents are TUI-only → `tui`); `watch` = the hub produces a live message feed for the kind (`GET …/messages` + the `message.appended` event); `input` = feed-input posting mode (`gated` = `POST …/input` accepted only while the session is waiting, absent = no feed input). `watch`/`input` are codex-only in this phase. `claude-broker` and `shell` are omitted. |
 
 The `list` envelope embeds this block as `capabilities`. It is a pointer with
 `omitempty`, so an **old** binary's bare `{"rc_sessions":[…]}` output still decodes — a
@@ -194,6 +194,13 @@ absent when no hub is running or the kind is unsupported:
 | `activity` | Live work dimension, orthogonal to `state`: `working` \| `needs_input` \| `idle` \| `unknown` (the value `needs_approval` is reserved in the wire contract but not produced yet). Lifecycle trumps activity — a `needs-trust`/`needs-auth`/`dead` session reports no activity. |
 | `activity_at` | RFC3339 timestamp the activity was last derived/changed. |
 | `last_message` | Sanitized preview of the most recent message — ANSI/control-stripped, whitespace-collapsed, truncated to ≤200 runes. |
+
+Two notes on the hub's codex **message feed** (`GET /v1/sessions/{slug}/messages`).
+Message history remains readable while a blocking lifecycle state gates activity and
+input posting — it is pre-gate content the operator already saw on the pane, and the
+server-side proxy is the authorization boundary. Treat the feed as **same-trust as
+the pane itself**: `tool.detail` carries raw command lines and tool outputs (bounded
+at 8 KiB per message).
 
 ## Exit codes
 

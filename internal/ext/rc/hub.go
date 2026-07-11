@@ -221,14 +221,47 @@ type Hub struct {
 	// then broadcasts after unlocking).
 	subMu sync.Mutex
 	subs  map[*subscriber]struct{}
+
+	// inputLockMu guards inputLocks: per-SLUG input-delivery mutexes. Keyed on the
+	// hub rather than the trackedSession so a tracked-entry replacement mid-request
+	// (a recreate reconciled between a handler's lookup and its lock acquisition)
+	// cannot yield two live locks for one pane. Entries are pruned when a session
+	// disappears (see reconcile).
+	inputLockMu sync.Mutex
+	inputLocks  map[string]*sync.Mutex
 }
 
 func newHub(cfg HubConfig) *Hub {
 	return &Hub{
-		cfg:     cfg.resolve(),
-		tracked: map[string]*trackedSession{},
-		subs:    map[*subscriber]struct{}{},
+		cfg:        cfg.resolve(),
+		tracked:    map[string]*trackedSession{},
+		subs:       map[*subscriber]struct{}{},
+		inputLocks: map[string]*sync.Mutex{},
 	}
+}
+
+// inputLock returns the slug's input-delivery mutex, creating it on first use. The
+// same slug always yields the same mutex until the session disappears (pruned), so
+// input serialization survives a tracked-entry replacement (kill+recreate keeps the
+// slug present → keeps the lock).
+func (h *Hub) inputLock(slug string) *sync.Mutex {
+	h.inputLockMu.Lock()
+	defer h.inputLockMu.Unlock()
+	mu, ok := h.inputLocks[slug]
+	if !ok {
+		mu = &sync.Mutex{}
+		h.inputLocks[slug] = mu
+	}
+	return mu
+}
+
+// pruneInputLock drops a disappeared slug's input mutex. A request still holding the
+// old mutex finishes against a gone pane (its delivery 404s); a later recreate at the
+// same slug gets a fresh lock.
+func (h *Hub) pruneInputLock(slug string) {
+	h.inputLockMu.Lock()
+	defer h.inputLockMu.Unlock()
+	delete(h.inputLocks, slug)
 }
 
 // handler builds the hub's HTTP routes. Go's method+wildcard ServeMux patterns
@@ -239,13 +272,8 @@ func (h *Hub) handler() http.Handler {
 	mux.HandleFunc("GET /v1/health", h.handleHealth)
 	mux.HandleFunc("GET /v1/sessions", h.handleSessions)
 	mux.HandleFunc("GET /v1/events", h.handleEvents)
-	// /messages and /input are wired now but not implemented until the message-feed
-	// commit — they return 501 (route exists, not yet implemented) rather than 404
-	// so a client can tell "hub too old / feature absent" from "unknown slug" (which
-	// is the 404 the real handlers will return). The `activity`/`serve` capability
-	// tokens advertise this hub; the `messages` token is withheld until these land.
-	mux.HandleFunc("GET /v1/sessions/{slug}/messages", h.handleNotImplemented)
-	mux.HandleFunc("POST /v1/sessions/{slug}/input", h.handleNotImplemented)
+	mux.HandleFunc("GET /v1/sessions/{slug}/messages", h.handleMessages)
+	mux.HandleFunc("POST /v1/sessions/{slug}/input", h.handleInput)
 	return mux
 }
 
@@ -299,11 +327,213 @@ func (h *Hub) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, hubHealth{App: hubAppID, Version: version.Info(), PID: os.Getpid()})
 }
 
-// handleNotImplemented is the placeholder for the message-feed/input routes filled
-// in a later commit.
-func (h *Hub) handleNotImplemented(w http.ResponseWriter, _ *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not_implemented",
-		"endpoint not implemented in this hub version")
+// handleMessages serves GET /v1/sessions/{slug}/messages: a page of the session's feed
+// ring after the exclusive `since` seq (default from the start), bounded by `limit`
+// (≤200, default 100). truncated=true when `since` predates the ring (drop-oldest
+// discarded messages the client hasn't seen) or points beyond the current tail (the
+// ring restarted — refetch). 404 for an unknown slug, 400 for a malformed
+// `since`/`limit`.
+//
+// POLICY (intended asymmetry with DisplayActivity): message history REMAINS readable
+// while a blocking lifecycle state (needs-trust/needs-auth/dead) gates the activity
+// dimension and input posting. The ring holds pre-gate content the operator already
+// saw on the pane, this is a loopback-only surface, and the server-side proxy is the
+// authorization boundary — suppressing history here would only hide context a client
+// needs to render the "session died mid-conversation" view.
+func (h *Hub) handleMessages(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+
+	var since uint64
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		v, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_since", "since must be a non-negative integer")
+			return
+		}
+		since = v
+	}
+	limit := defaultMessagesLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "limit must be a non-negative integer")
+			return
+		}
+		limit = v
+	}
+
+	h.trackMu.Lock()
+	tr, ok := h.tracked[slug]
+	var ring *messageRing
+	if ok {
+		ring = tr.ring
+	}
+	h.trackMu.Unlock()
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown_slug", "no such rc session")
+		return
+	}
+
+	msgs, truncated := ring.since(since, limit)
+	if msgs == nil {
+		msgs = []feedMessage{} // encode [] not null for an empty page
+	}
+	writeJSON(w, http.StatusOK, hubMessagesResponse{Messages: msgs, Truncated: truncated})
+}
+
+// inputRequest is the POST /v1/sessions/{slug}/input body.
+type inputRequest struct {
+	Text string `json:"text"`
+}
+
+// handleInput serves POST /v1/sessions/{slug}/input: validate + re-derive live state
+// under the per-session mutex, then deliver the text through the bracketed-paste path.
+// Statuses: 400 invalid/unsafe text, 404 unknown/gone slug, 409 not accepting (wrong
+// activity, recreated identity, or a non-input-gated kind), 413 body too large.
+func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+
+	// Bound the body BEFORE decoding so an oversized payload is a 413, not an OOM.
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	var req inputRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "too_large", "input body exceeds 16 KiB")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+
+	text := NormalizeNewlines(req.Text)
+	if trimFeedText(text) == "" {
+		writeError(w, http.StatusBadRequest, "empty_text", "text is required")
+		return
+	}
+	if HasUnsafePromptChars(text) {
+		writeError(w, http.StatusBadRequest, "unsafe_text", "text contains an unsupported control character")
+		return
+	}
+
+	// Look up the tracked session and snapshot the identity the re-check pins against.
+	// The read runs under trackMu — reconcile mutates tracked under the same lock.
+	h.trackMu.Lock()
+	tr, ok := h.tracked[slug]
+	var wantID, wantCreatedAt string
+	if ok {
+		wantID, wantCreatedAt = tr.id, tr.createdAt
+	}
+	h.trackMu.Unlock()
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown_slug", "no such rc session")
+		return
+	}
+
+	// Per-SLUG mutex (hub-keyed, not on the tracked entry): the acceptance re-check +
+	// delivery are one critical section, and the same slug maps to the same mutex even
+	// if reconcile replaces the tracked entry between our lookup and this lock — two
+	// concurrent posts can never interleave keystrokes into one pane.
+	mu := h.inputLock(slug)
+	mu.Lock()
+	defer mu.Unlock()
+
+	name := TmuxName(slug)
+	pane, err := capturePaneChecked(h.cfg.runner, name)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			// The session vanished between the lookup and this re-capture.
+			writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
+			return
+		}
+		// A transient tmux failure is not evidence the session is gone — surface it as
+		// a server error so the client retries rather than dropping the session.
+		writeError(w, http.StatusInternalServerError, "capture_failed", "pane re-capture failed")
+		return
+	}
+	fresh := ParseSession(name, showEnvironment(h.cfg.runner, name), pane, nil)
+
+	// Identity guard: the slug must still be the same incarnation we looked up.
+	if fresh.ID != wantID || fresh.CreatedAt != wantCreatedAt {
+		writeError(w, http.StatusConflict, "not_accepting", "session was recreated")
+		return
+	}
+	// Feed input is codex-only in this phase (kind_features.input == "gated").
+	if !inputGatedKind(fresh.Kind) {
+		writeError(w, http.StatusConflict, "not_accepting", "this kind does not accept feed input")
+		return
+	}
+	// A blocking lifecycle state suppresses the activity dimension entirely — nothing
+	// is accepting typed input.
+	if DisplayActivity(fresh.State, ActivityWorking) == "" {
+		writeError(w, http.StatusConflict, "not_accepting", "session is not in an input-accepting state")
+		return
+	}
+
+	// Re-read the CURRENT watcher + stability under trackMu (they may have been
+	// replaced since the pre-lock lookup; identity was just re-verified above).
+	h.trackMu.Lock()
+	var (
+		watcher   *fileWatcher
+		stability Activity
+	)
+	if cur, ok := h.tracked[slug]; ok {
+		watcher, stability = cur.watcher, cur.lastStability
+	}
+	h.trackMu.Unlock()
+
+	if !h.inputAccepted(watcher, stability, fresh.Kind, pane) {
+		writeError(w, http.StatusConflict, "not_accepting", "session is not waiting for input")
+		return
+	}
+
+	// Deliver via the shared bracketed-paste path (single line → send-keys -l + Enter;
+	// multi-line → set-buffer + paste-buffer + Enter). AcceptsTypedInput holds for the
+	// gated kinds.
+	if res := sendLine(h.cfg.runner, name, text); res.Code != 0 {
+		if isMissingSession(res.Stderr) {
+			writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "delivery_failed", "input delivery failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"delivered": true})
+}
+
+// inputAccepted re-derives, from a FRESH pane capture, whether the session is waiting
+// for typed input — running the SAME watcher+stability merge the reconcile loop uses
+// (mergedActivity, working-grace included), so the handler can never be more
+// permissive than the hub's own displayed activity:
+//
+//   - merged working → reject. This covers a fresh working verdict AND the
+//     expired-working case (a >120s-quiet tool call whose stability is not settled) —
+//     delivering mid-turn would interleave input into an active turn.
+//   - a FRESH watcher needs_input → accept outright (the structured signal is settled
+//     and authoritative; the pane may legitimately not match the anchor).
+//   - anything else (merged idle/unknown, or a stability-derived needs_input whose
+//     evidence is a previous tick's pane) → the degraded-path policy: accept only if
+//     the kind's prompt anchor is visible on the FRESH pane. Requiring the fresh
+//     anchor here is what closes the lookup→lock race — a pane that flipped back to
+//     churning no longer shows the composer and is rejected.
+func (h *Hub) inputAccepted(watcher *fileWatcher, stability Activity, kind Kind, pane string) bool {
+	var (
+		watcherAct                   Activity
+		watcherFresh, expiredWorking bool
+	)
+	if watcher != nil {
+		watcher.refresh(h.cfg.now())
+		watcherAct, _, watcherFresh, expiredWorking = watcher.snapshot(h.cfg.now())
+	}
+	merged, _ := mergedActivity(watcherAct, "", watcherFresh, expiredWorking, stability)
+	if merged == ActivityWorking {
+		return false
+	}
+	if watcherFresh && watcherAct == ActivityNeedsInput {
+		return true
+	}
+	anchor := promptAnchorFor(kind)
+	return anchor != nil && anchor.MatchString(pane)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

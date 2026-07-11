@@ -280,14 +280,20 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 
 // List returns every rc-* session's DTO. displayFallback receives a slug.
 func List(r Runner, displayFallback func(slug string) string) ListResponse {
-	names := listSessionNames(r)
+	return ListResponse{RCSessions: sessionsForNames(r, listSessionNames(r), displayFallback)}
+}
+
+// sessionsForNames builds the session DTOs for the given tmux session names — the
+// shared enumeration loop behind List and the hub's reconcile pass (which lists names
+// through listSessionNamesChecked first so a transient tmux failure skips the pass).
+func sessionsForNames(r Runner, names []string, displayFallback func(slug string) string) []Session {
 	sessions := make([]Session, 0, len(names))
 	for _, name := range names {
 		env := showEnvironment(r, name)
 		pane := capturePane(r, name).Stdout
 		sessions = append(sessions, ParseSession(name, env, pane, displayFallback))
 	}
-	return ListResponse{RCSessions: sessions}
+	return sessions
 }
 
 // capturePaneChecked returns a session's pane text, mapping a gone session to

@@ -65,8 +65,13 @@ func TestGoldenFixtureDecodes(t *testing.T) {
 	if info, ok := caps.Agents["cursor"]; !ok || info.Installed || info.Version != "" {
 		t.Errorf("uninstalled cursor should have no version: %+v", info)
 	}
-	if kf, ok := caps.KindFeatures[KindCodex]; !ok || !kf.PostInput || kf.Approvals != "tui" {
+	if kf, ok := caps.KindFeatures[KindCodex]; !ok || !kf.PostInput || kf.Approvals != "tui" ||
+		!kf.Watch || kf.Input != "gated" {
 		t.Errorf("codex kind_features wrong: %+v", kf)
+	}
+	// Non-codex kinds carry no watch/input (feed is codex-only this phase).
+	if kf, ok := caps.KindFeatures[KindClaudeRC]; !ok || kf.Watch || kf.Input != "" {
+		t.Errorf("claude-rc must not advertise watch/input: %+v", kf)
 	}
 }
 
