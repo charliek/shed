@@ -250,7 +250,18 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     for warning in &ssh_warnings {
         log.warn(warning);
     }
-    let ssh_keys = ssh_backend.list().unwrap_or_default();
+    // Enumerate keys at startup ONLY for local-keys (a free local file read, matching
+    // Go's `newLocalKeysBackend`, which logs each loaded file). For agent-forward, Go
+    // NEVER probes the forwarded agent at startup — it only logs "auto-detected …
+    // agent-forward". Listing here would issue an extra REQUEST_IDENTITIES to the host
+    // agent on every daemon start that Go does not, a wire-visible divergence the
+    // agent-forward transcript differential (test_ssh_backend.py) catches. So gate the
+    // enumeration on the mode.
+    let ssh_keys = if ssh_backend.mode() == "local-keys" {
+        ssh_backend.list().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     for key in &ssh_keys {
         log.info(&format!(
             "ssh backend loaded key type={} comment={}",

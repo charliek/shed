@@ -22,12 +22,15 @@
 //!   * TLS pin: install the pin verifier on an https URL, fail-closed if a pin is
 //!     set but the URL is not https.
 //!
-//! Scope: the daemon subscribes only to `ssh-agent` and implements the gated
-//! **`sign`** flow (decode → approval gate → ed25519 backend → response + audit,
-//! wire-compatible with the Go `ssh_handler.go`) plus `ping` → `pong`. The other
-//! credential backends (aws/docker) and the ssh `list`/`status` ops are LATER slices
-//! — an unimplemented op still gets an `INTERNAL_ERROR` envelope so the shed's
-//! request doesn't hang (a clear seam for the real backends).
+//! Scope: the daemon subscribes only to `ssh-agent` and implements the full
+//! ssh-agent op set — the gated **`sign`** flow (decode → approval gate → backend →
+//! response + audit, wire-compatible with the Go `ssh_handler.go`), the ungated
+//! **`list`** (backend keys → `SSHListResponse` + a durable non-gated audit) and
+//! **`status`** (`{connected, mode, key_count}`) ops, and `ping` → `pong`. An unknown
+//! operation gets Go's exact `unknown operation: <op>` `INTERNAL_ERROR` envelope, and
+//! a payload that isn't a JSON object gets `{invalid payload, INTERNAL_ERROR}` — so the
+//! shed's request never hangs. The other credential backends (aws/docker) are LATER
+//! slices.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -164,8 +167,11 @@ impl Envelope {
         }
     }
 
-    /// The `operation` discriminator of the payload (`{"operation": "..."}`), if
-    /// present — the request verb the handlers switch on (`ssh_handler.go`).
+    /// The `operation` discriminator of the payload (`{"operation": "..."}`) as a
+    /// string, if present. Production dispatch now goes through [`parse_operation`]
+    /// (which also distinguishes Go's `invalid payload` case); this stays as a small
+    /// accessor the envelope-shape tests read, so it is dead in non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn operation(&self) -> Option<&str> {
         self.payload.get("operation").and_then(|v| v.as_str())
     }
@@ -842,13 +848,16 @@ pub async fn run_single_server_bus(
     ));
 }
 
-/// Answer one inbound bus request. `ping` → `{"status":"ok"}`; `sign` → the gated
-/// ed25519 flow (approval gate → backend → response + audit); any other operation
-/// (aws/docker, ssh `list`/`status`) gets an `INTERNAL_ERROR` envelope so the shed's
-/// request doesn't hang — the seam for the later backends. The reply plumbing (mint
-/// response, echo `shed`, POST, warn-on-failure) is shared; the audit is written
-/// AFTER the response, matching `ssh_handler.go` (sendResponse/sendError then
-/// LogEntry).
+/// Answer one inbound bus request, mirroring `ssh_handler.go:handleMessage`'s
+/// dispatch. `ping` → `{"status":"ok"}`; `sign` → the gated flow (approval gate →
+/// backend → response + audit); `list` → the ungated key listing + a durable
+/// non-gated audit; `status` → `{connected, mode, key_count}` (no audit). An unknown
+/// operation → Go's exact `unknown operation: <op>` (`<op>` empty when the field is
+/// absent); a payload that is not a JSON object (or null) → `{invalid payload,
+/// INTERNAL_ERROR}` — both fail the shed's request cleanly instead of hanging. The
+/// reply plumbing (mint response, echo `shed`, POST, warn-on-failure) is shared; the
+/// audit is written AFTER the response, matching `ssh_handler.go` (sendResponse/
+/// sendError then Log/LogEntry).
 async fn handle_bus_message(
     client: &BusClient,
     namespace: &str,
@@ -857,30 +866,40 @@ async fn handle_bus_message(
     handlers: &BusHandlers,
 ) {
     let shed_name = env.shed.as_ref().map(|s| s.name.as_str()).unwrap_or("");
-    let (payload, audit_entry, what) = match env.operation() {
-        Some("ping") => (serde_json::json!({"status": "ok"}), None, "ping response"),
-        Some("sign") => {
-            let (payload, entry) = handle_sign(
-                env,
-                &handlers.server_name,
-                shed_name,
-                &handlers.gate,
-                &handlers.backend,
-            )
-            .await;
-            (payload, entry, "sign response")
-        }
-        other => {
-            let op = other.unwrap_or("");
-            (
-                serde_json::json!({
-                    "error": format!("operation not implemented in this build: {op}"),
-                    "code": SSH_CODE_INTERNAL,
-                }),
+    let (payload, audit_entry, what) = match parse_operation(&env.payload) {
+        // A non-object/non-null payload (or a non-string `operation`) is Go's
+        // `json.Unmarshal(payload, &op)` error → {invalid payload, INTERNAL_ERROR}; no audit.
+        Err(()) => (
+            ssh_error("invalid payload", SSH_CODE_INTERNAL),
+            None,
+            "error response",
+        ),
+        Ok(op) => match op.as_str() {
+            "ping" => (serde_json::json!({"status": "ok"}), None, "ping response"),
+            "sign" => {
+                let (payload, entry) = handle_sign(
+                    env,
+                    &handlers.server_name,
+                    shed_name,
+                    &handlers.gate,
+                    &handlers.backend,
+                )
+                .await;
+                (payload, entry, "sign response")
+            }
+            "list" => {
+                let (payload, entry) =
+                    handle_list(&handlers.server_name, shed_name, &handlers.backend);
+                (payload, Some(entry), "list response")
+            }
+            "status" => (handle_status(&handlers.backend), None, "status response"),
+            // Go's `default` arm: `unknown operation: <op>` (`<op>` empty when absent).
+            other => (
+                ssh_error(&format!("unknown operation: {other}"), SSH_CODE_INTERNAL),
                 None,
                 "error response",
-            )
-        }
+            ),
+        },
     };
     let mut resp = Envelope::new_response(&env.id, namespace, payload);
     resp.shed = env.shed.clone(); // route the reply back (ssh_handler.go: resp.Shed = req.Shed)
@@ -910,11 +929,150 @@ struct SignRequestPayload {
     flags: u32,
 }
 
-/// An `{error, code}` SSH error payload (`SSHErrorResponse`). Built as a
-/// `serde_json::Value`; shed-server parses it order-insensitively and the
-/// differential compares canonically, so the key order is not load-bearing.
+// ---------------------------------------------------------------------------
+// SSH response payload types (serde mirrors of internal/ext/protocol/ssh.go).
+// Built as typed structs (not ad-hoc json!) so the field/tag names are pinned in one
+// place and the golden runner can exercise the same types — the drift guard the live
+// differential complements (see `golden_ssh_payload_shapes`).
+// ---------------------------------------------------------------------------
+
+/// `SSHKeyInfo` — one public key in a `list` response. `blob` is base64 of the
+/// SSH-wire marshaled public key.
+#[derive(Serialize)]
+struct SshKeyInfoResp {
+    format: String,
+    blob: String,
+    comment: String,
+}
+
+/// `SSHListResponse` — the `list` op's success payload. An empty backend serializes
+/// to `{"keys":[]}` (Go's `make([]SSHKeyInfo, 0)` marshals to `[]`, not `null`).
+#[derive(Serialize)]
+struct SshListResponse {
+    keys: Vec<SshKeyInfoResp>,
+}
+
+/// `SSHSignResponse` — the `sign` op's success payload. `rest` is always present and
+/// pinned to `""` (Go keeps `ssh.Signature.Rest`; the daemon never has trailing bytes).
+#[derive(Serialize)]
+struct SshSignResponse {
+    format: String,
+    blob: String,
+    rest: String,
+}
+
+/// `SSHStatusResponse` — the `status` op's payload.
+#[derive(Serialize)]
+struct SshStatusResponse {
+    connected: bool,
+    mode: String,
+    key_count: usize,
+}
+
+/// `SSHErrorResponse` — an `{error, code}` error payload.
+#[derive(Serialize)]
+struct SshErrorResponse {
+    error: String,
+    code: String,
+}
+
+/// Serialize an SSH response payload struct to a `serde_json::Value`. The response
+/// structs are all plain `String`/`bool`/`usize`/`Vec<struct>` fields, so `to_value` is
+/// infallible; `.expect` fails loud on the impossible rather than silently emitting a
+/// divergent shape (the typed structs are the single source of the wire field/tag names).
+fn to_payload<T: Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).expect("serialize ssh response payload")
+}
+
+/// Build an `{error, code}` SSH error payload (`SSHErrorResponse`). shed-server parses
+/// it order-insensitively and the differential compares canonically, so key order is
+/// not load-bearing.
 fn ssh_error(msg: &str, code: &str) -> serde_json::Value {
-    serde_json::json!({ "error": msg, "code": code })
+    to_payload(&SshErrorResponse {
+        error: msg.to_string(),
+        code: code.to_string(),
+    })
+}
+
+/// Extract the request `operation`, mirroring Go's
+/// `json.Unmarshal(env.Payload, &struct{Operation string})` (`ssh_handler.go:59-66`):
+/// a JSON **object** (absent/`null` `operation` → `""`) or a bare `null` payload parse
+/// cleanly; a non-object/non-null payload, or an `operation` that isn't a string/null,
+/// is an unmarshal error → the caller returns `{invalid payload, INTERNAL_ERROR}`.
+fn parse_operation(payload: &serde_json::Value) -> Result<String, ()> {
+    match payload {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::Object(map) => match map.get("operation") {
+            None | Some(serde_json::Value::Null) => Ok(String::new()),
+            Some(serde_json::Value::String(s)) => Ok(s.clone()),
+            Some(_) => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+/// The `list` op — a faithful port of `ssh_handler.go:handleList`. NO approval gate.
+/// Success → `SSHListResponse{keys:[{format, blob(b64), comment}]}` + a durable audit
+/// via Go's **positional** `AuditLogger.Log` form (result:"ok", detail:"N keys",
+/// approval:"none", and NO decided_by/scope/ttl — distinct from the gated `sign_audit`).
+/// A backend error → `{key listing failed, INTERNAL_ERROR}` + audit result:"error",
+/// detail = the backend error string, approval:"none". Unlike `sign`, `list` ALWAYS
+/// audits.
+fn handle_list(
+    server_name: &str,
+    shed_name: &str,
+    backend: &Arc<dyn SshBackend>,
+) -> (serde_json::Value, AuditEntry) {
+    match backend.list() {
+        Ok(keys) => {
+            let resp = SshListResponse {
+                keys: keys
+                    .iter()
+                    .map(|k| SshKeyInfoResp {
+                        format: k.format.clone(),
+                        blob: base64::engine::general_purpose::STANDARD.encode(&k.blob),
+                        comment: k.comment.clone(),
+                    })
+                    .collect(),
+            };
+            let payload = to_payload(&resp);
+            let entry = list_audit(server_name, shed_name, "ok", &format!("{} keys", keys.len()));
+            (payload, entry)
+        }
+        Err(e) => {
+            let entry = list_audit(server_name, shed_name, "error", &e);
+            (ssh_error("key listing failed", SSH_CODE_INTERNAL), entry)
+        }
+    }
+}
+
+/// The `status` op — a faithful port of `ssh_handler.go:handleStatus`:
+/// `{connected:true, mode, key_count}`. `key_count` = `list().len()`, or **0** on a
+/// list error (Go computes the count only when `err == nil`). NO audit.
+fn handle_status(backend: &Arc<dyn SshBackend>) -> serde_json::Value {
+    let key_count = backend.list().map(|k| k.len()).unwrap_or(0);
+    let resp = SshStatusResponse {
+        connected: true,
+        mode: backend.mode().to_string(),
+        key_count,
+    };
+    to_payload(&resp)
+}
+
+/// A non-gated audit entry (Go's positional `AuditLogger.Log`): the fixed ssh-agent
+/// ns + `op:"list"` with the given result/detail, `approval:"none"`, and NO
+/// decided_by/scope/ttl. Distinct from `sign_audit` (which carries the gate outcome).
+fn list_audit(server_name: &str, shed_name: &str, result: &str, detail: &str) -> AuditEntry {
+    AuditEntry {
+        server: server_name.to_string(),
+        shed: shed_name.to_string(),
+        ns: NS_SSH_AGENT.to_string(),
+        op: "list".to_string(),
+        result: result.to_string(),
+        detail: detail.to_string(),
+        approval: "none".to_string(),
+        ..Default::default()
+    }
 }
 
 /// An [`AuditEntry`] scaffold for a sign op with the fixed ns/op + the shared
@@ -1038,11 +1196,12 @@ async fn handle_sign(
     //    (detail = key type). Success → SSHSignResponse + ok audit (detail = key type).
     match backend.sign(&pub_bytes, &data, req.flags) {
         Ok(sig) => {
-            let payload = serde_json::json!({
-                "format": sig.format,
-                "blob": base64::engine::general_purpose::STANDARD.encode(&sig.blob),
-                "rest": "",
-            });
+            let resp = SshSignResponse {
+                format: sig.format,
+                blob: base64::engine::general_purpose::STANDARD.encode(&sig.blob),
+                rest: String::new(),
+            };
+            let payload = to_payload(&resp);
             let entry = sign_audit(server_name, shed_name, "ok", &key_type, approval, &outcome);
             (payload, Some(entry))
         }
@@ -1875,9 +2034,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unimplemented_op_gets_internal_error() {
-        // `list`/`status` stay placeholder in this slice — an unimplemented op still
-        // gets an INTERNAL_ERROR envelope so the shed's request doesn't hang.
+    async fn unknown_op_exact_string() {
+        // A truly-unknown op (`list`/`status`/`sign`/`ping` are all implemented now)
+        // gets Go's exact `unknown operation: <op>` INTERNAL_ERROR envelope so the
+        // shed's request doesn't hang. (Retargeted from the old `list`-probe test now
+        // that `list` is a real op.)
         let server = MockServer::start_async().await;
         let respond = server
             .mock_async(|w, t| {
@@ -1889,7 +2050,8 @@ mod tests {
                             .as_ref()
                             .map(|b| String::from_utf8_lossy(b).to_string())
                             .unwrap_or_default();
-                        body.contains("\"in_reply_to\":\"list-req\"")
+                        body.contains("\"in_reply_to\":\"del-req\"")
+                            && body.contains("unknown operation: delete")
                             && body.contains("INTERNAL_ERROR")
                     });
                 t.status(204);
@@ -1897,13 +2059,13 @@ mod tests {
             .await;
         let client = open_client(&server.base_url());
         let req = Envelope {
-            id: "list-req".into(),
+            id: "del-req".into(),
             namespace: "ssh-agent".into(),
             msg_type: "request".into(),
             in_reply_to: String::new(),
             is_final: true,
             timestamp: "t".into(),
-            payload: serde_json::json!({"operation":"list"}),
+            payload: serde_json::json!({"operation":"delete"}),
             shed: None,
         };
         handle_bus_message(
@@ -1915,6 +2077,242 @@ mod tests {
         )
         .await;
         respond.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_internal_error() {
+        // A payload that is not a JSON object (here a JSON array) is Go's
+        // `json.Unmarshal(payload, &op)` failure → {invalid payload, INTERNAL_ERROR}.
+        let server = MockServer::start_async().await;
+        let respond = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/ssh-agent/respond")
+                    .matches(|req| {
+                        let body = req
+                            .body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                            .unwrap_or_default();
+                        body.contains("\"in_reply_to\":\"bad-req\"")
+                            && body.contains("invalid payload")
+                            && body.contains("INTERNAL_ERROR")
+                    });
+                t.status(204);
+            })
+            .await;
+        let client = open_client(&server.base_url());
+        let req = Envelope {
+            id: "bad-req".into(),
+            namespace: "ssh-agent".into(),
+            msg_type: "request".into(),
+            in_reply_to: String::new(),
+            is_final: true,
+            timestamp: "t".into(),
+            payload: serde_json::json!([1, 2, 3]),
+            shed: None,
+        };
+        handle_bus_message(
+            &client,
+            "ssh-agent",
+            &req,
+            &never_shutdown(),
+            &test_handlers(approve_gate(), noop_audit(), empty_backend()),
+        )
+        .await;
+        respond.assert_async().await;
+    }
+
+    #[test]
+    fn parse_operation_matches_go_unmarshal() {
+        use serde_json::json;
+        // Object with a string operation → that op.
+        assert_eq!(parse_operation(&json!({"operation":"list"})), Ok("list".into()));
+        // Object without operation, or operation null, or a bare null → "" (Go's zero).
+        assert_eq!(parse_operation(&json!({})), Ok(String::new()));
+        assert_eq!(parse_operation(&json!({"operation":null})), Ok(String::new()));
+        assert_eq!(parse_operation(&serde_json::Value::Null), Ok(String::new()));
+        // A non-object/non-null payload, or a non-string operation, is Go's unmarshal
+        // error → invalid payload.
+        assert_eq!(parse_operation(&json!([1, 2])), Err(()));
+        assert_eq!(parse_operation(&json!("hi")), Err(()));
+        assert_eq!(parse_operation(&json!(123)), Err(()));
+        assert_eq!(parse_operation(&json!({"operation":123})), Err(()));
+    }
+
+    // ---- list / status ops (mirror ssh_handler.go handleList/handleStatus) ----
+
+    /// A backend with a configurable `list()` result + mode, for the list/status tests.
+    struct ListStubBackend {
+        list_result: Result<Vec<SshKeyInfo>, String>,
+        mode: &'static str,
+    }
+    impl SshBackend for ListStubBackend {
+        fn list(&self) -> Result<Vec<SshKeyInfo>, String> {
+            self.list_result.clone()
+        }
+        fn sign(&self, _pk: &[u8], _d: &[u8], _f: u32) -> Result<SshSignature, String> {
+            Err("key not found".to_string())
+        }
+        fn mode(&self) -> &str {
+            self.mode
+        }
+    }
+
+    #[test]
+    fn ssh_list_responds_keys() {
+        // Two keys → SSHListResponse{keys:[{format,blob(b64),comment}]} + an ok audit
+        // via the positional Log form (detail="2 keys", approval="none", NO outcome).
+        let backend: Arc<dyn SshBackend> = Arc::new(ListStubBackend {
+            list_result: Ok(vec![
+                SshKeyInfo {
+                    format: "ssh-ed25519".into(),
+                    blob: b"blob-ed".to_vec(),
+                    comment: "id_ed25519".into(),
+                },
+                SshKeyInfo {
+                    format: "ssh-rsa".into(),
+                    blob: b"blob-rsa".to_vec(),
+                    comment: "id_rsa".into(),
+                },
+            ]),
+            mode: "local-keys",
+        });
+        let (payload, entry) = handle_list("", "web", &backend);
+        assert_eq!(payload["keys"][0]["format"], "ssh-ed25519");
+        assert_eq!(payload["keys"][0]["blob"], b64(b"blob-ed"));
+        assert_eq!(payload["keys"][0]["comment"], "id_ed25519");
+        assert_eq!(payload["keys"][1]["format"], "ssh-rsa");
+        assert_eq!(payload["keys"][1]["comment"], "id_rsa");
+        // Positional-Log audit shape: op=list, ok, detail="2 keys", approval=none,
+        // NO decided_by/scope/ttl/code/reason.
+        assert_eq!(entry.op, "list");
+        assert_eq!(entry.ns, "ssh-agent");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.detail, "2 keys");
+        assert_eq!(entry.approval, "none");
+        assert_eq!(entry.shed, "web");
+        assert_eq!(entry.server, "");
+        assert_eq!(entry.decided_by, "");
+        assert_eq!(entry.scope, "");
+        assert_eq!(entry.ttl, "");
+        assert_eq!(entry.code, "");
+    }
+
+    #[test]
+    fn ssh_list_empty_serializes_as_empty_array() {
+        // An empty backend serializes to {"keys":[]} (NOT null) — Go's make([]_,0).
+        let backend: Arc<dyn SshBackend> = Arc::new(ListStubBackend {
+            list_result: Ok(Vec::new()),
+            mode: "local-keys",
+        });
+        let (payload, entry) = handle_list("", "", &backend);
+        assert_eq!(payload, serde_json::json!({"keys": []}));
+        assert_eq!(entry.detail, "0 keys");
+    }
+
+    #[test]
+    fn ssh_list_error_returns_key_listing_failed() {
+        // A backend list error → {key listing failed, INTERNAL_ERROR} + an error audit
+        // whose detail carries the raw backend error string, approval=none.
+        let backend: Arc<dyn SshBackend> = Arc::new(ListStubBackend {
+            list_result: Err("agent: failed to list keys".into()),
+            mode: "agent-forward",
+        });
+        let (payload, entry) = handle_list("", "web", &backend);
+        assert_eq!(payload["error"], "key listing failed");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert_eq!(entry.result, "error");
+        assert_eq!(entry.detail, "agent: failed to list keys");
+        assert_eq!(entry.approval, "none");
+        assert_eq!(entry.op, "list");
+    }
+
+    #[test]
+    fn ssh_status_reports_mode_and_count() {
+        // status → {connected:true, mode, key_count=list().len()}.
+        let backend: Arc<dyn SshBackend> = Arc::new(ListStubBackend {
+            list_result: Ok(vec![SshKeyInfo {
+                format: "ssh-ed25519".into(),
+                blob: b"b".to_vec(),
+                comment: "c".into(),
+            }]),
+            mode: "local-keys",
+        });
+        assert_eq!(
+            handle_status(&backend),
+            serde_json::json!({"connected": true, "mode": "local-keys", "key_count": 1})
+        );
+        // A list error → key_count 0 (Go counts only when err==nil), mode still reported.
+        let err_backend: Arc<dyn SshBackend> = Arc::new(ListStubBackend {
+            list_result: Err("boom".into()),
+            mode: "agent-forward",
+        });
+        assert_eq!(
+            handle_status(&err_backend),
+            serde_json::json!({"connected": true, "mode": "agent-forward", "key_count": 0})
+        );
+    }
+
+    // ---- golden: SSH payload shapes (in-crate, following the load_discovered_servers
+    //      controltoken.rs precedent — a bin crate has no lib target, so the golden
+    //      that builds bus-internal serde types lives here, not in tests/golden.rs) ----
+
+    #[test]
+    fn golden_ssh_payload_shapes() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/ssh_payload_shapes.json");
+        let data = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fx: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            fx["protocol_version"].as_i64(),
+            Some(1),
+            "ssh_payload_shapes.json protocol_version skew"
+        );
+
+        for v in fx["list_vectors"].as_array().expect("list_vectors") {
+            let keys: Vec<SshKeyInfoResp> = v["input"]["keys"]
+                .as_array()
+                .expect("input.keys")
+                .iter()
+                .map(|k| SshKeyInfoResp {
+                    format: k["format"].as_str().unwrap().to_string(),
+                    blob: k["blob_b64"].as_str().unwrap().to_string(),
+                    comment: k["comment"].as_str().unwrap().to_string(),
+                })
+                .collect();
+            let got = serde_json::to_value(SshListResponse { keys }).unwrap();
+            assert_eq!(got, v["expected"], "list vector {}", v["name"]);
+        }
+
+        for v in fx["sign_vectors"].as_array().expect("sign_vectors") {
+            let got = serde_json::to_value(SshSignResponse {
+                format: v["input"]["format"].as_str().unwrap().to_string(),
+                blob: v["input"]["blob_b64"].as_str().unwrap().to_string(),
+                rest: String::new(),
+            })
+            .unwrap();
+            assert_eq!(got, v["expected"], "sign vector {}", v["name"]);
+        }
+
+        for v in fx["status_vectors"].as_array().expect("status_vectors") {
+            let got = serde_json::to_value(SshStatusResponse {
+                connected: true,
+                mode: v["input"]["mode"].as_str().unwrap().to_string(),
+                key_count: v["input"]["key_count"].as_u64().unwrap() as usize,
+            })
+            .unwrap();
+            assert_eq!(got, v["expected"], "status vector {}", v["name"]);
+        }
+
+        for v in fx["error_vectors"].as_array().expect("error_vectors") {
+            let got = ssh_error(
+                v["input"]["error"].as_str().unwrap(),
+                v["input"]["code"].as_str().unwrap(),
+            );
+            assert_eq!(got, v["expected"], "error vector {}", v["name"]);
+        }
     }
 
     // ---- gated sign flow (mirrors ssh_handler.go:handleSign) ----

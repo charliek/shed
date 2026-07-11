@@ -16,8 +16,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
+
+	"github.com/charliek/shed/internal/ext/protocol"
 )
 
 // fixturesDir resolves the shared fixture directory relative to THIS source file,
@@ -132,6 +135,101 @@ func TestGoldenLoadDiscoveredServers(t *testing.T) {
 		if string(gj) != string(wj) {
 			t.Errorf("%s: LoadDiscoveredServers =\n  %s\nwant\n  %s", v.Name, gj, wj)
 		}
+	}
+}
+
+// assertJSONShapeEqual marshals `got` (a built protocol.* struct), then unmarshals
+// both the result and the fixture's raw `expected` into interface{} and compares them
+// with reflect.DeepEqual — a parsed-value compare (key order insensitive), matching how
+// the Rust runner compares serde_json::Value.
+func assertJSONShapeEqual(t *testing.T, name string, got any, expected json.RawMessage) {
+	t.Helper()
+	gj, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("%s: marshal: %v", name, err)
+	}
+	var gotV, wantV any
+	if err := json.Unmarshal(gj, &gotV); err != nil {
+		t.Fatalf("%s: unmarshal got: %v", name, err)
+	}
+	if err := json.Unmarshal(expected, &wantV); err != nil {
+		t.Fatalf("%s: unmarshal expected: %v", name, err)
+	}
+	if !reflect.DeepEqual(gotV, wantV) {
+		t.Errorf("%s:\n  got  %s\n  want %s", name, gj, expected)
+	}
+}
+
+// TestGoldenSSHPayloadShapes pins the four ssh-agent response payload shapes
+// (internal/ext/protocol/ssh.go) against the SAME fixture the Rust in-crate runner
+// (bus.rs:golden_ssh_payload_shapes) reads: tag names, the b64 pass-through of blobs,
+// the always-present rest:"", and that an empty key list marshals as [] not null.
+func TestGoldenSSHPayloadShapes(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		ListVectors     []struct {
+			Name  string `json:"name"`
+			Input struct {
+				Keys []struct {
+					Format  string `json:"format"`
+					BlobB64 string `json:"blob_b64"`
+					Comment string `json:"comment"`
+				} `json:"keys"`
+			} `json:"input"`
+			Expected json.RawMessage `json:"expected"`
+		} `json:"list_vectors"`
+		SignVectors []struct {
+			Name  string `json:"name"`
+			Input struct {
+				Format  string `json:"format"`
+				BlobB64 string `json:"blob_b64"`
+			} `json:"input"`
+			Expected json.RawMessage `json:"expected"`
+		} `json:"sign_vectors"`
+		StatusVectors []struct {
+			Name  string `json:"name"`
+			Input struct {
+				Mode     string `json:"mode"`
+				KeyCount int    `json:"key_count"`
+			} `json:"input"`
+			Expected json.RawMessage `json:"expected"`
+		} `json:"status_vectors"`
+		ErrorVectors []struct {
+			Name  string `json:"name"`
+			Input struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			} `json:"input"`
+			Expected json.RawMessage `json:"expected"`
+		} `json:"error_vectors"`
+	}
+	readFixture(t, "ssh_payload_shapes.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("ssh_payload_shapes.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.ListVectors) == 0 || len(fx.SignVectors) == 0 || len(fx.StatusVectors) == 0 || len(fx.ErrorVectors) == 0 {
+		t.Fatal("ssh_payload_shapes.json missing vectors")
+	}
+
+	for _, v := range fx.ListVectors {
+		keys := make([]protocol.SSHKeyInfo, 0, len(v.Input.Keys))
+		for _, k := range v.Input.Keys {
+			keys = append(keys, protocol.SSHKeyInfo{Format: k.Format, Blob: k.BlobB64, Comment: k.Comment})
+		}
+		assertJSONShapeEqual(t, "list/"+v.Name, protocol.SSHListResponse{Keys: keys}, v.Expected)
+	}
+	for _, v := range fx.SignVectors {
+		got := protocol.SSHSignResponse{Format: v.Input.Format, Blob: v.Input.BlobB64, Rest: ""}
+		assertJSONShapeEqual(t, "sign/"+v.Name, got, v.Expected)
+	}
+	for _, v := range fx.StatusVectors {
+		got := protocol.SSHStatusResponse{Connected: true, Mode: v.Input.Mode, KeyCount: v.Input.KeyCount}
+		assertJSONShapeEqual(t, "status/"+v.Name, got, v.Expected)
+	}
+	for _, v := range fx.ErrorVectors {
+		got := protocol.SSHErrorResponse{Error: v.Input.Error, Code: v.Input.Code}
+		assertJSONShapeEqual(t, "error/"+v.Name, got, v.Expected)
 	}
 }
 

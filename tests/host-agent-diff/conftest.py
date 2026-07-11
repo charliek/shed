@@ -138,11 +138,16 @@ class CliResult:
     home: str
 
 
-def _clean_env(socket_dir, home, path_prepend=None) -> dict:
+def _clean_env(socket_dir, home, path_prepend=None, ssh_auth_sock=None) -> dict:
     """A hermetic environment: real PATH (so `go`/system tools resolve) but an
     isolated HOME + socket dir, and no ambient ssh-agent. `path_prepend` (a dir)
     goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved
-    before the real one — both daemons use `exec.LookPath`/`look_ssh` on PATH."""
+    before the real one — both daemons use `exec.LookPath`/`look_ssh` on PATH.
+
+    `SSH_AUTH_SOCK` is stripped by default (so the local-keys backend is the
+    auto-detect result); pass `ssh_auth_sock` to point BOTH daemons' agent-forward
+    backend at a fake agent (the ssh-backend tests) — it is set AFTER the strip so it
+    wins."""
     env = dict(os.environ)
     env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
     env["HOME"] = str(home)
@@ -150,6 +155,8 @@ def _clean_env(socket_dir, home, path_prepend=None) -> dict:
     env.pop("XDG_RUNTIME_DIR", None)
     if path_prepend is not None:
         env["PATH"] = str(path_prepend) + os.pathsep + env.get("PATH", "")
+    if ssh_auth_sock is not None:
+        env["SSH_AUTH_SOCK"] = str(ssh_auth_sock)
     return env
 
 
@@ -318,6 +325,8 @@ def daemon(binaries, tmp_path_factory):
         impl,
         config_text,
         install_ssh_key: bool = False,
+        install_ssh_keys=None,
+        ssh_auth_sock: str | None = None,
         shed_config: str | None = None,
         known_hosts: str | None = None,
         ssh_shim_bundle: str | None = None,
@@ -335,13 +344,25 @@ def daemon(binaries, tmp_path_factory):
         # `<HOME>/.ssh/id_ed25519` (dir 0700, file 0600) BEFORE launch, so a
         # local-keys `sign` finds the SAME key on both impls (Go `os.UserHomeDir()`
         # + Rust `user_home_dir()` both resolve `$HOME`, set by `_clean_env`).
+        # `install_ssh_key=True` installs id_ed25519 (unchanged default). The additive
+        # `install_ssh_keys` kwarg installs a list of committed fixture STEMS (e.g.
+        # "test_ed25519","test_rsa","test_ecdsa") as `<HOME>/.ssh/id_<algo>` — the
+        # local-keys backend loads them in STANDARD_KEY_FILES order (ed25519, rsa,
+        # ecdsa) on both impls. A stem `test_<algo>` maps to `id_<algo>`.
+        keys_to_install: list[str] = []
         if install_ssh_key:
+            keys_to_install.append("test_ed25519")
+        if install_ssh_keys:
+            keys_to_install.extend(install_ssh_keys)
+        if keys_to_install:
             ssh_dir = home / ".ssh"
             ssh_dir.mkdir(mode=0o700, exist_ok=True)
-            key_dst = ssh_dir / "id_ed25519"
-            key_dst.write_bytes(TEST_ED25519_KEY.read_bytes())
             os.chmod(ssh_dir, 0o700)
-            os.chmod(key_dst, 0o600)
+            for stem in keys_to_install:
+                dst_name = stem.replace("test_", "id_", 1)
+                key_dst = ssh_dir / dst_name
+                key_dst.write_bytes((FIXTURES_DIR / stem).read_bytes())
+                os.chmod(key_dst, 0o600)
 
         # The minter reads `<HOME>/.shed/{config.yaml,known_hosts}` (the shed CLI
         # config it resolves servers from + the host-key pin). Both impls read the
@@ -382,7 +403,9 @@ def daemon(binaries, tmp_path_factory):
         # (which would trip the suite's warnings-as-errors as ResourceWarnings).
         proc = subprocess.Popen(
             [binaries[impl], "-config", str(config_path), "-log-file", str(log_path)],
-            env=_clean_env(socket_dir, home, path_prepend=path_prepend),
+            env=_clean_env(
+                socket_dir, home, path_prepend=path_prepend, ssh_auth_sock=ssh_auth_sock
+            ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

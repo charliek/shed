@@ -25,9 +25,11 @@ That target (root `Makefile`) runs, in order:
 
 1. `cd tests/host-agent-diff && uv sync && uv run pytest -v` — the live differential
    (the session fixture builds both binaries with `go build` + `cargo build`).
-2. `go test ./cmd/shed-host-agent/... -run Golden` — the Go golden-fixture runner.
-3. `cargo test -p shed-host-agent --test golden` — the Rust golden-fixture runner
-   (with `~/.cargo/bin` on PATH).
+2. `go test ./cmd/shed-host-agent/... -run Golden` — the Go golden-fixture runners.
+3. `cargo test -p shed-host-agent golden` — the Rust golden-fixture runners (name
+   filter, so it covers both `tests/golden.rs` and the **in-crate** goldens —
+   `load_discovered_servers` in `controltoken.rs` and `ssh_payload_shapes` in `bus.rs`;
+   with `~/.cargo/bin` on PATH).
 
 Requires **Go + Rust (cargo) + Python/uv**. Install uv via `brew install uv`.
 
@@ -107,6 +109,24 @@ expected []ServerTarget`. The Go runner (`TestGoldenLoadDiscoveredServers` in
 `load_discovered_servers`) both parse each vector's YAML and assert equal `ServerTarget`s.
 It pins the load-bearing divergences from `shed-core::ShedConfig`: `ssh_port` defaults to
 **0** (not 22) when omitted, empty-host entries are skipped, targets sort by name.
+
+`fixtures/ssh_payload_shapes.json` (`"protocol_version": 1`) pins the four ssh-agent
+**response payload shapes** (`internal/ext/protocol/ssh.go`). The Go runner
+(`TestGoldenSSHPayloadShapes` in `golden_test.go`) builds the `protocol.SSH*Response`
+structs; the Rust runner (`golden_ssh_payload_shapes`, an **in-crate** `bus.rs` test —
+the bus serde types are bin-crate-internal, so `tests/golden.rs` can't reach them, same
+precedent as `load_discovered_servers`) builds the bus serde types; both marshal and
+assert equal to each vector's `expected` (compared as parsed JSON values). It pins the
+tag names, the base64 pass-through of `blob`s, the always-present `rest:""`, and that an
+empty key list marshals as `[]` not `null`.
+
+**Key fixtures.** `fixtures/test_ed25519{,.pub}` (slice 0) plus `fixtures/test_rsa{,.pub}`
+(2048-bit) and `fixtures/test_ecdsa{,.pub}` (P-256), added for the ssh-backend cells, are
+**throwaway, non-secret, passphrase-less** OpenSSH keypairs generated once (comment
+`hadiff-test`) and committed so both daemons load an identical key set. They guard nothing
+and must never be reused anywhere real. The `daemon` fixture installs them into each
+daemon's isolated `<HOME>/.ssh/id_<algo>`; `fake_ssh_agent.py` also serves them as agent
+identities (real-signing ed25519, canned blobs for rsa/ecdsa).
 
 ## Known contract gaps (slice 0)
 
@@ -193,7 +213,17 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | bus | aws-credentials / docker-credentials subscription | **xfail** | live surface B — later slices; slice 1b wires **ssh-agent only** (see "Known contract gaps") |
 | status | single-server `LiveStatus.servers[]` per-namespace state (incl. 409-rejected) | **xfail** | supervisor slice — Go surfaces `HostClient.Status()` via supervisor health; the Rust bus records the state + logs it, but `servers[]` stays empty until the supervisor lands |
 | egress | events / 401 / 404-501, 5m vs 30s backoff | **xfail** | live ("no reconnect in window") + unit (consts) |
-| ssh backend | agent-forward / local-keys, list/sign/ping/status | **xfail** | live (transcripts) + golden (payloads) |
+| ssh backend · local-keys | `list` (masked canonical-equal + durable non-gated audit line) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · local-keys | `sign` rsa flags 0/2/4/6 (→ `ssh-rsa`/`rsa-sha2-256`/`rsa-sha2-512`/`rsa-sha2-256`; format diffed, blob verified per-impl) | **enforced** | live (`test_ssh_backend.py`, verify-not-bytes) |
+| ssh backend · local-keys | `sign` ecdsa (format diffed, blob verified per-impl) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · local-keys | `sign` ed25519 (deterministic blob compared UNMASKED) | **enforced** | live (`test_bus_sign_gated.py`) |
+| ssh backend · local-keys | `status` (`{connected:true, mode:"local-keys", key_count:3}`) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · agent-forward | `list` (3 fake identities canonical-equal + audit + fake transcript diff) | **enforced** | live (`test_ssh_backend.py` + `fake_ssh_agent.py`) |
+| ssh backend · agent-forward | `sign` ed25519 (fake real-signs → blob UNMASKED) + `sign` rsa flags=2 (canned blob byte-equal, transcript `flags==2` passthrough) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · agent-forward | `status` (`mode:"agent-forward"`, extra REQUEST_IDENTITIES on the transcript) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · mode resolution | unknown `ssh.mode` → exit 1 (single-server AND `discovery:` config shapes) | **enforced** | live (`test_ssh_mode_error.py`) |
+| ssh backend | response payload shapes (`list`/`sign`/`status`/`error`: tag names, b64 pass-through, `rest:""`, empty-list `[]` not `null`) | **enforced** | golden (Go + Rust runners on `ssh_payload_shapes.json`) |
+| ssh backend | agent-client wire (framing/failure/oversize/wedged bounds), flag-bit matrix, resolve matrix, missing/encrypted skip, unknown-op/invalid-payload strings, list-error audit | **enforced (unit)** | Rust unit (`ssh_backend*.rs`, `bus.rs`) + fake-seam self-test (`test_fake_ssh_agent.py`) |
 | aws backend | passthrough, cache-hit/expiry | **xfail** (live) | live; assume-role → **out-of-scope** (golden+unit, no Go STS seam) |
 | docker backend | allowlist / allow_all / helper / inline, not-found vs not-allowed | **xfail** | live (helper transcript) + golden (resolution matrix) |
 | minter | control-scope argv + success `token.response` | **enforced** | live (`test_token_get.py`: `token`/`expires_at` compared + argv == expected vector, `<scope>` == `control`) |

@@ -3,11 +3,14 @@ name = "host-agent-diff"
 version = "0.1.0"
 description = "Hermetic Go-vs-Rust differential harness for the shed-host-agent Rust port (slice 0). Spawns BOTH daemon binaries and asserts equal wire-visible output under a defined canonicalization."
 requires-python = ">=3.11"
-# Slice 0 needs only pytest — the daemons are driven as black-box subprocesses and
-# the compared payloads are canonicalized with the stdlib `json`. The TLS / ssh-agent
-# fakes (which pull in `cryptography`) arrive in slice 1.
+# pytest drives the daemons as black-box subprocesses and canonicalizes the compared
+# payloads with the stdlib `json`. `cryptography` backs the ssh-agent fake
+# (`fake_ssh_agent.py`): it real-signs the ed25519 identity deterministically and
+# verifies the RSA/ECDSA `sign` blobs the local-keys backend produces (verify-not-bytes,
+# per the harness plan).
 dependencies = [
     "pytest>=8.0",
+    "cryptography>=42",
 ]
 
 [tool.pytest.ini_options]
