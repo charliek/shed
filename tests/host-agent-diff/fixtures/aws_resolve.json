@@ -1,0 +1,84 @@
+{
+  "_comment": "Golden fixture for the AWS config slice — input host-agent config YAML (block-style only, the yaml_lite subset) -> per-(server,shed) Resolve() results + Enabled() verdict + the applied load defaults (source_profile/session_duration/cache_refresh_before). Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenAWSResolve, via the production LoadConfig->AWS.Resolve/Enabled path) and the Rust runner (crates/shed-host-agent/src/config.rs tests::golden_aws_resolve, via HostAgentConfig::parse().aws) so the two impls cannot drift together on the layering / mode-normalization / enabled / load-defaults semantics. Mirrors TestAWSResolve / TestMixedModeResolve / TestAWSEnabled / TestLoadConfigAWS / TestLoadConfigDefaults.",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "top-level only; defaults applied when keys absent; session_duration falls back to top-level default",
+      "config_yaml": "aws:\n  default_role: arn:aws:iam::123:role/default\n",
+      "queries": [
+        {"server": "mini2", "shed": "web", "role": "arn:aws:iam::123:role/default", "mode": "assume-role", "session_duration": "1h"},
+        {"server": "mini3", "shed": "api", "role": "arn:aws:iam::123:role/default", "mode": "assume-role", "session_duration": "1h"}
+      ],
+      "enabled": true,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "per-server role override; defaults overridden by explicit keys; same shed name on other server isolated",
+      "config_yaml": "aws:\n  source_profile: staging\n  default_role: arn:aws:iam::123:role/default\n  session_duration: 2h\n  cache_refresh_before: 10m\n  servers:\n    mini2:\n      default_role: arn:aws:iam::123:role/mini2\n",
+      "queries": [
+        {"server": "mini2", "shed": "web", "role": "arn:aws:iam::123:role/mini2", "mode": "assume-role", "session_duration": "2h"},
+        {"server": "mini3", "shed": "web", "role": "arn:aws:iam::123:role/default", "mode": "assume-role", "session_duration": "2h"}
+      ],
+      "enabled": true,
+      "defaults": {"source_profile": "staging", "session_duration": "2h", "cache_refresh_before": "10m"}
+    },
+    {
+      "name": "per-server + per-shed session_duration layering (shed wins over server wins over top-level default)",
+      "config_yaml": "aws:\n  default_role: arn:aws:iam::123:role/default\n  servers:\n    mini2:\n      session_duration: 3h\n      sheds:\n        web:\n          role: arn:aws:iam::123:role/web\n          session_duration: 30m\n        api:\n          role: arn:aws:iam::123:role/api\n",
+      "queries": [
+        {"server": "mini2", "shed": "web", "role": "arn:aws:iam::123:role/web", "mode": "assume-role", "session_duration": "30m"},
+        {"server": "mini2", "shed": "api", "role": "arn:aws:iam::123:role/api", "mode": "assume-role", "session_duration": "3h"},
+        {"server": "mini2", "shed": "other", "role": "arn:aws:iam::123:role/default", "mode": "assume-role", "session_duration": "3h"}
+      ],
+      "enabled": true,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "mixed passthrough/assume-role per shed; role present under passthrough is ignored for mode",
+      "config_yaml": "aws:\n  default_role: arn:aws:iam::111:role/dev\n  servers:\n    mini2:\n      sheds:\n        sso-app:\n          mode: passthrough\n        scoped-app:\n          role: arn:aws:iam::111:role/scoped\n",
+      "queries": [
+        {"server": "mini2", "shed": "sso-app", "role": "arn:aws:iam::111:role/dev", "mode": "passthrough", "session_duration": "1h"},
+        {"server": "mini2", "shed": "scoped-app", "role": "arn:aws:iam::111:role/scoped", "mode": "assume-role", "session_duration": "1h"}
+      ],
+      "enabled": true,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "empty-mode inheritance: child role under passthrough parent stays passthrough",
+      "config_yaml": "aws:\n  servers:\n    mini2:\n      mode: passthrough\n      sheds:\n        web:\n          role: arn:aws:iam::123:role/web\n",
+      "queries": [
+        {"server": "mini2", "shed": "web", "role": "arn:aws:iam::123:role/web", "mode": "passthrough", "session_duration": "1h"}
+      ],
+      "enabled": true,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "child assume-role overrides passthrough parent; sibling with no override inherits passthrough",
+      "config_yaml": "aws:\n  mode: passthrough\n  servers:\n    mini2:\n      sheds:\n        scoped:\n          mode: assume-role\n          role: arn:aws:iam::123:role/scoped\n",
+      "queries": [
+        {"server": "mini2", "shed": "scoped", "role": "arn:aws:iam::123:role/scoped", "mode": "assume-role", "session_duration": "1h"},
+        {"server": "mini2", "shed": "other", "role": "", "mode": "passthrough", "session_duration": "1h"}
+      ],
+      "enabled": true,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "enabled-false: explicit assume-role with no role anywhere is AWS off",
+      "config_yaml": "aws:\n  mode: assume-role\n",
+      "queries": [
+        {"server": "mini2", "shed": "web", "role": "", "mode": "assume-role", "session_duration": "1h"}
+      ],
+      "enabled": false,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "no aws block at all: defaults applied, empty mode normalizes to assume-role, disabled",
+      "config_yaml": "server: http://localhost:8080\n",
+      "queries": [
+        {"server": "mini2", "shed": "web", "role": "", "mode": "assume-role", "session_duration": "1h"}
+      ],
+      "enabled": false,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    }
+  ]
+}

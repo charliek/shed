@@ -233,6 +233,72 @@ func TestGoldenSSHPayloadShapes(t *testing.T) {
 	}
 }
 
+// TestGoldenAWSResolve is the Go half of the aws_resolve golden. It routes each
+// vector's config YAML through the PRODUCTION LoadConfig (so the same DefaultConfig
+// defaulting + yaml merge the daemon uses is exercised), then asserts AWS.Resolve /
+// AWS.Enabled / the applied load defaults against the shared fixture the Rust runner
+// (config.rs:golden_aws_resolve) also reads.
+func TestGoldenAWSResolve(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name       string `json:"name"`
+			ConfigYAML string `json:"config_yaml"`
+			Queries    []struct {
+				Server          string `json:"server"`
+				Shed            string `json:"shed"`
+				Role            string `json:"role"`
+				Mode            string `json:"mode"`
+				SessionDuration string `json:"session_duration"`
+			} `json:"queries"`
+			Enabled  bool `json:"enabled"`
+			Defaults struct {
+				SourceProfile      string `json:"source_profile"`
+				SessionDuration    string `json:"session_duration"`
+				CacheRefreshBefore string `json:"cache_refresh_before"`
+			} `json:"defaults"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "aws_resolve.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("aws_resolve.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("aws_resolve.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(v.ConfigYAML), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Errorf("%s: LoadConfig: %v", v.Name, err)
+			continue
+		}
+		if got := cfg.AWS.Enabled(); got != v.Enabled {
+			t.Errorf("%s: Enabled() = %v, want %v", v.Name, got, v.Enabled)
+		}
+		if cfg.AWS.SourceProfile != v.Defaults.SourceProfile {
+			t.Errorf("%s: source_profile = %q, want %q", v.Name, cfg.AWS.SourceProfile, v.Defaults.SourceProfile)
+		}
+		if cfg.AWS.SessionDuration != v.Defaults.SessionDuration {
+			t.Errorf("%s: session_duration = %q, want %q", v.Name, cfg.AWS.SessionDuration, v.Defaults.SessionDuration)
+		}
+		if cfg.AWS.CacheRefreshBefore != v.Defaults.CacheRefreshBefore {
+			t.Errorf("%s: cache_refresh_before = %q, want %q", v.Name, cfg.AWS.CacheRefreshBefore, v.Defaults.CacheRefreshBefore)
+		}
+		for _, q := range v.Queries {
+			got := cfg.AWS.Resolve(q.Server, q.Shed)
+			if got.Role != q.Role || got.Mode != q.Mode || got.SessionDuration != q.SessionDuration {
+				t.Errorf("%s: Resolve(%q,%q) = {role:%q mode:%q dur:%q}, want {role:%q mode:%q dur:%q}",
+					v.Name, q.Server, q.Shed, got.Role, got.Mode, got.SessionDuration, q.Role, q.Mode, q.SessionDuration)
+			}
+		}
+	}
+}
+
 func TestGoldenGateNamespaces(t *testing.T) {
 	var fx struct {
 		ProtocolVersion int `json:"protocol_version"`

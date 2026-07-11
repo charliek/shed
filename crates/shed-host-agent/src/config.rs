@@ -8,6 +8,7 @@
 //! indentation-aware nested-map/scalar reader (`yaml_lite`) rather than a YAML
 //! crate dependency — the repo intentionally avoids serde_yaml/serde_norway.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -158,6 +159,14 @@ pub struct HostAgentConfig {
     /// started — mirroring Go's `cfg.Discovery != nil` gate in `main.go`. This
     /// minimal reader does not yet parse the discovery contents, only its presence.
     pub has_discovery: bool,
+    /// The layered AWS credential policy (`aws.{source_profile,default_role,mode,
+    /// session_duration,cache_refresh_before,servers…}`), mirroring Go's `AWSConfig`.
+    /// The `aws.approval.policy` gate is kept in `aws_policy` above (unchanged); this
+    /// field carries only the resolution/vending knobs. Consumed by the AWS backend
+    /// (commit 2) + the in-crate golden/unit tests; unused by production code in this
+    /// slice, hence the `dead_code` allow.
+    #[allow(dead_code)]
+    pub aws: AwsConfig,
 }
 
 impl HostAgentConfig {
@@ -213,6 +222,7 @@ impl HostAgentConfig {
             ),
             server,
             has_discovery: root.has_key("discovery"),
+            aws: AwsConfig::from_node(&root),
         }
     }
 
@@ -264,6 +274,207 @@ impl HostAgentConfig {
             .filter(|ns| self.effective_policy(ns) == POLICY_SHED_DESKTOP)
             .map(str::to_string)
             .collect()
+    }
+}
+
+/// AWS credential vending modes (mirror Go's `AWSMode*` in `config.go`). `mode`
+/// selects how the agent obtains the creds it vends for a shed: `assume-role`
+/// (default) does `sts:AssumeRole` from the source profile into the resolved role;
+/// `passthrough` vends the source profile's existing session credentials directly
+/// (SSO/SAML setups with no assumable role). An empty mode means assume-role.
+pub const AWS_MODE_ASSUME_ROLE: &str = "assume-role";
+pub const AWS_MODE_PASSTHROUGH: &str = "passthrough";
+
+/// `normalize_aws_mode` maps an empty mode to the assume-role default (Go's
+/// `normalizeAWSMode`).
+fn normalize_aws_mode(mode: &str) -> &str {
+    if mode.is_empty() {
+        AWS_MODE_ASSUME_ROLE
+    } else {
+        mode
+    }
+}
+
+/// The layered AWS config (`aws.*`), a faithful port of Go's `AWSConfig`. The
+/// top-level fields are the defaults; `servers` carries per-server (and per-shed)
+/// overrides layered over them. `source_profile` and `cache_refresh_before` are
+/// process-global and are not overridable per server. The `aws.approval.policy`
+/// gate lives on `HostAgentConfig.aws_policy`, not here.
+///
+/// Consumed by the AWS backend (commit 2) + the in-crate golden/unit tests; unused
+/// by production code in this slice, hence the `dead_code` allows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AwsConfig {
+    pub source_profile: String,
+    pub default_role: String,
+    /// `""` (= assume-role) | `assume-role` | `passthrough`.
+    pub mode: String,
+    pub session_duration: String,
+    pub cache_refresh_before: String,
+    pub servers: BTreeMap<String, AwsServerConfig>,
+}
+
+/// Per-server AWS overrides (Go's `AWSServerConfig`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AwsServerConfig {
+    pub default_role: String,
+    pub mode: String,
+    pub session_duration: String,
+    pub sheds: BTreeMap<String, AwsShedConfig>,
+}
+
+/// Per-shed AWS overrides (Go's `ShedAWSConfig`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AwsShedConfig {
+    pub role: String,
+    pub mode: String,
+    pub session_duration: String,
+}
+
+/// The effective AWS policy for a single `(server, shed)` pair (Go's `ResolvedAWS`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ResolvedAws {
+    /// Assumed-role ARN (`""` => no role configured).
+    pub role: String,
+    /// `AWS_MODE_ASSUME_ROLE` | `AWS_MODE_PASSTHROUGH` (never `""`).
+    pub mode: String,
+    /// `""` => fall back to the backend default.
+    pub session_duration: String,
+}
+
+#[allow(dead_code)]
+impl AwsConfig {
+    /// Build the AWS slice from the parsed config tree, applying the same load
+    /// defaults Go's `DefaultConfig`/`LoadConfig` do (`config.go:439-443`): an
+    /// empty/absent `source_profile` → `"default"`, `session_duration` → `"1h"`,
+    /// `cache_refresh_before` → `"5m"`. These are applied whether or not an `aws:`
+    /// block is present, matching Go (the defaults sit on `DefaultConfig` and the
+    /// YAML merge only overwrites keys it names).
+    ///
+    /// `aws.sheds` (Go's removed global per-shed map) is intentionally NOT read: it
+    /// is parse-and-ignore for resolution. Go's `AWSConfig.validate` rejects it with
+    /// a migration message; that rejection is sub-plan 5.
+    fn from_node(root: &yaml_lite::Node) -> AwsConfig {
+        use yaml_lite::Node;
+        let aws = root.as_map().and_then(|m| m.get("aws")).and_then(Node::as_map);
+        let scalar = |key: &str| -> String {
+            aws.and_then(|m| m.get(key))
+                .and_then(Node::as_scalar)
+                .unwrap_or("")
+                .to_string()
+        };
+        let default_if_empty = |v: String, d: &str| if v.is_empty() { d.to_string() } else { v };
+
+        let mut servers = BTreeMap::new();
+        if let Some(servers_map) = aws.and_then(|m| m.get("servers")).and_then(Node::as_map) {
+            for (name, entry) in servers_map {
+                let Some(fields) = entry.as_map() else { continue };
+                let sfield = |k: &str| {
+                    fields
+                        .get(k)
+                        .and_then(Node::as_scalar)
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let mut sheds = BTreeMap::new();
+                if let Some(sheds_map) = fields.get("sheds").and_then(Node::as_map) {
+                    for (sname, sentry) in sheds_map {
+                        let Some(sf) = sentry.as_map() else { continue };
+                        let g = |k: &str| sf.get(k).and_then(Node::as_scalar).unwrap_or("").to_string();
+                        sheds.insert(
+                            sname.clone(),
+                            AwsShedConfig {
+                                role: g("role"),
+                                mode: g("mode"),
+                                session_duration: g("session_duration"),
+                            },
+                        );
+                    }
+                }
+                servers.insert(
+                    name.clone(),
+                    AwsServerConfig {
+                        default_role: sfield("default_role"),
+                        mode: sfield("mode"),
+                        session_duration: sfield("session_duration"),
+                        sheds,
+                    },
+                );
+            }
+        }
+
+        AwsConfig {
+            source_profile: default_if_empty(scalar("source_profile"), "default"),
+            default_role: scalar("default_role"),
+            mode: scalar("mode"),
+            session_duration: default_if_empty(scalar("session_duration"), "1h"),
+            cache_refresh_before: default_if_empty(scalar("cache_refresh_before"), "5m"),
+            servers,
+        }
+    }
+
+    /// Layer AWS overrides for a `(server, shed)` pair, most specific wins:
+    /// top-level defaults → `servers[server]` → `servers[server].sheds[shed]`. Role,
+    /// mode, and session_duration each layer independently; an empty mode means "no
+    /// override" while layering and is normalized to `AWS_MODE_ASSUME_ROLE` at the
+    /// end (so a child that only sets a role under a passthrough parent stays
+    /// passthrough). A faithful port of Go's `AWSConfig.Resolve` (config.go:317-343).
+    pub fn resolve(&self, server: &str, shed: &str) -> ResolvedAws {
+        let mut role = self.default_role.clone();
+        let mut mode = self.mode.clone();
+        let mut session_duration = self.session_duration.clone();
+        if let Some(sv) = self.servers.get(server) {
+            if !sv.default_role.is_empty() {
+                role = sv.default_role.clone();
+            }
+            if !sv.mode.is_empty() {
+                mode = sv.mode.clone();
+            }
+            if !sv.session_duration.is_empty() {
+                session_duration = sv.session_duration.clone();
+            }
+            if let Some(sc) = sv.sheds.get(shed) {
+                if !sc.role.is_empty() {
+                    role = sc.role.clone();
+                }
+                if !sc.mode.is_empty() {
+                    mode = sc.mode.clone();
+                }
+                if !sc.session_duration.is_empty() {
+                    session_duration = sc.session_duration.clone();
+                }
+            }
+        }
+        ResolvedAws {
+            role,
+            mode: normalize_aws_mode(&mode).to_string(),
+            session_duration,
+        }
+    }
+
+    /// Report whether the AWS handler should start at all: true if any resolution
+    /// path selects passthrough mode or configures a non-empty role. An explicit
+    /// assume-role with no role anywhere is "AWS off" (false). A faithful port of
+    /// Go's `AWSConfig.Enabled` (config.go:356-371).
+    pub fn enabled(&self) -> bool {
+        if self.mode == AWS_MODE_PASSTHROUGH || !self.default_role.is_empty() {
+            return true;
+        }
+        for sv in self.servers.values() {
+            if sv.mode == AWS_MODE_PASSTHROUGH || !sv.default_role.is_empty() {
+                return true;
+            }
+            for s in sv.sheds.values() {
+                if s.mode == AWS_MODE_PASSTHROUGH || !s.role.is_empty() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -580,5 +791,415 @@ discovery:
             expand_tilde("~/x/y"),
             home.join("x/y").to_string_lossy().into_owned()
         );
+    }
+
+    // ---- AWS config slice (mirror aws_backend_test.go / config_test.go) ----------
+
+    fn sheds(entries: &[(&str, AwsShedConfig)]) -> BTreeMap<String, AwsShedConfig> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn servers(entries: &[(&str, AwsServerConfig)]) -> BTreeMap<String, AwsServerConfig> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn shed_role(role: &str) -> AwsShedConfig {
+        AwsShedConfig {
+            role: role.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Mirrors `aws_backend_test.go:TestAWSResolve` — layering matrix, role + mode
+    /// only (session_duration layering is exercised by the golden).
+    #[test]
+    fn aws_resolve_matrix() {
+        struct Case {
+            name: &'static str,
+            cfg: AwsConfig,
+            server: &'static str,
+            shed: &'static str,
+            want_role: &'static str,
+            want_mode: &'static str,
+        }
+        let cases = vec![
+            Case {
+                name: "default role",
+                cfg: AwsConfig {
+                    default_role: "arn:aws:iam::123:role/default".into(),
+                    ..Default::default()
+                },
+                server: "mini2",
+                shed: "my-shed",
+                want_role: "arn:aws:iam::123:role/default",
+                want_mode: AWS_MODE_ASSUME_ROLE,
+            },
+            Case {
+                name: "per-server override",
+                cfg: AwsConfig {
+                    default_role: "arn:aws:iam::123:role/default".into(),
+                    servers: servers(&[(
+                        "mini2",
+                        AwsServerConfig {
+                            default_role: "arn:aws:iam::123:role/mini2".into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                server: "mini2",
+                shed: "my-shed",
+                want_role: "arn:aws:iam::123:role/mini2",
+                want_mode: AWS_MODE_ASSUME_ROLE,
+            },
+            Case {
+                name: "per-server-per-shed override wins",
+                cfg: AwsConfig {
+                    default_role: "arn:aws:iam::123:role/default".into(),
+                    servers: servers(&[(
+                        "mini2",
+                        AwsServerConfig {
+                            default_role: "arn:aws:iam::123:role/mini2".into(),
+                            sheds: sheds(&[("web", shed_role("arn:aws:iam::123:role/web"))]),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                server: "mini2",
+                shed: "web",
+                want_role: "arn:aws:iam::123:role/web",
+                want_mode: AWS_MODE_ASSUME_ROLE,
+            },
+            Case {
+                name: "same shed name on different server is isolated",
+                cfg: AwsConfig {
+                    default_role: "arn:aws:iam::123:role/default".into(),
+                    servers: servers(&[(
+                        "mini2",
+                        AwsServerConfig {
+                            sheds: sheds(&[("web", shed_role("arn:aws:iam::123:role/mini2-web"))]),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                server: "mini3",
+                shed: "web",
+                want_role: "arn:aws:iam::123:role/default",
+                want_mode: AWS_MODE_ASSUME_ROLE,
+            },
+            Case {
+                name: "no config normalizes to assume-role",
+                cfg: AwsConfig::default(),
+                server: "mini2",
+                shed: "my-shed",
+                want_role: "",
+                want_mode: AWS_MODE_ASSUME_ROLE,
+            },
+            Case {
+                name: "top-level passthrough",
+                cfg: AwsConfig {
+                    mode: AWS_MODE_PASSTHROUGH.into(),
+                    ..Default::default()
+                },
+                server: "mini2",
+                shed: "my-shed",
+                want_role: "",
+                want_mode: AWS_MODE_PASSTHROUGH,
+            },
+            Case {
+                name: "server-level passthrough ignores role",
+                cfg: AwsConfig {
+                    default_role: "arn:aws:iam::123:role/default".into(),
+                    servers: servers(&[(
+                        "mini2",
+                        AwsServerConfig {
+                            mode: AWS_MODE_PASSTHROUGH.into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                server: "mini2",
+                shed: "web",
+                want_role: "arn:aws:iam::123:role/default",
+                want_mode: AWS_MODE_PASSTHROUGH,
+            },
+            Case {
+                name: "child role under passthrough parent stays passthrough",
+                cfg: AwsConfig {
+                    servers: servers(&[(
+                        "mini2",
+                        AwsServerConfig {
+                            mode: AWS_MODE_PASSTHROUGH.into(),
+                            sheds: sheds(&[("web", shed_role("arn:aws:iam::123:role/web"))]),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                server: "mini2",
+                shed: "web",
+                want_role: "arn:aws:iam::123:role/web",
+                want_mode: AWS_MODE_PASSTHROUGH,
+            },
+            Case {
+                name: "child assume-role overrides passthrough parent",
+                cfg: AwsConfig {
+                    mode: AWS_MODE_PASSTHROUGH.into(),
+                    servers: servers(&[(
+                        "mini2",
+                        AwsServerConfig {
+                            sheds: sheds(&[(
+                                "scoped",
+                                AwsShedConfig {
+                                    mode: AWS_MODE_ASSUME_ROLE.into(),
+                                    role: "arn:aws:iam::123:role/scoped".into(),
+                                    ..Default::default()
+                                },
+                            )]),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                server: "mini2",
+                shed: "scoped",
+                want_role: "arn:aws:iam::123:role/scoped",
+                want_mode: AWS_MODE_ASSUME_ROLE,
+            },
+        ];
+        for c in cases {
+            let got = c.cfg.resolve(c.server, c.shed);
+            assert_eq!(got.role, c.want_role, "{}: role", c.name);
+            assert_eq!(got.mode, c.want_mode, "{}: mode", c.name);
+        }
+    }
+
+    /// Mirrors `aws_backend_test.go:TestAWSEnabled`.
+    #[test]
+    fn aws_enabled_matrix() {
+        let cases: Vec<(&str, AwsConfig, bool)> = vec![
+            ("empty", AwsConfig::default(), false),
+            (
+                "explicit assume-role, no role",
+                AwsConfig {
+                    mode: AWS_MODE_ASSUME_ROLE.into(),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "default role",
+                AwsConfig {
+                    default_role: "x".into(),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "top-level passthrough",
+                AwsConfig {
+                    mode: AWS_MODE_PASSTHROUGH.into(),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "server default role",
+                AwsConfig {
+                    servers: servers(&[(
+                        "m",
+                        AwsServerConfig {
+                            default_role: "x".into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "server passthrough",
+                AwsConfig {
+                    servers: servers(&[(
+                        "m",
+                        AwsServerConfig {
+                            mode: AWS_MODE_PASSTHROUGH.into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "shed role",
+                AwsConfig {
+                    servers: servers(&[(
+                        "m",
+                        AwsServerConfig {
+                            sheds: sheds(&[("s", shed_role("x"))]),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "shed passthrough",
+                AwsConfig {
+                    servers: servers(&[(
+                        "m",
+                        AwsServerConfig {
+                            sheds: sheds(&[(
+                                "s",
+                                AwsShedConfig {
+                                    mode: AWS_MODE_PASSTHROUGH.into(),
+                                    ..Default::default()
+                                },
+                            )]),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ];
+        for (name, cfg, want) in cases {
+            assert_eq!(cfg.enabled(), want, "{name}");
+        }
+    }
+
+    /// Mirrors `aws_backend_test.go:TestMixedModeResolve`.
+    #[test]
+    fn aws_mixed_mode_resolve() {
+        let cfg = AwsConfig {
+            default_role: "arn:aws:iam::111:role/dev".into(),
+            servers: servers(&[(
+                "mini2",
+                AwsServerConfig {
+                    sheds: sheds(&[
+                        (
+                            "sso-app",
+                            AwsShedConfig {
+                                mode: AWS_MODE_PASSTHROUGH.into(),
+                                ..Default::default()
+                            },
+                        ),
+                        ("scoped-app", shed_role("arn:aws:iam::111:role/scoped")),
+                    ]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve("mini2", "sso-app").mode, AWS_MODE_PASSTHROUGH);
+        let scoped = cfg.resolve("mini2", "scoped-app");
+        assert_eq!(scoped.mode, AWS_MODE_ASSUME_ROLE);
+        assert_eq!(scoped.role, "arn:aws:iam::111:role/scoped");
+    }
+
+    /// Mirrors the parse halves of `config_test.go:TestLoadConfigAWS` +
+    /// `TestLoadConfigDefaults` (Validate parity is sub-plan 5).
+    #[test]
+    fn aws_load_and_defaults() {
+        // TestLoadConfigAWS: explicit values + nested per-shed overrides parse.
+        let cfg = HostAgentConfig::parse(
+            "\
+server: http://localhost:8080
+aws:
+  source_profile: staging
+  default_role: arn:aws:iam::123456789012:role/dev
+  session_duration: 2h
+  cache_refresh_before: 10m
+  approval:
+    policy: approve-all
+  servers:
+    mini2:
+      sheds:
+        sso-app:
+          mode: passthrough
+        my-service:
+          role: arn:aws:iam::123456789012:role/my-service
+",
+        );
+        let aws = &cfg.aws;
+        assert_eq!(aws.source_profile, "staging");
+        assert_eq!(aws.default_role, "arn:aws:iam::123456789012:role/dev");
+        assert_eq!(aws.session_duration, "2h");
+        assert_eq!(aws.cache_refresh_before, "10m");
+        // The aws.approval.policy gate still resolves via the existing accessor.
+        assert_eq!(cfg.effective_policy(NS_AWS_CREDENTIALS), "approve-all");
+        let sheds = &aws.servers["mini2"].sheds;
+        assert_eq!(sheds["sso-app"].mode, AWS_MODE_PASSTHROUGH);
+        assert_eq!(sheds["my-service"].role, "arn:aws:iam::123456789012:role/my-service");
+
+        // TestLoadConfigDefaults: with no aws block the load defaults apply.
+        let defaults = HostAgentConfig::parse("server: http://localhost:8080\n");
+        assert_eq!(defaults.aws.source_profile, "default");
+        assert_eq!(defaults.aws.session_duration, "1h");
+        assert_eq!(defaults.aws.cache_refresh_before, "5m");
+    }
+
+    /// The Rust half of the `aws_resolve` golden — reads the SAME shared fixture the
+    /// Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenAWSResolve`),
+    /// so the two impls can't drift together on the layering / defaults / enabled
+    /// semantics. Lives in-crate (the `load_discovered_servers` precedent) because
+    /// this is a binary crate with no lib.
+    #[test]
+    fn golden_aws_resolve() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/aws_resolve.json");
+        let raw = std::fs::read_to_string(&path).expect("read golden fixture");
+        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(fx["protocol_version"], 1, "version skew");
+        let vectors = fx["vectors"].as_array().unwrap();
+        assert!(!vectors.is_empty(), "fixture has no vectors");
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let cfg = HostAgentConfig::parse(v["config_yaml"].as_str().unwrap());
+            let aws = &cfg.aws;
+            assert_eq!(
+                aws.enabled(),
+                v["enabled"].as_bool().unwrap(),
+                "enabled {name:?}"
+            );
+            let d = &v["defaults"];
+            assert_eq!(
+                aws.source_profile,
+                d["source_profile"].as_str().unwrap(),
+                "source_profile {name:?}"
+            );
+            assert_eq!(
+                aws.session_duration,
+                d["session_duration"].as_str().unwrap(),
+                "session_duration {name:?}"
+            );
+            assert_eq!(
+                aws.cache_refresh_before,
+                d["cache_refresh_before"].as_str().unwrap(),
+                "cache_refresh_before {name:?}"
+            );
+            for q in v["queries"].as_array().unwrap() {
+                let r = aws.resolve(q["server"].as_str().unwrap(), q["shed"].as_str().unwrap());
+                assert_eq!(r.role, q["role"].as_str().unwrap(), "role {name:?}");
+                assert_eq!(r.mode, q["mode"].as_str().unwrap(), "mode {name:?}");
+                assert_eq!(
+                    r.session_duration,
+                    q["session_duration"].as_str().unwrap(),
+                    "session_duration {name:?}"
+                );
+            }
+        }
     }
 }
