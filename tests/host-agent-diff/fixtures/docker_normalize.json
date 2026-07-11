@@ -1,0 +1,22 @@
+{
+  "_comment": "Golden fixture for the Docker registry-key canonicalization + config-map lookup. `normalize_vectors` pin normalizeRegistry (docker_backend.go:375 / docker_backend.rs:normalize_registry): strip https://|http:// prefix then trailing `/`, `/v1`, `/v2` — in THAT order, each a SINGLE occurrence (strip_prefix/strip_suffix, not trim_*_matches). `ghcr.io//` -> `ghcr.io/` pins one-occurrence; `.../v1/` -> `...` and `reg.io/v2/` -> `reg.io` pin the strip ORDER (trailing `/` before `/v1`|`/v2`). `lookup_vectors` pin lookupConfigMap's 3-way search (raw key -> normalized key -> normalize-every-key scan): each runner computes normalized = normalizeRegistry(raw) then looks it up, so a config key stored as `https://index.docker.io/v1/` matches a guest `index.docker.io` and vice versa; `expected` null = miss. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenDockerNormalize) and the Rust runner (crates/shed-host-agent/src/docker_backend.rs tests::golden_docker_normalize).",
+  "protocol_version": 1,
+  "normalize_vectors": [
+    {"input": "us-docker.pkg.dev", "expected": "us-docker.pkg.dev"},
+    {"input": "https://us-docker.pkg.dev", "expected": "us-docker.pkg.dev"},
+    {"input": "https://index.docker.io/v1/", "expected": "index.docker.io"},
+    {"input": "https://index.docker.io/v1", "expected": "index.docker.io"},
+    {"input": "http://localhost:5000", "expected": "localhost:5000"},
+    {"input": "ghcr.io", "expected": "ghcr.io"},
+    {"input": "ghcr.io/", "expected": "ghcr.io"},
+    {"input": "ghcr.io//", "expected": "ghcr.io/"},
+    {"input": "https://reg.io/v2", "expected": "reg.io"},
+    {"input": "reg.io/v2/", "expected": "reg.io"}
+  ],
+  "lookup_vectors": [
+    {"name": "exact raw key", "map": {"ghcr.io": "helperB", "https://index.docker.io/v1/": "helperA"}, "raw": "ghcr.io", "expected": "helperB"},
+    {"name": "scan-all-keys: guest sends normalized host, key is full docker form", "map": {"https://index.docker.io/v1/": "helperA"}, "raw": "index.docker.io", "expected": "helperA"},
+    {"name": "normalized-key path: guest sends full docker form, key is normalized", "map": {"index.docker.io": "helperC"}, "raw": "https://index.docker.io/v1/", "expected": "helperC"},
+    {"name": "miss", "map": {"a.io": "h"}, "raw": "b.io", "expected": null}
+  ]
+}

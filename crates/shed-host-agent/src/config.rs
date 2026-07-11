@@ -552,7 +552,6 @@ pub struct DockerShedConfig {
 /// `ResolvedDocker`). `registry_count` in the backend's `Status` is just
 /// `registries.len()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Constructed only by `resolve` (also staged below) until the backend/bus land.
 pub struct ResolvedDocker {
     pub registries: Vec<String>,
     pub allow_all: bool,
@@ -628,8 +627,9 @@ impl DockerConfig {
     /// `Some(vec![])` replaces with empty (child denies all); an unset (`None`)
     /// `registries`/`allow_all` inherits. A faithful port of Go's
     /// `DockerConfig.Resolve` (`config.go:233-254`, the `sv.Registries != nil` /
-    /// `sv.AllowAll != nil` checks).
-    #[allow(dead_code)] // Consumed by the backend Status/get (commit 2) + bus wiring (commit 3); today only the config unit tests + docker_resolve golden reach it. Staged like the AWS slice.
+    /// `sv.AllowAll != nil` checks). Consumed by the Docker backend's
+    /// `get_credentials`/`list_credentials`/`status` (`docker_backend.rs`, commit 2)
+    /// + the config unit tests + the `docker_resolve` golden.
     pub fn resolve(&self, server: &str, shed: &str) -> ResolvedDocker {
         let mut registries = self.registries.clone();
         let mut allow_all = self.allow_all;

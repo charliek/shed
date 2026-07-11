@@ -1,0 +1,12 @@
+{
+  "_comment": "Golden fixture for augmentPATH (docker_backend.go:323 / docker_backend.rs:augment_path): the credential-helper install dirs (/usr/local/bin, /opt/homebrew/bin) are APPENDED to the child's PATH (skipping any already present), NOT prepended. Non-go_only vectors carry a single `path` string + `extra_dirs` -> `expected_path`; both runners produce the resulting PATH value and compare. An empty `path` yields ONLY the extras (no leading separator). go_only vectors carry an `env` array (multiple PATH= entries, or no PATH= entry) that only Go's []string-env augmentPATH can represent — the Rust Command env is a MAP keyed by name (no duplicate-PATH, no missing-PATH branch), so the Rust runner SKIPS them (see augment_path_go_only_note). The Go runner feeds `env` (if present) else [`PATH=`+path] to augmentPATH and extracts the effective (last-wins) PATH value. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenDockerPathAugment) and the Rust runner (crates/shed-host-agent/src/docker_backend.rs tests::golden_docker_path_augment).",
+  "protocol_version": 1,
+  "vectors": [
+    {"name": "append missing dirs", "path": "/usr/bin:/bin", "extra_dirs": ["/usr/local/bin", "/opt/homebrew/bin"], "expected_path": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"},
+    {"name": "no duplicate for a dir already present", "path": "/usr/local/bin:/usr/bin", "extra_dirs": ["/usr/local/bin"], "expected_path": "/usr/local/bin:/usr/bin"},
+    {"name": "empty PATH value yields only the extras (no leading separator)", "path": "", "extra_dirs": ["/opt/homebrew/bin"], "expected_path": "/opt/homebrew/bin"},
+    {"name": "extra already mid-PATH keeps single copy", "path": "/a:/opt/homebrew/bin:/b", "extra_dirs": ["/opt/homebrew/bin"], "expected_path": "/a:/opt/homebrew/bin:/b"},
+    {"name": "go_only: env has NO PATH entry -> a PATH is added (Go []string-env branch; Rust has no missing-PATH case)", "go_only": true, "env": ["HOME=/home/user"], "extra_dirs": ["/opt/homebrew/bin"], "expected_path": "/opt/homebrew/bin"},
+    {"name": "go_only: duplicate PATH= entries, the LAST is augmented (Go last-key-wins; Rust env is a map)", "go_only": true, "env": ["PATH=/early", "HOME=/home/user", "PATH=/usr/bin"], "extra_dirs": ["/opt/homebrew/bin"], "expected_path": "/usr/bin:/opt/homebrew/bin"}
+  ]
+}

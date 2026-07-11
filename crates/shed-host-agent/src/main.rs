@@ -28,6 +28,7 @@ mod bus;
 mod config;
 #[cfg(feature = "desktop-forwarding")]
 mod controltoken;
+mod docker_backend;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop;
 #[cfg(feature = "desktop-forwarding")]

@@ -13,6 +13,7 @@ package main
 // the package is fine for a Go test and does not affect `go list ./...`.
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -455,6 +456,156 @@ func TestGoldenGateNamespaces(t *testing.T) {
 		if !equalStrings(got, v.Gate) {
 			t.Errorf("desktopGateNamespaces(ssh=%q,aws=%q,docker=%q) = %v, want %v",
 				v.SSH, v.AWS, v.Docker, got, v.Gate)
+		}
+	}
+}
+
+// TestGoldenDockerNormalize is the Go half of the docker_normalize golden. It routes
+// each vector through the PRODUCTION normalizeRegistry + lookupConfigMap (the same
+// canonicalization + 3-way config-map search the backend uses), against the shared
+// fixture the Rust runner (docker_backend.rs:tests::golden_docker_normalize) also
+// reads, so the one-occurrence strip / strip-order / raw->normalized->scan lookup
+// semantics cannot drift together.
+func TestGoldenDockerNormalize(t *testing.T) {
+	var fx struct {
+		ProtocolVersion  int `json:"protocol_version"`
+		NormalizeVectors []struct {
+			Input    string `json:"input"`
+			Expected string `json:"expected"`
+		} `json:"normalize_vectors"`
+		LookupVectors []struct {
+			Name     string            `json:"name"`
+			Map      map[string]string `json:"map"`
+			Raw      string            `json:"raw"`
+			Expected *string           `json:"expected"`
+		} `json:"lookup_vectors"`
+	}
+	readFixture(t, "docker_normalize.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("docker_normalize.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.NormalizeVectors) == 0 || len(fx.LookupVectors) == 0 {
+		t.Fatal("docker_normalize.json missing vectors")
+	}
+
+	for _, v := range fx.NormalizeVectors {
+		if got := normalizeRegistry(v.Input); got != v.Expected {
+			t.Errorf("normalizeRegistry(%q) = %q, want %q", v.Input, got, v.Expected)
+		}
+	}
+	for _, v := range fx.LookupVectors {
+		normalized := normalizeRegistry(v.Raw)
+		got, ok := lookupConfigMap(v.Map, v.Raw, normalized)
+		switch {
+		case v.Expected == nil:
+			if ok {
+				t.Errorf("%s: lookupConfigMap(raw=%q) = %q, want miss", v.Name, v.Raw, got)
+			}
+		case !ok:
+			t.Errorf("%s: lookupConfigMap(raw=%q) = miss, want %q", v.Name, v.Raw, *v.Expected)
+		case got != *v.Expected:
+			t.Errorf("%s: lookupConfigMap(raw=%q) = %q, want %q", v.Name, v.Raw, got, *v.Expected)
+		}
+	}
+}
+
+// TestGoldenDockerInlineAuth is the Go half of the docker_inline_auth golden. It
+// base64-STANDARD-encodes each vector's `plain` (matching the Rust runner's own
+// STANDARD encode), routes it through the PRODUCTION decodeInlineAuth, and asserts the
+// username/secret split (valid) or the exact error string (invalid). The
+// malformed-base64 case is intentionally absent (its runtime suffix is impl-dependent
+// — see the fixture comment).
+func TestGoldenDockerInlineAuth(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		ValidVectors    []struct {
+			Name      string `json:"name"`
+			ServerURL string `json:"server_url"`
+			Plain     string `json:"plain"`
+			Username  string `json:"username"`
+			Secret    string `json:"secret"`
+		} `json:"valid_vectors"`
+		InvalidVectors []struct {
+			Name          string `json:"name"`
+			ServerURL     string `json:"server_url"`
+			Plain         string `json:"plain"`
+			ExpectedError string `json:"expected_error"`
+		} `json:"invalid_vectors"`
+	}
+	readFixture(t, "docker_inline_auth.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("docker_inline_auth.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.ValidVectors) == 0 || len(fx.InvalidVectors) == 0 {
+		t.Fatal("docker_inline_auth.json missing vectors")
+	}
+
+	for _, v := range fx.ValidVectors {
+		encoded := base64.StdEncoding.EncodeToString([]byte(v.Plain))
+		cred, err := decodeInlineAuth(v.ServerURL, encoded)
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", v.Name, err)
+			continue
+		}
+		if cred.Username != v.Username || cred.Secret != v.Secret {
+			t.Errorf("%s: decodeInlineAuth = {user:%q secret:%q}, want {user:%q secret:%q}",
+				v.Name, cred.Username, cred.Secret, v.Username, v.Secret)
+		}
+		if cred.ServerURL != v.ServerURL {
+			t.Errorf("%s: ServerURL = %q, want %q", v.Name, cred.ServerURL, v.ServerURL)
+		}
+	}
+	for _, v := range fx.InvalidVectors {
+		encoded := base64.StdEncoding.EncodeToString([]byte(v.Plain))
+		_, err := decodeInlineAuth(v.ServerURL, encoded)
+		if err == nil {
+			t.Errorf("%s: expected error, got nil", v.Name)
+			continue
+		}
+		if err.Error() != v.ExpectedError {
+			t.Errorf("%s: error = %q, want %q", v.Name, err.Error(), v.ExpectedError)
+		}
+	}
+}
+
+// TestGoldenDockerPathAugment is the Go half of the docker_path_augment golden. It
+// routes each vector through the PRODUCTION augmentPATH (over os.Environ()-shaped
+// []string) and extracts the effective (last-wins) PATH value via pathValue, against
+// the shared fixture the Rust runner (docker_backend.rs:tests::golden_docker_path_augment)
+// also reads. go_only vectors (multiple PATH= entries / no PATH= entry) exercise the
+// Go []string-env branches the Rust map-env has no equivalent for; the Rust runner
+// skips them.
+func TestGoldenDockerPathAugment(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name         string   `json:"name"`
+			GoOnly       bool     `json:"go_only"`
+			Path         string   `json:"path"`
+			Env          []string `json:"env"`
+			ExtraDirs    []string `json:"extra_dirs"`
+			ExpectedPath string   `json:"expected_path"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "docker_path_augment.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("docker_path_augment.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("docker_path_augment.json has no vectors")
+	}
+
+	for _, v := range fx.Vectors {
+		env := v.Env
+		if env == nil {
+			env = []string{"PATH=" + v.Path}
+		}
+		got := augmentPATH(env, v.ExtraDirs)
+		if pv := pathValue(t, got); pv != v.ExpectedPath {
+			t.Errorf("%s: augmentPATH PATH = %q, want %q", v.Name, pv, v.ExpectedPath)
 		}
 	}
 }
