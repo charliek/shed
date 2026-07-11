@@ -168,6 +168,14 @@ pub struct HostAgentConfig {
     /// field carries only the resolution/vending knobs. Consumed by the AWS backend
     /// (`aws_backend.rs`).
     pub aws: AwsConfig,
+    /// The layered Docker registry-credential policy (`docker.{registries,
+    /// allow_all,config_path,servers…}`), mirroring Go's `DockerConfig`. The
+    /// `docker.approval.policy` gate is kept in `docker_policy` above (unchanged);
+    /// this field carries only the allowlist/config-path knobs. Consumed by the
+    /// Docker backend (`docker_backend.rs`, commit 2) + `main.rs` bus wiring
+    /// (commit 3); in commit 1 only the config tests + the docker_resolve golden
+    /// read it.
+    pub docker: DockerConfig,
 }
 
 impl HostAgentConfig {
@@ -224,6 +232,7 @@ impl HostAgentConfig {
             server,
             has_discovery: root.has_key("discovery"),
             aws: AwsConfig::from_node(&root),
+            docker: DockerConfig::from_node(&root),
         }
     }
 
@@ -484,6 +493,178 @@ impl AwsConfig {
     }
 }
 
+/// The layered Docker registry-credential config (`docker.*`), a faithful port of
+/// Go's `DockerConfig` (`config.go:198-254`). The top-level fields are the defaults;
+/// `servers` carries per-server (and per-shed) overrides layered over them.
+/// `config_path` (the Docker `config.json` override) is process-global. The
+/// `docker.approval.policy` gate lives on `HostAgentConfig.docker_policy`, not here.
+///
+/// Unlike [`AwsConfig`], Docker has **no `enabled()` method and no load-defaults**:
+/// Go's `DockerConfig` carries no `Enabled()` and `DefaultConfig` sets no Docker
+/// fields, so an absent/empty `docker:` block yields an empty-registries,
+/// `allow_all: false`, empty-`config_path` config that STILL constructs a live
+/// backend (which then denies every registry). That asymmetry — AWS gates itself
+/// off when unconfigured, Docker stays on — is the crux of the Docker slice and is
+/// carried by the constructor (commit 2), not by this config type.
+///
+/// Built by [`DockerConfig::from_node`] (called from `HostAgentConfig::parse`) and
+/// consumed by the Docker backend (`docker_backend.rs`, commit 2) + `main.rs` bus
+/// wiring (commit 3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockerConfig {
+    /// Registry hostnames to allow by default. A plain `Vec` (Go's top-level
+    /// `[]string`): absent → empty, which — with `allow_all: false` — denies all.
+    pub registries: Vec<String>,
+    /// Bypass the allowlist entirely (Go's top-level `bool` default).
+    pub allow_all: bool,
+    /// Override the Docker `config.json` path (`~/`-expansion is applied by the
+    /// backend constructor, mirroring Go's `NewDockerBackend`, not here — Go's
+    /// `LoadConfig` likewise stores it raw).
+    pub config_path: String,
+    /// Per-server overrides, each optionally with per-shed nesting.
+    pub servers: BTreeMap<String, DockerServerConfig>,
+}
+
+/// Per-server Docker overrides (Go's `DockerServerConfig`). `registries` and
+/// `allow_all` are BOTH optional so an unset value **inherits** the parent rather
+/// than forcing empty/false. `registries: Option<Vec<String>>` is the load-bearing
+/// choice (mirroring Go's `sv.Registries != nil` replace check): `None` = inherit,
+/// `Some(vec![])` = **replace-with-empty** (the child DENIES ALL — a security
+/// lockdown a plain `Vec` would silently fold into "inherit"), `Some(vec![..])` =
+/// replace. `allow_all: Option<bool>` mirrors Go's `*bool`: `None` = inherit,
+/// `Some(false)` = force-off, `Some(true)` = force-on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockerServerConfig {
+    pub registries: Option<Vec<String>>,
+    pub allow_all: Option<bool>,
+    pub sheds: BTreeMap<String, DockerShedConfig>,
+}
+
+/// Per-shed Docker overrides (Go's `DockerShedConfig`). Same `Option` inherit/
+/// replace/force semantics as [`DockerServerConfig`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockerShedConfig {
+    pub registries: Option<Vec<String>>,
+    pub allow_all: Option<bool>,
+}
+
+/// The effective Docker policy for a single `(server, shed)` pair (Go's
+/// `ResolvedDocker`). `registry_count` in the backend's `Status` is just
+/// `registries.len()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Constructed only by `resolve` (also staged below) until the backend/bus land.
+pub struct ResolvedDocker {
+    pub registries: Vec<String>,
+    pub allow_all: bool,
+}
+
+impl DockerConfig {
+    /// Build the Docker slice from the parsed config tree. Reads a **list**
+    /// (`registries`, via [`yaml_lite::Node::as_scalar_list`]: absent key → `None`,
+    /// present `[]` → `Some(vec![])`, present `[a,b]` → `Some(vec![a,b])`) and a
+    /// **pointer bool** (`allow_all`: absent → `None`, present → `Some(_)`),
+    /// mirroring Go's `[]string`/`*bool` fields. The exact `AwsConfig::from_node`
+    /// walk, but sequence-aware.
+    ///
+    /// No load-defaults are applied (Go's `DefaultConfig` sets no Docker fields):
+    /// an absent `docker:` block yields `DockerConfig::default()` — empty
+    /// registries, `allow_all: false`, empty `config_path` — the unconfigured
+    /// deny-all backend.
+    fn from_node(root: &yaml_lite::Node) -> DockerConfig {
+        use yaml_lite::Node;
+        let docker = root
+            .as_map()
+            .and_then(|m| m.get("docker"))
+            .and_then(Node::as_map);
+
+        let mut servers = BTreeMap::new();
+        if let Some(servers_map) = docker.and_then(|m| m.get("servers")).and_then(Node::as_map) {
+            for (name, entry) in servers_map {
+                let Some(fields) = entry.as_map() else {
+                    continue;
+                };
+                let mut sheds = BTreeMap::new();
+                if let Some(sheds_map) = fields.get("sheds").and_then(Node::as_map) {
+                    for (sname, sentry) in sheds_map {
+                        let Some(sf) = sentry.as_map() else { continue };
+                        sheds.insert(
+                            sname.clone(),
+                            DockerShedConfig {
+                                registries: sf.get("registries").and_then(Node::as_scalar_list),
+                                allow_all: opt_bool(sf.get("allow_all")),
+                            },
+                        );
+                    }
+                }
+                servers.insert(
+                    name.clone(),
+                    DockerServerConfig {
+                        registries: fields.get("registries").and_then(Node::as_scalar_list),
+                        allow_all: opt_bool(fields.get("allow_all")),
+                        sheds,
+                    },
+                );
+            }
+        }
+
+        DockerConfig {
+            registries: docker
+                .and_then(|m| m.get("registries"))
+                .and_then(Node::as_scalar_list)
+                .unwrap_or_default(),
+            allow_all: opt_bool(docker.and_then(|m| m.get("allow_all"))).unwrap_or(false),
+            config_path: docker
+                .and_then(|m| m.get("config_path"))
+                .and_then(Node::as_scalar)
+                .unwrap_or("")
+                .to_string(),
+            servers,
+        }
+    }
+
+    /// Layer Docker overrides for a `(server, shed)` pair, most specific wins:
+    /// top-level defaults → `servers[server]` → `servers[server].sheds[shed]`. A
+    /// **`Some` registries list REPLACES** (does not merge) the inherited one —
+    /// `Some(vec![])` replaces with empty (child denies all); an unset (`None`)
+    /// `registries`/`allow_all` inherits. A faithful port of Go's
+    /// `DockerConfig.Resolve` (`config.go:233-254`, the `sv.Registries != nil` /
+    /// `sv.AllowAll != nil` checks).
+    #[allow(dead_code)] // Consumed by the backend Status/get (commit 2) + bus wiring (commit 3); today only the config unit tests + docker_resolve golden reach it. Staged like the AWS slice.
+    pub fn resolve(&self, server: &str, shed: &str) -> ResolvedDocker {
+        let mut registries = self.registries.clone();
+        let mut allow_all = self.allow_all;
+        if let Some(sv) = self.servers.get(server) {
+            if let Some(r) = &sv.registries {
+                registries = r.clone();
+            }
+            if let Some(a) = sv.allow_all {
+                allow_all = a;
+            }
+            if let Some(sc) = sv.sheds.get(shed) {
+                if let Some(r) = &sc.registries {
+                    registries = r.clone();
+                }
+                if let Some(a) = sc.allow_all {
+                    allow_all = a;
+                }
+            }
+        }
+        ResolvedDocker {
+            registries,
+            allow_all,
+        }
+    }
+}
+
+/// Read an optional YAML bool leaf, mirroring Go's `*bool` decode: an absent node
+/// → `None` (inherit), a present scalar → `Some(scalar == "true")` (so
+/// `allow_all: false` is `Some(false)` — force-off — not inherit). A present
+/// non-scalar (e.g. a map) → `None`.
+fn opt_bool(node: Option<&yaml_lite::Node>) -> Option<bool> {
+    node.and_then(yaml_lite::Node::as_scalar)
+        .map(|s| s == "true")
+}
+
 /// A deliberately tiny indentation-based reader. Handles exactly what the
 /// host-agent config's relevant subset contains: nested maps and scalar leaves.
 /// Inline `{}` is an empty map; comments (`#`) and blank lines are skipped. A port
@@ -495,13 +676,20 @@ pub(crate) mod yaml_lite {
     pub enum Node {
         Map(HashMap<String, Node>),
         Scalar(String),
+        /// A flow-style sequence (`[a, b, c]`) of scalar (or, in principle, nested)
+        /// nodes. Added for the Docker `registries` allowlist, which the shipped
+        /// config + `config_test.go` express as a flow list. Only flow-style `[..]`
+        /// is parsed — block-style `- item` lists are NOT supported by this minimal
+        /// reader (the line/colon model has no natural place for them; every fixture
+        /// that needs a list uses the flow form).
+        Sequence(Vec<Node>),
     }
 
     impl Node {
         pub fn as_scalar(&self) -> Option<&str> {
             match self {
                 Node::Scalar(s) => Some(s),
-                Node::Map(_) => None,
+                _ => None,
             }
         }
 
@@ -513,7 +701,36 @@ pub(crate) mod yaml_lite {
         pub fn as_map(&self) -> Option<&HashMap<String, Node>> {
             match self {
                 Node::Map(m) => Some(m),
-                Node::Scalar(_) => None,
+                _ => None,
+            }
+        }
+
+        /// The underlying slice when this node is a `Sequence`. Only the config
+        /// unit tests reach it directly today (the Docker `registries` reader uses
+        /// [`Node::as_scalar_list`]); kept as a first-class accessor because the
+        /// sequence node is reusable by later config slices.
+        #[allow(dead_code)]
+        pub fn as_seq(&self) -> Option<&[Node]> {
+            match self {
+                Node::Sequence(v) => Some(v),
+                _ => None,
+            }
+        }
+
+        /// A `Sequence` flattened to its scalar items (non-scalar items are
+        /// dropped) — the convenience the Docker `registries` allowlist reader
+        /// wants. `None` when this node is not a sequence, which lets the reader
+        /// distinguish an ABSENT key (`get` → `None`) from a present empty list
+        /// (`[]` → `Some(vec![])`) — the load-bearing nil-vs-empty distinction
+        /// Go's `[]string != nil` replace check depends on.
+        pub fn as_scalar_list(&self) -> Option<Vec<String>> {
+            match self {
+                Node::Sequence(v) => Some(
+                    v.iter()
+                        .filter_map(|n| n.as_scalar().map(str::to_string))
+                        .collect(),
+                ),
+                _ => None,
             }
         }
 
@@ -523,7 +740,7 @@ pub(crate) mod yaml_lite {
         pub fn has_key(&self, key: &str) -> bool {
             match self {
                 Node::Map(m) => m.contains_key(key),
-                Node::Scalar(_) => false,
+                _ => false,
             }
         }
 
@@ -545,7 +762,7 @@ pub(crate) mod yaml_lite {
     struct Line {
         indent: usize,
         key: String,
-        value: Option<String>, // None → a nested block follows
+        value: Option<Node>, // None → a nested block follows; Some → a leaf (scalar or sequence)
     }
 
     pub fn parse(text: &str) -> Node {
@@ -566,8 +783,11 @@ pub(crate) mod yaml_lite {
                 }
                 let value = if rest.is_empty() || rest == "{}" {
                     None
+                } else if rest.starts_with('[') && rest.ends_with(']') {
+                    // A flow-style sequence `[a, b, c]` (or empty `[]`).
+                    Some(parse_flow_seq(&rest[1..rest.len() - 1]))
                 } else {
-                    Some(unquote(&rest))
+                    Some(Node::Scalar(unquote(&rest)))
                 };
                 Some(Line {
                     indent,
@@ -578,6 +798,22 @@ pub(crate) mod yaml_lite {
             .collect();
         let mut index = 0;
         build(&lines, &mut index, -1)
+    }
+
+    /// Parse the comma-separated inner content of a flow-style list (the text
+    /// between `[` and `]`) into a `Node::Sequence` of scalars. Items are trimmed
+    /// and unquoted; empty items are dropped by the filter, so an empty (or
+    /// whitespace-only) inner yields an empty sequence — the `[]` deny-all case —
+    /// as does a trailing empty element from a dangling comma (the shipped flow
+    /// lists never carry one).
+    fn parse_flow_seq(inner: &str) -> Node {
+        let items = inner
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| Node::Scalar(unquote(s)))
+            .collect();
+        Node::Sequence(items)
     }
 
     fn build(lines: &[Line], index: &mut usize, parent_indent: isize) -> Node {
@@ -598,8 +834,8 @@ pub(crate) mod yaml_lite {
             }
             let key = lines[*index].key.clone();
             match lines[*index].value.clone() {
-                Some(value) => {
-                    map.insert(key, Node::Scalar(value));
+                Some(node) => {
+                    map.insert(key, node);
                     *index += 1;
                 }
                 None => {
@@ -1204,6 +1440,280 @@ aws:
                     r.session_duration,
                     q["session_duration"].as_str().unwrap(),
                     "session_duration {name:?}"
+                );
+            }
+        }
+    }
+
+    // ---- yaml_lite flow-list sequence (the Docker registries prerequisite) -------
+
+    /// The new `Node::Sequence` flow-list parser: `[a, b]`, empty `[]`, single item,
+    /// quoted items, and internal whitespace, plus the absent-vs-empty distinction
+    /// the Docker registries reader depends on.
+    #[test]
+    fn yaml_lite_sequence_flow_list() {
+        use yaml_lite::Node;
+        let root = yaml_lite::parse(
+            "\
+a: [x, y, z]
+b: []
+c: [only]
+d: [\"q1\", 'q2']
+e: [ spaced ,  items ]
+f: scalar
+g:
+  nested: [deep]
+",
+        );
+        let m = root.as_map().unwrap();
+        // Multi-item flow list.
+        assert_eq!(
+            m["a"].as_scalar_list().unwrap(),
+            vec!["x".to_string(), "y".to_string(), "z".to_string()]
+        );
+        // Empty list is Some(empty) — present, not absent.
+        assert_eq!(m["b"].as_scalar_list().unwrap(), Vec::<String>::new());
+        assert!(matches!(&m["b"], Node::Sequence(v) if v.is_empty()));
+        // Single item.
+        assert_eq!(m["c"].as_scalar_list().unwrap(), vec!["only".to_string()]);
+        // Quoted items are unquoted.
+        assert_eq!(
+            m["d"].as_scalar_list().unwrap(),
+            vec!["q1".to_string(), "q2".to_string()]
+        );
+        // Internal whitespace is trimmed.
+        assert_eq!(
+            m["e"].as_scalar_list().unwrap(),
+            vec!["spaced".to_string(), "items".to_string()]
+        );
+        // A scalar is NOT a sequence.
+        assert!(m["f"].as_scalar_list().is_none());
+        assert_eq!(m["f"].as_scalar(), Some("scalar"));
+        // Nested block still parses; the leaf inside it is a sequence.
+        assert_eq!(
+            m["g"].as_map().unwrap()["nested"].as_scalar_list().unwrap(),
+            vec!["deep".to_string()]
+        );
+        // as_seq exposes the raw nodes.
+        assert_eq!(m["a"].as_seq().unwrap().len(), 3);
+        // An ABSENT key is None — the inherit signal (distinct from present `[]`).
+        assert!(m.get("absent").is_none());
+    }
+
+    // ---- Docker config slice (mirror config_discovery_test.go / config_test.go) ---
+
+    /// Mirrors `config_discovery_test.go:TestDockerResolve`, extended to a full
+    /// matrix over the `Option` inherit/replace/force semantics — Rust-stronger:
+    /// Go has no `Resolve` layering test beyond the three subtests folded in here
+    /// (absent→inherit, per-server pointer override, per-shed replace+force-false),
+    /// plus the `Some(vec![])`→replace-with-empty (deny-all lockdown) and the
+    /// `allow_all` `Option<bool>` None/false/true cases the golden also pins.
+    #[test]
+    fn docker_resolve_matrix() {
+        // (shed-name, registries-override, allow_all-override) — a type alias keeps
+        // the `sv` helper below under clippy::type_complexity.
+        type ShedSpec<'a> = (&'a str, Option<Vec<&'a str>>, Option<bool>);
+        fn sv(
+            registries: Option<Vec<&str>>,
+            allow_all: Option<bool>,
+            sheds: &[ShedSpec],
+        ) -> DockerServerConfig {
+            DockerServerConfig {
+                registries: registries.map(|v| v.iter().map(|s| s.to_string()).collect()),
+                allow_all,
+                sheds: sheds
+                    .iter()
+                    .map(|(name, r, a)| {
+                        (
+                            name.to_string(),
+                            DockerShedConfig {
+                                registries: r
+                                    .as_ref()
+                                    .map(|v| v.iter().map(|s| s.to_string()).collect()),
+                                allow_all: *a,
+                            },
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        let want = |registries: &[&str], allow_all: bool| ResolvedDocker {
+            registries: registries.iter().map(|s| s.to_string()).collect(),
+            allow_all,
+        };
+
+        // The TestDockerResolve config: top-level [ghcr.io]/allow_all=false, server
+        // mini2 forces allow_all=true, shed mini2/web replaces registries + forces
+        // allow_all back to false.
+        let cfg = DockerConfig {
+            registries: vec!["ghcr.io".to_string()],
+            allow_all: false,
+            config_path: String::new(),
+            servers: [(
+                "mini2".to_string(),
+                sv(
+                    None,
+                    Some(true),
+                    &[("web", Some(vec!["reg.example.com"]), Some(false))],
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        // defaults when no server override
+        assert_eq!(cfg.resolve("mini3", "anything"), want(&["ghcr.io"], false));
+        // per-server allow_all pointer override, registries inherited
+        assert_eq!(cfg.resolve("mini2", "api"), want(&["ghcr.io"], true));
+        // per-shed replaces registries + forces allow_all false
+        assert_eq!(
+            cfg.resolve("mini2", "web"),
+            want(&["reg.example.com"], false)
+        );
+
+        // Some(vec![]) at the server tier → replace-with-empty (deny-all lockdown),
+        // even though the top level allows ghcr.io. A sibling server inherits.
+        let locked = DockerConfig {
+            registries: vec!["ghcr.io".to_string(), "index.docker.io".to_string()],
+            allow_all: false,
+            config_path: String::new(),
+            servers: [("locked".to_string(), sv(Some(vec![]), None, &[]))]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(locked.resolve("locked", "x"), want(&[], false));
+        assert_eq!(
+            locked.resolve("other", "x"),
+            want(&["ghcr.io", "index.docker.io"], false)
+        );
+
+        // Some(vec![]) at the SHED tier under an allow_all=true server → deny-all
+        // lockdown for that one shed; the sibling shed inherits allow_all=true.
+        let shed_lock = DockerConfig {
+            registries: vec![],
+            allow_all: true,
+            config_path: String::new(),
+            servers: [(
+                "mini2".to_string(),
+                sv(None, None, &[("locked", Some(vec![]), Some(false))]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(shed_lock.resolve("mini2", "locked"), want(&[], false));
+        assert_eq!(shed_lock.resolve("mini2", "other"), want(&[], true));
+
+        // Unconfigured (default) → empty registries, allow_all false (deny-all).
+        assert_eq!(
+            DockerConfig::default().resolve("any", "any"),
+            want(&[], false)
+        );
+    }
+
+    /// Mirrors the Docker parse rows of `config_test.go` (`TestLoadConfig:62`,
+    /// `TestExampleConfigIsValid:276-281`): flow-list `registries` parse + the
+    /// `docker.approval.policy` gate (still via the existing accessor). Validate
+    /// biometric-reject parity is sub-plan 5.
+    #[test]
+    fn docker_load_parse() {
+        // Single-item flow list + shed-desktop policy (TestLoadConfig header).
+        let cfg = HostAgentConfig::parse(
+            "\
+docker:
+  registries: [ghcr.io]
+  approval:
+    policy: shed-desktop
+",
+        );
+        assert_eq!(cfg.docker.registries, vec!["ghcr.io".to_string()]);
+        assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), "shed-desktop");
+        assert!(!cfg.docker.allow_all);
+
+        // Two-item flow list + allow_all + config_path + per-server/shed nesting.
+        let cfg = HostAgentConfig::parse(
+            "\
+docker:
+  registries: [index.docker.io, ghcr.io]
+  allow_all: false
+  config_path: /custom/config.json
+  approval:
+    policy: approve-all
+  servers:
+    mini2:
+      allow_all: true
+      sheds:
+        web:
+          registries: [reg.example.com]
+",
+        );
+        assert_eq!(
+            cfg.docker.registries,
+            vec!["index.docker.io".to_string(), "ghcr.io".to_string()]
+        );
+        assert_eq!(cfg.docker.config_path, "/custom/config.json");
+        assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), "approve-all");
+        assert_eq!(cfg.docker.servers["mini2"].allow_all, Some(true));
+        assert_eq!(
+            cfg.docker.servers["mini2"].sheds["web"].registries,
+            Some(vec!["reg.example.com".to_string()])
+        );
+        // A resolve through the parsed tree honors the pointer + replace semantics.
+        assert_eq!(
+            cfg.docker.resolve("mini2", "web"),
+            ResolvedDocker {
+                registries: vec!["reg.example.com".to_string()],
+                allow_all: true,
+            }
+        );
+    }
+
+    /// Mirrors `config_test.go:TestLoadConfigDefaults:179` — an absent `docker:`
+    /// block leaves the gate at deny-all and the resolution config empty (the
+    /// unconfigured deny-all backend). No load-defaults are applied to Docker.
+    #[test]
+    fn docker_policy_default_deny_all() {
+        let cfg = HostAgentConfig::parse("server: http://localhost:8080\n");
+        assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), POLICY_DENY_ALL);
+        assert_eq!(cfg.docker, DockerConfig::default());
+        assert!(cfg.docker.registries.is_empty());
+        assert!(!cfg.docker.allow_all);
+        assert!(cfg.docker.config_path.is_empty());
+    }
+
+    /// The Rust half of the `docker_resolve` golden — reads the SAME shared fixture
+    /// the Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenDockerResolve`,
+    /// via the production `LoadConfig`→`Docker.Resolve` path), so the two impls can't
+    /// drift together on the `Option<Vec<String>>` replace / `Option<bool>` force /
+    /// flow-list-parse semantics. Go has NO `Resolve` layering test, so this golden
+    /// is Rust-stronger. In-crate (the `aws_resolve` precedent — binary crate, no lib).
+    #[test]
+    fn golden_docker_resolve() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/docker_resolve.json");
+        let raw = std::fs::read_to_string(&path).expect("read golden fixture");
+        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(fx["protocol_version"], 1, "version skew");
+        let vectors = fx["vectors"].as_array().unwrap();
+        assert!(!vectors.is_empty(), "fixture has no vectors");
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let cfg = HostAgentConfig::parse(v["config_yaml"].as_str().unwrap());
+            for q in v["queries"].as_array().unwrap() {
+                let r = cfg
+                    .docker
+                    .resolve(q["server"].as_str().unwrap(), q["shed"].as_str().unwrap());
+                let want_registries: Vec<String> = q["registries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.as_str().unwrap().to_string())
+                    .collect();
+                assert_eq!(r.allow_all, q["allow_all"].as_bool().unwrap(), "allow_all {name:?}");
+                assert_eq!(r.registries, want_registries, "registries {name:?}");
+                // registry_count is the backend Status verdict (registries.len()).
+                assert_eq!(
+                    r.registries.len() as u64,
+                    q["registry_count"].as_u64().unwrap(),
+                    "registry_count {name:?}"
                 );
             }
         }

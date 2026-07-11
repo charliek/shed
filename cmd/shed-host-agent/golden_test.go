@@ -366,6 +366,67 @@ func TestGoldenAWSExpiry(t *testing.T) {
 	}
 }
 
+// TestGoldenDockerResolve is the Go half of the docker_resolve golden. It routes each
+// vector's config YAML through the PRODUCTION LoadConfig (so the same DefaultConfig
+// defaulting + yaml merge the daemon uses is exercised — Docker gets NO load-defaults,
+// unlike AWS), then asserts Docker.Resolve's allow_all + registries + registry_count
+// against the shared fixture the Rust runner (config.rs:golden_docker_resolve) also
+// reads. Go has no Resolve layering test, so this golden is the drift guard for the
+// Option<Vec<String>> replace / Option<bool> force / flow-list-parse semantics.
+func TestGoldenDockerResolve(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name       string `json:"name"`
+			ConfigYAML string `json:"config_yaml"`
+			Queries    []struct {
+				Server        string   `json:"server"`
+				Shed          string   `json:"shed"`
+				AllowAll      bool     `json:"allow_all"`
+				Registries    []string `json:"registries"`
+				RegistryCount int      `json:"registry_count"`
+			} `json:"queries"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "docker_resolve.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("docker_resolve.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("docker_resolve.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(v.ConfigYAML), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Errorf("%s: LoadConfig: %v", v.Name, err)
+			continue
+		}
+		for _, q := range v.Queries {
+			got := cfg.Docker.Resolve(q.Server, q.Shed)
+			if got.AllowAll != q.AllowAll {
+				t.Errorf("%s: Resolve(%q,%q).AllowAll = %v, want %v",
+					v.Name, q.Server, q.Shed, got.AllowAll, q.AllowAll)
+			}
+			// equalStrings treats a nil slice and an empty slice as equal — Go's
+			// Resolve returns a nil Registries for the inherited-empty case, the
+			// fixture decodes `[]` to a non-nil empty slice.
+			if !equalStrings(got.Registries, q.Registries) {
+				t.Errorf("%s: Resolve(%q,%q).Registries = %v, want %v",
+					v.Name, q.Server, q.Shed, got.Registries, q.Registries)
+			}
+			if len(got.Registries) != q.RegistryCount {
+				t.Errorf("%s: Resolve(%q,%q) registry_count = %d, want %d",
+					v.Name, q.Server, q.Shed, len(got.Registries), q.RegistryCount)
+			}
+		}
+	}
+}
+
 func TestGoldenGateNamespaces(t *testing.T) {
 	var fx struct {
 		ProtocolVersion int `json:"protocol_version"`
