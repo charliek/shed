@@ -82,7 +82,10 @@ fn parse_approval_timeout(raw: &str) -> Duration {
 /// malformed string (unknown unit, missing number, etc.). A faithful subset — the
 /// caller only needs positivity + magnitude, so the signed result lets it detect a
 /// non-positive value and fall back to the default.
-fn parse_go_duration_nanos(s: &str) -> Option<i128> {
+///
+/// `pub(crate)` so `aws_backend`'s `parse_duration_or` (the AWS session-duration /
+/// cache-refresh knobs) reuses the same Go-`time.ParseDuration` subset.
+pub(crate) fn parse_go_duration_nanos(s: &str) -> Option<i128> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -163,9 +166,7 @@ pub struct HostAgentConfig {
     /// session_duration,cache_refresh_before,servers…}`), mirroring Go's `AWSConfig`.
     /// The `aws.approval.policy` gate is kept in `aws_policy` above (unchanged); this
     /// field carries only the resolution/vending knobs. Consumed by the AWS backend
-    /// (commit 2) + the in-crate golden/unit tests; unused by production code in this
-    /// slice, hence the `dead_code` allow.
-    #[allow(dead_code)]
+    /// (`aws_backend.rs`).
     pub aws: AwsConfig,
 }
 
@@ -301,10 +302,9 @@ fn normalize_aws_mode(mode: &str) -> &str {
 /// process-global and are not overridable per server. The `aws.approval.policy`
 /// gate lives on `HostAgentConfig.aws_policy`, not here.
 ///
-/// Consumed by the AWS backend (commit 2) + the in-crate golden/unit tests; unused
-/// by production code in this slice, hence the `dead_code` allows.
+/// Built by [`AwsConfig::from_node`] (called from `HostAgentConfig::parse`) and
+/// consumed by the AWS backend (`aws_backend.rs`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AwsConfig {
     pub source_profile: String,
     pub default_role: String,
@@ -317,7 +317,6 @@ pub struct AwsConfig {
 
 /// Per-server AWS overrides (Go's `AWSServerConfig`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AwsServerConfig {
     pub default_role: String,
     pub mode: String,
@@ -327,7 +326,6 @@ pub struct AwsServerConfig {
 
 /// Per-shed AWS overrides (Go's `ShedAWSConfig`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AwsShedConfig {
     pub role: String,
     pub mode: String,
@@ -335,6 +333,11 @@ pub struct AwsShedConfig {
 }
 
 /// The effective AWS policy for a single `(server, shed)` pair (Go's `ResolvedAWS`).
+/// Only [`AwsConfig::resolve`] constructs it, and `resolve` is reached only through
+/// the AWS backend, which `main.rs` wires in commit 3 — so under a plain
+/// `cargo build --no-default-features` (no test targets) it is not yet reachable.
+/// The allow keeps that headless build warning-free until the wiring lands (same
+/// ported-but-unwired posture as `minter.rs`); it is live under `--all-targets`/tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct ResolvedAws {
@@ -346,14 +349,24 @@ pub struct ResolvedAws {
     pub session_duration: String,
 }
 
+// `from_node` is live (called by `HostAgentConfig::parse`); `resolve`/`enabled` are
+// reached only through the AWS backend, which `main.rs` wires in commit 3, so under a
+// plain `cargo build --no-default-features` (no test targets) they are not yet
+// reachable. The block-level allow keeps that headless build warning-free until the
+// wiring lands (ported-but-unwired posture); all three are live under `--all-targets`.
 #[allow(dead_code)]
 impl AwsConfig {
     /// Build the AWS slice from the parsed config tree, applying the same load
     /// defaults Go's `DefaultConfig`/`LoadConfig` do (`config.go:439-443`): an
     /// empty/absent `source_profile` → `"default"`, `session_duration` → `"1h"`,
-    /// `cache_refresh_before` → `"5m"`. These are applied whether or not an `aws:`
-    /// block is present, matching Go (the defaults sit on `DefaultConfig` and the
-    /// YAML merge only overwrites keys it names).
+    /// `cache_refresh_before` → `"5m"`. For an ABSENT key (or absent `aws:` block)
+    /// this matches Go exactly (the defaults sit on `DefaultConfig` and the YAML
+    /// merge only overwrites keys the document names). For an EXPLICITLY-EMPTY
+    /// scalar (`source_profile: ""`) Go keeps the empty string — it would call STS
+    /// with profile `""` — while this port re-applies the default; `yaml_lite`
+    /// cannot even represent the distinction (a bare `key:` parses as an empty
+    /// map). Known divergence, same class as the other `yaml_lite` permissiveness
+    /// gaps, closed by the config-port sub-plan (cursor review, 2026-07-11).
     ///
     /// `aws.sheds` (Go's removed global per-shed map) is intentionally NOT read: it
     /// is parse-and-ignore for resolution. Go's `AWSConfig.validate` rejects it with

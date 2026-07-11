@@ -92,6 +92,32 @@ p521 = { version = "0.13", default-features = false, features = ["ecdsa", "pem",
 # base64 StdEncoding for the sign req/resp (public_key / data / blob), matching Go's
 # encoding/base64.StdEncoding.
 base64 = "0.22"
+# --- AWS assume-role backend (aws_backend.rs) ------------------------------------
+# The SDK is bought ONLY for the assume-role source-profile credential CHAIN
+# (SSO / credential_process / static), which Go gets from
+# config.LoadDefaultConfig(WithSharedConfigProfile) — a product-fidelity purchase
+# with zero differential coverage (the differentially-tested passthrough path is
+# hand-rolled and SDK-free). Always-on because the bus is not feature-gated; the
+# headless `--no-default-features` build carries it too.
+#
+# Feature choices (verified by an out-of-repo probe; see the PR's DEP_DELTA):
+#   - `sso` + `credentials-process` re-enable those source-profile providers (they
+#     are default-on but `default-features = false` drops them), so
+#     `profile_name(p).load()` resolves SSO / process / static exactly like Go's chain.
+#   - `behavior-version-latest` pins the SDK behavior version (no per-call opt-in).
+#   - `rt-tokio` gives the async sleep/spawn impl on the workspace's tokio.
+#   - `default-https-client` is deliberately OFF: it defaults to a rustls-aws-lc TLS
+#     stack that pulls the heavy `aws-lc-sys` C build. Instead the backend builds the
+#     HTTPS connector explicitly via `aws-smithy-http-client`'s `rustls-ring`, so the
+#     SDK reuses the SAME ring + rustls 0.23 + hyper 1.x the workspace already
+#     compiles (reqwest/shed-core) — cargo unifies one build, no new C toolchain dep.
+#   - `aws-smithy-types` (already transitive) is named directly only for
+#     `DisplayErrorContext`, to render the full SdkError chain into the
+#     `sts:AssumeRole failed for <arn>: <err>` message (Go's `%w`).
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "sso", "credentials-process"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-types = "1"
 
 [dev-dependencies]
 # Throwaway socket dirs for the status "not running" exit-code test.

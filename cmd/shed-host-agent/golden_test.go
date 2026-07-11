@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/ext/protocol"
 )
@@ -295,6 +296,72 @@ func TestGoldenAWSResolve(t *testing.T) {
 				t.Errorf("%s: Resolve(%q,%q) = {role:%q mode:%q dur:%q}, want {role:%q mode:%q dur:%q}",
 					v.Name, q.Server, q.Shed, got.Role, got.Mode, got.SessionDuration, q.Role, q.Mode, q.SessionDuration)
 			}
+		}
+	}
+}
+
+// TestGoldenAWSExpiry is the Go half of the aws_expiry golden. It routes each vector
+// through the PRODUCTION expiry scan (parseSessionExpiry -> parseExpiryValue), the
+// handler's expiration Format layout ("2006-01-02T15:04:05Z", the literal-Z render),
+// and awsExpiryDetail, against the shared fixture the Rust runner
+// (aws_backend.rs:golden_aws_expiry) also reads.
+func TestGoldenAWSExpiry(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		ExpiryVectors   []struct {
+			Name         string `json:"name"`
+			INI          string `json:"ini"`
+			Profile      string `json:"profile"`
+			ExpectedUnix *int64 `json:"expected_unix"`
+		} `json:"expiry_vectors"`
+		LiteralZVectors []struct {
+			Unix     int64  `json:"unix"`
+			Expected string `json:"expected"`
+		} `json:"literal_z_vectors"`
+		ExpiryDetailVectors []struct {
+			Unix     *int64 `json:"unix"`
+			Expected string `json:"expected"`
+		} `json:"expiry_detail_vectors"`
+	}
+	readFixture(t, "aws_expiry.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("aws_expiry.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.ExpiryVectors) == 0 || len(fx.LiteralZVectors) == 0 || len(fx.ExpiryDetailVectors) == 0 {
+		t.Fatal("aws_expiry.json missing vectors")
+	}
+
+	for _, v := range fx.ExpiryVectors {
+		path := filepath.Join(t.TempDir(), "credentials")
+		if err := os.WriteFile(path, []byte(v.INI), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got := parseSessionExpiry(path, v.Profile)
+		switch {
+		case v.ExpectedUnix == nil:
+			if !got.IsZero() {
+				t.Errorf("%s: expected zero time, got %v", v.Name, got)
+			}
+		case got.IsZero():
+			t.Errorf("%s: expected unix %d, got zero time", v.Name, *v.ExpectedUnix)
+		case got.Unix() != *v.ExpectedUnix:
+			t.Errorf("%s: got unix %d, want %d", v.Name, got.Unix(), *v.ExpectedUnix)
+		}
+	}
+	for _, v := range fx.LiteralZVectors {
+		got := time.Unix(v.Unix, 0).UTC().Format("2006-01-02T15:04:05Z")
+		if got != v.Expected {
+			t.Errorf("literal_z(%d) = %q, want %q", v.Unix, got, v.Expected)
+		}
+	}
+	for _, v := range fx.ExpiryDetailVectors {
+		var exp time.Time // zero value => awsExpiryDetail returns "expires:none"
+		if v.Unix != nil {
+			exp = time.Unix(*v.Unix, 0).UTC()
+		}
+		if got := awsExpiryDetail(exp); got != v.Expected {
+			t.Errorf("awsExpiryDetail(unix=%v) = %q, want %q", v.Unix, got, v.Expected)
 		}
 	}
 }

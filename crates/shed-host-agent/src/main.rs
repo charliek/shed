@@ -15,6 +15,7 @@
 //! off, matching the Go daemon's `cfg.Discovery == nil` gate.
 
 mod approval;
+mod aws_backend;
 mod audit;
 // The SSH-bootstrap minter (bootstrap exchange + credential source) and the
 // control-token provider. This slice's only consumer is `token.get` on surface A, so

@@ -381,7 +381,7 @@ fn parse_rfc3339_to_unix(s: &str) -> Result<Option<i64>, ()> {
     if y == 1 && mo == 1 && d == 1 && h == 0 && mi == 0 && se == 0 && offset_secs == 0 {
         return Ok(None);
     }
-    let days = days_from_civil(y, mo, d);
+    let days = crate::status::days_from_civil(y, mo, d);
     let secs = days * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + (se as i64) - offset_secs;
     Ok(Some(secs))
 }
@@ -421,18 +421,6 @@ fn parse_fixed<T: std::str::FromStr>(s: &str, width: usize) -> Result<T, ()> {
         return Err(());
     }
     s.parse().map_err(|_| ())
-}
-
-/// Days from the civil date to the unix epoch (Howard Hinnant's `days_from_civil`; the
-/// inverse of the civil-from-days math in [`crate::status::rfc3339_utc`]).
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 } as i64; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
 }
 
 /// serde field deserializer for `Bundle.expires_at`: `None` for absent/null/empty/zero;
