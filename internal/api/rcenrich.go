@@ -202,7 +202,7 @@ func (s *Server) RCCapabilities(ctx context.Context, shedName string, fresh bool
 // config.Session.RC. The decode type stays the canonical internal/ext/rc type; this
 // is presentation-only, not a third copy of the wire shape.
 func toSessionRC(s rc.Session) *config.SessionRC {
-	return &config.SessionRC{
+	out := &config.SessionRC{
 		Kind:        string(s.Kind),
 		State:       string(s.State),
 		Managed:     s.Managed,
@@ -210,6 +210,18 @@ func toSessionRC(s rc.Session) *config.SessionRC {
 		URL:         s.URL,
 		CreatedBy:   s.CreatedBy,
 	}
+	// Activity dimension carries the lifecycle-trumps-activity precedence: a
+	// needs-auth/dead row never shows activity. When DisplayActivity suppresses the
+	// activity, the WHOLE dimension is dropped together — activity_at and
+	// last_message too: a bare timestamp is meaningless without its activity, and a
+	// stale last_message on a dead/gated row would present pre-death context as
+	// current.
+	if act := rc.DisplayActivity(s.State, s.Activity); act != "" {
+		out.Activity = string(act)
+		out.ActivityAt = s.ActivityAt
+		out.LastMessage = s.LastMessage
+	}
+	return out
 }
 
 // enrichSessionsRC fills the RC field of every rc-* session in sessions by exec'ing

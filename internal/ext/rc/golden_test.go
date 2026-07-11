@@ -34,11 +34,19 @@ func TestGoldenFixtureDecodes(t *testing.T) {
 		full.ID == "" || !strings.Contains(full.URL, "session_") || full.TargetLabel == "" {
 		t.Fatalf("fully-populated session mismatch: %+v", full)
 	}
+	// The additive Phase-C activity fields decode inside the rc block.
+	if full.Activity != ActivityWorking || full.ActivityAt == "" || full.LastMessage == "" {
+		t.Fatalf("activity fields not decoded: %+v", full)
+	}
 
 	minimal := resp.RCSessions[1]
 	if minimal.Kind != KindClaudeBroker || minimal.Managed ||
 		minimal.DisplayName != "" || minimal.Workdir != "" || minimal.URL != "" || minimal.ID != "" {
 		t.Fatalf("minimal session should have optionals omitted: %+v", minimal)
+	}
+	// Absent activity fields decode to the zero value (not present on the wire).
+	if minimal.Activity != "" || minimal.ActivityAt != "" || minimal.LastMessage != "" {
+		t.Fatalf("minimal session should omit activity fields: %+v", minimal)
 	}
 
 	caps := resp.Capabilities
@@ -72,7 +80,7 @@ func TestSessionMarshalOmitsEmptyOptionals(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(out)
-	for _, omitted := range []string{"display_name", "workdir", "url", "id", "created_by", "created_at", "target_label", "null"} {
+	for _, omitted := range []string{"display_name", "workdir", "url", "id", "created_by", "created_at", "target_label", "activity", "activity_at", "last_message", "null"} {
 		if strings.Contains(s, omitted) {
 			t.Errorf("expected %q to be omitted, got %s", omitted, s)
 		}

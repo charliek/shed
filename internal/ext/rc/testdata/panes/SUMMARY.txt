@@ -93,6 +93,12 @@ Needs-auth splash [cursor-t03/t10/t30.txt]:
   "Tip: You can start the Cursor CLI with `agent` (same as `cursor-agent`)."
   "Cursor Agent"  "v2026.07.09-a3815c0"  "Press any key to log in..."
   anchors: /Cursor Agent/, /v2026\.\d/, /Press any key to log in\.\.\./
+Ready(authed) [cursor-ready.txt, cursor-ready-active.txt]:
+  Fresh composer: "→ Plan, search, build anything"  (cursor-ready.txt)
+  Mid-conversation composer (after the first exchange): "→ Add a follow-up"
+  (cursor-ready-active.txt, captured 2026-07-11 — the placeholder text SWAPS once a
+  turn completes; both are the ready/waiting-for-input composer). Footer "Auto".
+  anchors: /^\s*→ (Plan, search, build anything|Add a follow-up)\s*$/ (line-anchored)
 Device/browser login [cursor-login.txt] (after any keypress):
   "Signing in"
   "If your browser didn't open, click this link to log in:"

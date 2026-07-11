@@ -73,7 +73,7 @@ exclusive. Omitting both passes no posture (each tool's own default).
 | Generic mode | claude | codex | cursor | opencode |
 |------|--------|-------|--------|----------|
 | `default` | (none) | (none) | (none) | (none) |
-| `auto` | `--permission-mode auto` | `--full-auto` | (none) | `--auto` |
+| `auto` | `--permission-mode auto` | `--ask-for-approval on-request --sandbox workspace-write` | (none) | `--auto` |
 | `skip` | `--permission-mode bypassPermissions` | `--dangerously-bypass-approvals-and-sandbox` | `--force` | `--auto` |
 
 The **claude** kinds additionally accept claude's full historical `--permission-mode`
@@ -173,7 +173,10 @@ not `null`) when unknown; `managed` is always present.
   "id": "…uuid…",
   "created_by": "shed-remote-agent/0.1.0",
   "created_at": "2026-06-19T18:53:00Z",
-  "target_label": "shed:t1@host"
+  "target_label": "shed:t1@host",
+  "activity": "working",
+  "activity_at": "2026-06-19T18:54:12Z",
+  "last_message": "Running the test suite now."
 }
 ```
 
@@ -181,6 +184,16 @@ not `null`) when unknown; `managed` is always present.
 derived live from the pane (never stored). A golden fixture of this shape
 (`internal/ext/rc/testdata/rcSessionDto.golden.json`) is byte-identical to the consuming
 repos' copies and asserted to decode in each — the guard against contract drift.
+
+The `activity`, `activity_at`, and `last_message` fields are the additive **live
+activity** dimension (a resident per-shed rc hub derives them). They are optional and
+absent when no hub is running or the kind is unsupported:
+
+| Field | Meaning |
+|-------|---------|
+| `activity` | Live work dimension, orthogonal to `state`: `working` \| `needs_input` \| `idle` \| `unknown` (the value `needs_approval` is reserved in the wire contract but not produced yet). Lifecycle trumps activity — a `needs-trust`/`needs-auth`/`dead` session reports no activity. |
+| `activity_at` | RFC3339 timestamp the activity was last derived/changed. |
+| `last_message` | Sanitized preview of the most recent message — ANSI/control-stripped, whitespace-collapsed, truncated to ≤200 runes. |
 
 ## Exit codes
 

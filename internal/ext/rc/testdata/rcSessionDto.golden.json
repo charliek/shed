@@ -12,7 +12,10 @@
       "id": "9f1c0e7a-1111-4222-8333-444455556666",
       "created_by": "shed-remote-agent/0.1.0",
       "created_at": "2026-06-19T18:53:00Z",
-      "target_label": "shed:t1@localmac-dev"
+      "target_label": "shed:t1@localmac-dev",
+      "activity": "working",
+      "activity_at": "2026-06-19T18:54:12Z",
+      "last_message": "Running the test suite now."
     },
     {
       "slug": "brk900",

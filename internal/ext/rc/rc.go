@@ -136,6 +136,18 @@ type Session struct {
 	CreatedBy   string `json:"created_by,omitempty"`
 	CreatedAt   string `json:"created_at,omitempty"`
 	TargetLabel string `json:"target_label,omitempty"`
+
+	// Live-activity dimension (Phase C). These are additive and live INSIDE the rc
+	// block (the wire contract): absent when no hub is running / the kind is
+	// unsupported. Activity is orthogonal to State (lifecycle) — DisplayActivity
+	// encodes the precedence (lifecycle trumps activity). See activity.go.
+	Activity Activity `json:"activity,omitempty"`
+	// ActivityAt is the RFC3339 timestamp the activity was last derived/changed.
+	ActivityAt string `json:"activity_at,omitempty"`
+	// LastMessage is a short, sanitized preview of the session's most recent
+	// message (ANSI/control-stripped, whitespace-collapsed, ≤200 runes). See
+	// SanitizeLastMessage.
+	LastMessage string `json:"last_message,omitempty"`
 }
 
 // ListResponse is the `list` subcommand's stdout shape. Capabilities is embedded so a

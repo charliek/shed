@@ -205,6 +205,13 @@ type SessionRC struct {
 	DisplayName string `json:"display_name,omitempty"`
 	URL         string `json:"url,omitempty"`
 	CreatedBy   string `json:"created_by,omitempty"`
+	// Live-activity dimension (Phase C), projected from the rc DTO so listings can
+	// carry it once a hub is running. Absent when the hub is not running / the kind
+	// is unsupported. Activity is one of working|needs_input|idle|unknown; ActivityAt
+	// is RFC3339; LastMessage is a sanitized ≤200-rune preview.
+	Activity    string `json:"activity,omitempty"`
+	ActivityAt  string `json:"activity_at,omitempty"`
+	LastMessage string `json:"last_message,omitempty"`
 }
 
 // Session constants.
