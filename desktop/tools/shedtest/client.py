@@ -379,9 +379,20 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         return self.call("ui.modal").get("modal")
 
     def computed_style(self) -> dict | None:
-        """A computed-style sample the frontend reported (body bg/color + accent),
-        so a test can confirm the WebView applied the theme."""
+        """A computed-style sample the frontend reported (body bg/color + accent +
+        the active light/dark mode), so a test can confirm the WebView applied the
+        theme and observe the appearance op."""
         return self.call("ui.computed_style").get("style")
+
+    def set_appearance(self, mode: str) -> None:
+        """Drive the dashboard's light/dark mode (`ui.set_appearance` → the shell's
+        `set-appearance` listener), so dark screenshots are deterministic."""
+        self.call("ui.set_appearance", {"mode": mode})
+
+    def badges(self) -> dict | None:
+        """The sidebar nav badge counts the shell reported ({sheds, agents, hosts,
+        pending}), or None before its first report — UI truth, like agents_dump."""
+        return self.call("ui.badges").get("badges")
 
     def system_df(self) -> list[dict]:
         """Per-host disk usage (`[HostDiskUsage]`); each row has host/usage/error."""

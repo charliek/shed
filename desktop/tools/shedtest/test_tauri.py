@@ -111,15 +111,59 @@ def test_navigate_reports_rendered_pane(tauri):
     tauri.wait_until(lambda: tauri.current_pane() == "agents", timeout=15, what="pane=agents")
 
 
+def _norm(color: str) -> str:
+    """Whitespace/case-insensitive color compare (hex token vs computed rgb)."""
+    return "".join(color.split()).lower()
+
+
 def test_computed_style_probe_confirms_theme(tauri):
     # The machine-checkable half of the WebKitGTK render gate: the WebView actually
-    # applied the linen CSS, so the body background resolves to a real (non-
-    # transparent) color. If oklch/color-mix failed to parse, the var-backed bg
-    # would fall back to transparent (rgba(0, 0, 0, 0)).
+    # applied the Plex CSS, so the body background resolves to a real (non-
+    # transparent) color and the accent token is the brand orange #F2541B. If
+    # color-mix failed to parse, the var-backed bg would fall back to transparent
+    # (rgba(0, 0, 0, 0)); a missing token would blank the accent.
     tauri.wait_until(lambda: (tauri.computed_style() or {}).get("bg"), timeout=15, what="computed style reported")
     style = tauri.computed_style()
     assert style["bg"], f"no body background reported: {style}"
-    assert style["bg"] != "rgba(0, 0, 0, 0)", f"linen theme not applied (bg transparent): {style}"
+    assert style["bg"] != "rgba(0, 0, 0, 0)", f"Plex theme not applied (bg transparent): {style}"
+    # The accent token is the hard gate now, not just non-transparency: #F2541B.
+    assert _norm(style["accent"]) in {"#f2541b", "rgb(242,84,27)"}, \
+        f"accent token is not the brand orange #F2541B: {style}"
+
+
+def test_set_appearance_drives_dark_and_light(tauri):
+    # ui.set_appearance drives the dashboard light/dark mode deterministically (so
+    # the harness can capture dark screenshots without the header toggle): dark
+    # flips the reported mode + the body background; light restores both. An unknown
+    # mode is a bad_request. Restore to light after (the app is session-scoped).
+    tauri.wait_until(lambda: (tauri.computed_style() or {}).get("bg"), timeout=15, what="computed style reported")
+    light_bg = tauri.computed_style()["bg"]
+    try:
+        tauri.set_appearance("dark")
+        tauri.wait_until(lambda: (tauri.computed_style() or {}).get("mode") == "dark",
+                         timeout=15, what="mode=dark")
+        dark = tauri.computed_style()
+        assert dark["mode"] == "dark"
+        assert dark["bg"] != light_bg, f"dark bg did not change: {dark}"
+        assert _norm(dark["accent"]) in {"#f2541b", "rgb(242,84,27)"}  # accent constant across modes
+        with pytest.raises(ShedError) as e:
+            tauri.set_appearance("sepia")
+        assert e.value.code == "bad_request"
+    finally:
+        tauri.set_appearance("light")
+        tauri.wait_until(lambda: (tauri.computed_style() or {}).get("mode") == "light",
+                         timeout=15, what="mode=light")
+    assert tauri.computed_style()["bg"] == light_bg
+
+
+def test_sidebar_badges_match_fixture(tauri):
+    # The sidebar nav badge counts are UI truth, reported over IPC (ui.badges), so
+    # they're asserted as logical content, not pixels. The default fixture has 2
+    # sheds on 1 host, no RC sessions, no pending approvals.
+    tauri.wait_until(lambda: (tauri.badges() or {}).get("sheds") == 2,
+                     timeout=15, what="sidebar badges reported")
+    b = tauri.badges()
+    assert b == {"sheds": 2, "agents": 0, "hosts": 1, "pending": 0}, f"unexpected badges: {b}"
 
 
 def test_second_launch_hands_off(tauri):

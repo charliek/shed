@@ -208,6 +208,10 @@ impl Handler {
             "ui.computed_style" => Ok(json!({ "style": self.ui_get("style") })),
             // Which modal (if any) the frontend has open: "prefs" | "create" | null.
             "ui.modal" => Ok(json!({ "modal": self.ui_get("modal") })),
+            // The sidebar nav badge counts the shell reported {sheds, agents, hosts,
+            // pending}, or null before its first report.
+            "ui.badges" => Ok(json!({ "badges": self.ui_get("badges") })),
+            "ui.set_appearance" => self.set_appearance(params),
             "ui.show_window" | "app.activate" => {
                 present_main_window(&self.app);
                 Ok(json!({}))
@@ -333,6 +337,19 @@ impl Handler {
             ));
         }
         let _ = self.app.emit("navigate", json!({ "pane": pane }));
+        Ok(json!({}))
+    }
+
+    /// `ui.set_appearance {mode}` → drive the dashboard's light/dark mode (a
+    /// `set-appearance` event the shell listens for), so the harness can capture
+    /// dark screenshots deterministically instead of relying on the header toggle.
+    /// Validates the mode; the shell's own listener ignores anything else too.
+    fn set_appearance(&self, params: &Value) -> Result<Value, (String, String)> {
+        let mode = params.get("mode").and_then(Value::as_str).unwrap_or("");
+        if !matches!(mode, "light" | "dark") {
+            return Err(err("bad_request", format!("unknown mode: {mode:?}")));
+        }
+        let _ = self.app.emit("set-appearance", json!({ "mode": mode }));
         Ok(json!({}))
     }
 

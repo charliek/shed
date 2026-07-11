@@ -52,20 +52,19 @@ fn ui_report(
     // Mirror the running-shed count onto the menu-bar status item (Swift parity).
     // The dashboard (`main`) reports the full shed list here even while hidden at
     // launch, so the tray count is live without a Rust-side poller. macOS-only;
-    // computed before the snapshot is moved into `merge`.
+    // computed before the snapshot is moved into `merge`. Guarded on the `sheds` key
+    // being PRESENT (defense-in-depth): the shell only sends full snapshots now, but
+    // a report that omitted `sheds` must NOT be read as "zero running" and blank the
+    // count — skip it and keep the last known count instead.
     #[cfg(target_os = "macos")]
     if window.label() == "main" {
-        let running = snapshot
-            .get("sheds")
-            .and_then(|v| v.as_array())
-            .map(|sheds| {
-                sheds
-                    .iter()
-                    .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("running"))
-                    .count()
-            })
-            .unwrap_or(0);
-        crate::tray::update_running_count(window.app_handle(), running);
+        if let Some(sheds) = snapshot.get("sheds").and_then(|v| v.as_array()) {
+            let running = sheds
+                .iter()
+                .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("running"))
+                .count();
+            crate::tray::update_running_count(window.app_handle(), running);
+        }
     }
     if let Ok(mut s) = ui.lock() {
         s.merge(window.label(), snapshot);

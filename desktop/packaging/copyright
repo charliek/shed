@@ -5,3 +5,13 @@ Source: https://github.com/charliek/shed-desktop
 Files: *
 Copyright: Stride Labs
 License: MIT
+
+Files: tauri/ui/src/assets/fonts/IBMPlex*.ttf
+Copyright: 2017 IBM Corp. (https://github.com/IBM/plex)
+License: OFL-1.1
+ This Font Software is licensed under the SIL Open Font License, Version 1.1.
+ This license is available with a FAQ at: https://openfontlicense.org
+ .
+ The IBM Plex typeface (Sans + Mono) is Copyright (c) 2017 IBM Corp., licensed
+ under the SIL Open Font License 1.1. The full license text ships with the
+ upstream release at https://github.com/IBM/plex/blob/master/LICENSE.txt

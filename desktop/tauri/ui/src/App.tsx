@@ -4,13 +4,15 @@
    `ui.navigate` op (via the `navigate` Tauri event); the rendered pane + a
    computed-style sample are reported back to Rust (useUiBridge) so the harness can
    assert them over IPC. */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Boxes, Shield, Sparkles, ScrollText, HardDrive, Box, Plus,
   Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key,
   Fingerprint, Moon, Sun, Settings, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import owlOrange from "@/assets/owl-orange.svg";
+import owlAmber from "@/assets/owl-amber.svg";
 import {
   useUiBridge, shedAction, fetchSystemDf, openTerminal,
   fetchTerminalPresets, getPrefs, setTerminalPref,
@@ -18,7 +20,7 @@ import {
   createStart, createStatus, createCancel, fetchHosts,
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   getSshApproval, setSshApproval,
-  rcLaunch, rcKill, reportAgents,
+  rcLaunch, rcKill, reportAgents, useAgentCount,
   useCoordinatorData, useNowTick,
   type Pane, type Shed, type HostDiskUsage, type TerminalPresetInfo,
   type Modal, type CreateProgress, type Approval, type AuditEntry, type SshPrefs,
@@ -297,7 +299,7 @@ function rcStateTone(state: RcState): { bg: string; fg: string } {
   return { bg: "color-mix(in srgb, var(--shed-attention) 18%, var(--shed-surface))", fg: "var(--shed-attention)" };
 }
 
-function AgentsPane({ sheds }: { sheds: Shed[] }) {
+function AgentsPane({ sheds, onSessionsChanged }: { sheds: Shed[]; onSessionsChanged: () => void }) {
   const [sessions, setSessions] = useState<RcSession[]>([]);
   const [capabilities, setCapabilities] = useState<Record<string, RcCapabilities>>({});
   const [showForm, setShowForm] = useState(false);
@@ -322,7 +324,7 @@ function AgentsPane({ sheds }: { sheds: Shed[] }) {
         right={<HeadAction icon={Plus} label="New session" onClick={() => { setError(null); setShowForm((v) => !v); }} />}
       />
       {showForm && (
-        <LaunchForm sheds={sheds} capabilities={capabilities} onLaunched={() => { setShowForm(false); void refresh(); }} onError={setError} />
+        <LaunchForm sheds={sheds} capabilities={capabilities} onLaunched={() => { setShowForm(false); void refresh(); onSessionsChanged(); }} onError={setError} />
       )}
       {error && (
         <div className={cn(card, "mb-3 flex items-start gap-2 p-3.5 text-[13px]")} style={{ borderColor: "var(--shed-danger)", color: "var(--shed-danger)" }}>
@@ -334,7 +336,7 @@ function AgentsPane({ sheds }: { sheds: Shed[] }) {
       ) : (
         <div className="flex flex-col gap-3">
           {sessions.map((s) => (
-            <SessionCard key={`${s.host}/${s.shed}/${s.slug}`} session={s} onKilled={() => void refresh()} onError={setError} />
+            <SessionCard key={`${s.host}/${s.shed}/${s.slug}`} session={s} onKilled={() => { void refresh(); onSessionsChanged(); }} onError={setError} />
           ))}
         </div>
       )}
@@ -1028,19 +1030,34 @@ export default function App() {
   const [pane, setPane] = useState<Pane>("sheds");
   const [mode, setMode] = useState<"light" | "dark">("light");
   const [modal, setModal] = useState<Modal>(null);
-  const { sheds, refresh } = useUiBridge(pane, setPane, modal);
+  // Bumped by the Agents pane on a launch/kill so `useAgentCount` re-fetches (that
+  // path emits no `refresh` event) — keeps the sidebar badge + ui.badges.agents live.
+  const [agentsBump, setAgentsBump] = useState(0);
   // Live approval queue (drives the badge + the pane) + the delegated namespaces
   // (a non-empty set = the host agent handshook, so it's connected).
   const approvals = useCoordinatorData<Approval[]>("approvals-changed", fetchApprovals, []);
   const gateNs = useCoordinatorData<string[]>("connected-changed", fetchGateNamespaces, []);
   const connected = gateNs.length > 0;
+  const pending = approvals.length;
+  // The active RC-session count for the Agents sidebar badge — a dedicated fetch,
+  // NOT reportAgents (which the backend blanks off the agents pane).
+  const agentCount = useAgentCount(agentsBump);
+  // The bridge owns the single full `ui_report`; hand it the badge inputs (sheds +
+  // hosts it derives itself, agents/pending from here) and the mode so the report is
+  // one complete snapshot, never a partial that races the `main` slot / tray count.
+  const { sheds, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, pending);
 
-  useEffect(() => {
+  // Apply the appearance to the root BEFORE the bridge's report effect samples it (a
+  // layout effect runs ahead of that passive effect), so `ui.computed_style` reflects
+  // the flip. The report itself is folded into useUiBridge's full snapshot (which
+  // depends on `mode`) — no separate partial style report here.
+  useLayoutEffect(() => {
     document.documentElement.dataset.mode = mode;
   }, [mode]);
 
   // Open the modals both from the buttons and from the ui.show_preferences /
-  // ui.show_create IPC ops (events), so the harness can drive + screenshot them.
+  // ui.show_create IPC ops (events); drive dark/light from ui.set_appearance —
+  // so the harness can drive + screenshot each deterministically.
   useEffect(() => {
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
     const uns: Array<() => void> = [];
@@ -1048,6 +1065,11 @@ export default function App() {
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(await listen("show-preferences", () => setModal("prefs")));
       uns.push(await listen("show-create", () => setModal("create")));
+      uns.push(
+        await listen<{ mode?: unknown }>("set-appearance", (e) => {
+          if (e.payload?.mode === "light" || e.payload?.mode === "dark") setMode(e.payload.mode);
+        }),
+      );
       if (cancelled) uns.forEach((u) => u());
     });
     return () => {
@@ -1056,34 +1078,44 @@ export default function App() {
     };
   }, []);
 
-  const pending = approvals.length;
   // Sidebar hosts are the distinct hosts of the live sheds (all reachable — the
-  // "N unreachable" rollup rides in with the System pane at A1c).
+  // "N unreachable" rollup rides in with the System pane at A1c). The bridge derives
+  // the same count for the reported badges from the same `sheds`.
   const hosts = [...new Set(sheds.map((s) => s.host))];
 
   return (
     <div className="flex h-full">
       {/* sidebar */}
-      <aside className="flex w-[200px] flex-none flex-col gap-[3px] border-r border-shed-border bg-shed-bg-sidebar px-2 pb-2.5 pt-3">
+      <aside className="flex w-[244px] flex-none flex-col border-r border-shed-border bg-shed-bg-sidebar px-3 pb-3.5 pt-4">
+        <div className="flex items-center gap-2.5 px-2 pb-4 pt-0.5">
+          <img src={mode === "dark" ? owlAmber : owlOrange} width={26} height={22} alt="" />
+          <span className="text-[19px] font-bold leading-none text-shed-text" style={{ letterSpacing: "-.01em" }}>Shed</span>
+        </div>
         {NAV.map(([id, label, Icon]) => {
           const active = pane === id;
-          const badge = id === "sheds" ? sheds.length || null : id === "approvals" && pending ? pending : null;
-          const alert = id === "approvals" && pending > 0;
+          const isApprovals = id === "approvals";
+          const badge =
+            id === "sheds" ? sheds.length
+            : id === "agents" ? agentCount
+            : id === "system" ? hosts.length
+            : isApprovals && pending ? pending : null;
+          const alert = isApprovals && pending > 0;
           return (
             <button
               key={id}
               onClick={() => setPane(id)}
-              className={cn("nav-item flex w-full items-center gap-[9px] rounded-lg px-[9px] py-2 text-left text-[13px]", active ? "font-medium" : "font-normal", active && "is-active")}
+              className={cn("nav-item mb-0.5 flex w-full items-center gap-[11px] rounded-[9px] px-[11px] py-2 text-left text-[13.5px] font-semibold", active && "is-active")}
               style={{
-                background: active ? "var(--shed-accent-subtle)" : "transparent",
+                background: active ? "color-mix(in srgb, var(--shed-accent) 14%, transparent)" : "transparent",
+                color: active ? "var(--shed-accent)" : "var(--shed-text-secondary)",
               }}
             >
-              <Icon size={16} className="flex-none" style={{ color: active ? "var(--shed-accent)" : "var(--shed-text-muted)" }} />
-              <span className="flex-1" style={{ color: active ? "var(--shed-accent)" : "var(--shed-text-secondary)" }}>{label}</span>
+              <Icon size={18} className="flex-none" style={{ color: active ? "var(--shed-accent)" : "var(--shed-text-secondary)" }} />
+              <span className="flex-1">{label}</span>
               {badge != null && (
                 <span
-                  className="inline-flex items-center justify-center rounded-full px-[7px] py-px text-[11px] font-medium"
-                  style={{ background: alert ? "color-mix(in srgb, var(--shed-danger) 13%, var(--shed-surface))" : "var(--shed-inset)", color: alert ? "var(--shed-danger)" : "var(--shed-text-secondary)" }}
+                  className="rounded-full px-2 py-0.5 font-mono text-[11px] font-semibold leading-none"
+                  style={{ background: alert ? "var(--shed-deny-bg)" : "var(--shed-inset)", color: alert ? "var(--shed-danger)" : "var(--shed-text-secondary)" }}
                 >
                   {badge}
                 </span>
@@ -1091,43 +1123,50 @@ export default function App() {
             </button>
           );
         })}
-        <div className="mx-1 my-3 h-px bg-shed-border" />
-        <div className="px-2.5 pb-1 pt-0.5 text-[11px] font-semibold tracking-wider text-shed-text-muted">HOSTS</div>
+        <div className="flex-1" />
+        <div className="flex items-center justify-between px-2.5 pb-2 pt-0.5">
+          <span className="font-mono text-[10px] font-semibold tracking-[.1em] text-shed-text-muted">HOSTS</span>
+          <button
+            onClick={() => setPane("system")}
+            className="hlink inline-flex items-center gap-1 rounded-md px-1 py-0.5 font-mono text-[11px] font-semibold text-shed-accent"
+          >
+            <Plus size={13} /> Add
+          </button>
+        </div>
         {hosts.map((h) => (
-          <div key={h} className="flex items-center gap-2 px-2.5 py-[5px] text-[13px] text-shed-text-secondary">
-            <Dot style={{ background: "var(--shed-ok)" }} />
-            <span>{h}</span>
+          <div key={h} className="flex items-center gap-2.5 px-2.5 py-1.5 text-[13px] font-medium text-shed-text">
+            <Dot className="h-2 w-2" style={{ background: "var(--shed-ok)" }} />
+            <span className="truncate">{h}</span>
           </div>
         ))}
-        <div className="flex-1" />
       </aside>
 
       {/* main column */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-[44px] flex-none items-center gap-2 border-b border-shed-border bg-shed-bg px-4">
-          <Box size={16} className="text-shed-text-secondary" />
-          <span className="text-[13px] font-medium text-shed-text-secondary">shed desktop</span>
+        <header className="flex h-[52px] flex-none items-center gap-3 border-b border-shed-border bg-shed-bg px-[22px]">
+          <Box size={19} className="text-shed-text-secondary" />
+          <span className="text-[14px] font-semibold text-shed-text">shed desktop</span>
           <div className="flex-1" />
           {pending > 0 && (
-            <button onClick={() => setPane("approvals")} className="hlink inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] font-medium" style={{ color: "var(--shed-danger)" }}>
-              <Shield size={13} /> {pending} pending
+            <button onClick={() => setPane("approvals")} className="hlink inline-flex items-center gap-1.5 rounded-lg px-[9px] py-1.5 text-[13px] font-semibold" style={{ color: "var(--shed-danger)" }}>
+              <Shield size={15} /> {pending} pending
             </button>
           )}
-          <span className="inline-flex items-center gap-1.5 text-[12px] text-shed-text-secondary">
-            <Dot className="h-[7px] w-[7px]" style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} /> host agent · {connected ? "connected" : "connecting…"}
+          <span className="inline-flex items-center gap-2 text-[13px] font-medium text-shed-text-secondary">
+            <Dot className="h-2 w-2" style={{ background: connected ? "var(--shed-ok)" : "var(--shed-text-muted)" }} /> host agent · {connected ? "connected" : "connecting…"}
           </span>
-          <button onClick={() => setModal("prefs")} title="Preferences" className="hlink ml-1 flex h-7 w-7 items-center justify-center rounded-md text-shed-text-muted">
-            <Settings size={15} />
+          <button onClick={() => setModal("prefs")} title="Preferences" className="hlink flex h-[34px] w-[34px] items-center justify-center rounded-[9px] text-shed-text-muted">
+            <Settings size={18} />
           </button>
-          <button onClick={() => setMode(mode === "light" ? "dark" : "light")} title="Toggle appearance" className="hlink flex h-7 w-7 items-center justify-center rounded-md text-shed-text-muted">
-            {mode === "light" ? <Moon size={15} /> : <Sun size={15} />}
+          <button onClick={() => setMode(mode === "light" ? "dark" : "light")} title="Toggle appearance" className="hlink flex h-[34px] w-[34px] items-center justify-center rounded-[9px] text-shed-text-muted">
+            {mode === "light" ? <Moon size={18} /> : <Sun size={18} />}
           </button>
         </header>
         <main className="flex-1 overflow-auto bg-shed-bg px-5 pb-4 pt-[18px]">
           <div data-pane={pane}>
             {pane === "sheds" && <ShedsPane sheds={sheds} refresh={refresh} onNew={() => setModal("create")} />}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
-            {pane === "agents" && <AgentsPane sheds={sheds} />}
+            {pane === "agents" && <AgentsPane sheds={sheds} onSessionsChanged={() => setAgentsBump((n) => n + 1)} />}
             {pane === "activity" && <ActivityPane />}
             {pane === "system" && <SystemPane />}
           </div>

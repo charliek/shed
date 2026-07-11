@@ -29,14 +29,18 @@ export function inTauri(): boolean {
 }
 
 /** Sample the rendered theme so the harness's computed-style probe can confirm
- *  the WebView actually applied the linen CSS (a resolved color, not a fallback). */
-function sampleStyle() {
+ *  the WebView actually applied the Plex CSS (a resolved color, not a fallback).
+ *  `mode` mirrors the active appearance so the appearance op is observable — taken
+ *  from the caller (the React state) when known, else read back off the root
+ *  `data-mode` (the readiness report, before a mode is threaded through). */
+function sampleStyle(mode?: string) {
   const cs = getComputedStyle(document.body);
   const main = document.querySelector("[data-pane]");
   return {
     bg: cs.backgroundColor,
     color: cs.color,
     accent: main ? getComputedStyle(main).getPropertyValue("--shed-accent").trim() : "",
+    mode: mode ?? document.documentElement.dataset.mode ?? "light",
   };
 }
 
@@ -47,12 +51,27 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return core.invoke<T>(cmd, args).catch(() => undefined);
 }
 
+/** The sidebar nav badge counts (sheds / active RC sessions / hosts / pending
+ *  approvals), carried in the shell's full snapshot so the harness can assert the
+ *  rendered counts as UI truth via `ui.badges` — not pixels. */
+export type Badges = { sheds: number; agents: number; hosts: number; pending: number };
+
 /** Report the rendered snapshot Rust relays to the harness (`ui.current_pane` /
- *  `ui.computed_style` / `dashboard.dump`). One blob, so a new reader is one more
- *  key. The refresh token is echoed so `sheds.refresh` can block on it. */
-function report(pane: Pane, sheds: Shed[], refreshToken: number, modal: Modal) {
+ *  `ui.computed_style` / `dashboard.dump` / `ui.badges`). ALWAYS a FULL blob — every
+ *  key present — so no partial report can (a) create the `main` slot before the shell
+ *  is ready and false-signal readiness to `sheds.refresh`, or (b) omit `sheds` and
+ *  zero the mac tray running-count (lib.rs recomputes it from each report). A new
+ *  reader is one more key. The refresh token is echoed so `sheds.refresh` blocks on it. */
+function report(
+  pane: Pane,
+  sheds: Shed[],
+  refreshToken: number,
+  modal: Modal,
+  badges: Badges,
+  mode?: string,
+) {
   void invoke("ui_report", {
-    snapshot: { pane, style: sampleStyle(), sheds, refresh_token: refreshToken, modal },
+    snapshot: { pane, style: sampleStyle(mode), sheds, refresh_token: refreshToken, modal, badges },
   });
 }
 
@@ -61,6 +80,12 @@ function report(pane: Pane, sheds: Shed[], refreshToken: number, modal: Modal) {
  *  op), and report the rendered snapshot back so the harness can assert it.
  *  Returns the live sheds + a `refresh` callback (a lifecycle button chains it to
  *  re-fetch after its action). A no-op in a plain browser.
+ *
+ *  This owns the SINGLE report path — the shell's badges (`agentCount`/`pending`
+ *  supplied by App, `sheds`/`hosts` derived here) and the active `mode` fold into
+ *  one full snapshot, so there are no partial `ui_report`s to race the `main` slot
+ *  or drop keys (App must apply `data-mode` before this effect runs — a
+ *  useLayoutEffect — so the sampled colors reflect the flip).
  *
  *  Readiness: the initial report is emitted only AFTER both the navigate + refresh
  *  listeners register, so `current_pane != null` tells the harness the listeners
@@ -71,6 +96,9 @@ export function useUiBridge(
   pane: Pane,
   setPane: (p: Pane) => void,
   modal: Modal,
+  mode: "light" | "dark",
+  agentCount: number,
+  pending: number,
 ): { sheds: Shed[]; refresh: () => void } {
   const [sheds, setSheds] = useState<Shed[]>([]);
   const [refreshToken, setRefreshToken] = useState(0);
@@ -116,10 +144,10 @@ export function useUiBridge(
       }
       ready.current = true; // both listeners live → readiness signal + initial report
       await fetchSheds(0);
-      // Fresh sheds arrive via the report effect on the next render; this initial
-      // report just publishes the pane, so `current_pane != null` = "listeners live".
-      // No modal is open at mount.
-      report(paneRef.current, [], 0, null);
+      // Fresh sheds + real badges arrive via the report effect on the next render;
+      // this initial report just publishes the pane, so `current_pane != null` =
+      // "listeners live". No modal is open at mount; badges seed at zero.
+      report(paneRef.current, [], 0, null, { sheds: 0, agents: 0, hosts: 0, pending: 0 });
     })();
     return () => {
       cancelled = true;
@@ -128,13 +156,17 @@ export function useUiBridge(
     };
   }, [setPane, fetchSheds]);
 
-  // Re-report on any rendered change (pane, sheds, or the echoed token). Gated on
-  // `ready` (not a first-run flag) so the listener effect owns the initial report
-  // and `current_pane` stays a true "listeners live" signal under StrictMode replay.
+  // Re-report on any rendered change (pane, sheds, echoed token, modal, the badge
+  // inputs, or the appearance mode). Gated on `ready` (not a first-run flag) so the
+  // listener effect owns the initial report and `current_pane` stays a true
+  // "listeners live" signal under StrictMode replay. One FULL snapshot per report —
+  // badges are derived+carried here, never published as a partial `ui_report`.
   useEffect(() => {
     if (!inTauri() || !ready.current) return;
-    report(pane, sheds, refreshToken, modal);
-  }, [pane, sheds, refreshToken, modal]);
+    const hosts = new Set(sheds.map((s) => s.host)).size;
+    const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts, pending };
+    report(pane, sheds, refreshToken, modal, badges, mode);
+  }, [pane, sheds, refreshToken, modal, mode, agentCount, pending]);
 
   const refresh = useCallback(() => void fetchSheds(0), [fetchSheds]);
   return { sheds, refresh };
@@ -494,6 +526,48 @@ export async function rcKill(shed: string, slug: string, host?: string): Promise
  *  (`ui_report` merges this `agents` key with the shell's snapshot.) */
 export function reportAgents(sessions: RcSession[]): void {
   void invoke("ui_report", { snapshot: { agents: sessions } });
+}
+
+/** The active RC-session COUNT for the Agents sidebar badge, kept live at the App
+ *  level. Derived from a dedicated `rc.list` fetch (NOT `reportAgents`, which the
+ *  backend blanks off-pane) — refreshed on mount, on each lifecycle `refresh` event
+ *  (sheds coming up/down), and whenever `bump` advances (the Agents pane signals a
+ *  launch/kill, which emits no `refresh` event). A no-op count of 0 in a plain
+ *  browser / on error. */
+export function useAgentCount(bump: number): number {
+  const [count, setCount] = useState(0);
+  // A generation guard shared across the event- and bump-driven reloads, so a
+  // slower older fetch can't overwrite a newer one's count.
+  const gen = useRef(0);
+  const reload = useCallback(() => {
+    if (!inTauri()) return;
+    const mine = ++gen.current;
+    void fetchRcList().then((r) => {
+      if (mine === gen.current) setCount(r.sessions.length);
+    });
+  }, []);
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const un = await listen("refresh", reload);
+      if (cancelled) un();
+      else unlisten = un;
+      reload(); // initial fetch, after the listener is live
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [reload]);
+  // Re-fetch when the Agents pane signals a session change (launch/kill); skip the
+  // initial mount value (bump===0) — the effect above already did the first fetch.
+  useEffect(() => {
+    if (bump > 0) reload();
+  }, [bump, reload]);
+  return count;
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */
