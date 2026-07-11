@@ -362,6 +362,10 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         """Open the New-Shed dialog (raises the window + emits the event)."""
         self.call("ui.show_create")
 
+    def show_launch(self) -> None:
+        """Open the New-session (launch agent) dialog (raises the window + emits the event)."""
+        self.call("ui.show_launch")
+
     def agents_dump(self) -> list[dict]:
         """The RC sessions the Agents pane rendered — the drivable `agents.dump`
         UI truth (empty unless the UI is on the agents pane)."""
@@ -379,13 +383,58 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         return self.call("ui.modal").get("modal")
 
     def computed_style(self) -> dict | None:
-        """A computed-style sample the frontend reported (body bg/color + accent),
-        so a test can confirm the WebView applied the theme."""
+        """A computed-style sample the frontend reported (body bg/color + accent +
+        the active light/dark mode), so a test can confirm the WebView applied the
+        theme and observe the appearance op."""
         return self.call("ui.computed_style").get("style")
+
+    def set_appearance(self, mode: str) -> None:
+        """Drive the dashboard's light/dark mode (`ui.set_appearance` → the shell's
+        `set-appearance` listener), so dark screenshots are deterministic."""
+        self.call("ui.set_appearance", {"mode": mode})
+
+    def badges(self) -> dict | None:
+        """The sidebar nav badge counts the shell reported ({sheds, agents, hosts,
+        pending}), or None before its first report — UI truth, like agents_dump."""
+        return self.call("ui.badges").get("badges")
 
     def system_df(self) -> list[dict]:
         """Per-host disk usage (`[HostDiskUsage]`); each row has host/usage/error."""
         return self.call("system.df")["usage"]
+
+    def egress_dump(self) -> dict | None:
+        """The Egress pane's rendered state (`egress.profiles` UI truth, like
+        agents_dump): `{tab, profiles, errors, selected, activity_count}` — or
+        None unless the UI is on the egress pane and it has reported."""
+        return self.call("egress.profiles").get("egress")
+
+    def egress_show(self, tab: str | None = None, profile: str | None = None,
+                    host: str | None = None) -> None:
+        """Drive the Egress pane's sub-tab ('activity'|'profiles') and/or the
+        selected profile — the `egress.show` op → `egress-show` event. Selection
+        resolves by (host, name) when `host` is given, else by name (first match).
+
+        The pane's `egress-show` listener attaches asynchronously after mount, so the
+        op returns `frontend_not_ready` until the pane has reported (its snapshot is
+        non-null, which implies the listener is live). Retry on that — never on a real
+        error like `bad_request` — so a drive right after navigation can't be lost to
+        the attach race (harness convention: wait, don't sleep-and-hope)."""
+        params: dict = {}
+        if tab is not None:
+            params["tab"] = tab
+        if profile is not None:
+            params["profile"] = profile
+        if host is not None:
+            params["host"] = host
+        deadline = time.monotonic() + scaled_timeout(15.0)
+        while True:
+            try:
+                self.call("egress.show", params)
+                return
+            except ShedError as e:
+                if e.code != "frontend_not_ready" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
 
     def terminal_preview(self, shed: str, host: str | None = None, session: str | None = None,
                          preset: str | None = None, template: str | None = None) -> dict:

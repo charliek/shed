@@ -1,0 +1,18 @@
+# Down-host fixture for the hermetic down-host E2E module (test_tauri_downhost.py).
+# Same shape as config.yaml, but TWO servers: `mock` (reachable — redirected to
+# the in-process mock like the shared fixture) and `down` (named in the launch's
+# SHED_*_MOCK_UNREACHABLE_HOSTS override, so the backend points it at a closed
+# port and it surfaces as a per-host error row). Host/port are placeholders — the
+# server name is what the override matches on. Kept SEPARATE from config.yaml so
+# the shared suite / m0 gates / screenshots see no `down` host.
+servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+    down:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {}

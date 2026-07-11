@@ -88,6 +88,14 @@ make -C desktop smoke                # drive the app + capture labeled screensho
   existing 4-space style; formatting churn muddies review.
 - The control socket + lock live under `~/Library/Caches/ShedDesktop/` and are NOT
   moved by `SHED_DESKTOP_STATE_DIR`, so the harness + a dev session agree on them.
+- **Tauri screenshots on macOS are Screen-Recording-TCC-gated.** The mac app's
+  `app.screenshot` renders the content view in-process (no permission needed), but
+  the **Tauri** client (`--target tauri` on a Mac) has no in-process WebKitGTK
+  capture — it shells out to `screencapture`, which exits 1 without a Screen-
+  Recording grant in an agent/headless session. Those Tauri screenshot assertions
+  **skip on Darwin by design** (see `test_tauri.py`); for real visual capture of the
+  Tauri client run the `shedtest-linux` render gate under Xvfb (`ui.set_appearance`
+  makes the dark shot deterministic there).
 
 ## When you hit a NEW rough edge
 

@@ -4,13 +4,14 @@ export default {
   darkMode: ["class", '[data-mode="dark"]'],
   theme: {
     extend: {
-      // The linen theme's --shed-* CSS vars, surfaced as Tailwind color tokens so
+      // The Plex theme's --shed-* CSS vars, surfaced as Tailwind color tokens so
       // components use `bg-shed-bg` / `text-shed-text-muted` etc. (the vars live in
       // index.css and carry the light/dark values).
       colors: {
         shed: {
           bg: "var(--shed-bg)",
           "bg-sidebar": "var(--shed-bg-sidebar)",
+          titlebar: "var(--shed-titlebar)",
           surface: "var(--shed-surface)",
           "surface-hover": "var(--shed-surface-hover)",
           inset: "var(--shed-inset)",
@@ -25,16 +26,29 @@ export default {
           "accent-subtle": "var(--shed-accent-subtle)",
           "accent-border": "var(--shed-accent-border)",
           ok: "var(--shed-ok)",
+          approve: "var(--shed-approve)",
+          "approve-fg": "var(--shed-approve-fg)",
           attention: "var(--shed-attention)",
           danger: "var(--shed-danger)",
+          denied: "var(--shed-denied)",
           "deny-bg": "var(--shed-deny-bg)",
+          "ok-bg": "var(--shed-ok-bg)",
+          "ok-fg": "var(--shed-ok-fg)",
+          "warn-bg": "var(--shed-warn-bg)",
+          "warn-fg": "var(--shed-warn-fg)",
+          "err-bg": "var(--shed-err-bg)",
+          "err-fg": "var(--shed-err-fg)",
+          "idle-bg": "var(--shed-idle-bg)",
+          "idle-fg": "var(--shed-idle-fg)",
+          "btn-dark": "var(--shed-btn-dark)",
+          "btn-dark-fg": "var(--shed-btn-dark-fg)",
         },
       },
       borderRadius: { shed: "var(--shed-radius)" },
-      boxShadow: { shed: "var(--shed-shadow)" },
+      boxShadow: { shed: "var(--shed-shadow)", "shed-sel": "var(--shed-shadow-sel)" },
       fontFamily: {
-        sans: ["-apple-system", "BlinkMacSystemFont", '"SF Pro Text"', "system-ui", "sans-serif"],
-        mono: ["ui-monospace", "SFMono-Regular", "monospace"],
+        sans: ['"IBM Plex Sans"', "system-ui", "-apple-system", "BlinkMacSystemFont", "sans-serif"],
+        mono: ['"IBM Plex Mono"', "ui-monospace", "SFMono-Regular", "monospace"],
       },
     },
   },

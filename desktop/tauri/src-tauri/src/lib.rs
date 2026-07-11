@@ -52,20 +52,19 @@ fn ui_report(
     // Mirror the running-shed count onto the menu-bar status item (Swift parity).
     // The dashboard (`main`) reports the full shed list here even while hidden at
     // launch, so the tray count is live without a Rust-side poller. macOS-only;
-    // computed before the snapshot is moved into `merge`.
+    // computed before the snapshot is moved into `merge`. Guarded on the `sheds` key
+    // being PRESENT (defense-in-depth): the shell only sends full snapshots now, but
+    // a report that omitted `sheds` must NOT be read as "zero running" and blank the
+    // count — skip it and keep the last known count instead.
     #[cfg(target_os = "macos")]
     if window.label() == "main" {
-        let running = snapshot
-            .get("sheds")
-            .and_then(|v| v.as_array())
-            .map(|sheds| {
-                sheds
-                    .iter()
-                    .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("running"))
-                    .count()
-            })
-            .unwrap_or(0);
-        crate::tray::update_running_count(window.app_handle(), running);
+        if let Some(sheds) = snapshot.get("sheds").and_then(|v| v.as_array()) {
+            let running = sheds
+                .iter()
+                .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("running"))
+                .count();
+            crate::tray::update_running_count(window.app_handle(), running);
+        }
     }
     if let Ok(mut s) = ui.lock() {
         s.merge(window.label(), snapshot);
@@ -167,6 +166,18 @@ async fn shed_action(
 #[tauri::command]
 async fn system_df(backend: tauri::State<'_, Arc<Backend>>) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!(backend.system_df().await))
+}
+
+/// The WebView's per-host egress profiles — `invoke("egress_profiles")` when the
+/// Egress pane mounts / on its Refresh. Each row is a host's profiles or the
+/// error it returned (unreachable / egress-disabled hosts are kept as error rows,
+/// not dropped) — the same fan-out shape as `system_df`. The harness reads the
+/// RENDERED rows via the `egress.profiles` IPC op instead (UI truth).
+#[tauri::command]
+async fn egress_profiles(
+    backend: tauri::State<'_, Arc<Backend>>,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!(backend.egress_profiles().await))
 }
 
 // -- terminal + prefs commands (the frontend Preferences view + the shed-card
@@ -558,6 +569,7 @@ pub fn run() {
         env.mock_base_url.as_deref(),
         &env.config_path,
         minter.as_ref(),
+        &env.mock_unreachable_hosts,
     ));
 
     // The Agents / Remote-Control service (session store + process seam). Same
@@ -589,6 +601,7 @@ pub fn run() {
             list_hosts,
             shed_action,
             system_df,
+            egress_profiles,
             create_start,
             create_status,
             create_cancel,

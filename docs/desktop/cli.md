@@ -28,7 +28,7 @@ The named subcommands cover inspection and UI control (including the mutating
 [IPC op catalog](ipc.md) — lifecycle (`shed.start` …), create, terminal, remote control
 (`rc.*`), approvals (`approval.decide` …), and `system.df` — is reached through
 `shedctl call <op>`. Panes for `ui navigate` are `sheds | approvals | agents | activity |
-system`.
+egress | system`.
 
 ## Examples
 

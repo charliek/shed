@@ -39,6 +39,20 @@ make -C desktop e2e-swift   # mac: same, Rust core forced off (SHED_DESKTOP_RUST
 make -C desktop e2e-tauri   # tauri: shared suite + test_tauri (needs a display; Xvfb on Linux)
 ```
 
+### Simulating a down (unreachable) host
+
+The shared session redirects every configured server to the one in-process mock, so a
+per-host error row (an unreachable host in the Egress / System panes) can't appear there. To
+exercise it, point a **dedicated** fixture config at an extra server and name it in the
+`SHED_TAURI_MOCK_UNREACHABLE_HOSTS` / `SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS` override
+(comma-separated server names, parsed only in test mode): the backend points those hosts at a
+closed port (`http://127.0.0.1:1`, a deterministic connection refusal) while the rest still hit
+the mock. `test_tauri_downhost.py` is the pattern — it launches its own throwaway app instance
+(distinct HOME/`XDG_RUNTIME_DIR` → distinct socket and single-instance lock, so it coexists
+with the session app) against `fixtures/config-downhost.yaml`. Keep the down host out of the
+shared `fixtures/config.yaml` so the golden ship-gates and healthy-path screenshots are
+undisturbed.
+
 ## The Linux render gate + `.deb`
 
 The Tauri client's real shipped WebView is WebKitGTK, so a Linux-only render gate runs the
@@ -52,11 +66,19 @@ make -C desktop deb-validate        # build the .deb + install-validate in a cle
 
 ## Screenshots
 
-`app.screenshot` renders a window's content view to a PNG in-process (no screen-capture
-permission, works occluded/off-screen). The harness asserts the PNG decodes and matches
-`app.window_metrics`; an agent can also read the PNG directly to eyeball a change.
+On the **mac** app `app.screenshot` renders a window's content view to a PNG in-process (no
+screen-capture permission, works occluded/off-screen). The harness asserts the PNG decodes
+and matches `app.window_metrics`; an agent can also read the PNG directly to eyeball a change.
 
 ```bash
 shedctl ui show-window
 shedctl screenshot --surface window --scale 2 --out /tmp/shot.png
 ```
+
+The **Tauri** client has no in-process WebKitGTK capture, so its `app.screenshot` shells out
+to a platform tool (`grim`/`scrot` on Linux, `screencapture` on macOS). On macOS that path is
+Screen-Recording-TCC-gated and exits non-zero in an agent/headless session, so the Tauri
+screenshot assertions **skip on Darwin by design** — the Linux render gate under Xvfb is the
+visual gate. `ui.set_appearance {mode: light|dark}` drives the dashboard's light/dark mode
+deterministically (the reported `computed_style.mode` echoes it), so a dark-mode capture
+doesn't depend on toggling the header.

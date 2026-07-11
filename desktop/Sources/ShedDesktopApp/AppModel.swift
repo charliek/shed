@@ -392,7 +392,13 @@ final class AppModel: NSObject, UiBridge {
             let baseURL: URL
             let pin: String
             if let mockBase, let url = URL(string: mockBase) {
-                baseURL = url
+                // TEST-ONLY: a server named in mockUnreachableHosts is pointed at a
+                // closed port (fast deterministic ECONNREFUSED) instead of the mock,
+                // so the per-host error row is exercisable e2e (parity with the Rust
+                // backend's mock-arm override).
+                baseURL = ShedBackend.shared.mockUnreachableHosts.contains(entry.name)
+                    ? (URL(string: "http://127.0.0.1:1") ?? url)
+                    : url
                 pin = ""  // hermetic mock is plain http; no pinning
             } else {
                 let resolved = entry.resolvedEndpoint()

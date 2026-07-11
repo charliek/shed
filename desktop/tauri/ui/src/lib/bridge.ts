@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export type Pane = "sheds" | "approvals" | "agents" | "activity" | "system";
+export type Pane = "sheds" | "approvals" | "agents" | "activity" | "egress" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it. */
-export type Modal = null | "prefs" | "create";
+export type Modal = null | "prefs" | "create" | "launch";
 
-const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "system"];
+const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "egress", "system"];
 
 /** Narrow an untrusted value (an IPC payload) to a known pane. */
 export function isPane(x: unknown): x is Pane {
@@ -29,14 +29,18 @@ export function inTauri(): boolean {
 }
 
 /** Sample the rendered theme so the harness's computed-style probe can confirm
- *  the WebView actually applied the linen CSS (a resolved color, not a fallback). */
-function sampleStyle() {
+ *  the WebView actually applied the Plex CSS (a resolved color, not a fallback).
+ *  `mode` mirrors the active appearance so the appearance op is observable — taken
+ *  from the caller (the React state) when known, else read back off the root
+ *  `data-mode` (the readiness report, before a mode is threaded through). */
+function sampleStyle(mode?: string) {
   const cs = getComputedStyle(document.body);
   const main = document.querySelector("[data-pane]");
   return {
     bg: cs.backgroundColor,
     color: cs.color,
     accent: main ? getComputedStyle(main).getPropertyValue("--shed-accent").trim() : "",
+    mode: mode ?? document.documentElement.dataset.mode ?? "light",
   };
 }
 
@@ -47,12 +51,27 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return core.invoke<T>(cmd, args).catch(() => undefined);
 }
 
+/** The sidebar nav badge counts (sheds / active RC sessions / hosts / pending
+ *  approvals), carried in the shell's full snapshot so the harness can assert the
+ *  rendered counts as UI truth via `ui.badges` — not pixels. */
+export type Badges = { sheds: number; agents: number; hosts: number; pending: number };
+
 /** Report the rendered snapshot Rust relays to the harness (`ui.current_pane` /
- *  `ui.computed_style` / `dashboard.dump`). One blob, so a new reader is one more
- *  key. The refresh token is echoed so `sheds.refresh` can block on it. */
-function report(pane: Pane, sheds: Shed[], refreshToken: number, modal: Modal) {
+ *  `ui.computed_style` / `dashboard.dump` / `ui.badges`). ALWAYS a FULL blob — every
+ *  key present — so no partial report can (a) create the `main` slot before the shell
+ *  is ready and false-signal readiness to `sheds.refresh`, or (b) omit `sheds` and
+ *  zero the mac tray running-count (lib.rs recomputes it from each report). A new
+ *  reader is one more key. The refresh token is echoed so `sheds.refresh` blocks on it. */
+function report(
+  pane: Pane,
+  sheds: Shed[],
+  refreshToken: number,
+  modal: Modal,
+  badges: Badges,
+  mode?: string,
+) {
   void invoke("ui_report", {
-    snapshot: { pane, style: sampleStyle(), sheds, refresh_token: refreshToken, modal },
+    snapshot: { pane, style: sampleStyle(mode), sheds, refresh_token: refreshToken, modal, badges },
   });
 }
 
@@ -61,6 +80,12 @@ function report(pane: Pane, sheds: Shed[], refreshToken: number, modal: Modal) {
  *  op), and report the rendered snapshot back so the harness can assert it.
  *  Returns the live sheds + a `refresh` callback (a lifecycle button chains it to
  *  re-fetch after its action). A no-op in a plain browser.
+ *
+ *  This owns the SINGLE report path — the shell's badges (`agentCount`/`hostCount`/
+ *  `pending` supplied by App, `sheds` derived here) and the active `mode` fold into
+ *  one full snapshot, so there are no partial `ui_report`s to race the `main` slot
+ *  or drop keys (App must apply `data-mode` before this effect runs — a
+ *  useLayoutEffect — so the sampled colors reflect the flip).
  *
  *  Readiness: the initial report is emitted only AFTER both the navigate + refresh
  *  listeners register, so `current_pane != null` tells the harness the listeners
@@ -71,6 +96,10 @@ export function useUiBridge(
   pane: Pane,
   setPane: (p: Pane) => void,
   modal: Modal,
+  mode: "light" | "dark",
+  agentCount: number,
+  hostCount: number,
+  pending: number,
 ): { sheds: Shed[]; refresh: () => void } {
   const [sheds, setSheds] = useState<Shed[]>([]);
   const [refreshToken, setRefreshToken] = useState(0);
@@ -116,10 +145,10 @@ export function useUiBridge(
       }
       ready.current = true; // both listeners live → readiness signal + initial report
       await fetchSheds(0);
-      // Fresh sheds arrive via the report effect on the next render; this initial
-      // report just publishes the pane, so `current_pane != null` = "listeners live".
-      // No modal is open at mount.
-      report(paneRef.current, [], 0, null);
+      // Fresh sheds + real badges arrive via the report effect on the next render;
+      // this initial report just publishes the pane, so `current_pane != null` =
+      // "listeners live". No modal is open at mount; badges seed at zero.
+      report(paneRef.current, [], 0, null, { sheds: 0, agents: 0, hosts: 0, pending: 0 });
     })();
     return () => {
       cancelled = true;
@@ -128,13 +157,18 @@ export function useUiBridge(
     };
   }, [setPane, fetchSheds]);
 
-  // Re-report on any rendered change (pane, sheds, or the echoed token). Gated on
-  // `ready` (not a first-run flag) so the listener effect owns the initial report
-  // and `current_pane` stays a true "listeners live" signal under StrictMode replay.
+  // Re-report on any rendered change (pane, sheds, echoed token, modal, the badge
+  // inputs, or the appearance mode). Gated on `ready` (not a first-run flag) so the
+  // listener effect owns the initial report and `current_pane` stays a true
+  // "listeners live" signal under StrictMode replay. One FULL snapshot per report —
+  // badges are derived+carried here, never published as a partial `ui_report`.
   useEffect(() => {
     if (!inTauri() || !ready.current) return;
-    report(pane, sheds, refreshToken, modal);
-  }, [pane, sheds, refreshToken, modal]);
+    // `hosts` = the configured-host count (with reachability) the shell supplies —
+    // covers zero-shed hosts, unlike a sheds-derived distinct-host count.
+    const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount, pending };
+    report(pane, sheds, refreshToken, modal, badges, mode);
+  }, [pane, sheds, refreshToken, modal, mode, agentCount, hostCount, pending]);
 
   const refresh = useCallback(() => void fetchSheds(0), [fetchSheds]);
   return { sheds, refresh };
@@ -166,6 +200,61 @@ export type HostDiskUsage = {
  *  serves the harness). An unreachable host comes back as an error row. */
 export async function fetchSystemDf(): Promise<HostDiskUsage[]> {
   return (await invoke<HostDiskUsage[]>("system_df")) ?? [];
+}
+
+/* ---- egress (mac parity: profiles per host + the ns=="egress" activity) ---- */
+
+/** One egress profile fragment, as shed-core decodes it (shed-server's
+ *  `config.EgressProfile` — all fields optional). */
+export type EgressProfile = {
+  mode?: string | null;
+  allow?: string[] | null;
+  deny?: string[] | null;
+  rule?: string | null;
+};
+/** One entry of `GET /api/egress/profiles` (`source`: "config" | "user"). */
+export type EgressProfileInfo = { name: string; source: string; profile: EgressProfile };
+/** One host's egress profiles, or the error that host returned — unreachable /
+ *  egress-disabled hosts come back as error rows (the system_df row shape). */
+export type HostEgressProfiles = {
+  host: string;
+  profiles: EgressProfileInfo[];
+  error?: string | null;
+};
+
+/** Per-host egress profiles for the Egress pane's Profiles sub-tab. */
+export async function fetchEgressProfiles(): Promise<HostEgressProfiles[]> {
+  return (await invoke<HostEgressProfiles[]>("egress_profiles")) ?? [];
+}
+
+/** The Egress pane's rendered state, reported so the `egress.profiles` op can
+ *  observe it (UI truth, like `reportAgents`): the active sub-tab, the flat
+ *  profile rows + per-host error rows, the selected profile's detail, and how
+ *  many ns=="egress" activity rows the Activity sub-tab renders. Keys are
+ *  additive + stable — the harness asserts them. */
+export type EgressReport = {
+  tab: "activity" | "profiles";
+  profiles: { host: string; name: string; source: string }[];
+  errors: { host: string; error: string }[];
+  selected: {
+    host: string;
+    name: string;
+    source: string;
+    allow: string[];
+    deny: string[];
+    mode?: string | null;
+    rule?: string | null;
+  } | null;
+  activity_count: number;
+};
+
+/** Report the rendered Egress pane state (mounted-only, like `reportAgents` —
+ *  `ui_report` merges this `egress` key with the shell's snapshot). Pass `null` on
+ *  unmount to CLEAR the key (the merge overwrites `egress` with null, not skips it),
+ *  so an off-pane or freshly-remounted-but-not-yet-reported `egress.profiles` dump
+ *  returns null instead of the previous mount's stale snapshot. */
+export function reportEgress(snapshot: EgressReport | null): void {
+  void invoke("ui_report", { snapshot: { egress: snapshot } });
 }
 
 /* ---- terminal + prefs (the Preferences view + the shed-card button) ------- */
@@ -494,6 +583,49 @@ export async function rcKill(shed: string, slug: string, host?: string): Promise
  *  (`ui_report` merges this `agents` key with the shell's snapshot.) */
 export function reportAgents(sessions: RcSession[]): void {
   void invoke("ui_report", { snapshot: { agents: sessions } });
+}
+
+/** The SINGLE source of truth for RC sessions + per-shed capabilities, lifted to the
+ *  App so the sidebar badge (`sessions.length`), the Agents pane's list, and the
+ *  launch dialog's capability gating all read ONE `rc.list` fetch — no divergence
+ *  between independent fetches with different triggers. Refreshed on mount, on each
+ *  lifecycle `refresh` event (sheds coming up/down), and whenever a caller (the pane
+ *  Refresh button, a launch/kill, the pane/dialog on open) invokes the returned
+ *  `refresh`. Empty in a plain browser / on error. */
+export function useRcSessions(): {
+  sessions: RcSession[];
+  capabilities: Record<string, RcCapabilities>;
+  refresh: () => void;
+} {
+  const [state, setState] = useState<RcListResult>({ sessions: [], capabilities: {} });
+  // A generation guard shared across the mount-, event-, and caller-driven reloads,
+  // so a slower older fetch can't overwrite a newer one (the pane's superseded-fetch
+  // guard, now owned here for the shared state).
+  const gen = useRef(0);
+  const refresh = useCallback(() => {
+    if (!inTauri()) return;
+    const mine = ++gen.current;
+    void fetchRcList().then((r) => {
+      if (mine === gen.current) setState(r);
+    });
+  }, []);
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const un = await listen("refresh", () => refresh());
+      if (cancelled) un();
+      else unlisten = un;
+      refresh(); // initial fetch, after the listener is live
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refresh]);
+  return { sessions: state.sessions, capabilities: state.capabilities, refresh };
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */

@@ -7,6 +7,7 @@
 //! `(test_mode, mock_base_url, config_path)` rather than a client's `SHED_*_` env
 //! struct, so the GTK + Tauri clients share one implementation.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
@@ -15,7 +16,7 @@ use tokio::runtime::Handle;
 use shed_core::config::ShedConfig;
 use shed_core::create::{CreateProgress, CreateStore};
 use shed_core::http::{Client, ShedError};
-use shed_core::models::{CreateShedRequest, Shed, ShedStatus, SystemDiskUsage};
+use shed_core::models::{CreateShedRequest, EgressProfileInfo, Shed, ShedStatus, SystemDiskUsage};
 use shed_core::terminal::{self, TerminalCommand};
 use shed_core::token::TokenMinter;
 
@@ -63,18 +64,28 @@ impl Backend {
         mock_base_url: Option<&str>,
         config_path: &Path,
     ) -> Self {
-        Self::from_env_parts_with_minter(test_mode, mock_base_url, config_path, None)
+        Self::from_env_parts_with_minter(
+            test_mode,
+            mock_base_url,
+            config_path,
+            None,
+            &HashSet::new(),
+        )
     }
 
     /// As [`from_env_parts`](Self::from_env_parts), but threads a control-token
     /// `minter` (the host-agent bridge) into every non-mock server's client, so a
     /// secure server mints/refreshes its bearer via `token.get` and fails closed
     /// on a mint failure (F6). GTK passes `None` (static-token only).
+    ///
+    /// `unreachable_hosts` is a TEST-ONLY per-host down simulation consulted only in
+    /// the mock arm (see [`from_config_with_minter`](Self::from_config_with_minter)).
     pub fn from_env_parts_with_minter(
         test_mode: bool,
         mock_base_url: Option<&str>,
         config_path: &Path,
         minter: Option<&Arc<dyn TokenMinter>>,
+        unreachable_hosts: &HashSet<String>,
     ) -> Self {
         if test_mode && mock_base_url.is_none() {
             return Self {
@@ -85,24 +96,31 @@ impl Backend {
             };
         }
         let config = ShedConfig::load(&config_path.to_string_lossy());
-        Self::from_config_with_minter(&config, mock_base_url, minter)
+        Self::from_config_with_minter(&config, mock_base_url, minter, unreachable_hosts)
     }
 
     /// Build clients from an already-parsed config. When `mock_base_url` is set
     /// (test mode) every server is redirected to that single hermetic mock —
     /// plain HTTP, no pin, no token — so no real host is touched.
     pub fn from_config(config: &ShedConfig, mock_base_url: Option<&str>) -> Self {
-        Self::from_config_with_minter(config, mock_base_url, None)
+        Self::from_config_with_minter(config, mock_base_url, None, &HashSet::new())
     }
 
     /// As [`from_config`](Self::from_config), but threads a control-token `minter`
     /// into every non-mock server (see
     /// [`from_env_parts_with_minter`](Self::from_env_parts_with_minter)). The mock
     /// path never gets a minter (hermetic — a static, tokenless mock).
+    ///
+    /// `unreachable_hosts` is a TEST-ONLY per-host down simulation: in the mock arm
+    /// a server whose NAME is in the set is pointed at a closed port
+    /// (`http://127.0.0.1:1`, a fast deterministic ECONNREFUSED) instead of the
+    /// mock, so the harness can exercise the per-host error row end-to-end.
+    /// Mock-mode-only by construction — the production `None` arm never consults it.
     pub fn from_config_with_minter(
         config: &ShedConfig,
         mock_base_url: Option<&str>,
         minter: Option<&Arc<dyn TokenMinter>>,
+        unreachable_hosts: &HashSet<String>,
     ) -> Self {
         let clients = config
             .servers
@@ -110,7 +128,12 @@ impl Backend {
             .filter_map(|s| {
                 let client = match mock_base_url {
                     Some(mock) => {
-                        Client::new(mock.to_string(), s.name.clone(), String::new(), None, None)
+                        let url = if unreachable_hosts.contains(&s.name) {
+                            "http://127.0.0.1:1".to_string()
+                        } else {
+                            mock.to_string()
+                        };
+                        Client::new(url, s.name.clone(), String::new(), None, None)
                     }
                     None => {
                         // A pin on a non-https URL fails closed in Client::new → that
@@ -158,6 +181,24 @@ impl Backend {
     fn client_for(&self, host: Option<&str>) -> Result<&Client, ShedError> {
         resolve(&self.clients, self.default_server.as_deref(), host)
             .ok_or_else(|| no_configured_host(host))
+    }
+
+    /// Fan `call` out across every configured host concurrently, tagging each
+    /// result with its server name. `join_all` so a slow/down host never
+    /// serializes the others (each bounded by shed-core's per-request timeout).
+    /// The shared plumbing behind `refresh`/`system_df`/`egress_profiles` — each
+    /// caller decides whether a per-host `Err` is rolled up, kept as an error
+    /// row, or dropped.
+    async fn per_host<T>(
+        &self,
+        call: impl AsyncFn(&Client) -> Result<T, ShedError>,
+    ) -> Vec<(String, Result<T, ShedError>)> {
+        let call = &call;
+        let fetches = self
+            .clients
+            .iter()
+            .map(|(name, c)| async move { (name.clone(), call(c).await) });
+        futures::future::join_all(fetches).await.into_iter().collect()
     }
 
     /// Fetch sheds from every configured host concurrently (host-stamped by
@@ -246,13 +287,9 @@ impl Backend {
     /// `list_sheds` keeps its error-dropping contract (GTK uses it and never
     /// surfaces the rollup); the Tauri client surfaces `last_error`.
     pub async fn refresh(&self) -> Reachability {
-        let fetches = self
-            .clients
-            .iter()
-            .map(|(name, c)| async move { (name.clone(), c.list_sheds().await) });
         let mut sheds = Vec::new();
         let mut errors = Vec::new();
-        for (name, result) in futures::future::join_all(fetches).await {
+        for (name, result) in self.per_host(async |c: &Client| c.list_sheds().await).await {
             match result {
                 Ok(mut s) => sheds.append(&mut s),
                 Err(e) => errors.push(format!("{name}: {e}")),
@@ -270,11 +307,7 @@ impl Backend {
     /// `list_sheds`, a per-host failure is KEPT as an error row (the pane shows
     /// which host is unreachable + why), mirroring the Swift `system.df`. Concurrent.
     pub async fn system_df(&self) -> Vec<HostDiskUsage> {
-        let fetches = self
-            .clients
-            .iter()
-            .map(|(name, c)| async move { (name.clone(), c.system_df().await) });
-        futures::future::join_all(fetches)
+        self.per_host(async |c: &Client| c.system_df().await)
             .await
             .into_iter()
             .map(|(host, result)| match result {
@@ -286,6 +319,29 @@ impl Backend {
                 Err(e) => HostDiskUsage {
                     host,
                     usage: None,
+                    error: Some(e.to_string()),
+                },
+            })
+            .collect()
+    }
+
+    /// Per-host egress profiles (`GET /api/egress/profiles`) for the Egress pane.
+    /// Like [`system_df`](Self::system_df), a per-host failure is KEPT as an error
+    /// row (that host is unreachable or has egress disabled) rather than failing
+    /// the call, mirroring the Swift `doEgressRefresh`. Concurrent.
+    pub async fn egress_profiles(&self) -> Vec<HostEgressProfiles> {
+        self.per_host(async |c: &Client| c.egress_profiles().await)
+            .await
+            .into_iter()
+            .map(|(host, result)| match result {
+                Ok(profiles) => HostEgressProfiles {
+                    host,
+                    profiles,
+                    error: None,
+                },
+                Err(e) => HostEgressProfiles {
+                    host,
+                    profiles: Vec::new(),
                     error: Some(e.to_string()),
                 },
             })
@@ -416,6 +472,16 @@ pub struct HostDiskUsage {
     pub error: Option<String>,
 }
 
+/// One host's egress profiles, or the error that host returned — the Egress pane
+/// shows an error row per host (unreachable / egress disabled) rather than
+/// dropping it. Mirrors the Swift `HostEgressProfiles` + the `HostDiskUsage` row shape.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HostEgressProfiles {
+    pub host: String,
+    pub profiles: Vec<EgressProfileInfo>,
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +502,18 @@ mod tests {
     fn client_at(name: &str, base_url: String) -> (String, Client) {
         let client = Client::new(base_url, name.to_string(), String::new(), None, None).unwrap();
         (name.to_string(), client)
+    }
+
+    fn server_entry(name: &str) -> shed_core::config::ShedServerEntry {
+        shed_core::config::ShedServerEntry {
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            http_port: 8080,
+            ssh_port: 2222,
+            control_token: String::new(),
+            api_url: String::new(),
+            tls_cert_fingerprint: String::new(),
+        }
     }
 
     #[tokio::test]
@@ -623,6 +701,101 @@ mod tests {
         let b = rows.iter().find(|r| r.host == "bad").unwrap();
         assert!(b.usage.is_none());
         assert!(b.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn egress_profiles_keeps_error_row_for_down_host() {
+        // Mirrors system_df_keeps_error_row_for_down_host: a healthy host's
+        // profiles decode; a down (or egress-disabled) host is KEPT as an error
+        // row, never a failed call or a dropped host.
+        let good = MockServer::start_async().await;
+        good.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(200).body(
+                r#"[{"name":"default","source":"config","profile":{"mode":"audit","allow":["*.github.com"],"deny":["evil.example.com"]}},{"name":"custom","source":"user","profile":{"allow":["api.example.com"]}}]"#,
+            );
+        })
+        .await;
+        let bad = MockServer::start_async().await;
+        bad.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(500);
+        })
+        .await;
+        let rows = backend_with(vec![
+            client_at("good", good.base_url()),
+            client_at("bad", bad.base_url()),
+        ])
+        .egress_profiles()
+        .await;
+        assert_eq!(rows.len(), 2);
+        // healthy host → both profiles present (config baseline + user), no error
+        let g = rows.iter().find(|r| r.host == "good").unwrap();
+        assert!(g.error.is_none());
+        assert_eq!(g.profiles.len(), 2);
+        assert_eq!(g.profiles[0].name, "default");
+        assert_eq!(g.profiles[0].source, "config");
+        assert_eq!(g.profiles[0].profile.mode.as_deref(), Some("audit"));
+        assert_eq!(
+            g.profiles[0].profile.deny.as_deref(),
+            Some(&["evil.example.com".to_string()][..])
+        );
+        assert_eq!(g.profiles[1].source, "user");
+        // down host → KEPT as an error row (not dropped), profiles absent
+        let b = rows.iter().find(|r| r.host == "bad").unwrap();
+        assert!(b.profiles.is_empty());
+        assert!(b.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn from_config_with_unreachable_host_yields_error_row() {
+        // The mock-arm per-host down override (backs SHED_*_MOCK_UNREACHABLE_HOSTS):
+        // a config-built backend whose `down` server is in the set points that
+        // client at a closed port while `mock` reaches the httpmock — so
+        // egress_profiles / system_df keep `down` as an error row (the e2e
+        // down-host contract, verified at the constructor level rather than only
+        // via hand-built clients).
+        let mock = MockServer::start_async().await;
+        mock.mock_async(|w, t| {
+            w.method(GET).path("/api/egress/profiles");
+            t.status(200).body(
+                r#"[{"name":"default","source":"config","profile":{"allow":["*.github.com"]}}]"#,
+            );
+        })
+        .await;
+        mock.mock_async(|w, t| {
+            w.method(GET).path("/api/system/df");
+            t.status(200).body(
+                r#"{"server_name":"mock","backend":"vz","totals":{"all":{"logical_bytes":1,"physical_bytes":1}}}"#,
+            );
+        })
+        .await;
+        let config = ShedConfig {
+            servers: vec![server_entry("mock"), server_entry("down")],
+            default_server: Some("mock".into()),
+        };
+        let unreachable: HashSet<String> = ["down".to_string()].into_iter().collect();
+        let backend =
+            Backend::from_config_with_minter(&config, Some(&mock.base_url()), None, &unreachable);
+
+        // egress: `mock` reaches the httpmock (profile decoded); `down` is KEPT as
+        // an error row (redirected to the closed port), never a dropped host.
+        let egress = backend.egress_profiles().await;
+        assert_eq!(egress.len(), 2);
+        let m = egress.iter().find(|r| r.host == "mock").unwrap();
+        assert!(m.error.is_none());
+        assert_eq!(m.profiles.len(), 1);
+        let d = egress.iter().find(|r| r.host == "down").unwrap();
+        assert!(d.profiles.is_empty());
+        assert!(d.error.is_some());
+
+        // system_df: same split — `mock` healthy, `down` an error row with no usage.
+        let df = backend.system_df().await;
+        assert_eq!(df.len(), 2);
+        let m = df.iter().find(|r| r.host == "mock").unwrap();
+        assert!(m.usage.is_some() && m.error.is_none());
+        let d = df.iter().find(|r| r.host == "down").unwrap();
+        assert!(d.usage.is_none() && d.error.is_some());
     }
 
     #[test]
