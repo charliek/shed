@@ -401,8 +401,8 @@ Consequences taken in this design:
 |---|---|---|
 | **A. Kinds + capabilities** | agent registry refactor, `codex/opencode/cursor` kinds, per-agent classifiers + golden fixtures, `capabilities`, generic perm modes, plan delivery in core (`--plan-stdin`), `shed plan` porcelain, Dockerfile cursor install, CLI `--kind`, shed-plan skill rewrite, mobile chips | — |
 | **B. HTTP read plane** | server-side enrichment (+`?rc=0`), shared `internal/rcmeta`, `GET /api/overview`, `features` in `/api/info`, CLI prefers server RC, mobile drops SSH fan-out | A (capabilities in list envelope) |
-| **C. Hub + status** | `serve` mode, on-demand lifecycle, pane-stability engine (baseline status for **all** kinds), codex rollout tail + claude transcript tail (shared machinery), `activity` fields, server rc proxy + aggregate SSE | A; B for exposure |
-| **D. Codex non-TUI** | message feed + input POST in hub, mobile chat view, `kind_features` gating | C |
+| **C. Hub + status** _(shipped — server/CLI)_ | `serve` mode, on-demand lifecycle, pane-stability engine (baseline status for **all** kinds), codex rollout tail + claude transcript tail (shared machinery), `activity` fields, server rc proxy + aggregate SSE | A; B for exposure |
+| **D. Codex non-TUI** _(shed-side shipped; mobile pending)_ | message feed + input POST in hub _(shipped)_, `kind_features` gating _(shipped)_, mobile chat view _(pending — shed-mobile)_ | C |
 | **E. Follow-ons** | claude messages (non-TUI view), cursor hooks adapter, opencode serve-split, machine transport, push notifier, credential-mount conventions | D |
 
 Phase A alone delivers "kick off codex/opencode/cursor from the app or skill";
