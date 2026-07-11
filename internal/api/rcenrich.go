@@ -33,6 +33,12 @@ const (
 	// change without a lifecycle event); shorter than a human notices, long enough to
 	// keep a hot poll path from re-probing every call.
 	rcCapsTTL = 5 * time.Minute
+	// rcHubConsultBudget bounds the enrichment-time hub consult: after the exec-based
+	// listing, if a running hub answers within this budget its live activity is
+	// overlaid onto the rc rows. It NEVER starts a hub (a cheap read-only dial), and
+	// fits inside the 2s exec budget alongside the capability probe. A miss (no hub,
+	// FC loopback-unreachable, slow) falls back silently to the exec-only rows.
+	rcHubConsultBudget = 200 * time.Millisecond
 )
 
 // rcEnrichEnabled reports whether a request wants rc enrichment. Enrichment is
@@ -111,6 +117,18 @@ func (c *rcCapsCache) invalidate(shed string) {
 	defer c.mu.Unlock()
 	delete(c.entries, shed)
 	c.gens[shed]++
+}
+
+// invalidateShedRC drops every piece of per-shed rc-derived server state on a
+// lifecycle transition (stop/start/reset/delete): the cached capabilities block
+// AND the hub-start circuit-breaker entry. The two travel together — a
+// transitioned shed's cached caps are stale for the same reason its past hub
+// start failures no longer predict anything — and routing both through one
+// helper keeps the breaker map from leaking entries for deleted sheds and keeps
+// any future per-shed rc state from missing the lifecycle seams.
+func (s *Server) invalidateShedRC(name string) {
+	s.rcCaps.invalidate(name)
+	s.rcHubBreaker.reset(name)
 }
 
 // limitedWriter buffers up to limit bytes and silently discards the rest, always
@@ -224,6 +242,63 @@ func toSessionRC(s rc.Session) *config.SessionRC {
 	return out
 }
 
+// overlayHubActivity consults shedName's resident rc hub (GET /v1/sessions) with
+// a short budget and overlays the live activity dimension (activity, activity_at,
+// last_message) onto the already-enriched rc rows, matched by tmux session name.
+// It NEVER starts a hub — a plain read-only dial through the hub transport — and
+// falls back silently on any miss (no hub running, FC loopback-unreachable, a slow
+// or malformed response), so exec-only rows (no activity) remain the baseline.
+// The lifecycle-trumps-activity precedence is re-applied here (DisplayActivity):
+// a needs-auth/dead row carries no activity even if the hub reports one.
+func (s *Server) overlayHubActivity(ctx context.Context, shedName string, sessions []config.Session, idxs []int) {
+	hubSessions, ok := s.fetchHubSessions(ctx, shedName)
+	if !ok {
+		return
+	}
+	byTmux := rc.IndexByTmux(hubSessions)
+	for _, i := range idxs {
+		if sessions[i].RC == nil {
+			continue
+		}
+		hs, ok := byTmux[sessions[i].Name]
+		if !ok {
+			continue
+		}
+		act := rc.DisplayActivity(hs.State, hs.Activity)
+		if act == "" {
+			continue // lifecycle suppresses the whole activity dimension
+		}
+		sessions[i].RC.Activity = string(act)
+		sessions[i].RC.ActivityAt = hs.ActivityAt
+		sessions[i].RC.LastMessage = hs.LastMessage
+	}
+}
+
+// fetchHubSessions reads GET /v1/sessions from shedName's hub through the hub
+// transport within rcHubConsultBudget. Returns (sessions, true) only on a clean
+// 200 + decode; any error/timeout/non-200 returns (nil, false) for a silent
+// fallback. Read-only: it never starts a hub.
+func (s *Server) fetchHubSessions(ctx context.Context, shedName string) ([]rc.Session, bool) {
+	ctx, cancel := context.WithTimeout(ctx, rcHubConsultBudget)
+	defer cancel()
+
+	resp, err := s.hubGet(ctx, shedName, "/v1/sessions")
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var body struct {
+		Sessions []rc.Session `json:"sessions"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, rcExecOutputLimit)).Decode(&body) != nil {
+		return nil, false
+	}
+	return body.Sessions, true
+}
+
 // enrichSessionsRC fills the RC field of every rc-* session in sessions by exec'ing
 // `shed-ext-rc list` once per shed that actually has rc-* rows, keyed by
 // Session.ShedName. Concurrency is capped (rcEnrichConcurrency), each exec is
@@ -270,6 +345,10 @@ func (s *Server) enrichSessionsRC(ctx context.Context, sessions []config.Session
 					sessions[i].RC = toSessionRC(rs)
 				}
 			}
+			// Overlay live activity from a running hub (best-effort, budgeted, never
+			// starts one). The one-shot `shed-ext-rc list` above is a separate process
+			// with no activity signal; the resident hub does. A miss is silent.
+			s.overlayHubActivity(ctx, shedName, sessions, idxs)
 			return nil
 		})
 	}

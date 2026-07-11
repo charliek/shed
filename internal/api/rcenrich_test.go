@@ -33,6 +33,12 @@ type rcFakeBackend struct {
 	// listErr injects a per-shed ListSessions failure (keyed by shed name) so the
 	// overview session-list-degrade path is testable; nil entries list normally.
 	listErr map[string]error
+	// dialFn backs DialService (the rc-hub proxy / aggregator / enrichment consult
+	// dial through it). nil defaults to a connection-refused-style error so the
+	// enrichment hub-consult degrades silently — the common case for tests that
+	// don't stand up a fake hub. Proxy/aggregator tests set this to dial a real
+	// httptest hub (or to return the shed-not-running/refused sentinels).
+	dialFn func(ctx context.Context, shed string, port uint16) (net.Conn, error)
 }
 
 func (f *rcFakeBackend) Type() backend.Type { return backend.TypeVZ }
@@ -70,8 +76,11 @@ func (f *rcFakeBackend) Exec(ctx context.Context, shed string, opts backend.Exec
 	}
 	panic("unexpected Exec call")
 }
-func (f *rcFakeBackend) DialService(context.Context, string, uint16) (net.Conn, error) {
-	panic("unexpected")
+func (f *rcFakeBackend) DialService(ctx context.Context, shed string, port uint16) (net.Conn, error) {
+	if f.dialFn != nil {
+		return f.dialFn(ctx, shed, port)
+	}
+	return nil, errors.New("dial tcp 127.0.0.1:1029: connect: connection refused")
 }
 func (f *rcFakeBackend) ListImages(context.Context) ([]config.ImageInfo, error) { panic("unexpected") }
 func (f *rcFakeBackend) InspectImage(context.Context, string) (config.ImageInspectResponse, error) {

@@ -309,11 +309,13 @@ type hubSessionsResponse struct {
 	Sessions []Session `json:"sessions"`
 }
 
-// hubAppID is the identity token GET /v1/health returns in `app`. Port 1029 being
+// HubAppID is the identity token GET /v1/health returns in `app`. Port 1029 being
 // bound proves only that SOMETHING is listening — the bind-as-lock and detach-probe
-// paths verify this token so a foreign process squatting the port is reported as an
-// error instead of being mistaken for a running hub.
-const hubAppID = "shed-rc-hub"
+// paths (and the server's rc proxy ensure-start) verify this token so a foreign
+// process squatting the port is reported as an error instead of being mistaken for
+// a running hub. Exported so the server-side probe (internal/api) verifies the
+// same constant rather than a duplicate.
+const HubAppID = "shed-rc-hub"
 
 // hubHealth is the GET /v1/health payload — the hub's identity handshake.
 type hubHealth struct {
@@ -322,9 +324,9 @@ type hubHealth struct {
 	PID     int    `json:"pid"`
 }
 
-// handleHealth answers the identity probe (see hubAppID).
+// handleHealth answers the identity probe (see HubAppID).
 func (h *Hub) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, hubHealth{App: hubAppID, Version: version.Info(), PID: os.Getpid()})
+	writeJSON(w, http.StatusOK, hubHealth{App: HubAppID, Version: version.Info(), PID: os.Getpid()})
 }
 
 // handleMessages serves GET /v1/sessions/{slug}/messages: a page of the session's feed
@@ -741,7 +743,7 @@ func writePidfile(dir string) error {
 
 // queryHubHealth performs ONE identity check against addr's /v1/health:
 //
-//	(true, nil)  — a live hub answered with app == hubAppID;
+//	(true, nil)  — a live hub answered with app == HubAppID;
 //	(false, nil) — SOMETHING is listening but it is not a hub (foreign process);
 //	(false, err) — nothing answered at all (connection refused / timeout).
 //
@@ -767,7 +769,7 @@ func queryHubHealth(addr string, timeout time.Duration) (bool, error) {
 	if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&hh) != nil {
 		return false, nil
 	}
-	return hh.App == hubAppID, nil
+	return hh.App == HubAppID, nil
 }
 
 // probeHubIdentity polls addr until a VERIFIED hub answers /v1/health or the budget
