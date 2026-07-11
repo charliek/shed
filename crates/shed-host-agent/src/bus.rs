@@ -48,6 +48,7 @@ use shed_core::tls::pinned_client_config;
 
 use crate::approval::ApprovalGate;
 use crate::audit::{AuditEntry, AuditSink};
+use crate::aws_backend::{aws_expiry_detail, aws_literal_z, AwsBackend};
 use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
 use crate::ssh_backend::SshBackend;
 
@@ -55,6 +56,16 @@ use crate::ssh_backend::SshBackend;
 const SSH_CODE_KEY_NOT_FOUND: &str = "KEY_NOT_FOUND";
 const SSH_CODE_SIGN_FAILED: &str = "SIGN_FAILED";
 const SSH_CODE_INTERNAL: &str = "INTERNAL_ERROR";
+
+/// AWS protocol error codes (`internal/ext/protocol/aws.go`). `ASSUME_ROLE_FAILED` is
+/// scoped to `get_credentials` failures only (gate-deny / backend-error); the shared
+/// unknown-op / invalid-payload dispatch uses `INTERNAL_ERROR` (`AWSCodeInternal`).
+/// Go also defines `ROLE_NOT_FOUND`, but the handler NEVER emits it, so it is
+/// intentionally omitted here.
+const AWS_CODE_ASSUME_ROLE_FAILED: &str = "ASSUME_ROLE_FAILED";
+const AWS_CODE_INTERNAL: &str = "INTERNAL_ERROR";
+/// The gated AWS op — the only one whose audit carries the approval outcome.
+const AWS_OP_GET_CREDENTIALS: &str = "get_credentials";
 
 // ---------------------------------------------------------------------------
 // Constants (mirrors hostclient.go)
@@ -786,31 +797,46 @@ fn build_http_client(pin: Option<&str>) -> Result<reqwest::Client, BusError> {
 // Single-server daemon entry point + ping responder
 // ---------------------------------------------------------------------------
 
-/// The bus's injected seams for the gated credential flow — built in `main.rs` and
-/// threaded through the subscribe loop into `handle_bus_message`/`handle_sign`: the
-/// approval `gate` (selected from `ssh.approval.policy`), the `audit` sink (durable
-/// JSONL + desktop fan-out), the ed25519 sign `backend`, and the discovery
-/// `server_name` (the audit/approval `server` field — empty in single-server mode).
-/// Grouping the seams keeps the two entry points below the argument-count lint and
-/// gives later slices (aws/docker backends, the credential minter) one place to grow.
+/// The bus's injected seams for the gated credential flows — built in `main.rs` and
+/// threaded through the subscribe loops: the ssh approval `gate` (selected from
+/// `ssh.approval.policy`), the `audit` sink (durable JSONL + desktop fan-out; SHARED
+/// across namespaces), the ed25519 sign `backend`, the discovery `server_name` (the
+/// audit/approval `server` field — empty in single-server mode), and the optional
+/// [`AwsHandlers`] (the second bus namespace). Grouping the seams keeps the entry
+/// points below the argument-count lint and gives later slices (docker backend, the
+/// credential minter) one place to grow.
 pub struct BusHandlers {
     pub gate: Arc<dyn ApprovalGate>,
     pub audit: Arc<dyn AuditSink>,
     pub backend: Arc<dyn SshBackend>,
     pub server_name: String,
+    /// The aws-credentials handler's seams, present only when `aws.enabled()` and the
+    /// backend constructed (Go main.go:166-173 — a nil AWS backend means no aws
+    /// handler). `None` ⇒ the aws-credentials namespace is never subscribed.
+    pub aws: Option<AwsHandlers>,
 }
 
-/// Run the single-server message bus: subscribe to `ssh-agent` (open mode — no
-/// token, no pin) and answer inbound requests until `shutdown` flips. `ping` → a
-/// `pong`; `sign` runs the gated ed25519 flow (approval gate → backend → response +
-/// audit). Mirrors the Go daemon's single-server path
-/// (`main.go` → `startWatcherGroup` → `NewSSHHandler(...).Run`). `server_name` is the
-/// audit/approval `server` field — empty in single-server mode (matches Go).
+/// The aws-credentials handler's seams (the second bus namespace). Carries its OWN
+/// per-namespace approval `gate` (selected from `aws.approval.policy`, NEVER ssh's —
+/// panel F6) and the `backend`; the audit sink + `server_name` are shared from
+/// [`BusHandlers`]. Present iff `main.rs` built the AWS backend.
+pub struct AwsHandlers {
+    pub backend: Arc<dyn AwsBackend>,
+    pub gate: Arc<dyn ApprovalGate>,
+}
+
+/// Run the single-server message bus: subscribe to `ssh-agent` (always) and
+/// `aws-credentials` (when the AWS backend is configured) in open mode (no token, no
+/// pin) and answer inbound requests until `shutdown` flips. Each namespace runs its own
+/// subscribe+serve loop (both racing `shutdown`), mirroring the Go daemon's
+/// per-namespace watcher goroutines (`main.go` → `startWatcherGroup` → the per-handler
+/// `.Run`). `server_name` is the audit/approval `server` field — empty in single-server
+/// mode (matches Go).
 ///
 /// KNOWN GAP (for the harness): Go's watcher group also subscribes to
-/// `aws-credentials`, `docker-credentials`, and the egress-audit stream, and answers
-/// the ssh `list`/`status` ops. Those need their backends + the egress route, so they
-/// are deliberately NOT wired here — this slice wires the ssh-agent ping + gated sign.
+/// `docker-credentials` and the egress-audit stream. Those need their backends + the
+/// egress route, so they are deliberately NOT wired here — this slice wires ssh-agent +
+/// (configured) aws-credentials.
 pub async fn run_single_server_bus(
     server_url: String,
     shutdown: watch::Receiver<bool>,
@@ -838,20 +864,57 @@ pub async fn run_single_server_bus(
         }
     };
     log.info(&format!("brokering for single server server={server_url}"));
-    // The known gap for the harness: only ssh-agent is wired this slice; the other
-    // credential namespaces + egress need their backends (later slices).
+
+    // The subscription set: always ssh-agent; aws-credentials when the AWS backend is
+    // configured (Go: a nil AWS backend means no aws handler). docker-credentials + the
+    // egress stream remain later slices. Compute the set once, then log + spawn from it
+    // so a new namespace is a single push (no parallel branches to keep in sync).
+    let mut subscribed: Vec<&'static str> = vec![NS_SSH_AGENT];
+    if handlers.aws.is_some() {
+        subscribed.push(NS_AWS_CREDENTIALS);
+    }
+    let deferred: Vec<&'static str> = BUS_NAMESPACES
+        .iter()
+        .copied()
+        .filter(|ns| !subscribed.contains(ns))
+        .collect();
     log.info(&format!(
-        "message bus subscribing namespace={}; deferred (later slices): {:?}",
-        NS_SSH_AGENT,
-        &BUS_NAMESPACES[1..]
+        "message bus subscribing namespaces={subscribed:?}; deferred (later slices): {deferred:?}"
     ));
 
-    // Subscribe + run the ping responder. On shutdown (or a terminal 409) the
-    // subscribe loop drops its sender, closing `rx` and ending this loop; the
-    // subscription's Drop then aborts the (already-finished) task. The recv is also
-    // raced against shutdown, and `shutdown` is threaded into `handle_bus_message`
-    // so a `respond` to a hung server can't pin this loop past a SIGTERM/SIGINT.
-    let mut sub = client.subscribe(NS_SSH_AGENT, shutdown.clone());
+    // Share the seams across the per-namespace loops. Each namespace subscribes +
+    // serves independently (both racing `shutdown`), so a slow op on one namespace
+    // can't stall the other.
+    let handlers = Arc::new(handlers);
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    for namespace in subscribed {
+        tasks.push(tokio::spawn(serve_namespace(
+            client.clone(),
+            namespace,
+            shutdown.clone(),
+            handlers.clone(),
+            log.clone(),
+        )));
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
+}
+
+/// Subscribe to one namespace's SSE stream and answer inbound requests until `shutdown`
+/// flips (or the subscription is terminally rejected). On shutdown (or a terminal 409)
+/// the subscribe loop drops its sender, closing `rx` and ending this loop; the recv is
+/// also raced against shutdown, and `shutdown` is threaded into the dispatch so a
+/// `respond` to a hung server can't pin the loop past a SIGTERM/SIGINT. Dispatch is
+/// namespace-aware (see [`dispatch_bus_message`]).
+async fn serve_namespace(
+    client: BusClient,
+    namespace: &'static str,
+    shutdown: watch::Receiver<bool>,
+    handlers: Arc<BusHandlers>,
+    log: Arc<dyn BusLog>,
+) {
+    let mut sub = client.subscribe(namespace, shutdown.clone());
     loop {
         let env = tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => break,
@@ -860,13 +923,42 @@ pub async fn run_single_server_bus(
                 None => break, // sender dropped: shutdown or terminal 409
             },
         };
-        handle_bus_message(&client, NS_SSH_AGENT, &env, &shutdown, &handlers).await;
+        dispatch_bus_message(&client, namespace, &env, &shutdown, &handlers).await;
     }
     let s = sub.status();
     log.info(&format!(
         "message bus stopped namespace={} state={:?} last_error={}",
         s.namespace, s.state, s.last_error
     ));
+}
+
+/// Route one inbound request to its namespace handler: `aws-credentials` → the gated
+/// AWS flow (its OWN per-namespace gate + AWS error codes), every other namespace
+/// (ssh-agent) → [`handle_bus_message`]. The aws branch is reached only when
+/// `handlers.aws` is `Some` (its loop is started only then); a defensive fall-through
+/// to the ssh dispatch keeps a stray aws frame from hanging the shed's request.
+async fn dispatch_bus_message(
+    client: &BusClient,
+    namespace: &str,
+    env: &Envelope,
+    shutdown: &watch::Receiver<bool>,
+    handlers: &BusHandlers,
+) {
+    match (namespace, &handlers.aws) {
+        (NS_AWS_CREDENTIALS, Some(aws)) => {
+            handle_aws_bus_message(
+                client,
+                namespace,
+                env,
+                shutdown,
+                aws,
+                &handlers.audit,
+                &handlers.server_name,
+            )
+            .await
+        }
+        _ => handle_bus_message(client, namespace, env, shutdown, handlers).await,
+    }
 }
 
 /// Answer one inbound bus request, mirroring `ssh_handler.go:handleMessage`'s
@@ -1245,8 +1337,222 @@ async fn handle_sign(
     }
 }
 
+// ---------------------------------------------------------------------------
+// AWS credential handler (a faithful port of aws_handler.go) — the second bus
+// namespace. Uses its own per-namespace gate + the AWS protocol error codes, and the
+// LogEntry audit form (approval + decided_by/scope/ttl) — unlike the ssh positional
+// `list` audit.
+// ---------------------------------------------------------------------------
+
+/// AWS response payload types (serde mirrors of `internal/ext/protocol/aws.go`). Built
+/// as typed structs (not ad-hoc `json!`) so the tag names are pinned in one place; the
+/// `aws_payload_tag_names_match_protocol` test asserts they equal the Go json tags.
+/// `expiration`/`cached_until` use `skip_serializing_if` = Go's `omitempty`.
+#[derive(Serialize)]
+struct AwsCredentialsResponse {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiration: Option<String>,
+}
+
+/// `AWSPingResponse` — the `ping` op's payload.
+#[derive(Serialize)]
+struct AwsPingResponse {
+    status: String,
+}
+
+/// `AWSStatusResponse` — the `status` op's payload. `cached_until` is omitted (Go
+/// `omitempty`) when there is no known expiry.
+#[derive(Serialize)]
+struct AwsStatusResponse {
+    connected: bool,
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_until: Option<String>,
+}
+
+/// `AWSErrorResponse` — an `{error, code}` error payload.
+#[derive(Serialize)]
+struct AwsErrorResponse {
+    error: String,
+    code: String,
+}
+
+/// Build an `{error, code}` AWS error payload (`AWSErrorResponse`).
+fn aws_error(msg: &str, code: &str) -> serde_json::Value {
+    to_payload(&AwsErrorResponse {
+        error: msg.to_string(),
+        code: code.to_string(),
+    })
+}
+
+/// A gated AWS audit entry — the LogEntry form (unlike the ssh positional `list`
+/// audit). The fixed aws-credentials ns + `get_credentials` op, the given result/detail,
+/// the approval method, and the gate outcome's decided_by/scope/ttl. NO `code`/`reason`
+/// (aws_handler.go sets neither on ANY get_credentials audit); `detail` is empty on the
+/// deny path, `err.Error()` on error, and `awsExpiryDetail` on ok.
+fn aws_audit(
+    server_name: &str,
+    shed_name: &str,
+    result: &str,
+    detail: &str,
+    approval: String,
+    outcome: &crate::approval::ApprovalOutcome,
+) -> AuditEntry {
+    AuditEntry {
+        server: server_name.to_string(),
+        shed: shed_name.to_string(),
+        ns: NS_AWS_CREDENTIALS.to_string(),
+        op: AWS_OP_GET_CREDENTIALS.to_string(),
+        result: result.to_string(),
+        detail: detail.to_string(),
+        approval,
+        decided_by: outcome.decided_by.clone(),
+        scope: outcome.scope.clone().unwrap_or_default(),
+        ttl: outcome.ttl.clone().unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// Answer one inbound aws-credentials request, mirroring `aws_handler.go:handleMessage`'s
+/// dispatch. `get_credentials` runs the gated flow (approval gate → backend → response +
+/// audit); `ping` → `{"status":"ok"}`; `status` → `{connected, role, cached_until?}` (no
+/// audit); an unknown op → Go's exact `unknown operation: <op>` `INTERNAL_ERROR`; a
+/// non-object/non-null payload → `{invalid payload, INTERNAL_ERROR}` (the shared
+/// [`parse_operation`], but with AWS codes). The reply plumbing (mint response, echo
+/// `shed`, POST, warn-on-failure) + audit-after-response order match the ssh path.
+async fn handle_aws_bus_message(
+    client: &BusClient,
+    namespace: &str,
+    env: &Envelope,
+    shutdown: &watch::Receiver<bool>,
+    aws: &AwsHandlers,
+    audit: &Arc<dyn AuditSink>,
+    server_name: &str,
+) {
+    let (payload, audit_entry) = aws_dispatch(env, aws, server_name).await;
+    let mut resp = Envelope::new_response(&env.id, namespace, payload);
+    resp.shed = env.shed.clone(); // route the reply back (aws_handler.go: resp.Shed = req.Shed)
+    if let Err(e) = client.respond(namespace, &resp, shutdown).await {
+        client.log.warn(&format!("failed to send aws response: {e}"));
+    }
+    // Audit after responding (aws_handler.go order). Only get_credentials audits; ping/
+    // status/unknown/invalid leave `audit_entry` None.
+    if let Some(entry) = audit_entry {
+        audit.log(entry);
+    }
+}
+
+/// Compute the aws-credentials response payload + optional audit entry for one request,
+/// mirroring `aws_handler.go:handleMessage`'s op dispatch (the network-free core of
+/// [`handle_aws_bus_message`], so unit tests can inspect the payload + audit directly).
+async fn aws_dispatch(
+    env: &Envelope,
+    aws: &AwsHandlers,
+    server_name: &str,
+) -> (serde_json::Value, Option<AuditEntry>) {
+    let shed_name = env.shed.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+    match parse_operation(&env.payload) {
+        Err(()) => (aws_error("invalid payload", AWS_CODE_INTERNAL), None),
+        Ok(op) => match op.as_str() {
+            "get_credentials" => {
+                handle_aws_get_credentials(server_name, shed_name, &aws.gate, &aws.backend).await
+            }
+            "ping" => (
+                to_payload(&AwsPingResponse {
+                    status: "ok".to_string(),
+                }),
+                None,
+            ),
+            "status" => (
+                handle_aws_status(server_name, shed_name, &aws.backend),
+                None,
+            ),
+            other => (
+                aws_error(&format!("unknown operation: {other}"), AWS_CODE_INTERNAL),
+                None,
+            ),
+        },
+    }
+}
+
+/// The gated `get_credentials` flow — a faithful port of
+/// `aws_handler.go:handleGetCredentials`. ORDER matches Go: approval gate FIRST
+/// (deny-all fails closed), THEN the backend vend. Returns the response payload + the
+/// audit entry (all three outcomes — deny/error/ok — audit; the parse-error paths in
+/// [`handle_aws_bus_message`] do not).
+async fn handle_aws_get_credentials(
+    server_name: &str,
+    shed_name: &str,
+    gate: &Arc<dyn ApprovalGate>,
+    backend: &Arc<dyn AwsBackend>,
+) -> (serde_json::Value, Option<AuditEntry>) {
+    let outcome = gate
+        .approve(
+            NS_AWS_CREDENTIALS,
+            AWS_OP_GET_CREDENTIALS,
+            server_name,
+            shed_name,
+            "AWS credentials request",
+        )
+        .await;
+    let approval = gate.method().to_string();
+    if !outcome.approved {
+        // Deny audit: result=denied, approval + decided_by/scope/ttl; NO detail, NO
+        // code, NO reason (aws_handler.go's deny path sets none of those).
+        let entry = aws_audit(server_name, shed_name, "denied", "", approval, &outcome);
+        return (
+            aws_error("approval denied", AWS_CODE_ASSUME_ROLE_FAILED),
+            Some(entry),
+        );
+    }
+
+    match backend.get_credentials(server_name, shed_name).await {
+        Err(e) => {
+            // Error audit: result=error, detail=err.Error(), approval + outcome; NO code.
+            let entry = aws_audit(server_name, shed_name, "error", &e, approval, &outcome);
+            (
+                aws_error("credential request failed", AWS_CODE_ASSUME_ROLE_FAILED),
+                Some(entry),
+            )
+        }
+        Ok(creds) => {
+            // expiration OMITTED when None (Go's zero time.Time → omitempty), else the
+            // literal-Z UTC render (Go's Format("2006-01-02T15:04:05Z")).
+            let resp = AwsCredentialsResponse {
+                access_key_id: creds.access_key_id,
+                secret_access_key: creds.secret_access_key,
+                session_token: creds.session_token,
+                expiration: creds.expiration.map(aws_literal_z),
+            };
+            let detail = aws_expiry_detail(creds.expiration);
+            let entry = aws_audit(server_name, shed_name, "ok", &detail, approval, &outcome);
+            (to_payload(&resp), Some(entry))
+        }
+    }
+}
+
+/// The `status` op — a faithful port of `aws_handler.go:handleStatus`:
+/// `{connected:true, role, cached_until?}`. NO audit (`backend.status` never errors;
+/// `cached_until` renders literal-Z when Some, else the field is omitted).
+fn handle_aws_status(
+    server_name: &str,
+    shed_name: &str,
+    backend: &Arc<dyn AwsBackend>,
+) -> serde_json::Value {
+    let (role, cached_until) = backend.status(server_name, shed_name);
+    to_payload(&AwsStatusResponse {
+        connected: true,
+        role,
+        cached_until: cached_until.map(aws_literal_z),
+    })
+}
+
 /// The credential namespaces (re-exported from `config` for callers wiring the
-/// bus). Only `ssh-agent` is subscribed in this slice.
+/// bus). `ssh-agent` is always subscribed; `aws-credentials` when configured;
+/// `docker-credentials` is a later slice.
 pub const BUS_NAMESPACES: [&str; 3] = [NS_SSH_AGENT, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS];
 
 #[cfg(test)]
@@ -1364,6 +1670,7 @@ mod tests {
             audit,
             backend,
             server_name: String::new(),
+            aws: None,
         }
     }
 
@@ -2564,6 +2871,356 @@ mod tests {
         assert_eq!(
             BUS_NAMESPACES,
             ["ssh-agent", "aws-credentials", "docker-credentials"]
+        );
+    }
+
+    // ---- AWS credential handler (mirror aws_handler.go) --------------------------
+
+    use crate::aws_backend::CachedCreds;
+
+    /// A scripted AWS backend: `get_credentials` returns a canned Result (and counts
+    /// calls, to prove the gate short-circuits a deny); `status` returns a canned
+    /// `(role, expiry)`.
+    struct FakeAwsBackend {
+        creds: Result<CachedCreds, String>,
+        status: (String, Option<i64>),
+        calls: AtomicUsize,
+    }
+    impl FakeAwsBackend {
+        fn new(creds: Result<CachedCreds, String>, status: (String, Option<i64>)) -> Arc<Self> {
+            Arc::new(Self {
+                creds,
+                status,
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn creds_ok(creds: CachedCreds) -> Arc<Self> {
+            Self::new(Ok(creds), ("unused".into(), None))
+        }
+        fn creds_err(msg: &str) -> Arc<Self> {
+            Self::new(Err(msg.to_string()), ("unused".into(), None))
+        }
+        fn with_status(role: &str, until: Option<i64>) -> Arc<Self> {
+            Self::new(Err("unused".into()), (role.to_string(), until))
+        }
+    }
+    #[async_trait::async_trait]
+    impl AwsBackend for FakeAwsBackend {
+        async fn get_credentials(&self, _server: &str, _shed: &str) -> Result<CachedCreds, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.creds.clone()
+        }
+        fn status(&self, _server: &str, _shed: &str) -> (String, Option<i64>) {
+            self.status.clone()
+        }
+    }
+
+    fn creds(exp: Option<i64>) -> CachedCreds {
+        CachedCreds {
+            access_key_id: "ASIATESTKEY".into(),
+            secret_access_key: "SECRETKEY".into(),
+            session_token: "SESSIONTOKEN".into(),
+            expiration: exp,
+        }
+    }
+
+    fn aws_handlers(backend: Arc<dyn AwsBackend>, gate: Arc<dyn ApprovalGate>) -> AwsHandlers {
+        AwsHandlers { backend, gate }
+    }
+
+    /// Build an aws-credentials request Envelope carrying `payload` + a fixed shed.
+    fn aws_env(payload: serde_json::Value) -> Envelope {
+        Envelope {
+            id: "aws-req".into(),
+            namespace: "aws-credentials".into(),
+            msg_type: "request".into(),
+            in_reply_to: String::new(),
+            is_final: true,
+            timestamp: "t".into(),
+            payload: Some(payload),
+            shed: Some(ShedInfo {
+                name: "web".into(),
+                backend: "vz".into(),
+                server: "mini2".into(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn aws_get_credentials_ok() {
+        // 4071049445 == 2099-01-02T15:04:05Z.
+        let backend: Arc<dyn AwsBackend> = FakeAwsBackend::creds_ok(creds(Some(4071049445)));
+        // Single-server mode: server_name is empty (matches Go's h.server).
+        let (payload, entry) =
+            handle_aws_get_credentials("", "web", &approve_gate(), &backend).await;
+        assert_eq!(payload["access_key_id"], "ASIATESTKEY");
+        assert_eq!(payload["secret_access_key"], "SECRETKEY");
+        assert_eq!(payload["session_token"], "SESSIONTOKEN");
+        assert_eq!(payload["expiration"], "2099-01-02T15:04:05Z");
+        // ok audit: ns/op fixed, detail = awsExpiryDetail, approval, empty outcome.
+        let entry = entry.expect("ok path audits");
+        assert_eq!(entry.ns, "aws-credentials");
+        assert_eq!(entry.op, "get_credentials");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.detail, "expires:15:04");
+        assert_eq!(entry.approval, "approve-all");
+        assert_eq!(entry.shed, "web");
+        assert_eq!(entry.server, "");
+        // aws_handler.go sets NO code/reason on ANY get_credentials audit.
+        assert_eq!(entry.code, "");
+        assert_eq!(entry.reason, "");
+    }
+
+    #[tokio::test]
+    async fn aws_expiration_omitted_when_zero() {
+        // No expiry hint → the expiration key is ABSENT (Go omitempty), audit expires:none.
+        let backend: Arc<dyn AwsBackend> = FakeAwsBackend::creds_ok(creds(None));
+        let (payload, entry) =
+            handle_aws_get_credentials("", "web", &approve_gate(), &backend).await;
+        assert!(
+            payload.get("expiration").is_none(),
+            "expiration key must be absent for a None expiry, got {payload}"
+        );
+        assert_eq!(payload["access_key_id"], "ASIATESTKEY");
+        assert_eq!(entry.expect("ok path audits").detail, "expires:none");
+    }
+
+    #[test]
+    fn aws_expiry_detail_format() {
+        // The handler's audit detail helper (aws_backend::aws_expiry_detail): none / HH:MM.
+        assert_eq!(aws_expiry_detail(None), "expires:none");
+        assert_eq!(aws_expiry_detail(Some(4071049445)), "expires:15:04");
+    }
+
+    #[tokio::test]
+    async fn aws_ping() {
+        // ping → {"status":"ok"}, no audit.
+        let aws = aws_handlers(FakeAwsBackend::creds_err("unused"), approve_gate());
+        let (payload, entry) = aws_dispatch(&aws_env(serde_json::json!({"operation":"ping"})), &aws, "").await;
+        assert_eq!(payload, serde_json::json!({"status": "ok"}));
+        assert!(entry.is_none(), "ping does not audit");
+    }
+
+    #[tokio::test]
+    async fn aws_backend_error_maps_assume_role_failed() {
+        let backend: Arc<dyn AwsBackend> =
+            FakeAwsBackend::creds_err("sts:AssumeRole failed for arn:aws:iam::9:role/x: boom");
+        let (payload, entry) =
+            handle_aws_get_credentials("srv", "web", &approve_gate(), &backend).await;
+        // The guest gets the generic mapping; ASSUME_ROLE_FAILED is get_credentials-scoped.
+        assert_eq!(payload["error"], "credential request failed");
+        assert_eq!(payload["code"], "ASSUME_ROLE_FAILED");
+        // error audit: result=error, detail=raw backend error, approval; NO code.
+        let entry = entry.expect("error path audits");
+        assert_eq!(entry.result, "error");
+        assert_eq!(
+            entry.detail,
+            "sts:AssumeRole failed for arn:aws:iam::9:role/x: boom"
+        );
+        assert_eq!(entry.approval, "approve-all");
+        assert_eq!(entry.code, "");
+        assert_eq!(entry.reason, "");
+    }
+
+    #[tokio::test]
+    async fn aws_status_role_and_cached_until() {
+        // Some(expiry) → cached_until rendered literal-Z; status never audits.
+        let aws = aws_handlers(
+            FakeAwsBackend::with_status("passthrough:shed-test", Some(4071049445)),
+            approve_gate(),
+        );
+        let (payload, entry) =
+            aws_dispatch(&aws_env(serde_json::json!({"operation":"status"})), &aws, "").await;
+        assert_eq!(
+            payload,
+            serde_json::json!({"connected": true, "role": "passthrough:shed-test", "cached_until": "2099-01-02T15:04:05Z"})
+        );
+        assert!(entry.is_none(), "status does not audit");
+        // None → cached_until omitted (Go covers only the nil case; Rust covers both).
+        let aws = aws_handlers(
+            FakeAwsBackend::with_status("arn:aws:iam::9:role/x", None),
+            approve_gate(),
+        );
+        let (payload, _) =
+            aws_dispatch(&aws_env(serde_json::json!({"operation":"status"})), &aws, "").await;
+        assert_eq!(
+            payload,
+            serde_json::json!({"connected": true, "role": "arn:aws:iam::9:role/x"})
+        );
+        assert!(payload.get("cached_until").is_none());
+    }
+
+    #[tokio::test]
+    async fn aws_denied_by_gate() {
+        // A deny-all gate rejects before the backend is hit; the denied audit carries NO
+        // detail/code/reason and the empty deny-all outcome.
+        let backend = FakeAwsBackend::creds_ok(creds(Some(4071049445)));
+        let dyn_backend: Arc<dyn AwsBackend> = backend.clone();
+        let (payload, entry) =
+            handle_aws_get_credentials("srv", "web", &deny_gate(), &dyn_backend).await;
+        assert_eq!(payload["error"], "approval denied");
+        assert_eq!(payload["code"], "ASSUME_ROLE_FAILED");
+        let entry = entry.expect("deny path audits");
+        assert_eq!(entry.result, "denied");
+        assert_eq!(entry.approval, "deny-all");
+        assert_eq!(entry.detail, "");
+        assert_eq!(entry.code, "");
+        assert_eq!(entry.reason, "");
+        assert_eq!(entry.decided_by, ""); // deny-all's empty outcome
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            0,
+            "backend must not be consulted when the gate denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn aws_unknown_op_exact_string() {
+        let aws = aws_handlers(FakeAwsBackend::creds_err("unused"), approve_gate());
+        let (payload, entry) =
+            aws_dispatch(&aws_env(serde_json::json!({"operation": "delete"})), &aws, "").await;
+        assert_eq!(payload["error"], "unknown operation: delete");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn aws_invalid_payload_internal_error() {
+        // A non-object payload → {invalid payload, INTERNAL_ERROR} (AWS code, shared parse).
+        let aws = aws_handlers(FakeAwsBackend::creds_err("unused"), approve_gate());
+        let (payload, entry) = aws_dispatch(&aws_env(serde_json::json!([1, 2, 3])), &aws, "").await;
+        assert_eq!(payload["error"], "invalid payload");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn aws_uses_aws_gate_not_ssh() {
+        // One BusHandlers: ssh gate = deny-all, aws gate = approve-all. Routed through the
+        // real dispatcher ([`dispatch_bus_message`]) + the wire, an aws get_credentials is
+        // APPROVED (uses aws.gate → the mock only matches a vended-key body) while an ssh
+        // sign is DENIED (uses the ssh gate → the mock only matches an "approval denied"
+        // body). Each mock's `.assert()` fails if the wrong gate was consulted, proving
+        // per-namespace gate selection (F6).
+        let handlers = BusHandlers {
+            gate: deny_gate(),                                  // ssh gate: deny-all
+            audit: noop_audit(),
+            backend: empty_backend(),
+            server_name: String::new(),
+            aws: Some(AwsHandlers {
+                backend: FakeAwsBackend::creds_ok(creds(None)), // aws gate: approve-all
+                gate: approve_gate(),
+            }),
+        };
+
+        // aws-credentials → the approve-all aws gate vends the key (never "approval denied").
+        let server = MockServer::start_async().await;
+        let aws_ok = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/aws-credentials/respond")
+                    .matches(|req| {
+                        let body = req
+                            .body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                            .unwrap_or_default();
+                        body.contains("ASIATESTKEY") && !body.contains("approval denied")
+                    });
+                t.status(204);
+            })
+            .await;
+        let client = open_client(&server.base_url());
+        dispatch_bus_message(
+            &client,
+            "aws-credentials",
+            &aws_env(serde_json::json!({"operation": "get_credentials"})),
+            &never_shutdown(),
+            &handlers,
+        )
+        .await;
+        aws_ok.assert_async().await;
+
+        // ssh-agent → the deny-all ssh gate rejects the sign (never a signature response).
+        let ssh_server = MockServer::start_async().await;
+        let ssh_denied = ssh_server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/ssh-agent/respond")
+                    .matches(|req| {
+                        let body = req
+                            .body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                            .unwrap_or_default();
+                        body.contains("approval denied") && body.contains("SIGN_FAILED")
+                    });
+                t.status(204);
+            })
+            .await;
+        let ssh_client = open_client(&ssh_server.base_url());
+        dispatch_bus_message(
+            &ssh_client,
+            "ssh-agent",
+            &sign_env(&b64(&fixed_ed25519_pub()), &b64(b"data"), 0),
+            &never_shutdown(),
+            &handlers,
+        )
+        .await;
+        ssh_denied.assert_async().await;
+    }
+
+    #[test]
+    fn aws_payload_tag_names_match_protocol() {
+        // Golden-consistency: the serde tag names equal the Go json tags in aws.go.
+        assert_eq!(
+            serde_json::to_value(AwsCredentialsResponse {
+                access_key_id: "a".into(),
+                secret_access_key: "b".into(),
+                session_token: "c".into(),
+                expiration: Some("2099-01-02T15:04:05Z".into()),
+            })
+            .unwrap(),
+            serde_json::json!({"access_key_id":"a","secret_access_key":"b","session_token":"c","expiration":"2099-01-02T15:04:05Z"})
+        );
+        assert_eq!(
+            serde_json::to_value(AwsCredentialsResponse {
+                access_key_id: "a".into(),
+                secret_access_key: "b".into(),
+                session_token: "c".into(),
+                expiration: None,
+            })
+            .unwrap(),
+            serde_json::json!({"access_key_id":"a","secret_access_key":"b","session_token":"c"})
+        );
+        assert_eq!(
+            serde_json::to_value(AwsStatusResponse {
+                connected: true,
+                role: "passthrough:p".into(),
+                cached_until: Some("2099-01-02T15:04:05Z".into()),
+            })
+            .unwrap(),
+            serde_json::json!({"connected":true,"role":"passthrough:p","cached_until":"2099-01-02T15:04:05Z"})
+        );
+        assert_eq!(
+            serde_json::to_value(AwsStatusResponse {
+                connected: true,
+                role: "passthrough:p".into(),
+                cached_until: None,
+            })
+            .unwrap(),
+            serde_json::json!({"connected":true,"role":"passthrough:p"})
+        );
+        assert_eq!(
+            serde_json::to_value(AwsPingResponse {
+                status: "ok".into()
+            })
+            .unwrap(),
+            serde_json::json!({"status":"ok"})
+        );
+        assert_eq!(
+            aws_error("boom", "INTERNAL_ERROR"),
+            serde_json::json!({"error":"boom","code":"INTERNAL_ERROR"})
         );
     }
 }

@@ -390,19 +390,23 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             // hand its `Arc` to the bus.
             let backend: Arc<dyn ssh_backend::SshBackend> = ssh_backend;
 
-            // Select the ssh approval gate from the effective policy (empty →
-            // deny-all, fail-closed). shed-desktop delegates to the desktop server;
-            // any policy this slice doesn't implement (deny-all, biometrics) fails
-            // closed to deny-all — the touch-id gates are a later slice.
-            let ssh_policy = cfg.effective_policy(config::NS_SSH_AGENT);
-            let gate: Arc<dyn approval::ApprovalGate> = match ssh_policy.as_str() {
-                config::POLICY_APPROVE_ALL => Arc::new(approval::ApproveAllGate),
-                #[cfg(feature = "desktop-forwarding")]
-                config::POLICY_SHED_DESKTOP => {
-                    Arc::new(desktop::DesktopGate::new(desktop_server.clone()))
+            // Select each namespace's approval gate from its own effective policy (empty
+            // → deny-all, fail-closed). shed-desktop delegates to the desktop server; any
+            // policy this slice doesn't implement (deny-all, biometrics) fails closed to
+            // deny-all — the touch-id gates are a later slice. The closure gives ssh and
+            // aws their OWN per-namespace gate (never a shared one), from
+            // `<ns>.approval.policy`.
+            let select_gate = |policy: &str| -> Arc<dyn approval::ApprovalGate> {
+                match policy {
+                    config::POLICY_APPROVE_ALL => Arc::new(approval::ApproveAllGate),
+                    #[cfg(feature = "desktop-forwarding")]
+                    config::POLICY_SHED_DESKTOP => {
+                        Arc::new(desktop::DesktopGate::new(desktop_server.clone()))
+                    }
+                    _ => Arc::new(approval::DenyAllGate),
                 }
-                _ => Arc::new(approval::DenyAllGate),
             };
+            let gate = select_gate(&cfg.effective_policy(config::NS_SSH_AGENT));
 
             #[cfg(feature = "desktop-forwarding")]
             let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(
@@ -412,11 +416,34 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             #[cfg(not(feature = "desktop-forwarding"))]
             let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(&cfg));
 
+            // The AWS credential backend (optional; Go main.go:166-173 parity): build it
+            // from `aws.*`. A construction error — including `new_sts_backend`'s "no AWS
+            // credentials configured…" not-enabled case — warns and leaves `aws` None, so
+            // the aws-credentials namespace is simply never subscribed. Its gate is the
+            // aws-credentials per-namespace gate (from `aws.approval.policy`), distinct
+            // from ssh's.
+            let aws = match aws_backend::new_sts_backend(cfg.aws.clone(), bus_log.clone()) {
+                Ok(sts) => {
+                    let backend_dyn: Arc<dyn aws_backend::AwsBackend> = Arc::new(sts);
+                    let aws_gate =
+                        select_gate(&cfg.effective_policy(config::NS_AWS_CREDENTIALS));
+                    Some(bus::AwsHandlers {
+                        backend: backend_dyn,
+                        gate: aws_gate,
+                    })
+                }
+                Err(e) => {
+                    bus_log.warn(&format!("AWS handler disabled error={e}"));
+                    None
+                }
+            };
+
             let handlers = bus::BusHandlers {
                 gate,
                 audit,
                 backend,
                 server_name: String::new(),
+                aws,
             };
             tasks.push(tokio::spawn(async move {
                 bus::run_single_server_bus(server_url, rx, bus_log, handlers).await;

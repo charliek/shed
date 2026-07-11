@@ -143,16 +143,24 @@ class SyntheticBus:
     def await_response(self, ns: str, timeout: float = 5.0) -> dict:
         """Block until the daemon POSTs a response Envelope for `{ns}` and return the
         first one (or raise on timeout). Deadline-driven."""
+        return self.await_response_at(ns, 0, timeout)
+
+    def await_response_at(self, ns: str, index: int, timeout: float = 5.0) -> dict:
+        """Block until the daemon has POSTed at least `index + 1` responses for `{ns}`
+        and return the one at `index` (arrival order). Deadline-driven. Lets a test that
+        drives two sequential requests (e.g. the re-login pickup) read the SECOND
+        response without racing the first."""
         deadline = time.monotonic() + timeout
         with self._cond:
-            while not self._responses.get(ns):
+            while len(self._responses.get(ns, [])) <= index:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise AssertionError(
-                        f"no response POSTed for {ns!r} within {timeout}s"
+                        f"fewer than {index + 1} responses POSTed for {ns!r} within "
+                        f"{timeout}s (got {len(self._responses.get(ns, []))})"
                     )
                 self._cond.wait(remaining)
-            return self._responses[ns][0]
+            return self._responses[ns][index]
 
     def subscribed_namespaces(self) -> list[str]:
         """A snapshot of the namespaces subscribed so far (sorted)."""

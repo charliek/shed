@@ -333,13 +333,9 @@ pub struct AwsShedConfig {
 }
 
 /// The effective AWS policy for a single `(server, shed)` pair (Go's `ResolvedAWS`).
-/// Only [`AwsConfig::resolve`] constructs it, and `resolve` is reached only through
-/// the AWS backend, which `main.rs` wires in commit 3 — so under a plain
-/// `cargo build --no-default-features` (no test targets) it is not yet reachable.
-/// The allow keeps that headless build warning-free until the wiring lands (same
-/// ported-but-unwired posture as `minter.rs`); it is live under `--all-targets`/tests.
+/// Constructed by [`AwsConfig::resolve`] and consumed by the AWS backend
+/// (`aws_backend.rs`), which `main.rs` wires into the bus.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ResolvedAws {
     /// Assumed-role ARN (`""` => no role configured).
     pub role: String,
@@ -350,11 +346,8 @@ pub struct ResolvedAws {
 }
 
 // `from_node` is live (called by `HostAgentConfig::parse`); `resolve`/`enabled` are
-// reached only through the AWS backend, which `main.rs` wires in commit 3, so under a
-// plain `cargo build --no-default-features` (no test targets) they are not yet
-// reachable. The block-level allow keeps that headless build warning-free until the
-// wiring lands (ported-but-unwired posture); all three are live under `--all-targets`.
-#[allow(dead_code)]
+// reached through the AWS backend + `main.rs`, wired into the bus (`new_sts_backend`
+// calls `enabled`; the backend's get_credentials/status call `resolve`).
 impl AwsConfig {
     /// Build the AWS slice from the parsed config tree, applying the same load
     /// defaults Go's `DefaultConfig`/`LoadConfig` do (`config.go:439-443`): an

@@ -23,12 +23,9 @@
 //! build is preserved (the behavioural property the `passthrough_only_never_builds_client`
 //! test pins); there is simply no load-time error to latch.
 //!
-//! **Wiring:** this whole module is ported in this slice but reached only through the
-//! aws-credentials handler + `main.rs`, which are added in commit 3. Until then it is
-//! unreachable in a non-test build, so a module-wide `allow(dead_code)` keeps the
-//! headless `cargo build --no-default-features` warning-free (the module is fully
-//! exercised under `--all-targets`/tests). Remove this allow when commit 3 wires it.
-#![allow(dead_code)]
+//! **Wiring:** this module is reached through the aws-credentials bus handler
+//! (`bus.rs`) + `main.rs`, which construct the backend via [`new_sts_backend`] and
+//! dispatch `get_credentials`/`status` to it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

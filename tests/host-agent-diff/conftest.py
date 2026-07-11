@@ -330,6 +330,7 @@ def daemon(binaries, tmp_path_factory):
         shed_config: str | None = None,
         known_hosts: str | None = None,
         ssh_shim_bundle: str | None = None,
+        install_aws_credentials: str | None = None,
     ):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
         home = root / "home"
@@ -363,6 +364,19 @@ def daemon(binaries, tmp_path_factory):
                 key_dst = ssh_dir / dst_name
                 key_dst.write_bytes((FIXTURES_DIR / stem).read_bytes())
                 os.chmod(key_dst, 0o600)
+
+        # Install the AWS shared-credentials fixture into this daemon's isolated
+        # `<HOME>/.aws/{credentials,config}` BEFORE launch, so a passthrough vend reads
+        # the SAME profile on both impls (Go `~/.aws/credentials` default + Rust
+        # `user_home_dir().join(".aws")`, both keyed off `$HOME`). The config file is
+        # written EMPTY (Go's `LoadSharedConfigProfile` merges config + credentials; the
+        # credentials file carries the static keys). Hermetic by construction — no
+        # AWS_SHARED_CREDENTIALS_FILE env plumbing needed (that route is unit-covered).
+        if install_aws_credentials is not None:
+            aws_dir = home / ".aws"
+            aws_dir.mkdir(exist_ok=True)
+            (aws_dir / "credentials").write_text(install_aws_credentials)
+            (aws_dir / "config").write_text("")
 
         # The minter reads `<HOME>/.shed/{config.yaml,known_hosts}` (the shed CLI
         # config it resolves servers from + the host-key pin). Both impls read the
