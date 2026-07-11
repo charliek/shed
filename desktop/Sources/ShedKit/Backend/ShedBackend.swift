@@ -30,6 +30,12 @@ public final class ShedBackend {
     /// harness can fail fast if a run isn't actually hermetic.
     public private(set) var mockBaseURL: String?
 
+    /// TEST-ONLY per-host down simulation: the comma-separated server names from
+    /// `SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS` (parsed only in test mode) that
+    /// `AppModel` points at a closed port instead of the mock, so the per-host
+    /// error row is exercisable e2e. Empty unless test mode + the var is set.
+    public private(set) var mockUnreachableHosts: Set<String> = []
+
     /// Route read/lifecycle/create ops through the Rust shed-core. Default **on**
     /// (M0); `SHED_DESKTOP_RUST_CORE=0` forces the legacy Swift `URLSession` path
     /// (a rollback escape hatch kept for ≥2 releases). Reported by `identify` as
@@ -73,6 +79,15 @@ public final class ShedBackend {
         self.testMode = env["SHED_DESKTOP_TEST_MODE"] == "1"
         self.mockBaseURL = env["SHED_DESKTOP_MOCK_BASE_URL"]
         self.rustCore = env["SHED_DESKTOP_RUST_CORE"] != "0"
+        // Only consulted in the mock branch; parse it only in test mode so a stray
+        // env var can never affect a production run.
+        self.mockUnreachableHosts = self.testMode
+            ? Set(
+                (env["SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS"] ?? "")
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty })
+            : []
 
         let home = (env["HOME"] ?? NSHomeDirectory()) as NSString
         self.shedConfigPath = env["SHED_DESKTOP_SHED_CONFIG"]

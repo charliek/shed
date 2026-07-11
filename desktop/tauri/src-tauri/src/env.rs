@@ -2,6 +2,7 @@
 //! Swift `ShedBackend` hermeticity hooks so the pytest harness can point the Tauri
 //! app at an in-process mock + a fixture config without touching real hosts.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -12,6 +13,11 @@ pub struct Env {
     /// (`SHED_TAURI_MOCK_BASE_URL`). Echoed by `identify` so the harness can fail
     /// fast if a run isn't actually hermetic.
     pub mock_base_url: Option<String>,
+    /// TEST-ONLY per-host down simulation: the comma-separated server NAMES from
+    /// `SHED_TAURI_MOCK_UNREACHABLE_HOSTS` (parsed only in test mode) that the
+    /// backend points at a closed port instead of the mock, so the harness can
+    /// exercise the per-host error row. Empty unless test mode + the var is set.
+    pub mock_unreachable_hosts: HashSet<String>,
     /// The shed config to read (`SHED_TAURI_SHED_CONFIG`, else `~/.shed/config.yaml`).
     #[allow(dead_code)] // read by the shed-app backend in A1b
     pub config_path: PathBuf,
@@ -41,9 +47,25 @@ impl Env {
                     default_config_path()
                 }
             });
+        // Only consulted in the mock arm; parse it only in test mode so a stray env
+        // var can never affect a production run.
+        let mock_unreachable_hosts = if test_mode {
+            var("SHED_TAURI_MOCK_UNREACHABLE_HOSTS")
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
         Self {
             test_mode,
             mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
+            mock_unreachable_hosts,
             config_path,
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)

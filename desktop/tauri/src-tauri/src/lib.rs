@@ -569,6 +569,7 @@ pub fn run() {
         env.mock_base_url.as_deref(),
         &env.config_path,
         minter.as_ref(),
+        &env.mock_unreachable_hosts,
     ));
 
     // The Agents / Remote-Control service (session store + process seam). Same
