@@ -52,11 +52,19 @@ make -C desktop deb-validate        # build the .deb + install-validate in a cle
 
 ## Screenshots
 
-`app.screenshot` renders a window's content view to a PNG in-process (no screen-capture
-permission, works occluded/off-screen). The harness asserts the PNG decodes and matches
-`app.window_metrics`; an agent can also read the PNG directly to eyeball a change.
+On the **mac** app `app.screenshot` renders a window's content view to a PNG in-process (no
+screen-capture permission, works occluded/off-screen). The harness asserts the PNG decodes
+and matches `app.window_metrics`; an agent can also read the PNG directly to eyeball a change.
 
 ```bash
 shedctl ui show-window
 shedctl screenshot --surface window --scale 2 --out /tmp/shot.png
 ```
+
+The **Tauri** client has no in-process WebKitGTK capture, so its `app.screenshot` shells out
+to a platform tool (`grim`/`scrot` on Linux, `screencapture` on macOS). On macOS that path is
+Screen-Recording-TCC-gated and exits non-zero in an agent/headless session, so the Tauri
+screenshot assertions **skip on Darwin by design** — the Linux render gate under Xvfb is the
+visual gate. `ui.set_appearance {mode: light|dark}` drives the dashboard's light/dark mode
+deterministically (the reported `computed_style.mode` echoes it), so a dark-mode capture
+doesn't depend on toggling the header.

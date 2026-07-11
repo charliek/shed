@@ -21,7 +21,7 @@ Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
 |----|--------|--------|
 | `identify` | — | `socket_path`, `pid`, `app_label`, `app_id`, `ui_version`, `protocol_version`, `test_mode`, `mock_base_url?` |
 | `ui.state` | — | `pane`, `hosts[]`, `sheds[]`, `host_agent_connected`, `last_error?` |
-| `ui.navigate` | `pane` (sheds\|approvals\|agents\|activity\|system) | `pane` |
+| `ui.navigate` | `pane` (sheds\|approvals\|agents\|activity\|egress\|system) | `pane` |
 | `ui.set_ssh_approval` | `method?`, `scope?`, `ttl?` | `{}` (applies SSH approval prefs + resets live SSH grants) |
 | `ui.show_window` | — | `{}` |
 | `ui.hide_window` | — | `{}` (closes the dashboard → menu-bar-only accessory) |

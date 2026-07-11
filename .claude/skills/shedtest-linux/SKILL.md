@@ -70,6 +70,44 @@ exactly as in the repo. The source is copied into a writable `/work` (not a read
 because Tauri's `build.rs` writes `gen/` next to `Cargo.toml`. Rust builds to a `/target`
 volume so it never clobbers the mac target dir.
 
+## Capturing deterministic screenshots (the render gate, repurposed)
+
+The render gate proves the app renders; to grab labeled PNGs of a specific
+pane/appearance (e.g. the Plex reskin, the Egress pane, a dark-mode shot), run a
+**one-off `docker run` that mirrors `tauri-build-linux`** but swaps the pytest
+command for a small Python driver. Same wiring as the target (see the Makefile):
+
+- `docker build -t shed-tauri-linux:latest - < Dockerfile.tauri-linux` first.
+- Mount the **REPO/WORKTREE ROOT** (the dir that holds `crates/` + `desktop/`)
+  **read-only** at `/repo` (`-v "$ROOT:/repo:ro"`), and add a **writable** out dir
+  for the PNGs (`-v "$HOST_OUT:/out"` — the `deb` target's pattern).
+- Reuse the `shed-tauri-linux-{cargo,target}` cache volumes so the Rust build is
+  incremental across runs (`-v shed-tauri-linux-cargo:/usr/local/cargo/registry -v
+  shed-tauri-linux-target:/target`), with `-e CARGO_TARGET_DIR=/target`.
+- `--cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g` and
+  `-e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri` (point the harness at the
+  binary this run builds).
+
+Inside the container: `tar` the repo-root layout (`crates desktop/tauri
+desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock`) into
+`/work`, `cd /work/desktop/tauri/src-tauri && cargo build --locked`, then
+`xvfb-run -a --server-args="-screen 0 1400x900x24"` a Python driver that:
+
+- adds `/work/desktop/tools/shedtest` + `/work/desktop/tools/fake-host-agent` to
+  `sys.path` and imports `ui`, `client`, `mockserver`, `fake_host_agent`;
+- launches the mock + fake host-agent + the app hermetically via the harness's own
+  `ui.launch` (throwaway HOME/XDG under `/work` or `/tmp`);
+- seeds fixtures — `rc.inject_test` sessions for the Agents pane, `fake.emit_event`
+  audit frames for Activity/Egress (mixed-ns: an `ssh-agent` + an `egress` event is
+  the ns-filter fixture) — `navigate`s to the pane, drives sub-state
+  (`egress.show`), calls `ui.set_appearance("dark")` for the dark shot, and captures
+  via the `app.screenshot` op, writing each PNG under `/out`.
+
+`app.screenshot` on the Xvfb (X11) leg shells out to `scrot`, so the PNG is the full
+display; the reported truth ops (`dashboard.dump` / `agents.dump` /
+`egress.profiles` / `ui.badges` / `ui.computed_style`) stay the deterministic
+assertions, the pixels are the eyeball.
+
 ## Gremlins
 
 - **WebKitGTK web-process dies / JS never runs** → the render gate needs
@@ -88,6 +126,15 @@ volume so it never clobbers the mac target dir.
   this reason. Building the crate by hand? build the UI bundle first.
 - **In-container paths** → everything runs under `/work/desktop`; `uv` uses
   `UV_PROJECT_ENVIRONMENT=/tmp/uv-venv` (the repo mount is read-only). Don't assume host paths.
+- **`cargo: command not found` in a fresh shell** → the host Rust toolchain is
+  mise-managed and isn't on a non-login shell's PATH. `export PATH="$HOME/.cargo/bin:$PATH"`
+  before running `cargo`/`make tauri-*` by hand (the Docker legs carry their own in-image
+  cargo, so this only bites host-side builds — the native run + the ad-hoc screenshot driver).
+- **`rc.inject_test` state silently coerces to `ready`** → the valid `RcState` wire values
+  are `starting|ready|reconnecting|needs-trust|needs-auth|dead` — there is no `working`/`idle`.
+  An unrecognized `state` fails to deserialize and falls back to `RcState::Ready` with **no
+  error** (`ipc.rs::build_inject_session`), so a fixture with a typo'd/invented state renders
+  Ready and you chase a phantom. Send the exact wire value.
 
 ## Native run on a Mac (quick UI-comparison loop)
 
