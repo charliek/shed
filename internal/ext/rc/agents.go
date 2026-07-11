@@ -429,13 +429,22 @@ func classifyOpencode(_ Kind, pane string) PaneResult {
 // notice).
 var cursorAuthRe = regexp.MustCompile(`(?i)Press any key to log in\.\.\.|Authentication required to use Cursor Agent|click this link to log in`)
 
-// classifyCursor derives a cursor-agent pane's lifecycle state. Its authed/ready
-// screen needs an interactive login and was not captured live, so a logged-in cursor
-// currently reads as starting (tracked as an authed-fixture follow-up); needs-auth is
-// the definitively-classified state.
+// cursorReadyRe anchors on the authed composer's placeholder (live-captured,
+// cursor-agent 2026.07.09), line-anchored with its arrow prefix so the phrase
+// quoted inside agent output can't read as ready. Like opencode's placeholder it
+// may disappear once a conversation starts — a mid-conversation capture is still
+// wanted to add a persistent-chrome anchor.
+var cursorReadyRe = regexp.MustCompile(`(?m)^\s*→ Plan, search, build anything\s*$`)
+
+// classifyCursor derives a cursor-agent pane's lifecycle state. The auth screens and
+// the authed composer are disjoint, so auth is checked first and ready second;
+// anything else (booting, mid-conversation) reads as starting.
 func classifyCursor(_ Kind, pane string) PaneResult {
 	if cursorAuthRe.MatchString(pane) {
 		return PaneResult{State: StateNeedsAuth}
+	}
+	if cursorReadyRe.MatchString(pane) {
+		return PaneResult{State: StateReady}
 	}
 	return PaneResult{State: StateStarting}
 }
