@@ -1,0 +1,27 @@
+{
+  "_comment": "Golden fixture for LoadDiscoveredServers / load_discovered_servers — input ~/.shed/config.yaml text -> expected []ServerTarget. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go) and the Rust runner (in crates/shed-host-agent/src/controltoken.rs tests) so the two impls cannot drift together. Pins the load-bearing divergences from shed-core::ShedConfig: ssh_port defaults to 0 (NOT 22) when omitted, and empty-host entries are skipped. Targets are sorted by name.",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "ssh_port default 0, empty-host skipped, api_url vs http fallback, sorted",
+      "config_yaml": "servers:\n  https-with-ssh:\n    api_url: https://a.example:8443\n    host: a.example\n    ssh_port: 2222\n  https-no-ssh:\n    api_url: https://b.example:8443\n    host: b.example\n  plain:\n    host: c.example\n    http_port: 9000\n  empty-host:\n    ssh_port: 2222\n",
+      "expected": [
+        {"name": "https-no-ssh", "url": "https://b.example:8443", "token": "", "tls_fingerprint": "", "ssh_host": "b.example", "ssh_port": 0},
+        {"name": "https-with-ssh", "url": "https://a.example:8443", "token": "", "tls_fingerprint": "", "ssh_host": "a.example", "ssh_port": 2222},
+        {"name": "plain", "url": "http://c.example:9000", "token": "", "tls_fingerprint": "", "ssh_host": "c.example", "ssh_port": 0}
+      ]
+    },
+    {
+      "name": "credentials_token + raw tls_cert_fingerprint carried; ssh_port parsed; default http_port 8080",
+      "config_yaml": "servers:\n  s:\n    host: s.example\n    ssh_port: 8022\n    credentials_token: tok-abc\n    tls_cert_fingerprint: sha256:AABBcc\n",
+      "expected": [
+        {"name": "s", "url": "http://s.example:8080", "token": "tok-abc", "tls_fingerprint": "sha256:AABBcc", "ssh_host": "s.example", "ssh_port": 8022}
+      ]
+    },
+    {
+      "name": "no servers block -> empty",
+      "config_yaml": "default_server: x\n",
+      "expected": []
+    }
+  ]
+}

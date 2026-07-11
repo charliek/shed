@@ -1,0 +1,71 @@
+[package]
+name = "shed-host-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-host-agent — the host-side credential-broker daemon (Rust port). Slice 0: scaffold + CLI surface (version/status subcommands) + the read-only status UDS + a minimal LiveStatus-scoped config reader, wire-compatible with the Go shed-host-agent daemon (status_server.go / status.go / sockets.go / main.go)."
+
+[[bin]]
+name = "shed-host-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# The desktop approval channel (the async UDS server in `desktop.rs`). On by
+# default; a headless build (`--no-default-features`) drops that MODULE only. The
+# message bus (`bus.rs`) is the daemon's core job, so it is NOT gated — its deps
+# (shed-core / reqwest / futures-util / uuid / async-trait) are always compiled in,
+# and a headless build still builds the bus. The feature is now a pure code cfg.
+default = ["desktop-forwarding"]
+desktop-forwarding = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# net (UnixListener/UnixStream) + io-util (AsyncWriteExt/BufReader) + sync
+# (mpsc/oneshot/watch) + signal (SIGTERM/SIGINT) + process (the SSH-bootstrap minter shells
+# `ssh` via tokio::process::Command) on top of rt-multi-thread/macros/time.
+tokio = { workspace = true, features = ["net", "io-util", "sync", "signal", "process", "rt-multi-thread", "macros", "time"] }
+# getpid() for the LiveStatus `pid` field (matches the Go daemon's os.Getpid()).
+libc = "0.2"
+# The shared client core: reused by the bus for the SSE parser (sse.rs) + the
+# leaf-cert TLS pin verifier (tls.rs), and by the desktop server for the wire codec
+# + ControlTokenMinter seam. Always-on because the bus is not feature-gated.
+shed-core = { path = "../shed-core" }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+# The bus HTTP client: reqwest (rustls) for SSE subscribe + respond POST, and
+# futures-util for the bytes-stream adaptor. Match shed-core's stack so cargo
+# unifies one reqwest/rustls build across the workspace.
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+# The ssh-agent `sign` backend (surface B, always-on — the bus is not gated, so
+# these are NOT behind `desktop-forwarding` and the headless build compiles them).
+# ed25519-dalek does RFC-8032 *deterministic* ed25519 signing, byte-identical to
+# Go's `x/crypto/ssh` ed25519 signer (same key + data → same 64-byte blob), so the
+# differential can compare the signature blob directly. ssh-key parses the OpenSSH
+# `~/.ssh/id_ed25519` private key + decodes the SSH public-key wire blob; its
+# ed25519 feature reuses the same ed25519-dalek v2, so cargo unifies one build.
+#
+# The ecdsa/p256/p384/p521/rsa/dsa features give ssh-key's `known_hosts` parser the
+# SAME host-key-algorithm coverage as Go's `x/crypto/ssh.ParseKnownHosts` (used by the
+# minter's `known_hosts` pin pre-check, `minter.rs`). Without them an ed25519-only
+# build would reject a valid ecdsa/rsa/dsa host-key pin line with "unknown algorithm"
+# where Go accepts it — fail-closed but a compat regression. These are RustCrypto
+# crates (no UI/WebKitGTK deps), so they don't cross the crates/ dependency-clean line.
+ed25519-dalek = "2"
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "ecdsa", "p256", "p384", "p521", "rsa", "dsa", "std"] }
+# base64 StdEncoding for the sign req/resp (public_key / data / blob), matching Go's
+# encoding/base64.StdEncoding.
+base64 = "0.22"
+
+[dev-dependencies]
+# Throwaway socket dirs for the status "not running" exit-code test.
+tempfile = "3"
+# Hermetic mock shed-server for the bus unit tests (subscribe/respond/409/401),
+# mirroring shed-core's http.rs test rig.
+httpmock = { workspace = true }

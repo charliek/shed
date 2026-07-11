@@ -4,6 +4,8 @@ dist/
 /shed
 /shed-server
 /shed-agent
+# bare `go build ./cmd/shed-host-agent` drops the binary at the repo root
+/shed-host-agent
 firecracker/shed-agent
 vz/shed-agent
 # Guest extension binaries + /etc overlay staged into the rootfs build
@@ -101,6 +103,9 @@ uv.lock
 !tests/integration/uv.lock
 # … and the desktop workspace's lockfile is committed too:
 !desktop/uv.lock
+# … and the host-agent differential harness's lockfile is committed too:
+!tests/host-agent-diff/uv.lock
 # Python tooling caches for the integration suite
 tests/integration/.pytest_cache/
+tests/host-agent-diff/.pytest_cache/
 **/__pycache__/

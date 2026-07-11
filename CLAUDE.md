@@ -15,7 +15,7 @@ The Go tree (`cmd/`, `internal/`, the CLI/server/agent) is the primary product. 
 
 The Go build never traverses `crates/` or `desktop/` (`go list ./...` / `golangci-lint` stay Go-only); root `make build`/`test`/`check` are Go-only. Desktop targets are reached via the reserved `desktop-` passthrough (`make desktop-<target>`, e.g. `make desktop-build`) or `make -C desktop <target>`.
 
-**Two pytest suites, never merged:** `tests/integration/` is the live server-facing create-cycle suite (drives a real `shed-server`); `desktop/tools/shedtest/` is the mock-server UI harness (drives the real app over its IPC socket, hermetic). Different worlds — don't cross-wire them.
+**Three pytest suites, never merged:** `tests/integration/` is the live server-facing create-cycle suite (drives a real `shed-server`); `desktop/tools/shedtest/` is the mock-server UI harness (drives the real app over its IPC socket, hermetic); `tests/host-agent-diff/` is the hermetic Go-vs-Rust host-agent **differential** harness — it spawns BOTH `shed-host-agent` daemon binaries (Go `cmd/shed-host-agent` + Rust `crates/shed-host-agent`) and asserts equal wire-visible output under a defined canonicalization, so it needs Go + Rust + Python (run it with `make test-host-agent-diff`). Different worlds — don't cross-wire them.
 
 ## Release model
 

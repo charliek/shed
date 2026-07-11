@@ -4,14 +4,14 @@
 # standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl"]
+members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-host-agent"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
 # (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
 # dependency, so it gets Mac `cargo test` coverage too; the Mac bundle is unaffected
 # (build-core.sh is `-p shed-core-ffi`-scoped). The Tauri client (WebKitGTK) lives
 # in its OWN workspace so its heavy deps never enter this one.
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl"]
+default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-host-agent"]
 
 [workspace.package]
 version = "0.7.10"
