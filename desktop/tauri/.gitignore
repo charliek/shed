@@ -2,6 +2,11 @@
 src-tauri/target/
 src-tauri/gen/
 
+# Sparkle staging (scripts/fetch-sparkle.sh — pinned download, never committed).
+src-tauri/Sparkle.framework/
+src-tauri/.sparkle-dist/
+src-tauri/.sparkle-stage.*/
+
 # Frontend build output + deps (A0b: Vite). The committed Cargo.lock stays.
 ui/dist/
 ui/node_modules/
