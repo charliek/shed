@@ -108,11 +108,13 @@ impl ControlTokenMinter for ControlTokenProvider {
 /// server missing `ssh_port` reject as "no ssh endpoint" rather than silently minting
 /// against port 22.
 ///
-/// NOTE (tracked gap, config-port slice): Go errors on malformed YAML; the permissive
-/// `yaml_lite` reader does not — so a malformed `~/.shed/config.yaml` diverges (likely
-/// `unknown server`). The harness writes a valid block-style config, so the differential
-/// doesn't exercise it. Same class as the `config-parse · inline-flow` / `config-validate`
-/// xfail cells.
+/// Malformed YAML is an error, matching Go's `LoadDiscoveredServers` — the
+/// `yaml_lite` reader is now backed by `saphyr-parser`, so a malformed
+/// `~/.shed/config.yaml` returns `Err` (was silently permissive before the config-port
+/// slice). Go uses `parsing shed config %s` for a YAML parse failure (`discovery.go:73`)
+/// and `reading shed config %s` for a file-read failure (`discovery.go:68`); this
+/// mirrors both. The error bubbles up through `resolve`'s outer `reading server config:`
+/// wrapper into the `token.get` response — the shared assertable prefix.
 pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> {
     use crate::config::yaml_lite::{self, Node};
 
@@ -122,7 +124,7 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
         Err(e) => return Err(format!("reading shed config {path}: {e}")),
     };
 
-    let root = yaml_lite::parse(&data);
+    let root = yaml_lite::parse(&data).map_err(|e| format!("parsing shed config {path}: {e}"))?;
     let mut targets = Vec::new();
     if let Some(servers) = root.as_map().and_then(|m| m.get("servers")).and_then(Node::as_map) {
         for (name, entry) in servers {
@@ -276,6 +278,18 @@ servers:
             load_discovered_servers("/nonexistent/config.yaml").unwrap(),
             Vec::new()
         );
+    }
+
+    /// A malformed `~/.shed/config.yaml` is now an error (mirrors Go's
+    /// `LoadDiscoveredServers`; the saphyr-backed reader detects it where the old
+    /// line/colon reader was silently permissive). The error carries Go's inner
+    /// `parsing shed config` prefix and bubbles through `resolve`'s outer
+    /// `reading server config:` wrapper into the `token.get` response.
+    #[test]
+    fn load_discovered_servers_errors_on_malformed() {
+        let (_d, cfg) = write_config("{{invalid yaml");
+        let err = load_discovered_servers(&cfg).expect_err("malformed config rejected");
+        assert!(err.contains("parsing shed config"), "err = {err}");
     }
 
     /// The Rust half of the `load_discovered_servers` golden — reads the SAME shared

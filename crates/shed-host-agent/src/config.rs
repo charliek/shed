@@ -4,9 +4,16 @@
 //! config schema (discovery, per-server overrides, AWS/Docker resolution,
 //! biometric scope/ttl, `Validate()`) is a later slice.
 //!
-//! Parser style follows shed-core's `config.rs`: a deliberately tiny
-//! indentation-aware nested-map/scalar reader (`yaml_lite`) rather than a YAML
-//! crate dependency — the repo intentionally avoids serde_yaml/serde_norway.
+//! Parsing: the `yaml_lite` mod exposes the same tiny `Node` model shed-core's
+//! reader uses, but its parser is backed by `saphyr-parser` (a pure-Rust,
+//! no-serde/no-C YAML-1.2 *event* stream). The repo's deliberate no-YAML-dep
+//! posture targets the serde-based crates (`serde_yaml`/`serde_norway`); the
+//! host-agent reader is the scoped exception — a real parser gains block
+//! sequences, flow maps, and malformed-input detection the line/colon reader
+//! could not, which the shipped `configs/extensions.example.yaml` (block-style
+//! `registries:`) actually needs. See `crates/CLAUDE.md` for the carve-out;
+//! shed-core's own `yaml_lite` (a separate crate, Swift byte-parity test) stays
+//! hand-rolled.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -194,13 +201,33 @@ impl HostAgentConfig {
     pub fn load(path: &str) -> io::Result<HostAgentConfig> {
         let expanded = expand_tilde(path);
         let text = std::fs::read_to_string(&expanded)?;
-        Ok(Self::parse(&text))
+        // Malformed YAML is a hard error (mirrors Go's `yaml.Unmarshal` →
+        // `os.Exit(1)`); the daemon must not fail open with a half-read policy.
+        Self::try_parse(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Parse config text. Missing keys take their defaults (policies default to
-    /// empty → deny-all effective; logging enabled true).
+    /// Parse config text, returning an error on malformed YAML. Missing keys take
+    /// their defaults (policies default to empty → deny-all effective; logging
+    /// enabled true). This is the fallible path `load` uses; the infallible
+    /// `HostAgentConfig::parse` convenience wraps it for known-good test literals.
+    pub fn try_parse(text: &str) -> Result<HostAgentConfig, String> {
+        let root = yaml_lite::parse(text)?;
+        Ok(Self::from_root(&root))
+    }
+
+    /// Parse known-good config text, panicking on malformed YAML. A convenience for
+    /// the in-crate tests + fixtures that pass literals known to parse; production
+    /// load goes through [`HostAgentConfig::try_parse`] (via `load`), so this is
+    /// only reached from test builds — so it is `#[cfg(test)]`-gated out of the
+    /// production binary entirely rather than kept as a dead-code-allowed symbol.
+    #[cfg(test)]
     pub fn parse(text: &str) -> HostAgentConfig {
-        let root = yaml_lite::parse(text);
+        Self::try_parse(text).expect("yaml fixture parses")
+    }
+
+    /// Build the config from an already-parsed `Node` tree (the `Node → config`
+    /// half of `try_parse`).
+    fn from_root(root: &yaml_lite::Node) -> HostAgentConfig {
         let policy = |ns_key: &str| -> String {
             root.get_path(&[ns_key, "approval", "policy"])
                 .unwrap_or_default()
@@ -239,8 +266,8 @@ impl HostAgentConfig {
             ),
             server,
             has_discovery: root.has_key("discovery"),
-            aws: AwsConfig::from_node(&root),
-            docker: DockerConfig::from_node(&root),
+            aws: AwsConfig::from_node(root),
+            docker: DockerConfig::from_node(root),
         }
     }
 
@@ -368,29 +395,41 @@ pub struct ResolvedAws {
 impl AwsConfig {
     /// Build the AWS slice from the parsed config tree, applying the same load
     /// defaults Go's `DefaultConfig`/`LoadConfig` do (`config.go:439-443`): an
-    /// empty/absent `source_profile` → `"default"`, `session_duration` → `"1h"`,
-    /// `cache_refresh_before` → `"5m"`. For an ABSENT key (or absent `aws:` block)
-    /// this matches Go exactly (the defaults sit on `DefaultConfig` and the YAML
-    /// merge only overwrites keys the document names). For an EXPLICITLY-EMPTY
-    /// scalar (`source_profile: ""`) Go keeps the empty string — it would call STS
-    /// with profile `""` — while this port re-applies the default; `yaml_lite`
-    /// cannot even represent the distinction (a bare `key:` parses as an empty
-    /// map). Known divergence, same class as the other `yaml_lite` permissiveness
-    /// gaps, closed by the config-port sub-plan (cursor review, 2026-07-11).
+    /// absent `source_profile` → `"default"`, `session_duration` → `"1h"`,
+    /// `cache_refresh_before` → `"5m"`.
+    ///
+    /// Null-vs-empty parity (matches Go's `yaml.Unmarshal`-over-`DefaultConfig`
+    /// merge, verified against `LoadConfig`): an ABSENT key OR a bare `key:` (YAML
+    /// null) leaves the `DefaultConfig` default in place, while an EXPLICIT empty
+    /// string `key: ""` overwrites it with `""` (Go would then call STS with
+    /// profile `""`). The saphyr swap makes this representable — a null value parses
+    /// to [`yaml_lite::Node::Null`] and a quoted empty to `Scalar("")` — so the
+    /// `scalar_or_default` helper branches on the node shape, not on emptiness.
+    /// (Pinned cross-language by the `source_profile` vectors in the `aws_resolve`
+    /// golden.)
     ///
     /// `aws.sheds` (Go's removed global per-shed map) is intentionally NOT read: it
     /// is parse-and-ignore for resolution. Go's `AWSConfig.validate` rejects it with
-    /// a migration message; that rejection is sub-plan 5.
+    /// a migration message; that rejection is sub-plan 5's `validate()` (commit 2).
     fn from_node(root: &yaml_lite::Node) -> AwsConfig {
         use yaml_lite::Node;
         let aws = root.as_map().and_then(|m| m.get("aws")).and_then(Node::as_map);
+        // A non-defaulted scalar: absent / null / non-scalar → "".
         let scalar = |key: &str| -> String {
             aws.and_then(|m| m.get(key))
                 .and_then(Node::as_scalar)
                 .unwrap_or("")
                 .to_string()
         };
-        let default_if_empty = |v: String, d: &str| if v.is_empty() { d.to_string() } else { v };
+        // A defaulted scalar with Go's null-vs-empty semantics: an explicit
+        // `Scalar` (including `""`) is kept verbatim; absent / null / non-scalar
+        // falls back to the DefaultConfig default.
+        let scalar_or_default = |key: &str, d: &str| -> String {
+            match aws.and_then(|m| m.get(key)) {
+                Some(Node::Scalar(s)) => s.clone(),
+                _ => d.to_string(),
+            }
+        };
 
         let mut servers = BTreeMap::new();
         if let Some(servers_map) = aws.and_then(|m| m.get("servers")).and_then(Node::as_map) {
@@ -431,11 +470,11 @@ impl AwsConfig {
         }
 
         AwsConfig {
-            source_profile: default_if_empty(scalar("source_profile"), "default"),
+            source_profile: scalar_or_default("source_profile", "default"),
             default_role: scalar("default_role"),
             mode: scalar("mode"),
-            session_duration: default_if_empty(scalar("session_duration"), "1h"),
-            cache_refresh_before: default_if_empty(scalar("cache_refresh_before"), "5m"),
+            session_duration: scalar_or_default("session_duration", "1h"),
+            cache_refresh_before: scalar_or_default("cache_refresh_before", "5m"),
             servers,
         }
     }
@@ -673,24 +712,36 @@ fn opt_bool(node: Option<&yaml_lite::Node>) -> Option<bool> {
         .map(|s| s == "true")
 }
 
-/// A deliberately tiny indentation-based reader. Handles exactly what the
-/// host-agent config's relevant subset contains: nested maps and scalar leaves.
-/// Inline `{}` is an empty map; comments (`#`) and blank lines are skipped. A port
-/// of shed-core's `yaml_lite` (with a `get_path` map-walk helper added).
+/// The host-agent config parser, exposing a tiny `Node` model (nested maps,
+/// scalars, sequences, and an explicit null) over a real YAML-1.2 parser.
+///
+/// The parser is driven off `saphyr-parser`'s low-level *event* stream (see the
+/// module-level carve-out note at the top of this file): [`parse`] pulls
+/// `StreamStart`/`DocumentStart`/`MappingStart`/`Scalar`/… events and folds them
+/// into `Node`. Only the FIRST document is consumed (mirrors Go's
+/// `yaml.Unmarshal`); duplicate map keys and malformed input return `Err`
+/// (matching yaml.v3). The old hand-rolled line/colon reader is gone — with it the
+/// silent block-sequence drop, the flow-map-as-opaque-scalar gap, and the
+/// can't-detect-malformed gap that `config.rs`/`README` tracked as divergences.
 pub(crate) mod yaml_lite {
+    use saphyr_parser::{Event, Parser, ScalarStyle};
+    use std::borrow::Cow;
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Node {
         Map(HashMap<String, Node>),
         Scalar(String),
-        /// A flow-style sequence (`[a, b, c]`) of scalar (or, in principle, nested)
-        /// nodes. Added for the Docker `registries` allowlist, which the shipped
-        /// config + `config_test.go` express as a flow list. Only flow-style `[..]`
-        /// is parsed — block-style `- item` lists are NOT supported by this minimal
-        /// reader (the line/colon model has no natural place for them; every fixture
-        /// that needs a list uses the flow form).
+        /// A YAML sequence (array), from either flow style (`[a, b, c]`) or block
+        /// style (`- a`\n`- b`). Both fold to the same node now that a real parser
+        /// backs the reader; the shipped `configs/extensions.example.yaml` uses the
+        /// block form for `docker.registries`.
         Sequence(Vec<Node>),
+        /// An explicit YAML null: a bare `key:`, `key: ~`, or `key: null`. Distinct
+        /// from an empty string `key: ""` (a `Scalar("")`) so the readers can port
+        /// Go's null-vs-empty merge semantics — a null leaves a `DefaultConfig`
+        /// default in place; an empty string overwrites it.
+        Null,
     }
 
     impl Node {
@@ -767,115 +818,117 @@ pub(crate) mod yaml_lite {
         }
     }
 
-    struct Line {
-        indent: usize,
-        key: String,
-        value: Option<Node>, // None → a nested block follows; Some → a leaf (scalar or sequence)
+    /// Parse config text into a [`Node`] tree, consuming ONLY the first YAML
+    /// document (mirrors Go's `yaml.Unmarshal`, which decodes the first document
+    /// and ignores the rest). Returns `Err(message)` on malformed input or a
+    /// duplicate map key — the cases yaml.v3 rejects and the old line/colon reader
+    /// silently swallowed. An empty input (no document) yields an empty map.
+    pub fn parse(text: &str) -> Result<Node, String> {
+        let mut builder = Builder {
+            parser: Parser::new_from_str(text),
+        };
+        loop {
+            match builder.next_event()? {
+                // Skip stream/framing events until the first document's root.
+                Event::StreamStart | Event::Nothing => continue,
+                Event::StreamEnd => return Ok(Node::Map(HashMap::new())),
+                Event::DocumentStart(_) => {
+                    let root_ev = builder.next_event()?;
+                    // A document with no content node (e.g. `---` alone) → null.
+                    return match root_ev {
+                        Event::DocumentEnd | Event::StreamEnd => Ok(Node::Null),
+                        other => builder.build_node(other),
+                    };
+                }
+                other => return Err(format!("unexpected top-level YAML event: {other:?}")),
+            }
+        }
     }
 
-    pub fn parse(text: &str) -> Node {
-        let lines: Vec<Line> = text
-            .split('\n')
-            .filter_map(|raw| {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    return None;
+    /// Drives the saphyr event stream into the `Node` model.
+    struct Builder<'a> {
+        parser: Parser<'a, saphyr_parser::StrInput<'a>>,
+    }
+
+    impl<'a> Builder<'a> {
+        /// Pull the next event, flattening a scan error or a truncated stream into
+        /// an `Err` message. The returned `Event` borrows from the parser INPUT
+        /// (`'a`), not from `&mut self`, so a built child node can be assembled while
+        /// the next event is pulled.
+        fn next_event(&mut self) -> Result<Event<'a>, String> {
+            match self.parser.next_event() {
+                Some(Ok((ev, _span))) => Ok(ev),
+                Some(Err(e)) => Err(e.to_string()),
+                None => Err("unexpected end of YAML event stream".to_string()),
+            }
+        }
+
+        /// Build a node from `first_ev`, recursing into maps/sequences.
+        fn build_node(&mut self, first_ev: Event<'a>) -> Result<Node, String> {
+            match first_ev {
+                Event::Scalar(value, style, _anchor, _tag) => Ok(scalar_node(value, style)),
+                Event::SequenceStart(..) => self.build_sequence(),
+                Event::MappingStart(..) => self.build_mapping(),
+                Event::Alias(_) => {
+                    Err("YAML anchors/aliases are not supported in host-agent config".to_string())
                 }
-                let indent = raw.len() - raw.trim_start_matches(' ').len();
-                let colon = raw.find(':')?;
-                let key = raw[..colon].trim();
-                let mut rest = raw[colon + 1..].trim().to_string();
-                // Strip an inline comment after a scalar value.
-                if let Some(hash) = rest.find('#') {
-                    rest = rest[..hash].trim().to_string();
+                other => Err(format!("unexpected YAML node event: {other:?}")),
+            }
+        }
+
+        /// Fold a sequence's items until `SequenceEnd`.
+        fn build_sequence(&mut self) -> Result<Node, String> {
+            let mut items = Vec::new();
+            loop {
+                match self.next_event()? {
+                    Event::SequenceEnd => return Ok(Node::Sequence(items)),
+                    ev => items.push(self.build_node(ev)?),
                 }
-                let value = if rest.is_empty() || rest == "{}" {
-                    None
-                } else if rest.starts_with('[') && rest.ends_with(']') {
-                    // A flow-style sequence `[a, b, c]` (or empty `[]`).
-                    Some(parse_flow_seq(&rest[1..rest.len() - 1]))
-                } else {
-                    Some(Node::Scalar(unquote(&rest)))
+            }
+        }
+
+        /// Fold a mapping's key/value pairs until `MappingEnd`. A duplicate key is
+        /// an error (yaml.v3 rejects it; a silent last-wins insert would over- or
+        /// under-grant a policy). Non-scalar keys are rejected (documented-open).
+        fn build_mapping(&mut self) -> Result<Node, String> {
+            let mut map = HashMap::new();
+            loop {
+                let key = match self.next_event()? {
+                    Event::MappingEnd => return Ok(Node::Map(map)),
+                    Event::Scalar(value, _style, _anchor, _tag) => value.into_owned(),
+                    other => {
+                        return Err(format!("unsupported non-scalar map key: {other:?}"));
+                    }
                 };
-                Some(Line {
-                    indent,
-                    key: unquote(key),
-                    value,
-                })
-            })
-            .collect();
-        let mut index = 0;
-        build(&lines, &mut index, -1)
-    }
-
-    /// Parse the comma-separated inner content of a flow-style list (the text
-    /// between `[` and `]`) into a `Node::Sequence` of scalars. Items are trimmed
-    /// and unquoted; empty items are dropped by the filter, so an empty (or
-    /// whitespace-only) inner yields an empty sequence — the `[]` deny-all case —
-    /// as does a trailing empty element from a dangling comma (the shipped flow
-    /// lists never carry one).
-    ///
-    /// **Known divergence (CodeRabbit review, tracked for the config-port
-    /// sub-plan):** a MALFORMED flow list (`registries: [only-this` — unterminated
-    /// bracket) fails the `ends_with(']')` detector and degrades to a scalar,
-    /// which the Option-typed readers treat as an ABSENT key → inherit. Go's
-    /// yaml.Unmarshal hard-fails and the daemon refuses to start, so an operator
-    /// typo in a lockdown line is loud there and silently fail-open here. The
-    /// permissive-`yaml_lite`-vs-strict-Go class (incl. this case) is closed by
-    /// the config-port slice's validation parity (malformed YAML → exit 1).
-    /// Quoted items containing commas also split naively (documented flow-list
-    /// scope; registry hostnames cannot contain commas).
-    fn parse_flow_seq(inner: &str) -> Node {
-        let items = inner
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| Node::Scalar(unquote(s)))
-            .collect();
-        Node::Sequence(items)
-    }
-
-    fn build(lines: &[Line], index: &mut usize, parent_indent: isize) -> Node {
-        let mut map = HashMap::new();
-        if *index >= lines.len() {
-            return Node::Map(map);
-        }
-        let child_indent = lines[*index].indent as isize;
-        while *index < lines.len() {
-            let indent = lines[*index].indent as isize;
-            if indent <= parent_indent {
-                break;
-            }
-            if indent != child_indent {
-                // A line deeper than expected without a parent (defensive skip).
-                *index += 1;
-                continue;
-            }
-            let key = lines[*index].key.clone();
-            match lines[*index].value.clone() {
-                Some(node) => {
-                    map.insert(key, node);
-                    *index += 1;
-                }
-                None => {
-                    *index += 1;
-                    let child = build(lines, index, child_indent);
-                    map.insert(key, child);
+                let value_ev = self.next_event()?;
+                let value = self.build_node(value_ev)?;
+                if map.insert(key.clone(), value).is_some() {
+                    return Err(format!("duplicate map key {key:?}"));
                 }
             }
         }
-        Node::Map(map)
     }
 
-    fn unquote(s: &str) -> String {
-        if s.len() >= 2
-            && ((s.starts_with('"') && s.ends_with('"'))
-                || (s.starts_with('\'') && s.ends_with('\'')))
-        {
-            s[1..s.len() - 1].to_string()
+    /// Map a scalar event to a node, resolving a plain YAML null (`` / `~` /
+    /// `null`) to [`Node::Null`]. A quoted empty (`""`, style `DoubleQuoted`/
+    /// `SingleQuoted`) stays `Scalar("")` — the null-vs-empty distinction the AWS
+    /// reader depends on. saphyr has already unquoted/unescaped the content.
+    fn scalar_node(value: Cow<'_, str>, style: ScalarStyle) -> Node {
+        if style == ScalarStyle::Plain && is_yaml_null(&value) {
+            Node::Null
         } else {
-            s.to_string()
+            // Move the String out of an owned Cow (escaped/quoted scalars) for
+            // free; allocate only for a borrowed one — mirrors the map-key path's
+            // `value.into_owned()` rather than an unconditional `to_string()`.
+            Node::Scalar(value.into_owned())
         }
+    }
+
+    /// The YAML-1.2 core-schema null tokens (only meaningful for a PLAIN scalar).
+    /// An empty plain node surfaces as `~` from saphyr, but `""` is included
+    /// defensively.
+    fn is_yaml_null(s: &str) -> bool {
+        matches!(s, "" | "~" | "null" | "Null" | "NULL")
     }
 }
 
@@ -1483,7 +1536,8 @@ f: scalar
 g:
   nested: [deep]
 ",
-        );
+        )
+        .expect("valid flow-list config parses");
         let m = root.as_map().unwrap();
         // Multi-item flow list.
         assert_eq!(
@@ -1517,6 +1571,169 @@ g:
         assert_eq!(m["a"].as_seq().unwrap().len(), 3);
         // An ABSENT key is None — the inherit signal (distinct from present `[]`).
         assert!(m.get("absent").is_none());
+    }
+
+    // ---- yaml_lite: the saphyr-backed parser (block seqs, flow maps, null-vs-empty,
+    //      malformed/duplicate-key detection, first-document-only) -------------------
+
+    /// Block-style sequences now parse — the load-bearing new deliverable. The
+    /// shipped `configs/extensions.example.yaml` writes `docker.registries` as a
+    /// `- item` block list; the old line/colon reader dropped the colonless items so
+    /// `docker.registries` parsed EMPTY. Cross-language pinned by the block-seq
+    /// vector in the `docker_resolve` golden.
+    #[test]
+    fn yaml_lite_block_sequence() {
+        let cfg = HostAgentConfig::parse(
+            "\
+docker:
+  registries:
+    - index.docker.io
+    - ghcr.io
+  approval:
+    policy: approve-all
+",
+        );
+        assert_eq!(
+            cfg.docker.registries,
+            vec!["index.docker.io".to_string(), "ghcr.io".to_string()]
+        );
+    }
+
+    /// The shipped example config's block-style `registries:` parses to the two
+    /// hostnames Go's `TestExampleConfigIsValid` asserts — the real uncaught
+    /// divergence on the product's own default config. (Full validate parity of the
+    /// example config is commit 2; this pins only the parse-level block-seq win.)
+    #[test]
+    fn example_config_registries_parse() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs/extensions.example.yaml");
+        let text = std::fs::read_to_string(&path).expect("read example config");
+        let cfg = HostAgentConfig::try_parse(&text).expect("example config parses");
+        assert_eq!(
+            cfg.docker.registries,
+            vec!["index.docker.io".to_string(), "ghcr.io".to_string()]
+        );
+        assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), "approve-all");
+    }
+
+    /// A flow-style map (`ssh: { approval: { policy: X } }`) parses to the SAME
+    /// nested `Node::Map` structure as the block form — the old reader treated the
+    /// whole `{ ... }` as an opaque scalar (→ all deny-all).
+    #[test]
+    fn yaml_lite_inline_flow_map() {
+        let flow = HostAgentConfig::parse("ssh: { approval: { policy: shed-desktop } }\n");
+        let block = HostAgentConfig::parse("ssh:\n  approval:\n    policy: shed-desktop\n");
+        assert_eq!(flow.effective_policy(NS_SSH_AGENT), "shed-desktop");
+        assert_eq!(
+            flow.effective_policy(NS_SSH_AGENT),
+            block.effective_policy(NS_SSH_AGENT)
+        );
+    }
+
+    /// Flow sequences: empty `[]` is a present-but-empty `Sequence(vec![])` (NOT
+    /// absent) so the Docker `Option<Vec>` replace semantics see a deny-all
+    /// lockdown; a non-empty list carries its items.
+    #[test]
+    fn yaml_lite_flow_sequence_empty_and_nonempty() {
+        use yaml_lite::Node;
+        let root = yaml_lite::parse("a: []\nb: [x, y]\n").expect("parses");
+        let m = root.as_map().unwrap();
+        assert!(matches!(&m["a"], Node::Sequence(v) if v.is_empty()));
+        assert_eq!(m["a"].as_scalar_list().unwrap(), Vec::<String>::new());
+        assert_eq!(
+            m["b"].as_scalar_list().unwrap(),
+            vec!["x".to_string(), "y".to_string()]
+        );
+    }
+
+    /// Null-vs-empty scalar recovery (the M1 adapter contract + C1): a bare `key:`
+    /// (YAML null) is `Node::Null`; a quoted empty `key: ""` is `Scalar("")`. A
+    /// null-valued key is STILL inserted into the map (so `has_key` stays true for a
+    /// bare `discovery:`). The Go-golden `source_profile` cross-language vector
+    /// (`aws_resolve` golden) pins the resolved-config half.
+    #[test]
+    fn yaml_lite_null_vs_empty_scalar() {
+        use yaml_lite::Node;
+        let root = yaml_lite::parse(
+            "\
+bare:
+tilde: ~
+word: null
+empty: \"\"
+value: hi
+discovery:
+",
+        )
+        .expect("parses");
+        let m = root.as_map().unwrap();
+        assert_eq!(m["bare"], Node::Null);
+        assert_eq!(m["tilde"], Node::Null);
+        assert_eq!(m["word"], Node::Null);
+        assert_eq!(m["empty"], Node::Scalar(String::new()));
+        assert_eq!(m["value"], Node::Scalar("hi".to_string()));
+        // A null-valued key is inserted — presence detection still works.
+        assert!(root.has_key("discovery"));
+        assert!(root.has_key("bare"));
+        // as_scalar on Null is None → get_path yields None → the reader defaults.
+        assert_eq!(m["bare"].as_scalar(), None);
+
+        // The resolved-config half: bare `source_profile:` (null) keeps the
+        // DefaultConfig default; explicit `source_profile: ""` keeps the empty
+        // string. (Verified against Go's LoadConfig; goldened cross-language.)
+        let null_sp = HostAgentConfig::parse("aws:\n  source_profile:\n");
+        assert_eq!(null_sp.aws.source_profile, "default");
+        let empty_sp = HostAgentConfig::parse("aws:\n  source_profile: \"\"\n");
+        assert_eq!(empty_sp.aws.source_profile, "");
+    }
+
+    /// A duplicate map key is an error (yaml.v3 rejects it; a silent last-wins
+    /// insert would over/under-grant). Cross-language pinned `{valid:false}` in
+    /// commit 2's validate golden.
+    #[test]
+    fn yaml_lite_duplicate_key_errors() {
+        let err = yaml_lite::parse("server: http://a:8080\nserver: http://b:8080\n")
+            .expect_err("duplicate key rejected");
+        assert!(err.contains("duplicate map key"), "err = {err}");
+        // Nested duplicate keys are caught too.
+        assert!(
+            yaml_lite::parse("aws:\n  mode: passthrough\n  mode: assume-role\n").is_err(),
+            "nested duplicate key should error"
+        );
+    }
+
+    /// Malformed input returns `Err` (the saphyr win the line/colon reader could
+    /// not detect): top-level garbage and an unterminated flow bracket both fail,
+    /// so `load` exits 1 like Go's `yaml.Unmarshal`.
+    #[test]
+    fn yaml_lite_parse_errors_on_malformed() {
+        assert!(yaml_lite::parse("{{invalid yaml").is_err());
+        assert!(yaml_lite::parse("docker:\n  registries: [only-this\n").is_err());
+        assert!(yaml_lite::parse("a: b\n\tc: d\n").is_err()); // tab indentation
+        // And `load` surfaces it as an error (main.rs exits 1).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "{{invalid yaml").unwrap();
+        assert!(HostAgentConfig::load(path.to_str().unwrap()).is_err());
+    }
+
+    /// Only the FIRST document is consumed (mirrors Go's `yaml.Unmarshal`): a
+    /// multi-document stream resolves the first document's values and ignores the
+    /// rest.
+    #[test]
+    fn yaml_lite_multi_doc_takes_first() {
+        let cfg = HostAgentConfig::parse("server: http://a:8080\n---\nserver: http://b:8080\n");
+        assert_eq!(cfg.server, "http://a:8080");
+    }
+
+    /// Empty / comment-only input yields an empty map (all defaults), unchanged from
+    /// the old reader.
+    #[test]
+    fn yaml_lite_empty_and_comment_only() {
+        assert_eq!(yaml_lite::parse("").unwrap(), yaml_lite::Node::Map(Default::default()));
+        assert_eq!(
+            yaml_lite::parse("# just a comment\n").unwrap(),
+            yaml_lite::Node::Map(Default::default())
+        );
     }
 
     // ---- Docker config slice (mirror config_discovery_test.go / config_test.go) ---

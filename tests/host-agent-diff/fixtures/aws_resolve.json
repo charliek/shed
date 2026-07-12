@@ -79,6 +79,20 @@
       ],
       "enabled": false,
       "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "null-vs-empty: bare source_profile: (YAML null) keeps the DefaultConfig default (verified against Go LoadConfig)",
+      "config_yaml": "aws:\n  source_profile:\n",
+      "queries": [],
+      "enabled": false,
+      "defaults": {"source_profile": "default", "session_duration": "1h", "cache_refresh_before": "5m"}
+    },
+    {
+      "name": "null-vs-empty: explicit source_profile: \"\" (empty string) overwrites the default with empty (verified against Go LoadConfig)",
+      "config_yaml": "aws:\n  source_profile: \"\"\n",
+      "queries": [],
+      "enabled": false,
+      "defaults": {"source_profile": "", "session_duration": "1h", "cache_refresh_before": "5m"}
     }
   ]
 }

@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden fixture for the Docker config slice — input host-agent config YAML (block-style maps + flow-list `[a, b]` registries, the yaml_lite subset) -> per-(server,shed) DockerConfig.Resolve() results: allow_all + registries + registry_count (== len(registries), the backend Status verdict). Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenDockerResolve, via the production LoadConfig->Docker.Resolve path) and the Rust runner (crates/shed-host-agent/src/config.rs tests::golden_docker_resolve, via HostAgentConfig::parse().docker.resolve). Go has NO Resolve layering test, so this golden is Rust-STRONGER. It pins the load-bearing Option semantics: registries Option<Vec<String>> (absent -> inherit, `[]` -> REPLACE-with-empty / deny-all lockdown, `[a,b]` -> replace-not-merge across top/server/shed) and allow_all Option<bool> (absent -> inherit, false -> force-off, true -> force-on), plus the flow-list `[a, b]` parse the new yaml_lite Node::Sequence enables. Mirrors config_discovery_test.go:TestDockerResolve (extended).",
+  "_comment": "Golden fixture for the Docker config slice — input host-agent config YAML (block-style maps + flow-list `[a, b]` registries, the yaml_lite subset) -> per-(server,shed) DockerConfig.Resolve() results: allow_all + registries + registry_count (== len(registries), the backend Status verdict). Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenDockerResolve, via the production LoadConfig->Docker.Resolve path) and the Rust runner (crates/shed-host-agent/src/config.rs tests::golden_docker_resolve, via HostAgentConfig::parse().docker.resolve). Go has NO Resolve layering test, so this golden is Rust-STRONGER. It pins the load-bearing Option semantics: registries Option<Vec<String>> (absent -> inherit, `[]` -> REPLACE-with-empty / deny-all lockdown, `[a,b]` -> replace-not-merge across top/server/shed) and allow_all Option<bool> (absent -> inherit, false -> force-off, true -> force-on), plus the flow-list `[a, b]` AND block-style `- item` (the shipped extensions.example.yaml form) parse the saphyr-backed yaml_lite Node::Sequence enables. Mirrors config_discovery_test.go:TestDockerResolve (extended).",
   "protocol_version": 1,
   "vectors": [
     {
@@ -48,6 +48,13 @@
       "config_yaml": "server: http://localhost:8080\n",
       "queries": [
         {"server": "any", "shed": "any", "allow_all": false, "registries": [], "registry_count": 0}
+      ]
+    },
+    {
+      "name": "BLOCK-STYLE registries sequence (the shipped extensions.example.yaml form) parses to [index.docker.io, ghcr.io], not empty",
+      "config_yaml": "docker:\n  registries:\n    - index.docker.io\n    - ghcr.io\n  allow_all: false\n",
+      "queries": [
+        {"server": "mini3", "shed": "anything", "allow_all": false, "registries": ["index.docker.io", "ghcr.io"], "registry_count": 2}
       ]
     }
   ]

@@ -38,6 +38,16 @@ libc = "0.2"
 shed-core = { path = "../shed-core" }
 async-trait = { workspace = true }
 uuid = { workspace = true }
+# The host-agent config reader's YAML parser (config.rs `yaml_lite` mod). The repo's
+# clients otherwise hand-roll a tiny indentation reader to avoid a YAML dep (see the
+# carve-out note in crates/CLAUDE.md); this crate is the scoped exception. saphyr-parser
+# is a pure-Rust, no-serde, no-C, YAML-1.2 event-stream parser (no encoding_rs in 0.0.x)
+# — used ONLY to feed the existing `Node` model, so the swap stays behind that interface.
+# It buys real structure (block sequences, flow maps, malformed-input detection) that the
+# line/colon reader cannot: the shipped configs/extensions.example.yaml uses block-style
+# `registries:` sequences the old reader silently dropped. Leaf-crate only — see the PR's
+# DEP_DELTA for the reverse-dep proof that it does NOT reach shed-app/Tauri.
+saphyr-parser = { version = "0.0.11", default-features = false }
 # The bus HTTP client: reqwest (rustls) for SSE subscribe + respond POST, and
 # futures-util for the bytes-stream adaptor. Match shed-core's stack so cargo
 # unifies one reqwest/rustls build across the workspace.
