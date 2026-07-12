@@ -151,8 +151,7 @@ identities (real-signing ed25519, canned blobs for rsa/ecdsa).
   normal path resolves immediately either way; a pathological full-backlog peer could hang
   the Rust side longer. Low severity, tracked for the config/lifecycle slice.
 
-- **Bus subscription set: ssh-agent + (configured) aws-credentials + docker-credentials
-  on both; ONLY egress remains Go-only.** In single-server mode (no `discovery:` block)
+- **Bus subscription set — converged.** In single-server mode (no `discovery:` block)
   both daemons connect to `server:` and subscribe to `ssh-agent`; when `aws.*` is
   configured (mode passthrough, or a role) both ALSO subscribe `aws-credentials`; and
   both subscribe `docker-credentials` in the common case — the Docker backend is non-nil
@@ -160,14 +159,11 @@ identities (real-signing ed25519, canned blobs for rsa/ecdsa).
   `config_path`), so the namespace is subscribed for every server. Each cell
   `wait_for_subscribe`-es its namespace on both impls (`test_bus_ping_pong.py`,
   `test_aws_backend.py`, `test_docker_backend.py`), so they compare apples to apples.
-  The **one** residual asymmetry remaining by design: the Go daemon also GETs
-  `/api/egress/stream` (its always-on egress subscriber), whereas the Rust daemon does
-  not yet (egress is the last unwired namespace, its own slice). The synthetic bus
-  tolerates the extra Go subscribe (501s the egress GET — Go backs off 5m, DEBUG-quiet)
-  — so the asymmetry is absorbed by the harness, not diffed. The differential asserts
-  only the compared **response envelope** for the namespace under test, never which
-  routes each daemon hit. This flips to a full match when the egress slice wires the Rust
-  egress path.
+  As of the egress slice both daemons ALSO GET the always-on egress-audit stream
+  (`/api/egress/stream`), so the Go and Rust **endpoint sets fully converge** — there is
+  no residual endpoint asymmetry. The synthetic bus now asserts (not tolerates) that both
+  impls hit egress: `test_egress.py` proves the subscribe, the fixed-ts audit diff, and
+  the per-impl 501 hard-backoff (no reconnect in window).
 
 - **Event replay ring.** The surface-A handshake (`hello`→`hello_ack`), the non-hello
   drop, single-consumer supersede, event fan-out + approval correlation (via the gated
@@ -217,7 +213,12 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | bus | aws-credentials subscription (when configured) | **enforced** | live surface B (`test_aws_backend.py`: both impls `wait_for_subscribe("aws-credentials")`) |
 | bus | docker-credentials subscription (even unconfigured) | **enforced** | live surface B (`test_docker_backend.py`: both impls `wait_for_subscribe("docker-credentials")`, incl. the unconfigured cell) |
 | status | single-server `LiveStatus.servers[]` per-namespace state (incl. 409-rejected) | **xfail** | supervisor slice — Go surfaces `HostClient.Status()` via supervisor health; the Rust bus records the state + logs it, but `servers[]` stays empty until the supervisor lands |
-| egress | events / 401 / 404-501, 5m vs 30s backoff | **xfail** | live ("no reconnect in window") + unit (consts) |
+| egress | subscription convergence (both impls GET `/api/egress/stream`) | **enforced** | live surface B (`test_egress.py`: both `wait_for_egress`) |
+| egress | events → durable audit line (fixed-ts, diffed UNMASKED incl. `"approval":""`) | **enforced** | live surface B (`test_egress.py`) |
+| egress | 501 → hard 5m backoff (per-impl `egress_hits()==1`, no reconnect in window) | **enforced** | live surface B (`test_egress.py`) |
+| egress | 401-invalidate + control-token scope | **out-of-scope** | unit (`egress.rs`: `status_401_invalidates_source`, `sends_control_token_not_credentials`) — harness runs open (no token to invalidate) |
+| egress | 404→unavailable + backoff constants (1s/30s/5m, no held-reset) | **out-of-scope** | unit (`egress.rs`: `status_404_returns_unavailable`, `backoff_*`) — control-flow, not pure in→out |
+| egress | `egressDecision`→`AuditEntry` mapping (detail/ts-UTC/empty-ts/offset/`approval:""`) | **enforced** | golden (Go + Rust runners, `egress_audit_entry.json`) |
 | ssh backend · local-keys | `list` (masked canonical-equal + durable non-gated audit line) | **enforced** | live (`test_ssh_backend.py`) |
 | ssh backend · local-keys | `sign` rsa flags 0/2/4/6 (→ `ssh-rsa`/`rsa-sha2-256`/`rsa-sha2-512`/`rsa-sha2-256`; format diffed, blob verified per-impl) | **enforced** | live (`test_ssh_backend.py`, verify-not-bytes) |
 | ssh backend · local-keys | `sign` ecdsa (format diffed, blob verified per-impl) | **enforced** | live (`test_ssh_backend.py`) |

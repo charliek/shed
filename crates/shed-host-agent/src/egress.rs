@@ -17,11 +17,11 @@
 //! route is control-scoped, unlike the credentials-scoped bus); a 401 invalidates the
 //! source so the next reconnect re-mints. An open server sends the static config token.
 //!
-//! NOTE (commit 1 of the egress slice): this module is LANDED but not yet SPAWNED — the
-//! always-on per-server task is wired in commit 2. Hence the module-level
-//! `#![allow(dead_code)]`; commit 2 removes it once `run_single_server_bus` spawns the
-//! side task.
-#![allow(dead_code)]
+//! The always-on per-server task is spawned as a SIDE TASK by
+//! [`crate::bus::run_single_server_bus`] (racing the shared shutdown) — mirroring the Go
+//! watcher group's `run(NewEgressSubscriber(...).Run)`. This slice wires the OPEN path
+//! (`tokens = None`, static token); the concrete secure-control `CredentialSource` spawn
+//! arrives with the discovery/supervisor slice.
 
 use std::sync::Arc;
 use std::time::Duration;

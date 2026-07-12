@@ -13,10 +13,16 @@ server. It exposes exactly the three routes a single-server daemon touches:
 * `POST /api/plugins/listeners/{ns}/respond` — reads the response Envelope body,
   records it keyed by namespace, and returns **204** (the status the client
   expects; a non-204 is a bus error on both sides).
-* `GET /api/egress/stream` — returns **501** so the Go daemon's always-on egress
-  subscriber backs off hard (5m, DEBUG-quiet) instead of erroring. The Rust
-  slice-1b daemon never hits this route (egress is a later slice); the bus
-  tolerates the asymmetry — the differential compares only the ssh-agent response.
+* `GET /api/egress/stream` — the always-on egress-audit consumer's route, hit by
+  BOTH daemons now (the endpoint sets converged). Two modes, chosen at construction
+  (`SyntheticBus(egress=...)`):
+    - `"unavailable"` (default) → **501**, so each daemon's egress subscriber backs
+      off hard (5m, DEBUG-quiet) — the harness asserts per-impl `egress_hits() == 1`
+      within a short window to prove that hard backoff (no reconnect).
+    - `"events"` → **200** + a held `text/event-stream` that pushes `data:` decision
+      frames (`push_egress`) with FIXED timestamps, so both daemons write the SAME
+      durable audit JSONL line (a deterministic differential — Go stamps `now()` only
+      for an ABSENT ts).
 * Any other path — **404**.
 
 Threading model mirrors the plain-`socket`/blocking style of `desktop_client.py`:
@@ -58,11 +64,13 @@ class SyntheticBus:
     to point a daemon's `server:` at.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, egress: str = "unavailable") -> None:
+        assert egress in ("unavailable", "events"), f"bad egress mode {egress!r}"
         self.url: str | None = None
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._shutdown = threading.Event()
+        self._egress_mode = egress  # "unavailable" (501) | "events" (200 + decision stream)
 
         # One Condition guards all cross-thread state below (subscribe/respond
         # records + the per-namespace push queues + the SSE thread registry).
@@ -71,6 +79,7 @@ class SyntheticBus:
         self._responses: dict[str, list[dict]] = {}  # ns -> response Envelopes (arrival order)
         self._queues: dict[str, queue.Queue] = {}  # ns -> frames to push over its SSE stream
         self._egress_hits = 0  # count of GET /api/egress/stream
+        self._egress_queue: queue.Queue = queue.Queue()  # decision frames (events mode)
         self._sse_threads: set[threading.Thread] = set()  # live SSE handler threads
 
     # -- lifecycle -----------------------------------------------------------
@@ -99,6 +108,7 @@ class SyntheticBus:
         with self._cond:
             for q in self._queues.values():
                 q.put(None)
+            self._egress_queue.put(None)  # unblock a parked egress-events SSE loop
             threads = list(self._sse_threads)
         for t in threads:
             t.join(timeout=2.0)
@@ -168,10 +178,32 @@ class SyntheticBus:
             return sorted(self._subscribed)
 
     def egress_hits(self) -> int:
-        """How many times `GET /api/egress/stream` has been hit (Go always; Rust
-        never, this slice)."""
+        """How many times `GET /api/egress/stream` has been hit by this bus instance's
+        daemon (each impl gets its OWN `SyntheticBus`, so this is a per-impl counter).
+        Both impls hit it now (the always-on egress subscriber)."""
         with self._cond:
             return self._egress_hits
+
+    def wait_for_egress(self, timeout: float = 5.0) -> None:
+        """Block until the daemon has GET-ed `/api/egress/stream` at least once (or raise
+        on timeout). A deadline poll, not a sleep — closes the daemon-connect window.
+        Proves this impl's daemon reaches the egress route (endpoint-set convergence)."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._egress_hits < 1:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"no GET /api/egress/stream within {timeout}s"
+                    )
+                self._cond.wait(remaining)
+
+    def push_egress(self, decision: dict) -> None:
+        """Push one egress `decision` onto the (events-mode) egress SSE stream as a
+        `data:` frame. Call after `wait_for_egress()` so the drainer is attached; the
+        queue buffers, so an early push simply waits. No-op unless `egress="events"`."""
+        frame = json.dumps(decision, separators=(",", ":"))
+        self._egress_queue.put(frame)
 
     # -- internals (called from handler threads) -----------------------------
 
@@ -196,6 +228,7 @@ class SyntheticBus:
     def _record_egress(self) -> None:
         with self._cond:
             self._egress_hits += 1
+            self._cond.notify_all()  # wake wait_for_egress
 
     def _register_sse_thread(self) -> None:
         with self._cond:
@@ -220,9 +253,7 @@ class _BusHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == _EGRESS_PATH:
-            # Egress disabled → 501; the Go egress subscriber backs off hard.
-            self._bus._record_egress()
-            self._send_empty(501)
+            self._serve_egress()
             return
         m = _MESSAGES_RE.match(path)
         if m:
@@ -240,10 +271,29 @@ class _BusHandler(BaseHTTPRequestHandler):
 
     # -- route handlers ------------------------------------------------------
 
+    def _serve_egress(self) -> None:
+        """The `GET /api/egress/stream` route. Records the hit (both impls now GET it),
+        then either 501s (`"unavailable"` mode → the daemon backs off hard) or holds a
+        200 `text/event-stream` and pushes queued decision frames (`"events"` mode)."""
+        bus = self._bus
+        bus._record_egress()
+        if bus._egress_mode != "events":
+            # Egress disabled → 501; each impl's subscriber backs off the hard 5m.
+            self._send_empty(501)
+            return
+        self._stream_sse(bus._egress_queue)
+
     def _serve_sse(self, ns: str) -> None:
         """Open the SSE stream for `ns`, record the subscribe, then push queued
         request frames until shutdown / client disconnect."""
         self._bus._record_subscribe(ns, self.headers.get("Authorization"))
+        self._stream_sse(self._bus._queue_for(ns))
+
+    def _stream_sse(self, q: queue.Queue) -> None:
+        """Send the 200 SSE handshake, then hold the connection and drain `q`, pushing
+        each frame as a `data:` line, until shutdown / `None` sentinel / client
+        disconnect. The shared streaming body of `_serve_sse` (per-namespace queue) and
+        `_serve_egress` events mode (the egress decision queue)."""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -255,7 +305,6 @@ class _BusHandler(BaseHTTPRequestHandler):
         except OSError:
             return  # client vanished mid-handshake
 
-        q = self._bus._queue_for(ns)
         bus = self._bus
         bus._register_sse_thread()
         try:

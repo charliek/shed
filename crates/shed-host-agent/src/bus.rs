@@ -30,8 +30,9 @@
 //! operation gets Go's exact `unknown operation: <op>` `INTERNAL_ERROR` envelope, and
 //! a payload that isn't a JSON object gets `{invalid payload, INTERNAL_ERROR}` — so the
 //! shed's request never hangs. The `aws-credentials` and `docker-credentials` namespaces
-//! are wired alongside (each its own per-namespace gate); only egress remains a later
-//! slice.
+//! are wired alongside (each its own per-namespace gate), and the always-on egress-audit
+//! SSE consumer ([`crate::egress`]) runs as a side task per server — so the Go and Rust
+//! daemons now touch the same endpoint set (the endpoint asymmetry closed with this slice).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -871,10 +872,14 @@ pub struct DockerHandlers {
 /// per-handler `.Run`). `server_name` is the audit/approval `server` field — empty in
 /// single-server mode (matches Go).
 ///
-/// KNOWN GAP (for the harness): Go's watcher group also GETs the egress-audit stream
-/// (`/api/egress/stream`). That needs the egress route, so it is deliberately NOT wired
-/// here — after this slice the Rust daemon wires ssh-agent + (configured) aws-credentials
-/// + docker-credentials, and ONLY egress remains asymmetric.
+/// The always-on egress-audit SSE consumer (`GET /api/egress/stream`,
+/// [`crate::egress::EgressSubscriber`]) also runs — as a read-only SIDE TASK on the same
+/// `tasks` vec, racing the shared `shutdown` (mirroring Go's watcher group, which GETs
+/// the egress stream for every server). It is NOT a bus namespace, so it is not in
+/// `BUS_NAMESPACES`/`subscribed`. This slice wires the OPEN path (`tokens = None`, static
+/// token — `run_single_server_bus` is hardcoded open); the secure-control token source is
+/// a later (discovery/supervisor) slice. With egress wired the Go and Rust endpoint sets
+/// fully converge.
 pub async fn run_single_server_bus(
     server_url: String,
     shutdown: watch::Receiver<bool>,
@@ -907,8 +912,9 @@ pub async fn run_single_server_bus(
     // configured (Go: a nil AWS backend means no aws handler); docker-credentials when
     // the docker backend constructed — effectively unconditional, since the constructor
     // near-always yields `Some` (Go's `NewDockerBackend` is non-nil even unconfigured).
-    // Only the egress stream remains a later slice. Compute the set once, then log + spawn
-    // from it so a new namespace is a single push (no parallel branches to keep in sync).
+    // The always-on egress-audit SSE consumer runs alongside as a side task (below); it is
+    // NOT a bus namespace, so it is absent from this set. Compute the set once, then log +
+    // spawn from it so a new namespace is a single push (no parallel branches to sync).
     let mut subscribed: Vec<&'static str> = vec![NS_SSH_AGENT];
     if handlers.aws.is_some() {
         subscribed.push(NS_AWS_CREDENTIALS);
@@ -922,7 +928,8 @@ pub async fn run_single_server_bus(
         .filter(|ns| !subscribed.contains(ns))
         .collect();
     log.info(&format!(
-        "message bus subscribing namespaces={subscribed:?}; deferred (later slices): {deferred:?}"
+        "message bus subscribing namespaces={subscribed:?}; deferred (later slices): \
+         {deferred:?}; egress side task: always-on"
     ));
 
     // Share the seams across the per-namespace loops. Each namespace subscribes +
@@ -939,6 +946,27 @@ pub async fn run_single_server_bus(
             log.clone(),
         )));
     }
+
+    // The always-on egress-audit SSE consumer — Go's watcher group GETs
+    // `/api/egress/stream` for every server. NOT a bus namespace: a read-only SIDE TASK on
+    // the same `tasks` vec, racing the shared `shutdown`. This slice wires the OPEN path
+    // (`run_single_server_bus` is hardcoded open): no token source (`None`), an empty
+    // static token, no TLS pin. The secure-control `CredentialSource` spawn is deferred to
+    // the discovery/supervisor slice (this path has no `ServerTarget`/minter yet).
+    let egress = crate::egress::EgressSubscriber::new(
+        handlers.server_name.clone(),
+        server_url,
+        String::new(),
+        "",
+        None,
+        handlers.audit.clone(),
+        log.clone(),
+    );
+    let egress_shutdown = shutdown.clone();
+    tasks.push(tokio::spawn(async move {
+        egress.run(egress_shutdown).await;
+    }));
+
     for t in tasks {
         let _ = t.await;
     }
