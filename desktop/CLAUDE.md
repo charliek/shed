@@ -45,6 +45,17 @@ Core/UI split (see `docs/desktop/architecture.md`):
 The dedicated GTK client that used to ship the `.deb` has been **retired** — Tauri replaced
 it. There is no `--target gtk` and no `shed-gtk` crate.
 
+The Tauri client also has a **macOS packaging path** (Swift→Tauri transition): `make
+tauri-bundle-mac` / `make tauri-dmg-mac` build a signed `ShedDesktop.app`/DMG with an
+embedded real Sparkle updater. On **Darwin** every Tauri build (`tauri-build`/`-lint`/`-test`/
+`-run`) needs `Sparkle.framework` staged first (`make sparkle-framework` runs
+`scripts/fetch-sparkle.sh`, pinned + gitignored) — the sparkle-updater crate's `build.rs`
+panics without it. The mac Tauri bundle aligns its identity to the Swift app
+(`ai.stridelabs.ShedDesktop`, mac-only overlay `tauri.macos.conf.json`), so the mac dev
+config dir is `~/Library/Application Support/ai.stridelabs.ShedDesktop`; the **Linux** identity
+`ai.stridelabs.shed-desktop` (polkit/D-Bus/nfpm) is unchanged. See `desktop/RELEASING.md` for
+the beta-rollout release flow.
+
 ## The change loop (macOS)
 
 ```bash
