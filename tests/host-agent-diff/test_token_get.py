@@ -191,3 +191,47 @@ def test_token_get(daemon, single_server_config, differential):
     # The control-scope live check: the remote command's <scope> is `control`.
     scope = argv[argv.index("_bootstrap") + 1 + 1]  # ..._bootstrap <host> <scope>
     assert scope == "control", f"minted with scope {scope!r}, want control"
+
+
+# A MALFORMED `~/.shed/config.yaml` the control-token provider reads when resolving a
+# server for `token.get`. Before the config-port slice the Rust `load_discovered_servers`
+# reused the permissive line/colon `yaml_lite` reader, which never errored; Go
+# `LoadDiscoveredServers` errored on malformed YAML. The reader is now backed by
+# `saphyr-parser`, so BOTH impls surface an error — wrapped as `reading server config:`
+# in the `token.response.error`.
+MALFORMED_SHED_CONFIG = "{{invalid yaml"
+
+
+@pytest.mark.parametrize("impl", ["go", "rust"])
+def test_token_get_malformed_shed_config(daemon, single_server_config, impl):
+    """A `token.get` against a daemon whose `~/.shed/config.yaml` is MALFORMED fails
+    closed: the control-token provider's resolve reads the config, the parse errors, and
+    the daemon replies `token.response{error}` (never a partial token).
+
+    The OUTER wrapper prefix `reading server config:` is the only shared, assertable
+    surface (P: C3): Go's inner text is `parsing shed config <path>` (`discovery.go:73`
+    for malformed) while Rust's is `parsing shed config <path>: <saphyr msg>` — the inner
+    body is yaml-lib specific and excluded (docker suffix precedent), so this asserts the
+    outer prefix per-impl (NOT a full-string differential). The launch config itself is a
+    VALID single-server block config, so the daemon boots normally; only the SEPARATE
+    `~/.shed/config.yaml` the minter reads is malformed (the M2 "different file, different
+    chain" reason this stays a distinct cell from the config-validate matrix)."""
+    with SyntheticBus() as bus:
+        with daemon(
+            impl,
+            single_server_config(bus.url),
+            shed_config=MALFORMED_SHED_CONFIG,
+        ) as d:
+            with DesktopClient(str(d.desktop_sock)) as app:
+                app.send_hello()
+                wait_for_consumer(d, connected=True, timeout=10.0)
+                app.send({"type": "token.get", "id": "q1", "server": "prod"})
+                resp = app.await_frame("token.response", timeout=10.0)
+
+    assert resp["type"] == "token.response"
+    assert resp["in_reply_to"] == "q1"
+    assert resp.get("token", "") == "", f"{impl}: a failed mint must not carry a token: {resp!r}"
+    err = resp.get("error", "")
+    assert "reading server config:" in err, (
+        f"{impl}: token.response.error {err!r} lacks the outer 'reading server config:' prefix"
+    )

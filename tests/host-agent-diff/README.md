@@ -130,21 +130,39 @@ identities (real-signing ed25519, canned blobs for rsa/ecdsa).
 
 ## Known contract gaps (slice 0)
 
-- **Inline flow-style YAML config.** The Rust slice-0 `yaml_lite` config parser handles
-  **block-style** maps only; it treats an inline flow map like
-  `ssh: { approval: { policy: shed-desktop } }` as an opaque scalar and falls back to
-  all-`deny-all` with an empty gate list, whereas the Go daemon (real YAML) parses it.
-  The harness therefore writes its launch config in **block style** (both parsers agree),
-  and this divergence is tracked as an `xfail`/out-of-scope cell below (`config-parse ·
-  inline-flow`) — a later slice brings the Rust parser to parity.
+- **Config parsing & validation — STRUCTURAL sub-class retired; typed-decode residue
+  documented-open.** The Rust config reader (`config.rs` `yaml_lite`) is now backed by
+  `saphyr-parser` (a pure-Rust YAML-1.2 event parser, `default-features = false`), not the
+  old line/colon reader. That **retires the structural sub-class** of the Go-vs-Rust gap:
+  inline **flow maps** (`ssh: { approval: { policy: shed-desktop } }`) and **flow
+  sequences** parse like block style (`test_config_inline_flow.py`); **block-style
+  sequences** parse (the shipped `configs/extensions.example.yaml` `registries:` block list
+  parses to `[index.docker.io, ghcr.io]` instead of silently dropping to empty — golden
+  `config_validate` + the `example_config_loads_and_validates` unit); **malformed YAML is
+  detected** (returns `Err` → exit 1) instead of being swallowed; and a bare `key:` (YAML
+  null) is distinct from `key: ""` (empty string), so Go's null-vs-empty merge is
+  reproduced (`source_profile` cross-language golden). On top of the parser, the Rust
+  `HostAgentConfig::load` now runs a faithful `validate()` port and **rejects (exit 1) the
+  SAME configs Go `LoadConfig`/`Validate` rejects** — unknown/biometric policy strings, the
+  AWS/Docker biometric policies, `aws.mode`/`aws.sheds` errors, a non-positive/invalid
+  `approval_timeout`, malformed YAML, and duplicate map keys — enforced live by
+  `test_config_validate.py` (exit-1 parity on both impls) and pinned per-vector by the
+  `config_validate.json` golden (both runners).
 
-- **Config validation.** The Rust slice-0 config reader is `LiveStatus`-scoped: it does
-  **not** yet reject the things Go `LoadConfig`/`Validate` rejects (unknown policy strings,
-  the AWS/Docker biometric policies, `aws.mode`/`aws.sheds` errors, a non-positive
-  `approval_timeout`, malformed YAML). So e.g. `aws.approval.policy: biometrics` exits 1 in
-  Go but currently starts in Rust and echoes `biometrics`. The full config **port +
-  validation-parity differential** is its own later slice (config.go's `Validate` is ~120
-  lines); tracked as `config-validate` below.
+  **Documented-open (a real parser fixes STRUCTURE, not typed resolution):** the `Node`
+  model is stringly-typed and the readers coerce leniently, so a **typed-decode residue**
+  survives and is NOT closed here — **scalar-into-typed-field coercion** (`http_port:
+  not-a-number` → Go errors, Rust defaults; `approval_timeout: [a,b]` → Go errors, Rust
+  falls back to 25s; a scalar where a list is expected), and **bool alternate forms**
+  (`allow_all: yes` / `on` / `True` → Go `yaml.v3` resolves to a bool, but Rust `opt_bool`
+  treats only lowercase `"true"` as true — CodeRabbit-confirmed). **Closed** by the swap:
+  duplicate map keys (→ `Err`, matching yaml.v3) and multi-document input (first document
+  consumed, matching Go's `yaml.Unmarshal`). Also documented-open: anchors/aliases/
+  merge-keys, non-string keys, tagged scalars (low real-world risk), and the **cross-client
+  inconsistency on the shared `~/.shed/config.yaml`** — the host-agent (`saphyr-parser`) and
+  the desktop app (shed-core's own hand-rolled `yaml_lite`, a separate crate with a Swift
+  byte-parity test) may now diverge on the SAME file; converging the two readers is a
+  separate shed-core slice, not this one.
 
 - **Bounded connect timeout.** The Rust `status` client and the daemon's live-socket
   stale-probe use blocking Unix `connect()`; Go uses `net.DialTimeout` (2s / 500ms). The
@@ -173,11 +191,16 @@ identities (real-signing ed25519, canned blobs for rsa/ecdsa).
   flows (they connect a fresh consumer with `replay_events:0`) — a buffered-then-connect
   drive is a follow-up.
 
-- **Minter — malformed `~/.shed/config.yaml`.** The Rust `load_discovered_servers` reuses
-  the permissive `yaml_lite` reader, which never errors; Go `LoadDiscoveredServers` errors
-  on malformed YAML (→ `reading server config: …` in `token.response.error`). The harness
-  writes a valid block-style config, so the differential doesn't exercise it. Same class as
-  the inline-flow / config-validate gaps; brought to parity by the config-port slice.
+- **Minter — malformed `~/.shed/config.yaml` — CLOSED.** The Rust `load_discovered_servers`
+  is backed by the saphyr `yaml_lite` reader now, so a malformed `~/.shed/config.yaml`
+  returns `Err` (was silently permissive), matching Go `LoadDiscoveredServers`. Both impls
+  surface it as `reading server config: …` in the `token.response.error` when a `token.get`
+  triggers a resolve — enforced live by `test_token_get.py::test_token_get_malformed_shed_config`
+  (the outer `reading server config:` prefix, per-impl; the inner body is yaml-lib specific
+  — Go `parsing shed config` vs the saphyr message — and excluded per the docker suffix
+  precedent). This stays a SEPARATE cell from the `config-validate` matrix: it exercises a
+  DIFFERENT file (`~/.shed/config.yaml`, not the launch `-config`) and a DIFFERENT chain
+  (`token.get` → `resolve` → `load_discovered_servers`).
 
 ## Per-cell status table
 
@@ -196,10 +219,10 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | lifecycle | SIGTERM → exit 0 + both sockets unlinked | **enforced** | live (`test_lifecycle.py`) |
 | socket | status socket bind + `0600` file perms | **enforced** | live (`conftest` daemon + `test_socket_perms.py`) |
 | socket | socket-dir `0700` + stale-vs-live rebinding | **xfail** | live (config/lifecycle slice) |
-| config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML (parity) | **xfail** | live (config-port slice; see "Known contract gaps") |
+| config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML, duplicate key (exit-1 parity) | **enforced** | live (`test_config_validate.py`) + golden (`config_validate.json`, Go + Rust runners) |
 | decision | `EffectivePolicy` (`""→deny-all`, echoes) | **enforced** | golden (Go + Rust runners) |
 | decision | `desktopGateNamespaces` ordered gate list | **enforced** | golden (Go + Rust runners) |
-| config-parse | inline-flow-style YAML (`{ ... }`) parity | **xfail** | live — Rust `yaml_lite` block-only (see "Known contract gaps") |
+| config-parse | inline-flow-style YAML (`{ ... }`) parity (masked `LiveStatus` policies canonical-equal) | **enforced** | live (`test_config_inline_flow.py`) |
 | desktop UDS server | hello/hello_ack handshake (masked canonical-equal) + non-hello first line dropped | **enforced** | live surface A (`test_desktop_handshake.py`, `test_desktop_first_non_hello_drops.py`) |
 | desktop UDS server | single-consumer last-writer-wins supersede (`accepted:false, reason:"superseded"`, old closed) | **enforced** | live surface A (`test_desktop_supersede.py`) |
 | desktop UDS server | `token.get` → `token.response` (masked; `token`+`expires_at` compared UNMASKED via the PATH-shim mint) | **enforced** | live surface A (`test_token_get.py`) |
@@ -239,7 +262,7 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | minter | host-key-mismatch terminal; single-flight; refresh cadence | **enforced (unit)** | unit parity (`minter.rs` / `bootstrap.rs`, incl. real-runner shell-shim tests) |
 | minter | `load_discovered_servers` shape (ssh_port=0-vs-22, empty-host skip, sort) | **enforced (golden)** | Go + Rust golden runners on `fixtures/load_discovered_servers.json` |
 | minter | credentials-scope live bus drive | **xfail** | supervisor slice (no bus token provider wired yet) |
-| minter | malformed `~/.shed/config.yaml` error parity | **xfail** | config-port slice — Go `LoadDiscoveredServers` errors on bad YAML; the permissive `yaml_lite` reader does not (same class as `config-parse · inline-flow` / `config-validate`) |
+| minter | malformed `~/.shed/config.yaml` error parity (outer `reading server config:` prefix, per-impl) | **enforced** | live (`test_token_get.py::test_token_get_malformed_shed_config`) |
 | supervisor | reconcile / restart-on-cred-or-TLS-change | **xfail** | live; `shouldMint` matrix → golden |
 | discovery | off / poll / fsnotify | **xfail** | live (convergence w/ deadline); `LoadDiscoveredServers` shape → golden |
 | concurrency | single-flight mint, drop-on-full fan-out | **out-of-scope** | unit parity |
