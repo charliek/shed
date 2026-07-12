@@ -723,6 +723,29 @@ export async function openPreferences(): Promise<void> {
 export async function quitApp(): Promise<void> {
   await invoke("app_exit");
 }
+
+/** The Sparkle updater's status the popover "Check for Updates…" row reads on
+ *  render: `{ os, enabled, reason }` (enabled == reason=="ok"). Disabled reasons
+ *  drive a truthful tooltip (test_mode / no_bundle / linux_apt). Swallows errors to
+ *  undefined (the row then degrades to disabled). */
+export type UpdaterStatus = {
+  os: "macos" | "linux";
+  enabled: boolean;
+  reason: "ok" | "test_mode" | "no_bundle" | "linux_apt";
+  /** Whether a real Sparkle updater was instantiated (macOS bundle only; always false
+   *  off macOS AND under the harness — the drivable proof test mode never made one). */
+  instantiated: boolean;
+};
+export async function updaterStatus(): Promise<UpdaterStatus | undefined> {
+  return invoke<UpdaterStatus>("updater_status");
+}
+/** A user-invoked update check (the enabled row's click). Fire-and-forget — on the
+ *  enabled path Sparkle presents its own dialog; a disabled/failed call is logged,
+ *  not surfaced (the row is only clickable when status.enabled). */
+export async function updaterCheck(): Promise<void> {
+  const core = await import("@tauri-apps/api/core");
+  await core.invoke("updater_check").catch((e) => console.error("updater_check failed", e));
+}
 /** Ask Rust to content-size the popover window to the measured height (Swift NSPopover
  *  parity — no dead space). macOS-only in effect; a no-op on other targets. */
 export async function resizePopover(height: number): Promise<void> {

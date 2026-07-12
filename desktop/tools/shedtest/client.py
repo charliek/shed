@@ -536,3 +536,17 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
     def tray_hide(self) -> None:
         """Hide the mac popover."""
         self.call("tray.hide")
+
+    # -- Sparkle updater (the popover "Check for Updates…" row) -----------
+    def updater_status(self) -> dict:
+        """The updater's status: `{os, enabled, reason}` (enabled == reason=='ok').
+        Platform-truthful: Linux ⇒ reason 'linux_apt'; mac under the harness ⇒
+        'test_mode' (the plugin is never registered in test mode); mac unbundled ⇒
+        'no_bundle'; a real bundle ⇒ 'ok'."""
+        return self.call("updater.status")
+
+    def updater_check(self) -> None:
+        """A user-invoked update check. On the enabled path presents Sparkle; when
+        disabled raises ShedError('updater_disabled') whose message carries the
+        reason ('updater_disabled:<reason>') — never crashes the app."""
+        self.call("updater.check")

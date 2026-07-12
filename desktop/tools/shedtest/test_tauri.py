@@ -89,6 +89,34 @@ def test_tray_popover_drivable(tauri):
                      timeout=15, what="popover hidden after tray.hide")
 
 
+def test_updater_status_and_check_disabled(tauri):
+    # Sparkle updater (C2): the drivable status/check ops prove the gated wiring.
+    # The plugin is NEVER registered under the harness (test mode ⇒ Swift-parity: no
+    # updater instantiated), so on macOS the status is disabled with reason
+    # 'test_mode'. On Linux there's no in-app updater at all (apt channel), so the
+    # reason is 'linux_apt' regardless of test mode. Branch on the platform per the
+    # existing precedent in this file. `instantiated` is the independent proof that no
+    # Sparkle updater was ever made under the harness — false on BOTH platforms.
+    status = tauri.updater_status()
+    if platform.system() == "Darwin":
+        assert status == {"enabled": False, "reason": "test_mode", "os": "macos",
+                          "instantiated": False}
+    else:
+        assert status == {"enabled": False, "reason": "linux_apt", "os": "linux",
+                          "instantiated": False}
+
+    # updater.check on the disabled path returns the deterministic `updater_disabled`
+    # error (message carries the reason) — and NEVER crashes the app (a live op after
+    # confirms the process is still serving).
+    reason = "test_mode" if platform.system() == "Darwin" else "linux_apt"
+    with pytest.raises(ShedError) as exc:
+        tauri.updater_check()
+    assert exc.value.code == "updater_disabled"
+    assert exc.value.message == f"updater_disabled:{reason}"
+    # The app is still alive + serving after the (rejected) check.
+    assert tauri.identify()["platform"] == "tauri"
+
+
 def test_navigate_rejects_unknown_pane(tauri):
     # An unknown pane is a bad_request, not blindly emitted — a bogus pane would
     # otherwise blank the UI (PANES[pane] undefined).
