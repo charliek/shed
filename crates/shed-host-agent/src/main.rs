@@ -29,6 +29,9 @@ mod config;
 #[cfg(feature = "desktop-forwarding")]
 mod controltoken;
 mod docker_backend;
+// The always-on egress-audit SSE consumer (bus-side, not gated — like `bus`/`aws_backend`/
+// `docker_backend`). Landed here; the per-server side task is spawned in commit 2.
+mod egress;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop;
 #[cfg(feature = "desktop-forwarding")]

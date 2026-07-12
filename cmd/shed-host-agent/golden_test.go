@@ -428,6 +428,41 @@ func TestGoldenDockerResolve(t *testing.T) {
 	}
 }
 
+// TestGoldenEgressAuditEntry is the Go half of the egress_audit_entry golden. It
+// unmarshals each vector's `decision` into egressDecision (so the ts goes through the
+// PRODUCTION time.Time parse, incl. offset normalization and the zero-time case), routes
+// it through egressAuditEntry, and compares the resulting AuditEntry's wire JSON against
+// the shared fixture the Rust runner (egress.rs:tests::golden_egress_audit_entry) reads.
+// Pins the detail formatting, ns/op/result/reason mapping, ts UTC-render/blank, and the
+// always-present "approval":"" byte so the two impls cannot drift together.
+func TestGoldenEgressAuditEntry(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name     string          `json:"name"`
+			Server   string          `json:"server"`
+			Decision json.RawMessage `json:"decision"`
+			Expected json.RawMessage `json:"expected"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "egress_audit_entry.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("egress_audit_entry.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("egress_audit_entry.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		var dec egressDecision
+		if err := json.Unmarshal(v.Decision, &dec); err != nil {
+			t.Errorf("%s: decode decision: %v", v.Name, err)
+			continue
+		}
+		assertJSONShapeEqual(t, "egress/"+v.Name, egressAuditEntry(v.Server, dec), v.Expected)
+	}
+}
+
 func TestGoldenGateNamespaces(t *testing.T) {
 	var fx struct {
 		ProtocolVersion int `json:"protocol_version"`

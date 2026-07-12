@@ -17,6 +17,13 @@ use std::time::Duration;
 pub const NS_SSH_AGENT: &str = "ssh-agent";
 pub const NS_AWS_CREDENTIALS: &str = "aws-credentials";
 pub const NS_DOCKER_CREDENTIALS: &str = "docker-credentials";
+/// The audit namespace stamped on every egress-control decision (mirror Go's
+/// `namespaceEgress`). Unlike the three above it is NOT a plugin-bus namespace — the
+/// egress consumer reads the read-only `GET /api/egress/stream` SSE route — so it is
+/// deliberately absent from `BUS_NAMESPACES`. `#[allow(dead_code)]` until commit 2 wires
+/// the egress side task (its only consumer today is `egress_audit_entry`, itself unwired).
+#[allow(dead_code)]
+pub const NS_EGRESS: &str = "egress";
 
 /// Approval-policy value that fails closed — the effective policy for an empty or
 /// omitted `approval.policy` (matches the Go `EffectivePolicy`).

@@ -1,0 +1,30 @@
+{
+  "_comment": "Golden fixture for the egress decision->audit mapping (cmd/shed-host-agent/egress_handler.go:egressAuditEntry / crates/shed-host-agent/src/egress.rs:egress_audit_entry). Each vector's `decision` is the streamed egressDecision JSON; `expected` is the durable-JSONL AuditEntry wire object. Read by BOTH the Go runner (golden_test.go:TestGoldenEgressAuditEntry, via json.Unmarshal->egressAuditEntry->json.Marshal) and the Rust runner (egress.rs:tests::golden_egress_audit_entry, via serde_json->egress_audit_entry->audit::to_jsonl) so the two impls cannot drift together on the detail formatting, ns/op/result/reason mapping, ts UTC-normalization, empty-ts blanking, or the always-present \"approval\":\"\" byte. Mirrors TestEgressAuditEntry / TestEgressAuditEntry_NoResolvedIP plus the Rust-stronger offset-ts and empty-ts rows. Compared as parsed values (key order irrelevant).",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "full fields incl resolved ip; UTC ts",
+      "server": "srv",
+      "decision": {"ts": "2020-01-01T00:00:00Z", "shed": "web", "host": "evil.com", "port": 443, "resolved_ip": "1.2.3.4", "protocol": "https", "verdict": "deny", "reason": "default-deny"},
+      "expected": {"ts": "2020-01-01T00:00:00Z", "server": "srv", "shed": "web", "ns": "egress", "op": "https", "result": "deny", "detail": "evil.com:443 (1.2.3.4)", "reason": "default-deny", "approval": ""}
+    },
+    {
+      "name": "no resolved ip -> bare host:port detail; no reason",
+      "server": "srv",
+      "decision": {"shed": "web", "host": "x.com", "port": 80, "protocol": "http", "verdict": "allow"},
+      "expected": {"ts": "", "server": "srv", "shed": "web", "ns": "egress", "op": "http", "result": "allow", "detail": "x.com:80", "approval": ""}
+    },
+    {
+      "name": "absent ts -> blank ts (the sink stamps now downstream)",
+      "server": "srv",
+      "decision": {"shed": "web", "host": "a.com", "port": 8080, "protocol": "tcp", "verdict": "deny", "reason": "policy"},
+      "expected": {"ts": "", "server": "srv", "shed": "web", "ns": "egress", "op": "tcp", "result": "deny", "detail": "a.com:8080", "reason": "policy", "approval": ""}
+    },
+    {
+      "name": "non-UTC offset ts normalizes to UTC (Rust-stronger; Go test only used UTC)",
+      "server": "srv",
+      "decision": {"ts": "2020-01-01T02:00:00+02:00", "shed": "web", "host": "evil.com", "port": 443, "protocol": "https", "verdict": "deny", "reason": "default-deny"},
+      "expected": {"ts": "2020-01-01T00:00:00Z", "server": "srv", "shed": "web", "ns": "egress", "op": "https", "result": "deny", "detail": "evil.com:443", "reason": "default-deny", "approval": ""}
+    }
+  ]
+}

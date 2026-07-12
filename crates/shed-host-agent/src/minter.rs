@@ -279,9 +279,11 @@ impl CredentialSource {
     }
 
     /// The current token, minting or re-minting as needed (implements the token half of
-    /// `sdk.TokenProvider`). Test-only until the supervisor slice wires the credentials
-    /// bus provider; the control path uses [`Self::force_token_with_expiry`].
-    #[cfg(test)]
+    /// `sdk.TokenProvider`). The egress SSE consumer is its first production consumer
+    /// (via the `EgressTokenSource` bridge for `Arc<CredentialSource>` in `egress.rs`,
+    /// behind `desktop-forwarding`): the control-scoped egress token is cached and
+    /// re-minted, and cleared by [`Self::invalidate`] after a 401. The `token.get` control
+    /// path instead uses [`Self::force_token_with_expiry`] (never a cached copy).
     pub async fn token(self: &Arc<Self>) -> Result<String, String> {
         self.obtain(false).await.map(|(tok, _)| tok)
     }
@@ -296,8 +298,8 @@ impl CredentialSource {
         self.obtain(true).await
     }
 
-    /// Clear the cached token so the next obtain re-mints. Called after a 401.
-    #[cfg(test)]
+    /// Clear the cached token so the next obtain re-mints. Called after a 401 (the egress
+    /// consumer's `EgressTokenSource::invalidate`, mirror Go `credentialSource.Invalidate`).
     pub fn invalidate(&self) {
         let mut st = self.state.lock().unwrap();
         st.token.clear();
@@ -714,6 +716,28 @@ mod tests {
         assert_eq!(fm.calls.load(Ordering::SeqCst), 1);
         s.invalidate();
         assert_eq!(s.token().await.unwrap(), "tok2"); // re-mint
+        assert_eq!(fm.calls.load(Ordering::SeqCst), 2);
+    }
+
+    // The egress slice un-gated `token()`/`invalidate()` from `#[cfg(test)]` to `pub`
+    // (first production consumer). These two rows re-pin the cache + invalidate semantics
+    // unguarded — the plan's BLOCKER-1 mapping rows.
+    #[tokio::test]
+    async fn credential_source_token_caches() {
+        let fm = FakeMinter::new(vec![Ok(minted("tok1")), Ok(minted("tok2"))]);
+        let s = new_credential_source(fm.clone(), target("s", "", 0), SCOPE_CONTROL);
+        assert_eq!(s.token().await.unwrap(), "tok1");
+        assert_eq!(s.token().await.unwrap(), "tok1"); // 2nd call served from cache
+        assert_eq!(fm.calls.load(Ordering::SeqCst), 1, "cached → one mint");
+    }
+
+    #[tokio::test]
+    async fn credential_source_invalidate_forces_remint() {
+        let fm = FakeMinter::new(vec![Ok(minted("tok1")), Ok(minted("tok2"))]);
+        let s = new_credential_source(fm.clone(), target("s", "", 0), SCOPE_CONTROL);
+        assert_eq!(s.token().await.unwrap(), "tok1");
+        s.invalidate();
+        assert_eq!(s.token().await.unwrap(), "tok2"); // next token() re-mints
         assert_eq!(fm.calls.load(Ordering::SeqCst), 2);
     }
 
