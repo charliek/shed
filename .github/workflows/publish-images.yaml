@@ -636,7 +636,11 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists — reusing it"
           else
-            gh release create "$TAG" --title "$TAG" \
+            # Prerelease tags (the Tauri beta track) must not become the
+            # repo's "latest" release.
+            PRERELEASE_FLAG=""
+            case "$TAG" in *-*) PRERELEASE_FLAG="--prerelease" ;; esac
+            gh release create "$TAG" --title "$TAG" $PRERELEASE_FLAG \
               --notes "Release $TAG — assets are uploading."
           fi
 

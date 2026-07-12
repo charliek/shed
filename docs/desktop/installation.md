@@ -13,7 +13,8 @@ Grab the latest `ShedDesktop-<version>.dmg` from the
 
 Official release DMGs are Developer-ID-signed and notarized when the release
 pipeline has signing credentials, and then launch without a Gatekeeper prompt.
-(An unsigned build ships a `FIRST-LAUNCH.txt` with the one-time bypass steps.)
+(An ad-hoc-signed, non-notarized build ships a `FIRST-LAUNCH.txt` with the
+one-time bypass steps.)
 
 ### Updates
 

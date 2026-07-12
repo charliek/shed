@@ -55,7 +55,6 @@ All notable changes to this project will be documented in this file.
   macOS, Tauri Linux) gain the new kinds and the generic permission mode, gate the create
   sheet's kind chips on each shed's capabilities, surface `needs-auth` per agent, and
   apply the unknown-kind neutral-rendering policy.
-<<<<<<< HEAD
 - **Live RC activity (the rc hub).** `shed-ext-rc serve` runs a resident, on-demand,
   self-exiting per-shed daemon (loopback `127.0.0.1:1029`) that tails codex rollout and
   claude transcript JSONL — with a spinner-normalizing pane-stability engine as the
@@ -98,7 +97,8 @@ All notable changes to this project will be documented in this file.
 - **Tauri mac DMG packaging + prerelease-tag release job.** New `make tauri-dmg-mac`
   packaging (Sparkle staged by `scripts/fetch-sparkle.sh`, signed in Sparkle's ordered
   inner→outer sequence) and a `desktop-macos-tauri` release job: **prerelease** desktop
-  tags (`vX.Y.Z-rc.N`) build/notarize the Tauri DMG and append a **beta-channel** appcast
+  tags (`vX.Y.Z-rc.N`) build and — when Apple signing credentials are configured —
+  notarize the Tauri DMG and append a **beta-channel** appcast
   entry, while stable tags keep shipping the Swift DMG (mutually exclusive gates). This is
   the beta rollout track — stable users are untouched until promotion.
 
