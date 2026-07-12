@@ -270,7 +270,7 @@ All endpoints are loopback-only and reached through the server proxy at
 | `POST /v1/sessions/{slug}/input` | body `{"text":"…"}` (≤16 KiB) | `{"delivered":true}` | `400` invalid/unsafe/empty text; `404` unknown/gone slug; `409` not accepting; `413` body too large |
 
 Errors carry a JSON envelope `{"error":"<code>","message":"…"}`. A hub-down condition is
-surfaced by the proxy, not the hub — see [FC degrade](#firecracker-degrade).
+surfaced by the proxy, not the hub — see [Hub-down degrade](#hub-down-degrade).
 
 ### SSE events (`GET /v1/events`)
 
@@ -444,14 +444,18 @@ Session **listings** are enriched cheaply too: `shed-ext-rc list` consults an
 *already-running* hub with a ~200 ms deadline for activity (it never *starts* one), with
 instant fallback to today's hub-less behavior.
 
-### Firecracker degrade
+### Hub-down degrade
 
-The hub binds loopback only, and on Firecracker `DialService` reaches the VM's **bridge
-IP**, not loopback — so the hub is unreachable there (binding `0.0.0.0` is ruled out by
-the security invariant). On FC the proxy returns **503 `RC_HUB_UNAVAILABLE`**, listings
-carry no activity fields, and clients hide watch/activity affordances (a clean
-feature-degrade). Clients key feature-degrade off the `RC_HUB_UNAVAILABLE` code. FC
-parity (a vsock TCP-proxy like VZ) is a tracked follow-up.
+The hub binds loopback only. `DialService` routes through the guest agent's vsock TCP
+proxy on **both** VZ and Firecracker (the agent dials the target on `127.0.0.1`), so the
+loopback hub is reachable on both backends — there is no backend-structural degrade.
+(Binding `0.0.0.0` is ruled out by the security invariant regardless.)
+
+The proxy still returns **503 `RC_HUB_UNAVAILABLE`** when the hub genuinely isn't
+answering: the hub hasn't started yet, it crashed, or the image predates the hub binary.
+In that case listings carry no activity fields and clients hide watch/activity
+affordances (a clean feature-degrade). Clients key feature-degrade off the
+`RC_HUB_UNAVAILABLE` code.
 
 ## Exit codes
 

@@ -344,6 +344,7 @@ firecracker:
   vsock_base_cid: 100
   console_port: 1024
   notify_port: 1026
+  tcp_proxy_port: 1028
   start_timeout: 120s
   stop_timeout: 10s
   bridge_name: shed-br0
@@ -374,6 +375,7 @@ from the server version.
 | `vsock_base_cid` | int | `100` | Starting CID for vsock guest addressing |
 | `console_port` | int | `1024` | Vsock port for VM console I/O |
 | `notify_port` | int | `1026` | Vsock port for the message channel (health checks, plugins) |
+| `tcp_proxy_port` | int | `1028` | Vsock port for the TCP proxy (used by `DialService` for tunnels and the Connect API). Must match the guest agent's flagless default (1028) — the systemd unit runs `shed-agent` without a `--tcp-proxy-port` override. |
 | `start_timeout` | duration | `30s` | VM startup timeout |
 | `stop_timeout` | duration | `10s` | Graceful shutdown timeout |
 | `guest_mtu` | int | `0` | Guest primary-interface MTU. `0` (default) auto-detects the host egress path MTU at VM start and lowers the guest to match a reduced path (e.g. a VPN/overlay), otherwise leaves it at 1500. Set `1280`–`1500` to pin a value when detection misses. See note below. |

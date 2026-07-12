@@ -448,13 +448,17 @@ func TestBreaker_LifecycleReset(t *testing.T) {
 	}
 }
 
-// TestRCProxy_FCDegrade models the Firecracker degrade: DialService reaches the
-// VM's bridge IP where the loopback-only hub is unreachable, so every dial is
-// refused. The proxy attempts one start then returns 503 RC_HUB_UNAVAILABLE.
-func TestRCProxy_FCDegrade(t *testing.T) {
+// TestRCProxy_HubDown models a hub-down degrade: DialService succeeds in
+// reaching the guest agent's TCP proxy, but the rc hub itself is not listening
+// on 127.0.0.1:1029 (old image, or the hub failed to start), so every dial to
+// the hub port is refused. The proxy attempts one start then returns 503
+// RC_HUB_UNAVAILABLE. This is backend-agnostic: both VZ and Firecracker route
+// through the tcpproxy now, so a refused dial means the hub is down, not that
+// the backend is structurally unable to reach loopback.
+func TestRCProxy_HubDown(t *testing.T) {
 	be := &rcFakeBackend{
 		dialFn: func(context.Context, string, uint16) (net.Conn, error) {
-			return nil, errors.New("connect: connection refused") // loopback hub unreachable from the bridge IP
+			return nil, errors.New("connect: connection refused") // hub not listening on 127.0.0.1:1029
 		},
 		execFn: func(context.Context, string, backend.ExecOptions) error { return nil },
 	}
@@ -464,7 +468,7 @@ func TestRCProxy_FCDegrade(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
 	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), rcHubUnavailableCode) {
-		t.Fatalf("FC degrade: got %d %s, want 503 %s", w.Code, w.Body.String(), rcHubUnavailableCode)
+		t.Fatalf("hub down: got %d %s, want 503 %s", w.Code, w.Body.String(), rcHubUnavailableCode)
 	}
 }
 

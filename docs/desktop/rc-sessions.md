@@ -112,7 +112,9 @@ and `rc-events` feature tokens on `GET /api/info` / `GET /api/overview`):
 
 When a hub is running, enriched session listings additionally carry `activity`,
 `activity_at`, and `last_message` inside each row's `rc` block (absent when no hub is
-running, or on Firecracker, where the proxy degrades to `503 RC_HUB_UNAVAILABLE` and
-clients hide activity affordances). The full contract — lifecycle-trumps-activity
+running — e.g. the hub hasn't started yet or the image predates it — in which case the
+proxy degrades to `503 RC_HUB_UNAVAILABLE` and clients hide activity affordances). This
+is backend-agnostic: both VZ and Firecracker reach the loopback hub through the guest
+agent's vsock TCP proxy. The full contract — lifecycle-trumps-activity
 precedence, SSE envelopes, message-feed and input semantics — lives in
 [shed-ext-rc](../extensions/rc-helper.md#the-rc-activity-hub-serve).

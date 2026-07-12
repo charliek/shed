@@ -77,8 +77,13 @@ All notable changes to this project will be documented in this file.
   credential-stripping — the server is the authorization boundary for the loopback-only
   hub. `GET /api/rc/events` is a demand-driven aggregate activity SSE stream across every
   shed (zero clients ⇒ zero upstreams). Both are advertised as the `rc-proxy` and
-  `rc-events` feature tokens. On Firecracker (where the loopback hub is unreachable) the
-  proxy degrades to `503 RC_HUB_UNAVAILABLE` and listings carry no activity fields.
+  `rc-events` feature tokens. `DialService` routes through the guest agent's vsock TCP
+  proxy on **both** VZ and Firecracker, so the loopback hub is reachable on either
+  backend; the proxy degrades to `503 RC_HUB_UNAVAILABLE` (and listings carry no activity
+  fields) only when the hub is genuinely down or the image predates it. On Firecracker
+  this also means `connect/{port}` now reaches loopback-bound guest services — parity with
+  VZ — instead of dialing the VM's bridge IP (the peer address a guest service sees
+  becomes `127.0.0.1`).
 
 ## v0.7.10 — 2026-07-08
 

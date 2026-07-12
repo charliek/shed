@@ -118,8 +118,8 @@ class ApiEndpoint:
 
         A 401 is treated as an expired control_token and SKIPS (an environment
         gap, not a regression). Every other `HTTPError` propagates with its body
-        intact so callers can classify it themselves — e.g. the 503
-        RC_HUB_UNAVAILABLE skip, or a genuine failure.
+        intact so callers can classify it themselves — e.g. distinguishing a
+        transient 503 RC_HUB_UNAVAILABLE from a genuine failure.
         """
         req = self.request(path, accept=accept)
         try:

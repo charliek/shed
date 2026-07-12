@@ -172,8 +172,8 @@ sequenceDiagram
 
 `DialService` is the foundational primitive for opening TCP connections into VMs. It abstracts the per-backend connectivity:
 
-- **VZ:** Dials the vsock TCP proxy port (1028) via a Unix socket, performs a CONNECT handshake (`CONNECT <port>\n` / `OK\n`), and returns a raw TCP connection to the target port inside the VM.
-- **Firecracker:** Dials the VM's bridge IP directly over TCP (no proxy needed since VMs have routable IPs).
+- **VZ:** Dials the vsock TCP proxy port (1028) via a Unix socket, performs a CONNECT handshake (`CONNECT <port>\n` / `OK\n`), and returns a raw connection to the target port inside the VM.
+- **Firecracker:** Dials the same vsock TCP proxy port (1028) through the Firecracker vsock UDS mux, then performs the same tcpproxy CONNECT handshake. (Historically FC dialed the VM's routable bridge IP directly; it now routes through the guest agent's TCP proxy for parity with VZ, so loopback-bound guest services such as the rc hub are reachable and the peer address the guest sees is `127.0.0.1`.)
 
 The **Connect API** (`GET /api/sheds/{name}/connect/{port}`) exposes `DialService` to external processes via HTTP upgrade (101 Switching Protocols). After the upgrade, the connection is a raw bidirectional byte stream.
 

@@ -915,7 +915,7 @@ Upgrade: shed-tcp
 
 **Success response:** `101 Switching Protocols`
 
-After the 101 response, the connection becomes a bidirectional byte stream to the target port inside the VM. The server uses `DialService` internally — for VZ this goes through the vsock TCP proxy (port 1028), for Firecracker it connects directly to the bridge IP.
+After the 101 response, the connection becomes a bidirectional byte stream to the target port inside the VM. The server uses `DialService` internally — on both VZ and Firecracker this goes through the guest agent's vsock TCP proxy (port 1028), which dials the target on the guest's loopback. Loopback-bound guest services (e.g. the rc hub) are reachable on both backends, and the peer address the guest service sees is `127.0.0.1`.
 
 **Error responses:**
 

@@ -26,16 +26,17 @@ import (
 // circuit breaker) it and the aggregator share. The proxy forwards a strict
 // allowlist of hub endpoints into a shed's guest-local rc hub over
 // backend.DialService(shed, rc.HubPort); everything outside the allowlist is
-// rejected BEFORE any dial. The hub is loopback-only inside the guest, so on
-// Firecracker (where DialService reaches the VM's bridge IP, not loopback) the
-// hub is unreachable and the proxy degrades to 503 RC_HUB_UNAVAILABLE — the
-// documented FC-degrade.
+// rejected BEFORE any dial. The hub is loopback-only inside the guest;
+// DialService routes through the guest agent's TCP proxy on both backends (VZ
+// and, since the hub-parity change, Firecracker), so the loopback hub is
+// reachable on both. If the hub is not listening (old image, or it failed to
+// start), the dial is refused and the proxy degrades to 503 RC_HUB_UNAVAILABLE.
 
 const (
 	// rcHubUnavailableCode is the error code returned when a shed's rc hub can't
 	// be reached (dial refused after an ensure-start attempt, a foreign listener
-	// on the port, the circuit breaker is open, or the FC loopback-unreachable
-	// degrade). Clients key feature-degrade off this code.
+	// on the port, the circuit breaker is open, or the hub isn't running yet /
+	// the image predates the hub). Clients key feature-degrade off this code.
 	rcHubUnavailableCode = "RC_HUB_UNAVAILABLE"
 
 	// rcHubProbeTimeout bounds a single /v1/health identity probe through the hub
@@ -141,8 +142,8 @@ func (s *Server) probeHubHealth(ctx context.Context, shedName string) hubReachCl
 		case errors.Is(err, config.ErrShedNotFoundSentinel):
 			return hubReachNotFound
 		default:
-			// Dial reached (or tried to reach) the VM but the hub port isn't
-			// answering — hub absent (or, on FC, loopback-unreachable).
+			// Dial reached the guest agent's TCP proxy but the hub port isn't
+			// answering — hub absent (not running yet, or the image predates it).
 			return hubReachAbsent
 		}
 	}

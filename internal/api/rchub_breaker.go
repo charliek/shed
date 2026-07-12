@@ -11,8 +11,9 @@ import (
 // hubBreaker is a per-shed circuit breaker over rc hub start attempts. After
 // rcHubBreakerThreshold failed starts within rcHubBreakerWindow, allow() reports
 // false for the remainder of the window so a shed whose hub refuses to start
-// (e.g. FC loopback-unreachable, a broken binary) can't drive an exec storm — the
-// proxy returns 503 immediately instead. A successful start resets the shed.
+// (e.g. an old image without the hub binary, or a broken binary) can't drive an
+// exec storm — the proxy returns 503 immediately instead. A successful start
+// resets the shed.
 //
 // now is injectable so the window/threshold behavior is testable without sleeps.
 type hubBreaker struct {

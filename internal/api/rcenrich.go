@@ -36,8 +36,8 @@ const (
 	// rcHubConsultBudget bounds the enrichment-time hub consult: after the exec-based
 	// listing, if a running hub answers within this budget its live activity is
 	// overlaid onto the rc rows. It NEVER starts a hub (a cheap read-only dial), and
-	// fits inside the 2s exec budget alongside the capability probe. A miss (no hub,
-	// FC loopback-unreachable, slow) falls back silently to the exec-only rows.
+	// fits inside the 2s exec budget alongside the capability probe. A miss (no hub
+	// running yet, old image, slow) falls back silently to the exec-only rows.
 	rcHubConsultBudget = 200 * time.Millisecond
 )
 
@@ -246,8 +246,8 @@ func toSessionRC(s rc.Session) *config.SessionRC {
 // a short budget and overlays the live activity dimension (activity, activity_at,
 // last_message) onto the already-enriched rc rows, matched by tmux session name.
 // It NEVER starts a hub — a plain read-only dial through the hub transport — and
-// falls back silently on any miss (no hub running, FC loopback-unreachable, a slow
-// or malformed response), so exec-only rows (no activity) remain the baseline.
+// falls back silently on any miss (no hub running, old image, a slow or malformed
+// response), so exec-only rows (no activity) remain the baseline.
 // The lifecycle-trumps-activity precedence is re-applied here (DisplayActivity):
 // a needs-auth/dead row carries no activity even if the hub reports one.
 func (s *Server) overlayHubActivity(ctx context.Context, shedName string, sessions []config.Session, idxs []int) {

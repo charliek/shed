@@ -38,7 +38,7 @@ type Server struct {
 	rcHubFlight singleflight.Group
 	// rcHubBreaker is the per-shed circuit breaker over hub start attempts (3 fails
 	// in 5 min → immediate 503 for the window), so a shed whose hub can't start
-	// (FC loopback-unreachable, broken binary) can't drive an exec storm.
+	// (old image without the hub binary, or a broken binary) can't drive an exec storm.
 	rcHubBreaker *hubBreaker
 	// rcAgg is the demand-driven GET /api/rc/events aggregator: zero connected
 	// clients ⇒ zero upstream hub connections.
