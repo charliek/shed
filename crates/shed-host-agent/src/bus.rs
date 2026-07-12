@@ -1177,12 +1177,13 @@ struct SshErrorResponse {
     code: String,
 }
 
-/// Serialize an SSH response payload struct to a `serde_json::Value`. The response
-/// structs are all plain `String`/`bool`/`usize`/`Vec<struct>` fields, so `to_value` is
-/// infallible; `.expect` fails loud on the impossible rather than silently emitting a
+/// Serialize a bus response payload struct (ssh/aws/docker) to a
+/// `serde_json::Value`. The response structs are all plain
+/// `String`/`bool`/`usize`/map/`Vec<struct>` fields, so `to_value` is infallible;
+/// `.expect` fails loud on the impossible rather than silently emitting a
 /// divergent shape (the typed structs are the single source of the wire field/tag names).
 fn to_payload<T: Serialize>(value: &T) -> serde_json::Value {
-    serde_json::to_value(value).expect("serialize ssh response payload")
+    serde_json::to_value(value).expect("serialize bus response payload")
 }
 
 /// Build an `{error, code}` SSH error payload (`SSHErrorResponse`). shed-server parses

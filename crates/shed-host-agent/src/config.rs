@@ -806,6 +806,17 @@ pub(crate) mod yaml_lite {
     /// whitespace-only) inner yields an empty sequence — the `[]` deny-all case —
     /// as does a trailing empty element from a dangling comma (the shipped flow
     /// lists never carry one).
+    ///
+    /// **Known divergence (CodeRabbit review, tracked for the config-port
+    /// sub-plan):** a MALFORMED flow list (`registries: [only-this` — unterminated
+    /// bracket) fails the `ends_with(']')` detector and degrades to a scalar,
+    /// which the Option-typed readers treat as an ABSENT key → inherit. Go's
+    /// yaml.Unmarshal hard-fails and the daemon refuses to start, so an operator
+    /// typo in a lockdown line is loud there and silently fail-open here. The
+    /// permissive-`yaml_lite`-vs-strict-Go class (incl. this case) is closed by
+    /// the config-port slice's validation parity (malformed YAML → exit 1).
+    /// Quoted items containing commas also split naively (documented flow-list
+    /// scope; registry hostnames cannot contain commas).
     fn parse_flow_seq(inner: &str) -> Node {
         let items = inner
             .split(',')
