@@ -47,6 +47,7 @@ mod ssh_backend;
 mod ssh_backend_agent;
 mod status;
 mod version;
+mod watcher;
 
 use std::io::{self, Write};
 use std::path::Path;

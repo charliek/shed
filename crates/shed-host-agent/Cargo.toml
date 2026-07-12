@@ -48,6 +48,17 @@ uuid = { workspace = true }
 # `registries:` sequences the old reader silently dropped. Leaf-crate only — see the PR's
 # DEP_DELTA for the reverse-dep proof that it does NOT reach shed-app/Tauri.
 saphyr-parser = { version = "0.0.11", default-features = false }
+# The discovery-source file watcher (watcher.rs `fsnotify` mode). `notify` is the
+# de-facto Rust fs-notification crate — it wraps the platform backend (FSEvents on
+# macOS, inotify on Linux, ReadDirectoryChangesW on Windows) behind one
+# `recommended_watcher` API, which is exactly Go's `fsnotify` role. Default features
+# are KEPT: they enable the real event-driven backend (fsevent-sys/macos_fsevent on
+# macOS, inotify on Linux) — dropping them would leave only the poll fallback and
+# defeat the whole point of the `fsnotify` mode. notify 8's defaults are already lean:
+# no `crossbeam-channel`, no `serde`, no `mio-extra` — the callback (`EventHandler`)
+# API we use needs none of them. Leaf-crate only (see the PR DEP_DELTA reverse-dep
+# proof): it must not reach shed-core / shed-core-ffi / shed-app.
+notify = "8"
 # The bus HTTP client: reqwest (rustls) for SSE subscribe + respond POST, and
 # futures-util for the bytes-stream adaptor. Match shed-core's stack so cargo
 # unifies one reqwest/rustls build across the workspace.

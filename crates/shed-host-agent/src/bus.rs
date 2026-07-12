@@ -762,7 +762,7 @@ impl Drop for Subscription {
 /// Resolve when `shutdown` is (or becomes) true; returns immediately if already
 /// flagged. Idempotent + cancel-safe, so it's reusable across select arms (unlike
 /// `changed()`, which only fires on a fresh change).
-async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
+pub(crate) async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|flagged| *flagged).await;
 }
 
