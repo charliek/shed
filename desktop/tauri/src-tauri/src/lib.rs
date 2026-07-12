@@ -16,6 +16,7 @@ mod single_instance;
 mod state;
 mod termctl;
 mod tray;
+mod updater;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -695,6 +696,27 @@ fn resize_popover(app: tauri::AppHandle, height: f64) {
 #[tauri::command]
 fn resize_popover(_app: tauri::AppHandle, _height: f64) {}
 
+// -- Sparkle updater (the popover "Check for Updates…" row + the drivable ops) --
+
+/// The updater's status — `{ os: "macos"|"linux", enabled, reason }` (enabled ==
+/// reason=="ok"). Drives the popover row (enabled vs a truthful disabled tooltip).
+/// Platform-truthful everywhere: Linux ⇒ `linux_apt`, mac test mode ⇒ `test_mode`,
+/// mac unbundled ⇒ `no_bundle`, else `ok`. Mirrors the `updater.status` IPC op.
+#[tauri::command]
+fn updater_status(app: tauri::AppHandle, env: tauri::State<'_, Env>) -> serde_json::Value {
+    updater::status(&app, env.test_mode)
+}
+
+/// A user-invoked update check (the popover row's click). On the enabled path fronts
+/// the app + presents Sparkle; otherwise returns an error string that distinguishes a
+/// policy-disabled check (`updater_disabled:<reason>`, unchanged) from an operational
+/// failure on the enabled path (`updater_failed:<msg>`). Mirrors the `updater.check`
+/// IPC op (which maps the same split onto the `updater_disabled`/`action_failed` codes).
+#[tauri::command]
+fn updater_check(app: tauri::AppHandle, env: tauri::State<'_, Env>) -> Result<(), String> {
+    updater::check(&app, env.test_mode).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let env = Env::from_process();
@@ -754,7 +776,8 @@ pub fn run() {
     // the real path shells out `shed-ext-rc` over SSH.
     let rc_service = Arc::new(RcService::new_default(env.test_mode, env!("CARGO_PKG_VERSION")));
 
-    tauri::Builder::default()
+    #[allow(unused_mut)] // only the macOS+non-test arm re-binds it (the sparkle plugin)
+    let mut builder = tauri::Builder::default()
         // Launch-at-login (B4): register the plugin so `app.autolaunch()` resolves;
         // it does NOT enable autostart on its own (no startup side effect). The
         // React toggle drives our guarded `loginitem_*` commands, not the plugin's
@@ -774,7 +797,20 @@ pub fn run() {
         .manage(LoginItemCell(Mutex::new(false)))
         // The app-wide light/dark appearance, shared across webviews (unset at
         // launch → the OS `prefers-color-scheme` is the fallback).
-        .manage(AppearanceState(Mutex::new(None)))
+        .manage(AppearanceState(Mutex::new(None)));
+
+    // Real Sparkle updater — registered ONLY on macOS AND outside test mode, so the
+    // updater is never instantiated under the harness (Swift-parity, enforced at
+    // registration, not inside the crate). The plugin's setup manages a
+    // `SparkleUpdater` state iff it's a valid bundle (inert under `cargo run` / the
+    // raw harness binary). Its post-init config (auto-checks off + the channel set)
+    // is applied in `.setup` below via `updater::configure`.
+    #[cfg(target_os = "macos")]
+    if !env.test_mode {
+        builder = builder.plugin(tauri_plugin_sparkle_updater::init());
+    }
+
+    builder
         .invoke_handler(tauri::generate_handler![
             ui_report,
             list_sheds,
@@ -809,7 +845,9 @@ pub fn run() {
             open_dashboard,
             open_preferences,
             app_exit,
-            resize_popover
+            resize_popover,
+            updater_status,
+            updater_check
         ])
         .setup(move |app| {
             // The bundled terminal openers live in <resources>/bin; None in an
@@ -982,6 +1020,11 @@ pub fn run() {
                         let _ = main.hide();
                     }
                     ipc::set_activation_policy_prod(app.handle(), false);
+                    // Post-init updater config (the plugin's setup already ran +
+                    // managed the SparkleUpdater state if this is a valid bundle):
+                    // automatic checks off + the beta-iff-prerelease channel set,
+                    // applied before any user-invoked check_for_updates().
+                    updater::configure(app.handle(), env!("CARGO_PKG_VERSION"));
                 }
             }
             Ok(())

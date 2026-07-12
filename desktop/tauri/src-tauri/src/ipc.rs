@@ -372,6 +372,11 @@ impl Handler {
                 Ok(json!({}))
             }
             "tray.dump" => Ok(self.tray_dump()),
+            // The Sparkle updater's drivable surface — proves the wiring + the
+            // test-mode disablement (the plugin is never registered under the
+            // harness, so `updater.status` reports `test_mode`/disabled here).
+            "updater.status" => Ok(crate::updater::status(&self.app, self.env.test_mode)),
+            "updater.check" => self.updater_check(),
             other => Err(err("unknown_op", format!("unknown op: {other}"))),
         }
     }
@@ -404,6 +409,22 @@ impl Handler {
             "popover_visible": popover_visible,
             "popover_height": popover_height,
         })
+    }
+
+    /// `updater.check` → on the enabled path front the app + present Sparkle (`{}`);
+    /// otherwise split by failure kind: a policy-disabled check is the deterministic
+    /// `updater_disabled` error whose message carries the reason
+    /// (`updater_disabled:<reason>`, so the harness can assert disablement without a
+    /// crash — never registered under the harness ⇒ test mode reports
+    /// `updater_disabled:test_mode`), while a runtime failure on the enabled path
+    /// surfaces via this file's `action_failed` convention.
+    fn updater_check(&self) -> Result<Value, (String, String)> {
+        use crate::updater::CheckError;
+        match crate::updater::check(&self.app, self.env.test_mode) {
+            Ok(()) => Ok(json!({})),
+            Err(e @ CheckError::Disabled(_)) => Err(err("updater_disabled", e.to_string())),
+            Err(CheckError::Operational(msg)) => Err(err("action_failed", msg)),
+        }
     }
 
     /// `prefs.dump` → the Preferences window's drivable state: the React-reported

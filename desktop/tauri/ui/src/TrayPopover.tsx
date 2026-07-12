@@ -9,14 +9,34 @@ import { Fingerprint, Check, X, Shield, AppWindow, Settings, ArrowDownCircle, Po
 import {
   inTauri, fetchSheds, fetchApprovals, fetchGateNamespaces, decideApproval,
   openDashboard, openPreferences, quitApp, reportTray, resizePopover,
-  type Shed, type Approval,
+  updaterStatus, updaterCheck,
+  type Shed, type Approval, type UpdaterStatus,
 } from "@/lib/bridge";
+
+/** The row tooltip for each updater reason — `ok` is the enabled prompt; the rest are
+ *  truthful about WHY the check is unavailable (test mode / installed app / apt). */
+const UPDATER_TOOLTIP: Record<UpdaterStatus["reason"], string> = {
+  ok: "Check for updates",
+  test_mode: "Updates are disabled in test mode",
+  no_bundle: "Updates require the installed app",
+  linux_apt: "Updates arrive via apt",
+};
 
 export default function TrayPopover() {
   const [sheds, setSheds] = useState<Shed[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [connected, setConnected] = useState(false);
+  // The updater row's status (fetched once on mount — it's fixed for the process
+  // lifetime). Null until fetched → the row renders disabled (the safe default).
+  const [updater, setUpdater] = useState<UpdaterStatus | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    void updaterStatus().then((s) => { if (!cancelled && s) setUpdater(s); });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!inTauri()) return;
@@ -178,7 +198,16 @@ export default function TrayPopover() {
       <div className="flex flex-col p-1.5">
         <FooterRow icon={AppWindow} label="Open dashboard" onClick={() => void openDashboard()} />
         <FooterRow icon={Settings} label="Preferences…" onClick={() => void openPreferences()} />
-        <FooterRow icon={ArrowDownCircle} label="Check for Updates…" disabled title="Updates arrive with the Tauri updater" />
+        <FooterRow
+          icon={ArrowDownCircle}
+          label="Check for Updates…"
+          disabled={!updater?.enabled}
+          // While the status fetch is unresolved OR after a failed fetch (updater ===
+          // null in both cases), show a neutral tooltip — never the no_bundle reason,
+          // which would misattribute the state. The row stays disabled meanwhile.
+          title={updater ? UPDATER_TOOLTIP[updater.reason] : "Checking updater status…"}
+          onClick={updater?.enabled ? () => void updaterCheck() : undefined}
+        />
         <FooterRow icon={Power} label="Quit" onClick={() => void quitApp()} />
       </div>
     </div>

@@ -84,6 +84,23 @@ All notable changes to this project will be documented in this file.
   this also means `connect/{port}` now reaches loopback-bound guest services — parity with
   VZ — instead of dialing the VM's bridge IP (the peer address a guest service sees
   becomes `127.0.0.1`).
+- **Tauri macOS app gains Sparkle auto-update.** The Tauri client now packages a macOS
+  DMG (`ShedDesktop-<version>.dmg`) containing a signed `ShedDesktop.app` with an
+  embedded `Sparkle.framework`, wired to
+  the **same feed and EdDSA keys as the Swift app**
+  (`https://charliek.github.io/shed/appcast.xml`). Updates are **user-invoked only** — the
+  tray popover's **Check for Updates…** row is now live (no automatic background checks;
+  Swift parity) — and the macOS bundle identity is aligned to `ai.stridelabs.ShedDesktop`
+  so the eventual Swift→Tauri hop is a same-key, in-place update. On Linux the row stays a
+  truthful "Updates arrive via apt" tooltip. Drivable over IPC via `updater.status` /
+  `updater.check`.
+- **Tauri mac DMG packaging + prerelease-tag release job.** New `make tauri-dmg-mac`
+  packaging (Sparkle staged by `scripts/fetch-sparkle.sh`, signed in Sparkle's ordered
+  inner→outer sequence) and a `desktop-macos-tauri` release job: **prerelease** desktop
+  tags (`vX.Y.Z-rc.N`) build and — when Apple signing credentials are configured —
+  notarize the Tauri DMG and append a **beta-channel** appcast
+  entry, while stable tags keep shipping the Swift DMG (mutually exclusive gates). This is
+  the beta rollout track — stable users are untouched until promotion.
 
 ## v0.7.10 — 2026-07-08
 

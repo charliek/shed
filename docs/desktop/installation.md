@@ -11,9 +11,30 @@ Grab the latest `ShedDesktop-<version>.dmg` from the
 [releases page](https://github.com/charliek/shed/releases), open it, and drag
 **ShedDesktop.app** to Applications.
 
-Release DMGs are **Developer-ID-signed and notarized**, so they launch without a Gatekeeper
-prompt. After the first launch the app **auto-updates** via Sparkle — menu → **Check for
-Updates…** — verified by an EdDSA signature independent of Apple notarization. See
+Official release DMGs are Developer-ID-signed and notarized when the release
+pipeline has signing credentials, and then launch without a Gatekeeper prompt.
+(An ad-hoc-signed, non-notarized build ships a `FIRST-LAUNCH.txt` with the
+one-time bypass steps.)
+
+### Updates
+
+The app updates through **Sparkle**, served from the appcast at
+`https://charliek.github.io/shed/appcast.xml` and verified by an EdDSA signature independent
+of Apple notarization. Updates are **user-invoked only** — there are no automatic background
+checks. Trigger one from the menu-bar dropdown (or the tray popover) → **Check for Updates…**;
+if a newer build is published, Sparkle offers it and applies it in place.
+
+| Behavior | Value |
+|---|---|
+| Trigger | User-invoked (**Check for Updates…**); no automatic/scheduled checks |
+| Feed | `https://charliek.github.io/shed/appcast.xml` (stable channel) |
+| Verification | EdDSA signature (`SUPublicEDKey`), independent of Apple notarization |
+| Channels | Stable by default; prerelease (rc) builds subscribe to a **beta** channel |
+
+The Tauri macOS app is on a **beta rollout** — prerelease (`vX.Y.Z-rc.N`) tags publish a
+beta-channel Tauri DMG while stable users keep receiving the Swift app. Both share the same
+feed, EdDSA key, and bundle identity (`ai.stridelabs.ShedDesktop`), so the eventual promotion
+is a seamless in-place update. See
 [RELEASING.md](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
 
 Locally built DMGs (`make -C desktop dmg`) are **ad-hoc signed**, so Gatekeeper blocks the

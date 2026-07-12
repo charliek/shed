@@ -67,6 +67,16 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
+# NSApp.activate before a Sparkle check (updater.rs) — the crate's own Gap 1: on a
+# tray/accessory app the Sparkle window can appear behind/unfocused. objc2-app-kit
+# 0.3 is already transitively in the lock (the sparkle-updater crate pulls it); we
+# depend on it directly for the `NSApplication` activation glue.
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+# Real Sparkle updater (macOS only, Swift-parity). Exact pin — young third-party
+# crate, deliberate bumps only. Registered ONLY outside test mode (lib.rs), so the
+# harness never instantiates an updater. build.rs links the staged Sparkle.framework
+# (make sparkle-framework prereq); Linux never compiles it (mac-only target dep).
+tauri-plugin-sparkle-updater = "=0.2.4"
 # macOS-only tauri features, unioned into the base `tauri` features:
 #  - image-png: `Image::from_bytes` for the menu-bar template tray icon (tray.rs).
 #  - macos-private-api: a TRANSPARENT popover window — needed for both its rounded

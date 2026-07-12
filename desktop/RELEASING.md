@@ -97,6 +97,77 @@ That makes `vX.Y.Z-rc.1` (with the desktop manifests bumped to match)
 the recommended dress rehearsal for DMG + notarize + EdDSA + appcast +
 deb before a first-of-its-kind release.
 
+## Tauri macOS app — the beta rollout (transition)
+
+The macOS app is transitioning from the Swift menu-bar app to the Tauri
+client. During the transition **the tag's channel picks the mac
+artifact** — two mutually exclusive jobs, exactly one per desktop-shipping
+tag (both still require `ship_desktop`, i.e. `desktop/VERSION` == the tag):
+
+| Tag shape | Job | Mac artifact | Appcast channel |
+|---|---|---|---|
+| Stable (`vX.Y.Z`) | `desktop-macos` (Swift) | `ShedDesktop-<ver>.dmg` (Swift) | stable |
+| Prerelease (`vX.Y.Z-rc.N`, any `-`) | `desktop-macos-tauri` | `ShedDesktop-<ver>.dmg` (Tauri) | beta |
+
+The gate is `contains(github.event.inputs.version || github.ref_name,
+'-')` (the Swift job carries the negation) — the `inputs.version ||`
+half keeps the `workflow_dispatch` republish path routing correctly
+(`ref_name` is a branch on dispatch). Both jobs emit the identically
+named `ShedDesktop-<ver>.dmg`, so the appcast append step is unchanged;
+`update-appcast.py` stamps `<sparkle:channel>beta</sparkle:channel>`
+whenever the tag contains `-` (the same rc-tag guard above).
+
+The Tauri client subscribes to the **beta** channel iff its own version
+carries a prerelease suffix (`CARGO_PKG_VERSION` contains `-`) — so an rc
+build receives rc appcast entries and a stable build never does. That is
+what makes an rc1→rc2 pair a **real in-place Sparkle update**, not a
+same-version no-op.
+
+### `desktop-macos-tauri` specifics (delta from the Swift job)
+
+- Builds via `make -C desktop tauri-dmg-mac` (Sparkle staged first by
+  `scripts/fetch-sparkle.sh`, pinned Sparkle 2.8.1) and runs
+  `make -C desktop tauri-test` (the Tauri crate's unit tests — **not**
+  the Swift `make test`).
+- `sign_update` comes from
+  `desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update` (staged by
+  `fetch-sparkle.sh`), **NOT** the SwiftPM `desktop/.build/artifacts`
+  path the Swift job uses.
+- Signing is **deliberately stricter** than the Swift `bundle.sh`. The
+  Tauri script (`scripts/bundle-tauri-mac.sh`) signs Sparkle's nested
+  helpers in the required inner→outer order (`Installer.xpc` →
+  `Downloader.xpc` with `--preserve-metadata=entitlements` → `Autoupdate`
+  → `Updater.app` → `Sparkle.framework` → app) and **never `--deep`**,
+  while the Swift `bundle.sh` still `--deep`-signs its framework. Do NOT
+  "align" the Tauri script down to `--deep` — wrong order / `--deep`
+  signs and notarizes clean but breaks at update time.
+
+### Mandatory post-merge rehearsal before any promotion
+
+PR-time CI cannot prove installability — a wrong signing order
+notarizes clean and only fails when Sparkle applies the update. The only
+real proof is a two-tag rehearsal, done **after merge, before promotion**:
+
+1. Cut `vX.Y.Z-rc.1` (desktop-only prerelease bump via
+   `scripts/release/update-version.sh X.Y.Z-rc.1 --components desktop`)
+   → `desktop-macos-tauri` builds/notarizes the beta DMG.
+2. **Install rc1's DMG by hand** (first install — nothing to update from
+   yet).
+3. Cut `vX.Y.Z-rc.2` (repeat the desktop version bump —
+   `update-version.sh X.Y.Z-rc.2 --components desktop` — commit, tag; a
+   tag without the bump fails `release-plan.sh`) and verify a **real
+   in-place Sparkle update rc1→rc2** in the installed app (the rc build
+   is on the beta channel, so it sees the rc2 entry). This is the
+   signing-order proof.
+
+### Promotion (a later decision — NOT this PR)
+
+Promotion flips the two job gates so **stable** tags build the Tauri DMG
+(and the Swift job retires). Because the Tauri mac bundle carries the
+Swift app's identity (`ai.stridelabs.ShedDesktop`) and the same EdDSA
+key, the first stable Tauri release rides the same-key appcast chain
+straight into existing Swift installs as an in-place update.
+
 ## Local commands
 
 ```bash
@@ -104,6 +175,8 @@ make -C desktop bundle        # build + assemble ShedDesktop.app (debug)
 make -C desktop dmg           # release bundle + drag-install DMG (ad-hoc unless
                               # SHED_DESKTOP_DEVELOPER_ID_IDENTITY is set)
 make -C desktop test          # swift unit tests (builds the Rust core first)
+make -C desktop tauri-dmg-mac # Tauri mac bundle + drag-install DMG (Sparkle staged + signed;
+                              # clobbers the Swift `dmg` outputs under desktop/build/)
 make -C desktop deb           # the Tauri .deb via Docker
 make -C desktop deb-validate  # install-validate it in a clean container
 scripts/release/release-scripts-test.sh   # self-test the release scripts (repo root)
@@ -118,6 +191,11 @@ all of them: `scripts/release/update-version.sh X.Y.Z --components
 desktop`. `release-plan.sh` exits 1 naming the offender if they drift.
 (`desktop/tauri/ui/package.json` is deliberately NOT a version surface —
 the Tauri bundle version comes from `tauri.conf.json`.)
+
+The mac-only Tauri overlay `desktop/tauri/src-tauri/tauri.macos.conf.json`
+(productName/identifier/embedded `Sparkle.framework`) carries **no**
+`version` key — the base `tauri.conf.json` remains the single lockstep
+surface, so the Tauri mac DMG and the Linux `.deb` share one version.
 
 ## History
 

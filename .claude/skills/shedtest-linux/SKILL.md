@@ -71,6 +71,12 @@ make -C desktop e2e-tauri       # shared suite + test_tauri at --target tauri (n
   `prefs.remove_shed_rule {server, shed}` (the per-shed override row's remove button). Note
   `ui.modal` now only ever reports `create` | `launch` | `null` — Preferences is never a
   modal value.
+- **Updater ops on Linux report `linux_apt`.** `updater.status` → `{os, enabled, reason,
+  instantiated}` and `updater.check` exist on both targets (the Sparkle updater is macOS-only;
+  Linux ships via apt). On the Linux render gate `updater.status` is
+  `{os:"linux", enabled:false, reason:"linux_apt", instantiated:false}` regardless of test
+  mode, and `updater.check` returns the deterministic `updater_disabled:linux_apt` error
+  without crashing. `test_tauri.py` branches on `platform.system()` and pins this cell.
 - **Simulating a down (unreachable) host.** The shared session redirects EVERY configured
   server to the one in-process mock, so a per-host error row can't appear there. To exercise
   it, use a DEDICATED fixture config with an extra server plus the
