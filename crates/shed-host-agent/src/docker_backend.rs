@@ -44,11 +44,9 @@
 //! commit 2, wired later — the "ported, wired by a later slice" posture the AWS
 //! backend established.
 //!
-//! Everything here is unwired in this commit (the handler + `main.rs` land in commit
-//! 3), so the module carries a blanket `allow(dead_code)`; commit 3 removes it once
-//! the bus references `new_docker_backend` / the `DockerBackend` trait (the AWS slice
-//! carried the same allow in its commit 2, then dropped it on wiring).
-#![allow(dead_code)]
+//! Wired in commit 3b: the bus references `new_docker_backend` / the `DockerBackend`
+//! trait + the `DOCKER_CODE_*` codes (the AWS slice carried a blanket `allow(dead_code)`
+//! in its commit 2, then dropped it on wiring — done here likewise).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -67,10 +65,15 @@ use crate::config::{expand_tilde, user_home_dir, DockerConfig};
 // The Docker wire error codes (mirror `internal/ext/protocol/docker.go`). Duplicated
 // here as string constants because the Rust daemon does not link the Go protocol
 // package; the handler (commit 3) maps these onto `DockerErrorResponse.code`.
-const DOCKER_CODE_NOT_FOUND: &str = "CREDENTIALS_NOT_FOUND";
-const DOCKER_CODE_NOT_ALLOWED: &str = "REGISTRY_NOT_ALLOWED";
+// NOT_FOUND / NOT_ALLOWED / INTERNAL are `pub(crate)` — the bus handler maps them onto
+// the guest wire (the anonymous-vs-error audit split keys on NOT_FOUND; deny returns
+// NOT_ALLOWED; unknown-op/invalid-payload/list-error/empty-code use INTERNAL).
+// HELPER_FAILED is only ever set by the executor here, so it stays private (the handler
+// forwards `DockerCredError.code` verbatim, never naming it).
+pub(crate) const DOCKER_CODE_NOT_FOUND: &str = "CREDENTIALS_NOT_FOUND";
+pub(crate) const DOCKER_CODE_NOT_ALLOWED: &str = "REGISTRY_NOT_ALLOWED";
 const DOCKER_CODE_HELPER_FAILED: &str = "HELPER_FAILED";
-const DOCKER_CODE_INTERNAL: &str = "INTERNAL_ERROR";
+pub(crate) const DOCKER_CODE_INTERNAL: &str = "INTERNAL_ERROR";
 
 /// The list separator for `PATH`. The daemon targets macOS/Linux only (vsock/UDS), so
 /// the unix `:` is correct; Go uses `os.PathListSeparator` for the same reason.

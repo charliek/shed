@@ -135,6 +135,11 @@ fn decision_to_outcome(dec: DesktopDecision) -> ApprovalOutcome {
         decided_by,
         scope: dec.scope,
         ttl: dec.ttl,
+        // The desktop deny reason ("approval denied by shed-desktop" etc.) is
+        // sub-plan 5 (docker.approval desktop parity); this slice's only reason
+        // consumer is the docker deny-all path. Left empty here — ssh/aws never read
+        // it, and docker-desktop deny isn't wired/tested yet.
+        reason: String::new(),
     }
 }
 

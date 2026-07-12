@@ -29,9 +29,11 @@
 //! **`status`** (`{connected, mode, key_count}`) ops, and `ping` → `pong`. An unknown
 //! operation gets Go's exact `unknown operation: <op>` `INTERNAL_ERROR` envelope, and
 //! a payload that isn't a JSON object gets `{invalid payload, INTERNAL_ERROR}` — so the
-//! shed's request never hangs. The other credential backends (aws/docker) are LATER
-//! slices.
+//! shed's request never hangs. The `aws-credentials` and `docker-credentials` namespaces
+//! are wired alongside (each its own per-namespace gate); only egress remains a later
+//! slice.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,6 +52,9 @@ use crate::approval::ApprovalGate;
 use crate::audit::{AuditEntry, AuditSink};
 use crate::aws_backend::{aws_expiry_detail, aws_literal_z, AwsBackend};
 use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
+use crate::docker_backend::{
+    DockerBackend, DOCKER_CODE_INTERNAL, DOCKER_CODE_NOT_ALLOWED, DOCKER_CODE_NOT_FOUND,
+};
 use crate::ssh_backend::SshBackend;
 
 /// SSH protocol error codes (`internal/ext/protocol/ssh.go`).
@@ -66,6 +71,21 @@ const AWS_CODE_ASSUME_ROLE_FAILED: &str = "ASSUME_ROLE_FAILED";
 const AWS_CODE_INTERNAL: &str = "INTERNAL_ERROR";
 /// The gated AWS op — the only one whose audit carries the approval outcome.
 const AWS_OP_GET_CREDENTIALS: &str = "get_credentials";
+
+/// Docker operations (`internal/ext/protocol/docker.go`) used for the audit `op` field
+/// / gate op. The remaining ops (`ping`/`status`) match as literals in `docker_dispatch`.
+const DOCKER_OP_GET: &str = "get";
+const DOCKER_OP_LIST: &str = "list";
+/// The audit-only code for a request the approval gate rejected — distinct from
+/// `REGISTRY_NOT_ALLOWED` (an allowlist deny). The guest receives
+/// `REGISTRY_NOT_ALLOWED` for BOTH (preserving its behavior); this code only
+/// disambiguates the cause on host/admin surfaces (mirror Go's `auditCodeApprovalDenied`,
+/// `docker_handler.go:32`).
+const DOCKER_AUDIT_CODE_APPROVAL_DENIED: &str = "APPROVAL_DENIED";
+/// The docker `get` audit result for an allowed registry that had no credential
+/// (`CREDENTIALS_NOT_FOUND`): NOT a failure — the guest pulls anonymously — so it is
+/// recorded distinctly from a real error (mirror Go's `auditResultAnonymous`).
+const DOCKER_AUDIT_RESULT_ANONYMOUS: &str = "anonymous";
 
 // ---------------------------------------------------------------------------
 // Constants (mirrors hostclient.go)
@@ -814,6 +834,13 @@ pub struct BusHandlers {
     /// backend constructed (Go main.go:166-173 — a nil AWS backend means no aws
     /// handler). `None` ⇒ the aws-credentials namespace is never subscribed.
     pub aws: Option<AwsHandlers>,
+    /// The docker-credentials handler's seams. Unlike `aws`, this is `Some` in the
+    /// COMMON case even when unconfigured: `new_docker_backend` errors ONLY when an
+    /// explicit `config_path` is unstat-able (Go `NewDockerBackend`, main.go:175-180),
+    /// so `main.rs` all but always sets it — the docker-credentials namespace is
+    /// subscribed for every server (denying everything under an empty allowlist). `None`
+    /// only on that explicit-config_path error.
+    pub docker: Option<DockerHandlers>,
 }
 
 /// The aws-credentials handler's seams (the second bus namespace). Carries its OWN
@@ -825,18 +852,29 @@ pub struct AwsHandlers {
     pub gate: Arc<dyn ApprovalGate>,
 }
 
-/// Run the single-server message bus: subscribe to `ssh-agent` (always) and
-/// `aws-credentials` (when the AWS backend is configured) in open mode (no token, no
-/// pin) and answer inbound requests until `shutdown` flips. Each namespace runs its own
-/// subscribe+serve loop (both racing `shutdown`), mirroring the Go daemon's
-/// per-namespace watcher goroutines (`main.go` → `startWatcherGroup` → the per-handler
-/// `.Run`). `server_name` is the audit/approval `server` field — empty in single-server
-/// mode (matches Go).
+/// The docker-credentials handler's seams (the third bus namespace). Carries its OWN
+/// per-namespace approval `gate` (selected from `docker.approval.policy`, NEVER ssh's or
+/// aws's) and the `backend`; the audit sink + `server_name` are shared from
+/// [`BusHandlers`]. Present in the common case (the constructor near-always yields a live
+/// backend — see [`BusHandlers::docker`]).
+pub struct DockerHandlers {
+    pub backend: Arc<dyn DockerBackend>,
+    pub gate: Arc<dyn ApprovalGate>,
+}
+
+/// Run the single-server message bus: subscribe to `ssh-agent` (always),
+/// `aws-credentials` (when the AWS backend is configured), and `docker-credentials`
+/// (when the docker backend constructed — the COMMON case, even unconfigured) in open
+/// mode (no token, no pin) and answer inbound requests until `shutdown` flips. Each
+/// namespace runs its own subscribe+serve loop (both racing `shutdown`), mirroring the
+/// Go daemon's per-namespace watcher goroutines (`main.go` → `startWatcherGroup` → the
+/// per-handler `.Run`). `server_name` is the audit/approval `server` field — empty in
+/// single-server mode (matches Go).
 ///
-/// KNOWN GAP (for the harness): Go's watcher group also subscribes to
-/// `docker-credentials` and the egress-audit stream. Those need their backends + the
-/// egress route, so they are deliberately NOT wired here — this slice wires ssh-agent +
-/// (configured) aws-credentials.
+/// KNOWN GAP (for the harness): Go's watcher group also GETs the egress-audit stream
+/// (`/api/egress/stream`). That needs the egress route, so it is deliberately NOT wired
+/// here — after this slice the Rust daemon wires ssh-agent + (configured) aws-credentials
+/// + docker-credentials, and ONLY egress remains asymmetric.
 pub async fn run_single_server_bus(
     server_url: String,
     shutdown: watch::Receiver<bool>,
@@ -866,12 +904,17 @@ pub async fn run_single_server_bus(
     log.info(&format!("brokering for single server server={server_url}"));
 
     // The subscription set: always ssh-agent; aws-credentials when the AWS backend is
-    // configured (Go: a nil AWS backend means no aws handler). docker-credentials + the
-    // egress stream remain later slices. Compute the set once, then log + spawn from it
-    // so a new namespace is a single push (no parallel branches to keep in sync).
+    // configured (Go: a nil AWS backend means no aws handler); docker-credentials when
+    // the docker backend constructed — effectively unconditional, since the constructor
+    // near-always yields `Some` (Go's `NewDockerBackend` is non-nil even unconfigured).
+    // Only the egress stream remains a later slice. Compute the set once, then log + spawn
+    // from it so a new namespace is a single push (no parallel branches to keep in sync).
     let mut subscribed: Vec<&'static str> = vec![NS_SSH_AGENT];
     if handlers.aws.is_some() {
         subscribed.push(NS_AWS_CREDENTIALS);
+    }
+    if handlers.docker.is_some() {
+        subscribed.push(NS_DOCKER_CREDENTIALS);
     }
     let deferred: Vec<&'static str> = BUS_NAMESPACES
         .iter()
@@ -933,10 +976,11 @@ async fn serve_namespace(
 }
 
 /// Route one inbound request to its namespace handler: `aws-credentials` → the gated
-/// AWS flow (its OWN per-namespace gate + AWS error codes), every other namespace
-/// (ssh-agent) → [`handle_bus_message`]. The aws branch is reached only when
-/// `handlers.aws` is `Some` (its loop is started only then); a defensive fall-through
-/// to the ssh dispatch keeps a stray aws frame from hanging the shed's request.
+/// AWS flow, `docker-credentials` → the docker flow (each with its OWN per-namespace
+/// gate + its own error codes), every other namespace (ssh-agent) → [`handle_bus_message`].
+/// The aws/docker branches are reached only when their handlers are `Some` (their loops
+/// are started only then); a defensive fall-through to the ssh dispatch keeps a stray
+/// frame from hanging the shed's request.
 async fn dispatch_bus_message(
     client: &BusClient,
     namespace: &str,
@@ -944,14 +988,26 @@ async fn dispatch_bus_message(
     shutdown: &watch::Receiver<bool>,
     handlers: &BusHandlers,
 ) {
-    match (namespace, &handlers.aws) {
-        (NS_AWS_CREDENTIALS, Some(aws)) => {
+    match (namespace, &handlers.aws, &handlers.docker) {
+        (NS_AWS_CREDENTIALS, Some(aws), _) => {
             handle_aws_bus_message(
                 client,
                 namespace,
                 env,
                 shutdown,
                 aws,
+                &handlers.audit,
+                &handlers.server_name,
+            )
+            .await
+        }
+        (NS_DOCKER_CREDENTIALS, _, Some(docker)) => {
+            handle_docker_bus_message(
+                client,
+                namespace,
+                env,
+                shutdown,
+                docker,
                 &handlers.audit,
                 &handlers.server_name,
             )
@@ -1586,9 +1642,332 @@ fn handle_aws_status(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Docker credential handler (a faithful port of docker_handler.go) — the third bus
+// namespace. Uses its own per-namespace gate + the Docker protocol error codes. The
+// get audit is a LogEntry form that — unlike ssh/aws — SETS code+reason and splits
+// `result` into anonymous-vs-error (the CREDENTIALS_NOT_FOUND → anonymous-pull case);
+// the list audit is the ssh-style positional form (success only, `approval:"none"`).
+// ---------------------------------------------------------------------------
+
+/// Docker response payload types (serde mirrors of `internal/ext/protocol/docker.go`).
+/// Built as typed structs (not ad-hoc `json!`) so the tag names are pinned in one place;
+/// `docker_payload_tag_names_match_protocol` asserts they equal the Go json tags.
+#[derive(Serialize)]
+struct DockerGetResponse {
+    server_url: String,
+    username: String,
+    secret: String,
+}
+
+/// `DockerListResponse` — the `list` op's payload. `registries` is a registry→username
+/// map (Go `map[string]string`; a `BTreeMap` here so the wire is deterministic).
+#[derive(Serialize)]
+struct DockerListResponse {
+    registries: BTreeMap<String, String>,
+}
+
+/// `DockerPingResponse` — the `ping` op's payload.
+#[derive(Serialize)]
+struct DockerPingResponse {
+    status: String,
+}
+
+/// `DockerStatusResponse` — the `status` op's payload.
+#[derive(Serialize)]
+struct DockerStatusResponse {
+    connected: bool,
+    allow_all: bool,
+    registry_count: usize,
+}
+
+/// `DockerErrorResponse` — an `{error, code}` error payload.
+#[derive(Serialize)]
+struct DockerErrorResponse {
+    error: String,
+    code: String,
+}
+
+/// The `get` request payload (`DockerGetRequest`). `operation` is already dispatched on;
+/// only `server_url` is needed. `#[serde(default)]` so an absent field zero-fills (Go
+/// `json.Unmarshal`); a wrong-typed `server_url` fails the decode (Go too).
+#[derive(Deserialize)]
+struct DockerGetRequestPayload {
+    #[serde(default)]
+    server_url: String,
+}
+
+/// Build an `{error, code}` Docker error payload (`DockerErrorResponse`).
+fn docker_error(msg: &str, code: &str) -> serde_json::Value {
+    to_payload(&DockerErrorResponse {
+        error: msg.to_string(),
+        code: code.to_string(),
+    })
+}
+
+/// A Docker `get` audit entry — the LogEntry form carrying the gate outcome AND
+/// `code`/`reason` (unlike ssh/aws get audits, which set neither). Fixed
+/// docker-credentials ns + `get` op; `detail` is always the requested `server_url`; a
+/// `code`/`reason` of `""` is omitted by the sink (Go omitempty), so the ok path passes
+/// `""` for both. Mirrors `docker_handler.go`'s three `LogEntry` calls.
+#[allow(clippy::too_many_arguments)]
+fn docker_get_audit(
+    server_name: &str,
+    shed_name: &str,
+    result: &str,
+    detail: &str,
+    code: &str,
+    reason: &str,
+    approval: String,
+    outcome: &crate::approval::ApprovalOutcome,
+) -> AuditEntry {
+    AuditEntry {
+        server: server_name.to_string(),
+        shed: shed_name.to_string(),
+        ns: NS_DOCKER_CREDENTIALS.to_string(),
+        op: DOCKER_OP_GET.to_string(),
+        result: result.to_string(),
+        detail: detail.to_string(),
+        code: code.to_string(),
+        reason: reason.to_string(),
+        approval,
+        decided_by: outcome.decided_by.clone(),
+        scope: outcome.scope.clone().unwrap_or_default(),
+        ttl: outcome.ttl.clone().unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// A Docker `list` audit entry — Go's positional `AuditLogger.Log` form (like ssh's
+/// `list`, NOT the LogEntry form): fixed docker-credentials ns + `list` op, the given
+/// result/detail, `approval:"none"`, and NO decided_by/scope/ttl/code/reason. `list`
+/// audits ONLY on success (the error path returns audit-silent).
+fn docker_list_audit(server_name: &str, shed_name: &str, detail: &str) -> AuditEntry {
+    AuditEntry {
+        server: server_name.to_string(),
+        shed: shed_name.to_string(),
+        ns: NS_DOCKER_CREDENTIALS.to_string(),
+        op: DOCKER_OP_LIST.to_string(),
+        result: "ok".to_string(),
+        detail: detail.to_string(),
+        approval: "none".to_string(),
+        ..Default::default()
+    }
+}
+
+/// Answer one inbound docker-credentials request, mirroring `docker_handler.go:handleMessage`'s
+/// dispatch. `get` runs the gated flow (approval gate → backend → response + audit);
+/// `list` → the UNGATED registry listing (success audits positionally, error is
+/// audit-silent); `ping` → `{"status":"ok"}`; `status` → `{connected, allow_all,
+/// registry_count}`; an unknown op → Go's exact `unknown operation: <op>` `INTERNAL_ERROR`;
+/// a non-object/non-null payload → `{invalid payload, INTERNAL_ERROR}` (the shared
+/// [`parse_operation`], but with Docker codes). The reply plumbing + audit-after-response
+/// order match the ssh/aws paths (`respond_and_audit`).
+async fn handle_docker_bus_message(
+    client: &BusClient,
+    namespace: &str,
+    env: &Envelope,
+    shutdown: &watch::Receiver<bool>,
+    docker: &DockerHandlers,
+    audit: &Arc<dyn AuditSink>,
+    server_name: &str,
+) {
+    let (payload, audit_entry) = docker_dispatch(env, docker, server_name).await;
+    respond_and_audit(
+        client,
+        namespace,
+        env,
+        shutdown,
+        audit,
+        payload,
+        audit_entry,
+        "docker response",
+    )
+    .await;
+}
+
+/// Compute the docker-credentials response payload + optional audit entry for one request
+/// (the network-free core of [`handle_docker_bus_message`], so unit tests inspect the
+/// payload + audit directly). `get`/`list` audit per Go; `ping`/`status`/unknown/invalid
+/// do not.
+async fn docker_dispatch(
+    env: &Envelope,
+    docker: &DockerHandlers,
+    server_name: &str,
+) -> (serde_json::Value, Option<AuditEntry>) {
+    let shed_name = env.shed.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+    match parse_operation(&env.payload) {
+        Err(()) => (docker_error("invalid payload", DOCKER_CODE_INTERNAL), None),
+        Ok(op) => match op.as_str() {
+            DOCKER_OP_GET => {
+                handle_docker_get(env, server_name, shed_name, &docker.gate, &docker.backend).await
+            }
+            DOCKER_OP_LIST => {
+                handle_docker_list(server_name, shed_name, &docker.backend).await
+            }
+            "ping" => (
+                to_payload(&DockerPingResponse {
+                    status: "ok".to_string(),
+                }),
+                None,
+            ),
+            "status" => (
+                handle_docker_status(server_name, shed_name, &docker.backend),
+                None,
+            ),
+            other => (
+                docker_error(&format!("unknown operation: {other}"), DOCKER_CODE_INTERNAL),
+                None,
+            ),
+        },
+    }
+}
+
+/// The gated `get` flow — a faithful port of `docker_handler.go:handleGet`. ORDER matches
+/// Go: parse request → **approval gate** → backend. On gate-deny the guest gets
+/// `{approval denied, REGISTRY_NOT_ALLOWED}` while the audit carries `code:APPROVAL_DENIED,
+/// result:denied` (the two-code disambiguation). On a backend error the guest gets the
+/// original code (`DockerCredError.code`, or `INTERNAL_ERROR` when empty) and the audit
+/// splits `result` into `anonymous` (CREDENTIALS_NOT_FOUND — the guest pulls anonymously)
+/// vs `error`, with `code`+`reason`(err msg)+`detail`(server_url). On success →
+/// `DockerGetResponse` + an ok audit (detail = server_url, NO code/reason).
+async fn handle_docker_get(
+    env: &Envelope,
+    server_name: &str,
+    shed_name: &str,
+    gate: &Arc<dyn ApprovalGate>,
+    backend: &Arc<dyn DockerBackend>,
+) -> (serde_json::Value, Option<AuditEntry>) {
+    // Parse the get request (a wrong-typed `server_url` → invalid get request; no audit).
+    let req: DockerGetRequestPayload =
+        match serde_json::from_value(env.payload.clone().unwrap_or_default()) {
+            Ok(r) => r,
+            Err(_) => return (docker_error("invalid get request", DOCKER_CODE_INTERNAL), None),
+        };
+
+    // Approval gate FIRST (deny-all fails closed). The reason names the registry so the
+    // desktop approval card shows what is being requested (Go's `fmt.Sprintf`).
+    let outcome = gate
+        .approve(
+            NS_DOCKER_CREDENTIALS,
+            DOCKER_OP_GET,
+            server_name,
+            shed_name,
+            &format!("Docker credentials for {}", req.server_url),
+        )
+        .await;
+    let approval = gate.method().to_string();
+    if !outcome.approved {
+        // Deny audit: code=APPROVAL_DENIED (audit-only), reason=the gate deny reason,
+        // detail=server_url + the outcome. The guest still receives REGISTRY_NOT_ALLOWED.
+        let entry = docker_get_audit(
+            server_name,
+            shed_name,
+            "denied",
+            &req.server_url,
+            DOCKER_AUDIT_CODE_APPROVAL_DENIED,
+            &outcome.reason,
+            approval,
+            &outcome,
+        );
+        return (
+            docker_error("approval denied", DOCKER_CODE_NOT_ALLOWED),
+            Some(entry),
+        );
+    }
+
+    match backend
+        .get_credentials(server_name, shed_name, &req.server_url)
+        .await
+    {
+        Ok(cred) => {
+            let resp = DockerGetResponse {
+                server_url: cred.server_url,
+                username: cred.username,
+                secret: cred.secret,
+            };
+            // ok audit: detail=server_url, NO code/reason (Go passes neither).
+            let entry = docker_get_audit(
+                server_name,
+                shed_name,
+                "ok",
+                &req.server_url,
+                "",
+                "",
+                approval,
+                &outcome,
+            );
+            (to_payload(&resp), Some(entry))
+        }
+        Err(e) => {
+            // An empty backend code maps to INTERNAL_ERROR (Go's bare-`fmt.Errorf` cases).
+            let code = if e.code.is_empty() {
+                DOCKER_CODE_INTERNAL
+            } else {
+                e.code.as_str()
+            };
+            // CREDENTIALS_NOT_FOUND for an allowed registry is an anonymous pull, not a
+            // failure → audit `anonymous`; everything else (deny, helper fault) → `error`.
+            let result = if code == DOCKER_CODE_NOT_FOUND {
+                DOCKER_AUDIT_RESULT_ANONYMOUS
+            } else {
+                "error"
+            };
+            // The guest receives the original code; the audit enriches with code+reason.
+            let entry = docker_get_audit(
+                server_name,
+                shed_name,
+                result,
+                &req.server_url,
+                code,
+                &e.msg,
+                approval,
+                &outcome,
+            );
+            (docker_error("credential request failed", code), Some(entry))
+        }
+    }
+}
+
+/// The `list` op — a faithful port of `docker_handler.go:handleList`. UNGATED (Go never
+/// invokes the approval gate on `list`). Success → `DockerListResponse{registries}` + a
+/// positional audit (`count:N`, `approval:none`). A backend error → `{list failed,
+/// INTERNAL_ERROR}` and returns with **NO audit** (Go returns early; only success audits).
+async fn handle_docker_list(
+    server_name: &str,
+    shed_name: &str,
+    backend: &Arc<dyn DockerBackend>,
+) -> (serde_json::Value, Option<AuditEntry>) {
+    match backend.list_credentials(server_name, shed_name).await {
+        Ok(registries) => {
+            let count = registries.len();
+            let payload = to_payload(&DockerListResponse { registries });
+            let entry = docker_list_audit(server_name, shed_name, &format!("count:{count}"));
+            (payload, Some(entry))
+        }
+        // Error path: audit-silent (matches Go's early return, no LogEntry).
+        Err(_) => (docker_error("list failed", DOCKER_CODE_INTERNAL), None),
+    }
+}
+
+/// The `status` op — a faithful port of `docker_handler.go:handleStatus`:
+/// `{connected:true, allow_all, registry_count}`. `Status` never errors. NO audit.
+fn handle_docker_status(
+    server_name: &str,
+    shed_name: &str,
+    backend: &Arc<dyn DockerBackend>,
+) -> serde_json::Value {
+    let (allow_all, registry_count) = backend.status(server_name, shed_name);
+    to_payload(&DockerStatusResponse {
+        connected: true,
+        allow_all,
+        registry_count,
+    })
+}
+
 /// The credential namespaces (re-exported from `config` for callers wiring the
 /// bus). `ssh-agent` is always subscribed; `aws-credentials` when configured;
-/// `docker-credentials` is a later slice.
+/// `docker-credentials` in the common case (even unconfigured).
 pub const BUS_NAMESPACES: [&str; 3] = [NS_SSH_AGENT, NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS];
 
 #[cfg(test)]
@@ -1707,6 +2086,7 @@ mod tests {
             backend,
             server_name: String::new(),
             aws: None,
+            docker: None,
         }
     }
 
@@ -3147,6 +3527,7 @@ mod tests {
                 backend: FakeAwsBackend::creds_ok(creds(None)), // aws gate: approve-all
                 gate: approve_gate(),
             }),
+            docker: None,
         };
 
         // aws-credentials → the approve-all aws gate vends the key (never "approval denied").
@@ -3256,6 +3637,419 @@ mod tests {
         );
         assert_eq!(
             aws_error("boom", "INTERNAL_ERROR"),
+            serde_json::json!({"error":"boom","code":"INTERNAL_ERROR"})
+        );
+    }
+
+    // ---- Docker credential handler (mirror docker_handler.go) --------------------
+
+    use crate::docker_backend::{DockerCredError, DockerCredential};
+
+    /// A scripted Docker backend: `get_credentials` returns a canned Result (and counts
+    /// calls, to prove the gate short-circuits a deny); `list_credentials`/`status`
+    /// return canned values.
+    struct FakeDockerBackend {
+        get: Result<DockerCredential, DockerCredError>,
+        list: Result<BTreeMap<String, String>, String>,
+        status: (bool, usize),
+        get_calls: AtomicUsize,
+    }
+    impl FakeDockerBackend {
+        fn new(
+            get: Result<DockerCredential, DockerCredError>,
+            list: Result<BTreeMap<String, String>, String>,
+            status: (bool, usize),
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                get,
+                list,
+                status,
+                get_calls: AtomicUsize::new(0),
+            })
+        }
+        fn get_ok(cred: DockerCredential) -> Arc<Self> {
+            Self::new(Ok(cred), Ok(BTreeMap::new()), (false, 0))
+        }
+        fn get_err(e: DockerCredError) -> Arc<Self> {
+            Self::new(Err(e), Ok(BTreeMap::new()), (false, 0))
+        }
+        fn with_list(list: BTreeMap<String, String>) -> Arc<Self> {
+            Self::new(Err(unused_err()), Ok(list), (false, 0))
+        }
+        fn list_err() -> Arc<Self> {
+            Self::new(Err(unused_err()), Err("boom".to_string()), (false, 0))
+        }
+        fn with_status(allow_all: bool, count: usize) -> Arc<Self> {
+            Self::new(Err(unused_err()), Ok(BTreeMap::new()), (allow_all, count))
+        }
+    }
+    #[async_trait::async_trait]
+    impl DockerBackend for FakeDockerBackend {
+        async fn get_credentials(
+            &self,
+            _server: &str,
+            _shed: &str,
+            _server_url: &str,
+        ) -> Result<DockerCredential, DockerCredError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.get.clone()
+        }
+        async fn list_credentials(
+            &self,
+            _server: &str,
+            _shed: &str,
+        ) -> Result<BTreeMap<String, String>, String> {
+            self.list.clone()
+        }
+        fn status(&self, _server: &str, _shed: &str) -> (bool, usize) {
+            self.status
+        }
+    }
+
+    fn unused_err() -> DockerCredError {
+        DockerCredError {
+            msg: "unused".to_string(),
+            code: "UNUSED".to_string(),
+        }
+    }
+    fn cred(server_url: &str, username: &str, secret: &str) -> DockerCredential {
+        DockerCredential {
+            server_url: server_url.to_string(),
+            username: username.to_string(),
+            secret: secret.to_string(),
+        }
+    }
+    fn docker_handlers(backend: Arc<dyn DockerBackend>, gate: Arc<dyn ApprovalGate>) -> DockerHandlers {
+        DockerHandlers { backend, gate }
+    }
+    /// A docker-credentials request Envelope carrying `payload` + a fixed shed.
+    fn docker_env(payload: serde_json::Value) -> Envelope {
+        Envelope {
+            id: "docker-req".into(),
+            namespace: "docker-credentials".into(),
+            msg_type: "request".into(),
+            in_reply_to: String::new(),
+            is_final: true,
+            timestamp: "t".into(),
+            payload: Some(payload),
+            shed: Some(ShedInfo {
+                name: "web".into(),
+                backend: "vz".into(),
+                server: "mini2".into(),
+            }),
+        }
+    }
+    fn docker_get_env(server_url: &str) -> Envelope {
+        docker_env(serde_json::json!({"operation": "get", "server_url": server_url}))
+    }
+
+    #[tokio::test]
+    async fn docker_get_ok() {
+        let backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_ok(cred("ghcr.io", "u", "s"));
+        let (payload, entry) =
+            docker_dispatch(&docker_get_env("ghcr.io"), &docker_handlers(backend, approve_gate()), "").await;
+        assert_eq!(payload["server_url"], "ghcr.io");
+        assert_eq!(payload["username"], "u");
+        assert_eq!(payload["secret"], "s");
+        // ok audit: ns/op fixed, detail=server_url, approval; NO code/reason.
+        let entry = entry.expect("ok path audits");
+        assert_eq!(entry.ns, "docker-credentials");
+        assert_eq!(entry.op, "get");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.detail, "ghcr.io");
+        assert_eq!(entry.approval, "approve-all");
+        assert_eq!(entry.shed, "web");
+        assert_eq!(entry.code, "");
+        assert_eq!(entry.reason, "");
+    }
+
+    #[tokio::test]
+    async fn docker_get_error_maps_code() {
+        // The guest receives the backend's raw code (REGISTRY_NOT_ALLOWED here).
+        let backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_err(DockerCredError {
+            msg: "registry not allowed".into(),
+            code: DOCKER_CODE_NOT_ALLOWED.into(),
+        });
+        let (payload, _entry) =
+            docker_dispatch(&docker_get_env("blocked.io"), &docker_handlers(backend, approve_gate()), "").await;
+        assert_eq!(payload["error"], "credential request failed");
+        assert_eq!(payload["code"], "REGISTRY_NOT_ALLOWED");
+    }
+
+    async fn docker_get_audit_case(code: &str, msg: &str) -> AuditEntry {
+        let backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_err(DockerCredError {
+            msg: msg.into(),
+            code: code.into(),
+        });
+        let (_p, entry) = docker_dispatch(
+            &docker_get_env("https://index.docker.io/v1/"),
+            &docker_handlers(backend, approve_gate()),
+            "",
+        )
+        .await;
+        entry.expect("get error path audits")
+    }
+
+    #[tokio::test]
+    async fn docker_get_audit_anonymous_on_not_found() {
+        // CREDENTIALS_NOT_FOUND for an allowed registry → audit result "anonymous"
+        // (guest pulls anonymously), code+reason+detail set.
+        let e = docker_get_audit_case(DOCKER_CODE_NOT_FOUND, "no credentials found").await;
+        assert_eq!(e.result, "anonymous");
+        assert_eq!(e.code, "CREDENTIALS_NOT_FOUND");
+        assert_eq!(e.reason, "no credentials found");
+        assert_eq!(e.detail, "https://index.docker.io/v1/");
+        assert_eq!(e.op, "get");
+    }
+
+    #[tokio::test]
+    async fn docker_get_audit_error_on_not_allowed() {
+        // An allowlist deny (a backend REGISTRY_NOT_ALLOWED) stays "error", not anonymous.
+        let e = docker_get_audit_case(DOCKER_CODE_NOT_ALLOWED, "registry not allowed").await;
+        assert_eq!(e.result, "error");
+        assert_eq!(e.code, "REGISTRY_NOT_ALLOWED");
+        assert_eq!(e.reason, "registry not allowed");
+    }
+
+    #[tokio::test]
+    async fn docker_get_audit_error_on_helper_failed() {
+        let e = docker_get_audit_case("HELPER_FAILED", "boom").await;
+        assert_eq!(e.result, "error");
+        assert_eq!(e.code, "HELPER_FAILED");
+        assert_eq!(e.reason, "boom");
+    }
+
+    #[tokio::test]
+    async fn docker_get_denied_guest_not_allowed_audit_approval_denied() {
+        // A deny-all gate: the guest still receives REGISTRY_NOT_ALLOWED (back-compat)
+        // while the audit carries APPROVAL_DENIED + result denied (two-code
+        // disambiguation) + the deny reason. The backend is never consulted.
+        let backend = FakeDockerBackend::get_ok(cred("ghcr.io", "u", "s"));
+        let dyn_backend: Arc<dyn DockerBackend> = backend.clone();
+        let (payload, entry) =
+            docker_dispatch(&docker_get_env("ghcr.io"), &docker_handlers(dyn_backend, deny_gate()), "").await;
+        assert_eq!(payload["error"], "approval denied");
+        assert_eq!(payload["code"], "REGISTRY_NOT_ALLOWED");
+        let entry = entry.expect("deny path audits");
+        assert_eq!(entry.result, "denied");
+        assert_eq!(entry.code, "APPROVAL_DENIED");
+        assert_eq!(entry.reason, "denied: approval policy is deny-all");
+        assert_eq!(entry.detail, "ghcr.io");
+        assert_eq!(entry.approval, "deny-all");
+        assert_eq!(entry.decided_by, ""); // deny-all's empty outcome
+        assert_eq!(
+            backend.get_calls.load(Ordering::SeqCst),
+            0,
+            "backend must not be consulted when the gate denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_ping() {
+        let backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_ok(cred("x", "y", "z"));
+        let (payload, entry) =
+            docker_dispatch(&docker_env(serde_json::json!({"operation":"ping"})), &docker_handlers(backend, approve_gate()), "").await;
+        assert_eq!(payload, serde_json::json!({"status": "ok"}));
+        assert!(entry.is_none(), "ping does not audit");
+    }
+
+    #[tokio::test]
+    async fn docker_status_connected() {
+        let backend: Arc<dyn DockerBackend> = FakeDockerBackend::with_status(true, 3);
+        let (payload, entry) =
+            docker_dispatch(&docker_env(serde_json::json!({"operation":"status"})), &docker_handlers(backend, approve_gate()), "").await;
+        assert_eq!(
+            payload,
+            serde_json::json!({"connected": true, "allow_all": true, "registry_count": 3})
+        );
+        assert!(entry.is_none(), "status does not audit");
+    }
+
+    #[tokio::test]
+    async fn docker_list_ok() {
+        let mut m = BTreeMap::new();
+        m.insert("gcr.io".to_string(), "user1".to_string());
+        m.insert("ghcr.io".to_string(), "user2".to_string());
+        let backend: Arc<dyn DockerBackend> = FakeDockerBackend::with_list(m);
+        let (payload, entry) =
+            docker_dispatch(&docker_env(serde_json::json!({"operation":"list"})), &docker_handlers(backend, approve_gate()), "").await;
+        assert_eq!(payload["registries"]["gcr.io"], "user1");
+        assert_eq!(payload["registries"]["ghcr.io"], "user2");
+        // Positional audit: op=list, ok, detail="count:2", approval=none, NO outcome/code.
+        let entry = entry.expect("list success audits");
+        assert_eq!(entry.op, "list");
+        assert_eq!(entry.ns, "docker-credentials");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.detail, "count:2");
+        assert_eq!(entry.approval, "none");
+        assert_eq!(entry.decided_by, "");
+        assert_eq!(entry.code, "");
+    }
+
+    #[tokio::test]
+    async fn docker_list_error_has_no_audit() {
+        // A backend list error → {list failed, INTERNAL_ERROR} + NO audit (Go returns
+        // early; list audits ONLY on success).
+        let backend: Arc<dyn DockerBackend> = FakeDockerBackend::list_err();
+        let (payload, entry) =
+            docker_dispatch(&docker_env(serde_json::json!({"operation":"list"})), &docker_handlers(backend, approve_gate()), "").await;
+        assert_eq!(payload["error"], "list failed");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none(), "list error path is audit-silent");
+    }
+
+    fn dummy_docker() -> Arc<dyn DockerBackend> {
+        FakeDockerBackend::get_ok(cred("x", "y", "z"))
+    }
+
+    #[tokio::test]
+    async fn docker_omitted_payload_invalid() {
+        // An OMITTED payload (Go nil json.RawMessage) → {invalid payload, INTERNAL_ERROR}.
+        let mut env = docker_env(serde_json::json!({"operation":"ping"}));
+        env.payload = None;
+        let (payload, entry) =
+            docker_dispatch(&env, &docker_handlers(dummy_docker(), approve_gate()), "").await;
+        assert_eq!(payload["error"], "invalid payload");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn docker_null_payload_unknown_op_empty() {
+        // Explicit null payload → zero op → "unknown operation: " (INTERNAL_ERROR).
+        let mut env = docker_env(serde_json::json!({"operation":"ping"}));
+        env.payload = Some(serde_json::Value::Null);
+        let (payload, entry) =
+            docker_dispatch(&env, &docker_handlers(dummy_docker(), approve_gate()), "").await;
+        assert_eq!(payload["error"], "unknown operation: ");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn docker_missing_op_unknown_op_empty() {
+        // Object with no `operation` → zero op → "unknown operation: ".
+        let (payload, entry) =
+            docker_dispatch(&docker_env(serde_json::json!({})), &docker_handlers(dummy_docker(), approve_gate()), "").await;
+        assert_eq!(payload["error"], "unknown operation: ");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn docker_unknown_op_exact_string() {
+        let (payload, entry) = docker_dispatch(
+            &docker_env(serde_json::json!({"operation":"delete"})),
+            &docker_handlers(dummy_docker(), approve_gate()),
+            "",
+        )
+        .await;
+        assert_eq!(payload["error"], "unknown operation: delete");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn docker_array_or_scalar_op_invalid() {
+        // A non-object payload (array or scalar) OR a non-string `operation` → the shared
+        // parse_operation error → {invalid payload, INTERNAL_ERROR}.
+        for payload in [
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("hi"),
+            serde_json::json!({"operation": 123}),
+        ] {
+            let (resp, entry) =
+                docker_dispatch(&docker_env(payload), &docker_handlers(dummy_docker(), approve_gate()), "").await;
+            assert_eq!(resp["error"], "invalid payload");
+            assert_eq!(resp["code"], "INTERNAL_ERROR");
+            assert!(entry.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn docker_uses_docker_gate_not_ssh_or_aws() {
+        // One BusHandlers: ssh gate = deny-all, docker gate = approve-all. Routed through
+        // the real dispatcher over the wire, a docker `get` is APPROVED (uses docker.gate,
+        // never the ssh gate) → the mock only matches a vended-credential body. Proves
+        // per-namespace gate selection.
+        let docker_backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_ok(cred("ghcr.io", "u", "s"));
+        let handlers = BusHandlers {
+            gate: deny_gate(), // ssh gate: deny-all
+            audit: noop_audit(),
+            backend: empty_backend(),
+            server_name: String::new(),
+            aws: None,
+            docker: Some(DockerHandlers {
+                backend: docker_backend,
+                gate: approve_gate(), // docker gate: approve-all
+            }),
+        };
+        let server = MockServer::start_async().await;
+        let ok = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/plugins/listeners/docker-credentials/respond")
+                    .matches(|req| {
+                        let body = req
+                            .body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                            .unwrap_or_default();
+                        body.contains("\"secret\":\"s\"") && !body.contains("approval denied")
+                    });
+                t.status(204);
+            })
+            .await;
+        let client = open_client(&server.base_url());
+        dispatch_bus_message(
+            &client,
+            "docker-credentials",
+            &docker_get_env("ghcr.io"),
+            &never_shutdown(),
+            &handlers,
+        )
+        .await;
+        ok.assert_async().await;
+    }
+
+    #[test]
+    fn docker_payload_tag_names_match_protocol() {
+        // Golden-consistency: the guest-wire serde tag names equal the Go json tags in
+        // docker.go (distinct from the Capitalized helper-protocol struct in
+        // docker_backend.rs, whose roundtrip is guarded there).
+        assert_eq!(
+            serde_json::to_value(DockerGetResponse {
+                server_url: "a".into(),
+                username: "b".into(),
+                secret: "c".into(),
+            })
+            .unwrap(),
+            serde_json::json!({"server_url":"a","username":"b","secret":"c"})
+        );
+        let mut m = BTreeMap::new();
+        m.insert("ghcr.io".to_string(), "u".to_string());
+        assert_eq!(
+            serde_json::to_value(DockerListResponse { registries: m }).unwrap(),
+            serde_json::json!({"registries":{"ghcr.io":"u"}})
+        );
+        assert_eq!(
+            serde_json::to_value(DockerPingResponse {
+                status: "ok".into()
+            })
+            .unwrap(),
+            serde_json::json!({"status":"ok"})
+        );
+        assert_eq!(
+            serde_json::to_value(DockerStatusResponse {
+                connected: true,
+                allow_all: false,
+                registry_count: 2,
+            })
+            .unwrap(),
+            serde_json::json!({"connected":true,"allow_all":false,"registry_count":2})
+        );
+        assert_eq!(
+            docker_error("boom", "INTERNAL_ERROR"),
             serde_json::json!({"error":"boom","code":"INTERNAL_ERROR"})
         );
     }

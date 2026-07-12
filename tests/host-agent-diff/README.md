@@ -151,22 +151,23 @@ identities (real-signing ed25519, canned blobs for rsa/ecdsa).
   normal path resolves immediately either way; a pathological full-backlog peer could hang
   the Rust side longer. Low severity, tracked for the config/lifecycle slice.
 
-- **Bus subscription set: ssh-agent + (configured) aws-credentials on both; docker +
-  egress remain Go-only.** In single-server mode (no `discovery:` block) both daemons
-  connect to `server:` and subscribe to `ssh-agent`; when `aws.*` is configured (mode
-  passthrough, or a role) both ALSO subscribe `aws-credentials` — so the ssh ping/pong
-  (`test_bus_ping_pong.py`) AND the AWS passthrough cells (`test_aws_backend.py`)
-  compare apples to apples, each `wait_for_subscribe`-ing its namespace on both impls.
-  A residual asymmetry remains by design this slice: the Go daemon also GETs
-  `/api/egress/stream` (its always-on egress subscriber) and subscribes to
-  `docker-credentials` (its Docker backend is non-nil even unconfigured), whereas the
-  Rust daemon wires **ssh-agent + aws-credentials only** (egress + the docker backend
-  are later slices). The synthetic bus tolerates the extra Go subscribes (records them,
-  holds the streams open, never pushes) and 501s the egress GET (Go backs off 5m,
-  DEBUG-quiet) — so the asymmetry is absorbed by the harness, not diffed. The
-  differential asserts only the compared **response envelope** for the namespace under
-  test, never which routes each daemon hit. This flips to a full match when the later
-  slices wire the Rust egress + docker paths.
+- **Bus subscription set: ssh-agent + (configured) aws-credentials + docker-credentials
+  on both; ONLY egress remains Go-only.** In single-server mode (no `discovery:` block)
+  both daemons connect to `server:` and subscribe to `ssh-agent`; when `aws.*` is
+  configured (mode passthrough, or a role) both ALSO subscribe `aws-credentials`; and
+  both subscribe `docker-credentials` in the common case — the Docker backend is non-nil
+  even unconfigured (its constructor errors ONLY on an explicit-but-unstat-able
+  `config_path`), so the namespace is subscribed for every server. Each cell
+  `wait_for_subscribe`-es its namespace on both impls (`test_bus_ping_pong.py`,
+  `test_aws_backend.py`, `test_docker_backend.py`), so they compare apples to apples.
+  The **one** residual asymmetry remaining by design: the Go daemon also GETs
+  `/api/egress/stream` (its always-on egress subscriber), whereas the Rust daemon does
+  not yet (egress is the last unwired namespace, its own slice). The synthetic bus
+  tolerates the extra Go subscribe (501s the egress GET — Go backs off 5m, DEBUG-quiet)
+  — so the asymmetry is absorbed by the harness, not diffed. The differential asserts
+  only the compared **response envelope** for the namespace under test, never which
+  routes each daemon hit. This flips to a full match when the egress slice wires the Rust
+  egress path.
 
 - **Event replay ring.** The surface-A handshake (`hello`→`hello_ack`), the non-hello
   drop, single-consumer supersede, event fan-out + approval correlation (via the gated
@@ -214,7 +215,7 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | bus | subscribe → ping → respond (open) ping/pong (masked canonical-equal) | **enforced** | live surface B (`test_bus_ping_pong.py`) |
 | bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **xfail** | live surface B — secure needs the TLS pin from a `discovery:` config (later slice); the pin/reconnect/401/409 logic is already `bus.rs`-unit-tested |
 | bus | aws-credentials subscription (when configured) | **enforced** | live surface B (`test_aws_backend.py`: both impls `wait_for_subscribe("aws-credentials")`) |
-| bus | docker-credentials subscription | **xfail** | live surface B — later slice; the Rust daemon wires ssh-agent + aws-credentials (see "Known contract gaps") |
+| bus | docker-credentials subscription (even unconfigured) | **enforced** | live surface B (`test_docker_backend.py`: both impls `wait_for_subscribe("docker-credentials")`, incl. the unconfigured cell) |
 | status | single-server `LiveStatus.servers[]` per-namespace state (incl. 409-rejected) | **xfail** | supervisor slice — Go surfaces `HostClient.Status()` via supervisor health; the Rust bus records the state + logs it, but `servers[]` stays empty until the supervisor lands |
 | egress | events / 401 / 404-501, 5m vs 30s backoff | **xfail** | live ("no reconnect in window") + unit (consts) |
 | ssh backend · local-keys | `list` (masked canonical-equal + durable non-gated audit line) | **enforced** | live (`test_ssh_backend.py`) |
@@ -231,7 +232,8 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | aws backend · passthrough | `get_credentials` (success + no-expiry-hint + no-static error; payload + audit diffed, error detail home-normalized), `status` (`passthrough:<profile>` + `cached_until`), `ping`, unknown-op, re-login pickup (atomic rewrite) | **enforced** | live (`test_aws_backend.py`) |
 | aws backend · assume-role | cache hit/stale, role resolution + layering, STS/nil-creds errors, session-name shape | **out-of-scope** | golden (`aws_resolve`/`aws_expiry` runners) + Rust unit (`AssumeRoler` fake) — no Go STS seam to drive live |
 | aws backend | response payload shapes (`get_credentials`/`status`/`ping`/`error`: tag names, `expiration`/`cached_until` omitempty) + per-namespace gate selection | **enforced (unit)** | Rust unit (`bus.rs`: `aws_*`, incl. `aws_uses_aws_gate_not_ssh`, `aws_payload_tag_names_match_protocol`) |
-| docker backend | allowlist / allow_all / helper / inline, not-found vs not-allowed | **xfail** | live (helper transcript) + golden (resolution matrix) |
+| docker backend | `get` inline-auth (payload+audit) / helper (transcript diffed + payload + ok audit) / not-allowed (backend REGISTRY_NOT_ALLOWED) / approval-deny (guest REGISTRY_NOT_ALLOWED + audit APPROVAL_DENIED, the two-code split) / not-found→anonymous (guest CREDENTIALS_NOT_FOUND + audit anonymous) / `list` (positional `count:N`) / `status` / `ping` / unknown-op / **unconfigured** (still subscribes + denies) | **enforced** | live (`test_docker_backend.py`, fake `docker-credential-testhelper` seam + self-test) |
+| docker backend | `resolve` layering (Option registries/allow_all, flow-list), `normalize_registry` (one-occurrence strip), inline-auth decode, PATH augment (append), helper-exec seam (abs-resolve, 5s timeout, PascalCase-avoidance tag guard) | **enforced (golden+unit)** | golden (`docker_resolve`/`docker_normalize`/`docker_inline_auth`/`docker_path_augment` runners) + Rust unit (`docker_backend.rs`, `bus.rs` docker handler incl. `docker_uses_docker_gate_not_ssh_or_aws`, `docker_payload_tag_names_match_protocol`) |
 | minter | control-scope argv + success `token.response` | **enforced** | live (`test_token_get.py`: `token`/`expires_at` compared + argv == expected vector, `<scope>` == `control`) |
 | minter | host-key-mismatch terminal; single-flight; refresh cadence | **enforced (unit)** | unit parity (`minter.rs` / `bootstrap.rs`, incl. real-runner shell-shim tests) |
 | minter | `load_discovered_servers` shape (ssh_port=0-vs-22, empty-host skip, sort) | **enforced (golden)** | Go + Rust golden runners on `fixtures/load_discovered_servers.json` |

@@ -153,6 +153,10 @@ def _clean_env(socket_dir, home, path_prepend=None, ssh_auth_sock=None) -> dict:
     env["HOME"] = str(home)
     env.pop("SSH_AUTH_SOCK", None)
     env.pop("XDG_RUNTIME_DIR", None)
+    # Strip DOCKER_CONFIG so `find_docker_config` resolves the isolated
+    # `<HOME>/.docker/config.json` on BOTH impls (a dev-Mac DOCKER_CONFIG would
+    # otherwise leak a real Docker config into the differential — non-hermetic).
+    env.pop("DOCKER_CONFIG", None)
     if path_prepend is not None:
         env["PATH"] = str(path_prepend) + os.pathsep + env.get("PATH", "")
     if ssh_auth_sock is not None:
@@ -237,6 +241,7 @@ class DaemonHandle:
         log_path,
         audit_log_path,
         ssh_argv_file=None,
+        docker_transcript_file=None,
     ):
         self.impl = impl
         self.binary = binary
@@ -249,6 +254,13 @@ class DaemonHandle:
         # appends its argv (one element per line) to this file — the daemon's exact
         # `ssh` invocation, captured for the differential's argv comparison.
         self.ssh_argv_file = Path(ssh_argv_file) if ssh_argv_file else None
+        # When launched with a fake `docker-credential-testhelper` (the docker helper
+        # cells), the helper appends one JSONL record per invocation — `{"argv":[...],
+        # "stdin":"<server_url>"}`, argv+stdin ONLY, never PATH/env — captured for the
+        # exec-seam transcript diff.
+        self.docker_transcript_file = (
+            Path(docker_transcript_file) if docker_transcript_file else None
+        )
         # The DURABLE audit JSONL (`logging.path`), distinct from the operational log
         # above. Populated by gated ops (the sign flow); a fan-out `event` is sent
         # AFTER the file line is written on both impls (Rust `JsonlAuditSink::log`,
@@ -286,16 +298,16 @@ class DaemonHandle:
             f"{self.impl}: shim ssh argv file {self.ssh_argv_file} empty within {timeout}s"
         )
 
-    def read_audit_jsonl(self, expect: int = 1, timeout: float = 5.0) -> list:
-        """Poll the durable audit file until it holds `expect` non-empty JSONL lines
-        (a deadline poll, never a fixed sleep) and return them parsed. Raises on
-        timeout or on a line that isn't a JSON object. Robust against the small window
-        between the desktop `event` and the file flush landing on disk."""
+    def _poll_jsonl(self, path: Path, what: str, expect: int, timeout: float) -> list:
+        """Poll `path` until it holds `expect` non-empty JSONL lines (a deadline poll,
+        never a fixed sleep) and return them parsed. Raises on timeout or on a line
+        that isn't valid JSON. Robust against the small window between the triggering
+        event and the file flush landing on disk."""
         deadline = time.monotonic() + timeout
         last: list = []
         while time.monotonic() < deadline:
             try:
-                raw = self.audit_log_path.read_text()
+                raw = path.read_text()
             except OSError:
                 raw = ""
             last = [line for line in raw.splitlines() if line.strip()]
@@ -305,9 +317,22 @@ class DaemonHandle:
                 return [_json.loads(line) for line in last]
             time.sleep(0.02)
         raise AssertionError(
-            f"{self.impl}: audit file {self.audit_log_path} held {len(last)} line(s), "
+            f"{self.impl}: {what} {path} held {len(last)} line(s), "
             f"expected {expect} within {timeout}s; contents={last!r}"
         )
+
+    def read_docker_transcript(self, expect: int = 1, timeout: float = 5.0) -> list:
+        """Poll the fake docker-helper's transcript until it holds `expect` non-empty
+        JSONL lines and return them parsed (each `{"argv":[...], "stdin":"..."}`)."""
+        assert self.docker_transcript_file is not None, (
+            "daemon was not launched with docker_helper_bundle"
+        )
+        return self._poll_jsonl(self.docker_transcript_file, "docker transcript", expect, timeout)
+
+    def read_audit_jsonl(self, expect: int = 1, timeout: float = 5.0) -> list:
+        """Poll the durable audit file (`logging.path`) until it holds `expect`
+        non-empty JSONL lines and return them parsed."""
+        return self._poll_jsonl(self.audit_log_path, "audit file", expect, timeout)
 
 
 @pytest.fixture
@@ -331,6 +356,8 @@ def daemon(binaries, tmp_path_factory):
         known_hosts: str | None = None,
         ssh_shim_bundle: str | None = None,
         install_aws_credentials: str | None = None,
+        install_docker_config: str | None = None,
+        docker_helper_bundle: str | None = None,
     ):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
         home = root / "home"
@@ -378,6 +405,17 @@ def daemon(binaries, tmp_path_factory):
             (aws_dir / "credentials").write_text(install_aws_credentials)
             (aws_dir / "config").write_text("")
 
+        # Install the Docker `config.json` fixture into this daemon's isolated
+        # `<HOME>/.docker/config.json` BEFORE launch, so a `get`/`list` reads the SAME
+        # config on both impls (`find_docker_config` resolves `$HOME/.docker/config.json`
+        # with DOCKER_CONFIG stripped by `_clean_env`). Hermetic by construction — no
+        # DOCKER_CONFIG env plumbing. When None (the UNCONFIGURED cell), no file is
+        # written, so the default path is absent → the backend denies every registry.
+        if install_docker_config is not None:
+            docker_dir = home / ".docker"
+            docker_dir.mkdir(exist_ok=True)
+            (docker_dir / "config.json").write_text(install_docker_config)
+
         # The minter reads `<HOME>/.shed/{config.yaml,known_hosts}` (the shed CLI
         # config it resolves servers from + the host-key pin). Both impls read the
         # SAME isolated HOME.
@@ -401,6 +439,25 @@ def daemon(binaries, tmp_path_factory):
             ssh_argv_file = root / "ssh-argv.txt"
             _write_ssh_shim(shim_dir / "ssh", ssh_argv_file, ssh_shim_bundle)
             path_prepend = shim_dir
+
+        # Install a fake `docker-credential-testhelper` (a python3 script, 0755 + shebang)
+        # into a PATH-PREPENDED `helper-bin` dir — `look_helper_path` resolves via PATH
+        # (`which`-equivalent) FIRST, so the front-of-PATH shim wins on both impls. It
+        # captures its argv + stdin (the server_url) to a per-impl transcript JSONL,
+        # then prints the fixed bundle. The two cells are mutually exclusive with the ssh
+        # shim (both want `path_prepend`).
+        docker_transcript_file = None
+        if docker_helper_bundle is not None:
+            assert ssh_shim_bundle is None, "ssh shim + docker helper both want path_prepend"
+            helper_dir = root / "helper-bin"
+            helper_dir.mkdir()
+            docker_transcript_file = root / "docker-helper-transcript.jsonl"
+            _write_docker_helper(
+                helper_dir / "docker-credential-testhelper",
+                docker_transcript_file,
+                docker_helper_bundle,
+            )
+            path_prepend = helper_dir
 
         # The socket dir must be SHORT: an AF_UNIX bind path caps at ~104 bytes
         # (macOS) / ~108 (Linux), and pytest's nested tmp tree blows past that. A
@@ -453,6 +510,7 @@ def daemon(binaries, tmp_path_factory):
             log_path,
             audit_log,
             ssh_argv_file=ssh_argv_file,
+            docker_transcript_file=docker_transcript_file,
         )
         try:
             yield handle
@@ -499,6 +557,25 @@ def _write_ssh_shim(path: Path, argv_file: Path, bundle_json: str) -> None:
         f'for a in "$@"; do printf \'%s\\n\' "$a" >> "{argv_file}"; done\n'
         f"printf '%s' '{bundle_json}'\n"
         "exit 0\n"
+    )
+    path.write_text(script)
+    os.chmod(path, 0o755)
+
+
+def _write_docker_helper(path: Path, transcript_file: Path, bundle_json: str) -> None:
+    """Write an executable `#!/usr/bin/env python3` fake `docker-credential-testhelper`
+    that (a) reads stdin (the raw `server_url`), (b) appends ONE JSONL record of its
+    argv + stdin — argv+stdin ONLY, NEVER the augmented PATH/env (per-impl/host-dependent;
+    APPEND parity is the `augment_path` golden's job) — to `transcript_file`, and (c)
+    prints the fixed `bundle_json` to stdout, exit 0. The deterministic exec seam both
+    daemons run over."""
+    script = (
+        "#!/usr/bin/env python3\n"
+        "import sys, json\n"
+        "stdin = sys.stdin.read()\n"
+        f"with open({str(transcript_file)!r}, 'a') as f:\n"
+        "    f.write(json.dumps({'argv': sys.argv[1:], 'stdin': stdin}) + '\\n')\n"
+        f"sys.stdout.write({bundle_json!r})\n"
     )
     path.write_text(script)
     os.chmod(path, 0o755)

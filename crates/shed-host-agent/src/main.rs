@@ -439,12 +439,36 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
                 }
             };
 
+            // The Docker credential backend (Go main.go:175-180 parity). The ASYMMETRY
+            // vs aws: there is NO `enabled()` gate — `new_docker_backend` errors ONLY
+            // when an explicit `config_path` is unstat-able, so an absent/empty `docker:`
+            // block still constructs a live backend (denying every registry under an
+            // empty allowlist) and the docker-credentials namespace is subscribed for
+            // every server. `None` only on that explicit-config_path error. Its gate is
+            // the docker-credentials per-namespace gate (from `docker.approval.policy`).
+            let docker = match docker_backend::new_docker_backend(cfg.docker.clone(), bus_log.clone()) {
+                Ok(backend) => {
+                    let backend_dyn: Arc<dyn docker_backend::DockerBackend> = Arc::new(backend);
+                    let docker_gate =
+                        select_gate(&cfg.effective_policy(config::NS_DOCKER_CREDENTIALS));
+                    Some(bus::DockerHandlers {
+                        backend: backend_dyn,
+                        gate: docker_gate,
+                    })
+                }
+                Err(e) => {
+                    bus_log.warn(&format!("Docker handler disabled error={e}"));
+                    None
+                }
+            };
+
             let handlers = bus::BusHandlers {
                 gate,
                 audit,
                 backend,
                 server_name: String::new(),
                 aws,
+                docker,
             };
             tasks.push(tokio::spawn(async move {
                 bus::run_single_server_bus(server_url, rx, bus_log, handlers).await;

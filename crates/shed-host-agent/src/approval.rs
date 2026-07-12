@@ -33,6 +33,13 @@ pub struct ApprovalOutcome {
     pub scope: Option<String>,
     /// TTL applied (e.g. `4h`). `None` → omitted from audit.
     pub ttl: Option<String>,
+    /// The deny reason — the faithful port of Go's `(ApprovalOutcome, error)`: on a
+    /// deny, Go carries an `error` alongside the outcome whose `Error()` some handlers
+    /// record as the audit `reason` (the docker `get` deny path,
+    /// `docker_handler.go:115`). The seam folds that string in here so a single value
+    /// carries the decision + its deny reason. Empty on approve. The ssh/aws deny
+    /// audits set no `reason`, so they ignore it; only the docker `get` deny reads it.
+    pub reason: String,
 }
 
 impl ApprovalOutcome {
@@ -45,6 +52,9 @@ impl ApprovalOutcome {
             decided_by: String::new(),
             scope: None,
             ttl: None,
+            // No specific reason — this is the generic fail-closed (no consumer /
+            // timeout / disconnect); the deny-all gate builds its own reason below.
+            reason: String::new(),
         }
     }
 }
@@ -94,6 +104,7 @@ impl ApprovalGate for ApproveAllGate {
             decided_by: String::new(),
             scope: None,
             ttl: None,
+            reason: String::new(),
         }
     }
     fn method(&self) -> &str {
@@ -116,7 +127,12 @@ impl ApprovalGate for DenyAllGate {
         _shed: &str,
         _detail: &str,
     ) -> ApprovalOutcome {
-        ApprovalOutcome::denied_no_decision()
+        // The deny-all reason is Go's `denyAllGate.Approve` error string verbatim
+        // (`approval.go:36`) — the docker `get` deny audit records it as `reason`.
+        ApprovalOutcome {
+            reason: "denied: approval policy is deny-all".to_string(),
+            ..ApprovalOutcome::denied_no_decision()
+        }
     }
     fn method(&self) -> &str {
         POLICY_DENY_ALL
@@ -152,6 +168,9 @@ mod tests {
         assert_eq!(out.decided_by, "");
         assert_eq!(out.scope, None);
         assert_eq!(out.ttl, None);
+        // The deny-all reason is Go's verbatim error string (recorded as the docker
+        // get deny audit `reason`).
+        assert_eq!(out.reason, "denied: approval policy is deny-all");
         assert_eq!(g.method(), "deny-all");
     }
 
@@ -162,5 +181,8 @@ mod tests {
         assert_eq!(out.decided_by, "");
         assert!(out.scope.is_none());
         assert!(out.ttl.is_none());
+        // The generic fail-closed carries no specific reason (the deny-all gate sets
+        // its own; the desktop no-decision paths leave it empty — sub-plan 5).
+        assert_eq!(out.reason, "");
     }
 }
