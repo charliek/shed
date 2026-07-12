@@ -453,7 +453,7 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 	}
 
 	dialer := NewVZDialer(c.cfg.SocketDir, name)
-	return dialer.DialService(ctx, c.cfg.TCPProxyPort, port)
+	return vmutil.DialService(ctx, dialer, c.cfg.TCPProxyPort, port)
 }
 
 // SetShedEgress applies a new egress profile selection to a shed. On a running

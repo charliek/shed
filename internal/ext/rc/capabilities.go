@@ -16,13 +16,21 @@ const CapabilityVersion = 3
 // capabilityFeatures is the feature list (a set of stable tokens) advertised to
 // clients for capability discovery, replacing error-string sniffing. It advertises
 // ONLY what this binary actually supports — a feature token is appended in the same
-// change that ships the feature (planned next: "serve" with the rc hub):
+// change that ships the feature:
 //   - generic-perm — the generic default|auto|skip permission tri-state for all kinds.
 //   - plan-stdin — `create --plan-stdin` writes a plan to a per-kind HOME-rooted file
 //     and composes+delivers a kickoff referencing it.
 //   - prompt-b64 — `create --plan-stdin --prompt-b64 <base64>` prepends decoded caller
 //     framing to the composed plan kickoff (stdin stays reserved for the plan).
-var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64"}
+//   - serve — `shed-ext-rc serve` runs the resident rc activity hub (loopback HTTP:
+//     GET /v1/sessions + SSE /v1/events), spawned on demand and self-exiting.
+//   - activity — sessions carry the live activity dimension (activity/activity_at/
+//     last_message inside the rc block) derived by the hub.
+//   - messages — the hub serves the codex message feed (GET /v1/sessions/{slug}/
+//     messages + the message.appended SSE event) and gated feed input (POST
+//     /v1/sessions/{slug}/input). Per-kind availability is in kind_features
+//     (watch / input); this token says the endpoints exist on this binary.
+var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"}
 
 // AgentInfo is one agent's install probe result under capabilities.agents. Version is
 // omitted when the agent is not installed (or its version could not be read).
@@ -33,11 +41,17 @@ type AgentInfo struct {
 
 // KindFeatures describes what a client can do with a kind's sessions. v1 agents are
 // TUI-only, so approvals happen in the terminal ("tui"); post_input reports whether a
-// typed line can be delivered to the pane. (watch/live-feed features arrive with the
-// rc hub in a later phase.)
+// typed line can be delivered to the pane. watch reports whether the hub produces a
+// live message feed for the kind (GET /messages + message.appended); input reports the
+// feed-input posting mode — "gated" means POST /input is accepted only while the
+// session is waiting (see the hub's acceptance re-check), "" means no feed input (the
+// TUI-only post_input path still applies). Both are codex-only in this phase; omitempty
+// keeps the wire shape unchanged for the other kinds.
 type KindFeatures struct {
 	PostInput bool   `json:"post_input"`
 	Approvals string `json:"approvals"`
+	Watch     bool   `json:"watch,omitempty"`
+	Input     string `json:"input,omitempty"`
 }
 
 // Capabilities is the `shed-ext-rc capabilities` payload and the block embedded in the
@@ -162,7 +176,15 @@ func kindFeatures() map[Kind]KindFeatures {
 		case KindClaudeBroker, KindShell:
 			continue
 		default:
-			out[k] = KindFeatures{PostInput: AcceptsTypedInput(k), Approvals: "tui"}
+			kf := KindFeatures{PostInput: AcceptsTypedInput(k), Approvals: "tui"}
+			// The message feed + gated input are codex-only in this phase: codex is the
+			// one kind whose rollout JSONL the watcher folds into a normalized feed and
+			// whose composer anchor gates input acceptance.
+			if k == KindCodex {
+				kf.Watch = true
+				kf.Input = "gated"
+			}
+			out[k] = kf
 		}
 	}
 	return out

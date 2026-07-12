@@ -187,6 +187,58 @@ Edit agent → unit tests (Docker) → rebuild rootfs (step 2) → verify (step 
 integration (step 5). Comment-only edits don't change the binary, so they don't
 need a rebuild.
 
+## Guest extension binaries (`shed-ext-rc` and friends)
+
+The `cmd/shed-ext-*` binaries (notably **`shed-ext-rc`**, which now includes the resident
+`serve` **rc activity hub**) are baked into the `extensions`/`full` variants the same way
+`shed-agent` is baked into every variant — so the **full rebuild loop above applies
+unchanged**: edit `cmd/shed-ext-rc/` (or `internal/ext/rc/`) → rebuild the `extensions`
+variant (step 2, `--variant extensions`) → verify (`shed-ext-rc version` reports a dev
+string, step 4) → create a fresh shed. `internal/ext/rc/*.go` is **not** `//go:build
+linux`, so its unit tests run under plain `make test` on macOS (no Docker needed, unlike
+the agent tests).
+
+> **Rebuild BOTH `extensions` AND `full` for the rc-hub integration tests.** The rc-hub
+> integration tests (`tests/integration/test_rc_enrichment.py`,
+> `tests/integration/test_rc_hub_activity.py`) provision their sheds from the
+> **`extensions`** alias (`server.create(shed, image="extensions")`), *not* the dev
+> server's usual `full` `default_image`. So a dev-image rebuild done only as
+> `--variant full` leaves the `extensions` alias pointing at a **stale** image — the rc
+> tests then run old guest code (or skip on an image that predates `shed-ext-rc serve`)
+> while looking green. When validating an rc change, rebuild **both**
+> `./scripts/build-vz-rootfs.sh --variant full …` **and** `--variant extensions …` (FC:
+> the matching `build-firecracker-rootfs.sh` invocations) so both aliases carry your build.
+
+### Fast loop: copy the binary into a running shed
+
+A full rootfs rebuild is minutes; for a tight edit→test loop on a guest binary you can
+**cross-compile and drop it into a running shed**, skipping the image rebuild entirely:
+
+```bash
+# VZ is arm64; FC is amd64. Match the shed's arch.
+GOOS=linux GOARCH=arm64 go build -o /tmp/shed-ext-rc ./cmd/shed-ext-rc
+shed -s my-server-dev cp /tmp/shed-ext-rc dbg:/tmp/shed-ext-rc   # or: pipe over `exec … tee`
+shed -s my-server-dev exec dbg -- sudo install -m0755 /tmp/shed-ext-rc /usr/local/bin/shed-ext-rc
+shed -s my-server-dev exec dbg -- shed-ext-rc version            # confirm the dev build
+```
+
+If `shed cp` is unavailable, stream it: `go build -o /dev/stdout … | shed -s … exec dbg
+-- sudo tee /usr/local/bin/shed-ext-rc >/dev/null` then `chmod +x`.
+
+**Two caveats specific to the rc hub:**
+
+1. **A recreated shed reverts to the image binary.** The copy lives only in that shed's
+   writable upper — `shed create`/recreate (or a snapshot restore) boots the baked
+   image's `shed-ext-rc` again. Use the copy shortcut for iteration; use the full rootfs
+   rebuild (step 2) for anything you'll assert on across a recreate, and for the final
+   pre-PR verification.
+2. **Kill the running hub so your new binary takes over.** The old `serve` daemon keeps
+   running the *previous* binary (the port bind is the lock, so a fresh `serve` just
+   exits 0 against it). After installing, stop it — kill the hub process (or every
+   `rc-*` session, which lets it idle-exit) — so the next ensure-start spawns **your**
+   build. Confirm with `shed -s … exec dbg -- pgrep -af 'shed-ext-rc serve'` and check
+   `~/.shed-rc-hub/hub.log`.
+
 ## Gremlin: FC remote rootfs build + mise + sudo
 
 The FC dev image is built on the remote (`mini3`), and the dev image store

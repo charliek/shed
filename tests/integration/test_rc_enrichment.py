@@ -21,13 +21,11 @@ rc presence is the feature under test.
 
 from __future__ import annotations
 
-import json
 import time
-import urllib.request
 
 import pytest
 
-from fixtures.server import resolve_server_entry
+from fixtures.apiendpoint import resolve_api_endpoint
 
 # Substrings that identify a fixture-environment gap — the guest image's
 # shed-ext-rc predates multi-agent RC (no `--kind` flag / unknown kind) or the
@@ -82,29 +80,6 @@ def _poll_rc_row(fetch, *, timeout: float = 10.0, interval: float = 0.5):
         time.sleep(interval)
 
 
-def _api_base(server) -> str:
-    """Return the dev server's HTTP base URL from its client-config entry.
-
-    `shed_server_dev` is parameterized across VZ (localhost) and FC (remote,
-    `$SHED_FC_HOST`); the config entry carries the right host + http_port for
-    each, the same way the CLI reaches the server. Dev servers run in open mode
-    (plain HTTP, no token).
-    """
-    entry = resolve_server_entry(server.name)
-    if not entry:
-        pytest.skip(f"no config entry for server {server.name!r}")
-    host = entry.get("host") or "localhost"
-    port = int(entry.get("http_port") or 0)
-    if port <= 0:
-        pytest.skip(f"config entry for {server.name!r} has no http_port")
-    return f"http://{host}:{port}"
-
-
-def _get_json(base: str, path: str) -> dict:
-    with urllib.request.urlopen(f"{base}{path}", timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 def _find_rc_row(sessions: list[dict], shed: str) -> dict | None:
     for s in sessions:
         if s.get("shed_name") == shed and str(s.get("name", "")).startswith("rc-"):
@@ -126,14 +101,14 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
     and `?rc=0` returns the same row without it."""
     server = shed_server_dev
     shed = test_shed_name_dev
-    base = _api_base(server)
+    ep = resolve_api_endpoint(server.name)
 
     # Genuine server precondition: once /api/info advertises a feature list, a
     # server without "rc-enrich" explicitly predates the feature — skip. A dev
     # server without the list at all is asserted against directly below (this
     # suite leg targets the developer's own build; a missing rc block there is
     # a regression, not a skip).
-    info = _get_json(base, "/api/info")
+    info = ep.get_json("/api/info")
     features = info.get("features")
     if isinstance(features, list) and "rc-enrich" not in features:
         pytest.skip(
@@ -160,7 +135,7 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
     # is a brew/deb-installed server, rerun via make test-integration-dev).
     # --wait=false returned before the session registered, so poll for the row.
     def _fetch_global():
-        resp = _get_json(base, "/api/sessions")
+        resp = ep.get_json("/api/sessions")
         return _find_rc_row(resp.get("sessions") or [], shed), resp
 
     row, resp = _poll_rc_row(_fetch_global)
@@ -180,7 +155,7 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
     assert rc.get("state"), f"rc.state should be populated: {rc!r}"
 
     # ?rc=0 must return the same row WITHOUT the rc block (enrichment skipped).
-    resp0 = _get_json(base, "/api/sessions?rc=0")
+    resp0 = ep.get_json("/api/sessions?rc=0")
     row0 = _find_rc_row(resp0.get("sessions") or [], shed)
     assert row0 is not None, (
         f"rc-* row disappeared under ?rc=0 for shed {shed!r}: {resp0.get('sessions')!r}"
@@ -191,7 +166,7 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
 
     # Per-shed listing (GET /api/sheds/{name}/sessions) must carry the same
     # contract as the aggregate: enriched by default, rc omitted under ?rc=0.
-    per_shed = _get_json(base, f"/api/sheds/{shed}/sessions")
+    per_shed = ep.get_json(f"/api/sheds/{shed}/sessions")
     prow = _find_rc_row(per_shed.get("sessions") or [], shed)
     assert prow is not None, (
         f"no rc-* row for shed {shed!r} in GET /api/sheds/{shed}/sessions: "
@@ -205,7 +180,7 @@ def test_rc_enrichment_populates_and_rc0_opts_out(
     )
     assert prc.get("kind") == "shell", f"unexpected per-shed rc.kind: {prc!r}"
 
-    per_shed0 = _get_json(base, f"/api/sheds/{shed}/sessions?rc=0")
+    per_shed0 = ep.get_json(f"/api/sheds/{shed}/sessions?rc=0")
     prow0 = _find_rc_row(per_shed0.get("sessions") or [], shed)
     assert prow0 is not None, (
         f"rc-* row disappeared under ?rc=0 on the per-shed route for shed "
@@ -228,12 +203,12 @@ def test_overview_shape(shed_server_dev, test_shed_name_dev):
     """
     server = shed_server_dev
     shed = test_shed_name_dev
-    base = _api_base(server)
+    ep = resolve_api_endpoint(server.name)
 
     # Precondition: a features list without "overview" means the server predates
     # the endpoint. A dev server without any list is asserted directly (regression,
     # not skip) — the /api/overview call below 404s loudly if the route is absent.
-    info = _get_json(base, "/api/info")
+    info = ep.get_json("/api/info")
     features = info.get("features")
     if isinstance(features, list) and "overview" not in features:
         pytest.skip(
@@ -252,7 +227,7 @@ def test_overview_shape(shed_server_dev, test_shed_name_dev):
     # --wait=false returned before the session registered; poll /api/overview for
     # the enriched shell row under our shed before asserting the payload.
     def _fetch_overview():
-        payload = _get_json(base, "/api/overview")
+        payload = ep.get_json("/api/overview")
         entry = _find_overview_shed(payload.get("sheds") or [], shed)
         sessions = (entry or {}).get("sessions") or []
         return _find_rc_row(sessions, shed), payload

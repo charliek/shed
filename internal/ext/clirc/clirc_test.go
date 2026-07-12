@@ -524,3 +524,66 @@ func TestParseVersionFromLoginShell(t *testing.T) {
 		})
 	}
 }
+
+// TestServeDispatch checks the `serve` subcommand's local validation: --detach and
+// --foreground are mutually exclusive (rejected before any hub side effect), and an
+// unexpected positional argument is rejected. The bind/run paths are covered by the
+// hub package's own tests (they need an injectable address).
+func TestServeDispatch(t *testing.T) {
+	cases := []struct {
+		name       string
+		args       []string
+		wantCode   int
+		wantErrSub string // substring required in stderr ("" = not checked)
+	}{
+		{
+			name:       "mutually exclusive detach and foreground",
+			args:       []string{"serve", "--detach", "--foreground"},
+			wantCode:   2,
+			wantErrSub: "mutually exclusive",
+		},
+		{
+			name:     "unexpected positional argument",
+			args:     []string{"serve", "stray"},
+			wantCode: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// No ensureHub wired → a bad-args rejection can have no hub side effect.
+			code, _, errOut := runCLI(extCfg, &fakeRunner{}, nil, "", tc.args...)
+			if code != tc.wantCode {
+				t.Fatalf("%v exit = %d, want %d (stderr %q)", tc.args, code, tc.wantCode, errOut)
+			}
+			if tc.wantErrSub != "" && !strings.Contains(errOut, tc.wantErrSub) {
+				t.Fatalf("stderr = %q, want substring %q", errOut, tc.wantErrSub)
+			}
+		})
+	}
+}
+
+// TestCreateDoesNotSpawnHubInTests guards the ensureHub gate: dispatch-level create
+// (with no ensureHub wired, as in every test) must not attempt to spawn the daemon.
+func TestCreateDoesNotSpawnHubInTests(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "create shell session does not spawn hub",
+			args: []string{"create", "--kind", "shell", "--slug", "abc123"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &fakeRunner{}
+			env := map[string]string{"HOME": t.TempDir()}
+			code, _, errOut := runCLI(extCfg, r, env, "", tc.args...)
+			if code != 0 {
+				t.Fatalf("create exit = %d (stderr %q), want 0", code, errOut)
+			}
+			// A hub spawn would shell out to the real binary; the fake runner only sees
+			// tmux calls, so reaching exit 0 with no panic confirms no daemon side effect.
+		})
+	}
+}

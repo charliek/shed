@@ -475,10 +475,11 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	// Drop any cached rc capabilities up front — the shed is being torn down, so
-	// the entry is stale regardless of which teardown path (plain/SSE) runs and
-	// regardless of outcome (a failed delete just re-probes on the next list).
-	s.rcCaps.invalidate(name)
+	// Drop the per-shed rc state (cached capabilities + hub breaker entry) up
+	// front — the shed is being torn down, so it is stale regardless of which
+	// teardown path (plain/SSE) runs and regardless of outcome (a failed delete
+	// just re-probes on the next list).
+	s.invalidateShedRC(name)
 
 	// Stream teardown progress via SSE if the client requests it.
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
@@ -541,8 +542,9 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
-	// A restart can pick up an in-place agent install; drop any stale caps.
-	s.rcCaps.invalidate(name)
+	// A restart can pick up an in-place agent install; drop the stale per-shed rc
+	// state (caps + hub breaker — a fresh boot deserves fresh start attempts).
+	s.invalidateShedRC(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -558,9 +560,9 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
-	// A stopped shed can't be re-probed; drop its cached caps so a later start
-	// re-probes fresh.
-	s.rcCaps.invalidate(name)
+	// A stopped shed can't be re-probed; drop its per-shed rc state (caps + hub
+	// breaker) so a later start re-probes fresh.
+	s.invalidateShedRC(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -578,8 +580,9 @@ func (s *Server) handleResetShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
-	// Recreated upper layer: any cached caps are for the old rootfs state.
-	s.rcCaps.invalidate(name)
+	// Recreated upper layer: the cached caps and any hub-start breaker entry are
+	// for the old rootfs state.
+	s.invalidateShedRC(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }

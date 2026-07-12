@@ -114,8 +114,10 @@ func TestNotifyConnResetsBackoffAfterConnection(t *testing.T) {
 
 	dialer := &pipeDialer{
 		handler: func(conn net.Conn) {
-			count := atomic.AddInt32(&connectCount, 1)
+			// Send before incrementing so "connectCount >= 3" implies three
+			// buffered timestamps — the main goroutine drains right after.
 			connectTimes <- time.Now()
+			count := atomic.AddInt32(&connectCount, 1)
 			switch count {
 			case 1:
 				// First: close immediately (simulates dial failure at app level)
@@ -149,11 +151,11 @@ func TestNotifyConnResetsBackoffAfterConnection(t *testing.T) {
 
 	nc.Stop()
 
-	// Collect times
-	close(connectTimes)
+	// Collect times. Drain without closing: Stop doesn't wait for an
+	// in-flight reconnect handler goroutine, which may still send.
 	var times []time.Time
-	for ts := range connectTimes {
-		times = append(times, ts)
+	for len(connectTimes) > 0 {
+		times = append(times, <-connectTimes)
 	}
 
 	if len(times) < 3 {

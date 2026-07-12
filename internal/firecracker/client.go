@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -803,8 +802,22 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMo
 	return metadataToShed(meta), nil
 }
 
-// DialService opens a TCP connection to a service port inside a running Firecracker shed.
-// Firecracker VMs have routable bridge IPs, so this dials directly.
+// DialService opens a connection to a service port inside a running Firecracker
+// shed by routing through the guest agent's TCP proxy on vsock, exactly like VZ.
+//
+// Historically this dialed the VM's routable bridge IP directly. That could not
+// reach guest services bound to 127.0.0.1 (e.g. the rc hub on 127.0.0.1:1029),
+// so those degraded to RC_HUB_UNAVAILABLE on Firecracker. Routing through the
+// tcpproxy (the guest agent dials the target on 127.0.0.1) gives parity with VZ:
+// connect/{port} now reaches loopback-bound guest services, and the peer address
+// the guest sees becomes 127.0.0.1. Services bound only to the bridge IP become
+// unreachable via connect/{port} — none exist in-tree; sshd and user services
+// bind 0.0.0.0, which the proxy reaches via loopback all the same.
+//
+// Semantic delta vs the old bridge dial: half-close/EOF does not propagate
+// through the tcpproxy until full close (guest-side tcpproxy CloseWrite asserts
+// *net.TCPConn, which fails for the vsock.Conn it holds). This matches VZ; a
+// guest-side fix is deferred (it needs an image rebuild).
 func (c *Client) DialService(ctx context.Context, name string, port uint16) (net.Conn, error) {
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
 	if err != nil {
@@ -817,9 +830,9 @@ func (c *Client) DialService(ctx context.Context, name string, port uint16) (net
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, name)
 	}
 
-	addr := net.JoinHostPort(meta.IPAddress, strconv.FormatUint(uint64(port), 10))
-	var d net.Dialer
-	return d.DialContext(ctx, "tcp", addr)
+	vsockPath := filepath.Join(c.cfg.SocketDir, fmt.Sprintf("%s.vsock", name))
+	dialer := NewFirecrackerDialer(vsockPath)
+	return vmutil.DialService(ctx, dialer, c.cfg.TCPProxyPort, port)
 }
 
 // ResetShed nukes the per-shed upper and recreates it as a fresh

@@ -56,17 +56,23 @@ type deps struct {
 	// payload. nil → the real command-based probe (command -v + --version, 2s budget);
 	// tests inject a fake so no external process is spawned.
 	probe rc.AgentProbe
+	// ensureHub best-effort spawns/verifies the local rc hub after a successful
+	// create. nil in tests (so create never forks a real daemon); Run wires the real
+	// detached-serve spawn. Gating it here keeps hub side effects out of the pure
+	// dispatch tests while giving production the ensure-on-create behavior.
+	ensureHub func(d deps)
 }
 
 // Run dispatches args with real process dependencies and returns a process exit code.
 func Run(cfg Config, args []string) int {
 	return run(cfg, deps{
-		runner:   rc.DefaultRunner(),
-		getenv:   os.Getenv,
-		stdin:    os.Stdin,
-		stdout:   os.Stdout,
-		stderr:   os.Stderr,
-		hostname: shortHostname,
+		runner:    rc.DefaultRunner(),
+		getenv:    os.Getenv,
+		stdin:     os.Stdin,
+		stdout:    os.Stdout,
+		stderr:    os.Stderr,
+		hostname:  shortHostname,
+		ensureHub: realEnsureHub,
 	}, args)
 }
 
@@ -92,6 +98,8 @@ func run(cfg Config, d deps, args []string) int {
 		return doPrompt(cfg, d, rest)
 	case "kill":
 		return doKill(cfg, d, rest)
+	case "serve":
+		return doServe(cfg, d, rest)
 	case "claude":
 		if !cfg.EnableClaudeVerb {
 			return unknown(cfg, d, cmd)
@@ -125,6 +133,7 @@ func usage(cfg Config, d deps) {
   accept-trust --slug <s>
   prompt   --slug <s> [--session-id <uuid>]   (text read from stdin)
   kill     --slug <s>
+  serve    [--detach | --foreground]   run the local rc activity hub (loopback 127.0.0.1:1029)
   version
 `)
 	fmt.Fprint(d.stderr, b.String())
@@ -303,6 +312,7 @@ func doCreate(cfg Config, d deps, args []string) int {
 		Wait:             *wait,
 		InteractiveShell: *interactive,
 		PermissionMode:   mode,
+		EnsureHub:        ensureHubHook(d),
 	}, d.sleep)
 	if err != nil {
 		return fail(cfg, d, err)
@@ -480,6 +490,58 @@ func doKill(cfg Config, d deps, args []string) int {
 	})
 }
 
+// hubConfig builds the rc.HubConfig from the injected process dependencies. Only
+// the tmux runner and env are wired; the hub applies its own defaults for clock,
+// intervals, and the loopback address.
+func hubConfig(d deps) rc.HubConfig {
+	return rc.HubConfig{Runner: d.runner, Getenv: d.getenv}
+}
+
+// realEnsureHub is the production ensureHub: spawn/verify the detached rc hub,
+// logging any (best-effort) failure to stderr. Wired only in Run so dispatch tests
+// never fork a real daemon.
+func realEnsureHub(d deps) {
+	rc.EnsureHub(hubConfig(d), d.stderr)
+}
+
+// ensureHubHook returns the CreateOptions.EnsureHub callback, or nil when no
+// ensureHub is wired (tests) so create performs no hub side effect.
+func ensureHubHook(d deps) func() {
+	if d.ensureHub == nil {
+		return nil
+	}
+	return func() { d.ensureHub(d) }
+}
+
+// doServe runs the local rc activity hub. With --detach it double-forks a detached
+// daemon and returns once the port is up (what `create`'s ensure-hub and the server
+// proxy invoke over a guest exec); otherwise it runs in the foreground until the hub
+// idle-exits or is signaled (--foreground makes that intent explicit; it is the
+// default and is mutually exclusive with --detach). Binding the loopback port is the
+// lock — a second serve exits 0 when a hub is already running.
+func doServe(cfg Config, d deps, args []string) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(d.stderr)
+	detach := fs.Bool("detach", false, "double-fork a detached hub and exit once the port is up")
+	foreground := fs.Bool("foreground", false, "run the hub in the foreground (default; for debugging)")
+	if code, ok := parseArgs(cfg, d, fs, args); !ok {
+		return code
+	}
+	if *detach && *foreground {
+		return fail(cfg, d, fmt.Errorf("%w: --detach and --foreground are mutually exclusive", rc.ErrBadArgs))
+	}
+	if *detach {
+		if err := rc.DetachHub(hubConfig(d)); err != nil {
+			return fail(cfg, d, err)
+		}
+		return 0
+	}
+	if err := rc.RunHub(hubConfig(d)); err != nil {
+		return fail(cfg, d, err)
+	}
+	return 0
+}
+
 func doPrompt(cfg Config, d deps, args []string) int {
 	fs := flag.NewFlagSet("prompt", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
@@ -558,6 +620,7 @@ func doClaude(cfg Config, d deps, args []string) int {
 		Wait:             true,
 		InteractiveShell: true,
 		PermissionMode:   mode,
+		EnsureHub:        ensureHubHook(d),
 	}, d.sleep)
 	if err != nil {
 		return fail(cfg, d, err)

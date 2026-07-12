@@ -413,6 +413,7 @@ func validFirecrackerConfig() *FirecrackerConfig {
 		VsockBaseCID:    100,
 		ConsolePort:     1024,
 		NotifyPort:      1026,
+		TCPProxyPort:    1028,
 		StartTimeout:    Duration(30 * time.Second),
 		StopTimeout:     Duration(10 * time.Second),
 		BridgeName:      "shed-br0",
@@ -488,6 +489,26 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 		{
 			name:    "console port over max",
 			modify:  func(c *FirecrackerConfig) { c.ConsolePort = MaxVsockPort + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "tcp proxy port zero",
+			modify:  func(c *FirecrackerConfig) { c.TCPProxyPort = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "tcp proxy port over max",
+			modify:  func(c *FirecrackerConfig) { c.TCPProxyPort = MaxVsockPort + 1 },
+			wantErr: true,
+		},
+		{
+			name:    "tcp proxy port collides with console",
+			modify:  func(c *FirecrackerConfig) { c.TCPProxyPort = c.ConsolePort },
+			wantErr: true,
+		},
+		{
+			name:    "tcp proxy port collides with notify",
+			modify:  func(c *FirecrackerConfig) { c.TCPProxyPort = c.NotifyPort },
 			wantErr: true,
 		},
 		// Timeout bounds
@@ -952,6 +973,29 @@ func TestVZConfigApplyDefaults(t *testing.T) {
 
 	// Should not overwrite non-zero values
 	cfg2 := &VZConfig{NotifyPort: 2000, TCPProxyPort: 2002}
+	cfg2.applyDefaults()
+	if cfg2.NotifyPort != 2000 {
+		t.Errorf("NotifyPort = %d after applyDefaults, want 2000", cfg2.NotifyPort)
+	}
+	if cfg2.TCPProxyPort != 2002 {
+		t.Errorf("TCPProxyPort = %d after applyDefaults, want 2002", cfg2.TCPProxyPort)
+	}
+}
+
+func TestFirecrackerConfigApplyDefaults(t *testing.T) {
+	cfg := &FirecrackerConfig{}
+	cfg.applyDefaults()
+
+	if cfg.NotifyPort != 1026 {
+		t.Errorf("NotifyPort = %d after applyDefaults, want 1026", cfg.NotifyPort)
+	}
+
+	if cfg.TCPProxyPort != 1028 {
+		t.Errorf("TCPProxyPort = %d after applyDefaults, want 1028 (must match the guest agent's flagless default)", cfg.TCPProxyPort)
+	}
+
+	// Should not overwrite non-zero values.
+	cfg2 := &FirecrackerConfig{NotifyPort: 2000, TCPProxyPort: 2002}
 	cfg2.applyDefaults()
 	if cfg2.NotifyPort != 2000 {
 		t.Errorf("NotifyPort = %d after applyDefaults, want 2000", cfg2.NotifyPort)

@@ -71,10 +71,12 @@ type Backend interface {
 
 	// Network
 
-	// DialService opens a TCP connection to a port inside a running shed's VM.
-	// For VZ: dials via vsock TCP proxy (port 1028) with CONNECT handshake.
-	// For Firecracker: dials the VM's bridge IP directly over TCP.
-	// The returned net.Conn is a raw TCP stream.
+	// DialService opens a connection to a port inside a running shed's VM.
+	// Both backends route through the guest agent's vsock TCP proxy (port 1028)
+	// with a CONNECT handshake; the agent dials the target on the guest's
+	// loopback, so loopback-bound services are reachable and the peer address the
+	// guest sees is 127.0.0.1. (VZ reaches the proxy via a per-port Unix socket;
+	// Firecracker via its vsock UDS mux.) The returned net.Conn is a raw stream.
 	DialService(ctx context.Context, shedName string, port uint16) (net.Conn, error)
 
 	// Images

@@ -33,6 +33,12 @@ type rcFakeBackend struct {
 	// listErr injects a per-shed ListSessions failure (keyed by shed name) so the
 	// overview session-list-degrade path is testable; nil entries list normally.
 	listErr map[string]error
+	// dialFn backs DialService (the rc-hub proxy / aggregator / enrichment consult
+	// dial through it). nil defaults to a connection-refused-style error so the
+	// enrichment hub-consult degrades silently — the common case for tests that
+	// don't stand up a fake hub. Proxy/aggregator tests set this to dial a real
+	// httptest hub (or to return the shed-not-running/refused sentinels).
+	dialFn func(ctx context.Context, shed string, port uint16) (net.Conn, error)
 }
 
 func (f *rcFakeBackend) Type() backend.Type { return backend.TypeVZ }
@@ -70,8 +76,11 @@ func (f *rcFakeBackend) Exec(ctx context.Context, shed string, opts backend.Exec
 	}
 	panic("unexpected Exec call")
 }
-func (f *rcFakeBackend) DialService(context.Context, string, uint16) (net.Conn, error) {
-	panic("unexpected")
+func (f *rcFakeBackend) DialService(ctx context.Context, shed string, port uint16) (net.Conn, error) {
+	if f.dialFn != nil {
+		return f.dialFn(ctx, shed, port)
+	}
+	return nil, errors.New("dial tcp 127.0.0.1:1029: connect: connection refused")
 }
 func (f *rcFakeBackend) ListImages(context.Context) ([]config.ImageInfo, error) { panic("unexpected") }
 func (f *rcFakeBackend) InspectImage(context.Context, string) (config.ImageInspectResponse, error) {
@@ -152,6 +161,43 @@ func findSession(sessions []config.Session, name string) *config.Session {
 
 // TestEnrich_NewEnvelope_PopulatesRCAndCachesCaps: an rc-* row is enriched from a
 // modern envelope AND the capabilities block is cached.
+// TestToSessionRC_LifecycleSuppressesActivityDimension pins the projection-seam
+// precedence: a blocking lifecycle state (needs-trust/needs-auth/dead) drops the
+// WHOLE activity dimension — activity, activity_at, AND last_message together (a
+// stale last_message on a dead/gated row would present pre-death context as
+// current) — while a ready row carries all three through.
+func TestToSessionRC_LifecycleSuppressesActivityDimension(t *testing.T) {
+	in := rc.Session{
+		Slug: "abc234", TmuxSession: "rc-abc234", Kind: rc.KindCodex, Managed: true,
+		Activity: rc.ActivityWorking, ActivityAt: "2026-07-11T10:00:00Z",
+		LastMessage: "Running the test suite now.",
+	}
+
+	for _, st := range []rc.State{rc.StateNeedsTrust, rc.StateNeedsAuth, rc.StateDead} {
+		s := in
+		s.State = st
+		got := toSessionRC(s)
+		if got.Activity != "" || got.ActivityAt != "" || got.LastMessage != "" {
+			t.Errorf("state %s: activity dimension must be fully suppressed, got %+v", st, got)
+		}
+		// The lifecycle fields themselves still project.
+		if got.State != string(st) || got.Kind != string(rc.KindCodex) {
+			t.Errorf("state %s: lifecycle fields mangled: %+v", st, got)
+		}
+	}
+
+	for _, st := range []rc.State{rc.StateStarting, rc.StateReady, rc.StateReconnecting} {
+		s := in
+		s.State = st
+		got := toSessionRC(s)
+		if got.Activity != string(rc.ActivityWorking) ||
+			got.ActivityAt != "2026-07-11T10:00:00Z" ||
+			got.LastMessage != "Running the test suite now." {
+			t.Errorf("state %s: activity dimension must pass through, got %+v", st, got)
+		}
+	}
+}
+
 func TestEnrich_NewEnvelope_PopulatesRCAndCachesCaps(t *testing.T) {
 	be := &rcFakeBackend{
 		sessions: map[string][]config.Session{
