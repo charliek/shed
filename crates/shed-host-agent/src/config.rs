@@ -60,6 +60,12 @@ pub const POLICY_BIOMETRICS_OR_PASSWORD: &str = "biometrics-or-password";
 /// (`config.go:428`). Used only in single-server mode (no `discovery:` block).
 pub const DEFAULT_SERVER_URL: &str = "http://localhost:8080";
 
+/// The shed CLI config the agent discovers servers from when discovery is enabled
+/// without an explicit `source:` (mirror `config.go:DefaultDiscoverySource`). Applied
+/// (and tilde-expanded) by [`DiscoveryConfig::apply_defaults`]; also re-exported by
+/// `controltoken` for its single-server resolve default.
+pub const DEFAULT_DISCOVERY_SOURCE: &str = "~/.shed/config.yaml";
+
 /// `effective_policy_from_raw` maps a raw `approval.policy` string to its effective
 /// value: an empty/omitted policy fails closed to deny-all; any other value is
 /// echoed verbatim. This is the namespace-independent core of Go's
@@ -328,11 +334,14 @@ pub struct HostAgentConfig {
     /// The message-bus daemon connects here in single-server mode. In Go this is
     /// `Config.Server`, used only when `Discovery` is nil.
     pub server: String,
-    /// Whether a `discovery:` block is present. When true the agent is in
-    /// multi-server discovery mode (a later slice) and the single-server bus is NOT
-    /// started — mirroring Go's `cfg.Discovery != nil` gate in `main.go`. This
-    /// minimal reader does not yet parse the discovery contents, only its presence.
-    pub has_discovery: bool,
+    /// The parsed `discovery:` block, or `None` in single-server mode (the block is
+    /// absent or an explicit YAML null). Mirrors Go's `Config.Discovery
+    /// *DiscoveryConfig` (nil ⟺ single-server): when `Some`, the agent brokers for the
+    /// discovered servers the selector picks; `is_single_server`/`has_discovery` and
+    /// the reconcile path (`resolve_targets`, wired by the supervisor slice) gate on
+    /// its presence. Defaults are applied at parse time (matching Go's `LoadConfig`
+    /// calling `applyDefaults` only when `Discovery != nil`).
+    pub(crate) discovery: Option<DiscoveryConfig>,
     /// The layered AWS credential policy (`aws.{source_profile,default_role,mode,
     /// session_duration,cache_refresh_before,servers…}`), mirroring Go's `AWSConfig`.
     /// The `aws.approval.policy` gate is kept in `aws_policy` above (unchanged); this
@@ -465,11 +474,17 @@ impl HostAgentConfig {
             // null into `*DiscoveryConfig` as nil, and every discovery path gates on
             // `cfg.Discovery != nil` (`main.go:142/207/235`), so a null `discovery:`
             // stays SINGLE-server. `discovery: {}` (empty map) is non-null → multi
-            // (Go gives a non-nil empty struct). (CodeRabbit review finding.)
-            has_discovery: !matches!(
-                root.as_map().and_then(|m| m.get("discovery")),
-                None | Some(yaml_lite::Node::Null)
-            ),
+            // (Go gives a non-nil empty struct). (CodeRabbit review finding.) Defaults
+            // are applied here, matching Go's `LoadConfig` calling `applyDefaults` only
+            // when `Discovery != nil`.
+            discovery: match root.as_map().and_then(|m| m.get("discovery")) {
+                None | Some(yaml_lite::Node::Null) => None,
+                Some(node) => {
+                    let mut dc = DiscoveryConfig::from_node(node);
+                    dc.apply_defaults();
+                    Some(dc)
+                }
+            },
             aws: AwsConfig::from_node(root),
             docker: DockerConfig::from_node(root),
         }
@@ -477,10 +492,19 @@ impl HostAgentConfig {
 
     /// True when the agent runs in single-server mode — no `discovery:` block, so
     /// the message-bus daemon connects to the single `server:` URL. Mirrors Go's
-    /// `cfg.Discovery == nil` branch in `main.go`; multi-server discovery is a later
-    /// slice, so with a `discovery:` block present the single-server bus stays off.
+    /// `cfg.Discovery == nil` branch in `main.go`; with a `discovery:` block present
+    /// the daemon reconciles over the discovered servers instead (supervisor slice).
     pub fn is_single_server(&self) -> bool {
-        !self.has_discovery
+        self.discovery.is_none()
+    }
+
+    /// Whether a `discovery:` block is present (the inverse of
+    /// [`is_single_server`](Self::is_single_server)) — mirrors Go's
+    /// `cfg.Discovery != nil`. Retained as the test/probe accessor now that the field
+    /// is a parsed `Option` rather than the old presence bool.
+    #[cfg(test)]
+    pub fn has_discovery(&self) -> bool {
+        self.discovery.is_some()
     }
 
     /// The delegated-approval budget the desktop server enforces per request, and
@@ -525,6 +549,148 @@ impl HostAgentConfig {
             .filter(|ns| self.effective_policy(ns) == POLICY_SHED_DESKTOP)
             .map(str::to_string)
             .collect()
+    }
+}
+
+/// Selects which discovered servers a single agent process watches and how it reacts
+/// to changes in the discovery source — a faithful port of Go's `DiscoveryConfig`
+/// (`config.go:60`). Present (`Some`) on [`HostAgentConfig`] means multi-server mode.
+///
+/// The reload knobs (`watch`/`poll_interval`/`debounce`) are consumed by the watcher
+/// (commit 2) and `servers` by the reconcile path (commit 3); `apply_defaults` reads
+/// the four string knobs at parse time. The whole block is parsed + unit/golden-tested
+/// in commit 1 (`#[allow(dead_code)]` covers the fields not yet read in a headless
+/// production build).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub(crate) struct DiscoveryConfig {
+    /// Which discovered servers to watch (default: all). See [`ServerSelector`].
+    pub servers: ServerSelector,
+    /// Overrides the shed CLI config path (default `~/.shed/config.yaml`,
+    /// tilde-expanded by `apply_defaults`).
+    pub source: String,
+    /// Live-reload mode: `"fsnotify"` (default), `"poll"`, or `"off"`.
+    pub watch: String,
+    /// Reconcile cadence when `watch == "poll"` (default `10s`).
+    pub poll_interval: String,
+    /// Debounce window coalescing rapid fsnotify events (default `500ms`).
+    pub debounce: String,
+}
+
+impl DiscoveryConfig {
+    /// Build a `DiscoveryConfig` from the `discovery:` block node — the scalar knobs
+    /// plus the [`ServerSelector`]. Absent/non-scalar knobs read as `""` and are filled
+    /// by [`apply_defaults`](Self::apply_defaults) (mirroring Go's zero-value struct +
+    /// `LoadConfig`-time `applyDefaults`).
+    fn from_node(node: &yaml_lite::Node) -> DiscoveryConfig {
+        let map = node.as_map();
+        let scalar = |k: &str| {
+            map.and_then(|m| m.get(k))
+                .and_then(yaml_lite::Node::as_scalar)
+                .unwrap_or("")
+                .to_string()
+        };
+        DiscoveryConfig {
+            servers: ServerSelector::from_node(map.and_then(|m| m.get("servers"))),
+            source: scalar("source"),
+            watch: scalar("watch"),
+            poll_interval: scalar("poll_interval"),
+            debounce: scalar("debounce"),
+        }
+    }
+
+    /// Fill unset discovery fields and expand `~` in `source` — a faithful port of Go's
+    /// `applyDefaults` (`config.go:595`): `source` defaults to
+    /// [`DEFAULT_DISCOVERY_SOURCE`] then tilde-expands; `watch` defaults to `"fsnotify"`,
+    /// `poll_interval` to `"10s"`, `debounce` to `"500ms"`.
+    fn apply_defaults(&mut self) {
+        if self.source.is_empty() {
+            self.source = DEFAULT_DISCOVERY_SOURCE.to_string();
+        }
+        self.source = expand_tilde(&self.source);
+        if self.watch.is_empty() {
+            self.watch = "fsnotify".to_string();
+        }
+        if self.poll_interval.is_empty() {
+            self.poll_interval = "10s".to_string();
+        }
+        if self.debounce.is_empty() {
+            self.debounce = "500ms".to_string();
+        }
+    }
+}
+
+/// Chooses which discovered servers to watch — a faithful port of Go's `ServerSelector`
+/// and its `UnmarshalYAML` (`config.go:78-124`). The scalar `""`/`"all"` (and a bare
+/// null) select every server; any other scalar is a one-element list; a YAML sequence is
+/// the explicit list. The nil-vs-empty distinction is load-bearing: an OMITTED selector
+/// (`names` is `None`) selects everything, while an EXPLICIT empty list (`servers: []`,
+/// i.e. `names` is `Some(vec![])`) selects nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub(crate) struct ServerSelector {
+    /// The `all`/`""`/null scalar form (mirror Go's `All bool`).
+    pub all: bool,
+    /// The explicit name list. `None` = omitted selector (⇒ select all, matching Go's
+    /// `Names == nil`); `Some(vec![])` = explicit empty (`servers: []` ⇒ select none);
+    /// `Some(names)` = membership. Mirrors Go's `Names []string` nil-vs-empty.
+    pub names: Option<Vec<String>>,
+}
+
+impl ServerSelector {
+    /// Interpret the `servers:` node, mirroring Go's `UnmarshalYAML` (`config.go:85`):
+    /// an OMITTED node → the zero value (⇒ select all); a null (bare `servers:`) or the
+    /// scalar `""`/`"all"` → `all = true`; any other scalar → a one-element list; a
+    /// sequence → the name list (empty stays `Some(vec![])`, the watch-none form). Go
+    /// errors on a mapping value; the lenient reader can't fail here, so a map falls
+    /// back to the zero value (⇒ select all) — a documented-open edge the harness never
+    /// writes.
+    fn from_node(node: Option<&yaml_lite::Node>) -> ServerSelector {
+        use yaml_lite::Node;
+        match node {
+            None => ServerSelector::default(),
+            // A bare `servers:` is a YAML null; Go's UnmarshalYAML sees a scalar whose
+            // Value is "" → All. Match that (a null and `servers: ""` both ⇒ all).
+            Some(Node::Null) => ServerSelector {
+                all: true,
+                names: None,
+            },
+            Some(Node::Scalar(s)) => {
+                if s.is_empty() || s == "all" {
+                    ServerSelector {
+                        all: true,
+                        names: None,
+                    }
+                } else {
+                    ServerSelector {
+                        all: false,
+                        names: Some(vec![s.clone()]),
+                    }
+                }
+            }
+            // Delegate to the canonical sequence-flatten helper, whose doc pins the
+            // load-bearing empty-`[]` → `Some(vec![])` (watch-none) semantics; a
+            // `Sequence` node always yields `Some`, so `names` is never `None` here.
+            Some(seq @ Node::Sequence(_)) => ServerSelector {
+                all: false,
+                names: seq.as_scalar_list(),
+            },
+            // A mapping (or any other) selector is invalid in Go; default to select-all.
+            Some(_) => ServerSelector::default(),
+        }
+    }
+
+    /// Whether a discovered server name should be watched — a faithful port of Go's
+    /// `Selected` (`config.go:114`): `all` OR an omitted list (`names == None`) selects
+    /// everything; an explicit list is a membership test (so `servers: []` selects
+    /// nothing). Reached by `resolve_targets_from`; wired live by the supervisor slice
+    /// (commit 3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn selected(&self, name: &str) -> bool {
+        if self.all || self.names.is_none() {
+            return true;
+        }
+        self.names.as_ref().is_some_and(|names| names.iter().any(|n| n == name))
     }
 }
 
@@ -1284,8 +1450,18 @@ discovery:
 ",
         );
         assert!(!cfg.is_single_server());
-        assert!(cfg.has_discovery);
+        assert!(cfg.has_discovery());
         assert_eq!(cfg.server, DEFAULT_SERVER_URL);
+        // The block CONTENTS parse: the explicit empty list is the watch-none form, and
+        // `watch`/`source` are read through (source is absolute, so tilde-expand is a
+        // no-op). `apply_defaults` still fills `poll_interval`/`debounce`.
+        let dc = cfg.discovery.as_ref().expect("discovery present");
+        assert_eq!(dc.servers.names, Some(Vec::<String>::new()));
+        assert!(!dc.servers.all);
+        assert_eq!(dc.watch, "off");
+        assert_eq!(dc.source, "/tmp/x.yaml");
+        assert_eq!(dc.poll_interval, "10s");
+        assert_eq!(dc.debounce, "500ms");
 
         // A bare `discovery:` (YAML null) reads as ABSENT → SINGLE-server, matching
         // Go's nil `*DiscoveryConfig` (CodeRabbit review). An empty MAP `discovery: {}`
@@ -1293,6 +1469,130 @@ discovery:
         assert!(HostAgentConfig::parse("discovery:\n").is_single_server());
         assert!(!HostAgentConfig::parse("discovery: {}\n").is_single_server());
         assert!(!HostAgentConfig::parse("discovery:\n  watch: off\n").is_single_server());
+    }
+
+    // ---- discovery: ServerSelector / DiscoveryConfig / resolve_targets ---------------
+
+    /// Parse a `discovery:`-block-body YAML literal into a `DiscoveryConfig` via the same
+    /// `Node → DiscoveryConfig` path `from_root` uses (WITHOUT `apply_defaults`, so the
+    /// raw selector/knob parse can be asserted). Mirrors Go's `yaml.Unmarshal(body, &dc)`.
+    fn parse_discovery(body: &str) -> DiscoveryConfig {
+        let node = yaml_lite::parse(body).expect("discovery body parses");
+        DiscoveryConfig::from_node(&node)
+    }
+
+    /// Mirrors `config_discovery_test.go:TestServerSelectorUnmarshal`: scalar `all`/`""`
+    /// (and a bare null) → `all`; an omitted selector → the zero value (nil names); any
+    /// other scalar → a one-element list; a sequence → the list (empty stays non-nil —
+    /// the watch-none form).
+    #[test]
+    fn server_selector_unmarshal() {
+        let cases: &[(&str, bool, Option<Vec<String>>)] = &[
+            ("servers: all\n", true, None),
+            ("watch: poll\n", false, None), // omitted selector
+            ("servers: \"\"\n", true, None), // empty scalar
+            ("servers: []\n", false, Some(vec![])), // explicit empty = watch none
+            (
+                "servers: [mini2, mini3]\n",
+                false,
+                Some(vec!["mini2".into(), "mini3".into()]),
+            ),
+            ("servers: mini2\n", false, Some(vec!["mini2".into()])),
+            ("servers:\n", true, None), // bare null ⇒ all (Go's null Value == "")
+        ];
+        for (body, want_all, want_names) in cases {
+            let dc = parse_discovery(body);
+            assert_eq!(dc.servers.all, *want_all, "all for {body:?}");
+            assert_eq!(&dc.servers.names, want_names, "names for {body:?}");
+        }
+    }
+
+    /// Mirrors `config_discovery_test.go:TestServerSelectorSelected`: `all` OR an omitted
+    /// list selects everything; an explicit list is a membership test; an explicit empty
+    /// list (`servers: []`) selects nothing — the load-bearing nil-vs-empty distinction.
+    #[test]
+    fn server_selector_selected() {
+        let all = ServerSelector {
+            all: true,
+            names: None,
+        };
+        assert!(all.selected("anything"));
+        // The zero value (omitted selector) selects everything (nil names).
+        assert!(ServerSelector::default().selected("anything"));
+        let list = ServerSelector {
+            all: false,
+            names: Some(vec!["mini2".into()]),
+        };
+        assert!(list.selected("mini2"));
+        assert!(!list.selected("mini3"));
+        let empty = ServerSelector {
+            all: false,
+            names: Some(vec![]),
+        };
+        assert!(!empty.selected("anything"));
+    }
+
+    /// Mirrors `config_discovery_test.go:TestLoadConfigDiscoveryDefaults`: through the
+    /// real `parse` (which applies defaults when the block is present) an absent
+    /// `watch`/`poll_interval`/`debounce` default to `fsnotify`/`10s`/`500ms`, and
+    /// `source` defaults to the shed CLI config with `~` EXPANDED (not the literal
+    /// `~/...`). Explicit values are kept.
+    #[test]
+    fn discovery_apply_defaults() {
+        let cfg = HostAgentConfig::parse("discovery:\n  servers: all\n");
+        let dc = cfg.discovery.as_ref().expect("discovery present");
+        assert!(dc.servers.all);
+        assert_eq!(dc.watch, "fsnotify");
+        assert_eq!(dc.poll_interval, "10s");
+        assert_eq!(dc.debounce, "500ms");
+        // Source defaulted AND tilde-expanded (so neither empty nor the literal default).
+        assert!(!dc.source.is_empty());
+        assert_ne!(dc.source, DEFAULT_DISCOVERY_SOURCE);
+        assert!(!dc.source.starts_with("~/"));
+
+        // Explicit knobs are kept, not overwritten by defaults.
+        let cfg = HostAgentConfig::parse(
+            "discovery:\n  watch: poll\n  poll_interval: 3s\n  debounce: 100ms\n  source: /abs/x.yaml\n",
+        );
+        let dc = cfg.discovery.as_ref().unwrap();
+        assert_eq!(dc.watch, "poll");
+        assert_eq!(dc.poll_interval, "3s");
+        assert_eq!(dc.debounce, "100ms");
+        assert_eq!(dc.source, "/abs/x.yaml");
+    }
+
+    // The `resolve_targets` unit tests (which build `crate::discovery::ServerTarget`
+    // and call the `resolve_targets*` methods) live in `discovery.rs` — those methods
+    // + type are defined there, and `config.rs` must stay self-contained for the
+    // standalone `#[path]` golden include (`tests/golden.rs`).
+
+    /// The Rust half of the `server_selector` golden — reads the SAME shared fixture the
+    /// Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenServerSelector`, via
+    /// a real `yaml.Unmarshal` into `DiscoveryConfig` + `Selected`), so the two impls
+    /// can't drift on the all / one-name / list-member / empty-list-none / absent-all
+    /// selector semantics (the nil-vs-empty distinction). In-crate (binary crate, no lib
+    /// — the `aws_resolve`/`docker_resolve` precedent).
+    #[test]
+    fn golden_server_selector() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/server_selector.json");
+        let raw = std::fs::read_to_string(&path).expect("read golden fixture");
+        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(fx["protocol_version"], 1, "version skew");
+        let vectors = fx["vectors"].as_array().unwrap();
+        assert!(!vectors.is_empty(), "fixture has no vectors");
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let selector = parse_discovery(v["selector_yaml"].as_str().unwrap()).servers;
+            for q in v["queries"].as_array().unwrap() {
+                let qn = q["name"].as_str().unwrap();
+                assert_eq!(
+                    selector.selected(qn),
+                    q["selected"].as_bool().unwrap(),
+                    "vector {name:?} name {qn:?}"
+                );
+            }
+        }
     }
 
     #[test]

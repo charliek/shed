@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/ext/protocol"
+	"gopkg.in/yaml.v3"
 )
 
 // fixturesDir resolves the shared fixture directory relative to THIS source file,
@@ -507,6 +508,45 @@ func TestGoldenConfigValidate(t *testing.T) {
 		}
 		if v.ErrorSubstring != "" && !strings.Contains(err.Error(), v.ErrorSubstring) {
 			t.Errorf("%s: error %q lacks substring %q", v.Name, err.Error(), v.ErrorSubstring)
+		}
+	}
+}
+
+// TestGoldenServerSelector is the Go half of the server_selector golden. It
+// yaml.Unmarshals each vector's selector body into a DiscoveryConfig (so the
+// production ServerSelector.UnmarshalYAML runs — scalar all/one, sequence, the
+// nil-vs-empty distinction), then asserts Servers.Selected(name) against the shared
+// fixture the Rust runner (config.rs:golden_server_selector) also reads.
+func TestGoldenServerSelector(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name         string `json:"name"`
+			SelectorYAML string `json:"selector_yaml"`
+			Queries      []struct {
+				Name     string `json:"name"`
+				Selected bool   `json:"selected"`
+			} `json:"queries"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "server_selector.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("server_selector.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("server_selector.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		var dc DiscoveryConfig
+		if err := yaml.Unmarshal([]byte(v.SelectorYAML), &dc); err != nil {
+			t.Errorf("%s: unmarshal selector: %v", v.Name, err)
+			continue
+		}
+		for _, q := range v.Queries {
+			if got := dc.Servers.Selected(q.Name); got != q.Selected {
+				t.Errorf("%s: Selected(%q) = %v, want %v", v.Name, q.Name, got, q.Selected)
+			}
 		}
 	}
 }

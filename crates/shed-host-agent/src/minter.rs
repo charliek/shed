@@ -24,6 +24,7 @@ use tokio::sync::watch;
 
 use crate::bootstrap::{BootstrapRunner, Params, SystemSshRunner};
 use crate::config::expand_tilde;
+use crate::discovery::ServerTarget;
 use crate::status::now_unix;
 
 /// Token scopes the host-agent mints over SSH: `credentials` for its own bus
@@ -42,31 +43,6 @@ const MIN_REFRESH_DELAY: Duration = Duration::from_secs(60);
 const MAX_REFRESH_DELAY: Duration = Duration::from_secs(12 * 3600);
 /// De-synchronizes a fleet re-minting together: the delay is spread ±this of its base.
 const JITTER_FRACTION: f64 = 0.25;
-
-/// A resolved shed server this agent brokers for (mirror `config.go:ServerTarget`).
-/// `name` is the identity key (empty in single-server mode); `url` is the broker base
-/// URL. `ssh_host`/`ssh_port` are the SSH endpoint used to mint over `_bootstrap`;
-/// `ssh_port == 0` means the entry omitted it (the agent can't self-mint).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerTarget {
-    pub name: String,
-    pub url: String,
-    /// The credentials-scoped bearer token from config (empty when not token-gated). In
-    /// secure mode the agent mints this itself; carried for the (deferred) bus provider.
-    pub token: String,
-    pub tls_fingerprint: String,
-    pub ssh_host: String,
-    pub ssh_port: u16,
-}
-
-impl ServerTarget {
-    /// Whether the server is reached over https — the authoritative local signal that
-    /// it runs in secure mode (tokens ⟺ TLS ⟺ secure) and that the agent should
-    /// self-mint (mirror `config.go:IsSecure`: scheme, not fingerprint presence).
-    pub fn is_secure(&self) -> bool {
-        self.url.to_lowercase().starts_with("https://")
-    }
-}
 
 /// A minted token plus its expiry as unix seconds (`None` = non-expiring / the server
 /// returned none — Go's zero `time.Time`).

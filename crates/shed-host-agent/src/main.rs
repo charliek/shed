@@ -28,6 +28,10 @@ mod bus;
 mod config;
 #[cfg(feature = "desktop-forwarding")]
 mod controltoken;
+// Multi-server discovery: `ServerTarget` + `load_discovered_servers`, hoisted here
+// (always-on) so the headless supervisor/reconcile path can resolve targets. The
+// `DiscoveryConfig`/`ServerSelector` parse + `resolve_targets` live in `config`.
+mod discovery;
 mod docker_backend;
 // The always-on egress-audit SSE consumer (bus-side, not gated — like `bus`/`aws_backend`/
 // `docker_backend`). Landed here; the per-server side task is spawned in commit 2.
