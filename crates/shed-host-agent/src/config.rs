@@ -1,8 +1,11 @@
 //! Minimal host-agent config reader for slice 0 — deliberately scoped to exactly
 //! what the LiveStatus self-report needs: the three approval policies
-//! (`ssh/aws/docker .approval.policy`) plus `logging.{enabled,path}`. The full
-//! config schema (discovery, per-server overrides, AWS/Docker resolution,
-//! biometric scope/ttl, `Validate()`) is a later slice.
+//! (`ssh/aws/docker .approval.policy`) plus `logging.{enabled,path}`. `load` now
+//! also runs [`HostAgentConfig::validate`] — a faithful port of Go's
+//! `Config.Validate` (the three policy allow-sets, `aws.sheds`/`aws.mode`, and
+//! `approval_timeout`), so the Rust daemon rejects (exit 1) exactly the configs the
+//! Go daemon rejects. The remaining schema (discovery-block contents, per-server
+//! biometric scope/ttl) stays structurally out of this headless reader.
 //!
 //! Parsing: the `yaml_lite` mod exposes the same tiny `Node` model shed-core's
 //! reader uses, but its parser is backed by `saphyr-parser` (a pure-Rust,
@@ -45,6 +48,13 @@ pub const POLICY_DENY_ALL: &str = "deny-all";
 pub const POLICY_APPROVE_ALL: &str = "approve-all";
 /// Approval-policy value that delegates the decision to the shed-desktop app.
 pub const POLICY_SHED_DESKTOP: &str = "shed-desktop";
+/// Native Touch ID biometric policy (SSH only — `validate` rejects it for
+/// aws/docker). Matches Go's `PolicyBiometrics`. Referenced only by `validate`'s
+/// ssh allow-set.
+pub const POLICY_BIOMETRICS: &str = "biometrics";
+/// Native Touch ID + Apple Watch / password fallback (SSH only). Matches Go's
+/// `PolicyBiometricsOrPassword`.
+pub const POLICY_BIOMETRICS_OR_PASSWORD: &str = "biometrics-or-password";
 
 /// The single-server bus URL default — matches Go's `Config.Server` default
 /// (`config.go:428`). Used only in single-server mode (no `discovery:` block).
@@ -152,6 +162,144 @@ pub(crate) fn parse_go_duration_nanos(s: &str) -> Option<i128> {
     Some(if neg { -total } else { total })
 }
 
+/// Validate one extension's `approval.policy` against its allow-set, mirroring Go's
+/// `validatePolicy` (`config.go:544-554`). An empty policy is valid (means deny-all).
+/// A non-empty value not in `allowed` → the exact Go error
+/// `%s.approval.policy %q is not one of %s` (allow-set joined by `", "`, in the
+/// order Go passes it). The `%q` render is reproduced with literal double quotes so
+/// the bytes match for the ASCII policy tokens in play (never `{:?}`, which could
+/// diverge from Go's `%q` escaping on non-ASCII).
+fn validate_policy(provider: &str, policy: &str, allowed: &[&str]) -> Result<(), String> {
+    if policy.is_empty() || allowed.contains(&policy) {
+        return Ok(());
+    }
+    Err(format!(
+        "{provider}.approval.policy \"{policy}\" is not one of {}",
+        allowed.join(", ")
+    ))
+}
+
+/// Validate an AWS `mode` field, mirroring Go's `validateMode` (`config.go:580-588`).
+/// An empty value (means assume-role) or a known mode is valid; anything else → the
+/// exact Go error `%s %q is not one of %s, %s` (`assume-role, passthrough`). `field`
+/// is the located field name (`aws.mode`, `aws.servers.<s>.mode`,
+/// `aws.servers.<s>.sheds.<sh>.mode`).
+fn validate_mode(field: &str, mode: &str) -> Result<(), String> {
+    match mode {
+        "" | AWS_MODE_ASSUME_ROLE | AWS_MODE_PASSTHROUGH => Ok(()),
+        _ => Err(format!(
+            "{field} \"{mode}\" is not one of {AWS_MODE_ASSUME_ROLE}, {AWS_MODE_PASSTHROUGH}"
+        )),
+    }
+}
+
+/// Validate `approval_timeout` off its RAW string, mirroring Go's
+/// `ApprovalTimeoutDuration` (`config.go:511-524`) as invoked by `Validate`: an
+/// EMPTY raw defaults to `"25s"` (valid); a non-empty raw is parsed with the strict
+/// Go-`time.ParseDuration` semantics — a parse failure → `approval_timeout %q is not
+/// a valid duration: <inner>` (the `%q` shows the RAW, so it is `""` for the empty
+/// case, matching Go), and a non-positive value → `approval_timeout %q must be
+/// positive`. Both `%q` renders use the RAW (not the defaulted `"25s"`), matching
+/// Go's `c.ApprovalTimeout` in the format args.
+fn validate_approval_timeout(raw: &str) -> Result<(), String> {
+    let to_parse = if raw.is_empty() { "25s" } else { raw };
+    match parse_go_duration_strict(to_parse) {
+        Err(inner) => Err(format!(
+            "approval_timeout \"{raw}\" is not a valid duration: {inner}"
+        )),
+        Ok(nanos) if nanos <= 0 => Err(format!("approval_timeout \"{raw}\" must be positive")),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// A STRICT Go-`time.ParseDuration` port for the validate path: unlike the fail-safe
+/// [`parse_go_duration_nanos`] (which the accessor keeps), this does NOT trim
+/// whitespace (Go rejects `" 5s "`), uses integer/checked arithmetic (no `f64`
+/// precision loss), and returns `Err` on overflow beyond `i64` nanoseconds (Go's
+/// duration is an `int64`). Result is signed nanoseconds so the caller can test
+/// positivity. The `Err` payload is Rust-internal (the golden pins only
+/// `is not a valid duration`, never the inner text — yaml/`fmt`-lib specific, per the
+/// docker suffix precedent).
+fn parse_go_duration_strict(s: &str) -> Result<i128, String> {
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let (neg, rest0) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    // Go accepts a bare "0" (and "+0"/"-0") with no unit.
+    if rest0 == "0" {
+        return Ok(0);
+    }
+    if rest0.is_empty() {
+        return Err("no digits in duration".to_string());
+    }
+    let mut rest = rest0;
+    let mut total: i128 = 0;
+    while !rest.is_empty() {
+        // Each fragment is a number (integer part + optional `.frac`) then a unit.
+        // A leading char that is neither a digit nor '.' is malformed (this also
+        // rejects embedded whitespace, since we never trimmed).
+        if !rest.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+            return Err("expected digit or '.' in duration".to_string());
+        }
+        let int_len = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let int_str = &rest[..int_len];
+        rest = &rest[int_len..];
+        let mut frac_str = "";
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            let frac_len = after_dot
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_dot.len());
+            frac_str = &after_dot[..frac_len];
+            rest = &after_dot[frac_len..];
+        }
+        if int_str.is_empty() && frac_str.is_empty() {
+            return Err("number without digits in duration".to_string());
+        }
+        // Unit: the run of chars up to the next number/'.'.
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let unit_nanos: i128 = match &rest[..unit_len] {
+            "" => return Err("missing unit in duration".to_string()),
+            "ns" => 1,
+            "us" | "µs" | "μs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            other => return Err(format!("unknown unit {other:?} in duration")),
+        };
+        rest = &rest[unit_len..];
+        // Integer contribution (checked, no f64).
+        let int_val: i128 = int_str
+            .parse()
+            .map_err(|_| "integer overflow in duration".to_string())?;
+        let mut frag = int_val.checked_mul(unit_nanos).ok_or("duration overflow")?;
+        // Fractional contribution: keep up to 18 digits (ns precision; guards the
+        // scale `pow` from overflowing) and scale down with integer division.
+        if !frac_str.is_empty() {
+            let flen = frac_str.len().min(18);
+            let frac_val: i128 = frac_str[..flen]
+                .parse()
+                .map_err(|_| "fraction overflow in duration".to_string())?;
+            let scale = 10i128.pow(flen as u32);
+            let frac_nanos = frac_val.checked_mul(unit_nanos).ok_or("duration overflow")? / scale;
+            frag = frag.checked_add(frac_nanos).ok_or("duration overflow")?;
+        }
+        total = total.checked_add(frag).ok_or("duration overflow")?;
+        // Bound to i64 nanoseconds like Go's int64 duration.
+        if total > i64::MAX as i128 {
+            return Err("duration overflow".to_string());
+        }
+    }
+    Ok(if neg { -total } else { total })
+}
+
 /// The slice-0/1 view of the host-agent config: the fields LiveStatus needs plus
 /// `approval_timeout` (the delegated-approval budget the desktop server enforces).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +316,14 @@ pub struct HostAgentConfig {
     // Read only by `approval_timeout()`, which only the desktop server calls.
     #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     approval_timeout: Duration,
+    /// The RAW `approval_timeout` string exactly as written in the config (`""`
+    /// when the key is absent/null). Retained so [`HostAgentConfig::validate`] can
+    /// re-check it the way Go's `Validate` re-parses `Config.ApprovalTimeout`: an
+    /// EMPTY raw is valid (→ 25s default); a non-empty raw that fails to parse or is
+    /// non-positive is rejected. The parsed `approval_timeout` above still fail-safes
+    /// the VALUE to 25s (the accessor never rejects), mirroring Go's second,
+    /// error-ignoring `ApprovalTimeoutDuration()` call in `main.go`.
+    approval_timeout_raw: String,
     /// The single-server bus URL (`server:`), defaulting to `DEFAULT_SERVER_URL`.
     /// The message-bus daemon connects here in single-server mode. In Go this is
     /// `Config.Server`, used only when `Discovery` is nil.
@@ -201,9 +357,43 @@ impl HostAgentConfig {
     pub fn load(path: &str) -> io::Result<HostAgentConfig> {
         let expanded = expand_tilde(path);
         let text = std::fs::read_to_string(&expanded)?;
-        // Malformed YAML is a hard error (mirrors Go's `yaml.Unmarshal` →
-        // `os.Exit(1)`); the daemon must not fail open with a half-read policy.
-        Self::try_parse(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        // load = parse → validate (mirrors Go's `LoadConfig`: `yaml.Unmarshal` then
+        // `Validate()`). Malformed YAML is a hard error (Go's `parsing config` path);
+        // a validate failure is a hard error too (Go's `invalid config` path). Either
+        // one → `Err` → `main.rs` exits 1; the daemon must not fail open with a
+        // half-read or invalid policy.
+        let cfg =
+            Self::try_parse(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        cfg.validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(cfg)
+    }
+
+    /// Validate the loaded config, in Go's EXACT `Config.Validate` check order
+    /// (`config.go:487-505`): the three approval-policy allow-sets
+    /// (ssh → aws → docker), then `AWS.validate` (`aws.sheds` → `aws.mode` →
+    /// per-server → per-shed), then `approval_timeout`. Returns the FIRST failure's
+    /// message (Go returns the first error), with the same field prefixes and
+    /// message shapes so the language-neutral golden can pin per-vector substrings.
+    /// An empty policy is valid (→ deny-all); SSH alone accepts the native biometric
+    /// policies (aws/docker reject them). Called from [`HostAgentConfig::load`].
+    pub fn validate(&self) -> Result<(), String> {
+        // Go's `sshAllowed` / `credAllowed` (`config.go:488-489`), same order — the
+        // order is byte-visible in the `is not one of %s` join.
+        const SSH_ALLOWED: &[&str] = &[
+            POLICY_DENY_ALL,
+            POLICY_APPROVE_ALL,
+            POLICY_BIOMETRICS,
+            POLICY_BIOMETRICS_OR_PASSWORD,
+            POLICY_SHED_DESKTOP,
+        ];
+        const CRED_ALLOWED: &[&str] = &[POLICY_DENY_ALL, POLICY_APPROVE_ALL, POLICY_SHED_DESKTOP];
+        validate_policy("ssh", &self.ssh_policy, SSH_ALLOWED)?;
+        validate_policy("aws", &self.aws_policy, CRED_ALLOWED)?;
+        validate_policy("docker", &self.docker_policy, CRED_ALLOWED)?;
+        self.aws.validate()?;
+        validate_approval_timeout(&self.approval_timeout_raw)?;
+        Ok(())
     }
 
     /// Parse config text, returning an error on malformed YAML. Missing keys take
@@ -233,6 +423,12 @@ impl HostAgentConfig {
                 .unwrap_or_default()
                 .to_string()
         };
+        // The RAW `approval_timeout` string, read once and shared between the
+        // fail-safe parsed Duration (the accessor) and the string `validate` re-checks.
+        let approval_timeout_raw = root
+            .get_path(&["approval_timeout"])
+            .unwrap_or_default()
+            .to_string();
         let logging_enabled = match root.get_path(&["logging", "enabled"]) {
             Some(v) => v != "false",
             None => true,
@@ -261,11 +457,19 @@ impl HostAgentConfig {
                 .to_string(),
             logging_enabled,
             logging_path,
-            approval_timeout: parse_approval_timeout(
-                root.get_path(&["approval_timeout"]).unwrap_or_default(),
-            ),
+            approval_timeout: parse_approval_timeout(&approval_timeout_raw),
+            approval_timeout_raw,
             server,
-            has_discovery: root.has_key("discovery"),
+            // A `discovery:` key PRESENT and NON-NULL flips to multi-server mode.
+            // A bare `discovery:` (YAML null) must read as ABSENT: Go unmarshals a
+            // null into `*DiscoveryConfig` as nil, and every discovery path gates on
+            // `cfg.Discovery != nil` (`main.go:142/207/235`), so a null `discovery:`
+            // stays SINGLE-server. `discovery: {}` (empty map) is non-null → multi
+            // (Go gives a non-nil empty struct). (CodeRabbit review finding.)
+            has_discovery: !matches!(
+                root.as_map().and_then(|m| m.get("discovery")),
+                None | Some(yaml_lite::Node::Null)
+            ),
             aws: AwsConfig::from_node(root),
             docker: DockerConfig::from_node(root),
         }
@@ -282,9 +486,11 @@ impl HostAgentConfig {
     /// The delegated-approval budget the desktop server enforces per request, and
     /// which drives the `hello_ack.request_timeout_ms` it advertises. Mirrors Go's
     /// `ApprovalTimeoutDuration` + `NewDesktopServer`'s guard: an absent, invalid,
-    /// or non-positive `approval_timeout` falls back to 25s. (The full config's
-    /// `Validate()` hard-rejects an invalid value at startup; this minimal reader
-    /// does no validation, so it fails safe to the default instead — a later slice.)
+    /// or non-positive `approval_timeout` falls back to 25s. [`HostAgentConfig::load`]
+    /// now hard-rejects an invalid/non-positive value at startup (via `validate`), so
+    /// production never reaches this accessor with a bad value; the fail-safe remains
+    /// for the in-crate `parse` convenience (which skips validation), mirroring Go's
+    /// second, error-ignoring `ApprovalTimeoutDuration()` call in `main.go`.
     #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     pub fn approval_timeout(&self) -> Duration {
         self.approval_timeout
@@ -356,6 +562,12 @@ pub struct AwsConfig {
     pub mode: String,
     pub session_duration: String,
     pub cache_refresh_before: String,
+    /// The REMOVED global per-shed override map (Go's `AWSConfig.Sheds`). Parsed
+    /// ONLY so [`HostAgentConfig::validate`] can reject a populated one with the
+    /// migration message (`config.go:561`, the `len > 0` reject); it does NOT affect
+    /// resolution. Bare `sheds:` / `sheds: {}` / `sheds: null` parse to an EMPTY map
+    /// (len 0 = valid); only a populated map rejects.
+    pub sheds: BTreeMap<String, AwsShedConfig>,
     pub servers: BTreeMap<String, AwsServerConfig>,
 }
 
@@ -389,6 +601,30 @@ pub struct ResolvedAws {
     pub session_duration: String,
 }
 
+/// Read a `sheds:` submap into `AwsShedConfig` entries (the per-shed `role`/`mode`/
+/// `session_duration` scalars). Shared by both the per-server `servers.<s>.sheds`
+/// walk (used for resolution) and the removed global `aws.sheds` walk (used only for
+/// the validate reject). A non-map entry is skipped, matching the lenient reader.
+fn read_aws_sheds(
+    map: &std::collections::HashMap<String, yaml_lite::Node>,
+) -> BTreeMap<String, AwsShedConfig> {
+    use yaml_lite::Node;
+    let mut out = BTreeMap::new();
+    for (name, entry) in map {
+        let Some(sf) = entry.as_map() else { continue };
+        let g = |k: &str| sf.get(k).and_then(Node::as_scalar).unwrap_or("").to_string();
+        out.insert(
+            name.clone(),
+            AwsShedConfig {
+                role: g("role"),
+                mode: g("mode"),
+                session_duration: g("session_duration"),
+            },
+        );
+    }
+    out
+}
+
 // `from_node` is live (called by `HostAgentConfig::parse`); `resolve`/`enabled` are
 // reached through the AWS backend + `main.rs`, wired into the bus (`new_sts_backend`
 // calls `enabled`; the backend's get_credentials/status call `resolve`).
@@ -408,9 +644,9 @@ impl AwsConfig {
     /// (Pinned cross-language by the `source_profile` vectors in the `aws_resolve`
     /// golden.)
     ///
-    /// `aws.sheds` (Go's removed global per-shed map) is intentionally NOT read: it
-    /// is parse-and-ignore for resolution. Go's `AWSConfig.validate` rejects it with
-    /// a migration message; that rejection is sub-plan 5's `validate()` (commit 2).
+    /// `aws.sheds` (Go's removed global per-shed map) IS parsed now — but only so
+    /// [`HostAgentConfig::validate`] can reject a populated one (the `len > 0`
+    /// migration reject, `config.go:561`). It stays parse-and-ignore for resolution.
     fn from_node(root: &yaml_lite::Node) -> AwsConfig {
         use yaml_lite::Node;
         let aws = root.as_map().and_then(|m| m.get("aws")).and_then(Node::as_map);
@@ -442,21 +678,11 @@ impl AwsConfig {
                         .unwrap_or("")
                         .to_string()
                 };
-                let mut sheds = BTreeMap::new();
-                if let Some(sheds_map) = fields.get("sheds").and_then(Node::as_map) {
-                    for (sname, sentry) in sheds_map {
-                        let Some(sf) = sentry.as_map() else { continue };
-                        let g = |k: &str| sf.get(k).and_then(Node::as_scalar).unwrap_or("").to_string();
-                        sheds.insert(
-                            sname.clone(),
-                            AwsShedConfig {
-                                role: g("role"),
-                                mode: g("mode"),
-                                session_duration: g("session_duration"),
-                            },
-                        );
-                    }
-                }
+                let sheds = fields
+                    .get("sheds")
+                    .and_then(Node::as_map)
+                    .map(read_aws_sheds)
+                    .unwrap_or_default();
                 servers.insert(
                     name.clone(),
                     AwsServerConfig {
@@ -475,8 +701,35 @@ impl AwsConfig {
             mode: scalar("mode"),
             session_duration: scalar_or_default("session_duration", "1h"),
             cache_refresh_before: scalar_or_default("cache_refresh_before", "5m"),
+            // The removed global `aws.sheds` map: parsed for the validate reject
+            // (`!is_empty()`), never used for resolution. Bare/`{}`/`null` → empty.
+            sheds: aws
+                .and_then(|m| m.get("sheds"))
+                .and_then(Node::as_map)
+                .map(read_aws_sheds)
+                .unwrap_or_default(),
             servers,
         }
+    }
+
+    /// Validate the AWS slice, mirroring Go's `AWSConfig.validate` (`config.go:560-578`)
+    /// in the same order: the removed `aws.sheds` map (`len > 0` → migration reject),
+    /// then `aws.mode`, then each server's mode, then each per-shed mode.
+    fn validate(&self) -> Result<(), String> {
+        if !self.sheds.is_empty() {
+            return Err(
+                "aws.sheds was removed; move entries under aws.servers.<server>.sheds.<shed>"
+                    .to_string(),
+            );
+        }
+        validate_mode("aws.mode", &self.mode)?;
+        for (name, sv) in &self.servers {
+            validate_mode(&format!("aws.servers.{name}.mode"), &sv.mode)?;
+            for (shed, sc) in &sv.sheds {
+                validate_mode(&format!("aws.servers.{name}.sheds.{shed}.mode"), &sc.mode)?;
+            }
+        }
+        Ok(())
     }
 
     /// Layer AWS overrides for a `(server, shed)` pair, most specific wins:
@@ -793,9 +1046,11 @@ pub(crate) mod yaml_lite {
             }
         }
 
-        /// Whether this node is a map containing `key` (as a scalar or a nested
-        /// block). Used to detect the presence of a top-level block like
-        /// `discovery:` whose contents this minimal reader doesn't yet parse.
+        /// Whether this node is a map containing `key` (present at any value,
+        /// including a null value). Production now distinguishes present-and-null
+        /// from present-and-non-null directly (`has_discovery`), so this stays as a
+        /// test-only presence accessor.
+        #[cfg(test)]
         pub fn has_key(&self, key: &str) -> bool {
             match self {
                 Node::Map(m) => m.contains_key(key),
@@ -1031,6 +1286,13 @@ discovery:
         assert!(!cfg.is_single_server());
         assert!(cfg.has_discovery);
         assert_eq!(cfg.server, DEFAULT_SERVER_URL);
+
+        // A bare `discovery:` (YAML null) reads as ABSENT → SINGLE-server, matching
+        // Go's nil `*DiscoveryConfig` (CodeRabbit review). An empty MAP `discovery: {}`
+        // is non-null → multi-server (Go non-nil empty struct).
+        assert!(HostAgentConfig::parse("discovery:\n").is_single_server());
+        assert!(!HostAgentConfig::parse("discovery: {}\n").is_single_server());
+        assert!(!HostAgentConfig::parse("discovery:\n  watch: off\n").is_single_server());
     }
 
     #[test]
@@ -1599,23 +1861,6 @@ docker:
         );
     }
 
-    /// The shipped example config's block-style `registries:` parses to the two
-    /// hostnames Go's `TestExampleConfigIsValid` asserts — the real uncaught
-    /// divergence on the product's own default config. (Full validate parity of the
-    /// example config is commit 2; this pins only the parse-level block-seq win.)
-    #[test]
-    fn example_config_registries_parse() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../configs/extensions.example.yaml");
-        let text = std::fs::read_to_string(&path).expect("read example config");
-        let cfg = HostAgentConfig::try_parse(&text).expect("example config parses");
-        assert_eq!(
-            cfg.docker.registries,
-            vec!["index.docker.io".to_string(), "ghcr.io".to_string()]
-        );
-        assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), "approve-all");
-    }
-
     /// A flow-style map (`ssh: { approval: { policy: X } }`) parses to the SAME
     /// nested `Node::Map` structure as the block form — the old reader treated the
     /// whole `{ ... }` as an opaque scalar (→ all deny-all).
@@ -1951,6 +2196,311 @@ docker:
                     q["registry_count"].as_u64().unwrap(),
                     "registry_count {name:?}"
                 );
+            }
+        }
+    }
+
+    // ---- validate() parity (mirror config_test.go's Validate tests) --------------
+
+    /// Parse `yaml` then `validate()` — the `load = parse → validate` chain without a
+    /// temp file. Returns the validate error (parse is known-good for these literals).
+    fn validate_yaml(yaml: &str) -> Result<(), String> {
+        HostAgentConfig::parse(yaml).validate()
+    }
+
+    /// Mirrors `config_test.go:TestLoadConfigRejectsBadPolicy`. An unknown ssh policy
+    /// is rejected with the EXACT Go message (allow-set joined in Go's order). (P: C2)
+    /// the substring the golden pins is `ssh.approval.policy`, NOT bare `is not one
+    /// of` (which also matches `aws.mode`).
+    #[test]
+    fn validate_rejects_unknown_ssh_policy() {
+        let err = validate_yaml("ssh:\n  approval:\n    policy: maybe\n")
+            .expect_err("unknown ssh policy rejected");
+        assert_eq!(
+            err,
+            "ssh.approval.policy \"maybe\" is not one of \
+             deny-all, approve-all, biometrics, biometrics-or-password, shed-desktop"
+        );
+    }
+
+    /// aws + docker unknown policies are rejected with the cred allow-set (no
+    /// biometrics). The prefixes prove the aws/docker path fired, not ssh.
+    #[test]
+    fn validate_rejects_unknown_aws_and_docker_policy() {
+        let aws = validate_yaml("aws:\n  approval:\n    policy: maybe\n")
+            .expect_err("unknown aws policy rejected");
+        assert_eq!(
+            aws,
+            "aws.approval.policy \"maybe\" is not one of deny-all, approve-all, shed-desktop"
+        );
+        let docker = validate_yaml("docker:\n  approval:\n    policy: maybe\n")
+            .expect_err("unknown docker policy rejected");
+        assert_eq!(
+            docker,
+            "docker.approval.policy \"maybe\" is not one of deny-all, approve-all, shed-desktop"
+        );
+    }
+
+    /// Mirrors `config_test.go:TestValidateRejectsBiometricForAWS` — the native
+    /// biometric policies are SSH-only; the cred allow-set excludes them for
+    /// aws/docker. The same policy is ACCEPTED for ssh.
+    #[test]
+    fn validate_rejects_biometrics_for_aws_and_docker() {
+        assert!(validate_yaml("aws:\n  approval:\n    policy: biometrics\n").is_err());
+        assert!(
+            validate_yaml("docker:\n  approval:\n    policy: biometrics-or-password\n").is_err()
+        );
+        // ...but ssh accepts both native biometric policies.
+        assert!(validate_yaml("ssh:\n  approval:\n    policy: biometrics\n").is_ok());
+        assert!(validate_yaml("ssh:\n  approval:\n    policy: biometrics-or-password\n").is_ok());
+    }
+
+    /// Mirrors `config_test.go:TestValidateAcceptsValidPolicies` — ssh
+    /// biometrics-or-password + aws shed-desktop + docker approve-all all validate.
+    #[test]
+    fn validate_accepts_valid_policies() {
+        assert!(validate_yaml(
+            "ssh:\n  approval:\n    policy: biometrics-or-password\n\
+             aws:\n  approval:\n    policy: shed-desktop\n\
+             docker:\n  approval:\n    policy: approve-all\n"
+        )
+        .is_ok());
+    }
+
+    /// Mirrors `config_test.go:TestValidateAWS` (removed-sheds subtest). A POPULATED
+    /// `aws.sheds` map is rejected with the migration message (P: H2 — the reject is
+    /// `len > 0`, `config.go:561`, built as a map then `!is_empty()`).
+    #[test]
+    fn validate_rejects_aws_sheds_removed() {
+        let err = validate_yaml("aws:\n  sheds:\n    web:\n      role: arn:aws:iam::123:role/web\n")
+            .expect_err("populated aws.sheds rejected");
+        assert_eq!(
+            err,
+            "aws.sheds was removed; move entries under aws.servers.<server>.sheds.<shed>"
+        );
+    }
+
+    /// (P: H2 — the four-case pin.) Bare `sheds:` (null), `sheds: {}` (empty map), and
+    /// `sheds: null` are ALL valid (len 0); only a populated map rejects. This proves
+    /// the check is `!is_empty()`, NOT `has_key`.
+    #[test]
+    fn validate_aws_sheds_empty_forms_ok() {
+        assert!(validate_yaml("aws:\n  sheds:\n").is_ok(), "bare sheds:");
+        assert!(validate_yaml("aws:\n  sheds: {}\n").is_ok(), "empty map");
+        assert!(validate_yaml("aws:\n  sheds: null\n").is_ok(), "explicit null");
+        // ...and an absent aws block entirely.
+        assert!(validate_yaml("").is_ok(), "no aws block");
+    }
+
+    /// Mirrors `config_test.go:TestValidateAWS` (mode subtests). An unknown mode at
+    /// the top level, a server, or a shed is rejected with the located field name and
+    /// the `assume-role, passthrough` allow-set.
+    #[test]
+    fn validate_rejects_bad_aws_mode() {
+        let top = validate_yaml("aws:\n  mode: bogus\n").expect_err("bad top mode");
+        assert_eq!(top, "aws.mode \"bogus\" is not one of assume-role, passthrough");
+        let server = validate_yaml("aws:\n  servers:\n    mini2:\n      mode: nope\n")
+            .expect_err("bad server mode");
+        assert_eq!(
+            server,
+            "aws.servers.mini2.mode \"nope\" is not one of assume-role, passthrough"
+        );
+        let shed = validate_yaml(
+            "aws:\n  servers:\n    mini2:\n      sheds:\n        web:\n          mode: nope\n",
+        )
+        .expect_err("bad shed mode");
+        assert_eq!(
+            shed,
+            "aws.servers.mini2.sheds.web.mode \"nope\" is not one of assume-role, passthrough"
+        );
+    }
+
+    /// Mirrors `config_test.go:TestValidateAWS` (accepts-valid-modes subtest). Valid
+    /// modes at every level (empty/assume-role/passthrough) validate.
+    #[test]
+    fn validate_accepts_valid_aws_modes() {
+        let ok = validate_yaml(
+            "\
+aws:
+  mode: passthrough
+  servers:
+    mini2:
+      mode: assume-role
+      sheds:
+        web:
+          mode: passthrough
+",
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    /// Mirrors `config_test.go:TestApprovalTimeout` + the H1 edge vectors. The
+    /// accessor still fail-safes the VALUE to 25s (unchanged); `validate` now REJECTS
+    /// a bad/non-positive raw with the RIGHT per-vector message (P: C2), and the
+    /// STRICT parser rejects what the fail-safe f64 parser tolerated (whitespace /
+    /// overflow).
+    #[test]
+    fn validate_rejects_bad_approval_timeout() {
+        // Empty raw is valid (→ 25s default) — Go's `v == "" → "25s"`.
+        assert!(validate_yaml("").is_ok(), "absent approval_timeout");
+        assert!(
+            validate_yaml("approval_timeout: 40s\n").is_ok(),
+            "valid approval_timeout"
+        );
+        // Unparseable → `is not a valid duration`.
+        for bad in ["nonsense", "10"] {
+            let err = validate_yaml(&format!("approval_timeout: {bad}\n"))
+                .expect_err("unparseable approval_timeout");
+            assert!(
+                err.contains("is not a valid duration"),
+                "approval_timeout {bad:?}: {err:?}"
+            );
+            assert!(err.contains("approval_timeout"), "{err:?}");
+        }
+        // Non-positive → `must be positive`.
+        for bad in ["0s", "-5s"] {
+            let err = validate_yaml(&format!("approval_timeout: {bad}\n"))
+                .expect_err("non-positive approval_timeout");
+            assert!(err.contains("must be positive"), "approval_timeout {bad:?}: {err:?}");
+        }
+        // STRICT-parser hardening (P: H1): quoted leading/trailing whitespace (Go
+        // errors, the fail-safe parser trimmed) and an i64-overflowing magnitude are
+        // BOTH rejected here even though the accessor would silently 25s them.
+        let ws = validate_yaml("approval_timeout: \" 5s \"\n").expect_err("whitespace rejected");
+        assert!(ws.contains("is not a valid duration"), "{ws:?}");
+        let overflow = validate_yaml("approval_timeout: 10000000000000000000h\n")
+            .expect_err("overflow rejected");
+        assert!(overflow.contains("is not a valid duration"), "{overflow:?}");
+    }
+
+    /// The strict duration parser (`parse_go_duration_strict`) is a faithful
+    /// `time.ParseDuration` subset: it ACCEPTS the same valid forms the fail-safe f64
+    /// parser does, but REJECTS whitespace + overflow (no trim, integer/checked math).
+    #[test]
+    fn go_duration_strict_edge_cases() {
+        assert_eq!(parse_go_duration_strict("25s"), Ok(25_000_000_000));
+        assert_eq!(parse_go_duration_strict("1.5h"), Ok(5_400_000_000_000));
+        assert_eq!(parse_go_duration_strict("1h30m"), Ok(5_400_000_000_000));
+        assert_eq!(parse_go_duration_strict("300ms"), Ok(300_000_000));
+        assert_eq!(parse_go_duration_strict("0"), Ok(0));
+        assert_eq!(parse_go_duration_strict("-5s"), Ok(-5_000_000_000));
+        // Rejected (Go rejects too): no unit, whitespace, empty, unknown unit, overflow.
+        assert!(parse_go_duration_strict("10").is_err(), "bare number, no unit");
+        assert!(parse_go_duration_strict(" 5s ").is_err(), "whitespace not trimmed");
+        assert!(parse_go_duration_strict("5 s").is_err(), "internal whitespace");
+        assert!(parse_go_duration_strict("").is_err(), "empty");
+        assert!(parse_go_duration_strict("5y").is_err(), "unknown unit");
+        assert!(
+            parse_go_duration_strict("10000000000000000000h").is_err(),
+            "overflow"
+        );
+    }
+
+    /// Mirrors `config_test.go:TestExampleConfigIsValid`. The shipped default config
+    /// loads + validates and carries the documented, CARRIED defaults (ssh
+    /// biometrics-or-password, aws off/deny-all, docker approve-all + the block-seq
+    /// `registries == [index.docker.io, ghcr.io]`). (P: HONEST SCOPE) it CANNOT assert
+    /// `session_ttl == "1h"` (native-biometric, not in `HostAgentConfig`).
+    #[test]
+    fn example_config_loads_and_validates() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs/extensions.example.yaml");
+        let text = std::fs::read_to_string(&path).expect("read example config");
+        let cfg = HostAgentConfig::try_parse(&text).expect("example config parses");
+        cfg.validate().expect("example config validates");
+        assert_eq!(cfg.effective_policy(NS_SSH_AGENT), "biometrics-or-password");
+        assert_eq!(cfg.effective_policy(NS_AWS_CREDENTIALS), POLICY_DENY_ALL);
+        assert_eq!(cfg.effective_policy(NS_DOCKER_CREDENTIALS), "approve-all");
+        assert_eq!(
+            cfg.docker.registries,
+            vec!["index.docker.io".to_string(), "ghcr.io".to_string()]
+        );
+    }
+
+    /// Mirrors `config_test.go:TestLoadConfigDeprecatedDesktopKeysIgnored`. A config
+    /// that still sets the deprecated `desktop.*` keys with EXPLICIT ZERO/false values
+    /// LOADS OK (exit 0) — the Rust reader ignores the block entirely, and validate
+    /// touches only policies/aws/approval_timeout. (P: H3) this is unit-owned: "still
+    /// loads" has no live exit-code cell. (P: H4) warnings are op-log-only and not
+    /// ported. Driven through the real `load` (parse → validate) on a temp file.
+    #[test]
+    fn deprecated_desktop_keys_load_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "server: http://localhost:8080\n\
+             desktop:\n  enabled: false\n  socket_path: ~/somewhere/else.sock\n  timeout_ms: 0\n",
+        )
+        .unwrap();
+        let cfg =
+            HostAgentConfig::load(path.to_str().unwrap()).expect("deprecated desktop keys load ok");
+        // The budget still comes from approval_timeout (defaulted 25s), not timeout_ms.
+        assert_eq!(cfg.approval_timeout(), Duration::from_secs(25));
+    }
+
+    /// Validate runs in Go's EXACT order (`config.go:487-505`): ssh → aws → docker
+    /// policy → aws.validate(sheds → mode → …) → approval_timeout. With multiple
+    /// errors present, the FIRST in that order surfaces.
+    #[test]
+    fn validate_check_order_is_go() {
+        // ssh policy is checked before aws.mode before approval_timeout: a config bad
+        // on all three surfaces the SSH error first.
+        let err = validate_yaml(
+            "ssh:\n  approval:\n    policy: maybe\naws:\n  mode: bogus\napproval_timeout: nonsense\n",
+        )
+        .expect_err("multi-error config");
+        assert!(err.starts_with("ssh.approval.policy"), "{err:?}");
+        // With ssh valid, aws.validate (mode) beats approval_timeout.
+        let err = validate_yaml("aws:\n  mode: bogus\napproval_timeout: nonsense\n")
+            .expect_err("aws + timeout bad");
+        assert!(err.starts_with("aws.mode"), "{err:?}");
+    }
+
+    /// Wiring proof: a validate-failing config FILE surfaces through `load` as an
+    /// `Err` (the same path `main.rs` maps to exit 1, mirroring `main.go:82-86`).
+    #[test]
+    fn load_rejects_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "ssh:\n  approval:\n    policy: maybe\n").unwrap();
+        assert!(
+            HostAgentConfig::load(path.to_str().unwrap()).is_err(),
+            "invalid policy config must fail load (main.rs exit 1)"
+        );
+    }
+
+    /// The Rust half of the `config_validate` golden — reads the SAME shared fixture
+    /// the Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenConfigValidate`,
+    /// via the production `LoadConfig`), driving `try_parse` → `validate` (the
+    /// `load = parse → validate` chain minus the file I/O). Pins that both impls agree
+    /// on valid-vs-invalid and (for the semantic errors) share the PER-VECTOR message
+    /// substring. Malformed-YAML + duplicate-key vectors pin only `{valid:false}` (the
+    /// message body is yaml-lib specific — docker suffix precedent). In-crate (the
+    /// `aws_resolve`/`docker_resolve` precedent — binary crate, no lib).
+    #[test]
+    fn golden_config_validate() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/config_validate.json");
+        let raw = std::fs::read_to_string(&path).expect("read golden fixture");
+        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(fx["protocol_version"], 1, "version skew");
+        let vectors = fx["vectors"].as_array().unwrap();
+        assert!(!vectors.is_empty(), "fixture has no vectors");
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let want_valid = v["valid"].as_bool().unwrap();
+            let yaml = v["config_yaml"].as_str().unwrap();
+            // load = parse → validate; a parse error (malformed / duplicate-key) OR a
+            // validate error both mean "not valid" (Go's LoadConfig fails at either).
+            let result: Result<(), String> = match HostAgentConfig::try_parse(yaml) {
+                Err(e) => Err(e),
+                Ok(cfg) => cfg.validate(),
+            };
+            assert_eq!(result.is_ok(), want_valid, "valid {name:?}: {result:?}");
+            if let Some(sub) = v["error_substring"].as_str() {
+                let err = result.expect_err("substring vector must produce an error");
+                assert!(err.contains(sub), "vector {name:?}: {err:?} lacks {sub:?}");
             }
         }
     }

@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -460,6 +461,53 @@ func TestGoldenEgressAuditEntry(t *testing.T) {
 			continue
 		}
 		assertJSONShapeEqual(t, "egress/"+v.Name, egressAuditEntry(v.Server, dec), v.Expected)
+	}
+}
+
+// TestGoldenConfigValidate is the Go half of the config_validate golden. It routes
+// each vector's config YAML through the PRODUCTION LoadConfig (yaml.Unmarshal then
+// Validate) on a temp file, and asserts the valid flag + (for the semantic errors)
+// the per-vector message substring against the shared fixture the Rust runner
+// (config.rs:golden_config_validate, via HostAgentConfig::try_parse+validate) also
+// reads. Malformed-YAML + duplicate-key vectors carry no substring — the message body
+// is yaml-lib specific (Go yaml.v3 vs saphyr), excluded per the docker suffix policy.
+func TestGoldenConfigValidate(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name           string `json:"name"`
+			ConfigYAML     string `json:"config_yaml"`
+			Valid          bool   `json:"valid"`
+			ErrorSubstring string `json:"error_substring"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "config_validate.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("config_validate.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("config_validate.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(v.ConfigYAML), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadConfig(path)
+		if v.Valid {
+			if err != nil {
+				t.Errorf("%s: expected valid, got error: %v", v.Name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: expected invalid config to error", v.Name)
+			continue
+		}
+		if v.ErrorSubstring != "" && !strings.Contains(err.Error(), v.ErrorSubstring) {
+			t.Errorf("%s: error %q lacks substring %q", v.Name, err.Error(), v.ErrorSubstring)
+		}
 	}
 }
 

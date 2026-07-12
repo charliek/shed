@@ -1,0 +1,96 @@
+{
+  "_comment": "Golden fixture for the host-agent config validate() gate — input config YAML -> {valid, error_substring?}. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenConfigValidate, via the production LoadConfig, which runs yaml.Unmarshal then Validate) and the Rust runner (crates/shed-host-agent/src/config.rs tests::golden_config_validate, via HostAgentConfig::try_parse then validate) so the two impls cannot drift together on valid-vs-invalid or the per-vector semantic-error message substrings. Mirrors config_test.go TestLoadConfigRejectsBadPolicy / TestValidateRejectsBiometricForAWS / TestValidateAcceptsValidPolicies / TestValidateAWS / TestApprovalTimeout / TestLoadConfigInvalidYAML. PER-VECTOR substrings (P: C2): each carries the RIGHT substring so it proves the intended path fired (e.g. ssh.approval.policy, NOT bare 'is not one of' which also matches aws.mode). Malformed-YAML + duplicate-key pin only {valid:false} — the message body is yaml-lib specific (Go yaml.v3 vs saphyr), excluded per the docker suffix precedent.",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "valid: empty config (all deny-all, default approval_timeout)",
+      "config_yaml": "",
+      "valid": true
+    },
+    {
+      "name": "valid: ssh biometrics-or-password + aws shed-desktop + docker approve-all",
+      "config_yaml": "ssh:\n  approval:\n    policy: biometrics-or-password\naws:\n  approval:\n    policy: shed-desktop\ndocker:\n  approval:\n    policy: approve-all\n",
+      "valid": true
+    },
+    {
+      "name": "valid: aws modes at every level (passthrough / assume-role / passthrough)",
+      "config_yaml": "aws:\n  mode: passthrough\n  servers:\n    mini2:\n      mode: assume-role\n      sheds:\n        web:\n          mode: passthrough\n",
+      "valid": true
+    },
+    {
+      "name": "valid: aws.sheds empty map is len 0 (not a reject)",
+      "config_yaml": "aws:\n  sheds: {}\n",
+      "valid": true
+    },
+    {
+      "name": "invalid: unknown ssh policy",
+      "config_yaml": "ssh:\n  approval:\n    policy: maybe\n",
+      "valid": false,
+      "error_substring": "ssh.approval.policy"
+    },
+    {
+      "name": "invalid: biometrics rejected for aws (cred allow-set excludes it)",
+      "config_yaml": "aws:\n  approval:\n    policy: biometrics\n",
+      "valid": false,
+      "error_substring": "aws.approval.policy"
+    },
+    {
+      "name": "invalid: biometrics-or-password rejected for docker",
+      "config_yaml": "docker:\n  approval:\n    policy: biometrics-or-password\n",
+      "valid": false,
+      "error_substring": "docker.approval.policy"
+    },
+    {
+      "name": "invalid: populated aws.sheds removed",
+      "config_yaml": "aws:\n  sheds:\n    web:\n      role: arn:aws:iam::123:role/web\n",
+      "valid": false,
+      "error_substring": "aws.sheds was removed"
+    },
+    {
+      "name": "invalid: unknown aws.mode",
+      "config_yaml": "aws:\n  mode: bogus\n",
+      "valid": false,
+      "error_substring": "aws.mode \"bogus\" is not one of"
+    },
+    {
+      "name": "invalid: unknown per-shed aws mode (located field name)",
+      "config_yaml": "aws:\n  servers:\n    mini2:\n      sheds:\n        web:\n          mode: nope\n",
+      "valid": false,
+      "error_substring": "aws.servers.mini2.sheds.web.mode"
+    },
+    {
+      "name": "invalid: approval_timeout nonsense",
+      "config_yaml": "approval_timeout: nonsense\n",
+      "valid": false,
+      "error_substring": "is not a valid duration"
+    },
+    {
+      "name": "invalid: approval_timeout bare number (missing unit)",
+      "config_yaml": "approval_timeout: 10\n",
+      "valid": false,
+      "error_substring": "is not a valid duration"
+    },
+    {
+      "name": "invalid: approval_timeout zero is not positive",
+      "config_yaml": "approval_timeout: 0s\n",
+      "valid": false,
+      "error_substring": "must be positive"
+    },
+    {
+      "name": "invalid: approval_timeout negative is not positive",
+      "config_yaml": "approval_timeout: -5s\n",
+      "valid": false,
+      "error_substring": "must be positive"
+    },
+    {
+      "name": "invalid: malformed YAML (top-level garbage)",
+      "config_yaml": "{{invalid yaml",
+      "valid": false
+    },
+    {
+      "name": "invalid: duplicate map key",
+      "config_yaml": "server: http://a:8080\nserver: http://b:8080\n",
+      "valid": false
+    }
+  ]
+}
