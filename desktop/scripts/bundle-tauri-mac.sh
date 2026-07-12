@@ -16,6 +16,10 @@
 # Env (same conventions as bundle.sh):
 #   SHED_DESKTOP_DEVELOPER_ID_IDENTITY  codesign identity (default: ad-hoc "-")
 #   SHED_DESKTOP_ALLOW_UNSIGNED=1       continue past codesign failures
+#   SHED_TAURI_CONFIG_OVERRIDE          inline `tauri build --config <json>` merge
+#                                       (CI smoke only — e.g. a prerelease version
+#                                       override to prove the suffix survives plist
+#                                       stamping verbatim; NOT used by releases)
 #
 # Usage:
 #   ./scripts/bundle-tauri-mac.sh            # release (default)
@@ -75,6 +79,11 @@ TAURI_FLAGS=(--bundles app)
 if [ "${CONFIG}" = "debug" ]; then
   TAURI_FLAGS+=(--debug)
 fi
+# An inline config merge (CI smoke uses it to override the version) — passed to
+# the tauri CLI, before the standalone `--` that forwards the rest to cargo.
+if [ -n "${SHED_TAURI_CONFIG_OVERRIDE:-}" ]; then
+  TAURI_FLAGS+=(--config "${SHED_TAURI_CONFIG_OVERRIDE}")
+fi
 pushd "${REPO_ROOT}/tauri" >/dev/null
 npm --prefix ui exec tauri -- build "${TAURI_FLAGS[@]}" -- --locked
 popd >/dev/null
@@ -86,6 +95,11 @@ if [ ! -d "${BUNDLED_APP}" ]; then
 fi
 
 echo "==> Copying to ${APP_DIR}"
+# cp -R preserves read-only directory bits (Sparkle's dist has some), which can
+# make a bare rm -rf of a previous copy fail with "Directory not empty".
+if [ -d "${APP_DIR}" ]; then
+  chmod -R u+w "${APP_DIR}"
+fi
 rm -rf "${APP_DIR}"
 mkdir -p "${OUT_DIR}"
 cp -R "${BUNDLED_APP}" "${APP_DIR}"
