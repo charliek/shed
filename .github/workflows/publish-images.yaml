@@ -435,10 +435,11 @@ jobs:
     name: Build and Release
     needs: [release-plan, publish-build-tools, publish-vz, publish-fc, smoke]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-plan.outputs.ship_go == 'true'
-    # macos-latest: shed-host-agent's darwin build needs CGO (Touch ID), which
-    # can't cross-compile from linux. The shed-extensions release pipeline ran on
-    # macos-latest — this is the proven shape. The image-publish jobs above keep
-    # their linux runners (they build the guest binaries with CGO off).
+    # macos-latest: the shipped shed-host-agent is Rust (builder: rust / cargo
+    # zigbuild — cross-builds the linux targets from macOS via zig), and the
+    # detached Go rollback ids still compile here (darwin needs CGO for Touch ID).
+    # This mirrors the ci.yml release-snapshot job so the snapshot is a faithful
+    # dry-run. The image-publish jobs above keep their linux runners.
     runs-on: macos-latest
     permissions:
       contents: write
@@ -454,6 +455,21 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # Rust + cross tooling for `builder: rust` (mirrors release-snapshot).
+      # goreleaser's rust builder shells out to `cargo zigbuild`, needing zig +
+      # cargo-zigbuild; it auto-runs `rustup target add`, but pre-adding fails
+      # fast if a target is unavailable. The build env SHED_HOST_AGENT_VERSION=
+      # {{ .Version }} lives in .goreleaser.yaml, so it applies identically to
+      # the snapshot and this release — no per-job version munging.
+      - name: Rust toolchain + zig cross tooling
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+                            aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+          brew install zig
+          cargo install --locked cargo-zigbuild
 
       # The old inline "Verify plugin.json matches tag" step is gone: the
       # release-plan job owns that gate now (this job only runs when

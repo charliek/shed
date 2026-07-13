@@ -140,7 +140,7 @@ Every release is a `vX.Y.Z` tag on shed's existing track (v0.7.x → …). What 
 | Desktop | `desktop/VERSION` (+ `crates/` Cargo versions in lockstep) | macOS DMG + EdDSA-signed Sparkle appcast entry + notarization; Linux `shed-desktop` .deb; apt dispatch |
 | Mobile | — (ad hoc, unchanged from today's shed-mobile flow) | manual / existing workflow, carried over at import |
 
-¹ until Phase 3 removes the standalone host-agent artifact.
+¹ `shed-host-agent` is now built from the **Rust** crate (`builder: rust`) as of leg 3a.1's release-wiring change — same brew formula + tarballs, Go kept as time-boxed rollback (see §6 · 3a.1 Status). The standalone artifact is retired only at 3a.2 (absorbed into the desktop app; the headless standalone persists for server/no-desktop use).
 
 So `v0.1.8` may bump both manifests (shed + desktop ship together — the default when both changed); `v0.1.9` may bump only `plugin.json` (server-only). The release skill takes a component list and bumps only those manifests; the changelog entry states what shipped.
 
@@ -272,6 +272,7 @@ The consolidation thesis (§1) is one shared client-side implementation — the 
 **Leg 3a — host-agent → Rust**, in two plans:
 
 - **3a.1 — port.** A standalone Rust host-agent daemon (`crates/shed-host-agent`), **wire-compatible** with the Go server, guest extensions, and desktop client, across the daemon's **two wire surfaces**: (A) the desktop/status **UDS** (approval / `token.get` / status / audit — wire types + client already in Rust), and (B) the shed-server **plugin bus** via `sdk.HostClient` (where the credential backends live — networked HTTP-streaming subscribe/respond, TLS-pinned, green-field in Rust). Shipped opt-in, diffed against the Go daemon via a differential + golden-fixture harness, then default. `objc2-local-authentication` replaces the Go CGO Touch-ID path (removes the CGO-on-darwin dependency). Ships **no user-visible change** — the install win is 3a.2.
+    - **Status (release-wiring done, pre-tag).** The port + full parity/differential harness are complete, and the release pipeline now builds the shipped `shed-host-agent` homebrew binary from the Rust crate via GoReleaser's OSS `builder: rust` (`cargo zigbuild`; `builder: prebuilt` is Pro-only). The Go `cmd/shed-host-agent` stays in-tree as ~2-release **rollback insurance** (its goreleaser ids are compiled + CI-asserted every snapshot but detached from the archive; revert = one-line `archives[].ids` flip). Retirement of the Go daemon + the differential harness is a **separate, later** task once the Rust binary has shipped clean for ~2 releases. See `RELEASING.md` § "Host-agent: Rust binary, Go rollback". No tag has been cut for this yet — the first tag that ships the Rust binary is a deliberate maintainer action.
 - **3a.2 — absorb into the desktop clients.** Move the daemon in-process into the desktop app (mac Swift + Tauri Linux; the Rust `HostAgentClient` already exists → process-to-in-process). **This is where the install-story win lands for desktop users**: the separate host-agent install step disappears (its brew formula + launchd/systemd unit retire for the desktop path) → `brew install shed` + the app. The **headless standalone host-agent** distribution stays available for server / no-desktop environments (see the Headless brokering bullet).
 
 Consequences to design for:

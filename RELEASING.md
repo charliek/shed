@@ -140,12 +140,49 @@ by GoReleaser via `.goreleaser.yaml`'s `builds[].ldflags`. The Docker
 images are tagged from `GITHUB_REF_NAME` at workflow time. None of
 those need a source-tree bump.
 
+> **Cross-selector subtlety — the Rust `shed-host-agent`.** Its source
+> version (`crates/Cargo.toml [workspace.package].version`) tracks the
+> **desktop** selector, but the binary **ships on the go selector** (see
+> "Host-agent: Rust binary, Go rollback" below). The shipped `shed-host-agent
+> version` is **not** `CARGO_PKG_VERSION`; GoReleaser's `builder: rust` build
+> sets `SHED_HOST_AGENT_VERSION={{ .Version }}` (the go tag), which
+> `crates/shed-host-agent/src/version.rs` reads via `option_env!`. So no
+> source bump is needed for the host-agent's shipped version either.
+
 `CHANGELOG.md` is maintained by the release skill for human-readable
 in-repo history. GoReleaser's auto-generated release notes (filtered:
 skip `docs:`, `test:`, `chore:`, `ci:`) go on the GitHub Release body.
 
 `pyproject.toml` is for mkdocs only and has its own version cadence;
 not touched by `update-version.sh`.
+
+## Host-agent: Rust binary, Go rollback
+
+Since the Phase-3 leg-3a.1 release-wiring change, the shipped
+`shed-host-agent` homebrew binary is built from the **Rust**
+`crates/shed-host-agent` (not the Go `cmd/shed-host-agent`), via
+GoReleaser's OSS `builder: rust` (which runs `cargo zigbuild`; the
+`release` + `release-snapshot` jobs install `zig` + `cargo-zigbuild`).
+`builder: prebuilt` is GoReleaser **Pro-only** and was not an option.
+
+- **Install identity is unchanged.** Same binary/formula/archive name, same
+  `brew services` `service` block (run args, PATH env, `keep_alive`, log
+  paths), same bundled `extensions.example.yaml` → `etc/shed/extensions.yaml`,
+  same `shed-host-agent status`/`version` surface. The swap only changed where
+  the binary is compiled from. No apt/`.deb` (the host-agent is brew-only).
+- **The Go build is kept as rollback insurance.** The Go ids
+  `shed-host-agent-{darwin,linux}` stay defined in `.goreleaser.yaml` (GoReleaser
+  compiles every `builds[]` entry regardless of archive references, so they are
+  still built + CI-exercised every snapshot; `release-snapshot` asserts them in
+  `dist/artifacts.json`) but are **detached from the archive**. To revert to the
+  Go binary, flip `archives[shed-host-agent].ids` back to the two Go ids — a
+  one-line change that already compiles green.
+- **Retirement trigger (a SEPARATE future task, not yet done).** Once the Rust
+  `shed-host-agent` has shipped clean for ~2 releases, delete `cmd/shed-host-agent`,
+  the two Go goreleaser ids, and the `hostagent`-filter's `cmd/shed-host-agent/**`
+  entry; the Go-vs-Rust differential harness (`tests/host-agent-diff/`) retires
+  with the Go daemon. Do this deliberately in its own PR — do NOT bundle it with
+  a feature change.
 
 ## Snapshot / dev versioning
 
