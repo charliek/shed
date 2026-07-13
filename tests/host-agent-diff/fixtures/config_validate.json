@@ -91,6 +91,23 @@
       "name": "invalid: duplicate map key",
       "config_yaml": "server: http://a:8080\nserver: http://b:8080\n",
       "valid": false
+    },
+    {
+      "name": "invalid: map-valued discovery.servers (block map) — D3 exit-1",
+      "config_yaml": "discovery:\n  servers:\n    web: {}\n",
+      "valid": false,
+      "error_substring": "discovery.servers must be"
+    },
+    {
+      "name": "invalid: map-valued discovery.servers (flow map) — D3 exit-1",
+      "config_yaml": "discovery:\n  servers: {a: b}\n",
+      "valid": false,
+      "error_substring": "discovery.servers must be"
+    },
+    {
+      "name": "valid: discovery.servers list form still parses (not the map reject)",
+      "config_yaml": "discovery:\n  servers: [mini2, mini3]\n",
+      "valid": true
     }
   ]
 }

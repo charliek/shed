@@ -1,0 +1,33 @@
+{
+  "_comment": "Golden fixture for the config bool alternate-forms (D2 FIX) — input a YAML scalar `value` -> `resolved`: a bool when gopkg.in/yaml.v3 v3.0.1 resolves that plain scalar into a `bool` field, or the string \"error\" when yaml.v3 REJECTS it (!!str/!!int into bool). Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenConfigBoolForms, which decodes `v: <value>` into a Go struct{ V bool } via yaml.Unmarshal, asserting resolve-vs-error) and the Rust runner (crates/shed-host-agent/src/config.rs tests::golden_config_bool_forms, via parse_yaml_bool). CROSS-LANGUAGE for the resolving set (both agree on the bool). For the ERROR set the two impls diverge BY DESIGN and it is pinned EXPLICITLY, not silently: Go yaml.v3 ERRORS (typed decode), but the stringly-typed host-agent reader can't error without a typed Node layer, so parse_yaml_bool returns None (the D6 typed-decode residue, ACCEPT); the Go runner asserts the error, the Rust runner asserts None. The resolved set is yaml.v3's YAML-1.1 bool tokens in THREE canonical case forms only (orchestrator-probed + re-verified in-worktree): true/True/TRUE, yes/Yes/YES, on/On/ON, y/Y ; false/False/FALSE, no/No/NO, off/Off/OFF, n/N. A non-canonical case (tRUe, yEs), nonsense, 1, 0 are NOT bools. Wire-visible through docker.allow_all (see docker_resolve.json `allow_all: yes`) and logging.enabled.",
+  "protocol_version": 1,
+  "vectors": [
+    {"value": "true", "resolved": true},
+    {"value": "True", "resolved": true},
+    {"value": "TRUE", "resolved": true},
+    {"value": "yes", "resolved": true},
+    {"value": "Yes", "resolved": true},
+    {"value": "YES", "resolved": true},
+    {"value": "on", "resolved": true},
+    {"value": "On", "resolved": true},
+    {"value": "ON", "resolved": true},
+    {"value": "y", "resolved": true},
+    {"value": "Y", "resolved": true},
+    {"value": "false", "resolved": false},
+    {"value": "False", "resolved": false},
+    {"value": "FALSE", "resolved": false},
+    {"value": "no", "resolved": false},
+    {"value": "No", "resolved": false},
+    {"value": "NO", "resolved": false},
+    {"value": "off", "resolved": false},
+    {"value": "Off", "resolved": false},
+    {"value": "OFF", "resolved": false},
+    {"value": "n", "resolved": false},
+    {"value": "N", "resolved": false},
+    {"value": "nonsense", "resolved": "error"},
+    {"value": "1", "resolved": "error"},
+    {"value": "0", "resolved": "error"},
+    {"value": "tRUe", "resolved": "error"},
+    {"value": "yEs", "resolved": "error"}
+  ]
+}

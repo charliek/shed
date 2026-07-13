@@ -425,7 +425,7 @@ impl HostAgentConfig {
     /// `HostAgentConfig::parse` convenience wraps it for known-good test literals.
     pub fn try_parse(text: &str) -> Result<HostAgentConfig, String> {
         let root = yaml_lite::parse(text)?;
-        Ok(Self::from_root(&root))
+        Self::from_root(&root)
     }
 
     /// Parse known-good config text, panicking on malformed YAML. A convenience for
@@ -439,8 +439,10 @@ impl HostAgentConfig {
     }
 
     /// Build the config from an already-parsed `Node` tree (the `Node → config`
-    /// half of `try_parse`).
-    fn from_root(root: &yaml_lite::Node) -> HostAgentConfig {
+    /// half of `try_parse`). Fallible only through the discovery `ServerSelector`
+    /// (D3): a map-valued `discovery.servers:` surfaces the exact Go error so
+    /// `try_parse`/`load` reject it → exit 1, matching Go's `UnmarshalYAML`.
+    fn from_root(root: &yaml_lite::Node) -> Result<HostAgentConfig, String> {
         let policy = |ns_key: &str| -> String {
             root.get_path(&[ns_key, "approval", "policy"])
                 .unwrap_or_default()
@@ -452,8 +454,15 @@ impl HostAgentConfig {
             .get_path(&["approval_timeout"])
             .unwrap_or_default()
             .to_string();
+        // `logging.enabled` defaults to true (Go's `DefaultConfig` sets it true and
+        // yaml.v3 overlays). An ABSENT/null value keeps that default; a present scalar
+        // resolves through yaml.v3's bool set (`false`/`no`/`off`/`n` → off — the D2
+        // FIX; `off` used to leak through the old `v != "false"` and keep logging ON).
+        // A non-resolvable present scalar (`nonsense`/`1`/`0`) is the D6 residue: Go
+        // errors, here it falls back to the default `true` (the pre-D2 lenient outcome
+        // for any non-`false` scalar — preserved).
         let logging_enabled = match root.get_path(&["logging", "enabled"]) {
-            Some(v) => v != "false",
+            Some(v) => parse_yaml_bool(v).unwrap_or(true),
             None => true,
         };
         let logging_path = match root.get_path(&["logging", "path"]) {
@@ -488,7 +497,23 @@ impl HostAgentConfig {
                 _ => d.to_string(),
             }
         };
-        HostAgentConfig {
+        // A `discovery:` key PRESENT and NON-NULL flips to multi-server mode. A bare
+        // `discovery:` (YAML null) must read as ABSENT: Go unmarshals a null into
+        // `*DiscoveryConfig` as nil, and every discovery path gates on `cfg.Discovery
+        // != nil` (`main.go:142/207/235`), so a null `discovery:` stays SINGLE-server.
+        // `discovery: {}` (empty map) is non-null → multi (Go gives a non-nil empty
+        // struct). (CodeRabbit review finding.) Defaults are applied here, matching
+        // Go's `LoadConfig` calling `applyDefaults` only when `Discovery != nil`. The
+        // `?` propagates a map-valued `discovery.servers:` as the D3 exit-1 error.
+        let discovery = match root.as_map().and_then(|m| m.get("discovery")) {
+            None | Some(yaml_lite::Node::Null) => None,
+            Some(node) => {
+                let mut dc = DiscoveryConfig::from_node(node)?;
+                dc.apply_defaults();
+                Some(dc)
+            }
+        };
+        Ok(HostAgentConfig {
             ssh_policy: policy("ssh"),
             aws_policy: policy("aws"),
             docker_policy: policy("docker"),
@@ -503,25 +528,10 @@ impl HostAgentConfig {
             approval_timeout: parse_approval_timeout(&approval_timeout_raw),
             approval_timeout_raw,
             server,
-            // A `discovery:` key PRESENT and NON-NULL flips to multi-server mode.
-            // A bare `discovery:` (YAML null) must read as ABSENT: Go unmarshals a
-            // null into `*DiscoveryConfig` as nil, and every discovery path gates on
-            // `cfg.Discovery != nil` (`main.go:142/207/235`), so a null `discovery:`
-            // stays SINGLE-server. `discovery: {}` (empty map) is non-null → multi
-            // (Go gives a non-nil empty struct). (CodeRabbit review finding.) Defaults
-            // are applied here, matching Go's `LoadConfig` calling `applyDefaults` only
-            // when `Discovery != nil`.
-            discovery: match root.as_map().and_then(|m| m.get("discovery")) {
-                None | Some(yaml_lite::Node::Null) => None,
-                Some(node) => {
-                    let mut dc = DiscoveryConfig::from_node(node);
-                    dc.apply_defaults();
-                    Some(dc)
-                }
-            },
+            discovery,
             aws: AwsConfig::from_node(root),
             docker: DockerConfig::from_node(root),
-        }
+        })
     }
 
     /// True when the agent runs in single-server mode — no `discovery:` block, so
@@ -632,8 +642,9 @@ impl DiscoveryConfig {
     /// Build a `DiscoveryConfig` from the `discovery:` block node — the scalar knobs
     /// plus the [`ServerSelector`]. Absent/non-scalar knobs read as `""` and are filled
     /// by [`apply_defaults`](Self::apply_defaults) (mirroring Go's zero-value struct +
-    /// `LoadConfig`-time `applyDefaults`).
-    fn from_node(node: &yaml_lite::Node) -> DiscoveryConfig {
+    /// `LoadConfig`-time `applyDefaults`). Fallible only via [`ServerSelector::from_node`]
+    /// — a map-valued `servers:` propagates the D3 exit-1 error up to `try_parse`/`load`.
+    fn from_node(node: &yaml_lite::Node) -> Result<DiscoveryConfig, String> {
         let map = node.as_map();
         let scalar = |k: &str| {
             map.and_then(|m| m.get(k))
@@ -641,13 +652,13 @@ impl DiscoveryConfig {
                 .unwrap_or("")
                 .to_string()
         };
-        DiscoveryConfig {
-            servers: ServerSelector::from_node(map.and_then(|m| m.get("servers"))),
+        Ok(DiscoveryConfig {
+            servers: ServerSelector::from_node(map.and_then(|m| m.get("servers")))?,
             source: scalar("source"),
             watch: scalar("watch"),
             poll_interval: scalar("poll_interval"),
             debounce: scalar("debounce"),
-        }
+        })
     }
 
     /// Fill unset discovery fields and expand `~` in `source` — a faithful port of Go's
@@ -691,13 +702,15 @@ impl ServerSelector {
     /// Interpret the `servers:` node, mirroring Go's `UnmarshalYAML` (`config.go:85`):
     /// an OMITTED node → the zero value (⇒ select all); a null (bare `servers:`) or the
     /// scalar `""`/`"all"` → `all = true`; any other scalar → a one-element list; a
-    /// sequence → the name list (empty stays `Some(vec![])`, the watch-none form). Go
-    /// errors on a mapping value; the lenient reader can't fail here, so a map falls
-    /// back to the zero value (⇒ select all) — a documented-open edge the harness never
-    /// writes.
-    fn from_node(node: Option<&yaml_lite::Node>) -> ServerSelector {
+    /// sequence → the name list (empty stays `Some(vec![])`, the watch-none form). A
+    /// MAPPING value is invalid: Go's `UnmarshalYAML` returns the error
+    /// `discovery.servers must be "all" or a list of server names` (`config.go:107`) →
+    /// `LoadConfig` fails → exit 1. This reader is fallible for exactly that case (D3
+    /// FIX), returning the SAME message so `try_parse`/`load` reject it too (Go-faithful
+    /// exit 1, not the pre-D3 silent select-all fallback).
+    fn from_node(node: Option<&yaml_lite::Node>) -> Result<ServerSelector, String> {
         use yaml_lite::Node;
-        match node {
+        Ok(match node {
             None => ServerSelector::default(),
             // A bare `servers:` is a YAML null; Go's UnmarshalYAML sees a scalar whose
             // Value is "" → All. Match that (a null and `servers: ""` both ⇒ all).
@@ -725,9 +738,14 @@ impl ServerSelector {
                 all: false,
                 names: seq.as_scalar_list(),
             },
-            // A mapping (or any other) selector is invalid in Go; default to select-all.
-            Some(_) => ServerSelector::default(),
-        }
+            // A mapping selector is invalid in Go (its `UnmarshalYAML` default arm
+            // errors) → reject with the exact Go message so the daemon exits 1.
+            Some(Node::Map(_)) => {
+                return Err(
+                    "discovery.servers must be \"all\" or a list of server names".to_string(),
+                );
+            }
+        })
     }
 
     /// Whether a discovered server name should be watched — a faithful port of Go's
@@ -1170,13 +1188,41 @@ impl DockerConfig {
     }
 }
 
+/// Resolve a YAML scalar to a bool EXACTLY as `gopkg.in/yaml.v3` v3.0.1 does when
+/// decoding a plain scalar into a `bool` field (orchestrator-probed + re-verified
+/// against the vendored yaml.v3): the YAML-1.1 bool token set in its three canonical
+/// case forms — `true/True/TRUE`, `yes/Yes/YES`, `on/On/ON`, `y/Y` → `Some(true)`;
+/// `false/False/FALSE`, `no/No/NO`, `off/Off/OFF`, `n/N` → `Some(false)`. Anything
+/// else — a non-canonical case (`tRUe`, `yEs`), `nonsense`, `1`, `0`, or a non-scalar
+/// — is NOT a resolvable bool: yaml.v3 ERRORS (`!!str`/`!!int` into bool), but the
+/// stringly-typed host-agent reader can't error without a typed `Node` layer, so it
+/// returns `None` (the D6 typed-decode residue, ACCEPT — the caller keeps its lenient
+/// default). This is the D2 FIX: `opt_bool`/`logging_enabled` previously matched only
+/// lowercase `true`/`false`, silently mis-reading `allow_all: yes` / `logging.enabled:
+/// off`.
+fn parse_yaml_bool(s: &str) -> Option<bool> {
+    match s {
+        "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" | "y" | "Y" => {
+            Some(true)
+        }
+        "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF" | "n" | "N" => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
 /// Read an optional YAML bool leaf, mirroring Go's `*bool` decode: an absent node
-/// → `None` (inherit), a present scalar → `Some(scalar == "true")` (so
-/// `allow_all: false` is `Some(false)` — force-off — not inherit). A present
-/// non-scalar (e.g. a map) → `None`.
+/// → `None` (inherit), a present scalar → `Some(resolved)` for yaml.v3's bool token
+/// set (so `allow_all: false`/`no`/`off` are `Some(false)` — force-off — and
+/// `allow_all: yes`/`on`/`true` are `Some(true)` — force-on — not inherit). A present
+/// scalar that yaml.v3 would NOT resolve to a bool (`nonsense`/`1`/`0`) is the D6
+/// residue: Go errors, but here it maps to `Some(false)` (the pre-D2 lenient outcome
+/// for a non-`true` scalar — preserved, not silently flipped). A present non-scalar
+/// (e.g. a map) → `None` (inherit).
 fn opt_bool(node: Option<&yaml_lite::Node>) -> Option<bool> {
     node.and_then(yaml_lite::Node::as_scalar)
-        .map(|s| s == "true")
+        .map(|s| parse_yaml_bool(s).unwrap_or(false))
 }
 
 /// The host-agent config parser, exposing a tiny `Node` model (nested maps,
@@ -1526,7 +1572,7 @@ discovery:
     /// raw selector/knob parse can be asserted). Mirrors Go's `yaml.Unmarshal(body, &dc)`.
     fn parse_discovery(body: &str) -> DiscoveryConfig {
         let node = yaml_lite::parse(body).expect("discovery body parses");
-        DiscoveryConfig::from_node(&node)
+        DiscoveryConfig::from_node(&node).expect("discovery selector valid")
     }
 
     /// Mirrors `config_discovery_test.go:TestServerSelectorUnmarshal`: scalar `all`/`""`
@@ -2892,6 +2938,124 @@ aws:
             if let Some(sub) = v["error_substring"].as_str() {
                 let err = result.expect_err("substring vector must produce an error");
                 assert!(err.contains(sub), "vector {name:?}: {err:?} lacks {sub:?}");
+            }
+        }
+    }
+
+    // ---- D2 bool alternate forms + D3 selector-map exit-1 ------------------------
+
+    /// `parse_yaml_bool` resolves EXACTLY yaml.v3's plain-scalar bool set (the D2 FIX,
+    /// orchestrator-probed + re-verified in this worktree): the three canonical case
+    /// forms of the YAML-1.1 bool tokens resolve; a non-canonical case (`tRUe`/`yEs`),
+    /// `nonsense`, `1`, `0` do NOT (yaml.v3 errors — the D6 residue, `None` here).
+    #[test]
+    fn parse_yaml_bool_matches_yaml_v3_resolved_set() {
+        for t in [
+            "true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON", "y", "Y",
+        ] {
+            assert_eq!(parse_yaml_bool(t), Some(true), "{t:?} → true");
+        }
+        for f in [
+            "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF", "n", "N",
+        ] {
+            assert_eq!(parse_yaml_bool(f), Some(false), "{f:?} → false");
+        }
+        // The D6 residue: yaml.v3 ERRORS on these (Rust can't without a typed layer → None).
+        for e in ["nonsense", "1", "0", "tRUe", "yEs", "", "2", "yess"] {
+            assert_eq!(parse_yaml_bool(e), None, "{e:?} → residue None");
+        }
+    }
+
+    /// Wire behavior of the D2 FIX through the real reader: `logging.enabled: off`/`no`
+    /// now reads OFF (was ON via the old `!= "false"`), `docker.allow_all: yes`/`on`/
+    /// `True` now reads ON (was force-off via the old `== "true"`), and the residue
+    /// forms preserve the pre-D2 lenient outcome (`logging` stays ON, `allow_all` reads
+    /// force-off).
+    #[test]
+    fn bool_alternate_forms_wire_through_reader() {
+        // logging.enabled resolving-false forms → OFF.
+        for off in ["off", "no", "false", "No", "OFF", "n", "N"] {
+            let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {off}\n"));
+            assert!(!cfg.logging_enabled, "logging.enabled: {off} → off");
+        }
+        // logging.enabled resolving-true forms + absent → ON.
+        for on in ["on", "yes", "true", "Yes", "TRUE", "y"] {
+            let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {on}\n"));
+            assert!(cfg.logging_enabled, "logging.enabled: {on} → on");
+        }
+        assert!(HostAgentConfig::parse("").logging_enabled, "absent → default on");
+        // Residue: a non-resolvable value keeps the pre-D2 lenient default (ON).
+        for res in ["nonsense", "1", "0"] {
+            let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {res}\n"));
+            assert!(cfg.logging_enabled, "logging.enabled: {res} → residue on");
+        }
+        // docker.allow_all resolving-true forms → force-on.
+        for on in ["yes", "on", "true", "True", "ON"] {
+            let cfg = HostAgentConfig::parse(&format!("docker:\n  allow_all: {on}\n"));
+            assert!(cfg.docker.allow_all, "docker.allow_all: {on} → on");
+        }
+        // docker.allow_all resolving-false + residue → off.
+        for off in ["no", "off", "false", "nonsense", "1", "0"] {
+            let cfg = HostAgentConfig::parse(&format!("docker:\n  allow_all: {off}\n"));
+            assert!(!cfg.docker.allow_all, "docker.allow_all: {off} → off");
+        }
+    }
+
+    /// D3: a MAP-valued `discovery.servers:` is rejected by `try_parse` with the exact
+    /// Go `ServerSelector.UnmarshalYAML` message (`config.go:107`) — so `load` → exit 1,
+    /// matching Go (which errored → select-ALL was the pre-D3 Rust fallback). The valid
+    /// selector forms (all / one / list / none / bare-null) still parse.
+    #[test]
+    fn discovery_servers_map_value_rejected() {
+        let err = HostAgentConfig::try_parse("discovery:\n  servers:\n    web: {}\n")
+            .expect_err("map-valued servers rejected");
+        assert_eq!(
+            err,
+            "discovery.servers must be \"all\" or a list of server names"
+        );
+        // A nested-map form errors too.
+        assert!(HostAgentConfig::try_parse("discovery:\n  servers:\n    web:\n      x: y\n").is_err());
+        // The valid forms still parse (all / one / list / explicit-none / bare null).
+        for ok in [
+            "discovery:\n  servers: all\n",
+            "discovery:\n  servers: mini2\n",
+            "discovery:\n  servers: [mini2, mini3]\n",
+            "discovery:\n  servers: []\n",
+            "discovery:\n  servers:\n",
+        ] {
+            assert!(HostAgentConfig::try_parse(ok).is_ok(), "valid selector {ok:?}");
+        }
+    }
+
+    /// The Rust half of the `config_bool_forms` golden — reads the SAME shared fixture
+    /// the Go runner reads (`cmd/shed-host-agent/golden_test.go:TestGoldenConfigBoolForms`,
+    /// which decodes `v: <value>` into a Go `bool` via yaml.v3, asserting resolve-vs-error).
+    /// The Rust side routes each value through [`parse_yaml_bool`]: a fixture `resolved`
+    /// of `true`/`false` must be `Some(bool)`; a `resolved` of `"error"` is the D6
+    /// asymmetry — Go ERRORS (`!!str`/`!!int` into bool), Rust returns `None` (the
+    /// stringly-typed reader can't error without a typed layer, so the residue is `None`,
+    /// documented here, NOT a silent pass). In-crate (the `docker_resolve` precedent).
+    #[test]
+    fn golden_config_bool_forms() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/config_bool_forms.json");
+        let raw = std::fs::read_to_string(&path).expect("read golden fixture");
+        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(fx["protocol_version"], 1, "version skew");
+        let vectors = fx["vectors"].as_array().unwrap();
+        assert!(!vectors.is_empty(), "fixture has no vectors");
+        for v in vectors {
+            let value = v["value"].as_str().unwrap();
+            let got = parse_yaml_bool(value);
+            match &v["resolved"] {
+                serde_json::Value::Bool(b) => {
+                    assert_eq!(got, Some(*b), "value {value:?} → resolved {b}");
+                }
+                serde_json::Value::String(s) if s == "error" => {
+                    // Go yaml.v3 errors here; Rust maps the error set to None (D6 residue).
+                    assert_eq!(got, None, "value {value:?} → Go-errors / Rust-None residue");
+                }
+                other => panic!("value {value:?}: bad fixture `resolved` {other:?}"),
             }
         }
     }

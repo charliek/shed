@@ -512,6 +512,62 @@ func TestGoldenConfigValidate(t *testing.T) {
 	}
 }
 
+// TestGoldenConfigBoolForms is the Go half of the config_bool_forms golden (D2). For
+// each vector it decodes `v: <value>` into a Go struct{ V bool } through the PRODUCTION
+// yaml.v3 (the same decoder LoadConfig uses for docker.allow_all / logging.enabled), and
+// asserts resolve-vs-error against the shared fixture the Rust runner
+// (config.rs:golden_config_bool_forms, via parse_yaml_bool) also reads. The resolving
+// set is cross-language (both agree on the bool). The ERROR set is the D6 asymmetry,
+// pinned EXPLICITLY, not silently: Go yaml.v3 ERRORS (!!str/!!int into bool) while the
+// Rust reader returns None (the stringly-typed residue) — the Go runner asserts err!=nil,
+// the Rust runner asserts None. So a fixture `resolved:"error"` means "Go errors here".
+func TestGoldenConfigBoolForms(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Value    string          `json:"value"`
+			Resolved json.RawMessage `json:"resolved"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "config_bool_forms.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("config_bool_forms.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("config_bool_forms.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		var probe struct {
+			V bool `yaml:"v"`
+		}
+		// Feed the value UNQUOTED so yaml.v3 resolves the plain scalar (a quoted value
+		// would force !!str and always error) — exactly how allow_all/enabled reach it.
+		err := yaml.Unmarshal([]byte("v: "+v.Value+"\n"), &probe)
+		var wantBool bool
+		if jsonErr := json.Unmarshal(v.Resolved, &wantBool); jsonErr == nil {
+			// resolved is a JSON bool → yaml.v3 must resolve to that bool with no error.
+			if err != nil {
+				t.Errorf("value %q: expected resolve to %v, got error: %v", v.Value, wantBool, err)
+				continue
+			}
+			if probe.V != wantBool {
+				t.Errorf("value %q: resolved to %v, want %v", v.Value, probe.V, wantBool)
+			}
+			continue
+		}
+		// resolved is the string "error" → yaml.v3 must reject (Go side of the D6
+		// asymmetry; the Rust runner asserts parse_yaml_bool → None for the same vector).
+		var wantStr string
+		if jsonErr := json.Unmarshal(v.Resolved, &wantStr); jsonErr != nil || wantStr != "error" {
+			t.Fatalf("value %q: fixture `resolved` must be a bool or \"error\", got %s", v.Value, v.Resolved)
+		}
+		if err == nil {
+			t.Errorf("value %q: expected yaml.v3 to error (D6 residue), but it resolved to %v", v.Value, probe.V)
+		}
+	}
+}
+
 // TestGoldenServerSelector is the Go half of the server_selector golden. It
 // yaml.Unmarshals each vector's selector body into a DiscoveryConfig (so the
 // production ServerSelector.UnmarshalYAML runs — scalar all/one, sequence, the

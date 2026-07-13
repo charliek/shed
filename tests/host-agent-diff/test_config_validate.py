@@ -45,6 +45,7 @@ BAD_CONFIGS = [
     ("approval-timeout-negative", "approval_timeout: -5s\n"),
     ("approval-timeout-bare-10", "approval_timeout: 10\n"),
     ("duplicate-key", "server: http://a:8080\nserver: http://b:8080\n"),
+    ("map-valued-discovery-servers", "discovery:\n  servers:\n    web: {}\n"),
     ("malformed-top-level-garbage", "{{invalid yaml"),
     ("malformed-unterminated-flow", "ssh:\n  approval:\n    policy: [unterminated\n"),
 ]

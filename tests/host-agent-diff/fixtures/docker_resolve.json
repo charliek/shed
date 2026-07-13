@@ -56,6 +56,15 @@
       "queries": [
         {"server": "mini3", "shed": "anything", "allow_all": false, "registries": ["index.docker.io", "ghcr.io"], "registry_count": 2}
       ]
+    },
+    {
+      "name": "D2 bool alternate forms: allow_all `yes` at top forces on; server `True` force-on; server `no` force-off (was mis-read pre-D2)",
+      "config_yaml": "docker:\n  allow_all: yes\n  servers:\n    on-server:\n      allow_all: True\n    off-server:\n      allow_all: no\n",
+      "queries": [
+        {"server": "unknown", "shed": "x", "allow_all": true, "registries": [], "registry_count": 0},
+        {"server": "on-server", "shed": "x", "allow_all": true, "registries": [], "registry_count": 0},
+        {"server": "off-server", "shed": "x", "allow_all": false, "registries": [], "registry_count": 0}
+      ]
     }
   ]
 }

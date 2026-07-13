@@ -167,11 +167,20 @@ real.
   model is stringly-typed and the readers coerce leniently, so a **typed-decode residue**
   survives and is NOT closed here — **scalar-into-typed-field coercion** (`http_port:
   not-a-number` → Go errors, Rust defaults; `approval_timeout: [a,b]` → Go errors, Rust
-  falls back to 25s; a scalar where a list is expected), and **bool alternate forms**
-  (`allow_all: yes` / `on` / `True` → Go `yaml.v3` resolves to a bool, but Rust `opt_bool`
-  treats only lowercase `"true"` as true — CodeRabbit-confirmed). **Closed** by the swap:
-  duplicate map keys (→ `Err`, matching yaml.v3) and multi-document input (first document
-  consumed, matching Go's `yaml.Unmarshal`). Also documented-open: anchors/aliases/
+  falls back to 25s; a scalar where a list is expected), and the **bool forms yaml.v3
+  itself REJECTS** (`allow_all: nonsense` / `1` / `0`, or a non-canonical case like
+  `tRUe`/`yEs`, and any non-scalar into a bool → Go errors, but the stringly-typed reader
+  can't error without a typed layer, so it keeps its lenient default). The **bool
+  ALTERNATE FORMS yaml.v3 RESOLVES are now CLOSED (D2 FIX):** `allow_all: yes`/`on`/`True`
+  and `logging.enabled: off`/`no` read the SAME bool Go does — `parse_yaml_bool` mirrors
+  yaml.v3's YAML-1.1 bool token set in its three canonical case forms (`true/True/TRUE`,
+  `yes/Yes/YES`, `on/On/ON`, `y/Y` and their false counterparts), pinned cross-language by
+  the `config_bool_forms.json` golden (both runners) and wire-visible through
+  `docker.allow_all` (a `yes`/`True`/`no` vector in `docker_resolve.json`). (This corrects
+  the earlier stale claim that `allow_all: yes` was a Go error — yaml.v3 resolves it to
+  `true`; only the forms above ERROR.) **Also closed** by the parser swap: duplicate map
+  keys (→ `Err`, matching yaml.v3) and multi-document input (first document consumed,
+  matching Go's `yaml.Unmarshal`). Also documented-open: anchors/aliases/
   merge-keys, non-string keys, tagged scalars (low real-world risk), and the **cross-client
   inconsistency on the shared `~/.shed/config.yaml`** — the host-agent (`saphyr-parser`) and
   the desktop app (shed-core's own hand-rolled `yaml_lite`, a separate crate with a Swift
@@ -257,7 +266,8 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | socket | status socket bind + `0600` file perms | **enforced** | live (`conftest` daemon + `test_socket_perms.py`) |
 | socket | socket-dir `0700` re-chmod + stale-socket rebind | **enforced** | live (`test_socket_rebind.py`: pre-existing 0777 dir → 0700; stale AF_UNIX sockets at both fixed paths → unlinked + rebound, daemon answers) |
 | socket | live-socket / non-socket-file refuse (op-log-only, no equal wire consequence) | **out-of-scope(unit-owned)** | Rust unit (`sockets.rs::prepare_refuses_live_socket`, `prepare_refuses_non_socket_file`) + Go `TestPrepareSocketPath` |
-| config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML, duplicate key (exit-1 parity) | **enforced** | live (`test_config_validate.py`) + golden (`config_validate.json`, Go + Rust runners) |
+| config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML, duplicate key, **map-valued `discovery.servers` (D3, exit-1)** | **enforced** | live (`test_config_validate.py`) + golden (`config_validate.json`, Go + Rust runners; the D3 map-selector vectors pin the `discovery.servers must be` message) |
+| config-parse | **bool alternate forms (D2)** — `docker.allow_all` / `logging.enabled` resolve yaml.v3's YAML-1.1 bool token set (`yes/on/y/True/…`) identically; the yaml.v3-ERROR forms (`nonsense`/`1`/`0`/non-canonical-case) are the D6 residue (Go errors, Rust → `None`, pinned explicitly) | **enforced** | golden (`config_bool_forms.json`, Go [yaml.v3 decode] + Rust [`parse_yaml_bool`] runners) + Rust unit (`parse_yaml_bool_matches_yaml_v3_resolved_set`, `bool_alternate_forms_wire_through_reader`) + wire-visible `docker_resolve.json` (`allow_all: yes`/`True`/`no`) |
 | decision | `EffectivePolicy` (`""→deny-all`, echoes) | **enforced** | golden (Go + Rust runners) |
 | decision | `desktopGateNamespaces` ordered gate list | **enforced** | golden (Go + Rust runners) |
 | config-parse | inline-flow-style YAML (`{ ... }`) parity (masked `LiveStatus` policies canonical-equal) | **enforced** | live (`test_config_inline_flow.py`) |
