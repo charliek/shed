@@ -229,13 +229,16 @@ real.
   (TLS-pinned mint + 401-remint + wrong-pin-fails-closed), plus the `should_mint.json`
   golden and the `supervisor.rs`/`watcher.rs` units.
 
-- **Event replay ring.** The surface-A handshake (`hello`→`hello_ack`), the non-hello
-  drop, single-consumer supersede, event fan-out + approval correlation (via the gated
-  `sign`), and **`token.get`** (via the real SSH-bootstrap minter + a PATH-shim `ssh`,
-  `test_token_get.py`) are all differentially enforced. One surface-A cell stays `xfail`:
-  the **event replay ring** (`replay_events` on connect) is not exercised by the current
-  flows (they connect a fresh consumer with `replay_events:0`) — a buffered-then-connect
-  drive is a follow-up.
+- **Event replay ring — CLOSED.** The surface-A handshake (`hello`→`hello_ack`), the
+  non-hello drop, single-consumer supersede, event fan-out + approval correlation (via the
+  gated `sign`), **`token.get`** (via the real SSH-bootstrap minter + a PATH-shim `ssh`,
+  `test_token_get.py`), AND the **event replay ring** (`replay_events` on connect) are all
+  differentially enforced. The replay cell (`test_replay.py`) drives a non-gated ssh `list`
+  that buffers an `event` in each daemon's ring with NO desktop consumer connected, then
+  connects a consumer with `replay_events:N` and asserts the buffered frame is replayed
+  `mask_event`-equal (id/ts masked). `publish_audit` is wired to the ring on both impls
+  (Rust `audit.rs:203` → `main.rs`, `desktop-forwarding`-gated), so the buffer is fed by a
+  real caller in either mode — no reclassification.
 
 - **Minter — malformed `~/.shed/config.yaml` — CLOSED.** The Rust `load_discovered_servers`
   is backed by the saphyr `yaml_lite` reader now, so a malformed `~/.shed/config.yaml`
@@ -248,11 +251,57 @@ real.
   DIFFERENT file (`~/.shed/config.yaml`, not the launch `-config`) and a DIFFERENT chain
   (`token.get` → `resolve` → `load_discovered_servers`).
 
+## Accepted divergences
+
+A small set of Go-vs-Rust behavior differences are **formally accepted** rather than closed:
+each is either **unreachable on the real shed-server** (so it can never surface as a live
+diff) or requires machinery deliberately out of scope for this port (a typed-decode `Node`
+layer). They carry no cell — they are recorded here so the audit is complete, not silent.
+
+- **D4 · egress https-only redirect (Rust is strictly SAFER; unreachable).** The Rust egress
+  client installs an https-only redirect policy (`Policy::custom`, `egress.rs:egress_http_client`)
+  and refuses a non-https redirect even on an open/unpinned server; Go's `egressHTTPClient`
+  follows ANY redirect including an `http://` downgrade. The shed-server never emits a 3xx on
+  `/api/egress/stream` — `writeSSEEvent` (`internal/api/handlers.go:323`) is
+  `fmt.Fprintf(w, "event: %s\ndata: %s\n\n", …)` after `WriteHeader(200)` — so the redirect
+  arm is never exercised. Rust's stricter policy is a safe superset kept on purpose.
+- **D5 · egress `data:` prefix-strip/trim + multi-`data:` concatenation (Rust tolerant
+  superset; unreachable).** Rust's SSE frame parse (`egress.rs::forward`) tolerates a trimmed
+  `data:` prefix and would concatenate multiple `data:` lines; Go's differs on the `data: `
+  (with-space) requirement. The same `writeSSEEvent` (`handlers.go:323`) emits exactly one
+  `data: {json}` line WITH the space, no multi-`data:`, no embedded `\n` — so the tolerant
+  branches never fire on the real server.
+- **D6 · typed-decode residue (needs a typed `Node` layer; out of scope).** The Rust `Node`
+  model (`config.rs`, saphyr-backed) is stringly-typed, so **scalar-into-typed-field**
+  coercion still diverges: `http_port: not-a-number` → Go errors, Rust defaults;
+  `approval_timeout: [a,b]` → Go errors, Rust falls back to 25 s. Likewise the bool forms
+  **yaml.v3 itself REJECTS** — `allow_all: nonsense` / `1` / `0`, a non-canonical case
+  (`tRUe`/`yEs`), or any non-scalar into a bool → Go errors, but the stringly-typed reader
+  falls back to its lenient default / `None`. Closing this needs typed resolution over the
+  parse tree (saphyr gives structure, not typed decode) — out of scope for a hardening pass.
+  (This is the ERROR set ONLY; the bool forms yaml.v3 RESOLVES — `yes/on/y/True/…` — are the
+  D2 FIX, closed and pinned by `config_bool_forms.json`.)
+- **D7 · `serve_namespace` shutdown at SIGTERM — verified NO divergence.** The gated-sign path
+  calls `RequestApproval` via `desktopGate.Approve` (`cmd/shed-host-agent/desktop_gate.go:21`)
+  passing `context.Background()` — never cancelled — and `ApprovalGate.Approve`
+  (`approval.go:19`) carries no `ctx`. So Go's `ctx.Done()` `select` arm is DEAD on this path:
+  at SIGTERM Go blocks on `time.After(timeout)` (≤ 25 s), EXACTLY like the Rust `select!`
+  (decision oneshot vs `sleep(timeout)`) today. Both are bounded by `approval_timeout`; there
+  is no divergence, so the Rust `select!` does NOT grow a shutdown arm (that would make Rust
+  faster than Go and INTRODUCE a divergence in a parity port).
+
 ## Per-cell status table
 
-`enforced` = asserted equal (or smoke-asserted) now; `xfail` = a real port surface not
-yet implemented in Rust, tracked to flip to `enforced` when it lands; `out-of-scope` =
-owned by a different mechanism (golden/unit) or later slice, not the live diff.
+**Completeness (as of sub-plan 8):** every cell below is **enforced** (with the live test /
+golden runner / unit named), **out-of-scope(mechanism)** (with the owning mechanism named),
+or **deferred-to-3a.2(named)** (with the named follow-up) — **zero bare `xfail`s.** All three
+prior `xfail` cells (socket-dir rebind, event replay ring, sign timeout / no-consumer
+fail-closed) are now enforced; the accepted divergences above (D4/D5/D6/D7) carry no cell.
+
+`enforced` = asserted equal (or smoke-asserted) now; `out-of-scope` = owned by a different
+mechanism (golden/unit) or later slice, not the live diff. (`xfail` — a real port surface
+not yet implemented in Rust — was the transitional third status; no cell carries it as of
+sub-plan 8.)
 
 | Axis | Cell | Status | Owning mechanism |
 |---|---|---|---|

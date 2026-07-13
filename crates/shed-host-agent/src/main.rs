@@ -534,6 +534,7 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             let cfg = Arc::new(cfg.clone());
             let reconcile_log = bus_log.clone();
             let watch_log = bus_log.clone();
+            let shutdown_log = bus_log.clone();
             let shutdown = shutdown_rx.clone();
             tasks.push(tokio::spawn(async move {
                 let reconcile = {
@@ -555,6 +556,9 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
                     }
                 };
                 watcher::run_watch_loop(watch_cfg, reconcile, shutdown, watch_log).await;
+                // Shutdown was signalled (the watch loop returned) — log before draining the
+                // groups, matching Go's `Info("stopping server watchers")` (main.go:243).
+                shutdown_log.info("stopping server watchers");
                 sup.shutdown().await;
                 let _ = listener_tx.send(true);
             }));
