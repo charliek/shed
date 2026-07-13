@@ -107,6 +107,38 @@ builds:
       - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
       - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
 
+  # The SHIPPED host-agent binary — Rust (crates/shed-host-agent), built by
+  # goreleaser's OSS `builder: rust` (which runs `cargo zigbuild`) on the
+  # macos-latest release runner; it cross-compiles all four targets, linux via
+  # zig (probe-proven: linux ELF from macOS). The two Go ids above stay defined
+  # (goreleaser compiles every build regardless of archive refs) as ~2-release
+  # rollback insurance, but are detached from the archive below — flip
+  # archives[shed-host-agent].ids back to them to revert. See RELEASING.md
+  # "Host-agent: Rust binary, Go rollback". No `main:` (rust builder rejects it).
+  - id: shed-host-agent
+    builder: rust
+    binary: shed-host-agent
+    dir: crates
+    # -p= is REQUIRED: crates/ is a Cargo workspace and goreleaser's rust builder
+    # refuses a workspace build without --package/-p. --locked pins the committed
+    # Cargo.lock; --release is the builder default but explicit here.
+    flags:
+      - --release
+      - --locked
+      - -p=shed-host-agent
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+    env:
+      # Baked into `shed-host-agent version` at compile time (version.rs
+      # option_env!). {{ .Version }} is the tag, already v-stripped (a snapshot
+      # pseudo-version under --snapshot), so the shipped version tracks the go
+      # release tag rather than CARGO_PKG_VERSION (which follows the desktop
+      # selector and is not bumped on a go-only tag).
+      - SHED_HOST_AGENT_VERSION={{ .Version }}
+
   - id: shed-machine-rc
     binary: shed-machine-rc
     main: ./cmd/shed-machine-rc
@@ -164,9 +196,12 @@ archives:
       - none*
 
   - id: shed-host-agent
+    # Ships the RUST build (id: shed-host-agent) — the Go ids
+    # (shed-host-agent-{darwin,linux}) stay defined + compiled as rollback
+    # insurance; flip this back to them to revert. Archive name/layout and the
+    # bundled extensions.example.yaml are UNCHANGED (install-identity anchor).
     ids:
-      - shed-host-agent-darwin
-      - shed-host-agent-linux
+      - shed-host-agent
     formats:
       - tar.gz
     name_template: "shed-host-agent_{{ .Os }}_{{ .Arch }}"
