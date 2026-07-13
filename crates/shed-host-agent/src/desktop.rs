@@ -45,9 +45,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// A new connection must send its `hello` within this grace period. Matches the Go
 /// 2s first-line read deadline.
 const HELLO_DEADLINE: Duration = Duration::from_secs(2);
-/// Replay ring capacity (last N audit events). Matches Go's `ringMax`. (Used by
-/// `publish_audit`, which has no bus/backend caller until slice 1b/1c.)
-#[allow(dead_code)]
+/// Replay ring capacity (last N audit events). Matches Go's `ringMax`.
 const RING_MAX: usize = 100;
 /// Bounded outbound-writer queue depth. The Go server has NO app-level queue — it
 /// writes each frame synchronously under a write mutex with the 5s deadline, so a
@@ -309,8 +307,8 @@ impl DesktopServer {
 
     /// Map an audit entry to an `event` frame, append it to the replay ring, and
     /// send it to the active consumer (if any). Non-blocking. Mirrors the Go
-    /// `forwardAudit` fan-out. No bus/backend caller until slice 1b/1c.
-    #[allow(dead_code)]
+    /// `forwardAudit` fan-out. Wired from the audit sink (`audit.rs:JsonlAuditSink::log`
+    /// → `main.rs`) under `desktop-forwarding`.
     pub fn publish_audit(&self, entry: &AuditEntryView) {
         let frame = protocol::event(&new_id(), &entry.ts, entry);
         // Enqueue under the lock (a bounded `try_send` never awaits). On overflow /
