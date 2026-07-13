@@ -53,6 +53,7 @@ use crate::approval::ApprovalGate;
 use crate::audit::{AuditEntry, AuditSink};
 use crate::aws_backend::{aws_expiry_detail, aws_literal_z, AwsBackend};
 use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT};
+use crate::discovery::ServerTarget;
 use crate::docker_backend::{
     DockerBackend, DOCKER_CODE_INTERNAL, DOCKER_CODE_NOT_ALLOWED, DOCKER_CODE_NOT_FOUND,
 };
@@ -751,6 +752,15 @@ impl Subscription {
     pub fn status(&self) -> SubStatus {
         self.status.lock().unwrap().clone()
     }
+
+    /// A shared handle to the subscription's live status, so a watcher group can
+    /// register it with the supervisor and `Supervisor::health()` can read the
+    /// per-namespace state (incl. the 409 `Rejected` terminal) for `servers[]` long
+    /// after this `Subscription` is owned by its serve task (mirror Go's
+    /// `HostClient.Status()`, which the supervisor reads off its stored client).
+    pub fn status_handle(&self) -> Arc<Mutex<SubStatus>> {
+        self.status.clone()
+    }
 }
 
 impl Drop for Subscription {
@@ -826,6 +836,10 @@ fn build_http_client(pin: Option<&str>) -> Result<reqwest::Client, BusError> {
 /// [`AwsHandlers`] (the second bus namespace). Grouping the seams keeps the entry
 /// points below the argument-count lint and gives later slices (docker backend, the
 /// credential minter) one place to grow.
+///
+/// Per group, `spawn_server_group` rebuilds one by manual field construction from the
+/// shared [`crate::supervisor::SharedDeps`], stamping only `server_name` per target
+/// (every other field is an `Arc`/`Option<Arc>` — a cheap pointer clone).
 pub struct BusHandlers {
     pub gate: Arc<dyn ApprovalGate>,
     pub audit: Arc<dyn AuditSink>,
@@ -848,6 +862,7 @@ pub struct BusHandlers {
 /// per-namespace approval `gate` (selected from `aws.approval.policy`, NEVER ssh's —
 /// panel F6) and the `backend`; the audit sink + `server_name` are shared from
 /// [`BusHandlers`]. Present iff `main.rs` built the AWS backend.
+#[derive(Clone)]
 pub struct AwsHandlers {
     pub backend: Arc<dyn AwsBackend>,
     pub gate: Arc<dyn ApprovalGate>,
@@ -858,68 +873,133 @@ pub struct AwsHandlers {
 /// aws's) and the `backend`; the audit sink + `server_name` are shared from
 /// [`BusHandlers`]. Present in the common case (the constructor near-always yields a live
 /// backend — see [`BusHandlers::docker`]).
+#[derive(Clone)]
 pub struct DockerHandlers {
     pub backend: Arc<dyn DockerBackend>,
     pub gate: Arc<dyn ApprovalGate>,
 }
 
-/// Run the single-server message bus: subscribe to `ssh-agent` (always),
-/// `aws-credentials` (when the AWS backend is configured), and `docker-credentials`
-/// (when the docker backend constructed — the COMMON case, even unconfigured) in open
-/// mode (no token, no pin) and answer inbound requests until `shutdown` flips. Each
-/// namespace runs its own subscribe+serve loop (both racing `shutdown`), mirroring the
-/// Go daemon's per-namespace watcher goroutines (`main.go` → `startWatcherGroup` → the
-/// per-handler `.Run`). `server_name` is the audit/approval `server` field — empty in
-/// single-server mode (matches Go).
+/// The live handles the supervisor keeps for one watcher group ([`spawn_server_group`]'s
+/// return): `cancel` tears the group down individually (a reconcile drop), `done` resolves
+/// once every group task has exited (drained after releasing the supervisor lock), and
+/// `statuses` are the per-namespace [`SubStatus`] handles `Supervisor::health()` reads for
+/// `servers[]`.
+pub struct GroupHandles {
+    /// Flip to `true` to cancel just this group (the supervisor holds it; the parent
+    /// shutdown also flips it via the bridge task). `Arc` so both the supervisor and the
+    /// parent-bridge task can send (a `watch::Sender` is not itself `Clone`).
+    pub cancel: Arc<watch::Sender<bool>>,
+    /// Joins every spawned group task (per-namespace serve loops + refresh + egress).
+    pub done: JoinHandle<()>,
+    /// Shared per-namespace status handles for `health()` (incl. the 409 `Rejected`
+    /// terminal) — read long after the `Subscription`s are owned by their serve tasks.
+    pub statuses: Vec<Arc<Mutex<SubStatus>>>,
+}
+
+/// Spawn one shed server's watcher group — a MECHANICAL GENERALIZATION of the former
+/// `run_single_server_bus` (its body, now driven per-[`ServerTarget`] by the supervisor):
+/// subscribe to `ssh-agent` (always), `aws-credentials` (when the AWS backend is
+/// configured), and `docker-credentials` (when the docker backend constructed — the COMMON
+/// case, even unconfigured), plus the always-on egress-audit SSE side task, answering
+/// inbound requests until the group's `cancel` (or the parent `shutdown`) flips. Each
+/// namespace runs its own subscribe+serve loop, mirroring the Go daemon's per-namespace
+/// watcher goroutines (`main.go` → `startWatcherGroup` → the per-handler `.Run`).
 ///
-/// The always-on egress-audit SSE consumer (`GET /api/egress/stream`,
-/// [`crate::egress::EgressSubscriber`]) also runs — as a read-only SIDE TASK on the same
-/// `tasks` vec, racing the shared `shutdown` (mirroring Go's watcher group, which GETs
-/// the egress stream for every server). It is NOT a bus namespace, so it is not in
-/// `BUS_NAMESPACES`/`subscribed`. This slice wires the OPEN path (`tokens = None`, static
-/// token — `run_single_server_bus` is hardcoded open); the secure-control token source is
-/// a later (discovery/supervisor) slice. With egress wired the Go and Rust endpoint sets
-/// fully converge.
-pub async fn run_single_server_bus(
-    server_url: String,
-    shutdown: watch::Receiver<bool>,
-    log: Arc<dyn BusLog>,
-    handlers: BusHandlers,
-) {
-    // Open mode: the static/empty token provider (no token) and no pin. Open
-    // servers don't gate, so they never 401 — the provider-vs-static distinction
-    // (which only gates the 401-retry) is unobservable here, so the empty provider
-    // is behaviorally identical to Go's open-mode `WithToken("")`. A secure single
-    // server would instead pass a self-minted credentials provider + the TLS pin
-    // (later slices).
-    let provider: Arc<dyn TokenProvider> = Arc::new(StaticTokenProvider::new(String::new()));
+/// The four deltas from the old single-server body (all supervisor-driven): (a) `server_name`
+/// comes from `target.name` — **empty `""` for the single unnamed target** (the `servers[]`
+/// "(default)" render); (b) the provider + TLS pin come from [`crate::supervisor::should_mint`]
+/// — a credentials-scope `CredentialSource` bridged onto [`TokenProvider`] + `target.tls_fingerprint`
+/// when secure, else `StaticTokenProvider(target.token)` and no pin (the unnamed target has
+/// `ssh_host=""` → open/no-pin, behavior-identical to the old hardcoded-open path); (c) the
+/// egress side task uses a **control-scope** `CredentialSource` when secure (Go's second
+/// per-server source), else the static token; (d) the credentials source's `refresh_loop`
+/// is spawned as a group task when secure. Each subscription's `status_handle()` is
+/// registered so `health()` can read it.
+///
+/// Returns synchronously (the subscribes + spawns are non-async) so the supervisor can
+/// register `statuses` at group-construction time — the reason this is a spawn-and-return
+/// helper rather than an awaited `run_*` fn.
+pub fn spawn_server_group(
+    parent_shutdown: watch::Receiver<bool>,
+    target: &ServerTarget,
+    deps: &crate::supervisor::SharedDeps,
+) -> GroupHandles {
+    let log = deps.log.clone();
+
+    // A per-group cancel channel: the supervisor cancels this group directly, and a bridge
+    // task flips it when the parent daemon shutdown flips (Go's `context.WithCancel(parent)`
+    // — the child ctx is done on EITHER the parent OR the group's own cancel).
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let cancel = Arc::new(cancel_tx);
+    {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            wait_shutdown(parent_shutdown).await;
+            let _ = cancel.send(true);
+        });
+    }
+
+    // Provider + pin from should_mint (Go's `startWatcherGroup`): a SECURE server
+    // (https + ssh endpoint + minter) authenticates with a self-minted, auto-refreshing
+    // credentials-scope token bridged onto the bus `TokenProvider`, pinned to
+    // `tls_fingerprint`; an OPEN server sends its (usually empty) static token with no pin.
+    let secure = crate::supervisor::should_mint(deps, target);
+    let mut refresh_source: Option<Arc<crate::minter::CredentialSource>> = None;
+    let (provider, pin): (Arc<dyn TokenProvider>, Option<String>) = if secure {
+        let minter = deps
+            .minter
+            .clone()
+            .expect("should_mint implies a minter is present");
+        let src = crate::minter::new_credential_source(
+            minter,
+            target.clone(),
+            crate::minter::SCOPE_CREDENTIALS,
+        );
+        refresh_source = Some(src.clone());
+        // `Arc<CredentialSource>: TokenProvider` (the bridge in `supervisor.rs`) — box it
+        // into the trait object the client holds.
+        (
+            Arc::new(src) as Arc<dyn TokenProvider>,
+            Some(target.tls_fingerprint.clone()),
+        )
+    } else {
+        (
+            Arc::new(StaticTokenProvider::new(target.token.clone())) as Arc<dyn TokenProvider>,
+            None,
+        )
+    };
+
     let client = match BusClient::new(
-        server_url.clone(),
+        target.url.clone(),
         String::new(),
         Some(provider),
-        None,
+        pin,
         log.clone(),
     ) {
         Ok(c) => c,
         Err(e) => {
-            log.error(&format!("message bus disabled: {e}"));
-            return;
+            log.error(&format!(
+                "message bus disabled server={} url={}: {e}",
+                target.name, target.url
+            ));
+            // An empty group (no subscriptions) whose `done` resolves immediately, so a
+            // reconcile drain doesn't hang on a group that never started.
+            let done = tokio::spawn(async {});
+            return GroupHandles {
+                cancel,
+                done,
+                statuses: Vec::new(),
+            };
         }
     };
-    log.info(&format!("brokering for single server server={server_url}"));
 
     // The subscription set: always ssh-agent; aws-credentials when the AWS backend is
-    // configured (Go: a nil AWS backend means no aws handler); docker-credentials when
-    // the docker backend constructed — effectively unconditional, since the constructor
-    // near-always yields `Some` (Go's `NewDockerBackend` is non-nil even unconfigured).
-    // The always-on egress-audit SSE consumer runs alongside as a side task (below); it is
-    // NOT a bus namespace, so it is absent from this set. Compute the set once, then log +
-    // spawn from it so a new namespace is a single push (no parallel branches to sync).
+    // configured; docker-credentials when the docker backend constructed (near-always).
     let mut subscribed: Vec<&'static str> = vec![NS_SSH_AGENT];
-    if handlers.aws.is_some() {
+    if deps.aws.is_some() {
         subscribed.push(NS_AWS_CREDENTIALS);
     }
-    if handlers.docker.is_some() {
+    if deps.docker.is_some() {
         subscribed.push(NS_DOCKER_CREDENTIALS);
     }
     let deferred: Vec<&'static str> = BUS_NAMESPACES
@@ -928,47 +1008,92 @@ pub async fn run_single_server_bus(
         .filter(|ns| !subscribed.contains(ns))
         .collect();
     log.info(&format!(
-        "message bus subscribing namespaces={subscribed:?}; deferred (later slices): \
-         {deferred:?}; egress side task: always-on"
+        "message bus subscribing server={} namespaces={subscribed:?}; deferred: {deferred:?}; \
+         egress side task: always-on",
+        target.name
     ));
 
-    // Share the seams across the per-namespace loops. Each namespace subscribes +
-    // serves independently (both racing `shutdown`), so a slow op on one namespace
-    // can't stall the other.
-    let handlers = Arc::new(handlers);
+    // Rebuild the per-group `BusHandlers` from the shared deps, stamping this target's
+    // `server_name` (every other field is an Arc clone).
+    let handlers = Arc::new(BusHandlers {
+        gate: deps.ssh_gate.clone(),
+        audit: deps.audit.clone(),
+        backend: deps.ssh_backend.clone(),
+        server_name: target.name.clone(),
+        aws: deps.aws.clone(),
+        docker: deps.docker.clone(),
+    });
+
+    // Subscribe synchronously (so `statuses` is ready for health()), then hand each
+    // `Subscription` to its serve loop. Each namespace subscribes + serves independently
+    // (both racing the group cancel), so a slow op on one can't stall the others.
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    let mut statuses: Vec<Arc<Mutex<SubStatus>>> = Vec::new();
     for namespace in subscribed {
+        let sub = client.subscribe(namespace, cancel_rx.clone());
+        statuses.push(sub.status_handle());
         tasks.push(tokio::spawn(serve_namespace(
             client.clone(),
+            sub,
             namespace,
-            shutdown.clone(),
+            cancel_rx.clone(),
             handlers.clone(),
             log.clone(),
         )));
     }
 
-    // The always-on egress-audit SSE consumer — Go's watcher group GETs
-    // `/api/egress/stream` for every server. NOT a bus namespace: a read-only SIDE TASK on
-    // the same `tasks` vec, racing the shared `shutdown`. This slice wires the OPEN path
-    // (`run_single_server_bus` is hardcoded open): no token source (`None`), an empty
-    // static token, no TLS pin. The secure-control `CredentialSource` spawn is deferred to
-    // the discovery/supervisor slice (this path has no `ServerTarget`/minter yet).
+    // Proactively re-mint the credentials token (jittered) for a secure server so an idle
+    // server's bus token stays fresh and a reconnect never pays the mint latency inline.
+    if let Some(src) = refresh_source {
+        tasks.push(tokio::spawn(src.refresh_loop(cancel_rx.clone())));
+    }
+
+    // The always-on egress-audit SSE consumer (Go's watcher group GETs `/api/egress/stream`
+    // for every server). NOT a bus namespace: a read-only side task racing the group cancel.
+    // A SECURE server gets its OWN control-scope source (the bus token is credentials-scope;
+    // the egress route is control-scoped) — NOT refresh-looped (bus-only). An OPEN server
+    // passes `None` and sends the static config token.
+    let egress_tokens: Option<Arc<dyn crate::egress::EgressTokenSource>> = if secure {
+        let minter = deps
+            .minter
+            .clone()
+            .expect("should_mint implies a minter is present");
+        let control = crate::minter::new_credential_source(
+            minter,
+            target.clone(),
+            crate::minter::SCOPE_CONTROL,
+        );
+        Some(Arc::new(control) as Arc<dyn crate::egress::EgressTokenSource>)
+    } else {
+        None
+    };
     let egress = crate::egress::EgressSubscriber::new(
-        handlers.server_name.clone(),
-        server_url,
-        String::new(),
-        "",
-        None,
-        handlers.audit.clone(),
+        target.name.clone(),
+        target.url.clone(),
+        target.token.clone(),
+        &target.tls_fingerprint,
+        egress_tokens,
+        deps.audit.clone(),
         log.clone(),
     );
-    let egress_shutdown = shutdown.clone();
+    let egress_cancel = cancel_rx.clone();
     tasks.push(tokio::spawn(async move {
-        egress.run(egress_shutdown).await;
+        egress.run(egress_cancel).await;
     }));
 
-    for t in tasks {
-        let _ = t.await;
+    log.info(&format!(
+        "watching server server={} url={}",
+        target.name, target.url
+    ));
+    let done = tokio::spawn(async move {
+        for t in tasks {
+            let _ = t.await;
+        }
+    });
+    GroupHandles {
+        cancel,
+        done,
+        statuses,
     }
 }
 
@@ -978,14 +1103,19 @@ pub async fn run_single_server_bus(
 /// also raced against shutdown, and `shutdown` is threaded into the dispatch so a
 /// `respond` to a hung server can't pin the loop past a SIGTERM/SIGINT. Dispatch is
 /// namespace-aware (see [`dispatch_bus_message`]).
+///
+/// The `Subscription` is created by the caller ([`spawn_server_group`]) and passed in, so
+/// its `status_handle()` can be registered for `health()` before this loop runs — the only
+/// structural change from the former inline `client.subscribe(...)`; the dispatch is
+/// otherwise untouched.
 async fn serve_namespace(
     client: BusClient,
+    mut sub: Subscription,
     namespace: &'static str,
     shutdown: watch::Receiver<bool>,
     handlers: Arc<BusHandlers>,
     log: Arc<dyn BusLog>,
 ) {
-    let mut sub = client.subscribe(namespace, shutdown.clone());
     loop {
         let env = tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => break,

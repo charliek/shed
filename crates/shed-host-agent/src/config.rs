@@ -493,7 +493,11 @@ impl HostAgentConfig {
     /// True when the agent runs in single-server mode — no `discovery:` block, so
     /// the message-bus daemon connects to the single `server:` URL. Mirrors Go's
     /// `cfg.Discovery == nil` branch in `main.go`; with a `discovery:` block present
-    /// the daemon reconciles over the discovered servers instead (supervisor slice).
+    /// the daemon reconciles over the discovered servers instead. Now that the daemon
+    /// unifies on the supervisor (which drives both modes via `resolve_targets`, keying
+    /// on `discovery.as_ref()` directly), production no longer branches on this — it
+    /// remains as a test/probe accessor (like [`has_discovery`](Self::has_discovery)).
+    #[cfg(test)]
     pub fn is_single_server(&self) -> bool {
         self.discovery.is_none()
     }
@@ -557,12 +561,9 @@ impl HostAgentConfig {
 /// (`config.go:60`). Present (`Some`) on [`HostAgentConfig`] means multi-server mode.
 ///
 /// The reload knobs (`watch`/`poll_interval`/`debounce`) are consumed by the watcher
-/// (commit 2) and `servers` by the reconcile path (commit 3); `apply_defaults` reads
-/// the four string knobs at parse time. The whole block is parsed + unit/golden-tested
-/// in commit 1 (`#[allow(dead_code)]` covers the fields not yet read in a headless
-/// production build).
+/// (`run_watch_loop`) and `servers` by the reconcile path (`resolve_targets`);
+/// `apply_defaults` reads the four string knobs at parse time.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[allow(dead_code)]
 pub(crate) struct DiscoveryConfig {
     /// Which discovered servers to watch (default: all). See [`ServerSelector`].
     pub servers: ServerSelector,
@@ -627,7 +628,6 @@ impl DiscoveryConfig {
 /// (`names` is `None`) selects everything, while an EXPLICIT empty list (`servers: []`,
 /// i.e. `names` is `Some(vec![])`) selects nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[allow(dead_code)]
 pub(crate) struct ServerSelector {
     /// The `all`/`""`/null scalar form (mirror Go's `All bool`).
     pub all: bool,
@@ -683,9 +683,7 @@ impl ServerSelector {
     /// Whether a discovered server name should be watched — a faithful port of Go's
     /// `Selected` (`config.go:114`): `all` OR an omitted list (`names == None`) selects
     /// everything; an explicit list is a membership test (so `servers: []` selects
-    /// nothing). Reached by `resolve_targets_from`; wired live by the supervisor slice
-    /// (commit 3).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// nothing). Reached by `resolve_targets_from` on the daemon reconcile path.
     pub fn selected(&self, name: &str) -> bool {
         if self.all || self.names.is_none() {
             return true;

@@ -1,0 +1,62 @@
+{
+  "_comment": "Golden fixture for the supervisor's should_mint decision — input {minter_present, url, ssh_host, ssh_port} -> the mint verdict. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenShouldMint, via shouldMint(SharedDeps, ServerTarget)) and the Rust runner (crates/shed-host-agent/src/supervisor.rs tests::golden_should_mint, via should_mint(&SharedDeps, &ServerTarget)). Pins the load-bearing rule: mint iff a minter is present AND the target has a non-empty ssh_host AND ssh_port>0 AND the api_url is https (the scheme, case-insensitive — NOT tls-fingerprint presence, NOT ssh_port alone). Mirrors supervisor_test.go:TestShouldMint (7 cases).",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "https + ssh + minter",
+      "minter_present": true,
+      "url": "https://h:8443",
+      "ssh_host": "h",
+      "ssh_port": 2222,
+      "expected": true
+    },
+    {
+      "name": "HTTPS uppercase normalized",
+      "minter_present": true,
+      "url": "HTTPS://h:8443",
+      "ssh_host": "h",
+      "ssh_port": 2222,
+      "expected": true
+    },
+    {
+      "name": "http is open -> no mint",
+      "minter_present": true,
+      "url": "http://h:8080",
+      "ssh_host": "h",
+      "ssh_port": 2222,
+      "expected": false
+    },
+    {
+      "name": "empty url -> no mint",
+      "minter_present": true,
+      "url": "",
+      "ssh_host": "h",
+      "ssh_port": 2222,
+      "expected": false
+    },
+    {
+      "name": "nil minter -> no mint",
+      "minter_present": false,
+      "url": "https://h:8443",
+      "ssh_host": "h",
+      "ssh_port": 2222,
+      "expected": false
+    },
+    {
+      "name": "no ssh host -> no mint",
+      "minter_present": true,
+      "url": "https://h:8443",
+      "ssh_host": "",
+      "ssh_port": 2222,
+      "expected": false
+    },
+    {
+      "name": "no ssh port -> no mint",
+      "minter_present": true,
+      "url": "https://h:8443",
+      "ssh_host": "h",
+      "ssh_port": 0,
+      "expected": false
+    }
+  ]
+}

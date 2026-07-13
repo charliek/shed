@@ -37,11 +37,7 @@ impl ServerTarget {
     /// Whether the server is reached over https — the authoritative local signal that
     /// it runs in secure mode (tokens ⟺ TLS ⟺ secure) and that the agent should
     /// self-mint (mirror `config.go:IsSecure`: scheme, not fingerprint presence).
-    ///
-    /// In a headless build (`--no-default-features`) the only production caller
-    /// (`controltoken::resolve`) is gated out; the always-on `should_mint` consumer
-    /// arrives with the supervisor (commit 3), so it is dead-code-allowed only there.
-    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
+    /// Consumed by the always-on [`crate::supervisor::should_mint`] in BOTH feature configs.
     pub fn is_secure(&self) -> bool {
         self.url.to_lowercase().starts_with("https://")
     }
@@ -114,11 +110,7 @@ impl HostAgentConfig {
     /// `server` out of audit logs / desktop events and scopes per-shed state under
     /// `/<shed>`). Discovery mode filters `discovered` by the selector and dedups by name
     /// (first occurrence wins). Pure (no I/O); [`resolve_targets`](Self::resolve_targets)
-    /// is the I/O wrapper.
-    ///
-    /// Only test-reached in commit 1 (units + the `server_selector` golden); the
-    /// supervisor reconcile wires it into the daemon in commit 3.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// is the I/O wrapper the daemon reconcile loop calls.
     pub(crate) fn resolve_targets_from(&self, discovered: Vec<ServerTarget>) -> Vec<ServerTarget> {
         let Some(dc) = self.discovery.as_ref() else {
             return vec![ServerTarget {
@@ -147,8 +139,7 @@ impl HostAgentConfig {
     /// entry the daemon reconcile loop and the `status` subcommand both call. Discovery
     /// mode loads `discovery.source` then filters; single-server mode returns the unnamed
     /// target. `Err` only on a discovery read/parse failure (the caller keeps its current
-    /// servers). Wired into `main.rs`'s reconcile loop by the supervisor slice (commit 3).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// servers). Called by `main.rs`'s reconcile closure (and shared with `status`).
     pub(crate) fn resolve_targets(&self) -> Result<Vec<ServerTarget>, String> {
         let discovered = match self.discovery.as_ref() {
             Some(dc) => load_discovered_servers(&dc.source)?,

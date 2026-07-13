@@ -551,6 +551,44 @@ func TestGoldenServerSelector(t *testing.T) {
 	}
 }
 
+// TestGoldenShouldMint is the Go half of the should_mint golden. It builds a
+// SharedDeps (with or without a non-nil Minter) + a ServerTarget from each vector and
+// asserts shouldMint against the shared fixture the Rust runner
+// (crates/shed-host-agent/src/supervisor.rs tests::golden_should_mint) also reads. Pins
+// the mint rule (minter present AND ssh_host!="" AND ssh_port>0 AND https scheme) so the
+// two impls cannot drift on the https-scheme / ssh-endpoint / minter-presence matrix.
+func TestGoldenShouldMint(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name          string `json:"name"`
+			MinterPresent bool   `json:"minter_present"`
+			URL           string `json:"url"`
+			SSHHost       string `json:"ssh_host"`
+			SSHPort       int    `json:"ssh_port"`
+			Expected      bool   `json:"expected"`
+		} `json:"vectors"`
+	}
+	readFixture(t, "should_mint.json", &fx)
+
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("should_mint.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("should_mint.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		var deps SharedDeps
+		if v.MinterPresent {
+			deps.Minter = &CredentialMinter{} // non-nil; never dialed
+		}
+		tgt := ServerTarget{URL: v.URL, SSHHost: v.SSHHost, SSHPort: v.SSHPort}
+		if got := shouldMint(deps, tgt); got != v.Expected {
+			t.Errorf("%s: shouldMint = %v, want %v", v.Name, got, v.Expected)
+		}
+	}
+}
+
 func TestGoldenGateNamespaces(t *testing.T) {
 	var fx struct {
 		ProtocolVersion int `json:"protocol_version"`

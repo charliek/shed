@@ -71,14 +71,16 @@ pub struct NamespaceHealth {
 /// `build_live_status` snapshots the daemon's live self-report. `consumer` is the
 /// desktop approval channel's current consumer identity (`Some((name, version))`
 /// when an app is connected, `None` otherwise) — the desktop server's
-/// `consumer_info()` in slice 1, or always `None` in the headless build with no
-/// desktop server. There is still no supervisor, so `servers` is empty.
+/// `consumer_info()`, or always `None` in the headless build with no desktop server.
+/// `servers` is the supervisor's per-server connection snapshot (`Supervisor::health()`),
+/// populated in BOTH modes (single-server shows one entry, `name:""`).
 pub fn build_live_status(
     cfg: &HostAgentConfig,
     config_path: &str,
     started_at: &str,
     version: &str,
     consumer: Option<(String, String)>,
+    servers: Vec<ServerHealth>,
 ) -> LiveStatus {
     // Keyed by the fixed status/gate namespace order; the BTreeMap re-sorts on
     // insert, so the emitted JSON key order is identical regardless.
@@ -107,7 +109,7 @@ pub fn build_live_status(
             client_name,
             client_version,
         },
-        servers: Vec::new(),
+        servers,
     }
 }
 

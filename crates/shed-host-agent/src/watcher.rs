@@ -15,12 +15,9 @@
 //! always-available safety net: any `notify` setup failure downgrades to it, exactly
 //! like Go's `runFsnotifyLoop`.
 //!
-//! The `reconcile` callback is injected: the supervisor slice (commit 3) wires the
-//! real `resolve_targets → Supervisor::reconcile` closure and drives this loop from
-//! `main.rs`. This commit tests it with a counting fake reconcile. The whole module
-//! is therefore dead in a non-`test` build until commit 3 — hence the module-level
-//! `allow(dead_code)` below (dropped when `main.rs` wires it in).
-#![cfg_attr(not(test), allow(dead_code))]
+//! The `reconcile` callback is injected: `main.rs`'s daemon loop wires the real
+//! `resolve_targets → Supervisor::reconcile` closure and drives this loop; the units
+//! here exercise it with a counting fake reconcile.
 
 use std::ffi::OsStr;
 use std::future::Future;
@@ -92,6 +89,9 @@ async fn run_poll_loop<F, Fut>(
     // matching Go's ticker — the immediate reconcile already happened in run_watch_loop.
     let start = tokio::time::Instant::now() + interval;
     let mut ticker = tokio::time::interval_at(start, interval);
+    // Go's time.Ticker DROPS ticks missed while a slow reconcile ran; tokio's default
+    // (Burst) would fire catch-up ticks back-to-back. Delay matches Go (CodeRabbit review).
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = wait_shutdown(shutdown.clone()) => return,

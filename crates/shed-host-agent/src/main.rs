@@ -17,12 +17,12 @@
 mod approval;
 mod aws_backend;
 mod audit;
-// The SSH-bootstrap minter (bootstrap exchange + credential source) and the
-// control-token provider. This slice's only consumer is `token.get` on surface A, so
-// they are gated with it; the supervisor slice ungates them for the always-on
-// credentials-scope bus token provider. (Keeps the `--no-default-features` headless
-// build free of dead-code the minter would otherwise be.)
-#[cfg(feature = "desktop-forwarding")]
+// The SSH-bootstrap minter (bootstrap exchange + credential source) — ALWAYS-ON as of the
+// supervisor slice: the supervisor is its first headless consumer (a secure server's bus
+// token provider self-mints a credentials-scope token, and its egress side task a
+// control-scope one). It is dependency-clean (no `use crate::desktop`), so it un-gates
+// without pulling the desktop half into the headless build. `controltoken` (below) STAYS
+// gated — it has a module-level `use crate::desktop`.
 mod bootstrap;
 mod bus;
 mod config;
@@ -38,7 +38,8 @@ mod docker_backend;
 mod egress;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop;
-#[cfg(feature = "desktop-forwarding")]
+// The credential minter (bootstrap-backed CredentialSource) — ALWAYS-ON as of the
+// supervisor slice (its first headless consumer); see the `bootstrap` note above.
 mod minter;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop_protocol;
@@ -46,6 +47,10 @@ mod sockets;
 mod ssh_backend;
 mod ssh_backend_agent;
 mod status;
+// The multi-server supervisor: reconciles per-server watcher groups against the desired
+// set the discovery source resolves to. Always-on (the daemon drives it in BOTH modes —
+// single-server is just a discovery config that reconciles once and never reloads).
+mod supervisor;
 mod version;
 mod watcher;
 
@@ -284,35 +289,37 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         ssh_keys.len()
     ));
 
-    // Surface B: in single-server mode (no `discovery:` block) the message-bus
-    // daemon connects to the single `server:` URL and answers ssh-agent pings. In
-    // multi-server (`discovery:`) mode it stays off — matching Go's
-    // `cfg.Discovery == nil` gate — since discovery/backends are later slices.
-    let bus_server = cfg.is_single_server().then(|| cfg.server.clone());
-    if let Some(url) = &bus_server {
-        log.info(&format!("message bus: single-server mode server={url}"));
-    }
-
     let version = full_info();
     let status_path = status_socket_path();
     let status_listener = bind_unix_socket("status socket", &status_path, &mut log);
 
-    // The desktop approval channel (feature-gated). Bind its socket + build the
-    // server here so the status snapshot can report its live consumer info. The
-    // control-token minter answers `token.get`: it mints CONTROL-scoped tokens over a
-    // server's SSH `_bootstrap` channel (via the system ssh client), resolving servers
-    // from the shed CLI config. The known_hosts pin is `~/.shed/known_hosts` (the same
-    // trust `shed server add` wrote); the SSH identity is resolved by ssh, so no key
-    // file is read here. Mirrors `main.go:136-148`.
+    // Two shutdown watches (creatable without a runtime). `shutdown` flips on SIGTERM/SIGINT
+    // and drives the supervisor's watch loop (Go's `ctx.Done()`); `listener_shutdown` is
+    // flipped by that watch-loop task ONLY AFTER `sup.shutdown()` has drained every watcher
+    // group, so the status/desktop listeners finalize (unlink their sockets) only after the
+    // groups are down — delivering Go's `main.go:241-247` order (drain groups, THEN close
+    // listeners) rather than a siblings-race on one watch.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (listener_tx, listener_rx) = tokio::sync::watch::channel(false);
+
+    // The credential minter — built UNCONDITIONALLY (Go `main.go:136`), shared by the
+    // supervisor (each secure server's bus + egress token sources self-mint over SSH) and,
+    // when the desktop feature is on, the `token.get` control-token provider. known_hosts pin
+    // `~/.shed/known_hosts` (the trust `shed server add` wrote); the SSH identity is resolved
+    // by the system ssh client, so no key file is read here.
+    let minter: Arc<dyn minter::Minter> =
+        Arc::new(minter::CredentialMinter::new("~/.shed/known_hosts"));
+
+    // The desktop approval channel (feature-gated). Bind its socket + build the server here so
+    // the status snapshot can report its live consumer info. The control-token provider
+    // answers `token.get`, reusing the shared `minter`. Mirrors `main.go:136-148`.
     #[cfg(feature = "desktop-forwarding")]
     let (desktop_server, desktop_listener, desktop_path) = {
-        let minter: Arc<dyn minter::Minter> =
-            Arc::new(minter::CredentialMinter::new("~/.shed/known_hosts"));
-        // token.get resolves servers from the shed CLI config. In single-server mode Go
-        // uses DefaultDiscoverySource; the discovery-source override (discovery mode)
-        // lands with the discovery slice (this reader doesn't parse `discovery.source`).
+        // token.get resolves servers from the shed CLI config (DefaultDiscoverySource; the
+        // discovery-source override is a per-server concern the supervisor path owns).
         let control_source = controltoken::DEFAULT_DISCOVERY_SOURCE;
-        let control_minter = Arc::new(controltoken::ControlTokenProvider::new(minter, control_source));
+        let control_minter =
+            Arc::new(controltoken::ControlTokenProvider::new(minter.clone(), control_source));
         let server = desktop::DesktopServer::new(
             version.clone(),
             cfg.gate_namespaces(),
@@ -324,13 +331,123 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         (server, listener, path)
     };
 
-    // The status snapshot is recomputed per connection (fresh written_at/pid). It
-    // reports the desktop consumer identity when the feature is on, else no consumer.
+    // The bus log sink — shared across every watcher group and the backend-construction
+    // warnings below.
+    let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
+
+    // Select each namespace's approval gate from its own effective policy (empty → deny-all,
+    // fail-closed). shed-desktop delegates to the desktop server; any policy this build
+    // doesn't implement fails closed to deny-all. Gives ssh/aws/docker their OWN per-namespace
+    // gate (never a shared one). Mirrors `main.go:157-159`'s `gateFor` calls.
+    let select_gate = |policy: &str| -> Arc<dyn approval::ApprovalGate> {
+        match policy {
+            config::POLICY_APPROVE_ALL => Arc::new(approval::ApproveAllGate),
+            #[cfg(feature = "desktop-forwarding")]
+            config::POLICY_SHED_DESKTOP => {
+                Arc::new(desktop::DesktopGate::new(desktop_server.clone()))
+            }
+            _ => Arc::new(approval::DenyAllGate),
+        }
+    };
+    let ssh_gate = select_gate(&cfg.effective_policy(config::NS_SSH_AGENT));
+
+    // The audit sink (durable JSONL + desktop fan-out), shared across every group.
+    #[cfg(feature = "desktop-forwarding")]
+    let audit: Arc<dyn audit::AuditSink> =
+        Arc::new(audit::JsonlAuditSink::new(&cfg, Some(desktop_server.clone())));
+    #[cfg(not(feature = "desktop-forwarding"))]
+    let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(&cfg));
+
+    // The AWS credential backend (optional; Go `main.go:166-173`): a construction error —
+    // incl. the "no AWS credentials configured…" not-enabled case — warns and leaves `aws`
+    // None, so the aws-credentials namespace is never subscribed. Its gate is the
+    // aws-credentials per-namespace gate, distinct from ssh's.
+    let aws = match aws_backend::new_sts_backend(cfg.aws.clone(), bus_log.clone()) {
+        Ok(sts) => {
+            let backend_dyn: Arc<dyn aws_backend::AwsBackend> = Arc::new(sts);
+            let aws_gate = select_gate(&cfg.effective_policy(config::NS_AWS_CREDENTIALS));
+            Some(bus::AwsHandlers {
+                backend: backend_dyn,
+                gate: aws_gate,
+            })
+        }
+        Err(e) => {
+            bus_log.warn(&format!("AWS handler disabled error={e}"));
+            None
+        }
+    };
+
+    // The Docker credential backend (Go `main.go:175-180`). The ASYMMETRY vs aws: no
+    // `enabled()` gate — `new_docker_backend` errors ONLY on an unstat-able explicit
+    // `config_path`, so an absent/empty `docker:` block still constructs a live backend
+    // (denying everything under an empty allowlist) and the docker-credentials namespace is
+    // subscribed for every server. `None` only on that explicit-config_path error.
+    let docker = match docker_backend::new_docker_backend(cfg.docker.clone(), bus_log.clone()) {
+        Ok(backend) => {
+            let backend_dyn: Arc<dyn docker_backend::DockerBackend> = Arc::new(backend);
+            let docker_gate = select_gate(&cfg.effective_policy(config::NS_DOCKER_CREDENTIALS));
+            Some(bus::DockerHandlers {
+                backend: backend_dyn,
+                gate: docker_gate,
+            })
+        }
+        Err(e) => {
+            bus_log.warn(&format!("Docker handler disabled error={e}"));
+            None
+        }
+    };
+
+    // The server-agnostic deps + the supervisor. ONE supervisor drives BOTH modes: Go has no
+    // separate single-server path — single-server is just a discovery config that reconciles
+    // once and never reloads, and the single unnamed target has `ssh_host=""` → `should_mint`
+    // false → open/no-pin (why the existing single-server bus surface survives unchanged).
+    let deps = supervisor::SharedDeps {
+        ssh_backend,
+        ssh_gate,
+        aws,
+        docker,
+        audit,
+        minter: Some(minter),
+        log: bus_log.clone(),
+    };
+    let sup = Arc::new(supervisor::Supervisor::new(shutdown_rx.clone(), deps));
+
+    // The watch mode: single-server = discovery-off (reconcile once, never reload); else the
+    // parsed discovery config (Go `main.go:234-240`).
+    let watch_cfg = match cfg.discovery.clone() {
+        Some(dc) => {
+            bus_log.info(&format!(
+                "multi-server discovery enabled source={} watch={}",
+                dc.source, dc.watch
+            ));
+            dc
+        }
+        None => {
+            bus_log.info(&format!("brokering for single server server={}", cfg.server));
+            config::DiscoveryConfig {
+                watch: "off".to_string(),
+                ..Default::default()
+            }
+        }
+    };
+    // `server:` is ignored when `discovery:` is configured (op-log only; Go `main.go:207`).
+    if cfg.discovery.is_some() && !cfg.server.is_empty() && cfg.server != config::DEFAULT_SERVER_URL
+    {
+        bus_log.warn(&format!(
+            "`server:` is ignored when `discovery:` is configured server={}",
+            cfg.server
+        ));
+    }
+
+    // The status snapshot is recomputed per connection (fresh written_at/pid) and now
+    // includes the supervisor's per-server health (`servers[]`). It reports the desktop
+    // consumer identity when the feature is on, else no consumer.
     let health: Arc<dyn Fn() -> LiveStatus + Send + Sync> = {
         let cfg = cfg.clone();
         let config_path = resolved_config_path;
         let started_at = started_at.clone();
         let version = version.clone();
+        let sup = sup.clone();
         #[cfg(feature = "desktop-forwarding")]
         let desktop_server = desktop_server.clone();
         Arc::new(move || {
@@ -338,7 +455,14 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             let consumer = desktop_server.consumer_info();
             #[cfg(not(feature = "desktop-forwarding"))]
             let consumer = None;
-            build_live_status(&cfg, &config_path, &started_at, &version, consumer)
+            build_live_status(
+                &cfg,
+                &config_path,
+                &started_at,
+                &version,
+                consumer,
+                sup.health(),
+            )
         })
     };
 
@@ -356,9 +480,7 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     };
 
     runtime.block_on(async move {
-        // One shutdown signal shared by every socket server: a task flips the watch
-        // on SIGTERM/SIGINT; each server's shutdown future resolves when it flips.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // A task flips `shutdown` on SIGTERM/SIGINT; the watch-loop task races it.
         tokio::spawn(async move {
             wait_for_shutdown().await;
             let _ = shutdown_tx.send(true);
@@ -366,8 +488,10 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+        // The status + desktop listeners race `listener_shutdown` (flipped after the groups
+        // drain), NOT the raw SIGTERM watch — so their sockets outlive the group teardown.
         if let Some(listener) = status_listener.and_then(into_tokio_listener) {
-            let rx = shutdown_rx.clone();
+            let rx = listener_rx.clone();
             tasks.push(tokio::spawn(async move {
                 serve_status_socket(listener, status_path, health, wait_shutdown(rx)).await;
             }));
@@ -375,7 +499,7 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
         #[cfg(feature = "desktop-forwarding")]
         if let Some(listener) = desktop_listener.and_then(into_tokio_listener) {
-            let rx = shutdown_rx.clone();
+            let rx = listener_rx.clone();
             let server = desktop_server.clone();
             tasks.push(tokio::spawn(async move {
                 server
@@ -384,112 +508,47 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             }));
         }
 
-        // The message bus (surface B). Shares the same shutdown watch, so a
-        // SIGTERM/SIGINT tears the subscribe loop + gated-sign responder down cleanly
-        // alongside the socket servers. The bus's three seams — the ssh approval gate
-        // (selected from `ssh.approval.policy`), the audit sink (durable JSONL +
-        // desktop fan-out), and the SSH sign backend (resolved above from `ssh.mode`)
-        // — are built here and injected, so the desktop server + bus + audit form one
-        // cross-surface daemon. `server` name is empty in single-server mode (Go).
-        if let Some(server_url) = bus_server {
-            let rx = shutdown_rx.clone();
-            let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
-
-            // The SSH sign backend was resolved unconditionally at startup (above);
-            // hand its `Arc` to the bus.
-            let backend: Arc<dyn ssh_backend::SshBackend> = ssh_backend;
-
-            // Select each namespace's approval gate from its own effective policy (empty
-            // → deny-all, fail-closed). shed-desktop delegates to the desktop server; any
-            // policy this slice doesn't implement (deny-all, biometrics) fails closed to
-            // deny-all — the touch-id gates are a later slice. The closure gives ssh and
-            // aws their OWN per-namespace gate (never a shared one), from
-            // `<ns>.approval.policy`.
-            let select_gate = |policy: &str| -> Arc<dyn approval::ApprovalGate> {
-                match policy {
-                    config::POLICY_APPROVE_ALL => Arc::new(approval::ApproveAllGate),
-                    #[cfg(feature = "desktop-forwarding")]
-                    config::POLICY_SHED_DESKTOP => {
-                        Arc::new(desktop::DesktopGate::new(desktop_server.clone()))
-                    }
-                    _ => Arc::new(approval::DenyAllGate),
-                }
-            };
-            let gate = select_gate(&cfg.effective_policy(config::NS_SSH_AGENT));
-
-            #[cfg(feature = "desktop-forwarding")]
-            let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(
-                &cfg,
-                Some(desktop_server.clone()),
-            ));
-            #[cfg(not(feature = "desktop-forwarding"))]
-            let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(&cfg));
-
-            // The AWS credential backend (optional; Go main.go:166-173 parity): build it
-            // from `aws.*`. A construction error — including `new_sts_backend`'s "no AWS
-            // credentials configured…" not-enabled case — warns and leaves `aws` None, so
-            // the aws-credentials namespace is simply never subscribed. Its gate is the
-            // aws-credentials per-namespace gate (from `aws.approval.policy`), distinct
-            // from ssh's.
-            let aws = match aws_backend::new_sts_backend(cfg.aws.clone(), bus_log.clone()) {
-                Ok(sts) => {
-                    let backend_dyn: Arc<dyn aws_backend::AwsBackend> = Arc::new(sts);
-                    let aws_gate =
-                        select_gate(&cfg.effective_policy(config::NS_AWS_CREDENTIALS));
-                    Some(bus::AwsHandlers {
-                        backend: backend_dyn,
-                        gate: aws_gate,
-                    })
-                }
-                Err(e) => {
-                    bus_log.warn(&format!("AWS handler disabled error={e}"));
-                    None
-                }
-            };
-
-            // The Docker credential backend (Go main.go:175-180 parity). The ASYMMETRY
-            // vs aws: there is NO `enabled()` gate — `new_docker_backend` errors ONLY
-            // when an explicit `config_path` is unstat-able, so an absent/empty `docker:`
-            // block still constructs a live backend (denying every registry under an
-            // empty allowlist) and the docker-credentials namespace is subscribed for
-            // every server. `None` only on that explicit-config_path error. Its gate is
-            // the docker-credentials per-namespace gate (from `docker.approval.policy`).
-            let docker = match docker_backend::new_docker_backend(cfg.docker.clone(), bus_log.clone()) {
-                Ok(backend) => {
-                    let backend_dyn: Arc<dyn docker_backend::DockerBackend> = Arc::new(backend);
-                    let docker_gate =
-                        select_gate(&cfg.effective_policy(config::NS_DOCKER_CREDENTIALS));
-                    Some(bus::DockerHandlers {
-                        backend: backend_dyn,
-                        gate: docker_gate,
-                    })
-                }
-                Err(e) => {
-                    bus_log.warn(&format!("Docker handler disabled error={e}"));
-                    None
-                }
-            };
-
-            let handlers = bus::BusHandlers {
-                gate,
-                audit,
-                backend,
-                server_name: String::new(),
-                aws,
-                docker,
-            };
+        // The watch-loop/supervisor task (H1 shutdown ordering): reconcile per the watch mode
+        // until `shutdown` flips, then drain every group (`sup.shutdown()`), THEN release the
+        // listeners. The reconcile closure resolves the desired server set from the discovery
+        // source and reconciles — on a discovery READ error it logs + keeps the current
+        // servers (no reconcile), so a transient/partial-write read can't tear all groups down
+        // (Go `main.go:216-224`). A MISSING file is `Ok(vec![])`, which DOES reconcile to empty.
+        {
+            let sup = sup.clone();
+            // Share one config across every reconcile tick — each tick only reads it
+            // (`resolve_targets`), so an `Arc` bump replaces a full deep clone per tick.
+            let cfg = Arc::new(cfg.clone());
+            let reconcile_log = bus_log.clone();
+            let watch_log = bus_log.clone();
+            let shutdown = shutdown_rx.clone();
             tasks.push(tokio::spawn(async move {
-                bus::run_single_server_bus(server_url, rx, bus_log, handlers).await;
+                let reconcile = {
+                    // A reconcile-owned clone; the task keeps its own `sup` for the
+                    // post-drain `sup.shutdown()` below.
+                    let sup = sup.clone();
+                    move || {
+                        let sup = sup.clone();
+                        let cfg = cfg.clone();
+                        let log = reconcile_log.clone();
+                        async move {
+                            match cfg.resolve_targets() {
+                                Ok(desired) => sup.reconcile(desired).await,
+                                Err(e) => log.warn(&format!(
+                                    "discovery read failed; keeping current servers error={e}"
+                                )),
+                            }
+                        }
+                    }
+                };
+                watcher::run_watch_loop(watch_cfg, reconcile, shutdown, watch_log).await;
+                sup.shutdown().await;
+                let _ = listener_tx.send(true);
             }));
         }
 
-        if tasks.is_empty() {
-            // No sockets bound: still behave like a daemon (wait for a signal).
-            wait_shutdown(shutdown_rx).await;
-        } else {
-            for task in tasks {
-                let _ = task.await;
-            }
+        for task in tasks {
+            let _ = task.await;
         }
     });
 

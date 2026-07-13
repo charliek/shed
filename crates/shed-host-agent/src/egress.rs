@@ -18,10 +18,10 @@
 //! source so the next reconnect re-mints. An open server sends the static config token.
 //!
 //! The always-on per-server task is spawned as a SIDE TASK by
-//! [`crate::bus::run_single_server_bus`] (racing the shared shutdown) — mirroring the Go
-//! watcher group's `run(NewEgressSubscriber(...).Run)`. This slice wires the OPEN path
-//! (`tokens = None`, static token); the concrete secure-control `CredentialSource` spawn
-//! arrives with the discovery/supervisor slice.
+//! [`crate::bus::spawn_server_group`] (racing the group cancel) — mirroring the Go watcher
+//! group's `run(NewEgressSubscriber(...).Run)`. A SECURE server gets a control-scope
+//! `CredentialSource` here (its bus token is credentials-scope); an OPEN server passes
+//! `None` and sends the static config token.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,10 +165,10 @@ pub trait EgressTokenSource: Send + Sync {
 }
 
 /// Bridge the caching, invalidatable control-token source onto [`EgressTokenSource`].
-/// Behind `desktop-forwarding` because the minter itself is feature-gated (so
-/// `--no-default-features` stays green). Ported now; spawned live by the discovery/
-/// supervisor slice (the single-server open path this slice wires uses `None`/static).
-#[cfg(feature = "desktop-forwarding")]
+/// ALWAYS-ON as of the supervisor slice (which un-gated the minter): a secure server's
+/// egress side task spawns a control-scope `CredentialSource` and passes it here.
+/// `Arc<CredentialSource>` also carries the bus `TokenProvider` impl (`supervisor.rs`) —
+/// two distinct crate-local traits, no coherence conflict.
 #[async_trait::async_trait]
 impl EgressTokenSource for Arc<crate::minter::CredentialSource> {
     async fn token(&self) -> Result<String, String> {

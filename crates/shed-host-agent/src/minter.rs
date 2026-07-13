@@ -29,9 +29,8 @@ use crate::status::now_unix;
 
 /// Token scopes the host-agent mints over SSH: `credentials` for its own bus
 /// brokering, `control` for a `token.get` on the desktop's behalf (`credmint.go:48`).
-/// `credentials` is wired by the credentials bus token provider (supervisor slice, task
-/// #6); this slice only mints the `control` scope (via the control-token provider).
-#[allow(dead_code)]
+/// `credentials` is the bus token provider's scope (wired by the supervisor's
+/// credentials-scope `CredentialSource`); `control` is the egress side task + `token.get`.
 pub const SCOPE_CREDENTIALS: &str = "credentials";
 pub const SCOPE_CONTROL: &str = "control";
 
@@ -249,7 +248,9 @@ pub fn new_credential_source(
 
 impl CredentialSource {
     /// The server this source mints for (used by the control-token provider to detect an
-    /// endpoint change and recreate the source).
+    /// endpoint change and recreate the source). The control-token provider is
+    /// desktop-gated, so this is dead in a headless build.
+    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     pub fn target(&self) -> &ServerTarget {
         &self.target
     }
@@ -267,7 +268,9 @@ impl CredentialSource {
     /// Drop any completed cached token and mint fresh, while still coalescing callers
     /// that overlap a single in-flight mint. The control path (`token.get`) uses this: a
     /// restarted server silently invalidates control tokens, so a cached copy must never
-    /// be served (mirror `credmint.go:forceTokenWithExpiry`).
+    /// be served (mirror `credmint.go:forceTokenWithExpiry`). The `token.get` control path
+    /// is desktop-gated, so this is dead in a headless build (the bus uses [`Self::token`]).
+    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     pub async fn force_token_with_expiry(
         self: &Arc<Self>,
     ) -> Result<(String, Option<i64>), String> {
@@ -312,9 +315,7 @@ impl CredentialSource {
     /// Always start/join a mint (no cache short-circuit and no completed-token clear) —
     /// the proactive-refresh path (mirror `credmint.go:refresh`, which calls
     /// `obtainLocked` directly). Shared by [`Self::refresh`] (tests) and
-    /// [`Self::refresh_loop`]; `#[allow(dead_code)]` because in a non-test build only the
-    /// (dead) refresh loop reaches it this slice.
-    #[allow(dead_code)]
+    /// [`Self::refresh_loop`] (the supervisor spawns the loop per secure server).
     async fn obtain_refresh(self: &Arc<Self>) -> Result<(String, Option<i64>), String> {
         let rx = {
             let mut st = self.state.lock().unwrap();
@@ -374,9 +375,8 @@ impl CredentialSource {
     }
 
     /// Proactively re-mint at ~50% of the time until expiry (jittered), so an idle
-    /// server's token stays fresh. Stops when `cancel` resolves. Wired by the supervisor
-    /// slice (task #6); ported here for completeness.
-    #[allow(dead_code)]
+    /// server's token stays fresh. Stops when `cancel` resolves. Spawned per secure server
+    /// by the supervisor's group builder ([`crate::bus::spawn_server_group`]).
     pub async fn refresh_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             let delay = self.next_refresh_delay();
@@ -394,7 +394,6 @@ impl CredentialSource {
     /// ~50% of the time until the cached token expires, jittered ±25%, clamped
     /// `[MIN_REFRESH_DELAY, MAX_REFRESH_DELAY]`; `DEFAULT_REFRESH_DELAY` when no token has
     /// been minted yet (mirror `nextRefreshDelay`).
-    #[allow(dead_code)]
     fn next_refresh_delay(&self) -> Duration {
         let expiry = self.state.lock().unwrap().expiry;
         apply_jitter_and_clamp(base_refresh_delay(expiry, now_unix()), random_jitter_fraction())
