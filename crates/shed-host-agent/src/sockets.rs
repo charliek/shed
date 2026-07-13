@@ -12,7 +12,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::user_home_dir;
 use crate::Log;
@@ -270,9 +270,14 @@ fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
 
 /// Poll `fd` for writability (connect completion) up to `timeout`. `Err(TimedOut)`
 /// when the deadline passes with no readiness (the bound Go's `DialTimeout` gives).
+/// An `EINTR` re-poll uses the REMAINING time to an absolute deadline (not the full
+/// `timeout` again), so a signal storm can't push the wait past the bound — matching
+/// Go's absolute-deadline `DialTimeout` (CodeRabbit review).
 fn wait_writable(fd: RawFd, timeout: Duration) -> io::Result<()> {
-    let ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    let deadline = Instant::now() + timeout;
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let ms = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLOUT,
@@ -283,7 +288,7 @@ fn wait_writable(fd: RawFd, timeout: Duration) -> io::Result<()> {
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
-                continue; // interrupted; re-poll (rare on a local UDS)
+                continue; // interrupted; re-poll with the remaining deadline
             }
             return Err(err);
         }
@@ -383,6 +388,31 @@ mod tests {
         );
         // ECONNREFUSED for a bound-but-unaccepted stale socket.
         assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED), "{err}");
+    }
+
+    #[test]
+    fn wait_writable_times_out_on_never_writable_fd() {
+        // Direct coverage of the poll-timeout branch (the fast-refuse tests only hit
+        // terminal errnos, never wait_writable's rc==0). A read-half pipe fd is never
+        // POLLOUT-writable, so a short bound must return TimedOut promptly (and the
+        // absolute-deadline retry keeps it near the bound).
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: a 2-element array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let start = Instant::now();
+        let err = wait_writable(read_fd, Duration::from_millis(100)).expect_err("read end never POLLOUT");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_millis(80)..Duration::from_millis(600)).contains(&elapsed),
+            "timed out in {elapsed:?} (expected ~100ms bound)"
+        );
+        // SAFETY: close both raw fds we opened.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     #[test]
