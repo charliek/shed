@@ -128,6 +128,20 @@ and must never be reused anywhere real. The `daemon` fixture installs them into 
 daemon's isolated `<HOME>/.ssh/id_<algo>`; `fake_ssh_agent.py` also serves them as agent
 identities (real-signing ed25519, canned blobs for rsa/ecdsa).
 
+**Committed TLS pair (secure-bus cells).** `fixtures/synthetic_bus_{cert,key}.pem` is a
+**throwaway, non-secret** self-signed RSA-2048 cert/key (CN `shed-host-agent-diff synthetic
+bus`, `subjectAltName=IP:127.0.0.1`, 100-year validity) generated ONCE with `openssl req
+-x509` and committed because Python's stdlib `ssl` cannot generate a cert at runtime — a
+fixed pair means a **stable leaf-DER fingerprint**. `synthetic_bus.py`'s TLS mode serves it
+via `ssl.SSLContext.wrap_socket`; the `discovery:` config pins it as `tls_cert_fingerprint =
+"sha256:" + hex(sha256(leaf_DER))` — the SAME derivation as Go's `sdk.certFingerprint`
+(`sha256:` + `hex.EncodeToString(sha256(rawCerts[0]))`, the leaf DER) and Rust's
+`shed_core::tls::fingerprint` (leaf DER, lowercase hex), so ONE fingerprint string pins
+both impls. **If the pair is regenerated, recompute the pin** (`python3 -c "import
+ssl,hashlib; print('sha256:'+hashlib.sha256(ssl.PEM_cert_to_DER_cert(open('fixtures/synthetic_bus_cert.pem').read())).hexdigest())"`)
+and update `CERT_PIN` in `test_secure_bus.py`. It guards nothing; never reuse it anywhere
+real.
+
 ## Known contract gaps (slice 0)
 
 - **Config parsing & validation — STRUCTURAL sub-class retired; typed-decode residue
@@ -183,6 +197,22 @@ identities (real-signing ed25519, canned blobs for rsa/ecdsa).
   impls hit egress: `test_egress.py` proves the subscribe, the fixed-ts audit diff, and
   the per-impl 501 hard-backoff (no reconnect in window).
 
+- **Supervisor, discovery & `servers[]` — converged.** Both daemons now run ONE supervisor
+  in BOTH modes (single-server = a discovery config that reconciles once and never reloads;
+  the single unnamed target has `ssh_host=""` → `should_mint` false → open/no-pin). The
+  supervisor's `health()` populates `LiveStatus.servers[]` (one entry per watched server;
+  `name:""` for the single unnamed target), with each namespace's connection state — incl.
+  the 409-`rejected` terminal — surfaced identically (masking only `since`, RFC3339-shape
+  asserted first; `state`/`last_error` diffed). The Rust `health()` sorts `namespaces` by
+  name to match Go's `HostClient.Status()` sort. A SECURE server reached via `discovery:`
+  self-mints a **credentials-scope** bus token over SSH and subscribes over a TLS-pinned
+  https connection; the `discovery:` reload loop (`off`/`poll`) converges both impls to the
+  same server set (the live diff drives `poll` for determinism; the production `fsnotify`
+  default is `notify`-unit-covered). Cells: `test_servers.py` (servers[] connected +
+  409-rejected), `test_discovery.py` (off/poll convergence), `test_secure_bus.py`
+  (TLS-pinned mint + 401-remint + wrong-pin-fails-closed), plus the `should_mint.json`
+  golden and the `supervisor.rs`/`watcher.rs` units.
+
 - **Event replay ring.** The surface-A handshake (`hello`→`hello_ack`), the non-hello
   drop, single-consumer supersede, event fan-out + approval correlation (via the gated
   `sign`), and **`token.get`** (via the real SSH-bootstrap minter + a PATH-shim `ssh`,
@@ -232,10 +262,10 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | approval | gated `sign` timeout / no-consumer fail-closed | **xfail** | unit-covered (`desktop.rs`); a live differential drive is a follow-up |
 | approval | native Touch-ID (biometrics) | **out-of-scope** | separate manual sign-off (needs live biometric) |
 | bus | subscribe → ping → respond (open) ping/pong (masked canonical-equal) | **enforced** | live surface B (`test_bus_ping_pong.py`) |
-| bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **xfail** | live surface B — secure needs the TLS pin from a `discovery:` config (later slice); the pin/reconnect/401/409 logic is already `bus.rs`-unit-tested |
+| bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **enforced** | live surface B (`test_secure_bus.py`: a `discovery:`-config secure server, committed-cert TLS pin, minted-Bearer subscribe, 401→re-mint→reconnect, wrong-pin fails closed) + `bus.rs` unit (409-rejected + pin/401 machinery) |
 | bus | aws-credentials subscription (when configured) | **enforced** | live surface B (`test_aws_backend.py`: both impls `wait_for_subscribe("aws-credentials")`) |
 | bus | docker-credentials subscription (even unconfigured) | **enforced** | live surface B (`test_docker_backend.py`: both impls `wait_for_subscribe("docker-credentials")`, incl. the unconfigured cell) |
-| status | single-server `LiveStatus.servers[]` per-namespace state (incl. 409-rejected) | **xfail** | supervisor slice — Go surfaces `HostClient.Status()` via supervisor health; the Rust bus records the state + logs it, but `servers[]` stays empty until the supervisor lands |
+| status | single-server `LiveStatus.servers[]` per-namespace state (incl. 409-rejected) | **enforced** | live surface B (`test_servers.py`: masked `servers[]` canonical-equal for the connected case + the 409-`rejected` terminal, `since` masked / `state`+`last_error` diffed) |
 | egress | subscription convergence (both impls GET `/api/egress/stream`) | **enforced** | live surface B (`test_egress.py`: both `wait_for_egress`) |
 | egress | events → durable audit line (fixed-ts, diffed UNMASKED incl. `"approval":""`) | **enforced** | live surface B (`test_egress.py`) |
 | egress | 501 → hard 5m backoff (per-impl `egress_hits()==1`, no reconnect in window) | **enforced** | live surface B (`test_egress.py`) |
@@ -261,10 +291,10 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | minter | control-scope argv + success `token.response` | **enforced** | live (`test_token_get.py`: `token`/`expires_at` compared + argv == expected vector, `<scope>` == `control`) |
 | minter | host-key-mismatch terminal; single-flight; refresh cadence | **enforced (unit)** | unit parity (`minter.rs` / `bootstrap.rs`, incl. real-runner shell-shim tests) |
 | minter | `load_discovered_servers` shape (ssh_port=0-vs-22, empty-host skip, sort) | **enforced (golden)** | Go + Rust golden runners on `fixtures/load_discovered_servers.json` |
-| minter | credentials-scope live bus drive | **xfail** | supervisor slice (no bus token provider wired yet) |
+| minter | credentials-scope live bus drive | **enforced** | live surface B (`test_secure_bus.py::test_secure_bus_credentials_mint`: a secure discovery server self-mints a credentials-scope token over the PATH-shim `ssh` and presents `Bearer <minted>` on the TLS-pinned bus subscribe) |
 | minter | malformed `~/.shed/config.yaml` error parity (outer `reading server config:` prefix, per-impl) | **enforced** | live (`test_token_get.py::test_token_get_malformed_shed_config`) |
-| supervisor | reconcile / restart-on-cred-or-TLS-change | **xfail** | live; `shouldMint` matrix → golden |
-| discovery | off / poll / fsnotify | **xfail** | live (convergence w/ deadline); `LoadDiscoveredServers` shape → golden |
+| supervisor | reconcile / restart-on-cred-or-TLS-change | **enforced** | golden (`should_mint.json`, Go + Rust runners) + Rust unit (`supervisor.rs`: `reconcile_{add_remove,no_churn,url_change,credential_or_pin_change,dedup}`, `shutdown`, `health`, the fake-group factory) — reconcile/restart is fake-group-owned (no wire surface); `should_mint` is the wire-visible half |
+| discovery | off / poll / fsnotify | **enforced** | live (`test_discovery.py`: `poll` convergence within a deadline + `off` no-reload, `servers[]` names converge on both impls) + `watcher.rs` `notify`-backed unit smoke (the production `fsnotify` default; the live diff drives POLL for determinism) + golden (`load_discovered_servers.json`) |
 | concurrency | single-flight mint, drop-on-full fan-out | **out-of-scope** | unit parity |
 
 Update this table as slices land (Kimi acceptance-criteria ask in the plan).

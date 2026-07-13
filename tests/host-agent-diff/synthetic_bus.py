@@ -64,13 +64,35 @@ class SyntheticBus:
     to point a daemon's `server:` at.
     """
 
-    def __init__(self, egress: str = "unavailable") -> None:
+    def __init__(
+        self,
+        egress: str = "unavailable",
+        conflict: set[str] | None = None,
+        tls_cert: str | None = None,
+        tls_key: str | None = None,
+        unauthorized: set[str] | None = None,
+    ) -> None:
         assert egress in ("unavailable", "events"), f"bad egress mode {egress!r}"
         self.url: str | None = None
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._shutdown = threading.Event()
         self._egress_mode = egress  # "unavailable" (501) | "events" (200 + decision stream)
+        # Namespaces whose SSE subscribe answers 409 Conflict (another listener owns them).
+        # The client records the state as terminal `rejected` (no hot-retry) — the
+        # `servers[]` 409-rejected differential cell.
+        self._conflict: set[str] = set(conflict or ())
+        # Namespaces whose FIRST SSE subscribe answers 401 (token rejected → the client
+        # invalidates + re-mints, then reconnects). A per-namespace one-shot: the second
+        # subscribe succeeds, so the secure-bus 401-invalidate cell can observe the re-mint.
+        self._unauthorized: set[str] = set(unauthorized or ())
+        self._401_seen: set[str] = set()  # namespaces that have already been 401'd once
+        # TLS: when a committed cert/key pair is supplied, the listen socket is wrapped in
+        # an ssl.SSLContext (Python's stdlib `ssl` can't GENERATE a cert, so the harness
+        # commits a fixed self-signed pair) and `url` is https:// — the secure-bus cells.
+        self._tls_cert = tls_cert
+        self._tls_key = tls_key
+        self._subscribe_auths: dict[str, list[str | None]] = {}  # ns -> every Authorization seen
 
         # One Condition guards all cross-thread state below (subscribe/respond
         # records + the per-namespace push queues + the SSE thread registry).
@@ -85,14 +107,25 @@ class SyntheticBus:
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> "SyntheticBus":
-        """Bind the server on a fresh port and serve on a background thread."""
+        """Bind the server on a fresh port and serve on a background thread. When a
+        committed TLS cert/key pair was supplied, the listen socket is wrapped in an
+        `ssl.SSLContext` and `url` is https://."""
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _BusHandler)
         # Handler threads are daemonic (won't block interpreter exit); we still
         # join them explicitly in stop() so their sockets close deterministically.
         self._httpd.daemon_threads = True
         self._httpd.bus = self  # type: ignore[attr-defined]  # handlers read self.server.bus
         port = self._httpd.server_address[1]
-        self.url = f"http://127.0.0.1:{port}"
+        scheme = "http"
+        if self._tls_cert is not None:
+            import ssl
+
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=self._tls_cert, keyfile=self._tls_key)
+            # Wrap the already-bound listen socket; each accepted connection inherits TLS.
+            self._httpd.socket = ctx.wrap_socket(self._httpd.socket, server_side=True)
+            scheme = "https"
+        self.url = f"{scheme}://127.0.0.1:{port}"
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, name="synthetic-bus", daemon=True
         )
@@ -143,6 +176,22 @@ class SyntheticBus:
                     )
                 self._cond.wait(remaining)
             return self._subscribed[ns]
+
+    def wait_for_subscribe_count(self, ns: str, count: int, timeout: float = 10.0) -> list:
+        """Block until `{ns}` has been subscribed at least `count` times (a deadline poll)
+        and return every recorded `Authorization`. Lets the 401→re-mint→reconnect cell wait
+        for the SECOND subscribe (the fresh token)."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while len(self._subscribe_auths.get(ns, [])) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"fewer than {count} subscribes for {ns!r} within {timeout}s "
+                        f"(got {len(self._subscribe_auths.get(ns, []))})"
+                    )
+                self._cond.wait(remaining)
+            return list(self._subscribe_auths[ns])
 
     def push_request(self, ns: str, envelope: dict) -> None:
         """Push one request Envelope onto `{ns}`'s SSE stream as a `data:` frame.
@@ -218,7 +267,17 @@ class SyntheticBus:
     def _record_subscribe(self, ns: str, auth: str | None) -> None:
         with self._cond:
             self._subscribed[ns] = auth
+            self._subscribe_auths.setdefault(ns, []).append(auth)
             self._cond.notify_all()
+
+    def _should_401(self, ns: str) -> bool:
+        """Whether this subscribe of `ns` should answer 401 (a per-namespace one-shot: the
+        first subscribe of a `unauthorized` namespace 401s, later ones succeed)."""
+        with self._cond:
+            if ns in self._unauthorized and ns not in self._401_seen:
+                self._401_seen.add(ns)
+                return True
+            return False
 
     def _record_response(self, ns: str, env: dict) -> None:
         with self._cond:
@@ -285,9 +344,19 @@ class _BusHandler(BaseHTTPRequestHandler):
 
     def _serve_sse(self, ns: str) -> None:
         """Open the SSE stream for `ns`, record the subscribe, then push queued
-        request frames until shutdown / client disconnect."""
-        self._bus._record_subscribe(ns, self.headers.get("Authorization"))
-        self._stream_sse(self._bus._queue_for(ns))
+        request frames until shutdown / client disconnect. A namespace in the bus's
+        `conflict` set answers 409 (terminal `rejected`, no retry); one in `unauthorized`
+        answers 401 on its FIRST subscribe (token rejected → the client invalidates +
+        re-mints, then reconnects and succeeds)."""
+        bus = self._bus
+        bus._record_subscribe(ns, self.headers.get("Authorization"))
+        if ns in bus._conflict:
+            self._send_empty(409)
+            return
+        if bus._should_401(ns):
+            self._send_empty(401)
+            return
+        self._stream_sse(bus._queue_for(ns))
 
     def _stream_sse(self, q: queue.Queue) -> None:
         """Send the 200 SSE handshake, then hold the connection and drain `q`, pushing

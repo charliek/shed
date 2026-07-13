@@ -270,7 +270,7 @@ impl Supervisor {
         let mut out: Vec<ServerHealth> = refs
             .into_iter()
             .map(|GroupRef { name, url, statuses }| {
-                let namespaces = statuses
+                let mut namespaces: Vec<NamespaceHealth> = statuses
                     .iter()
                     .map(|s| {
                         let st = s.lock().unwrap();
@@ -278,15 +278,18 @@ impl Supervisor {
                             namespace: st.namespace.clone(),
                             state: conn_state_str(st.state).to_string(),
                             last_error: st.last_error.clone(),
-                            // NOTE (commit 4): the Rust `SubStatus` does not yet track a
-                            // `since` timestamp, so this is empty; Go emits an RFC3339 UTC
-                            // `since`. The `servers[]` differential masks `since`, but the
-                            // secure/rejected live cells may need a `since` added to
-                            // `SubStatus` before the masked-shape assertion passes.
-                            since: String::new(),
+                            // The RFC3339-UTC instant the current state began (Go's
+                            // `st.Since.UTC().Format(RFC3339)`); the `servers[]` differential
+                            // masks the value after shape-asserting it.
+                            since: st.since.clone(),
                         }
                     })
                     .collect();
+                // Sort by namespace to match Go's `HostClient.Status()`, which
+                // `sort.Slice`s by namespace before the supervisor reads it — so
+                // `servers[].namespaces[]` is in the same order on both impls regardless of
+                // subscribe order (ssh-agent, docker-credentials, ...).
+                namespaces.sort_by(|a, b| a.namespace.cmp(&b.namespace));
                 ServerHealth {
                     name,
                     url,

@@ -355,18 +355,31 @@ pub enum ConnState {
     Rejected,
 }
 
-/// A snapshot of one subscription's state (`hostclient.go:SubStatus`).
+/// A snapshot of one subscription's state (`hostclient.go:SubStatus`). `since` is the
+/// RFC3339-UTC instant the CURRENT state began — re-stamped only when the state actually
+/// changes (mirror the Go SDK's `setState`), so a snapshot shows how long the subscription
+/// has held its state. `servers[]` masks the `since` value (RFC3339-shape asserted first).
 #[derive(Debug, Clone)]
 pub struct SubStatus {
     pub namespace: String,
     pub state: ConnState,
     pub last_error: String,
+    pub since: String,
 }
 
+/// Record a namespace's connection state, stamping `since` only when the state actually
+/// changes (a same-state call just refreshes `last_error`) — a faithful port of the Go
+/// SDK's `HostClient.setState` (`hostclient.go:256`).
 fn set_state(status: &Arc<Mutex<SubStatus>>, state: ConnState, cause: Option<&str>) {
     let mut s = status.lock().unwrap();
+    let err = cause.unwrap_or("").to_string();
+    if s.state == state {
+        s.last_error = err;
+        return;
+    }
     s.state = state;
-    s.last_error = cause.unwrap_or("").to_string();
+    s.last_error = err;
+    s.since = crate::status::now_rfc3339();
 }
 
 /// How a single `stream_messages` attempt ended, driving the reconnect decision.
@@ -452,6 +465,9 @@ impl BusClient {
             namespace: namespace.to_string(),
             state: ConnState::Reconnecting,
             last_error: String::new(),
+            // Stamp the initial "reconnecting" instant (Go's `subscribeLoop` opens with a
+            // `setState(ConnReconnecting)`); subsequent same-state calls keep it.
+            since: crate::status::now_rfc3339(),
         }));
         let client = self.clone();
         let ns = namespace.to_string();

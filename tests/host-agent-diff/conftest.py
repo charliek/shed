@@ -127,6 +127,54 @@ def _sign_config(bus_url: str) -> str:
     return SIGN_CONFIG.replace("{server}", bus_url)
 
 
+# The discovery `watch: poll` launch config (short poll interval so the convergence
+# differential resolves within a test deadline). BOTH impls build a supervisor and
+# reconcile the desired server set from `{source}` (a `~/.shed/config.yaml`-style
+# `servers:` doc) every poll tick — so an appearance/change of `{source}` converges the
+# `servers[]` on both. The live differential drives POLL for determinism (production's
+# default is event-driven `notify`; that path is unit-covered). BLOCK style (the Rust
+# reader is block-only). `{source}`/`{audit_log}` are filled by the `daemon` fixture.
+DISCOVERY_POLL_CONFIG = """\
+ssh:
+  approval:
+    policy: approve-all
+logging:
+  enabled: true
+  path: {audit_log}
+discovery:
+  watch: poll
+  poll_interval: 300ms
+  source: {source}
+"""
+
+# The discovery `watch: off` launch config: reconciles ONCE at startup, then never
+# reloads — so a later `{source}` change is NOT picked up (the deterministic half of the
+# off/poll convergence cell).
+DISCOVERY_OFF_CONFIG = """\
+ssh:
+  approval:
+    policy: approve-all
+logging:
+  enabled: true
+  path: {audit_log}
+discovery:
+  watch: off
+  source: {source}
+"""
+
+
+def discovery_source_doc(servers: dict) -> str:
+    """Render a `~/.shed/config.yaml`-style discovery source doc from
+    `{name: {field: value, ...}, ...}` (block style — both readers agree). An empty dict
+    renders a bare `servers:` (an empty set → the daemon watches nothing)."""
+    lines = ["servers:"]
+    for name, fields in servers.items():
+        lines.append(f"  {name}:")
+        for key, value in fields.items():
+            lines.append(f"    {key}: {value}")
+    return "\n".join(lines) + "\n"
+
+
 @dataclasses.dataclass
 class CliResult:
     """The outcome of one one-shot subcommand invocation."""
@@ -242,6 +290,7 @@ class DaemonHandle:
         audit_log_path,
         ssh_argv_file=None,
         docker_transcript_file=None,
+        source_path=None,
     ):
         self.impl = impl
         self.binary = binary
@@ -250,6 +299,10 @@ class DaemonHandle:
         self.home = str(home)
         self.config_path = str(config_path)
         self.log_path = Path(log_path)
+        # The discovery `source:` file (a `~/.shed/config.yaml`-style `servers:` doc). A
+        # discovery test writes/rewrites it to drive the poll/off convergence differential;
+        # `None` for the non-discovery configs.
+        self.source_path = Path(source_path) if source_path else None
         # When the daemon was launched with a shim `ssh` (the minter tests), the shim
         # appends its argv (one element per line) to this file — the daemon's exact
         # `ssh` invocation, captured for the differential's argv comparison.
@@ -273,6 +326,27 @@ class DaemonHandle:
     def status(self, json: bool = False) -> CliResult:
         args = ["status"] + (["--json"] if json else [])
         return _run_cli(self.binary, args, self.socket_dir, self.home)
+
+    def poll_status(self, predicate, timeout: float = 12.0) -> dict:
+        """Poll `status --json` until `predicate(obj)` holds (a deadline poll, never a
+        fixed sleep) and return the parsed status object. A non-zero `status` exit is
+        retried, not fatal. Raises on timeout with the last snapshot for a readable
+        failure — the shared primitive behind the discovery/servers[] convergence cells."""
+        import json as _json
+
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            r = self.status(json=True)
+            if r.returncode == 0:
+                last = _json.loads(r.stdout)
+                if predicate(last):
+                    return last
+            time.sleep(0.05)
+        raise AssertionError(
+            f"{self.impl}: status --json never satisfied the predicate within "
+            f"{timeout}s; last={last!r}"
+        )
 
     def read_log(self) -> str:
         return _safe_read(self.log_path)
@@ -511,6 +585,7 @@ def daemon(binaries, tmp_path_factory):
             audit_log,
             ssh_argv_file=ssh_argv_file,
             docker_transcript_file=docker_transcript_file,
+            source_path=source,
         )
         try:
             yield handle
@@ -611,6 +686,20 @@ def sign_config():
     with `daemon(..., install_ssh_key=True)` so the committed ed25519 key is loaded.
     See SIGN_CONFIG."""
     return _sign_config
+
+
+@pytest.fixture
+def discovery_poll_config() -> str:
+    """The block-style `watch: poll` discovery launch-config template (see
+    DISCOVERY_POLL_CONFIG). The `daemon` fixture fills `{source}`/`{audit_log}`."""
+    return DISCOVERY_POLL_CONFIG
+
+
+@pytest.fixture
+def discovery_off_config() -> str:
+    """The block-style `watch: off` discovery launch-config template (see
+    DISCOVERY_OFF_CONFIG)."""
+    return DISCOVERY_OFF_CONFIG
 
 
 @pytest.fixture
