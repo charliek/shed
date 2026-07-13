@@ -141,9 +141,16 @@ mod gate {
             scope: &str,
             session_ttl: &str,
         ) -> TouchIdGate {
+            // Go: `time.ParseDuration` succeeds → keep the value (incl. 0 / negative);
+            // only a PARSE ERROR (or empty) falls back to 4h (`touchid_darwin.go:64`).
+            // A zero/negative TTL clamps to `Duration::ZERO`, so the strict `< ttl`
+            // cache check is always false → always re-prompt — matching Go, where a
+            // `session_ttl: "0"` is the natural "no caching" hardening choice
+            // (`now.Sub(t) < 0` is always false). The earlier `n > 0` guard wrongly
+            // rewrote 0/negative to 4h (CodeRabbit F1).
             let ttl = match config::parse_go_duration_nanos(session_ttl) {
-                Some(n) if n > 0 => Duration::from_nanos(n as u64),
-                _ => Duration::from_secs(4 * 60 * 60),
+                Some(n) => Duration::from_nanos(n.max(0) as u64),
+                None => Duration::from_secs(4 * 60 * 60),
             };
             TouchIdGate {
                 auth,
@@ -433,6 +440,21 @@ mod gate {
             let out = approve(&g, "srv", "web").await;
             assert_eq!(out.decided_by, "touchid", "expired → re-prompt");
             assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn zero_and_negative_ttl_always_reprompt() {
+            // Go: ParseDuration("0")=(0,nil) → sessionTTL=0 → cache check `now.Sub(t)<0`
+            // always false → always re-prompt (the "no caching" hardening choice).
+            // Must NOT fall back to 4h (CodeRabbit F1). Same for a negative TTL.
+            for ttl in ["0", "-5m"] {
+                let (g, state) = gate_with(true, true, "per-session", ttl, false);
+                assert_eq!(g.ttl, Duration::ZERO, "ttl={ttl}");
+                assert_eq!(approve(&g, "srv", "web").await.decided_by, "touchid");
+                // Second sign in the same instant: strict `< ZERO` is always false → prompt again.
+                assert_eq!(approve(&g, "srv", "web").await.decided_by, "touchid");
+                assert_eq!(state.calls.load(Ordering::SeqCst), 2, "ttl={ttl}: re-prompted");
+            }
         }
 
         #[tokio::test]
