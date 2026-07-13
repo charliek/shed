@@ -4,8 +4,10 @@
 //! also runs [`HostAgentConfig::validate`] — a faithful port of Go's
 //! `Config.Validate` (the three policy allow-sets, `aws.sheds`/`aws.mode`, and
 //! `approval_timeout`), so the Rust daemon rejects (exit 1) exactly the configs the
-//! Go daemon rejects. The remaining schema (discovery-block contents, per-server
-//! biometric scope/ttl) stays structurally out of this headless reader.
+//! Go daemon rejects. The reader also surfaces the native-biometric approval knobs
+//! (`ssh.approval.{scope,session_ttl}`) that feed `touchid::new_biometric_gate`; the
+//! remaining schema (discovery-block contents) stays structurally out of this
+//! headless reader.
 //!
 //! Parsing: the `yaml_lite` mod exposes the same tiny `Node` model shed-core's
 //! reader uses, but its parser is backed by `saphyr-parser` (a pure-Rust,
@@ -317,6 +319,18 @@ pub struct HostAgentConfig {
     /// (auto-detect). Mirrors Go's `SSHConfig.Mode`; consumed by
     /// `ssh_backend::resolve_ssh_backend`.
     ssh_mode: String,
+    /// The native-biometric approval scope (`ssh.approval.scope`): `per-request`,
+    /// `per-session` (default), or `per-shed`. Applies ONLY to the biometric policies
+    /// (validate confines them to ssh); passed to `touchid::new_biometric_gate`. Read
+    /// NULL-AWARE to mirror Go's `DefaultConfig`-then-overlay: absent/null →
+    /// `per-session`, an explicit `scope: ""` is kept verbatim (→ the gate always
+    /// prompts). Mirrors Go's `ApprovalConfig.Scope`.
+    ssh_scope: String,
+    /// The RAW native-biometric session TTL (`ssh.approval.session_ttl`), default
+    /// `4h`. Kept verbatim: the gate parses it (parse-fail → 4h) AND audits the raw
+    /// text (`out.TTL = cfg.SessionTTL`). Same null-aware defaulting as `ssh_scope`.
+    /// Mirrors Go's `ApprovalConfig.SessionTTL`.
+    ssh_session_ttl_raw: String,
     pub logging_enabled: bool,
     pub logging_path: String,
     // Read only by `approval_timeout()`, which only the desktop server calls.
@@ -456,6 +470,24 @@ impl HostAgentConfig {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => DEFAULT_SERVER_URL.to_string(),
         };
+        // The native-biometric knobs under `ssh.approval.*`, read NULL-AWARE (the same
+        // `scalar_or_default` shape `AwsConfig::from_node` uses): an explicit `Scalar`
+        // (including `""`) is kept verbatim; absent / null / non-scalar falls back to
+        // the `DefaultConfig` default (`per-session` / `4h`). This reproduces Go's
+        // `DefaultConfig`-then-overlay so `scope: ""` → always-prompt while absent →
+        // `per-session`.
+        let ssh_approval = root
+            .as_map()
+            .and_then(|m| m.get("ssh"))
+            .and_then(yaml_lite::Node::as_map)
+            .and_then(|m| m.get("approval"))
+            .and_then(yaml_lite::Node::as_map);
+        let ssh_scalar_or_default = |key: &str, d: &str| -> String {
+            match ssh_approval.and_then(|m| m.get(key)) {
+                Some(yaml_lite::Node::Scalar(s)) => s.clone(),
+                _ => d.to_string(),
+            }
+        };
         HostAgentConfig {
             ssh_policy: policy("ssh"),
             aws_policy: policy("aws"),
@@ -464,6 +496,8 @@ impl HostAgentConfig {
                 .get_path(&["ssh", "mode"])
                 .unwrap_or_default()
                 .to_string(),
+            ssh_scope: ssh_scalar_or_default("scope", "per-session"),
+            ssh_session_ttl_raw: ssh_scalar_or_default("session_ttl", "4h"),
             logging_enabled,
             logging_path,
             approval_timeout: parse_approval_timeout(&approval_timeout_raw),
@@ -529,6 +563,22 @@ impl HostAgentConfig {
     /// `ssh_backend::resolve_ssh_backend_from_env` at daemon startup.
     pub fn ssh_mode(&self) -> &str {
         &self.ssh_mode
+    }
+
+    /// The native-biometric approval scope (`ssh.approval.scope`), null-aware
+    /// defaulted to `per-session`. Passed to `touchid::new_biometric_gate` in
+    /// `main.rs`'s `select_gate` (the biometric arm); ignored by every non-biometric
+    /// gate. Mirrors Go's `ApprovalConfig.Scope`.
+    pub(crate) fn ssh_scope(&self) -> &str {
+        &self.ssh_scope
+    }
+
+    /// The RAW native-biometric session TTL (`ssh.approval.session_ttl`), null-aware
+    /// defaulted to `4h`. Passed verbatim to `touchid::new_biometric_gate`, which
+    /// parses it for the cache TTL (parse-fail → 4h) and audits the raw text. Mirrors
+    /// Go's `ApprovalConfig.SessionTTL`.
+    pub(crate) fn ssh_session_ttl(&self) -> &str {
+        &self.ssh_session_ttl_raw
     }
 
     /// `effective_policy` returns the configured policy for a namespace, defaulting
@@ -2697,8 +2747,9 @@ aws:
     /// Mirrors `config_test.go:TestExampleConfigIsValid`. The shipped default config
     /// loads + validates and carries the documented, CARRIED defaults (ssh
     /// biometrics-or-password, aws off/deny-all, docker approve-all + the block-seq
-    /// `registries == [index.docker.io, ghcr.io]`). (P: HONEST SCOPE) it CANNOT assert
-    /// `session_ttl == "1h"` (native-biometric, not in `HostAgentConfig`).
+    /// `registries == [index.docker.io, ghcr.io]`). Now that the reader surfaces the
+    /// native-biometric knobs, it ALSO asserts `ssh.approval.{scope,session_ttl}` from
+    /// the example (`per-session` / `1h`, `configs/extensions.example.yaml:67-68`).
     #[test]
     fn example_config_loads_and_validates() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2713,6 +2764,48 @@ aws:
             cfg.docker.registries,
             vec!["index.docker.io".to_string(), "ghcr.io".to_string()]
         );
+        assert_eq!(cfg.ssh_scope(), "per-session");
+        assert_eq!(cfg.ssh_session_ttl(), "1h");
+    }
+
+    /// The native-biometric knobs default null-aware (Go's `DefaultConfig`-then-
+    /// overlay): an ABSENT `ssh.approval.{scope,session_ttl}` → `per-session` / `4h`;
+    /// a bare `scope:` / `session_ttl:` (YAML null) also → the defaults. Mirrors Go's
+    /// `applyDefaults` seeding.
+    #[test]
+    fn biometric_knobs_default_when_absent_or_null() {
+        // Absent (only a policy under ssh.approval).
+        let cfg = HostAgentConfig::parse("ssh:\n  approval:\n    policy: biometrics\n");
+        assert_eq!(cfg.ssh_scope(), "per-session");
+        assert_eq!(cfg.ssh_session_ttl(), "4h");
+        // Explicit YAML null → still the defaults (null-aware read).
+        let cfg =
+            HostAgentConfig::parse("ssh:\n  approval:\n    scope:\n    session_ttl: null\n");
+        assert_eq!(cfg.ssh_scope(), "per-session");
+        assert_eq!(cfg.ssh_session_ttl(), "4h");
+    }
+
+    /// (H2) An EXPLICIT empty `scope: ""` / `session_ttl: ""` is kept verbatim — it
+    /// overwrites the `DefaultConfig` default with `""` (Go's overlay), so the gate
+    /// always-prompts and the raw `""` is what `session_ttl` audits. The null-aware
+    /// read must NOT re-default an explicit empty string.
+    #[test]
+    fn biometric_knobs_keep_explicit_empty() {
+        let cfg = HostAgentConfig::parse(
+            "ssh:\n  approval:\n    scope: \"\"\n    session_ttl: \"\"\n",
+        );
+        assert_eq!(cfg.ssh_scope(), "");
+        assert_eq!(cfg.ssh_session_ttl(), "");
+    }
+
+    /// A non-default scope/ttl round-trips verbatim through the accessors.
+    #[test]
+    fn biometric_knobs_read_explicit_values() {
+        let cfg = HostAgentConfig::parse(
+            "ssh:\n  approval:\n    scope: per-shed\n    session_ttl: 30m\n",
+        );
+        assert_eq!(cfg.ssh_scope(), "per-shed");
+        assert_eq!(cfg.ssh_session_ttl(), "30m");
     }
 
     /// Mirrors `config_test.go:TestLoadConfigDeprecatedDesktopKeysIgnored`. A config

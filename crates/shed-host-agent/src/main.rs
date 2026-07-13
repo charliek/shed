@@ -47,6 +47,10 @@ mod sockets;
 mod ssh_backend;
 mod ssh_backend_agent;
 mod status;
+// The native macOS Touch-ID / biometrics approval gate (always-on, `#[cfg(target_os=
+// "macos")]` inside — NOT feature-gated: a headless mac daemon needs no desktop app to
+// do biometrics). On non-mac the biometric policies fail closed to deny-all.
+mod touchid;
 // The multi-server supervisor: reconciles per-server watcher groups against the desired
 // set the discovery source resolves to. Always-on (the daemon drives it in BOTH modes —
 // single-server is just a discovery config that reconciles once and never reloads).
@@ -342,6 +346,15 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     let select_gate = |policy: &str| -> Arc<dyn approval::ApprovalGate> {
         match policy {
             config::POLICY_APPROVE_ALL => Arc::new(approval::ApproveAllGate),
+            // The two native-biometric policies route to the Touch-ID gate. UNCONDITIONAL
+            // match arm (NO `#[cfg]` here) — mirroring Go's `gateFor → newApprovalGate`;
+            // the single `#[cfg(target_os="macos")]` seam lives inside
+            // `touchid::new_biometric_gate` (macos → TouchIdGate; non-mac → DenyAllGate).
+            // Only the ssh gate can ever reach here — `validate` rejects biometrics for
+            // aws/docker.
+            config::POLICY_BIOMETRICS | config::POLICY_BIOMETRICS_OR_PASSWORD => {
+                touchid::new_biometric_gate(policy, cfg.ssh_scope(), cfg.ssh_session_ttl())
+            }
             #[cfg(feature = "desktop-forwarding")]
             config::POLICY_SHED_DESKTOP => {
                 Arc::new(desktop::DesktopGate::new(desktop_server.clone()))
