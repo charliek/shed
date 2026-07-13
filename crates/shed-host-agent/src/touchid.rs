@@ -630,7 +630,6 @@ mod real {
 #[cfg(all(test, not(target_os = "macos")))]
 mod stub_tests {
     use super::new_biometric_gate;
-    use crate::approval::ApprovalGate;
     use crate::config::POLICY_DENY_ALL;
 
     #[tokio::test]
