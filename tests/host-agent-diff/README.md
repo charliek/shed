@@ -178,10 +178,17 @@ real.
   byte-parity test) may now diverge on the SAME file; converging the two readers is a
   separate shed-core slice, not this one.
 
-- **Bounded connect timeout.** The Rust `status` client and the daemon's live-socket
-  stale-probe use blocking Unix `connect()`; Go uses `net.DialTimeout` (2s / 500ms). The
-  normal path resolves immediately either way; a pathological full-backlog peer could hang
-  the Rust side longer. Low severity, tracked for the config/lifecycle slice.
+- **Bounded connect timeout — CLOSED (D1).** The Rust `status` client and the daemon's
+  live-socket stale-probe now bound the Unix `connect()` to match Go's `net.DialTimeout`
+  (2s / 500ms). `std::os::unix::net::UnixStream` has no `connect_timeout` (std offers it
+  only for `TcpStream`) and both paths run synchronously before any tokio runtime, so the
+  bound is a `libc` nonblocking `connect(2)` + `poll(POLLOUT)` + `SO_ERROR` check
+  (`sockets::connect_unix_timeout`, `cfg(unix)`; `libc` is already a direct dep — no new
+  crate). A pathological full-backlog peer can no longer hang either side past the bound.
+  Pinned by the `sockets.rs` units (`connect_unix_timeout_connects_to_live_listener`,
+  `connect_unix_timeout_refuses_stale_fast`, `connect_unix_timeout_missing_path_fails_fast`,
+  `connect_unix_timeout_rejects_overlong_path`); the normal not-running path stays
+  byte-parity-tested live (`test_status_not_running.py`).
 
 - **Bus subscription set — converged.** In single-server mode (no `discovery:` block)
   both daemons connect to `server:` and subscribe to `ssh-agent`; when `aws.*` is
@@ -248,7 +255,8 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | lifecycle | config-load error → exit 1 (exit code only) | **enforced** | live (`test_config_error.py`) |
 | lifecycle | SIGTERM → exit 0 + both sockets unlinked | **enforced** | live (`test_lifecycle.py`) |
 | socket | status socket bind + `0600` file perms | **enforced** | live (`conftest` daemon + `test_socket_perms.py`) |
-| socket | socket-dir `0700` + stale-vs-live rebinding | **xfail** | live (config/lifecycle slice) |
+| socket | socket-dir `0700` re-chmod + stale-socket rebind | **enforced** | live (`test_socket_rebind.py`: pre-existing 0777 dir → 0700; stale AF_UNIX sockets at both fixed paths → unlinked + rebound, daemon answers) |
+| socket | live-socket / non-socket-file refuse (op-log-only, no equal wire consequence) | **out-of-scope(unit-owned)** | Rust unit (`sockets.rs::prepare_refuses_live_socket`, `prepare_refuses_non_socket_file`) + Go `TestPrepareSocketPath` |
 | config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML, duplicate key (exit-1 parity) | **enforced** | live (`test_config_validate.py`) + golden (`config_validate.json`, Go + Rust runners) |
 | decision | `EffectivePolicy` (`""→deny-all`, echoes) | **enforced** | golden (Go + Rust runners) |
 | decision | `desktopGateNamespaces` ordered gate list | **enforced** | golden (Go + Rust runners) |

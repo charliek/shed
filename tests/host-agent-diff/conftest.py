@@ -432,6 +432,7 @@ def daemon(binaries, tmp_path_factory):
         install_aws_credentials: str | None = None,
         install_docker_config: str | None = None,
         docker_helper_bundle: str | None = None,
+        pre_launch=None,
     ):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
         home = root / "home"
@@ -542,6 +543,14 @@ def daemon(binaries, tmp_path_factory):
 
         status_sock = socket_dir / STATUS_SOCK_NAME
         desktop_sock = socket_dir / DESKTOP_SOCK_NAME
+
+        # `pre_launch(socket_dir)` runs AFTER the socket dir exists but BEFORE the
+        # daemon launches — the seam the A1 socket-lifecycle cell uses to widen the
+        # dir to 0777 (so the daemon's re-chmod-to-0700 is observable) or to plant a
+        # stale AF_UNIX socket at the fixed socket paths (so the daemon's stale-detect
+        # + rebind is exercised). No-op for every other test.
+        if pre_launch is not None:
+            pre_launch(socket_dir)
 
         # The daemon writes its operational log to -log-file, so stdout/stderr carry
         # nothing worth capturing; DEVNULL avoids leaving un-read pipe file objects

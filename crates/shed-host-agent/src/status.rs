@@ -349,7 +349,11 @@ fn not_running_message(sock: &Path) -> String {
 /// `runStatus`.
 pub fn run_status(json_out: bool, out: &mut dyn Write) -> i32 {
     let sock = crate::sockets::status_socket_path();
-    let mut conn = match std::os::unix::net::UnixStream::connect(&sock) {
+    // Bounded connect (2s) — the client-side analog of the daemon's 500ms live-probe.
+    // Mirrors Go's `net.DialTimeout("unix", sock, 2*time.Second)` (`status.go:30`); a
+    // wedged daemon can't hang the CLI forever. std `UnixStream` has no connect_timeout
+    // and this path is sync (no runtime), so `sockets::connect_unix_timeout` bounds it.
+    let mut conn = match crate::sockets::connect_unix_timeout(&sock, Duration::from_secs(2)) {
         Ok(c) => c,
         Err(_) => {
             eprint!("{}", not_running_message(&sock));
