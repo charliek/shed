@@ -464,12 +464,16 @@ jobs:
       # the snapshot and this release — no per-job version munging.
       - name: Rust toolchain + zig cross tooling
         run: |
-          rustup toolchain install stable --profile minimal
+          # Kept byte-identical to ci.yml's release-snapshot step (see the note
+          # there): explicit rustfmt+clippy (rust-toolchain.toml declares them),
+          # and cargo-zigbuild pinned to the validated version. zig is brew-current;
+          # a zig bump is a loud failure caught by release-snapshot pre-tag.
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin \
                             aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
           brew install zig
-          cargo install --locked cargo-zigbuild
+          cargo install --locked --version 0.23.0 cargo-zigbuild
 
       # The old inline "Verify plugin.json matches tag" step is gone: the
       # release-plan job owns that gate now (this job only runs when

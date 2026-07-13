@@ -85,6 +85,12 @@ jobs:
               # harness, the committed wire reference, and the shared build
               # manifests/locks/toolchain a dependency bump would ride in on.
               - 'crates/shed-host-agent/**'
+              # The Rust host-agent has a path-dep on shed-core, and the release
+              # build (builder: rust) reads rust-toolchain.toml — a change to
+              # either can break the shipped binary, so both must trigger the
+              # differential + the release-snapshot (which is gated on this filter).
+              - 'crates/shed-core/**'
+              - 'crates/rust-toolchain.toml'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
               - 'cmd/shed-host-agent/**'
@@ -182,12 +188,19 @@ jobs:
       # `rustup target add`, but pre-adding fails fast if a target is unavailable.
       - name: Rust toolchain + zig cross tooling
         run: |
-          rustup toolchain install stable --profile minimal
+          # components: crates/rust-toolchain.toml declares rustfmt+clippy, which
+          # rustup would auto-install on first cargo use in crates/ (a flaky-network
+          # CI-only failure risk); install them explicitly up front.
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin \
                             aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+          # cargo-zigbuild pinned to the locally-validated version (reproducibility).
+          # zig itself is brew-current: a zig bump is a LOUD build failure caught
+          # by this snapshot job before any tag (not a silent ship); pinning zig
+          # harder is a tracked follow-up (see .goreleaser.yaml glibc-floor note).
           brew install zig
-          cargo install --locked cargo-zigbuild
+          cargo install --locked --version 0.23.0 cargo-zigbuild
       # First-ever CI exercise of the darwin build-tag half (the Go rollback
       # shed-host-agent's touchid_darwin.go, CGO) — de-risks the macos release job.
       - name: Run tests
@@ -215,10 +228,7 @@ jobs:
           # (ii) per-arch shed-machine-rc .debs, named to match apt-charliek's glob.
           ls dist/shed-machine-rc_*_amd64.deb dist/shed-machine-rc_*_arm64.deb
           # (iii) ALL FOUR shed-host-agent archives (now Rust) carry the binary AND
-          # the example config. Extract + run `version` on the darwin ones (this is
-          # a macos runner) to catch a present-but-broken cross-build that still
-          # passes `tar tzf`; assert the arm64 binary keeps its linker ad-hoc
-          # signature (matches the Go baseline — no explicit codesign step).
+          # the example config.
           workdir="$(mktemp -d)"
           for os in darwin linux; do
             for arch in amd64 arm64; do
@@ -228,16 +238,23 @@ jobs:
               tar tzf "$tgz" | grep -qx 'extensions.example.yaml' || { echo "::error::$tgz missing extensions.example.yaml"; tar tzf "$tgz"; exit 1; }
             done
           done
-          for arch in amd64 arm64; do
-            rm -f "$workdir/shed-host-agent"
-            tar xzf "dist/shed-host-agent_darwin_${arch}.tar.gz" -C "$workdir" shed-host-agent
-            out="$("$workdir/shed-host-agent" version)"
-            echo "darwin/${arch}: $out"
-            case "$out" in shed-host-agent\ *) ;; *) echo "::error::darwin/${arch} version output unexpected: $out"; exit 1;; esac
-          done
-          # The loop above ends on arm64, so $workdir/shed-host-agent is the arm64
-          # binary — assert its linker ad-hoc signature survived packaging.
+          # Runtime check for the DARWIN binaries. macos-latest is arm64 (Apple
+          # Silicon) with no guaranteed Rosetta, so only the NATIVE arm64 binary is
+          # executed (`version` — catches a present-but-broken cross-build that
+          # passes `tar tzf`); the x86_64 one is validated structurally with `file`
+          # (never executed, so no Rosetta dependency). Assert the arm64 binary
+          # keeps its linker ad-hoc signature (matches the Go baseline — no explicit
+          # codesign step; a future zig that drops it fails loudly here, pre-tag).
+          tar xzf dist/shed-host-agent_darwin_arm64.tar.gz -C "$workdir" shed-host-agent
+          arm64_out="$("$workdir/shed-host-agent" version)"
+          echo "darwin/arm64: $arm64_out"
+          case "$arm64_out" in shed-host-agent\ *) ;; *) echo "::error::darwin/arm64 version output unexpected: $arm64_out"; exit 1;; esac
           codesign -dv "$workdir/shed-host-agent" 2>&1 | grep -q 'Signature=adhoc' || { echo "::error::arm64 shed-host-agent lost its ad-hoc signature"; codesign -dv "$workdir/shed-host-agent" 2>&1; exit 1; }
+          rm -f "$workdir/shed-host-agent"
+          tar xzf dist/shed-host-agent_darwin_amd64.tar.gz -C "$workdir" shed-host-agent
+          amd64_file="$(file "$workdir/shed-host-agent")"
+          echo "$amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::darwin/amd64 is not a well-formed x86_64 Mach-O: $amd64_file"; exit 1; }
+          echo "darwin/amd64: $amd64_file"
           # (iv) rollback insurance: the detached Go ids still compiled.
           python3 - <<'PY'
           import json,sys

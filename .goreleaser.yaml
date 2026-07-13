@@ -119,13 +119,24 @@ builds:
     builder: rust
     binary: shed-host-agent
     dir: crates
-    # -p= is REQUIRED: crates/ is a Cargo workspace and goreleaser's rust builder
-    # refuses a workspace build without --package/-p. --locked pins the committed
-    # Cargo.lock; --release is the builder default but explicit here.
+    # --package= is REQUIRED: crates/ is a Cargo workspace and goreleaser's rust
+    # builder refuses a workspace build without --package/-p (it detects the
+    # `--package=`/`-p=` prefix). --locked pins the committed Cargo.lock;
+    # --release is the builder default but explicit here.
     flags:
       - --release
       - --locked
-      - -p=shed-host-agent
+      - --package=shed-host-agent
+    # NOTE (linux glibc floor): the two *-unknown-linux-gnu targets currently link
+    # against cargo-zigbuild's default glibc (~2.30 — modern distros: Ubuntu 20.04+,
+    # RHEL 9+). The Go rollback build was CGO_ENABLED=0 (static), so the linux
+    # tarball's floor rose. Pinning it lower (e.g. `x86_64-unknown-linux-gnu.2.17`)
+    # is NOT possible on the pinned goreleaser v2.15.2 — its rust builder passes the
+    # raw glibc-suffixed triple to `rustup target add`, which rejects it (only
+    # `cargo zigbuild` itself strips the suffix). Tracked follow-up: pin the floor
+    # once goreleaser's rust builder strips the suffix before rustup. The linux
+    # tarball is a secondary GH-release download (no apt; brew/macOS is the only
+    # wired install path), so this does not affect the primary install identity.
     targets:
       - aarch64-apple-darwin
       - x86_64-apple-darwin
