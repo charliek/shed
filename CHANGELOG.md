@@ -55,6 +55,52 @@ All notable changes to this project will be documented in this file.
   macOS, Tauri Linux) gain the new kinds and the generic permission mode, gate the create
   sheet's kind chips on each shed's capabilities, surface `needs-auth` per agent, and
   apply the unknown-kind neutral-rendering policy.
+- **Live RC activity (the rc hub).** `shed-ext-rc serve` runs a resident, on-demand,
+  self-exiting per-shed daemon (loopback `127.0.0.1:1029`) that tails codex rollout and
+  claude transcript JSONL — with a spinner-normalizing pane-stability engine as the
+  universal fallback for every kind — to derive a live `activity` dimension
+  (`working`/`needs_input`/`idle`/`unknown`) plus `activity_at` and a sanitized
+  `last_message`, additive inside each session's `rc` block. Lifecycle trumps activity: a
+  `needs-trust`/`needs-auth`/`dead` session reports none. `capabilities.features` gains
+  `serve`, `activity`, and `messages`. Session listings enrich activity by consulting an
+  already-running hub (~200 ms budget, never starting one), with instant fallback to the
+  hub-less behavior.
+- **Codex message feed + gated input.** The hub folds the codex rollout stream into a
+  normalized, bounded per-session message ring served by
+  `GET /v1/sessions/{slug}/messages` (`since`/`limit`, `truncated` on cursor
+  misalignment), notified by a `message.appended` SSE event, and accepts
+  `POST /v1/sessions/{slug}/input` gated on a fresh re-derivation of the session state
+  (`kind_features` gains `watch` and `input: "gated"`, codex-only in this phase).
+- **Server rc proxy + aggregate SSE.** `GET/POST /api/sheds/{name}/rc/*` reverse-proxies
+  the hub's `/v1` API into a shed over `DialService` with a strict method/path allowlist,
+  SSE flushing, header/body bounds, ensure-start (singleflight + circuit breaker), and
+  credential-stripping — the server is the authorization boundary for the loopback-only
+  hub. `GET /api/rc/events` is a demand-driven aggregate activity SSE stream across every
+  shed (zero clients ⇒ zero upstreams). Both are advertised as the `rc-proxy` and
+  `rc-events` feature tokens. `DialService` routes through the guest agent's vsock TCP
+  proxy on **both** VZ and Firecracker, so the loopback hub is reachable on either
+  backend; the proxy degrades to `503 RC_HUB_UNAVAILABLE` (and listings carry no activity
+  fields) only when the hub is genuinely down or the image predates it. On Firecracker
+  this also means `connect/{port}` now reaches loopback-bound guest services — parity with
+  VZ — instead of dialing the VM's bridge IP (the peer address a guest service sees
+  becomes `127.0.0.1`).
+- **Tauri macOS app gains Sparkle auto-update.** The Tauri client now packages a macOS
+  DMG (`ShedDesktop-<version>.dmg`) containing a signed `ShedDesktop.app` with an
+  embedded `Sparkle.framework`, wired to
+  the **same feed and EdDSA keys as the Swift app**
+  (`https://charliek.github.io/shed/appcast.xml`). Updates are **user-invoked only** — the
+  tray popover's **Check for Updates…** row is now live (no automatic background checks;
+  Swift parity) — and the macOS bundle identity is aligned to `ai.stridelabs.ShedDesktop`
+  so the eventual Swift→Tauri hop is a same-key, in-place update. On Linux the row stays a
+  truthful "Updates arrive via apt" tooltip. Drivable over IPC via `updater.status` /
+  `updater.check`.
+- **Tauri mac DMG packaging + prerelease-tag release job.** New `make tauri-dmg-mac`
+  packaging (Sparkle staged by `scripts/fetch-sparkle.sh`, signed in Sparkle's ordered
+  inner→outer sequence) and a `desktop-macos-tauri` release job: **prerelease** desktop
+  tags (`vX.Y.Z-rc.N`) build and — when Apple signing credentials are configured —
+  notarize the Tauri DMG and append a **beta-channel** appcast
+  entry, while stable tags keep shipping the Swift DMG (mutually exclusive gates). This is
+  the beta rollout track — stable users are untouched until promotion.
 
 ## v0.7.10 — 2026-07-08
 

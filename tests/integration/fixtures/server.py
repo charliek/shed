@@ -713,6 +713,10 @@ class RemoteServer(LocalServer):
                     ],
                     capture_output=True,
                     text=True,
+                    # Lenient decode, like the local read (:525): the dev
+                    # server log carries raw VM console bytes, and the byte
+                    # offset can split a multibyte character.
+                    errors="replace",
                     timeout=10,
                 )
             except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -743,6 +747,7 @@ class RemoteServer(LocalServer):
                 ],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=10,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError):

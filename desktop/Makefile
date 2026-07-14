@@ -14,6 +14,15 @@ APP := build/ShedDesktop.app
 # the recreated /work layout exactly as they do in the repo.
 REPO_ROOT := $(abspath $(CURDIR)/..)
 
+# Paths excluded from every Docker-leg source tarball: build outputs + the
+# mac-only staged Sparkle framework/dist (a dev Mac's staging must never enter
+# the containers).
+TAR_EXCLUDES := --exclude=desktop/tauri/src-tauri/target \
+  --exclude=desktop/tauri/src-tauri/Sparkle.framework \
+  --exclude=desktop/tauri/src-tauri/.sparkle-dist \
+  --exclude=desktop/tauri/ui/node_modules \
+  --exclude=crates/target
+
 .PHONY: help
 help:  ## List available targets
 	@echo "shed-desktop dev tasks:"
@@ -84,7 +93,7 @@ deb: tauri-ui-build  ## Build the shed-desktop Tauri .deb in Docker (ubuntu:24.0
 	    echo "deb [trusted=yes] https://repo.goreleaser.com/apt/ /" > /etc/apt/sources.list.d/goreleaser.list && \
 	    apt-get update -qq && apt-get install -y -qq nfpm >/dev/null && \
 	    mkdir -p /work && \
-	    tar -C /repo --exclude=desktop/tauri/src-tauri/target --exclude=desktop/tauri/ui/node_modules --exclude=crates/target \
+	    tar -C /repo $(TAR_EXCLUDES) \
 	      -cf - crates desktop/tauri desktop/linux desktop/packaging desktop/Resources desktop/pyproject.toml desktop/uv.lock | tar -C /work -xf - && \
 	    cd /work/desktop && ./linux/scripts/build-deb.sh $(DEB_VERSION) && \
 	    cp /work/desktop/out/*.deb /out/'
@@ -94,7 +103,36 @@ deb-validate: deb  ## Build + install-validate the .deb in a clean ubuntu:24.04 
 
 # ---- tauri (Phase A: a real Linux client toward Mac parity) -----------
 
+UNAME_S := $(shell uname -s)
+
 .PHONY: tauri-build tauri-run tauri-lint tauri-test tauri-ui-build tauri-build-linux tauri-test-linux
+.PHONY: sparkle-framework tauri-bundle-mac tauri-dmg-mac
+
+sparkle-framework:  ## Stage Sparkle.framework + bin tools for the Tauri mac app (pinned; idempotent)
+	./scripts/fetch-sparkle.sh
+
+# On Darwin every Tauri mac build needs Sparkle.framework staged first:
+# tauri.macos.conf.json's bundle.macOS.frameworks references it (the bundler
+# copies it at bundle time), and the sparkle-updater crate's build.rs (C2)
+# links it and panics when it is absent. Linux never compiles that crate
+# (mac-only target dep), and the Docker legs --exclude the staged framework
+# so it never enters the containers.
+ifeq ($(UNAME_S),Darwin)
+tauri-build: sparkle-framework
+tauri-run: sparkle-framework
+tauri-lint: sparkle-framework
+tauri-test: sparkle-framework
+endif
+
+# NOTE: `dmg` (Swift) and `tauri-dmg-mac` (Tauri) write the SAME outputs —
+# build/ShedDesktop.app + build/ShedDesktop-<ver>.dmg — building one clobbers
+# the other's artifacts.
+tauri-bundle-mac: sparkle-framework  ## Build + sign the Tauri mac app -> build/ShedDesktop.app
+	./scripts/bundle-tauri-mac.sh
+
+tauri-dmg-mac: tauri-bundle-mac  ## Tauri mac bundle + drag-install DMG (reuses make-dmg.sh; clobbers the Swift `dmg` outputs)
+	./scripts/make-dmg.sh
+
 tauri-ui-build:  ## Build the Vite/React frontend bundle (tauri/ui/dist)
 	cd tauri/ui && npm run build
 
@@ -139,7 +177,7 @@ tauri-build-linux: tauri-ui-build  ## Render gate: Tauri e2e on ubuntu:24.04 + W
 	  -e SHED_TAURI_TEST_TIMEOUT_SCALE=6 \
 	  shed-tauri-linux:latest \
 	  bash -lc 'set -e; mkdir -p /work; \
-	    tar -C /repo --exclude=desktop/tauri/src-tauri/target --exclude=desktop/tauri/ui/node_modules --exclude=crates/target \
+	    tar -C /repo $(TAR_EXCLUDES) \
 	      -cf - crates desktop/tauri desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock | tar -C /work -xf -; \
 	    cd /work/desktop && (cd tauri/src-tauri && cargo build --locked) && \
 	    xvfb-run -a --server-args="-screen 0 1400x900x24" \
@@ -161,7 +199,7 @@ tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Lin
 	  -e CARGO_TARGET_DIR=/target \
 	  shed-tauri-linux:latest \
 	  bash -lc 'set -e; mkdir -p /work; \
-	    tar -C /repo --exclude=desktop/tauri/src-tauri/target --exclude=desktop/tauri/ui/node_modules --exclude=crates/target \
+	    tar -C /repo $(TAR_EXCLUDES) \
 	      -cf - crates desktop/tauri desktop/tools desktop/Resources desktop/pyproject.toml desktop/uv.lock | tar -C /work -xf -; \
 	    cd /work/desktop/tauri/src-tauri && cargo test --locked'
 

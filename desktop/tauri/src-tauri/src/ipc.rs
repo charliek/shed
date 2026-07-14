@@ -107,6 +107,62 @@ pub fn present_main_window<R: tauri::Runtime>(app: &AppHandle<R>) {
     set_activation_policy_prod(app, true);
 }
 
+/// The Preferences window label (a dedicated webview, created lazily on first
+/// open). Its snapshot is keyed under this label, read by `prefs.dump`.
+pub const PREFERENCES_ID: &str = "preferences";
+
+/// The Preferences window's fixed content size. The mac window is 460×560; this
+/// carries the same grouped form with the Plex kit's roomier spacing. Fixed —
+/// the window is not resizable (mac parity).
+const PREFS_WIDTH: f64 = 520.0;
+const PREFS_HEIGHT: f64 = 640.0;
+
+/// Show + focus the singleton Preferences window — lazy-create on the first open,
+/// front-if-already-open after (mac `AppModel.openPreferences` parity). Closing it
+/// only HIDES it (the generic `CloseRequested` arm in `lib.rs` hides + prevents
+/// close for every window), so a reopen is a plain show+focus — the mac
+/// `isReleasedWhenClosed = false` semantics. Creation is marshalled to the main
+/// thread (required on macOS — the IPC handler runs on a tokio worker; harmless on
+/// Linux). Shared by the tray menu, the popover footer, the dashboard gear
+/// (`open_preferences` command), and the `ui.show_preferences`/`ui.open_preferences`
+/// ops — one Rust path. macOS-dev note: prefs closing while main is hidden leaves
+/// the Dock icon until the next policy flip — accepted (Linux is the shipped target).
+pub fn show_preferences_window(app: &AppHandle) {
+    let handle = app.clone();
+    // Marshal the WHOLE check-then-create-or-focus onto the main thread so it is
+    // atomic with respect to the sibling `prefs.close` hide (also main-thread
+    // marshalled). Main-thread closures run FIFO, so a create queued before a
+    // close always runs before it — the last op queued wins the final state, and
+    // two rapid opens can't race two builders (the second sees the window and
+    // focuses instead of double-building).
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = handle.get_webview_window(PREFERENCES_ID) {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+            set_activation_policy_prod(&handle, true);
+            return;
+        }
+        if let Err(e) = tauri::WebviewWindowBuilder::new(
+            &handle,
+            PREFERENCES_ID,
+            tauri::WebviewUrl::App("preferences.html".into()),
+        )
+        .title("shed desktop — Preferences")
+        .inner_size(PREFS_WIDTH, PREFS_HEIGHT)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .center()
+        .build()
+        {
+            eprintln!("shed-desktop-tauri: preferences window unavailable ({e})");
+            return;
+        }
+        set_activation_policy_prod(&handle, true);
+    });
+}
+
 /// Flip the macOS activation policy in PRODUCTION only (guarded off under the
 /// harness — an unguarded flip can leave `main` unmounted so `ui_report` never fires
 /// and `wait_until(current_pane)` times out). `regular` shows the Dock icon (a
@@ -206,20 +262,32 @@ impl Handler {
             "ui.navigate" => self.navigate(params),
             "ui.current_pane" => Ok(json!({ "pane": self.ui_get("pane") })),
             "ui.computed_style" => Ok(json!({ "style": self.ui_get("style") })),
-            // Which modal (if any) the frontend has open: "prefs" | "create" | null.
+            // Which modal (if any) the frontend has open: "create" | "launch" |
+            // null. (Preferences is a dedicated window, not a modal — see prefs.dump.)
             "ui.modal" => Ok(json!({ "modal": self.ui_get("modal") })),
+            // The sidebar nav badge counts the shell reported {sheds, agents, hosts,
+            // pending}, or null before its first report.
+            "ui.badges" => Ok(json!({ "badges": self.ui_get("badges") })),
+            "ui.set_appearance" => self.set_appearance(params),
             "ui.show_window" | "app.activate" => {
                 present_main_window(&self.app);
                 Ok(json!({}))
             }
-            "ui.show_preferences" => {
-                present_main_window(&self.app);
-                let _ = self.app.emit("show-preferences", json!({}));
+            // Open/focus the dedicated Preferences window (it no longer raises the
+            // dashboard — mac parity). `ui.open_preferences` is the mac op name,
+            // aliased so the now-shared behavior has one name across targets.
+            "ui.show_preferences" | "ui.open_preferences" => {
+                show_preferences_window(&self.app);
                 Ok(json!({}))
             }
             "ui.show_create" => {
                 present_main_window(&self.app);
                 let _ = self.app.emit("show-create", json!({}));
+                Ok(json!({}))
+            }
+            "ui.show_launch" => {
+                present_main_window(&self.app);
+                let _ = self.app.emit("show-launch", json!({}));
                 Ok(json!({}))
             }
             "app.screenshot" => self.screenshot().await,
@@ -236,6 +304,8 @@ impl Handler {
             "create.status" => self.create_status(params),
             "create.cancel" => self.create_cancel(params),
             "system.df" => Ok(json!({ "usage": self.backend.system_df().await })),
+            "egress.profiles" => Ok(self.egress_dump()),
+            "egress.show" => self.egress_show(params),
             "terminal.preview" => self.terminal_preview(params),
             "terminal.open" => self.terminal_open(params),
             "terminal.presets" => Ok(self.terminal_presets()),
@@ -247,6 +317,30 @@ impl Handler {
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
             "prefs.set_terminal" => self.prefs_set_terminal(params),
+            // Provider (AWS/Docker) approval modes — the production Preferences
+            // surface (ungated, unlike test-mode `policy.set`).
+            "prefs.provider_modes" => self.provider_modes().await,
+            "prefs.set_provider" => self.set_provider(params).await,
+            // The Preferences window's drivable surface: its merged snapshot +
+            // native state, hide (close-hides contract), and the per-shed override
+            // remove (the row button's path, ungated like prefs.set_provider — it
+            // only removes an override, falling back to the namespace policy).
+            "prefs.dump" => Ok(self.prefs_dump()),
+            "prefs.close" => {
+                // Marshal the hide onto the main thread so it stays FIFO-ordered
+                // with the main-thread-marshalled create/focus in
+                // `show_preferences_window` — otherwise a close could run before a
+                // still-queued create and be a no-op, leaving the window open even
+                // though close was the last op.
+                let handle = self.app.clone();
+                let _ = self.app.run_on_main_thread(move || {
+                    if let Some(w) = handle.get_webview_window(PREFERENCES_ID) {
+                        let _ = w.hide();
+                    }
+                });
+                Ok(json!({}))
+            }
+            "prefs.remove_shed_rule" => self.remove_shed_rule(params).await,
             // -- approvals (the security spine) --
             "approvals.list" => self.approvals_list().await,
             "approval.decide" => self.approval_decide(params).await,
@@ -278,6 +372,11 @@ impl Handler {
                 Ok(json!({}))
             }
             "tray.dump" => Ok(self.tray_dump()),
+            // The Sparkle updater's drivable surface — proves the wiring + the
+            // test-mode disablement (the plugin is never registered under the
+            // harness, so `updater.status` reports `test_mode`/disabled here).
+            "updater.status" => Ok(crate::updater::status(&self.app, self.env.test_mode)),
+            "updater.check" => self.updater_check(),
             other => Err(err("unknown_op", format!("unknown op: {other}"))),
         }
     }
@@ -312,6 +411,62 @@ impl Handler {
         })
     }
 
+    /// `updater.check` → on the enabled path front the app + present Sparkle (`{}`);
+    /// otherwise split by failure kind: a policy-disabled check is the deterministic
+    /// `updater_disabled` error whose message carries the reason
+    /// (`updater_disabled:<reason>`, so the harness can assert disablement without a
+    /// crash — never registered under the harness ⇒ test mode reports
+    /// `updater_disabled:test_mode`), while a runtime failure on the enabled path
+    /// surfaces via this file's `action_failed` convention.
+    fn updater_check(&self) -> Result<Value, (String, String)> {
+        use crate::updater::CheckError;
+        match crate::updater::check(&self.app, self.env.test_mode) {
+            Ok(()) => Ok(json!({})),
+            Err(e @ CheckError::Disabled(_)) => Err(err("updater_disabled", e.to_string())),
+            Err(CheckError::Operational(msg)) => Err(err("action_failed", msg)),
+        }
+    }
+
+    /// `prefs.dump` → the Preferences window's drivable state: the React-reported
+    /// snapshot (`{sections, values, mode}`, keyed under the `preferences` window
+    /// label) MERGED with Rust-side native window truth (`visible`, `title`) read
+    /// like `tray.dump` — a native hide/close never triggers a React report, so
+    /// visibility must come from Rust. `visible` is false + `prefs` null before the
+    /// first open (the window is created lazily).
+    fn prefs_dump(&self) -> Value {
+        let snapshot = self.ui.lock().ok().and_then(|s| s.get(PREFERENCES_ID, "prefs"));
+        let win = self.app.get_webview_window(PREFERENCES_ID);
+        let visible = win
+            .as_ref()
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+        let title = win.as_ref().and_then(|w| w.title().ok());
+        json!({
+            "visible": visible,
+            "title": title,
+            "prefs": snapshot,
+        })
+    }
+
+    /// `prefs.remove_shed_rule {server, shed}` → remove one per-shed override rule +
+    /// persist the remaining set (the same path as the window's remove button).
+    /// `server` is matched verbatim (`""` = the single/unnamed server — F12).
+    async fn remove_shed_rule(&self, params: &Value) -> Result<Value, (String, String)> {
+        let server = req_str(params, "server")?.to_string();
+        let shed = req_str(params, "shed")?.to_string();
+        self.coordinator.remove_shed_rule(server, shed).await;
+        crate::persist_shed_rules(&self.prefs, &self.coordinator).await;
+        self.emit_prefs_changed();
+        Ok(json!({}))
+    }
+
+    /// Emit `prefs-changed` so the Preferences window (if open) re-fetches values an
+    /// IPC-driven mutation changed behind its back (its own controls keep local
+    /// state directly; the dashboard has no prefs UI to notify).
+    fn emit_prefs_changed(&self) {
+        let _ = self.app.emit("prefs-changed", ());
+    }
+
     /// `ui.navigate {pane}` → tell the frontend to switch panes (a `navigate`
     /// event). A0a's placeholder frontend ignores it; A0b's React wires it up. It
     /// always acks so the harness can drive navigation.
@@ -319,7 +474,7 @@ impl Handler {
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
         if !matches!(
             pane,
-            "sheds" | "approvals" | "agents" | "activity" | "system"
+            "sheds" | "approvals" | "agents" | "activity" | "egress" | "system"
         ) {
             return Err(err("bad_request", format!("unknown pane: {pane:?}")));
         }
@@ -333,6 +488,28 @@ impl Handler {
             ));
         }
         let _ = self.app.emit("navigate", json!({ "pane": pane }));
+        // Echo the pane like the mac handler, so both surfaces match ipc.md.
+        Ok(json!({ "pane": pane }))
+    }
+
+    /// `ui.set_appearance {mode}` → drive the dashboard's light/dark mode (a
+    /// `set-appearance` event the shell listens for), so the harness can capture
+    /// dark screenshots deterministically instead of relying on the header toggle.
+    /// Validates the mode; the shell's own listener ignores anything else too.
+    fn set_appearance(&self, params: &Value) -> Result<Value, (String, String)> {
+        let mode = params.get("mode").and_then(Value::as_str).unwrap_or("");
+        if !matches!(mode, "light" | "dark") {
+            return Err(err("bad_request", format!("unknown mode: {mode:?}")));
+        }
+        // Update the managed appearance cell DIRECTLY (in Rust) before emitting, so a
+        // window reading `get_appearance_state` sees the new value even if its
+        // `set-appearance` listener hasn't attached yet (kills the attach race).
+        if let Some(cell) = self.app.try_state::<crate::AppearanceState>() {
+            if let Ok(mut cur) = cell.0.lock() {
+                *cur = Some(mode.to_string());
+            }
+        }
+        let _ = self.app.emit("set-appearance", json!({ "mode": mode }));
         Ok(json!({}))
     }
 
@@ -472,8 +649,11 @@ impl Handler {
             .get("template")
             .and_then(Value::as_str)
             .map(str::to_string);
-        self.terminal
-            .prefs_set_terminal(req_str(params, "preset")?, template)
+        let r = self
+            .terminal
+            .prefs_set_terminal(req_str(params, "preset")?, template)?;
+        self.emit_prefs_changed();
+        Ok(r)
     }
 
     // -- RC / Agents (B2.3) — the launcher + session table -------------------
@@ -620,6 +800,69 @@ impl Handler {
         json!({ "sessions": sessions })
     }
 
+    // -- egress (mac parity) — the pane's UI truth + its sub-tab driver --------
+
+    /// `egress.profiles` → the egress state the frontend reported (UI truth, like
+    /// `agents.dump` reads the rendered sessions): `{tab, profiles, errors,
+    /// selected, activity_count}`. The Egress pane reports only while mounted, so
+    /// off-pane this returns `null` rather than a stale snapshot.
+    fn egress_dump(&self) -> Value {
+        let on_egress = self
+            .ui_get("pane")
+            .and_then(|p| p.as_str().map(|s| s == "egress"))
+            .unwrap_or(false);
+        let egress = if on_egress {
+            self.ui_get("egress").unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        json!({ "egress": egress })
+    }
+
+    /// `egress.show {tab?, profile?, host?}` → drive the Egress pane's sub-tab
+    /// and/or selected profile (an `egress-show` event the pane listens for), so the
+    /// harness can render the Profiles list→detail deterministically (the
+    /// `set-appearance` pattern). Validates the tab; the pane resolves `profile` by
+    /// (host, name) when `host` is given, else by name (first match) — so a name
+    /// that collides across hosts (e.g. `default` on every server) is selectable
+    /// deterministically.
+    ///
+    /// Readiness (mirrors `ui.navigate`'s `frontend_not_ready` gate): the pane's
+    /// `egress-show` LISTENER attaches asynchronously after mount, and — like
+    /// `useUiBridge` — the pane publishes its egress snapshot only AFTER that
+    /// listener is live. So a non-null reported `egress` snapshot proves the
+    /// listener is attached; a null/absent one means an emit would be lost to the
+    /// attach race, so fail fast and let the caller retry.
+    fn egress_show(&self, params: &Value) -> Result<Value, (String, String)> {
+        let tab = params.get("tab").and_then(Value::as_str);
+        if let Some(t) = tab {
+            if !matches!(t, "activity" | "profiles") {
+                return Err(err("bad_request", format!("unknown tab: {t:?}")));
+            }
+        }
+        // snapshot non-null ⟹ the pane mounted AND its egress-show listener attached
+        // (see the pane's effect ordering), so the emit below is heard. Null/absent
+        // ⟹ not yet reported → fail fast so the caller retries (the harness waits).
+        if self.ui_get("egress").is_none_or(|v| v.is_null()) {
+            return Err(err(
+                "frontend_not_ready",
+                "egress pane has not reported yet; retry",
+            ));
+        }
+        let mut payload = serde_json::Map::new();
+        if let Some(t) = tab {
+            payload.insert("tab".into(), json!(t));
+        }
+        if let Some(p) = params.get("profile").and_then(Value::as_str) {
+            payload.insert("profile".into(), json!(p));
+        }
+        if let Some(h) = params.get("host").and_then(Value::as_str) {
+            payload.insert("host".into(), json!(h));
+        }
+        let _ = self.app.emit("egress-show", Value::Object(payload));
+        Ok(json!({}))
+    }
+
     // -- approvals (the security spine; the harness drives the full matrix) ----
 
     /// `approvals.list` → the pending approval cards (each with its gate + the SSH
@@ -642,6 +885,7 @@ impl Handler {
         }
         let p: P = serde_json::from_value(params.clone())
             .map_err(|e| err("bad_request", e.to_string()))?;
+        let persist = p.persist;
         self.coordinator
             .decide_approval(
                 p.id,
@@ -649,10 +893,16 @@ impl Handler {
                     decision: p.decision,
                     scope: p.scope,
                     ttl: p.ttl,
-                    persist: p.persist,
+                    persist,
                 },
             )
             .await;
+        // A persisted decision adds a per-shed rule — mirror it into prefs.json (same
+        // path as the frontend command) so the override survives a restart.
+        if persist {
+            crate::persist_shed_rules(&self.prefs, &self.coordinator).await;
+            self.emit_prefs_changed();
+        }
         Ok(json!({}))
     }
 
@@ -738,6 +988,7 @@ impl Handler {
         // harness-driven change also survives a restart.
         let (m, pol, ttl) = crate::ssh_prefs_wire(&self.coordinator.ssh_prefs().await);
         self.prefs.set_ssh(m, pol, ttl);
+        self.emit_prefs_changed();
         Ok(json!({}))
     }
 
@@ -746,6 +997,32 @@ impl Handler {
     /// harness can assert what a set actually applied (the drivability North Star).
     async fn ssh_prefs(&self) -> Result<Value, (String, String)> {
         Ok(json!(self.coordinator.ssh_prefs().await))
+    }
+
+    /// `prefs.provider_modes` → the coordinator's current AWS/Docker approval modes
+    /// (`{namespace: "approve"|"deny"}`) — the read side of `prefs.set_provider`.
+    async fn provider_modes(&self) -> Result<Value, (String, String)> {
+        Ok(json!(self.coordinator.provider_modes().await))
+    }
+
+    /// `prefs.set_provider {namespace, decision}` → set an AWS/Docker provider mode +
+    /// persist (the same path as the frontend `set_provider_mode` command). The
+    /// coordinator rejects a non-provider namespace (surfaced as `bad_request`).
+    async fn set_provider(&self, params: &Value) -> Result<Value, (String, String)> {
+        #[derive(serde::Deserialize)]
+        struct P {
+            namespace: String,
+            decision: ApprovalDecision,
+        }
+        let p: P = serde_json::from_value(params.clone())
+            .map_err(|e| err("bad_request", e.to_string()))?;
+        self.coordinator
+            .set_provider_mode(p.namespace, p.decision)
+            .await
+            .map_err(|e| err("bad_request", e))?;
+        crate::persist_provider_modes(&self.prefs, &self.coordinator).await;
+        self.emit_prefs_changed();
+        Ok(json!({}))
     }
 
     /// `loginitem.set {enabled}` → enable/disable launch-at-login (the Preferences
@@ -757,6 +1034,7 @@ impl Handler {
             .and_then(Value::as_bool)
             .ok_or_else(|| err("bad_request", "missing 'enabled' (bool)"))?;
         crate::login_item_set(&self.app, &self.env, enabled).map_err(|e| err("action_failed", e))?;
+        self.emit_prefs_changed();
         Ok(json!({}))
     }
 
@@ -942,6 +1220,7 @@ mod tests {
         Env {
             test_mode: true,
             mock_base_url: mock.map(str::to_string),
+            mock_unreachable_hosts: std::collections::HashSet::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),

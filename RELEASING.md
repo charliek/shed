@@ -19,7 +19,7 @@ equals the tag**:
 | Component | Ship selector (version manifest) | Artifacts |
 |---|---|---|
 | `go` | `.claude-plugin/plugin.json` `.version` | Go binaries, brew formulas, `shed-server`/`shed-machine-rc` debs, ghcr rootfs images |
-| `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG + Sparkle appcast, `shed-desktop` debs |
+| `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG + Sparkle appcast, `shed-desktop` debs — during the Swift→Tauri transition, **stable** tags ship the Swift DMG and **prerelease** (`-`) tags ship the Tauri DMG on the appcast beta channel (see [`desktop/RELEASING.md`](desktop/RELEASING.md)) |
 
 - **Bumping**: `scripts/release/update-version.sh X.Y.Z
   [--components go,desktop]`. The default is `go` (preserves the

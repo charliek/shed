@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Extra Info.plist keys for the Tauri mac app — Tauri merges this file into
+  the plist it generates for ShedDesktop.app (mac-only by nature).
+
+  These MUST stay identical to the Swift app's Resources/Info.plist.template:
+  same SUFeedURL + SUPublicEDKey means the eventual Swift-to-Tauri hop is a
+  same-feed, same-key, in-place Sparkle update. The matching private key is
+  the SPARKLE_ED_PRIVATE_KEY repo secret. SUEnableAutomaticChecks=false so a
+  background check never pops a panel (updates are user-invoked, Swift
+  parity). LSUIElement=true: menu-bar/accessory app, no Dock icon (runtime
+  activation-policy switching promotes to Regular when a window opens).
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>shed desktop</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>SUFeedURL</key>
+  <string>https://charliek.github.io/shed/appcast.xml</string>
+  <key>SUPublicEDKey</key>
+  <string>ROs7kN5cyTTVpMUriF1B/RZ/BaV/HJeOC8gMbBjDw+4=</string>
+  <key>SUEnableAutomaticChecks</key>
+  <false/>
+</dict>
+</plist>

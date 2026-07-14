@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "preferences",
+  "description": "The Preferences window webview: it may call our app commands (get_prefs / terminal_presets / set_terminal_pref / loginitem_* / ssh_prefs_get / set_ssh_approval / gate_namespaces / provider_modes_get / set_provider_mode / policy_list_shed / remove_shed_rule / get_appearance_state / ui_report) and listen for Rust-emitted events (set-appearance / connected-changed / prefs-changed). App-defined commands need no extra ACL; only core + event access is granted, scoped to the `preferences` window (least privilege — it does NOT share `main`'s capability).",
+  "windows": ["preferences"],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}

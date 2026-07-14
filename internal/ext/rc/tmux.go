@@ -3,6 +3,7 @@ package rc
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -73,10 +74,26 @@ func capturePane(r Runner, name string) Result {
 }
 
 // listSessionNames returns the rc-* tmux session names (empty if no server/sessions).
+// Any listing failure reads as empty — fine for the one-shot subcommands; the hub's
+// reconcile loop uses listSessionNamesChecked so a transient tmux failure is not
+// mistaken for "every session is gone".
 func listSessionNames(r Runner) []string {
+	names, _ := listSessionNamesChecked(r)
+	return names
+}
+
+// listSessionNamesChecked returns the rc-* tmux session names, distinguishing a REAL
+// empty (tmux answered "no server running"/"no sessions" — killing the last session
+// stops the server) from a transient listing failure (tmux missing/hiccuping), which
+// is returned as an error so a stateful caller (the hub) can keep its tracked state
+// instead of treating every session as gone.
+func listSessionNamesChecked(r Runner) ([]string, error) {
 	res := r.Run("ls", "-F", "#{session_name}")
 	if res.Code != 0 {
-		return nil // no server running / no sessions
+		if isMissingSession(res.Stderr) {
+			return nil, nil // no server / no sessions: a genuine empty list
+		}
+		return nil, fmt.Errorf("tmux ls failed: %s", strings.TrimSpace(res.Stderr))
 	}
 	var names []string
 	for _, line := range strings.Split(res.Stdout, "\n") {
@@ -85,7 +102,7 @@ func listSessionNames(r Runner) []string {
 			names = append(names, line)
 		}
 	}
-	return names
+	return names, nil
 }
 
 // showEnvironment returns a session's SHED_RC_*-filtered show-environment dump.

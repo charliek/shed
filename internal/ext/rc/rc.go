@@ -117,7 +117,14 @@ const (
 	envCreatedBy   = "SHED_RC_CREATED_BY"
 	envCreatedAt   = "SHED_RC_CREATED_AT"
 	envTarget      = "SHED_RC_TARGET"
-	envPrefix      = "SHED_RC_"
+	// envAgentSession is the ADDITIVE, write-once-on-correlate key the hub back-writes
+	// once it has pinned a session to its agent JSONL file (codex rollout id / claude
+	// transcript session id). It is NOT part of the create-time BuildEnvArgs set — the
+	// hub stamps it later via `tmux set-environment` so a hub restart re-correlates
+	// exactly instead of re-running the cwd+window heuristic. It rides the SHED_RC_
+	// prefix so parseEnv/showEnvironment already surface it.
+	envAgentSession = "SHED_RC_AGENT_SESSION"
+	envPrefix       = "SHED_RC_"
 )
 
 // Session is the neutral, target-agnostic DTO the binary prints. Optional fields are
@@ -136,6 +143,18 @@ type Session struct {
 	CreatedBy   string `json:"created_by,omitempty"`
 	CreatedAt   string `json:"created_at,omitempty"`
 	TargetLabel string `json:"target_label,omitempty"`
+
+	// Live-activity dimension (Phase C). These are additive and live INSIDE the rc
+	// block (the wire contract): absent when no hub is running / the kind is
+	// unsupported. Activity is orthogonal to State (lifecycle) — DisplayActivity
+	// encodes the precedence (lifecycle trumps activity). See activity.go.
+	Activity Activity `json:"activity,omitempty"`
+	// ActivityAt is the RFC3339 timestamp the activity was last derived/changed.
+	ActivityAt string `json:"activity_at,omitempty"`
+	// LastMessage is a short, sanitized preview of the session's most recent
+	// message (ANSI/control-stripped, whitespace-collapsed, ≤200 runes). See
+	// SanitizeLastMessage.
+	LastMessage string `json:"last_message,omitempty"`
 }
 
 // ListResponse is the `list` subcommand's stdout shape. Capabilities is embedded so a

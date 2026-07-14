@@ -20,13 +20,17 @@ const (
 	// FeatureRCEnrich signals server-side rc enrichment of session listings
 	// (Session.RC populated on GET /api/sessions and the per-shed listing).
 	FeatureRCEnrich = "rc-enrich"
+	// FeatureRCEvents signals the GET /api/rc/events aggregate activity SSE stream.
+	FeatureRCEvents = "rc-events"
+	// FeatureRCProxy signals the GET/POST /api/sheds/{name}/rc/* hub reverse proxy.
+	FeatureRCProxy = "rc-proxy"
 )
 
 // serverFeatures returns the feature-token set as a fresh slice, so the
 // advertised set lives in exactly one place yet no caller can mutate it through
 // the returned value (an append can't alias a shared backing array).
 func serverFeatures() []string {
-	return []string{FeatureOverview, FeatureRCEnrich}
+	return []string{FeatureOverview, FeatureRCEnrich, FeatureRCEvents, FeatureRCProxy}
 }
 
 // OverviewServer is the server block of GET /api/overview: the server's version

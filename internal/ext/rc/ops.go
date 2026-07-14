@@ -55,6 +55,12 @@ type CreateOptions struct {
 	// claude's own default). e.g. "auto" or "bypassPermissions" for an unattended
 	// run; with bypassPermissions, Wait also auto-accepts the one-time bypass dialog.
 	PermissionMode string
+	// EnsureHub, when non-nil, is invoked (best-effort) once a session has been
+	// created, to make sure the local rc activity hub is running so the new session
+	// is watched. It must never fail or meaningfully delay the create — a spawn
+	// error is the hook's own concern (it logs and swallows). nil in tests and for
+	// any caller that doesn't want the hub; production wires the detached-serve spawn.
+	EnsureHub func()
 }
 
 // Create bootstraps a managed RC session and returns its DTO. With Wait (or a
@@ -162,6 +168,13 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		opts.Prompt = composePlanKickoff(planFile, opts.PlanFraming)
 	}
 
+	// The session now exists in tmux. Best-effort ensure the local hub is running so
+	// it starts watching this session — deferred so it fires on the way out
+	// regardless of the wait/kickoff outcome, and never blocks the create result.
+	if opts.EnsureHub != nil {
+		defer opts.EnsureHub()
+	}
+
 	session := Session{
 		Slug:        slug,
 		TmuxSession: name,
@@ -267,14 +280,20 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 
 // List returns every rc-* session's DTO. displayFallback receives a slug.
 func List(r Runner, displayFallback func(slug string) string) ListResponse {
-	names := listSessionNames(r)
+	return ListResponse{RCSessions: sessionsForNames(r, listSessionNames(r), displayFallback)}
+}
+
+// sessionsForNames builds the session DTOs for the given tmux session names — the
+// shared enumeration loop behind List and the hub's reconcile pass (which lists names
+// through listSessionNamesChecked first so a transient tmux failure skips the pass).
+func sessionsForNames(r Runner, names []string, displayFallback func(slug string) string) []Session {
 	sessions := make([]Session, 0, len(names))
 	for _, name := range names {
 		env := showEnvironment(r, name)
 		pane := capturePane(r, name).Stdout
 		sessions = append(sessions, ParseSession(name, env, pane, displayFallback))
 	}
-	return ListResponse{RCSessions: sessions}
+	return sessions
 }
 
 // capturePaneChecked returns a session's pane text, mapping a gone session to

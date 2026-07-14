@@ -18,7 +18,7 @@ pub mod token_minter;
 pub mod traits;
 
 pub use audit_store::AuditStore;
-pub use backend::{Backend, HostDiskUsage, RcTarget, Reachability};
+pub use backend::{Backend, HostDiskUsage, HostEgressProfiles, RcTarget, Reachability};
 #[cfg(feature = "rc")]
 pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ShedDesktop",
+  "mainBinaryName": "ShedDesktop",
+  "identifier": "ai.stridelabs.ShedDesktop",
+  "bundle": {
+    "macOS": {
+      "frameworks": ["Sparkle.framework"],
+      "minimumSystemVersion": "14.0",
+      "entitlements": "./ShedDesktop.entitlements"
+    }
+  }
+}

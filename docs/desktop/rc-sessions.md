@@ -94,3 +94,27 @@ state (closing the [shed follow-up](https://github.com/charliek/shed/issues/199)
 data — server info (with a `features` discovery array), disk usage, and every shed with
 its rc-enriched sessions and per-shed `rc_capabilities` — into one call for
 mobile-style clients.
+
+## Live activity (the rc hub)
+
+On VZ sheds a resident guest daemon — the **RC activity hub** (`shed-ext-rc serve`) —
+derives a live `activity` dimension for each session and, for codex, a message feed and
+gated input. Two server endpoints expose it to clients (advertised via the `rc-proxy`
+and `rc-events` feature tokens on `GET /api/info` / `GET /api/overview`):
+
+- **`GET/POST /api/sheds/{name}/rc/*`** reverse-proxies the hub's `/v1` API (session
+  list, SSE `/v1/events`, the codex `/messages` feed, and `POST /input`), ensure-starting
+  the hub on demand. The server is the authorization boundary; the hub is loopback-only
+  inside the guest.
+- **`GET /api/rc/events`** is a single demand-driven aggregate SSE stream carrying
+  `activity.changed` / `session.updated` / `message.appended` across every shed, so a
+  client subscribes once for the whole host.
+
+When a hub is running, enriched session listings additionally carry `activity`,
+`activity_at`, and `last_message` inside each row's `rc` block (absent when no hub is
+running — e.g. the hub hasn't started yet or the image predates it — in which case the
+proxy degrades to `503 RC_HUB_UNAVAILABLE` and clients hide activity affordances). This
+is backend-agnostic: both VZ and Firecracker reach the loopback hub through the guest
+agent's vsock TCP proxy. The full contract — lifecycle-trumps-activity
+precedence, SSE envelopes, message-feed and input semantics — lives in
+[shed-ext-rc](../extensions/rc-helper.md#the-rc-activity-hub-serve).

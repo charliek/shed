@@ -24,7 +24,7 @@ The macOS app and the Linux Tauri app are two thin shells over one shared **Rust
 
 Shipping. The dashboard, lifecycle/create, RC agent launcher, the credential-approval gate,
 the System (disk) pane, and Sparkle auto-update are all implemented on macOS, with the Tauri
-Linux client at full feature parity (except egress). Since the [monorepo
+Linux client at full feature parity (the Egress pane included). Since the [monorepo
 consolidation](https://github.com/charliek/shed) the app moved onto shed's shared `vX.Y.Z`
 release line — a `git tag` cuts the macOS DMG and the Linux `.deb` together when the desktop
 component ships.

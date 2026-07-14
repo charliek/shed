@@ -78,6 +78,9 @@ firecracker:
   vsock_base_cid: 100
   console_port: 1024
   notify_port: 1026
+  # Must match the guest agent's flagless default (1028); the systemd unit
+  # starts shed-agent without a --tcp-proxy-port override.
+  tcp_proxy_port: 1028
   start_timeout: 90s
   stop_timeout: 10s
   bridge_name: shed-br0

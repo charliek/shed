@@ -167,8 +167,9 @@ pub struct SystemDiskUsage {
 }
 
 /// One egress profile fragment. Mirrors shed-server's `config.EgressProfile`
-/// (all-lowercase single-word keys).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// (all-lowercase single-word keys). `Serialize` so shed-app's per-host egress
+/// rows serialize straight to the clients (like `SystemDiskUsage`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EgressProfile {
     pub mode: Option<String>,
     pub allow: Option<Vec<String>>,
@@ -177,7 +178,7 @@ pub struct EgressProfile {
 }
 
 /// One entry of `GET /api/egress/profiles`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EgressProfileInfo {
     pub name: String,
     pub source: String,

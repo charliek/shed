@@ -26,6 +26,8 @@ The sidebar selects a pane:
   Claude" for ready ones.
 - **Activity** — the merged audit feed (host-agent credentials + the app's decisions), with
   a "Reveal log" button.
+- **Egress** — per-host egress profiles (allow/deny rules, by source) plus an activity
+  sub-tab filtered to the `egress` namespace.
 - **System** — per-host disk usage (images / sheds / snapshots / orphans).
 - **Hosts** (sidebar footer) — each configured server with a reachability dot.
 

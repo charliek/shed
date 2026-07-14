@@ -478,6 +478,11 @@ type FirecrackerConfig struct {
 	// NotifyPort is the vsock port for the message channel (health checks, plugins, credentials)
 	NotifyPort uint32 `yaml:"notify_port"`
 
+	// TCPProxyPort is the vsock port for the TCP proxy (used by DialService to
+	// reach VM services). Must match the guest agent's flagless default (1028);
+	// the systemd unit starts shed-agent without a --tcp-proxy-port override.
+	TCPProxyPort uint32 `yaml:"tcp_proxy_port"`
+
 	// StartTimeout is the timeout for VM startup
 	StartTimeout Duration `yaml:"start_timeout"`
 
@@ -621,9 +626,12 @@ func (c *VZConfig) GetPullConcurrency() int { return c.PullConcurrency }
 //     resource shape per shed on both backends. A user moving a shed
 //     between platforms should see identical resource sizing by
 //     default.
-//   - ConsolePort (1024) / NotifyPort (1026): the agent's vsock
-//     contract. Same on both so the same shed-agent binary speaks
-//     to both backends without per-platform port plumbing.
+//   - ConsolePort (1024) / NotifyPort (1026) / TCPProxyPort (1028): the
+//     agent's vsock contract. Same on both so the same shed-agent binary
+//     speaks to both backends without per-platform port plumbing.
+//     TCPProxyPort is aligned across backends as of the hub-parity change
+//     — both backends route DialService through the guest agent's TCP proxy
+//     on this port.
 //   - StopTimeout (10 s): the budget for the shutdown-hook + sync +
 //     graceful-stop sequence. Same on both because the in-guest work
 //     (sync, hook execution) is identical regardless of VMM.
@@ -637,9 +645,6 @@ func (c *VZConfig) GetPullConcurrency() int { return c.PullConcurrency }
 //     that worst case. As of v0.5.5 warm VZ create is ~1.6 s, so 60 s
 //     is generous; the value stands to absorb cold-state and
 //     overloaded-host variance without surprising the operator.
-//   - TCPProxyPort (1028): VZ exposes a TCP proxy via vsock for
-//     `shed forward`-style use cases. Firecracker uses its own
-//     network stack with TAP devices and does not need it.
 //   - VfkitPath: VZ-only (vfkit is the macOS VMM); Firecracker
 //     equivalent is invoked directly by the binary at FirecrackerPath
 //     (set elsewhere).
@@ -669,7 +674,7 @@ func DefaultVZConfig() *VZConfig {
 		DefaultDiskGB:   20,                         // see "Cross-backend alignment" above
 		ConsolePort:     1024,                       // see "Cross-backend alignment" above
 		NotifyPort:      1026,                       // see "Cross-backend alignment" above
-		TCPProxyPort:    1028,                       // VZ-only — see header comment
+		TCPProxyPort:    1028,                       // aligned with FC — see header comment
 		StartTimeout:    Duration(60 * time.Second), // diverges from FC's 30s — see header comment
 		StopTimeout:     Duration(10 * time.Second), // see "Cross-backend alignment" above
 	}
@@ -1178,8 +1183,12 @@ func (c *FirecrackerConfig) ResolveBaseRootfs() (ResolvedImage, error) {
 //
 //   - DefaultCPUs / DefaultMemoryMB / DefaultDiskGB: same physical
 //     resource shape per shed on both backends.
-//   - ConsolePort (1024) / NotifyPort (1026): the shared agent vsock
-//     contract.
+//   - ConsolePort (1024) / NotifyPort (1026) / TCPProxyPort (1028): the
+//     shared agent vsock contract. TCPProxyPort is aligned across backends
+//     as of the hub-parity change — FC's DialService routes through the
+//     guest agent's TCP proxy on this vsock port exactly like VZ (previously
+//     FC dialed the bridge IP directly and could not reach loopback-bound
+//     guest services such as the rc hub).
 //   - StopTimeout (10 s): same in-guest stop sequence.
 //
 // Intentionally divergent from VZ:
@@ -1218,6 +1227,7 @@ func DefaultFirecrackerConfig() *FirecrackerConfig {
 		VsockBaseCID:     100,                         // FC-only — see header
 		ConsolePort:      1024,                        // aligned with VZ — see header
 		NotifyPort:       1026,                        // aligned with VZ — see header
+		TCPProxyPort:     1028,                        // aligned with VZ — see header
 		StartTimeout:     Duration(30 * time.Second),  // diverges from VZ's 60s — see header
 		StopTimeout:      Duration(10 * time.Second),  // aligned with VZ — see header
 		BridgeName:       "shed-br0",                  // FC-only — see header
@@ -1864,6 +1874,9 @@ func (c *FirecrackerConfig) applyDefaults() {
 	if c.NotifyPort == 0 {
 		c.NotifyPort = 1026
 	}
+	if c.TCPProxyPort == 0 {
+		c.TCPProxyPort = 1028
+	}
 
 	// Resolve version-aware image refs before path handling: expand the
 	// ${shed.version} token and synthesize the lockstep release default /
@@ -1968,8 +1981,14 @@ func (c *FirecrackerConfig) Validate() error {
 	if c.NotifyPort > MaxVsockPort {
 		return fmt.Errorf("notify_port must be at most %d", MaxVsockPort)
 	}
-	if c.ConsolePort == c.NotifyPort {
-		return fmt.Errorf("console_port and notify_port must be different")
+	if c.TCPProxyPort == 0 {
+		return fmt.Errorf("tcp_proxy_port must be set")
+	}
+	if c.TCPProxyPort > MaxVsockPort {
+		return fmt.Errorf("tcp_proxy_port must be at most %d", MaxVsockPort)
+	}
+	if c.ConsolePort == c.NotifyPort || c.ConsolePort == c.TCPProxyPort || c.NotifyPort == c.TCPProxyPort {
+		return fmt.Errorf("console_port, notify_port, and tcp_proxy_port must all be different")
 	}
 
 	if c.VsockBaseCID < 3 {

@@ -71,6 +71,12 @@ jobs:
               # and the Linux legs run inside this Dockerfile's image
               - 'desktop/Resources/**'
               - 'desktop/Dockerfile.tauri-linux'
+              # the mac bundle-smoke path (Sparkle staging + bundle/sign) and the
+              # Makefile that wires its targets — a change to only these must still
+              # run the tauri-mac bundle smoke
+              - 'desktop/scripts/fetch-sparkle.sh'
+              - 'desktop/scripts/bundle-tauri-mac.sh'
+              - 'desktop/Makefile'
             packaging:
               - 'desktop/packaging/**'
               - 'desktop/linux/**'
@@ -508,6 +514,82 @@ jobs:
         # + tauri-linux legs do). WKWebView needs no Xvfb; the mac screenshot op is
         # TCC-gated so it's skipped here (the WebKitGTK leg is the screenshot gate).
         run: SHED_TAURI_TEST_TIMEOUT_SCALE=4 make -C desktop e2e-tauri
+      - name: Bundle smoke (Sparkle staging + ordered re-sign + plist/signing assertions)
+        # The ONLY PR-time guard on the mac packaging path (the release job can't
+        # run per-PR). Runs bundle-tauri-mac.sh end-to-end with the ad-hoc identity
+        # (--debug; the script fetches Sparkle itself) — the raw Tauri bundler
+        # output would fail strict verify without the ordered Sparkle re-sign, so
+        # this exercises the real ship path. node_modules is already installed
+        # ("Frontend deps" above); the tauri build's beforeBuildCommand rebuilds
+        # the dist. The second bundle shares the cargo target dir (incremental).
+        working-directory: desktop
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$1"; exit 1; }
+          assert_bundle() {
+            local expect_ver="$1"
+            local app="build/ShedDesktop.app"
+            local plist="${app}/Contents/Info.plist"
+            [ -d "${app}" ] || die "${app} missing"
+            # ShedDesktop.app named + bundle id aligned to the Swift app (so the
+            # eventual Swift->Tauri hop is a same-identity in-place Sparkle update).
+            local bid; bid="$(plutil -extract CFBundleIdentifier raw "${plist}")"
+            [ "${bid}" = "ai.stridelabs.ShedDesktop" ] || die "CFBundleIdentifier ${bid} != ai.stridelabs.ShedDesktop"
+            # CFBundleExecutable must name a real Mach-O under Contents/MacOS/.
+            local exec; exec="$(plutil -extract CFBundleExecutable raw "${plist}")"
+            [ -f "${app}/Contents/MacOS/${exec}" ] || die "CFBundleExecutable ${exec} not a file under Contents/MacOS/"
+            file -b "${app}/Contents/MacOS/${exec}" | grep -q "Mach-O" || die "CFBundleExecutable ${exec} is not Mach-O"
+            # Version stamped VERBATIM (both plist keys) — the prerelease run proves
+            # a `-rc.N` suffix is NOT normalized away (else rc1->rc2 false-passes).
+            local cfv cfsv
+            cfv="$(plutil -extract CFBundleVersion raw "${plist}")"
+            cfsv="$(plutil -extract CFBundleShortVersionString raw "${plist}")"
+            [ "${cfv}" = "${expect_ver}" ] || die "CFBundleVersion ${cfv} != ${expect_ver}"
+            [ "${cfsv}" = "${expect_ver}" ] || die "CFBundleShortVersionString ${cfsv} != ${expect_ver}"
+            # Sparkle embedded; Downloader.xpc entitlements after the re-sign are
+            # IDENTICAL to the pristine dist copy's (an EMPTY dict — Sparkle >=2.6
+            # dropped the Downloader sandbox, sparkle-project/Sparkle#2511). The
+            # load-bearing property: --preserve-metadata=entitlements kept the
+            # dist's and never injected the app's. (Do NOT grep for app-sandbox.)
+            local fw="${app}/Contents/Frameworks/Sparkle.framework"
+            [ -d "${fw}" ] || die "Sparkle.framework missing"
+            local bundled_dl="${fw}/Versions/B/XPCServices/Downloader.xpc"
+            local dist_dl="tauri/src-tauri/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc"
+            # Capture both extractions and require each to succeed with output —
+            # a diff of two failed/empty streams would false-green.
+            local ent_dir; ent_dir="$(mktemp -d)"
+            codesign -d --entitlements :- "${bundled_dl}" > "${ent_dir}/bundled" \
+              || die "codesign entitlements extraction failed: ${bundled_dl}"
+            codesign -d --entitlements :- "${dist_dl}" > "${ent_dir}/dist" \
+              || die "codesign entitlements extraction failed: ${dist_dl}"
+            [ -s "${ent_dir}/bundled" ] || die "empty entitlements output for ${bundled_dl}"
+            diff "${ent_dir}/bundled" "${ent_dir}/dist" >/dev/null \
+              || die "Downloader.xpc entitlements differ from the pristine dist copy"
+            rm -rf "${ent_dir}"
+            # The three Sparkle keys are present, and SUPublicEDKey matches the
+            # Swift app's Info.plist.template (a drift would break the EdDSA chain
+            # exactly at the Swift->Tauri hop).
+            local k
+            for k in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks; do
+              plutil -extract "${k}" raw "${plist}" >/dev/null 2>&1 || die "Info.plist missing ${k}"
+            done
+            local app_edkey tmpl_edkey
+            app_edkey="$(plutil -extract SUPublicEDKey raw "${plist}")"
+            tmpl_edkey="$(plutil -extract SUPublicEDKey raw Resources/Info.plist.template)"
+            [ "${app_edkey}" = "${tmpl_edkey}" ] || die "SUPublicEDKey ${app_edkey} != template ${tmpl_edkey}"
+            # The ordered re-sign must produce a strictly-valid bundle.
+            codesign --verify --strict "${app}" || die "codesign --verify --strict failed"
+            echo "bundle smoke OK: id=${bid} exec=${exec} ver=${cfv}/${cfsv} edkey=${app_edkey}"
+          }
+          # 1) The configured version, stamped verbatim.
+          ./scripts/bundle-tauri-mac.sh --debug
+          EXPECT_VER="$(python3 -c "import json,sys; print(json.load(open('tauri/src-tauri/tauri.conf.json'))['version'])")"
+          assert_bundle "${EXPECT_VER}"
+          # 2) A prerelease override — proves the suffix survives Tauri's plist
+          #    stamping verbatim (guards the rc1->rc2 rehearsal from a silent
+          #    false "up to date"). Incremental: shares the cargo target dir.
+          SHED_TAURI_CONFIG_OVERRIDE='{"version":"0.0.0-rc.1"}' ./scripts/bundle-tauri-mac.sh --debug
+          assert_bundle "0.0.0-rc.1"
 
   docs-build:
     name: docs build

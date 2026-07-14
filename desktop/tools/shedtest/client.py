@@ -355,17 +355,56 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         self.call("ui.show_window")
 
     def show_preferences(self) -> None:
-        """Open the in-app Preferences modal (raises the window + emits the event)."""
+        """Open/focus the dedicated Preferences window (a singleton: created lazily
+        on the first open, fronted if already open; closing it hides it). Does NOT
+        raise the dashboard (mac parity). `ui.open_preferences` is an equivalent
+        alias op (the mac op name)."""
         self.call("ui.show_preferences")
+
+    def open_preferences(self) -> None:
+        """The `ui.open_preferences` alias (the mac op name) for show_preferences."""
+        self.call("ui.open_preferences")
+
+    def prefs_dump(self) -> dict:
+        """The Preferences window's drivable state: `{visible, title, prefs}`.
+        `visible`/`title` are Rust-side native window truth (visible False and
+        prefs None before the first open); `prefs` is the window's reported
+        snapshot `{sections, values, mode}`."""
+        return self.call("prefs.dump")
+
+    def prefs_close(self) -> None:
+        """Close (hide) the Preferences window — the close-hides singleton contract."""
+        self.call("prefs.close")
+
+    def remove_shed_rule(self, server: str, shed: str) -> None:
+        """Remove one per-shed override rule + persist the remaining set (the same
+        path as the Preferences row's remove button). `server` is matched verbatim
+        ('' = the single/unnamed server)."""
+        self.call("prefs.remove_shed_rule", {"server": server, "shed": shed})
 
     def show_create(self) -> None:
         """Open the New-Shed dialog (raises the window + emits the event)."""
         self.call("ui.show_create")
 
+    def show_launch(self) -> None:
+        """Open the New-session (launch agent) dialog (raises the window + emits the event)."""
+        self.call("ui.show_launch")
+
     def agents_dump(self) -> list[dict]:
         """The RC sessions the Agents pane rendered — the drivable `agents.dump`
         UI truth (empty unless the UI is on the agents pane)."""
         return self.call("agents.dump")["sessions"]
+
+    def provider_modes_get(self) -> dict:
+        """The AWS/Docker provider approval modes ({namespace: 'approve'|'deny'}) —
+        the read side of set_provider_mode. A namespace absent from the map is Deny."""
+        return self.call("prefs.provider_modes")
+
+    def set_provider_mode(self, namespace: str, decision: str) -> None:
+        """Set an AWS/Docker provider mode + persist. `namespace` is the full string
+        ('aws-credentials'|'docker-credentials'); `decision` is 'approve'|'deny'. A
+        non-provider namespace is rejected (bad_request)."""
+        self.call("prefs.set_provider", {"namespace": namespace, "decision": decision})
 
     def activate(self) -> None:
         self.call("app.activate")
@@ -375,17 +414,63 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         return self.call("ui.current_pane").get("pane")
 
     def modal(self) -> str | None:
-        """Which modal (if any) the frontend has open: 'prefs' | 'create' | None."""
+        """Which modal (if any) the frontend has open: 'create' | 'launch' | None.
+        (Preferences is a dedicated window, not a modal — see prefs_dump.)"""
         return self.call("ui.modal").get("modal")
 
     def computed_style(self) -> dict | None:
-        """A computed-style sample the frontend reported (body bg/color + accent),
-        so a test can confirm the WebView applied the theme."""
+        """A computed-style sample the frontend reported (body bg/color + accent +
+        the active light/dark mode), so a test can confirm the WebView applied the
+        theme and observe the appearance op."""
         return self.call("ui.computed_style").get("style")
+
+    def set_appearance(self, mode: str) -> None:
+        """Drive the dashboard's light/dark mode (`ui.set_appearance` → the shell's
+        `set-appearance` listener), so dark screenshots are deterministic."""
+        self.call("ui.set_appearance", {"mode": mode})
+
+    def badges(self) -> dict | None:
+        """The sidebar nav badge counts the shell reported ({sheds, agents, hosts,
+        pending}), or None before its first report — UI truth, like agents_dump."""
+        return self.call("ui.badges").get("badges")
 
     def system_df(self) -> list[dict]:
         """Per-host disk usage (`[HostDiskUsage]`); each row has host/usage/error."""
         return self.call("system.df")["usage"]
+
+    def egress_dump(self) -> dict | None:
+        """The Egress pane's rendered state (`egress.profiles` UI truth, like
+        agents_dump): `{tab, profiles, errors, selected, activity_count}` — or
+        None unless the UI is on the egress pane and it has reported."""
+        return self.call("egress.profiles").get("egress")
+
+    def egress_show(self, tab: str | None = None, profile: str | None = None,
+                    host: str | None = None) -> None:
+        """Drive the Egress pane's sub-tab ('activity'|'profiles') and/or the
+        selected profile — the `egress.show` op → `egress-show` event. Selection
+        resolves by (host, name) when `host` is given, else by name (first match).
+
+        The pane's `egress-show` listener attaches asynchronously after mount, so the
+        op returns `frontend_not_ready` until the pane has reported (its snapshot is
+        non-null, which implies the listener is live). Retry on that — never on a real
+        error like `bad_request` — so a drive right after navigation can't be lost to
+        the attach race (harness convention: wait, don't sleep-and-hope)."""
+        params: dict = {}
+        if tab is not None:
+            params["tab"] = tab
+        if profile is not None:
+            params["profile"] = profile
+        if host is not None:
+            params["host"] = host
+        deadline = time.monotonic() + scaled_timeout(15.0)
+        while True:
+            try:
+                self.call("egress.show", params)
+                return
+            except ShedError as e:
+                if e.code != "frontend_not_ready" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
 
     def terminal_preview(self, shed: str, host: str | None = None, session: str | None = None,
                          preset: str | None = None, template: str | None = None) -> dict:
@@ -451,3 +536,17 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
     def tray_hide(self) -> None:
         """Hide the mac popover."""
         self.call("tray.hide")
+
+    # -- Sparkle updater (the popover "Check for Updates…" row) -----------
+    def updater_status(self) -> dict:
+        """The updater's status: `{os, enabled, reason}` (enabled == reason=='ok').
+        Platform-truthful: Linux ⇒ reason 'linux_apt'; mac under the harness ⇒
+        'test_mode' (the plugin is never registered in test mode); mac unbundled ⇒
+        'no_bundle'; a real bundle ⇒ 'ok'."""
+        return self.call("updater.status")
+
+    def updater_check(self) -> None:
+        """A user-invoked update check. On the enabled path presents Sparkle; when
+        disabled raises ShedError('updater_disabled') whose message carries the
+        reason ('updater_disabled:<reason>') — never crashes the app."""
+        self.call("updater.check")

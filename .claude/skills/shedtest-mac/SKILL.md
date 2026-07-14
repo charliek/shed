@@ -88,6 +88,54 @@ make -C desktop smoke                # drive the app + capture labeled screensho
   existing 4-space style; formatting churn muddies review.
 - The control socket + lock live under `~/Library/Caches/ShedDesktop/` and are NOT
   moved by `SHED_DESKTOP_STATE_DIR`, so the harness + a dev session agree on them.
+- **Tauri screenshots on macOS are Screen-Recording-TCC-gated.** The mac app's
+  `app.screenshot` renders the content view in-process (no permission needed), but
+  the **Tauri** client (`--target tauri` on a Mac) has no in-process WebKitGTK
+  capture — it shells out to `screencapture`, which exits 1 without a Screen-
+  Recording grant in an agent/headless session. Those Tauri screenshot assertions
+  **skip on Darwin by design** (see `test_tauri.py`); for real visual capture of the
+  Tauri client run the `shedtest-linux` render gate under Xvfb (`ui.set_appearance`
+  makes the dark shot deterministic there).
+
+## Tauri mac packaging + Sparkle updater (rough edges)
+
+The Tauri client now ships a **macOS** DMG with an embedded real Sparkle updater
+(`make -C desktop tauri-dmg-mac`; the updater is the tray popover's "Check for Updates…"
+row, drivable over IPC). Mac-specific gotchas:
+
+- **Every mac Tauri build needs `Sparkle.framework` staged first.** The overlay
+  `tauri.macos.conf.json` embeds it and the `tauri-plugin-sparkle-updater` crate's
+  `build.rs` **panics at build time if it is absent**. `make -C desktop sparkle-framework`
+  stages it (`scripts/fetch-sparkle.sh`, pinned Sparkle 2.8.1, checksum-verified,
+  idempotent); on Darwin it is an **automatic prerequisite** of `tauri-build` /
+  `tauri-lint` / `tauri-test` / `tauri-run`. The framework + `.sparkle-dist/` bin tools
+  are **gitignored** and `--exclude`'d from the Docker tar legs.
+- **Unbundled binaries load Sparkle via a debug-only rpath** injected by `build.rs`, so
+  `cargo test` / `make tauri-run` / the raw harness binary can link the staged framework.
+  **Release DMGs stay clean** — they use the bundled `@executable_path/../Frameworks` copy.
+- **Verifying the Sparkle dialog on a dev Mac is TCC-bound** (no in-process WebKitGTK
+  capture, and `screencapture` needs a Screen-Recording grant). The reliable signal is the
+  log, not a screenshot: `log show --predicate 'subsystem == "org.sparkle-project.Sparkle"'`
+  (look for the `.sessionInProgress` line) confirms the check ran and fronted a session.
+- **`npm --prefix ui exec tauri` keeps the shell's cwd** (load-bearing — the Tauri CLI
+  walks up from cwd to find `src-tauri/tauri.conf.json`; `bundle-tauri-mac.sh` runs it from
+  `desktop/tauri`). A wrong cwd fails to locate the config.
+- **Sparkle ≥ 2.6's `Downloader.xpc` has EMPTY entitlements** (its sandbox was removed,
+  Sparkle #2511). Never assert `app-sandbox` on it; the re-sign preserves the dist's empty
+  entitlements and must not inject the app's.
+- **The updater is drivable over IPC:** `updater.status` → `{os, enabled, reason,
+  instantiated}` and `updater.check`. Under the harness the plugin is **never registered**
+  (Swift parity), so status is `enabled=false, instantiated=false`, `reason="test_mode"` on
+  mac (`"linux_apt"` on the Linux render gate); `updater.check` returns the deterministic
+  `updater_disabled:<reason>` error and never crashes. `test_tauri.py` pins both.
+- **The mac dev config dir moved** to `~/Library/Application Support/ai.stridelabs.ShedDesktop`
+  (identity alignment for the Swift→Tauri hop). The harness is unaffected — it runs under a
+  throwaway HOME — but a hand-run dev bundle reads/writes there now.
+- **`hdiutil detach` can report a different disk number than `attach` printed** — verify the
+  actual device with `hdiutil info` rather than trusting the attach output when scripting
+  DMG mount/unmount.
+- **`cp -R` preserves read-only directory bits** — after copying a signed/notarized `.app`
+  around, `chmod -R u+w` it before `rm -rf`, or the delete fails on the read-only dirs.
 
 ## When you hit a NEW rough edge
 

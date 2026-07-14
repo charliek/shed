@@ -148,7 +148,7 @@ shed-ext-proxy-host (:9080, reverse proxy with route table)
   |  HTTP upgrade to Connect API
   v
 shed-server (:8080, Connect API endpoint)
-  |  DialService (vsock CONNECT for VZ, bridge TCP for Firecracker)
+  |  DialService (vsock CONNECT through the guest tcpproxy on both VZ and Firecracker)
   v
 Service inside VM (:3000, :8080, etc.)
 ```

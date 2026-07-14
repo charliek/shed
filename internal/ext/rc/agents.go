@@ -50,6 +50,13 @@ type AgentSpec struct {
 	// in a terminal to log in (surfaced by clients via AuthHintFor). Empty for tools
 	// with no auth (shell).
 	AuthHint string
+	// PromptAnchor matches a stable pane that is sitting at this tool's empty input
+	// composer — the "waiting for the operator to type" chrome. The pane-stability
+	// engine (stability.go) uses it to distinguish needs_input (quiet AND at a prompt)
+	// from plain idle (quiet, no prompt visible). nil for tools whose activity is not
+	// pane-derived and that expose no anchor. Matched against the RAW captured pane
+	// (not the normalized snapshot) so composer chrome survives.
+	PromptAnchor *regexp.Regexp
 }
 
 // PaneResult is a Classify outcome: the derived lifecycle state plus the optional
@@ -100,6 +107,41 @@ const (
 	toolShell    = "shell"
 )
 
+// Prompt anchors — the empty-composer / waiting-for-input chrome per tool, used by
+// the pane-stability engine to split needs_input from idle on a quiet pane. Each is
+// pinned to a live-captured fixture line under testdata/panes (or the SUMMARY.txt
+// capture notes where no ready fixture is committed) — see the doc comment on each.
+var (
+	// codexPromptAnchorRe matches codex's empty-composer placeholder — the prompt
+	// codex draws when idle and waiting for a line. Composed from the shared
+	// codexComposerPlaceholder literal (one source of truth with codexReadyRe, the
+	// opencode composition pattern). Deliberately narrower than codexReadyRe (which
+	// also matches the boot banner) so ONLY a pane genuinely parked at the composer
+	// reads needs_input.
+	codexPromptAnchorRe = regexp.MustCompile(codexComposerPlaceholder)
+	// opencodePromptAnchorRe matches opencode's fresh-composer placeholder
+	// ("Ask anything...", testdata/panes/opencode-ready.txt) or its persistent
+	// "ctrl+p commands" footer (opencode-ready-active.txt) — the placeholder is the
+	// clean idle-at-prompt signal, the footer catches a mid-conversation quiescent
+	// pane where the placeholder is gone. Composed from the two classifier ready-chrome
+	// regexes (opencodePlaceholderRe | opencodeFooterRe) rather than re-spelling their
+	// literals, so the anchor shares one source of truth with them and can't silently
+	// drift out of sync if opencode rebrands either string.
+	opencodePromptAnchorRe = regexp.MustCompile(opencodePlaceholderRe.String() + "|" + opencodeFooterRe.String())
+	// claudePromptAnchorRe matches claude's composer box ("> Try \"…\"" placeholder)
+	// or its "? for shortcuts" footer hint. No claude-ready pane fixture is committed
+	// (only claude-dead.txt); the anchor text is taken from the live capture recorded
+	// in testdata/panes/SUMMARY.txt (CLAUDE section: composer `> Try "refactor
+	// <filepath>"`, footer `? for shortcuts · <- for agents`). claude's activity is
+	// primarily transcript-derived; this anchor is the stability fallback.
+	claudePromptAnchorRe = regexp.MustCompile(`(?m)^\s*>\s+Try "|\? for shortcuts`)
+	// shellPromptAnchorRe matches a bare shed guest login-shell prompt line
+	// ("[shed:<name>] <cwd> $") anywhere in the pane — a shell session idle at its
+	// PS1 is waiting for a command. Mirrors shedShellPromptRe but multiline (matches a
+	// prompt line within the whole capture, not just the trimmed last line).
+	shellPromptAnchorRe = regexp.MustCompile(`(?m)^\s*\[shed:[^\]]+\][^$]*\$\s*$`)
+)
+
 // noPostureMap is the generic tri-state mapping for tools whose modes need no flags
 // at all (shell): every generic mode is accepted but produces nothing. Agent specs
 // define their own maps with the real flags.
@@ -127,8 +169,9 @@ var agentRegistry = []*AgentSpec{
 			PermModeSkip:    {"--permission-mode", PermissionModeBypass},
 		},
 		// claude additionally accepts its full historical --permission-mode set.
-		ExtraModes: []string{"acceptEdits", "plan", "dontAsk", PermissionModeBypass},
-		AuthHint:   "run `claude` \u2192 /login",
+		ExtraModes:   []string{"acceptEdits", "plan", "dontAsk", PermissionModeBypass},
+		AuthHint:     "run `claude` \u2192 /login",
+		PromptAnchor: claudePromptAnchorRe,
 	},
 	{
 		Tool:         toolCodex,
@@ -150,7 +193,8 @@ var agentRegistry = []*AgentSpec{
 			PermModeAuto: {"--ask-for-approval", "on-request", "--sandbox", "workspace-write"},
 			PermModeSkip: {"--dangerously-bypass-approvals-and-sandbox"},
 		},
-		AuthHint: "run `codex` and complete login (`codex login`)",
+		AuthHint:     "run `codex` and complete login (`codex login`)",
+		PromptAnchor: codexPromptAnchorRe,
 	},
 	{
 		Tool:         toolOpencode,
@@ -166,7 +210,8 @@ var agentRegistry = []*AgentSpec{
 			PermModeAuto: {"--auto"},
 			PermModeSkip: {"--auto"},
 		},
-		AuthHint: "run `opencode auth login`",
+		AuthHint:     "run `opencode auth login`",
+		PromptAnchor: opencodePromptAnchorRe,
 	},
 	{
 		Tool:         toolCursor,
@@ -182,6 +227,9 @@ var agentRegistry = []*AgentSpec{
 			PermModeSkip: {"--force"},
 		},
 		AuthHint: "run `cursor-agent login`",
+		// cursorReadyRe is the authed composer placeholder ("→ Plan, search, build
+		// anything", testdata/panes/cursor-ready.txt) — reused as the prompt anchor.
+		PromptAnchor: cursorReadyRe,
 	},
 	{
 		Tool:         toolShell,
@@ -192,8 +240,19 @@ var agentRegistry = []*AgentSpec{
 		Preseed:      nil,
 		// A shell has no permission posture; the generic modes are accepted (valid for
 		// ALL kinds) but produce no flags.
-		PermMap: noPostureMap,
+		PermMap:      noPostureMap,
+		PromptAnchor: shellPromptAnchorRe,
 	},
+}
+
+// promptAnchorFor returns the kind's prompt-anchor regex, or nil for an unregistered
+// kind or a spec that declares none. Used by the pane-stability engine to decide
+// needs_input vs idle on a quiet pane.
+func promptAnchorFor(k Kind) *regexp.Regexp {
+	if spec, ok := specForKind(k); ok {
+		return spec.PromptAnchor
+	}
+	return nil
 }
 
 // kindToSpec indexes the registry by kind for O(1) lookup. It is populated in init()
@@ -358,11 +417,19 @@ func classifyClaude(kind Kind, pane string) PaneResult {
 	}
 }
 
+// codexComposerPlaceholder is the regex source for codex's empty-composer
+// placeholder line ("› Find and fix a bug in @filename",
+// testdata/panes/codex-ready.txt line 40). Hoisted so codexReadyRe (banner OR
+// composer ⇒ ready) and codexPromptAnchorRe (composer only ⇒ needs_input anchor)
+// share one literal and can't silently drift apart if codex rewords the hint.
+const codexComposerPlaceholder = `Find and fix a bug in @filename`
+
 var (
 	// codex: the composer banner means codex is usable — it wins even over the MCP
 	// token_expired warning below (that warning is an MCP-app sub-service failure, not
-	// core auth, and appears inline on the working ready screen).
-	codexReadyRe = regexp.MustCompile(`>_ OpenAI Codex \(v|Find and fix a bug in @filename`)
+	// core auth, and appears inline on the working ready screen). Composed as the
+	// version banner OR the shared composer placeholder.
+	codexReadyRe = regexp.MustCompile(`>_ OpenAI Codex \(v` + `|` + codexComposerPlaceholder)
 	codexTrustRe = regexp.MustCompile(`(?i)Do you trust the contents of this directory\?`)
 	// codex core-auth failure / not-signed-in (only meaningful when the composer is
 	// absent). A fresh, never-authed codex shows the "Sign in with ChatGPT" onboarding
@@ -429,13 +496,26 @@ func classifyOpencode(_ Kind, pane string) PaneResult {
 // notice).
 var cursorAuthRe = regexp.MustCompile(`(?i)Press any key to log in\.\.\.|Authentication required to use Cursor Agent|click this link to log in`)
 
-// classifyCursor derives a cursor-agent pane's lifecycle state. Its authed/ready
-// screen needs an interactive login and was not captured live, so a logged-in cursor
-// currently reads as starting (tracked as an authed-fixture follow-up); needs-auth is
-// the definitively-classified state.
+// cursorReadyRe anchors on the authed composer's placeholder, line-anchored with its
+// arrow prefix so the phrase quoted inside agent output can't read as ready. cursor
+// swaps the placeholder text after the first exchange: a fresh composer shows
+// "→ Plan, search, build anything" (testdata/panes/cursor-ready.txt), a
+// mid-conversation composer shows "→ Add a follow-up"
+// (testdata/panes/cursor-ready-active.txt) — both are the same "ready / waiting for
+// input" chrome, so both must classify ready (a live capture proved the follow-up
+// form dropped the session back to starting). Also reused as cursor's stability
+// PromptAnchor, so needs_input fires at either composer.
+var cursorReadyRe = regexp.MustCompile(`(?m)^\s*→ (?:Plan, search, build anything|Add a follow-up)\s*$`)
+
+// classifyCursor derives a cursor-agent pane's lifecycle state. The auth screens and
+// the authed composer are disjoint, so auth is checked first and ready second;
+// anything else (booting, mid-conversation) reads as starting.
 func classifyCursor(_ Kind, pane string) PaneResult {
 	if cursorAuthRe.MatchString(pane) {
 		return PaneResult{State: StateNeedsAuth}
+	}
+	if cursorReadyRe.MatchString(pane) {
+		return PaneResult{State: StateReady}
 	}
 	return PaneResult{State: StateStarting}
 }

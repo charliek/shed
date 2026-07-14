@@ -16,6 +16,7 @@ mod single_instance;
 mod state;
 mod termctl;
 mod tray;
+mod updater;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,14 +29,15 @@ use shed_app::{
     HelloClientInfo, HostAgentClient, HostAgentTokenMinter, RcService, SshPrefs,
 };
 use shed_core::approval::{
-    ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, SshApprovalPolicy,
+    namespace, ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule,
+    PolicyScope, SshApprovalPolicy,
 };
 use shed_core::models::CreateShedRequest;
 use shed_core::rc::RcKind;
 use shed_core::token::TokenMinter;
 use single_instance::AcquireError;
 use state::{SharedUi, UiState};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// A React frontend reports its rendered snapshot (`{pane, style, sheds,
 /// refresh_token}`) here, so the harness reads the real rendered state over IPC
@@ -52,20 +54,19 @@ fn ui_report(
     // Mirror the running-shed count onto the menu-bar status item (Swift parity).
     // The dashboard (`main`) reports the full shed list here even while hidden at
     // launch, so the tray count is live without a Rust-side poller. macOS-only;
-    // computed before the snapshot is moved into `merge`.
+    // computed before the snapshot is moved into `merge`. Guarded on the `sheds` key
+    // being PRESENT (defense-in-depth): the shell only sends full snapshots now, but
+    // a report that omitted `sheds` must NOT be read as "zero running" and blank the
+    // count — skip it and keep the last known count instead.
     #[cfg(target_os = "macos")]
     if window.label() == "main" {
-        let running = snapshot
-            .get("sheds")
-            .and_then(|v| v.as_array())
-            .map(|sheds| {
-                sheds
-                    .iter()
-                    .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("running"))
-                    .count()
-            })
-            .unwrap_or(0);
-        crate::tray::update_running_count(window.app_handle(), running);
+        if let Some(sheds) = snapshot.get("sheds").and_then(|v| v.as_array()) {
+            let running = sheds
+                .iter()
+                .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("running"))
+                .count();
+            crate::tray::update_running_count(window.app_handle(), running);
+        }
     }
     if let Ok(mut s) = ui.lock() {
         s.merge(window.label(), snapshot);
@@ -167,6 +168,18 @@ async fn shed_action(
 #[tauri::command]
 async fn system_df(backend: tauri::State<'_, Arc<Backend>>) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!(backend.system_df().await))
+}
+
+/// The WebView's per-host egress profiles — `invoke("egress_profiles")` when the
+/// Egress pane mounts / on its Refresh. Each row is a host's profiles or the
+/// error it returned (unreachable / egress-disabled hosts are kept as error rows,
+/// not dropped) — the same fan-out shape as `system_df`. The harness reads the
+/// RENDERED rows via the `egress.profiles` IPC op instead (UI truth).
+#[tauri::command]
+async fn egress_profiles(
+    backend: tauri::State<'_, Arc<Backend>>,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!(backend.egress_profiles().await))
 }
 
 // -- terminal + prefs commands (the frontend Preferences view + the shed-card
@@ -289,12 +302,14 @@ async fn approvals_list(
 #[tauri::command]
 async fn approval_decide(
     coordinator: tauri::State<'_, Coordinator>,
+    prefs: tauri::State<'_, prefs::SharedPrefs>,
     id: String,
     decision: ApprovalDecision,
     scope: Option<ApprovalScope>,
     ttl: Option<String>,
     persist: Option<bool>,
 ) -> Result<(), String> {
+    let persist = persist.unwrap_or(false);
     coordinator
         .decide_approval(
             id,
@@ -302,10 +317,15 @@ async fn approval_decide(
                 decision,
                 scope,
                 ttl,
-                persist: persist.unwrap_or(false),
+                persist,
             },
         )
         .await;
+    // A persisted (always-allow/deny) decision adds a per-shed rule — mirror it into
+    // prefs.json so the override survives a restart (the hydration source of truth).
+    if persist {
+        persist_shed_rules(&prefs, &coordinator).await;
+    }
     Ok(())
 }
 
@@ -389,6 +409,174 @@ async fn ssh_prefs_get(
     coordinator: tauri::State<'_, Coordinator>,
 ) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!(coordinator.ssh_prefs().await))
+}
+
+// -- provider (AWS/Docker) approval modes + per-shed overrides -----------------
+
+/// Serialize the coordinator's provider modes to their wire strings (the map the
+/// Preferences segmented control reads back + the shape persisted to prefs.json),
+/// via serde rather than a hand-maintained enum→string match. An unserializable
+/// value falls back to the fail-closed `"deny"`.
+pub(crate) fn provider_modes_wire(
+    modes: &HashMap<String, ApprovalDecision>,
+) -> HashMap<String, String> {
+    modes
+        .iter()
+        .map(|(ns, d)| {
+            let wire = serde_json::to_value(d)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "deny".to_string());
+            (ns.clone(), wire)
+        })
+        .collect()
+}
+
+/// The per-shed (scope == Shed) rules from the engine, as wire JSON for persistence.
+/// The namespace rules (SSH/AWS/Docker) are rebuilt from prefs at startup, so only
+/// the derived per-shed overrides are persisted.
+pub(crate) fn shed_rules_wire(rules: &[PolicyRule]) -> Vec<serde_json::Value> {
+    rules
+        .iter()
+        .filter(|r| r.scope == PolicyScope::Shed)
+        .map(|r| serde_json::json!(r))
+        .collect()
+}
+
+/// Mirror the coordinator's current per-shed override rules into prefs.json — the
+/// single write-through every rule-mutating path (persist decision, remove) shares,
+/// so the persisted set always matches the live engine (the hydration source of truth).
+pub(crate) async fn persist_shed_rules(prefs: &prefs::PrefsStore, coordinator: &Coordinator) {
+    prefs.set_extra_rules(shed_rules_wire(&coordinator.policy_list().await));
+}
+
+/// Mirror the coordinator's current provider (AWS/Docker) modes into prefs.json — the
+/// shared write-through for every provider-mode change so the choice survives a restart.
+pub(crate) async fn persist_provider_modes(prefs: &prefs::PrefsStore, coordinator: &Coordinator) {
+    prefs.set_provider_modes(provider_modes_wire(&coordinator.provider_modes().await));
+}
+
+/// Rebuild the provider modes from the persisted store, keyed by the FULL namespace
+/// constants and parsing each decision via serde — falling back to the fail-closed
+/// `Deny` for any unparseable value, and ignoring any namespace other than the two
+/// providers (so a corrupt file never panics and never widens a mode). Empty when
+/// absent (unset == Deny by default in the coordinator).
+fn provider_modes_from_store(store: &prefs::PrefsStore) -> HashMap<String, ApprovalDecision> {
+    store
+        .get()
+        .provider_modes
+        .into_iter()
+        .filter(|(ns, _)| ns == namespace::AWS || ns == namespace::DOCKER)
+        .map(|(ns, v)| {
+            let d = parse_wire::<ApprovalDecision>(&v).unwrap_or(ApprovalDecision::Deny);
+            (ns, d)
+        })
+        .collect()
+}
+
+/// Rebuild the per-shed override rules from the persisted store, skipping any rule a
+/// current build can't parse (corrupt-tolerant — a dropped rule fails closed to the
+/// namespace policy rather than blocking startup).
+fn extra_rules_from_store(store: &prefs::PrefsStore) -> Vec<PolicyRule> {
+    store
+        .get()
+        .extra_rules
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<PolicyRule>(v).ok())
+        // extra_rules is per-shed override storage: a hand-edited/corrupt prefs.json
+        // must not be able to inject default- or namespace-scope policy at startup.
+        .filter(|r| r.scope == PolicyScope::Shed)
+        .collect()
+}
+
+/// The current provider (AWS/Docker) modes (`{namespace: "approve"|"deny"}`) — drives
+/// the Preferences segmented Allow|Deny so it reflects the running coordinator.
+#[tauri::command]
+async fn provider_modes_get(
+    coordinator: tauri::State<'_, Coordinator>,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!(coordinator.provider_modes().await))
+}
+
+/// Set an AWS/Docker provider mode + persist, so the choice survives a restart. The
+/// coordinator rejects any namespace other than the two providers (surfaced as the
+/// error string). Persists the coordinator's RESULTING modes (source of truth).
+#[tauri::command]
+async fn set_provider_mode(
+    coordinator: tauri::State<'_, Coordinator>,
+    prefs: tauri::State<'_, prefs::SharedPrefs>,
+    ns: String,
+    decision: ApprovalDecision,
+) -> Result<(), String> {
+    coordinator.set_provider_mode(ns, decision).await?;
+    persist_provider_modes(&prefs, &coordinator).await;
+    Ok(())
+}
+
+/// The per-shed override rules (scope == shed) — the Preferences "Per-shed overrides"
+/// list. A filtered read of the full policy (the namespace rules are excluded).
+#[tauri::command]
+async fn policy_list_shed(
+    coordinator: tauri::State<'_, Coordinator>,
+) -> Result<serde_json::Value, String> {
+    let rules = coordinator.policy_list().await;
+    Ok(serde_json::json!(shed_rules_wire(&rules)))
+}
+
+/// Remove one per-shed override rule (the row's remove button) + persist the
+/// remaining set, so the removal survives a restart.
+#[tauri::command]
+async fn remove_shed_rule(
+    coordinator: tauri::State<'_, Coordinator>,
+    prefs: tauri::State<'_, prefs::SharedPrefs>,
+    server: String,
+    shed: String,
+) -> Result<(), String> {
+    coordinator.remove_shed_rule(server, shed).await;
+    persist_shed_rules(&prefs, &coordinator).await;
+    Ok(())
+}
+
+// -- appearance (light/dark) sync across webviews ------------------------------
+
+/// The app-wide light/dark appearance, held in Rust so a second webview (the
+/// Preferences window) reads the initial value synchronously and every window stays
+/// in sync via the `set-appearance` event. `None` = unset (fall back to the OS
+/// `prefers-color-scheme`, popover-parity default).
+pub(crate) struct AppearanceState(pub(crate) Mutex<Option<String>>);
+
+/// The current app-wide appearance (`{mode: "light"|"dark"|null}`) — the Preferences
+/// window reads this on mount so it opens in the dashboard's mode without a flash.
+#[tauri::command]
+fn get_appearance_state(app: tauri::AppHandle) -> serde_json::Value {
+    let mode = app
+        .state::<AppearanceState>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|m| m.clone());
+    serde_json::json!({ "mode": mode })
+}
+
+/// Set the app-wide appearance + broadcast `set-appearance` to every window.
+/// Idempotent: a no-op (no re-emit) when unchanged, so the dashboard's mode effect
+/// re-invoking this on an IPC-driven change can't loop. Invoked from the dashboard's
+/// mode effect (both the manual toggle and IPC-driven changes flow through it).
+#[tauri::command]
+fn set_appearance_state(app: tauri::AppHandle, mode: String) -> Result<(), String> {
+    if !matches!(mode.as_str(), "light" | "dark") {
+        return Err(format!("unknown mode: {mode:?}"));
+    }
+    let cell = app.state::<AppearanceState>();
+    {
+        let mut cur = cell.0.lock().map_err(|_| "appearance state poisoned")?;
+        if cur.as_deref() == Some(mode.as_str()) {
+            return Ok(()); // unchanged — no re-emit (breaks the echo loop)
+        }
+        *cur = Some(mode.clone());
+    }
+    let _ = app.emit("set-appearance", serde_json::json!({ "mode": mode }));
+    Ok(())
 }
 
 // -- launch-at-login (B4) ------------------------------------------------------
@@ -477,7 +665,8 @@ fn open_dashboard(app: tauri::AppHandle) {
     tray::open_dashboard(&app);
 }
 
-/// The popover footer's "Preferences…" → raise the dashboard + open Preferences.
+/// The popover footer's "Preferences…" + the dashboard header gear → open/focus
+/// the dedicated Preferences window (and dismiss the popover if shown).
 #[tauri::command]
 fn open_preferences(app: tauri::AppHandle) {
     tray::open_preferences(&app);
@@ -506,6 +695,27 @@ fn resize_popover(app: tauri::AppHandle, height: f64) {
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
 fn resize_popover(_app: tauri::AppHandle, _height: f64) {}
+
+// -- Sparkle updater (the popover "Check for Updates…" row + the drivable ops) --
+
+/// The updater's status — `{ os: "macos"|"linux", enabled, reason }` (enabled ==
+/// reason=="ok"). Drives the popover row (enabled vs a truthful disabled tooltip).
+/// Platform-truthful everywhere: Linux ⇒ `linux_apt`, mac test mode ⇒ `test_mode`,
+/// mac unbundled ⇒ `no_bundle`, else `ok`. Mirrors the `updater.status` IPC op.
+#[tauri::command]
+fn updater_status(app: tauri::AppHandle, env: tauri::State<'_, Env>) -> serde_json::Value {
+    updater::status(&app, env.test_mode)
+}
+
+/// A user-invoked update check (the popover row's click). On the enabled path fronts
+/// the app + presents Sparkle; otherwise returns an error string that distinguishes a
+/// policy-disabled check (`updater_disabled:<reason>`, unchanged) from an operational
+/// failure on the enabled path (`updater_failed:<msg>`). Mirrors the `updater.check`
+/// IPC op (which maps the same split onto the `updater_disabled`/`action_failed` codes).
+#[tauri::command]
+fn updater_check(app: tauri::AppHandle, env: tauri::State<'_, Env>) -> Result<(), String> {
+    updater::check(&app, env.test_mode).map_err(|e| e.to_string())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -558,6 +768,7 @@ pub fn run() {
         env.mock_base_url.as_deref(),
         &env.config_path,
         minter.as_ref(),
+        &env.mock_unreachable_hosts,
     ));
 
     // The Agents / Remote-Control service (session store + process seam). Same
@@ -565,7 +776,8 @@ pub fn run() {
     // the real path shells out `shed-ext-rc` over SSH.
     let rc_service = Arc::new(RcService::new_default(env.test_mode, env!("CARGO_PKG_VERSION")));
 
-    tauri::Builder::default()
+    #[allow(unused_mut)] // only the macOS+non-test arm re-binds it (the sparkle plugin)
+    let mut builder = tauri::Builder::default()
         // Launch-at-login (B4): register the plugin so `app.autolaunch()` resolves;
         // it does NOT enable autostart on its own (no startup side effect). The
         // React toggle drives our guarded `loginitem_*` commands, not the plugin's
@@ -583,12 +795,29 @@ pub fn run() {
         .manage(rc_service.clone())
         // The macOS test-mode login-item cell (see [`LoginItemCell`]).
         .manage(LoginItemCell(Mutex::new(false)))
+        // The app-wide light/dark appearance, shared across webviews (unset at
+        // launch → the OS `prefers-color-scheme` is the fallback).
+        .manage(AppearanceState(Mutex::new(None)));
+
+    // Real Sparkle updater — registered ONLY on macOS AND outside test mode, so the
+    // updater is never instantiated under the harness (Swift-parity, enforced at
+    // registration, not inside the crate). The plugin's setup manages a
+    // `SparkleUpdater` state iff it's a valid bundle (inert under `cargo run` / the
+    // raw harness binary). Its post-init config (auto-checks off + the channel set)
+    // is applied in `.setup` below via `updater::configure`.
+    #[cfg(target_os = "macos")]
+    if !env.test_mode {
+        builder = builder.plugin(tauri_plugin_sparkle_updater::init());
+    }
+
+    builder
         .invoke_handler(tauri::generate_handler![
             ui_report,
             list_sheds,
             list_hosts,
             shed_action,
             system_df,
+            egress_profiles,
             create_start,
             create_status,
             create_cancel,
@@ -605,12 +834,20 @@ pub fn run() {
             gate_namespaces,
             set_ssh_approval,
             ssh_prefs_get,
+            provider_modes_get,
+            set_provider_mode,
+            policy_list_shed,
+            remove_shed_rule,
+            get_appearance_state,
+            set_appearance_state,
             loginitem_status,
             loginitem_set,
             open_dashboard,
             open_preferences,
             app_exit,
-            resize_popover
+            resize_popover,
+            updater_status,
+            updater_check
         ])
         .setup(move |app| {
             // The bundled terminal openers live in <resources>/bin; None in an
@@ -674,6 +911,11 @@ pub fn run() {
             // to the default on an absent/corrupt file), so the user's choice
             // survives a restart rather than resetting to the coordinator default.
             let ssh_prefs = ssh_prefs_from_store(&prefs);
+            // Same treatment for the provider (AWS/Docker) modes + per-shed override
+            // rules — hydrate from the persisted store so the user's choices survive
+            // a restart rather than resetting to the coordinator defaults.
+            let provider_modes = provider_modes_from_store(&prefs);
+            let extra_rules = extra_rules_from_store(&prefs);
             // Pushes coordinator changes to the webview (app.emit) so the
             // Approvals/Activity panes re-fetch reactively.
             let coord_sink: shed_app::traits::EventSinkRef =
@@ -694,8 +936,8 @@ pub fn run() {
                         sink: coord_sink,
                         audit,
                         ssh: ssh_prefs,
-                        extra_rules: Vec::new(),
-                        provider_modes: HashMap::new(),
+                        extra_rules,
+                        provider_modes,
                     },
                     host_events,
                 );
@@ -778,6 +1020,11 @@ pub fn run() {
                         let _ = main.hide();
                     }
                     ipc::set_activation_policy_prod(app.handle(), false);
+                    // Post-init updater config (the plugin's setup already ran +
+                    // managed the SparkleUpdater state if this is a valid bundle):
+                    // automatic checks off + the beta-iff-prerelease channel set,
+                    // applied before any user-invoked check_for_updates().
+                    updater::configure(app.handle(), env!("CARGO_PKG_VERSION"));
                 }
             }
             Ok(())
