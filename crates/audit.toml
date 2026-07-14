@@ -1,0 +1,17 @@
+# cargo-audit configuration for the crates/ workspace.
+#
+# Not yet wired into CI (adopting `cargo audit` as a gate is a tracked
+# follow-up); this file records the accepted advisories so that adoption
+# does not hard-fail on a known, unfixable, ecosystem-wide issue.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — `rsa` Marvin timing side-channel (medium 5.9).
+    # No fixed version exists (ecosystem-wide; the pure-Rust rsa crate has no
+    # constant-time private-key path yet). It reaches shed-host-agent via the
+    # local-keys SSH backend's RSA sign path (direct dep + via ssh-key 0.6.7),
+    # gated behind the approval gate. This is a port-specific residual: Go's
+    # crypto/rsa carries Marvin mitigations. Tracked for re-evaluation when an
+    # upstream fix lands or the RSA local-key path is reconsidered.
+    "RUSTSEC-2023-0071",
+]
