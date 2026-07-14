@@ -955,13 +955,24 @@ pub fn spawn_server_group(
         });
     }
 
-    // Provider + pin from should_mint (Go's `startWatcherGroup`): a SECURE server
+    // TLS leaf pin from the target fingerprint ALONE — never the token choice.
+    // Computed ONCE here (not per-branch) so it can't be dropped on one path: Go's
+    // `startWatcherGroup` passes `WithTLSPin(t.TLSFingerprint)` unconditionally
+    // (supervisor.go). A discovery target can be https + pinned + static-token
+    // (fingerprint set, no ssh endpoint ⇒ not minting); dropping the pin there — as
+    // this code previously did on the static branch — sent the static bearer under
+    // plain WebPKI against a pinned server. `BusClient::new` filters an empty
+    // fingerprint (open http servers) to no-pin, and refuses a real pin on a
+    // non-https URL (covered by `pin_on_*`/`empty_pin_is_ignored_on_http`).
+    let pin = Some(target.tls_fingerprint.clone());
+
+    // Provider from should_mint (Go's `startWatcherGroup`): a SECURE server
     // (https + ssh endpoint + minter) authenticates with a self-minted, auto-refreshing
-    // credentials-scope token bridged onto the bus `TokenProvider`, pinned to
-    // `tls_fingerprint`; an OPEN server sends its (usually empty) static token with no pin.
+    // credentials-scope token bridged onto the bus `TokenProvider`; an OPEN server
+    // sends its (usually empty) static token.
     let secure = crate::supervisor::should_mint(deps, target);
     let mut refresh_source: Option<Arc<crate::minter::CredentialSource>> = None;
-    let (provider, pin): (Arc<dyn TokenProvider>, Option<String>) = if secure {
+    let provider: Arc<dyn TokenProvider> = if secure {
         let minter = deps
             .minter
             .clone()
@@ -974,15 +985,9 @@ pub fn spawn_server_group(
         refresh_source = Some(src.clone());
         // `Arc<CredentialSource>: TokenProvider` (the bridge in `supervisor.rs`) — box it
         // into the trait object the client holds.
-        (
-            Arc::new(src) as Arc<dyn TokenProvider>,
-            Some(target.tls_fingerprint.clone()),
-        )
+        Arc::new(src) as Arc<dyn TokenProvider>
     } else {
-        (
-            Arc::new(StaticTokenProvider::new(target.token.clone())) as Arc<dyn TokenProvider>,
-            None,
-        )
+        Arc::new(StaticTokenProvider::new(target.token.clone())) as Arc<dyn TokenProvider>
     };
 
     let client = match BusClient::new(
