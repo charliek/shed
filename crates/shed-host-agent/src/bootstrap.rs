@@ -840,7 +840,7 @@ mod tests {
     /// error-asserting tests (timeout, changed-host-key) are unaffected.
     async fn run_shim(body: &str, p: &Params, timeout: Duration) -> Result<Bundle, BootstrapError> {
         let mut delay = Duration::from_millis(10);
-        for _ in 0..9 {
+        for _ in 0..10 {
             let (_dir, ssh) = write_shim(body);
             match SystemSshRunner::with_shim(ssh, timeout).run(p).await {
                 Err(BootstrapError::SshFailed(m)) if m.contains("os error 26") => {
@@ -850,8 +850,11 @@ mod tests {
                 r => return r,
             }
         }
-        let (_dir, ssh) = write_shim(body);
-        SystemSshRunner::with_shim(ssh, timeout).run(p).await
+        // Exhaustion must fail LOUDLY (mirrors docker_backend::exec_retrying): a
+        // persistent ETXTBSY is not the transient fork/exec race, and returning
+        // the SshFailed would let error-asserting callers mistake it for the
+        // error they intended to provoke.
+        panic!("persistent ETXTBSY exec'ing the ssh shim — not the transient fork/exec race");
     }
 
     #[tokio::test]

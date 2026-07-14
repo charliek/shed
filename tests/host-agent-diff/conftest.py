@@ -253,9 +253,16 @@ def binaries(tmp_path_factory) -> dict:
         env=cargo_env,
     )
     # Honor CARGO_TARGET_DIR (standard cargo redirection — used e.g. by the
-    # rehab's Linux loop container to keep linux artifacts off the bind mount);
-    # default to the workspace-relative target/ otherwise.
-    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "crates" / "target"))
+    # rehab's Linux loop container to keep linux artifacts off the bind mount).
+    # Cargo resolves a RELATIVE value against ITS cwd (crates/, where we invoke
+    # it above) — not pytest's cwd — so anchor relative values there too.
+    env_target = os.environ.get("CARGO_TARGET_DIR")
+    if env_target:
+        target_dir = Path(env_target)
+        if not target_dir.is_absolute():
+            target_dir = REPO_ROOT / "crates" / target_dir
+    else:
+        target_dir = REPO_ROOT / "crates" / "target"
     rust_bin = target_dir / "debug" / "shed-host-agent"
 
     assert go_bin.exists(), f"go binary missing: {go_bin}"

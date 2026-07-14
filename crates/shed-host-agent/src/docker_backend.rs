@@ -862,7 +862,7 @@ mod tests {
         url: &str,
     ) -> Result<DockerCredential, DockerCredError> {
         let mut delay = Duration::from_millis(10);
-        for _ in 0..9 {
+        for _ in 0..10 {
             match block_on(exec.exec_helper(helper, url)) {
                 Err(e) if e.msg.contains("os error 26") => {
                     std::thread::sleep(delay);
@@ -871,7 +871,11 @@ mod tests {
                 r => return r,
             }
         }
-        block_on(exec.exec_helper(helper, url))
+        // Exhaustion must fail LOUDLY: a persistent ETXTBSY is not the transient
+        // fork/exec race, and its error also carries HELPER_FAILED — returning it
+        // would falsely satisfy the error-asserting tests below without ever
+        // exercising the behavior they exist to check.
+        panic!("persistent ETXTBSY exec'ing helper {helper:?} — not the transient fork/exec race");
     }
 
     // ---- normalize_registry (TestNormalizeRegistry) -----------------------------
