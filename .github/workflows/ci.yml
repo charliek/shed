@@ -410,6 +410,13 @@ jobs:
         run: |
           cargo test -p shed-host-agent --all-targets --locked
           cargo clippy -p shed-host-agent --all-targets --locked -- -D warnings
+      # The headless variant (surface A dropped) is the 3a.2 server/no-desktop
+      # distribution — it must not bit-rot unwatched on the platform it ships to.
+      - name: Rust host-agent — headless (--no-default-features) test + clippy (Linux)
+        working-directory: crates
+        run: |
+          cargo test -p shed-host-agent --all-targets --locked --no-default-features
+          cargo clippy -p shed-host-agent --all-targets --locked --no-default-features -- -D warnings
       - name: Go-vs-Rust differential + golden runners
         # Builds both daemon binaries (conftest) and runs the pytest differential
         # + the Go and Rust golden-fixture runners.
