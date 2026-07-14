@@ -175,8 +175,7 @@ fn known_hosts_pinned(known_hosts_path: &str, host: &str, port: u16) -> Result<(
     // matching how OpenSSH (and shed) records it.
     let want = normalize(host, port);
     for entry in KnownHosts::new(&data) {
-        let entry =
-            entry.map_err(|e| format!("parsing known_hosts {known_hosts_path}: {e}"))?;
+        let entry = entry.map_err(|e| format!("parsing known_hosts {known_hosts_path}: {e}"))?;
         // Skip marked lines: a @revoked key must never be a pin, a @cert-authority line
         // is a CA not a host-key pin (Go skips any non-empty marker).
         if entry.marker().is_some() {
@@ -396,7 +395,10 @@ impl CredentialSource {
     /// been minted yet (mirror `nextRefreshDelay`).
     fn next_refresh_delay(&self) -> Duration {
         let expiry = self.state.lock().unwrap().expiry;
-        apply_jitter_and_clamp(base_refresh_delay(expiry, now_unix()), random_jitter_fraction())
+        apply_jitter_and_clamp(
+            base_refresh_delay(expiry, now_unix()),
+            random_jitter_fraction(),
+        )
     }
 }
 
@@ -471,7 +473,7 @@ async fn wait_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::{Bundle, BootstrapError};
+    use crate::bootstrap::{BootstrapError, Bundle};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn target(name: &str, host: &str, port: u16) -> ServerTarget {
@@ -629,7 +631,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_host_key_mismatch());
-        assert!(err.message().starts_with("bootstrapping control token for \"s\":"));
+        assert!(err
+            .message()
+            .starts_with("bootstrapping control token for \"s\":"));
     }
 
     #[tokio::test]
@@ -782,7 +786,11 @@ mod tests {
         for h in handles {
             assert_eq!(h.await.unwrap().unwrap(), "tok");
         }
-        assert_eq!(gm.calls.load(Ordering::SeqCst), 1, "single-flight → one mint");
+        assert_eq!(
+            gm.calls.load(Ordering::SeqCst),
+            1,
+            "single-flight → one mint"
+        );
     }
 
     // ---- refresh-delay math (no Go test; panel F6) ----------------------------------

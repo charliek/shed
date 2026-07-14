@@ -1414,7 +1414,12 @@ fn handle_list(
                     .collect(),
             };
             let payload = to_payload(&resp);
-            let entry = list_audit(server_name, shed_name, "ok", &format!("{} keys", keys.len()));
+            let entry = list_audit(
+                server_name,
+                shed_name,
+                "ok",
+                &format!("{} keys", keys.len()),
+            );
             (payload, entry)
         }
         Err(e) => {
@@ -1507,10 +1512,11 @@ async fn handle_sign(
     backend: &Arc<dyn SshBackend>,
 ) -> (serde_json::Value, Option<AuditEntry>) {
     // 1. Decode the sign request (a wrong-typed field → invalid sign request; no audit).
-    let req: SignRequestPayload = match serde_json::from_value(env.payload.clone().unwrap_or_default()) {
-        Ok(r) => r,
-        Err(_) => return (ssh_error("invalid sign request", SSH_CODE_INTERNAL), None),
-    };
+    let req: SignRequestPayload =
+        match serde_json::from_value(env.payload.clone().unwrap_or_default()) {
+            Ok(r) => r,
+            Err(_) => return (ssh_error("invalid sign request", SSH_CODE_INTERNAL), None),
+        };
 
     // 2. Approval gate FIRST (deny-all default fails closed). The reason shown to the
     //    app is the fixed "SSH sign request" (Go's desktopGate reason) — NOT the key
@@ -1977,9 +1983,7 @@ async fn docker_dispatch(
             DOCKER_OP_GET => {
                 handle_docker_get(env, server_name, shed_name, &docker.gate, &docker.backend).await
             }
-            DOCKER_OP_LIST => {
-                handle_docker_list(server_name, shed_name, &docker.backend).await
-            }
+            DOCKER_OP_LIST => handle_docker_list(server_name, shed_name, &docker.backend).await,
             "ping" => (
                 to_payload(&DockerPingResponse {
                     status: "ok".to_string(),
@@ -2017,7 +2021,12 @@ async fn handle_docker_get(
     let req: DockerGetRequestPayload =
         match serde_json::from_value(env.payload.clone().unwrap_or_default()) {
             Ok(r) => r,
-            Err(_) => return (docker_error("invalid get request", DOCKER_CODE_INTERNAL), None),
+            Err(_) => {
+                return (
+                    docker_error("invalid get request", DOCKER_CODE_INTERNAL),
+                    None,
+                )
+            }
         };
 
     // Approval gate FIRST (deny-all fails closed). The reason names the registry so the
@@ -3066,11 +3075,20 @@ mod tests {
     fn parse_operation_matches_go_unmarshal() {
         use serde_json::json;
         // Object with a string operation → that op.
-        assert_eq!(parse_operation(&Some(json!({"operation":"list"}))), Ok("list".into()));
+        assert_eq!(
+            parse_operation(&Some(json!({"operation":"list"}))),
+            Ok("list".into())
+        );
         // Object without operation, or operation null, or a bare null → "" (Go's zero).
         assert_eq!(parse_operation(&Some(json!({}))), Ok(String::new()));
-        assert_eq!(parse_operation(&Some(json!({"operation":null}))), Ok(String::new()));
-        assert_eq!(parse_operation(&Some(serde_json::Value::Null)), Ok(String::new()));
+        assert_eq!(
+            parse_operation(&Some(json!({"operation":null}))),
+            Ok(String::new())
+        );
+        assert_eq!(
+            parse_operation(&Some(serde_json::Value::Null)),
+            Ok(String::new())
+        );
         // A non-object/non-null payload, or a non-string operation, is Go's unmarshal
         // error → invalid payload.
         assert_eq!(parse_operation(&Some(json!([1, 2]))), Err(()));
@@ -3587,7 +3605,8 @@ mod tests {
     async fn aws_ping() {
         // ping → {"status":"ok"}, no audit.
         let aws = aws_handlers(FakeAwsBackend::creds_err("unused"), approve_gate());
-        let (payload, entry) = aws_dispatch(&aws_env(serde_json::json!({"operation":"ping"})), &aws, "").await;
+        let (payload, entry) =
+            aws_dispatch(&aws_env(serde_json::json!({"operation":"ping"})), &aws, "").await;
         assert_eq!(payload, serde_json::json!({"status": "ok"}));
         assert!(entry.is_none(), "ping does not audit");
     }
@@ -3620,8 +3639,12 @@ mod tests {
             FakeAwsBackend::with_status("passthrough:shed-test", Some(4071049445)),
             approve_gate(),
         );
-        let (payload, entry) =
-            aws_dispatch(&aws_env(serde_json::json!({"operation":"status"})), &aws, "").await;
+        let (payload, entry) = aws_dispatch(
+            &aws_env(serde_json::json!({"operation":"status"})),
+            &aws,
+            "",
+        )
+        .await;
         assert_eq!(
             payload,
             serde_json::json!({"connected": true, "role": "passthrough:shed-test", "cached_until": "2099-01-02T15:04:05Z"})
@@ -3632,8 +3655,12 @@ mod tests {
             FakeAwsBackend::with_status("arn:aws:iam::9:role/x", None),
             approve_gate(),
         );
-        let (payload, _) =
-            aws_dispatch(&aws_env(serde_json::json!({"operation":"status"})), &aws, "").await;
+        let (payload, _) = aws_dispatch(
+            &aws_env(serde_json::json!({"operation":"status"})),
+            &aws,
+            "",
+        )
+        .await;
         assert_eq!(
             payload,
             serde_json::json!({"connected": true, "role": "arn:aws:iam::9:role/x"})
@@ -3668,8 +3695,12 @@ mod tests {
     #[tokio::test]
     async fn aws_unknown_op_exact_string() {
         let aws = aws_handlers(FakeAwsBackend::creds_err("unused"), approve_gate());
-        let (payload, entry) =
-            aws_dispatch(&aws_env(serde_json::json!({"operation": "delete"})), &aws, "").await;
+        let (payload, entry) = aws_dispatch(
+            &aws_env(serde_json::json!({"operation": "delete"})),
+            &aws,
+            "",
+        )
+        .await;
         assert_eq!(payload["error"], "unknown operation: delete");
         assert_eq!(payload["code"], "INTERNAL_ERROR");
         assert!(entry.is_none());
@@ -3694,7 +3725,7 @@ mod tests {
         // body). Each mock's `.assert()` fails if the wrong gate was consulted, proving
         // per-namespace gate selection (F6).
         let handlers = BusHandlers {
-            gate: deny_gate(),                                  // ssh gate: deny-all
+            gate: deny_gate(), // ssh gate: deny-all
             audit: noop_audit(),
             backend: empty_backend(),
             server_name: String::new(),
@@ -3894,7 +3925,10 @@ mod tests {
             secret: secret.to_string(),
         }
     }
-    fn docker_handlers(backend: Arc<dyn DockerBackend>, gate: Arc<dyn ApprovalGate>) -> DockerHandlers {
+    fn docker_handlers(
+        backend: Arc<dyn DockerBackend>,
+        gate: Arc<dyn ApprovalGate>,
+    ) -> DockerHandlers {
         DockerHandlers { backend, gate }
     }
     /// A docker-credentials request Envelope carrying `payload` + a fixed shed.
@@ -3921,8 +3955,12 @@ mod tests {
     #[tokio::test]
     async fn docker_get_ok() {
         let backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_ok(cred("ghcr.io", "u", "s"));
-        let (payload, entry) =
-            docker_dispatch(&docker_get_env("ghcr.io"), &docker_handlers(backend, approve_gate()), "").await;
+        let (payload, entry) = docker_dispatch(
+            &docker_get_env("ghcr.io"),
+            &docker_handlers(backend, approve_gate()),
+            "",
+        )
+        .await;
         assert_eq!(payload["server_url"], "ghcr.io");
         assert_eq!(payload["username"], "u");
         assert_eq!(payload["secret"], "s");
@@ -3945,8 +3983,12 @@ mod tests {
             msg: "registry not allowed".into(),
             code: DOCKER_CODE_NOT_ALLOWED.into(),
         });
-        let (payload, _entry) =
-            docker_dispatch(&docker_get_env("blocked.io"), &docker_handlers(backend, approve_gate()), "").await;
+        let (payload, _entry) = docker_dispatch(
+            &docker_get_env("blocked.io"),
+            &docker_handlers(backend, approve_gate()),
+            "",
+        )
+        .await;
         assert_eq!(payload["error"], "credential request failed");
         assert_eq!(payload["code"], "REGISTRY_NOT_ALLOWED");
     }
@@ -4001,8 +4043,12 @@ mod tests {
         // disambiguation) + the deny reason. The backend is never consulted.
         let backend = FakeDockerBackend::get_ok(cred("ghcr.io", "u", "s"));
         let dyn_backend: Arc<dyn DockerBackend> = backend.clone();
-        let (payload, entry) =
-            docker_dispatch(&docker_get_env("ghcr.io"), &docker_handlers(dyn_backend, deny_gate()), "").await;
+        let (payload, entry) = docker_dispatch(
+            &docker_get_env("ghcr.io"),
+            &docker_handlers(dyn_backend, deny_gate()),
+            "",
+        )
+        .await;
         assert_eq!(payload["error"], "approval denied");
         assert_eq!(payload["code"], "REGISTRY_NOT_ALLOWED");
         let entry = entry.expect("deny path audits");
@@ -4022,8 +4068,12 @@ mod tests {
     #[tokio::test]
     async fn docker_ping() {
         let backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_ok(cred("x", "y", "z"));
-        let (payload, entry) =
-            docker_dispatch(&docker_env(serde_json::json!({"operation":"ping"})), &docker_handlers(backend, approve_gate()), "").await;
+        let (payload, entry) = docker_dispatch(
+            &docker_env(serde_json::json!({"operation":"ping"})),
+            &docker_handlers(backend, approve_gate()),
+            "",
+        )
+        .await;
         assert_eq!(payload, serde_json::json!({"status": "ok"}));
         assert!(entry.is_none(), "ping does not audit");
     }
@@ -4031,8 +4081,12 @@ mod tests {
     #[tokio::test]
     async fn docker_status_connected() {
         let backend: Arc<dyn DockerBackend> = FakeDockerBackend::with_status(true, 3);
-        let (payload, entry) =
-            docker_dispatch(&docker_env(serde_json::json!({"operation":"status"})), &docker_handlers(backend, approve_gate()), "").await;
+        let (payload, entry) = docker_dispatch(
+            &docker_env(serde_json::json!({"operation":"status"})),
+            &docker_handlers(backend, approve_gate()),
+            "",
+        )
+        .await;
         assert_eq!(
             payload,
             serde_json::json!({"connected": true, "allow_all": true, "registry_count": 3})
@@ -4046,8 +4100,12 @@ mod tests {
         m.insert("gcr.io".to_string(), "user1".to_string());
         m.insert("ghcr.io".to_string(), "user2".to_string());
         let backend: Arc<dyn DockerBackend> = FakeDockerBackend::with_list(m);
-        let (payload, entry) =
-            docker_dispatch(&docker_env(serde_json::json!({"operation":"list"})), &docker_handlers(backend, approve_gate()), "").await;
+        let (payload, entry) = docker_dispatch(
+            &docker_env(serde_json::json!({"operation":"list"})),
+            &docker_handlers(backend, approve_gate()),
+            "",
+        )
+        .await;
         assert_eq!(payload["registries"]["gcr.io"], "user1");
         assert_eq!(payload["registries"]["ghcr.io"], "user2");
         // Positional audit: op=list, ok, detail="count:2", approval=none, NO outcome/code.
@@ -4066,8 +4124,12 @@ mod tests {
         // A backend list error → {list failed, INTERNAL_ERROR} + NO audit (Go returns
         // early; list audits ONLY on success).
         let backend: Arc<dyn DockerBackend> = FakeDockerBackend::list_err();
-        let (payload, entry) =
-            docker_dispatch(&docker_env(serde_json::json!({"operation":"list"})), &docker_handlers(backend, approve_gate()), "").await;
+        let (payload, entry) = docker_dispatch(
+            &docker_env(serde_json::json!({"operation":"list"})),
+            &docker_handlers(backend, approve_gate()),
+            "",
+        )
+        .await;
         assert_eq!(payload["error"], "list failed");
         assert_eq!(payload["code"], "INTERNAL_ERROR");
         assert!(entry.is_none(), "list error path is audit-silent");
@@ -4104,8 +4166,12 @@ mod tests {
     #[tokio::test]
     async fn docker_missing_op_unknown_op_empty() {
         // Object with no `operation` → zero op → "unknown operation: ".
-        let (payload, entry) =
-            docker_dispatch(&docker_env(serde_json::json!({})), &docker_handlers(dummy_docker(), approve_gate()), "").await;
+        let (payload, entry) = docker_dispatch(
+            &docker_env(serde_json::json!({})),
+            &docker_handlers(dummy_docker(), approve_gate()),
+            "",
+        )
+        .await;
         assert_eq!(payload["error"], "unknown operation: ");
         assert_eq!(payload["code"], "INTERNAL_ERROR");
         assert!(entry.is_none());
@@ -4133,8 +4199,12 @@ mod tests {
             serde_json::json!("hi"),
             serde_json::json!({"operation": 123}),
         ] {
-            let (resp, entry) =
-                docker_dispatch(&docker_env(payload), &docker_handlers(dummy_docker(), approve_gate()), "").await;
+            let (resp, entry) = docker_dispatch(
+                &docker_env(payload),
+                &docker_handlers(dummy_docker(), approve_gate()),
+                "",
+            )
+            .await;
             assert_eq!(resp["error"], "invalid payload");
             assert_eq!(resp["code"], "INTERNAL_ERROR");
             assert!(entry.is_none());
@@ -4147,7 +4217,8 @@ mod tests {
         // the real dispatcher over the wire, a docker `get` is APPROVED (uses docker.gate,
         // never the ssh gate) → the mock only matches a vended-credential body. Proves
         // per-namespace gate selection.
-        let docker_backend: Arc<dyn DockerBackend> = FakeDockerBackend::get_ok(cred("ghcr.io", "u", "s"));
+        let docker_backend: Arc<dyn DockerBackend> =
+            FakeDockerBackend::get_ok(cred("ghcr.io", "u", "s"));
         let handlers = BusHandlers {
             gate: deny_gate(), // ssh gate: deny-all
             audit: noop_audit(),

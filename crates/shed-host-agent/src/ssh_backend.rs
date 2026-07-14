@@ -180,14 +180,20 @@ impl EcdsaMaterial {
         // end of each arm, so its `as_bytes()` slice feeds `ssh_string` directly (no
         // intermediate owned copy of the point bytes).
         let point_str = match self {
-            EcdsaMaterial::P256(sk) => ssh_string(sk.verifying_key().to_encoded_point(false).as_bytes()),
-            EcdsaMaterial::P384(sk) => ssh_string(sk.verifying_key().to_encoded_point(false).as_bytes()),
+            EcdsaMaterial::P256(sk) => {
+                ssh_string(sk.verifying_key().to_encoded_point(false).as_bytes())
+            }
+            EcdsaMaterial::P384(sk) => {
+                ssh_string(sk.verifying_key().to_encoded_point(false).as_bytes())
+            }
             // p521 0.13's newtype `SigningKey::verifying_key` is gated on a `verifying`
             // feature the crate never defines; `VerifyingKey::from(&SigningKey)` is the
             // supported path (the crate's own doctest uses it).
-            EcdsaMaterial::P521(sk) => {
-                ssh_string(p521::ecdsa::VerifyingKey::from(sk).to_encoded_point(false).as_bytes())
-            }
+            EcdsaMaterial::P521(sk) => ssh_string(
+                p521::ecdsa::VerifyingKey::from(sk)
+                    .to_encoded_point(false)
+                    .as_bytes(),
+            ),
         };
         let mut out = ssh_string(self.format().as_bytes());
         out.extend(ssh_string(self.curve_id().as_bytes()));
@@ -251,8 +257,12 @@ impl KeyMaterial {
                 // string("ssh-rsa") ‖ mpint(e) ‖ mpint(n).
                 let pk = sk.to_public_key();
                 let mut out = ssh_string(b"ssh-rsa");
-                out.extend(ssh_mpint(&rsa::traits::PublicKeyParts::e(&pk).to_bytes_be()));
-                out.extend(ssh_mpint(&rsa::traits::PublicKeyParts::n(&pk).to_bytes_be()));
+                out.extend(ssh_mpint(
+                    &rsa::traits::PublicKeyParts::e(&pk).to_bytes_be(),
+                ));
+                out.extend(ssh_mpint(
+                    &rsa::traits::PublicKeyParts::n(&pk).to_bytes_be(),
+                ));
                 out
             }
             KeyMaterial::Ecdsa(m) => m.marshaled_pub(),
@@ -306,8 +316,8 @@ fn unsupported_algo_err(key_format: &str, algo: RsaHash) -> String {
 fn rsa_sign(key: &rsa::RsaPrivateKey, data: &[u8], hash: RsaHash) -> Result<SshSignature, String> {
     use rsa::Pkcs1v15Sign;
     use sha2::Digest as _; // brings the `digest::Digest` trait into scope (covers Sha1 too).
-    // The signature `format` name (`ssh-rsa`/`rsa-sha2-256`/`rsa-sha2-512`) is owned by
-    // `RsaHash::ssh_format()`; only the blob differs per digest.
+                           // The signature `format` name (`ssh-rsa`/`rsa-sha2-256`/`rsa-sha2-512`) is owned by
+                           // `RsaHash::ssh_format()`; only the blob differs per digest.
     let blob = match hash {
         RsaHash::Sha1 => key.sign(Pkcs1v15Sign::new::<sha1::Sha1>(), &sha1::Sha1::digest(data)),
         RsaHash::Sha256 => key.sign(
@@ -352,7 +362,10 @@ fn ssh_string(bytes: &[u8]) -> Vec<u8> {
 /// prepended when the top bit is set (to keep the value positive). Zero is the empty
 /// string. Inputs here are positive non-zero ECDSA scalars.
 fn ssh_mpint(scalar_be: &[u8]) -> Vec<u8> {
-    let start = scalar_be.iter().position(|&b| b != 0).unwrap_or(scalar_be.len());
+    let start = scalar_be
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(scalar_be.len());
     let trimmed = &scalar_be[start..];
     let mut body = Vec::with_capacity(trimmed.len() + 1);
     if let Some(&first) = trimmed.first() {
@@ -454,7 +467,9 @@ fn load_key(path: &Path, comment: &str) -> Result<Option<LoadedKey>, String> {
             Err("encrypted or invalid: key is passphrase-protected".to_string())
         }
         (Some("DSA PRIVATE KEY"), Some(_)) => Err("unsupported key type: DSA/ssh-dss".to_string()),
-        (Some(other), Some(_)) => Err(format!("encrypted or invalid: unsupported PEM type {other:?}")),
+        (Some(other), Some(_)) => Err(format!(
+            "encrypted or invalid: unsupported PEM type {other:?}"
+        )),
         (Some(_), None) => Err("encrypted or invalid: truncated PEM block".to_string()),
         (None, _) => Err("encrypted or invalid: not a PEM private key".to_string()),
     }
@@ -473,10 +488,13 @@ fn load_openssh_key(data: &str, path: &Path, comment: &str) -> Result<LoadedKey,
     let private = PrivateKey::from_openssh(data)
         .map_err(|e| skip_warning(path, &format!("encrypted or invalid: {e}")))?;
     if private.is_encrypted() {
-        return Err(skip_warning(path, "encrypted or invalid: key is passphrase-protected"));
+        return Err(skip_warning(
+            path,
+            "encrypted or invalid: key is passphrase-protected",
+        ));
     }
-    let material = key_material(&private)
-        .ok_or_else(|| skip_warning(path, "unsupported key type"))?;
+    let material =
+        key_material(&private).ok_or_else(|| skip_warning(path, "unsupported key type"))?;
     let marshaled_pub = private
         .public_key()
         .to_bytes()
@@ -591,7 +609,9 @@ fn load_sec1_ec(pem: &str) -> Result<KeyMaterial, String> {
         return Ok(KeyMaterial::Ecdsa(EcdsaMaterial::P384(sk.into())));
     }
     if let Ok(sk) = p521::SecretKey::from_sec1_pem(pem) {
-        return Ok(KeyMaterial::Ecdsa(EcdsaMaterial::P521(p521_signing_key(&sk))));
+        return Ok(KeyMaterial::Ecdsa(EcdsaMaterial::P521(p521_signing_key(
+            &sk,
+        ))));
     }
     Err("encrypted or invalid: unsupported SEC1 EC private key".to_string())
 }
@@ -622,10 +642,7 @@ fn p521_signing_key(sk: &p521::SecretKey) -> p521::ecdsa::SigningKey {
 
 /// The warn message for a skipped key (mirrors Go's `logger.Warn` shape).
 fn skip_warning(path: &Path, reason: &str) -> String {
-    format!(
-        "skipping SSH key ({reason}) path={}",
-        path.display()
-    )
+    format!("skipping SSH key ({reason}) path={}", path.display())
 }
 
 /// Extract the signable material from a parsed (non-encrypted) private key. `None`
@@ -1038,7 +1055,11 @@ thaWnPuu0EWHWhqSQuP3zx/47Kd98x5FMIW92hlf+vZxuURwYr0VwYB/tz9p4s4Z\n\
             private: Ed25519PrivateKey::from_bytes(&SEED),
         };
         let pk = PrivateKey::new(KeypairData::Ed25519(keypair), "test").unwrap();
-        write_key(dir, "id_ed25519", pk.to_openssh(LineEnding::LF).unwrap().as_str());
+        write_key(
+            dir,
+            "id_ed25519",
+            pk.to_openssh(LineEnding::LF).unwrap().as_str(),
+        );
     }
 
     /// Decode an SSH `mpint`-encoded ECDSA blob `mpint(r)‖mpint(s)` back into the two
@@ -1117,7 +1138,8 @@ thaWnPuu0EWHWhqSQuP3zx/47Kd98x5FMIW92hlf+vZxuURwYr0VwYB/tz9p4s4Z\n\
         .unwrap();
         use ed25519_dalek::Verifier;
         let dalek_sig = ed25519_dalek::Signature::from_slice(&sig.blob).unwrap();
-        vk.verify(CHALLENGE, &dalek_sig).expect("ed25519 sig verifies");
+        vk.verify(CHALLENGE, &dalek_sig)
+            .expect("ed25519 sig verifies");
     }
 
     #[test]
@@ -1625,4 +1647,3 @@ thaWnPuu0EWHWhqSQuP3zx/47Kd98x5FMIW92hlf+vZxuURwYr0VwYB/tz9p4s4Z\n\
         assert_eq!(backend.list().unwrap().len(), 1, "{warnings:?}");
     }
 }
-

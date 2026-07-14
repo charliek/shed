@@ -232,13 +232,14 @@ fn backoff_step(prev: Duration, outcome: &Result<(), EgressStreamError>) -> (Dur
 /// client REFUSES non-https redirects (matching shed-core's pinned session) — a Rust-side
 /// improvement kept on purpose, not parity.
 pub fn egress_http_client(server_url: &str, fingerprint: &str) -> Result<reqwest::Client, String> {
-    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.url().scheme() == "https" {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    }));
+    let builder =
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }));
     if fingerprint.is_empty() {
         return builder.build().map_err(|e| e.to_string());
     }
@@ -328,10 +329,7 @@ impl EgressSubscriber {
     /// Make one connection and forward decisions until it errors, the stream ends, or
     /// `shutdown` flips (mirror `stream()`). `shutdown` is threaded through the connect +
     /// every read so a SIGTERM tears the loop down promptly (Go's `ctx`).
-    async fn stream(
-        &self,
-        shutdown: &watch::Receiver<bool>,
-    ) -> Result<(), EgressStreamError> {
+    async fn stream(&self, shutdown: &watch::Receiver<bool>) -> Result<(), EgressStreamError> {
         // Fail-closed latch: a pin on a non-https URL errors every request.
         let http = match &self.http {
             Ok(c) => c,
@@ -637,7 +635,9 @@ mod tests {
         )
         .is_err());
         // An empty-string ts is likewise a parse error (Go time.Time can't parse "").
-        assert!(serde_json::from_str::<EgressDecision>(r#"{"ts":"","host":"x","port":1}"#).is_err());
+        assert!(
+            serde_json::from_str::<EgressDecision>(r#"{"ts":"","host":"x","port":1}"#).is_err()
+        );
         // An ABSENT ts is fine → None.
         let d: EgressDecision =
             serde_json::from_str(r#"{"host":"x","port":1}"#).expect("absent ts is valid");
@@ -679,10 +679,7 @@ mod tests {
             (UNAVAILABLE_BACKOFF, BASE_BACKOFF)
         );
         assert_eq!(
-            backoff_step(
-                Duration::from_secs(8),
-                &Err(EgressStreamError::Unavailable)
-            ),
+            backoff_step(Duration::from_secs(8), &Err(EgressStreamError::Unavailable)),
             (UNAVAILABLE_BACKOFF, BASE_BACKOFF)
         );
     }
@@ -692,12 +689,27 @@ mod tests {
         // Other error → wait current, double to the 30s cap; NO 60s-held-reset. A clean
         // Ok(()) ALSO backs off + doubles (finding 10).
         let err = || Err(EgressStreamError::Other("boom".into()));
-        assert_eq!(backoff_step(BASE_BACKOFF, &err()), (Duration::from_secs(1), Duration::from_secs(2)));
-        assert_eq!(backoff_step(Duration::from_secs(2), &err()), (Duration::from_secs(2), Duration::from_secs(4)));
-        assert_eq!(backoff_step(Duration::from_secs(16), &err()), (Duration::from_secs(16), MAX_BACKOFF));
-        assert_eq!(backoff_step(MAX_BACKOFF, &err()), (MAX_BACKOFF, MAX_BACKOFF));
+        assert_eq!(
+            backoff_step(BASE_BACKOFF, &err()),
+            (Duration::from_secs(1), Duration::from_secs(2))
+        );
+        assert_eq!(
+            backoff_step(Duration::from_secs(2), &err()),
+            (Duration::from_secs(2), Duration::from_secs(4))
+        );
+        assert_eq!(
+            backoff_step(Duration::from_secs(16), &err()),
+            (Duration::from_secs(16), MAX_BACKOFF)
+        );
+        assert_eq!(
+            backoff_step(MAX_BACKOFF, &err()),
+            (MAX_BACKOFF, MAX_BACKOFF)
+        );
         // A clean stream-end is !unavailable → still exp-backs-off (no no-backoff branch).
-        assert_eq!(backoff_step(BASE_BACKOFF, &Ok(())), (Duration::from_secs(1), Duration::from_secs(2)));
+        assert_eq!(
+            backoff_step(BASE_BACKOFF, &Ok(())),
+            (Duration::from_secs(1), Duration::from_secs(2))
+        );
     }
 
     /// Records requested waits + trips shutdown after `stop_after` sleeps so `run`
@@ -767,7 +779,9 @@ mod tests {
             .await;
         let audit = CollectingAudit::new();
         let sub = subscriber(&server.base_url(), "tok", None, audit.clone());
-        sub.stream(&never_shutdown()).await.expect("clean stream end");
+        sub.stream(&never_shutdown())
+            .await
+            .expect("clean stream end");
         let entries = audit.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].ns, "egress");
@@ -787,7 +801,9 @@ mod tests {
             .await;
         let audit = CollectingAudit::new();
         let sub = subscriber(&server.base_url(), "", None, audit.clone());
-        sub.stream(&never_shutdown()).await.expect("clean stream end");
+        sub.stream(&never_shutdown())
+            .await
+            .expect("clean stream end");
         // Only the good frame fanned out.
         let entries = audit.entries();
         assert_eq!(entries.len(), 1);
@@ -813,7 +829,9 @@ mod tests {
             Some(FakeTokenSource::ok("ctl-tok")),
             audit,
         );
-        sub.stream(&never_shutdown()).await.expect("clean stream end");
+        sub.stream(&never_shutdown())
+            .await
+            .expect("clean stream end");
         m.assert_async().await;
     }
 
@@ -887,7 +905,12 @@ mod tests {
         let sub = subscriber("http://x", "", None, audit.clone());
         assert_eq!(sub.bearer().await, None);
         // A source that errors on mint → no header (→ 401 → retry).
-        let sub = subscriber("http://x", "ignored", Some(FakeTokenSource::erroring()), audit);
+        let sub = subscriber(
+            "http://x",
+            "ignored",
+            Some(FakeTokenSource::erroring()),
+            audit,
+        );
         assert_eq!(sub.bearer().await, None);
     }
 }

@@ -314,7 +314,8 @@ impl DockerBackend for DockerHelperBackend {
         // registry is refused even when the config is missing or unreadable, and even
         // when a perfectly good local credential exists for it.
         let resolved = self.cfg.resolve(server, shed);
-        if !resolved.allow_all && !normalize_registry_set(&resolved.registries).contains(&normalized)
+        if !resolved.allow_all
+            && !normalize_registry_set(&resolved.registries).contains(&normalized)
         {
             return Err(DockerCredError::new(
                 format!("registry {server_url:?} not in allowlist"),
@@ -323,9 +324,9 @@ impl DockerBackend for DockerHelperBackend {
         }
 
         // (3) read config.json.
-        let cfg = self
-            .read_config()
-            .map_err(|e| DockerCredError::new(format!("reading docker config: {e}"), DOCKER_CODE_INTERNAL))?;
+        let cfg = self.read_config().map_err(|e| {
+            DockerCredError::new(format!("reading docker config: {e}"), DOCKER_CODE_INTERNAL)
+        })?;
 
         // (4) credHelpers first (per-registry helper). Look up both raw + normalized
         // forms since config keys may be "https://index.docker.io/v1/" while the guest
@@ -337,7 +338,11 @@ impl DockerBackend for DockerHelperBackend {
         // (5) credsStore (default helper). On error FALL THROUGH to inline auths (the
         // asymmetry: only credsStore failure is swallowed).
         if !cfg.creds_store.is_empty() {
-            match self.executor.exec_helper(&cfg.creds_store, server_url).await {
+            match self
+                .executor
+                .exec_helper(&cfg.creds_store, server_url)
+                .await
+            {
                 Ok(cred) => return Ok(cred),
                 Err(e) => {
                     self.log.debug(&format!(
@@ -473,7 +478,10 @@ fn lookup_config_map<'a, V>(
 ///   live-diffed.
 /// * no colon → `"invalid auth format for <url>"` — prefix-only, no runtime text,
 ///   golden-fixtured.
-fn decode_inline_auth(server_url: &str, encoded: &str) -> Result<DockerCredential, DockerCredError> {
+fn decode_inline_auth(
+    server_url: &str,
+    encoded: &str,
+) -> Result<DockerCredential, DockerCredError> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|e| DockerCredError::plain(format!("decoding auth for {server_url}: {e}")))?;
@@ -909,7 +917,10 @@ mod tests {
 
     #[test]
     fn get_allow_all_bypasses() {
-        let json = format!(r#"{{"auths":{{"any-registry.io":{{"auth":"{}"}}}}}}"#, b64("user:pass"));
+        let json = format!(
+            r#"{{"auths":{{"any-registry.io":{{"auth":"{}"}}}}}}"#,
+            b64("user:pass")
+        );
         let (_d, b) = backend_with(&json, cfg_allow_all(), panic_exec());
         let c = block_on(b.get_credentials("srv", "shed", "any-registry.io")).unwrap();
         assert_eq!(c.username, "user");
@@ -978,7 +989,10 @@ mod tests {
             r#"{{"credHelpers":{{"registry.example.com":"custom-helper"}},"auths":{{"registry.example.com":{{"auth":"{}"}}}}}}"#,
             b64("inline-user:inline-secret")
         );
-        let exec = FakeExecutor::err(DockerCredError::new("helper boom", DOCKER_CODE_HELPER_FAILED));
+        let exec = FakeExecutor::err(DockerCredError::new(
+            "helper boom",
+            DOCKER_CODE_HELPER_FAILED,
+        ));
         let (_d, b) = backend_with(&json, cfg_allow_all(), exec);
         let e = block_on(b.get_credentials("srv", "shed", "registry.example.com")).unwrap_err();
         assert_eq!(e.code, DOCKER_CODE_HELPER_FAILED);
@@ -1106,7 +1120,10 @@ mod tests {
         let got = new_docker_backend(cfg, silent());
         std::env::remove_var("HOME");
         let b = got.expect("tilde path resolves to an existing file");
-        assert_eq!(b.config_path.as_deref(), Some(path.to_string_lossy().as_ref()));
+        assert_eq!(
+            b.config_path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
     }
 
     // ---- status + read_config + error -------------------------------------------
@@ -1184,7 +1201,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dirs = vec![dir.path().to_string_lossy().into_owned()];
         let e = look_helper_path("docker-credential-does-not-exist", &dirs).unwrap_err();
-        assert!(e.contains(dir.path().to_string_lossy().as_ref()), "err {e:?} names dir");
+        assert!(
+            e.contains(dir.path().to_string_lossy().as_ref()),
+            "err {e:?} names dir"
+        );
     }
 
     #[test]
@@ -1279,7 +1299,8 @@ mod tests {
             vec![dir.path().to_string_lossy().into_owned()],
             Duration::from_secs(5),
         );
-        let e = block_on(exec.exec_helper("definitely-missing", "registry.example.com")).unwrap_err();
+        let e =
+            block_on(exec.exec_helper("definitely-missing", "registry.example.com")).unwrap_err();
         assert_eq!(e.code, DOCKER_CODE_HELPER_FAILED);
     }
 
@@ -1290,7 +1311,11 @@ mod tests {
         }
         // Non-zero exit → HELPER_FAILED.
         let dir = tempfile::tempdir().unwrap();
-        write_exec(dir.path(), "docker-credential-failexit", "#!/bin/sh\ncat >/dev/null\nexit 1\n");
+        write_exec(
+            dir.path(),
+            "docker-credential-failexit",
+            "#!/bin/sh\ncat >/dev/null\nexit 1\n",
+        );
         let exec = RealHelperExecutor::with_dirs(
             vec![dir.path().to_string_lossy().into_owned()],
             Duration::from_secs(5),
@@ -1300,14 +1325,22 @@ mod tests {
 
         // Exit 0 but non-JSON stdout → HELPER_FAILED (parse error).
         let dir2 = tempfile::tempdir().unwrap();
-        write_exec(dir2.path(), "docker-credential-badjson", "#!/bin/sh\ncat >/dev/null\nprintf 'not json'\n");
+        write_exec(
+            dir2.path(),
+            "docker-credential-badjson",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'not json'\n",
+        );
         let exec2 = RealHelperExecutor::with_dirs(
             vec![dir2.path().to_string_lossy().into_owned()],
             Duration::from_secs(5),
         );
         let e2 = block_on(exec2.exec_helper("badjson", "registry.example.com")).unwrap_err();
         assert_eq!(e2.code, DOCKER_CODE_HELPER_FAILED);
-        assert!(e2.msg.starts_with("parsing docker-credential-badjson output: "), "got {e2:?}");
+        assert!(
+            e2.msg
+                .starts_with("parsing docker-credential-badjson output: "),
+            "got {e2:?}"
+        );
     }
 
     #[test]
@@ -1316,7 +1349,11 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        write_exec(dir.path(), "docker-credential-sleeper", "#!/bin/sh\nsleep 30\n");
+        write_exec(
+            dir.path(),
+            "docker-credential-sleeper",
+            "#!/bin/sh\nsleep 30\n",
+        );
         let exec = RealHelperExecutor::with_dirs(
             vec![dir.path().to_string_lossy().into_owned()],
             Duration::from_millis(300),
@@ -1324,7 +1361,10 @@ mod tests {
         let start = std::time::Instant::now();
         let e = block_on(exec.exec_helper("sleeper", "registry.example.com")).unwrap_err();
         assert_eq!(e.code, DOCKER_CODE_HELPER_FAILED);
-        assert!(start.elapsed() < Duration::from_secs(5), "did not abort promptly");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "did not abort promptly"
+        );
     }
 
     // ---- lookup_config_map (3-way) ----------------------------------------------
@@ -1332,7 +1372,10 @@ mod tests {
     #[test]
     fn lookup_config_map_3way() {
         let mut m: BTreeMap<String, String> = BTreeMap::new();
-        m.insert("https://index.docker.io/v1/".to_string(), "helperA".to_string());
+        m.insert(
+            "https://index.docker.io/v1/".to_string(),
+            "helperA".to_string(),
+        );
         m.insert("ghcr.io".to_string(), "helperB".to_string());
 
         let lookup = |raw: &str| -> Option<String> {
@@ -1371,7 +1414,10 @@ mod tests {
         // The snake_case guest tags must NOT populate this struct.
         let wrong = r#"{"server_url":"reg.io","username":"u","secret":"s"}"#;
         let c2: HelperCredential = serde_json::from_str(wrong).unwrap();
-        assert!(c2.server_url.is_empty(), "snake_case must not fill ServerURL");
+        assert!(
+            c2.server_url.is_empty(),
+            "snake_case must not fill ServerURL"
+        );
     }
 
     // ---- golden runners (Rust half) ---------------------------------------------
@@ -1413,15 +1459,30 @@ mod tests {
             let url = v["server_url"].as_str().unwrap();
             let encoded = b64(v["plain"].as_str().unwrap());
             let c = decode_inline_auth(url, &encoded).unwrap();
-            assert_eq!(c.username, v["username"].as_str().unwrap(), "user {}", v["name"]);
-            assert_eq!(c.secret, v["secret"].as_str().unwrap(), "secret {}", v["name"]);
+            assert_eq!(
+                c.username,
+                v["username"].as_str().unwrap(),
+                "user {}",
+                v["name"]
+            );
+            assert_eq!(
+                c.secret,
+                v["secret"].as_str().unwrap(),
+                "secret {}",
+                v["name"]
+            );
             assert_eq!(c.server_url, url);
         }
         for v in fx["invalid_vectors"].as_array().unwrap() {
             let url = v["server_url"].as_str().unwrap();
             let encoded = b64(v["plain"].as_str().unwrap());
             let e = decode_inline_auth(url, &encoded).unwrap_err();
-            assert_eq!(e.msg, v["expected_error"].as_str().unwrap(), "err {}", v["name"]);
+            assert_eq!(
+                e.msg,
+                v["expected_error"].as_str().unwrap(),
+                "err {}",
+                v["name"]
+            );
         }
     }
 
@@ -1442,7 +1503,12 @@ mod tests {
                 .map(|d| d.as_str().unwrap().to_string())
                 .collect();
             let got = augment_path(v["path"].as_str().unwrap(), &extras);
-            assert_eq!(got, v["expected_path"].as_str().unwrap(), "augment {}", v["name"]);
+            assert_eq!(
+                got,
+                v["expected_path"].as_str().unwrap(),
+                "augment {}",
+                v["name"]
+            );
         }
     }
 }

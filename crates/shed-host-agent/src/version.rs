@@ -21,7 +21,10 @@ fn pick_version<'a>(injected: Option<&'a str>, fallback: &'a str) -> &'a str {
 /// `full_info` returns the daemon's version line, printed by the `version`
 /// subcommand and carried in the LiveStatus `version` field.
 pub fn full_info() -> String {
-    let version = pick_version(option_env!("SHED_HOST_AGENT_VERSION"), env!("CARGO_PKG_VERSION"));
+    let version = pick_version(
+        option_env!("SHED_HOST_AGENT_VERSION"),
+        env!("CARGO_PKG_VERSION"),
+    );
     format!("shed-host-agent {version}")
 }
 
@@ -38,7 +41,10 @@ mod tests {
     #[test]
     fn pick_version_prefers_injected() {
         assert_eq!(pick_version(Some("0.8.0"), "0.7.10"), "0.8.0");
-        assert_eq!(pick_version(Some("0.0.0-snapshot-abc"), "0.7.10"), "0.0.0-snapshot-abc");
+        assert_eq!(
+            pick_version(Some("0.0.0-snapshot-abc"), "0.7.10"),
+            "0.0.0-snapshot-abc"
+        );
     }
 
     #[test]

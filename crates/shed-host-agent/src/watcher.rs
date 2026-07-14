@@ -56,7 +56,9 @@ pub(crate) async fn run_watch_loop<F, Fut>(
         "poll" => run_poll_loop(&dc, reconcile, shutdown, log).await,
         "fsnotify" | "" => run_fsnotify_loop(&dc, reconcile, shutdown, log).await,
         other => {
-            log.warn(&format!("unknown discovery.watch mode, using poll: mode={other}"));
+            log.warn(&format!(
+                "unknown discovery.watch mode, using poll: mode={other}"
+            ));
             run_poll_loop(&dc, reconcile, shutdown, log).await;
         }
     }
@@ -125,7 +127,9 @@ async fn run_fsnotify_loop<F, Fut>(
     }) {
         Ok(w) => w,
         Err(e) => {
-            log.warn(&format!("fsnotify unavailable, falling back to polling: error={e}"));
+            log.warn(&format!(
+                "fsnotify unavailable, falling back to polling: error={e}"
+            ));
             return run_poll_loop(dc, reconcile, shutdown, log).await;
         }
     };
@@ -254,7 +258,10 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         let handle = tokio::spawn(run_watch_loop(dc("off"), reconcile, rx, test_log()));
 
-        assert!(wait_count(&n, 1, Duration::from_secs(1)).await, "no initial reconcile");
+        assert!(
+            wait_count(&n, 1, Duration::from_secs(1)).await,
+            "no initial reconcile"
+        );
         // Off must not reconcile again.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(n.load(Ordering::SeqCst), 1, "off reconciled more than once");
@@ -276,8 +283,14 @@ mod tests {
         cfg.poll_interval = "20ms".to_string();
         tokio::spawn(run_watch_loop(cfg, reconcile, rx, test_log()));
 
-        assert!(wait_count(&n, 1, Duration::from_secs(1)).await, "no initial reconcile");
-        assert!(wait_count(&n, 2, Duration::from_secs(1)).await, "no poll-tick reconcile");
+        assert!(
+            wait_count(&n, 1, Duration::from_secs(1)).await,
+            "no initial reconcile"
+        );
+        assert!(
+            wait_count(&n, 2, Duration::from_secs(1)).await,
+            "no poll-tick reconcile"
+        );
     }
 
     /// `fsnotify` reconciles initially, then again after the source file is written —
@@ -299,7 +312,10 @@ mod tests {
         };
         tokio::spawn(run_watch_loop(cfg, reconcile, rx, test_log()));
 
-        assert!(wait_count(&n, 1, Duration::from_secs(2)).await, "no initial reconcile");
+        assert!(
+            wait_count(&n, 1, Duration::from_secs(2)).await,
+            "no initial reconcile"
+        );
 
         let mut got = false;
         for _ in 0..50 {
@@ -328,7 +344,10 @@ mod tests {
         };
         tokio::spawn(run_watch_loop(cfg, reconcile, rx, test_log()));
 
-        assert!(wait_count(&n, 1, Duration::from_secs(1)).await, "no initial reconcile");
+        assert!(
+            wait_count(&n, 1, Duration::from_secs(1)).await,
+            "no initial reconcile"
+        );
         assert!(
             wait_count(&n, 2, Duration::from_secs(1)).await,
             "fsnotify setup error did not fall back to poll"
@@ -344,8 +363,14 @@ mod tests {
         cfg.poll_interval = "20ms".to_string();
         tokio::spawn(run_watch_loop(cfg, reconcile, rx, test_log()));
 
-        assert!(wait_count(&n, 1, Duration::from_secs(1)).await, "no initial reconcile");
-        assert!(wait_count(&n, 2, Duration::from_secs(1)).await, "unknown mode did not poll");
+        assert!(
+            wait_count(&n, 1, Duration::from_secs(1)).await,
+            "no initial reconcile"
+        );
+        assert!(
+            wait_count(&n, 2, Duration::from_secs(1)).await,
+            "unknown mode did not poll"
+        );
     }
 
     /// The duration helper the loops share (`aws_backend::parse_duration_or`, the Go

@@ -870,7 +870,11 @@ mod tests {
         // and its fresh creds returned. Stronger than Go's mock-only TestCacheMiss.
         let now = 1_000_000_000;
         let roler = FakeRoler::new(vec![Ok(Some(assumed("FRESH", Some(now + 3600))))]);
-        let mut b = backend_fixed(aws_cfg_role("arn:aws:iam::123:role/test"), roler.clone(), now);
+        let mut b = backend_fixed(
+            aws_cfg_role("arn:aws:iam::123:role/test"),
+            roler.clone(),
+            now,
+        );
         b.refresh_before = Duration::from_secs(300);
         b.cache.lock().unwrap().insert(
             "mini2/my-shed".to_string(),
@@ -985,8 +989,9 @@ mod tests {
         // The env-var resolution path (AWS_SHARED_CREDENTIALS_FILE) — Go pins this in
         // its own tests; the differential harness uses the isolated-$HOME route.
         let _g = crate::env_lock();
-        let (_d, creds_path) =
-            passthrough_env("[p]\naws_access_key_id = A\naws_secret_access_key = S\naws_session_token = T\n");
+        let (_d, creds_path) = passthrough_env(
+            "[p]\naws_access_key_id = A\naws_secret_access_key = S\naws_session_token = T\n",
+        );
         assert_eq!(shared_credentials_path(), creds_path);
         let creds = block_on(passthrough_backend("p").get_credentials("s", "sh")).unwrap();
         assert_eq!(creds.access_key_id, "A");
@@ -1018,8 +1023,9 @@ mod tests {
     #[test]
     fn passthrough_relogin_pickup() {
         let _g = crate::env_lock();
-        let (dir, creds_path) =
-            passthrough_env("[p]\naws_access_key_id = A1\naws_secret_access_key = S1\naws_session_token = T1\n");
+        let (dir, creds_path) = passthrough_env(
+            "[p]\naws_access_key_id = A1\naws_secret_access_key = S1\naws_session_token = T1\n",
+        );
         let b = passthrough_backend("p");
         let first = block_on(b.get_credentials("s", "sh")).unwrap();
         assert_eq!(first.access_key_id, "A1");
@@ -1053,8 +1059,7 @@ mod tests {
         cleanup_env();
 
         // No session token → EXACT Go string.
-        let (_d2, _c2) =
-            passthrough_env("[p]\naws_access_key_id = A\naws_secret_access_key = S\n");
+        let (_d2, _c2) = passthrough_env("[p]\naws_access_key_id = A\naws_secret_access_key = S\n");
         let err = block_on(passthrough_backend("p").get_credentials("s", "sh")).unwrap_err();
         assert_eq!(
             err,
@@ -1178,24 +1183,51 @@ mod tests {
     fn parse_expiry_value_layouts() {
         // Layout 1/2: RFC3339 (Z, +00:00), RFC3339Nano (fractional).
         assert_eq!(parse_expiry_value("2099-01-02T15:04:05Z"), Some(4071049445));
-        assert_eq!(parse_expiry_value("2099-01-02T15:04:05.123Z"), Some(4071049445));
-        assert_eq!(parse_expiry_value("2099-01-02T15:04:05+00:00"), Some(4071049445));
+        assert_eq!(
+            parse_expiry_value("2099-01-02T15:04:05.123Z"),
+            Some(4071049445)
+        );
+        assert_eq!(
+            parse_expiry_value("2099-01-02T15:04:05+00:00"),
+            Some(4071049445)
+        );
         // Non-zero colon offset: +02:00 → 2h earlier in UTC.
-        assert_eq!(parse_expiry_value("2099-01-02T17:04:05+02:00"), Some(4071049445));
+        assert_eq!(
+            parse_expiry_value("2099-01-02T17:04:05+02:00"),
+            Some(4071049445)
+        );
         // Negative offset: -05:00 → 5h later in UTC.
-        assert_eq!(parse_expiry_value("2099-01-02T10:04:05-05:00"), Some(4071049445));
+        assert_eq!(
+            parse_expiry_value("2099-01-02T10:04:05-05:00"),
+            Some(4071049445)
+        );
         // Layout 3: numeric offset, NO colon.
-        assert_eq!(parse_expiry_value("2099-01-02T17:04:05+0200"), Some(4071049445));
+        assert_eq!(
+            parse_expiry_value("2099-01-02T17:04:05+0200"),
+            Some(4071049445)
+        );
         assert_eq!(parse_expiry_value("2099-01-02T15:04:05Z"), Some(4071049445));
         // Layout 4: SPACE separator, colon offset.
-        assert_eq!(parse_expiry_value("2099-01-02 17:04:05+02:00"), Some(4071049445));
+        assert_eq!(
+            parse_expiry_value("2099-01-02 17:04:05+02:00"),
+            Some(4071049445)
+        );
         assert_eq!(parse_expiry_value("2099-01-02 15:04:05Z"), Some(4071049445));
         // Fractional seconds accepted under EVERY layout (Go's time.Parse leniency),
         // truncated to whole seconds. 15:04:05.5+0200 == 13:04:05Z == 4071042245.
-        assert_eq!(parse_expiry_value("2099-01-02T15:04:05.5+0200"), Some(4071042245));
-        assert_eq!(parse_expiry_value("2099-01-02 15:04:05.25Z"), Some(4071049445));
+        assert_eq!(
+            parse_expiry_value("2099-01-02T15:04:05.5+0200"),
+            Some(4071042245)
+        );
+        assert_eq!(
+            parse_expiry_value("2099-01-02 15:04:05.25Z"),
+            Some(4071049445)
+        );
         // Quotes trimmed.
-        assert_eq!(parse_expiry_value("\"2099-01-02T15:04:05Z\""), Some(4071049445));
+        assert_eq!(
+            parse_expiry_value("\"2099-01-02T15:04:05Z\""),
+            Some(4071049445)
+        );
         // Failures → None.
         assert_eq!(parse_expiry_value("garbage"), None);
         assert_eq!(parse_expiry_value(""), None);

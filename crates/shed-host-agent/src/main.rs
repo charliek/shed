@@ -15,8 +15,8 @@
 //! off, matching the Go daemon's `cfg.Discovery == nil` gate.
 
 mod approval;
-mod aws_backend;
 mod audit;
+mod aws_backend;
 // The SSH-bootstrap minter (bootstrap exchange + credential source) — ALWAYS-ON as of the
 // supervisor slice: the supervisor is its first headless consumer (a secure server's bus
 // token provider self-mints a credentials-scope token, and its egress side task a
@@ -35,14 +35,14 @@ mod discovery;
 mod docker_backend;
 // The always-on egress-audit SSE consumer (bus-side, not gated — like `bus`/`aws_backend`/
 // `docker_backend`). Landed here; the per-server side task is spawned in commit 2.
-mod egress;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop;
+mod egress;
 // The credential minter (bootstrap-backed CredentialSource) — ALWAYS-ON as of the
 // supervisor slice (its first headless consumer); see the `bootstrap` note above.
-mod minter;
 #[cfg(feature = "desktop-forwarding")]
 mod desktop_protocol;
+mod minter;
 mod sockets;
 mod ssh_backend;
 mod ssh_backend_agent;
@@ -322,8 +322,10 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
         // token.get resolves servers from the shed CLI config (DefaultDiscoverySource; the
         // discovery-source override is a per-server concern the supervisor path owns).
         let control_source = controltoken::DEFAULT_DISCOVERY_SOURCE;
-        let control_minter =
-            Arc::new(controltoken::ControlTokenProvider::new(minter.clone(), control_source));
+        let control_minter = Arc::new(controltoken::ControlTokenProvider::new(
+            minter.clone(),
+            control_source,
+        ));
         let server = desktop::DesktopServer::new(
             version.clone(),
             cfg.gate_namespaces(),
@@ -366,8 +368,10 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
 
     // The audit sink (durable JSONL + desktop fan-out), shared across every group.
     #[cfg(feature = "desktop-forwarding")]
-    let audit: Arc<dyn audit::AuditSink> =
-        Arc::new(audit::JsonlAuditSink::new(&cfg, Some(desktop_server.clone())));
+    let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(
+        &cfg,
+        Some(desktop_server.clone()),
+    ));
     #[cfg(not(feature = "desktop-forwarding"))]
     let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(&cfg));
 
@@ -436,7 +440,10 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             dc
         }
         None => {
-            bus_log.info(&format!("brokering for single server server={}", cfg.server));
+            bus_log.info(&format!(
+                "brokering for single server server={}",
+                cfg.server
+            ));
             config::DiscoveryConfig {
                 watch: "off".to_string(),
                 ..Default::default()

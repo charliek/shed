@@ -709,8 +709,8 @@ mod tests {
     #[test]
     fn unreachable_socket_errors_on_op() {
         // Construction stores the path; the dial failure surfaces on the first op.
-        let be =
-            AgentForwardBackend::from_sock(Some(OsString::from("/nonexistent/agent.sock"))).unwrap();
+        let be = AgentForwardBackend::from_sock(Some(OsString::from("/nonexistent/agent.sock")))
+            .unwrap();
         let err = be.list().unwrap_err();
         assert!(
             err.starts_with("connecting to SSH agent at /nonexistent/agent.sock:"),

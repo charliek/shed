@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(parse_rfc3339_to_unix("garbage"), Err(()));
         assert_eq!(parse_rfc3339_to_unix("2030-13-01T00:00:00Z"), Err(())); // bad month
-        // The Go zero time collapses to None (omitted expires_at / absent egress ts).
+                                                                            // The Go zero time collapses to None (omitted expires_at / absent egress ts).
         assert_eq!(parse_rfc3339_to_unix("0001-01-01T00:00:00Z"), Ok(None));
     }
 

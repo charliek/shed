@@ -23,7 +23,9 @@ use tokio::task::JoinHandle;
 
 use crate::approval::ApprovalGate;
 use crate::audit::AuditSink;
-use crate::bus::{AwsHandlers, BusError, BusLog, DockerHandlers, ConnState, SubStatus, TokenProvider};
+use crate::bus::{
+    AwsHandlers, BusError, BusLog, ConnState, DockerHandlers, SubStatus, TokenProvider,
+};
 use crate::discovery::ServerTarget;
 use crate::minter::{CredentialSource, Minter};
 use crate::ssh_backend::SshBackend;
@@ -140,7 +142,11 @@ impl Supervisor {
         Supervisor::with_factory(parent, deps, factory)
     }
 
-    fn with_factory(parent: watch::Receiver<bool>, deps: SharedDeps, new_group: GroupFactory) -> Supervisor {
+    fn with_factory(
+        parent: watch::Receiver<bool>,
+        deps: SharedDeps,
+        new_group: GroupFactory,
+    ) -> Supervisor {
         Supervisor {
             parent,
             deps,
@@ -269,33 +275,39 @@ impl Supervisor {
         };
         let mut out: Vec<ServerHealth> = refs
             .into_iter()
-            .map(|GroupRef { name, url, statuses }| {
-                let mut namespaces: Vec<NamespaceHealth> = statuses
-                    .iter()
-                    .map(|s| {
-                        let st = s.lock().unwrap();
-                        NamespaceHealth {
-                            namespace: st.namespace.clone(),
-                            state: conn_state_str(st.state).to_string(),
-                            last_error: st.last_error.clone(),
-                            // The RFC3339-UTC instant the current state began (Go's
-                            // `st.Since.UTC().Format(RFC3339)`); the `servers[]` differential
-                            // masks the value after shape-asserting it.
-                            since: st.since.clone(),
-                        }
-                    })
-                    .collect();
-                // Sort by namespace to match Go's `HostClient.Status()`, which
-                // `sort.Slice`s by namespace before the supervisor reads it — so
-                // `servers[].namespaces[]` is in the same order on both impls regardless of
-                // subscribe order (ssh-agent, docker-credentials, ...).
-                namespaces.sort_by(|a, b| a.namespace.cmp(&b.namespace));
-                ServerHealth {
-                    name,
-                    url,
-                    namespaces,
-                }
-            })
+            .map(
+                |GroupRef {
+                     name,
+                     url,
+                     statuses,
+                 }| {
+                    let mut namespaces: Vec<NamespaceHealth> = statuses
+                        .iter()
+                        .map(|s| {
+                            let st = s.lock().unwrap();
+                            NamespaceHealth {
+                                namespace: st.namespace.clone(),
+                                state: conn_state_str(st.state).to_string(),
+                                last_error: st.last_error.clone(),
+                                // The RFC3339-UTC instant the current state began (Go's
+                                // `st.Since.UTC().Format(RFC3339)`); the `servers[]` differential
+                                // masks the value after shape-asserting it.
+                                since: st.since.clone(),
+                            }
+                        })
+                        .collect();
+                    // Sort by namespace to match Go's `HostClient.Status()`, which
+                    // `sort.Slice`s by namespace before the supervisor reads it — so
+                    // `servers[].namespaces[]` is in the same order on both impls regardless of
+                    // subscribe order (ssh-agent, docker-credentials, ...).
+                    namespaces.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+                    ServerHealth {
+                        name,
+                        url,
+                        namespaces,
+                    }
+                },
+            )
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
@@ -318,7 +330,7 @@ mod tests {
     use super::*;
     use crate::bus::FileBusLog;
     use crate::discovery::ServerTarget;
-    use crate::minter::{MinterError, Minted};
+    use crate::minter::{Minted, MinterError};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- test stubs: the fake factory never touches the heavy deps, so these satisfy

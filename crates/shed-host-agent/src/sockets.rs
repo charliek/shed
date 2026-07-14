@@ -246,7 +246,10 @@ fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> 
             bytes.len(),
         );
     }
-    Ok((addr, std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t))
+    Ok((
+        addr,
+        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+    ))
 }
 
 /// Set or clear `O_NONBLOCK` on `fd`.
@@ -401,7 +404,8 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let (read_fd, write_fd) = (fds[0], fds[1]);
         let start = Instant::now();
-        let err = wait_writable(read_fd, Duration::from_millis(100)).expect_err("read end never POLLOUT");
+        let err =
+            wait_writable(read_fd, Duration::from_millis(100)).expect_err("read end never POLLOUT");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         let elapsed = start.elapsed();
         assert!(
@@ -420,8 +424,7 @@ mod tests {
         let dir = short_tmpdir();
         let path = dir.path().join("absent.sock");
         let start = Instant::now();
-        connect_unix_timeout(&path, Duration::from_secs(5))
-            .expect_err("missing path must fail");
+        connect_unix_timeout(&path, Duration::from_secs(5)).expect_err("missing path must fail");
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 

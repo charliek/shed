@@ -296,7 +296,10 @@ fn parse_go_duration_strict(s: &str) -> Result<i128, String> {
                 .parse()
                 .map_err(|_| "fraction overflow in duration".to_string())?;
             let scale = 10i128.pow(flen as u32);
-            let frac_nanos = frac_val.checked_mul(unit_nanos).ok_or("duration overflow")? / scale;
+            let frac_nanos = frac_val
+                .checked_mul(unit_nanos)
+                .ok_or("duration overflow")?
+                / scale;
             frag = frag.checked_add(frac_nanos).ok_or("duration overflow")?;
         }
         total = total.checked_add(frag).ok_or("duration overflow")?;
@@ -756,7 +759,9 @@ impl ServerSelector {
         if self.all || self.names.is_none() {
             return true;
         }
-        self.names.as_ref().is_some_and(|names| names.iter().any(|n| n == name))
+        self.names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|n| n == name))
     }
 }
 
@@ -844,7 +849,12 @@ fn read_aws_sheds(
     let mut out = BTreeMap::new();
     for (name, entry) in map {
         let Some(sf) = entry.as_map() else { continue };
-        let g = |k: &str| sf.get(k).and_then(Node::as_scalar).unwrap_or("").to_string();
+        let g = |k: &str| {
+            sf.get(k)
+                .and_then(Node::as_scalar)
+                .unwrap_or("")
+                .to_string()
+        };
         out.insert(
             name.clone(),
             AwsShedConfig {
@@ -881,7 +891,10 @@ impl AwsConfig {
     /// migration reject, `config.go:561`). It stays parse-and-ignore for resolution.
     fn from_node(root: &yaml_lite::Node) -> AwsConfig {
         use yaml_lite::Node;
-        let aws = root.as_map().and_then(|m| m.get("aws")).and_then(Node::as_map);
+        let aws = root
+            .as_map()
+            .and_then(|m| m.get("aws"))
+            .and_then(Node::as_map);
         // A non-defaulted scalar: absent / null / non-scalar → "".
         let scalar = |key: &str| -> String {
             aws.and_then(|m| m.get(key))
@@ -902,7 +915,9 @@ impl AwsConfig {
         let mut servers = BTreeMap::new();
         if let Some(servers_map) = aws.and_then(|m| m.get("servers")).and_then(Node::as_map) {
             for (name, entry) in servers_map {
-                let Some(fields) = entry.as_map() else { continue };
+                let Some(fields) = entry.as_map() else {
+                    continue;
+                };
                 let sfield = |k: &str| {
                     fields
                         .get(k)
@@ -1583,8 +1598,8 @@ discovery:
     fn server_selector_unmarshal() {
         let cases: &[(&str, bool, Option<Vec<String>>)] = &[
             ("servers: all\n", true, None),
-            ("watch: poll\n", false, None), // omitted selector
-            ("servers: \"\"\n", true, None), // empty scalar
+            ("watch: poll\n", false, None),         // omitted selector
+            ("servers: \"\"\n", true, None),        // empty scalar
             ("servers: []\n", false, Some(vec![])), // explicit empty = watch none
             (
                 "servers: [mini2, mini3]\n",
@@ -1704,8 +1719,10 @@ discovery:
             "local-keys"
         );
         assert_eq!(
-            HostAgentConfig::parse("ssh:\n  mode: agent-forward\n  approval:\n    policy: shed-desktop\n")
-                .ssh_mode(),
+            HostAgentConfig::parse(
+                "ssh:\n  mode: agent-forward\n  approval:\n    policy: shed-desktop\n"
+            )
+            .ssh_mode(),
             "agent-forward"
         );
     }
@@ -2112,7 +2129,10 @@ aws:
         assert_eq!(cfg.effective_policy(NS_AWS_CREDENTIALS), "approve-all");
         let sheds = &aws.servers["mini2"].sheds;
         assert_eq!(sheds["sso-app"].mode, AWS_MODE_PASSTHROUGH);
-        assert_eq!(sheds["my-service"].role, "arn:aws:iam::123456789012:role/my-service");
+        assert_eq!(
+            sheds["my-service"].role,
+            "arn:aws:iam::123456789012:role/my-service"
+        );
 
         // TestLoadConfigDefaults: with no aws block the load defaults apply.
         let defaults = HostAgentConfig::parse("server: http://localhost:8080\n");
@@ -2348,7 +2368,7 @@ discovery:
         assert!(yaml_lite::parse("{{invalid yaml").is_err());
         assert!(yaml_lite::parse("docker:\n  registries: [only-this\n").is_err());
         assert!(yaml_lite::parse("a: b\n\tc: d\n").is_err()); // tab indentation
-        // And `load` surfaces it as an error (main.rs exits 1).
+                                                              // And `load` surfaces it as an error (main.rs exits 1).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.yaml");
         std::fs::write(&path, "{{invalid yaml").unwrap();
@@ -2368,7 +2388,10 @@ discovery:
     /// the old reader.
     #[test]
     fn yaml_lite_empty_and_comment_only() {
-        assert_eq!(yaml_lite::parse("").unwrap(), yaml_lite::Node::Map(Default::default()));
+        assert_eq!(
+            yaml_lite::parse("").unwrap(),
+            yaml_lite::Node::Map(Default::default())
+        );
         assert_eq!(
             yaml_lite::parse("# just a comment\n").unwrap(),
             yaml_lite::Node::Map(Default::default())
@@ -2582,7 +2605,11 @@ docker:
                     .iter()
                     .map(|s| s.as_str().unwrap().to_string())
                     .collect();
-                assert_eq!(r.allow_all, q["allow_all"].as_bool().unwrap(), "allow_all {name:?}");
+                assert_eq!(
+                    r.allow_all,
+                    q["allow_all"].as_bool().unwrap(),
+                    "allow_all {name:?}"
+                );
                 assert_eq!(r.registries, want_registries, "registries {name:?}");
                 // registry_count is the backend Status verdict (registries.len()).
                 assert_eq!(
@@ -2666,8 +2693,9 @@ docker:
     /// `len > 0`, `config.go:561`, built as a map then `!is_empty()`).
     #[test]
     fn validate_rejects_aws_sheds_removed() {
-        let err = validate_yaml("aws:\n  sheds:\n    web:\n      role: arn:aws:iam::123:role/web\n")
-            .expect_err("populated aws.sheds rejected");
+        let err =
+            validate_yaml("aws:\n  sheds:\n    web:\n      role: arn:aws:iam::123:role/web\n")
+                .expect_err("populated aws.sheds rejected");
         assert_eq!(
             err,
             "aws.sheds was removed; move entries under aws.servers.<server>.sheds.<shed>"
@@ -2681,7 +2709,10 @@ docker:
     fn validate_aws_sheds_empty_forms_ok() {
         assert!(validate_yaml("aws:\n  sheds:\n").is_ok(), "bare sheds:");
         assert!(validate_yaml("aws:\n  sheds: {}\n").is_ok(), "empty map");
-        assert!(validate_yaml("aws:\n  sheds: null\n").is_ok(), "explicit null");
+        assert!(
+            validate_yaml("aws:\n  sheds: null\n").is_ok(),
+            "explicit null"
+        );
         // ...and an absent aws block entirely.
         assert!(validate_yaml("").is_ok(), "no aws block");
     }
@@ -2692,7 +2723,10 @@ docker:
     #[test]
     fn validate_rejects_bad_aws_mode() {
         let top = validate_yaml("aws:\n  mode: bogus\n").expect_err("bad top mode");
-        assert_eq!(top, "aws.mode \"bogus\" is not one of assume-role, passthrough");
+        assert_eq!(
+            top,
+            "aws.mode \"bogus\" is not one of assume-role, passthrough"
+        );
         let server = validate_yaml("aws:\n  servers:\n    mini2:\n      mode: nope\n")
             .expect_err("bad server mode");
         assert_eq!(
@@ -2755,7 +2789,10 @@ aws:
         for bad in ["0s", "-5s"] {
             let err = validate_yaml(&format!("approval_timeout: {bad}\n"))
                 .expect_err("non-positive approval_timeout");
-            assert!(err.contains("must be positive"), "approval_timeout {bad:?}: {err:?}");
+            assert!(
+                err.contains("must be positive"),
+                "approval_timeout {bad:?}: {err:?}"
+            );
         }
         // STRICT-parser hardening (P: H1): quoted leading/trailing whitespace (Go
         // errors, the fail-safe parser trimmed) and an i64-overflowing magnitude are
@@ -2779,9 +2816,18 @@ aws:
         assert_eq!(parse_go_duration_strict("0"), Ok(0));
         assert_eq!(parse_go_duration_strict("-5s"), Ok(-5_000_000_000));
         // Rejected (Go rejects too): no unit, whitespace, empty, unknown unit, overflow.
-        assert!(parse_go_duration_strict("10").is_err(), "bare number, no unit");
-        assert!(parse_go_duration_strict(" 5s ").is_err(), "whitespace not trimmed");
-        assert!(parse_go_duration_strict("5 s").is_err(), "internal whitespace");
+        assert!(
+            parse_go_duration_strict("10").is_err(),
+            "bare number, no unit"
+        );
+        assert!(
+            parse_go_duration_strict(" 5s ").is_err(),
+            "whitespace not trimmed"
+        );
+        assert!(
+            parse_go_duration_strict("5 s").is_err(),
+            "internal whitespace"
+        );
         assert!(parse_go_duration_strict("").is_err(), "empty");
         assert!(parse_go_duration_strict("5y").is_err(), "unknown unit");
         assert!(
@@ -2825,8 +2871,7 @@ aws:
         assert_eq!(cfg.ssh_scope(), "per-session");
         assert_eq!(cfg.ssh_session_ttl(), "4h");
         // Explicit YAML null → still the defaults (null-aware read).
-        let cfg =
-            HostAgentConfig::parse("ssh:\n  approval:\n    scope:\n    session_ttl: null\n");
+        let cfg = HostAgentConfig::parse("ssh:\n  approval:\n    scope:\n    session_ttl: null\n");
         assert_eq!(cfg.ssh_scope(), "per-session");
         assert_eq!(cfg.ssh_session_ttl(), "4h");
     }
@@ -2837,9 +2882,8 @@ aws:
     /// read must NOT re-default an explicit empty string.
     #[test]
     fn biometric_knobs_keep_explicit_empty() {
-        let cfg = HostAgentConfig::parse(
-            "ssh:\n  approval:\n    scope: \"\"\n    session_ttl: \"\"\n",
-        );
+        let cfg =
+            HostAgentConfig::parse("ssh:\n  approval:\n    scope: \"\"\n    session_ttl: \"\"\n");
         assert_eq!(cfg.ssh_scope(), "");
         assert_eq!(cfg.ssh_session_ttl(), "");
     }
@@ -2983,7 +3027,10 @@ aws:
             let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {on}\n"));
             assert!(cfg.logging_enabled, "logging.enabled: {on} → on");
         }
-        assert!(HostAgentConfig::parse("").logging_enabled, "absent → default on");
+        assert!(
+            HostAgentConfig::parse("").logging_enabled,
+            "absent → default on"
+        );
         // Residue: a non-resolvable value keeps the pre-D2 lenient default (ON).
         for res in ["nonsense", "1", "0"] {
             let cfg = HostAgentConfig::parse(&format!("logging:\n  enabled: {res}\n"));
@@ -3014,7 +3061,9 @@ aws:
             "discovery.servers must be \"all\" or a list of server names"
         );
         // A nested-map form errors too.
-        assert!(HostAgentConfig::try_parse("discovery:\n  servers:\n    web:\n      x: y\n").is_err());
+        assert!(
+            HostAgentConfig::try_parse("discovery:\n  servers:\n    web:\n      x: y\n").is_err()
+        );
         // The valid forms still parse (all / one / list / explicit-none / bare null).
         for ok in [
             "discovery:\n  servers: all\n",
@@ -3023,7 +3072,10 @@ aws:
             "discovery:\n  servers: []\n",
             "discovery:\n  servers:\n",
         ] {
-            assert!(HostAgentConfig::try_parse(ok).is_ok(), "valid selector {ok:?}");
+            assert!(
+                HostAgentConfig::try_parse(ok).is_ok(),
+                "valid selector {ok:?}"
+            );
         }
     }
 

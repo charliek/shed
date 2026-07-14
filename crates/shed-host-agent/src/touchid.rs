@@ -453,7 +453,11 @@ mod gate {
                 assert_eq!(approve(&g, "srv", "web").await.decided_by, "touchid");
                 // Second sign in the same instant: strict `< ZERO` is always false → prompt again.
                 assert_eq!(approve(&g, "srv", "web").await.decided_by, "touchid");
-                assert_eq!(state.calls.load(Ordering::SeqCst), 2, "ttl={ttl}: re-prompted");
+                assert_eq!(
+                    state.calls.load(Ordering::SeqCst),
+                    2,
+                    "ttl={ttl}: re-prompted"
+                );
             }
         }
 

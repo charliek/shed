@@ -65,9 +65,15 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
 
     let root = yaml_lite::parse(&data).map_err(|e| format!("parsing shed config {path}: {e}"))?;
     let mut targets = Vec::new();
-    if let Some(servers) = root.as_map().and_then(|m| m.get("servers")).and_then(Node::as_map) {
+    if let Some(servers) = root
+        .as_map()
+        .and_then(|m| m.get("servers"))
+        .and_then(Node::as_map)
+    {
         for (name, entry) in servers {
-            let Some(fields) = entry.as_map() else { continue };
+            let Some(fields) = entry.as_map() else {
+                continue;
+            };
             let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
             let host = scalar("host").unwrap_or("");
             if host.is_empty() {

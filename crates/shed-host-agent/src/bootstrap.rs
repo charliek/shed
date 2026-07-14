@@ -223,7 +223,10 @@ pub fn validate(p: &Params) -> Result<(), BootstrapError> {
         )));
     }
     if p.host.contains([' ', '\t', '\r', '\n', '\0', '@']) {
-        return Err(BootstrapError::Validate(format!("invalid host {:?}", p.host)));
+        return Err(BootstrapError::Validate(format!(
+            "invalid host {:?}",
+            p.host
+        )));
     }
     // Port is a u16 so 0 is the only out-of-range value Go's 1..=65535 check rejects.
     if p.port == 0 {
@@ -281,10 +284,13 @@ pub fn decode_bundle(out: &[u8], want_scope: &str) -> Result<Bundle, BootstrapEr
         .map_err(|_| BootstrapError::Decode("ssh produced no valid bootstrap bundle".into()))?;
     // Require EOF after the single object (trailing whitespace is fine) — Go reads the
     // next token and insists the stream is exhausted.
-    de.end()
-        .map_err(|_| BootstrapError::Decode("unexpected trailing data after bootstrap bundle".into()))?;
+    de.end().map_err(|_| {
+        BootstrapError::Decode("unexpected trailing data after bootstrap bundle".into())
+    })?;
     if b.token.trim().is_empty() {
-        return Err(BootstrapError::Decode("bootstrap returned an empty token".into()));
+        return Err(BootstrapError::Decode(
+            "bootstrap returned an empty token".into(),
+        ));
     }
     if b.https_port == 0 && b.http_port == 0 {
         return Err(BootstrapError::Decode(
@@ -519,10 +525,7 @@ impl<'a> MarkerScanner<'a> {
         }
         let mut hay = std::mem::take(&mut self.carry);
         hay.extend_from_slice(chunk);
-        if hay
-            .windows(self.marker.len())
-            .any(|w| w == self.marker)
-        {
+        if hay.windows(self.marker.len()).any(|w| w == self.marker) {
             self.seen = true;
             return;
         }
@@ -645,7 +648,10 @@ mod tests {
         assert!(bad(&|p| p.host = "a@b".into()), "host @");
         assert!(bad(&|p| p.host = "a\0b".into()), "host NUL");
         assert!(bad(&|p| p.port = 0), "port 0");
-        assert!(bad(&|p| p.known_hosts_path = String::new()), "no known_hosts");
+        assert!(
+            bad(&|p| p.known_hosts_path = String::new()),
+            "no known_hosts"
+        );
         assert!(bad(&|p| p.scope = String::new()), "empty scope");
         assert!(bad(&|p| p.scope = "a b".into()), "scope whitespace");
         assert!(bad(&|p| p.client_kind = "a b".into()), "kind whitespace");
@@ -655,8 +661,12 @@ mod tests {
     #[test]
     fn classify_matrix() {
         // 255 + banner → terminal.
-        assert!(classify(255, true, "REMOTE HOST IDENTIFICATION HAS CHANGED\nsomething")
-            .is_host_key_mismatch());
+        assert!(classify(
+            255,
+            true,
+            "REMOTE HOST IDENTIFICATION HAS CHANGED\nsomething"
+        )
+        .is_host_key_mismatch());
         // Banner but WRONG exit code → NOT terminal (the AND-gate; CodeRabbit F3).
         assert!(!classify(1, true, "REMOTE HOST IDENTIFICATION HAS CHANGED").is_host_key_mismatch());
         // 255 without the banner → NOT terminal.
@@ -681,7 +691,10 @@ mod tests {
             BootstrapError::Ssh { exit: 1, .. }
         ));
         // No stderr → bare failure.
-        assert!(matches!(classify(-1, false, ""), BootstrapError::SshFailed(_)));
+        assert!(matches!(
+            classify(-1, false, ""),
+            BootstrapError::SshFailed(_)
+        ));
     }
 
     fn bundle_json(token: &str, https: bool, scope: &str) -> String {
@@ -695,7 +708,9 @@ mod tests {
         } else {
             r#""http_port":8080,"#
         };
-        format!(r#"{{{port}{fp}"token":"{token}","scope":"{scope}","token_id":"t1","expires_at":"2030-01-01T00:00:00Z"}}"#)
+        format!(
+            r#"{{{port}{fp}"token":"{token}","scope":"{scope}","token_id":"t1","expires_at":"2030-01-01T00:00:00Z"}}"#
+        )
     }
 
     #[test]
@@ -714,14 +729,12 @@ mod tests {
         let trailing = format!("{} garbage", bundle_json("tok", true, "control"));
         assert!(decode_bundle(trailing.as_bytes(), "control").is_err());
         assert!(decode_bundle(br#"{"token":"tok"}"#, "control").is_err()); // no port
+        assert!(decode_bundle(br#"{"https_port":8443,"token":"tok"}"#, "control").is_err()); // https w/o fingerprint
         assert!(decode_bundle(
-            br#"{"https_port":8443,"token":"tok"}"#,
+            bundle_json("tok", true, "credentials").as_bytes(),
             "control"
         )
-        .is_err()); // https w/o fingerprint
-        assert!(
-            decode_bundle(bundle_json("tok", true, "credentials").as_bytes(), "control").is_err()
-        ); // scope mismatch
+        .is_err()); // scope mismatch
     }
 
     #[test]
@@ -734,11 +747,7 @@ mod tests {
     fn decode_bundle_scope_absent_is_accepted() {
         // A bundle that omits `scope` is accepted for any want_scope (Go only checks a
         // NON-empty echoed scope).
-        let b = decode_bundle(
-            br#"{"http_port":8080,"token":"tok"}"#,
-            "control",
-        )
-        .unwrap();
+        let b = decode_bundle(br#"{"http_port":8080,"token":"tok"}"#, "control").unwrap();
         assert_eq!(b.scope, "");
         assert_eq!(b.expires_at, None); // absent expires_at → None (non-expiring)
     }
@@ -887,6 +896,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BootstrapError::Aborted(_)), "got {err:?}");
-        assert!(start.elapsed() < Duration::from_secs(5), "did not abort promptly");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "did not abort promptly"
+        );
     }
 }
