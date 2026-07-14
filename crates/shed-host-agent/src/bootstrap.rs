@@ -223,7 +223,10 @@ pub fn validate(p: &Params) -> Result<(), BootstrapError> {
         )));
     }
     if p.host.contains([' ', '\t', '\r', '\n', '\0', '@']) {
-        return Err(BootstrapError::Validate(format!("invalid host {:?}", p.host)));
+        return Err(BootstrapError::Validate(format!(
+            "invalid host {:?}",
+            p.host
+        )));
     }
     // Port is a u16 so 0 is the only out-of-range value Go's 1..=65535 check rejects.
     if p.port == 0 {
@@ -281,10 +284,13 @@ pub fn decode_bundle(out: &[u8], want_scope: &str) -> Result<Bundle, BootstrapEr
         .map_err(|_| BootstrapError::Decode("ssh produced no valid bootstrap bundle".into()))?;
     // Require EOF after the single object (trailing whitespace is fine) — Go reads the
     // next token and insists the stream is exhausted.
-    de.end()
-        .map_err(|_| BootstrapError::Decode("unexpected trailing data after bootstrap bundle".into()))?;
+    de.end().map_err(|_| {
+        BootstrapError::Decode("unexpected trailing data after bootstrap bundle".into())
+    })?;
     if b.token.trim().is_empty() {
-        return Err(BootstrapError::Decode("bootstrap returned an empty token".into()));
+        return Err(BootstrapError::Decode(
+            "bootstrap returned an empty token".into(),
+        ));
     }
     if b.https_port == 0 && b.http_port == 0 {
         return Err(BootstrapError::Decode(
@@ -334,107 +340,6 @@ fn find_on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     None
 }
 
-/// Parse an RFC3339 timestamp to unix seconds, matching what Go's `time.Time` collapses
-/// to for the mint bundle: `Ok(None)` for the zero time (`0001-01-01T00:00:00Z`),
-/// `Ok(Some(secs))` for a valid instant (offset applied, sub-second **truncated** as Go's
-/// `Format(time.RFC3339)` drops it), `Err(())` for a malformed non-empty value. The
-/// inverse of [`crate::status::rfc3339_utc`]; a round-trip against it is unit-pinned.
-fn parse_rfc3339_to_unix(s: &str) -> Result<Option<i64>, ()> {
-    // Layout: YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM). Split date/time on 'T'.
-    let (date, time_and_zone) = s.split_once('T').ok_or(())?;
-    let (y, mo, d) = {
-        let mut it = date.split('-');
-        let y: i64 = it.next().ok_or(())?.parse().map_err(|_| ())?;
-        let mo: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
-        let d: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
-        if it.next().is_some() {
-            return Err(());
-        }
-        (y, mo, d)
-    };
-    // Split the zone suffix off the time, then split off any fractional seconds.
-    let (time_part, offset_secs) = split_zone(time_and_zone)?;
-    let (hms, frac) = match time_part.split_once('.') {
-        Some((h, f)) => (h, Some(f)),
-        None => (time_part, None),
-    };
-    if let Some(f) = frac {
-        // Sub-second digits are validated (Go's RFC3339Nano parse would) then dropped.
-        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(());
-        }
-    }
-    let (h, mi, se) = {
-        let mut it = hms.split(':');
-        let h: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
-        let mi: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
-        let se: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
-        if it.next().is_some() {
-            return Err(());
-        }
-        (h, mi, se)
-    };
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
-        return Err(());
-    }
-    // The Go zero time → None (Go's `IsZero()` → omitted `expires_at`).
-    if y == 1 && mo == 1 && d == 1 && h == 0 && mi == 0 && se == 0 && offset_secs == 0 {
-        return Ok(None);
-    }
-    let days = days_from_civil(y, mo, d);
-    let secs = days * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + (se as i64) - offset_secs;
-    Ok(Some(secs))
-}
-
-/// Split an RFC3339 zone suffix (`Z` or `±HH:MM`) off the end, returning the remaining
-/// time text and the offset in seconds to SUBTRACT to reach UTC.
-fn split_zone(time_and_zone: &str) -> Result<(&str, i64), ()> {
-    if let Some(rest) = time_and_zone.strip_suffix('Z') {
-        return Ok((rest, 0));
-    }
-    // Find the last '+' or '-' that starts the offset (after the time, so index >= 1).
-    let bytes = time_and_zone.as_bytes();
-    let mut idx = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if (b == b'+' || b == b'-') && i > 0 {
-            idx = Some(i);
-        }
-    }
-    let i = idx.ok_or(())?;
-    let (time_part, off) = time_and_zone.split_at(i);
-    // A `+05:00` zone is 5h AHEAD of UTC, so 5h is SUBTRACTED from the local time to
-    // reach UTC (positive value to subtract); `-05:00` adds (negative value).
-    let sign = if off.as_bytes()[0] == b'+' { 1 } else { -1 };
-    let off = &off[1..];
-    let (oh, om) = off.split_once(':').ok_or(())?;
-    let oh: i64 = parse_fixed::<u32>(oh, 2)? as i64;
-    let om: i64 = parse_fixed::<u32>(om, 2)? as i64;
-    if oh > 23 || om > 59 {
-        return Err(());
-    }
-    Ok((time_part, sign * (oh * 3_600 + om * 60)))
-}
-
-/// Parse an exactly-`width`-digit unsigned field (RFC3339 fields are fixed-width).
-fn parse_fixed<T: std::str::FromStr>(s: &str, width: usize) -> Result<T, ()> {
-    if s.len() != width || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(());
-    }
-    s.parse().map_err(|_| ())
-}
-
-/// Days from the civil date to the unix epoch (Howard Hinnant's `days_from_civil`; the
-/// inverse of the civil-from-days math in [`crate::status::rfc3339_utc`]).
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 } as i64; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
-
 /// serde field deserializer for `Bundle.expires_at`: `None` for absent/null/empty/zero;
 /// `Some(secs)` for a valid instant; a serde error for a malformed non-empty value (so
 /// the whole `Bundle::deserialize` fails, matching Go's `json.Unmarshal` into
@@ -449,7 +354,7 @@ where
     if s.is_empty() {
         return Ok(None);
     }
-    match parse_rfc3339_to_unix(s) {
+    match crate::status::parse_rfc3339_to_unix(s) {
         Ok(v) => Ok(v),
         Err(()) => Err(D::Error::custom("invalid RFC3339 expires_at")),
     }
@@ -620,10 +525,7 @@ impl<'a> MarkerScanner<'a> {
         }
         let mut hay = std::mem::take(&mut self.carry);
         hay.extend_from_slice(chunk);
-        if hay
-            .windows(self.marker.len())
-            .any(|w| w == self.marker)
-        {
+        if hay.windows(self.marker.len()).any(|w| w == self.marker) {
             self.seen = true;
             return;
         }
@@ -659,7 +561,6 @@ fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status::rfc3339_utc;
 
     fn params() -> Params {
         Params {
@@ -747,7 +648,10 @@ mod tests {
         assert!(bad(&|p| p.host = "a@b".into()), "host @");
         assert!(bad(&|p| p.host = "a\0b".into()), "host NUL");
         assert!(bad(&|p| p.port = 0), "port 0");
-        assert!(bad(&|p| p.known_hosts_path = String::new()), "no known_hosts");
+        assert!(
+            bad(&|p| p.known_hosts_path = String::new()),
+            "no known_hosts"
+        );
         assert!(bad(&|p| p.scope = String::new()), "empty scope");
         assert!(bad(&|p| p.scope = "a b".into()), "scope whitespace");
         assert!(bad(&|p| p.client_kind = "a b".into()), "kind whitespace");
@@ -757,8 +661,12 @@ mod tests {
     #[test]
     fn classify_matrix() {
         // 255 + banner → terminal.
-        assert!(classify(255, true, "REMOTE HOST IDENTIFICATION HAS CHANGED\nsomething")
-            .is_host_key_mismatch());
+        assert!(classify(
+            255,
+            true,
+            "REMOTE HOST IDENTIFICATION HAS CHANGED\nsomething"
+        )
+        .is_host_key_mismatch());
         // Banner but WRONG exit code → NOT terminal (the AND-gate; CodeRabbit F3).
         assert!(!classify(1, true, "REMOTE HOST IDENTIFICATION HAS CHANGED").is_host_key_mismatch());
         // 255 without the banner → NOT terminal.
@@ -783,7 +691,10 @@ mod tests {
             BootstrapError::Ssh { exit: 1, .. }
         ));
         // No stderr → bare failure.
-        assert!(matches!(classify(-1, false, ""), BootstrapError::SshFailed(_)));
+        assert!(matches!(
+            classify(-1, false, ""),
+            BootstrapError::SshFailed(_)
+        ));
     }
 
     fn bundle_json(token: &str, https: bool, scope: &str) -> String {
@@ -797,7 +708,9 @@ mod tests {
         } else {
             r#""http_port":8080,"#
         };
-        format!(r#"{{{port}{fp}"token":"{token}","scope":"{scope}","token_id":"t1","expires_at":"2030-01-01T00:00:00Z"}}"#)
+        format!(
+            r#"{{{port}{fp}"token":"{token}","scope":"{scope}","token_id":"t1","expires_at":"2030-01-01T00:00:00Z"}}"#
+        )
     }
 
     #[test]
@@ -816,14 +729,12 @@ mod tests {
         let trailing = format!("{} garbage", bundle_json("tok", true, "control"));
         assert!(decode_bundle(trailing.as_bytes(), "control").is_err());
         assert!(decode_bundle(br#"{"token":"tok"}"#, "control").is_err()); // no port
+        assert!(decode_bundle(br#"{"https_port":8443,"token":"tok"}"#, "control").is_err()); // https w/o fingerprint
         assert!(decode_bundle(
-            br#"{"https_port":8443,"token":"tok"}"#,
+            bundle_json("tok", true, "credentials").as_bytes(),
             "control"
         )
-        .is_err()); // https w/o fingerprint
-        assert!(
-            decode_bundle(bundle_json("tok", true, "credentials").as_bytes(), "control").is_err()
-        ); // scope mismatch
+        .is_err()); // scope mismatch
     }
 
     #[test]
@@ -836,11 +747,7 @@ mod tests {
     fn decode_bundle_scope_absent_is_accepted() {
         // A bundle that omits `scope` is accepted for any want_scope (Go only checks a
         // NON-empty echoed scope).
-        let b = decode_bundle(
-            br#"{"http_port":8080,"token":"tok"}"#,
-            "control",
-        )
-        .unwrap();
+        let b = decode_bundle(br#"{"http_port":8080,"token":"tok"}"#, "control").unwrap();
         assert_eq!(b.scope, "");
         assert_eq!(b.expires_at, None); // absent expires_at → None (non-expiring)
     }
@@ -865,30 +772,6 @@ mod tests {
             "control"
         )
         .is_err());
-    }
-
-    #[test]
-    fn rfc3339_round_trip_against_renderer() {
-        // parse_rfc3339_to_unix is the inverse of status::rfc3339_utc.
-        for unix in [0i64, 1_893_456_000, 1_700_000_000, 253_402_300_799] {
-            let s = rfc3339_utc(unix);
-            assert_eq!(parse_rfc3339_to_unix(&s), Ok(Some(unix)), "round-trip {s}");
-        }
-    }
-
-    #[test]
-    fn rfc3339_offset_and_fraction() {
-        // +05:00 offset normalizes to UTC; fractional seconds are truncated.
-        assert_eq!(
-            parse_rfc3339_to_unix("2030-01-01T05:00:00+05:00"),
-            Ok(Some(1_893_456_000))
-        );
-        assert_eq!(
-            parse_rfc3339_to_unix("2030-01-01T00:00:00.500Z"),
-            Ok(Some(1_893_456_000))
-        );
-        assert_eq!(parse_rfc3339_to_unix("garbage"), Err(()));
-        assert_eq!(parse_rfc3339_to_unix("2030-13-01T00:00:00Z"), Err(())); // bad month
     }
 
     #[test]
@@ -945,9 +828,33 @@ mod tests {
         (dir, ssh)
     }
 
+    /// Run a shim with a bounded ETXTBSY retry. Another test's fork can
+    /// transiently inherit this shim's write fd across our exec — the fd table
+    /// is process-wide, so a concurrent `Command::spawn` anywhere in this test
+    /// binary races every freshly-written executable (the classic fork/exec
+    /// race; hits ~100% on the 4-vCPU ubuntu runner, unreproducible on dev
+    /// machines). The spawn errno is stringified away by
+    /// `BootstrapError::SshFailed(e.to_string())`, so match the locale-stable
+    /// `"os error 26"` suffix, never the English prose. Each attempt writes a
+    /// FRESH shim (fresh tempdir); non-ETXTBSY results return immediately, so
+    /// error-asserting tests (timeout, changed-host-key) are unaffected.
     async fn run_shim(body: &str, p: &Params, timeout: Duration) -> Result<Bundle, BootstrapError> {
-        let (_dir, ssh) = write_shim(body);
-        SystemSshRunner::with_shim(ssh, timeout).run(p).await
+        let mut delay = Duration::from_millis(10);
+        for _ in 0..10 {
+            let (_dir, ssh) = write_shim(body);
+            match SystemSshRunner::with_shim(ssh, timeout).run(p).await {
+                Err(BootstrapError::SshFailed(m)) if m.contains("os error 26") => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(160));
+                }
+                r => return r,
+            }
+        }
+        // Exhaustion must fail LOUDLY (mirrors docker_backend::exec_retrying): a
+        // persistent ETXTBSY is not the transient fork/exec race, and returning
+        // the SshFailed would let error-asserting callers mistake it for the
+        // error they intended to provoke.
+        panic!("persistent ETXTBSY exec'ing the ssh shim — not the transient fork/exec race");
     }
 
     #[tokio::test]
@@ -967,9 +874,11 @@ mod tests {
         // subprocess sees exactly the argv the differential also compares).
         let dir = tempfile::tempdir().unwrap();
         let argv_file = dir.path().join("argv");
+        // `: >` truncates first so an ETXTBSY retry (run_shim) can't double the
+        // captured argv via the appends below.
         let body = format!(
-            "for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\nprintf '{{\"http_port\":8080,\"token\":\"t\"}}'\n",
-            argv_file.display()
+            ": > '{p}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{p}'; done\nprintf '{{\"http_port\":8080,\"token\":\"t\"}}'\n",
+            p = argv_file.display()
         );
         run_shim(&body, &params(), Duration::from_secs(5))
             .await
@@ -1013,6 +922,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BootstrapError::Aborted(_)), "got {err:?}");
-        assert!(start.elapsed() < Duration::from_secs(5), "did not abort promptly");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "did not abort promptly"
+        );
     }
 }

@@ -57,6 +57,11 @@ vendor/
 .env.*.local
 *.pem
 *.key
+# Exception: the committed, throwaway self-signed TLS pair the host-agent-diff harness
+# serves for the secure-bus cells (non-secret; Python `ssl` can't generate one at runtime,
+# so a fixed pair is committed for a stable leaf-DER pin). See tests/host-agent-diff/README.
+!tests/host-agent-diff/fixtures/synthetic_bus_cert.pem
+!tests/host-agent-diff/fixtures/synthetic_bus_key.pem
 
 # Desktop app local secrets (Sparkle private key, notarization creds)
 desktop/.secrets/

@@ -1,0 +1,53 @@
+{
+  "_comment": "Golden fixture for the discovery ServerSelector — input a `discovery:`-block-body YAML (the selector line, plus optionally another key so the selector can be omitted) -> per-name Selected() verdicts. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenServerSelector, via a real yaml.Unmarshal into DiscoveryConfig + Servers.Selected) and the Rust runner (crates/shed-host-agent/src/config.rs tests::golden_server_selector, via yaml_lite::parse -> DiscoveryConfig::from_node -> ServerSelector::selected). Pins the load-bearing nil-vs-empty distinction: an ABSENT selector selects everything, an EXPLICIT empty list (`servers: []`) selects nothing. Mirrors config_discovery_test.go:TestServerSelectorUnmarshal + TestServerSelectorSelected.",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "scalar all selects everything",
+      "selector_yaml": "servers: all\n",
+      "queries": [
+        {"name": "mini2", "selected": true},
+        {"name": "anything", "selected": true}
+      ]
+    },
+    {
+      "name": "empty scalar selects everything",
+      "selector_yaml": "servers: \"\"\n",
+      "queries": [
+        {"name": "x", "selected": true}
+      ]
+    },
+    {
+      "name": "omitted selector (absent servers key) selects everything",
+      "selector_yaml": "watch: poll\n",
+      "queries": [
+        {"name": "x", "selected": true}
+      ]
+    },
+    {
+      "name": "explicit empty list selects nothing (watch-none)",
+      "selector_yaml": "servers: []\n",
+      "queries": [
+        {"name": "mini2", "selected": false},
+        {"name": "x", "selected": false}
+      ]
+    },
+    {
+      "name": "list membership",
+      "selector_yaml": "servers: [mini2, mini3]\n",
+      "queries": [
+        {"name": "mini2", "selected": true},
+        {"name": "mini3", "selected": true},
+        {"name": "mini4", "selected": false}
+      ]
+    },
+    {
+      "name": "single-name scalar becomes a one-element list",
+      "selector_yaml": "servers: mini2\n",
+      "queries": [
+        {"name": "mini2", "selected": true},
+        {"name": "mini3", "selected": false}
+      ]
+    }
+  ]
+}

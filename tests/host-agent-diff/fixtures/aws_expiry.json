@@ -1,0 +1,184 @@
+{
+  "_comment": "Language-neutral goldens for the AWS expiry-hint scan + timestamp render helpers. The Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenAWSExpiry) routes each vector through the REAL parseSessionExpiry/parseExpiryValue + the handler's expiration Format + awsExpiryDetail; the Rust runner (crates/shed-host-agent/src/aws_backend.rs:golden_aws_expiry) routes through parse_session_expiry/parse_expiry_value + aws_literal_z + aws_expiry_detail. expiry_vectors: INI text + profile -> expected unix seconds (or null). literal_z_vectors: unix -> literal-Z UTC string. expiry_detail_vectors: unix (or null) -> audit detail.",
+  "protocol_version": 1,
+  "expiry_vectors": [
+    {
+      "name": "rfc3339_z",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "x_security_token_expires",
+      "ini": "[p]\nx_security_token_expires = 2099-01-02T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "rfc3339_nano_fractional",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T15:04:05.123Z\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "offset_colon_positive",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T17:04:05+02:00\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "offset_colon_negative",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T10:04:05-05:00\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "offset_nocolon_z0700",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T17:04:05+0200\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "space_separator_colon_offset",
+      "ini": "[p]\naws_session_expiration = 2099-01-02 17:04:05+02:00\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "space_separator_z",
+      "ini": "[p]\naws_session_expiration = 2099-01-02 15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "fractional_under_nocolon_offset",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T15:04:05.5+0200\n",
+      "profile": "p",
+      "expected_unix": 4071042245
+    },
+    {
+      "name": "quoted_value",
+      "ini": "[p]\naws_session_expiration = \"2099-01-02T15:04:05Z\"\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "comment_and_whitespace",
+      "ini": "# header\n[p]\n  aws_session_expiration = 2099-01-02T15:04:05Z  \n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "config_style_profile_prefix",
+      "ini": "[profile p]\naws_session_expiration = 2099-01-02T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "profile_with_dot",
+      "ini": "[a.b]\naws_session_expiration = 2099-01-02T15:04:05Z\n",
+      "profile": "a.b",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "duplicate_section_first_wins",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T15:04:05Z\n[p]\naws_session_expiration = 2100-01-01T00:00:00Z\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "key_order_first_line_wins",
+      "ini": "[p]\nx_security_token_expires = 2099-01-02T15:04:05Z\naws_session_expiration = 2100-01-01T00:00:00Z\n",
+      "profile": "p",
+      "expected_unix": 4071049445
+    },
+    {
+      "name": "missing_key",
+      "ini": "[p]\naws_access_key_id = A\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "missing_profile",
+      "ini": "[other]\naws_session_expiration = 2099-01-02T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "unparseable_value",
+      "ini": "[p]\naws_session_expiration = not-a-time\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "no_zone_rejected",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T15:04:05\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "calendar_invalid_feb30",
+      "ini": "[p]\naws_session_expiration = 2099-02-30T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "calendar_invalid_apr31",
+      "ini": "[p]\naws_session_expiration = 2099-04-31T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "calendar_nonleap_feb29",
+      "ini": "[p]\naws_session_expiration = 2099-02-29T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "calendar_leap_feb29_ok",
+      "ini": "[p]\naws_session_expiration = 2096-02-29T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": 3981366245
+    },
+    {
+      "name": "leap_second_rejected",
+      "ini": "[p]\naws_session_expiration = 2099-01-02T15:04:60Z\n",
+      "profile": "p",
+      "expected_unix": null
+    },
+    {
+      "name": "five_digit_year_rejected",
+      "ini": "[p]\naws_session_expiration = 12345-01-02T15:04:05Z\n",
+      "profile": "p",
+      "expected_unix": null
+    }
+  ],
+  "literal_z_vectors": [
+    {
+      "unix": 0,
+      "expected": "1970-01-01T00:00:00Z"
+    },
+    {
+      "unix": 1000000000,
+      "expected": "2001-09-09T01:46:40Z"
+    },
+    {
+      "unix": 4071049445,
+      "expected": "2099-01-02T15:04:05Z"
+    }
+  ],
+  "expiry_detail_vectors": [
+    {
+      "unix": null,
+      "expected": "expires:none"
+    },
+    {
+      "unix": 4071049445,
+      "expected": "expires:15:04"
+    },
+    {
+      "unix": 0,
+      "expected": "expires:00:00"
+    }
+  ]
+}

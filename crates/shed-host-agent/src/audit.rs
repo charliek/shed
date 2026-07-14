@@ -89,8 +89,11 @@ fn is_empty_str(s: &&str) -> bool {
     s.is_empty()
 }
 
-/// Serialize one entry to its durable JSONL line (no trailing newline).
-fn to_jsonl(entry: &AuditEntry) -> String {
+/// Serialize one entry to its durable JSONL line (no trailing newline). `pub(crate)` so
+/// the egress golden runner (`egress::tests::golden_egress_audit_entry`) can pin the wire
+/// bytes — incl. the always-present `"approval":""` — against the shared fixture the Go
+/// runner compares via `json.Marshal(AuditEntry)`.
+pub(crate) fn to_jsonl(entry: &AuditEntry) -> String {
     let wire = WireEntry {
         ts: &entry.ts,
         server: &entry.server,

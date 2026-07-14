@@ -127,6 +127,54 @@ def _sign_config(bus_url: str) -> str:
     return SIGN_CONFIG.replace("{server}", bus_url)
 
 
+# The discovery `watch: poll` launch config (short poll interval so the convergence
+# differential resolves within a test deadline). BOTH impls build a supervisor and
+# reconcile the desired server set from `{source}` (a `~/.shed/config.yaml`-style
+# `servers:` doc) every poll tick — so an appearance/change of `{source}` converges the
+# `servers[]` on both. The live differential drives POLL for determinism (production's
+# default is event-driven `notify`; that path is unit-covered). BLOCK style (the Rust
+# reader is block-only). `{source}`/`{audit_log}` are filled by the `daemon` fixture.
+DISCOVERY_POLL_CONFIG = """\
+ssh:
+  approval:
+    policy: approve-all
+logging:
+  enabled: true
+  path: {audit_log}
+discovery:
+  watch: poll
+  poll_interval: 300ms
+  source: {source}
+"""
+
+# The discovery `watch: off` launch config: reconciles ONCE at startup, then never
+# reloads — so a later `{source}` change is NOT picked up (the deterministic half of the
+# off/poll convergence cell).
+DISCOVERY_OFF_CONFIG = """\
+ssh:
+  approval:
+    policy: approve-all
+logging:
+  enabled: true
+  path: {audit_log}
+discovery:
+  watch: off
+  source: {source}
+"""
+
+
+def discovery_source_doc(servers: dict) -> str:
+    """Render a `~/.shed/config.yaml`-style discovery source doc from
+    `{name: {field: value, ...}, ...}` (block style — both readers agree). An empty dict
+    renders a bare `servers:` (an empty set → the daemon watches nothing)."""
+    lines = ["servers:"]
+    for name, fields in servers.items():
+        lines.append(f"  {name}:")
+        for key, value in fields.items():
+            lines.append(f"    {key}: {value}")
+    return "\n".join(lines) + "\n"
+
+
 @dataclasses.dataclass
 class CliResult:
     """The outcome of one one-shot subcommand invocation."""
@@ -138,18 +186,29 @@ class CliResult:
     home: str
 
 
-def _clean_env(socket_dir, home, path_prepend=None) -> dict:
+def _clean_env(socket_dir, home, path_prepend=None, ssh_auth_sock=None) -> dict:
     """A hermetic environment: real PATH (so `go`/system tools resolve) but an
     isolated HOME + socket dir, and no ambient ssh-agent. `path_prepend` (a dir)
     goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved
-    before the real one — both daemons use `exec.LookPath`/`look_ssh` on PATH."""
+    before the real one — both daemons use `exec.LookPath`/`look_ssh` on PATH.
+
+    `SSH_AUTH_SOCK` is stripped by default (so the local-keys backend is the
+    auto-detect result); pass `ssh_auth_sock` to point BOTH daemons' agent-forward
+    backend at a fake agent (the ssh-backend tests) — it is set AFTER the strip so it
+    wins."""
     env = dict(os.environ)
     env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
     env["HOME"] = str(home)
     env.pop("SSH_AUTH_SOCK", None)
     env.pop("XDG_RUNTIME_DIR", None)
+    # Strip DOCKER_CONFIG so `find_docker_config` resolves the isolated
+    # `<HOME>/.docker/config.json` on BOTH impls (a dev-Mac DOCKER_CONFIG would
+    # otherwise leak a real Docker config into the differential — non-hermetic).
+    env.pop("DOCKER_CONFIG", None)
     if path_prepend is not None:
         env["PATH"] = str(path_prepend) + os.pathsep + env.get("PATH", "")
+    if ssh_auth_sock is not None:
+        env["SSH_AUTH_SOCK"] = str(ssh_auth_sock)
     return env
 
 
@@ -193,7 +252,18 @@ def binaries(tmp_path_factory) -> dict:
         cwd=REPO_ROOT / "crates",
         env=cargo_env,
     )
-    rust_bin = REPO_ROOT / "crates" / "target" / "debug" / "shed-host-agent"
+    # Honor CARGO_TARGET_DIR (standard cargo redirection — used e.g. by the
+    # rehab's Linux loop container to keep linux artifacts off the bind mount).
+    # Cargo resolves a RELATIVE value against ITS cwd (crates/, where we invoke
+    # it above) — not pytest's cwd — so anchor relative values there too.
+    env_target = os.environ.get("CARGO_TARGET_DIR")
+    if env_target:
+        target_dir = Path(env_target)
+        if not target_dir.is_absolute():
+            target_dir = REPO_ROOT / "crates" / target_dir
+    else:
+        target_dir = REPO_ROOT / "crates" / "target"
+    rust_bin = target_dir / "debug" / "shed-host-agent"
 
     assert go_bin.exists(), f"go binary missing: {go_bin}"
     assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
@@ -230,6 +300,8 @@ class DaemonHandle:
         log_path,
         audit_log_path,
         ssh_argv_file=None,
+        docker_transcript_file=None,
+        source_path=None,
     ):
         self.impl = impl
         self.binary = binary
@@ -238,10 +310,21 @@ class DaemonHandle:
         self.home = str(home)
         self.config_path = str(config_path)
         self.log_path = Path(log_path)
+        # The discovery `source:` file (a `~/.shed/config.yaml`-style `servers:` doc). A
+        # discovery test writes/rewrites it to drive the poll/off convergence differential;
+        # `None` for the non-discovery configs.
+        self.source_path = Path(source_path) if source_path else None
         # When the daemon was launched with a shim `ssh` (the minter tests), the shim
         # appends its argv (one element per line) to this file — the daemon's exact
         # `ssh` invocation, captured for the differential's argv comparison.
         self.ssh_argv_file = Path(ssh_argv_file) if ssh_argv_file else None
+        # When launched with a fake `docker-credential-testhelper` (the docker helper
+        # cells), the helper appends one JSONL record per invocation — `{"argv":[...],
+        # "stdin":"<server_url>"}`, argv+stdin ONLY, never PATH/env — captured for the
+        # exec-seam transcript diff.
+        self.docker_transcript_file = (
+            Path(docker_transcript_file) if docker_transcript_file else None
+        )
         # The DURABLE audit JSONL (`logging.path`), distinct from the operational log
         # above. Populated by gated ops (the sign flow); a fan-out `event` is sent
         # AFTER the file line is written on both impls (Rust `JsonlAuditSink::log`,
@@ -254,6 +337,27 @@ class DaemonHandle:
     def status(self, json: bool = False) -> CliResult:
         args = ["status"] + (["--json"] if json else [])
         return _run_cli(self.binary, args, self.socket_dir, self.home)
+
+    def poll_status(self, predicate, timeout: float = 12.0) -> dict:
+        """Poll `status --json` until `predicate(obj)` holds (a deadline poll, never a
+        fixed sleep) and return the parsed status object. A non-zero `status` exit is
+        retried, not fatal. Raises on timeout with the last snapshot for a readable
+        failure — the shared primitive behind the discovery/servers[] convergence cells."""
+        import json as _json
+
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            r = self.status(json=True)
+            if r.returncode == 0:
+                last = _json.loads(r.stdout)
+                if predicate(last):
+                    return last
+            time.sleep(0.05)
+        raise AssertionError(
+            f"{self.impl}: status --json never satisfied the predicate within "
+            f"{timeout}s; last={last!r}"
+        )
 
     def read_log(self) -> str:
         return _safe_read(self.log_path)
@@ -279,16 +383,16 @@ class DaemonHandle:
             f"{self.impl}: shim ssh argv file {self.ssh_argv_file} empty within {timeout}s"
         )
 
-    def read_audit_jsonl(self, expect: int = 1, timeout: float = 5.0) -> list:
-        """Poll the durable audit file until it holds `expect` non-empty JSONL lines
-        (a deadline poll, never a fixed sleep) and return them parsed. Raises on
-        timeout or on a line that isn't a JSON object. Robust against the small window
-        between the desktop `event` and the file flush landing on disk."""
+    def _poll_jsonl(self, path: Path, what: str, expect: int, timeout: float) -> list:
+        """Poll `path` until it holds `expect` non-empty JSONL lines (a deadline poll,
+        never a fixed sleep) and return them parsed. Raises on timeout or on a line
+        that isn't valid JSON. Robust against the small window between the triggering
+        event and the file flush landing on disk."""
         deadline = time.monotonic() + timeout
         last: list = []
         while time.monotonic() < deadline:
             try:
-                raw = self.audit_log_path.read_text()
+                raw = path.read_text()
             except OSError:
                 raw = ""
             last = [line for line in raw.splitlines() if line.strip()]
@@ -298,9 +402,22 @@ class DaemonHandle:
                 return [_json.loads(line) for line in last]
             time.sleep(0.02)
         raise AssertionError(
-            f"{self.impl}: audit file {self.audit_log_path} held {len(last)} line(s), "
+            f"{self.impl}: {what} {path} held {len(last)} line(s), "
             f"expected {expect} within {timeout}s; contents={last!r}"
         )
+
+    def read_docker_transcript(self, expect: int = 1, timeout: float = 5.0) -> list:
+        """Poll the fake docker-helper's transcript until it holds `expect` non-empty
+        JSONL lines and return them parsed (each `{"argv":[...], "stdin":"..."}`)."""
+        assert self.docker_transcript_file is not None, (
+            "daemon was not launched with docker_helper_bundle"
+        )
+        return self._poll_jsonl(self.docker_transcript_file, "docker transcript", expect, timeout)
+
+    def read_audit_jsonl(self, expect: int = 1, timeout: float = 5.0) -> list:
+        """Poll the durable audit file (`logging.path`) until it holds `expect`
+        non-empty JSONL lines and return them parsed."""
+        return self._poll_jsonl(self.audit_log_path, "audit file", expect, timeout)
 
 
 @pytest.fixture
@@ -318,9 +435,15 @@ def daemon(binaries, tmp_path_factory):
         impl,
         config_text,
         install_ssh_key: bool = False,
+        install_ssh_keys=None,
+        ssh_auth_sock: str | None = None,
         shed_config: str | None = None,
         known_hosts: str | None = None,
         ssh_shim_bundle: str | None = None,
+        install_aws_credentials: str | None = None,
+        install_docker_config: str | None = None,
+        docker_helper_bundle: str | None = None,
+        pre_launch=None,
     ):
         root = tmp_path_factory.mktemp(f"daemon-{impl}")
         home = root / "home"
@@ -335,13 +458,49 @@ def daemon(binaries, tmp_path_factory):
         # `<HOME>/.ssh/id_ed25519` (dir 0700, file 0600) BEFORE launch, so a
         # local-keys `sign` finds the SAME key on both impls (Go `os.UserHomeDir()`
         # + Rust `user_home_dir()` both resolve `$HOME`, set by `_clean_env`).
+        # `install_ssh_key=True` installs id_ed25519 (unchanged default). The additive
+        # `install_ssh_keys` kwarg installs a list of committed fixture STEMS (e.g.
+        # "test_ed25519","test_rsa","test_ecdsa") as `<HOME>/.ssh/id_<algo>` — the
+        # local-keys backend loads them in STANDARD_KEY_FILES order (ed25519, rsa,
+        # ecdsa) on both impls. A stem `test_<algo>` maps to `id_<algo>`.
+        keys_to_install: list[str] = []
         if install_ssh_key:
+            keys_to_install.append("test_ed25519")
+        if install_ssh_keys:
+            keys_to_install.extend(install_ssh_keys)
+        if keys_to_install:
             ssh_dir = home / ".ssh"
             ssh_dir.mkdir(mode=0o700, exist_ok=True)
-            key_dst = ssh_dir / "id_ed25519"
-            key_dst.write_bytes(TEST_ED25519_KEY.read_bytes())
             os.chmod(ssh_dir, 0o700)
-            os.chmod(key_dst, 0o600)
+            for stem in keys_to_install:
+                dst_name = stem.replace("test_", "id_", 1)
+                key_dst = ssh_dir / dst_name
+                key_dst.write_bytes((FIXTURES_DIR / stem).read_bytes())
+                os.chmod(key_dst, 0o600)
+
+        # Install the AWS shared-credentials fixture into this daemon's isolated
+        # `<HOME>/.aws/{credentials,config}` BEFORE launch, so a passthrough vend reads
+        # the SAME profile on both impls (Go `~/.aws/credentials` default + Rust
+        # `user_home_dir().join(".aws")`, both keyed off `$HOME`). The config file is
+        # written EMPTY (Go's `LoadSharedConfigProfile` merges config + credentials; the
+        # credentials file carries the static keys). Hermetic by construction — no
+        # AWS_SHARED_CREDENTIALS_FILE env plumbing needed (that route is unit-covered).
+        if install_aws_credentials is not None:
+            aws_dir = home / ".aws"
+            aws_dir.mkdir(exist_ok=True)
+            (aws_dir / "credentials").write_text(install_aws_credentials)
+            (aws_dir / "config").write_text("")
+
+        # Install the Docker `config.json` fixture into this daemon's isolated
+        # `<HOME>/.docker/config.json` BEFORE launch, so a `get`/`list` reads the SAME
+        # config on both impls (`find_docker_config` resolves `$HOME/.docker/config.json`
+        # with DOCKER_CONFIG stripped by `_clean_env`). Hermetic by construction — no
+        # DOCKER_CONFIG env plumbing. When None (the UNCONFIGURED cell), no file is
+        # written, so the default path is absent → the backend denies every registry.
+        if install_docker_config is not None:
+            docker_dir = home / ".docker"
+            docker_dir.mkdir(exist_ok=True)
+            (docker_dir / "config.json").write_text(install_docker_config)
 
         # The minter reads `<HOME>/.shed/{config.yaml,known_hosts}` (the shed CLI
         # config it resolves servers from + the host-key pin). Both impls read the
@@ -367,6 +526,25 @@ def daemon(binaries, tmp_path_factory):
             _write_ssh_shim(shim_dir / "ssh", ssh_argv_file, ssh_shim_bundle)
             path_prepend = shim_dir
 
+        # Install a fake `docker-credential-testhelper` (a python3 script, 0755 + shebang)
+        # into a PATH-PREPENDED `helper-bin` dir — `look_helper_path` resolves via PATH
+        # (`which`-equivalent) FIRST, so the front-of-PATH shim wins on both impls. It
+        # captures its argv + stdin (the server_url) to a per-impl transcript JSONL,
+        # then prints the fixed bundle. The two cells are mutually exclusive with the ssh
+        # shim (both want `path_prepend`).
+        docker_transcript_file = None
+        if docker_helper_bundle is not None:
+            assert ssh_shim_bundle is None, "ssh shim + docker helper both want path_prepend"
+            helper_dir = root / "helper-bin"
+            helper_dir.mkdir()
+            docker_transcript_file = root / "docker-helper-transcript.jsonl"
+            _write_docker_helper(
+                helper_dir / "docker-credential-testhelper",
+                docker_transcript_file,
+                docker_helper_bundle,
+            )
+            path_prepend = helper_dir
+
         # The socket dir must be SHORT: an AF_UNIX bind path caps at ~104 bytes
         # (macOS) / ~108 (Linux), and pytest's nested tmp tree blows past that. A
         # shallow mkdtemp under $TMPDIR keeps `<dir>/host-agent-status.sock` well
@@ -377,12 +555,22 @@ def daemon(binaries, tmp_path_factory):
         status_sock = socket_dir / STATUS_SOCK_NAME
         desktop_sock = socket_dir / DESKTOP_SOCK_NAME
 
+        # `pre_launch(socket_dir)` runs AFTER the socket dir exists but BEFORE the
+        # daemon launches — the seam the A1 socket-lifecycle cell uses to widen the
+        # dir to 0777 (so the daemon's re-chmod-to-0700 is observable) or to plant a
+        # stale AF_UNIX socket at the fixed socket paths (so the daemon's stale-detect
+        # + rebind is exercised). No-op for every other test.
+        if pre_launch is not None:
+            pre_launch(socket_dir)
+
         # The daemon writes its operational log to -log-file, so stdout/stderr carry
         # nothing worth capturing; DEVNULL avoids leaving un-read pipe file objects
         # (which would trip the suite's warnings-as-errors as ResourceWarnings).
         proc = subprocess.Popen(
             [binaries[impl], "-config", str(config_path), "-log-file", str(log_path)],
-            env=_clean_env(socket_dir, home, path_prepend=path_prepend),
+            env=_clean_env(
+                socket_dir, home, path_prepend=path_prepend, ssh_auth_sock=ssh_auth_sock
+            ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -416,6 +604,8 @@ def daemon(binaries, tmp_path_factory):
             log_path,
             audit_log,
             ssh_argv_file=ssh_argv_file,
+            docker_transcript_file=docker_transcript_file,
+            source_path=source,
         )
         try:
             yield handle
@@ -467,6 +657,25 @@ def _write_ssh_shim(path: Path, argv_file: Path, bundle_json: str) -> None:
     os.chmod(path, 0o755)
 
 
+def _write_docker_helper(path: Path, transcript_file: Path, bundle_json: str) -> None:
+    """Write an executable `#!/usr/bin/env python3` fake `docker-credential-testhelper`
+    that (a) reads stdin (the raw `server_url`), (b) appends ONE JSONL record of its
+    argv + stdin — argv+stdin ONLY, NEVER the augmented PATH/env (per-impl/host-dependent;
+    APPEND parity is the `augment_path` golden's job) — to `transcript_file`, and (c)
+    prints the fixed `bundle_json` to stdout, exit 0. The deterministic exec seam both
+    daemons run over."""
+    script = (
+        "#!/usr/bin/env python3\n"
+        "import sys, json\n"
+        "stdin = sys.stdin.read()\n"
+        f"with open({str(transcript_file)!r}, 'a') as f:\n"
+        "    f.write(json.dumps({'argv': sys.argv[1:], 'stdin': stdin}) + '\\n')\n"
+        f"sys.stdout.write({bundle_json!r})\n"
+    )
+    path.write_text(script)
+    os.chmod(path, 0o755)
+
+
 def _safe_read(path) -> str:
     try:
         return Path(path).read_text()
@@ -497,6 +706,20 @@ def sign_config():
     with `daemon(..., install_ssh_key=True)` so the committed ed25519 key is loaded.
     See SIGN_CONFIG."""
     return _sign_config
+
+
+@pytest.fixture
+def discovery_poll_config() -> str:
+    """The block-style `watch: poll` discovery launch-config template (see
+    DISCOVERY_POLL_CONFIG). The `daemon` fixture fills `{source}`/`{audit_log}`."""
+    return DISCOVERY_POLL_CONFIG
+
+
+@pytest.fixture
+def discovery_off_config() -> str:
+    """The block-style `watch: off` discovery launch-config template (see
+    DISCOVERY_OFF_CONFIG)."""
+    return DISCOVERY_OFF_CONFIG
 
 
 @pytest.fixture

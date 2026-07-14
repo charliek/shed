@@ -34,6 +34,24 @@ compile everywhere (macOS, Linux, and eventually mobile) without dragging a desk
 The Tauri crate consumes `shed-core` + `shed-app` as cross-workspace **path-deps**; it is not a
 member here. Do not add it as one.
 
+### The no-YAML-dep posture — and its one carve-out
+
+Both clients hand-roll a tiny indentation reader (`shed-core`'s and `shed-host-agent`'s own
+`yaml_lite` mods) rather than take a YAML dependency. That aversion targets the **serde-based**
+crates (`serde_yaml` — archived/unmaintained — and `serde_norway`): serde-derive on the config
+structs is what's being avoided, not a parser per se.
+
+**The scoped exception:** `shed-host-agent` depends on **`saphyr-parser`** (pure-Rust, no-serde,
+no-C, no encoding_rs, `default-features = false`) to back ITS `yaml_lite::parse`. Justification:
+the shipped `configs/extensions.example.yaml` uses block-style `docker.registries:` sequences the
+line/colon reader silently dropped, and Go's `LoadConfig` rejects malformed YAML the hand-rolled
+reader could not detect — a real Go-vs-Rust divergence on the product's own default config.
+`saphyr-parser` sits behind the `Node` interface (swap-insulation for its pre-1.0 API) and is a
+**leaf-crate dep of the `shed-host-agent` binary only** — it does NOT reach `shed-core`/`shed-app`/
+`shed-core-ffi`/the Tauri client (proven by `cargo tree -i saphyr-parser`). **shed-core's own
+`yaml_lite` stays hand-rolled** (it carries a Swift byte-parity test); converging the two readers
+onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
+
 ## Build / test
 
 ```bash

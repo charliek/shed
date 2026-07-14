@@ -273,3 +273,93 @@ def test_bus_sign_gated_deny(daemon, sign_config, differential):
         "approval": "shed-desktop",
         "decided_by": "user",
     }
+
+
+# The fail-closed audit both A3 drives produce: a denied `sign`, `approval:"shed-desktop"`,
+# and — unlike the consumer-deny path above (`decided_by:"user"`) — NO `decided_by`. The
+# no-consumer / timeout gate returns the ERROR path (`desktopGate.Approve` →
+# `ApprovalOutcome{}` + err on Go; `denied_no_decision()` on Rust), so the empty
+# `DecidedBy`/`Scope`/`TTL` are all omitted (omitempty on both sides).
+FAIL_CLOSED_AUDIT = {
+    "ts": "<ts>",
+    "shed": "web",
+    "ns": "ssh-agent",
+    "op": "sign",
+    "result": "denied",
+    "approval": "shed-desktop",
+}
+
+
+@pytest.mark.differential
+def test_bus_sign_no_consumer_fails_closed(daemon, sign_config, differential):
+    """A3 · no-consumer fail-closed. With NO desktop consumer connected, a gated `sign`
+    denies immediately (Go `errNoConsumer`, Rust `denied_no_decision()` — no wait): the
+    guest gets `{approval denied, SIGN_FAILED}` and the durable line is a denied audit
+    with no `decided_by`. The gated-sign capstone minus the consumer connect."""
+
+    def scenario(impl):
+        with SyntheticBus() as bus:
+            with daemon(impl, sign_config(bus.url), install_ssh_key=True) as d:
+                bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+                bus.push_request("ssh-agent", SIGN_REQUEST)
+                response = bus.await_response("ssh-agent", timeout=10.0)
+                audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
+                return {
+                    "response": canonical(mask_bus_response(response)),
+                    "audit": canonical(mask_audit_entry(audit)),
+                }
+
+    result = differential(scenario)
+    resp = result["response"]
+    assert resp["type"] == "response"
+    assert resp["final"] is True
+    assert resp["in_reply_to"] == "sign-1"
+    assert resp["namespace"] == "ssh-agent"
+    assert resp["shed"] == EXPECTED_SHED
+    assert resp["payload"] == {"error": "approval denied", "code": "SIGN_FAILED"}
+    assert resp["id"] == "<id>"
+    assert resp["timestamp"] == "<ts>"
+    assert result["audit"] == FAIL_CLOSED_AUDIT
+
+
+@pytest.mark.differential
+def test_bus_sign_timeout_fails_closed(daemon, sign_config, differential):
+    """A3 · timeout fail-closed. A consumer connects and receives the `approval_request`
+    but NEVER replies; with a SHORT `approval_timeout` (1s) both daemons time out and
+    deny — Go on `time.After(s.timeout)`, Rust on the `tokio::time::sleep` arm of the
+    `select!` — returning `{approval denied, SIGN_FAILED}` + the same no-`decided_by`
+    denied audit. This exercises the EXISTING timeout arm; per D7 (ACCEPT, no divergence)
+    the Rust `select!` has NO shutdown arm (adding one would make Rust faster than Go)."""
+
+    def scenario(impl):
+        with SyntheticBus() as bus:
+            # Append a short top-level approval_timeout so the wait is bounded to ~1s.
+            cfg = sign_config(bus.url) + "approval_timeout: 1s\n"
+            with daemon(impl, cfg, install_ssh_key=True) as d:
+                with DesktopClient(str(d.desktop_sock)) as app:
+                    app.send_hello()
+                    # The consumer must be PROMOTED before the sign, else it's the
+                    # no-consumer path, not the timeout path.
+                    wait_for_consumer(d, connected=True, timeout=10.0)
+                    bus.wait_for_subscribe("ssh-agent", timeout=10.0)
+
+                    bus.push_request("ssh-agent", SIGN_REQUEST)
+                    # The prompt reaches the app (which never answers) → timeout deny.
+                    app.await_frame("approval_request", timeout=10.0)
+
+                    response = bus.await_response("ssh-agent", timeout=10.0)
+                    audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
+                    return {
+                        "response": canonical(mask_bus_response(response)),
+                        "audit": canonical(mask_audit_entry(audit)),
+                    }
+
+    result = differential(scenario)
+    resp = result["response"]
+    assert resp["type"] == "response"
+    assert resp["final"] is True
+    assert resp["in_reply_to"] == "sign-1"
+    assert resp["namespace"] == "ssh-agent"
+    assert resp["shed"] == EXPECTED_SHED
+    assert resp["payload"] == {"error": "approval denied", "code": "SIGN_FAILED"}
+    assert result["audit"] == FAIL_CLOSED_AUDIT

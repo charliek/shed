@@ -1,0 +1,62 @@
+{
+  "protocol_version": 1,
+  "_comment": "input -> expected wire JSON for the four ssh-agent response payload types (internal/ext/protocol/ssh.go). The Go runner (golden_test.go:TestGoldenSSHPayloadShapes) builds protocol.* structs; the Rust runner (bus.rs:golden_ssh_payload_shapes) builds the bus serde types; both marshal and assert equal to `expected` (compared as parsed JSON values). Pins tag names, the b64 pass-through of blobs, the always-present rest:\"\", and that an empty key list marshals as [] not null.",
+  "list_vectors": [
+    {
+      "name": "two-keys",
+      "input": {
+        "keys": [
+          {"format": "ssh-ed25519", "blob_b64": "AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE", "comment": "id_ed25519"},
+          {"format": "ssh-rsa", "blob_b64": "AAAAB3NzaC1yc2EAAAADEXAMPLE", "comment": "id_rsa"}
+        ]
+      },
+      "expected": {
+        "keys": [
+          {"format": "ssh-ed25519", "blob": "AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLE", "comment": "id_ed25519"},
+          {"format": "ssh-rsa", "blob": "AAAAB3NzaC1yc2EAAAADEXAMPLE", "comment": "id_rsa"}
+        ]
+      }
+    },
+    {
+      "name": "empty-list-is-array-not-null",
+      "input": {"keys": []},
+      "expected": {"keys": []}
+    }
+  ],
+  "sign_vectors": [
+    {
+      "name": "rsa-sha2-256",
+      "input": {"format": "rsa-sha2-256", "blob_b64": "c2lnbmF0dXJlLWJ5dGVz"},
+      "expected": {"format": "rsa-sha2-256", "blob": "c2lnbmF0dXJlLWJ5dGVz", "rest": ""}
+    },
+    {
+      "name": "ssh-ed25519",
+      "input": {"format": "ssh-ed25519", "blob_b64": "ZWQyNTUxOS1zaWduYXR1cmU"},
+      "expected": {"format": "ssh-ed25519", "blob": "ZWQyNTUxOS1zaWduYXR1cmU", "rest": ""}
+    }
+  ],
+  "status_vectors": [
+    {
+      "name": "local-keys-3",
+      "input": {"mode": "local-keys", "key_count": 3},
+      "expected": {"connected": true, "mode": "local-keys", "key_count": 3}
+    },
+    {
+      "name": "agent-forward-0",
+      "input": {"mode": "agent-forward", "key_count": 0},
+      "expected": {"connected": true, "mode": "agent-forward", "key_count": 0}
+    }
+  ],
+  "error_vectors": [
+    {
+      "name": "key-listing-failed",
+      "input": {"error": "key listing failed", "code": "INTERNAL_ERROR"},
+      "expected": {"error": "key listing failed", "code": "INTERNAL_ERROR"}
+    },
+    {
+      "name": "unknown-operation",
+      "input": {"error": "unknown operation: delete", "code": "INTERNAL_ERROR"},
+      "expected": {"error": "unknown operation: delete", "code": "INTERNAL_ERROR"}
+    }
+  ]
+}

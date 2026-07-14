@@ -1,0 +1,70 @@
+{
+  "_comment": "Golden fixture for the Docker config slice — input host-agent config YAML (block-style maps + flow-list `[a, b]` registries, the yaml_lite subset) -> per-(server,shed) DockerConfig.Resolve() results: allow_all + registries + registry_count (== len(registries), the backend Status verdict). Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenDockerResolve, via the production LoadConfig->Docker.Resolve path) and the Rust runner (crates/shed-host-agent/src/config.rs tests::golden_docker_resolve, via HostAgentConfig::parse().docker.resolve). Go has NO Resolve layering test, so this golden is Rust-STRONGER. It pins the load-bearing Option semantics: registries Option<Vec<String>> (absent -> inherit, `[]` -> REPLACE-with-empty / deny-all lockdown, `[a,b]` -> replace-not-merge across top/server/shed) and allow_all Option<bool> (absent -> inherit, false -> force-off, true -> force-on), plus the flow-list `[a, b]` AND block-style `- item` (the shipped extensions.example.yaml form) parse the saphyr-backed yaml_lite Node::Sequence enables. Mirrors config_discovery_test.go:TestDockerResolve (extended).",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "top-level defaults inherited when no server override; flow-list [a, b] parse",
+      "config_yaml": "docker:\n  registries: [ghcr.io, index.docker.io]\n  allow_all: false\n",
+      "queries": [
+        {"server": "mini3", "shed": "anything", "allow_all": false, "registries": ["ghcr.io", "index.docker.io"], "registry_count": 2}
+      ]
+    },
+    {
+      "name": "per-server allow_all pointer override inherits registries; per-shed replaces registries + forces allow_all false",
+      "config_yaml": "docker:\n  registries: [ghcr.io]\n  servers:\n    mini2:\n      allow_all: true\n      sheds:\n        web:\n          registries: [reg.example.com]\n          allow_all: false\n",
+      "queries": [
+        {"server": "mini3", "shed": "anything", "allow_all": false, "registries": ["ghcr.io"], "registry_count": 1},
+        {"server": "mini2", "shed": "api", "allow_all": true, "registries": ["ghcr.io"], "registry_count": 1},
+        {"server": "mini2", "shed": "web", "allow_all": false, "registries": ["reg.example.com"], "registry_count": 1}
+      ]
+    },
+    {
+      "name": "explicit empty registries [] at server -> replace-with-empty (deny-all lockdown); sibling server inherits",
+      "config_yaml": "docker:\n  registries: [ghcr.io, index.docker.io]\n  servers:\n    locked:\n      registries: []\n",
+      "queries": [
+        {"server": "locked", "shed": "x", "allow_all": false, "registries": [], "registry_count": 0},
+        {"server": "other", "shed": "x", "allow_all": false, "registries": ["ghcr.io", "index.docker.io"], "registry_count": 2}
+      ]
+    },
+    {
+      "name": "allow_all Option layering: None inherit / Some(false) force-off / Some(true) force-on; registries replace at server tier",
+      "config_yaml": "docker:\n  allow_all: true\n  registries: [ghcr.io]\n  servers:\n    off-server:\n      allow_all: false\n    inherit-server:\n      registries: [only.io]\n",
+      "queries": [
+        {"server": "off-server", "shed": "x", "allow_all": false, "registries": ["ghcr.io"], "registry_count": 1},
+        {"server": "inherit-server", "shed": "x", "allow_all": true, "registries": ["only.io"], "registry_count": 1},
+        {"server": "unknown", "shed": "x", "allow_all": true, "registries": ["ghcr.io"], "registry_count": 1}
+      ]
+    },
+    {
+      "name": "empty registries [] at shed under allow_all-true server -> per-shed deny-all lockdown; sibling shed inherits allow_all",
+      "config_yaml": "docker:\n  allow_all: true\n  servers:\n    mini2:\n      sheds:\n        locked:\n          registries: []\n          allow_all: false\n",
+      "queries": [
+        {"server": "mini2", "shed": "locked", "allow_all": false, "registries": [], "registry_count": 0},
+        {"server": "mini2", "shed": "other", "allow_all": true, "registries": [], "registry_count": 0}
+      ]
+    },
+    {
+      "name": "no docker block at all -> unconfigured deny-all (empty registries, allow_all false)",
+      "config_yaml": "server: http://localhost:8080\n",
+      "queries": [
+        {"server": "any", "shed": "any", "allow_all": false, "registries": [], "registry_count": 0}
+      ]
+    },
+    {
+      "name": "BLOCK-STYLE registries sequence (the shipped extensions.example.yaml form) parses to [index.docker.io, ghcr.io], not empty",
+      "config_yaml": "docker:\n  registries:\n    - index.docker.io\n    - ghcr.io\n  allow_all: false\n",
+      "queries": [
+        {"server": "mini3", "shed": "anything", "allow_all": false, "registries": ["index.docker.io", "ghcr.io"], "registry_count": 2}
+      ]
+    },
+    {
+      "name": "D2 bool alternate forms: allow_all `yes` at top forces on; server `True` force-on; server `no` force-off (was mis-read pre-D2)",
+      "config_yaml": "docker:\n  allow_all: yes\n  servers:\n    on-server:\n      allow_all: True\n    off-server:\n      allow_all: no\n",
+      "queries": [
+        {"server": "unknown", "shed": "x", "allow_all": true, "registries": [], "registry_count": 0},
+        {"server": "on-server", "shed": "x", "allow_all": true, "registries": [], "registry_count": 0},
+        {"server": "off-server", "shed": "x", "allow_all": false, "registries": [], "registry_count": 0}
+      ]
+    }
+  ]
+}

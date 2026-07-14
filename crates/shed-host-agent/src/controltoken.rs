@@ -1,6 +1,7 @@
 //! The control-token provider — a faithful Rust port of
-//! `cmd/shed-host-agent/controltoken.go` plus the `ServerTarget`/`LoadDiscoveredServers`
-//! slice of `config.go`/`discovery.go` that its resolve path needs.
+//! `cmd/shed-host-agent/controltoken.go`. The `ServerTarget` / `load_discovered_servers`
+//! slice its resolve path needs now lives in the always-on [`crate::discovery`] module
+//! (hoisted out of here so the headless supervisor path can use it too).
 //!
 //! [`ControlTokenProvider`] mints and caches CONTROL-scoped tokens for named servers on
 //! the desktop's behalf (the `token.get` UDS request). Minting is BROAD: it can mint for
@@ -13,15 +14,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::desktop::{ControlTokenMinter, MintedControlToken};
-use crate::minter::{new_credential_source, CredentialSource, Minter, ServerTarget, SCOPE_CONTROL};
+use crate::discovery::{load_discovered_servers, ServerTarget};
+use crate::minter::{new_credential_source, CredentialSource, Minter, SCOPE_CONTROL};
 use crate::status::rfc3339_utc;
 
 /// The shed CLI config (`~/.shed/config.yaml`) the control-token provider resolves
 /// servers from in single-server mode (mirror `config.go:DefaultDiscoverySource`).
-pub const DEFAULT_DISCOVERY_SOURCE: &str = "~/.shed/config.yaml";
-
-/// shed's default server HTTP port (mirror `discovery.go:defaultShedHTTPPort`).
-const DEFAULT_SHED_HTTP_PORT: u16 = 8080;
+/// Re-exported from `config` (the single canonical definition the discovery
+/// `apply_defaults` also uses) so `main.rs`'s `controltoken::DEFAULT_DISCOVERY_SOURCE`
+/// reference stays stable.
+pub use crate::config::DEFAULT_DISCOVERY_SOURCE;
 
 /// Answers `token.get` by minting CONTROL tokens over SSH (mirror
 /// `controltoken.go:controlTokenProvider`).
@@ -98,62 +100,6 @@ impl ControlTokenMinter for ControlTokenProvider {
             expires_at: expiry.map(rfc3339_utc),
         })
     }
-}
-
-/// Read the shed CLI config at `path` and return one [`ServerTarget`] per registered
-/// server, sorted by name (mirror `discovery.go:LoadDiscoveredServers`). A missing file
-/// is not an error — it yields an empty slice so the agent picks servers up live once the
-/// file appears. Entries with an empty host are skipped. **`ssh_port` defaults to 0 when
-/// omitted (NOT 22)** — the divergence from `shed-core::ShedConfig` that makes an https
-/// server missing `ssh_port` reject as "no ssh endpoint" rather than silently minting
-/// against port 22.
-///
-/// NOTE (tracked gap, config-port slice): Go errors on malformed YAML; the permissive
-/// `yaml_lite` reader does not — so a malformed `~/.shed/config.yaml` diverges (likely
-/// `unknown server`). The harness writes a valid block-style config, so the differential
-/// doesn't exercise it. Same class as the `config-parse · inline-flow` / `config-validate`
-/// xfail cells.
-pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> {
-    use crate::config::yaml_lite::{self, Node};
-
-    let data = match std::fs::read_to_string(path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("reading shed config {path}: {e}")),
-    };
-
-    let root = yaml_lite::parse(&data);
-    let mut targets = Vec::new();
-    if let Some(servers) = root.as_map().and_then(|m| m.get("servers")).and_then(Node::as_map) {
-        for (name, entry) in servers {
-            let Some(fields) = entry.as_map() else { continue };
-            let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
-            let host = scalar("host").unwrap_or("");
-            if host.is_empty() {
-                continue;
-            }
-            let http_port: u16 = scalar("http_port")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_SHED_HTTP_PORT);
-            // Prefer the explicit api_url (carries the https scheme + port) over the
-            // legacy host+http_port plain-HTTP form.
-            let url = match scalar("api_url") {
-                Some(u) if !u.is_empty() => u.to_string(),
-                _ => format!("http://{host}:{http_port}"),
-            };
-            targets.push(ServerTarget {
-                name: name.clone(),
-                url,
-                token: scalar("credentials_token").unwrap_or("").to_string(),
-                tls_fingerprint: scalar("tls_cert_fingerprint").unwrap_or("").to_string(),
-                ssh_host: host.to_string(),
-                // ssh_port omitted → 0 (NOT 22): a server without it can't self-mint.
-                ssh_port: scalar("ssh_port").and_then(|s| s.parse().ok()).unwrap_or(0),
-            });
-        }
-    }
-    targets.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(targets)
 }
 
 #[cfg(test)]
@@ -268,90 +214,7 @@ servers:
         );
     }
 
-    // ---- load_discovered_servers (the ssh_port=0-vs-22 + empty-host divergence) ------
-
-    #[test]
-    fn load_missing_file_is_empty() {
-        assert_eq!(
-            load_discovered_servers("/nonexistent/config.yaml").unwrap(),
-            Vec::new()
-        );
-    }
-
-    /// The Rust half of the `load_discovered_servers` golden — reads the SAME shared
-    /// fixture the Go runner reads (`cmd/shed-host-agent/golden_test.go`), so the two
-    /// impls can't drift together on the ssh_port=0/empty-host/sort semantics. Lives
-    /// in-crate (not `tests/golden.rs`) because this is a binary crate with no lib, so
-    /// an integration test can't reach `load_discovered_servers`.
-    #[test]
-    fn golden_load_discovered_servers() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/host-agent-diff/fixtures/load_discovered_servers.json");
-        let raw = std::fs::read_to_string(&path).expect("read golden fixture");
-        let fx: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(fx["protocol_version"], 1, "version skew");
-        let vectors = fx["vectors"].as_array().unwrap();
-        assert!(!vectors.is_empty(), "fixture has no vectors");
-        for v in vectors {
-            let name = v["name"].as_str().unwrap();
-            let (_d, cfg) = write_config(v["config_yaml"].as_str().unwrap());
-            let got = load_discovered_servers(&cfg).unwrap();
-            let got_json: Vec<serde_json::Value> = got
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "url": t.url,
-                        "token": t.token,
-                        "tls_fingerprint": t.tls_fingerprint,
-                        "ssh_host": t.ssh_host,
-                        "ssh_port": t.ssh_port,
-                    })
-                })
-                .collect();
-            assert_eq!(
-                serde_json::Value::from(got_json),
-                v["expected"],
-                "golden vector {name:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn load_defaults_and_skips_empty_host() {
-        let (_d, cfg) = write_config(
-            "\
-servers:
-  https-with-ssh:
-    api_url: https://a.example:8443
-    host: a.example
-    ssh_port: 2222
-  https-no-ssh:
-    api_url: https://b.example:8443
-    host: b.example
-  plain:
-    host: c.example
-  empty-host:
-    ssh_port: 2222
-",
-        );
-        let got = load_discovered_servers(&cfg).unwrap();
-        // Sorted by name; empty-host entry skipped.
-        let names: Vec<&str> = got.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["https-no-ssh", "https-with-ssh", "plain"]);
-
-        let with_ssh = &got[1];
-        assert_eq!(with_ssh.ssh_port, 2222);
-        assert!(with_ssh.is_secure());
-
-        // The divergence: an https server missing ssh_port → 0 (NOT 22).
-        let no_ssh = &got[0];
-        assert_eq!(no_ssh.ssh_port, 0);
-        assert!(no_ssh.is_secure());
-
-        // Plain http fallback URL + http_port default 8080.
-        let plain = &got[2];
-        assert_eq!(plain.url, "http://c.example:8080");
-        assert!(!plain.is_secure());
-    }
+    // The `load_discovered_servers` unit + golden tests moved to `discovery.rs`
+    // alongside the hoisted function (the ssh_port=0-vs-22 + empty-host + sort +
+    // malformed divergences it pins).
 }

@@ -38,6 +38,27 @@ libc = "0.2"
 shed-core = { path = "../shed-core" }
 async-trait = { workspace = true }
 uuid = { workspace = true }
+# The host-agent config reader's YAML parser (config.rs `yaml_lite` mod). The repo's
+# clients otherwise hand-roll a tiny indentation reader to avoid a YAML dep (see the
+# carve-out note in crates/CLAUDE.md); this crate is the scoped exception. saphyr-parser
+# is a pure-Rust, no-serde, no-C, YAML-1.2 event-stream parser (no encoding_rs in 0.0.x)
+# — used ONLY to feed the existing `Node` model, so the swap stays behind that interface.
+# It buys real structure (block sequences, flow maps, malformed-input detection) that the
+# line/colon reader cannot: the shipped configs/extensions.example.yaml uses block-style
+# `registries:` sequences the old reader silently dropped. Leaf-crate only — see the PR's
+# DEP_DELTA for the reverse-dep proof that it does NOT reach shed-app/Tauri.
+saphyr-parser = { version = "0.0.11", default-features = false }
+# The discovery-source file watcher (watcher.rs `fsnotify` mode). `notify` is the
+# de-facto Rust fs-notification crate — it wraps the platform backend (FSEvents on
+# macOS, inotify on Linux, ReadDirectoryChangesW on Windows) behind one
+# `recommended_watcher` API, which is exactly Go's `fsnotify` role. Default features
+# are KEPT: they enable the real event-driven backend (fsevent-sys/macos_fsevent on
+# macOS, inotify on Linux) — dropping them would leave only the poll fallback and
+# defeat the whole point of the `fsnotify` mode. notify 8's defaults are already lean:
+# no `crossbeam-channel`, no `serde`, no `mio-extra` — the callback (`EventHandler`)
+# API we use needs none of them. Leaf-crate only (see the PR DEP_DELTA reverse-dep
+# proof): it must not reach shed-core / shed-core-ffi / shed-app.
+notify = "8"
 # The bus HTTP client: reqwest (rustls) for SSE subscribe + respond POST, and
 # futures-util for the bytes-stream adaptor. Match shed-core's stack so cargo
 # unifies one reqwest/rustls build across the workspace.
@@ -57,11 +78,83 @@ futures-util = { workspace = true }
 # build would reject a valid ecdsa/rsa/dsa host-key pin line with "unknown algorithm"
 # where Go accepts it — fail-closed but a compat regression. These are RustCrypto
 # crates (no UI/WebKitGTK deps), so they don't cross the crates/ dependency-clean line.
-ed25519-dalek = "2"
+# `pem` (pulls `pkcs8`) lets `ssh_backend.rs` load a `-----BEGIN PRIVATE KEY-----`
+# (PKCS#8) ed25519 key, matching Go's `ssh.ParsePrivateKey` legacy-PEM acceptance.
+ed25519-dalek = { version = "2", features = ["pem"] }
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "ecdsa", "p256", "p384", "p521", "rsa", "dsa", "std"] }
+# The full local-keys signing matrix (ssh_backend.rs). ssh-key parses the OpenSSH
+# private keys, but its own RSA signer emits **SHA-512 only** — it cannot produce Go's
+# `ssh-rsa` (SHA-1) default nor the flag-selected `rsa-sha2-256`. So we drive the
+# RustCrypto signers directly, pinned to the SAME versions ssh-key already pulls in
+# transitively (cargo unifies one build of each — see the DEP_DELTA in the PR body):
+#   - rsa 0.9: `RsaPrivateKey::sign(Pkcs1v15Sign::new::<D>(), &hash)` → the raw
+#     PKCS#1 v1.5 signature bytes, byte-identical to Go's `rsa.SignPKCS1v15`.
+#   - sha1/sha2 (with the `oid` feature so `Pkcs1v15Sign::new::<D>()` finds the
+#     DigestInfo prefix OID): SHA-1 / SHA-256 / SHA-512 for the three RSA formats.
+#   - p256/p384/p521 (`ecdsa` feature): ECDSA signing over the curve's canonical
+#     hash (P-256→SHA-256, P-384→SHA-384, P-521→SHA-512), matching x/crypto/ssh.
+# All RustCrypto crates (no UI/WebKitGTK deps), so they stay on the clean side of
+# the crates/ dependency line, and none is behind `desktop-forwarding` (the bus owns
+# `sign`, always compiled — the headless `--no-default-features` build builds them).
+#
+# `ssh_backend.rs:load_key` also loads the legacy PEM encodings Go's
+# `ssh.ParsePrivateKey` accepts beyond OpenSSH (`-----BEGIN RSA/EC/PRIVATE KEY-----`):
+#   - rsa's `pem` feature (already on by default) → `RsaPrivateKey::from_pkcs1_pem`
+#     (PKCS#1) + `from_pkcs8_pem` (PKCS#8 RSA).
+#   - p256/p384/p521's `pem` feature (pulls `pkcs8` + `sec1`) → `SecretKey::from_sec1_pem`
+#     (`EC PRIVATE KEY`) + `from_pkcs8_pem` (PKCS#8 EC). These promote existing
+#     transitive nodes; no new crate is compiled.
+rsa = "0.9"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "std"] }
+p521 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "std"] }
 # base64 StdEncoding for the sign req/resp (public_key / data / blob), matching Go's
 # encoding/base64.StdEncoding.
 base64 = "0.22"
+# --- AWS assume-role backend (aws_backend.rs) ------------------------------------
+# The SDK is bought ONLY for the assume-role source-profile credential CHAIN
+# (SSO / credential_process / static), which Go gets from
+# config.LoadDefaultConfig(WithSharedConfigProfile) — a product-fidelity purchase
+# with zero differential coverage (the differentially-tested passthrough path is
+# hand-rolled and SDK-free). Always-on because the bus is not feature-gated; the
+# headless `--no-default-features` build carries it too.
+#
+# Feature choices (verified by an out-of-repo probe; see the PR's DEP_DELTA):
+#   - `sso` + `credentials-process` re-enable those source-profile providers (they
+#     are default-on but `default-features = false` drops them), so
+#     `profile_name(p).load()` resolves SSO / process / static exactly like Go's chain.
+#   - `behavior-version-latest` pins the SDK behavior version (no per-call opt-in).
+#   - `rt-tokio` gives the async sleep/spawn impl on the workspace's tokio.
+#   - `default-https-client` is deliberately OFF: it defaults to a rustls-aws-lc TLS
+#     stack that pulls the heavy `aws-lc-sys` C build. Instead the backend builds the
+#     HTTPS connector explicitly via `aws-smithy-http-client`'s `rustls-ring`, so the
+#     SDK reuses the SAME ring + rustls 0.23 + hyper 1.x the workspace already
+#     compiles (reqwest/shed-core) — cargo unifies one build, no new C toolchain dep.
+#   - `aws-smithy-types` (already transitive) is named directly only for
+#     `DisplayErrorContext`, to render the full SdkError chain into the
+#     `sts:AssumeRole failed for <arn>: <err>` message (Go's `%w`).
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "sso", "credentials-process"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-types = "1"
+
+# --- Native Touch-ID / biometrics gate (touchid.rs) ------------------------------
+# macOS-ONLY: the LocalAuthentication `LAContext.evaluatePolicy` gate for the
+# `biometrics` / `biometrics-or-password` SSH approval policies (Go's CGO
+# touchid_darwin.go, now pure objc2 → the Rust binary needs NO C toolchain / no
+# `import "C"`). These are Apple-framework bindings only (LocalAuthentication /
+# Foundation) — NO WebKitGTK / GTK / Tauri — so they stay on the clean side of the
+# crates/ dependency line and reach ONLY this leaf crate (see the DEP_DELTA reverse-
+# dep proof). `[target.'cfg(target_os="macos")']` means a Linux/headless build NEVER
+# resolves them. Versions match desktop/tauri/src-tauri/Cargo.toml (the proven B3
+# gate) so cargo could unify one build if the graphs ever merged.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
 
 [dev-dependencies]
 # Throwaway socket dirs for the status "not running" exit-code test.

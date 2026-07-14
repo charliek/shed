@@ -25,9 +25,11 @@ That target (root `Makefile`) runs, in order:
 
 1. `cd tests/host-agent-diff && uv sync && uv run pytest -v` — the live differential
    (the session fixture builds both binaries with `go build` + `cargo build`).
-2. `go test ./cmd/shed-host-agent/... -run Golden` — the Go golden-fixture runner.
-3. `cargo test -p shed-host-agent --test golden` — the Rust golden-fixture runner
-   (with `~/.cargo/bin` on PATH).
+2. `go test ./cmd/shed-host-agent/... -run Golden` — the Go golden-fixture runners.
+3. `cargo test -p shed-host-agent golden` — the Rust golden-fixture runners (name
+   filter, so it covers both `tests/golden.rs` and the **in-crate** goldens —
+   `load_discovered_servers` in `controltoken.rs` and `ssh_payload_shapes` in `bus.rs`;
+   with `~/.cargo/bin` on PATH).
 
 Requires **Go + Rust (cargo) + Python/uv**. Install uv via `brew install uv`.
 
@@ -108,62 +110,198 @@ expected []ServerTarget`. The Go runner (`TestGoldenLoadDiscoveredServers` in
 It pins the load-bearing divergences from `shed-core::ShedConfig`: `ssh_port` defaults to
 **0** (not 22) when omitted, empty-host entries are skipped, targets sort by name.
 
+`fixtures/ssh_payload_shapes.json` (`"protocol_version": 1`) pins the four ssh-agent
+**response payload shapes** (`internal/ext/protocol/ssh.go`). The Go runner
+(`TestGoldenSSHPayloadShapes` in `golden_test.go`) builds the `protocol.SSH*Response`
+structs; the Rust runner (`golden_ssh_payload_shapes`, an **in-crate** `bus.rs` test —
+the bus serde types are bin-crate-internal, so `tests/golden.rs` can't reach them, same
+precedent as `load_discovered_servers`) builds the bus serde types; both marshal and
+assert equal to each vector's `expected` (compared as parsed JSON values). It pins the
+tag names, the base64 pass-through of `blob`s, the always-present `rest:""`, and that an
+empty key list marshals as `[]` not `null`.
+
+**Key fixtures.** `fixtures/test_ed25519{,.pub}` (slice 0) plus `fixtures/test_rsa{,.pub}`
+(2048-bit) and `fixtures/test_ecdsa{,.pub}` (P-256), added for the ssh-backend cells, are
+**throwaway, non-secret, passphrase-less** OpenSSH keypairs generated once (comment
+`hadiff-test`) and committed so both daemons load an identical key set. They guard nothing
+and must never be reused anywhere real. The `daemon` fixture installs them into each
+daemon's isolated `<HOME>/.ssh/id_<algo>`; `fake_ssh_agent.py` also serves them as agent
+identities (real-signing ed25519, canned blobs for rsa/ecdsa).
+
+**Committed TLS pair (secure-bus cells).** `fixtures/synthetic_bus_{cert,key}.pem` is a
+**throwaway, non-secret** self-signed RSA-2048 cert/key (CN `shed-host-agent-diff synthetic
+bus`, `subjectAltName=IP:127.0.0.1`, 100-year validity) generated ONCE with `openssl req
+-x509` and committed because Python's stdlib `ssl` cannot generate a cert at runtime — a
+fixed pair means a **stable leaf-DER fingerprint**. `synthetic_bus.py`'s TLS mode serves it
+via `ssl.SSLContext.wrap_socket`; the `discovery:` config pins it as `tls_cert_fingerprint =
+"sha256:" + hex(sha256(leaf_DER))` — the SAME derivation as Go's `sdk.certFingerprint`
+(`sha256:` + `hex.EncodeToString(sha256(rawCerts[0]))`, the leaf DER) and Rust's
+`shed_core::tls::fingerprint` (leaf DER, lowercase hex), so ONE fingerprint string pins
+both impls. **If the pair is regenerated, recompute the pin** (`python3 -c "import
+ssl,hashlib; print('sha256:'+hashlib.sha256(ssl.PEM_cert_to_DER_cert(open('fixtures/synthetic_bus_cert.pem').read())).hexdigest())"`)
+and update `CERT_PIN` in `test_secure_bus.py`. It guards nothing; never reuse it anywhere
+real.
+
 ## Known contract gaps (slice 0)
 
-- **Inline flow-style YAML config.** The Rust slice-0 `yaml_lite` config parser handles
-  **block-style** maps only; it treats an inline flow map like
-  `ssh: { approval: { policy: shed-desktop } }` as an opaque scalar and falls back to
-  all-`deny-all` with an empty gate list, whereas the Go daemon (real YAML) parses it.
-  The harness therefore writes its launch config in **block style** (both parsers agree),
-  and this divergence is tracked as an `xfail`/out-of-scope cell below (`config-parse ·
-  inline-flow`) — a later slice brings the Rust parser to parity.
+- **Config parsing & validation — STRUCTURAL sub-class retired; typed-decode residue
+  documented-open.** The Rust config reader (`config.rs` `yaml_lite`) is now backed by
+  `saphyr-parser` (a pure-Rust YAML-1.2 event parser, `default-features = false`), not the
+  old line/colon reader. That **retires the structural sub-class** of the Go-vs-Rust gap:
+  inline **flow maps** (`ssh: { approval: { policy: shed-desktop } }`) and **flow
+  sequences** parse like block style (`test_config_inline_flow.py`); **block-style
+  sequences** parse (the shipped `configs/extensions.example.yaml` `registries:` block list
+  parses to `[index.docker.io, ghcr.io]` instead of silently dropping to empty — golden
+  `config_validate` + the `example_config_loads_and_validates` unit); **malformed YAML is
+  detected** (returns `Err` → exit 1) instead of being swallowed; and a bare `key:` (YAML
+  null) is distinct from `key: ""` (empty string), so Go's null-vs-empty merge is
+  reproduced (`source_profile` cross-language golden). On top of the parser, the Rust
+  `HostAgentConfig::load` now runs a faithful `validate()` port and **rejects (exit 1) the
+  SAME configs Go `LoadConfig`/`Validate` rejects** — unknown/biometric policy strings, the
+  AWS/Docker biometric policies, `aws.mode`/`aws.sheds` errors, a non-positive/invalid
+  `approval_timeout`, malformed YAML, and duplicate map keys — enforced live by
+  `test_config_validate.py` (exit-1 parity on both impls) and pinned per-vector by the
+  `config_validate.json` golden (both runners).
 
-- **Config validation.** The Rust slice-0 config reader is `LiveStatus`-scoped: it does
-  **not** yet reject the things Go `LoadConfig`/`Validate` rejects (unknown policy strings,
-  the AWS/Docker biometric policies, `aws.mode`/`aws.sheds` errors, a non-positive
-  `approval_timeout`, malformed YAML). So e.g. `aws.approval.policy: biometrics` exits 1 in
-  Go but currently starts in Rust and echoes `biometrics`. The full config **port +
-  validation-parity differential** is its own later slice (config.go's `Validate` is ~120
-  lines); tracked as `config-validate` below.
+  **Documented-open (a real parser fixes STRUCTURE, not typed resolution):** the `Node`
+  model is stringly-typed and the readers coerce leniently, so a **typed-decode residue**
+  survives and is NOT closed here — **scalar-into-typed-field coercion** (`http_port:
+  not-a-number` → Go errors, Rust defaults; `approval_timeout: [a,b]` → Go errors, Rust
+  falls back to 25s; a scalar where a list is expected), and the **bool forms yaml.v3
+  itself REJECTS** (`allow_all: nonsense` / `1` / `0`, or a non-canonical case like
+  `tRUe`/`yEs`, and any non-scalar into a bool → Go errors, but the stringly-typed reader
+  can't error without a typed layer, so it keeps its lenient default). The **bool
+  ALTERNATE FORMS yaml.v3 RESOLVES are now CLOSED (D2 FIX):** `allow_all: yes`/`on`/`True`
+  and `logging.enabled: off`/`no` read the SAME bool Go does — `parse_yaml_bool` mirrors
+  yaml.v3's YAML-1.1 bool token set in its three canonical case forms (`true/True/TRUE`,
+  `yes/Yes/YES`, `on/On/ON`, `y/Y` and their false counterparts), pinned cross-language by
+  the `config_bool_forms.json` golden (both runners) and wire-visible through
+  `docker.allow_all` (a `yes`/`True`/`no` vector in `docker_resolve.json`). (This corrects
+  the earlier stale claim that `allow_all: yes` was a Go error — yaml.v3 resolves it to
+  `true`; only the forms above ERROR.) **Also closed** by the parser swap: duplicate map
+  keys (→ `Err`, matching yaml.v3) and multi-document input (first document consumed,
+  matching Go's `yaml.Unmarshal`). Also documented-open: anchors/aliases/
+  merge-keys, non-string keys, tagged scalars (low real-world risk), and the **cross-client
+  inconsistency on the shared `~/.shed/config.yaml`** — the host-agent (`saphyr-parser`) and
+  the desktop app (shed-core's own hand-rolled `yaml_lite`, a separate crate with a Swift
+  byte-parity test) may now diverge on the SAME file; converging the two readers is a
+  separate shed-core slice, not this one.
 
-- **Bounded connect timeout.** The Rust `status` client and the daemon's live-socket
-  stale-probe use blocking Unix `connect()`; Go uses `net.DialTimeout` (2s / 500ms). The
-  normal path resolves immediately either way; a pathological full-backlog peer could hang
-  the Rust side longer. Low severity, tracked for the config/lifecycle slice.
+- **Bounded connect timeout — CLOSED (D1).** The Rust `status` client and the daemon's
+  live-socket stale-probe now bound the Unix `connect()` to match Go's `net.DialTimeout`
+  (2s / 500ms). `std::os::unix::net::UnixStream` has no `connect_timeout` (std offers it
+  only for `TcpStream`) and both paths run synchronously before any tokio runtime, so the
+  bound is a `libc` nonblocking `connect(2)` + `poll(POLLOUT)` + `SO_ERROR` check
+  (`sockets::connect_unix_timeout`, `cfg(unix)`; `libc` is already a direct dep — no new
+  crate). A pathological full-backlog peer can no longer hang either side past the bound.
+  Pinned by the `sockets.rs` units (`connect_unix_timeout_connects_to_live_listener`,
+  `connect_unix_timeout_refuses_stale_fast`, `connect_unix_timeout_missing_path_fails_fast`,
+  `connect_unix_timeout_rejects_overlong_path`); the normal not-running path stays
+  byte-parity-tested live (`test_status_not_running.py`).
 
-- **Bus subscription set: ssh-agent-only (Rust) vs egress + docker/aws (Go).** In
-  single-server mode (no `discovery:` block) both daemons connect to `server:` and
-  subscribe to `ssh-agent`, so the **ping/pong** differential (`test_bus_ping_pong.py`)
-  compares apples to apples. But the *set of endpoints each impl touches* differs by
-  design this slice: the Go daemon also GETs `/api/egress/stream` (its always-on egress
-  subscriber) and subscribes to `docker-credentials` (its Docker backend is non-nil even
-  unconfigured; `aws-credentials` too when configured), whereas the Rust slice-1b daemon
-  wires **ssh-agent only** (egress + the aws/docker backends are later slices). The
-  synthetic bus tolerates the extra Go subscribes (records them, holds the streams open,
-  never pushes) and 501s the egress GET (Go backs off 5m, DEBUG-quiet) — so the
-  asymmetry is absorbed by the harness, not diffed. The differential asserts only the
-  **ssh-agent response envelope**, never which routes each daemon hit. This flips to a
-  full match when the later slices wire the Rust egress + aws/docker paths.
+- **Bus subscription set — converged.** In single-server mode (no `discovery:` block)
+  both daemons connect to `server:` and subscribe to `ssh-agent`; when `aws.*` is
+  configured (mode passthrough, or a role) both ALSO subscribe `aws-credentials`; and
+  both subscribe `docker-credentials` in the common case — the Docker backend is non-nil
+  even unconfigured (its constructor errors ONLY on an explicit-but-unstat-able
+  `config_path`), so the namespace is subscribed for every server. Each cell
+  `wait_for_subscribe`-es its namespace on both impls (`test_bus_ping_pong.py`,
+  `test_aws_backend.py`, `test_docker_backend.py`), so they compare apples to apples.
+  As of the egress slice both daemons ALSO GET the always-on egress-audit stream
+  (`/api/egress/stream`), so the Go and Rust **endpoint sets fully converge** — there is
+  no residual endpoint asymmetry. The synthetic bus now asserts (not tolerates) that both
+  impls hit egress: `test_egress.py` proves the subscribe, the fixed-ts audit diff, and
+  the per-impl 501 hard-backoff (no reconnect in window).
 
-- **Event replay ring.** The surface-A handshake (`hello`→`hello_ack`), the non-hello
-  drop, single-consumer supersede, event fan-out + approval correlation (via the gated
-  `sign`), and **`token.get`** (via the real SSH-bootstrap minter + a PATH-shim `ssh`,
-  `test_token_get.py`) are all differentially enforced. One surface-A cell stays `xfail`:
-  the **event replay ring** (`replay_events` on connect) is not exercised by the current
-  flows (they connect a fresh consumer with `replay_events:0`) — a buffered-then-connect
-  drive is a follow-up.
+- **Supervisor, discovery & `servers[]` — converged.** Both daemons now run ONE supervisor
+  in BOTH modes (single-server = a discovery config that reconciles once and never reloads;
+  the single unnamed target has `ssh_host=""` → `should_mint` false → open/no-pin). The
+  supervisor's `health()` populates `LiveStatus.servers[]` (one entry per watched server;
+  `name:""` for the single unnamed target), with each namespace's connection state — incl.
+  the 409-`rejected` terminal — surfaced identically (masking only `since`, RFC3339-shape
+  asserted first; `state`/`last_error` diffed). The Rust `health()` sorts `namespaces` by
+  name to match Go's `HostClient.Status()` sort. A SECURE server reached via `discovery:`
+  self-mints a **credentials-scope** bus token over SSH and subscribes over a TLS-pinned
+  https connection; the `discovery:` reload loop (`off`/`poll`) converges both impls to the
+  same server set (the live diff drives `poll` for determinism; the production `fsnotify`
+  default is `notify`-unit-covered). Cells: `test_servers.py` (servers[] connected +
+  409-rejected), `test_discovery.py` (off/poll convergence), `test_secure_bus.py`
+  (TLS-pinned mint + 401-remint + wrong-pin-fails-closed), plus the `should_mint.json`
+  golden and the `supervisor.rs`/`watcher.rs` units.
 
-- **Minter — malformed `~/.shed/config.yaml`.** The Rust `load_discovered_servers` reuses
-  the permissive `yaml_lite` reader, which never errors; Go `LoadDiscoveredServers` errors
-  on malformed YAML (→ `reading server config: …` in `token.response.error`). The harness
-  writes a valid block-style config, so the differential doesn't exercise it. Same class as
-  the inline-flow / config-validate gaps; brought to parity by the config-port slice.
+- **Event replay ring — CLOSED.** The surface-A handshake (`hello`→`hello_ack`), the
+  non-hello drop, single-consumer supersede, event fan-out + approval correlation (via the
+  gated `sign`), **`token.get`** (via the real SSH-bootstrap minter + a PATH-shim `ssh`,
+  `test_token_get.py`), AND the **event replay ring** (`replay_events` on connect) are all
+  differentially enforced. The replay cell (`test_replay.py`) drives a non-gated ssh `list`
+  that buffers an `event` in each daemon's ring with NO desktop consumer connected, then
+  connects a consumer with `replay_events:N` and asserts the buffered frame is replayed
+  `mask_event`-equal (id/ts masked). `publish_audit` is wired to the ring on both impls
+  (Rust `audit.rs:203` → `main.rs`, `desktop-forwarding`-gated), so the buffer is fed by a
+  real caller in either mode — no reclassification.
+
+- **Minter — malformed `~/.shed/config.yaml` — CLOSED.** The Rust `load_discovered_servers`
+  is backed by the saphyr `yaml_lite` reader now, so a malformed `~/.shed/config.yaml`
+  returns `Err` (was silently permissive), matching Go `LoadDiscoveredServers`. Both impls
+  surface it as `reading server config: …` in the `token.response.error` when a `token.get`
+  triggers a resolve — enforced live by `test_token_get.py::test_token_get_malformed_shed_config`
+  (the outer `reading server config:` prefix, per-impl; the inner body is yaml-lib specific
+  — Go `parsing shed config` vs the saphyr message — and excluded per the docker suffix
+  precedent). This stays a SEPARATE cell from the `config-validate` matrix: it exercises a
+  DIFFERENT file (`~/.shed/config.yaml`, not the launch `-config`) and a DIFFERENT chain
+  (`token.get` → `resolve` → `load_discovered_servers`).
+
+## Accepted divergences
+
+A small set of Go-vs-Rust behavior differences are **formally accepted** rather than closed:
+each is either **unreachable on the real shed-server** (so it can never surface as a live
+diff) or requires machinery deliberately out of scope for this port (a typed-decode `Node`
+layer). They carry no cell — they are recorded here so the audit is complete, not silent.
+
+- **D4 · egress https-only redirect (Rust is strictly SAFER; unreachable).** The Rust egress
+  client installs an https-only redirect policy (`Policy::custom`, `egress.rs:egress_http_client`)
+  and refuses a non-https redirect even on an open/unpinned server; Go's `egressHTTPClient`
+  follows ANY redirect including an `http://` downgrade. The shed-server never emits a 3xx on
+  `/api/egress/stream` — `writeSSEEvent` (`internal/api/handlers.go:323`) is
+  `fmt.Fprintf(w, "event: %s\ndata: %s\n\n", …)` after `WriteHeader(200)` — so the redirect
+  arm is never exercised. Rust's stricter policy is a safe superset kept on purpose.
+- **D5 · egress `data:` prefix-strip/trim + multi-`data:` concatenation (Rust tolerant
+  superset; unreachable).** Rust's SSE frame parse (`egress.rs::forward`) tolerates a trimmed
+  `data:` prefix and would concatenate multiple `data:` lines; Go's differs on the `data: `
+  (with-space) requirement. The same `writeSSEEvent` (`handlers.go:323`) emits exactly one
+  `data: {json}` line WITH the space, no multi-`data:`, no embedded `\n` — so the tolerant
+  branches never fire on the real server.
+- **D6 · typed-decode residue (needs a typed `Node` layer; out of scope).** The Rust `Node`
+  model (`config.rs`, saphyr-backed) is stringly-typed, so **scalar-into-typed-field**
+  coercion still diverges: `http_port: not-a-number` → Go errors, Rust defaults;
+  `approval_timeout: [a,b]` → Go errors, Rust falls back to 25 s. Likewise the bool forms
+  **yaml.v3 itself REJECTS** — `allow_all: nonsense` / `1` / `0`, a non-canonical case
+  (`tRUe`/`yEs`), or any non-scalar into a bool → Go errors, but the stringly-typed reader
+  falls back to its lenient default / `None`. Closing this needs typed resolution over the
+  parse tree (saphyr gives structure, not typed decode) — out of scope for a hardening pass.
+  (This is the ERROR set ONLY; the bool forms yaml.v3 RESOLVES — `yes/on/y/True/…` — are the
+  D2 FIX, closed and pinned by `config_bool_forms.json`.)
+- **D7 · `serve_namespace` shutdown at SIGTERM — verified NO divergence.** The gated-sign path
+  calls `RequestApproval` via `desktopGate.Approve` (`cmd/shed-host-agent/desktop_gate.go:21`)
+  passing `context.Background()` — never cancelled — and `ApprovalGate.Approve`
+  (`approval.go:19`) carries no `ctx`. So Go's `ctx.Done()` `select` arm is DEAD on this path:
+  at SIGTERM Go blocks on `time.After(timeout)` (≤ 25 s), EXACTLY like the Rust `select!`
+  (decision oneshot vs `sleep(timeout)`) today. Both are bounded by `approval_timeout`; there
+  is no divergence, so the Rust `select!` does NOT grow a shutdown arm (that would make Rust
+  faster than Go and INTRODUCE a divergence in a parity port).
 
 ## Per-cell status table
 
-`enforced` = asserted equal (or smoke-asserted) now; `xfail` = a real port surface not
-yet implemented in Rust, tracked to flip to `enforced` when it lands; `out-of-scope` =
-owned by a different mechanism (golden/unit) or later slice, not the live diff.
+**Completeness (as of sub-plan 8):** every cell below is **enforced** (with the live test /
+golden runner / unit named), **out-of-scope(mechanism)** (with the owning mechanism named),
+or **deferred-to-3a.2(named)** (with the named follow-up) — **zero bare `xfail`s.** All three
+prior `xfail` cells (socket-dir rebind, event replay ring, sign timeout / no-consumer
+fail-closed) are now enforced; the accepted divergences above (D4/D5/D6/D7) carry no cell.
+
+`enforced` = asserted equal (or smoke-asserted) now; `out-of-scope` = owned by a different
+mechanism (golden/unit) or later slice, not the live diff. (`xfail` — a real port surface
+not yet implemented in Rust — was the transitional third status; no cell carries it as of
+sub-plan 8.)
 
 | Axis | Cell | Status | Owning mechanism |
 |---|---|---|---|
@@ -175,34 +313,55 @@ owned by a different mechanism (golden/unit) or later slice, not the live diff.
 | lifecycle | config-load error → exit 1 (exit code only) | **enforced** | live (`test_config_error.py`) |
 | lifecycle | SIGTERM → exit 0 + both sockets unlinked | **enforced** | live (`test_lifecycle.py`) |
 | socket | status socket bind + `0600` file perms | **enforced** | live (`conftest` daemon + `test_socket_perms.py`) |
-| socket | socket-dir `0700` + stale-vs-live rebinding | **xfail** | live (config/lifecycle slice) |
-| config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML (parity) | **xfail** | live (config-port slice; see "Known contract gaps") |
+| socket | socket-dir `0700` re-chmod + stale-socket rebind | **enforced** | live (`test_socket_rebind.py`: pre-existing 0777 dir → 0700; stale AF_UNIX sockets at both fixed paths → unlinked + rebound, daemon answers) |
+| socket | live-socket / non-socket-file refuse (op-log-only, no equal wire consequence) | **out-of-scope(unit-owned)** | Rust unit (`sockets.rs::prepare_refuses_live_socket`, `prepare_refuses_non_socket_file`) + Go `TestPrepareSocketPath` |
+| config-validate | reject unknown/biometric policy, bad mode/timeout, malformed YAML, duplicate key, **map-valued `discovery.servers` (D3, exit-1)** | **enforced** | live (`test_config_validate.py`) + golden (`config_validate.json`, Go + Rust runners; the D3 map-selector vectors pin the `discovery.servers must be` message) |
+| config-parse | **bool alternate forms (D2)** — `docker.allow_all` / `logging.enabled` resolve yaml.v3's YAML-1.1 bool token set (`yes/on/y/True/…`) identically; the yaml.v3-ERROR forms (`nonsense`/`1`/`0`/non-canonical-case) are the D6 residue (Go errors, Rust → `None`, pinned explicitly) | **enforced** | golden (`config_bool_forms.json`, Go [yaml.v3 decode] + Rust [`parse_yaml_bool`] runners) + Rust unit (`parse_yaml_bool_matches_yaml_v3_resolved_set`, `bool_alternate_forms_wire_through_reader`) + wire-visible `docker_resolve.json` (`allow_all: yes`/`True`/`no`) |
 | decision | `EffectivePolicy` (`""→deny-all`, echoes) | **enforced** | golden (Go + Rust runners) |
 | decision | `desktopGateNamespaces` ordered gate list | **enforced** | golden (Go + Rust runners) |
-| config-parse | inline-flow-style YAML (`{ ... }`) parity | **xfail** | live — Rust `yaml_lite` block-only (see "Known contract gaps") |
+| config-parse | inline-flow-style YAML (`{ ... }`) parity (masked `LiveStatus` policies canonical-equal) | **enforced** | live (`test_config_inline_flow.py`) |
 | desktop UDS server | hello/hello_ack handshake (masked canonical-equal) + non-hello first line dropped | **enforced** | live surface A (`test_desktop_handshake.py`, `test_desktop_first_non_hello_drops.py`) |
 | desktop UDS server | single-consumer last-writer-wins supersede (`accepted:false, reason:"superseded"`, old closed) | **enforced** | live surface A (`test_desktop_supersede.py`) |
 | desktop UDS server | `token.get` → `token.response` (masked; `token`+`expires_at` compared UNMASKED via the PATH-shim mint) | **enforced** | live surface A (`test_token_get.py`) |
 | desktop UDS server | event fan-out + approval request/response correlation (driven by the gated `sign`) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
-| desktop UDS server | event replay ring (`replay_events` on connect) | **xfail** | live — not exercised by the sign flow (fresh consumer, `replay_events:0`); needs a buffered-then-connect drive |
+| desktop UDS server | event replay ring (`replay_events` on connect) | **enforced** | live surface A+B (`test_replay.py`: a non-gated ssh `list` buffers an `event` in each ring with NO consumer connected, then a consumer connects with `replay_events:N` → the buffered frame is replayed `mask_event`-equal [id/ts masked], then a live `list` fans out to the connected consumer) |
 | approval | gated `sign` delegated approve/deny (deterministic ed25519 blob compared UNMASKED) | **enforced** | live surface A+B (`test_bus_sign_gated.py`) |
-| approval | gated `sign` timeout / no-consumer fail-closed | **xfail** | unit-covered (`desktop.rs`); a live differential drive is a follow-up |
+| approval | gated `sign` timeout / no-consumer fail-closed | **enforced** | live surface A+B (`test_bus_sign_gated.py`: `test_bus_sign_no_consumer_fails_closed` [no consumer → immediate `{approval denied, SIGN_FAILED}` + a no-`decided_by` denied audit] + `test_bus_sign_timeout_fails_closed` [silent consumer + `approval_timeout:1s` → timeout deny, same shape]); the Rust units `approval_without_consumer_denies_no_decision`/`approval_times_out_denies` stay the fast pin |
 | approval | native Touch-ID (biometrics) | **out-of-scope** | separate manual sign-off (needs live biometric) |
 | bus | subscribe → ping → respond (open) ping/pong (masked canonical-equal) | **enforced** | live surface B (`test_bus_ping_pong.py`) |
-| bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **xfail** | live surface B — secure needs the TLS pin from a `discovery:` config (later slice); the pin/reconnect/401/409 logic is already `bus.rs`-unit-tested |
-| bus | aws-credentials / docker-credentials subscription | **xfail** | live surface B — later slices; slice 1b wires **ssh-agent only** (see "Known contract gaps") |
-| status | single-server `LiveStatus.servers[]` per-namespace state (incl. 409-rejected) | **xfail** | supervisor slice — Go surfaces `HostClient.Status()` via supervisor health; the Rust bus records the state + logs it, but `servers[]` stays empty until the supervisor lands |
-| egress | events / 401 / 404-501, 5m vs 30s backoff | **xfail** | live ("no reconnect in window") + unit (consts) |
-| ssh backend | agent-forward / local-keys, list/sign/ping/status | **xfail** | live (transcripts) + golden (payloads) |
-| aws backend | passthrough, cache-hit/expiry | **xfail** (live) | live; assume-role → **out-of-scope** (golden+unit, no Go STS seam) |
-| docker backend | allowlist / allow_all / helper / inline, not-found vs not-allowed | **xfail** | live (helper transcript) + golden (resolution matrix) |
+| bus | secure (TLS-pin) subscribe/respond, 401/409, reconnect | **enforced** | live surface B (`test_secure_bus.py`: a `discovery:`-config secure server, committed-cert TLS pin, minted-Bearer subscribe, 401→re-mint→reconnect, wrong-pin fails closed) + `bus.rs` unit (409-rejected + pin/401 machinery) |
+| bus | aws-credentials subscription (when configured) | **enforced** | live surface B (`test_aws_backend.py`: both impls `wait_for_subscribe("aws-credentials")`) |
+| bus | docker-credentials subscription (even unconfigured) | **enforced** | live surface B (`test_docker_backend.py`: both impls `wait_for_subscribe("docker-credentials")`, incl. the unconfigured cell) |
+| status | single-server `LiveStatus.servers[]` per-namespace state (incl. 409-rejected) | **enforced** | live surface B (`test_servers.py`: masked `servers[]` canonical-equal for the connected case + the 409-`rejected` terminal, `since` masked / `state`+`last_error` diffed) |
+| egress | subscription convergence (both impls GET `/api/egress/stream`) | **enforced** | live surface B (`test_egress.py`: both `wait_for_egress`) |
+| egress | events → durable audit line (fixed-ts, diffed UNMASKED incl. `"approval":""`) | **enforced** | live surface B (`test_egress.py`) |
+| egress | 501 → hard 5m backoff (per-impl `egress_hits()==1`, no reconnect in window) | **enforced** | live surface B (`test_egress.py`) |
+| egress | 401-invalidate + control-token scope | **out-of-scope** | unit (`egress.rs`: `status_401_invalidates_source`, `sends_control_token_not_credentials`) — harness runs open (no token to invalidate) |
+| egress | 404→unavailable + backoff constants (1s/30s/5m, no held-reset) | **out-of-scope** | unit (`egress.rs`: `status_404_returns_unavailable`, `backoff_*`) — control-flow, not pure in→out |
+| egress | `egressDecision`→`AuditEntry` mapping (detail/ts-UTC/empty-ts/offset/`approval:""`) | **enforced** | golden (Go + Rust runners, `egress_audit_entry.json`) |
+| ssh backend · local-keys | `list` (masked canonical-equal + durable non-gated audit line) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · local-keys | `sign` rsa flags 0/2/4/6 (→ `ssh-rsa`/`rsa-sha2-256`/`rsa-sha2-512`/`rsa-sha2-256`; format diffed, blob verified per-impl) | **enforced** | live (`test_ssh_backend.py`, verify-not-bytes) |
+| ssh backend · local-keys | `sign` ecdsa (format diffed, blob verified per-impl) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · local-keys | `sign` ed25519 (deterministic blob compared UNMASKED) | **enforced** | live (`test_bus_sign_gated.py`) |
+| ssh backend · local-keys | `status` (`{connected:true, mode:"local-keys", key_count:3}`) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · agent-forward | `list` (3 fake identities canonical-equal + audit + fake transcript diff) | **enforced** | live (`test_ssh_backend.py` + `fake_ssh_agent.py`) |
+| ssh backend · agent-forward | `sign` ed25519 (fake real-signs → blob UNMASKED) + `sign` rsa flags=2 (canned blob byte-equal, transcript `flags==2` passthrough) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · agent-forward | `status` (`mode:"agent-forward"`, extra REQUEST_IDENTITIES on the transcript) | **enforced** | live (`test_ssh_backend.py`) |
+| ssh backend · mode resolution | unknown `ssh.mode` → exit 1 (single-server AND `discovery:` config shapes) | **enforced** | live (`test_ssh_mode_error.py`) |
+| ssh backend | response payload shapes (`list`/`sign`/`status`/`error`: tag names, b64 pass-through, `rest:""`, empty-list `[]` not `null`) | **enforced** | golden (Go + Rust runners on `ssh_payload_shapes.json`) |
+| ssh backend | agent-client wire (framing/failure/oversize/wedged bounds), flag-bit matrix, resolve matrix, missing/encrypted skip, unknown-op/invalid-payload strings, list-error audit | **enforced (unit)** | Rust unit (`ssh_backend*.rs`, `bus.rs`) + fake-seam self-test (`test_fake_ssh_agent.py`) |
+| aws backend · passthrough | `get_credentials` (success + no-expiry-hint + no-static error; payload + audit diffed, error detail home-normalized), `status` (`passthrough:<profile>` + `cached_until`), `ping`, unknown-op, re-login pickup (atomic rewrite) | **enforced** | live (`test_aws_backend.py`) |
+| aws backend · assume-role | cache hit/stale, role resolution + layering, STS/nil-creds errors, session-name shape | **out-of-scope** | golden (`aws_resolve`/`aws_expiry` runners) + Rust unit (`AssumeRoler` fake) — no Go STS seam to drive live |
+| aws backend | response payload shapes (`get_credentials`/`status`/`ping`/`error`: tag names, `expiration`/`cached_until` omitempty) + per-namespace gate selection | **enforced (unit)** | Rust unit (`bus.rs`: `aws_*`, incl. `aws_uses_aws_gate_not_ssh`, `aws_payload_tag_names_match_protocol`) |
+| docker backend | `get` inline-auth (payload+audit) / helper (transcript diffed + payload + ok audit) / not-allowed (backend REGISTRY_NOT_ALLOWED) / approval-deny (guest REGISTRY_NOT_ALLOWED + audit APPROVAL_DENIED, the two-code split) / not-found→anonymous (guest CREDENTIALS_NOT_FOUND + audit anonymous) / `list` (positional `count:N`) / `status` / `ping` / unknown-op / **unconfigured** (still subscribes + denies) | **enforced** | live (`test_docker_backend.py`, fake `docker-credential-testhelper` seam + self-test) |
+| docker backend | `resolve` layering (Option registries/allow_all, flow-list), `normalize_registry` (one-occurrence strip), inline-auth decode, PATH augment (append), helper-exec seam (abs-resolve, 5s timeout, PascalCase-avoidance tag guard) | **enforced (golden+unit)** | golden (`docker_resolve`/`docker_normalize`/`docker_inline_auth`/`docker_path_augment` runners) + Rust unit (`docker_backend.rs`, `bus.rs` docker handler incl. `docker_uses_docker_gate_not_ssh_or_aws`, `docker_payload_tag_names_match_protocol`) |
 | minter | control-scope argv + success `token.response` | **enforced** | live (`test_token_get.py`: `token`/`expires_at` compared + argv == expected vector, `<scope>` == `control`) |
 | minter | host-key-mismatch terminal; single-flight; refresh cadence | **enforced (unit)** | unit parity (`minter.rs` / `bootstrap.rs`, incl. real-runner shell-shim tests) |
 | minter | `load_discovered_servers` shape (ssh_port=0-vs-22, empty-host skip, sort) | **enforced (golden)** | Go + Rust golden runners on `fixtures/load_discovered_servers.json` |
-| minter | credentials-scope live bus drive | **xfail** | supervisor slice (no bus token provider wired yet) |
-| minter | malformed `~/.shed/config.yaml` error parity | **xfail** | config-port slice — Go `LoadDiscoveredServers` errors on bad YAML; the permissive `yaml_lite` reader does not (same class as `config-parse · inline-flow` / `config-validate`) |
-| supervisor | reconcile / restart-on-cred-or-TLS-change | **xfail** | live; `shouldMint` matrix → golden |
-| discovery | off / poll / fsnotify | **xfail** | live (convergence w/ deadline); `LoadDiscoveredServers` shape → golden |
+| minter | credentials-scope live bus drive | **enforced** | live surface B (`test_secure_bus.py::test_secure_bus_credentials_mint`: a secure discovery server self-mints a credentials-scope token over the PATH-shim `ssh` and presents `Bearer <minted>` on the TLS-pinned bus subscribe) |
+| minter | malformed `~/.shed/config.yaml` error parity (outer `reading server config:` prefix, per-impl) | **enforced** | live (`test_token_get.py::test_token_get_malformed_shed_config`) |
+| supervisor | reconcile / restart-on-cred-or-TLS-change | **enforced** | golden (`should_mint.json`, Go + Rust runners) + Rust unit (`supervisor.rs`: `reconcile_{add_remove,no_churn,url_change,credential_or_pin_change,dedup}`, `shutdown`, `health`, the fake-group factory) — reconcile/restart is fake-group-owned (no wire surface); `should_mint` is the wire-visible half |
+| discovery | off / poll / fsnotify | **enforced** | live (`test_discovery.py`: `poll` convergence within a deadline + `off` no-reload, `servers[]` names converge on both impls) + `watcher.rs` `notify`-backed unit smoke (the production `fsnotify` default; the live diff drives POLL for determinism) + golden (`load_discovered_servers.json`) |
 | concurrency | single-flight mint, drop-on-full fan-out | **out-of-scope** | unit parity |
 
 Update this table as slices land (Kimi acceptance-criteria ask in the plan).

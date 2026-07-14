@@ -91,6 +91,12 @@ jobs:
               # harness, the committed wire reference, and the shared build
               # manifests/locks/toolchain a dependency bump would ride in on.
               - 'crates/shed-host-agent/**'
+              # The Rust host-agent has a path-dep on shed-core, and the release
+              # build (builder: rust) reads rust-toolchain.toml — a change to
+              # either can break the shipped binary, so both must trigger the
+              # differential + the release-snapshot (which is gated on this filter).
+              - 'crates/shed-core/**'
+              - 'crates/rust-toolchain.toml'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
               - 'cmd/shed-host-agent/**'
@@ -165,10 +171,15 @@ jobs:
   release-snapshot:
     name: GoReleaser snapshot (artifact sanity)
     needs: changes
-    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true' }}
-    # macos-latest matches the real release runner: shed-host-agent's darwin build
-    # needs CGO (Touch ID), which can't cross-compile from linux. goreleaser's
-    # snapshot cross-builds the linux ids fine (CGO off for those).
+    # Also gated on `hostagent`: the SHIPPED shed-host-agent binary is now built
+    # from crates/shed-host-agent/ (builder: rust), so a crates-only PR must run
+    # this snapshot to prove the release build still resolves. The `hostagent`
+    # filter already scopes crates/shed-host-agent/** (+ cmd/shed-host-agent/**).
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.ci == 'true' }}
+    # macos-latest matches the real release runner. The shipped shed-host-agent is
+    # Rust (builder: rust / cargo zigbuild — cross-builds the linux targets from
+    # macOS via zig); the detached Go rollback ids still compile here (darwin needs
+    # CGO for Touch ID). goreleaser cross-builds the Go linux ids (CGO off) fine.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -178,8 +189,26 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      # First-ever CI exercise of the darwin build-tag half (shed-host-agent's
-      # touchid_darwin.go, CGO) — de-risks the macos release job before a tag.
+      # Rust + cross tooling for `builder: rust`. goreleaser's rust builder shells
+      # out to `cargo zigbuild`, which needs zig + cargo-zigbuild; it auto-runs
+      # `rustup target add`, but pre-adding fails fast if a target is unavailable.
+      - name: Rust toolchain + zig cross tooling
+        run: |
+          # components: crates/rust-toolchain.toml declares rustfmt+clippy, which
+          # rustup would auto-install on first cargo use in crates/ (a flaky-network
+          # CI-only failure risk); install them explicitly up front.
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+                            aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+          # cargo-zigbuild pinned to the locally-validated version (reproducibility).
+          # zig itself is brew-current: a zig bump is a LOUD build failure caught
+          # by this snapshot job before any tag (not a silent ship); pinning zig
+          # harder is a tracked follow-up (see .goreleaser.yaml glibc-floor note).
+          brew install zig
+          cargo install --locked --version 0.23.0 cargo-zigbuild
+      # First-ever CI exercise of the darwin build-tag half (the Go rollback
+      # shed-host-agent's touchid_darwin.go, CGO) — de-risks the macos release job.
       - name: Run tests
         run: go test ./...
       - name: GoReleaser snapshot build
@@ -204,13 +233,49 @@ jobs:
           done
           # (ii) per-arch shed-machine-rc .debs, named to match apt-charliek's glob.
           ls dist/shed-machine-rc_*_amd64.deb dist/shed-machine-rc_*_arm64.deb
-          # (iii) shed-host-agent darwin archives carry the binary AND the example config.
-          for arch in amd64 arm64; do
-            tgz="dist/shed-host-agent_darwin_${arch}.tar.gz"
-            ls "$tgz" >/dev/null || { echo "::error::missing $tgz"; exit 1; }
-            tar tzf "$tgz" | grep -qx 'shed-host-agent' || { echo "::error::$tgz missing shed-host-agent binary"; tar tzf "$tgz"; exit 1; }
-            tar tzf "$tgz" | grep -qx 'extensions.example.yaml' || { echo "::error::$tgz missing extensions.example.yaml"; tar tzf "$tgz"; exit 1; }
+          # (iii) ALL FOUR shed-host-agent archives (now Rust) carry the binary AND
+          # the example config.
+          workdir="$(mktemp -d)"
+          for os in darwin linux; do
+            for arch in amd64 arm64; do
+              tgz="dist/shed-host-agent_${os}_${arch}.tar.gz"
+              ls "$tgz" >/dev/null || { echo "::error::missing $tgz"; exit 1; }
+              tar tzf "$tgz" | grep -qx 'shed-host-agent' || { echo "::error::$tgz missing shed-host-agent binary"; tar tzf "$tgz"; exit 1; }
+              tar tzf "$tgz" | grep -qx 'extensions.example.yaml' || { echo "::error::$tgz missing extensions.example.yaml"; tar tzf "$tgz"; exit 1; }
+            done
           done
+          # Runtime check for the DARWIN binaries. macos-latest is arm64 (Apple
+          # Silicon) with no guaranteed Rosetta, so only the NATIVE arm64 binary is
+          # executed (`version` — catches a present-but-broken cross-build that
+          # passes `tar tzf`); the x86_64 one is validated structurally with `file`
+          # (never executed, so no Rosetta dependency). Assert the arm64 binary
+          # keeps its linker ad-hoc signature (matches the Go baseline — no explicit
+          # codesign step; a future zig that drops it fails loudly here, pre-tag).
+          tar xzf dist/shed-host-agent_darwin_arm64.tar.gz -C "$workdir" shed-host-agent
+          arm64_out="$("$workdir/shed-host-agent" version)"
+          echo "darwin/arm64: $arm64_out"
+          case "$arm64_out" in shed-host-agent\ *) ;; *) echo "::error::darwin/arm64 version output unexpected: $arm64_out"; exit 1;; esac
+          codesign -dv "$workdir/shed-host-agent" 2>&1 | grep -q 'Signature=adhoc' || { echo "::error::arm64 shed-host-agent lost its ad-hoc signature"; codesign -dv "$workdir/shed-host-agent" 2>&1; exit 1; }
+          rm -f "$workdir/shed-host-agent"
+          tar xzf dist/shed-host-agent_darwin_amd64.tar.gz -C "$workdir" shed-host-agent
+          amd64_file="$(file "$workdir/shed-host-agent")"
+          echo "$amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::darwin/amd64 is not a well-formed x86_64 Mach-O: $amd64_file"; exit 1; }
+          echo "darwin/amd64: $amd64_file"
+          # (iv) rollback insurance: the detached Go ids still compiled.
+          python3 - <<'PY'
+          import json,sys
+          arts=json.load(open('dist/artifacts.json'))
+          seen={}
+          for a in arts:
+              ex=a.get('extra') or {}
+              if a.get('type')=='Binary' and ex.get('ID') in ('shed-host-agent-darwin','shed-host-agent-linux'):
+                  seen.setdefault(ex['ID'],set()).add(f"{a.get('goos')}/{a.get('goarch')}")
+          want={'shed-host-agent-darwin':{'darwin/amd64','darwin/arm64'},'shed-host-agent-linux':{'linux/amd64','linux/arm64'}}
+          if {k:seen.get(k) for k in want}!={k:v for k,v in want.items()}:
+              print(f"::error::Go rollback builds missing from artifacts.json: got {seen}");sys.exit(1)
+          print("Go rollback ids present:",{k:sorted(v) for k,v in seen.items()})
+          PY
+          rm -rf "$workdir"
           echo "release snapshot artifacts OK"
 
   # ---- desktop / crates legs (imported from shed-desktop's ci.yml) ----------
@@ -345,6 +410,13 @@ jobs:
         run: |
           cargo test -p shed-host-agent --all-targets --locked
           cargo clippy -p shed-host-agent --all-targets --locked -- -D warnings
+      # The headless variant (surface A dropped) is the 3a.2 server/no-desktop
+      # distribution — it must not bit-rot unwatched on the platform it ships to.
+      - name: Rust host-agent — headless (--no-default-features) test + clippy (Linux)
+        working-directory: crates
+        run: |
+          cargo test -p shed-host-agent --all-targets --locked --no-default-features
+          cargo clippy -p shed-host-agent --all-targets --locked --no-default-features -- -D warnings
       - name: Go-vs-Rust differential + golden runners
         # Builds both daemon binaries (conftest) and runs the pytest differential
         # + the Go and Rust golden-fixture runners.

@@ -24,13 +24,13 @@ use tokio::sync::watch;
 
 use crate::bootstrap::{BootstrapRunner, Params, SystemSshRunner};
 use crate::config::expand_tilde;
+use crate::discovery::ServerTarget;
 use crate::status::now_unix;
 
 /// Token scopes the host-agent mints over SSH: `credentials` for its own bus
 /// brokering, `control` for a `token.get` on the desktop's behalf (`credmint.go:48`).
-/// `credentials` is wired by the credentials bus token provider (supervisor slice, task
-/// #6); this slice only mints the `control` scope (via the control-token provider).
-#[allow(dead_code)]
+/// `credentials` is the bus token provider's scope (wired by the supervisor's
+/// credentials-scope `CredentialSource`); `control` is the egress side task + `token.get`.
 pub const SCOPE_CREDENTIALS: &str = "credentials";
 pub const SCOPE_CONTROL: &str = "control";
 
@@ -42,31 +42,6 @@ const MIN_REFRESH_DELAY: Duration = Duration::from_secs(60);
 const MAX_REFRESH_DELAY: Duration = Duration::from_secs(12 * 3600);
 /// De-synchronizes a fleet re-minting together: the delay is spread ±this of its base.
 const JITTER_FRACTION: f64 = 0.25;
-
-/// A resolved shed server this agent brokers for (mirror `config.go:ServerTarget`).
-/// `name` is the identity key (empty in single-server mode); `url` is the broker base
-/// URL. `ssh_host`/`ssh_port` are the SSH endpoint used to mint over `_bootstrap`;
-/// `ssh_port == 0` means the entry omitted it (the agent can't self-mint).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerTarget {
-    pub name: String,
-    pub url: String,
-    /// The credentials-scoped bearer token from config (empty when not token-gated). In
-    /// secure mode the agent mints this itself; carried for the (deferred) bus provider.
-    pub token: String,
-    pub tls_fingerprint: String,
-    pub ssh_host: String,
-    pub ssh_port: u16,
-}
-
-impl ServerTarget {
-    /// Whether the server is reached over https — the authoritative local signal that
-    /// it runs in secure mode (tokens ⟺ TLS ⟺ secure) and that the agent should
-    /// self-mint (mirror `config.go:IsSecure`: scheme, not fingerprint presence).
-    pub fn is_secure(&self) -> bool {
-        self.url.to_lowercase().starts_with("https://")
-    }
-}
 
 /// A minted token plus its expiry as unix seconds (`None` = non-expiring / the server
 /// returned none — Go's zero `time.Time`).
@@ -200,8 +175,7 @@ fn known_hosts_pinned(known_hosts_path: &str, host: &str, port: u16) -> Result<(
     // matching how OpenSSH (and shed) records it.
     let want = normalize(host, port);
     for entry in KnownHosts::new(&data) {
-        let entry =
-            entry.map_err(|e| format!("parsing known_hosts {known_hosts_path}: {e}"))?;
+        let entry = entry.map_err(|e| format!("parsing known_hosts {known_hosts_path}: {e}"))?;
         // Skip marked lines: a @revoked key must never be a pin, a @cert-authority line
         // is a CA not a host-key pin (Go skips any non-empty marker).
         if entry.marker().is_some() {
@@ -273,15 +247,19 @@ pub fn new_credential_source(
 
 impl CredentialSource {
     /// The server this source mints for (used by the control-token provider to detect an
-    /// endpoint change and recreate the source).
+    /// endpoint change and recreate the source). The control-token provider is
+    /// desktop-gated, so this is dead in a headless build.
+    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     pub fn target(&self) -> &ServerTarget {
         &self.target
     }
 
     /// The current token, minting or re-minting as needed (implements the token half of
-    /// `sdk.TokenProvider`). Test-only until the supervisor slice wires the credentials
-    /// bus provider; the control path uses [`Self::force_token_with_expiry`].
-    #[cfg(test)]
+    /// `sdk.TokenProvider`). The egress SSE consumer is its first production consumer
+    /// (via the `EgressTokenSource` bridge for `Arc<CredentialSource>` in `egress.rs`,
+    /// behind `desktop-forwarding`): the control-scoped egress token is cached and
+    /// re-minted, and cleared by [`Self::invalidate`] after a 401. The `token.get` control
+    /// path instead uses [`Self::force_token_with_expiry`] (never a cached copy).
     pub async fn token(self: &Arc<Self>) -> Result<String, String> {
         self.obtain(false).await.map(|(tok, _)| tok)
     }
@@ -289,15 +267,17 @@ impl CredentialSource {
     /// Drop any completed cached token and mint fresh, while still coalescing callers
     /// that overlap a single in-flight mint. The control path (`token.get`) uses this: a
     /// restarted server silently invalidates control tokens, so a cached copy must never
-    /// be served (mirror `credmint.go:forceTokenWithExpiry`).
+    /// be served (mirror `credmint.go:forceTokenWithExpiry`). The `token.get` control path
+    /// is desktop-gated, so this is dead in a headless build (the bus uses [`Self::token`]).
+    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     pub async fn force_token_with_expiry(
         self: &Arc<Self>,
     ) -> Result<(String, Option<i64>), String> {
         self.obtain(true).await
     }
 
-    /// Clear the cached token so the next obtain re-mints. Called after a 401.
-    #[cfg(test)]
+    /// Clear the cached token so the next obtain re-mints. Called after a 401 (the egress
+    /// consumer's `EgressTokenSource::invalidate`, mirror Go `credentialSource.Invalidate`).
     pub fn invalidate(&self) {
         let mut st = self.state.lock().unwrap();
         st.token.clear();
@@ -334,9 +314,7 @@ impl CredentialSource {
     /// Always start/join a mint (no cache short-circuit and no completed-token clear) —
     /// the proactive-refresh path (mirror `credmint.go:refresh`, which calls
     /// `obtainLocked` directly). Shared by [`Self::refresh`] (tests) and
-    /// [`Self::refresh_loop`]; `#[allow(dead_code)]` because in a non-test build only the
-    /// (dead) refresh loop reaches it this slice.
-    #[allow(dead_code)]
+    /// [`Self::refresh_loop`] (the supervisor spawns the loop per secure server).
     async fn obtain_refresh(self: &Arc<Self>) -> Result<(String, Option<i64>), String> {
         let rx = {
             let mut st = self.state.lock().unwrap();
@@ -396,9 +374,8 @@ impl CredentialSource {
     }
 
     /// Proactively re-mint at ~50% of the time until expiry (jittered), so an idle
-    /// server's token stays fresh. Stops when `cancel` resolves. Wired by the supervisor
-    /// slice (task #6); ported here for completeness.
-    #[allow(dead_code)]
+    /// server's token stays fresh. Stops when `cancel` resolves. Spawned per secure server
+    /// by the supervisor's group builder ([`crate::bus::spawn_server_group`]).
     pub async fn refresh_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             let delay = self.next_refresh_delay();
@@ -416,10 +393,12 @@ impl CredentialSource {
     /// ~50% of the time until the cached token expires, jittered ±25%, clamped
     /// `[MIN_REFRESH_DELAY, MAX_REFRESH_DELAY]`; `DEFAULT_REFRESH_DELAY` when no token has
     /// been minted yet (mirror `nextRefreshDelay`).
-    #[allow(dead_code)]
     fn next_refresh_delay(&self) -> Duration {
         let expiry = self.state.lock().unwrap().expiry;
-        apply_jitter_and_clamp(base_refresh_delay(expiry, now_unix()), random_jitter_fraction())
+        apply_jitter_and_clamp(
+            base_refresh_delay(expiry, now_unix()),
+            random_jitter_fraction(),
+        )
     }
 }
 
@@ -494,7 +473,7 @@ async fn wait_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::{Bundle, BootstrapError};
+    use crate::bootstrap::{BootstrapError, Bundle};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn target(name: &str, host: &str, port: u16) -> ServerTarget {
@@ -652,7 +631,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_host_key_mismatch());
-        assert!(err.message().starts_with("bootstrapping control token for \"s\":"));
+        assert!(err
+            .message()
+            .starts_with("bootstrapping control token for \"s\":"));
     }
 
     #[tokio::test]
@@ -714,6 +695,28 @@ mod tests {
         assert_eq!(fm.calls.load(Ordering::SeqCst), 1);
         s.invalidate();
         assert_eq!(s.token().await.unwrap(), "tok2"); // re-mint
+        assert_eq!(fm.calls.load(Ordering::SeqCst), 2);
+    }
+
+    // The egress slice un-gated `token()`/`invalidate()` from `#[cfg(test)]` to `pub`
+    // (first production consumer). These two rows re-pin the cache + invalidate semantics
+    // unguarded — the plan's BLOCKER-1 mapping rows.
+    #[tokio::test]
+    async fn credential_source_token_caches() {
+        let fm = FakeMinter::new(vec![Ok(minted("tok1")), Ok(minted("tok2"))]);
+        let s = new_credential_source(fm.clone(), target("s", "", 0), SCOPE_CONTROL);
+        assert_eq!(s.token().await.unwrap(), "tok1");
+        assert_eq!(s.token().await.unwrap(), "tok1"); // 2nd call served from cache
+        assert_eq!(fm.calls.load(Ordering::SeqCst), 1, "cached → one mint");
+    }
+
+    #[tokio::test]
+    async fn credential_source_invalidate_forces_remint() {
+        let fm = FakeMinter::new(vec![Ok(minted("tok1")), Ok(minted("tok2"))]);
+        let s = new_credential_source(fm.clone(), target("s", "", 0), SCOPE_CONTROL);
+        assert_eq!(s.token().await.unwrap(), "tok1");
+        s.invalidate();
+        assert_eq!(s.token().await.unwrap(), "tok2"); // next token() re-mints
         assert_eq!(fm.calls.load(Ordering::SeqCst), 2);
     }
 
@@ -783,7 +786,11 @@ mod tests {
         for h in handles {
             assert_eq!(h.await.unwrap().unwrap(), "tok");
         }
-        assert_eq!(gm.calls.load(Ordering::SeqCst), 1, "single-flight → one mint");
+        assert_eq!(
+            gm.calls.load(Ordering::SeqCst),
+            1,
+            "single-flight → one mint"
+        );
     }
 
     // ---- refresh-delay math (no Go test; panel F6) ----------------------------------

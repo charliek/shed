@@ -71,14 +71,16 @@ pub struct NamespaceHealth {
 /// `build_live_status` snapshots the daemon's live self-report. `consumer` is the
 /// desktop approval channel's current consumer identity (`Some((name, version))`
 /// when an app is connected, `None` otherwise) — the desktop server's
-/// `consumer_info()` in slice 1, or always `None` in the headless build with no
-/// desktop server. There is still no supervisor, so `servers` is empty.
+/// `consumer_info()`, or always `None` in the headless build with no desktop server.
+/// `servers` is the supervisor's per-server connection snapshot (`Supervisor::health()`),
+/// populated in BOTH modes (single-server shows one entry, `name:""`).
 pub fn build_live_status(
     cfg: &HostAgentConfig,
     config_path: &str,
     started_at: &str,
     version: &str,
     consumer: Option<(String, String)>,
+    servers: Vec<ServerHealth>,
 ) -> LiveStatus {
     // Keyed by the fixed status/gate namespace order; the BTreeMap re-sorts on
     // insert, so the emitted JSON key order is identical regardless.
@@ -107,7 +109,7 @@ pub fn build_live_status(
             client_name,
             client_version,
         },
-        servers: Vec::new(),
+        servers,
     }
 }
 
@@ -158,6 +160,116 @@ pub(crate) fn rfc3339_utc(unix_secs: i64) -> String {
     };
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days from the civil date to the unix epoch (Howard Hinnant's `days_from_civil`;
+/// the inverse of the civil-from-days math in [`rfc3339_utc`] above). Lives in this
+/// always-on module so both `bootstrap` (desktop-gated) and `aws_backend` (always-on,
+/// bus-side) can reuse one implementation without a cross-gate dependency.
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse an RFC3339 timestamp to unix seconds, matching what Go's `time.Time` collapses
+/// to: `Ok(None)` for the zero time (`0001-01-01T00:00:00Z`), `Ok(Some(secs))` for a
+/// valid instant (offset applied, sub-second **truncated** as Go's `Format(time.RFC3339)`
+/// drops it), `Err(())` for a malformed non-empty value. The inverse of
+/// [`rfc3339_utc`]; a round-trip against it is unit-pinned.
+///
+/// `pub(crate)` and homed in this always-on module (not the `desktop-forwarding`-gated
+/// `bootstrap`) so both the mint-bundle deserializer (`bootstrap::de_expires_at`, gated)
+/// and the always-on, bus-side egress consumer (`egress::egress_audit_entry`) reuse one
+/// implementation without a cross-gate dependency — mirroring how `days_from_civil` is
+/// shared. Go's `d.Time.UTC().Format(RFC3339)` is reproduced exactly incl. the zero-time
+/// and offset-normalize cases.
+pub(crate) fn parse_rfc3339_to_unix(s: &str) -> Result<Option<i64>, ()> {
+    // Layout: YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM). Split date/time on 'T'.
+    let (date, time_and_zone) = s.split_once('T').ok_or(())?;
+    let (y, mo, d) = {
+        let mut it = date.split('-');
+        let y: i64 = it.next().ok_or(())?.parse().map_err(|_| ())?;
+        let mo: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
+        let d: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
+        if it.next().is_some() {
+            return Err(());
+        }
+        (y, mo, d)
+    };
+    // Split the zone suffix off the time, then split off any fractional seconds.
+    let (time_part, offset_secs) = split_zone(time_and_zone)?;
+    let (hms, frac) = match time_part.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (time_part, None),
+    };
+    if let Some(f) = frac {
+        // Sub-second digits are validated (Go's RFC3339Nano parse would) then dropped.
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(());
+        }
+    }
+    let (h, mi, se) = {
+        let mut it = hms.split(':');
+        let h: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
+        let mi: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
+        let se: u32 = parse_fixed(it.next().ok_or(())?, 2)?;
+        if it.next().is_some() {
+            return Err(());
+        }
+        (h, mi, se)
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return Err(());
+    }
+    // The Go zero time → None (Go's `IsZero()` → omitted `expires_at`).
+    if y == 1 && mo == 1 && d == 1 && h == 0 && mi == 0 && se == 0 && offset_secs == 0 {
+        return Ok(None);
+    }
+    let days = days_from_civil(y, mo, d);
+    let secs = days * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + (se as i64) - offset_secs;
+    Ok(Some(secs))
+}
+
+/// Split an RFC3339 zone suffix (`Z` or `±HH:MM`) off the end, returning the remaining
+/// time text and the offset in seconds to SUBTRACT to reach UTC.
+fn split_zone(time_and_zone: &str) -> Result<(&str, i64), ()> {
+    if let Some(rest) = time_and_zone.strip_suffix('Z') {
+        return Ok((rest, 0));
+    }
+    // Find the last '+' or '-' that starts the offset (after the time, so index >= 1).
+    let bytes = time_and_zone.as_bytes();
+    let mut idx = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if (b == b'+' || b == b'-') && i > 0 {
+            idx = Some(i);
+        }
+    }
+    let i = idx.ok_or(())?;
+    let (time_part, off) = time_and_zone.split_at(i);
+    // A `+05:00` zone is 5h AHEAD of UTC, so 5h is SUBTRACTED from the local time to
+    // reach UTC (positive value to subtract); `-05:00` adds (negative value).
+    let sign = if off.as_bytes()[0] == b'+' { 1 } else { -1 };
+    let off = &off[1..];
+    let (oh, om) = off.split_once(':').ok_or(())?;
+    let oh: i64 = parse_fixed::<u32>(oh, 2)? as i64;
+    let om: i64 = parse_fixed::<u32>(om, 2)? as i64;
+    if oh > 23 || om > 59 {
+        return Err(());
+    }
+    Ok((time_part, sign * (oh * 3_600 + om * 60)))
+}
+
+/// Parse an exactly-`width`-digit unsigned field (RFC3339 fields are fixed-width).
+fn parse_fixed<T: std::str::FromStr>(s: &str, width: usize) -> Result<T, ()> {
+    if s.len() != width || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    s.parse().map_err(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +349,11 @@ fn not_running_message(sock: &Path) -> String {
 /// `runStatus`.
 pub fn run_status(json_out: bool, out: &mut dyn Write) -> i32 {
     let sock = crate::sockets::status_socket_path();
-    let mut conn = match std::os::unix::net::UnixStream::connect(&sock) {
+    // Bounded connect (2s) — the client-side analog of the daemon's 500ms live-probe.
+    // Mirrors Go's `net.DialTimeout("unix", sock, 2*time.Second)` (`status.go:30`); a
+    // wedged daemon can't hang the CLI forever. std `UnixStream` has no connect_timeout
+    // and this path is sync (no runtime), so `sockets::connect_unix_timeout` bounds it.
+    let mut conn = match crate::sockets::connect_unix_timeout(&sock, Duration::from_secs(2)) {
         Ok(c) => c,
         Err(_) => {
             eprint!("{}", not_running_message(&sock));
@@ -461,6 +577,32 @@ mod tests {
         // The Unix "billennium": 2001-09-09 01:46:40 UTC.
         assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
         assert_eq!(rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn rfc3339_round_trip_against_renderer() {
+        // parse_rfc3339_to_unix is the inverse of rfc3339_utc.
+        for unix in [0i64, 1_893_456_000, 1_700_000_000, 253_402_300_799] {
+            let s = rfc3339_utc(unix);
+            assert_eq!(parse_rfc3339_to_unix(&s), Ok(Some(unix)), "round-trip {s}");
+        }
+    }
+
+    #[test]
+    fn rfc3339_offset_and_fraction() {
+        // +05:00 offset normalizes to UTC; fractional seconds are truncated.
+        assert_eq!(
+            parse_rfc3339_to_unix("2030-01-01T05:00:00+05:00"),
+            Ok(Some(1_893_456_000))
+        );
+        assert_eq!(
+            parse_rfc3339_to_unix("2030-01-01T00:00:00.500Z"),
+            Ok(Some(1_893_456_000))
+        );
+        assert_eq!(parse_rfc3339_to_unix("garbage"), Err(()));
+        assert_eq!(parse_rfc3339_to_unix("2030-13-01T00:00:00Z"), Err(())); // bad month
+                                                                            // The Go zero time collapses to None (omitted expires_at / absent egress ts).
+        assert_eq!(parse_rfc3339_to_unix("0001-01-01T00:00:00Z"), Ok(None));
     }
 
     #[test]

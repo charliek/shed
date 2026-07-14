@@ -1,0 +1,12 @@
+{
+  "_comment": "Golden fixture for decodeInlineAuth (docker_backend.go:406 / docker_backend.rs:decode_inline_auth): base64(user:pass) -> {username, secret} split on the FIRST colon (password may contain colons). Each runner base64-STANDARD-encodes `plain` itself (padded StdEncoding — identical bytes both sides), then decodes, so the fixture stays engine-neutral. `valid_vectors` check username/secret; `invalid_vectors` check the exact error string. IMPORTANT: a malformed-base64 vector is INTENTIONALLY EXCLUDED — its `decoding auth for <url>: <e>` message carries an impl-dependent SUFFIX (Go's `illegal base64 data at input byte N` vs the Rust base64 crate's text), so only the `invalid auth format for <url>` case (prefix-only, no runtime text) is goldenable; the decode-error PREFIX is unit-pinned instead, never live/golden-diffed. Read by BOTH the Go runner (cmd/shed-host-agent/golden_test.go:TestGoldenDockerInlineAuth) and the Rust runner (crates/shed-host-agent/src/docker_backend.rs tests::golden_docker_inline_auth).",
+  "protocol_version": 1,
+  "valid_vectors": [
+    {"name": "basic user:pass", "server_url": "registry.example.com", "plain": "myuser:mypass", "username": "myuser", "secret": "mypass"},
+    {"name": "colon in password preserved (SplitN-2)", "server_url": "registry.example.com", "plain": "user:pass:word:extra", "username": "user", "secret": "pass:word:extra"},
+    {"name": "empty password", "server_url": "reg.io", "plain": "onlyuser:", "username": "onlyuser", "secret": ""}
+  ],
+  "invalid_vectors": [
+    {"name": "no colon -> invalid auth format", "server_url": "registry.example.com", "plain": "nocolon", "expected_error": "invalid auth format for registry.example.com"}
+  ]
+}
