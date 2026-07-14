@@ -848,6 +848,32 @@ mod tests {
             .block_on(f)
     }
 
+    /// `exec_helper` with a bounded ETXTBSY retry — a concurrent test's fork can
+    /// transiently inherit a freshly-written helper's write fd across our exec
+    /// (the fd table is process-wide; the same fork/exec race as
+    /// `bootstrap::tests::run_shim`). The spawn errno is stringified into the
+    /// HELPER_FAILED message, so match the locale-stable `"os error 26"` suffix.
+    /// Non-ETXTBSY results return immediately — which also stops a transient
+    /// ETXTBSY from masquerading as the *intended* HELPER_FAILED in the
+    /// error-asserting tests below.
+    fn exec_retrying(
+        exec: &RealHelperExecutor,
+        helper: &str,
+        url: &str,
+    ) -> Result<DockerCredential, DockerCredError> {
+        let mut delay = Duration::from_millis(10);
+        for _ in 0..9 {
+            match block_on(exec.exec_helper(helper, url)) {
+                Err(e) if e.msg.contains("os error 26") => {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(160));
+                }
+                r => return r,
+            }
+        }
+        block_on(exec.exec_helper(helper, url))
+    }
+
     // ---- normalize_registry (TestNormalizeRegistry) -----------------------------
 
     #[test]
@@ -1286,7 +1312,7 @@ mod tests {
             vec![dir.path().to_string_lossy().into_owned()],
             Duration::from_secs(5),
         );
-        let c = block_on(exec.exec_helper("faketest", "registry.example.com")).unwrap();
+        let c = exec_retrying(&exec, "faketest", "registry.example.com").unwrap();
         assert_eq!(c.username, "fake-user");
         assert_eq!(c.secret, "fake-secret");
         assert_eq!(c.server_url, "registry.example.com");
@@ -1320,7 +1346,7 @@ mod tests {
             vec![dir.path().to_string_lossy().into_owned()],
             Duration::from_secs(5),
         );
-        let e = block_on(exec.exec_helper("failexit", "registry.example.com")).unwrap_err();
+        let e = exec_retrying(&exec, "failexit", "registry.example.com").unwrap_err();
         assert_eq!(e.code, DOCKER_CODE_HELPER_FAILED);
 
         // Exit 0 but non-JSON stdout → HELPER_FAILED (parse error).
@@ -1334,7 +1360,7 @@ mod tests {
             vec![dir2.path().to_string_lossy().into_owned()],
             Duration::from_secs(5),
         );
-        let e2 = block_on(exec2.exec_helper("badjson", "registry.example.com")).unwrap_err();
+        let e2 = exec_retrying(&exec2, "badjson", "registry.example.com").unwrap_err();
         assert_eq!(e2.code, DOCKER_CODE_HELPER_FAILED);
         assert!(
             e2.msg
@@ -1359,7 +1385,7 @@ mod tests {
             Duration::from_millis(300),
         );
         let start = std::time::Instant::now();
-        let e = block_on(exec.exec_helper("sleeper", "registry.example.com")).unwrap_err();
+        let e = exec_retrying(&exec, "sleeper", "registry.example.com").unwrap_err();
         assert_eq!(e.code, DOCKER_CODE_HELPER_FAILED);
         assert!(
             start.elapsed() < Duration::from_secs(5),

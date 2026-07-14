@@ -828,7 +828,28 @@ mod tests {
         (dir, ssh)
     }
 
+    /// Run a shim with a bounded ETXTBSY retry. Another test's fork can
+    /// transiently inherit this shim's write fd across our exec — the fd table
+    /// is process-wide, so a concurrent `Command::spawn` anywhere in this test
+    /// binary races every freshly-written executable (the classic fork/exec
+    /// race; hits ~100% on the 4-vCPU ubuntu runner, unreproducible on dev
+    /// machines). The spawn errno is stringified away by
+    /// `BootstrapError::SshFailed(e.to_string())`, so match the locale-stable
+    /// `"os error 26"` suffix, never the English prose. Each attempt writes a
+    /// FRESH shim (fresh tempdir); non-ETXTBSY results return immediately, so
+    /// error-asserting tests (timeout, changed-host-key) are unaffected.
     async fn run_shim(body: &str, p: &Params, timeout: Duration) -> Result<Bundle, BootstrapError> {
+        let mut delay = Duration::from_millis(10);
+        for _ in 0..9 {
+            let (_dir, ssh) = write_shim(body);
+            match SystemSshRunner::with_shim(ssh, timeout).run(p).await {
+                Err(BootstrapError::SshFailed(m)) if m.contains("os error 26") => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(160));
+                }
+                r => return r,
+            }
+        }
         let (_dir, ssh) = write_shim(body);
         SystemSshRunner::with_shim(ssh, timeout).run(p).await
     }
@@ -850,9 +871,11 @@ mod tests {
         // subprocess sees exactly the argv the differential also compares).
         let dir = tempfile::tempdir().unwrap();
         let argv_file = dir.path().join("argv");
+        // `: >` truncates first so an ETXTBSY retry (run_shim) can't double the
+        // captured argv via the appends below.
         let body = format!(
-            "for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\nprintf '{{\"http_port\":8080,\"token\":\"t\"}}'\n",
-            argv_file.display()
+            ": > '{p}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{p}'; done\nprintf '{{\"http_port\":8080,\"token\":\"t\"}}'\n",
+            p = argv_file.display()
         );
         run_shim(&body, &params(), Duration::from_secs(5))
             .await
