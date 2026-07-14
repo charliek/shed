@@ -114,20 +114,26 @@ def _req(req_id: str, operation: str) -> dict:
     }
 
 
-# --- D3.6 introspection: RAW captured pairs saved for the orchestrator ----------------
+# --- D3.6 introspection: RAW captured pairs, saved ONLY when a reviewer opts in -------
+#
+# During per-slice development the orchestrator manually diffs the RAW (unmasked)
+# Go/Rust wire pairs; setting SHED_HOST_AGENT_DIFF_INTROSPECTION to a writable file
+# path re-enables that capture. It MUST default off: an earlier revision hard-coded
+# a developer-machine absolute path here, which made these cells unrunnable on any
+# other host (caught by the first Linux CI execution of this suite).
 
-INTROSPECTION_PATH = Path(
-    "/private/tmp/claude-501/-Users-charliek-projects-shed/"
-    "97fd8aef-9216-431e-8aed-653022afed7c/scratchpad/aws-commit3-introspection.txt"
-)
 _introspection: dict = {}
 
 
 def _record_introspection(section: str, data: dict) -> None:
-    """Merge a RAW captured pair (response envelope + audit) into the introspection file
-    and rewrite it (tests run serially, so accumulation is safe)."""
+    """Merge a RAW captured pair (response envelope + audit) into the opt-in
+    introspection file and rewrite it (tests run serially, so accumulation is
+    safe). No-op unless SHED_HOST_AGENT_DIFF_INTROSPECTION names a target file."""
+    target = os.environ.get("SHED_HOST_AGENT_DIFF_INTROSPECTION")
+    if not target:
+        return
     _introspection[section] = data
-    INTROSPECTION_PATH.write_text(json.dumps(_introspection, indent=2, sort_keys=True))
+    Path(target).write_text(json.dumps(_introspection, indent=2, sort_keys=True))
 
 
 # =====================================================================================

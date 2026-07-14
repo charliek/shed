@@ -252,7 +252,11 @@ def binaries(tmp_path_factory) -> dict:
         cwd=REPO_ROOT / "crates",
         env=cargo_env,
     )
-    rust_bin = REPO_ROOT / "crates" / "target" / "debug" / "shed-host-agent"
+    # Honor CARGO_TARGET_DIR (standard cargo redirection — used e.g. by the
+    # rehab's Linux loop container to keep linux artifacts off the bind mount);
+    # default to the workspace-relative target/ otherwise.
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "crates" / "target"))
+    rust_bin = target_dir / "debug" / "shed-host-agent"
 
     assert go_bin.exists(), f"go binary missing: {go_bin}"
     assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
