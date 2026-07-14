@@ -2890,11 +2890,27 @@ mod tests {
             .with_test_backoff(Duration::from_millis(5), Duration::from_millis(10));
         let (tx, rx) = shutdown_pair();
         let sub = client.subscribe("ssh-agent", rx);
-        // Let several backoff cycles elapse, then stop.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Poll (bounded) until the quiet DEBUG tier has engaged — ≥1 DEBUG retry
+        // implies the single loud WARN already fired and the dedup latched. A
+        // fixed sleep here is scheduler-dependent: under CPU oversubscription
+        // (e.g. --test-threads=16 on 4 vCPUs) 80 ms of wall clock may not fit
+        // even one HTTP round-trip, which failed this test 12/12 in the rehab's
+        // stress loop.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while log.debugs.load(Ordering::SeqCst) < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "quiet DEBUG tier never engaged (warns={}, debugs={})",
+                log.warns.load(Ordering::SeqCst),
+                log.debugs.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let _ = tx.send(true);
         drop(sub);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Once a DEBUG retry has been observed, the counts are deterministic:
+        // the dedup guarantees exactly one WARN ever (first failure), so no
+        // post-shutdown drain sleep is needed.
         assert_eq!(
             log.warns.load(Ordering::SeqCst),
             1,
