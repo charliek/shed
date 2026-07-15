@@ -3182,6 +3182,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "shed-broker"
+version = "0.7.10"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sts",
+ "aws-smithy-http-client",
+ "aws-smithy-types",
+ "base64 0.22.1",
+ "block2",
+ "ed25519-dalek",
+ "futures-util",
+ "httpmock",
+ "libc",
+ "notify",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "p256",
+ "p384",
+ "p521",
+ "reqwest",
+ "rsa",
+ "saphyr-parser",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "shed-core",
+ "ssh-key",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "shed-core"
 version = "0.7.10"
 dependencies = [
@@ -3215,34 +3252,11 @@ name = "shed-host-agent"
 version = "0.7.10"
 dependencies = [
  "async-trait",
- "aws-config",
- "aws-sdk-sts",
- "aws-smithy-http-client",
- "aws-smithy-types",
- "base64 0.22.1",
- "block2",
- "ed25519-dalek",
- "futures-util",
- "httpmock",
- "libc",
- "notify",
- "objc2",
- "objc2-foundation",
- "objc2-local-authentication",
- "p256",
- "p384",
- "p521",
- "reqwest",
- "rsa",
- "saphyr-parser",
  "serde",
  "serde_json",
- "sha1",
- "sha2 0.10.9",
+ "shed-broker",
  "shed-core",
- "ssh-key",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "uuid",
 ]

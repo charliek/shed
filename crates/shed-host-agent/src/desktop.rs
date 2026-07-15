@@ -30,9 +30,17 @@ use crate::desktop_protocol::{
     self as protocol, ApprovalResponseMsg, AuditEntryView, ClientInfo, DesktopInbound, TokenGetMsg,
 };
 
-use crate::approval::{ApprovalGate, ApprovalOutcome};
-use crate::config::{NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT, POLICY_SHED_DESKTOP};
-use crate::status::{now_rfc3339, now_unix, rfc3339_utc};
+use shed_broker::approval::{ApprovalGate, ApprovalOutcome};
+use shed_broker::audit::{AuditEntry, AuditFanout};
+use shed_broker::config::{
+    NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT, POLICY_SHED_DESKTOP,
+};
+use shed_broker::controltoken::ControlTokenMinter;
+// `MintedControlToken` is named only by the test minters (`StubControlMinter` /
+// `GatedMinter`); production code returns it via the trait without naming the type.
+#[cfg(test)]
+use shed_broker::controltoken::MintedControlToken;
+use shed_broker::status::{now_rfc3339, now_unix, rfc3339_utc};
 
 /// 1 MiB per-line cap on inbound frames — a larger frame is a protocol violation
 /// (disconnect), never unbounded memory growth. Matches Go's `maxFrameBytes`.
@@ -67,23 +75,11 @@ const NAMESPACE_EGRESS: &str = "egress";
 // ---------------------------------------------------------------------------
 // Control-token minter seam
 // ---------------------------------------------------------------------------
-
-/// A minted control-scoped token: the token plus an optional RFC3339 expiry
-/// (`None` = non-expiring / unknown, which omits `expires_at` in the reply).
-#[derive(Debug)]
-pub struct MintedControlToken {
-    pub token: String,
-    pub expires_at: Option<String>,
-}
-
-/// Mints CONTROL-scoped tokens on the app's behalf (answers `token.get`). The real
-/// SSH-bootstrap minter is a later slice; this is the injection seam.
-#[async_trait::async_trait]
-pub trait ControlTokenMinter: Send + Sync {
-    /// Mint a control token for `server`. `Err(msg)` fails the `token.get` closed —
-    /// the reply carries the message and no token.
-    async fn mint_control(&self, server: &str) -> Result<MintedControlToken, String>;
-}
+//
+// `ControlTokenMinter` + `MintedControlToken` now live in the broker core
+// (`shed_broker::controltoken`, imported above) — the daemon's `token.get` UDS
+// handler and a future embedder both consume them. This module wires the production
+// `ControlTokenProvider` (in `main.rs`) and, for tests, the stand-in below.
 
 /// A stand-in minter that returns a canned token — used only by this module's tests to
 /// drive `token.get` without the real SSH-bootstrap minter. Production wires the real
@@ -99,6 +95,41 @@ impl ControlTokenMinter for StubControlMinter {
             token: "stub-control-token".to_string(),
             expires_at: None,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit fan-out (the bin's `AuditFanout` impl)
+// ---------------------------------------------------------------------------
+
+/// The daemon wires the desktop server as the broker core's [`AuditFanout`]: every
+/// recorded [`AuditEntry`] becomes an `event` frame on the all-namespace stream so
+/// the app's activity feed works even when file logging is disabled (catalog §3.3).
+/// The `AuditEntry`→wire-view conversion is bin-side, keeping the daemon-only wire
+/// type (`AuditEntryView`) out of the broker core.
+impl AuditFanout for DesktopServer {
+    fn forward(&self, entry: &AuditEntry) {
+        self.publish_audit(&entry_to_view(entry));
+    }
+}
+
+/// Map a durable [`AuditEntry`] to the desktop `event` frame's source view (1:1 copy;
+/// the `event` builder adds only `id`/`v`/`type`/`kind`).
+fn entry_to_view(entry: &AuditEntry) -> AuditEntryView {
+    AuditEntryView {
+        ts: entry.ts.clone(),
+        server: entry.server.clone(),
+        shed: entry.shed.clone(),
+        ns: entry.ns.clone(),
+        op: entry.op.clone(),
+        result: entry.result.clone(),
+        detail: entry.detail.clone(),
+        code: entry.code.clone(),
+        reason: entry.reason.clone(),
+        approval: entry.approval.clone(),
+        decided_by: entry.decided_by.clone(),
+        scope: entry.scope.clone(),
+        ttl: entry.ttl.clone(),
     }
 }
 

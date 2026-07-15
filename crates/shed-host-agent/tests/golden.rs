@@ -5,17 +5,14 @@
 //! every vector. The Go and Rust runners agreeing with a committed fixture is the
 //! drift guard the live differential cannot give.
 //!
-//! `shed-host-agent` is a binary-only crate (no `lib.rs`), so this integration test
-//! pulls in the self-contained `config` module directly via `#[path]` rather than
-//! importing a library target — keeping the crate a pure binary while still
-//! exercising its real config functions.
-
-#[path = "../src/config.rs"]
-mod config;
+//! `config` now lives in the `shed-broker` library crate, so this integration test
+//! imports its real config functions from the library `shed-host-agent` links (before
+//! the broker extraction, when `shed-host-agent` was binary-only, it `#[path]`-included
+//! `config.rs` standalone).
 
 use std::path::PathBuf;
 
-use config::{effective_policy_from_raw, HostAgentConfig};
+use shed_broker::config::{effective_policy_from_raw, HostAgentConfig};
 
 /// The shared fixture directory. `CARGO_MANIFEST_DIR` is `crates/shed-host-agent`;
 /// `../../` is the repo root, where `tests/host-agent-diff/fixtures` lives (the
@@ -34,7 +31,9 @@ fn config_from_policies(ssh: &str, aws: &str, docker: &str) -> HostAgentConfig {
          aws:\n  approval:\n    policy: {aws}\n\
          docker:\n  approval:\n    policy: {docker}\n"
     );
-    HostAgentConfig::parse(&text)
+    // `parse` is a `#[cfg(test)]`-only convenience inside the crate; from this external
+    // integration test use the public `try_parse` (same block-YAML path) + expect.
+    HostAgentConfig::try_parse(&text).expect("yaml fixture parses")
 }
 
 fn read_fixture(name: &str) -> serde_json::Value {

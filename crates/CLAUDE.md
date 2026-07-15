@@ -21,6 +21,14 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   in `desktop/scripts/build-core.sh`.
 - **`shedctl`** — a headless UDS/IPC client on `shed-core` (no GUI-toolkit dep), shipped in the
   Linux `.deb` and drives the Tauri app's socket. In `default-members`.
+- **`shed-broker`** — the embeddable host-agent broker core: the shed-server plugin bus,
+  the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
+  backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
+  (incl. the always-compiled `AuditFanout` fan-out and the native `touchid` gate), the
+  `config` reader, socket path-resolution + liveness probes, and the LiveStatus snapshot
+  builder. Consumed today by the **`shed-host-agent` bin** (the daemon shell — CLI,
+  signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
+  in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
@@ -36,19 +44,23 @@ member here. Do not add it as one.
 
 ### The no-YAML-dep posture — and its one carve-out
 
-Both clients hand-roll a tiny indentation reader (`shed-core`'s and `shed-host-agent`'s own
+Both clients hand-roll a tiny indentation reader (`shed-core`'s and `shed-broker`'s own
 `yaml_lite` mods) rather than take a YAML dependency. That aversion targets the **serde-based**
 crates (`serde_yaml` — archived/unmaintained — and `serde_norway`): serde-derive on the config
 structs is what's being avoided, not a parser per se.
 
-**The scoped exception:** `shed-host-agent` depends on **`saphyr-parser`** (pure-Rust, no-serde,
-no-C, no encoding_rs, `default-features = false`) to back ITS `yaml_lite::parse`. Justification:
-the shipped `configs/extensions.example.yaml` uses block-style `docker.registries:` sequences the
-line/colon reader silently dropped, and Go's `LoadConfig` rejects malformed YAML the hand-rolled
-reader could not detect — a real Go-vs-Rust divergence on the product's own default config.
-`saphyr-parser` sits behind the `Node` interface (swap-insulation for its pre-1.0 API) and is a
-**leaf-crate dep of the `shed-host-agent` binary only** — it does NOT reach `shed-core`/`shed-app`/
-`shed-core-ffi`/the Tauri client (proven by `cargo tree -i saphyr-parser`). **shed-core's own
+**The scoped exception:** `shed-broker` (the broker core, home of the host-agent `config`
+reader) depends on **`saphyr-parser`** (pure-Rust, no-serde, no-C, no encoding_rs,
+`default-features = false`) to back ITS `yaml_lite::parse`. Justification: the shipped
+`configs/extensions.example.yaml` uses block-style `docker.registries:` sequences the line/colon
+reader silently dropped, and Go's `LoadConfig` rejects malformed YAML the hand-rolled reader could
+not detect — a real Go-vs-Rust divergence on the product's own default config. `saphyr-parser`
+sits behind the `Node` interface (swap-insulation for its pre-1.0 API). It — and `shed-broker`'s
+other leaf deps (`notify`, the `aws-sdk-*` stack) — are **deps of `shed-broker`, reaching only its
+embedders** (today the `shed-host-agent` bin; from leg 3a.2 also `shed-app` under its non-default
+`broker` feature and, transitively, the Tauri client). They must **never** reach `shed-core`,
+`shed-core-ffi`, or **default-features `shed-app`** (proven by `cargo tree -i saphyr-parser` /
+`notify` / `aws-sdk-sts` — the §7 reverse-dep AC mechanically enforces this). **shed-core's own
 `yaml_lite` stays hand-rolled** (it carries a Swift byte-parity test); converging the two readers
 onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 

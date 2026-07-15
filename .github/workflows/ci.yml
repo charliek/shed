@@ -91,6 +91,12 @@ jobs:
               # harness, the committed wire reference, and the shared build
               # manifests/locks/toolchain a dependency bump would ride in on.
               - 'crates/shed-host-agent/**'
+              # The daemon bin is now a thin shell over the `shed-broker` lib crate
+              # (the broker core: bus, backends, minter, supervisor, config, the
+              # approval/audit seams, socket paths/liveness, the LiveStatus snapshot).
+              # A change there is a change to the shipped daemon's behavior, so it must
+              # trigger the differential harness + the release-snapshot.
+              - 'crates/shed-broker/**'
               # The Rust host-agent has a path-dep on shed-core, and the release
               # build (builder: rust) reads rust-toolchain.toml — a change to
               # either can break the shipped binary, so both must trigger the
@@ -405,13 +411,17 @@ jobs:
       - name: C toolchain (ring's crypto backend needs build-essential)
         run: sudo apt-get update && sudo apt-get install -y build-essential
       - uses: astral-sh/setup-uv@v6
+      # The broker core lives in `shed-broker` now; the bin is the daemon shell over
+      # it. Both must build/test/clippy-clean for the shipped daemon to be sound.
       - name: Rust host-agent — test + clippy (Linux)
         working-directory: crates
         run: |
-          cargo test -p shed-host-agent --all-targets --locked
-          cargo clippy -p shed-host-agent --all-targets --locked -- -D warnings
+          cargo test -p shed-broker -p shed-host-agent --all-targets --locked
+          cargo clippy -p shed-broker -p shed-host-agent --all-targets --locked -- -D warnings
       # The headless variant (surface A dropped) is the 3a.2 server/no-desktop
-      # distribution — it must not bit-rot unwatched on the platform it ships to.
+      # distribution — it must not bit-rot unwatched on the platform it ships to. The
+      # `desktop-forwarding` feature is the BIN's; `shed-broker` has no features, so
+      # `--no-default-features` reshapes only the shell.
       - name: Rust host-agent — headless (--no-default-features) test + clippy (Linux)
         working-directory: crates
         run: |

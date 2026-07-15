@@ -4,18 +4,21 @@
 //! config. Only the directory is overridable via `SHED_HOST_AGENT_SOCKET_DIR` (an
 //! escape hatch for tests and parallel dev agents). Faithful port of the Go
 //! daemon's `sockets.go`.
+//!
+//! This module is the daemon-agnostic half: socket **path resolution** and the
+//! **liveness probes** ([`socket_is_live`] / [`connect_unix_timeout`]) that both the
+//! daemon and an embedder use to detect a running peer. The daemon-only **bind
+//! ceremony** (which needs the daemon's `Log`) lives bin-side in `socket_bind.rs`.
 
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::user_home_dir;
-use crate::Log;
 
 /// `socket_dir` returns the fixed directory the agent's sockets live in. Order:
 /// the `SHED_HOST_AGENT_SOCKET_DIR` override, else macOS
@@ -60,94 +63,6 @@ fn env_nonempty(key: &str) -> Option<OsString> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared bind ceremony (Go `bindUnixSocket`) — used by BOTH the status socket
-// and the desktop approval socket. Trust is filesystem perms only: an owner-only
-// `0700` parent dir plus a `0600` socket (there is NO peer-UID check, matching the
-// Go server). `name` prefixes the operational log lines (e.g. "status socket",
-// "desktop"); the operational log is not a differential target.
-// ---------------------------------------------------------------------------
-
-/// Bind a fresh blocking std listener at `path`, applying the shared safety
-/// ceremony: create + restrict the parent dir to `0700`, refuse to clobber a live
-/// or non-socket path (`prepare_socket_path`), bind, then `chmod 0600`. Dir/perm
-/// failures are best-effort (logged, non-fatal); a refused or failed bind logs and
-/// returns `None`. The std listener is later handed to tokio via
-/// `UnixListener::from_std`, so this ceremony (and its logging) runs synchronously
-/// before the runtime starts. Mirrors the Go `bindUnixSocket`.
-pub(crate) fn bind_unix_socket(
-    name: &str,
-    path: &Path,
-    log: &mut Log,
-) -> Option<std::os::unix::net::UnixListener> {
-    if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-        {
-            log.warn(&format!(
-                "{name}: could not create socket dir {}: {e}",
-                dir.display()
-            ));
-        }
-        // Owner-only parent dir is the real protection (it covers the brief window
-        // before the socket chmod); enforce it even if the dir already existed.
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            log.warn(&format!(
-                "{name}: could not restrict socket dir perms {}: {e}",
-                dir.display()
-            ));
-        }
-    }
-    if let Err(e) = prepare_socket_path(path) {
-        log.error(&format!("{name}: refusing to bind {}: {e}", path.display()));
-        return None;
-    }
-    let listener = match std::os::unix::net::UnixListener::bind(path) {
-        Ok(l) => l,
-        Err(e) => {
-            log.error(&format!("{name}: failed to listen {}: {e}", path.display()));
-            return None;
-        }
-    };
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        log.warn(&format!(
-            "{name}: could not set socket perms 0600 {}: {e}",
-            path.display()
-        ));
-    }
-    log.info(&format!("{name}: socket listening {}", path.display()));
-    Some(listener)
-}
-
-/// Make `path` bindable for a fresh listener. Errors when the path is a non-socket
-/// file (a misconfigured path must never delete an unrelated file) or when another
-/// process is still accepting on it (clobbering a live socket would break the
-/// running agent). A truly stale socket (nothing accepting) is removed. Mirrors the
-/// Go `prepareSocketPath`.
-fn prepare_socket_path(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-        Ok(meta) => {
-            if !meta.file_type().is_socket() {
-                return Err(io::Error::other(format!(
-                    "path exists but is not a socket: {}",
-                    path.display()
-                )));
-            }
-            if socket_is_live(path) {
-                return Err(io::Error::other(format!(
-                    "socket already in use by another process: {}",
-                    path.display()
-                )));
-            }
-            std::fs::remove_file(path)
-        }
-    }
-}
-
 /// Bounds the "is this socket live?" probe. Mirrors the Go daemon's
 /// `socketProbeTimeout` (`desktop_server.go:23`, `500ms`): a live local agent
 /// accepts in well under this; a stale leftover file fails fast (ECONNREFUSED).
@@ -158,8 +73,9 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// immediately: it succeeds if a listener is bound, else fails fast (ECONNREFUSED /
 /// ENOENT). The connect is bounded by [`SOCKET_PROBE_TIMEOUT`] so a pathological
 /// peer with a full accept backlog cannot hang the probe (Go's
-/// `net.DialTimeout("unix", path, 500ms)`).
-fn socket_is_live(path: &Path) -> bool {
+/// `net.DialTimeout("unix", path, 500ms)`). `pub` so the bin's bind ceremony and
+/// an embedder's startup mode-probe (§3.3) both reuse one implementation.
+pub fn socket_is_live(path: &Path) -> bool {
     connect_unix_timeout(path, SOCKET_PROBE_TIMEOUT).is_ok()
 }
 
@@ -178,8 +94,9 @@ fn socket_is_live(path: &Path) -> bool {
 /// client reads a response after connecting, and the stale-probe just drops it, so
 /// blocking is the safe default for both. On timeout / refuse / any error → `Err`,
 /// which both callers treat exactly like the current unreachable-peer path ("not
-/// live" / "not running"). `cfg(unix)`; `libc` is already a direct dep.
-pub(crate) fn connect_unix_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+/// live" / "not running"). `cfg(unix)`; `libc` is already a direct dep. `pub` so the
+/// bin's `status` client (2s bound) reuses it cross-crate.
+pub fn connect_unix_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let (addr, addr_len) = sockaddr_un(path)?;
 
     // SAFETY: socket() with constant domain/type/protocol args; returns an fd or -1.
@@ -434,43 +351,5 @@ mod tests {
         let path = PathBuf::from(format!("/tmp/{}.sock", "x".repeat(200)));
         let err = connect_unix_timeout(&path, Duration::from_secs(1)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    // --- prepare_socket_path three-way gate (Go `prepareSocketPath`) ---
-    // The A1 live cell drives the dir-0700 + stale-rebind halves; the live-refuse and
-    // non-socket-refuse halves have no clean equal wire consequence (op-log-only
-    // refusal), so they are pinned here as units (named in the harness README).
-
-    #[test]
-    fn prepare_allows_absent_path() {
-        let dir = short_tmpdir();
-        prepare_socket_path(&dir.path().join("nope.sock")).expect("absent path is bindable");
-    }
-
-    #[test]
-    fn prepare_removes_stale_socket() {
-        let dir = short_tmpdir();
-        let path = dir.path().join("stale.sock");
-        make_stale_socket(&path);
-        prepare_socket_path(&path).expect("stale socket should be removable");
-        assert!(!path.exists(), "stale socket should have been removed");
-    }
-
-    #[test]
-    fn prepare_refuses_live_socket() {
-        let dir = short_tmpdir();
-        let path = dir.path().join("live.sock");
-        let _ln = UnixListener::bind(&path).unwrap(); // held live
-        prepare_socket_path(&path).expect_err("must refuse to clobber a live socket");
-        assert!(path.exists(), "live socket must be left intact");
-    }
-
-    #[test]
-    fn prepare_refuses_non_socket_file() {
-        let dir = short_tmpdir();
-        let path = dir.path().join("regular");
-        std::fs::write(&path, b"x").unwrap();
-        prepare_socket_path(&path).expect_err("must refuse a non-socket file");
-        assert!(path.exists(), "non-socket file must be left intact");
     }
 }

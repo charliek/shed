@@ -40,7 +40,7 @@ use crate::config::DiscoveryConfig;
 /// `reconcile` is `async` (it awaits the supervisor's cancel+drain in commit 3); it is
 /// called once up front and again on each trigger. `shutdown` is the daemon-wide
 /// `watch<bool>` (Go's `ctx.Done()`); the loop returns once it is (or becomes) true.
-pub(crate) async fn run_watch_loop<F, Fut>(
+pub async fn run_watch_loop<F, Fut>(
     dc: DiscoveryConfig,
     mut reconcile: F,
     shutdown: watch::Receiver<bool>,

@@ -105,9 +105,9 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
 
 // The `resolve_targets` methods live here (rather than on `HostAgentConfig` in
 // `config.rs`) because they depend on this module's `ServerTarget` /
-// `load_discovered_servers`, and `config.rs` must stay self-contained — the golden
-// integration test (`tests/golden.rs`) `#[path]`-includes it standalone, where
-// `crate::discovery` does not exist.
+// `load_discovered_servers`. `config.rs` stays self-contained (only std + serde +
+// saphyr-parser) as a matter of hygiene — it is the crate's foundational module and
+// carries no dependency on the rest of the broker.
 impl HostAgentConfig {
     /// The desired server set to broker for, filtered from an already-loaded
     /// `discovered` list — a faithful port of Go's `Config.ResolveTargets`
@@ -146,7 +146,8 @@ impl HostAgentConfig {
     /// mode loads `discovery.source` then filters; single-server mode returns the unnamed
     /// target. `Err` only on a discovery read/parse failure (the caller keeps its current
     /// servers). Called by `main.rs`'s reconcile closure (and shared with `status`).
-    pub(crate) fn resolve_targets(&self) -> Result<Vec<ServerTarget>, String> {
+    /// `pub` so the daemon bin (and a future embedder's reconcile) drives it cross-crate.
+    pub fn resolve_targets(&self) -> Result<Vec<ServerTarget>, String> {
         let discovered = match self.discovery.as_ref() {
             Some(dc) => load_discovered_servers(&dc.source)?,
             None => Vec::new(),

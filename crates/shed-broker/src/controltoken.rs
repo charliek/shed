@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::desktop::{ControlTokenMinter, MintedControlToken};
 use crate::discovery::{load_discovered_servers, ServerTarget};
 use crate::minter::{new_credential_source, CredentialSource, Minter, SCOPE_CONTROL};
 use crate::status::rfc3339_utc;
@@ -24,6 +23,33 @@ use crate::status::rfc3339_utc;
 /// `apply_defaults` also uses) so `main.rs`'s `controltoken::DEFAULT_DISCOVERY_SOURCE`
 /// reference stays stable.
 pub use crate::config::DEFAULT_DISCOVERY_SOURCE;
+
+// ---------------------------------------------------------------------------
+// Control-token minter seam
+// ---------------------------------------------------------------------------
+//
+// The `token.get` seam lives here (the broker core), not in the daemon's
+// `desktop` module: the desktop UDS server (`shed-host-agent`) and any future
+// embedder both consume it, and [`ControlTokenProvider`] below is its production
+// implementation. The bin's `DesktopServer` re-imports these from `shed_broker`.
+
+/// A minted control-scoped token: the token plus an optional RFC3339 expiry
+/// (`None` = non-expiring / unknown, which omits `expires_at` in the reply).
+#[derive(Debug)]
+pub struct MintedControlToken {
+    pub token: String,
+    pub expires_at: Option<String>,
+}
+
+/// Mints CONTROL-scoped tokens on the app's behalf (answers `token.get`). The
+/// production implementation is [`ControlTokenProvider`]; the injection seam lets
+/// the desktop server (and tests) swap in a stand-in.
+#[async_trait::async_trait]
+pub trait ControlTokenMinter: Send + Sync {
+    /// Mint a control token for `server`. `Err(msg)` fails the `token.get` closed —
+    /// the reply carries the message and no token.
+    async fn mint_control(&self, server: &str) -> Result<MintedControlToken, String>;
+}
 
 /// Answers `token.get` by minting CONTROL tokens over SSH (mirror
 /// `controltoken.go:controlTokenProvider`).
