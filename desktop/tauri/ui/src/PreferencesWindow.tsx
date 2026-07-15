@@ -120,6 +120,11 @@ export default function PreferencesWindow() {
   // Set once the user changes the mode — the change is deferred to the next launch, so
   // the control shows a restart-to-apply hint until then.
   const [brokerRestart, setBrokerRestart] = useState(false);
+  // Disables the broker-mode Select while a change is in flight — the serialize that
+  // stops an older selection's set/read-back round trip from landing after (and
+  // overwriting) a newer one, since the Select is unavailable until the latest settles.
+  const [brokerBusy, setBrokerBusy] = useState(false);
+  const brokerGen = useRef(0);
   const sshGen = useRef(0);
   const reloadGen = useRef(0); // bumped per reloadAll; guards every fetch's application
   const ttlAtFocus = useRef(""); // the Duration value when the field gained focus
@@ -284,21 +289,29 @@ export default function PreferencesWindow() {
   // Broker mode: persist the pref (optimistic on the pref field only — the EFFECTIVE
   // mode does NOT change until relaunch, so keep showing the running one). The restart
   // hint is backend truth (persisted pref vs. launch pref), taken from the set reply and
-  // then reconciled — along with the pref — from `broker.status` either way.
+  // then reconciled — along with the pref — from `broker.status` either way. The Select
+  // is disabled for the duration (brokerBusy) — the simplest serialize: with the control
+  // unavailable mid-flight there's no way to fire an overlapping change, so an older
+  // set/read-back can never resolve after (and clobber) a newer one. A generation guard
+  // backs it up in case a stray call still overlaps.
   const chooseBrokerMode = (mode: BrokerMode) => {
     setBroker((b) => (b ? { ...b, pref: mode } : b));
+    const mine = ++brokerGen.current;
+    setBrokerBusy(true);
     void (async () => {
       try {
         const res = await setBrokerMode(mode);
-        setBrokerRestart(res.restart_required);
+        if (mine === brokerGen.current) setBrokerRestart(res.restart_required);
       } catch {
         // fall through to reconcile from the backend truth
       }
       const fresh = await getBrokerStatus();
+      if (mine !== brokerGen.current) return; // superseded by a newer change
       if (fresh) {
         setBroker(fresh);
         setBrokerRestart(fresh.restart_required);
       }
+      setBrokerBusy(false);
     })();
   };
 
@@ -406,6 +419,7 @@ export default function PreferencesWindow() {
                   value={broker.pref}
                   onChange={(v) => chooseBrokerMode(v as BrokerMode)}
                   options={BROKER_MODES.map((m) => ({ value: m.id, label: m.label }))}
+                  disabled={brokerBusy}
                 />
               </span>
             </label>

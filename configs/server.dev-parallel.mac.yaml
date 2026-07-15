@@ -23,6 +23,8 @@ name: my-server-dev
 # Offset from brew's 8080/2222 so both can run simultaneously.
 http_port: 18080
 ssh_port: 12222
+# Secure-mode TLS listener; offset from brew's default 8443.
+https_port: 18443
 
 # Loopback (also the v0.7.4 default) — the suite drives this dev server over
 # localhost, so it stays on-box. Set explicitly to document intent.
@@ -31,13 +33,49 @@ bind_address: 127.0.0.1
 default_backend: vz
 log_level: debug
 
-# Intentionally NO credentials block:
-#   The dev server is for testing the SERVER itself, not for hosting
-#   the developer's working sheds. The brew install (`my-server`)
-#   is where ~/.shed/mounts/{claude,codex,opencode,gh} get mounted.
-#   Adding them here would mean two VMs concurrently writing to the
-#   same host files for the same tool — a race the integration suite
-#   doesn't need.
+# LOCAL (uncommitted) mobile-testing overrides: secure mode + the shed-mobile
+# app key so the pinned-HTTPS mobile client can mint tokens and connect.
+auth:
+  mode: secure
+  ssh:
+    github_users: [charliek]
+    authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBaqTm38OGnpaLoZdZGDEBupr/2C0lcFmdcxevD+wUJI shed-mobile
+
+# LOCAL (uncommitted) mounts for mobile testing so agent logins persist across
+# dev-server sheds. CAVEAT: these are the SAME host dirs the brew server
+# mounts — do not run a brew shed and a dev shed that both actively use the
+# same tool at the same time (concurrent writers to one host dir).
+mounts:
+  claude:
+    source: ~/.shed/mounts/claude
+    target: /home/shed/.claude
+    readonly: false
+  codex:
+    source: ~/.shed/mounts/codex
+    target: /home/shed/.codex
+    readonly: false
+  opencode_data:
+    source: ~/.shed/mounts/opencode/share
+    target: /home/shed/.local/share/opencode
+    readonly: false
+  opencode_state:
+    source: ~/.shed/mounts/opencode/state
+    target: /home/shed/.local/state/opencode
+    readonly: false
+  gh:
+    source: ~/.shed/mounts/gh
+    target: /home/shed/.config/gh
+    readonly: false
+  cursor:
+    source: ~/.shed/mounts/cursor
+    target: /home/shed/.cursor
+    readonly: false
+  # Linux cursor-agent tokens live OUTSIDE ~/.cursor:
+  cursor_config:
+    source: ~/.shed/mounts/cursor-config
+    target: /home/shed/.config/cursor
+    readonly: false
 
 # Intentionally NO extensions block:
 #   Same reason as credentials. Dev sheds don't need

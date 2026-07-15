@@ -35,10 +35,19 @@ pub use crate::config::DEFAULT_DISCOVERY_SOURCE;
 
 /// A minted control-scoped token: the token plus an optional RFC3339 expiry
 /// (`None` = non-expiring / unknown, which omits `expires_at` in the reply).
-#[derive(Debug)]
 pub struct MintedControlToken {
     pub token: String,
     pub expires_at: Option<String>,
+}
+
+impl std::fmt::Debug for MintedControlToken {
+    /// Redacts the live bearer token — only `expires_at` is printed as-is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedControlToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Mints CONTROL-scoped tokens on the app's behalf (answers `token.get`). The
@@ -243,4 +252,20 @@ servers:
     // The `load_discovered_servers` unit + golden tests moved to `discovery.rs`
     // alongside the hoisted function (the ssh_port=0-vs-22 + empty-host + sort +
     // malformed divergences it pins).
+
+    #[test]
+    fn debug_redacts_token() {
+        let secret = "super-secret-control-token-value";
+        let minted = MintedControlToken {
+            token: secret.to_string(),
+            expires_at: Some("2026-07-15T00:00:00Z".to_string()),
+        };
+        let debug_str = format!("{minted:?}");
+        assert!(
+            !debug_str.contains(secret),
+            "Debug output leaked the token: {debug_str}"
+        );
+        assert!(debug_str.contains("<redacted>"));
+        assert!(debug_str.contains("2026-07-15T00:00:00Z"));
+    }
 }

@@ -143,11 +143,13 @@ export function Select({
   onChange,
   options,
   id,
+  disabled,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
   id?: string;
+  disabled?: boolean;
 }) {
   return (
     <div className="relative">
@@ -155,7 +157,9 @@ export function Select({
         id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
         className="w-full appearance-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 pr-9 text-[14px] text-shed-text outline-none focus:border-shed-accent"
+        style={{ opacity: disabled ? 0.5 : 1 }}
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>

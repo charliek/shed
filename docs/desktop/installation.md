@@ -104,9 +104,12 @@ make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.0
 - A reachable `shed-server` on at least one configured host. Unreachable hosts are shown
   as a degraded state, never a hard failure.
 
-**Nothing else.** `brew install shed` (or `apt install shed`) plus the desktop app is a
-complete install — the app brokers credential approvals (SSH sign, AWS, Docker) itself.
-See below for how that differs between the two clients.
+**Nothing else — for the Tauri client.** `brew install shed` (or `apt install shed`) plus the
+Tauri desktop app is a complete install — its embedded broker handles credential approvals
+(SSH sign, AWS, Docker) itself, no extra daemon needed. The stable **Swift macOS client**
+still requires the separately-installed `shed-host-agent` daemon for credential approvals
+(Homebrew formula, `brew services start shed-host-agent`). See below for how that differs
+between the two clients.
 
 ## Credential broker
 

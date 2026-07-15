@@ -75,6 +75,7 @@ cargo test -p shed-app --features broker             # the embedded broker bridg
 cargo test -p shed-app --features broker,rc          # both non-default features together
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features rc --all-targets -- -D warnings
+cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
 ```
 
