@@ -24,9 +24,18 @@ def _now_iso() -> str:
 
 
 class FakeHostAgent:
-    def __init__(self):
+    def __init__(self, status_only: bool = False):
+        # `status_only` (leg 3a.2, the headless-coexist probe): bind ONLY the sibling
+        # `host-agent-status.sock` a HEADLESS `shed-host-agent` binds (the desktop
+        # socket stays absent), speaking just enough for liveness probing. The broker's
+        # three-way auto-detect (`shed_app::probe_sockets_at`) keys off
+        # `shed_broker::socket_is_live`, whose probe is a bare `connect(2)` success — so
+        # a bound+listening socket that accepts and closes suffices (no hello/ack). The
+        # default (False) keeps the full Surface-A desktop fake the mac suite uses.
+        self.status_only = status_only
         self._dir = tempfile.mkdtemp(prefix="fake-host-agent-")
-        self.socket_path = os.path.join(self._dir, "host-agent.sock")
+        sock_name = "host-agent-status.sock" if status_only else "host-agent.sock"
+        self.socket_path = os.path.join(self._dir, sock_name)
         self._srv: socket.socket | None = None
         self._conn: socket.socket | None = None
         self._lock = threading.Lock()
@@ -35,6 +44,11 @@ class FakeHostAgent:
         self._thread: threading.Thread | None = None
         self._running = False
         self.hello_count = 0
+        # `status_only` mode: a real headless daemon's status socket doesn't speak the
+        # desktop protocol at all — it never replies to anything. Record whatever
+        # frames arrive here (there should be none) instead of acking/handling them,
+        # so a cell can assert the app never tried to talk protocol on this socket.
+        self.status_frames: list[dict] = []
         # Which namespaces the agent delegates to shed-desktop (advertised in
         # hello_ack). Default to all three so the app shows every approval
         # prefs section. Set before the app connects to change it.
@@ -122,6 +136,12 @@ class FakeHostAgent:
             msg = json.loads(line)
         except ValueError:
             return
+        if self.status_only:
+            # A real headless status socket never speaks the desktop protocol —
+            # record and stop, no hello_ack, no handling of any frame type.
+            with self._lock:
+                self.status_frames.append(msg)
+            return
         t = msg.get("type")
         if t == "hello":
             ack = {
@@ -184,6 +204,12 @@ class FakeHostAgent:
     # -- test API ---------------------------------------------------------
     def wait_connected(self, timeout: float = 10.0) -> bool:
         return self._hello_seen.wait(timeout)
+
+    def received_frames(self) -> list[dict]:
+        """A snapshot of frames received on a `status_only` socket (empty is the
+        expected/only correct outcome — the status socket never speaks protocol)."""
+        with self._lock:
+            return list(self.status_frames)
 
     def wait_hello_count(self, n: int, timeout: float = 10.0) -> bool:
         """Wait until at least `n` hello handshakes have been seen (>=2 proves a

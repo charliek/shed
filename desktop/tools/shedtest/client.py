@@ -409,6 +409,25 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
     def activate(self) -> None:
         self.call("app.activate")
 
+    # -- credential broker (leg 3a.2) ------------------------------------
+    def broker_status(self) -> dict:
+        """The LiveStatus-shaped broker snapshot: `{effective_mode, pref,
+        restart_required, probe:{desktop_socket_live, status_socket_live},
+        config:{source, message}, resolved_ssh_mode, gate_namespaces, servers,
+        broker_error}`. The C4 embedded-mode truth op."""
+        return self.call("broker.status")
+
+    def broker_mode(self) -> dict:
+        """The `{effective, pref, restart_required}` fragment — the effective mode plus
+        the LIVE persisted pref (reflects a `broker_set_mode` without a relaunch)."""
+        return self.call("broker.mode")
+
+    def broker_set_mode(self, mode: str) -> dict:
+        """Persist the broker mode pref (`auto`|`embedded`|`external`). Effective mode is
+        fixed for the process lifetime, so a change sets `restart_required` until relaunch.
+        An unknown mode is rejected (`bad_request`)."""
+        return self.call("broker.set_mode", {"mode": mode})
+
     def current_pane(self) -> str | None:
         """The pane the React shell currently renders (reported via ui_report)."""
         return self.call("ui.current_pane").get("pane")
