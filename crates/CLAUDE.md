@@ -13,8 +13,10 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   classifier + argv builders). The Linux clients link it directly.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   `RcRunner` portability seam (`rc.rs`, behind the non-default `rc = ["tokio/process"]`
-  feature). A bare `cargo test`/`clippy` skips the `rc` module — cover it with
-  `-p shed-app --features rc`.
+  feature) and the embedded broker bridge (`broker_bridge.rs`, behind the non-default
+  `broker = ["dep:shed-broker"]` feature — leg 3a.2). A bare `cargo test`/`clippy` skips
+  both modules — cover them with `-p shed-app --features rc` and `-p shed-app --features
+  broker` (or `broker,rc` together).
 - **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
   exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
   unchanged); `lib` is required so `cargo run -p shed-core-ffi --bin uniffi-bindgen` works
@@ -69,8 +71,11 @@ onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 ```bash
 cd crates && cargo test                              # workspace tests
 cargo test -p shed-app --features rc                 # the non-default rc module
+cargo test -p shed-app --features broker             # the embedded broker bridge (3a.2)
+cargo test -p shed-app --features broker,rc          # both non-default features together
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features rc --all-targets -- -D warnings
+cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
 ```
 
 `shed-core` also builds/tests on Linux — `make -C desktop core-linux` runs it in Docker.

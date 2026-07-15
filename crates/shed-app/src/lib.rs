@@ -8,6 +8,8 @@
 
 pub mod audit_store;
 pub mod backend;
+#[cfg(feature = "broker")]
+pub mod broker_bridge;
 pub mod coordinator;
 pub mod fakes;
 pub mod host_agent;
@@ -19,6 +21,11 @@ pub mod traits;
 
 pub use audit_store::AuditStore;
 pub use backend::{Backend, HostDiskUsage, HostEgressProfiles, RcTarget, Reachability};
+#[cfg(feature = "broker")]
+pub use broker_bridge::{
+    detect_mode, load_or_synthesize, probe_sockets, resolve_mode, BrokerConfig, BrokerError,
+    DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
+};
 #[cfg(feature = "rc")]
 pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};

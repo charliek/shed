@@ -3176,7 +3176,9 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "shed-broker",
  "shed-core",
+ "tempfile",
  "tokio",
  "uuid",
 ]
