@@ -103,6 +103,11 @@ further.
 
 ### The host agent (Unix-domain socket)
 
+This section describes the **external-daemon** path — the only path the Swift macOS app
+has, and one of three modes the Tauri app can run (see [The embedded credential
+broker](#the-embedded-credential-broker-tauri) below for the Tauri-only in-process path
+and the mode selection between them).
+
 The headline feature. When an extension is configured with `approval.policy: shed-desktop`,
 `shed-host-agent` (which always serves the local Unix-domain socket) delegates
 that extension's **approval** decisions to the app (SSH interactively; AWS/Docker as a live
@@ -138,6 +143,73 @@ sequenceDiagram
     SRV->>VM: result
     HA-->>SD: event (audit; all namespaces)
 ```
+
+### The embedded credential broker (Tauri)
+
+The Tauri client (Linux; macOS beta) can also run the credential broker **in-process** —
+the same `shed-broker` Rust crate the standalone `shed-host-agent` daemon is built from,
+embedded via `shed-app`'s non-default `broker` feature instead of dialed over a socket.
+Quitting the app stops brokering (server-side fails closed, same as stopping the daemon);
+there is no LaunchAgent/systemd unit for it. The Swift app does not have this path — it
+always uses the [external daemon](#the-host-agent-unix-domain-socket) above.
+
+**Mode selection.** A persisted preference (`Preferences → Credential broker`; wire value
+`broker_mode`, default `auto`) resolved against a startup probe of both daemon sockets:
+
+| Effective mode | When | Broker behavior |
+|---|---|---|
+| `external` | Pref `auto` + the daemon's desktop socket is live, or pref pinned to `external` | Dials the daemon exactly as the Swift app does — unchanged. |
+| `headless-coexist` | Pref `auto` + only the daemon's *status* socket is live (a daemon run with `--no-default-features`, no desktop socket) | The app does **not** start its own bus broker (avoids per-namespace `409`s with the headless daemon) and gets no in-app approvals; it still self-mints its own secure-server tokens in-process. |
+| `embedded` | Pref `auto` + neither socket is live, or pref pinned to `embedded` | The app starts its own in-process broker. Pinning `embedded` alongside a running daemon is allowed — the two race per server/namespace; the loser gets `409 NAMESPACE_ALREADY_REGISTERED`, surfaced (never hidden) in `broker.status`, never a double prompt. |
+
+The mode is **fixed for the process lifetime** — it is resolved once at startup and never
+hot-swapped. Changing the pref via Preferences (or `broker.set_mode` over IPC) persists
+immediately but only takes effect on the next launch; until then, `broker.status` and
+`identify.broker_mode` report `restart_required: true`. Both ops also echo the probe
+evidence (`desktop_socket_live`, `status_socket_live`) so the UI can explain an `auto`
+choice.
+
+**`extensions.yaml` handling.** The embedded broker reads the same
+`~/.config/shed/extensions.yaml` the daemon does (see [Extensions →
+Configuration](../extensions/configuration.md)), with two deliberate divergences from the
+daemon (which exits 1 on either missing or invalid config):
+
+- **Missing file** (fresh install) — the broker synthesizes a default config through the
+  same parse/validate path a real file goes through, rather than exiting: discovery mode
+  over `~/.shed/config.yaml` (every configured server), `ssh.mode: ""` (auto-detect),
+  `ssh.approval.policy: shed-desktop` (routed to the in-app gate), and AWS/Docker left
+  unconfigured — Docker is still subscribed (denying every registry until configured),
+  AWS is not subscribed at all, matching the daemon's own empty-config behavior. Zero
+  config files to hand-write for a working install.
+- **Present but malformed/invalid** — the broker fails **closed**, not the app: no
+  minting, no approvals, but the app keeps running. The parse/validation error surfaces in
+  `broker.status` (`config.source: "error"`, `config.message`) and in the Preferences
+  window. A file that parses and validates is honored **identically** to the daemon —
+  same policies, allowlists, and discovery config.
+
+`broker.status` distinguishes the three provenances via `config.source`: `"loaded"`
+(a real file), `"synthesized"` (the fresh-install default), or `"error"`.
+
+**SSH auto-detect is environment-dependent.** `ssh.mode: ""` (the default, in both the
+synthesized config and a hand-authored one that omits `ssh.mode`) selects agent-forward
+if `$SSH_AUTH_SOCK` is set, else local-keys — and a GUI app launched via login-item
+autostart does not necessarily see the same environment a terminal-launched daemon does
+(macOS launch agents and Linux desktop autostart entries commonly start with a trimmed
+environment). The **resolved** mode — not the config's `ssh.mode` string — is exposed as
+`broker.status.resolved_ssh_mode`, so a support session can tell agent-forward and
+local-keys apart without guessing at the launch environment.
+
+**Two durable audit logs.** In embedded mode, every approval decision is written to
+**both** the broker's own configured `logging:` JSONL (parity with what the standalone
+daemon writes, default `~/.local/share/shed/extensions-audit.log`) **and** the app's own
+`audit.jsonl` (see [State + storage](#state-storage) below). The app's **Activity** pane
+only ever reads its own store — the broker's log exists for daemon-equivalent
+tooling/parity, not because the app needs two sources of truth.
+
+**No sockets served.** The embedded broker exposes neither of the daemon's Unix-domain
+sockets (§[Host Agent IPC](../extensions/host-agent-ipc.md)) — there is nothing external
+to dial or probe against it. All observability goes through the app's own IPC
+(`broker.status`, `identify.broker_mode`) instead.
 
 ### The shed CLI config
 

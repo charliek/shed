@@ -18,6 +18,25 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Tauri desktop app embeds the credential broker — no separate `shed-host-agent`
+  install needed.** The Linux client and the macOS Tauri beta can now broker SSH/AWS/
+  Docker credential approvals **in-process**, so a default install is `brew install shed`
+  (or `apt install shed`) plus the desktop app, full stop. A new `Preferences →
+  Credential broker` setting (`Automatic` / `In-app (embedded)` / `External daemon`,
+  default `Automatic`) picks the mode at launch: a running daemon ⇒ dial it as before
+  (`external`, zero change for existing daemon users); a *headless* daemon (no desktop
+  socket) ⇒ `headless-coexist` (mint-only, no in-app approvals, no namespace fights); no
+  daemon ⇒ `embedded`. The mode is fixed for the process lifetime — changing the pref
+  applies on the next launch, surfaced as `restart_required` in `broker.status` /
+  `identify.broker_mode`. The embedded broker honors an existing
+  `~/.config/shed/extensions.yaml` identically to the daemon, or synthesizes a working
+  fresh-install default when none exists (all configured servers, SSH auto-detect routed
+  to in-app approval); a malformed file fails the broker closed without taking the app
+  down, surfaced in Preferences. The Swift macOS app is unchanged — it still uses the
+  standalone daemon. Under the hood, the daemon's broker logic moved into a new library
+  crate (`crates/shed-broker`), shared by the standalone `shed-host-agent` binary (now a
+  thin shell around it — wire-identical, unchanged CLI/config/socket behavior) and the
+  desktop app's new embedded path.
 - **Multi-agent Remote Control sessions.** RC sessions (the detached `rc-<slug>` tmux
   sessions driven by `shed-ext-rc`) now run **codex**, **cursor**, and **opencode**
   alongside `claude-rc`/`claude-broker`/`shell`, each with its own pane classifier

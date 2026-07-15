@@ -105,6 +105,41 @@ in Docker). **Run `make tauri-build-linux` (the render gate) for any shared/Linu
 the mac WKWebView e2e alone can miss Linux-only breaks. On Linux the tray is a native menu
 (Tauri emits no Linux tray-click events → no popover; expected).
 
+## The embedded credential broker (leg 3a.2)
+
+The Tauri app can broker credentials **in-process**, no separate `shed-host-agent`
+daemon required. It embeds `crates/shed-broker` (the same lib crate the standalone
+daemon's `main.rs` wraps) via `shed-app`'s non-default `broker` feature
+(`crates/shed-app/src/broker_bridge.rs`), wired into the setup hook by
+`desktop/tauri/src-tauri/src/broker.rs`. Full behavior is documented user-facing in
+[docs/desktop/architecture.md § The embedded credential
+broker](../docs/desktop/architecture.md#the-embedded-credential-broker-tauri).
+
+Three modes, resolved once at startup from a persisted `broker_mode` pref (`auto`
+default) overlaid on a probe of both daemon sockets — `external` (a full daemon is
+running, dial it as before), `headless-coexist` (only a headless daemon's status
+socket is live — mint-only, no in-app approvals), `embedded` (neither socket live —
+start the in-process broker). The Swift app has no embedded path; it is always
+`external`.
+
+Test pointers:
+
+- `cargo test -p shed-app --features broker` / `--features broker,rc` — the bridge's
+  unit tests (mode resolution, `load_or_synthesize`, outcome mapping, timeout/dismiss).
+- `desktop/tools/shedtest/test_tauri_broker.py` — the `--target tauri`-only hermetic
+  e2e cells (three-way auto-detect, the bus → AppGate → Coordinator → respond
+  round-trip via the mock server's plugin-bus endpoints, split-namespace `409`,
+  malformed-config fail-closed, the synthesized fresh-install namespace set).
+- The mock server's plugin-bus routes live in `desktop/tools/shedtest/mockserver.py`
+  (`GET /api/plugins/listeners/{ns}/messages` SSE + `POST
+  /api/plugins/listeners/{ns}/respond`), shape-pinned against
+  `tests/host-agent-diff`'s synthetic bus and `docs/development/host-agent-wire-catalog.md`
+  so the fakes can't drift independently.
+- The Go-vs-Rust differential harness (`make test-host-agent-diff`, 108 cells) still
+  protects the extracted `shed-broker` core itself — it doesn't know about the
+  embedded path, only that the standalone daemon built from the same lib is
+  wire-identical.
+
 ## Socket paths
 
 - **mac IPC:** `~/Library/Caches/ShedDesktop/shed-desktop.sock` (override `SHED_DESKTOP_SOCKET`).
