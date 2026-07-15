@@ -17,8 +17,9 @@ import {
   getProviderModes, setProviderMode,
   listShedRules, removeShedRule,
   getAppearanceState, reportPrefs,
+  getBrokerStatus, setBrokerMode,
   type TerminalPresetInfo, type SshPrefs, type ProviderModes, type ShedRule,
-  type PrefsReport,
+  type PrefsReport, type BrokerMode, type BrokerStatus,
 } from "@/lib/bridge";
 
 /* The credential namespaces the host agent can delegate (mac CredentialNamespace). */
@@ -43,6 +44,23 @@ const SSH_POLICIES: { id: string; label: string; prompts: boolean; usesDuration:
   { id: "always-ask", label: "Always Ask", prompts: true, usesDuration: false },
   { id: "always-deny", label: "Always Deny", prompts: false, usesDuration: false },
 ];
+
+// The credential-broker modes (leg 3a.2), most → least automatic. `auto` follows a
+// socket probe (daemon present ⇒ external; headless daemon ⇒ coexist; neither ⇒
+// embedded); the others pin the mode. Changing it takes effect on the next launch.
+const BROKER_MODES: { id: BrokerMode; label: string }[] = [
+  { id: "auto", label: "Automatic" },
+  { id: "embedded", label: "In-app (embedded)" },
+  { id: "external", label: "External daemon" },
+];
+
+// The human line for the active effective mode — mac-style live note.
+const BROKER_EFFECTIVE_NOTE: Record<BrokerStatus["effective_mode"], string> = {
+  external: "Brokering credentials via the shed-host-agent daemon.",
+  embedded: "Brokering credentials in-app — no separate daemon needed.",
+  "headless-coexist":
+    "Brokering handled by a headless shed-host-agent; in-app approvals unavailable.",
+};
 
 /** A titled grouped card: the mac per-section mono label + the rounded container
     the section's rows live in. The optional Footnote is a separate sibling. */
@@ -98,6 +116,10 @@ export default function PreferencesWindow() {
   const [loginBusy, setLoginBusy] = useState(false);
   const [providerModes, setModes] = useState<ProviderModes>({});
   const [shedRules, setShedRules] = useState<ShedRule[]>([]);
+  const [broker, setBroker] = useState<BrokerStatus | null>(null);
+  // Set once the user changes the mode — the change is deferred to the next launch, so
+  // the control shows a restart-to-apply hint until then.
+  const [brokerRestart, setBrokerRestart] = useState(false);
   const sshGen = useRef(0);
   const reloadGen = useRef(0); // bumped per reloadAll; guards every fetch's application
   const ttlAtFocus = useRef(""); // the Duration value when the field gained focus
@@ -159,6 +181,14 @@ export default function PreferencesWindow() {
     });
     void listShedRules().then((v) => {
       if (fresh()) setShedRules(v);
+    });
+    void getBrokerStatus().then((v) => {
+      if (fresh() && v) {
+        setBroker(v);
+        // The restart hint is backend truth (persisted pref drifted from the launch
+        // pref) — reconciled here so it survives a prefs-changed reload too.
+        setBrokerRestart(v.restart_required);
+      }
     });
     // SSH keeps its own guard on top: applySsh bumps sshGen on an optimistic
     // edit, so a slow load must not clobber a newer edit (not just a newer reload).
@@ -251,6 +281,26 @@ export default function PreferencesWindow() {
       setShedRules(await listShedRules());
     })();
   };
+  // Broker mode: persist the pref (optimistic on the pref field only — the EFFECTIVE
+  // mode does NOT change until relaunch, so keep showing the running one). The restart
+  // hint is backend truth (persisted pref vs. launch pref), taken from the set reply and
+  // then reconciled — along with the pref — from `broker.status` either way.
+  const chooseBrokerMode = (mode: BrokerMode) => {
+    setBroker((b) => (b ? { ...b, pref: mode } : b));
+    void (async () => {
+      try {
+        const res = await setBrokerMode(mode);
+        setBrokerRestart(res.restart_required);
+      } catch {
+        // fall through to reconcile from the backend truth
+      }
+      const fresh = await getBrokerStatus();
+      if (fresh) {
+        setBroker(fresh);
+        setBrokerRestart(fresh.restart_required);
+      }
+    })();
+  };
 
   const policyMeta = SSH_POLICIES.find((p) => p.id === policy);
   const sshGated = gateNs.includes(NS_SSH);
@@ -269,6 +319,7 @@ export default function PreferencesWindow() {
   const sections: string[] = [
     "general",
     "terminal",
+    ...(broker ? ["broker"] : []),
     ...(anyGated ? [] : ["approvals-empty"]),
     ...(sshGated ? ["ssh"] : []),
     ...(awsGated ? ["aws"] : []),
@@ -289,6 +340,9 @@ export default function PreferencesWindow() {
       login: launchAtLogin,
       provider_modes: providerModes,
       shed_rules_count: shedRules.length,
+      broker_pref: broker?.pref ?? "auto",
+      broker_effective: broker?.effective_mode ?? "external",
+      broker_error: broker?.broker_error ?? null,
     },
     mode,
   };
@@ -340,6 +394,47 @@ export default function PreferencesWindow() {
           'Which terminal opens when you click "Open in Terminal" on a shed.'
         )}
       </Footnote>
+
+      {broker && (
+        <>
+          <Section title="Credential broker">
+            <label className="flex items-center gap-3 px-3.5 py-2.5" data-broker-mode>
+              <span className="flex-none text-[13px] text-shed-text">Mode</span>
+              <span className="flex-1" />
+              <span className="w-[200px]">
+                <Select
+                  value={broker.pref}
+                  onChange={(v) => chooseBrokerMode(v as BrokerMode)}
+                  options={BROKER_MODES.map((m) => ({ value: m.id, label: m.label }))}
+                />
+              </span>
+            </label>
+            {/* The active (running) mode + any broker-failed error — the status surface
+                the tray reuses; visible so a failed embedded broker isn't silent. */}
+            <div className="border-t border-shed-border px-3.5 py-2.5" data-broker-active>
+              <div className="flex items-center gap-2">
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full"
+                  style={{ background: broker.broker_error ? "var(--shed-danger)" : "var(--shed-ok)" }}
+                />
+                <span className="text-[12px] text-shed-text-muted">
+                  {BROKER_EFFECTIVE_NOTE[broker.effective_mode]}
+                </span>
+              </div>
+              {broker.broker_error && (
+                <div className="mt-1 text-[12px] font-medium text-shed-danger" data-broker-error>
+                  Broker unavailable: {broker.broker_error}
+                </div>
+              )}
+            </div>
+          </Section>
+          <Footnote>
+            Automatic uses the in-app broker when no shed-host-agent is running, and the
+            daemon when it is. Changes take effect{" "}
+            {brokerRestart ? <strong>after you restart Shed Desktop.</strong> : "on the next launch."}
+          </Footnote>
+        </>
+      )}
 
       {!anyGated && (
         <Section title="Approvals">

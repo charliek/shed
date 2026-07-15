@@ -234,6 +234,30 @@ pub fn probe_sockets() -> ModeProbe {
     }
 }
 
+/// Sibling status-socket filename the daemon binds next to the desktop socket
+/// (parity with `status_socket_path()`'s basename).
+const STATUS_SOCKET_FILE: &str = "host-agent-status.sock";
+
+/// Probe the daemon sockets the app would connect to in EXTERNAL mode, keyed off the
+/// app's **configured** desktop socket path rather than the shed-broker default.
+///
+/// An embedder (the Tauri app, its harness) may point the external client at a
+/// non-default socket via its own env override; auto-detect MUST probe the SAME path
+/// the client would dial, which [`probe_sockets`] — bound to the shed-broker default —
+/// would miss. The status socket is derived as the sibling [`STATUS_SOCKET_FILE`] in
+/// that path's directory (the daemon binds both there). Bounded-blocking like
+/// [`probe_sockets`]: run it before the runtime spins up, or via `spawn_blocking`.
+pub fn probe_sockets_at(desktop_socket: &std::path::Path) -> ModeProbe {
+    let status_socket = desktop_socket
+        .parent()
+        .map(|dir| dir.join(STATUS_SOCKET_FILE))
+        .unwrap_or_else(|| std::path::PathBuf::from(STATUS_SOCKET_FILE));
+    ModeProbe {
+        desktop_socket_live: socket_is_live(desktop_socket),
+        status_socket_live: socket_is_live(&status_socket),
+    }
+}
+
 /// The pure three-way probe (§3.3): desktop live ⇒ External; status-only live ⇒
 /// HeadlessCoexist; neither ⇒ Embedded.
 ///
@@ -1568,5 +1592,37 @@ mod tests {
         drop(status);
         drop(desktop);
         std::env::remove_var("SHED_HOST_AGENT_SOCKET_DIR");
+    }
+
+    #[test]
+    fn probe_sockets_at_keys_off_the_given_path_and_sibling_status() {
+        use std::os::unix::net::UnixListener;
+        // No env: this variant probes an EXPLICIT desktop path (the embedder's
+        // configured socket) + its sibling status socket — the path the harness
+        // overrides that the default `probe_sockets` would miss.
+        let dir = tempfile::Builder::new()
+            .prefix("shed-mode-at")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let desktop = dir.path().join("host-agent.sock");
+
+        // Neither bound → Embedded.
+        assert_eq!(detect_mode(probe_sockets_at(&desktop)), DetectedMode::Embedded);
+
+        // Only the sibling status socket live → HeadlessCoexist.
+        let status = UnixListener::bind(dir.path().join(STATUS_SOCKET_FILE)).unwrap();
+        assert_eq!(
+            detect_mode(probe_sockets_at(&desktop)),
+            DetectedMode::HeadlessCoexist
+        );
+
+        // The configured desktop socket live too → External (desktop wins).
+        let d = UnixListener::bind(&desktop).unwrap();
+        let p = probe_sockets_at(&desktop);
+        assert!(p.desktop_socket_live && p.status_socket_live);
+        assert_eq!(detect_mode(p), DetectedMode::External);
+
+        drop(status);
+        drop(d);
     }
 }

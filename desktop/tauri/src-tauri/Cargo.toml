@@ -27,7 +27,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 # The shared protocol + app-logic crates (cross-workspace path deps — this links
 # them; it does not make this crate a member of core's workspace).
 shed-core = { path = "../../../crates/shed-core" }
-shed-app = { path = "../../../crates/shed-app", features = ["rc"] }
+shed-app = { path = "../../../crates/shed-app", features = ["rc", "broker"] }
 # "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process"] }
 serde = { version = "1", features = ["derive"] }

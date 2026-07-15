@@ -23,8 +23,8 @@ pub use audit_store::AuditStore;
 pub use backend::{Backend, HostDiskUsage, HostEgressProfiles, RcTarget, Reachability};
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
-    detect_mode, load_or_synthesize, probe_sockets, resolve_mode, BrokerConfig, BrokerError,
-    DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
+    detect_mode, load_or_synthesize, probe_sockets, probe_sockets_at, resolve_mode, BrokerConfig,
+    BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
 };
 #[cfg(feature = "rc")]
 pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};

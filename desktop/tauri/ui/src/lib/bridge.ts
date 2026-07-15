@@ -292,6 +292,46 @@ export async function setLoginItem(enabled: boolean): Promise<void> {
   await core.invoke("loginitem_set", { enabled });
 }
 
+/* ---- credential broker (leg 3a.2) ----------------------------------------- */
+
+/** The persisted broker-mode preference (default `auto`). */
+export type BrokerMode = "auto" | "embedded" | "external";
+/** The effective mode auto-detect (or the pref) resolved to for this process. */
+export type BrokerEffective = "external" | "embedded" | "headless-coexist";
+
+/** The credential-broker status the Preferences control reads: the effective mode +
+ *  pref, the socket probe that produced it, the config provenance, and — in embedded
+ *  mode — the resolved ssh mode, gate namespaces, per-server health, and any
+ *  broker-failed error (fields that don't apply are null/empty). Mirrors
+ *  `broker::BrokerRuntime::status`. */
+export type BrokerStatus = {
+  effective_mode: BrokerEffective;
+  /** The LIVE persisted pref (tracks a `set_mode` without a relaunch). */
+  pref: BrokerMode;
+  /** The persisted pref drifted from the launch pref ⟹ a relaunch applies it. */
+  restart_required: boolean;
+  probe: { desktop_socket_live: boolean; status_socket_live: boolean };
+  config: { source: "loaded" | "synthesized" | "error" | null; message: string | null };
+  resolved_ssh_mode: string | null;
+  gate_namespaces: string[];
+  servers: unknown[];
+  broker_error: string | null;
+};
+
+export async function getBrokerStatus(): Promise<BrokerStatus | undefined> {
+  return invoke<BrokerStatus>("broker_status");
+}
+
+/** Set the broker mode. Does NOT hot-swap — the reply carries `restart_required:true`
+ *  and the CURRENT effective mode; the control shows a restart-to-apply hint. THROWS on
+ *  an unknown mode (unlike the swallowing `invoke`). */
+export async function setBrokerMode(
+  mode: BrokerMode,
+): Promise<{ pref: BrokerMode; effective: BrokerEffective; restart_required: boolean }> {
+  const core = await import("@tauri-apps/api/core");
+  return core.invoke("broker_set_mode", { mode });
+}
+
 /** Open a shed in the user's chosen terminal (best-effort; a no-op in a browser
  *  and disabled server-side under test mode). A non-empty `session` attaches that
  *  tmux session (the Agents console button → `tmux attach -t rc-<slug>`). */
@@ -485,6 +525,9 @@ export type PrefsReport = {
     login: boolean;
     provider_modes: ProviderModes;
     shed_rules_count: number;
+    broker_pref: BrokerMode;
+    broker_effective: BrokerEffective;
+    broker_error: string | null;
   };
   mode: string;
 };

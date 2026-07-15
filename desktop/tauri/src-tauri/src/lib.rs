@@ -8,6 +8,7 @@
 //! launch succeeds.
 
 mod approval;
+mod broker;
 mod env;
 mod ipc;
 mod prefs;
@@ -25,8 +26,8 @@ use env::Env;
 use ipc::{Handler, IpcServer};
 use shed_app::traits::{AuthGateRef, NotifierRef};
 use shed_app::{
-    AlwaysApprovedGate, AuditStore, Backend, Coordinator, CoordinatorDeps, FakeNotifier,
-    HelloClientInfo, HostAgentClient, HostAgentTokenMinter, RcService, SshPrefs,
+    AlwaysApprovedGate, AuditStore, Backend, Coordinator, CoordinatorDeps, FakeNotifier, RcService,
+    SshPrefs,
 };
 use shed_core::approval::{
     namespace, ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule,
@@ -34,7 +35,6 @@ use shed_core::approval::{
 };
 use shed_core::models::CreateShedRequest;
 use shed_core::rc::RcKind;
-use shed_core::token::TokenMinter;
 use single_instance::AcquireError;
 use state::{SharedUi, UiState};
 use tauri::{Emitter, Manager};
@@ -655,6 +655,42 @@ fn loginitem_set(
     login_item_set(&app, &env, enabled)
 }
 
+// -- credential broker (leg 3a.2): the mode pref + status surface -------------
+
+/// The credential-broker status the Preferences "Credential broker" control reads on
+/// mount + on `prefs-changed`: effective mode, pref, probe evidence, config source,
+/// resolved ssh mode, per-server health, and any broker-failed error. See
+/// [`broker::BrokerRuntime::status`].
+#[tauri::command]
+fn broker_status(app: tauri::AppHandle) -> serde_json::Value {
+    app.try_state::<broker::BrokerRuntime>()
+        .map(|rt| rt.status())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Set the credential-broker mode pref (`auto`/`embedded`/`external`) + persist. This
+/// does NOT hot-swap — the mode is fixed for the process life — so the reply carries the
+/// CURRENT effective mode and a computed `restart_required` (the persisted pref drifted
+/// from the launch pref), and the control shows a "restart to apply" hint when set.
+/// Guarded (mirrors `loginitem_set`): an unknown mode errors rather than persisting a
+/// value the next launch can't parse.
+#[tauri::command]
+fn broker_set_mode(
+    app: tauri::AppHandle,
+    prefs: tauri::State<'_, prefs::SharedPrefs>,
+    mode: String,
+) -> Result<serde_json::Value, String> {
+    if broker::parse_mode_pref(&mode).is_none() {
+        return Err(format!("unknown broker mode: {mode:?}"));
+    }
+    prefs.set_broker_mode(mode.clone());
+    let (effective, restart_required) = app
+        .try_state::<broker::BrokerRuntime>()
+        .map(|rt| (rt.effective_mode_str().to_string(), rt.restart_required()))
+        .unwrap_or_default();
+    Ok(serde_json::json!({ "pref": mode, "effective": effective, "restart_required": restart_required }))
+}
+
 // -- menu-bar popover footer commands (B1b) — a 2nd webview can't call the IPC ops
 //    or emit the main-window events, so the footer invokes these dedicated commands
 //    (test-mode-safe: they only show/emit/exit, never spawn or write). --
@@ -748,28 +784,13 @@ pub fn run() {
     // `dashboard.dump` read what the frontend reported.
     let ui: SharedUi = Arc::new(Mutex::new(UiState::default()));
 
-    // The host-agent connection (approvals + the all-namespace audit feed) + the
-    // control-token minter it backs. Construct BEFORE the Backend so each secure
-    // (non-mock) server's client mints its bearer via the agent's token.get (C2;
-    // fail-closed on a mint failure). The client CONNECTS in `setup`.
+    // The approval clock, shared by the external-mode host-agent client and the
+    // Coordinator. The credential broker (the external UDS client OR the in-process
+    // embedded broker) and the `Backend` it mints for are built in `setup`, after the
+    // broker MODE is resolved from the persisted pref + a socket probe (leg 3a.2) — the
+    // pref lives in prefs.json, which needs the AppHandle. Minter-before-Backend launch
+    // order (§3.2) is preserved inside setup.
     let clock = shed_app::traits::system_clock();
-    let host = HostAgentClient::new(env.host_agent_socket.clone(), clock.clone());
-    // Minting is for real (non-mock) servers only — the hermetic mock is tokenless.
-    let minter: Option<Arc<dyn TokenMinter>> = env
-        .mock_base_url
-        .is_none()
-        .then(|| Arc::new(HostAgentTokenMinter::new(host.clone())) as Arc<dyn TokenMinter>);
-
-    // One shared shed-core-backed Backend behind both surfaces: the WebView's
-    // `invoke` commands (list_sheds/shed_action) and the harness's IPC ops
-    // (sheds.*/shed.*/create.*). Hermetic in test mode (every host → the mock).
-    let backend = Arc::new(Backend::from_env_parts_with_minter(
-        env.test_mode,
-        env.mock_base_url.as_deref(),
-        &env.config_path,
-        minter.as_ref(),
-        &env.mock_unreachable_hosts,
-    ));
 
     // The Agents / Remote-Control service (session store + process seam). Same
     // test-mode flag as the coordinator fakes — test mode synthesizes sessions;
@@ -790,7 +811,6 @@ pub fn run() {
         // event forwarded (see `tray.rs::build`'s `on_tray_icon_event`).
         .plugin(tauri_plugin_positioner::init())
         .manage(ui.clone())
-        .manage(backend.clone())
         .manage(env.clone())
         .manage(rc_service.clone())
         // The macOS test-mode login-item cell (see [`LoginItemCell`]).
@@ -842,6 +862,8 @@ pub fn run() {
             set_appearance_state,
             loginitem_status,
             loginitem_set,
+            broker_status,
+            broker_set_mode,
             open_dashboard,
             open_preferences,
             app_exit,
@@ -872,32 +894,21 @@ pub fn run() {
             // Managed so `set_ssh_approval` (and its IPC twin) can write the chosen
             // SSH prefs through the same store.
             app.manage(prefs.clone());
-            // The terminal ops (preset resolution, launch, detection, the pref),
-            // shared by the IPC handler + the frontend invoke commands.
-            let terminal: termctl::SharedTerminal = Arc::new(termctl::TerminalCtl::new(
-                backend.clone(),
-                prefs.clone(),
-                scripts_dir,
-            ));
-            app.manage(terminal.clone());
 
-            // The approval spine: start the host-agent connection (its event stream
-            // feeds the coordinator), pick the seam impls (test-mode fakes vs the
-            // prod stubs — the real native gate + notifier land in B6), spawn the
-            // coordinator actor + its 1s expiry tick. The audit log lives under the
-            // app data dir (redirected + hermetic in test mode).
-            let hello = HelloClientInfo {
-                name: "shed-desktop".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                pid: std::process::id() as i32,
-                capabilities: vec!["approval.ssh".to_string(), "event.stream".to_string()],
-                replay_events: 50,
-            };
+            // ---- credential broker mode selection (leg 3a.2) ----
+            // Probe BOTH daemon sockets the external client would dial, BEFORE entering
+            // async (bounded-blocking connect(2)s): the app's CONFIGURED desktop socket
+            // (env.host_agent_socket — the harness overrides it) + its sibling status
+            // socket, so auto-detect keys off the same path, not the shed-broker default.
+            let broker_pref = broker::mode_pref(&prefs);
+            let broker_probe = shed_app::probe_sockets_at(&env.host_agent_socket);
+
+            // The approval seams (mode-independent): test-mode fakes vs the prod native
+            // gate + notifier (Linux polkit / mac Touch-ID; fail-closed stubs elsewhere).
+            // The audit log lives under the app data dir (redirected + hermetic in test).
             let (notifier, gate): (NotifierRef, AuthGateRef) = if env.test_mode {
                 (Arc::new(FakeNotifier::new()), Arc::new(AlwaysApprovedGate))
             } else {
-                // Linux: real polkit gate + zbus D-Bus notifier; other targets: the
-                // fail-closed stubs (the Tauri client's native gate is Linux-only).
                 approval::production_seams()
             };
             let audit = AuditStore::new(
@@ -906,45 +917,74 @@ pub fn run() {
                     .unwrap_or_else(|_| std::path::PathBuf::from("."))
                     .join("audit.jsonl"),
             );
-            let coord_clock = clock.clone();
-            // Hydrate the SSH approval prefs from the persisted store (falling back
-            // to the default on an absent/corrupt file), so the user's choice
-            // survives a restart rather than resetting to the coordinator default.
+            // Hydrate SSH prefs / provider modes / per-shed rules from the persisted
+            // store so the user's choices survive a restart (fallback on absent/corrupt).
             let ssh_prefs = ssh_prefs_from_store(&prefs);
-            // Same treatment for the provider (AWS/Docker) modes + per-shed override
-            // rules — hydrate from the persisted store so the user's choices survive
-            // a restart rather than resetting to the coordinator defaults.
             let provider_modes = provider_modes_from_store(&prefs);
             let extra_rules = extra_rules_from_store(&prefs);
             // Pushes coordinator changes to the webview (app.emit) so the
             // Approvals/Activity panes re-fetch reactively.
             let coord_sink: shed_app::traits::EventSinkRef =
                 Arc::new(approval::TauriEventSink::new(app.handle().clone()));
-            // Start the client loop + coordinator actor + expiry tick INSIDE the
-            // Tauri (tokio) runtime — tokio::spawn needs a runtime context, and the
-            // setup hook itself has none (the same reason the IPC bind below uses
-            // block_on). The spawned tasks are detached and outlive the block.
-            let coordinator = tauri::async_runtime::block_on(async move {
-                let host_events = host.start(hello);
-                let responder: shed_app::traits::ResponderRef = Arc::new(host);
-                let coordinator = Coordinator::spawn(
-                    CoordinatorDeps {
-                        responder,
-                        notifier,
-                        gate,
-                        clock: coord_clock,
-                        sink: coord_sink,
-                        audit,
-                        ssh: ssh_prefs,
-                        extra_rules,
-                        provider_modes,
-                    },
-                    host_events,
-                );
-                coordinator.start_expiry_tick();
-                coordinator
-            });
+            let coord_clock = clock.clone();
+            let build_clock = clock.clone();
+            // Build the mode-specific broker spine + the Backend it mints for + the
+            // Coordinator, all INSIDE the Tauri (tokio) runtime — the external client and
+            // the embedded broker both tokio::spawn, and the setup hook has no runtime of
+            // its own (the same reason the IPC bind below uses block_on). The minter is
+            // handed to the Backend BEFORE the embedded bus starts (`runtime.start()`),
+            // preserving the §3.2 launch order. `env` is borrowed (block_on runs to
+            // completion here), so it stays available for the handler + IPC bind below.
+            let env_ref = &env;
+            // The broker runtime reads the persisted pref LIVE (for `broker.status`'s
+            // `pref`/`restart_required`), so hand it its own store handle.
+            let broker_prefs = prefs.clone();
+            let (backend, broker_runtime, coordinator) =
+                tauri::async_runtime::block_on(async move {
+                    let spine =
+                        broker::build(env_ref, broker_pref, broker_probe, broker_prefs, build_clock);
+                    // Hermetic in test mode (every host → the mock); the minter is the
+                    // resolved mode's (external UDS token.get, or the embedded provider).
+                    let backend = Arc::new(Backend::from_env_parts_with_minter(
+                        env_ref.test_mode,
+                        env_ref.mock_base_url.as_deref(),
+                        &env_ref.config_path,
+                        spine.minter.as_ref(),
+                        &env_ref.mock_unreachable_hosts,
+                    ));
+                    let coordinator = Coordinator::spawn(
+                        CoordinatorDeps {
+                            responder: spine.responder,
+                            notifier,
+                            gate,
+                            clock: coord_clock,
+                            sink: coord_sink,
+                            audit,
+                            ssh: ssh_prefs,
+                            extra_rules,
+                            provider_modes,
+                        },
+                        spine.event_rx,
+                    );
+                    coordinator.start_expiry_tick();
+                    // Embedded only: start the bus now that the Coordinator is consuming
+                    // the bridge's event stream. A start failure fails closed (recorded
+                    // in broker_runtime; the app keeps running), never a crash.
+                    spine.runtime.start().await;
+                    (backend, spine.runtime, coordinator)
+                });
+            app.manage(backend.clone());
+            app.manage(broker_runtime);
             app.manage(coordinator.clone());
+
+            // The terminal ops (preset resolution, launch, detection, the pref), shared
+            // by the IPC handler + the frontend invoke commands (needs the Backend above).
+            let terminal: termctl::SharedTerminal = Arc::new(termctl::TerminalCtl::new(
+                backend.clone(),
+                prefs.clone(),
+                scripts_dir,
+            ));
+            app.manage(terminal.clone());
 
             let handler = Handler::new(
                 env.clone(),
@@ -1064,6 +1104,15 @@ pub fn run() {
             // the tray; a deliberate exit carries a code and is allowed through.
             tauri::RunEvent::ExitRequested { code, api, .. } if code.is_none() => {
                 api.prevent_exit();
+            }
+            // A deliberate quit (a code carried, e.g. tray → app.exit(0)) — best-effort
+            // drain the embedded broker on the way out (§3.6): flip the supervisor's
+            // shutdown watch. Non-blocking (it drains on its own task; server-side bus
+            // disconnects finish the cleanup), so this can't stall the exit.
+            tauri::RunEvent::ExitRequested { code: Some(_), .. } => {
+                if let Some(rt) = app_handle.try_state::<broker::BrokerRuntime>() {
+                    rt.signal_shutdown();
+                }
             }
             _ => {}
         });

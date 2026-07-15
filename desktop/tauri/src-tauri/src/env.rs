@@ -30,6 +30,11 @@ pub struct Env {
     /// macOS `~/Library/Application Support/shed`, Linux `$XDG_RUNTIME_DIR/shed` or
     /// `~/.local/share/shed`, both under `$SHED_HOST_AGENT_SOCKET_DIR` if set).
     pub host_agent_socket: PathBuf,
+    /// The host-agent `extensions.yaml` the EMBEDDED broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
+    /// else the daemon default `~/.config/shed/extensions.yaml`). Only read in embedded /
+    /// headless-coexist mode; external mode never touches it. The harness overrides it to
+    /// keep an embedded-mode run hermetic.
+    pub broker_extensions_path: PathBuf,
 }
 
 impl Env {
@@ -73,8 +78,22 @@ impl Env {
             host_agent_socket: var("SHED_TAURI_HOST_AGENT_SOCKET")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_host_agent_socket),
+            broker_extensions_path: var("SHED_TAURI_EXTENSIONS_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_extensions_path),
         }
     }
+}
+
+/// The embedded broker's `extensions.yaml`, matching where `shed-host-agent` reads it
+/// (`~/.config/shed/extensions.yaml`). Pre-expanded off `$HOME` so the broker's own
+/// tilde-expansion is a no-op; a missing file is not fatal here (the bridge synthesizes
+/// the fresh-install default).
+fn default_extensions_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".config/shed/extensions.yaml")
 }
 
 /// The host agent's approval socket, matching where `shed-host-agent` (and the

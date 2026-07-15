@@ -258,7 +258,16 @@ impl Handler {
     /// an error envelope.
     pub async fn dispatch(&self, op: &str, params: &Value) -> Result<Value, (String, String)> {
         match op {
-            "identify" => Ok(identify_payload(&self.env, self.pid)),
+            "identify" => {
+                // Augment the base payload with the resolved broker mode (leg 3a.2) —
+                // read from managed state, so `identify_payload` stays a pure, testable
+                // free fn of `Env`.
+                let mut v = identify_payload(&self.env, self.pid);
+                if let Some(rt) = self.app.try_state::<crate::broker::BrokerRuntime>() {
+                    v["broker_mode"] = rt.identify_fragment();
+                }
+                Ok(v)
+            }
             "ui.navigate" => self.navigate(params),
             "ui.current_pane" => Ok(json!({ "pane": self.ui_get("pane") })),
             "ui.computed_style" => Ok(json!({ "style": self.ui_get("style") })),
@@ -357,6 +366,10 @@ impl Handler {
                 Ok(json!({ "enabled": crate::login_item_enabled(&self.app, &self.env) }))
             }
             "loginitem.set" => self.login_item_set(params),
+            // -- credential broker (leg 3a.2) --
+            "broker.status" => Ok(self.broker_status()),
+            "broker.mode" => Ok(self.broker_mode()),
+            "broker.set_mode" => self.broker_set_mode(params),
             // The mac popover's hermetic drive path — OS tray clicks aren't drivable,
             // so these run the EXACT Rust path the tray-icon left-click runs.
             "tray.show" => {
@@ -1038,6 +1051,51 @@ impl Handler {
         Ok(json!({}))
     }
 
+    /// `broker.status` → the resolved broker mode + probe evidence + config source +
+    /// (embedded) resolved ssh mode / gate namespaces / per-server LiveStatus health.
+    /// The harness drives + asserts it (C4); shedtest reads it as broker truth.
+    fn broker_status(&self) -> Value {
+        self.app
+            .try_state::<crate::broker::BrokerRuntime>()
+            .map(|rt| rt.status())
+            .unwrap_or_else(|| json!({}))
+    }
+
+    /// `broker.mode` → the effective mode + the LIVE persisted pref + `restart_required`
+    /// (the persisted pref drifted from the launch pref ⟹ a relaunch applies it).
+    fn broker_mode(&self) -> Value {
+        self.app
+            .try_state::<crate::broker::BrokerRuntime>()
+            .map(|rt| {
+                json!({
+                    "pref": rt.pref_str(),
+                    "effective": rt.effective_mode_str(),
+                    "restart_required": rt.restart_required(),
+                })
+            })
+            .unwrap_or_else(|| json!({}))
+    }
+
+    /// `broker.set_mode {mode}` → persist the broker mode pref (the same path as the
+    /// `broker_set_mode` frontend command). Guarded: an unknown mode is `bad_request`.
+    /// The change is NOT hot-swapped — the CURRENT effective mode + the computed
+    /// `restart_required` (persisted pref != launch pref) are returned so a driver can
+    /// assert the deferred-apply contract.
+    fn broker_set_mode(&self, params: &Value) -> Result<Value, (String, String)> {
+        let mode = req_str(params, "mode")?;
+        if crate::broker::parse_mode_pref(mode).is_none() {
+            return Err(err("bad_request", format!("unknown broker mode: {mode:?}")));
+        }
+        self.prefs.set_broker_mode(mode.to_string());
+        let (effective, restart_required) = self
+            .app
+            .try_state::<crate::broker::BrokerRuntime>()
+            .map(|rt| (rt.effective_mode_str().to_string(), rt.restart_required()))
+            .unwrap_or_default();
+        self.emit_prefs_changed();
+        Ok(json!({ "pref": mode, "effective": effective, "restart_required": restart_required }))
+    }
+
     /// `app.screenshot` → shell out to a platform tool and return `{png (base64),
     /// width, height}`. The capture is blocking, so run it off the async worker.
     async fn screenshot(&self) -> Result<Value, (String, String)> {
@@ -1224,6 +1282,7 @@ mod tests {
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),
+            broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
         }
     }
 
