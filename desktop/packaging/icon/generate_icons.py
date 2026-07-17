@@ -23,6 +23,8 @@ Outputs (all committed; CI does not regenerate):
     tauri/src-tauri/icons/icon.ico              Windows multi-size (Pillow)
     tauri/src-tauri/icons/Square30x30Logo.png   30    Windows Store tile
     tauri/src-tauri/icons/StoreLogo.png         50    Windows Store logo
+    tauri/src-tauri/AppIcon.icon/               macOS 26 (Tahoe) glass icon —
+        Icon Composer source; scripts/bundle-tauri-mac.sh compiles it with actool
     packaging/icons/hicolor/256x256/apps/shed-desktop.png   Linux .deb hicolor
     packaging/icons/hicolor/512x512/apps/shed-desktop.png   Linux .deb hicolor
     Resources/AppIcon.icns                      Swift macOS app (iconutil)
@@ -36,6 +38,7 @@ PNGs + .ico and skips the .icns bundles. See ./regenerate.sh and ./README.md.
 
 import argparse
 import io
+import json
 import shutil
 import subprocess
 import sys
@@ -51,6 +54,7 @@ DESKTOP_ROOT = ICON_DIR.parent.parent  # .../desktop
 
 SVG = REF_DIR / "owl_logo_colored.svg"
 TAURI_ICONS = DESKTOP_ROOT / "tauri" / "src-tauri" / "icons"
+TAURI_APPICON_ICON = DESKTOP_ROOT / "tauri" / "src-tauri" / "AppIcon.icon"
 HICOLOR = DESKTOP_ROOT / "packaging" / "icons" / "hicolor"
 APPICON_ICNS = DESKTOP_ROOT / "Resources" / "AppIcon.icns"
 
@@ -92,18 +96,25 @@ def render_owl(owl_hex: str, eye_hex: str) -> Image.Image:
     return Image.open(io.BytesIO(png)).convert("RGBA")
 
 
-def compose(owl: Image.Image, size: int, bg: tuple[int, int, int]) -> Image.Image:
-    """Compose the owl on a rounded-square (squircle) at the requested px size."""
+def compose(owl: Image.Image, size: int, bg: tuple[int, int, int],
+            transparent: bool = False) -> Image.Image:
+    """Compose the owl on a rounded-square (squircle) at the requested px size.
+
+    With transparent=True the squircle background is skipped and the owl rides
+    on a bare transparent canvas — used for the Icon Composer foreground layer,
+    where the catalog's own `fill.solid` paints the background natively.
+    """
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     margin = int(size * MARGIN_PCT)
     inner = size - 2 * margin  # squircle side
 
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle(
-        [margin, margin, margin + inner - 1, margin + inner - 1],
-        radius=int(inner * CORNER_PCT),
-        fill=(*bg, 255),
-    )
+    if not transparent:
+        draw = ImageDraw.Draw(canvas)
+        draw.rounded_rectangle(
+            [margin, margin, margin + inner - 1, margin + inner - 1],
+            radius=int(inner * CORNER_PCT),
+            fill=(*bg, 255),
+        )
 
     # Fit the owl inside the square, preserving aspect ratio.
     owl_box = int(inner * (1 - 2 * OWL_PAD_PCT))
@@ -156,6 +167,51 @@ def build_icns(owl: Image.Image, bg: tuple[int, int, int], out: Path) -> None:
     print(f"  wrote {out.relative_to(DESKTOP_ROOT)}")
 
 
+def build_icon_composer(owl: Image.Image, bg: tuple[int, int, int], out: Path) -> None:
+    """Write the AppIcon.icon (Icon Composer) source bundle for the Tauri Mac app.
+
+    macOS 26 (Tahoe) masks every Dock/Cmd-Tab icon to its own squircle and draws
+    a glass tile behind it. A loose .icns is treated as legacy and *inset* on that
+    tile — a gray frame around our art, with muted color. Only a compiled .icon
+    catalog fills the tile edge-to-edge with the native glass treatment. We emit
+    the .icon *source* here — a solid brand-color fill (the orange squircle as a
+    NATIVE srgb fill, not a baked bitmap) with the shed owl as the foreground
+    layer; scripts/bundle-tauri-mac.sh compiles it with `actool` into the
+    Assets.car the app ships. The Linux PNGs / Windows .ico / flat .icns are
+    unaffected (no such tile) and stay as the pre-Tahoe / no-actool fallbacks.
+
+    Hand-authored JSON (not Icon Composer.app) so the whole icon regenerates from
+    the SVG with one command. 1024 = Icon Composer's design canvas; the owl rides
+    on a transparent canvas so the fill paints the tile background. shadow
+    mirrors roost's tuning (neutral 0.5); translucency is dialed to 0.35 (roost
+    uses 0.5) — the frosted-glass material lets the tile bleed through the white
+    owl, and shed's brighter orange bleeds far more loudly than roost's violet at
+    the same value, so a lower translucency keeps the owl reading as white.
+    """
+    # Rebuild from scratch so a changed layer set can't leave stale PNGs behind
+    # in the committed bundle.
+    if out.exists():
+        shutil.rmtree(out)
+    assets = out / "Assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    compose(owl, 1024, bg, transparent=True).save(assets / "owl.png", "PNG")
+    r, g, b = bg
+    icon = {
+        "fill": {"solid": f"srgb:{r / 255:.5f},{g / 255:.5f},{b / 255:.5f},1.00000"},
+        "groups": [
+            {
+                "layers": [{"image-name": "owl.png", "name": "owl"}],
+                "shadow": {"kind": "neutral", "opacity": 0.5},
+                "translucency": {"enabled": True, "value": 0.35},
+            }
+        ],
+        "supported-platforms": {"circles": ["watchOS"], "squares": "shared"},
+    }
+    (out / "icon.json").write_text(json.dumps(icon, indent=2) + "\n")
+    print(f"  wrote {(out / 'icon.json').relative_to(DESKTOP_ROOT)}")
+    print(f"  wrote {(assets / 'owl.png').relative_to(DESKTOP_ROOT)}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate shed-desktop owl icon assets.")
     ap.add_argument("--color", default=DEFAULT_COLOR, help="owl body color (#RRGGBB)")
@@ -186,6 +242,11 @@ def main() -> None:
     write_png(compose(owl, 50, bg), TAURI_ICONS / "StoreLogo.png")
     write_ico(owl, bg, TAURI_ICONS / "icon.ico")
     build_icns(owl, bg, TAURI_ICONS / "icon.icns")
+
+    # macOS 26 (Tahoe) glass-icon catalog — Icon Composer source compiled by
+    # scripts/bundle-tauri-mac.sh with actool. Platform-independent (pure JSON +
+    # a PNG), so it's written on Linux too.
+    build_icon_composer(owl, bg, TAURI_APPICON_ICON)
 
     # Linux .deb hicolor PNGs.
     write_png(compose(owl, 256, bg), HICOLOR / "256x256" / "apps" / "shed-desktop.png")
