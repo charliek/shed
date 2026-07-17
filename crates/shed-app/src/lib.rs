@@ -15,6 +15,7 @@ pub mod fakes;
 pub mod host_agent;
 #[cfg(feature = "rc")]
 pub mod rc;
+pub mod rc_events_watcher;
 pub mod timefmt;
 pub mod token_minter;
 pub mod traits;
@@ -31,6 +32,7 @@ pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
 pub use host_agent::{HelloClientInfo, HostAgentClient, HostAgentClientError, HostAgentEvent};
+pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
 pub use token_minter::HostAgentTokenMinter;
 pub use traits::{
     AuthGate, AuthGateRef, AuthOutcome, AuthPrompt, Clock, ClockRef, CoordinatorEvent, EventSink,
