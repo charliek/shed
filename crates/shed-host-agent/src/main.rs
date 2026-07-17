@@ -14,58 +14,39 @@
 //! later slices; in multi-server (`discovery:`) mode the single-server bus stays
 //! off, matching the Go daemon's `cfg.Discovery == nil` gate.
 
-mod approval;
-mod audit;
-mod aws_backend;
-// The SSH-bootstrap minter (bootstrap exchange + credential source) — ALWAYS-ON as of the
-// supervisor slice: the supervisor is its first headless consumer (a secure server's bus
-// token provider self-mints a credentials-scope token, and its egress side task a
-// control-scope one). It is dependency-clean (no `use crate::desktop`), so it un-gates
-// without pulling the desktop half into the headless build. `controltoken` (below) STAYS
-// gated — it has a module-level `use crate::desktop`.
-mod bootstrap;
-mod bus;
-mod config;
-#[cfg(feature = "desktop-forwarding")]
-mod controltoken;
-// Multi-server discovery: `ServerTarget` + `load_discovered_servers`, hoisted here
-// (always-on) so the headless supervisor/reconcile path can resolve targets. The
-// `DiscoveryConfig`/`ServerSelector` parse + `resolve_targets` live in `config`.
-mod discovery;
-mod docker_backend;
-// The always-on egress-audit SSE consumer (bus-side, not gated — like `bus`/`aws_backend`/
-// `docker_backend`). Landed here; the per-server side task is spawned in commit 2.
+// The broker core lives in the sibling `shed-broker` crate; this bin is the daemon
+// shell. The only modules that stay here are the daemon-only concerns:
+// The Surface-A desktop approval channel + its wire codec — gated by
+// `desktop-forwarding` (a headless build drops these MODULES only; the broker core
+// is always linked).
 #[cfg(feature = "desktop-forwarding")]
 mod desktop;
-mod egress;
-// The credential minter (bootstrap-backed CredentialSource) — ALWAYS-ON as of the
-// supervisor slice (its first headless consumer); see the `bootstrap` note above.
 #[cfg(feature = "desktop-forwarding")]
 mod desktop_protocol;
-mod minter;
-mod sockets;
-mod ssh_backend;
-mod ssh_backend_agent;
-mod status;
-// The native macOS Touch-ID / biometrics approval gate (always-on, `#[cfg(target_os=
-// "macos")]` inside — NOT feature-gated: a headless mac daemon needs no desktop app to
-// do biometrics). On non-mac the biometric policies fail closed to deny-all.
-mod touchid;
-// The multi-server supervisor: reconciles per-server watcher groups against the desired
-// set the discovery source resolves to. Always-on (the daemon drives it in BOTH modes —
-// single-server is just a discovery config that reconciles once and never reloads).
-mod supervisor;
+// The socket bind ceremony (touches `Log`) + the status UDS server / `status` CLI
+// client (only the daemon serves that socket). Path resolution + liveness probes +
+// the LiveStatus snapshot builder live in `shed_broker::{sockets,status}`.
+mod socket_bind;
+mod status_server;
 mod version;
-mod watcher;
 
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
-use config::HostAgentConfig;
-use sockets::{bind_unix_socket, status_socket_path};
-use status::{build_live_status, now_rfc3339, run_status, serve_status_socket, LiveStatus};
+// Bring the broker-core module names into scope so the daemon wiring below reads
+// against them (`config::HostAgentConfig`, `bus::FileBusLog`, `supervisor::…`, …) —
+// the same bare paths the pre-extraction single-crate daemon used.
+use shed_broker::{
+    approval, audit, aws_backend, bus, config, docker_backend, minter, sockets, ssh_backend,
+    supervisor, watcher,
+};
+use shed_broker::config::HostAgentConfig;
+use shed_broker::status::{build_live_status, now_rfc3339, LiveStatus};
+
+use crate::socket_bind::bind_unix_socket;
+use crate::status_server::{run_status, serve_status_socket};
 use version::full_info;
 
 /// The default config path (tilde-expanded at load) — matches the Go daemon's
@@ -294,7 +275,7 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     ));
 
     let version = full_info();
-    let status_path = status_socket_path();
+    let status_path = sockets::status_socket_path();
     let status_listener = bind_unix_socket("status socket", &status_path, &mut log);
 
     // Two shutdown watches (creatable without a runtime). `shutdown` flips on SIGTERM/SIGINT
@@ -321,8 +302,8 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     let (desktop_server, desktop_listener, desktop_path) = {
         // token.get resolves servers from the shed CLI config (DefaultDiscoverySource; the
         // discovery-source override is a per-server concern the supervisor path owns).
-        let control_source = controltoken::DEFAULT_DISCOVERY_SOURCE;
-        let control_minter = Arc::new(controltoken::ControlTokenProvider::new(
+        let control_source = shed_broker::controltoken::DEFAULT_DISCOVERY_SOURCE;
+        let control_minter = Arc::new(shed_broker::controltoken::ControlTokenProvider::new(
             minter.clone(),
             control_source,
         ));
@@ -342,38 +323,34 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     let bus_log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(log_file));
 
     // Select each namespace's approval gate from its own effective policy (empty → deny-all,
-    // fail-closed). shed-desktop delegates to the desktop server; any policy this build
-    // doesn't implement fails closed to deny-all. Gives ssh/aws/docker their OWN per-namespace
-    // gate (never a shared one). Mirrors `main.go:157-159`'s `gateFor` calls.
+    // fail-closed). The built-in policy→gate routing (approve-all / biometrics / unknown →
+    // deny) is hoisted into `shed_broker::approval::select_builtin_gate`; the `shed-desktop`
+    // arm is bin-only, so this shell composes it: `None` from the core means "supply the
+    // desktop gate" — the daemon delegates to its UDS `DesktopServer`, and a headless build
+    // (no desktop server) falls closed to deny-all (matching the pre-extraction `#[cfg]`'d
+    // match arm). Gives ssh/aws/docker their OWN per-namespace gate. Mirrors `main.go:157-159`.
     let select_gate = |policy: &str| -> Arc<dyn approval::ApprovalGate> {
-        match policy {
-            config::POLICY_APPROVE_ALL => Arc::new(approval::ApproveAllGate),
-            // The two native-biometric policies route to the Touch-ID gate. UNCONDITIONAL
-            // match arm (NO `#[cfg]` here) — mirroring Go's `gateFor → newApprovalGate`;
-            // the single `#[cfg(target_os="macos")]` seam lives inside
-            // `touchid::new_biometric_gate` (macos → TouchIdGate; non-mac → DenyAllGate).
-            // Only the ssh gate can ever reach here — `validate` rejects biometrics for
-            // aws/docker.
-            config::POLICY_BIOMETRICS | config::POLICY_BIOMETRICS_OR_PASSWORD => {
-                touchid::new_biometric_gate(policy, cfg.ssh_scope(), cfg.ssh_session_ttl())
-            }
+        approval::select_builtin_gate(policy, &cfg).unwrap_or_else(|| {
             #[cfg(feature = "desktop-forwarding")]
-            config::POLICY_SHED_DESKTOP => {
+            {
                 Arc::new(desktop::DesktopGate::new(desktop_server.clone()))
             }
-            _ => Arc::new(approval::DenyAllGate),
-        }
+            #[cfg(not(feature = "desktop-forwarding"))]
+            {
+                Arc::new(approval::DenyAllGate)
+            }
+        })
     };
     let ssh_gate = select_gate(&cfg.effective_policy(config::NS_SSH_AGENT));
 
-    // The audit sink (durable JSONL + desktop fan-out), shared across every group.
+    // The audit sink (durable JSONL + optional fan-out), shared across every group. The
+    // desktop server implements the always-compiled `AuditFanout` seam (bin-side),
+    // forwarding each entry as an `event` frame; a headless build wires no fan-out.
     #[cfg(feature = "desktop-forwarding")]
-    let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(
-        &cfg,
-        Some(desktop_server.clone()),
-    ));
+    let audit_fanout: Option<Arc<dyn audit::AuditFanout>> = Some(desktop_server.clone());
     #[cfg(not(feature = "desktop-forwarding"))]
-    let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(&cfg));
+    let audit_fanout: Option<Arc<dyn audit::AuditFanout>> = None;
+    let audit: Arc<dyn audit::AuditSink> = Arc::new(audit::JsonlAuditSink::new(&cfg, audit_fanout));
 
     // The AWS credential backend (optional; Go `main.go:166-173`): a construction error —
     // incl. the "no AWS credentials configured…" not-enabled case — warns and leaves `aws`

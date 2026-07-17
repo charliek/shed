@@ -41,6 +41,12 @@ pub struct Prefs {
     /// build can't parse is skipped at hydration rather than failing the whole file.
     #[serde(default)]
     pub extra_rules: Vec<Value>,
+    /// The credential-broker mode (`auto` | `embedded` | `external`, default `auto`).
+    /// Raw string — like the ssh fields — so a value a downgraded build can't parse
+    /// falls back to `auto` at hydration rather than failing the whole-file decode.
+    /// Changing it does NOT hot-swap; the new mode takes effect on the next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_mode: Option<String>,
 }
 
 /// Owns the prefs file path + the in-memory copy; writes through on every set.
@@ -96,6 +102,15 @@ impl PrefsStore {
     pub fn set_provider_modes(&self, modes: HashMap<String, String>) {
         if let Ok(mut prefs) = self.inner.lock() {
             prefs.provider_modes = modes;
+            self.save(&prefs);
+        }
+    }
+
+    /// Persist the credential-broker mode (`auto`/`embedded`/`external` wire string),
+    /// write-through. Read at the NEXT launch — the mode is fixed for the process life.
+    pub fn set_broker_mode(&self, mode: String) {
+        if let Ok(mut prefs) = self.inner.lock() {
+            prefs.broker_mode = Some(mode);
             self.save(&prefs);
         }
     }

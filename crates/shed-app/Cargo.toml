@@ -15,6 +15,10 @@ workspace = true
 
 [dependencies]
 shed-core = { path = "../shed-core" }
+# The embeddable broker core — ONLY under the non-default `broker` feature (leg 3a.2).
+# It carries the heavy leaf deps (aws-sdk-*/notify/saphyr-parser); keeping it optional
+# means a default `shed-app` (and the mac FFI build) never links them.
+shed-broker = { path = "../shed-broker", optional = true }
 # `net` (UnixStream) + `io-util` (buffered line reader) for the host-agent UDS
 # client, on top of the workspace's rt/macros/sync/time.
 tokio = { workspace = true, features = ["net", "io-util"] }
@@ -38,6 +42,13 @@ libc = "0.2"
 # which has no RC pane) never compiles it; the Tauri client enables it. `make test`
 # must pass `--features rc` or the rc unit tests are cfg'd out.
 rc = ["tokio/process"]
+# The in-process broker bridge (`broker_bridge.rs`): the embedded host-agent replacement
+# backed by `shed-broker`. NON-default (mirrors `rc`) so a featureless `shed-app` stays
+# broker-free — `cargo test --features broker` runs its unit tests.
+broker = ["dep:shed-broker"]
 
 [dev-dependencies]
 httpmock = { workspace = true }
+# Temp dirs/sockets for the `broker` bridge tests (config synthesis + the mode-detect
+# UDS matrix). Dev-only — never in the default lib dep graph.
+tempfile = "3"

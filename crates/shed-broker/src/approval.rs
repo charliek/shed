@@ -14,7 +14,12 @@
 //!   * `method()` names the policy for the audit `approval` field — one of the
 //!     `POLICY_*` constants (`deny-all`/`approve-all`/`shed-desktop`).
 
-use crate::config::{POLICY_APPROVE_ALL, POLICY_DENY_ALL};
+use std::sync::Arc;
+
+use crate::config::{
+    HostAgentConfig, POLICY_APPROVE_ALL, POLICY_BIOMETRICS, POLICY_BIOMETRICS_OR_PASSWORD,
+    POLICY_DENY_ALL, POLICY_SHED_DESKTOP,
+};
 
 /// Audit detail about how a request was decided, for the durable log. The
 /// shed-desktop gate populates it from the app's response (who decided + the
@@ -136,6 +141,33 @@ impl ApprovalGate for DenyAllGate {
     }
     fn method(&self) -> &str {
         POLICY_DENY_ALL
+    }
+}
+
+/// Map an effective policy string to its built-in approval gate — the core half of
+/// the daemon's `select_gate` (Go `gateFor` → `newApprovalGate`), hoisted here so
+/// the daemon bin and a future embedder share one policy→gate routing.
+///
+/// Returns:
+///   * `Some(gate)` for `approve-all`, the two biometric policies (→ the native
+///     `touchid` gate; the single `#[cfg(target_os="macos")]` seam inside
+///     `touchid::new_biometric_gate` yields `DenyAllGate` off-mac), and any
+///     unknown/empty policy (→ deny-all, fail-closed).
+///   * `None` for `shed-desktop` — the caller supplies the app/desktop gate
+///     (`DesktopGate`-over-UDS in the daemon, the in-process app gate in an
+///     embedder), a bin-only concern the core does not know about. A caller with no
+///     desktop gate (a headless daemon) falls closed to deny-all.
+///
+/// Only the ssh gate can ever reach the biometric arms — `config` validation rejects
+/// biometrics for aws/docker — so reading ssh's scope/session-TTL here is exact.
+pub fn select_builtin_gate(policy: &str, cfg: &HostAgentConfig) -> Option<Arc<dyn ApprovalGate>> {
+    match policy {
+        POLICY_APPROVE_ALL => Some(Arc::new(ApproveAllGate)),
+        POLICY_BIOMETRICS | POLICY_BIOMETRICS_OR_PASSWORD => Some(
+            crate::touchid::new_biometric_gate(policy, cfg.ssh_scope(), cfg.ssh_session_ttl()),
+        ),
+        POLICY_SHED_DESKTOP => None,
+        _ => Some(Arc::new(DenyAllGate)),
     }
 }
 

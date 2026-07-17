@@ -103,3 +103,40 @@ make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.0
   reads this read-only and watches it for changes.
 - A reachable `shed-server` on at least one configured host. Unreachable hosts are shown
   as a degraded state, never a hard failure.
+
+**Nothing else — for the Tauri client.** `brew install shed` (or `apt install shed`) plus the
+Tauri desktop app is a complete install — its embedded broker handles credential approvals
+(SSH sign, AWS, Docker) itself, no extra daemon needed. The stable **Swift macOS client**
+still requires the separately-installed `shed-host-agent` daemon for credential approvals
+(Homebrew formula, `brew services start shed-host-agent`). See below for how that differs
+between the two clients.
+
+## Credential broker
+
+The app's headline feature — SSH-sign approvals, AWS/Docker credential gating, and the
+Activity audit feed — needs a **credential broker** in the loop. How that broker runs
+differs by client:
+
+| Client | Broker |
+|---|---|
+| **Tauri** (Linux; macOS beta) | **Embedded** — runs in-process, on by default. No extra install. |
+| **Swift** (macOS stable) | **Separate daemon** — a standalone `shed-host-agent` process (Homebrew formula, `brew services start shed-host-agent`). See [Credential approvals](approvals.md). |
+
+The Tauri client can also run against a standalone daemon instead of its embedded broker
+— useful if you already run `shed-host-agent` headless on a server, or want one broker
+shared across tools. A **Preferences → Credential broker** setting (`Automatic` /
+`In-app (embedded)` / `External daemon`) controls it, default `Automatic`:
+
+| Mode | Behavior |
+|---|---|
+| `Automatic` (default) | Probes for a running `shed-host-agent` at startup: a full daemon present ⇒ **external** (dials it, unchanged from today); a *headless* daemon (status socket only, no desktop socket) ⇒ **coexist** (the app doesn't start its own broker — no namespace conflicts — and mints its own secure-server tokens, but gets no in-app approvals, since the headless daemon owns those); neither present ⇒ **embedded**. |
+| `In-app (embedded)` | Always starts the in-process broker, regardless of any running daemon. If a daemon is also running, the two race for each server's credential-bus namespace — the loser gets a per-namespace `409`, surfaced (not hidden) in `broker.status`; no double approval prompts. |
+| `External daemon` | Always dials the standalone daemon, never starts an in-process broker. |
+
+The resolved mode is **fixed for the app's process lifetime** — changing the preference
+takes effect on the **next launch**, not live. The active mode, the probe evidence that
+produced it, and (for embedded) the resolved SSH backend and per-server connection state
+are visible in Preferences and over IPC (`broker.status`, `identify.broker_mode`). Full
+mechanics — `extensions.yaml` handling, the synthesized fresh-install default, and the
+fail-closed behaviors — are documented in
+[Architecture → The embedded credential broker](architecture.md#the-embedded-credential-broker-tauri).

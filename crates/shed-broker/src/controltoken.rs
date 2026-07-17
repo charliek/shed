@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::desktop::{ControlTokenMinter, MintedControlToken};
 use crate::discovery::{load_discovered_servers, ServerTarget};
 use crate::minter::{new_credential_source, CredentialSource, Minter, SCOPE_CONTROL};
 use crate::status::rfc3339_utc;
@@ -24,6 +23,42 @@ use crate::status::rfc3339_utc;
 /// `apply_defaults` also uses) so `main.rs`'s `controltoken::DEFAULT_DISCOVERY_SOURCE`
 /// reference stays stable.
 pub use crate::config::DEFAULT_DISCOVERY_SOURCE;
+
+// ---------------------------------------------------------------------------
+// Control-token minter seam
+// ---------------------------------------------------------------------------
+//
+// The `token.get` seam lives here (the broker core), not in the daemon's
+// `desktop` module: the desktop UDS server (`shed-host-agent`) and any future
+// embedder both consume it, and [`ControlTokenProvider`] below is its production
+// implementation. The bin's `DesktopServer` re-imports these from `shed_broker`.
+
+/// A minted control-scoped token: the token plus an optional RFC3339 expiry
+/// (`None` = non-expiring / unknown, which omits `expires_at` in the reply).
+pub struct MintedControlToken {
+    pub token: String,
+    pub expires_at: Option<String>,
+}
+
+impl std::fmt::Debug for MintedControlToken {
+    /// Redacts the live bearer token — only `expires_at` is printed as-is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedControlToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Mints CONTROL-scoped tokens on the app's behalf (answers `token.get`). The
+/// production implementation is [`ControlTokenProvider`]; the injection seam lets
+/// the desktop server (and tests) swap in a stand-in.
+#[async_trait::async_trait]
+pub trait ControlTokenMinter: Send + Sync {
+    /// Mint a control token for `server`. `Err(msg)` fails the `token.get` closed —
+    /// the reply carries the message and no token.
+    async fn mint_control(&self, server: &str) -> Result<MintedControlToken, String>;
+}
 
 /// Answers `token.get` by minting CONTROL tokens over SSH (mirror
 /// `controltoken.go:controlTokenProvider`).
@@ -217,4 +252,20 @@ servers:
     // The `load_discovered_servers` unit + golden tests moved to `discovery.rs`
     // alongside the hoisted function (the ssh_port=0-vs-22 + empty-host + sort +
     // malformed divergences it pins).
+
+    #[test]
+    fn debug_redacts_token() {
+        let secret = "super-secret-control-token-value";
+        let minted = MintedControlToken {
+            token: secret.to_string(),
+            expires_at: Some("2026-07-15T00:00:00Z".to_string()),
+        };
+        let debug_str = format!("{minted:?}");
+        assert!(
+            !debug_str.contains(secret),
+            "Debug output leaked the token: {debug_str}"
+        );
+        assert!(debug_str.contains("<redacted>"));
+        assert!(debug_str.contains("2026-07-15T00:00:00Z"));
+    }
 }

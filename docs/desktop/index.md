@@ -60,8 +60,12 @@ into a shared **Rust core** (`shed-core`) so the same logic backs every client i
 being re-implemented per language. It is the macOS **default** backend (behind
 `SHED_DESKTOP_RUST_CORE`, on by default) and the base for the **Tauri** cross-platform
 client, which is now the **shipped Linux client** (WebKitGTK). An earlier GTK MVP proved the
-architecture and has since been **retired** in favor of Tauri. `shed-host-agent` stays a
-**separate** process on both platforms. See [Rust core](rust-core.md).
+architecture and has since been **retired** in favor of Tauri. The Swift app still requires
+`shed-host-agent` as a **separate** process; the Tauri client can broker credentials
+**in-process** instead (default) or against a separate daemon — see [Installation →
+Credential broker](installation.md#credential-broker) and [Architecture → The embedded
+credential broker](architecture.md#the-embedded-credential-broker-tauri). See [Rust
+core](rust-core.md).
 
 **Credentials.**
 
@@ -89,5 +93,6 @@ client — `tauri/src-tauri`, bin `shed-desktop-tauri` → `/usr/bin/shed-deskto
 **Larger bets.** A **mobile client** (Android-first) on the same core; an **embedded
 terminal** (revisited only if delegating to the user's terminal app proves insufficient);
 **in-app host management** (writing `~/.shed/config.yaml` instead of read-only reflection);
-and, deliberately **last**, a Rust rewrite of `shed-host-agent` on the shared core — the
-security-critical broker lands on the most-proven foundation. Have an idea? Open an issue.
+and, further out, retiring the standalone `shed-host-agent` formula/daemon for desktop
+users now that the Tauri client can broker credentials on its own (the headless daemon
+stays for server/no-desktop use). Have an idea? Open an issue.

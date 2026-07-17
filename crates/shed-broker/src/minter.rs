@@ -247,9 +247,7 @@ pub fn new_credential_source(
 
 impl CredentialSource {
     /// The server this source mints for (used by the control-token provider to detect an
-    /// endpoint change and recreate the source). The control-token provider is
-    /// desktop-gated, so this is dead in a headless build.
-    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
+    /// endpoint change and recreate the source).
     pub fn target(&self) -> &ServerTarget {
         &self.target
     }
@@ -267,9 +265,8 @@ impl CredentialSource {
     /// Drop any completed cached token and mint fresh, while still coalescing callers
     /// that overlap a single in-flight mint. The control path (`token.get`) uses this: a
     /// restarted server silently invalidates control tokens, so a cached copy must never
-    /// be served (mirror `credmint.go:forceTokenWithExpiry`). The `token.get` control path
-    /// is desktop-gated, so this is dead in a headless build (the bus uses [`Self::token`]).
-    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
+    /// be served (mirror `credmint.go:forceTokenWithExpiry`). Consumed by the `token.get`
+    /// control path (the bus itself uses [`Self::token`]).
     pub async fn force_token_with_expiry(
         self: &Arc<Self>,
     ) -> Result<(String, Option<i64>), String> {

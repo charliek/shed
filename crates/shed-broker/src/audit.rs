@@ -11,8 +11,12 @@
 //!     is emitted iff non-empty, EXCEPT `ts`/`shed`/`ns`/`op`/`result`/`approval`,
 //!     which are always present). Built from a typed struct (declaration order) so
 //!     the field order is pinned regardless of serde_json's map ordering.
-//!   * **Desktop fan-out** (catalog §3.3): each entry → an `event` frame 1:1 via
-//!     [`DesktopServer::publish_audit`](crate::desktop::DesktopServer::publish_audit).
+//!   * **Fan-out** (catalog §3.3): each entry → an injected [`AuditFanout`], 1:1.
+//!     The daemon shell wires the desktop `event`-frame forwarder here; a future
+//!     embedder wires its own activity sink. The seam is ALWAYS compiled — a
+//!     headless build simply passes `None` — so there is one constructor, not a
+//!     feature-split arity. The `AuditEntry`→wire-view conversion lives in the
+//!     embedder (bin-side), keeping daemon-only wire types out of the core.
 //!   * **Disabled / open failure** (catalog §3.2): logging off or the file can't be
 //!     opened → no file writes, no panic; the fan-out still happens.
 //!   * File perms: dir `0700`, file `O_APPEND|O_CREATE|O_WRONLY 0600` (umask-safe:
@@ -113,48 +117,47 @@ pub(crate) fn to_jsonl(entry: &AuditEntry) -> String {
 }
 
 /// Records an audit entry. Every credential handler holds an `Arc<dyn AuditSink>`;
-/// the seam keeps the durable-log + desktop-fan-out concerns out of the handler.
+/// the seam keeps the durable-log + fan-out concerns out of the handler.
 /// `log` is synchronous and non-blocking (no `.await`, no lock held across one) so
 /// it never stalls the bus request path.
 pub trait AuditSink: Send + Sync {
     fn log(&self, entry: AuditEntry);
 }
 
+/// The injectable fan-out seam: an embedder (the daemon's desktop `event`-frame
+/// forwarder, or a future in-process activity sink) receives every recorded entry
+/// 1:1. `forward` is synchronous and non-blocking, sharing [`AuditSink::log`]'s
+/// no-`.await`/no-held-lock contract. The `AuditEntry`→wire-view conversion lives
+/// in the embedder, so the core carries no daemon-only wire types.
+pub trait AuditFanout: Send + Sync {
+    fn forward(&self, entry: &AuditEntry);
+}
+
 /// The production sink: appends durable JSONL to the configured file AND fans each
-/// entry out to the desktop server. Either half may be absent — a disabled/failed
-/// file still fans out; a headless build (`--no-default-features`) has no desktop
-/// half at all.
+/// entry out to an optional [`AuditFanout`]. Either half may be absent — a
+/// disabled/failed file still fans out; `None` fan-out (a headless daemon) still
+/// writes the durable log.
 pub struct JsonlAuditSink {
     /// `None` when logging is disabled or the file couldn't be opened (no-op file
     /// half — the fan-out still runs). Behind a `Mutex` so concurrent handlers append
     /// atomically (Go guards `encoder.Encode` with a mutex).
     file: Option<Mutex<File>>,
-    /// The desktop fan-out target. `None` when no desktop server is present.
-    #[cfg(feature = "desktop-forwarding")]
-    desktop: Option<std::sync::Arc<crate::desktop::DesktopServer>>,
+    /// The fan-out target. `None` when no embedder is wired (headless daemon).
+    fanout: Option<std::sync::Arc<dyn AuditFanout>>,
 }
 
 impl JsonlAuditSink {
     /// Build the production sink from config. Opens the durable file when
     /// `logging.enabled` (creating the dir `0700` / file `0600`); an open failure
-    /// degrades to the no-op file half (no panic), still fanning out. `desktop` is
-    /// the fan-out target (pass the running `DesktopServer`, or `None`).
-    #[cfg(feature = "desktop-forwarding")]
+    /// degrades to the no-op file half (no panic), still fanning out. `fanout` is
+    /// the fan-out target (pass the embedder's [`AuditFanout`], or `None`).
     pub fn new(
         cfg: &HostAgentConfig,
-        desktop: Option<std::sync::Arc<crate::desktop::DesktopServer>>,
+        fanout: Option<std::sync::Arc<dyn AuditFanout>>,
     ) -> JsonlAuditSink {
         JsonlAuditSink {
             file: open_audit_file(cfg),
-            desktop,
-        }
-    }
-
-    /// Headless build: no desktop fan-out half.
-    #[cfg(not(feature = "desktop-forwarding"))]
-    pub fn new(cfg: &HostAgentConfig) -> JsonlAuditSink {
-        JsonlAuditSink {
-            file: open_audit_file(cfg),
+            fanout,
         }
     }
 }
@@ -197,38 +200,43 @@ impl AuditSink for JsonlAuditSink {
                 let _ = f.write_all(line.as_bytes());
             }
         }
-        // Fan out to the desktop app even when file logging is disabled (catalog §3.3).
-        #[cfg(feature = "desktop-forwarding")]
-        if let Some(desktop) = &self.desktop {
-            desktop.publish_audit(&entry_to_view(&entry));
+        // Fan out even when file logging is disabled (catalog §3.3).
+        if let Some(fanout) = &self.fanout {
+            fanout.forward(&entry);
         }
-    }
-}
-
-/// Map a durable [`AuditEntry`] to the desktop `event` frame's source view (1:1 copy;
-/// the `event` builder adds only `id`/`v`/`type`/`kind`).
-#[cfg(feature = "desktop-forwarding")]
-fn entry_to_view(entry: &AuditEntry) -> crate::desktop_protocol::AuditEntryView {
-    crate::desktop_protocol::AuditEntryView {
-        ts: entry.ts.clone(),
-        server: entry.server.clone(),
-        shed: entry.shed.clone(),
-        ns: entry.ns.clone(),
-        op: entry.op.clone(),
-        result: entry.result.clone(),
-        detail: entry.detail.clone(),
-        code: entry.code.clone(),
-        reason: entry.reason.clone(),
-        approval: entry.approval.clone(),
-        decided_by: entry.decided_by.clone(),
-        scope: entry.scope.clone(),
-        ttl: entry.ttl.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// The always-compiled fan-out seam fires on every logged entry (even with file
+    /// logging disabled), with the durable `ts` already stamped — the contract the
+    /// daemon's desktop forwarder + a future embedder both rely on.
+    #[test]
+    fn fanout_receives_every_entry_with_ts_stamped() {
+        #[derive(Default)]
+        struct Capture(Mutex<Vec<AuditEntry>>);
+        impl AuditFanout for Capture {
+            fn forward(&self, entry: &AuditEntry) {
+                self.0.lock().unwrap().push(entry.clone());
+            }
+        }
+        let cap = Arc::new(Capture::default());
+        let cfg = HostAgentConfig::parse("logging:\n  enabled: false\n");
+        let sink = JsonlAuditSink::new(&cfg, Some(cap.clone()));
+        sink.log(AuditEntry {
+            ns: "ssh-agent".into(),
+            op: "sign".into(),
+            result: "ok".into(),
+            ..Default::default()
+        });
+        let got = cap.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].ts.is_empty(), "ts must be stamped before fan-out");
+    }
 
     #[test]
     fn jsonl_field_order_and_omitempty_gated_ok_entry() {
@@ -297,10 +305,7 @@ mod tests {
     #[test]
     fn disabled_logging_writes_no_file_and_stamps_ts() {
         let cfg = HostAgentConfig::parse("logging:\n  enabled: false\n");
-        #[cfg(feature = "desktop-forwarding")]
         let sink = JsonlAuditSink::new(&cfg, None);
-        #[cfg(not(feature = "desktop-forwarding"))]
-        let sink = JsonlAuditSink::new(&cfg);
         // No file half; log() is a no-op-plus-stamp and must not panic.
         assert!(sink.file.is_none());
         sink.log(AuditEntry {
@@ -319,10 +324,7 @@ mod tests {
             "logging:\n  enabled: true\n  path: {}\n",
             path.display()
         ));
-        #[cfg(feature = "desktop-forwarding")]
         let sink = JsonlAuditSink::new(&cfg, None);
-        #[cfg(not(feature = "desktop-forwarding"))]
-        let sink = JsonlAuditSink::new(&cfg);
         sink.log(AuditEntry {
             ts: "T1".into(),
             ns: "ssh-agent".into(),

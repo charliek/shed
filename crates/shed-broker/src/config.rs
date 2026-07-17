@@ -336,8 +336,7 @@ pub struct HostAgentConfig {
     ssh_session_ttl_raw: String,
     pub logging_enabled: bool,
     pub logging_path: String,
-    // Read only by `approval_timeout()`, which only the desktop server calls.
-    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
+    // Read only by `approval_timeout()`, which the desktop/embedder approval path calls.
     approval_timeout: Duration,
     /// The RAW `approval_timeout` string exactly as written in the config (`""`
     /// when the key is absent/null). Retained so [`HostAgentConfig::validate`] can
@@ -358,7 +357,7 @@ pub struct HostAgentConfig {
     /// the reconcile path (`resolve_targets`, wired by the supervisor slice) gate on
     /// its presence. Defaults are applied at parse time (matching Go's `LoadConfig`
     /// calling `applyDefaults` only when `Discovery != nil`).
-    pub(crate) discovery: Option<DiscoveryConfig>,
+    pub discovery: Option<DiscoveryConfig>,
     /// The layered AWS credential policy (`aws.{source_profile,default_role,mode,
     /// session_duration,cache_refresh_before,servers…}`), mirroring Go's `AWSConfig`.
     /// The `aws.approval.policy` gate is kept in `aws_policy` above (unchanged); this
@@ -566,7 +565,6 @@ impl HostAgentConfig {
     /// production never reaches this accessor with a bad value; the fail-safe remains
     /// for the in-crate `parse` convenience (which skips validation), mirroring Go's
     /// second, error-ignoring `ApprovalTimeoutDuration()` call in `main.go`.
-    #[cfg_attr(not(feature = "desktop-forwarding"), allow(dead_code))]
     pub fn approval_timeout(&self) -> Duration {
         self.approval_timeout
     }
@@ -627,7 +625,7 @@ impl HostAgentConfig {
 /// (`run_watch_loop`) and `servers` by the reconcile path (`resolve_targets`);
 /// `apply_defaults` reads the four string knobs at parse time.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct DiscoveryConfig {
+pub struct DiscoveryConfig {
     /// Which discovered servers to watch (default: all). See [`ServerSelector`].
     pub servers: ServerSelector,
     /// Overrides the shed CLI config path (default `~/.shed/config.yaml`,
@@ -692,7 +690,7 @@ impl DiscoveryConfig {
 /// (`names` is `None`) selects everything, while an EXPLICIT empty list (`servers: []`,
 /// i.e. `names` is `Some(vec![])`) selects nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct ServerSelector {
+pub struct ServerSelector {
     /// The `all`/`""`/null scalar form (mirror Go's `All bool`).
     pub all: bool,
     /// The explicit name list. `None` = omitted selector (⇒ select all, matching Go's
