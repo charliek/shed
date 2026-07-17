@@ -21,6 +21,7 @@ use crate::models::{
     ShedImage, ShedList, SystemDiskUsage,
 };
 use crate::rc::RcMessagesPage;
+use crate::rc_events::{parse_rc_event, RcEvent};
 use crate::sse::SseParser;
 use crate::token::{ControlTokenProvider, TokenMinter};
 
@@ -44,6 +45,22 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max gap between SSE bytes during a create before we give up (a hung stream);
 /// generous so a healthy provision with periodic progress never trips it.
 const CREATE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Max gap between SSE BYTES on the long-lived rc-events stream before the
+/// client treats the connection as silently dead. The server heartbeats every
+/// 25s with a `: heartbeat` comment (`internal/api/rcevents.go:188-206`), and
+/// those comment bytes reset this timer even though the parser swallows them
+/// without emitting an event — the timeout wraps the byte-chunk future, never
+/// the parsed-event future (plan 001 §3.3; see [`Client::rc_events`]). 60s is
+/// two missed heartbeats plus slack.
+const RC_EVENTS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cap on the bytes buffered for a single rc-events SSE event, matching the
+/// broker bus's `MAX_SSE_EVENT_BYTES` (`shed-broker/src/bus.rs`): 1 MiB, the
+/// same bound Go's `bufio.Scanner` enforces. rc-events is a long-lived stream
+/// carrying guest-influenced payloads (unlike the bounded one-shot create
+/// stream, which stays uncapped), so an oversized / never-terminating event
+/// surfaces as an error → the watcher disconnects + reconnects, instead of
+/// buffering unboundedly.
+const RC_EVENTS_MAX_EVENT_BYTES: usize = 1 << 20;
 const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
 
 /// Sink for create progress. shed-core streams the SSE and drives these; the FFI
@@ -52,6 +69,14 @@ pub trait CreateSink: Send + Sync {
     fn on_progress(&self, message: String);
     fn on_complete(&self, shed: Shed);
     fn on_error(&self, message: String);
+}
+
+/// Sink for the rc-events live-activity stream (mirrors [`CreateSink`]):
+/// shed-core drives the SSE connection ([`Client::rc_events`]) and hands each
+/// decoded [`RcEvent`] here in arrival order; the fold + reconnect layer
+/// (shed-app's `RcEventsWatcher`) implements it.
+pub trait RcEventSink: Send + Sync {
+    fn on_event(&self, ev: RcEvent);
 }
 
 /// A read client for one shed-server host. `Clone` is cheap (reqwest::Client and
@@ -361,6 +386,143 @@ impl Client {
         self.request(reqwest::Method::POST, &url, WRITE_TIMEOUT, Some(&body))
             .await
             .map(|_| ())
+    }
+
+    /// `GET /api/rc/events` with `Accept: text/event-stream` — the host-wide
+    /// aggregate rc live-activity stream (Go `internal/api/rcevents.go:170-208`:
+    /// the server opens with a `: ok` comment preamble, heartbeats every 25s
+    /// with `: heartbeat` comments, and never sends a `retry:` hint — reconnect
+    /// policy is entirely the client's). Each SSE record is decoded via
+    /// [`parse_rc_event`] and delivered to `sink` in arrival order; a
+    /// malformed/unknown frame is skipped WITHOUT ending the stream (the decode
+    /// is tolerant by design — one bad guest frame must not become a reconnect
+    /// storm), and comment frames never reach the sink (the parser swallows
+    /// them). Success is exactly a 200 SSE response — any other status,
+    /// including a body-less 2xx like 204, is `BadStatus` (an empty-stream Ok
+    /// would mask the fault from the watcher). Returns `Ok(())` on clean EOF,
+    /// after flushing any final unterminated record to the sink. The idle
+    /// duration also bounds the whole connect phase (bearer mint + send).
+    ///
+    /// ONE connection — no in-method reconnect and no 401 retry: the reconnect
+    /// loop (shed-app's `RcEventsWatcher`) owns backoff AND re-auth. On a 401
+    /// this invalidates the token provider and returns `BadStatus(401)`, so
+    /// the watcher's next connect re-mints; an in-method retry would double up
+    /// on the watcher's backoff and hide the auth failure from its Down
+    /// signal.
+    ///
+    /// Liveness (plan 001 §3.3, panel-critical pin): the
+    /// [`RC_EVENTS_IDLE_TIMEOUT`] idle timer wraps the BYTE-chunk future
+    /// (`bytes_stream().next()`, the `create_stream` pattern), NOT the
+    /// parsed-event future — the server's 25s heartbeat comments arrive as
+    /// bytes and reset it even though the parser emits no event for them. An
+    /// event-level timer would falsely kill every healthy-but-quiet stream; the
+    /// byte-level timer converts a silently-dead connection into
+    /// disconnect → reconnect → resync (a liveness watchdog mobile's Dart loop
+    /// lacks). Idle/transport failures surface as [`ShedError::Transport`]
+    /// (`Create` is create-specific; to the reconnecting watcher every
+    /// teardown is the same "connection died" condition). Events are parsed
+    /// through a 1 MiB-capped [`SseParser`] ([`RC_EVENTS_MAX_EVENT_BYTES`]);
+    /// an overflow is an error, ending the stream.
+    pub async fn rc_events(&self, sink: &dyn RcEventSink) -> Result<(), ShedError> {
+        self.rc_events_with_idle(sink, RC_EVENTS_IDLE_TIMEOUT).await
+    }
+
+    /// [`Self::rc_events`] with an injectable idle timeout — the test seam
+    /// (deterministic timer tests must not wait out the 60s production value).
+    pub(crate) async fn rc_events_with_idle(
+        &self,
+        sink: &dyn RcEventSink,
+        idle: Duration,
+    ) -> Result<(), ShedError> {
+        self.rc_events_with_limits(sink, idle, RC_EVENTS_MAX_EVENT_BYTES)
+            .await
+    }
+
+    /// The full rc-events implementation with both knobs injectable (the cap
+    /// seam exists only for tests — an oversized-event test must not build a
+    /// >1 MiB body).
+    async fn rc_events_with_limits(
+        &self,
+        sink: &dyn RcEventSink,
+        idle: Duration,
+        max_event_bytes: usize,
+    ) -> Result<(), ShedError> {
+        let url = self.build_url(&["api", "rc", "events"], &[])?;
+        // Connection-open timeout: the same duration bounds the WHOLE connect
+        // phase — bearer resolution (a foreign `TokenMinter` impl can hang
+        // indefinitely) plus the request send — so no pre-stream await sits
+        // outside the bound (a server that accepts but never responds is as
+        // dead as a silent stream).
+        let connect = async {
+            let mut rb = self
+                .http
+                .get(url)
+                .header(reqwest::header::ACCEPT, "text/event-stream");
+            if let Some(tok) = self.bearer().await {
+                rb = rb.bearer_auth(tok);
+            }
+            rb.send().await
+        };
+        let resp = match tokio::time::timeout(idle, connect).await {
+            Err(_) => {
+                return Err(ShedError::Transport("rc-events connect timeout".into()));
+            }
+            Ok(r) => r.map_err(|e| ShedError::Transport(e.to_string()))?,
+        };
+        let status = resp.status().as_u16();
+        if status == 401 {
+            // Stale token: invalidate so the NEXT connect re-mints, then
+            // surface the 401 — the watcher owns re-auth (no in-method retry).
+            // Bounded await: invalidate only contends on the provider mutex,
+            // but that mutex is held across a mint by design, so a wedged mint
+            // could otherwise pin this call forever. On timeout we fall
+            // through and surface the 401 anyway — the cache keeps the stale
+            // token one extra cycle and the watcher's next 401 retries the
+            // invalidate.
+            // NOTE(C6): becomes invalidate_if_current(sent_bearer) — the
+            // unconditional invalidate can erase a NEWER token when a stale
+            // 401 races a rotation (plan §3.4 stale-401 guard).
+            if let Some(p) = &self.token_provider {
+                let _ = tokio::time::timeout(idle, p.invalidate()).await;
+            }
+        }
+        // Exactly 200, not any-2xx: SSE lives in a 200 response body — a
+        // 204/206 minted by an intermediary carries no event stream, and
+        // treating it as success would end as a silent empty-stream Ok,
+        // masking the fault from the watcher's Down/backoff signal.
+        if status != 200 {
+            return Err(ShedError::BadStatus(status));
+        }
+        let mut stream = resp.bytes_stream();
+        let mut parser = SseParser::new().with_max_event_bytes(max_event_bytes);
+        loop {
+            // The idle timer wraps the BYTE-chunk future (see rc_events docs):
+            // heartbeat comment bytes reset it even though they emit no event.
+            match tokio::time::timeout(idle, stream.next()).await {
+                Err(_) => {
+                    return Err(ShedError::Transport("rc-events stream idle timeout".into()));
+                }
+                Ok(None) => break, // clean EOF
+                Ok(Some(chunk)) => {
+                    let chunk = chunk.map_err(|e| ShedError::Transport(e.to_string()))?;
+                    let events = parser
+                        .try_feed(&chunk)
+                        .map_err(|e| ShedError::Transport(format!("rc-events stream: {e}")))?;
+                    for ev in &events {
+                        if let Some(rc) = parse_rc_event(ev) {
+                            sink.on_event(rc);
+                        }
+                    }
+                }
+            }
+        }
+        // Flush a final record that lacked its trailing blank line.
+        for ev in parser.finish() {
+            if let Some(rc) = parse_rc_event(&ev) {
+                sink.on_event(rc);
+            }
+        }
+        Ok(())
     }
 
     /// `POST /api/sheds/{name}/start`.
@@ -1370,5 +1532,377 @@ mod tests {
             c.rc_messages("proj", "..", 0, None).await,
             Err(ShedError::Config(_))
         ));
+    }
+
+    // ---- rc-events SSE stream (plan §3.3 test matrix + AC#8) ----
+
+    use crate::rc_events::RcEvent;
+
+    #[derive(Default)]
+    struct RecordingRcSink {
+        events: std::sync::Mutex<Vec<RcEvent>>,
+    }
+    impl RecordingRcSink {
+        fn events(&self) -> Vec<RcEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+    impl RcEventSink for RecordingRcSink {
+        fn on_event(&self, ev: RcEvent) {
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    /// A minimal raw-TCP SSE server for the streaming-TIMING tests httpmock
+    /// can't express (httpmock only serves complete pre-built bodies — it
+    /// cannot trickle bytes with real gaps): accepts ONE connection, reads the
+    /// request headers, writes an HTTP/1.1 200 SSE response head, then runs
+    /// `script` against the raw socket on a plain OS thread (std sleeps
+    /// between writes = real inter-chunk gaps). Dropping the socket at the end
+    /// of `script` is the clean EOF (`connection: close`). Every script runs
+    /// for a bounded time by construction; the caller MUST end its test with
+    /// [`join_sse_server`] so no thread or listener outlives the test.
+    fn spawn_sse_server(
+        script: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap(); // each write = one prompt chunk
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break; // headers complete (GET — no body follows)
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .unwrap();
+            script(&mut stream);
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Join the raw-TCP server thread with a bound (std's `JoinHandle` has no
+    /// timed join, so the blocking join runs on the blocking pool under a
+    /// tokio timeout): a wedged script fails the test instead of hanging the
+    /// suite, and a panic inside the server thread is propagated, not lost.
+    async fn join_sse_server(handle: std::thread::JoinHandle<()>) {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || handle.join().expect("sse server thread panicked")),
+        )
+        .await
+        .expect("sse server thread did not finish within the bound")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rc_events_delivers_decoded_events_in_order_and_clean_eof_is_ok() {
+        // Happy path: the server's `: ok` preamble (rcevents.go:185), two data
+        // frames, then EOF. The comment preamble produces no sink call; the
+        // events arrive decoded, in order; the ended stream is Ok(()).
+        let server = MockServer::start_async().await;
+        let sse = ": ok\n\n\
+                   event: activity.changed\n\
+                   data: {\"shed\":\"proj\",\"slug\":\"cdx777\",\"activity\":\"working\",\"state\":\"ready\"}\n\n\
+                   event: session.updated\n\
+                   data: {\"shed\":\"proj\",\"slug\":\"cdx777\",\"session\":{\"state\":\"ready\",\"activity\":\"idle\"}}\n\n";
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/rc/events")
+                    .header("accept", "text/event-stream");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(sse);
+            })
+            .await;
+        let sink = RecordingRcSink::default();
+        client(&server).rc_events(&sink).await.unwrap();
+        let evs = sink.events();
+        assert_eq!(evs.len(), 2, "got {evs:?}");
+        match &evs[0] {
+            RcEvent::ActivityChanged {
+                shed,
+                slug,
+                activity,
+                ..
+            } => {
+                assert_eq!(shed, "proj");
+                assert_eq!(slug, "cdx777");
+                assert_eq!(*activity, Some(crate::rc::RcActivity::Working));
+            }
+            other => panic!("wrong first event: {other:?}"),
+        }
+        match &evs[1] {
+            RcEvent::SessionUpdated { removed, .. } => assert!(!removed),
+            other => panic!("wrong second event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_events_skips_malformed_and_unknown_frames_without_ending_stream() {
+        // An unknown event name, a non-JSON payload, and a frame missing its
+        // required keys are each skipped (parse_rc_event → None) — the stream
+        // keeps going and a LATER valid event is still delivered, then Ok.
+        let server = MockServer::start_async().await;
+        let sse = "event: totally.unknown\ndata: {\"shed\":\"p\"}\n\n\
+                   event: activity.changed\ndata: not-json\n\n\
+                   event: activity.changed\ndata: {\"shed\":\"p\"}\n\n\
+                   event: message.appended\ndata: {\"shed\":\"p\",\"slug\":\"s\",\"seq\":7}\n\n";
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/rc/events");
+                t.status(200).body(sse);
+            })
+            .await;
+        let sink = RecordingRcSink::default();
+        client(&server).rc_events(&sink).await.unwrap();
+        assert_eq!(
+            sink.events(),
+            vec![RcEvent::MessageAppended {
+                shed: "p".into(),
+                slug: "s".into(),
+                seq: 7,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_events_clean_eof_flushes_final_unterminated_record() {
+        // A final record with no trailing blank line is flushed to the sink
+        // via parser.finish() on EOF — delivered, not dropped.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/rc/events");
+                t.status(200)
+                    .body("event: shed.stopped\ndata: {\"shed\":\"p\"}");
+            })
+            .await;
+        let sink = RecordingRcSink::default();
+        client(&server).rc_events(&sink).await.unwrap();
+        assert_eq!(
+            sink.events(),
+            vec![RcEvent::ShedStopped { shed: "p".into() }]
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_events_oversized_event_is_an_error() {
+        // The capped parser (with_max_event_bytes + try_feed — the broker
+        // bus's convention): an event exceeding the cap ends the stream as an
+        // error (the watcher reconnects with a fresh parser), never buffers
+        // on. Cap injected via the private seam so the test body stays small.
+        let server = MockServer::start_async().await;
+        let sse = format!("event: activity.changed\ndata: {}\n\n", "x".repeat(1024));
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/rc/events");
+                t.status(200).body(sse);
+            })
+            .await;
+        let sink = RecordingRcSink::default();
+        let err = client(&server)
+            .rc_events_with_limits(&sink, Duration::from_secs(5), 64)
+            .await
+            .unwrap_err();
+        match err {
+            ShedError::Transport(msg) => {
+                assert!(msg.contains("exceeded 64 bytes"), "got: {msg}");
+            }
+            other => panic!("expected Transport overflow, got {other:?}"),
+        }
+        assert!(sink.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rc_events_401_invalidates_provider_with_no_second_request() {
+        // 401 → invalidate + Err(BadStatus(401)), and NO in-method retry (the
+        // C5 watcher owns reconnect/re-auth): exactly one request hits the
+        // server, and the next bearer() re-mints.
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/rc/events")
+                    .header("authorization", "Bearer tok-1");
+                t.status(401);
+            })
+            .await;
+        let minter = Arc::new(SeqMinter {
+            calls: AtomicUsize::new(0),
+        });
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+        let sink = RecordingRcSink::default();
+        let err = c.rc_events(&sink).await.unwrap_err();
+        assert!(matches!(err, ShedError::BadStatus(401)), "got {err:?}");
+        assert_eq!(m.hits_async().await, 1, "401 must not retry in-method");
+        assert!(sink.events().is_empty());
+        // Invalidated: one mint so far, the next bearer() re-mints.
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 1);
+        let _ = c.bearer().await;
+        assert_eq!(
+            minter.calls.load(Ordering::SeqCst),
+            2,
+            "401 must invalidate so the watcher's next connect re-mints"
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_events_connection_open_timeout() {
+        // A server that accepts but never responds trips the connection-open
+        // timeout (the same idle duration bounds the initial send).
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/rc/events");
+                t.status(200).body(": ok\n\n").delay(Duration::from_secs(2));
+            })
+            .await;
+        let sink = RecordingRcSink::default();
+        let err = client(&server)
+            .rc_events_with_idle(&sink, Duration::from_millis(150))
+            .await
+            .unwrap_err();
+        match err {
+            ShedError::Transport(msg) => assert!(msg.contains("connect"), "got: {msg}"),
+            other => panic!("expected Transport connect timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_events_idle_timeout_fires_on_a_silent_stream() {
+        // Mid-stream silence: the server delivers one event then goes quiet
+        // while HOLDING the socket open (a silently-dead connection — the case
+        // the watchdog exists for). httpmock can't hold a stream open, so this
+        // uses the raw-TCP helper. The pre-silence event was delivered; the
+        // silence surfaces as the idle-timeout Transport error. Margin: the
+        // 2s silence is ~7x the 300ms idle, so the timeout fires well inside
+        // the quiet stretch even on a loaded worker.
+        let (base, server) = spawn_sse_server(|s| {
+            use std::io::Write;
+            s.write_all(b": ok\n\nevent: hub.unavailable\ndata: {\"shed\":\"p\"}\n\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_secs(2)); // silence >> idle
+        });
+        let c = Client::new(base, "mini2".into(), String::new(), None, None).unwrap();
+        let sink = RecordingRcSink::default();
+        let err = c
+            .rc_events_with_idle(&sink, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        match err {
+            ShedError::Transport(msg) => assert!(msg.contains("idle timeout"), "got: {msg}"),
+            other => panic!("expected Transport idle timeout, got {other:?}"),
+        }
+        assert_eq!(
+            sink.events(),
+            vec![RcEvent::HubUnavailable { shed: "p".into() }]
+        );
+        join_sse_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn rc_events_heartbeat_comments_reset_the_idle_timer() {
+        // AC#8, the panel-critical pin: comment-only `: heartbeat` frames must
+        // NOT trip the idle timer, even though the parser swallows them
+        // without emitting an event — the timer wraps the BYTE-chunk future.
+        // Real streaming gaps via the raw-TCP helper: 2.5s of comment-only
+        // traffic (25 × 100ms) against a 1.5s idle. Margins (both directions,
+        // CI-scheduling-safe): an event-level timer fires deterministically —
+        // zero parsed events for 2.5s, a full 1s past the idle window — while
+        // a false-fail of the byte-level timer needs the writer thread
+        // descheduled >1.5s, 15× its 100ms cadence. The event after the quiet
+        // stretch still arrives, then clean EOF → Ok.
+        let (base, server) = spawn_sse_server(|s| {
+            use std::io::Write;
+            s.write_all(b": ok\n\n").unwrap();
+            for _ in 0..25 {
+                std::thread::sleep(Duration::from_millis(100));
+                s.write_all(b": heartbeat\n\n").unwrap();
+            }
+            s.write_all(b"event: shed.stopped\ndata: {\"shed\":\"p\"}\n\n")
+                .unwrap();
+        });
+        let c = Client::new(base, "mini2".into(), String::new(), None, None).unwrap();
+        let sink = RecordingRcSink::default();
+        c.rc_events_with_idle(&sink, Duration::from_millis(1500))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.events(),
+            vec![RcEvent::ShedStopped { shed: "p".into() }]
+        );
+        join_sse_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn rc_events_connect_timeout_covers_a_hung_bearer_mint() {
+        // The connect bound wraps the WHOLE connect phase, bearer resolution
+        // included: a foreign TokenMinter that never resolves must surface as
+        // the connect timeout, not hang rc_events forever. (The mint pends
+        // before any dial, so the unroutable base URL is never touched.)
+        struct NeverMinter;
+        #[async_trait::async_trait]
+        impl TokenMinter for NeverMinter {
+            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+                std::future::pending().await
+            }
+        }
+        let c = Client::new(
+            "http://127.0.0.1:9".into(),
+            "s".into(),
+            String::new(),
+            None,
+            Some(Arc::new(NeverMinter)),
+        )
+        .unwrap();
+        let sink = RecordingRcSink::default();
+        let err = c
+            .rc_events_with_idle(&sink, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        match err {
+            ShedError::Transport(msg) => assert!(msg.contains("connect"), "got: {msg}"),
+            other => panic!("expected Transport connect timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_events_non_200_success_status_is_bad_status() {
+        // Exactly-200 contract: SSE lives in a 200 response body. A 204/206
+        // minted by an intermediary carries no event stream — any-2xx
+        // acceptance would end as a silent empty-stream Ok, masking the fault
+        // from the watcher's Down/backoff signal.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/rc/events");
+                t.status(204);
+            })
+            .await;
+        let sink = RecordingRcSink::default();
+        let err = client(&server).rc_events(&sink).await.unwrap_err();
+        assert!(matches!(err, ShedError::BadStatus(204)), "got {err:?}");
+        assert!(sink.events().is_empty());
     }
 }
