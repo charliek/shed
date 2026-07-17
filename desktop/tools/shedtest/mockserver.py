@@ -185,6 +185,12 @@ class MockShedServer:
         with self._lock:
             self.sheds = sheds
 
+    def add_shed(self, shed: dict) -> None:
+        """Append a shed to the served GET /api/sheds fixture, mimicking a shed
+        created OUTSIDE the app (e.g. `shed create` from the CLI). Used by the
+        dashboard auto-refresh cell to prove the open UI picks it up on its own."""
+        self._add(dict(shed))
+
     def reset(self) -> None:
         with self._lock:
             self.info = dict(DEFAULT_INFO)

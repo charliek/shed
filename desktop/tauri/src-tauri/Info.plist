@@ -17,6 +17,17 @@
 <dict>
   <key>CFBundleDisplayName</key>
   <string>shed desktop</string>
+  <!--
+    CFBundleIconName routes macOS 26 (Tahoe) to the compiled Icon Composer
+    catalog (Assets.car, from AppIcon.icon) that scripts/bundle-tauri-mac.sh
+    stages post-build — the glass, edge-to-edge treatment. Without it a loose
+    .icns is drawn as a legacy icon inset on the system tile (gray frame +
+    muted color). When actool is unavailable the script falls back to a flat
+    AppIcon.icns and the OS still resolves this name to it. Mirrors the Swift
+    app's Resources/Info.plist.template.
+  -->
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
   <key>LSUIElement</key>
   <true/>
   <key>SUFeedURL</key>

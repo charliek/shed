@@ -38,6 +38,11 @@ the UI tree, not here; this pipeline is only the app/launcher/dock icon.
 - `tauri/src-tauri/icons/icon.ico` — Windows multi-size (16/32/48/64/128/256, Pillow)
 - `tauri/src-tauri/icons/{Square30x30Logo,StoreLogo}.png` — Windows Store tiles
   (regenerated for consistency)
+- `tauri/src-tauri/AppIcon.icon/` — macOS 26 (Tahoe) **Icon Composer** catalog
+  (`icon.json` + `Assets/owl.png`): an `srgb` `fill.solid` brand background with
+  the owl as a foreground layer. `scripts/bundle-tauri-mac.sh` compiles it with
+  `actool` into `Assets.car` + a flattened `AppIcon.icns` at bundle time — see
+  the Tahoe note below
 - `packaging/icons/hicolor/{256x256,512x512}/apps/shed-desktop.png` — Linux
   `.deb` hicolor icons (nfpm installs the same file under both `shed-desktop`
   and `ai.stridelabs.shed-desktop` names — see `packaging/nfpm.yaml`)
@@ -90,11 +95,29 @@ Or nuke the cache: `sudo rm -rf /Library/Caches/com.apple.iconservices.store &&
 killall Dock Finder` (heavier hammer). On Linux, refresh with
 `gtk-update-icon-cache` after installing the `.deb`.
 
-## Note on macOS 26 (Tahoe) glass icons
+## macOS 26 (Tahoe) glass icons
 
-This pipeline ships a flat `.icns` (no Icon Composer `.icon` catalog yet). On
-Tahoe a loose `.icns` is inset on the system glass tile (a gray frame around the
-art) rather than filling it edge-to-edge. Adding a Tahoe `.icon` catalog is a
-deliberate follow-up (it needs `actool` / Xcode 26 at bundle time); the
-generator is structured so that leg can be added later without disturbing the
-committed PNG/`.icns` outputs.
+On Tahoe the system masks every Dock/Cmd-Tab icon to its own squircle and draws
+a glass tile behind it. A loose `.icns` is treated as a **legacy** icon and
+*inset* on that tile — a gray/white frame around the art, with muted color —
+rather than filling it edge-to-edge. The fix (ported from the sibling roost app)
+is a compiled **Icon Composer catalog**:
+
+- `generate_icons.py` emits `tauri/src-tauri/AppIcon.icon/` — a hand-authored
+  `icon.json` with the orange brand color as a **native `srgb` `fill.solid`**
+  (not a baked bitmap) plus the shed owl as a transparent foreground layer, with
+  roost's `shadow` (neutral 0.5) tuning and `translucency` dialed to 0.35 (roost
+  uses 0.5 — shed's brighter orange bleeds through the frosted white more loudly
+  than roost's violet, so a lower value keeps the owl reading as white).
+- `scripts/bundle-tauri-mac.sh` compiles it with `xcrun actool ... --app-icon
+  AppIcon` into `Contents/Resources/Assets.car` (+ a flattened `AppIcon.icns`)
+  *before* codesign, so the signature seals it. `actool` needs **full Xcode 26**
+  (not the bare Command Line Tools); when it's absent the script falls back to
+  the flat `AppIcon.icns` and logs it (the bundle still launches, just with the
+  framed legacy icon on Tahoe).
+- `CFBundleIconName=AppIcon` in `tauri/src-tauri/Info.plist` (merged into the
+  bundle plist by the Tauri bundler) routes the OS to the catalog.
+
+The catalog is committed; CI does not regenerate it. The Linux PNGs / Windows
+`.ico` / flat `.icns` are unaffected (no system tile there) and remain the
+pre-Tahoe / no-`actool` fallbacks.

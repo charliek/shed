@@ -4,7 +4,7 @@
    one vocabulary (replaces the former in-App ad-hoc Dot/Tag/ImageChip/PageHead/
    HeadAction/IconBtn/EmptyCard/card). */
 import type { LucideIcon } from "lucide-react";
-import { Layers } from "lucide-react";
+import { Layers, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /** The shared card surface (border + surface bg + Plex shadow/radius). */
@@ -164,6 +164,17 @@ export function PageHead({
       </div>
       {sub && <p className="mt-2 max-w-[620px] text-[14px] leading-snug text-shed-text-muted">{sub}</p>}
     </div>
+  );
+}
+
+/** The icon-only "Refresh" button paired with a `HeadAction` in a `PageHead`
+ *  `right` slot (Sheds, Agents panes) — bare glyph, no label, so it reads as a
+ *  secondary action next to the primary "New …" `HeadAction`. */
+export function RefreshHeadButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button onClick={onClick} title="Refresh" className="hlink flex items-center rounded-lg p-[7px] text-shed-text-secondary">
+      <RefreshCw size={18} />
+    </button>
   );
 }
 
