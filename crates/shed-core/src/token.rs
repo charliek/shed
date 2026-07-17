@@ -599,13 +599,25 @@ impl ControlTokenProvider {
         if let Some(current) = st.cached.clone() {
             if !expired(&current, now) {
                 if self.needs_refresh(&current, now) {
-                    if let Ok(minted) = self.mint_locked(&mut st, now).await {
-                        return Ok(minted.token);
+                    match self.mint_locked(&mut st, now).await {
+                        Ok(minted) => return Ok(minted.token),
+                        Err(e) => {
+                            // Keep-valid-on-proactive-failure (strict
+                            // improvement #1, `control_token_provider.dart:82-92`):
+                            // the refresh mint failed — normally fall through and
+                            // return the cached token rather than erroring. BUT
+                            // `now` was read before awaiting the minter: a slow
+                            // mint can finish AFTER the cached token expired, and
+                            // returning it then would hand back a dead credential.
+                            // Re-read the clock and only keep the token if it is
+                            // STILL valid against the fresh now; otherwise fail
+                            // closed with the real mint error.
+                            let fresh_now = (self.now_unix)();
+                            if expired(&current, fresh_now) {
+                                return Err(e);
+                            }
+                        }
                     }
-                    // Keep-valid-on-proactive-failure (strict improvement #1,
-                    // `control_token_provider.dart:82-92`): the refresh mint
-                    // failed but the cached token is not yet expired — fall
-                    // through and return it rather than erroring.
                 }
                 return Ok(current.token);
             }
@@ -916,6 +928,70 @@ mod tests {
             .with_seed(seed(10_000));
         assert_eq!(p.token().await.unwrap(), "seed"); // kept, not an error
         assert_eq!(minter.count(), 1); // the refresh mint WAS attempted
+    }
+
+    // Finding 4 (fail-closed correctness): `now` is captured BEFORE awaiting the
+    // minter, so a SLOW proactive mint can finish after the cached token has
+    // expired. Keep-valid must re-check the clock and NOT serve a now-expired
+    // token. A minter that advances the shared clock while it runs models the
+    // slow mint; the two sub-cases are (a) clock crosses expiry → Err, and (b)
+    // clock stays before expiry → the still-valid cached token.
+    #[tokio::test]
+    async fn proactive_mint_failure_fails_closed_when_the_clock_crossed_expiry() {
+        // A failing minter that, mid-mint, advances the shared clock to a target
+        // (simulating wall-clock elapsing during a slow doomed mint).
+        struct SlowFailMinter {
+            clock: Arc<AtomicU64>,
+            advance_to: u64,
+        }
+        #[async_trait::async_trait]
+        impl TokenMinter for SlowFailMinter {
+            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+                self.clock.store(self.advance_to, Ordering::SeqCst);
+                Err(ShedError::Transport("mint failed".into()))
+            }
+        }
+
+        // (a) clock advances 900 -> 1500, past the 1000 expiry → fail closed.
+        let clock = Arc::new(AtomicU64::new(900));
+        let p = ControlTokenProvider::new(
+            "mini3".into(),
+            Arc::new(SlowFailMinter {
+                clock: clock.clone(),
+                advance_to: 1500,
+            }),
+        )
+        .with_now({
+            let clock = clock.clone();
+            move || clock.load(Ordering::SeqCst)
+        })
+        .with_refresh_window(Duration::from_secs(5000)) // 900 >= 1000-5000 → in window
+        .with_seed(seed(1000));
+        // In the refresh window, mint attempted, fails, and by the time it
+        // returns the clock reads 1500 >= 1000 → the cached token is now expired.
+        assert!(
+            p.token().await.is_err(),
+            "must not return the now-expired cached token"
+        );
+        assert_eq!(clock.load(Ordering::SeqCst), 1500);
+
+        // (b) clock stays at 900 (mint fails without wall-clock crossing expiry)
+        // → the still-valid cached token is kept.
+        let clock = Arc::new(AtomicU64::new(900));
+        let p = ControlTokenProvider::new(
+            "mini3".into(),
+            Arc::new(SlowFailMinter {
+                clock: clock.clone(),
+                advance_to: 900, // no advance past expiry
+            }),
+        )
+        .with_now({
+            let clock = clock.clone();
+            move || clock.load(Ordering::SeqCst)
+        })
+        .with_refresh_window(Duration::from_secs(5000))
+        .with_seed(seed(1000));
+        assert_eq!(p.token().await.unwrap(), "seed"); // still valid → kept
     }
 
     // Dart `mints when the seed is expired, throwing if that mint fails`

@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{clean_display, opt_trimmed};
+use crate::models::{clean_display, dart_trim, opt_trimmed};
 use crate::terminal::{shell_quote, ssh_host_key_opts};
 
 /// Fallback workdir for a legacy/unmanaged session whose DTO omits one (the
@@ -486,7 +486,20 @@ impl RcSession {
             target_label: dto.target_label,
             activity: dto.activity,
             activity_at: dto.activity_at,
-            last_message: dto.last_message,
+            // Sanitize the guest-controlled preview text exactly as the
+            // overview adapter's `clean_display` does — strip Unicode format
+            // characters (category Cf: bidi overrides, zero-widths, BOM), then
+            // trim; a value that is only such chars degrades to None. The feed
+            // decoder and the overview path both clean this text, so the
+            // shed-ext-rc stdout path (`from_dto`) must not be laxer.
+            last_message: dto.last_message.and_then(|m| {
+                let cleaned = dart_trim(&strip_format_chars(&m)).to_string();
+                if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                }
+            }),
             managed: dto.managed,
         }
     }
@@ -1973,6 +1986,38 @@ mod tests {
         assert!(j.get("activity").is_none());
         assert!(j.get("activity_at").is_none());
         assert!(j.get("last_message").is_none());
+    }
+
+    // Finding 3: the guest-controlled last_message on the shed-ext-rc stdout
+    // path must be sanitized exactly like the overview / feed paths — a bidi
+    // override (U+202E) that could visually reverse the preview is stripped.
+    #[test]
+    fn from_dto_strips_format_chars_from_last_message() {
+        // U+202E (right-to-left override) embedded via a Rust escape so the
+        // source stays reviewable — the guest ships it in the rc stdout JSON.
+        let json = format!(
+            r#"{{"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready",
+                "managed":true,"last_message":"run{}evil"}}"#,
+            '\u{202E}'
+        );
+        let dto = decode_session(&json).unwrap();
+        // The DTO carries the raw guest text verbatim…
+        assert_eq!(dto.last_message.as_deref(), Some("run\u{202E}evil"));
+        // …and from_dto sanitizes it (Cf stripped) before it reaches RcSession.
+        let s = RcSession::from_dto(dto, "srv", "web");
+        assert_eq!(s.last_message.as_deref(), Some("runevil"));
+
+        // A value that is ONLY format characters degrades to None.
+        let json = format!(
+            r#"{{"slug":"b","tmux_session":"rc-b","kind":"shell","state":"ready",
+                "managed":true,"last_message":"{}{}"}}"#,
+            '\u{202E}', '\u{200B}'
+        );
+        let only_cf = decode_session(&json).unwrap();
+        assert_eq!(
+            RcSession::from_dto(only_cf, "srv", "web").last_message,
+            None
+        );
     }
 
     // ---- capabilities ----

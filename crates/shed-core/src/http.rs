@@ -171,6 +171,19 @@ impl Client {
         }
     }
 
+    /// [`Self::bearer`] BOUNDED by `bound`, mirroring the connect-phase guard
+    /// [`Self::rc_events`] already applies: a foreign [`crate::TokenMinter`]
+    /// impl can hang indefinitely (the provider holds its mutex across a mint),
+    /// so an unbounded bearer resolution in a JSON/lifecycle request or a create
+    /// would wedge the whole call. On timeout surface a Transport error rather
+    /// than block forever. Used by [`Self::request`] for both the initial and
+    /// the 401-retry bearer resolution.
+    async fn bounded_bearer(&self, bound: Duration) -> Result<Option<String>, ShedError> {
+        tokio::time::timeout(bound, self.bearer())
+            .await
+            .map_err(|_| ShedError::Transport("bearer resolution timeout".into()))
+    }
+
     /// 401 aftermath, shared by [`Self::request`], [`Self::create_stream`],
     /// and [`Self::rc_events`]: drop the provider's cache for the token
     /// actually SENT (`invalidate_if_current` — the stale-401 guard: a 401
@@ -294,7 +307,10 @@ impl Client {
         timeout: Duration,
         body: Option<&serde_json::Value>,
     ) -> Result<Vec<u8>, ShedError> {
-        let sent = self.bearer().await;
+        // Bound the bearer resolution under this request's own `timeout` (GET 8s
+        // / WRITE 15s) so a wedged minter can't hang the call outside any bound
+        // — the same guard rc_events applies to its connect phase.
+        let sent = self.bounded_bearer(timeout).await?;
         match self
             .send_once(method.clone(), url, timeout, body, sent.as_deref())
             .await
@@ -303,7 +319,7 @@ impl Client {
                 if !self.invalidate_sent(sent.as_deref(), timeout).await {
                     return Err(ShedError::BadStatus(401)); // wedged provider — no retry
                 }
-                let retry = self.bearer().await;
+                let retry = self.bounded_bearer(timeout).await?;
                 if retry.is_none() {
                     return Err(ShedError::BadStatus(401)); // never retry unauthenticated
                 }
@@ -654,20 +670,26 @@ impl Client {
         sink: &dyn CreateSink,
     ) -> Result<(), ShedError> {
         let url = self.build_url(&["api", "sheds"], &[])?;
-        let bearer = self.bearer().await;
-        let mut rb = self
-            .http
-            .post(url)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(req);
-        if let Some(tok) = &bearer {
-            rb = rb.bearer_auth(tok);
-        }
-        let resp = match tokio::time::timeout(CREATE_IDLE_TIMEOUT, rb.send()).await {
+        // Bound the WHOLE connect phase — bearer resolution (a foreign
+        // TokenMinter can hang) plus the request send — under CREATE_IDLE_TIMEOUT,
+        // mirroring rc_events, so no pre-stream await sits outside the bound.
+        let connect = async {
+            let bearer = self.bearer().await;
+            let mut rb = self
+                .http
+                .post(url)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(req);
+            if let Some(tok) = &bearer {
+                rb = rb.bearer_auth(tok);
+            }
+            (bearer, rb.send().await)
+        };
+        let (bearer, resp) = match tokio::time::timeout(CREATE_IDLE_TIMEOUT, connect).await {
             Err(_) => {
                 return Err(ShedError::Create("create stream idle timeout".into()));
             }
-            Ok(r) => r.map_err(|e| ShedError::Transport(e.to_string()))?,
+            Ok((bearer, r)) => (bearer, r.map_err(|e| ShedError::Transport(e.to_string()))?),
         };
         let status = resp.status().as_u16();
         if status == 401 {
@@ -2244,6 +2266,43 @@ mod tests {
         match err {
             ShedError::Transport(msg) => assert!(msg.contains("connect"), "got: {msg}"),
             other => panic!("expected Transport connect timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_bearer_resolution_is_bounded_against_a_hung_mint() {
+        // The bearer resolution in request() is bounded by the request's own
+        // timeout: a foreign TokenMinter that never resolves must surface as an
+        // error within the bound, not hang every JSON/lifecycle call. Mirrors
+        // rc_events_connect_timeout_covers_a_hung_bearer_mint for the JSON path.
+        struct NeverMinter;
+        #[async_trait::async_trait]
+        impl TokenMinter for NeverMinter {
+            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+                std::future::pending().await
+            }
+        }
+        let c = Client::new(
+            "http://127.0.0.1:9".into(),
+            "s".into(),
+            String::new(),
+            None,
+            Some(Arc::new(NeverMinter)),
+        )
+        .unwrap();
+        let url = c.build_url(&["api", "info"], &[]).unwrap();
+        // Outer guard: if the fix regressed, request() would hang and this
+        // 2s timeout would fire with the expect message instead of deadlocking.
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            c.request(reqwest::Method::GET, &url, Duration::from_millis(100), None),
+        )
+        .await
+        .expect("request must return within the bound, not hang")
+        .unwrap_err();
+        match err {
+            ShedError::Transport(msg) => assert!(msg.contains("bearer"), "got: {msg}"),
+            other => panic!("expected Transport bearer timeout, got {other:?}"),
         }
     }
 
