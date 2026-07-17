@@ -418,7 +418,7 @@ fn our_uid() -> u32 {
 
 /// The peer (server) UID on a connected Unix socket. `None` on error → treated as
 /// untrusted (fail closed). Linux uses `SO_PEERCRED` (glibc has no `getpeereid`);
-/// macOS/BSD use `getpeereid`.
+/// macOS/iOS use `getpeereid`. Other targets (mobile Android, etc.) return `None`.
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -443,13 +443,37 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
         };
         (rc == 0).then_some(cred.uid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
     {
         let mut uid: libc::uid_t = 0;
         let mut gid: libc::gid_t = 0;
         // SAFETY: `fd` is a valid connected AF_UNIX fd; the out-params are valid slots.
         let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
         (rc == 0).then_some(uid)
+    }
+    // Remaining targets — those without `getpeereid` (bionic/Android and other mobile,
+    // Windows) — that never bind the host-agent UDS server, so `peer_uid` is never
+    // called here. Returning `None` (untrusted) is the correct fail-closed default, and
+    // keeps shed-app compiling for those targets (e.g. `aarch64-linux-android`).
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        let _ = fd;
+        None
     }
 }
 

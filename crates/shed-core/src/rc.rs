@@ -752,6 +752,27 @@ pub fn kill_argv(bin: &str, slug: &str) -> Vec<String> {
     ]
 }
 
+/// Argv for a `prompt` — the kickoff line sent to an already-ready claude-rc/shell
+/// session on `slug`. The prompt text goes on **stdin**, not argv (like the other
+/// builders, this only produces argv). `session_id`, when present and non-empty,
+/// guards against a slug that was recreated under a new session. Mirrors mobile's
+/// `prompt()` (`rc_service.dart:201-209`).
+pub fn prompt_argv(bin: &str, slug: &str, session_id: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        bin.to_string(),
+        "prompt".to_string(),
+        "--slug".to_string(),
+        slug.to_string(),
+    ];
+    if let Some(id) = session_id {
+        if !id.is_empty() {
+            argv.push("--session-id".to_string());
+            argv.push(id.to_string());
+        }
+    }
+    argv
+}
+
 /// Map a non-zero exit code + stderr to an `RcError`. SSH-transport failures (the
 /// binary never ran) surface as `Failed` with the ssh stderr. Mirrors Swift's
 /// `RemoteControl.error`.
@@ -1645,6 +1666,23 @@ mod tests {
     fn list_and_kill_argv() {
         assert_eq!(list_argv("b"), ["b", "list"]);
         assert_eq!(kill_argv("b", "abc"), ["b", "kill", "--slug", "abc"]);
+    }
+
+    #[test]
+    fn prompt_argv_builder() {
+        assert_eq!(
+            prompt_argv("b", "abc", None),
+            ["b", "prompt", "--slug", "abc"]
+        );
+        assert_eq!(
+            prompt_argv("b", "abc", Some("sid")),
+            ["b", "prompt", "--slug", "abc", "--session-id", "sid"]
+        );
+        // An empty session id is guarded — no `--session-id` flag emitted.
+        assert_eq!(
+            prompt_argv("b", "abc", Some("")),
+            ["b", "prompt", "--slug", "abc"]
+        );
     }
 
     // ---- exit-code mapping ----
