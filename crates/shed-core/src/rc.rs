@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::models::{clean_display, opt_trimmed};
 use crate::terminal::{shell_quote, ssh_host_key_opts};
 
 /// Fallback workdir for a legacy/unmanaged session whose DTO omits one (the
@@ -663,6 +664,133 @@ pub fn decode_list_response(stdout: &str) -> Result<RcSessionListDto, RcError> {
         .map_err(|_| RcError::Failed("shed-ext-rc returned an invalid session list".to_string()))
 }
 
+// ---- rc hub messages feed ----
+//
+// The codex message feed served by the rc hub through the server proxy
+// (`GET /api/sheds/{name}/rc/v1/sessions/{slug}/messages`,
+// `internal/api/rchub.go:280-375`). Mirrors the guest's `feedMessage` /
+// `hubMessagesResponse` (`internal/ext/rc/hub_messages.go:44-201`,
+// handler `hub.go:332-385`) and mobile's decoder (`rc_feed.dart`): each
+// message is already hub-sanitized (ANSI/control-stripped, per-field capped),
+// so a client renders it as plain text. The one client-side addition: Unicode
+// format characters (category Cf — bidi overrides like U+202E) are stripped
+// from display text at decode via [`strip_format_chars`], because the hub's
+// sanitizer covers ANSI + C0/C1 controls but not Cf.
+//
+// Tolerant field readers: Dart's feed `_str`/`_text` (`rc_feed.dart:85-98`)
+// are byte-identical to `rc_models.dart`'s `_str`/`_cleanDisplay`, so this
+// section reuses [`crate::models::opt_trimmed`] / [`crate::models::clean_display`]
+// rather than re-declaring them.
+
+/// Dart's feed `_int` (`rc_feed.dart:83`), narrowed to the wire's non-negative
+/// seq: an integer as-is, another number truncated (negatives saturate to 0),
+/// anything else `0`. NOT shared with `models.rs`'s `int_or_zero` — that one
+/// mirrors a signed Dart `_int` and keeps negatives.
+fn feed_u64(v: Option<&serde_json::Value>) -> u64 {
+    v.and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+        .unwrap_or(0)
+}
+
+/// One tool call/result block on a feed message: a name plus a compact detail
+/// (invocation args for a `tool_use`, output for a `tool_result`). Both are
+/// hub-sanitized AND Cf-stripped here; either may be absent. Mirrors mobile's
+/// `RcFeedTool` (`rc_feed.dart:16-23`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcFeedTool {
+    pub name: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl RcFeedTool {
+    fn from_map(o: &serde_json::Map<String, serde_json::Value>) -> RcFeedTool {
+        RcFeedTool {
+            name: clean_display(o.get("name")),
+            detail: clean_display(o.get("detail")),
+        }
+    }
+}
+
+/// One normalized conversation message in the feed. `role` ∈ {user, assistant,
+/// tool, system}; `msg_type` (wire key `type`) ∈ {text, tool_use, tool_result,
+/// reasoning, status}. `seq` is monotonic per hub run (restarts from 1 on hub
+/// restart — a client that sees a seq lower than one it holds does a full
+/// refetch). Mirrors mobile's `RcFeedMessage` (`rc_feed.dart:29-58`); every
+/// field decodes tolerantly (wrong-typed → default/`None`, never an error).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcFeedMessage {
+    pub seq: u64,
+    /// RFC3339, verbatim (crate convention: timestamps are never parsed here).
+    pub ts: Option<String>,
+    pub role: String,
+    /// The wire's `type` field (renamed: `type` is a Rust keyword).
+    pub msg_type: String,
+    pub text: Option<String>,
+    pub tool: Option<RcFeedTool>,
+}
+
+impl RcFeedMessage {
+    fn from_map(o: &serde_json::Map<String, serde_json::Value>) -> RcFeedMessage {
+        RcFeedMessage {
+            seq: feed_u64(o.get("seq")),
+            ts: opt_trimmed(o.get("ts")),
+            role: opt_trimmed(o.get("role")).unwrap_or_default(),
+            msg_type: opt_trimmed(o.get("type")).unwrap_or_default(),
+            text: clean_display(o.get("text")),
+            // Only a map decodes; anything else is no tool block
+            // (`rc_feed.dart:54-56`).
+            tool: o
+                .get("tool")
+                .and_then(serde_json::Value::as_object)
+                .map(RcFeedTool::from_map),
+        }
+    }
+}
+
+/// A page of the feed: `GET …/messages?since=<seq>[&limit=<n>]`. `truncated`
+/// means the requested `since` cursor predates the ring (drop-oldest discarded
+/// unseen messages) OR points beyond the ring's current tail (the ring
+/// restarted) — in either case the client must refetch from the earliest
+/// retained message (`internal/ext/rc/hub_messages.go:129-140`). Mirrors
+/// mobile's `RcMessagesPage` (`rc_feed.dart:65-81`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcMessagesPage {
+    pub messages: Vec<RcFeedMessage>,
+    pub truncated: bool,
+}
+
+impl RcMessagesPage {
+    /// Tolerant decode; never fails. A non-object body, a missing/non-list
+    /// `messages` key → `[]`; only map elements decode to messages
+    /// (`rc_feed.dart:70-80`); `truncated` is `true` only when literally
+    /// boolean `true`.
+    pub fn from_value(v: &serde_json::Value) -> RcMessagesPage {
+        let Some(obj) = v.as_object() else {
+            return RcMessagesPage::default();
+        };
+        RcMessagesPage {
+            messages: obj
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(serde_json::Value::as_object)
+                        .map(RcFeedMessage::from_map)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            truncated: matches!(obj.get("truncated"), Some(serde_json::Value::Bool(true))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RcMessagesPage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(RcMessagesPage::from_value(&serde_json::Value::deserialize(
+            d,
+        )?))
+    }
+}
+
 // ---- SSH ----
 
 /// Build the **non-interactive** ssh argv that runs `remote_argv` on the target.
@@ -890,6 +1018,104 @@ mod tests {
         assert_eq!(strip_format_chars("\u{202E}"), "");
         // Non-Cf text passes through untouched (incl. non-ASCII).
         assert_eq!(strip_format_chars("héllo → wörld"), "héllo → wörld");
+    }
+
+    // ---- rc hub messages feed (ported from mobile's rc_feed_test.dart:9-67) ----
+
+    fn page(json: &str) -> RcMessagesPage {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn feed_page_decodes_mixed_text_and_tool_blocks() {
+        // rc_feed_test.dart:11-31.
+        let p = page(
+            r#"{
+              "messages": [
+                {"seq": 1, "ts": "2026-06-19T18:53:00Z", "role": "user", "type": "text", "text": "hi"},
+                {"seq": 2, "role": "assistant", "type": "reasoning", "text": "thinking"},
+                {"seq": 3, "role": "tool", "type": "tool_use",
+                 "tool": {"name": "shell", "detail": "ls -la"}}
+              ],
+              "truncated": false
+            }"#,
+        );
+        assert_eq!(p.messages.len(), 3);
+        assert!(!p.truncated);
+        assert_eq!(p.messages[0].role, "user");
+        assert_eq!(p.messages[0].text.as_deref(), Some("hi"));
+        assert_eq!(p.messages[0].ts.as_deref(), Some("2026-06-19T18:53:00Z"));
+        assert_eq!(p.messages[1].msg_type, "reasoning");
+        let tool = p.messages[2].tool.as_ref().unwrap();
+        assert_eq!(tool.name.as_deref(), Some("shell"));
+        assert_eq!(tool.detail.as_deref(), Some("ls -la"));
+        assert_eq!(p.messages[2].text, None);
+    }
+
+    #[test]
+    fn feed_page_truncated_flag_and_empty_list_not_null() {
+        // rc_feed_test.dart:33-37: [] decodes to an empty page, flag carried.
+        let p = page(r#"{"messages": [], "truncated": true}"#);
+        assert!(p.messages.is_empty());
+        assert!(p.truncated);
+        // truncated is true ONLY when literally boolean true.
+        let p = page(r#"{"messages": [], "truncated": "yes"}"#);
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn feed_page_tolerates_missing_messages_key_and_absent_fields() {
+        // rc_feed_test.dart:39-49.
+        let p = page(r#"{"truncated": false}"#);
+        assert!(p.messages.is_empty());
+        let one = page(r#"{"messages":[{"seq":5,"role":"system","type":"status"}]}"#);
+        assert_eq!(one.messages.len(), 1);
+        assert_eq!(one.messages[0].seq, 5);
+        assert_eq!(one.messages[0].ts, None);
+        assert_eq!(one.messages[0].text, None);
+        assert!(one.messages[0].tool.is_none());
+    }
+
+    #[test]
+    fn feed_page_skips_non_map_elements_and_wrong_types() {
+        // Only Map elements decode (rc_feed.dart:74-77); wrong-typed fields
+        // degrade per-field, never error.
+        let p = page(
+            r#"{"messages":[42,"nope",{"seq":"x","role":7,"type":null,"tool":"bad"}],
+                "truncated":null}"#,
+        );
+        assert_eq!(p.messages.len(), 1); // non-maps skipped
+        let m = &p.messages[0];
+        assert_eq!(m.seq, 0); // non-numeric → 0
+        assert_eq!(m.role, ""); // non-string → ""
+        assert_eq!(m.msg_type, "");
+        assert!(m.tool.is_none()); // non-map tool → None
+        assert!(!p.truncated); // null → false
+                               // A non-object body degrades to the empty page.
+        assert_eq!(
+            RcMessagesPage::from_value(&serde_json::json!([1, 2])),
+            RcMessagesPage::default()
+        );
+    }
+
+    #[test]
+    fn feed_page_strips_format_chars_from_text_and_tool_fields() {
+        // rc_feed_test.dart:51-65: the hub strips ANSI + C0/C1 controls but
+        // not category Cf — a U+202E (RLO) can visually reverse rendered
+        // text; U+200B hides content.
+        let p = page(
+            "{\"messages\":[{\"seq\":1,\"role\":\"assistant\",\"type\":\"text\",\
+              \"text\":\"safe\u{202E} EVIL\"},\
+             {\"seq\":2,\"role\":\"tool\",\"type\":\"tool_use\",\
+              \"tool\":{\"name\":\"sh\u{200B}ell\",\"detail\":\"rm\u{202E} x\"}}]}",
+        );
+        assert_eq!(p.messages[0].text.as_deref(), Some("safe EVIL"));
+        let tool = p.messages[1].tool.as_ref().unwrap();
+        assert_eq!(tool.name.as_deref(), Some("shell"));
+        assert_eq!(tool.detail.as_deref(), Some("rm x"));
+        // Cf-only text degrades to None.
+        let p = page("{\"messages\":[{\"seq\":1,\"role\":\"assistant\",\"type\":\"text\",\"text\":\"\u{202E}\"}]}");
+        assert_eq!(p.messages[0].text, None);
     }
 
     // ---- prompt normalization ----

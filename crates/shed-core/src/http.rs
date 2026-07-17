@@ -17,9 +17,10 @@ use futures_util::StreamExt;
 use thiserror::Error;
 
 use crate::models::{
-    CreateShedRequest, EgressProfileInfo, ImageList, ServerInfo, Shed, ShedImage, ShedList,
-    SystemDiskUsage,
+    CreateShedRequest, EgressProfileInfo, ImageList, Overview, ServerInfo, SessionsResponse, Shed,
+    ShedImage, ShedList, SystemDiskUsage,
 };
+use crate::rc::RcMessagesPage;
 use crate::sse::SseParser;
 use crate::token::{ControlTokenProvider, TokenMinter};
 
@@ -110,14 +111,58 @@ impl Client {
         }
     }
 
+    /// Build a request URL from literal path `segments` and `query` pairs.
+    /// Each segment is appended via the url crate's `path_segments_mut`, which
+    /// percent-encodes it as exactly ONE path segment (a `/` inside a value
+    /// becomes `%2F`, never a new segment), and bare `""`/`.`/`..` segments
+    /// are rejected outright (a `..` that survived to the wire would be
+    /// dot-normalized by the server's router into a DIFFERENT route — e.g. a
+    /// session-delete crossing into a shed-delete). Identifiers here are
+    /// server-vended (validated shed/session names, hub-generated slugs), but
+    /// the client enforces one-segment encoding anyway — defense in depth,
+    /// matching mobile's Dart client, which component-encodes every segment.
+    fn build_url(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<reqwest::Url, ShedError> {
+        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| {
+            ShedError::Config(format!("invalid base URL {}: {e}", self.base_url))
+        })?;
+        {
+            let mut parts = url.path_segments_mut().map_err(|_| {
+                ShedError::Config(format!(
+                    "base URL {} cannot carry a path",
+                    self.base_url
+                ))
+            })?;
+            parts.pop_if_empty(); // tolerate a trailing slash on base_url
+            for seg in segments {
+                if seg.is_empty() || *seg == "." || *seg == ".." {
+                    return Err(ShedError::Config(format!(
+                        "invalid URL path segment {seg:?}"
+                    )));
+                }
+                parts.push(seg);
+            }
+        }
+        for (k, v) in query {
+            url.query_pairs_mut().append_pair(k, v);
+        }
+        Ok(url)
+    }
+
     async fn send_once(
         &self,
         method: reqwest::Method,
-        path: &str,
+        url: &reqwest::Url,
         timeout: Duration,
+        body: Option<&serde_json::Value>,
     ) -> Result<Vec<u8>, ShedError> {
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let mut req = self.http.request(method, &url).timeout(timeout);
+        let mut req = self.http.request(method, url.clone()).timeout(timeout);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
         if let Some(tok) = self.bearer().await {
             req = req.bearer_auth(tok);
         }
@@ -138,44 +183,56 @@ impl Client {
 
     /// Send once, and on a provider-backed 401 invalidate + retry once
     /// (at-most-once, mirrors the SDK/CLI). Static/no-token clients don't retry.
+    /// `body`, when present, is a JSON request body (re-sent on the retry).
     async fn request(
         &self,
         method: reqwest::Method,
-        path: &str,
+        url: &reqwest::Url,
         timeout: Duration,
+        body: Option<&serde_json::Value>,
     ) -> Result<Vec<u8>, ShedError> {
-        match self.send_once(method.clone(), path, timeout).await {
+        match self.send_once(method.clone(), url, timeout, body).await {
             Err(ShedError::BadStatus(401)) if self.token_provider.is_some() => {
                 if let Some(p) = &self.token_provider {
                     p.invalidate().await;
                 }
-                self.send_once(method, path, timeout).await
+                self.send_once(method, url, timeout, body).await
             }
             other => other,
         }
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ShedError> {
+    /// GET the segment-built URL ([`Self::build_url`]) and decode JSON.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+    ) -> Result<T, ShedError> {
+        let url = self.build_url(segments, query)?;
         let bytes = self
-            .request(reqwest::Method::GET, path, GET_TIMEOUT)
+            .request(reqwest::Method::GET, &url, GET_TIMEOUT, None)
             .await?;
         serde_json::from_slice(&bytes).map_err(|e| ShedError::Decode(e.to_string()))
     }
 
-    /// A lifecycle mutation (POST/DELETE, no response body). 15s timeout.
-    async fn lifecycle(&self, method: reqwest::Method, path: &str) -> Result<(), ShedError> {
-        self.request(method, path, WRITE_TIMEOUT).await.map(|_| ())
+    /// A lifecycle mutation (POST/DELETE, no request body; any response body
+    /// ignored — success is any 2xx). 15s timeout.
+    async fn lifecycle(&self, method: reqwest::Method, segments: &[&str]) -> Result<(), ShedError> {
+        let url = self.build_url(segments, &[])?;
+        self.request(method, &url, WRITE_TIMEOUT, None)
+            .await
+            .map(|_| ())
     }
 
     /// `GET /api/info`.
     pub async fn info(&self) -> Result<ServerInfo, ShedError> {
-        self.get_json("/api/info").await
+        self.get_json(&["api", "info"], &[]).await
     }
 
     /// `GET /api/sheds` -> sheds stamped with this host's config name (the server
     /// omits `host`; the client stamps it, as Swift's `listSheds` does).
     pub async fn list_sheds(&self) -> Result<Vec<Shed>, ShedError> {
-        let list: ShedList = self.get_json("/api/sheds").await?;
+        let list: ShedList = self.get_json(&["api", "sheds"], &[]).await?;
         Ok(list
             .sheds
             .into_iter()
@@ -188,41 +245,145 @@ impl Client {
 
     /// `GET /api/system/df`.
     pub async fn system_df(&self) -> Result<SystemDiskUsage, ShedError> {
-        self.get_json("/api/system/df").await
+        self.get_json(&["api", "system", "df"], &[]).await
     }
 
     /// `GET /api/images`.
     pub async fn list_images(&self) -> Result<Vec<ShedImage>, ShedError> {
-        let list: ImageList = self.get_json("/api/images").await?;
+        let list: ImageList = self.get_json(&["api", "images"], &[]).await?;
         Ok(list.images)
     }
 
     /// `GET /api/egress/profiles`.
     pub async fn egress_profiles(&self) -> Result<Vec<EgressProfileInfo>, ShedError> {
-        self.get_json("/api/egress/profiles").await
+        self.get_json(&["api", "egress", "profiles"], &[]).await
+    }
+
+    // Path-building note: every method below hands `shed`/`session`/`slug`
+    // values to `build_url`, which percent-encodes each as exactly ONE path
+    // segment and rejects ""/"."/"..". The values are server-vended
+    // identifiers (validated shed/session names, hub-generated slugs), but
+    // the client enforces one-segment encoding anyway — defense in depth
+    // against a traversal like `delete_session(shed, "../../victim")`
+    // rewriting the route (mobile's Dart client component-encodes too).
+
+    /// `GET /api/overview` — the single-call host snapshot (server identity +
+    /// features, disk usage, every shed with its rc-enriched sessions and
+    /// capabilities; Go `internal/api/overview.go:38-63`). The decode is the
+    /// tolerant, never-failing [`Overview`] adapter.
+    ///
+    /// On an old server (pre-`overview`) the unrouted path falls through to
+    /// chi's default NotFound handler — a `text/plain` "404 page not found"
+    /// body that the server's ContentTypeJSON middleware has already labeled
+    /// `application/json`. That surfaces here as `BadStatus(404)`, never a
+    /// `Decode` error: the non-2xx check short-circuits before any body parse.
+    /// Don't feature-probe with this 404 — the reliable capability signal is
+    /// `ServerInfo::features` from the unauthenticated `/api/info` bootstrap
+    /// call ([`crate::models::FEATURE_OVERVIEW`]).
+    pub async fn overview(&self) -> Result<Overview, ShedError> {
+        self.get_json(&["api", "overview"], &[]).await
+    }
+
+    /// `GET /api/sheds/{shed}/sessions` — the shed's tmux sessions, rc-enriched
+    /// by default (Go `internal/api/handlers.go:592-610`; wire shapes
+    /// `internal/config/types.go:182-215, 287-291`). `warnings` carries
+    /// enrichment degradations (the rc rows then lack their `rc` block).
+    /// Errors are status-only per `mapSessionError`
+    /// (`handlers.go:765-786`): 404 unknown shed, 409 shed stopped, 503 tmux
+    /// unavailable.
+    pub async fn list_sessions(&self, shed: &str) -> Result<SessionsResponse, ShedError> {
+        self.get_json(&["api", "sheds", shed, "sessions"], &[]).await
+    }
+
+    /// `DELETE /api/sheds/{shed}/sessions/{session}` — kill one tmux session
+    /// (Go `internal/api/handlers.go:614-632`). The server replies 204; any
+    /// 2xx is success (consistent with the other lifecycle mutations). Errors
+    /// are status-only per `mapSessionError` (`handlers.go:765-786`): 400
+    /// invalid session name, 404 unknown session/shed, 409 shed stopped, 503
+    /// tmux unavailable.
+    pub async fn delete_session(&self, shed: &str, session: &str) -> Result<(), ShedError> {
+        self.lifecycle(
+            reqwest::Method::DELETE,
+            &["api", "sheds", shed, "sessions", session],
+        )
+        .await
+    }
+
+    /// `GET /api/sheds/{shed}/rc/v1/sessions/{slug}/messages?since=N[&limit=M]`
+    /// — one page of an RC session's message feed, reverse-proxied into the
+    /// guest's rc hub (proxy `internal/api/rchub.go:280-375`; hub handler
+    /// `internal/ext/rc/hub.go:332-385`). `since` is the exclusive seq cursor
+    /// (0 = from the start); `limit` defaults to 100 server-side (capped at
+    /// 200) when `None`. Decode is the tolerant [`RcMessagesPage`].
+    ///
+    /// Errors are status-only (plan §3.2 — the hub's flat `{code,message}`
+    /// bodies are deliberately not decoded): 400 malformed since/limit, 404
+    /// unknown slug/shed, 503 shed not running / hub unavailable, 502 proxy
+    /// failed / oversized upstream body.
+    pub async fn rc_messages(
+        &self,
+        shed: &str,
+        slug: &str,
+        since: u64,
+        limit: Option<u32>,
+    ) -> Result<RcMessagesPage, ShedError> {
+        let mut query = vec![("since", since.to_string())];
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        self.get_json(
+            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "messages"],
+            &query,
+        )
+        .await
+    }
+
+    /// `POST /api/sheds/{shed}/rc/v1/sessions/{slug}/input` with
+    /// `{"text": …}` — deliver a line of feed input to a gated RC session
+    /// (proxy `internal/api/rchub.go:280-375`; hub handler
+    /// `internal/ext/rc/hub.go:391-521`). Success is any 2xx; the 200 body
+    /// (`{"delivered":true}`) is ignored. Goes through the standard `request`
+    /// pipeline (WRITE_TIMEOUT, provider-backed 401 → invalidate +
+    /// retry-once, body re-sent).
+    ///
+    /// Errors are status-only (plan §3.2 — hub `{code,message}` bodies not
+    /// decoded; `BadStatus` carries the status): 400 invalid/unsafe text, 404
+    /// unknown slug/shed, 409 not accepting (`not_accepting` — wrong
+    /// activity, recreated identity, or a non-input-gated kind), 413 body too
+    /// large (`too_large`, >16 KiB), 503 shed not running / hub unavailable,
+    /// 502 proxy failed.
+    pub async fn rc_input(&self, shed: &str, slug: &str, text: &str) -> Result<(), ShedError> {
+        let body = serde_json::json!({ "text": text });
+        let url = self.build_url(
+            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "input"],
+            &[],
+        )?;
+        self.request(reqwest::Method::POST, &url, WRITE_TIMEOUT, Some(&body))
+            .await
+            .map(|_| ())
     }
 
     /// `POST /api/sheds/{name}/start`.
     pub async fn start(&self, name: &str) -> Result<(), ShedError> {
-        self.lifecycle(reqwest::Method::POST, &format!("/api/sheds/{name}/start"))
+        self.lifecycle(reqwest::Method::POST, &["api", "sheds", name, "start"])
             .await
     }
 
     /// `POST /api/sheds/{name}/stop`.
     pub async fn stop(&self, name: &str) -> Result<(), ShedError> {
-        self.lifecycle(reqwest::Method::POST, &format!("/api/sheds/{name}/stop"))
+        self.lifecycle(reqwest::Method::POST, &["api", "sheds", name, "stop"])
             .await
     }
 
     /// `POST /api/sheds/{name}/reset`.
     pub async fn reset(&self, name: &str) -> Result<(), ShedError> {
-        self.lifecycle(reqwest::Method::POST, &format!("/api/sheds/{name}/reset"))
+        self.lifecycle(reqwest::Method::POST, &["api", "sheds", name, "reset"])
             .await
     }
 
     /// `DELETE /api/sheds/{name}`.
     pub async fn delete(&self, name: &str) -> Result<(), ShedError> {
-        self.lifecycle(reqwest::Method::DELETE, &format!("/api/sheds/{name}"))
+        self.lifecycle(reqwest::Method::DELETE, &["api", "sheds", name])
             .await
     }
 
@@ -243,10 +404,10 @@ impl Client {
         req: &CreateShedRequest,
         sink: &dyn CreateSink,
     ) -> Result<(), ShedError> {
-        let url = format!("{}/api/sheds", self.base_url.trim_end_matches('/'));
+        let url = self.build_url(&["api", "sheds"], &[])?;
         let mut rb = self
             .http
-            .post(&url)
+            .post(url)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(req);
         if let Some(tok) = self.bearer().await {
@@ -829,5 +990,385 @@ mod tests {
             2,
             "401 on create must invalidate so the next bearer remints"
         );
+    }
+
+    // ---- overview (fetchOverview cases ported from mobile's
+    // overview_test.dart:119-134) ----
+
+    #[tokio::test]
+    async fn overview_decodes_golden_200() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/overview");
+                t.status(200)
+                    .header("content-type", "application/json")
+                    .body(include_str!("../../fixtures/overview.json"));
+            })
+            .await;
+        let o = client(&server).overview().await.unwrap();
+        assert_eq!(o.sheds.len(), 2);
+        assert_eq!(o.server.version, "0.8.0");
+    }
+
+    #[tokio::test]
+    async fn overview_404_old_server_is_bad_status_never_decode() {
+        // AC#9: an old server has no /api/overview route — chi's default
+        // NotFound handler writes a text/plain "404 page not found" body, but
+        // the server's ContentTypeJSON middleware has ALREADY stamped
+        // Content-Type: application/json on the response. The client must
+        // surface BadStatus(404) (the provider maps it to "unsupported"), and
+        // must never try to decode the mislabeled non-JSON body.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/overview");
+                t.status(404)
+                    .header("content-type", "application/json")
+                    .body("404 page not found");
+            })
+            .await;
+        let err = client(&server).overview().await.unwrap_err();
+        assert!(matches!(err, ShedError::BadStatus(404)), "got {err:?}");
+    }
+
+    // ---- sessions read-plane ----
+
+    #[tokio::test]
+    async fn list_sessions_decodes_rc_enriched_and_plain_rows() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds/proj/sessions");
+                t.status(200).body(
+                    r#"{"sessions":[
+                        {"name":"default","shed_name":"proj",
+                         "created_at":"2026-06-19T18:52:00Z","attached":true},
+                        {"name":"rc-abc234","shed_name":"proj",
+                         "created_at":"2026-06-19T18:53:00Z","attached":false,
+                         "rc":{"kind":"claude-rc","state":"ready","managed":true,
+                               "activity":"working",
+                               "last_message":"Running the test suite now."}}
+                    ],"warnings":null}"#,
+                );
+            })
+            .await;
+        let r = client(&server).list_sessions("proj").await.unwrap();
+        assert_eq!(r.sessions.len(), 2);
+        assert!(r.warnings.is_empty()); // null → []
+        assert!(r.sessions[0].rc.is_none()); // plain tmux row
+        let rc = r.sessions[1].rc.as_ref().unwrap();
+        assert_eq!(rc.kind.as_deref(), Some("claude-rc"));
+        assert!(rc.managed);
+        assert_eq!(rc.activity.as_deref(), Some("working"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_warnings_present_and_error_map() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds/degraded/sessions");
+                t.status(200).body(
+                    r#"{"sessions":[{"name":"rc-x","shed_name":"degraded",
+                                     "created_at":"2026-01-01T00:00:00Z","attached":false}],
+                        "warnings":["degraded: rc enrichment degraded"]}"#,
+                );
+            })
+            .await;
+        let r = client(&server).list_sessions("degraded").await.unwrap();
+        assert_eq!(r.warnings, ["degraded: rc enrichment degraded"]);
+        assert!(r.sessions[0].rc.is_none()); // enrichment degraded → no rc block
+                                             // Unknown shed → status-only 404 (mapSessionError).
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/sheds/missing/sessions");
+                t.status(404);
+            })
+            .await;
+        assert!(matches!(
+            client(&server).list_sessions("missing").await,
+            Err(ShedError::BadStatus(404))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_session_204_ok_and_404_maps() {
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(DELETE).path("/api/sheds/proj/sessions/rc-abc234");
+                t.status(204); // the server's success shape (handlers.go:631)
+            })
+            .await;
+        client(&server)
+            .delete_session("proj", "rc-abc234")
+            .await
+            .unwrap();
+        m.assert_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(DELETE).path("/api/sheds/proj/sessions/nope");
+                t.status(404);
+            })
+            .await;
+        assert!(matches!(
+            client(&server).delete_session("proj", "nope").await,
+            Err(ShedError::BadStatus(404))
+        ));
+    }
+
+    // ---- rc proxy: messages + input ----
+
+    #[tokio::test]
+    async fn rc_messages_happy_path_with_query_params() {
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds/proj/rc/v1/sessions/abc234/messages")
+                    .query_param("since", "7")
+                    .query_param("limit", "50");
+                t.status(200).body(
+                    r#"{"messages":[
+                        {"seq":8,"ts":"2026-06-19T18:53:00Z","role":"user","type":"text","text":"hi"},
+                        {"seq":9,"role":"tool","type":"tool_use",
+                         "tool":{"name":"shell","detail":"ls -la"}}
+                    ],"truncated":false}"#,
+                );
+            })
+            .await;
+        let p = client(&server)
+            .rc_messages("proj", "abc234", 7, Some(50))
+            .await
+            .unwrap();
+        m.assert_async().await;
+        assert_eq!(p.messages.len(), 2);
+        assert!(!p.truncated);
+        assert_eq!(p.messages[0].seq, 8);
+        assert_eq!(
+            p.messages[1].tool.as_ref().unwrap().name.as_deref(),
+            Some("shell")
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_messages_omits_limit_when_none() {
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds/proj/rc/v1/sessions/abc234/messages")
+                    .query_param("since", "0")
+                    // The server defaults limit (100, cap 200) — the client
+                    // must not send one.
+                    .matches(|req| {
+                        !req.query_params
+                            .as_ref()
+                            .is_some_and(|q| q.iter().any(|(k, _)| k == "limit"))
+                    });
+                t.status(200).body(r#"{"messages":[],"truncated":true}"#);
+            })
+            .await;
+        let p = client(&server)
+            .rc_messages("proj", "abc234", 0, None)
+            .await
+            .unwrap();
+        m.assert_async().await;
+        assert!(p.messages.is_empty());
+        assert!(p.truncated);
+    }
+
+    #[tokio::test]
+    async fn rc_messages_tolerates_missing_keys_and_maps_errors() {
+        let server = MockServer::start_async().await;
+        // A body with no messages key decodes to the empty page (tolerant).
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds/proj/rc/v1/sessions/sparse/messages");
+                t.status(200).body(r#"{"truncated":false}"#);
+            })
+            .await;
+        let p = client(&server)
+            .rc_messages("proj", "sparse", 0, None)
+            .await
+            .unwrap();
+        assert!(p.messages.is_empty());
+        assert!(!p.truncated);
+        // Unknown slug → status-only 404 (hub `{code,message}` body ignored).
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/sheds/proj/rc/v1/sessions/nope/messages");
+                t.status(404)
+                    .body(r#"{"code":"unknown_slug","message":"no such rc session"}"#);
+            })
+            .await;
+        assert!(matches!(
+            client(&server).rc_messages("proj", "nope", 0, None).await,
+            Err(ShedError::BadStatus(404))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rc_input_posts_json_body_and_ignores_delivered_body() {
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/proj/rc/v1/sessions/abc234/input")
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({"text": "looks good, continue"}));
+                t.status(200).body(r#"{"delivered":true}"#);
+            })
+            .await;
+        client(&server)
+            .rc_input("proj", "abc234", "looks good, continue")
+            .await
+            .unwrap();
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rc_input_status_code_errors_are_bad_status() {
+        // Status-only dispatch (plan §3.2): the hub's flat {code,message}
+        // bodies (hub.go:404-521) are NOT decoded; BadStatus carries the
+        // status the caller keys off.
+        let server = MockServer::start_async().await;
+        for (slug, status, body) in [
+            (
+                "busy",
+                409,
+                r#"{"code":"not_accepting","message":"session is not waiting for input"}"#,
+            ),
+            (
+                "big",
+                413,
+                r#"{"code":"too_large","message":"input body exceeds 16 KiB"}"#,
+            ),
+            (
+                "gone",
+                404,
+                r#"{"code":"unknown_slug","message":"no such rc session"}"#,
+            ),
+        ] {
+            server
+                .mock_async(|w, t| {
+                    w.method(POST)
+                        .path(format!("/api/sheds/proj/rc/v1/sessions/{slug}/input"));
+                    t.status(status).body(body);
+                })
+                .await;
+            let err = client(&server)
+                .rc_input("proj", slug, "x")
+                .await
+                .unwrap_err();
+            match err {
+                ShedError::BadStatus(s) => assert_eq!(s, status),
+                other => panic!("expected BadStatus({status}), got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_input_retries_once_on_401_resending_body() {
+        // Same 401 → invalidate + retry-once contract as every request()
+        // path; the JSON body must be re-sent on the retried attempt.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/proj/rc/v1/sessions/abc234/input")
+                    .header("authorization", "Bearer tok-1");
+                t.status(401);
+            })
+            .await;
+        let ok = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/proj/rc/v1/sessions/abc234/input")
+                    .header("authorization", "Bearer tok-2")
+                    .json_body(serde_json::json!({"text": "hi"}));
+                t.status(200).body(r#"{"delivered":true}"#);
+            })
+            .await;
+        let minter = Arc::new(SeqMinter {
+            calls: AtomicUsize::new(0),
+        });
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter),
+        )
+        .unwrap();
+        c.rc_input("proj", "abc234", "hi").await.unwrap();
+        ok.assert_async().await;
+    }
+
+    // ---- URL path-segment safety (build_url defense in depth) ----
+
+    #[tokio::test]
+    async fn delete_session_traversal_is_encoded_as_one_segment() {
+        // A malicious/corrupt session name must never rewrite the route: with
+        // naive string interpolation, `../../victim` would dot-normalize into
+        // DELETE /api/sheds/victim — a session-delete crossing into a
+        // shed-delete. build_url percent-encodes the value as ONE segment.
+        let server = MockServer::start_async().await;
+        let victim = server
+            .mock_async(|w, t| {
+                w.method(DELETE).path("/api/sheds/victim");
+                t.status(200);
+            })
+            .await;
+        let encoded = server
+            .mock_async(|w, t| {
+                w.method(DELETE)
+                    .path("/api/sheds/proj/sessions/..%2F..%2Fvictim");
+                t.status(204);
+            })
+            .await;
+        client(&server)
+            .delete_session("proj", "../../victim")
+            .await
+            .unwrap();
+        encoded.assert_async().await; // the encoded single segment was sent
+        assert_eq!(victim.hits_async().await, 0, "traversal must not escape");
+    }
+
+    #[tokio::test]
+    async fn rc_input_slug_with_slash_stays_one_segment() {
+        // A '/' inside a (remote-influenced) slug is %2F, never a new segment.
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/proj/rc/v1/sessions/a%2Fb/input")
+                    .json_body(serde_json::json!({"text": "hi"}));
+                t.status(200).body(r#"{"delivered":true}"#);
+            })
+            .await;
+        client(&server).rc_input("proj", "a/b", "hi").await.unwrap();
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn bare_dot_and_empty_segments_are_rejected_client_side() {
+        // ""/"."/".." can't be neutralized by encoding alone (a raw ".." that
+        // reached the wire would be dot-normalized by the server's router into
+        // a different route) — build_url refuses them outright.
+        let c = Client::new("http://x".into(), "s".into(), String::new(), None, None).unwrap();
+        assert!(matches!(c.delete("..").await, Err(ShedError::Config(_))));
+        assert!(matches!(
+            c.delete_session("proj", ".").await,
+            Err(ShedError::Config(_))
+        ));
+        assert!(matches!(c.list_sessions("").await, Err(ShedError::Config(_))));
+        assert!(matches!(
+            c.rc_messages("proj", "..", 0, None).await,
+            Err(ShedError::Config(_))
+        ));
     }
 }

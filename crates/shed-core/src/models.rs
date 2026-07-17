@@ -226,6 +226,83 @@ pub struct CreateShedRequest {
     pub no_provision: Option<bool>,
 }
 
+// ---- sessions read-plane (GET /api/sheds/{name}/sessions) ------------------
+
+/// One tmux session row from `GET /api/sheds/{name}/sessions` (and
+/// `GET /api/sessions`). Wire shape: Go `config.Session`
+/// (`internal/config/types.go:182-197`). Serde-derive like the other read
+/// DTOs — strict field types with defensive defaults where the Go side is
+/// `omitempty` (and on `created_at`, which Go always emits but we keep
+/// `Option` per crate convention: timestamps are carried VERBATIM as strings,
+/// never parsed on the decode path).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Session {
+    /// The tmux session name (`rc-<slug>` for RC sessions).
+    pub name: String,
+    /// The owning shed. Not `omitempty` in Go, but defaulted here so a
+    /// malformed row degrades a field instead of the whole page.
+    #[serde(default)]
+    pub shed_name: String,
+    /// Stamped only by the CLI's cross-server aggregation; the HTTP handlers
+    /// leave it empty (`omitempty` → absent).
+    pub server_name: Option<String>,
+    /// RFC3339, verbatim. Go marshals `time.Time` unconditionally (never
+    /// `omitempty`), so it is always present on the wire — `Option` is
+    /// defensiveness, not an expected absence.
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub attached: bool,
+    /// `omitempty` → absent when 0.
+    #[serde(default)]
+    pub window_count: i64,
+    /// RC Session Convention metadata for `rc-*` rows, populated by the
+    /// server's enrichment leg (`internal/api/rcenrich.go`). `None` for plain
+    /// tmux sessions and for rc rows on a shed whose enrichment degraded (a
+    /// `warnings` entry is added in that case).
+    pub rc: Option<SessionRC>,
+}
+
+/// The RC display subset inside a [`Session`] row. Wire shape: Go
+/// `config.SessionRC` (`internal/config/types.go:199-215`) — every field but
+/// `managed` is `omitempty`. `kind`/`state`/`activity` stay raw wire strings
+/// here (this is the read-plane row, not the enriched [`crate::rc::RcSession`]
+/// model — the overview adapter owns that mapping).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionRC {
+    pub kind: Option<String>,
+    pub state: Option<String>,
+    /// The only non-`omitempty` Go field; still defaulted (defensive per crate
+    /// style). `false` for legacy/unmanaged rc-* sessions.
+    #[serde(default)]
+    pub managed: bool,
+    pub display_name: Option<String>,
+    pub url: Option<String>,
+    pub created_by: Option<String>,
+    /// Live-activity dimension (`working|needs_input|idle|unknown`), absent
+    /// when no hub is running / the kind is unsupported / a blocking state
+    /// suppresses it.
+    pub activity: Option<String>,
+    /// RFC3339, verbatim; absent with `activity`.
+    pub activity_at: Option<String>,
+    /// Hub-sanitized ≤200-rune preview. NOTE: sanitized for ANSI/C0C1 only —
+    /// a renderer should still pass it through
+    /// [`crate::rc::strip_format_chars`] before display (the enriched paths
+    /// do this at decode; this raw row does not).
+    pub last_message: Option<String>,
+}
+
+/// The `GET /api/sheds/{name}/sessions` envelope (Go
+/// `config.SessionsResponse`, `internal/config/types.go:287-291`).
+/// `warnings` carries per-shed RC-enrichment degradations (`omitempty`);
+/// null/absent lists decode to `[]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionsResponse {
+    #[serde(default, deserialize_with = "null_default")]
+    pub sessions: Vec<Session>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub warnings: Vec<String>,
+}
+
 // ---- GET /api/overview single-call host snapshot ---------------------------
 
 /// Server feature token for the `GET /api/overview` endpoint itself. The
@@ -263,16 +340,19 @@ fn non_empty_str(v: Option<&Value>) -> Option<&str> {
 }
 
 /// [`non_empty_str`], owned (the Dart `_str` used for the session's optional
-/// string fields).
-fn opt_trimmed(v: Option<&Value>) -> Option<String> {
+/// string fields; `rc_feed.dart:85-89` carries a byte-identical `_str`, so
+/// the feed decoders in [`crate::rc`] share this helper).
+pub(crate) fn opt_trimmed(v: Option<&Value>) -> Option<String> {
     non_empty_str(v).map(str::to_string)
 }
 
 /// Dart `_cleanDisplay` (`rc_models.dart:284-290`): [`opt_trimmed`] plus a
 /// strip of Unicode format characters (category Cf) — for guest-controlled
 /// display text that could carry bidi-override spoofers. A value that is ONLY
-/// format characters degrades to `None`.
-fn clean_display(v: Option<&Value>) -> Option<String> {
+/// format characters degrades to `None`. `rc_feed.dart:93-98` carries a
+/// byte-identical `_text`, so the feed decoders in [`crate::rc`] share this
+/// helper too.
+pub(crate) fn clean_display(v: Option<&Value>) -> Option<String> {
     let stripped = strip_format_chars(non_empty_str(v)?);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
@@ -839,6 +919,88 @@ mod tests {
         );
         assert_eq!(profiles[1].source, "user");
         assert_eq!(profiles[1].profile.mode, None); // omitted
+    }
+
+    // ---- sessions read-plane ----
+
+    #[test]
+    fn sessions_response_rc_enriched_and_plain_rows() {
+        // One plain tmux row (no rc block, omitempty fields absent) + one
+        // rc-enriched row carrying the Phase C activity fields.
+        let r: SessionsResponse = serde_json::from_str(
+            r#"{"sessions":[
+                {"name":"default","shed_name":"proj",
+                 "created_at":"2026-06-19T18:52:00Z","attached":true},
+                {"name":"rc-abc234","shed_name":"proj",
+                 "created_at":"2026-06-19T18:53:00Z","attached":false,
+                 "window_count":2,
+                 "rc":{"kind":"claude-rc","state":"ready","managed":true,
+                       "display_name":"proj/abc234",
+                       "url":"https://claude.ai/code/session_abc234",
+                       "created_by":"shed-mobile/1.0",
+                       "activity":"working",
+                       "activity_at":"2026-06-19T18:54:12Z",
+                       "last_message":"Running the test suite now."}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.sessions.len(), 2);
+        assert!(r.warnings.is_empty()); // absent → []
+        let plain = &r.sessions[0];
+        assert_eq!(plain.name, "default");
+        assert_eq!(plain.shed_name, "proj");
+        assert!(plain.attached);
+        assert_eq!(plain.window_count, 0); // omitempty absent → 0
+        assert_eq!(plain.server_name, None); // HTTP handlers leave it empty
+        assert!(plain.rc.is_none());
+        let rc_row = &r.sessions[1];
+        assert_eq!(rc_row.window_count, 2);
+        assert_eq!(rc_row.created_at.as_deref(), Some("2026-06-19T18:53:00Z"));
+        let rc = rc_row.rc.as_ref().unwrap();
+        assert_eq!(rc.kind.as_deref(), Some("claude-rc"));
+        assert_eq!(rc.state.as_deref(), Some("ready"));
+        assert!(rc.managed);
+        assert_eq!(rc.display_name.as_deref(), Some("proj/abc234"));
+        assert_eq!(rc.activity.as_deref(), Some("working"));
+        assert_eq!(rc.activity_at.as_deref(), Some("2026-06-19T18:54:12Z"));
+        assert_eq!(
+            rc.last_message.as_deref(),
+            Some("Running the test suite now.")
+        );
+    }
+
+    #[test]
+    fn sessions_response_null_and_absent_lists() {
+        let r: SessionsResponse =
+            serde_json::from_str(r#"{"sessions":null,"warnings":null}"#).unwrap();
+        assert!(r.sessions.is_empty());
+        assert!(r.warnings.is_empty());
+        let r: SessionsResponse = serde_json::from_str("{}").unwrap();
+        assert!(r.sessions.is_empty());
+        // A degraded shed: rc rows WITHOUT an rc block + a warnings entry.
+        let r: SessionsResponse = serde_json::from_str(
+            r#"{"sessions":[{"name":"rc-abc","shed_name":"proj",
+                             "created_at":"2026-01-01T00:00:00Z","attached":false}],
+                "warnings":["proj: rc enrichment degraded"]}"#,
+        )
+        .unwrap();
+        assert!(r.sessions[0].rc.is_none());
+        assert_eq!(r.warnings, ["proj: rc enrichment degraded"]);
+    }
+
+    #[test]
+    fn session_rc_sparse_block_defaults() {
+        // A legacy/unmanaged rc row: bare block → every optional None,
+        // managed false (the only non-omitempty Go field, still defensive).
+        let s: Session =
+            serde_json::from_str(r#"{"name":"rc-old","shed_name":"p","rc":{}}"#).unwrap();
+        let rc = s.rc.as_ref().unwrap();
+        assert_eq!(rc.kind, None);
+        assert_eq!(rc.state, None);
+        assert!(!rc.managed);
+        assert_eq!(rc.activity, None);
+        assert_eq!(rc.last_message, None);
+        assert_eq!(s.created_at, None); // defensive, though Go always emits it
     }
 
     // ---- overview (golden fixture; assertions ported from mobile's
