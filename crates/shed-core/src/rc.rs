@@ -168,6 +168,20 @@ impl RcState {
             _ => RcState::Starting, // incl. "starting" and any future value
         }
     }
+
+    /// Whether this lifecycle state permits showing the live activity
+    /// dimension. The server already drops activity for a blocking state
+    /// (needs-trust / needs-auth / dead — lifecycle trumps activity); the
+    /// client mirrors that gate so it never invents — or leaves on screen — an
+    /// activity or last-message a blocking state should hide. Mirrors mobile's
+    /// `rcStatePermitsActivity` (`rc_models.dart:154-157`); consumed by the
+    /// [`crate::rc_events`] fold's suppression rule.
+    pub fn permits_activity(&self) -> bool {
+        !matches!(
+            self,
+            RcState::NeedsTrust | RcState::NeedsAuth | RcState::Dead
+        )
+    }
 }
 
 /// A session's live *work* dimension, orthogonal to the lifecycle [`RcState`].
@@ -1512,6 +1526,18 @@ mod tests {
         assert_eq!(RcState::from_wire("starting"), RcState::Starting);
         assert_eq!(RcState::from_wire("some-future-state"), RcState::Starting);
         assert_eq!(RcState::from_wire(""), RcState::Starting);
+    }
+
+    #[test]
+    fn rc_state_permits_activity_blocks_gating_states() {
+        // Blocking states (lifecycle trumps activity) — rc_models.dart:154-157.
+        assert!(!RcState::NeedsTrust.permits_activity());
+        assert!(!RcState::NeedsAuth.permits_activity());
+        assert!(!RcState::Dead.permits_activity());
+        // Everything else permits the live activity dimension.
+        assert!(RcState::Starting.permits_activity());
+        assert!(RcState::Ready.permits_activity());
+        assert!(RcState::Reconnecting.permits_activity());
     }
 
     #[test]

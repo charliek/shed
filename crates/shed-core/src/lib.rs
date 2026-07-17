@@ -10,6 +10,7 @@ pub mod create;
 pub mod http;
 pub mod models;
 pub mod rc;
+pub mod rc_events;
 pub mod sse;
 pub mod terminal;
 pub mod tls;
