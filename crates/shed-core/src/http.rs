@@ -7,8 +7,11 @@
 //! Parity with Swift's `ShedServerClient`: an 8s GET timeout, an explicit
 //! User-Agent, an https-only redirect policy, leaf-cert pinning (fail-closed on
 //! a non-https URL), a control-token bearer with a 401 → invalidate + retry-once
-//! (provider-backed only), and `ShedError` matching `ShedClientError`.
-//! Lifecycle + SSE create land in M4.
+//! (provider-backed only; the invalidate is the stale-401-guarded
+//! `invalidate_if_current` on the token actually SENT, and the retry is
+//! skipped when the re-mint returns the same rejected token — plan 001 §3.4),
+//! and `ShedError` matching `ShedClientError`. Lifecycle + SSE create land in
+//! M4.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +108,40 @@ impl Client {
         pin: Option<String>,
         minter: Option<Arc<dyn TokenMinter>>,
     ) -> Result<Self, ShedError> {
+        let token_provider =
+            minter.map(|m| Arc::new(ControlTokenProvider::new(server_name.clone(), m)));
+        Self::build(base_url, server_name, token, pin, token_provider)
+    }
+
+    /// Like [`Self::new`] but with a caller-tuned [`ControlTokenProvider`]
+    /// (plan 001 §3.4 Client plumbing): Phase B builds a provider with its
+    /// jitter/cooldown/seed/window knobs and hands it over; `new` keeps
+    /// constructing the default-knobbed provider from a bare minter.
+    /// Provider-backed by definition, so there is no static-token parameter.
+    ///
+    /// A `Client`+provider pair is immutable per transport identity — the
+    /// Dart provider's identity binding is deliberately NOT ported (§3.4):
+    /// the app layer constructs a NEW `Client` (and provider) when the
+    /// host/port/pin changes, deleting the identity-race class instead of
+    /// managing it (a Phase B invariant).
+    pub fn with_provider(
+        base_url: String,
+        server_name: String,
+        pin: Option<String>,
+        provider: Arc<ControlTokenProvider>,
+    ) -> Result<Self, ShedError> {
+        Self::build(base_url, server_name, String::new(), pin, Some(provider))
+    }
+
+    /// Shared tail of the constructors: pin validation (fail-closed on a
+    /// non-https URL) + the reqwest client build.
+    fn build(
+        base_url: String,
+        server_name: String,
+        token: String,
+        pin: Option<String>,
+        token_provider: Option<Arc<ControlTokenProvider>>,
+    ) -> Result<Self, ShedError> {
         let pin = pin.filter(|p| !p.is_empty());
         if pin.is_some() && !base_url.to_lowercase().starts_with("https://") {
             return Err(ShedError::Config(format!(
@@ -112,8 +149,6 @@ impl Client {
             )));
         }
         let http = build_http_client(pin.as_deref())?;
-        let token_provider =
-            minter.map(|m| Arc::new(ControlTokenProvider::new(server_name.clone(), m)));
         Ok(Self {
             base_url,
             server_name,
@@ -134,6 +169,28 @@ impl Client {
         } else {
             None
         }
+    }
+
+    /// 401 aftermath, shared by [`Self::request`], [`Self::create_stream`],
+    /// and [`Self::rc_events`]: drop the provider's cache for the token
+    /// actually SENT (`invalidate_if_current` — the stale-401 guard: a 401
+    /// racing a rotation must not erase the newer token; plan 001 §3.4),
+    /// BOUNDED by `bound`: invalidate only contends on the provider mutex,
+    /// but that mutex is held across a mint by design, so a concurrent
+    /// wedged mint could otherwise pin the await forever. Returns `false`
+    /// when the bound elapsed — the caller then surfaces the original 401
+    /// without retrying (the cache keeps the stale token one extra cycle and
+    /// the next 401 retries the invalidate). No-op `true` for provider-less
+    /// clients or when no token was sent. Retry policy stays with each
+    /// caller (request retries once; the streams don't — their watchers own
+    /// re-auth).
+    async fn invalidate_sent(&self, sent: Option<&str>, bound: Duration) -> bool {
+        let (Some(p), Some(tok)) = (&self.token_provider, sent) else {
+            return true;
+        };
+        tokio::time::timeout(bound, p.invalidate_if_current(tok))
+            .await
+            .is_ok()
     }
 
     /// Build a request URL from literal path `segments` and `query` pairs.
@@ -177,18 +234,22 @@ impl Client {
         Ok(url)
     }
 
+    /// One attempt with `bearer` (resolved by the CALLER — [`Self::request`]
+    /// resolves it per attempt so the 401 path knows exactly which token was
+    /// sent and can `invalidate_if_current` it; plan 001 §3.4).
     async fn send_once(
         &self,
         method: reqwest::Method,
         url: &reqwest::Url,
         timeout: Duration,
         body: Option<&serde_json::Value>,
+        bearer: Option<&str>,
     ) -> Result<Vec<u8>, ShedError> {
         let mut req = self.http.request(method, url.clone()).timeout(timeout);
         if let Some(b) = body {
             req = req.json(b);
         }
-        if let Some(tok) = self.bearer().await {
+        if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
         let resp = req
@@ -206,9 +267,26 @@ impl Client {
             .to_vec())
     }
 
-    /// Send once, and on a provider-backed 401 invalidate + retry once
-    /// (at-most-once, mirrors the SDK/CLI). Static/no-token clients don't retry.
-    /// `body`, when present, is a JSON request body (re-sent on the retry).
+    /// Send once, and on a provider-backed 401 invalidate the token actually
+    /// SENT ([`Self::invalidate_sent`], bounded by this request's own
+    /// `timeout`) then retry once with a re-resolved bearer (at-most-once,
+    /// mirrors the SDK/CLI). The retry is SKIPPED — surfacing the original
+    /// 401 — when:
+    ///   * the invalidate timed out (a wedged mint holds the provider mutex;
+    ///     the follow-up bearer resolution would block on the same mutex);
+    ///   * the re-resolved bearer is `None` — a provider-backed request never
+    ///     retries UNAUTHENTICATED: the re-mint failed, and dropping the
+    ///     Authorization header is a guaranteed second 401;
+    ///   * the re-resolved bearer equals the rejected one — a same-token
+    ///     retry is a guaranteed second 401 (Dart's `_mustMint` semantics
+    ///     make the provider force-mint here, so equality means the minter
+    ///     re-returned the rejected token). The successful same-token re-mint
+    ///     also re-CACHED the rejected token, so it is invalidated again
+    ///     before returning — the must-mint flag stays armed and no later
+    ///     call serves it.
+    ///
+    /// Static/no-token clients don't retry. `body`, when present, is a JSON
+    /// request body (re-sent on the retry).
     async fn request(
         &self,
         method: reqwest::Method,
@@ -216,12 +294,27 @@ impl Client {
         timeout: Duration,
         body: Option<&serde_json::Value>,
     ) -> Result<Vec<u8>, ShedError> {
-        match self.send_once(method.clone(), url, timeout, body).await {
+        let sent = self.bearer().await;
+        match self
+            .send_once(method.clone(), url, timeout, body, sent.as_deref())
+            .await
+        {
             Err(ShedError::BadStatus(401)) if self.token_provider.is_some() => {
-                if let Some(p) = &self.token_provider {
-                    p.invalidate().await;
+                if !self.invalidate_sent(sent.as_deref(), timeout).await {
+                    return Err(ShedError::BadStatus(401)); // wedged provider — no retry
                 }
-                self.send_once(method, url, timeout, body).await
+                let retry = self.bearer().await;
+                if retry.is_none() {
+                    return Err(ShedError::BadStatus(401)); // never retry unauthenticated
+                }
+                if retry == sent {
+                    // Re-arm the must-mint flag the same-token re-mint just
+                    // cleared, so the rejected token is never served again.
+                    let _ = self.invalidate_sent(sent.as_deref(), timeout).await;
+                    return Err(ShedError::BadStatus(401));
+                }
+                self.send_once(method, url, timeout, body, retry.as_deref())
+                    .await
             }
             other => other,
         }
@@ -405,8 +498,9 @@ impl Client {
     ///
     /// ONE connection — no in-method reconnect and no 401 retry: the reconnect
     /// loop (shed-app's `RcEventsWatcher`) owns backoff AND re-auth. On a 401
-    /// this invalidates the token provider and returns `BadStatus(401)`, so
-    /// the watcher's next connect re-mints; an in-method retry would double up
+    /// this invalidates the token it SENT (`invalidate_if_current` — the
+    /// stale-401 guard, plan §3.4) and returns `BadStatus(401)`, so the
+    /// watcher's next connect re-mints; an in-method retry would double up
     /// on the watcher's backoff and hide the auth failure from its Down
     /// signal.
     ///
@@ -454,37 +548,30 @@ impl Client {
         // outside the bound (a server that accepts but never responds is as
         // dead as a silent stream).
         let connect = async {
+            let bearer = self.bearer().await;
             let mut rb = self
                 .http
                 .get(url)
                 .header(reqwest::header::ACCEPT, "text/event-stream");
-            if let Some(tok) = self.bearer().await {
+            if let Some(tok) = &bearer {
                 rb = rb.bearer_auth(tok);
             }
-            rb.send().await
+            (bearer, rb.send().await)
         };
-        let resp = match tokio::time::timeout(idle, connect).await {
+        let (sent_bearer, resp) = match tokio::time::timeout(idle, connect).await {
             Err(_) => {
                 return Err(ShedError::Transport("rc-events connect timeout".into()));
             }
-            Ok(r) => r.map_err(|e| ShedError::Transport(e.to_string()))?,
+            Ok((bearer, r)) => (bearer, r.map_err(|e| ShedError::Transport(e.to_string()))?),
         };
         let status = resp.status().as_u16();
         if status == 401 {
-            // Stale token: invalidate so the NEXT connect re-mints, then
-            // surface the 401 — the watcher owns re-auth (no in-method retry).
-            // Bounded await: invalidate only contends on the provider mutex,
-            // but that mutex is held across a mint by design, so a wedged mint
-            // could otherwise pin this call forever. On timeout we fall
-            // through and surface the 401 anyway — the cache keeps the stale
-            // token one extra cycle and the watcher's next 401 retries the
-            // invalidate.
-            // NOTE(C6): becomes invalidate_if_current(sent_bearer) — the
-            // unconditional invalidate can erase a NEWER token when a stale
-            // 401 races a rotation (plan §3.4 stale-401 guard).
-            if let Some(p) = &self.token_provider {
-                let _ = tokio::time::timeout(idle, p.invalidate()).await;
-            }
+            // Stale token: invalidate the token we SENT ([`Self::invalidate_sent`],
+            // the stale-401 guard, bounded by `idle` — see the helper's docs)
+            // so the NEXT connect re-mints, then surface the 401 — the
+            // watcher owns re-auth (no in-method retry). On a timed-out
+            // invalidate we fall through and surface the 401 anyway.
+            let _ = self.invalidate_sent(sent_bearer.as_deref(), idle).await;
         }
         // Exactly 200, not any-2xx: SSE lives in a 200 response body — a
         // 204/206 minted by an intermediary carries no event stream, and
@@ -567,12 +654,13 @@ impl Client {
         sink: &dyn CreateSink,
     ) -> Result<(), ShedError> {
         let url = self.build_url(&["api", "sheds"], &[])?;
+        let bearer = self.bearer().await;
         let mut rb = self
             .http
             .post(url)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(req);
-        if let Some(tok) = self.bearer().await {
+        if let Some(tok) = &bearer {
             rb = rb.bearer_auth(tok);
         }
         let resp = match tokio::time::timeout(CREATE_IDLE_TIMEOUT, rb.send()).await {
@@ -583,9 +671,14 @@ impl Client {
         };
         let status = resp.status().as_u16();
         if status == 401 {
-            if let Some(p) = &self.token_provider {
-                p.invalidate().await;
-            }
+            // Invalidate the token we SENT ([`Self::invalidate_sent`], the
+            // stale-401 guard, bounded by the create idle timeout — see the
+            // helper's docs) so the next attempt re-mints; create stays
+            // one-shot (no retry), so a timed-out invalidate just falls
+            // through to the BadStatus below.
+            let _ = self
+                .invalidate_sent(bearer.as_deref(), CREATE_IDLE_TIMEOUT)
+                .await;
         }
         if !(200..300).contains(&status) {
             return Err(ShedError::BadStatus(status));
@@ -941,6 +1034,273 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.info().await.unwrap().name, "mini2"); // succeeds after retry
+    }
+
+    // A minter that always returns the SAME token, however often it's called.
+    struct SameMinter {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl TokenMinter for SameMinter {
+        async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MintedToken {
+                token: "tok-same".into(),
+                expires_at_unix: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_skipped_when_remint_returns_the_same_rejected_token() {
+        // Plan §3.4: after the 401 → invalidate_if_current, the forced re-mint
+        // yields the SAME rejected token — a retry would be a guaranteed
+        // second 401, so request() skips it: exactly ONE request hits the
+        // server and the original 401 surfaces.
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/info")
+                    .header("authorization", "Bearer tok-same");
+                t.status(401);
+            })
+            .await;
+        let minter = Arc::new(SameMinter {
+            calls: AtomicUsize::new(0),
+        });
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+        let err = c.info().await.unwrap_err();
+        assert!(matches!(err, ShedError::BadStatus(401)), "got {err:?}");
+        assert_eq!(
+            m.hits_async().await,
+            1,
+            "the same-token retry must be skipped"
+        );
+        // Two mints: the initial resolve + the forced post-invalidate re-mint
+        // that produced the identical token.
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_never_proceeds_unauthenticated_when_the_remint_fails() {
+        // C6 adversarial review #2a: after the 401 → invalidate, the forced
+        // re-mint FAILS, so bearer() resolves None. The retry must be skipped
+        // — a provider-backed request never drops its Authorization header
+        // (an unauthenticated retry against a secure server is a guaranteed
+        // second 401 and ships the request with no proof of identity).
+        struct FlipMinter {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl TokenMinter for FlipMinter {
+            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    Ok(MintedToken {
+                        token: "tok-1".into(),
+                        expires_at_unix: None,
+                    })
+                } else {
+                    Err(ShedError::Transport("mint down".into()))
+                }
+            }
+        }
+        let server = MockServer::start_async().await;
+        // An unauthenticated retry would hit THIS mock and turn the result
+        // into Ok — assert it is never touched.
+        let unauth = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info").matches(|req| {
+                    !req.headers.as_ref().is_some_and(|h| {
+                        h.iter()
+                            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    })
+                });
+                t.status(200)
+                    .body(include_str!("../../fixtures/server_info.json"));
+            })
+            .await;
+        let authed = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/info")
+                    .header("authorization", "Bearer tok-1");
+                t.status(401);
+            })
+            .await;
+        let minter = Arc::new(FlipMinter {
+            calls: AtomicUsize::new(0),
+        });
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+        let err = c.info().await.unwrap_err();
+        assert!(matches!(err, ShedError::BadStatus(401)), "got {err:?}");
+        assert_eq!(authed.hits_async().await, 1, "exactly one authed attempt");
+        assert_eq!(unauth.hits_async().await, 0, "no unauthenticated retry");
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 2); // initial + failed re-mint
+    }
+
+    #[tokio::test]
+    async fn rejected_token_is_not_served_after_a_same_token_retry_skip() {
+        // C6 adversarial review #2c: the successful same-token re-mint
+        // re-caches the rejected token and clears the must-mint flag; the
+        // equality-skip path must invalidate it AGAIN so a SUBSEQUENT call
+        // force-mints instead of serving the rejected token from cache.
+        struct ScriptMinter {
+            calls: AtomicUsize,
+            script: Vec<&'static str>,
+        }
+        #[async_trait::async_trait]
+        impl TokenMinter for ScriptMinter {
+            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(MintedToken {
+                    token: self.script[n.min(self.script.len() - 1)].into(),
+                    expires_at_unix: None,
+                })
+            }
+        }
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/info")
+                    .header("authorization", "Bearer tok-same");
+                t.status(401);
+            })
+            .await;
+        let minter = Arc::new(ScriptMinter {
+            calls: AtomicUsize::new(0),
+            script: vec!["tok-same", "tok-same", "tok-fresh"],
+        });
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+        let err = c.info().await.unwrap_err();
+        assert!(matches!(err, ShedError::BadStatus(401)), "got {err:?}");
+        assert_eq!(m.hits_async().await, 1, "same-token retry skipped");
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 2);
+        // The next bearer resolution must FORCE a mint (call 3 → tok-fresh),
+        // never serve the rejected tok-same from the re-populated cache.
+        assert_eq!(c.bearer().await.as_deref(), Some("tok-fresh"));
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn invalidate_sent_is_bounded_when_the_provider_mutex_is_wedged() {
+        // C6 adversarial review #5b: invalidate_if_current contends on the
+        // provider mutex, which is held ACROSS a mint by design — a wedged
+        // concurrent mint must not pin the 401 path forever. Wedge the mutex
+        // with a never-resolving mint, then assert invalidate_sent returns
+        // false within its bound instead of hanging.
+        struct WedgeMinter {
+            entered: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl TokenMinter for WedgeMinter {
+            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+                self.entered.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let minter = Arc::new(WedgeMinter {
+            entered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let provider = Arc::new(ControlTokenProvider::new("mini2".into(), minter.clone()));
+        let c = Client::with_provider(
+            "http://127.0.0.1:9".into(),
+            "mini2".into(),
+            None,
+            provider.clone(),
+        )
+        .unwrap();
+        // Wedge: this task acquires the provider lock and pends inside the
+        // mint forever (dropped with the test runtime).
+        let wedger = provider.clone();
+        tokio::spawn(async move {
+            let _ = wedger.token().await;
+        });
+        // Real-time poll (repo test convention) until the mint holds the lock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !minter.entered.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "wedge never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let invalidated = tokio::time::timeout(
+            Duration::from_secs(5),
+            c.invalidate_sent(Some("tok-x"), Duration::from_millis(100)),
+        )
+        .await
+        .expect("invalidate_sent must return within its bound, not hang");
+        assert!(
+            !invalidated,
+            "a wedged provider must report a timed-out invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_provider_client_sends_the_tuned_providers_token() {
+        // Client::with_provider (plan §3.4 Client plumbing): a caller-tuned
+        // provider (here: seeded) backs the client — the seed is sent as the
+        // bearer with no mint.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/info")
+                    .header("authorization", "Bearer seeded-tok");
+                t.status(200)
+                    .body(include_str!("../../fixtures/server_info.json"));
+            })
+            .await;
+        let minter = Arc::new(SeqMinter {
+            calls: AtomicUsize::new(0),
+        });
+        let provider = Arc::new(
+            ControlTokenProvider::new("mini2".into(), minter.clone()).with_seed(MintedToken {
+                token: "seeded-tok".into(),
+                expires_at_unix: None,
+            }),
+        );
+        let c = Client::with_provider(server.base_url(), "mini2".into(), None, provider).unwrap();
+        assert_eq!(c.info().await.unwrap().name, "mini2");
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 0, "seed used, no mint");
+    }
+
+    #[test]
+    fn with_provider_pin_on_non_https_is_config_error() {
+        let provider = Arc::new(ControlTokenProvider::new(
+            "s".into(),
+            Arc::new(SeqMinter {
+                calls: AtomicUsize::new(0),
+            }),
+        ));
+        let result = Client::with_provider(
+            "http://x".into(),
+            "s".into(),
+            Some("sha256:aa".into()),
+            provider,
+        );
+        assert!(matches!(result, Err(ShedError::Config(_))));
     }
 
     #[tokio::test]
