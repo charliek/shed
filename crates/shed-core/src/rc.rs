@@ -63,6 +63,23 @@ impl RcKind {
         !matches!(self, RcKind::Other(_))
     }
 
+    /// Whether this kind runs claude — i.e. one of the two claude kinds (and so
+    /// gets claude's full `--permission-mode` set and URL affordances). NOT true
+    /// for codex/cursor/opencode. Mirrors the guest's `IsClaudeKind` and mobile's
+    /// `RcKind.runsClaude` (`rc_models.dart:76`).
+    pub fn runs_claude(&self) -> bool {
+        matches!(self, RcKind::ClaudeBroker | RcKind::ClaudeRc)
+    }
+
+    /// Whether this kind carries an autonomy/permission posture: every known
+    /// agent kind does; `shell` has none, and an unknown kind renders neutrally
+    /// with none — a caller-supplied mode is dropped silently for both (see
+    /// [`validate_permission_mode`]). Mirrors mobile's `RcKind.hasPermissionMode`
+    /// (`rc_models.dart:81`).
+    pub fn has_permission_mode(&self) -> bool {
+        self.is_known() && !matches!(self, RcKind::Shell)
+    }
+
     /// The tool token this kind's agent maps to under `capabilities.agents`, or
     /// `None` for a kind with no installable agent (`shell`) or an unknown kind.
     pub fn tool(&self) -> Option<&'static str> {
@@ -555,12 +572,74 @@ pub fn normalize_rc_prompt(raw: Option<&str>, kind: &RcKind) -> Result<Option<St
     Ok(Some(trimmed.to_string()))
 }
 
+// ---- permission modes ----
+
+/// The generic permission tri-state accepted by EVERY kind and mapped per agent
+/// to that tool's real flags by shed-ext-rc (the VM is already the sandbox).
+/// Mirrors the guest's `genericPermModes` (`internal/ext/rc/rc.go`) and mobile's
+/// `rcGenericPermissionModes` (`rc_service.dart:22`).
+pub const GENERIC_PERMISSION_MODES: [&str; 3] = ["default", "auto", "skip"];
+
+/// claude's historical `--permission-mode` values, accepted on top of the
+/// generic tri-state by the claude kinds ONLY. Mirrors the claude spec's
+/// `ExtraModes` and mobile's `rcClaudeExtraModes` (`rc_service.dart:27-32`).
+pub const CLAUDE_EXTRA_MODES: [&str; 4] = ["acceptEdits", "plan", "dontAsk", "bypassPermissions"];
+
+/// The create-time default permission mode. `auto` keeps a session running
+/// autonomously rather than blocking on permission prompts; it is a member of
+/// both the generic tri-state and the claude set, so it is valid for every
+/// agent kind. Mirrors mobile's `defaultRcPermissionMode` (`rc_service.dart:65`).
+pub const DEFAULT_RC_PERMISSION_MODE: &str = "auto";
+
+/// The permission modes valid for `kind`: the full claude set (generic
+/// tri-state + historical extras, in that display order) for the claude kinds,
+/// else the generic tri-state (codex/cursor/opencode/shell). Mirrors the
+/// guest's `PermModeAcceptedBy` and mobile's `permissionModesFor`
+/// (`rc_service.dart:58-59`).
+pub fn permission_modes_for(kind: &RcKind) -> Vec<&'static str> {
+    let mut modes = GENERIC_PERMISSION_MODES.to_vec();
+    if kind.runs_claude() {
+        modes.extend(CLAUDE_EXTRA_MODES);
+    }
+    modes
+}
+
+/// Validate a caller-supplied permission mode against `kind`, returning the
+/// EFFECTIVE mode to pass to [`create_argv`]/[`create_invocation`]. A kind
+/// without a permission posture (`shell`, unknown) silently drops the mode —
+/// `Ok(None)`, no error (the UI hides the picker, but state can linger across a
+/// kind switch; same posture as a claude-broker's dropped prompt). For a
+/// supporting kind, a mode outside [`permission_modes_for`] is rejected with
+/// [`RcError::BadRequest`] before any SSH call. Mirrors mobile's `RcService.create`
+/// gate (`rc_service.dart:142-145`). [`create_invocation`] calls this itself (the
+/// single validating entry point); only [`create_argv`], the low-level builder,
+/// requires the pre-validated effective mode.
+pub fn validate_permission_mode<'a>(
+    kind: &RcKind,
+    mode: Option<&'a str>,
+) -> Result<Option<&'a str>, RcError> {
+    if !kind.has_permission_mode() {
+        return Ok(None);
+    }
+    match mode {
+        None => Ok(None),
+        Some(m) if permission_modes_for(kind).contains(&m) => Ok(Some(m)),
+        Some(_) => Err(RcError::BadRequest("invalid permission mode".to_string())),
+    }
+}
+
 // ---- shed-ext-rc argv ----
 
 /// argv for `shed-ext-rc create --wait` (the binary resolves the workdir,
 /// pre-seeds trust, polls to ready, accepts trust, and delivers a stdin prompt).
 /// `bin` is resolved by the caller (`shed-app` reads `SHED_EXT_RC_BIN`) so this
 /// stays pure. `slug` is caller-supplied (generated in `shed-app::rc`, not here).
+/// `permission_mode` is the already-EFFECTIVE mode and must only ever be the
+/// output of [`validate_permission_mode`] (the validating gate is
+/// [`create_invocation`]; this stays the low-level infallible builder): `Some`
+/// emits `--permission-mode <mode>` between `--workdir` and `--prompt-stdin`
+/// (mobile's exact ordering, `rc_service.dart:168-174`), `None` emits no flag
+/// (each tool's own default).
 #[allow(clippy::too_many_arguments)]
 pub fn create_argv(
     bin: &str,
@@ -570,6 +649,7 @@ pub fn create_argv(
     workdir: Option<&str>,
     created_by: &str,
     target: &str,
+    permission_mode: Option<&str>,
     has_prompt: bool,
 ) -> Vec<String> {
     let mut a = vec![
@@ -591,6 +671,10 @@ pub fn create_argv(
         a.push("--workdir".to_string());
         a.push(w.to_string());
     }
+    if let Some(m) = permission_mode {
+        a.push("--permission-mode".to_string());
+        a.push(m.to_string());
+    }
     if has_prompt {
         a.push("--prompt-stdin".to_string());
     }
@@ -601,6 +685,15 @@ pub fn create_argv(
 /// and the stdin payload can never disagree. `prompt` must already be normalized
 /// (see [`normalize_rc_prompt`]); it is dropped for a kind that doesn't accept
 /// typed input.
+///
+/// This is the **validating gate** for `permission_mode` (a deliberate, safer
+/// deviation from the plan's "both builders infallible"): the raw
+/// caller-supplied mode is run through [`validate_permission_mode`] here —
+/// silently dropped for a kind without a permission posture, rejected with
+/// [`RcError::BadRequest`] when outside the kind's set (no argv is built) — and
+/// only the returned EFFECTIVE mode reaches [`create_argv`]. Mirrors mobile's
+/// derive-then-validate-then-emit order (`rc_service.dart:142-145`, `:171-173`);
+/// [`create_argv`] stays the low-level infallible builder.
 #[allow(clippy::too_many_arguments)]
 pub fn create_invocation(
     bin: &str,
@@ -610,11 +703,27 @@ pub fn create_invocation(
     workdir: Option<&str>,
     created_by: &str,
     target: &str,
+    permission_mode: Option<&str>,
     prompt: Option<&str>,
-) -> (Vec<String>, Option<String>) {
-    let effective = if kind.accepts_typed_input() { prompt } else { None };
-    let argv = create_argv(bin, kind, name, slug, workdir, created_by, target, effective.is_some());
-    (argv, effective.map(str::to_string))
+) -> Result<(Vec<String>, Option<String>), RcError> {
+    let mode = validate_permission_mode(kind, permission_mode)?;
+    let effective = if kind.accepts_typed_input() {
+        prompt
+    } else {
+        None
+    };
+    let argv = create_argv(
+        bin,
+        kind,
+        name,
+        slug,
+        workdir,
+        created_by,
+        target,
+        mode,
+        effective.is_some(),
+    );
+    Ok((argv, effective.map(str::to_string)))
 }
 
 pub fn list_argv(bin: &str) -> Vec<String> {
@@ -847,7 +956,8 @@ pub fn ssh_argv(
 
 static RE_TRUST_FOLDER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)Yes,\s*I trust this folder").unwrap());
-static RE_RECONNECTING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bReconnecting\b").unwrap());
+static RE_RECONNECTING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bReconnecting\b").unwrap());
 static RE_URL_BROKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"https?://claude\.ai/code\?environment=env_[A-Za-z0-9_-]+").unwrap()
 });
@@ -976,8 +1086,15 @@ mod tests {
 
     #[test]
     fn classify_needs_auth() {
-        for pane in ["not logged in", "run claude auth login", "requires a claude.ai subscription"] {
-            assert_eq!(classify_pane(&RcKind::ClaudeRc, pane).state, RcState::NeedsAuth);
+        for pane in [
+            "not logged in",
+            "run claude auth login",
+            "requires a claude.ai subscription",
+        ] {
+            assert_eq!(
+                classify_pane(&RcKind::ClaudeRc, pane).state,
+                RcState::NeedsAuth
+            );
         }
     }
 
@@ -993,7 +1110,10 @@ mod tests {
         let pane = "Remote Control active\nhttps://claude.ai/code/session_XYZ789";
         let c = classify_pane(&RcKind::ClaudeRc, pane);
         assert_eq!(c.state, RcState::Ready);
-        assert_eq!(c.url.as_deref(), Some("https://claude.ai/code/session_XYZ789"));
+        assert_eq!(
+            c.url.as_deref(),
+            Some("https://claude.ai/code/session_XYZ789")
+        );
     }
 
     #[test]
@@ -1005,10 +1125,16 @@ mod tests {
 
     #[test]
     fn classify_shell_empty_vs_content() {
-        assert_eq!(classify_pane(&RcKind::Shell, "   \n ").state, RcState::Starting);
+        assert_eq!(
+            classify_pane(&RcKind::Shell, "   \n ").state,
+            RcState::Starting
+        );
         assert_eq!(classify_pane(&RcKind::Shell, "$ ls").state, RcState::Ready);
         // A shell never runs the trust/auth heuristics.
-        assert_eq!(classify_pane(&RcKind::Shell, "not logged in").state, RcState::Ready);
+        assert_eq!(
+            classify_pane(&RcKind::Shell, "not logged in").state,
+            RcState::Ready
+        );
     }
 
     #[test]
@@ -1144,7 +1270,10 @@ mod tests {
 
     #[test]
     fn normalize_prompt_blank_is_none() {
-        assert_eq!(normalize_rc_prompt(Some("   \n\t"), &RcKind::ClaudeRc).unwrap(), None);
+        assert_eq!(
+            normalize_rc_prompt(Some("   \n\t"), &RcKind::ClaudeRc).unwrap(),
+            None
+        );
         assert_eq!(normalize_rc_prompt(None, &RcKind::Shell).unwrap(), None);
     }
 
@@ -1164,7 +1293,9 @@ mod tests {
             Err(RcError::BadRequest(_))
         ));
         // Exactly 2000 bytes is fine.
-        assert!(normalize_rc_prompt(Some(&"a".repeat(2000)), &RcKind::Shell).unwrap().is_some());
+        assert!(normalize_rc_prompt(Some(&"a".repeat(2000)), &RcKind::Shell)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1182,10 +1313,15 @@ mod tests {
         let remote = vec!["shed-ext-rc".to_string(), "list".to_string()];
         let argv = ssh_argv("web", "10.0.0.5", 2222, "/k/known_hosts", &remote, 10);
         // No `-t` (a PTY would corrupt the JSON DTO decode).
-        assert!(!argv.contains(&"-t".to_string()), "RC ssh must not allocate a PTY");
+        assert!(
+            !argv.contains(&"-t".to_string()),
+            "RC ssh must not allocate a PTY"
+        );
         assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
         assert!(argv.contains(&"ConnectTimeout=10".to_string()));
-        assert!(argv.windows(2).any(|w| w == ["-o", "StrictHostKeyChecking=yes"]));
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["-o", "StrictHostKeyChecking=yes"]));
         // The remote command is a single shell-quoted string after `--`.
         let dd = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(argv[dd + 1], "shed-ext-rc list");
@@ -1196,7 +1332,11 @@ mod tests {
 
     #[test]
     fn ssh_argv_shell_quotes_a_prompt_arg() {
-        let remote = vec!["shed-ext-rc".to_string(), "create".to_string(), "a b".to_string()];
+        let remote = vec![
+            "shed-ext-rc".to_string(),
+            "create".to_string(),
+            "a b".to_string(),
+        ];
         let argv = ssh_argv("s", "h", 22, "/k", &remote, 10);
         assert_eq!(argv.last().unwrap(), "shed-ext-rc create 'a b'");
     }
@@ -1213,6 +1353,7 @@ mod tests {
             Some("/work"),
             "shed-desktop/1.0",
             "shed:web@srv",
+            None,
             true,
         );
         assert_eq!(a[0], "shed-ext-rc");
@@ -1227,7 +1368,15 @@ mod tests {
     #[test]
     fn create_argv_omits_empty_workdir_and_promptless() {
         let a = create_argv(
-            "b", &RcKind::Shell, "n", "s", Some(""), "c", "t", false,
+            "b",
+            &RcKind::Shell,
+            "n",
+            "s",
+            Some(""),
+            "c",
+            "t",
+            None,
+            false,
         );
         assert!(!a.contains(&"--workdir".to_string()));
         assert!(!a.contains(&"--prompt-stdin".to_string()));
@@ -1236,10 +1385,247 @@ mod tests {
     #[test]
     fn create_invocation_drops_prompt_for_broker() {
         let (argv, stdin) = create_invocation(
-            "b", &RcKind::ClaudeBroker, "n", "s", None, "c", "t", Some("hi"),
-        );
+            "b",
+            &RcKind::ClaudeBroker,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            None,
+            Some("hi"),
+        )
+        .unwrap();
         assert_eq!(stdin, None);
         assert!(!argv.contains(&"--prompt-stdin".to_string()));
+    }
+
+    // ---- permission modes (ported from mobile's rc_service_test.dart:58-253) ----
+
+    #[test]
+    fn default_permission_mode_is_a_member_of_both_sets() {
+        // rc_service_test.dart:59-64: the picker pre-selects the default; it must
+        // be a member of the full claude set AND (being generic) every kind's set.
+        assert_eq!(DEFAULT_RC_PERMISSION_MODE, "auto");
+        assert!(GENERIC_PERMISSION_MODES.contains(&DEFAULT_RC_PERMISSION_MODE));
+        assert!(permission_modes_for(&RcKind::ClaudeRc).contains(&DEFAULT_RC_PERMISSION_MODE));
+        assert!(permission_modes_for(&RcKind::Codex).contains(&DEFAULT_RC_PERMISSION_MODE));
+    }
+
+    #[test]
+    fn permission_modes_for_claude_is_union_others_generic_only() {
+        // rc_service.dart:58-59: claude kinds get generic ∪ extras (display
+        // order: tri-state first); the other kinds get the tri-state only.
+        for kind in [RcKind::ClaudeRc, RcKind::ClaudeBroker] {
+            assert!(kind.runs_claude());
+            assert_eq!(
+                permission_modes_for(&kind),
+                vec![
+                    "default",
+                    "auto",
+                    "skip",
+                    "acceptEdits",
+                    "plan",
+                    "dontAsk",
+                    "bypassPermissions"
+                ]
+            );
+        }
+        for kind in [
+            RcKind::Codex,
+            RcKind::Opencode,
+            RcKind::Cursor,
+            RcKind::Shell,
+            RcKind::Other("borg".into()),
+        ] {
+            assert!(!kind.runs_claude());
+            assert_eq!(permission_modes_for(&kind), vec!["default", "auto", "skip"]);
+        }
+    }
+
+    #[test]
+    fn has_permission_mode_excludes_shell_and_unknown() {
+        // rc_models.dart:81: every known agent kind has a permission posture;
+        // shell has none, and an unknown kind renders neutrally with none.
+        for kind in [
+            RcKind::ClaudeRc,
+            RcKind::ClaudeBroker,
+            RcKind::Codex,
+            RcKind::Opencode,
+            RcKind::Cursor,
+        ] {
+            assert!(kind.has_permission_mode());
+        }
+        assert!(!RcKind::Shell.has_permission_mode());
+        assert!(!RcKind::Other("borg".into()).has_permission_mode());
+    }
+
+    #[test]
+    fn validate_permission_mode_accepts_valid_modes() {
+        // rc_service_test.dart:183-201: codex takes the generic tri-state;
+        // rc_service_test.dart:145-158, 231-241: claude takes its full set.
+        assert_eq!(
+            validate_permission_mode(&RcKind::Codex, Some("auto")),
+            Ok(Some("auto"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::Codex, Some("skip")),
+            Ok(Some("skip"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("bypassPermissions")),
+            Ok(Some("bypassPermissions"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("auto")),
+            Ok(Some("auto"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("plan")),
+            Ok(Some("plan"))
+        );
+        // No mode chosen → no flag (each tool's own default),
+        // rc_service_test.dart:243-253.
+        assert_eq!(validate_permission_mode(&RcKind::ClaudeRc, None), Ok(None));
+    }
+
+    #[test]
+    fn validate_permission_mode_rejects_invalid_before_any_argv() {
+        // rc_service_test.dart:171-181 (unknown mode) + 203-217 (a claude-only
+        // mode on a non-claude kind) → RC_BAD_REQUEST, never reaching SSH.
+        assert_eq!(
+            validate_permission_mode(&RcKind::Codex, Some("plan")),
+            Err(RcError::BadRequest("invalid permission mode".to_string()))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("nope")),
+            Err(RcError::BadRequest("invalid permission mode".to_string()))
+        );
+    }
+
+    #[test]
+    fn validate_permission_mode_drops_silently_for_shell_and_unknown() {
+        // rc_service_test.dart:160-169: a shell has no permission mode; the mode
+        // is silently dropped (no error, no flag) even if a caller passes one —
+        // state can linger across a kind switch. Same for an unknown kind.
+        assert_eq!(
+            validate_permission_mode(&RcKind::Shell, Some("auto")),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::Shell, Some("plan")),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::Other("borg".into()), Some("auto")),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn create_argv_emits_permission_mode_between_workdir_and_prompt_stdin() {
+        // rc_service_test.dart:145-158 + the emission ordering of
+        // rc_service.dart:168-174: --workdir, then --permission-mode, then
+        // --prompt-stdin.
+        let a = create_argv(
+            "shed-ext-rc",
+            &RcKind::ClaudeRc,
+            "web/abc",
+            "abc",
+            Some("/work/dir"),
+            "shed-desktop/1.0",
+            "shed:web@srv",
+            Some("bypassPermissions"),
+            true,
+        );
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--permission-mode", "bypassPermissions"]));
+        let wd = a.iter().position(|x| x == "--workdir").unwrap();
+        let pm = a.iter().position(|x| x == "--permission-mode").unwrap();
+        let ps = a.iter().position(|x| x == "--prompt-stdin").unwrap();
+        assert!(
+            wd < pm && pm < ps,
+            "ordering must be --workdir < --permission-mode < --prompt-stdin"
+        );
+    }
+
+    #[test]
+    fn create_argv_omits_permission_mode_when_none() {
+        // rc_service_test.dart:243-253: a null mode means "pass no flag at all".
+        let a = create_argv(
+            "shed-ext-rc",
+            &RcKind::ClaudeRc,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            None,
+            false,
+        );
+        assert!(!a.contains(&"--permission-mode".to_string()));
+    }
+
+    #[test]
+    fn create_invocation_passes_permission_mode_through() {
+        // rc_service_test.dart:183-193: codex passes a generic mode; the
+        // invocation gate validates it and emits the flag.
+        let (argv, stdin) = create_invocation(
+            "b",
+            &RcKind::Codex,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            Some("auto"),
+            None,
+        )
+        .unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--permission-mode", "auto"]));
+        assert_eq!(stdin, None);
+    }
+
+    #[test]
+    fn create_invocation_rejects_invalid_mode_and_builds_no_argv() {
+        // rc_service_test.dart:203-217: a claude-only mode on a non-claude kind
+        // is rejected (RC_BAD_REQUEST) BEFORE any argv/SSH — the invocation gate
+        // validates, it does not forward raw modes.
+        assert_eq!(
+            create_invocation(
+                "b",
+                &RcKind::Codex,
+                "n",
+                "s",
+                None,
+                "c",
+                "t",
+                Some("plan"),
+                None
+            ),
+            Err(RcError::BadRequest("invalid permission mode".to_string()))
+        );
+    }
+
+    #[test]
+    fn create_invocation_silently_drops_mode_for_shell() {
+        // rc_service_test.dart:160-169: a shell has no permission mode; even a
+        // GARBAGE mode is dropped silently (Ok, no flag, no error) — Dart derives
+        // the effective mode BEFORE validating (rc_service.dart:142).
+        let (argv, _) = create_invocation(
+            "b",
+            &RcKind::Shell,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+        assert!(!argv.contains(&"--permission-mode".to_string()));
     }
 
     #[test]
@@ -1252,17 +1638,32 @@ mod tests {
 
     #[test]
     fn error_from_exit_maps_codes() {
-        assert_eq!(error_from_exit(3, "taken", ""), RcError::SlugTaken("taken".into()));
-        assert_eq!(error_from_exit(4, "gone", ""), RcError::NotFound("gone".into()));
-        assert_eq!(error_from_exit(2, "bad", ""), RcError::BadRequest("bad".into()));
+        assert_eq!(
+            error_from_exit(3, "taken", ""),
+            RcError::SlugTaken("taken".into())
+        );
+        assert_eq!(
+            error_from_exit(4, "gone", ""),
+            RcError::NotFound("gone".into())
+        );
+        assert_eq!(
+            error_from_exit(2, "bad", ""),
+            RcError::BadRequest("bad".into())
+        );
         assert_eq!(error_from_exit(127, "", ""), RcError::MissingBinary);
         assert_eq!(
             error_from_exit(1, "bash: shed-ext-rc: command not found", ""),
             RcError::MissingBinary
         );
-        assert_eq!(error_from_exit(1, "", ""), RcError::Failed("shed-ext-rc exited 1".into()));
+        assert_eq!(
+            error_from_exit(1, "", ""),
+            RcError::Failed("shed-ext-rc exited 1".into())
+        );
         // stdout is the fallback detail when stderr is empty.
-        assert_eq!(error_from_exit(5, "", "boom"), RcError::Failed("boom".into()));
+        assert_eq!(
+            error_from_exit(5, "", "boom"),
+            RcError::Failed("boom".into())
+        );
     }
 
     // ---- DTO → RcSession ----
@@ -1347,9 +1748,15 @@ mod tests {
 
     #[test]
     fn decode_session_rejects_garbage() {
-        assert!(matches!(decode_session("not json"), Err(RcError::Failed(_))));
+        assert!(matches!(
+            decode_session("not json"),
+            Err(RcError::Failed(_))
+        ));
         // A missing required field is not a valid DTO.
-        assert!(matches!(decode_session(r#"{"slug":"x"}"#), Err(RcError::Failed(_))));
+        assert!(matches!(
+            decode_session(r#"{"slug":"x"}"#),
+            Err(RcError::Failed(_))
+        ));
     }
 
     /// Decode the canonical golden fixture (byte-identical to shed-remote-agent's
@@ -1382,7 +1789,10 @@ mod tests {
         assert!(full.managed);
         assert_eq!(full.kind, RcKind::ClaudeRc);
         assert_eq!(full.display_name, "charliek/abc234"); // present, not the fallback
-        assert_eq!(full.rc_id.as_deref(), Some("9f1c0e7a-1111-4222-8333-444455556666"));
+        assert_eq!(
+            full.rc_id.as_deref(),
+            Some("9f1c0e7a-1111-4222-8333-444455556666")
+        );
         assert_eq!(full.created_by.as_deref(), Some("shed-remote-agent/0.1.0"));
         // Minimal legacy session: absent optionals default, fallbacks applied.
         assert!(!dtos[1].managed);

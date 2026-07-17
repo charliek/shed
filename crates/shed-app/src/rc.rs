@@ -255,6 +255,9 @@ impl RcService {
         // Real path — serialized against list/kill.
         let _guard = self.op_guard.lock().await;
         // Build argv + stdin together so `--prompt-stdin` and the payload can't disagree.
+        // The invocation is the permission-mode validating gate; desktop has no
+        // permission-mode UI yet, and a `None` mode can never fail validation, so
+        // the `?` here is unreachable in practice (argv stays byte-identical).
         let (argv, stdin) = rc::create_invocation(
             &binary_name(),
             &kind,
@@ -263,8 +266,9 @@ impl RcService {
             workdir.as_deref(),
             &created_by,
             &target_label,
+            None,
             prompt.as_deref(),
-        );
+        )?;
         let out = self
             .runner
             .run(ssh_for(shed, &target, &argv), stdin, CREATE_TIMEOUT)
