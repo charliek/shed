@@ -106,7 +106,9 @@ is a compiled **Icon Composer catalog**:
 - `generate_icons.py` emits `tauri/src-tauri/AppIcon.icon/` — a hand-authored
   `icon.json` with the orange brand color as a **native `srgb` `fill.solid`**
   (not a baked bitmap) plus the shed owl as a transparent foreground layer, with
-  roost's `shadow` (neutral 0.5) and `translucency` (enabled 0.5) tuning.
+  roost's `shadow` (neutral 0.5) tuning and `translucency` dialed to 0.35 (roost
+  uses 0.5 — shed's brighter orange bleeds through the frosted white more loudly
+  than roost's violet, so a lower value keeps the owl reading as white).
 - `scripts/bundle-tauri-mac.sh` compiles it with `xcrun actool ... --app-icon
   AppIcon` into `Contents/Resources/Assets.car` (+ a flattened `AppIcon.icns`)
   *before* codesign, so the signature seals it. `actool` needs **full Xcode 26**

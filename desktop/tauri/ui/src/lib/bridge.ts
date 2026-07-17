@@ -190,10 +190,19 @@ export function useUiBridge(
     let win: { isVisible: () => Promise<boolean> } | undefined;
     // `fetchSheds(0)` = refresh WITHOUT advancing the echoed token (this is a
     // background poll, not a `sheds.refresh` completion Rust blocks on).
+    // `pollInFlight` serializes the timer: if a `list_sheds` hangs past the
+    // interval, ticks skip rather than pile up unbounded behind the slow one.
+    let pollInFlight = false;
     const tick = async () => {
-      if (!win) return;
+      if (!win || pollInFlight) return;
       const visible = await win.isVisible().catch(() => true); // fail-open on probe error
-      if (!cancelled && visible) void fetchSheds(0);
+      if (cancelled || !visible) return;
+      pollInFlight = true;
+      try {
+        await fetchSheds(0);
+      } finally {
+        pollInFlight = false;
+      }
     };
     const timer = setInterval(() => void tick(), POLL_MS);
     const onVisibility = () => {
