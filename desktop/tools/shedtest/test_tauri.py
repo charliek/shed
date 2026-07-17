@@ -34,6 +34,29 @@ def test_ui_ops_ack(tauri):
     tauri.navigate("sheds")
 
 
+def test_dashboard_auto_refreshes_new_shed(tauri, mock):
+    # P1: the open dashboard polls on a cadence (5s, visible-only — mac AppModel
+    # parity) so a shed created OUTSIDE the app (e.g. `shed create` from the CLI)
+    # surfaces on its own, with NO manual refresh. Drive it: make the window
+    # visible, add a shed to the mock's served list, then assert it appears via the
+    # UI-truth dashboard.dump within one poll interval + slack — the test NEVER
+    # calls sheds_refresh, so only the background poll can surface it.
+    tauri.show_window()
+    tauri.activate()
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    # Baseline: the CLI shed isn't in the reset fixture (hello-world + callbell).
+    assert "cli-created" not in {r["name"] for r in tauri.dashboard_rows("tauri")}
+    # Externally create a shed (the mock stands in for the CLI) — no app-side action.
+    mock.add_shed({"name": "cli-created", "status": "running", "backend": "vz"})
+    tauri.wait_until(
+        lambda: "cli-created" in {r["name"] for r in tauri.dashboard_rows("tauri")},
+        timeout=9.0,  # covers the 5s poll interval + slack (wait_until scales it)
+        what="auto-refresh surfaces the CLI-created shed without a manual refresh",
+    )
+    rows = {r["name"]: r for r in tauri.dashboard_rows("tauri")}
+    assert rows["cli-created"]["status"] == "running"
+
+
 def test_tray_dump(tauri):
     # B1a: the menu-bar/tray is drivable over IPC (the North Star). Its actionable
     # menu ids are always reported; the tray *installs* on macOS (a status-bar host

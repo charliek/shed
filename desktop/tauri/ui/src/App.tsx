@@ -14,7 +14,7 @@ import owlOrange from "@/assets/owl-orange.svg";
 import owlAmber from "@/assets/owl-amber.svg";
 import {
   cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, ActBtn,
-  PageHead, HeadAction, Empty, agentColor, type Tone,
+  PageHead, HeadAction, RefreshHeadButton, Empty, agentColor, type Tone,
 } from "@/components/primitives";
 import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import {
@@ -108,7 +108,15 @@ function ShedsPane({ sheds, refresh, onNew }: { sheds: Shed[]; refresh: () => vo
   const act = (action: string, s: Shed) => void shedAction(action, s.name, s.host).then(refresh);
   return (
     <div>
-      <PageHead title="Sheds" right={<HeadAction icon={Plus} label="New shed" color="var(--shed-accent)" onClick={onNew} />} />
+      <PageHead
+        title="Sheds"
+        right={
+          <div className="flex items-center gap-[18px]">
+            <RefreshHeadButton onClick={refresh} />
+            <HeadAction icon={Plus} label="New shed" color="var(--shed-accent)" onClick={onNew} />
+          </div>
+        }
+      />
       {sheds.length === 0 ? (
         <Empty icon={Boxes} title="No sheds yet" body="No sheds on the configured hosts. Create one to spin up an isolated dev environment." />
       ) : (
@@ -247,9 +255,7 @@ function AgentsPane({ sessions, onLaunch, refresh }:
         accessory={<span className="font-mono text-[13px] text-shed-text-muted">{sessions.length} active</span>}
         right={
           <div className="flex items-center gap-[18px]">
-            <button onClick={() => refresh()} title="Refresh" className="hlink flex items-center rounded-lg p-[7px] text-shed-text-secondary">
-              <RefreshCw size={18} />
-            </button>
+            <RefreshHeadButton onClick={refresh} />
             <HeadAction icon={Plus} label="New session" color="var(--shed-accent)" onClick={onLaunch} />
           </div>
         }
@@ -1133,14 +1139,8 @@ export default function App() {
           );
         })}
         <div className="flex-1" />
-        <div className="flex items-center justify-between px-2.5 pb-2 pt-0.5">
+        <div className="flex items-center px-2.5 pb-2 pt-0.5">
           <span className="font-mono text-[10px] font-semibold tracking-[.1em] text-shed-text-muted">HOSTS</span>
-          <button
-            onClick={() => setPane("system")}
-            className="hlink inline-flex items-center gap-1 rounded-md px-1 py-0.5 font-mono text-[11px] font-semibold text-shed-accent"
-          >
-            <Plus size={13} /> Add
-          </button>
         </div>
         {hosts.map((h) => (
           <div key={h.name} className="flex items-center gap-2.5 px-2.5 py-1.5 text-[13px] font-medium text-shed-text">

@@ -77,8 +77,9 @@ function report(
 }
 
 /** Wire the shell to Rust: drive the pane from the `navigate` event, keep a live
- *  shed list (fetched on mount + on each `refresh` event — the `sheds.refresh`
- *  op), and report the rendered snapshot back so the harness can assert it.
+ *  shed list (fetched on mount, on each `refresh` event — the `sheds.refresh`
+ *  op — and on a 5s visible-only poll so a CLI-created shed surfaces on the open
+ *  dashboard), and report the rendered snapshot back so the harness can assert it.
  *  Returns the live sheds + a `refresh` callback (a lifecycle button chains it to
  *  re-fetch after its action). A no-op in a plain browser.
  *
@@ -114,13 +115,15 @@ export function useUiBridge(
   // Fetch the live shed list and store it; on a refresh, also advance the echoed
   // token so Rust's synchronous `sheds.refresh` observes completion. A generation
   // guard drops a superseded (slower, older) fetch so it can't overwrite a newer
-  // one's rows OR re-report stale rows under an already-advanced token.
+  // one's rows. The token echo runs BEFORE the guard: this fetch DID complete, so
+  // a token-bearing `sheds.refresh` must be acknowledged even when a concurrent
+  // background poll (token 0) supersedes its rows — else the op blocks to timeout.
   const fetchSheds = useCallback(async (token: number) => {
     const gen = ++fetchGen.current;
     const rows = (await invoke<Shed[]>("list_sheds")) ?? [];
-    if (gen !== fetchGen.current) return; // a newer fetch started — drop this one
-    setSheds(rows);
     if (token > 0) setRefreshToken(token);
+    if (gen !== fetchGen.current) return; // a newer fetch started — drop this one's rows
+    setSheds(rows);
   }, []);
 
   useEffect(() => {
@@ -157,6 +160,64 @@ export function useUiBridge(
       unlisten.forEach((u) => u());
     };
   }, [setPane, fetchSheds]);
+
+  // Auto-refresh the shed list on a cadence so an externally-created shed (e.g.
+  // `shed create` from the CLI, or another client) surfaces on the ALREADY-OPEN
+  // dashboard without a manual action — the mac AppModel polls every 5s
+  // (AppModel.swift `pollInterval`); this is the Tauri parity. Reuses the SAME
+  // `fetchSheds` path the `refresh` event uses — no second fetch mechanism.
+  //
+  // JS-side by design (why-only): no Rust ticker / IPC-event plumbing is needed —
+  // @tauri-apps/api/window is enough to observe visibility from JS. Unlike Swift
+  // (which polls even when hidden), we poll ONLY while the window is actually
+  // shown — the webview is HIDDEN (not unmounted) when the window is closed to the
+  // tray, so polling then would waste battery + network.
+  //
+  // The GATE is the NATIVE window `isVisible()` (shown vs hidden-to-tray), NOT
+  // `document.visibilityState`: the latter tracks WebKit *occlusion*, so a shown-
+  // but-occluded window (another app on top) reads "hidden" and would wrongly
+  // stall the poll — proven flaky under the harness in isolation. `isVisible()`
+  // tracks show()/hide() directly (CloseRequested → w.hide(), tray-reopen →
+  // show()+set_focus(); see lib.rs / ipc.rs present_main_window). We ALSO refresh
+  // IMMEDIATELY on regaining foreground (window focus, or the occlusion
+  // `visibilitychange` when it does fire) so a tray-reopen shows fresh state at
+  // once without waiting out the interval.
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    const POLL_MS = 5000;
+    // The window handle, resolved async below; until then the tick no-ops.
+    let win: { isVisible: () => Promise<boolean> } | undefined;
+    // `fetchSheds(0)` = refresh WITHOUT advancing the echoed token (this is a
+    // background poll, not a `sheds.refresh` completion Rust blocks on).
+    const tick = async () => {
+      if (!win) return;
+      const visible = await win.isVisible().catch(() => true); // fail-open on probe error
+      if (!cancelled && visible) void fetchSheds(0);
+    };
+    const timer = setInterval(() => void tick(), POLL_MS);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void fetchSheds(0);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    const unlistenFocus: Array<() => void> = [];
+    void (async () => {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const w = getCurrentWindow();
+      win = w;
+      const un = await w.onFocusChanged(({ payload: focused }) => {
+        if (focused) void fetchSheds(0); // authoritative "user reopened the window"
+      });
+      if (cancelled) un();
+      else unlistenFocus.push(un);
+    })();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+      unlistenFocus.forEach((u) => u());
+    };
+  }, [fetchSheds]);
 
   // Re-report on any rendered change (pane, sheds, echoed token, modal, the badge
   // inputs, or the appearance mode). Gated on `ready` (not a first-run flag) so the
