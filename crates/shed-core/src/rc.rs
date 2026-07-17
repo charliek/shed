@@ -150,6 +150,79 @@ pub enum RcState {
     Dead,
 }
 
+impl RcState {
+    /// Tolerant wire decode: an unknown state from a newer binary/server is
+    /// treated as `Starting` (transient) rather than `Dead`, so a forward-compat
+    /// session is never shown as gone. Mirrors mobile's `RcState.fromWire`
+    /// (`rc_models.dart:176-181`). The strict serde derive above stays the
+    /// contract for `shed-ext-rc` stdout (golden-pinned); this is for the
+    /// tolerant server-enrichment paths (overview `rc` blocks, rc-events).
+    pub fn from_wire(s: &str) -> RcState {
+        match s {
+            "ready" => RcState::Ready,
+            "reconnecting" => RcState::Reconnecting,
+            "needs-trust" => RcState::NeedsTrust,
+            "needs-auth" => RcState::NeedsAuth,
+            "dead" => RcState::Dead,
+            _ => RcState::Starting, // incl. "starting" and any future value
+        }
+    }
+}
+
+/// A session's live *work* dimension, orthogonal to the lifecycle [`RcState`].
+/// Derived live by the rc hub and reported additively inside a session's `rc`
+/// block. Mirrors the guest's `rc.Activity` (`internal/ext/rc/activity.go`) and
+/// mobile's `RcActivity` (`rc_models.dart:125-147`): `working` (producing
+/// output), `needs_input` (idle at a prompt anchor), `idle` (quiescent), and
+/// `unknown` (live but indeterminate).
+///
+/// Deliberately NO `Other(String)` case (unlike [`RcKind`]'s unknown-kind
+/// policy): an UNRECOGNIZED token — a future value, or the reserved
+/// `needs_approval` the hub does not derive yet — maps to
+/// [`RcActivity::Unknown`] (Dart parity, `rc_models.dart:125-146`), so it
+/// renders neutrally (no badge) and consumers key off a single variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RcActivity {
+    Working,
+    NeedsInput,
+    Idle,
+    Unknown,
+}
+
+impl RcActivity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RcActivity::Working => "working",
+            RcActivity::NeedsInput => "needs_input",
+            RcActivity::Idle => "idle",
+            RcActivity::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a wire activity string; any unrecognized value maps to
+    /// [`RcActivity::Unknown`] rather than failing (never-throw decode).
+    pub fn from_wire(s: &str) -> RcActivity {
+        match s {
+            "working" => RcActivity::Working,
+            "needs_input" => RcActivity::NeedsInput,
+            "idle" => RcActivity::Idle,
+            _ => RcActivity::Unknown,
+        }
+    }
+}
+
+impl Serialize for RcActivity {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RcActivity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(RcActivity::from_wire(&String::deserialize(d)?))
+    }
+}
+
 /// A pane-derived `(state, url)` — backs the pure `rc.classify` IPC utility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RcClassification {
@@ -196,6 +269,17 @@ pub struct RcSessionDto {
     pub created_by: Option<String>,
     pub created_at: Option<String>,
     pub target_label: Option<String>,
+    /// Live-activity dimension (additive inside the `rc` block; derived by the
+    /// rc hub). Absent when no hub is running, the kind is unsupported, or the
+    /// server suppressed it (a blocking lifecycle state trumps activity).
+    /// Mirrors mobile's `RcSession.activity` (`rc_models.dart:222-234`).
+    pub activity: Option<RcActivity>,
+    /// RFC3339 timestamp the activity was last derived/changed; absent with
+    /// `activity`.
+    pub activity_at: Option<String>,
+    /// A short, hub-sanitized (ANSI/control-stripped, ≤200 runes) preview of
+    /// the session's most recent message. Absent when the hub has none.
+    pub last_message: Option<String>,
 }
 
 /// The `shed-ext-rc list` response shape. Strict on `rc_sessions` like Swift's
@@ -222,12 +306,36 @@ pub struct RcAgentInfo {
 }
 
 /// Per-kind UI hints from [`RcCapabilities::kind_features`]. Mirrors the guest's
-/// `rc.KindFeatures`: `post_input` reports whether a typed line reaches the pane,
-/// `approvals` is where approvals surface (v1 agents are TUI-only → `"tui"`).
+/// `rc.KindFeatures` and mobile's `KindFeatures` (`rc_capabilities.dart:116-144`):
+/// `post_input` reports whether a typed line reaches the pane, `approvals` is
+/// where approvals surface (v1 agents are TUI-only → `"tui"`).
+///
+/// `watch` and `input` are additive hub hints (codex-only in this phase; absent
+/// → `false` / `""`): `watch` reports whether the hub produces a live message
+/// feed for the kind (`GET /messages` + `message.appended`), and `input` is the
+/// feed-input posting **mode string** — `"gated"` means `POST /input` is
+/// accepted only while the session is waiting, `""` means no feed input. Note
+/// the distinction from the adjacent `post_input`: `post_input` is the
+/// typed-input *capability* bool (a typed line reaches the pane over the
+/// TUI-only path), while `input` is the *gating mode* of the separate feed-input
+/// channel — a kind can have `post_input: true` with no feed input at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RcKindFeatures {
     pub post_input: bool,
     pub approvals: String,
+    #[serde(default)]
+    pub watch: bool,
+    #[serde(default)]
+    pub input: String,
+}
+
+impl RcKindFeatures {
+    /// Whether feed input is gated (`input == "gated"`) — a watch view's input
+    /// bar is only ever enabled for a gated kind waiting for input. Mirrors
+    /// mobile's `KindFeatures.inputGated` (`rc_capabilities.dart:136`).
+    pub fn input_gated(&self) -> bool {
+        self.input == "gated"
+    }
 }
 
 /// The `shed-ext-rc capabilities` payload, also embedded in the `list` envelope.
@@ -289,7 +397,12 @@ pub struct RcSession {
     pub slug: String,
     pub tmux_session: String,
     pub display_name: String,
-    pub workdir: String,
+    /// The session's working directory when known. `None` for a server-enriched
+    /// overview row that carries none (Dart parity, `rc_models.dart:261`);
+    /// [`RcSession::from_dto`] (the `shed-ext-rc` stdout path) still fills the
+    /// [`DEFAULT_WORKDIR`] fallback, so it is always `Some` there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
     pub kind: RcKind,
     pub state: RcState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,6 +415,13 @@ pub struct RcSession {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_label: Option<String>,
+    /// Live-activity dimension (see [`RcSessionDto::activity`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<RcActivity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<String>,
     #[serde(default)]
     pub managed: bool,
 }
@@ -324,7 +444,7 @@ impl RcSession {
             slug: dto.slug,
             tmux_session: dto.tmux_session,
             display_name,
-            workdir: dto.workdir.unwrap_or_else(|| DEFAULT_WORKDIR.to_string()),
+            workdir: Some(dto.workdir.unwrap_or_else(|| DEFAULT_WORKDIR.to_string())),
             kind: dto.kind,
             state: dto.state,
             url: dto.url,
@@ -332,6 +452,9 @@ impl RcSession {
             created_by: dto.created_by,
             created_at: dto.created_at,
             target_label: dto.target_label,
+            activity: dto.activity,
+            activity_at: dto.activity_at,
+            last_message: dto.last_message,
             managed: dto.managed,
         }
     }
@@ -358,6 +481,21 @@ pub fn synthetic_url(kind: &RcKind, slug: &str) -> Option<String> {
         RcKind::ClaudeRc => Some(format!("https://claude.ai/code/session_{slug}")),
         _ => None,
     }
+}
+
+// ---- guest-text sanitization ----
+
+static RE_FORMAT_CHARS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{Cf}").unwrap());
+
+/// Remove every Unicode format character (category Cf — bidi overrides like
+/// U+202E, zero-widths, BOM, soft hyphen, …) from `s`. Client-side defense for
+/// guest-controlled display text (last-message previews, feed messages): the
+/// rc hub strips ANSI escapes and C0/C1 control characters but NOT Cf, and a
+/// bidi override can visually reverse rendered text to spoof what a message
+/// appears to say. Mirrors mobile's `stripFormatChars` (`text_sanitize.dart`).
+/// Shared by the overview session adapter and the rc feed decoder.
+pub fn strip_format_chars(s: &str) -> String {
+    RE_FORMAT_CHARS.replace_all(s, "").into_owned()
 }
 
 // ---- prompt normalization ----
@@ -742,6 +880,18 @@ mod tests {
         assert!(j.get("url").is_none());
     }
 
+    // ---- guest-text sanitization ----
+
+    #[test]
+    fn strip_format_chars_removes_cf_category() {
+        // Bidi override (U+202E), zero-width space (U+200B), BOM (U+FEFF).
+        assert_eq!(strip_format_chars("safe\u{202E}txt"), "safetxt");
+        assert_eq!(strip_format_chars("a\u{200B}b\u{FEFF}c"), "abc");
+        assert_eq!(strip_format_chars("\u{202E}"), "");
+        // Non-Cf text passes through untouched (incl. non-ASCII).
+        assert_eq!(strip_format_chars("héllo → wörld"), "héllo → wörld");
+    }
+
     // ---- prompt normalization ----
 
     #[test]
@@ -892,12 +1042,15 @@ mod tests {
             created_by: Some("shed-desktop/1.0".into()),
             created_at: Some("2026-01-01T00:00:00Z".into()),
             target_label: None,
+            activity: None,
+            activity_at: None,
+            last_message: None,
         };
         let s = RcSession::from_dto(dto, "srv", "web");
         assert_eq!(s.host, "srv");
         assert_eq!(s.shed, "web");
         assert_eq!(s.display_name, "web/abc"); // fallback
-        assert_eq!(s.workdir, DEFAULT_WORKDIR); // fallback
+        assert_eq!(s.workdir.as_deref(), Some(DEFAULT_WORKDIR)); // fallback
         assert_eq!(s.rc_id.as_deref(), Some("id-1")); // id → rc_id
         assert_eq!(s.id(), "srv/web/abc");
     }
@@ -918,6 +1071,9 @@ mod tests {
                 created_by: None,
                 created_at: None,
                 target_label: None,
+                activity: None,
+                activity_at: None,
+                last_message: None,
             },
             "srv",
             "web",
@@ -992,7 +1148,7 @@ mod tests {
         assert!(!dtos[1].managed);
         let minimal = RcSession::from_dto(dtos[1].clone(), "h", "demo");
         assert_eq!(minimal.display_name, "demo/brk900"); // <shed>/<slug> fallback
-        assert_eq!(minimal.workdir, DEFAULT_WORKDIR); // fallback
+        assert_eq!(minimal.workdir.as_deref(), Some(DEFAULT_WORKDIR)); // fallback
         assert!(minimal.rc_id.is_none());
     }
 
@@ -1057,6 +1213,104 @@ mod tests {
         assert_eq!(dtos.len(), 2);
         assert_eq!(dtos[0].kind, RcKind::Codex);
         assert_eq!(dtos[1].kind, RcKind::Other("borg".into()));
+    }
+
+    // ---- kind_features watch/input hints ----
+
+    #[test]
+    fn kind_features_watch_input_absent_default() {
+        // A pre-hub payload carries neither hint → additive defaults (false/"").
+        let f: RcKindFeatures =
+            serde_json::from_str(r#"{"post_input":true,"approvals":"tui"}"#).unwrap();
+        assert!(f.post_input);
+        assert!(!f.watch);
+        assert_eq!(f.input, "");
+        assert!(!f.input_gated());
+    }
+
+    #[test]
+    fn kind_features_gated_input() {
+        let f: RcKindFeatures = serde_json::from_str(
+            r#"{"post_input":true,"approvals":"tui","watch":true,"input":"gated"}"#,
+        )
+        .unwrap();
+        assert!(f.watch);
+        assert!(f.input_gated());
+        // A non-"gated" mode string is preserved verbatim but not gated.
+        let f: RcKindFeatures =
+            serde_json::from_str(r#"{"post_input":false,"approvals":"","input":"open"}"#).unwrap();
+        assert_eq!(f.input, "open");
+        assert!(!f.input_gated());
+    }
+
+    // ---- activity dimension ----
+
+    #[test]
+    fn rc_activity_wire_round_trip() {
+        for (wire, activity) in [
+            ("working", RcActivity::Working),
+            ("needs_input", RcActivity::NeedsInput),
+            ("idle", RcActivity::Idle),
+            ("unknown", RcActivity::Unknown),
+        ] {
+            assert_eq!(RcActivity::from_wire(wire), activity);
+            assert_eq!(activity.as_str(), wire);
+            assert_eq!(serde_json::to_value(activity).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<RcActivity>(wire.into()).unwrap(),
+                activity
+            );
+        }
+        // Any unrecognized token — the reserved needs_approval, a future value,
+        // or garbage — maps to Unknown (Dart parity, rc_models.dart:125-146;
+        // deliberately NOT RcKind's preserve-raw policy), and Unknown
+        // round-trips as the real "unknown" wire value.
+        assert_eq!(RcActivity::from_wire("needs_approval"), RcActivity::Unknown);
+        assert_eq!(RcActivity::from_wire("borg"), RcActivity::Unknown);
+        assert_eq!(
+            serde_json::from_value::<RcActivity>("needs_approval".into()).unwrap(),
+            RcActivity::Unknown
+        );
+        assert_eq!(
+            serde_json::to_value(RcActivity::Unknown).unwrap(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn rc_state_from_wire_is_tolerant() {
+        assert_eq!(RcState::from_wire("ready"), RcState::Ready);
+        assert_eq!(RcState::from_wire("needs-auth"), RcState::NeedsAuth);
+        assert_eq!(RcState::from_wire("dead"), RcState::Dead);
+        // Unknown/missing states read as transient, never as gone.
+        assert_eq!(RcState::from_wire("starting"), RcState::Starting);
+        assert_eq!(RcState::from_wire("some-future-state"), RcState::Starting);
+        assert_eq!(RcState::from_wire(""), RcState::Starting);
+    }
+
+    #[test]
+    fn dto_carries_activity_fields_and_session_flows_them_through() {
+        let dto = decode_session(
+            r#"{"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready",
+                "managed":true,"activity":"working",
+                "activity_at":"2026-06-19T18:54:12Z","last_message":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(dto.activity, Some(RcActivity::Working));
+        let s = RcSession::from_dto(dto, "srv", "web");
+        assert_eq!(s.activity, Some(RcActivity::Working));
+        assert_eq!(s.activity_at.as_deref(), Some("2026-06-19T18:54:12Z"));
+        assert_eq!(s.last_message.as_deref(), Some("hi"));
+        // Absent activity → None, and None keys stay off the serialized wire.
+        let plain = decode_session(
+            r#"{"slug":"b","tmux_session":"rc-b","kind":"shell","state":"ready","managed":true}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.activity, None);
+        let j = serde_json::to_value(RcSession::from_dto(plain, "srv", "web")).unwrap();
+        assert!(j.get("activity").is_none());
+        assert!(j.get("activity_at").is_none());
+        assert!(j.get("last_message").is_none());
     }
 
     // ---- capabilities ----

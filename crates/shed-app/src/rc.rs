@@ -232,7 +232,7 @@ impl RcService {
                 slug: slug.clone(),
                 tmux_session: rc::tmux_name(&slug),
                 display_name: name,
-                workdir: workdir.unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string()),
+                workdir: Some(workdir.unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string())),
                 kind,
                 state: RcState::Ready,
                 url,
@@ -240,6 +240,9 @@ impl RcService {
                 created_by: Some(created_by),
                 created_at: Some(self.clock.now_iso8601()),
                 target_label: Some(target_label),
+                activity: None,
+                activity_at: None,
+                last_message: None,
                 managed: true,
             };
             self.store
@@ -613,6 +616,9 @@ mod tests {
                 created_by: None,
                 created_at: None,
                 target_label: None,
+                activity: None,
+                activity_at: None,
+                last_message: None,
             },
             "srv",
             "web",
