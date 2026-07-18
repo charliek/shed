@@ -1,0 +1,189 @@
+# GoReleaser config — HOST-AGENT component (plan 002: release component model).
+#
+# One of THREE split configs. The release job invokes goreleaser once per
+# SHIPPING component, in the FIXED order: server → host-agent → machine-rc.
+#   - .goreleaser.server.yaml      : brew `shed`, apt `shed-server` deb
+#   - .goreleaser.host-agent.yaml  (this file): brew `shed-host-agent` + GH linux tarball
+#   - .goreleaser.machine-rc.yaml  : brew + apt `shed-machine-rc`
+# See RELEASING.md "Component selection" for the selector law and the flow.
+# Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
+#
+# No before-hooks: this component builds Rust (+ Go rollback) and ships no deb,
+# so there is nothing to render. Keeping before-hooks empty also guarantees this
+# invocation never mutates a tracked file between the server and machine-rc runs.
+
+version: 2
+
+project_name: shed
+
+# Own subdir of dist/ (covered by .gitignore's `dist/`); `--clean` wipes only
+# this dir, never a sibling config's, so the three snapshots/releases coexist.
+dist: dist/host-agent
+
+builds:
+  - id: shed-host-agent-darwin
+    binary: shed-host-agent
+    main: ./cmd/shed-host-agent
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+  - id: shed-host-agent-linux
+    binary: shed-host-agent
+    main: ./cmd/shed-host-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+  # The SHIPPED host-agent binary — Rust (crates/shed-host-agent), built by
+  # goreleaser's OSS `builder: rust` (which runs `cargo zigbuild`) on the
+  # macos-latest release runner; it cross-compiles all four targets, linux via
+  # zig (probe-proven: linux ELF from macOS). The two Go ids above stay defined
+  # (goreleaser compiles every build regardless of archive refs) as ~2-release
+  # rollback insurance, but are detached from the archive below — flip
+  # archives[shed-host-agent].ids back to them to revert. See RELEASING.md
+  # "Host-agent: Rust binary, Go rollback". No `main:` (rust builder rejects it).
+  - id: shed-host-agent
+    builder: rust
+    binary: shed-host-agent
+    dir: crates
+    # --package= is REQUIRED: crates/ is a Cargo workspace and goreleaser's rust
+    # builder refuses a workspace build without --package/-p (it detects the
+    # `--package=`/`-p=` prefix). --locked pins the committed Cargo.lock;
+    # --release is the builder default but explicit here.
+    flags:
+      - --release
+      - --locked
+      - --package=shed-host-agent
+    # NOTE (linux glibc floor): the two *-unknown-linux-gnu targets currently link
+    # against cargo-zigbuild's default glibc (~2.30 — modern distros: Ubuntu 20.04+,
+    # RHEL 9+). The Go rollback build was CGO_ENABLED=0 (static), so the linux
+    # tarball's floor rose. Pinning it lower (e.g. `x86_64-unknown-linux-gnu.2.17`)
+    # is NOT possible on the pinned goreleaser v2.15.2 — its rust builder passes the
+    # raw glibc-suffixed triple to `rustup target add`, which rejects it (only
+    # `cargo zigbuild` itself strips the suffix). Tracked follow-up: pin the floor
+    # once goreleaser's rust builder strips the suffix before rustup. The linux
+    # tarball is a secondary GH-release download (no apt; brew/macOS is the only
+    # wired install path), so this does not affect the primary install identity.
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+    env:
+      # Baked into `shed-host-agent version` at compile time (version.rs
+      # option_env!). {{ .Version }} is the tag, already v-stripped (a snapshot
+      # pseudo-version under --snapshot), so the shipped version tracks the go
+      # release tag rather than CARGO_PKG_VERSION (which follows the desktop
+      # selector and is not bumped on a go-only tag).
+      - SHED_HOST_AGENT_VERSION={{ .Version }}
+
+archives:
+  - id: shed-host-agent
+    # Ships the RUST build (id: shed-host-agent) — the Go ids
+    # (shed-host-agent-{darwin,linux}) stay defined + compiled as rollback
+    # insurance; flip this back to them to revert. Archive name/layout and the
+    # bundled extensions.example.yaml are UNCHANGED (install-identity anchor).
+    ids:
+      - shed-host-agent
+    formats:
+      - tar.gz
+    name_template: "shed-host-agent_{{ .Os }}_{{ .Arch }}"
+    files:
+      - src: configs/extensions.example.yaml
+        dst: .
+        strip_parent: true
+
+brews:
+  - name: shed-host-agent
+    ids:
+      - shed-host-agent
+    repository:
+      owner: charliek
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/charliek/shed"
+    description: "Host-side credential brokering agent for shed VMs"
+    license: "MIT"
+    install: |
+      bin.install "shed-host-agent"
+      (etc/"shed").mkpath
+      (etc/"shed").install "extensions.example.yaml" => "extensions.yaml" unless (etc/"shed/extensions.yaml").exist?
+    service: |
+      # The agent writes its own size-capped, rotated operational log via
+      # -log-file. launchd never rotates, so the previously-captured stderr log
+      # grew unbounded (observed at 21 MB); error_log_path now only catches
+      # pre-logger panics / runtime crashes (tiny).
+      run [opt_bin/"shed-host-agent", "-config", etc/"shed/extensions.yaml", "-log-file", var/"log/shed-host-agent.log"]
+      keep_alive true
+      error_log_path var/"log/shed-host-agent.err.log"
+      # launchd provides only a bare PATH; include the locations where Docker
+      # Desktop (/usr/local/bin) and Homebrew (/opt/homebrew/bin) install
+      # credential helpers so docker-credential-* can be resolved.
+      environment_variables PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    caveats: |
+      The shed-host-agent config has been installed to:
+        #{HOMEBREW_PREFIX}/etc/shed/extensions.yaml
+
+      Update that file with your shed server URL and any credential
+      settings before starting the service.
+
+      To start shed-host-agent as a background service:
+        brew services start shed-host-agent
+
+      Then verify it's running and see which config it loaded:
+        shed-host-agent status
+
+      Logs: #{var}/log/shed-host-agent.log
+    test: |
+      system bin/"shed-host-agent", "version"
+
+checksum:
+  # Unique per-config name: the three configs publish to the SAME GH release
+  # (shared tag), so a shared `checksums.txt` would clobber across invocations.
+  name_template: "checksums-host-agent.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: charliek
+    name: shed
+  draft: false
+  prerelease: auto
+  # keep-existing: the first SHIPPING invocation (server → host-agent →
+  # machine-rc) creates the release + the goreleaser-changelog body; later
+  # invocations upload their assets without touching the body.
+  mode: keep-existing
+  # replace_existing_artifacts: a re-run of a partially-failed release job
+  # replaces its own already-uploaded assets instead of dying `already_exists`
+  # under keep-existing.
+  replace_existing_artifacts: true
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"

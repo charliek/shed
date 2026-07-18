@@ -120,7 +120,7 @@ jobs:
               - '.github/workflows/docs.yml'
             ci:
               - '.github/workflows/**'
-              - '.goreleaser.yaml'
+              - '.goreleaser*.yaml'
               - 'scripts/release/**'
               - 'Makefile'
               - 'desktop/Makefile'
@@ -213,38 +213,63 @@ jobs:
           # harder is a tracked follow-up (see .goreleaser.yaml glibc-floor note).
           brew install zig
           cargo install --locked --version 0.23.0 cargo-zigbuild
+      # Mirrors the release job's guard (plan 002 D5): the three configs are
+      # invoked sequentially and a before-hook MUST NOT mutate a tracked file
+      # (go.mod/go.sum) or a later invocation aborts on its own dirty-check. We
+      # assert tidiness here instead of running `go mod tidy` in a before-hook,
+      # and assert the server config's generated file stays gitignored.
+      - name: Guard — tidy tree + gitignored generated config
+        run: |
+          go mod tidy && git diff --exit-code go.mod go.sum
+          git check-ignore -q packaging/server.yaml.generated
       # First-ever CI exercise of the darwin build-tag half (the Go rollback
       # shed-host-agent's touchid_darwin.go, CGO) — de-risks the macos release job.
       - name: Run tests
         run: go test ./...
-      - name: GoReleaser snapshot build
+      # Three snapshot invocations, one per split config, in the FIXED release
+      # order (server → host-agent → machine-rc). All three run unconditionally
+      # here — the snapshot is the pre-tag proof of every component, incl. the
+      # Rust host-agent leg. Each writes its own dist/<component>/ subdir.
+      - name: GoReleaser snapshot — server
         uses: goreleaser/goreleaser-action@v7
         with:
           version: v2.15.2
-          args: release --snapshot --clean
+          args: release --snapshot --clean -f .goreleaser.server.yaml
+      - name: GoReleaser snapshot — host-agent
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.2
+          args: release --snapshot --clean -f .goreleaser.host-agent.yaml
+      - name: GoReleaser snapshot — machine-rc
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.2
+          args: release --snapshot --clean -f .goreleaser.machine-rc.yaml
       - name: Assert release artifacts
         run: |
           set -euo pipefail
+          # Each split config writes its own dist/<component>/ subdir (plan 002
+          # D2); the checks below are re-pointed accordingly.
           # (i) shed-machine-rc archives: darwin+linux × amd64+arm64, each containing
           # EXACTLY the one binary (ids: selectors must keep other builds out).
-          for tgz in dist/shed-machine-rc_*.tar.gz; do
+          for tgz in dist/machine-rc/shed-machine-rc_*.tar.gz; do
             entries=$(tar tzf "$tgz" | grep -c .)
             bins=$(tar tzf "$tgz" | grep -c '^shed-machine-rc$')
             { [ "$entries" = "1" ] && [ "$bins" = "1" ]; } || { echo "::error::$tgz must contain exactly the shed-machine-rc binary and nothing else"; tar tzf "$tgz"; exit 1; }
           done
           for os in darwin linux; do
             for arch in amd64 arm64; do
-              ls "dist/shed-machine-rc_${os}_${arch}.tar.gz" >/dev/null || { echo "::error::missing dist/shed-machine-rc_${os}_${arch}.tar.gz"; exit 1; }
+              ls "dist/machine-rc/shed-machine-rc_${os}_${arch}.tar.gz" >/dev/null || { echo "::error::missing dist/machine-rc/shed-machine-rc_${os}_${arch}.tar.gz"; exit 1; }
             done
           done
           # (ii) per-arch shed-machine-rc .debs, named to match apt-charliek's glob.
-          ls dist/shed-machine-rc_*_amd64.deb dist/shed-machine-rc_*_arm64.deb
+          ls dist/machine-rc/shed-machine-rc_*_amd64.deb dist/machine-rc/shed-machine-rc_*_arm64.deb
           # (iii) ALL FOUR shed-host-agent archives (now Rust) carry the binary AND
           # the example config.
           workdir="$(mktemp -d)"
           for os in darwin linux; do
             for arch in amd64 arm64; do
-              tgz="dist/shed-host-agent_${os}_${arch}.tar.gz"
+              tgz="dist/host-agent/shed-host-agent_${os}_${arch}.tar.gz"
               ls "$tgz" >/dev/null || { echo "::error::missing $tgz"; exit 1; }
               tar tzf "$tgz" | grep -qx 'shed-host-agent' || { echo "::error::$tgz missing shed-host-agent binary"; tar tzf "$tgz"; exit 1; }
               tar tzf "$tgz" | grep -qx 'extensions.example.yaml' || { echo "::error::$tgz missing extensions.example.yaml"; tar tzf "$tgz"; exit 1; }
@@ -257,20 +282,20 @@ jobs:
           # (never executed, so no Rosetta dependency). Assert the arm64 binary
           # keeps its linker ad-hoc signature (matches the Go baseline — no explicit
           # codesign step; a future zig that drops it fails loudly here, pre-tag).
-          tar xzf dist/shed-host-agent_darwin_arm64.tar.gz -C "$workdir" shed-host-agent
+          tar xzf dist/host-agent/shed-host-agent_darwin_arm64.tar.gz -C "$workdir" shed-host-agent
           arm64_out="$("$workdir/shed-host-agent" version)"
           echo "darwin/arm64: $arm64_out"
           case "$arm64_out" in shed-host-agent\ *) ;; *) echo "::error::darwin/arm64 version output unexpected: $arm64_out"; exit 1;; esac
           codesign -dv "$workdir/shed-host-agent" 2>&1 | grep -q 'Signature=adhoc' || { echo "::error::arm64 shed-host-agent lost its ad-hoc signature"; codesign -dv "$workdir/shed-host-agent" 2>&1; exit 1; }
           rm -f "$workdir/shed-host-agent"
-          tar xzf dist/shed-host-agent_darwin_amd64.tar.gz -C "$workdir" shed-host-agent
+          tar xzf dist/host-agent/shed-host-agent_darwin_amd64.tar.gz -C "$workdir" shed-host-agent
           amd64_file="$(file "$workdir/shed-host-agent")"
           echo "$amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::darwin/amd64 is not a well-formed x86_64 Mach-O: $amd64_file"; exit 1; }
           echo "darwin/amd64: $amd64_file"
-          # (iv) rollback insurance: the detached Go ids still compiled.
+          # (iv) rollback insurance: the detached Go ids still compiled (host-agent dist).
           python3 - <<'PY'
           import json,sys
-          arts=json.load(open('dist/artifacts.json'))
+          arts=json.load(open('dist/host-agent/artifacts.json'))
           seen={}
           for a in arts:
               ex=a.get('extra') or {}
@@ -282,6 +307,99 @@ jobs:
           print("Go rollback ids present:",{k:sorted(v) for k,v in seen.items()})
           PY
           rm -rf "$workdir"
+          # (v) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
+          # dropped ARCHIVE block is caught even when its BUILD still contributes
+          # the same ID string (codex review finding). Equality proves expected-
+          # present AND forbidden-absent. Plus partition invariants (deb
+          # ownership, one-checksums-file-per-dist, upload-basename uniqueness
+          # across dists) + brew formulas exact-set & `ruby -c` parse.
+          python3 - <<'PY'
+          import glob, json, os, subprocess, sys
+          EXPECTED = {
+              "server": {
+                  "dist": "dist/server",
+                  "typed_ids": {
+                      "Binary": {"shed", "shed-server", "shed-egress-proxy", "shed-agent"},
+                      "Archive": {"shed", "shed-server", "shed-agent", "shed-homebrew"},
+                      "Linux Package": {"shed-deb"},
+                  },
+                  "checksums": "checksums-server.txt",
+                  "formulas": {"shed.rb"},
+                  "has_deb": True,
+              },
+              "host-agent": {
+                  "dist": "dist/host-agent",
+                  "typed_ids": {
+                      # Go rollback ids compile as binaries but are detached from
+                      # the archive — Binary-only, by design (RELEASING.md).
+                      "Binary": {"shed-host-agent", "shed-host-agent-darwin", "shed-host-agent-linux"},
+                      "Archive": {"shed-host-agent"},
+                      "Linux Package": set(),
+                  },
+                  "checksums": "checksums-host-agent.txt",
+                  "formulas": {"shed-host-agent.rb"},
+                  "has_deb": False,
+              },
+              "machine-rc": {
+                  "dist": "dist/machine-rc",
+                  "typed_ids": {
+                      "Binary": {"shed-machine-rc"},
+                      "Archive": {"shed-machine-rc"},
+                      "Linux Package": {"shed-machine-rc"},
+                  },
+                  "checksums": "checksums-machine-rc.txt",
+                  "formulas": {"shed-machine-rc.rb"},
+                  "has_deb": True,
+              },
+          }
+          ALL_CHECKSUMS = {c["checksums"] for c in EXPECTED.values()}
+          def fail(m):
+              print("::error::" + m); sys.exit(1)
+          all_basenames = {}
+          for comp, spec in EXPECTED.items():
+              dist = spec["dist"]
+              if not os.path.isdir(dist):
+                  fail(f"{comp}: dist dir {dist} missing")
+              arts = json.load(open(os.path.join(dist, "artifacts.json")))
+              got = {t: set() for t in spec["typed_ids"]}
+              for a in arts:
+                  t = a.get("type")
+                  aid = (a.get("extra") or {}).get("ID")
+                  if t in got and aid:
+                      got[t].add(aid)
+              for t, want in spec["typed_ids"].items():
+                  if got[t] != want:
+                      fail(f"{comp}: {t} IDs {sorted(got[t])} != allowlist {sorted(want)}")
+              debs = glob.glob(os.path.join(dist, "*.deb"))
+              if spec["has_deb"] and not debs:
+                  fail(f"{comp}: expected .deb artifacts, found none")
+              if not spec["has_deb"] and debs:
+                  fail(f"{comp}: dist must contain NO .deb, found {[os.path.basename(d) for d in debs]}")
+              present = {os.path.basename(p) for p in glob.glob(os.path.join(dist, "checksums-*.txt"))}
+              if present != {spec["checksums"]}:
+                  fail(f"{comp}: checksums files {sorted(present)} != {{{spec['checksums']}}}")
+              if present & (ALL_CHECKSUMS - {spec["checksums"]}):
+                  fail(f"{comp}: contains a foreign checksums file")
+              # Exact formula SET — extras are as wrong as missing ones (a stray
+              # brew block would publish an unexpected formula at tag time).
+              rendered = {os.path.basename(p) for p in glob.glob(os.path.join(dist, "homebrew", "Formula", "*.rb"))}
+              if rendered != spec["formulas"]:
+                  fail(f"{comp}: rendered formulas {sorted(rendered)} != expected {sorted(spec['formulas'])}")
+              for f in spec["formulas"]:
+                  fp = os.path.join(dist, "homebrew", "Formula", f)
+                  r = subprocess.run(["ruby", "-c", fp], capture_output=True, text=True)
+                  if r.returncode != 0:
+                      fail(f"{comp}: {fp} failed `ruby -c`: {r.stderr.strip()}")
+              # release-uploaded assets only (archives, debs, checksums file)
+              for pat in ("*.tar.gz", "*.deb", "checksums-*.txt"):
+                  for p in glob.glob(os.path.join(dist, pat)):
+                      b = os.path.basename(p)
+                      if b in all_basenames:
+                          fail(f"upload basename {b} collides: {all_basenames[b]} and {comp}")
+                      all_basenames[b] = comp
+              print(f"{comp}: IDs OK; deb={'yes' if debs else 'no'}; checksums={spec['checksums']}; formulas parse OK")
+          print(f"partition OK: {len(all_basenames)} unique upload basenames across three dists")
+          PY
           echo "release snapshot artifacts OK"
 
   # ---- desktop / crates legs (imported from shed-desktop's ci.yml) ----------

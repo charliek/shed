@@ -1,0 +1,429 @@
+# GoReleaser config — SERVER component (plan 002: release component model).
+#
+# One of THREE split configs. The release job invokes goreleaser once per
+# SHIPPING component, in the FIXED order: server → host-agent → machine-rc.
+#   - .goreleaser.server.yaml      (this file): brew `shed`, apt `shed-server` deb
+#   - .goreleaser.host-agent.yaml  : brew `shed-host-agent` + GH linux tarball
+#   - .goreleaser.machine-rc.yaml  : brew + apt `shed-machine-rc`
+# See RELEASING.md "Component selection" for the selector law and the flow.
+# Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
+
+version: 2
+
+project_name: shed
+
+# Own subdir of dist/ (covered by .gitignore's `dist/`); `--clean` wipes only
+# this dir, never a sibling config's, so the three snapshots/releases coexist.
+dist: dist/server
+
+before:
+  hooks:
+    # ONLY the sed that renders packaging/server.yaml.generated (gitignored) for
+    # the shed-deb nfpm below. NO `go mod tidy` here: the release job runs the
+    # three configs sequentially (server → host-agent → machine-rc) and asserts
+    # a clean tree; a before-hook MUST NOT mutate a tracked file (go.mod/go.sum)
+    # or invocation #2 aborts on the dirty-check. CI asserts tidiness separately
+    # (go mod tidy && git diff --exit-code go.mod go.sum).
+    - sh -c 'sed "s/{{"{{"}}VERSION{{"}}"}}/{{ .Version }}/g" packaging/server.yaml.tmpl > packaging/server.yaml.generated'
+
+builds:
+  - id: shed
+    binary: shed
+    main: ./cmd/shed
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+  - id: shed-server
+    binary: shed-server
+    main: ./cmd/shed-server
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+  - id: shed-egress-proxy
+    binary: shed-egress-proxy
+    main: ./cmd/shed-egress-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+  - id: shed-agent
+    binary: shed-agent
+    main: ./cmd/shed-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+archives:
+  - id: shed
+    ids:
+      - shed
+    formats:
+      - tar.gz
+    name_template: "shed_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+  - id: shed-server
+    ids:
+      - shed-server
+    formats:
+      - tar.gz
+    name_template: "shed-server_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+  - id: shed-agent
+    ids:
+      - shed-agent
+    formats:
+      - tar.gz
+    name_template: "shed-agent_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+  - id: shed-homebrew
+    ids:
+      - shed
+      - shed-server
+      - shed-egress-proxy
+    formats:
+      - tar.gz
+    name_template: "shed-homebrew_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+brews:
+  - name: shed
+    ids:
+      - shed-homebrew
+    repository:
+      owner: charliek
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/charliek/shed"
+    description: "CLI and server for managing persistent VM-based dev environments"
+    license: "MIT"
+    dependencies:
+      - name: vfkit
+        os: mac
+      # v0.5.2 moved mkfs.erofs into the publisher-side
+      # shed-build-tools container — hosts no longer need
+      # erofs-utils. Kept the brew formula minimal.
+    install: |
+      bin.install "shed"
+      bin.install "shed-server"
+      bin.install "shed-egress-proxy"
+      (etc/"shed").mkpath
+      unless (etc/"shed/server.yaml").exist?
+        if OS.mac?
+          (etc/"shed/server.yaml").write <<~YAML
+            # Shed Server Configuration
+            # Full reference: https://github.com/charliek/shed/blob/main/configs/server.example.yaml
+
+            name: my-server
+
+            http_port: 8080
+            ssh_port: 2222
+
+            # bind_address: which interface every listener (HTTP/SSH) uses.
+            # Default loopback (127.0.0.1) = reachable on this machine only. To
+            # reach it from other hosts, prefer secure mode (auth.mode: secure;
+            # see the reference above) with bind_address: 0.0.0.0; or, for an
+            # OPEN server on a trusted private network, set bind_address: 0.0.0.0
+            # and allow_insecure_exposure: true.
+            bind_address: 127.0.0.1
+
+            default_backend: vz
+            log_level: info
+
+            # Host directories to mount into every shed (formerly "credentials")
+            # Using ~/.shed/mounts/ keeps host and VM configs separate.
+            # mounts:
+            #   claude:
+            #     source: ~/.shed/mounts/claude
+            #     target: /home/shed/.claude
+            #     readonly: false
+            #   codex:
+            #     source: ~/.shed/mounts/codex
+            #     target: /home/shed/.codex
+            #     readonly: false
+            #   opencode_data:
+            #     source: ~/.shed/mounts/opencode/share
+            #     target: /home/shed/.local/share/opencode
+            #     readonly: false
+            #   opencode_state:
+            #     source: ~/.shed/mounts/opencode/state
+            #     target: /home/shed/.local/state/opencode
+            #     readonly: false
+            #   gh:
+            #     source: ~/.shed/mounts/gh
+            #     target: /home/shed/.config/gh
+            #     readonly: false
+
+            # Environment file (KEY=value per line, injected into VMs)
+            # env_file: ~/.shed/env
+
+            # Extensions provide credential brokering from host to VM.
+            # Requires shed-host-agent to be installed and running:
+            #   brew install shed-host-agent
+            #   brew services start shed-host-agent
+            # extensions:
+            #   enabled:
+            #     - ssh-agent
+            #     - aws-credentials
+            #     - docker-credentials
+
+            vz:
+              vfkit_path: vfkit
+              kernel_path: ~/Library/Application Support/shed/vz/vmlinux
+              initrd_path: ~/Library/Application Support/shed/vz/initrd.img
+              # default_image / image_aliases resolve from the server version
+              # when unset: ghcr.io/charliek/shed-vz-{base,extensions,full}:vX.Y.Z.
+              # Pin explicitly to override the registry or variant.
+              pull_policy: missing
+              instance_dir: ~/Library/Application Support/shed/vz/instances
+              socket_dir: ~/.shed/vz/sockets
+              default_cpus: 2
+              default_memory_mb: 4096
+              default_disk_gb: 20
+              console_port: 1024
+              notify_port: 1026
+              tcp_proxy_port: 1028
+              start_timeout: 60s
+              stop_timeout: 10s
+          YAML
+        else
+          (etc/"shed/server.yaml").write <<~YAML
+            # Shed Server Configuration
+            # Full reference: https://github.com/charliek/shed/blob/main/configs/server.example.yaml
+
+            name: my-server
+
+            http_port: 8080
+            ssh_port: 2222
+
+            # bind_address: which interface every listener (HTTP/SSH) uses.
+            # Default loopback (127.0.0.1) = reachable on this machine only. To
+            # reach it from other hosts, prefer secure mode (auth.mode: secure;
+            # see the reference above) with bind_address: 0.0.0.0; or, for an
+            # OPEN server on a trusted private network, set bind_address: 0.0.0.0
+            # and allow_insecure_exposure: true.
+            bind_address: 127.0.0.1
+
+            default_backend: firecracker
+            log_level: info
+
+            # Host directories to mount into every shed (formerly "credentials")
+            # Using ~/.shed/mounts/ keeps host and VM configs separate.
+            # mounts:
+            #   claude:
+            #     source: ~/.shed/mounts/claude
+            #     target: /home/shed/.claude
+            #     readonly: false
+            #   codex:
+            #     source: ~/.shed/mounts/codex
+            #     target: /home/shed/.codex
+            #     readonly: false
+            #   gh:
+            #     source: ~/.shed/mounts/gh
+            #     target: /home/shed/.config/gh
+            #     readonly: false
+
+            # Environment file (KEY=value per line, injected into VMs)
+            # env_file: ~/.shed/env
+
+            # Extensions provide credential brokering from host to VM.
+            # Requires shed-host-agent to be installed and running:
+            #   brew install shed-host-agent
+            #   brew services start shed-host-agent
+            # extensions:
+            #   enabled:
+            #     - ssh-agent
+            #     - aws-credentials
+            #     - docker-credentials
+
+            firecracker:
+              kernel_path: /var/lib/shed/firecracker/images/vmlinux
+              # default_image / image_aliases resolve from the server version
+              # when unset: ghcr.io/charliek/shed-fc-{base,extensions,full}:vX.Y.Z.
+              # Pin explicitly to override the registry or variant.
+              pull_policy: missing
+              instance_dir: /var/lib/shed/firecracker/instances
+              socket_dir: /var/run/shed/firecracker
+              default_cpus: 2
+              default_memory_mb: 4096
+              default_disk_gb: 20
+              vsock_base_cid: 100
+              console_port: 1024
+              notify_port: 1026
+              start_timeout: 90s
+              stop_timeout: 10s
+              bridge_name: shed-br0
+              bridge_cidr: 172.30.0.1/24
+              tap_prefix: shed-tap
+          YAML
+        end
+      end
+    post_install: |
+      if OS.mac?
+        require "tempfile"
+        tmp = Tempfile.new(["shed-entitlements", ".plist"])
+        tmp.write <<~XML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.virtualization</key>
+            <true/>
+          </dict>
+          </plist>
+        XML
+        tmp.flush
+        system "codesign", "--force", "--sign", "-",
+               "--entitlements", tmp.path,
+               "#{bin}/shed-server"
+        tmp.close!
+      end
+    service: |
+      run [opt_bin/"shed-server", "serve", "--config", etc/"shed/server.yaml"]
+      keep_alive true
+      log_path var/"log/shed-server.log"
+      error_log_path var/"log/shed-server.log"
+      environment_variables PATH: "/usr/local/bin:#{std_service_path_env}"
+    caveats: |
+      The shed-server config has been installed to:
+        #{HOMEBREW_PREFIX}/etc/shed/server.yaml
+
+      Edit the config to enable credential mounts and extensions,
+      then start shed-server as a background service:
+        brew services start shed
+
+      By default shed-server listens on 127.0.0.1 only (the local-development
+      default). To reach it from other machines set bind_address in the config —
+      prefer auth.mode: secure for anything exposed on a network.
+
+      To enable extensions (SSH agent forwarding, AWS credentials,
+      Docker credentials), also install the host agent:
+        brew install shed-host-agent
+
+      Logs: #{var}/log/shed-server.log
+
+      Note: shed-server requires Docker for VM image management.
+    test: |
+      system bin/"shed", "version"
+
+nfpms:
+  - id: shed-deb
+    package_name: shed-server
+    file_name_template: "shed-server_{{ .Version }}_{{ .Arch }}"
+    vendor: charliek
+    homepage: "https://github.com/charliek/shed"
+    maintainer: "Charlie Knudsen"
+    description: "CLI and server for managing persistent VM-based dev environments"
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/local/bin
+    ids:
+      - shed
+      - shed-server
+      - shed-egress-proxy
+    # v0.5.2 moved mkfs.erofs into the publisher-side
+    # shed-build-tools container. Hosts no longer need erofs-utils
+    # — the rootfs erofs ships as a content-addressed OCI blob.
+    conflicts:
+      - shed
+    contents:
+      - src: packaging/shed-server.service
+        dst: /etc/systemd/system/shed-server.service
+        type: config
+      - src: packaging/server.yaml.generated
+        dst: /etc/shed/server.yaml
+        type: "config|noreplace"
+      - dst: /var/lib/shed/firecracker/instances
+        type: dir
+        file_info:
+          mode: 0755
+      - dst: /var/lib/shed/firecracker/images
+        type: dir
+        file_info:
+          mode: 0755
+      - dst: /var/run/shed/firecracker
+        type: dir
+        file_info:
+          mode: 0755
+    scripts:
+      postinstall: packaging/postinstall.sh
+
+checksum:
+  # Unique per-config name: the three configs publish to the SAME GH release
+  # (shared tag), so a shared `checksums.txt` would clobber across invocations.
+  name_template: "checksums-server.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: charliek
+    name: shed
+  draft: false
+  prerelease: auto
+  # keep-existing: the first SHIPPING invocation (server → host-agent →
+  # machine-rc) creates the release + the goreleaser-changelog body; later
+  # invocations upload their assets without touching the body.
+  mode: keep-existing
+  # replace_existing_artifacts: a re-run of a partially-failed release job
+  # replaces its own already-uploaded assets instead of dying `already_exists`
+  # under keep-existing.
+  replace_existing_artifacts: true
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
