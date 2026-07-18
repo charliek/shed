@@ -773,7 +773,7 @@ impl Handler {
                     format!("{shed}/{slug}")
                 }
             }),
-            workdir: opt("workdir").unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string()),
+            workdir: Some(opt("workdir").unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string())),
             // kind + state both default (like the Swift `RcInjectTestParams`) — this
             // is the test-only fixture op; the harness always sends valid values.
             kind: params
@@ -789,6 +789,9 @@ impl Handler {
             created_by: opt("created_by"),
             created_at: opt("created_at"),
             target_label: opt("target_label"),
+            activity: None,
+            activity_at: None,
+            last_message: None,
             managed,
         })
     }

@@ -232,7 +232,7 @@ impl RcService {
                 slug: slug.clone(),
                 tmux_session: rc::tmux_name(&slug),
                 display_name: name,
-                workdir: workdir.unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string()),
+                workdir: Some(workdir.unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string())),
                 kind,
                 state: RcState::Ready,
                 url,
@@ -240,6 +240,9 @@ impl RcService {
                 created_by: Some(created_by),
                 created_at: Some(self.clock.now_iso8601()),
                 target_label: Some(target_label),
+                activity: None,
+                activity_at: None,
+                last_message: None,
                 managed: true,
             };
             self.store
@@ -252,6 +255,9 @@ impl RcService {
         // Real path — serialized against list/kill.
         let _guard = self.op_guard.lock().await;
         // Build argv + stdin together so `--prompt-stdin` and the payload can't disagree.
+        // The invocation is the permission-mode validating gate; desktop has no
+        // permission-mode UI yet, and a `None` mode can never fail validation, so
+        // the `?` here is unreachable in practice (argv stays byte-identical).
         let (argv, stdin) = rc::create_invocation(
             &binary_name(),
             &kind,
@@ -260,8 +266,9 @@ impl RcService {
             workdir.as_deref(),
             &created_by,
             &target_label,
+            None,
             prompt.as_deref(),
-        );
+        )?;
         let out = self
             .runner
             .run(ssh_for(shed, &target, &argv), stdin, CREATE_TIMEOUT)
@@ -613,6 +620,9 @@ mod tests {
                 created_by: None,
                 created_at: None,
                 target_label: None,
+                activity: None,
+                activity_at: None,
+                last_message: None,
             },
             "srv",
             "web",

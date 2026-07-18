@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::models::{clean_display, dart_trim, opt_trimmed};
 use crate::terminal::{shell_quote, ssh_host_key_opts};
 
 /// Fallback workdir for a legacy/unmanaged session whose DTO omits one (the
@@ -60,6 +61,23 @@ impl RcKind {
     /// unknown-kind policy's neutral-render signal.
     pub fn is_known(&self) -> bool {
         !matches!(self, RcKind::Other(_))
+    }
+
+    /// Whether this kind runs claude — i.e. one of the two claude kinds (and so
+    /// gets claude's full `--permission-mode` set and URL affordances). NOT true
+    /// for codex/cursor/opencode. Mirrors the guest's `IsClaudeKind` and mobile's
+    /// `RcKind.runsClaude` (`rc_models.dart:76`).
+    pub fn runs_claude(&self) -> bool {
+        matches!(self, RcKind::ClaudeBroker | RcKind::ClaudeRc)
+    }
+
+    /// Whether this kind carries an autonomy/permission posture: every known
+    /// agent kind does; `shell` has none, and an unknown kind renders neutrally
+    /// with none — a caller-supplied mode is dropped silently for both (see
+    /// [`validate_permission_mode`]). Mirrors mobile's `RcKind.hasPermissionMode`
+    /// (`rc_models.dart:81`).
+    pub fn has_permission_mode(&self) -> bool {
+        self.is_known() && !matches!(self, RcKind::Shell)
     }
 
     /// The tool token this kind's agent maps to under `capabilities.agents`, or
@@ -150,6 +168,93 @@ pub enum RcState {
     Dead,
 }
 
+impl RcState {
+    /// Tolerant wire decode: an unknown state from a newer binary/server is
+    /// treated as `Starting` (transient) rather than `Dead`, so a forward-compat
+    /// session is never shown as gone. Mirrors mobile's `RcState.fromWire`
+    /// (`rc_models.dart:176-181`). The strict serde derive above stays the
+    /// contract for `shed-ext-rc` stdout (golden-pinned); this is for the
+    /// tolerant server-enrichment paths (overview `rc` blocks, rc-events).
+    pub fn from_wire(s: &str) -> RcState {
+        match s {
+            "ready" => RcState::Ready,
+            "reconnecting" => RcState::Reconnecting,
+            "needs-trust" => RcState::NeedsTrust,
+            "needs-auth" => RcState::NeedsAuth,
+            "dead" => RcState::Dead,
+            _ => RcState::Starting, // incl. "starting" and any future value
+        }
+    }
+
+    /// Whether this lifecycle state permits showing the live activity
+    /// dimension. The server already drops activity for a blocking state
+    /// (needs-trust / needs-auth / dead — lifecycle trumps activity); the
+    /// client mirrors that gate so it never invents — or leaves on screen — an
+    /// activity or last-message a blocking state should hide. Mirrors mobile's
+    /// `rcStatePermitsActivity` (`rc_models.dart:154-157`); consumed by the
+    /// [`crate::rc_events`] fold's suppression rule.
+    pub fn permits_activity(&self) -> bool {
+        !matches!(
+            self,
+            RcState::NeedsTrust | RcState::NeedsAuth | RcState::Dead
+        )
+    }
+}
+
+/// A session's live *work* dimension, orthogonal to the lifecycle [`RcState`].
+/// Derived live by the rc hub and reported additively inside a session's `rc`
+/// block. Mirrors the guest's `rc.Activity` (`internal/ext/rc/activity.go`) and
+/// mobile's `RcActivity` (`rc_models.dart:125-147`): `working` (producing
+/// output), `needs_input` (idle at a prompt anchor), `idle` (quiescent), and
+/// `unknown` (live but indeterminate).
+///
+/// Deliberately NO `Other(String)` case (unlike [`RcKind`]'s unknown-kind
+/// policy): an UNRECOGNIZED token — a future value, or the reserved
+/// `needs_approval` the hub does not derive yet — maps to
+/// [`RcActivity::Unknown`] (Dart parity, `rc_models.dart:125-146`), so it
+/// renders neutrally (no badge) and consumers key off a single variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RcActivity {
+    Working,
+    NeedsInput,
+    Idle,
+    Unknown,
+}
+
+impl RcActivity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RcActivity::Working => "working",
+            RcActivity::NeedsInput => "needs_input",
+            RcActivity::Idle => "idle",
+            RcActivity::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a wire activity string; any unrecognized value maps to
+    /// [`RcActivity::Unknown`] rather than failing (never-throw decode).
+    pub fn from_wire(s: &str) -> RcActivity {
+        match s {
+            "working" => RcActivity::Working,
+            "needs_input" => RcActivity::NeedsInput,
+            "idle" => RcActivity::Idle,
+            _ => RcActivity::Unknown,
+        }
+    }
+}
+
+impl Serialize for RcActivity {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RcActivity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(RcActivity::from_wire(&String::deserialize(d)?))
+    }
+}
+
 /// A pane-derived `(state, url)` — backs the pure `rc.classify` IPC utility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RcClassification {
@@ -196,6 +301,17 @@ pub struct RcSessionDto {
     pub created_by: Option<String>,
     pub created_at: Option<String>,
     pub target_label: Option<String>,
+    /// Live-activity dimension (additive inside the `rc` block; derived by the
+    /// rc hub). Absent when no hub is running, the kind is unsupported, or the
+    /// server suppressed it (a blocking lifecycle state trumps activity).
+    /// Mirrors mobile's `RcSession.activity` (`rc_models.dart:222-234`).
+    pub activity: Option<RcActivity>,
+    /// RFC3339 timestamp the activity was last derived/changed; absent with
+    /// `activity`.
+    pub activity_at: Option<String>,
+    /// A short, hub-sanitized (ANSI/control-stripped, ≤200 runes) preview of
+    /// the session's most recent message. Absent when the hub has none.
+    pub last_message: Option<String>,
 }
 
 /// The `shed-ext-rc list` response shape. Strict on `rc_sessions` like Swift's
@@ -222,12 +338,36 @@ pub struct RcAgentInfo {
 }
 
 /// Per-kind UI hints from [`RcCapabilities::kind_features`]. Mirrors the guest's
-/// `rc.KindFeatures`: `post_input` reports whether a typed line reaches the pane,
-/// `approvals` is where approvals surface (v1 agents are TUI-only → `"tui"`).
+/// `rc.KindFeatures` and mobile's `KindFeatures` (`rc_capabilities.dart:116-144`):
+/// `post_input` reports whether a typed line reaches the pane, `approvals` is
+/// where approvals surface (v1 agents are TUI-only → `"tui"`).
+///
+/// `watch` and `input` are additive hub hints (codex-only in this phase; absent
+/// → `false` / `""`): `watch` reports whether the hub produces a live message
+/// feed for the kind (`GET /messages` + `message.appended`), and `input` is the
+/// feed-input posting **mode string** — `"gated"` means `POST /input` is
+/// accepted only while the session is waiting, `""` means no feed input. Note
+/// the distinction from the adjacent `post_input`: `post_input` is the
+/// typed-input *capability* bool (a typed line reaches the pane over the
+/// TUI-only path), while `input` is the *gating mode* of the separate feed-input
+/// channel — a kind can have `post_input: true` with no feed input at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RcKindFeatures {
     pub post_input: bool,
     pub approvals: String,
+    #[serde(default)]
+    pub watch: bool,
+    #[serde(default)]
+    pub input: String,
+}
+
+impl RcKindFeatures {
+    /// Whether feed input is gated (`input == "gated"`) — a watch view's input
+    /// bar is only ever enabled for a gated kind waiting for input. Mirrors
+    /// mobile's `KindFeatures.inputGated` (`rc_capabilities.dart:136`).
+    pub fn input_gated(&self) -> bool {
+        self.input == "gated"
+    }
 }
 
 /// The `shed-ext-rc capabilities` payload, also embedded in the `list` envelope.
@@ -289,7 +429,12 @@ pub struct RcSession {
     pub slug: String,
     pub tmux_session: String,
     pub display_name: String,
-    pub workdir: String,
+    /// The session's working directory when known. `None` for a server-enriched
+    /// overview row that carries none (Dart parity, `rc_models.dart:261`);
+    /// [`RcSession::from_dto`] (the `shed-ext-rc` stdout path) still fills the
+    /// [`DEFAULT_WORKDIR`] fallback, so it is always `Some` there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
     pub kind: RcKind,
     pub state: RcState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,6 +447,13 @@ pub struct RcSession {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_label: Option<String>,
+    /// Live-activity dimension (see [`RcSessionDto::activity`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<RcActivity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<String>,
     #[serde(default)]
     pub managed: bool,
 }
@@ -324,7 +476,7 @@ impl RcSession {
             slug: dto.slug,
             tmux_session: dto.tmux_session,
             display_name,
-            workdir: dto.workdir.unwrap_or_else(|| DEFAULT_WORKDIR.to_string()),
+            workdir: Some(dto.workdir.unwrap_or_else(|| DEFAULT_WORKDIR.to_string())),
             kind: dto.kind,
             state: dto.state,
             url: dto.url,
@@ -332,6 +484,22 @@ impl RcSession {
             created_by: dto.created_by,
             created_at: dto.created_at,
             target_label: dto.target_label,
+            activity: dto.activity,
+            activity_at: dto.activity_at,
+            // Sanitize the guest-controlled preview text exactly as the
+            // overview adapter's `clean_display` does — strip Unicode format
+            // characters (category Cf: bidi overrides, zero-widths, BOM), then
+            // trim; a value that is only such chars degrades to None. The feed
+            // decoder and the overview path both clean this text, so the
+            // shed-ext-rc stdout path (`from_dto`) must not be laxer.
+            last_message: dto.last_message.and_then(|m| {
+                let cleaned = dart_trim(&strip_format_chars(&m)).to_string();
+                if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                }
+            }),
             managed: dto.managed,
         }
     }
@@ -358,6 +526,21 @@ pub fn synthetic_url(kind: &RcKind, slug: &str) -> Option<String> {
         RcKind::ClaudeRc => Some(format!("https://claude.ai/code/session_{slug}")),
         _ => None,
     }
+}
+
+// ---- guest-text sanitization ----
+
+static RE_FORMAT_CHARS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{Cf}").unwrap());
+
+/// Remove every Unicode format character (category Cf — bidi overrides like
+/// U+202E, zero-widths, BOM, soft hyphen, …) from `s`. Client-side defense for
+/// guest-controlled display text (last-message previews, feed messages): the
+/// rc hub strips ANSI escapes and C0/C1 control characters but NOT Cf, and a
+/// bidi override can visually reverse rendered text to spoof what a message
+/// appears to say. Mirrors mobile's `stripFormatChars` (`text_sanitize.dart`).
+/// Shared by the overview session adapter and the rc feed decoder.
+pub fn strip_format_chars(s: &str) -> String {
+    RE_FORMAT_CHARS.replace_all(s, "").into_owned()
 }
 
 // ---- prompt normalization ----
@@ -402,12 +585,74 @@ pub fn normalize_rc_prompt(raw: Option<&str>, kind: &RcKind) -> Result<Option<St
     Ok(Some(trimmed.to_string()))
 }
 
+// ---- permission modes ----
+
+/// The generic permission tri-state accepted by EVERY kind and mapped per agent
+/// to that tool's real flags by shed-ext-rc (the VM is already the sandbox).
+/// Mirrors the guest's `genericPermModes` (`internal/ext/rc/rc.go`) and mobile's
+/// `rcGenericPermissionModes` (`rc_service.dart:22`).
+pub const GENERIC_PERMISSION_MODES: [&str; 3] = ["default", "auto", "skip"];
+
+/// claude's historical `--permission-mode` values, accepted on top of the
+/// generic tri-state by the claude kinds ONLY. Mirrors the claude spec's
+/// `ExtraModes` and mobile's `rcClaudeExtraModes` (`rc_service.dart:27-32`).
+pub const CLAUDE_EXTRA_MODES: [&str; 4] = ["acceptEdits", "plan", "dontAsk", "bypassPermissions"];
+
+/// The create-time default permission mode. `auto` keeps a session running
+/// autonomously rather than blocking on permission prompts; it is a member of
+/// both the generic tri-state and the claude set, so it is valid for every
+/// agent kind. Mirrors mobile's `defaultRcPermissionMode` (`rc_service.dart:65`).
+pub const DEFAULT_RC_PERMISSION_MODE: &str = "auto";
+
+/// The permission modes valid for `kind`: the full claude set (generic
+/// tri-state + historical extras, in that display order) for the claude kinds,
+/// else the generic tri-state (codex/cursor/opencode/shell). Mirrors the
+/// guest's `PermModeAcceptedBy` and mobile's `permissionModesFor`
+/// (`rc_service.dart:58-59`).
+pub fn permission_modes_for(kind: &RcKind) -> Vec<&'static str> {
+    let mut modes = GENERIC_PERMISSION_MODES.to_vec();
+    if kind.runs_claude() {
+        modes.extend(CLAUDE_EXTRA_MODES);
+    }
+    modes
+}
+
+/// Validate a caller-supplied permission mode against `kind`, returning the
+/// EFFECTIVE mode to pass to [`create_argv`]/[`create_invocation`]. A kind
+/// without a permission posture (`shell`, unknown) silently drops the mode —
+/// `Ok(None)`, no error (the UI hides the picker, but state can linger across a
+/// kind switch; same posture as a claude-broker's dropped prompt). For a
+/// supporting kind, a mode outside [`permission_modes_for`] is rejected with
+/// [`RcError::BadRequest`] before any SSH call. Mirrors mobile's `RcService.create`
+/// gate (`rc_service.dart:142-145`). [`create_invocation`] calls this itself (the
+/// single validating entry point); only [`create_argv`], the low-level builder,
+/// requires the pre-validated effective mode.
+pub fn validate_permission_mode<'a>(
+    kind: &RcKind,
+    mode: Option<&'a str>,
+) -> Result<Option<&'a str>, RcError> {
+    if !kind.has_permission_mode() {
+        return Ok(None);
+    }
+    match mode {
+        None => Ok(None),
+        Some(m) if permission_modes_for(kind).contains(&m) => Ok(Some(m)),
+        Some(_) => Err(RcError::BadRequest("invalid permission mode".to_string())),
+    }
+}
+
 // ---- shed-ext-rc argv ----
 
 /// argv for `shed-ext-rc create --wait` (the binary resolves the workdir,
 /// pre-seeds trust, polls to ready, accepts trust, and delivers a stdin prompt).
 /// `bin` is resolved by the caller (`shed-app` reads `SHED_EXT_RC_BIN`) so this
 /// stays pure. `slug` is caller-supplied (generated in `shed-app::rc`, not here).
+/// `permission_mode` is the already-EFFECTIVE mode and must only ever be the
+/// output of [`validate_permission_mode`] (the validating gate is
+/// [`create_invocation`]; this stays the low-level infallible builder): `Some`
+/// emits `--permission-mode <mode>` between `--workdir` and `--prompt-stdin`
+/// (mobile's exact ordering, `rc_service.dart:168-174`), `None` emits no flag
+/// (each tool's own default).
 #[allow(clippy::too_many_arguments)]
 pub fn create_argv(
     bin: &str,
@@ -417,6 +662,7 @@ pub fn create_argv(
     workdir: Option<&str>,
     created_by: &str,
     target: &str,
+    permission_mode: Option<&str>,
     has_prompt: bool,
 ) -> Vec<String> {
     let mut a = vec![
@@ -438,6 +684,10 @@ pub fn create_argv(
         a.push("--workdir".to_string());
         a.push(w.to_string());
     }
+    if let Some(m) = permission_mode {
+        a.push("--permission-mode".to_string());
+        a.push(m.to_string());
+    }
     if has_prompt {
         a.push("--prompt-stdin".to_string());
     }
@@ -448,6 +698,15 @@ pub fn create_argv(
 /// and the stdin payload can never disagree. `prompt` must already be normalized
 /// (see [`normalize_rc_prompt`]); it is dropped for a kind that doesn't accept
 /// typed input.
+///
+/// This is the **validating gate** for `permission_mode` (a deliberate, safer
+/// deviation from the plan's "both builders infallible"): the raw
+/// caller-supplied mode is run through [`validate_permission_mode`] here —
+/// silently dropped for a kind without a permission posture, rejected with
+/// [`RcError::BadRequest`] when outside the kind's set (no argv is built) — and
+/// only the returned EFFECTIVE mode reaches [`create_argv`]. Mirrors mobile's
+/// derive-then-validate-then-emit order (`rc_service.dart:142-145`, `:171-173`);
+/// [`create_argv`] stays the low-level infallible builder.
 #[allow(clippy::too_many_arguments)]
 pub fn create_invocation(
     bin: &str,
@@ -457,11 +716,27 @@ pub fn create_invocation(
     workdir: Option<&str>,
     created_by: &str,
     target: &str,
+    permission_mode: Option<&str>,
     prompt: Option<&str>,
-) -> (Vec<String>, Option<String>) {
-    let effective = if kind.accepts_typed_input() { prompt } else { None };
-    let argv = create_argv(bin, kind, name, slug, workdir, created_by, target, effective.is_some());
-    (argv, effective.map(str::to_string))
+) -> Result<(Vec<String>, Option<String>), RcError> {
+    let mode = validate_permission_mode(kind, permission_mode)?;
+    let effective = if kind.accepts_typed_input() {
+        prompt
+    } else {
+        None
+    };
+    let argv = create_argv(
+        bin,
+        kind,
+        name,
+        slug,
+        workdir,
+        created_by,
+        target,
+        mode,
+        effective.is_some(),
+    );
+    Ok((argv, effective.map(str::to_string)))
 }
 
 pub fn list_argv(bin: &str) -> Vec<String> {
@@ -475,6 +750,27 @@ pub fn kill_argv(bin: &str, slug: &str) -> Vec<String> {
         "--slug".to_string(),
         slug.to_string(),
     ]
+}
+
+/// Argv for a `prompt` — the kickoff line sent to an already-ready claude-rc/shell
+/// session on `slug`. The prompt text goes on **stdin**, not argv (like the other
+/// builders, this only produces argv). `session_id`, when present and non-empty,
+/// guards against a slug that was recreated under a new session. Mirrors mobile's
+/// `prompt()` (`rc_service.dart:201-209`).
+pub fn prompt_argv(bin: &str, slug: &str, session_id: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        bin.to_string(),
+        "prompt".to_string(),
+        "--slug".to_string(),
+        slug.to_string(),
+    ];
+    if let Some(id) = session_id {
+        if !id.is_empty() {
+            argv.push("--session-id".to_string());
+            argv.push(id.to_string());
+        }
+    }
+    argv
 }
 
 /// Map a non-zero exit code + stderr to an `RcError`. SSH-transport failures (the
@@ -525,6 +821,133 @@ pub fn decode_list_response(stdout: &str) -> Result<RcSessionListDto, RcError> {
         .map_err(|_| RcError::Failed("shed-ext-rc returned an invalid session list".to_string()))
 }
 
+// ---- rc hub messages feed ----
+//
+// The codex message feed served by the rc hub through the server proxy
+// (`GET /api/sheds/{name}/rc/v1/sessions/{slug}/messages`,
+// `internal/api/rchub.go:280-375`). Mirrors the guest's `feedMessage` /
+// `hubMessagesResponse` (`internal/ext/rc/hub_messages.go:44-201`,
+// handler `hub.go:332-385`) and mobile's decoder (`rc_feed.dart`): each
+// message is already hub-sanitized (ANSI/control-stripped, per-field capped),
+// so a client renders it as plain text. The one client-side addition: Unicode
+// format characters (category Cf — bidi overrides like U+202E) are stripped
+// from display text at decode via [`strip_format_chars`], because the hub's
+// sanitizer covers ANSI + C0/C1 controls but not Cf.
+//
+// Tolerant field readers: Dart's feed `_str`/`_text` (`rc_feed.dart:85-98`)
+// are byte-identical to `rc_models.dart`'s `_str`/`_cleanDisplay`, so this
+// section reuses [`crate::models::opt_trimmed`] / [`crate::models::clean_display`]
+// rather than re-declaring them.
+
+/// Dart's feed `_int` (`rc_feed.dart:83`), narrowed to the wire's non-negative
+/// seq: an integer as-is, another number truncated (negatives saturate to 0),
+/// anything else `0`. NOT shared with `models.rs`'s `int_or_zero` — that one
+/// mirrors a signed Dart `_int` and keeps negatives.
+fn feed_u64(v: Option<&serde_json::Value>) -> u64 {
+    v.and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+        .unwrap_or(0)
+}
+
+/// One tool call/result block on a feed message: a name plus a compact detail
+/// (invocation args for a `tool_use`, output for a `tool_result`). Both are
+/// hub-sanitized AND Cf-stripped here; either may be absent. Mirrors mobile's
+/// `RcFeedTool` (`rc_feed.dart:16-23`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcFeedTool {
+    pub name: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl RcFeedTool {
+    fn from_map(o: &serde_json::Map<String, serde_json::Value>) -> RcFeedTool {
+        RcFeedTool {
+            name: clean_display(o.get("name")),
+            detail: clean_display(o.get("detail")),
+        }
+    }
+}
+
+/// One normalized conversation message in the feed. `role` ∈ {user, assistant,
+/// tool, system}; `msg_type` (wire key `type`) ∈ {text, tool_use, tool_result,
+/// reasoning, status}. `seq` is monotonic per hub run (restarts from 1 on hub
+/// restart — a client that sees a seq lower than one it holds does a full
+/// refetch). Mirrors mobile's `RcFeedMessage` (`rc_feed.dart:29-58`); every
+/// field decodes tolerantly (wrong-typed → default/`None`, never an error).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcFeedMessage {
+    pub seq: u64,
+    /// RFC3339, verbatim (crate convention: timestamps are never parsed here).
+    pub ts: Option<String>,
+    pub role: String,
+    /// The wire's `type` field (renamed: `type` is a Rust keyword).
+    pub msg_type: String,
+    pub text: Option<String>,
+    pub tool: Option<RcFeedTool>,
+}
+
+impl RcFeedMessage {
+    fn from_map(o: &serde_json::Map<String, serde_json::Value>) -> RcFeedMessage {
+        RcFeedMessage {
+            seq: feed_u64(o.get("seq")),
+            ts: opt_trimmed(o.get("ts")),
+            role: opt_trimmed(o.get("role")).unwrap_or_default(),
+            msg_type: opt_trimmed(o.get("type")).unwrap_or_default(),
+            text: clean_display(o.get("text")),
+            // Only a map decodes; anything else is no tool block
+            // (`rc_feed.dart:54-56`).
+            tool: o
+                .get("tool")
+                .and_then(serde_json::Value::as_object)
+                .map(RcFeedTool::from_map),
+        }
+    }
+}
+
+/// A page of the feed: `GET …/messages?since=<seq>[&limit=<n>]`. `truncated`
+/// means the requested `since` cursor predates the ring (drop-oldest discarded
+/// unseen messages) OR points beyond the ring's current tail (the ring
+/// restarted) — in either case the client must refetch from the earliest
+/// retained message (`internal/ext/rc/hub_messages.go:129-140`). Mirrors
+/// mobile's `RcMessagesPage` (`rc_feed.dart:65-81`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcMessagesPage {
+    pub messages: Vec<RcFeedMessage>,
+    pub truncated: bool,
+}
+
+impl RcMessagesPage {
+    /// Tolerant decode; never fails. A non-object body, a missing/non-list
+    /// `messages` key → `[]`; only map elements decode to messages
+    /// (`rc_feed.dart:70-80`); `truncated` is `true` only when literally
+    /// boolean `true`.
+    pub fn from_value(v: &serde_json::Value) -> RcMessagesPage {
+        let Some(obj) = v.as_object() else {
+            return RcMessagesPage::default();
+        };
+        RcMessagesPage {
+            messages: obj
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(serde_json::Value::as_object)
+                        .map(RcFeedMessage::from_map)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            truncated: matches!(obj.get("truncated"), Some(serde_json::Value::Bool(true))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RcMessagesPage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(RcMessagesPage::from_value(&serde_json::Value::deserialize(
+            d,
+        )?))
+    }
+}
+
 // ---- SSH ----
 
 /// Build the **non-interactive** ssh argv that runs `remote_argv` on the target.
@@ -567,7 +990,8 @@ pub fn ssh_argv(
 
 static RE_TRUST_FOLDER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)Yes,\s*I trust this folder").unwrap());
-static RE_RECONNECTING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bReconnecting\b").unwrap());
+static RE_RECONNECTING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bReconnecting\b").unwrap());
 static RE_URL_BROKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"https?://claude\.ai/code\?environment=env_[A-Za-z0-9_-]+").unwrap()
 });
@@ -696,8 +1120,15 @@ mod tests {
 
     #[test]
     fn classify_needs_auth() {
-        for pane in ["not logged in", "run claude auth login", "requires a claude.ai subscription"] {
-            assert_eq!(classify_pane(&RcKind::ClaudeRc, pane).state, RcState::NeedsAuth);
+        for pane in [
+            "not logged in",
+            "run claude auth login",
+            "requires a claude.ai subscription",
+        ] {
+            assert_eq!(
+                classify_pane(&RcKind::ClaudeRc, pane).state,
+                RcState::NeedsAuth
+            );
         }
     }
 
@@ -713,7 +1144,10 @@ mod tests {
         let pane = "Remote Control active\nhttps://claude.ai/code/session_XYZ789";
         let c = classify_pane(&RcKind::ClaudeRc, pane);
         assert_eq!(c.state, RcState::Ready);
-        assert_eq!(c.url.as_deref(), Some("https://claude.ai/code/session_XYZ789"));
+        assert_eq!(
+            c.url.as_deref(),
+            Some("https://claude.ai/code/session_XYZ789")
+        );
     }
 
     #[test]
@@ -725,10 +1159,16 @@ mod tests {
 
     #[test]
     fn classify_shell_empty_vs_content() {
-        assert_eq!(classify_pane(&RcKind::Shell, "   \n ").state, RcState::Starting);
+        assert_eq!(
+            classify_pane(&RcKind::Shell, "   \n ").state,
+            RcState::Starting
+        );
         assert_eq!(classify_pane(&RcKind::Shell, "$ ls").state, RcState::Ready);
         // A shell never runs the trust/auth heuristics.
-        assert_eq!(classify_pane(&RcKind::Shell, "not logged in").state, RcState::Ready);
+        assert_eq!(
+            classify_pane(&RcKind::Shell, "not logged in").state,
+            RcState::Ready
+        );
     }
 
     #[test]
@@ -740,6 +1180,116 @@ mod tests {
         .unwrap();
         assert_eq!(j["state"], "needs-trust");
         assert!(j.get("url").is_none());
+    }
+
+    // ---- guest-text sanitization ----
+
+    #[test]
+    fn strip_format_chars_removes_cf_category() {
+        // Bidi override (U+202E), zero-width space (U+200B), BOM (U+FEFF).
+        assert_eq!(strip_format_chars("safe\u{202E}txt"), "safetxt");
+        assert_eq!(strip_format_chars("a\u{200B}b\u{FEFF}c"), "abc");
+        assert_eq!(strip_format_chars("\u{202E}"), "");
+        // Non-Cf text passes through untouched (incl. non-ASCII).
+        assert_eq!(strip_format_chars("héllo → wörld"), "héllo → wörld");
+    }
+
+    // ---- rc hub messages feed (ported from mobile's rc_feed_test.dart:9-67) ----
+
+    fn page(json: &str) -> RcMessagesPage {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn feed_page_decodes_mixed_text_and_tool_blocks() {
+        // rc_feed_test.dart:11-31.
+        let p = page(
+            r#"{
+              "messages": [
+                {"seq": 1, "ts": "2026-06-19T18:53:00Z", "role": "user", "type": "text", "text": "hi"},
+                {"seq": 2, "role": "assistant", "type": "reasoning", "text": "thinking"},
+                {"seq": 3, "role": "tool", "type": "tool_use",
+                 "tool": {"name": "shell", "detail": "ls -la"}}
+              ],
+              "truncated": false
+            }"#,
+        );
+        assert_eq!(p.messages.len(), 3);
+        assert!(!p.truncated);
+        assert_eq!(p.messages[0].role, "user");
+        assert_eq!(p.messages[0].text.as_deref(), Some("hi"));
+        assert_eq!(p.messages[0].ts.as_deref(), Some("2026-06-19T18:53:00Z"));
+        assert_eq!(p.messages[1].msg_type, "reasoning");
+        let tool = p.messages[2].tool.as_ref().unwrap();
+        assert_eq!(tool.name.as_deref(), Some("shell"));
+        assert_eq!(tool.detail.as_deref(), Some("ls -la"));
+        assert_eq!(p.messages[2].text, None);
+    }
+
+    #[test]
+    fn feed_page_truncated_flag_and_empty_list_not_null() {
+        // rc_feed_test.dart:33-37: [] decodes to an empty page, flag carried.
+        let p = page(r#"{"messages": [], "truncated": true}"#);
+        assert!(p.messages.is_empty());
+        assert!(p.truncated);
+        // truncated is true ONLY when literally boolean true.
+        let p = page(r#"{"messages": [], "truncated": "yes"}"#);
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn feed_page_tolerates_missing_messages_key_and_absent_fields() {
+        // rc_feed_test.dart:39-49.
+        let p = page(r#"{"truncated": false}"#);
+        assert!(p.messages.is_empty());
+        let one = page(r#"{"messages":[{"seq":5,"role":"system","type":"status"}]}"#);
+        assert_eq!(one.messages.len(), 1);
+        assert_eq!(one.messages[0].seq, 5);
+        assert_eq!(one.messages[0].ts, None);
+        assert_eq!(one.messages[0].text, None);
+        assert!(one.messages[0].tool.is_none());
+    }
+
+    #[test]
+    fn feed_page_skips_non_map_elements_and_wrong_types() {
+        // Only Map elements decode (rc_feed.dart:74-77); wrong-typed fields
+        // degrade per-field, never error.
+        let p = page(
+            r#"{"messages":[42,"nope",{"seq":"x","role":7,"type":null,"tool":"bad"}],
+                "truncated":null}"#,
+        );
+        assert_eq!(p.messages.len(), 1); // non-maps skipped
+        let m = &p.messages[0];
+        assert_eq!(m.seq, 0); // non-numeric → 0
+        assert_eq!(m.role, ""); // non-string → ""
+        assert_eq!(m.msg_type, "");
+        assert!(m.tool.is_none()); // non-map tool → None
+        assert!(!p.truncated); // null → false
+                               // A non-object body degrades to the empty page.
+        assert_eq!(
+            RcMessagesPage::from_value(&serde_json::json!([1, 2])),
+            RcMessagesPage::default()
+        );
+    }
+
+    #[test]
+    fn feed_page_strips_format_chars_from_text_and_tool_fields() {
+        // rc_feed_test.dart:51-65: the hub strips ANSI + C0/C1 controls but
+        // not category Cf — a U+202E (RLO) can visually reverse rendered
+        // text; U+200B hides content.
+        let p = page(
+            "{\"messages\":[{\"seq\":1,\"role\":\"assistant\",\"type\":\"text\",\
+              \"text\":\"safe\u{202E} EVIL\"},\
+             {\"seq\":2,\"role\":\"tool\",\"type\":\"tool_use\",\
+              \"tool\":{\"name\":\"sh\u{200B}ell\",\"detail\":\"rm\u{202E} x\"}}]}",
+        );
+        assert_eq!(p.messages[0].text.as_deref(), Some("safe EVIL"));
+        let tool = p.messages[1].tool.as_ref().unwrap();
+        assert_eq!(tool.name.as_deref(), Some("shell"));
+        assert_eq!(tool.detail.as_deref(), Some("rm x"));
+        // Cf-only text degrades to None.
+        let p = page("{\"messages\":[{\"seq\":1,\"role\":\"assistant\",\"type\":\"text\",\"text\":\"\u{202E}\"}]}");
+        assert_eq!(p.messages[0].text, None);
     }
 
     // ---- prompt normalization ----
@@ -754,7 +1304,10 @@ mod tests {
 
     #[test]
     fn normalize_prompt_blank_is_none() {
-        assert_eq!(normalize_rc_prompt(Some("   \n\t"), &RcKind::ClaudeRc).unwrap(), None);
+        assert_eq!(
+            normalize_rc_prompt(Some("   \n\t"), &RcKind::ClaudeRc).unwrap(),
+            None
+        );
         assert_eq!(normalize_rc_prompt(None, &RcKind::Shell).unwrap(), None);
     }
 
@@ -774,7 +1327,9 @@ mod tests {
             Err(RcError::BadRequest(_))
         ));
         // Exactly 2000 bytes is fine.
-        assert!(normalize_rc_prompt(Some(&"a".repeat(2000)), &RcKind::Shell).unwrap().is_some());
+        assert!(normalize_rc_prompt(Some(&"a".repeat(2000)), &RcKind::Shell)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -792,10 +1347,15 @@ mod tests {
         let remote = vec!["shed-ext-rc".to_string(), "list".to_string()];
         let argv = ssh_argv("web", "10.0.0.5", 2222, "/k/known_hosts", &remote, 10);
         // No `-t` (a PTY would corrupt the JSON DTO decode).
-        assert!(!argv.contains(&"-t".to_string()), "RC ssh must not allocate a PTY");
+        assert!(
+            !argv.contains(&"-t".to_string()),
+            "RC ssh must not allocate a PTY"
+        );
         assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
         assert!(argv.contains(&"ConnectTimeout=10".to_string()));
-        assert!(argv.windows(2).any(|w| w == ["-o", "StrictHostKeyChecking=yes"]));
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["-o", "StrictHostKeyChecking=yes"]));
         // The remote command is a single shell-quoted string after `--`.
         let dd = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(argv[dd + 1], "shed-ext-rc list");
@@ -806,7 +1366,11 @@ mod tests {
 
     #[test]
     fn ssh_argv_shell_quotes_a_prompt_arg() {
-        let remote = vec!["shed-ext-rc".to_string(), "create".to_string(), "a b".to_string()];
+        let remote = vec![
+            "shed-ext-rc".to_string(),
+            "create".to_string(),
+            "a b".to_string(),
+        ];
         let argv = ssh_argv("s", "h", 22, "/k", &remote, 10);
         assert_eq!(argv.last().unwrap(), "shed-ext-rc create 'a b'");
     }
@@ -823,6 +1387,7 @@ mod tests {
             Some("/work"),
             "shed-desktop/1.0",
             "shed:web@srv",
+            None,
             true,
         );
         assert_eq!(a[0], "shed-ext-rc");
@@ -837,7 +1402,15 @@ mod tests {
     #[test]
     fn create_argv_omits_empty_workdir_and_promptless() {
         let a = create_argv(
-            "b", &RcKind::Shell, "n", "s", Some(""), "c", "t", false,
+            "b",
+            &RcKind::Shell,
+            "n",
+            "s",
+            Some(""),
+            "c",
+            "t",
+            None,
+            false,
         );
         assert!(!a.contains(&"--workdir".to_string()));
         assert!(!a.contains(&"--prompt-stdin".to_string()));
@@ -846,10 +1419,247 @@ mod tests {
     #[test]
     fn create_invocation_drops_prompt_for_broker() {
         let (argv, stdin) = create_invocation(
-            "b", &RcKind::ClaudeBroker, "n", "s", None, "c", "t", Some("hi"),
-        );
+            "b",
+            &RcKind::ClaudeBroker,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            None,
+            Some("hi"),
+        )
+        .unwrap();
         assert_eq!(stdin, None);
         assert!(!argv.contains(&"--prompt-stdin".to_string()));
+    }
+
+    // ---- permission modes (ported from mobile's rc_service_test.dart:58-253) ----
+
+    #[test]
+    fn default_permission_mode_is_a_member_of_both_sets() {
+        // rc_service_test.dart:59-64: the picker pre-selects the default; it must
+        // be a member of the full claude set AND (being generic) every kind's set.
+        assert_eq!(DEFAULT_RC_PERMISSION_MODE, "auto");
+        assert!(GENERIC_PERMISSION_MODES.contains(&DEFAULT_RC_PERMISSION_MODE));
+        assert!(permission_modes_for(&RcKind::ClaudeRc).contains(&DEFAULT_RC_PERMISSION_MODE));
+        assert!(permission_modes_for(&RcKind::Codex).contains(&DEFAULT_RC_PERMISSION_MODE));
+    }
+
+    #[test]
+    fn permission_modes_for_claude_is_union_others_generic_only() {
+        // rc_service.dart:58-59: claude kinds get generic ∪ extras (display
+        // order: tri-state first); the other kinds get the tri-state only.
+        for kind in [RcKind::ClaudeRc, RcKind::ClaudeBroker] {
+            assert!(kind.runs_claude());
+            assert_eq!(
+                permission_modes_for(&kind),
+                vec![
+                    "default",
+                    "auto",
+                    "skip",
+                    "acceptEdits",
+                    "plan",
+                    "dontAsk",
+                    "bypassPermissions"
+                ]
+            );
+        }
+        for kind in [
+            RcKind::Codex,
+            RcKind::Opencode,
+            RcKind::Cursor,
+            RcKind::Shell,
+            RcKind::Other("borg".into()),
+        ] {
+            assert!(!kind.runs_claude());
+            assert_eq!(permission_modes_for(&kind), vec!["default", "auto", "skip"]);
+        }
+    }
+
+    #[test]
+    fn has_permission_mode_excludes_shell_and_unknown() {
+        // rc_models.dart:81: every known agent kind has a permission posture;
+        // shell has none, and an unknown kind renders neutrally with none.
+        for kind in [
+            RcKind::ClaudeRc,
+            RcKind::ClaudeBroker,
+            RcKind::Codex,
+            RcKind::Opencode,
+            RcKind::Cursor,
+        ] {
+            assert!(kind.has_permission_mode());
+        }
+        assert!(!RcKind::Shell.has_permission_mode());
+        assert!(!RcKind::Other("borg".into()).has_permission_mode());
+    }
+
+    #[test]
+    fn validate_permission_mode_accepts_valid_modes() {
+        // rc_service_test.dart:183-201: codex takes the generic tri-state;
+        // rc_service_test.dart:145-158, 231-241: claude takes its full set.
+        assert_eq!(
+            validate_permission_mode(&RcKind::Codex, Some("auto")),
+            Ok(Some("auto"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::Codex, Some("skip")),
+            Ok(Some("skip"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("bypassPermissions")),
+            Ok(Some("bypassPermissions"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("auto")),
+            Ok(Some("auto"))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("plan")),
+            Ok(Some("plan"))
+        );
+        // No mode chosen → no flag (each tool's own default),
+        // rc_service_test.dart:243-253.
+        assert_eq!(validate_permission_mode(&RcKind::ClaudeRc, None), Ok(None));
+    }
+
+    #[test]
+    fn validate_permission_mode_rejects_invalid_before_any_argv() {
+        // rc_service_test.dart:171-181 (unknown mode) + 203-217 (a claude-only
+        // mode on a non-claude kind) → RC_BAD_REQUEST, never reaching SSH.
+        assert_eq!(
+            validate_permission_mode(&RcKind::Codex, Some("plan")),
+            Err(RcError::BadRequest("invalid permission mode".to_string()))
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::ClaudeRc, Some("nope")),
+            Err(RcError::BadRequest("invalid permission mode".to_string()))
+        );
+    }
+
+    #[test]
+    fn validate_permission_mode_drops_silently_for_shell_and_unknown() {
+        // rc_service_test.dart:160-169: a shell has no permission mode; the mode
+        // is silently dropped (no error, no flag) even if a caller passes one —
+        // state can linger across a kind switch. Same for an unknown kind.
+        assert_eq!(
+            validate_permission_mode(&RcKind::Shell, Some("auto")),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::Shell, Some("plan")),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_permission_mode(&RcKind::Other("borg".into()), Some("auto")),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn create_argv_emits_permission_mode_between_workdir_and_prompt_stdin() {
+        // rc_service_test.dart:145-158 + the emission ordering of
+        // rc_service.dart:168-174: --workdir, then --permission-mode, then
+        // --prompt-stdin.
+        let a = create_argv(
+            "shed-ext-rc",
+            &RcKind::ClaudeRc,
+            "web/abc",
+            "abc",
+            Some("/work/dir"),
+            "shed-desktop/1.0",
+            "shed:web@srv",
+            Some("bypassPermissions"),
+            true,
+        );
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--permission-mode", "bypassPermissions"]));
+        let wd = a.iter().position(|x| x == "--workdir").unwrap();
+        let pm = a.iter().position(|x| x == "--permission-mode").unwrap();
+        let ps = a.iter().position(|x| x == "--prompt-stdin").unwrap();
+        assert!(
+            wd < pm && pm < ps,
+            "ordering must be --workdir < --permission-mode < --prompt-stdin"
+        );
+    }
+
+    #[test]
+    fn create_argv_omits_permission_mode_when_none() {
+        // rc_service_test.dart:243-253: a null mode means "pass no flag at all".
+        let a = create_argv(
+            "shed-ext-rc",
+            &RcKind::ClaudeRc,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            None,
+            false,
+        );
+        assert!(!a.contains(&"--permission-mode".to_string()));
+    }
+
+    #[test]
+    fn create_invocation_passes_permission_mode_through() {
+        // rc_service_test.dart:183-193: codex passes a generic mode; the
+        // invocation gate validates it and emits the flag.
+        let (argv, stdin) = create_invocation(
+            "b",
+            &RcKind::Codex,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            Some("auto"),
+            None,
+        )
+        .unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--permission-mode", "auto"]));
+        assert_eq!(stdin, None);
+    }
+
+    #[test]
+    fn create_invocation_rejects_invalid_mode_and_builds_no_argv() {
+        // rc_service_test.dart:203-217: a claude-only mode on a non-claude kind
+        // is rejected (RC_BAD_REQUEST) BEFORE any argv/SSH — the invocation gate
+        // validates, it does not forward raw modes.
+        assert_eq!(
+            create_invocation(
+                "b",
+                &RcKind::Codex,
+                "n",
+                "s",
+                None,
+                "c",
+                "t",
+                Some("plan"),
+                None
+            ),
+            Err(RcError::BadRequest("invalid permission mode".to_string()))
+        );
+    }
+
+    #[test]
+    fn create_invocation_silently_drops_mode_for_shell() {
+        // rc_service_test.dart:160-169: a shell has no permission mode; even a
+        // GARBAGE mode is dropped silently (Ok, no flag, no error) — Dart derives
+        // the effective mode BEFORE validating (rc_service.dart:142).
+        let (argv, _) = create_invocation(
+            "b",
+            &RcKind::Shell,
+            "n",
+            "s",
+            None,
+            "c",
+            "t",
+            Some("garbage"),
+            None,
+        )
+        .unwrap();
+        assert!(!argv.contains(&"--permission-mode".to_string()));
     }
 
     #[test]
@@ -858,21 +1668,53 @@ mod tests {
         assert_eq!(kill_argv("b", "abc"), ["b", "kill", "--slug", "abc"]);
     }
 
+    #[test]
+    fn prompt_argv_builder() {
+        assert_eq!(
+            prompt_argv("b", "abc", None),
+            ["b", "prompt", "--slug", "abc"]
+        );
+        assert_eq!(
+            prompt_argv("b", "abc", Some("sid")),
+            ["b", "prompt", "--slug", "abc", "--session-id", "sid"]
+        );
+        // An empty session id is guarded — no `--session-id` flag emitted.
+        assert_eq!(
+            prompt_argv("b", "abc", Some("")),
+            ["b", "prompt", "--slug", "abc"]
+        );
+    }
+
     // ---- exit-code mapping ----
 
     #[test]
     fn error_from_exit_maps_codes() {
-        assert_eq!(error_from_exit(3, "taken", ""), RcError::SlugTaken("taken".into()));
-        assert_eq!(error_from_exit(4, "gone", ""), RcError::NotFound("gone".into()));
-        assert_eq!(error_from_exit(2, "bad", ""), RcError::BadRequest("bad".into()));
+        assert_eq!(
+            error_from_exit(3, "taken", ""),
+            RcError::SlugTaken("taken".into())
+        );
+        assert_eq!(
+            error_from_exit(4, "gone", ""),
+            RcError::NotFound("gone".into())
+        );
+        assert_eq!(
+            error_from_exit(2, "bad", ""),
+            RcError::BadRequest("bad".into())
+        );
         assert_eq!(error_from_exit(127, "", ""), RcError::MissingBinary);
         assert_eq!(
             error_from_exit(1, "bash: shed-ext-rc: command not found", ""),
             RcError::MissingBinary
         );
-        assert_eq!(error_from_exit(1, "", ""), RcError::Failed("shed-ext-rc exited 1".into()));
+        assert_eq!(
+            error_from_exit(1, "", ""),
+            RcError::Failed("shed-ext-rc exited 1".into())
+        );
         // stdout is the fallback detail when stderr is empty.
-        assert_eq!(error_from_exit(5, "", "boom"), RcError::Failed("boom".into()));
+        assert_eq!(
+            error_from_exit(5, "", "boom"),
+            RcError::Failed("boom".into())
+        );
     }
 
     // ---- DTO → RcSession ----
@@ -892,12 +1734,15 @@ mod tests {
             created_by: Some("shed-desktop/1.0".into()),
             created_at: Some("2026-01-01T00:00:00Z".into()),
             target_label: None,
+            activity: None,
+            activity_at: None,
+            last_message: None,
         };
         let s = RcSession::from_dto(dto, "srv", "web");
         assert_eq!(s.host, "srv");
         assert_eq!(s.shed, "web");
         assert_eq!(s.display_name, "web/abc"); // fallback
-        assert_eq!(s.workdir, DEFAULT_WORKDIR); // fallback
+        assert_eq!(s.workdir.as_deref(), Some(DEFAULT_WORKDIR)); // fallback
         assert_eq!(s.rc_id.as_deref(), Some("id-1")); // id → rc_id
         assert_eq!(s.id(), "srv/web/abc");
     }
@@ -918,6 +1763,9 @@ mod tests {
                 created_by: None,
                 created_at: None,
                 target_label: None,
+                activity: None,
+                activity_at: None,
+                last_message: None,
             },
             "srv",
             "web",
@@ -951,9 +1799,15 @@ mod tests {
 
     #[test]
     fn decode_session_rejects_garbage() {
-        assert!(matches!(decode_session("not json"), Err(RcError::Failed(_))));
+        assert!(matches!(
+            decode_session("not json"),
+            Err(RcError::Failed(_))
+        ));
         // A missing required field is not a valid DTO.
-        assert!(matches!(decode_session(r#"{"slug":"x"}"#), Err(RcError::Failed(_))));
+        assert!(matches!(
+            decode_session(r#"{"slug":"x"}"#),
+            Err(RcError::Failed(_))
+        ));
     }
 
     /// Decode the canonical golden fixture (byte-identical to shed-remote-agent's
@@ -986,13 +1840,16 @@ mod tests {
         assert!(full.managed);
         assert_eq!(full.kind, RcKind::ClaudeRc);
         assert_eq!(full.display_name, "charliek/abc234"); // present, not the fallback
-        assert_eq!(full.rc_id.as_deref(), Some("9f1c0e7a-1111-4222-8333-444455556666"));
+        assert_eq!(
+            full.rc_id.as_deref(),
+            Some("9f1c0e7a-1111-4222-8333-444455556666")
+        );
         assert_eq!(full.created_by.as_deref(), Some("shed-remote-agent/0.1.0"));
         // Minimal legacy session: absent optionals default, fallbacks applied.
         assert!(!dtos[1].managed);
         let minimal = RcSession::from_dto(dtos[1].clone(), "h", "demo");
         assert_eq!(minimal.display_name, "demo/brk900"); // <shed>/<slug> fallback
-        assert_eq!(minimal.workdir, DEFAULT_WORKDIR); // fallback
+        assert_eq!(minimal.workdir.as_deref(), Some(DEFAULT_WORKDIR)); // fallback
         assert!(minimal.rc_id.is_none());
     }
 
@@ -1057,6 +1914,148 @@ mod tests {
         assert_eq!(dtos.len(), 2);
         assert_eq!(dtos[0].kind, RcKind::Codex);
         assert_eq!(dtos[1].kind, RcKind::Other("borg".into()));
+    }
+
+    // ---- kind_features watch/input hints ----
+
+    #[test]
+    fn kind_features_watch_input_absent_default() {
+        // A pre-hub payload carries neither hint → additive defaults (false/"").
+        let f: RcKindFeatures =
+            serde_json::from_str(r#"{"post_input":true,"approvals":"tui"}"#).unwrap();
+        assert!(f.post_input);
+        assert!(!f.watch);
+        assert_eq!(f.input, "");
+        assert!(!f.input_gated());
+    }
+
+    #[test]
+    fn kind_features_gated_input() {
+        let f: RcKindFeatures = serde_json::from_str(
+            r#"{"post_input":true,"approvals":"tui","watch":true,"input":"gated"}"#,
+        )
+        .unwrap();
+        assert!(f.watch);
+        assert!(f.input_gated());
+        // A non-"gated" mode string is preserved verbatim but not gated.
+        let f: RcKindFeatures =
+            serde_json::from_str(r#"{"post_input":false,"approvals":"","input":"open"}"#).unwrap();
+        assert_eq!(f.input, "open");
+        assert!(!f.input_gated());
+    }
+
+    // ---- activity dimension ----
+
+    #[test]
+    fn rc_activity_wire_round_trip() {
+        for (wire, activity) in [
+            ("working", RcActivity::Working),
+            ("needs_input", RcActivity::NeedsInput),
+            ("idle", RcActivity::Idle),
+            ("unknown", RcActivity::Unknown),
+        ] {
+            assert_eq!(RcActivity::from_wire(wire), activity);
+            assert_eq!(activity.as_str(), wire);
+            assert_eq!(serde_json::to_value(activity).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<RcActivity>(wire.into()).unwrap(),
+                activity
+            );
+        }
+        // Any unrecognized token — the reserved needs_approval, a future value,
+        // or garbage — maps to Unknown (Dart parity, rc_models.dart:125-146;
+        // deliberately NOT RcKind's preserve-raw policy), and Unknown
+        // round-trips as the real "unknown" wire value.
+        assert_eq!(RcActivity::from_wire("needs_approval"), RcActivity::Unknown);
+        assert_eq!(RcActivity::from_wire("borg"), RcActivity::Unknown);
+        assert_eq!(
+            serde_json::from_value::<RcActivity>("needs_approval".into()).unwrap(),
+            RcActivity::Unknown
+        );
+        assert_eq!(
+            serde_json::to_value(RcActivity::Unknown).unwrap(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn rc_state_from_wire_is_tolerant() {
+        assert_eq!(RcState::from_wire("ready"), RcState::Ready);
+        assert_eq!(RcState::from_wire("needs-auth"), RcState::NeedsAuth);
+        assert_eq!(RcState::from_wire("dead"), RcState::Dead);
+        // Unknown/missing states read as transient, never as gone.
+        assert_eq!(RcState::from_wire("starting"), RcState::Starting);
+        assert_eq!(RcState::from_wire("some-future-state"), RcState::Starting);
+        assert_eq!(RcState::from_wire(""), RcState::Starting);
+    }
+
+    #[test]
+    fn rc_state_permits_activity_blocks_gating_states() {
+        // Blocking states (lifecycle trumps activity) — rc_models.dart:154-157.
+        assert!(!RcState::NeedsTrust.permits_activity());
+        assert!(!RcState::NeedsAuth.permits_activity());
+        assert!(!RcState::Dead.permits_activity());
+        // Everything else permits the live activity dimension.
+        assert!(RcState::Starting.permits_activity());
+        assert!(RcState::Ready.permits_activity());
+        assert!(RcState::Reconnecting.permits_activity());
+    }
+
+    #[test]
+    fn dto_carries_activity_fields_and_session_flows_them_through() {
+        let dto = decode_session(
+            r#"{"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready",
+                "managed":true,"activity":"working",
+                "activity_at":"2026-06-19T18:54:12Z","last_message":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(dto.activity, Some(RcActivity::Working));
+        let s = RcSession::from_dto(dto, "srv", "web");
+        assert_eq!(s.activity, Some(RcActivity::Working));
+        assert_eq!(s.activity_at.as_deref(), Some("2026-06-19T18:54:12Z"));
+        assert_eq!(s.last_message.as_deref(), Some("hi"));
+        // Absent activity → None, and None keys stay off the serialized wire.
+        let plain = decode_session(
+            r#"{"slug":"b","tmux_session":"rc-b","kind":"shell","state":"ready","managed":true}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.activity, None);
+        let j = serde_json::to_value(RcSession::from_dto(plain, "srv", "web")).unwrap();
+        assert!(j.get("activity").is_none());
+        assert!(j.get("activity_at").is_none());
+        assert!(j.get("last_message").is_none());
+    }
+
+    // Finding 3: the guest-controlled last_message on the shed-ext-rc stdout
+    // path must be sanitized exactly like the overview / feed paths — a bidi
+    // override (U+202E) that could visually reverse the preview is stripped.
+    #[test]
+    fn from_dto_strips_format_chars_from_last_message() {
+        // U+202E (right-to-left override) embedded via a Rust escape so the
+        // source stays reviewable — the guest ships it in the rc stdout JSON.
+        let json = format!(
+            r#"{{"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready",
+                "managed":true,"last_message":"run{}evil"}}"#,
+            '\u{202E}'
+        );
+        let dto = decode_session(&json).unwrap();
+        // The DTO carries the raw guest text verbatim…
+        assert_eq!(dto.last_message.as_deref(), Some("run\u{202E}evil"));
+        // …and from_dto sanitizes it (Cf stripped) before it reaches RcSession.
+        let s = RcSession::from_dto(dto, "srv", "web");
+        assert_eq!(s.last_message.as_deref(), Some("runevil"));
+
+        // A value that is ONLY format characters degrades to None.
+        let json = format!(
+            r#"{{"slug":"b","tmux_session":"rc-b","kind":"shell","state":"ready",
+                "managed":true,"last_message":"{}{}"}}"#,
+            '\u{202E}', '\u{200B}'
+        );
+        let only_cf = decode_session(&json).unwrap();
+        assert_eq!(
+            RcSession::from_dto(only_cf, "srv", "web").last_message,
+            None
+        );
     }
 
     // ---- capabilities ----

@@ -1,0 +1,74 @@
+{
+  "server": {
+    "version": "0.8.0",
+    "features": ["overview", "rc-enrich", "rc-events", "rc-proxy"]
+  },
+  "df": {
+    "server_name": "test-server",
+    "backend": "vz",
+    "totals": {
+      "images": { "physical_bytes": 1323184128 },
+      "sheds": { "physical_bytes": 6615306240 },
+      "all": { "physical_bytes": 14506430464 }
+    }
+  },
+  "sheds": [
+    {
+      "name": "proj",
+      "status": "running",
+      "backend": "vz",
+      "sessions": [
+        {
+          "name": "rc-abc234",
+          "shed_name": "proj",
+          "created_at": "2026-06-19T18:53:00Z",
+          "rc": {
+            "kind": "claude-rc",
+            "state": "ready",
+            "managed": true,
+            "display_name": "proj/abc234",
+            "url": "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr",
+            "created_by": "shed-remote-agent/0.1.0",
+            "activity": "working",
+            "activity_at": "2026-06-19T18:54:12Z",
+            "last_message": "Running the test suite now."
+          }
+        },
+        {
+          "name": "rc-cdx777",
+          "shed_name": "proj",
+          "created_at": "2026-06-19T19:10:00Z",
+          "rc": {
+            "kind": "codex",
+            "state": "needs-auth",
+            "managed": true,
+            "display_name": "proj/cdx777"
+          }
+        },
+        {
+          "name": "default",
+          "shed_name": "proj"
+        }
+      ],
+      "rc_capabilities": {
+        "rc_version": 3,
+        "kinds": ["claude-broker", "claude-rc", "codex", "opencode", "cursor", "shell"],
+        "agents": {
+          "claude": { "installed": true, "version": "2.1.206" },
+          "codex": { "installed": true, "version": "0.142.4" }
+        },
+        "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"],
+        "kind_features": {
+          "claude-rc": { "post_input": true, "approvals": "tui" },
+          "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" }
+        }
+      }
+    },
+    {
+      "name": "asleep",
+      "status": "stopped",
+      "sessions": []
+    }
+  ],
+  "warnings": []
+}
