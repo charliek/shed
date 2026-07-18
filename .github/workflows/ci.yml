@@ -210,7 +210,8 @@ jobs:
           # cargo-zigbuild pinned to the locally-validated version (reproducibility).
           # zig itself is brew-current: a zig bump is a LOUD build failure caught
           # by this snapshot job before any tag (not a silent ship); pinning zig
-          # harder is a tracked follow-up (see .goreleaser.yaml glibc-floor note).
+          # harder is a tracked follow-up (see the glibc-floor note in
+          # .goreleaser.host-agent.yaml).
           brew install zig
           cargo install --locked --version 0.23.0 cargo-zigbuild
       # Mirrors the release job's guard (plan 002 D5): the three configs are
