@@ -1,25 +1,39 @@
 name: Publish Images and Release
 
-# Single source-of-truth for tag-driven publishing, for BOTH release
+# Single source-of-truth for tag-driven publishing, for ALL release
 # components (the manifest-selected release model — see RELEASING.md):
 #
 #   release-plan                    (~10 s)   which components does this tag
-#                                             ship? (ship_go / ship_desktop)
+#                                             ship? (ship_server /
+#                                             ship_host_agent /
+#                                             ship_machine_rc / ship_desktop,
+#                                             plus ship_goreleaser = any of
+#                                             the first three)
 #
-#   Go component (ship_go):
+#   Server component (ship_server):
 #   1. publish-build-tools          (~2 min)  shed-build-tools image
 #   2. publish-vz, publish-fc       (~10 min) runtime images, need (1)
 #   3. smoke                        (~1 min)  reusable smoke-linux gate
 #                                             (no needs — runs in parallel
 #                                             with the image chain)
-#   4. release                      (~5 min)  goreleaser + apt-charliek
+#
+#   Goreleaser components (ship_goreleaser — server, host-agent, machine-rc):
+#   4. release                      (~5 min)  one goreleaser invocation PER
+#                                             SHIPPING component (config order
+#                                             server → host-agent → machine-rc,
+#                                             .goreleaser.<component>.yaml) +
+#                                             per-component apt-charliek
 #                                             dispatches — fires only on
-#                                             tag-push, gated on (1)-(3)
+#                                             tag-push; on server tags gated
+#                                             on (1)-(3), helper-only tags run
+#                                             it with the image chain skipped
 #
 #   Desktop component (ship_desktop):
-#   5. desktop-release-create                 gh release create — desktop-only
-#                                             tags only (goreleaser owns
-#                                             release creation when ship_go)
+#   5. desktop-release-create                 gh release create — runs only
+#                                             when NO goreleaser component
+#                                             ships (else the first shipping
+#                                             goreleaser invocation creates
+#                                             the release + changelog body)
 #   6. desktop-macos                          Swift DMG + notarize + Sparkle
 #                                             appcast — STABLE tags only
 #   6b. desktop-macos-tauri                   Tauri DMG + notarize + Sparkle
@@ -34,28 +48,38 @@ name: Publish Images and Release
 #   8. desktop-apt-dispatch                   apt-charliek dispatch (skips
 #                                             prerelease *-* tags)
 #
-# The Go chain keeps its strict ordering (the v0.5.2-era race fix: the
+# The server chain keeps its strict ordering (the v0.5.2-era race fix: the
 # apt-charliek dispatch must not publish a deb before its referenced
 # ghcr images exist). The desktop chain orders uploads strictly AFTER
-# goreleaser on combined tags (goreleaser `mode: replace` recreates the
-# release — desktop assets uploaded before it would be clobbered).
+# goreleaser on combined tags: whichever goreleaser invocation runs first
+# creates the release + owns the notes (`mode: keep-existing` — later
+# invocations and desktop jobs only add assets, never touch the body).
 #
-# Skipped-needs audit (every desktop job needs skippable jobs, so each
-# carries an explicit `always() && …` guard — a skipped upstream must
-# not block, a FAILED upstream must). Traced per scenario (tag push):
+# Skipped-needs audit (every desktop job — and now `release` itself —
+# needs skippable jobs, so each carries an explicit `!cancelled() && …`
+# or `always() && …` guard: a skipped upstream must not block, a FAILED
+# upstream must, and a user-cancelled run must publish nothing). Traced
+# per scenario (tag push; "helper" = host-agent and/or machine-rc with
+# ship_server false):
 #
-#   job                    | go-only tag | desktop-only tag | combined tag
-#   -----------------------|-------------|------------------|---------------------
-#   release-plan           | run         | run              | run
-#   publish-build-tools    | run         | skip (ship_go)   | run
-#   publish-vz/publish-fc  | run         | skip (needs)     | run
-#   smoke                  | run         | skip (ship_go)   | run
-#   release                | run         | skip (needs+if)  | run
-#   desktop-release-create | skip (ship) | run              | skip (ship_go=true)
-#   desktop-macos          | skip (ship) | run, after       | run, after
-#   desktop-macos-tauri    | skip (ship) |   create ok      |   goreleaser ok
-#   desktop-linux          |             |   (see below)    |   (see below)
-#   desktop-apt-dispatch   | skip (needs)| run              | run
+#   job                    | server tag  | helper-only tag | desktop-only tag | combined (srv+desk)
+#   -----------------------|-------------|-----------------|------------------|--------------------
+#   release-plan           | run         | run             | run              | run
+#   publish-build-tools    | run         | skip (ship)     | skip (ship)      | run
+#   publish-vz/publish-fc  | run         | skip (needs)    | skip (needs)     | run
+#   smoke                  | run         | skip (ship)     | skip (ship)      | run
+#   release                | run         | run (images     | skip (if:        | run
+#                          |             |   skipped ok)   |   ship_goreleaser)|
+#   desktop-release-create | skip (ship) | skip (ship)     | run              | skip (goreleaser)
+#   desktop-macos          | skip (ship) | skip (ship)     | run, after       | run, after
+#   desktop-macos-tauri    | skip (ship) | skip (ship)     |   create ok      |   goreleaser ok
+#   desktop-linux          |             |                 |   (see below)    |   (see below)
+#   desktop-apt-dispatch   | skip (needs)| skip (needs)    | run              | run
+#
+#   A helper+desktop tag behaves like the combined column, except the
+#   image chain skips (ship_server=false) while `release` still runs
+#   (ship_goreleaser) — so desktop-release-create stays skipped and the
+#   goreleaser invocation that runs first owns the release + notes.
 #
 # The two mac desktop jobs are MUTUALLY EXCLUSIVE on the same prerelease/stable
 # axis, and it's cross-cutting to the go/desktop/combined columns above:
@@ -71,20 +95,30 @@ name: Publish Images and Release
 # builds on both; apt-dispatch's own *-* guard already skips prereleases).
 #
 #   Failure propagation: release-plan fails → everything skips (loud, by
-#   design — includes the no-manifest-matches tag). On a combined tag, a
-#   failed image job skips `release` (needs), which leaves
-#   desktop-release-create skipped (ship_go=true) — desktop-macos/linux
-#   then run but fail fast at `gh release upload` (no release exists);
-#   re-run the failed Go job and the rerun restores the full chain. A
-#   FAILED `release` or `desktop-release-create` skips desktop-macos /
-#   desktop-linux via the `!= 'failure'` guards.
+#   design — includes the no-manifest-matches tag). On a server-shipping
+#   tag, a failed/cancelled/skipped image job blocks `release` (its `if:`
+#   requires all four `== 'success'` when ship_server — stricter than
+#   `!= 'failure'` on purpose: cancellation must not ship), which leaves
+#   desktop-release-create skipped (ship_goreleaser=true) —
+#   desktop-macos/linux then run but fail fast at `gh release upload`
+#   (no release exists); re-run the failed job and the rerun restores
+#   the full chain (`replace_existing_artifacts: true` makes goreleaser
+#   re-runs replace their own assets). A FAILED `release` or
+#   `desktop-release-create` skips desktop-macos / desktop-linux via the
+#   `!= 'failure'` guards. A user-cancelled run publishes nothing
+#   (`!cancelled()` on release/desktop-release-create).
 #
-# workflow_dispatch republishes re-run the image-publish chain and (for
-# desktop-shipping tags) the desktop asset jobs, which are idempotent
-# (--clobber uploads, appcast dedupe); the `release` job stays gated on
-# tag-push events so manual republishes don't accidentally cut a new
-# GitHub Release. A dispatch of a combined tag re-runs only the Go image
-# chain (desktop jobs skip: release is skipped, not success).
+# workflow_dispatch republishes re-run the image-publish chain (when
+# ship_server) and, for desktop-shipping tags, the desktop asset jobs —
+# both idempotent (--clobber uploads, appcast dedupe). The `release` job
+# stays gated on tag-push events so manual republishes never cut a new
+# GitHub Release or re-push formulas/debs. Desktop jobs DO run on a
+# dispatch of a desktop-shipping tag (release is skipped, not failed);
+# desktop-release-create re-runs only for desktop-only tags and is
+# idempotent (reuses the existing release). Dispatching a PRE-MIGRATION
+# tag runs that tag's old two-output release-plan.sh — the shim in the
+# release-plan step maps legacy ship_go to the three goreleaser
+# components so image republishes of old tags keep working.
 
 on:
   push:
@@ -106,17 +140,24 @@ concurrency:
 
 jobs:
   # Which components does this tag ship? A component ships iff its version
-  # manifest equals the tag (go: .claude-plugin/plugin.json; desktop:
-  # desktop/VERSION, with the crates/tauri surfaces lockstep-verified).
+  # manifest equals the tag (server: .claude-plugin/plugin.json; host-agent:
+  # crates/shed-host-agent/VERSION; machine-rc: cmd/shed-machine-rc/VERSION;
+  # desktop: desktop/VERSION, with the crates/tauri surfaces lockstep-verified).
   # scripts/release/release-plan.sh fails loudly when NO manifest matches
-  # (forgotten update-version.sh run), which fails this job and skips the
+  # (forgotten update-version.sh run) and cross-checks the CHANGELOG's
+  # **Ships:** line on stable tags, which fails this job and skips the
   # entire workflow — a silent no-op release is impossible.
   release-plan:
     name: Release plan
     runs-on: ubuntu-latest
     outputs:
-      ship_go: ${{ steps.plan.outputs.ship_go }}
+      ship_server: ${{ steps.plan.outputs.ship_server }}
+      ship_host_agent: ${{ steps.plan.outputs.ship_host_agent }}
+      ship_machine_rc: ${{ steps.plan.outputs.ship_machine_rc }}
       ship_desktop: ${{ steps.plan.outputs.ship_desktop }}
+      # true iff any of server/host-agent/machine-rc — computed in the
+      # script (bash-tested) so workflow expressions never re-derive it.
+      ship_goreleaser: ${{ steps.plan.outputs.ship_goreleaser }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -131,14 +172,34 @@ jobs:
             echo "::error::Version must start with 'v' (example: v1.2.3)"
             exit 1
           fi
-          # stdout is exactly the two ship_* key=value lines; diagnostics go
+          # stdout is exactly the ship_* key=value lines; diagnostics go
           # to stderr (still visible in the log).
-          scripts/release/release-plan.sh "$VERSION" | tee -a "$GITHUB_OUTPUT"
+          scripts/release/release-plan.sh "$VERSION" > plan.out
+          # Legacy-tag shim: this workflow file comes from the DISPATCHING
+          # ref (main), but the script above comes from the CHECKED-OUT tag.
+          # A workflow_dispatch republish of a pre-migration tag therefore
+          # runs the old two-output script (ship_go/ship_desktop only). Old
+          # ship_go shipped the server, host-agent, and machine-rc artifacts
+          # together — map it so image republishes of old tags keep working.
+          if grep -q '^ship_go=' plan.out && ! grep -q '^ship_server=' plan.out; then
+            # Strict true|false capture — immune to trailing whitespace/CRLF
+            # in the legacy script's output (a stray '\r' would otherwise
+            # poison every downstream == 'true' comparison).
+            go_val="$(sed -n 's/^ship_go=\(true\|false\).*/\1/p' plan.out | head -1)"
+            {
+              echo "ship_server=${go_val}"
+              echo "ship_host_agent=${go_val}"
+              echo "ship_machine_rc=${go_val}"
+              echo "ship_goreleaser=${go_val}"
+            } >> plan.out
+          fi
+          cat plan.out
+          cat plan.out >> "$GITHUB_OUTPUT"
 
   publish-build-tools:
     name: Publish shed-build-tools
     needs: release-plan
-    if: needs.release-plan.outputs.ship_go == 'true'
+    if: needs.release-plan.outputs.ship_server == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -188,7 +249,7 @@ jobs:
 
   publish-vz:
     name: Publish VZ Images
-    # Transitively gated on ship_go: when publish-build-tools skips, this
+    # Transitively gated on ship_server: when publish-build-tools skips, this
     # skips too (plain `needs` semantics — no `always()` here on purpose).
     needs: publish-build-tools
     runs-on: ubuntu-24.04-arm
@@ -322,7 +383,7 @@ jobs:
 
   publish-fc:
     name: Publish FC Images
-    # Transitively gated on ship_go via publish-build-tools (see publish-vz).
+    # Transitively gated on ship_server via publish-build-tools (see publish-vz).
     needs: publish-build-tools
     runs-on: ubuntu-latest
 
@@ -446,18 +507,41 @@ jobs:
   # job's needs).
   smoke:
     needs: release-plan
-    if: needs.release-plan.outputs.ship_go == 'true'
+    if: needs.release-plan.outputs.ship_server == 'true'
     uses: ./.github/workflows/smoke-linux.yml
 
-  # goreleaser + apt-charliek dispatches. Only fires on tag-push
-  # events (not manual workflow_dispatch republishes), and only
-  # after the build-tools image, runtime images, and smoke have all
-  # gone green. By that point apt-charliek pulling down the new
-  # deb finds every referenced ghcr image already published.
+  # goreleaser + apt-charliek dispatches — one goreleaser invocation per
+  # SHIPPING component (.goreleaser.{server,host-agent,machine-rc}.yaml,
+  # fixed order). Only fires on tag-push events (not manual
+  # workflow_dispatch republishes).
+  #
+  # The `if:` below is load-bearing; read it with these rules in mind:
+  # * `!cancelled()` (NOT the implicit success()) lets the job evaluate
+  #   over SKIPPED needs — on a helper-only tag (host-agent/machine-rc
+  #   without server) the whole image chain skips and this job must still
+  #   run. `always()` would be wrong: a user-cancelled run must publish
+  #   nothing.
+  # * GHA outputs are STRINGS and any non-empty string is truthy, so
+  #   every comparison is an explicit == / != against 'true'.
+  # * On a server-shipping tag the four upstream jobs must be exactly
+  #   'success' — stricter than `!= 'failure'` on purpose: a cancelled or
+  #   skipped image job must block the release (the v0.5.2-era race fix:
+  #   apt-charliek must never index a deb whose referenced ghcr images
+  #   don't exist).
   release:
     name: Build and Release
     needs: [release-plan, publish-build-tools, publish-vz, publish-fc, smoke]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-plan.outputs.ship_go == 'true'
+    if: >-
+      !cancelled() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.release-plan.result == 'success' &&
+      needs.release-plan.outputs.ship_goreleaser == 'true' &&
+      (needs.release-plan.outputs.ship_server != 'true' ||
+       (needs.publish-build-tools.result == 'success' &&
+        needs.publish-vz.result == 'success' &&
+        needs.publish-fc.result == 'success' &&
+        needs.smoke.result == 'success'))
     # macos-latest: the shipped shed-host-agent is Rust (builder: rust / cargo
     # zigbuild — cross-builds the linux targets from macOS via zig), and the
     # detached Go rollback ids still compile here (darwin needs CGO for Touch ID).
@@ -479,13 +563,28 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Sequential-invocation guard: goreleaser's git dirty-check runs on
+      # every invocation, so before-hooks must not mutate tracked files
+      # (none of the split configs run `go mod tidy` any more — assert the
+      # tag is tidy instead) and the server config's generated
+      # packaging/server.yaml.generated must stay gitignored or invocation
+      # #2 would abort on a dirty tree.
+      - name: Assert tidy go.mod + gitignored generated packaging
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+          git check-ignore -q packaging/server.yaml.generated
+
       # Rust + cross tooling for `builder: rust` (mirrors release-snapshot).
       # goreleaser's rust builder shells out to `cargo zigbuild`, needing zig +
       # cargo-zigbuild; it auto-runs `rustup target add`, but pre-adding fails
       # fast if a target is unavailable. The build env SHED_HOST_AGENT_VERSION=
-      # {{ .Version }} lives in .goreleaser.yaml, so it applies identically to
-      # the snapshot and this release — no per-job version munging.
+      # {{ .Version }} lives in .goreleaser.host-agent.yaml, so it applies
+      # identically to the snapshot and this release — no per-job version
+      # munging. Only needed when the host-agent ships (the other configs are
+      # pure Go) — skipping saves ~3 min on server/machine-rc-only tags.
       - name: Rust toolchain + zig cross tooling
+        if: success() && needs.release-plan.outputs.ship_host_agent == 'true'
         run: |
           # Kept byte-identical to ci.yml's release-snapshot step (see the note
           # there): explicit rustfmt+clippy (rust-toolchain.toml declares them),
@@ -499,8 +598,9 @@ jobs:
           cargo install --locked --version 0.23.0 cargo-zigbuild
 
       # The old inline "Verify plugin.json matches tag" step is gone: the
-      # release-plan job owns that gate now (this job only runs when
-      # release-plan already proved plugin.json == tag, i.e. ship_go).
+      # release-plan job owns manifest gating now (this job only runs when
+      # release-plan already proved at least one goreleaser component's
+      # manifest == tag, i.e. ship_goreleaser).
 
       - name: Run Tests
         run: go test ./...
@@ -531,26 +631,66 @@ jobs:
           # formula).
           permission-contents: write
 
-      - name: Run GoReleaser
+      # One invocation per SHIPPING component, fixed order server →
+      # host-agent → machine-rc. All three configs use release.mode
+      # keep-existing + replace_existing_artifacts, so whichever runs FIRST
+      # creates the GH release with the goreleaser-changelog body (the
+      # changelog is derived from the repo tag range — identical whichever
+      # config generates it) and later invocations only add their assets.
+      # Skipping a component means its artifacts are never built — no
+      # release asset exists for apt-charliek's asset scan to index, and
+      # its brew formula is never pushed (the published formula stays at
+      # the component's last-shipped version).
+      - name: Run GoReleaser (server)
+        if: success() && needs.release-plan.outputs.ship_server == 'true'
         uses: goreleaser/goreleaser-action@v7
         with:
           # Pinned to match the CI release-snapshot job so the snapshot is a
           # faithful proof of what the release runs (was `latest`).
-          version: v2.15.2
-          args: release --clean
+          version: v2.15.3
+          args: release --clean -f .goreleaser.server.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GoReleaser reads HOMEBREW_TAP_TOKEN from this env var (see
-          # .goreleaser.yaml: brews[].repository.token). Feed it the
-          # App-minted token instead of a PAT.
+          # GoReleaser reads HOMEBREW_TAP_TOKEN from this env var (see the
+          # split configs: brews[].repository.token). Feed it the
+          # App-minted token instead of a PAT (one mint, reused by all
+          # three invocations — token TTL 1h, the job runs well under it).
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
+
+      - name: Run GoReleaser (host-agent)
+        if: success() && needs.release-plan.outputs.ship_host_agent == 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.3
+          args: release --clean -f .goreleaser.host-agent.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
+
+      - name: Run GoReleaser (machine-rc)
+        if: success() && needs.release-plan.outputs.ship_machine_rc == 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.3
+          args: release --clean -f .goreleaser.machine-rc.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
 
       # Mint a release-bot App token scoped to charliek/apt-charliek for
-      # the publish dispatch. The App must be installed on apt-charliek
+      # the publish dispatches. The App must be installed on apt-charliek
       # (verify via sanity-check-app.yml). Replaces the legacy
-      # APT_DISPATCH_TOKEN PAT.
+      # APT_DISPATCH_TOKEN PAT. Only minted when a deb-shipping component
+      # is in the plan (server or machine-rc — host-agent has no deb).
+      # NOTE: the dispatches are freshness nudges only — apt-charliek
+      # re-scans every tracked package's release ASSETS on every publish
+      # run and ignores the dispatch payload for correctness, which is
+      # exactly why unshipped components must produce no assets at all.
       - name: Mint an apt-charliek App token
-        if: success()
+        if: >-
+          success() &&
+          (needs.release-plan.outputs.ship_server == 'true' ||
+           needs.release-plan.outputs.ship_machine_rc == 'true')
         id: apt
         uses: actions/create-github-app-token@v3
         with:
@@ -562,7 +702,7 @@ jobs:
           permission-contents: write
 
       - name: Trigger apt-charliek publish
-        if: success()
+        if: success() && needs.release-plan.outputs.ship_server == 'true'
         env:
           GH_TOKEN: ${{ steps.apt.outputs.token }}
         run: |
@@ -597,7 +737,7 @@ jobs:
       # NOTE: apt-charliek's packages.yaml must repoint shed-machine-rc to
       # charliek/shed before the first monorepo tag or this dispatch no-ops.
       - name: Trigger apt-charliek publish (shed-machine-rc)
-        if: success()
+        if: success() && needs.release-plan.outputs.ship_machine_rc == 'true'
         env:
           GH_TOKEN: ${{ steps.apt.outputs.token }}
         run: |
@@ -620,19 +760,22 @@ jobs:
 
   # ---- Desktop component (ported from shed-desktop's release.yml) -----------
 
-  # Desktop-only tags need a GitHub Release to upload into; goreleaser owns
-  # release creation whenever the Go side ships (Decision 6: mode:replace
-  # would clobber a pre-created release's assets), so this job runs ONLY when
-  # ship_desktop && !ship_go. Idempotent: reuses an existing release (e.g. a
-  # workflow_dispatch republish of a desktop-only tag).
+  # Desktop-only tags need a GitHub Release to upload into; whenever ANY
+  # goreleaser component ships, the first goreleaser invocation owns release
+  # creation + the changelog body (mode: keep-existing — a pre-created
+  # release would freeze the placeholder notes as the body, so this job must
+  # NOT run then). Runs ONLY when ship_desktop && !ship_goreleaser.
+  # Idempotent: reuses an existing release (e.g. a workflow_dispatch
+  # republish of a desktop-only tag). `!cancelled()` (not `always()`): a
+  # user-cancelled run must not create releases.
   desktop-release-create:
     name: Create desktop-only release
     needs: [release-plan, release]
     if: >-
-      always() &&
+      !cancelled() &&
       needs.release-plan.result == 'success' &&
       needs.release-plan.outputs.ship_desktop == 'true' &&
-      needs.release-plan.outputs.ship_go != 'true' &&
+      needs.release-plan.outputs.ship_goreleaser != 'true' &&
       needs.release.result == 'skipped'
     runs-on: ubuntu-latest
     permissions:
@@ -789,20 +932,20 @@ jobs:
 
       - name: Upload the DMG (+ notarization notes on desktop-only releases)
         # The release exists by now (goreleaser on combined tags,
-        # desktop-release-create on desktop-only tags). Notes handling per
-        # Decision 6: when the Go side ships, goreleaser owns the release
+        # desktop-release-create on desktop-only tags). Notes handling:
+        # when ANY goreleaser component ships, goreleaser owns the release
         # notes — never touch them; on a desktop-only release, APPEND the
         # notarization guidance rather than overwrite (the old repo's job
         # overwrote, which would clobber goreleaser's notes on combined tags).
         env:
           GH_TOKEN: ${{ github.token }}
           NOTARIZED: ${{ steps.dmg_notarized.outputs.value }}
-          SHIP_GO: ${{ needs.release-plan.outputs.ship_go }}
+          SHIP_GORELEASER: ${{ needs.release-plan.outputs.ship_goreleaser }}
         run: |
           set -euo pipefail
           VER="${TAG#v}"
           gh release upload "$TAG" "desktop/build/ShedDesktop-${VER}.dmg" --clobber
-          if [ "${SHIP_GO}" = "true" ]; then
+          if [ "${SHIP_GORELEASER}" = "true" ]; then
             echo "combined release — goreleaser owns the notes; skipping the notes edit."
             exit 0
           fi
@@ -1016,17 +1159,18 @@ jobs:
           fi
 
       - name: Upload the DMG (+ notarization notes on desktop-only releases)
-        # Same notes handling as desktop-macos: when the Go side ships, goreleaser
-        # owns the notes; on a desktop-only release, APPEND the guidance.
+        # Same notes handling as desktop-macos: when any goreleaser component
+        # ships, goreleaser owns the notes; on a desktop-only release, APPEND
+        # the guidance.
         env:
           GH_TOKEN: ${{ github.token }}
           NOTARIZED: ${{ steps.dmg_notarized.outputs.value }}
-          SHIP_GO: ${{ needs.release-plan.outputs.ship_go }}
+          SHIP_GORELEASER: ${{ needs.release-plan.outputs.ship_goreleaser }}
         run: |
           set -euo pipefail
           VER="${TAG#v}"
           gh release upload "$TAG" "desktop/build/ShedDesktop-${VER}.dmg" --clobber
-          if [ "${SHIP_GO}" = "true" ]; then
+          if [ "${SHIP_GORELEASER}" = "true" ]; then
             echo "combined release — goreleaser owns the notes; skipping the notes edit."
             exit 0
           fi

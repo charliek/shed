@@ -21,10 +21,12 @@ The Go build never traverses `crates/` or `desktop/` (`go list ./...` / `golangc
 
 One `vX.Y.Z` tag family, **manifest-selected** — a component ships iff its version manifest equals the tag:
 
-- **Go** selector = `.claude-plugin/plugin.json`; ships the CLI/server/agent brew + apt + rootfs images.
+- **server** selector = `.claude-plugin/plugin.json` (renamed from `go`; file unchanged); ships the CLI/server/agent brew + apt + rootfs images.
+- **host-agent** selector = `crates/shed-host-agent/VERSION`; ships brew `shed-host-agent` + a GH linux tarball (brew-only, no apt).
+- **machine-rc** selector = `cmd/shed-machine-rc/VERSION`; ships brew + apt `shed-machine-rc`.
 - **desktop** selector = `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified **lockstep**); ships the DMG + Sparkle appcast + `shed-desktop` debs.
 
-`scripts/release/update-version.sh X.Y.Z --components go,desktop` bumps the selected manifests (default `go`); `scripts/release/release-plan.sh` maps a tag → `ship_go`/`ship_desktop` and **exits 1 if neither matches** (forgotten-bump guard). Each `CHANGELOG.md` entry opens with a `**Ships:**` line naming the components. A **desktop-only** tag publishes **no** rootfs images. Full detail in `RELEASING.md` (and `desktop/RELEASING.md` for the recurring desktop steps).
+`scripts/release/update-version.sh X.Y.Z --components server,host-agent,machine-rc,desktop` bumps the selected manifests (default `server`; `go` accepted as a deprecated alias). `scripts/release/recommend-components.sh X.Y.Z` recommends the component set (all four on a minor/major bump, only what changed since each component's last-shipped tag on a patch) for the human to confirm/edit before bumping. `scripts/release/release-plan.sh` maps a tag → `ship_server`/`ship_host_agent`/`ship_machine_rc`/`ship_desktop` and **exits 1 if none match** (forgotten-bump guard). Each `CHANGELOG.md` entry opens with a `**Ships:**` line naming the components — **enforced** by `release-plan.sh` against the manifest-computed set on stable tags. A **desktop-only** tag publishes **no** rootfs images; a **helper-only** tag (host-agent and/or machine-rc, no server) also publishes no images and leaves the other components' brew/apt entries pinned at their prior release. Full detail in `RELEASING.md` (and `desktop/RELEASING.md` for the recurring desktop steps).
 
 ## Build & Test
 

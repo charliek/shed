@@ -1,0 +1,114 @@
+# GoReleaser config — MACHINE-RC component (plan 002: release component model).
+#
+# One of THREE split configs. The release job invokes goreleaser once per
+# SHIPPING component, in the FIXED order: server → host-agent → machine-rc.
+#   - .goreleaser.server.yaml      : brew `shed`, apt `shed-server` deb
+#   - .goreleaser.host-agent.yaml  : brew `shed-host-agent` + GH linux tarball
+#   - .goreleaser.machine-rc.yaml  (this file): brew + apt `shed-machine-rc`
+# See RELEASING.md "Component selection" for the selector law and the flow.
+# Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
+#
+# No before-hooks: nothing to render here, and keeping them empty guarantees the
+# machine-rc invocation never mutates a tracked file after the server run.
+
+version: 2
+
+project_name: shed
+
+# Own subdir of dist/ (covered by .gitignore's `dist/`); `--clean` wipes only
+# this dir, never a sibling config's, so the three snapshots/releases coexist.
+dist: dist/machine-rc
+
+builds:
+  - id: shed-machine-rc
+    binary: shed-machine-rc
+    main: ./cmd/shed-machine-rc
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
+      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+
+archives:
+  - id: shed-machine-rc
+    ids:
+      - shed-machine-rc
+    formats:
+      - tar.gz
+    name_template: "shed-machine-rc_{{ .Os }}_{{ .Arch }}"
+    # Single-binary archive — no README/LICENSE extras (matches the established
+    # single-binary-archive pattern and keeps the artifact exactly the binary).
+    files:
+      - none*
+
+brews:
+  - name: shed-machine-rc
+    ids:
+      - shed-machine-rc
+    repository:
+      owner: charliek
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/charliek/shed"
+    description: "RC session helper for native machines (claude remote-control), sibling of shed-ext-rc"
+    license: "MIT"
+    install: |
+      bin.install "shed-machine-rc"
+    test: |
+      system bin/"shed-machine-rc", "version"
+
+nfpms:
+  - id: shed-machine-rc
+    package_name: shed-machine-rc
+    file_name_template: "shed-machine-rc_{{ .Version }}_{{ .Arch }}"
+    ids:
+      - shed-machine-rc
+    formats:
+      - deb
+    bindir: /usr/local/bin
+    vendor: charliek
+    homepage: "https://github.com/charliek/shed"
+    maintainer: "Charlie Knudsen"
+    description: "RC session helper for native machines (claude remote-control)"
+    license: "MIT"
+    section: utils
+
+checksum:
+  # Unique per-config name: the three configs publish to the SAME GH release
+  # (shared tag), so a shared `checksums.txt` would clobber across invocations.
+  name_template: "checksums-machine-rc.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: charliek
+    name: shed
+  draft: false
+  prerelease: auto
+  # keep-existing: the first SHIPPING invocation (server → host-agent →
+  # machine-rc) creates the release + the goreleaser-changelog body; later
+  # invocations upload their assets without touching the body.
+  mode: keep-existing
+  # replace_existing_artifacts: a re-run of a partially-failed release job
+  # replaces its own already-uploaded assets instead of dying `already_exists`
+  # under keep-existing.
+  replace_existing_artifacts: true
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"

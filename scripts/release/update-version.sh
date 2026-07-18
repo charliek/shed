@@ -1,63 +1,85 @@
 #!/usr/bin/env bash
 # Bump shed's release version for the selected components.
 #
-# The monorepo carries multiple release components on ONE vX.Y.Z tag
-# family. A component ships in a release iff its version manifest equals
-# the tag (scripts/release/release-plan.sh is the CI-side selector):
+# The monorepo carries FOUR release components on ONE vX.Y.Z tag family. A
+# component ships in a release iff its version manifest equals the tag
+# (scripts/release/release-plan.sh is the CI-side selector):
 #
-#   go       — the Go binaries + Claude Code plugin.
-#              * Go binaries (shed, shed-server, shed-agent, ...) get their
-#                version from a build-time ldflag injected by GoReleaser at
-#                tag time — NOT bumped in the source tree.
-#              * .claude-plugin/plugin.json IS a source-tree manifest and is
-#                the go component's ship selector; bumped here by delegating
-#                to scripts/set-version.sh (the existing, tested bumper),
-#                then jq-verified.
+#   server      — the Go binaries + Claude Code plugin (brew `shed`, apt
+#                 `shed-server` deb, rootfs vz/fc images + build-tools).
+#                 * Go binaries (shed, shed-server, shed-agent, ...) get their
+#                   version from a build-time ldflag injected by GoReleaser at
+#                   tag time — NOT bumped in the source tree.
+#                 * .claude-plugin/plugin.json IS a source-tree manifest and is
+#                   the server component's ship selector; bumped here by
+#                   delegating to scripts/set-version.sh (the existing, tested
+#                   bumper), then jq-verified.
+#                 (Historically named `go`; `go` is still accepted as a
+#                 deprecated alias — it prints a one-line stderr warning and
+#                 behaves identically.)
 #
-#   desktop  — the shed-desktop app (absorbed from the old
-#              shed-desktop repo's scripts/release/update-version.sh).
-#              Bumps, in lockstep:
-#              * desktop/VERSION            the macOS app's marketing version
-#                                           (bundle.sh + shedctl identify read
-#                                           it); drives the DMG + Sparkle
-#                                           appcast. The desktop ship selector.
-#              * crates/Cargo.toml          the Rust workspace
-#                                           ([workspace.package].version; every
-#                                           member inherits) + Cargo.lock regen.
-#              * desktop/tauri/src-tauri    the Tauri client is its OWN cargo
-#                                           workspace — Cargo.toml
-#                                           [package].version + tauri.conf.json
-#                                           + Cargo.lock regen (the lock pins
-#                                           shed-core/shed-app by version, so a
-#                                           stale lock breaks the .deb's
-#                                           `cargo build --locked`).
+#   host-agent  — the host-side credential broker (brew `shed-host-agent` + a
+#                 GH linux tarball). Its shipped version is the tag ldflag
+#                 (crates/shed-host-agent/src/version.rs), NOT CARGO_PKG_VERSION
+#                 — so its ship selector is a standalone file,
+#                 crates/shed-host-agent/VERSION, written here and grep-verified.
+#                 (Intentionally divergent from crates/Cargo.toml's workspace
+#                 version, which the desktop component owns.)
+#
+#   machine-rc  — the host-side RC-session helper (brew + apt `shed-machine-rc`).
+#                 Ship selector: cmd/shed-machine-rc/VERSION (standalone file,
+#                 same rationale as host-agent), written here and grep-verified.
+#
+#   desktop     — the shed-desktop app (absorbed from the old shed-desktop
+#                 repo's scripts/release/update-version.sh). Bumps, in lockstep:
+#                 * desktop/VERSION            the macOS app's marketing version
+#                                              (bundle.sh + shedctl identify read
+#                                              it); drives the DMG + Sparkle
+#                                              appcast. The desktop ship selector.
+#                 * crates/Cargo.toml          the Rust workspace
+#                                              ([workspace.package].version; every
+#                                              member inherits) + Cargo.lock regen.
+#                 * desktop/tauri/src-tauri    the Tauri client is its OWN cargo
+#                                              workspace — Cargo.toml
+#                                              [package].version + tauri.conf.json
+#                                              + Cargo.lock regen (the lock pins
+#                                              shed-core/shed-app by version, so a
+#                                              stale lock breaks the .deb's
+#                                              `cargo build --locked`).
 #
 # Contract (cc-plugins:release-workflows references/update-version/README.md):
 #   - first arg: semver string, no `v` prefix
-#   - optional `--components go,desktop` (default: go — preserves the
-#     historical one-arg behavior; the release skill computes the set and
-#     passes it explicitly)
+#   - optional `--components server,host-agent,machine-rc,desktop`
+#     (default: server — preserves the historical one-arg behavior; the release
+#     skill computes the set from recommend-components.sh and passes it
+#     explicitly). `go` accepted as a deprecated alias for `server`.
 #   - unknown component → hard error listing valid names
+#   - PRERELEASE versions (X.Y.Z-suffix) are rejected for the three
+#     goreleaser components (server / host-agent / machine-rc) — they are
+#     stable-only. A desktop-only prerelease is allowed (the Tauri rc-rehearsal
+#     path).
 #   - idempotent (a same-version re-run leaves the tree unchanged)
 #   - no network (cargo runs --offline)
 #   - verifies its own work (jq/grep-back after every bump)
 #   - doesn't `git add` (release skill stages + commits)
 #
 # Usage:
-#   scripts/release/update-version.sh 0.8.0                       # go only
+#   scripts/release/update-version.sh 0.8.0                              # server only
+#   scripts/release/update-version.sh 0.8.0 --components host-agent
+#   scripts/release/update-version.sh 0.8.0 --components machine-rc
 #   scripts/release/update-version.sh 0.8.0 --components desktop
-#   scripts/release/update-version.sh 0.8.0 --components go,desktop
+#   scripts/release/update-version.sh 0.8.0 --components server,host-agent,machine-rc,desktop
 
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <X.Y.Z[-suffix]> [--components go,desktop]" >&2
-  echo "  e.g. $0 0.8.0 --components go,desktop   (default components: go)" >&2
+  echo "usage: $0 <X.Y.Z[-suffix]> [--components server,host-agent,machine-rc,desktop]" >&2
+  echo "  e.g. $0 0.8.0 --components server,desktop   (default components: server)" >&2
   exit 2
 }
 
 V=""
-COMPONENTS="go"
+COMPONENTS="server"
 while [ $# -gt 0 ]; do
   case "$1" in
     --components)
@@ -82,31 +104,84 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$V" ] || usage
 
-if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
-  echo "error: '$V' is not semver (X.Y.Z or X.Y.Z-suffix)" >&2
+# Each numeric field is (0|[1-9][0-9]*): a leading zero (e.g. 0.07.11) is
+# rejected as malformed rather than silently accepted/misparsed.
+if [[ ! "$V" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[a-zA-Z0-9.-]+)?$ ]]; then
+  echo "error: '$V' is not semver (X.Y.Z or X.Y.Z-suffix; no leading zeros)" >&2
   exit 2
 fi
+
+# A prerelease version carries a `-suffix` (e.g. 2.1.0-rc.1). Only the desktop
+# component has a beta channel — the three goreleaser components are stable-only.
+IS_PRERELEASE=false
+case "$V" in
+  *-*) IS_PRERELEASE=true ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-DO_GO=false
+VALID_COMPONENTS="server, host-agent, machine-rc, desktop"
+
+DO_SERVER=false
+DO_HOST_AGENT=false
+DO_MACHINE_RC=false
 DO_DESKTOP=false
 IFS=',' read -r -a comps <<< "${COMPONENTS}"
-[ "${#comps[@]}" -gt 0 ] || { echo "error: --components is empty (valid: go, desktop)" >&2; exit 2; }
+[ "${#comps[@]}" -gt 0 ] || { echo "error: --components is empty (valid: ${VALID_COMPONENTS})" >&2; exit 2; }
+GO_ALIAS_WARNED=false
 for c in "${comps[@]}"; do
   case "$c" in
-    go) DO_GO=true ;;
+    go)
+      # Deprecated alias for `server` (the component was renamed from `go`).
+      # Warn once per invocation even if `go` is repeated (e.g. --components go,go).
+      if [ "${GO_ALIAS_WARNED}" = "false" ]; then
+        echo "warning: component 'go' is a deprecated alias for 'server' — use --components server" >&2
+        GO_ALIAS_WARNED=true
+      fi
+      DO_SERVER=true
+      ;;
+    server) DO_SERVER=true ;;
+    host-agent) DO_HOST_AGENT=true ;;
+    machine-rc) DO_MACHINE_RC=true ;;
     desktop) DO_DESKTOP=true ;;
     *)
-      echo "error: unknown component '${c}' (valid: go, desktop)" >&2
+      echo "error: unknown component '${c}' (valid: ${VALID_COMPONENTS})" >&2
       exit 2
       ;;
   esac
 done
 
-# ---------------------------------------------------------------- component: go
-if $DO_GO; then
+# Stable-only guard for the three goreleaser components. A prerelease version is
+# only meaningful for a desktop-only rc rehearsal; selecting server/host-agent/
+# machine-rc with a `-suffix` version is a mistake (goreleaser components have no
+# beta channel — release-plan.sh would reject the resulting tag anyway).
+if [ "${IS_PRERELEASE}" = "true" ]; then
+  if $DO_SERVER || $DO_HOST_AGENT || $DO_MACHINE_RC; then
+    echo "error: prerelease version '${V}' selects a goreleaser component (server/host-agent/machine-rc), which are stable-only." >&2
+    echo "       Only --components desktop may take a prerelease (the Tauri rc-rehearsal path)." >&2
+    exit 1
+  fi
+fi
+
+# Write a standalone VERSION ship-selector (host-agent / machine-rc) and
+# grep-verify the write landed. Both files are ship-selectors ONLY — the shipped
+# binary's version is the tag ldflag (e.g. crates/shed-host-agent/src/version.rs),
+# NOT this file — and are intentionally independent of crates/Cargo.toml's
+# workspace version (owned by the desktop component). A single trailing newline;
+# argument is the repo-relative path.
+bump_selector_file() {
+  local rel="$1" abs="${REPO_ROOT}/$1"
+  printf '%s\n' "${V}" > "${abs}"
+  if ! grep -qx "${V}" "${abs}"; then
+    echo "error: ${rel} did not bump to ${V}" >&2
+    exit 1
+  fi
+  echo "${rel} -> ${V}"
+}
+
+# ------------------------------------------------------------ component: server
+if $DO_SERVER; then
   PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
 
   # Delegate to the existing plugin.json bumper.
@@ -122,6 +197,16 @@ if $DO_GO; then
     echo "error: plugin.json top-level .version did not bump to ${V}" >&2
     exit 1
   fi
+fi
+
+# -------------------------------------------------------- component: host-agent
+if $DO_HOST_AGENT; then
+  bump_selector_file "crates/shed-host-agent/VERSION"
+fi
+
+# -------------------------------------------------------- component: machine-rc
+if $DO_MACHINE_RC; then
+  bump_selector_file "cmd/shed-machine-rc/VERSION"
 fi
 
 # ----------------------------------------------------------- component: desktop

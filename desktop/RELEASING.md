@@ -21,10 +21,16 @@ the lockstep at workflow time and refuses to ship a drifted tree.
 
 1. **`desktop-release-create`** — desktop-only tags need a GitHub
    Release to upload into, so this job `gh release create`s one
-   (idempotent). On combined tags it is **skipped**: goreleaser
-   (`mode: replace`) owns release creation, and the desktop jobs run
-   strictly after the `release` job succeeds so goreleaser can never
-   clobber desktop assets.
+   (idempotent). It runs only when **no** goreleaser component ships
+   (`ship_goreleaser != 'true'`, i.e. neither server nor host-agent nor
+   machine-rc). Whenever any goreleaser component *does* ship, this job
+   is **skipped**: the root `release` job now runs one
+   `goreleaser release` invocation per shipping component (server →
+   host-agent → machine-rc, `release.mode: keep-existing`), and the
+   FIRST of those invocations creates the release and owns the
+   changelog body — later goreleaser invocations, and the desktop jobs
+   (which run strictly after `release` succeeds), only add assets and
+   never touch the body or clobber each other's uploads.
 
 2. **`desktop-macos`** (macos-15):
    - Builds the Rust core + Swift app and assembles

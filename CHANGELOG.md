@@ -3,13 +3,19 @@
 All notable changes to this project will be documented in this file.
 
 <!--
-  `**Ships:**` convention (debuts with the next entry; earlier entries
-  predate it): each release entry opens with a `**Ships:** …` line naming
-  the components that tag actually shipped — `server/CLI`, `desktop`, or
-  both. A component ships iff its version manifest equals the tag (go:
-  .claude-plugin/plugin.json; desktop: desktop/VERSION) — see RELEASING.md
-  "Component selection". Convention only, unenforced; shed-desktop's
-  pre-monorepo changelog stays in the archived charliek/shed-desktop repo.
+  `**Ships:**` convention: each release entry opens with a `**Ships:** …`
+  line naming the components that tag actually shipped, using the
+  canonical tokens `server`, `host-agent`, `machine-rc`, `desktop`
+  (comma-separated; legacy `server/CLI` is accepted as an alias for
+  `server`, for entries written before the rename). A component ships iff
+  its version manifest equals the tag (server: .claude-plugin/plugin.json;
+  host-agent: crates/shed-host-agent/VERSION; machine-rc:
+  cmd/shed-machine-rc/VERSION; desktop: desktop/VERSION) — see
+  RELEASING.md "Component selection". ENFORCED by
+  scripts/release/release-plan.sh on stable tags (a mismatched, missing,
+  unknown, or duplicate token fails the release); prerelease tags have no
+  entry and are exempt. shed-desktop's pre-monorepo changelog stays in the
+  archived charliek/shed-desktop repo.
 -->
 
 ## Unreleased
