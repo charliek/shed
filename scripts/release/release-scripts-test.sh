@@ -391,6 +391,29 @@ mv "${HOST_AGENT_VER}.bak" "${HOST_AGENT_VER}"
 ok "missing crates/shed-host-agent/VERSION rejected, naming the file"
 
 # ---------------------------------------------------------------------------
+step "release-plan.sh: a leading-zero tag (v0.07.11) is rejected as malformed (exit 2)"
+# SEMVER_RE bars leading zeros in each field, matching update-version.sh /
+# recommend-components.sh, so a zero-padded tag is a malformed-tag usage error.
+run_plan v0.07.11
+[ "${PLAN_RC}" -eq 2 ] || fail "leading-zero tag v0.07.11 exited ${PLAN_RC} (want 2)"
+out="$("${RP}" v0.07.11 2>&1 || true)"
+echo "${out}" | grep -q "is not vX.Y.Z" || fail "leading-zero-tag error missing: ${out}"
+ok "v0.07.11 rejected as a malformed tag (leading zeros barred)"
+
+# ---------------------------------------------------------------------------
+step "release-plan.sh: a zero-padded VERSION manifest (1.02.3) exits 1 naming the file"
+# read_version_file validates every VERSION manifest up front, so a zero-padded
+# field is caught as non-semver regardless of the (well-formed) tag argument.
+printf '1.02.3\n' > "${HOST_AGENT_VER}"
+run_plan v9.9.9
+[ "${PLAN_RC}" -eq 1 ] || fail "zero-padded-manifest plan exited ${PLAN_RC} (want 1)"
+out="$("${RP}" v9.9.9 2>&1 || true)"
+echo "${out}" | grep -q "crates/shed-host-agent/VERSION" || fail "zero-padded-manifest error doesn't name the file: ${out}"
+echo "${out}" | grep -q "not semver" || fail "zero-padded-manifest error missing 'not semver': ${out}"
+printf '0.7.10\n' > "${HOST_AGENT_VER}"   # restore
+ok "zero-padded 1.02.3 in crates/shed-host-agent/VERSION rejected, naming the file"
+
+# ---------------------------------------------------------------------------
 step "release-plan.sh: Ships line with a trailing comma exits 1"
 # `read -a` drops a trailing empty field, so `**Ships:** server,` used to slip
 # past the per-token empty check; the explicit leading/trailing-comma guard

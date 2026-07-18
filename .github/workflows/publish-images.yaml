@@ -647,7 +647,7 @@ jobs:
         with:
           # Pinned to match the CI release-snapshot job so the snapshot is a
           # faithful proof of what the release runs (was `latest`).
-          version: v2.15.2
+          version: v2.15.3
           args: release --clean -f .goreleaser.server.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -661,7 +661,7 @@ jobs:
         if: success() && needs.release-plan.outputs.ship_host_agent == 'true'
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: v2.15.2
+          version: v2.15.3
           args: release --clean -f .goreleaser.host-agent.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -671,7 +671,7 @@ jobs:
         if: success() && needs.release-plan.outputs.ship_machine_rc == 'true'
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: v2.15.2
+          version: v2.15.3
           args: release --clean -f .goreleaser.machine-rc.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

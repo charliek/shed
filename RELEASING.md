@@ -66,11 +66,12 @@ Cutting a release is a two-step flow, not a single command:
    confirmed set, then runs `scripts/release/update-version.sh X.Y.Z
    --components <confirmed set>` (`go` is a deprecated alias for
    `server`).
-3. **Mandatory before pushing the tag:** run
-   `scripts/release/release-plan.sh vX.Y.Z` locally. This is a pre-tag
-   mirror of every guard CI will run — including the `**Ships:**`
-   cross-check (see below) — so a mismatch is caught before the tag
-   exists, not after. CI is the backstop, not the first line of
+3. **Mandatory before tagging:** run
+   `scripts/release/release-plan.sh vX.Y.Z` locally, before `git tag`.
+   This is a pre-tag mirror of every guard CI will run — including the
+   `**Ships:**` cross-check (see below) — so a mismatch is caught before
+   the tag exists, not after (a failure that fired after tagging would
+   strand a stale local tag). CI is the backstop, not the first line of
    defense: a post-tag failure costs a **fresh version** under the
    never-retag rule (see "Break-glass recovery" below), so catching it
    locally is not optional.
@@ -146,10 +147,12 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
        `VERSION` files
      - `desktop` bumps the lockstep set (unchanged)
    - Commits as `chore(version): bump to X.Y.Z`
-   - Tags `vX.Y.Z` (annotated) on the version commit
    - **Runs `scripts/release/release-plan.sh vX.Y.Z` locally and
-     confirms it passes** before pushing — this is the mandatory
-     pre-tag mirror of the CI guards (see "Recommend + confirm" above).
+     confirms it passes** — this is the mandatory pre-tag mirror of the
+     CI guards (see "Recommend + confirm" above). It runs **before**
+     `git tag` on purpose: a guard failure must not leave a stale local
+     tag to unwind.
+   - Tags `vX.Y.Z` (annotated) on the version commit
    - `git push --follow-tags` (admin bypasses the ruleset)
 
 2. **`publish-images.yaml`** (CI, on tag push `v*`) — a `release-plan`
@@ -444,15 +447,25 @@ uploaded before the failure rather than erroring on `already_exists`.
 An invocation that never got to run in the failed attempt runs fresh, as
 normal.
 
-**Mixed-checksums note**: a `workflow_dispatch` republish of a tag from
-**before** this migration (the monolith-era, single `checksums.txt`)
-will leave that legacy `checksums.txt` sitting alongside any
-newer per-component `checksums-<component>.txt` files if you re-run it
-today — the legacy-dispatch shim (see "What happens" above) only maps
-`ship_*` outputs, it doesn't touch already-published assets. For any
-tag migrated to (or cut under) the split-config model, the
-per-component `checksums-<component>.txt` files are authoritative;
-ignore a stray `checksums.txt` from a pre-migration tag.
+**Checksums note (no mixed state)**: a release's goreleaser assets are
+never a *mix* of legacy and per-component checksums. The `release` job is
+event-gated on `tag-push` (see "What happens" above and "Notes for this
+repo" below), so a `workflow_dispatch` republish never runs goreleaser at
+all — dispatch only re-runs the image chain and cannot touch goreleaser
+assets. Concretely:
+
+- **Pre-migration releases** (monolith-era) carry a single
+  `checksums.txt` and **keep it forever** — nothing rewrites it.
+- **Post-migration releases** (cut under, or migrated to, the split-
+  config model) carry per-component `checksums-<component>.txt` files,
+  which are authoritative.
+- The **only** way an existing release's goreleaser assets change is
+  re-running a **failed** `release` job on a post-migration tag (the
+  Break-glass rerun above) — and that produces per-component files only.
+
+So a stray `checksums.txt` means a pre-migration tag; per-component
+`checksums-<component>.txt` means a post-migration tag; you will never
+see both on one release as a result of a dispatch republish.
 
 ### Image-publish job failed (build-tools / VZ / FC)
 
@@ -465,28 +478,51 @@ Every manifest that shipped on the released tag must be at that
 version on main, even without the sync-version job:
 
 ```bash
-# Manually fix the drifted manifest(s) on a hotfix branch:
+# Manually fix the drifted manifest(s) on a hotfix branch — include
+# ONLY the components that shipped on vX.Y.Z but whose manifests
+# drifted (bumping all four would falsely mark non-shipping
+# components as released at X.Y.Z):
 git checkout -b fix/version-resync
-scripts/release/update-version.sh X.Y.Z --components server,host-agent,machine-rc,desktop
+scripts/release/update-version.sh X.Y.Z --components <drifted components>
 git commit -am "chore(version): resync manifests to vX.Y.Z"
 # Open a PR; merge through normal flow.
 ```
 
-Then cut a fresh patch tag (`vX.Y.Z+1`) so the release pipeline picks
-up the corrected manifest(s). Don't try to retag `vX.Y.Z` — fight that
+Then, when the next release is due, run the NORMAL release flow for
+the concrete next version — it bumps the intended components'
+manifests to that new version *before* tagging. (Don't resync-then-tag
+`vX.Y.Z+1` directly: a tag whose version matches no manifest is
+rejected by release-plan.sh.) Don't try to retag `vX.Y.Z` — fight that
 URGE; force-updating tags strands published images and creates a
 confusing state.
 
 ### Revert path — the split pipeline is fundamentally broken
 
 If a defect in the split-config model itself (not a one-off CI flake)
-is blocking every release, `git revert` the plan-002 merge commit on
-`main`. That restores the single pre-migration monolith goreleaser
-config (`release.mode: replace`) and the two-component `go`/`desktop`
-selector wholesale. Cut a **fresh** version under the legacy component
-behavior — never retag the tag that exposed the defect. This is the
-same never-retag discipline as "Wrong version got tagged" above, just
-at pipeline scope instead of manifest scope.
+is blocking every release:
+
+1. **Revert the migration.** `git revert` the plan-002 merge commit on
+   `main`. That restores the single pre-migration monolith goreleaser
+   config (`release.mode: replace`) and the two-component `go`/`desktop`
+   selector wholesale.
+2. **Resync only the drifted manifests, if any.** If a manifest fell out
+   of sync with the last released version, resync **only the drifted
+   ones** back to that released version on a normal PR. Don't sweep every
+   manifest, and don't tag off this PR — it's housekeeping, not a
+   release.
+3. **Release the next version through the normal flow.** Run
+   `/release-workflows:release` for the concrete next version. Under the
+   reverted legacy pipeline that's the old `--components go,desktop`
+   behavior: the flow bumps the intended components' manifests to the
+   **new** version *before* tagging, so the tag matches its manifests and
+   the release proceeds. Do **not** resync manifests to the already-
+   released version and then tag the next one — a fresh tag whose
+   manifests still read the old version matches no manifest and
+   `release-plan.sh` rejects it.
+
+Never retag the tag that exposed the defect — same never-retag
+discipline as "Wrong version got tagged" above, just at pipeline scope
+instead of manifest scope.
 
 ## Adopting the convention (for new contributors)
 
@@ -514,12 +550,14 @@ in the framework repo.
   `release-plan.sh` run before pushing the tag (see "Recommend +
   confirm") exists so this rejection is caught pre-tag, not post-tag.
 - **GoReleaser pin**: `goreleaser-action@v7` is pinned to `version:
-  v2.15.2` everywhere it's invoked (the `release` job here, and ci.yml's
+  v2.15.3` everywhere it's invoked (the `release` job here, and ci.yml's
   `release-snapshot` job) — the split-config model was spiked and
-  proven against this exact version. `brews:` (used by all three split
-  configs) is **hard-deprecated in goreleaser 2.16**; the pin
-  deliberately defers that migration. A `brews:` → `homebrew_casks:`
-  rewrite is named future work, not scoped here.
+  proven against this line. v2.15.3 ships the secret-redaction fix that
+  prevents secrets from leaking into logs, so it's the security floor;
+  it's still **below** v2.16, where `brews:` (used by all three split
+  configs) is **hard-deprecated**, so the pin keeps `brews:` functional
+  while deliberately deferring that migration. A `brews:` →
+  `homebrew_casks:` rewrite is named future work, not scoped here.
 - **No `ci-gate` job in the release pipeline**: the inline `go test` +
   golangci-lint steps in the `release` job serve as the at-tag-time
   gate. The smoke job is a separate gate on `release`'s `needs:`. CI

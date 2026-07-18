@@ -53,7 +53,11 @@ fi
 
 # Shared semver grammar (X.Y.Z with an optional -prerelease suffix), reused by
 # the tag check and every manifest validation so the definition can't drift.
-SEMVER_RE='[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?'
+# Each numeric field bars a leading zero ((0|[1-9][0-9]*)) so a value like
+# 0.07.11 is malformed here too — matching update-version.sh /
+# recommend-components.sh, and keeping bash arithmetic from misreading a
+# 0-prefixed field as octal downstream.
+SEMVER_RE='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[A-Za-z0-9.-]+)?'
 
 # The tag must be a plain vX.Y.Z or a vX.Y.Z-prerelease. Reject anything else
 # before touching manifests so a typo can't be misread as a no-match.
@@ -220,7 +224,11 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
     echo "::error::CHANGELOG.md '## v${V}' **Ships:** line '${ships_line}' has an empty token (leading/trailing comma; grammar: token(, token)*)." >&2
     exit 1
   fi
-  declare -A ship_seen=()
+  # This local run is mandatory on stock macOS bash (3.2), which has no
+  # associative arrays — so the "already seen this token" set is tracked by a
+  # linear scan over actual_ships (canonical, ≤4 elements) rather than an
+  # associative `ship_seen`. Index-loop the scan so an empty actual_ships can't
+  # trip `set -u` on the `[@]` expansion.
   actual_ships=()
   IFS=',' read -r -a ship_parts <<< "${tokens_raw}"
   for part in "${ship_parts[@]}"; do
@@ -238,11 +246,14 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
         exit 1
         ;;
     esac
-    if [ -n "${ship_seen[${tok}]:-}" ]; then
-      echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has duplicate token '${tok}' (post-aliasing)." >&2
-      exit 1
-    fi
-    ship_seen[${tok}]=1
+    j=0
+    while [ "${j}" -lt "${#actual_ships[@]}" ]; do
+      if [ "${actual_ships[${j}]}" = "${tok}" ]; then
+        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has duplicate token '${tok}' (post-aliasing)." >&2
+        exit 1
+      fi
+      j=$((j + 1))
+    done
     actual_ships+=("${tok}")
   done
 

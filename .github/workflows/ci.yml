@@ -234,17 +234,17 @@ jobs:
       - name: GoReleaser snapshot — server
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: v2.15.2
+          version: v2.15.3
           args: release --snapshot --clean -f .goreleaser.server.yaml
       - name: GoReleaser snapshot — host-agent
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: v2.15.2
+          version: v2.15.3
           args: release --snapshot --clean -f .goreleaser.host-agent.yaml
       - name: GoReleaser snapshot — machine-rc
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: v2.15.2
+          version: v2.15.3
           args: release --snapshot --clean -f .goreleaser.machine-rc.yaml
       - name: Assert release artifacts
         run: |
