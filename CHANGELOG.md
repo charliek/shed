@@ -18,9 +18,9 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
-## Unreleased
+## v0.8.0 — 2026-07-18
 
-**Ships:** server/CLI, desktop
+**Ships:** server, host-agent, machine-rc, desktop
 
 ### Added
 
@@ -126,6 +126,50 @@ All notable changes to this project will be documented in this file.
   notarize the Tauri DMG and append a **beta-channel** appcast
   entry, while stable tags keep shipping the Swift DMG (mutually exclusive gates). This is
   the beta rollout track — stable users are untouched until promotion.
+- **Sheds dashboard auto-refresh + a Sheds Refresh button.** The Tauri client now polls
+  the shed list every 5s — gated on the native window being visible (not WebKit occlusion),
+  and refreshing immediately on regaining foreground — so a shed created out-of-band
+  (`shed create` from the CLI, or another client) appears on an already-open dashboard with
+  no manual action, matching the Swift host-poller. A `RefreshCw` **Refresh** button now
+  sits in the Sheds header (shared markup with the Agents pane), and the dead "+ Add" hosts
+  link (it only reopened the System pane) was removed. (#276)
+- **macOS Tahoe glass app icon.** On macOS 26 a loose `.icns` is treated as legacy and inset
+  on the system glass tile; the Tauri bundle now ships an Icon Composer catalog (orange as a
+  native `srgb` fill + the owl as a translucent foreground layer, translucency tuned to 0.35)
+  compiled by `actool` into `Assets.car` with `CFBundleIconName=AppIcon`, so the Dock icon
+  renders edge-to-edge glass. Falls back gracefully to the flat `.icns` when `actool` is
+  absent; flat PNG/`.ico` and Linux `.deb` hicolor outputs are unchanged. (#276)
+- **Shared Rust client core gains the mobile client surface (Phase A).** `shed-core` and
+  `shed-app` add — additively, library-only — the read-plane and RC surface the shed-mobile
+  Flutter app uses, ported field-for-field from the Dart sources so Swift (UniFFI) and Tauri
+  (and a later flutter_rust_bridge layer) consume one implementation: the `Overview` DTOs +
+  `overview()` (`GET /api/overview`) with Dart-tolerant per-field decode; `list_sessions()`/
+  `delete_session()`/`rc_messages()`/`rc_input()` and their DTOs; an `RcEvent` never-error
+  decode with an `ActivityOverlay` fold plus a reconnecting `RcEventsWatcher` (byte-level
+  idle timer, 500ms→30s backoff); `ServerInfo.features` + `has_feature()`; token-provider
+  FSM knobs (`with_now`/`with_refresh_window`/`with_mint_cooldown`/…) with a stale-401
+  `invalidate_if_current` guard; fail-closed token-bundle parsing; and rc permission modes.
+  Three strictly-safer desktop changes ride along: keep a still-valid cached control token on
+  a proactive-mint failure, the stale-401 invalidation guard, and one-segment URL encoding of
+  identifiers that closes a path-traversal class (byte-identical requests for valid names).
+  Also improves peer-ID detection portability toward Android. No manifest bump or FFI change
+  in this PR. (#277)
+
+### Changed
+
+- **The monorepo now ships four independently selected release components.** A `vX.Y.Z` tag
+  ships only the components whose version manifest equals the tag — `server`
+  (`.claude-plugin/plugin.json`), `host-agent` (`crates/shed-host-agent/VERSION`),
+  `machine-rc` (`cmd/shed-machine-rc/VERSION`), and `desktop` (`desktop/VERSION`) — so a
+  one-line `shed-host-agent` fix no longer forces a full server + rootfs-image republish, and
+  `shed-host-agent`/`shed-machine-rc` can now rev independently of server releases. Per-component
+  goreleaser configs (`.goreleaser.{server,host-agent,machine-rc}.yaml`) replace the monolithic
+  `.goreleaser.yaml`, so an unshipped component produces no release assets — load-bearing because
+  apt-charliek indexes by scanning release assets (unshipped = unbuilt = no asset). A new
+  `scripts/release/recommend-components.sh <X.Y.Z>` recommends the component set (minor/major →
+  all; patch → changed-since-last-shipped), and each CHANGELOG entry's `**Ships:**` line is now
+  enforced by `scripts/release/release-plan.sh` against the manifest-computed ship set on stable
+  tags. **v0.8.0 is the first release cut under this model, and ships all four components.** (#278)
 
 ## v0.7.10 — 2026-07-08
 
