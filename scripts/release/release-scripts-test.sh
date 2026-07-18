@@ -104,13 +104,13 @@ run_plan() {
   PLAN_OUT="$("${RP}" "$@" 2>/dev/null)" || PLAN_RC=$?
 }
 
-# The exact 6-line stdout release-plan.sh emits, in emission order. Building the
+# The exact 5-line stdout release-plan.sh emits, in emission order. Building the
 # expectation from named booleans keeps the assertions readable as the ship set
 # changes case-to-case.
 expect_plan() {
-  # $1 server, $2 host-agent, $3 machine-rc, $4 desktop, $5 goreleaser, $6 go
-  printf 'ship_server=%s\nship_host_agent=%s\nship_machine_rc=%s\nship_desktop=%s\nship_goreleaser=%s\nship_go=%s' \
-    "$1" "$2" "$3" "$4" "$5" "$6"
+  # $1 server, $2 host-agent, $3 machine-rc, $4 desktop, $5 goreleaser
+  printf 'ship_server=%s\nship_host_agent=%s\nship_machine_rc=%s\nship_desktop=%s\nship_goreleaser=%s' \
+    "$1" "$2" "$3" "$4" "$5"
 }
 
 # Write a synthetic scratch CHANGELOG.md for the version under test. The tag's
@@ -163,8 +163,8 @@ step "release-plan.sh: server-only tag (only plugin.json matches)"
 write_changelog 9.9.9 "server"
 run_plan v9.9.9
 [ "${PLAN_RC}" -eq 0 ] || fail "server-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true false false false true true)" ] || fail "server-only plan stdout: ${PLAN_OUT}"
-ok "ship_server=true, others false, ship_goreleaser=true, ship_go=true"
+[ "${PLAN_OUT}" = "$(expect_plan true false false false true)" ] || fail "server-only plan stdout: ${PLAN_OUT}"
+ok "ship_server=true, others false, ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
 step "update-version.sh --components desktop lands all four surfaces + both locks (0.0.x -> 0.8.0 jump)"
@@ -187,8 +187,8 @@ step "release-plan.sh: desktop-only tag (no goreleaser manifest matches)"
 write_changelog 0.8.0 "desktop"
 run_plan v0.8.0
 [ "${PLAN_RC}" -eq 0 ] || fail "desktop-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false false false true false false)" ] || fail "desktop-only plan stdout: ${PLAN_OUT}"
-ok "ship_desktop=true only, ship_goreleaser=false, ship_go=false"
+[ "${PLAN_OUT}" = "$(expect_plan false false false true false)" ] || fail "desktop-only plan stdout: ${PLAN_OUT}"
+ok "ship_desktop=true only, ship_goreleaser=false"
 
 # ---------------------------------------------------------------------------
 step "update-version.sh --components go,desktop; release-plan sees a combined tag"
@@ -197,15 +197,15 @@ step "update-version.sh --components go,desktop; release-plan sees a combined ta
 write_changelog 0.8.0 "server, desktop"
 run_plan v0.8.0
 [ "${PLAN_RC}" -eq 0 ] || fail "combined plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true false false true true true)" ] || fail "combined plan stdout: ${PLAN_OUT}"
-ok "ship_server=true ship_desktop=true ship_goreleaser=true ship_go=true"
+[ "${PLAN_OUT}" = "$(expect_plan true false false true true)" ] || fail "combined plan stdout: ${PLAN_OUT}"
+ok "ship_server=true ship_desktop=true ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: GITHUB_REF_NAME fallback (no positional arg)"
 run_plan_env_rc=0
 plan_env_out="$(GITHUB_REF_NAME=v0.8.0 "${RP}" 2>/dev/null)" || run_plan_env_rc=$?
 [ "${run_plan_env_rc}" -eq 0 ] || fail "GITHUB_REF_NAME fallback exited ${run_plan_env_rc}"
-[ "${plan_env_out}" = "$(expect_plan true false false true true true)" ] || fail "GITHUB_REF_NAME fallback stdout: ${plan_env_out}"
+[ "${plan_env_out}" = "$(expect_plan true false false true true)" ] || fail "GITHUB_REF_NAME fallback stdout: ${plan_env_out}"
 ok "reads the tag from GITHUB_REF_NAME"
 
 # ---------------------------------------------------------------------------
@@ -271,8 +271,8 @@ printf '1.2.3\n' > "${HOST_AGENT_VER}"
 write_changelog 1.2.3 "host-agent"
 run_plan v1.2.3
 [ "${PLAN_RC}" -eq 0 ] || fail "host-agent-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false true false false true false)" ] || fail "host-agent-only plan stdout: ${PLAN_OUT}"
-ok "ship_host_agent=true only, ship_goreleaser=true, ship_go=false"
+[ "${PLAN_OUT}" = "$(expect_plan false true false false true)" ] || fail "host-agent-only plan stdout: ${PLAN_OUT}"
+ok "ship_host_agent=true only, ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: machine-rc-only tag (only cmd/shed-machine-rc/VERSION matches)"
@@ -280,8 +280,8 @@ printf '3.4.5\n' > "${MACHINE_RC_VER}"
 write_changelog 3.4.5 "machine-rc"
 run_plan v3.4.5
 [ "${PLAN_RC}" -eq 0 ] || fail "machine-rc-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false false true false true false)" ] || fail "machine-rc-only plan stdout: ${PLAN_OUT}"
-ok "ship_machine_rc=true only, ship_goreleaser=true, ship_go=false"
+[ "${PLAN_OUT}" = "$(expect_plan false false true false true)" ] || fail "machine-rc-only plan stdout: ${PLAN_OUT}"
+ok "ship_machine_rc=true only, ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: combined server + host-agent (both manifests at 4.0.0)"
@@ -290,8 +290,8 @@ printf '4.0.0\n' > "${HOST_AGENT_VER}"
 write_changelog 4.0.0 "server, host-agent"
 run_plan v4.0.0
 [ "${PLAN_RC}" -eq 0 ] || fail "server+host-agent plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true true false false true true)" ] || fail "server+host-agent plan stdout: ${PLAN_OUT}"
-ok "ship_server=true ship_host_agent=true ship_goreleaser=true ship_go=true"
+[ "${PLAN_OUT}" = "$(expect_plan true true false false true)" ] || fail "server+host-agent plan stdout: ${PLAN_OUT}"
+ok "ship_server=true ship_host_agent=true ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: legacy 'server/CLI' alias accepted (server + desktop tag)"
@@ -299,7 +299,7 @@ step "release-plan.sh: legacy 'server/CLI' alias accepted (server + desktop tag)
 write_changelog 0.8.0 "server/CLI, desktop"
 run_plan v0.8.0
 [ "${PLAN_RC}" -eq 0 ] || fail "legacy-alias plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true false false true true true)" ] || fail "legacy-alias plan stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan true false false true true)" ] || fail "legacy-alias plan stdout: ${PLAN_OUT}"
 ok "server/CLI alias maps to server; ship_server=true ship_desktop=true"
 
 # ---------------------------------------------------------------------------
@@ -354,7 +354,7 @@ step "release-plan.sh: desktop-only prerelease plans cleanly (no Ships check)"
 "${UV}" 2.1.0-rc.1 --components desktop >/dev/null   # desktop surfaces at the rc, lockstep held
 run_plan v2.1.0-rc.1
 [ "${PLAN_RC}" -eq 0 ] || fail "desktop-only prerelease plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false false false true false false)" ] || fail "desktop-only prerelease stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan false false false true false)" ] || fail "desktop-only prerelease stdout: ${PLAN_OUT}"
 ok "ship_desktop=true only; prerelease skips the Ships cross-check"
 
 # ---------------------------------------------------------------------------

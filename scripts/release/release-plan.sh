@@ -24,11 +24,12 @@
 #   ship_machine_rc=true|false
 #   ship_desktop=true|false
 #   ship_goreleaser=true|false     # OR of the three goreleaser components
-#   ship_go=true|false             # LEGACY — see below
 #
-# The legacy `ship_go` line (== ship_server) is emitted so this commit stays
-# self-consistent while publish-images.yaml still reads `ship_go`; it is
-# removed when the workflow rewrite (C4) drops its last consumer.
+# (Pre-migration versions of this script emitted `ship_go`/`ship_desktop`
+# only; publish-images.yaml carries a permanent shim mapping legacy
+# `ship_go` output to the three goreleaser components when a pre-migration
+# tag is dispatched — the workflow file comes from the dispatching ref, this
+# script from the checked-out tag.)
 #
 # All diagnostics go to stderr so stdout stays machine-parseable.
 #
@@ -136,10 +137,6 @@ SHIP_GORELEASER=false
 if [ "${SHIP_SERVER}" = "true" ] || [ "${SHIP_HOST_AGENT}" = "true" ] || [ "${SHIP_MACHINE_RC}" = "true" ]; then
   SHIP_GORELEASER=true
 fi
-
-# LEGACY: publish-images.yaml still reads ship_go; keep it == ship_server until
-# C4 removes the last consumer (see the header note).
-SHIP_GO="${SHIP_SERVER}"
 
 if [ "${SHIP_SERVER}" = "false" ] && [ "${SHIP_HOST_AGENT}" = "false" ] \
    && [ "${SHIP_MACHINE_RC}" = "false" ] && [ "${SHIP_DESKTOP}" = "false" ]; then
@@ -271,5 +268,3 @@ echo "ship_host_agent=${SHIP_HOST_AGENT}"
 echo "ship_machine_rc=${SHIP_MACHINE_RC}"
 echo "ship_desktop=${SHIP_DESKTOP}"
 echo "ship_goreleaser=${SHIP_GORELEASER}"
-# LEGACY (removed in C4): kept == ship_server for publish-images.yaml.
-echo "ship_go=${SHIP_GO}"
