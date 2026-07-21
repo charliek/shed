@@ -460,7 +460,8 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "not_accepting", "session was recreated")
 		return
 	}
-	// Feed input is codex-only in this phase (kind_features.input == "gated").
+	// Feed input is codex- and opencode-only in this phase (kind_features.input ==
+	// "gated").
 	if !inputGatedKind(fresh.Kind) {
 		writeError(w, http.StatusConflict, "not_accepting", "this kind does not accept feed input")
 		return
@@ -709,8 +710,8 @@ func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
 	return n.nudge
 }
 
-// shutdown closes all SSE subscribers + JSONL watchers and gracefully stops the HTTP
-// server.
+// shutdown closes all SSE subscribers + session watchers (codex/claude JSONL tails,
+// opencode SSE clients) and gracefully stops the HTTP server.
 func (h *Hub) shutdown(srv *http.Server) error {
 	h.closeAllSubscribers()
 	h.closeAllWatchers()
@@ -720,7 +721,8 @@ func (h *Hub) shutdown(srv *http.Server) error {
 	return nil
 }
 
-// closeAllWatchers releases every tracked session's JSONL watcher (hub shutdown).
+// closeAllWatchers releases every tracked session's watcher — a JSONL tail (codex/
+// claude) or an opencode SSE client (hub shutdown).
 func (h *Hub) closeAllWatchers() {
 	h.trackMu.Lock()
 	defer h.trackMu.Unlock()

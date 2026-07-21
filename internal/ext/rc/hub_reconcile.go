@@ -40,14 +40,16 @@ type trackedSession struct {
 	// change detection and the /v1/sessions overlay.
 	activity    Activity
 	activityAt  string // RFC3339 time the displayed activity last changed
-	lastMessage string // sanitized preview from the JSONL watcher (or "" from stability)
+	lastMessage string // sanitized preview from the watcher (JSONL tail or opencode SSE; "" from stability)
 	lastState   State
 
-	// watcher is the correlated JSONL tail (codex rollout / claude transcript), lazily
-	// created once the session is pinned to a file (see ensureWatcher). nil for kinds
-	// with no structured signal, or before correlation succeeds. When present and
-	// FRESH, its activity overrides the pane-stability tracker (see reconcile's merge);
-	// when absent/stale, stability drives. Closed when the session disappears/recreates.
+	// watcher is the session's structured-signal watcher: a JSONL tail (codex rollout /
+	// claude transcript), lazily created once the session is pinned to a file, OR an
+	// opencode SSE client, lazily created against its recorded port and correlating
+	// asynchronously in its own goroutine (see ensureWatcher). nil for kinds with no
+	// structured signal, or before correlation succeeds. When present and FRESH, its
+	// activity overrides the pane-stability tracker (see reconcile's merge); when
+	// absent/stale, stability drives. Closed when the session disappears/recreates.
 	watcher sessionWatcher
 	// pendingAgentID is an AMBIGUOUS correlation's agent session id, held back until
 	// the watcher's first in-file event confirms the pick — only then is it back-
@@ -59,9 +61,9 @@ type trackedSession struct {
 	// does not re-scan the filesystem on every single tick forever.
 	correlateTried int
 
-	// ring is the session's message feed (populated only by the codex watcher in this
-	// phase; every tracked session has one so /messages returns 200-empty for a known
-	// slug and 404 only for an unknown one). Its own mutex guards concurrent access.
+	// ring is the session's message feed (populated by the codex and opencode watchers
+	// in this phase; every tracked session has one so /messages returns 200-empty for a
+	// known slug and 404 only for an unknown one). Its own mutex guards concurrent access.
 	ring *messageRing
 	// lastStability is the raw pane-stability verdict from the most recent successful
 	// tracker Tick (before the watcher merge / DisplayActivity). The input handler
@@ -101,8 +103,9 @@ func (tr *trackedSession) sameIdentity(s Session) bool {
 
 // reconcile runs one enumeration+tick pass and broadcasts the resulting events. It
 // holds trackMu only while READING/MUTATING handler-visible tracked fields; it RELEASES
-// the lock around each session's tmux/disk work (ensureWatcher's show/set-environment,
-// tracker.Tick's capture-pane, the JSONL watcher's file reads) so a slow tmux call can
+// the lock around each session's tmux/disk/network work (ensureWatcher's show/set-
+// environment, tracker.Tick's capture-pane, the watcher's I/O — a JSONL tail's file
+// reads or an opencode watcher's HTTP+SSE calls) so a slow tmux call can
 // never block the HTTP handlers that read tracked state. This is sound because reconcile
 // is the SOLE writer of tracked state (no other goroutine mutates it, so tr and the map
 // entry stay valid across the unlock) and the sub-objects touched unlocked are either
@@ -135,8 +138,9 @@ func (h *Hub) reconcile() {
 		if !ok || !tr.sameIdentity(s) {
 			// New session, or the slug was recreated (id OR created_at changed — the
 			// latter catches legacy sessions with no SHED_RC_ID) → start over. A
-			// recreate must drop the previous session's JSONL watcher (a new session
-			// gets a new file; keeping the old tail would report the dead session).
+			// recreate must drop the previous session's watcher (a new session gets a
+			// new JSONL file or opencode port; keeping the old tail/SSE connection would
+			// report the dead session).
 			if ok && tr.watcher != nil {
 				tr.watcher.close()
 			}
@@ -156,9 +160,11 @@ func (h *Hub) reconcile() {
 		// committed under the lock below, never published unlocked.
 		h.trackMu.Unlock()
 
-		// Lazily correlate the session to its agent JSONL file (codex rollout / claude
-		// transcript). Once correlated, the watcher tails it and — when FRESH — overrides
-		// the pane-stability tracker below. newW is any watcher freshly created this pass.
+		// Lazily correlate the session to its structured signal — codex rollout / claude
+		// transcript JSONL for those kinds, or an opencode session's SSE stream (async,
+		// its own goroutine). Once correlated, the watcher tails/subscribes and — when
+		// FRESH — overrides the pane-stability tracker below. newW is any watcher freshly
+		// created this pass.
 		newW := h.ensureWatcher(tr, s)
 		watcher := tr.watcher // existing committed watcher (read: sole writer, safe unlocked)
 		if newW != nil {
@@ -166,7 +172,7 @@ func (h *Hub) reconcile() {
 		}
 
 		// Derive activity. The pane-stability tracker is the universal fallback; a fresh,
-		// correlated JSONL watcher overrides it (mergedActivity). A stability capture
+		// correlated watcher (JSONL- or SSE-backed) overrides it (mergedActivity). A stability capture
 		// error (transient tmux hiccup) with no fresh watcher leaves the prior activity
 		// untouched rather than flapping the DTO to unknown.
 		raw, capErr := tr.tracker.Tick()
@@ -196,7 +202,7 @@ func (h *Hub) reconcile() {
 				}
 			}
 			// Drain any normalized feed messages the watcher produced this poll into the
-			// session ring (codex only; other kinds' watchers produce none). A per-message
+			// session ring (codex and opencode; other kinds' watchers produce none). A per-message
 			// message.appended notification lets subscribers know to fetch /messages — the
 			// body is deliberately not on the SSE frame (keeps fan-out tiny + drop-safe).
 			// The ring is self-synchronized and events is reconcile-local, so this is
@@ -250,8 +256,8 @@ func (h *Hub) reconcile() {
 		tr.lastMessage = effMsg
 	}
 
-	// Sessions that vanished since the last pass (killed). Release the JSONL watcher
-	// (its tail is now pointed at a dead session's file) and prune the slug's input
+	// Sessions that vanished since the last pass (killed). Release the watcher (its
+	// JSONL tail or opencode SSE connection is now pointed at a dead session) and prune the slug's input
 	// lock (a recreate at the same slug later gets a fresh one; an input request
 	// already holding the old lock finishes against a gone pane harmlessly).
 	for slug, tr := range h.tracked {

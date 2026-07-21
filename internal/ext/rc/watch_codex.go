@@ -52,8 +52,9 @@ type codexPayload struct {
 }
 
 // codexFold folds the codex rollout stream into an activity verdict AND a normalized
-// message feed (drainMessages). The feed is codex-only — the merged reconcile path
-// drains it into the per-session ring (see hub_messages.go).
+// message feed (drainMessages) — the codex half of the message feed (opencodeFold in
+// watch_opencode.go is the other); the merged reconcile path drains either into the
+// per-session ring (see hub_messages.go).
 type codexFold struct {
 	confirmed    bool              // seen ≥1 activity-relevant event
 	pending      map[string]bool   // open tool-call ids

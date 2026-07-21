@@ -270,9 +270,12 @@ func TestHubInputIdentityGuardIs409(t *testing.T) {
 	}
 }
 
-// A non-input-gated kind (opencode) is not accepted even when parked at its anchor —
-// feed input is codex-only this phase.
-func TestHubInputNonGatedKindIs409(t *testing.T) {
+// opencode is input-gated (kind_features.input == "gated"), but gating alone doesn't
+// accept: with no recorded SHED_RC_OPENCODE_PORT this session has no correlated
+// watcher, and its pane doesn't match the opencode prompt anchor (a bare "opencode
+// ready" string, not the composer placeholder or footer) — so the degraded-path
+// fallback rejects it.
+func TestHubInputUngatedPaneAnchorMismatchIs409(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	f.set("rc-ng111", "opencode ready", managedEnv("id-ng", KindOpencode))
@@ -281,7 +284,7 @@ func TestHubInputNonGatedKindIs409(t *testing.T) {
 	resp := postInput(t, srv.URL+"/v1/sessions/ng111/input", `{"text":"hi"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("non-gated kind status = %d, want 409", resp.StatusCode)
+		t.Fatalf("uncorrelated opencode session, anchor mismatch, status = %d, want 409", resp.StatusCode)
 	}
 }
 

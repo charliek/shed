@@ -16,17 +16,25 @@ import (
 // The JSONL watchers are the structured-signal source that OVERRIDES the pane
 // stability engine for codex and claude sessions: instead of inferring activity from
 // whether the tmux pane keeps redrawing, they tail the agent's own append-only log
-// (codex rollout / claude transcript) and read the turn/tool structure directly. The
-// hub merges the two per session (see hub_reconcile.go): a fresh, correlated watcher
-// wins; a broken/absent one falls back to stability so activity never goes dark.
+// (codex rollout / claude transcript) and read the turn/tool structure directly.
+// opencode has no append-only log to tail — its sessionWatcher (opencodeWatcher,
+// watch_opencode_transport.go) is a structurally parallel but transport-different
+// sibling that subscribes to the agent's embedded HTTP+SSE server instead of tailing a
+// file (see watchableKind below). The hub merges a session's watcher (JSONL- or
+// SSE-backed) with pane stability per session (see hub_reconcile.go): a fresh,
+// correlated watcher wins; a broken/absent one falls back to stability so activity
+// never goes dark.
 //
 // Layout of the watcher stack:
-//   - lineTailer (watch_tail.go): resilient byte-level tailing.
-//   - activityFold (below): a per-kind fold of the parsed line stream into an
-//     activity verdict + last-message preview (codexFold, claudeFold).
-//   - fileWatcher (below): tailer + fold + a freshness-annotated snapshot.
+//   - lineTailer (watch_tail.go): resilient byte-level tailing (codex/claude only).
+//   - activityFold (below): a per-kind fold of the parsed line/event stream into an
+//     activity verdict + last-message preview (codexFold, claudeFold, opencodeFold).
+//   - fileWatcher (below): tailer + fold + a freshness-annotated snapshot (codex/claude).
+//   - opencodeWatcher (watch_opencode_transport.go): SSE/REST client + fold + a
+//     freshness-annotated snapshot (opencode's sessionWatcher).
 //   - correlation (below + the per-kind files): mapping a tmux session to its file.
-//   - fsNudger (below): the fsnotify layer that wakes reconcile sub-tick on a write.
+//   - fsNudger (below): the fsnotify layer that wakes reconcile sub-tick on a write
+//     (codex/claude only; opencode's SSE stream is its own wakeup source).
 
 // watcherFreshWindow bounds how long a correlated watcher's non-settled, non-working
 // activity is trusted after its last folded event. A settled verdict (needs_input/
@@ -74,8 +82,9 @@ type activityFold interface {
 }
 
 // messageProducer is an activityFold that ALSO produces a normalized message feed
-// (codex only; claude feeds activity only in this phase). The fileWatcher drains it on
-// each refresh; a fold that does not implement it contributes no feed messages.
+// (codex and opencode; claude feeds activity only in this phase). The fileWatcher/
+// opencodeWatcher drains it on each refresh; a fold that does not implement it
+// contributes no feed messages.
 //
 // Ambiguous correlation caveat (accepted): a watcher attached on an AMBIGUOUS window
 // match is follow-only and its ACTIVITY stays untrusted (unknown) until an in-file
