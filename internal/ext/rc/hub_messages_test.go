@@ -312,9 +312,11 @@ func TestMessageRingSinceBeyondTailTruncated(t *testing.T) {
 func TestInputGatedKind(t *testing.T) {
 	for _, k := range allKinds {
 		want := k == KindCodex || k == KindOpencode
-		if got := inputGatedKind(k); got != want {
-			t.Errorf("inputGatedKind(%q) = %v, want %v", k, got, want)
-		}
+		t.Run(string(k), func(t *testing.T) {
+			if got := inputGatedKind(k); got != want {
+				t.Errorf("inputGatedKind(%q) = %v, want %v", k, got, want)
+			}
+		})
 	}
 }
 

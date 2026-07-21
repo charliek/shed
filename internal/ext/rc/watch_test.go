@@ -394,18 +394,23 @@ func TestOpencodeFoldSyntheticSnapshotDropsCachedPartial(t *testing.T) {
 // Fix 4: permission.asked / question.asked with absent/empty content must not emit a
 // fabricated row, and must report applyLine=false.
 func TestOpencodeFoldEmptyAskNoRow(t *testing.T) {
-	f := newOpencodeFold()
-	if f.applyLine([]byte(`{"type":"permission.asked","properties":{"sessionID":"s"}}`)) {
-		t.Fatal("permission.asked with no permission kind must return false")
+	cases := []struct {
+		name string
+		line []byte
+	}{
+		{"permission.asked with no permission kind", []byte(`{"type":"permission.asked","properties":{"sessionID":"s"}}`)},
+		{"question.asked with no questions", []byte(`{"type":"question.asked","properties":{"sessionID":"s"}}`)},
 	}
-	if got := f.drainMessages(); len(got) != 0 {
-		t.Fatalf("empty permission.asked emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
-	}
-	if f.applyLine([]byte(`{"type":"question.asked","properties":{"sessionID":"s"}}`)) {
-		t.Fatal("question.asked with no questions must return false")
-	}
-	if got := f.drainMessages(); len(got) != 0 {
-		t.Fatalf("empty question.asked emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newOpencodeFold()
+			if f.applyLine(c.line) {
+				t.Fatalf("%s must return false", c.name)
+			}
+			if got := f.drainMessages(); len(got) != 0 {
+				t.Fatalf("%s emitted %d rows, want 0:\n%s", c.name, len(got), formatOpencodeRows(got))
+			}
+		})
 	}
 }
 
@@ -469,18 +474,27 @@ func TestOpencodeFoldReseedDoesNotGrowCache(t *testing.T) {
 // Fix 8: an epoch-millis value that would expand to a year outside RFC3339's range yields ""
 // (the ring stamps it), never a non-RFC3339 expanded-year string.
 func TestOpencodeTSOutOfRange(t *testing.T) {
-	if got := opencodeTS(1 << 62); got != "" {
-		t.Fatalf("opencodeTS(1<<62) = %q, want \"\" (year out of RFC3339 range)", got)
+	cases := []struct {
+		name      string
+		ms        int64
+		wantEmpty bool
+	}{
+		{"year out of RFC3339 range", 1 << 62, true},
+		{"zero", 0, true},
+		{"negative", -5, true},
+		// A normal in-range value still converts.
+		{"normal in-range value", 1784613627681, false},
 	}
-	if got := opencodeTS(0); got != "" {
-		t.Fatalf("opencodeTS(0) = %q, want \"\"", got)
-	}
-	if got := opencodeTS(-5); got != "" {
-		t.Fatalf("opencodeTS(-5) = %q, want \"\"", got)
-	}
-	// A normal in-range value still converts.
-	if got := opencodeTS(1784613627681); got == "" {
-		t.Fatal("opencodeTS of a normal epoch-ms must convert, got empty")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := opencodeTS(c.ms)
+			if c.wantEmpty && got != "" {
+				t.Fatalf("opencodeTS(%d) = %q, want \"\"", c.ms, got)
+			}
+			if !c.wantEmpty && got == "" {
+				t.Fatalf("opencodeTS(%d) must convert, got empty", c.ms)
+			}
+		})
 	}
 }
 
