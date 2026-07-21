@@ -262,10 +262,12 @@ func mergedActivity(watcherActivity Activity, watcherMessage string, watcherFres
 	return stability, ""
 }
 
-// watchableKind reports whether a kind has a JSONL watcher (codex rollout / claude
-// transcript). Other kinds derive activity from pane stability alone.
+// watchableKind reports whether a kind has a structured-signal watcher: codex/claude
+// tail a JSONL file (rollout / transcript), opencode subscribes to its embedded
+// HTTP+SSE server (watch_opencode_transport.go). Other kinds derive activity from pane
+// stability alone.
 func watchableKind(k Kind) bool {
-	return k == KindCodex || IsClaudeKind(k)
+	return k == KindCodex || IsClaudeKind(k) || k == KindOpencode
 }
 
 // correlation is the outcome of mapping a tmux session to its agent JSONL file.

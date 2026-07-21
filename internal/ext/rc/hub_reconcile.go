@@ -183,6 +183,18 @@ func (h *Hub) reconcile() {
 				backWriteAgentSession(h.cfg.runner, s.TmuxSession, tr.pendingAgentID)
 				tr.pendingAgentID = ""
 			}
+			// The opencode watcher correlates ASYNC in its own transport goroutine (unlike
+			// the file watchers, which correlate off-line in ensureWatcher): once it pins the
+			// session id from a port-local SSE event it surfaces it here for back-write into
+			// SHED_RC_AGENT_SESSION, so a hub restart re-correlates exactly. drainConfirmedAgentID
+			// returns "" once drained (and "" for a prior-back-write pin), so a non-empty id is
+			// always a fresh one to stamp. Runs UNLOCKED like the rest of the heavy per-session
+			// work — backWriteAgentSession is a tmux set-environment, kept off trackMu.
+			if d, ok := watcher.(confirmedAgentIDDrainer); ok {
+				if id := d.drainConfirmedAgentID(); id != "" {
+					backWriteAgentSession(h.cfg.runner, s.TmuxSession, id)
+				}
+			}
 			// Drain any normalized feed messages the watcher produced this poll into the
 			// session ring (codex only; other kinds' watchers produce none). A per-message
 			// message.appended notification lets subscribers know to fetch /messages — the
@@ -277,17 +289,21 @@ func (h *Hub) reconcile() {
 // latency, while a never-appearing file stops re-scanning the filesystem forever.
 const maxCorrelateTries = 40
 
-// ensureWatcher lazily correlates a watchable session (codex/claude) to its JSONL file
-// and builds a tailing watcher, RETURNING it (nil when none was created this call: a
-// watcher already exists, the kind is unwatchable, the session is in a blocking
-// lifecycle state, the retry budget is exhausted, or correlation failed). It runs
+// ensureWatcher lazily builds a watchable session's structured-signal watcher, RETURNING
+// it (nil when none was created this call: a watcher already exists, the kind is
+// unwatchable, the session is in a blocking lifecycle state, the retry budget is
+// exhausted, correlation failed, or — opencode — no valid port was recorded). It runs
 // UNLOCKED from reconcile (tmux show-environment / set-environment), so it must NOT
 // publish tr.watcher — handlers read that field under trackMu; the caller commits the
 // returned watcher under the lock. It DOES mutate tr.correlateTried / tr.pendingAgentID,
 // which are reconcile-only (never read by handlers) and thus safe to touch unlocked.
-// On an unambiguous match it back-writes the discovered agent session id into the tmux
-// env so a hub restart re-correlates exactly; an ambiguous window match follows only
-// new appends (activity stays unknown until an in-file event confirms).
+//
+// codex/claude correlate a JSONL file (rollout / transcript) and build a tailing
+// fileWatcher here; on an unambiguous match it back-writes the discovered agent session
+// id into the tmux env so a hub restart re-correlates exactly, while an ambiguous window
+// match follows only new appends (activity stays unknown until an in-file event confirms).
+// opencode instead returns a NON-BLOCKING SSE/REST watcher that correlates itself on its
+// own goroutine (see the opencode arm below and drainConfirmedAgentID in reconcile).
 func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 	if tr.watcher != nil || !watchableKind(s.Kind) {
 		return nil
@@ -296,6 +312,28 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 	case StateNeedsTrust, StateNeedsAuth, StateDead:
 		return nil // no live activity to tail; retry once the session becomes usable
 	}
+
+	// opencode diverges from the codex/claude file-correlation path below: its watcher
+	// owns its OWN async correlation over SSE/REST (constructed NON-BLOCKING; it pins the
+	// session id from its own /event stream and surfaces it via drainConfirmedAgentID —
+	// see watch_opencode_transport.go). So it needs none of the file-correlation +
+	// maxCorrelateTries + pendingAgentID/back-write machinery here — it returns early with
+	// its own watcher, built on the FIRST eligible tick (ensureWatcher no-ops thereafter,
+	// tr.watcher being set), never spuriously blocked by the correlate-retry budget. A
+	// session with no valid recorded port — a pre-upgrade session created before the port
+	// plumbing shipped, or an out-of-range value — is unwatchable over this transport, so
+	// it returns nil and falls back to pane stability (see opencodePortEnv).
+	if s.Kind == KindOpencode {
+		port, ok := opencodePortEnv(h.cfg.runner, s.TmuxSession)
+		if !ok {
+			return nil
+		}
+		// A prior back-written SHED_RC_AGENT_SESSION (from an earlier hub lifetime) is the
+		// trusted pin; "" means the watcher searches its SSE stream for the session id.
+		agentID := agentSessionEnv(h.cfg.runner, s.TmuxSession)
+		return newOpencodeWatcher(port, s.Workdir, agentID, h.cfg.now, h.cfg.logf)
+	}
+
 	if tr.correlateTried >= maxCorrelateTries {
 		return nil
 	}

@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1403,5 +1406,162 @@ func TestReconcileCodexWatcherOverridesStability(t *testing.T) {
 	h.trackMu.Unlock()
 	if sessions[0].Activity != ActivityNeedsInput || sessions[0].LastMessage != "2+2 equals 4." {
 		t.Fatalf("overlay = %+v", sessions[0])
+	}
+}
+
+// ---- opencode watcher wire-in (C5) ----
+
+// watchableKind must admit opencode (so ensureWatcher's first guard lets it through to
+// the SSE/REST arm) while non-agentic kinds stay stability-only.
+func TestWatchableKindOpencode(t *testing.T) {
+	if !watchableKind(KindOpencode) {
+		t.Fatal("watchableKind(KindOpencode) = false, want true")
+	}
+	if watchableKind(KindShell) {
+		t.Fatal("watchableKind(KindShell) = true, want false (stability only)")
+	}
+}
+
+// A pre-upgrade opencode session (created before the port plumbing shipped, so no
+// SHED_RC_OPENCODE_PORT is stamped) is unwatchable over the SSE transport: ensureWatcher
+// returns no watcher and pane-stability drives its activity.
+func TestReconcileOpencodeNoPortStabilityOnly(t *testing.T) {
+	tm := newHubTmux()
+	env := strings.Join([]string{
+		envV + "=2",
+		envID + "=id-oc-legacy",
+		envKind + "=" + string(KindOpencode),
+		envWorkdir + "=/home/shed",
+		// deliberately NO SHED_RC_OPENCODE_PORT
+	}, "\n") + "\n"
+	tm.set("rc-ocleg1", "opencode\nAsk anything...", env)
+
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(tm, clk)
+
+	h.reconcile()
+
+	h.trackMu.Lock()
+	tr := h.tracked["ocleg1"]
+	h.trackMu.Unlock()
+	if tr == nil {
+		t.Fatal("opencode session not tracked")
+	}
+	if tr.watcher != nil {
+		t.Fatal("a session with no recorded port must get NO watcher (stability only)")
+	}
+	// Pane-stability drives: a ready, just-appeared session reports working on tick 1.
+	if tr.activity != ActivityWorking {
+		t.Fatalf("activity = %q, want working (pane-stability)", tr.activity)
+	}
+}
+
+// End-to-end: a correlated opencode SSE watcher overrides pane stability, populates the
+// message ring, and its discovered session id is back-written into the tmux env. Mirrors
+// TestReconcileCodexWatcherOverridesStability but drives the fake opencode HTTP+SSE server
+// (from watch_opencode_transport_test.go) over the hub's real reconcile loop.
+func TestReconcileOpencodeWatcherOverridesStability(t *testing.T) {
+	f := newFakeOpencode(t)
+	// A fresh session: no candidate list; status reports busy during the turn; the SSE
+	// fixture arc drives the pin (session.created dir-match), the feed, and the activity arc.
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	frames := fixtureFrames(t)
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		for _, fr := range frames {
+			writeSSE(w, flush, fr)
+		}
+		<-ctx.Done() // hold the connection open (no reconnect churn)
+	}
+
+	tm := newHubTmux()
+	// A ready opencode session whose workdir matches the fixture directory (so the SSE
+	// transport pins on the fixture's session.created) and whose recorded port targets the
+	// fake server. The pane classifies ready ("Ask anything...") and — because the hub
+	// clock never advances below — pane-stability can only ever report working (it never
+	// reaches the quiet period), so a needs_input verdict MUST come from the SSE watcher.
+	env := strings.Join([]string{
+		envV + "=2",
+		envID + "=id-oc",
+		envKind + "=" + string(KindOpencode),
+		envWorkdir + "=" + ocFixtureDir,
+		envOpencodePort + "=" + strconv.Itoa(f.port(t)),
+	}, "\n") + "\n"
+	tm.set("rc-oc0001", "opencode\nAsk anything...", env)
+
+	clk := opencodeClock() // fixed instant; never advanced
+	h := newTestHub(tm, clk)
+	// The SSE watcher runs a background goroutine — close every tracked watcher on teardown
+	// (before the fake server's own cleanup, LIFO) so the goroutine exits, no leak.
+	t.Cleanup(func() {
+		h.trackMu.Lock()
+		defer h.trackMu.Unlock()
+		for _, tr := range h.tracked {
+			if tr.watcher != nil {
+				tr.watcher.close()
+			}
+		}
+	})
+
+	// Poll the reconcile loop (real sleeps, frozen clock) until the async SSE watcher has
+	// folded the whole arc: activity settles to needs_input AND the ring holds the 5 rows.
+	var tr *trackedSession
+	var msgs []feedMessage
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h.reconcile()
+		h.trackMu.Lock()
+		tr = h.tracked["oc0001"]
+		h.trackMu.Unlock()
+		if tr != nil {
+			msgs, _ = tr.ring.since(0, 10)
+			if tr.activity == ActivityNeedsInput && len(msgs) >= 5 {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if tr == nil {
+		t.Fatal("opencode session was never tracked")
+	}
+
+	h.trackMu.Lock()
+	activity := tr.activity
+	lastStability := tr.lastStability
+	lastMessage := tr.lastMessage
+	watcher := tr.watcher
+	h.trackMu.Unlock()
+
+	if activity != ActivityNeedsInput {
+		t.Fatalf("activity = %q, want needs_input (SSE watcher override)", activity)
+	}
+	if _, ok := watcher.(*opencodeWatcher); !ok {
+		t.Fatalf("watcher = %T, want *opencodeWatcher", watcher)
+	}
+	// The override is real: pane-stability, with the clock frozen, held working the whole
+	// time — the needs_input verdict came from the watcher, not the anchor/quiet fallback.
+	if lastStability != ActivityWorking {
+		t.Fatalf("lastStability = %q, want working (frozen clock never reaches quiet)", lastStability)
+	}
+	if lastMessage != "3 .txt files." {
+		t.Fatalf("last_message = %q, want %q", lastMessage, "3 .txt files.")
+	}
+
+	// The ring holds the normalized turn in order: user → reasoning → tool_use →
+	// tool_result → assistant.
+	want := []opencodeFeedRow{
+		{role: feedRoleUser, typ: feedTypeText, textPrefix: "Use the bash tool"},
+		{role: feedRoleAssistant, typ: feedTypeReasoning, textPrefix: "The user wants"},
+		{role: feedRoleTool, typ: feedTypeToolUse, toolName: "bash", detailHas: "ls"},
+		{role: feedRoleTool, typ: feedTypeToolResult, toolName: "bash", detailHas: "a.txt"},
+		{role: feedRoleAssistant, typ: feedTypeText, textPrefix: "3 .txt files."},
+	}
+	assertOpencodeRows(t, msgs, want)
+
+	// The SSE-discovered session id was back-written into the tmux env for exact
+	// re-correlation on a hub restart (drainConfirmedAgentID → backWriteAgentSession).
+	wantEnv := envAgentSession + "=" + ocFixtureSID
+	if !slices.Contains(tm.setEnvCalls(), wantEnv) {
+		t.Fatalf("set-environment calls = %v, want one == %q", tm.setEnvCalls(), wantEnv)
 	}
 }

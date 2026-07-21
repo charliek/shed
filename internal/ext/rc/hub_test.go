@@ -41,14 +41,15 @@ func (c *hubClock) advance(d time.Duration) {
 // keyed by tmux session name. Safe for concurrent use (the reconcile goroutine and
 // a test goroutine can both call it).
 type hubTmux struct {
-	mu     sync.Mutex
-	names  []string          // rc-* (and other) session names for `ls`
-	panes  map[string]string // tmux name → capture-pane stdout
-	envs   map[string]string // tmux name → show-environment stdout
-	gone   map[string]bool   // tmux name → capture-pane reports "can't find pane"
-	flaky  map[string]bool   // tmux name → capture-pane fails TRANSIENTLY (not gone)
-	lsFail string            // non-empty → `ls` fails transiently with this stderr
-	sent   []string          // recorded delivery payloads (send-keys -l / set-buffer text)
+	mu      sync.Mutex
+	names   []string          // rc-* (and other) session names for `ls`
+	panes   map[string]string // tmux name → capture-pane stdout
+	envs    map[string]string // tmux name → show-environment stdout
+	gone    map[string]bool   // tmux name → capture-pane reports "can't find pane"
+	flaky   map[string]bool   // tmux name → capture-pane fails TRANSIENTLY (not gone)
+	lsFail  string            // non-empty → `ls` fails transiently with this stderr
+	sent    []string          // recorded delivery payloads (send-keys -l / set-buffer text)
+	setEnvs []string          // recorded set-environment "KEY=VALUE" (e.g. the agent-session back-write)
 }
 
 func newHubTmux() *hubTmux {
@@ -123,6 +124,16 @@ func (f *hubTmux) Run(args ...string) Result {
 	case "show-environment":
 		name := targetOf(args)
 		return Result{Stdout: f.envs[name]}
+	case "set-environment":
+		// set-environment -t <name> <KEY> <VALUE>: record the KEY=VALUE and apply it to
+		// the session's env dump so a later show-environment reads it back (realistic).
+		name := targetOf(args)
+		if ti := indexOf(args, "-t"); ti >= 0 && ti+3 < len(args) {
+			pair := args[ti+2] + "=" + args[ti+3]
+			f.setEnvs = append(f.setEnvs, pair)
+			f.envs[name] = f.envs[name] + pair + "\n"
+		}
+		return Result{}
 	case "send-keys":
 		// Record the literal text of a `send-keys -t <name> -l -- <text>` delivery
 		// (the single-line paste path); the bare Enter submit is ignored.
@@ -172,6 +183,14 @@ func (f *hubTmux) recorded() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.sent...)
+}
+
+// setEnvCalls returns the recorded set-environment "KEY=VALUE" pairs (used to assert the
+// hub back-wrote SHED_RC_AGENT_SESSION after a watcher confirmed the session id).
+func (f *hubTmux) setEnvCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.setEnvs...)
 }
 
 func targetOf(args []string) string {
