@@ -476,7 +476,7 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 	// replaced since the pre-lock lookup; identity was just re-verified above).
 	h.trackMu.Lock()
 	var (
-		watcher   *fileWatcher
+		watcher   sessionWatcher
 		stability Activity
 	)
 	if cur, ok := h.tracked[slug]; ok {
@@ -536,7 +536,7 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //     the kind's prompt anchor is visible on the FRESH pane. Requiring the fresh
 //     anchor here is what closes the lookup→lock race — a pane that flipped back to
 //     churning no longer shows the composer and is rejected.
-func (h *Hub) inputAccepted(watcher *fileWatcher, stability Activity, kind Kind, pane string) bool {
+func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kind, pane string) bool {
 	var (
 		watcherAct                   Activity
 		watcherFresh, expiredWorking bool

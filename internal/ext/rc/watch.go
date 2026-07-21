@@ -86,6 +86,31 @@ type messageProducer interface {
 	drainMessages() []feedMessage
 }
 
+// sessionWatcher is the narrow surface the reconcile loop and the input handler need
+// from a per-session watcher: refresh it, read its current verdict, drain any feed
+// messages it produced, and check whether it has ever folded an event. *fileWatcher
+// (below) satisfies this interface structurally — no other change is required for it
+// to be used through the interface. The seam exists so a second, network/SSE-backed
+// watcher (an opencode session's event stream, added later) can plug into the same
+// reconcile/input-handler call sites: both hub_reconcile.go and hub.go hold the
+// per-session watcher as a sessionWatcher and call only these five methods, so
+// reconcile is transport-agnostic between a tailed JSONL file and a live SSE feed.
+type sessionWatcher interface {
+	// refresh polls for new state and updates the watcher's current verdict. now
+	// stamps the last-event time used by the freshness decision (see snapshot).
+	refresh(now time.Time)
+	// snapshot reports the watcher's activity + message and its authority at now; see
+	// (*fileWatcher).snapshot for the fresh/expiredWorking contract reconcile relies on.
+	snapshot(now time.Time) (activity Activity, message string, fresh, expiredWorking bool)
+	// drainPending returns and clears the feed messages produced since the last drain.
+	drainPending() []feedMessage
+	// hadEvent reports whether the watcher has folded at least one activity-relevant
+	// event since it was created (used to confirm an ambiguous correlation).
+	hadEvent() bool
+	// close releases the watcher's resources and marks it terminally closed.
+	close()
+}
+
 // fileWatcher pairs a tailer with a fold and tracks freshness for the reconcile merge.
 type fileWatcher struct {
 	tailer *lineTailer
@@ -99,6 +124,10 @@ type fileWatcher struct {
 	pending     []feedMessage // feed messages produced since the last drainPending
 	closed      bool          // terminal: refresh no-ops after close (see close)
 }
+
+// var _ sessionWatcher = (*fileWatcher)(nil) is a compile-time check that fileWatcher's
+// method set has not drifted from the interface reconcile/the input handler depend on.
+var _ sessionWatcher = (*fileWatcher)(nil)
 
 func newFileWatcher(path string, catchUp bool, fold activityFold) *fileWatcher {
 	return &fileWatcher{

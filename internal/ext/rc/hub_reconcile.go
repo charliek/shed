@@ -48,7 +48,7 @@ type trackedSession struct {
 	// with no structured signal, or before correlation succeeds. When present and
 	// FRESH, its activity overrides the pane-stability tracker (see reconcile's merge);
 	// when absent/stale, stability drives. Closed when the session disappears/recreates.
-	watcher *fileWatcher
+	watcher sessionWatcher
 	// pendingAgentID is an AMBIGUOUS correlation's agent session id, held back until
 	// the watcher's first in-file event confirms the pick — only then is it back-
 	// written to SHED_RC_AGENT_SESSION. Back-writing an unconfirmed ambiguous pick
@@ -288,7 +288,7 @@ const maxCorrelateTries = 40
 // On an unambiguous match it back-writes the discovered agent session id into the tmux
 // env so a hub restart re-correlates exactly; an ambiguous window match follows only
 // new appends (activity stays unknown until an in-file event confirms).
-func (h *Hub) ensureWatcher(tr *trackedSession, s Session) *fileWatcher {
+func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 	if tr.watcher != nil || !watchableKind(s.Kind) {
 		return nil
 	}
