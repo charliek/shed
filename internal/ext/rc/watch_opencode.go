@@ -148,6 +148,7 @@ type ocPartCache struct {
 // serializes access, mirroring the fileWatcher/activityFold contract).
 type opencodeFold struct {
 	confirmed    bool            // seen ≥1 activity-relevant event (session.status/idle or a tool part)
+	sawStatus    bool            // seen ≥1 LIVE session.status/session.idle boundary (REST status is a fallback)
 	lastBoundary string          // "busy" | "idle" | "" (retry maps to busy)
 	pending      map[string]bool // open tool-call ids (pending/running)
 	lastMsg      string          // latest assistant text (sanitized on read)
@@ -204,10 +205,12 @@ func (f *opencodeFold) applyLine(line []byte) bool {
 		switch props.Status.Type {
 		case "busy", "retry": // retry keeps working (and keeps the prior last message)
 			f.confirmed = true
+			f.sawStatus = true
 			f.lastBoundary = "busy"
 			return true
 		case "idle":
 			f.confirmed = true
+			f.sawStatus = true
 			f.lastBoundary = "idle"
 			return true
 		default:
@@ -215,6 +218,7 @@ func (f *opencodeFold) applyLine(line []byte) bool {
 		}
 	case "session.idle":
 		f.confirmed = true
+		f.sawStatus = true
 		f.lastBoundary = "idle"
 		return true
 	case "message.updated":
@@ -498,6 +502,25 @@ func (f *opencodeFold) activity() Activity {
 func (f *opencodeFold) settled() bool { return f.activity() == ActivityNeedsInput }
 
 func (f *opencodeFold) lastMessage() string { return SanitizeLastMessage(f.lastMsg) }
+
+// applyStatusFallback applies a REST-seed-derived status boundary as a FALLBACK: it establishes
+// the activity boundary ONLY when the fold has NOT observed a live session.status/session.idle
+// event (sawStatus). The live /event stream is authoritative and ordered; the REST /session/status
+// snapshot is only for reconstructing a session that was quiescent at connect (§3.4) — it must
+// never override a newer buffered live busy/idle. idle=true → needs_input; idle=false → working.
+// Returns whether it actually set the boundary (so the caller can count it as a seed event).
+func (f *opencodeFold) applyStatusFallback(idle bool) bool {
+	if f.sawStatus {
+		return false // a live status boundary was present: the live stream wins
+	}
+	f.confirmed = true
+	if idle {
+		f.lastBoundary = "idle"
+	} else {
+		f.lastBoundary = "busy"
+	}
+	return true
+}
 
 // noteGap drops the pending tool-call set — a gap (an SSE inbox overflow / dropped frame)
 // may have swallowed a completed/error part, and a forever-pending callID would pin the
