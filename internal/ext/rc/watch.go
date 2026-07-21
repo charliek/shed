@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -347,6 +348,24 @@ func parseJSONLTime(s string) (time.Time, bool) {
 // ("" when absent). It rides showEnvironment's SHED_RC_ filter.
 func agentSessionEnv(r Runner, tmuxName string) string {
 	return parseEnv(showEnvironment(r, tmuxName))[envAgentSession]
+}
+
+// opencodePortEnv reads the create-time SHED_RC_OPENCODE_PORT for a tmux session
+// (stamped by BuildEnvArgs, meta.go) and range-validates it: a missing key, a value
+// that doesn't parse as an integer, or one outside 1..65535 all report ok=false — the
+// session is unwatchable over the opencode SSE transport (a pre-upgrade session
+// created before this port plumbing shipped simply never had the key stamped, which
+// is exactly this "missing" case; see the design doc's "pre-upgrade sessions" note).
+// Mirrors agentSessionEnv's shape (same showEnvironment/parseEnv path) but returns an
+// (int, bool) instead of a "" sentinel since 0 is not itself an invalid port value in
+// general — the explicit bool avoids overloading a magic int.
+func opencodePortEnv(r Runner, tmuxName string) (int, bool) {
+	raw := parseEnv(showEnvironment(r, tmuxName))[envOpencodePort]
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
 }
 
 // backWriteAgentSession stamps SHED_RC_AGENT_SESSION into the tmux session env so a

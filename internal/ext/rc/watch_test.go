@@ -577,6 +577,33 @@ func TestBackWriteAgentSessionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOpencodePortEnv(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string // "" means the key is never set
+		wantOK  bool
+		wantVal int
+	}{
+		{"round-trip", "4096", true, 4096},
+		{"missing", "", false, 0},
+		{"non-numeric", "abc", false, 0},
+		{"zero-out-of-range", "0", false, 0},
+		{"above-max-out-of-range", "70000", false, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &envRecRunner{env: map[string]string{}}
+			if c.raw != "" {
+				r.env[envOpencodePort] = c.raw
+			}
+			gotVal, gotOK := opencodePortEnv(r, "rc-x")
+			if gotOK != c.wantOK || gotVal != c.wantVal {
+				t.Errorf("opencodePortEnv() = (%d, %v), want (%d, %v)", gotVal, gotOK, c.wantVal, c.wantOK)
+			}
+		})
+	}
+}
+
 // ---- same-size rewrite detection (header tripwire) ----
 
 func TestLineTailerSameSizeRewriteResets(t *testing.T) {

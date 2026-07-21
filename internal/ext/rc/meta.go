@@ -3,6 +3,7 @@ package rc
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -15,6 +16,12 @@ type Metadata struct {
 	CreatedBy   string
 	CreatedAt   string // RFC3339 UTC (…Z)
 	Target      string // optional advisory label
+	// Port is opencode's allocated loopback SSE/HTTP server port (0 = none / not
+	// opencode). Set by Create via freeLoopbackPort (netutil.go) BEFORE Metadata is
+	// built, so BuildEnvArgs below can stamp it into the session env for the hub's
+	// opencode watcher (opencodePortEnv, watch.go) to read back. Ignored by
+	// BuildEnvArgs for non-opencode kinds even if nonzero.
+	Port int
 }
 
 // envValue validates the single-line / no-control-char grammar and returns the
@@ -27,8 +34,19 @@ func envValue(key, value string) (string, error) {
 }
 
 // BuildEnvArgs returns the `-e KEY=value …` argv fragment for `tmux new-session`,
-// in deterministic order. SHED_RC_TARGET is included only when set. Values are
-// validated against the single-line grammar.
+// in deterministic order. SHED_RC_TARGET is included only when set; SHED_RC_OPENCODE_PORT
+// only when the kind is opencode and a port was allocated. Values are validated
+// against the single-line grammar.
+//
+// For an opencode session it ALSO appends a bare `OPENCODE_SERVER_PASSWORD=` (empty
+// value) launch-env override, regardless of whether a port was allocated — opencode's
+// embedded HTTP server always runs when the bare TUI starts, and this neutralizes any
+// OPENCODE_SERVER_PASSWORD an inherited shell rc file might otherwise set, so the
+// hub's watcher (an unauthenticated second client) never hits a 401. This is
+// deliberately NOT a SHED_RC_* key — it's a plain launch-env override for the opencode
+// process itself, so it doesn't ride the SHED_RC_ prefix and is never read back by
+// parseEnv/showEnvironment (which filter to that prefix): it can't pollute SHED_RC_
+// metadata parsing.
 func BuildEnvArgs(m Metadata) ([]string, error) {
 	pairs := [][2]string{
 		{envV, fmt.Sprintf("%d", SchemaVersion)},
@@ -42,13 +60,19 @@ func BuildEnvArgs(m Metadata) ([]string, error) {
 	if m.Target != "" {
 		pairs = append(pairs, [2]string{envTarget, m.Target})
 	}
-	args := make([]string, 0, len(pairs)*2)
+	if m.Kind == KindOpencode && m.Port != 0 {
+		pairs = append(pairs, [2]string{envOpencodePort, strconv.Itoa(m.Port)})
+	}
+	args := make([]string, 0, len(pairs)*2+2)
 	for _, p := range pairs {
 		v, err := envValue(p[0], p[1])
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, "-e", p[0]+"="+v)
+	}
+	if m.Kind == KindOpencode {
+		args = append(args, "-e", "OPENCODE_SERVER_PASSWORD=")
 	}
 	return args, nil
 }
