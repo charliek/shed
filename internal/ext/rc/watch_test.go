@@ -137,6 +137,368 @@ func TestClaudeFoldNoMidTurnFlap(t *testing.T) {
 	}
 }
 
+// ---- opencode fold: the sanitized live /event capture folds to the expected arc ----
+
+// opencodeFeedRow is one expected drained feed row (only the fields the tests assert).
+type opencodeFeedRow struct {
+	role, typ  string
+	textPrefix string // Text must have this prefix ("" = don't check)
+	toolName   string // Tool.Name must equal this ("" = don't check / not a tool row)
+	detailHas  string // Tool.Detail must contain this substring ("" = don't check)
+}
+
+func TestOpencodeFoldFixtureArc(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+
+	// Before any confirming (activity-relevant) event the verdict is unknown.
+	if got := f.activity(); got != ActivityUnknown {
+		t.Fatalf("initial activity = %q, want unknown", got)
+	}
+
+	sawWorking := false
+	for _, ln := range lines {
+		f.applyLine(ln)
+		if f.activity() == ActivityWorking {
+			sawWorking = true
+		}
+	}
+	if !sawWorking {
+		t.Error("expected a working verdict during the turn")
+	}
+	// The arc ends at session.idle → needs_input, settled, with the final answer.
+	if got := f.activity(); got != ActivityNeedsInput {
+		t.Fatalf("final activity = %q, want needs_input", got)
+	}
+	if !f.settled() {
+		t.Error("final verdict should be settled")
+	}
+	if got := f.lastMessage(); got != "3 .txt files." {
+		t.Fatalf("last_message = %q, want %q", got, "3 .txt files.")
+	}
+
+	// The feed is the normalized turn: user prompt → reasoning → tool_use → tool_result
+	// → assistant answer, in that order.
+	want := []opencodeFeedRow{
+		{role: feedRoleUser, typ: feedTypeText, textPrefix: "Use the bash tool"},
+		{role: feedRoleAssistant, typ: feedTypeReasoning, textPrefix: "The user wants"},
+		{role: feedRoleTool, typ: feedTypeToolUse, toolName: "bash", detailHas: "ls"},
+		{role: feedRoleTool, typ: feedTypeToolResult, toolName: "bash", detailHas: "a.txt"},
+		{role: feedRoleAssistant, typ: feedTypeText, textPrefix: "3 .txt files."},
+	}
+	got := f.drainMessages()
+	assertOpencodeRows(t, got, want)
+
+	// Every row carried a source time, so every TS is non-empty and chronological
+	// (RFC3339 sorts lexicographically in time order; equal-second rows are allowed).
+	prev := ""
+	for i, m := range got {
+		if m.TS == "" {
+			t.Errorf("row %d (%s/%s) has an empty TS, want a source-derived time", i, m.Role, m.Type)
+		}
+		if m.TS < prev {
+			t.Errorf("row %d TS %q is before the previous row's %q (not chronological)", i, m.TS, prev)
+		}
+		prev = m.TS
+	}
+}
+
+func assertOpencodeRows(t *testing.T, got []feedMessage, want []opencodeFeedRow) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("drained %d rows, want %d:\n got=%s", len(got), len(want), formatOpencodeRows(got))
+	}
+	for i, w := range want {
+		m := got[i]
+		if m.Role != w.role || m.Type != w.typ {
+			t.Errorf("row %d = (%s/%s), want (%s/%s)", i, m.Role, m.Type, w.role, w.typ)
+		}
+		if w.textPrefix != "" && !strings.HasPrefix(m.Text, w.textPrefix) {
+			t.Errorf("row %d text = %q, want prefix %q", i, m.Text, w.textPrefix)
+		}
+		if w.toolName != "" {
+			if m.Tool == nil || m.Tool.Name != w.toolName {
+				t.Errorf("row %d tool = %+v, want name %q", i, m.Tool, w.toolName)
+			}
+		}
+		if w.detailHas != "" {
+			if m.Tool == nil || !strings.Contains(m.Tool.Detail, w.detailHas) {
+				t.Errorf("row %d tool detail = %+v, want substring %q", i, m.Tool, w.detailHas)
+			}
+		}
+	}
+}
+
+func formatOpencodeRows(rows []feedMessage) string {
+	var b strings.Builder
+	for _, m := range rows {
+		fmt.Fprintf(&b, "  %s/%s text=%q tool=%+v\n", m.Role, m.Type, m.Text, m.Tool)
+	}
+	return b.String()
+}
+
+// A reconnect re-seeds the same history WITHOUT resetting the fold; the partID/callID
+// dedup must make the second fold of the identical arc emit ZERO new rows.
+func TestOpencodeFoldReseedIdempotent(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 5 {
+		t.Fatalf("first drain = %d rows, want 5", len(got))
+	}
+	// Feed the SAME fixture again (a reconnect reseed — NO reset()).
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("reseed drain = %d rows, want 0 (dedup by partID/callID):\n%s", len(got), formatOpencodeRows(got))
+	}
+	// Activity is still the settled end-state after the reseed.
+	if got := f.activity(); got != ActivityNeedsInput {
+		t.Fatalf("post-reseed activity = %q, want needs_input", got)
+	}
+}
+
+// An assistant text part that gets two non-empty snapshots (partial then full, only the
+// full carrying part.time.end) emits exactly ONE row with the COMPLETE text.
+func TestOpencodeFoldMultiSnapshot(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"msgX","role":"assistant","time":{"created":1784613627000}}}}`))
+	// Partial snapshot: non-empty but no time.end → cached, not emitted.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"prtX","messageID":"msgX","type":"text","text":"3 .txt","time":{"start":1784613627679}}},"time":1784613627679}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("partial (no time.end) drained %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+	// Full snapshot with time.end → emit the complete text once.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"prtX","messageID":"msgX","type":"text","text":"3 .txt files.","time":{"start":1784613627679,"end":1784613627681}}},"time":1784613627681}`))
+	got := f.drainMessages()
+	if len(got) != 1 {
+		t.Fatalf("full snapshot drained %d rows, want 1:\n%s", len(got), formatOpencodeRows(got))
+	}
+	if got[0].Role != feedRoleAssistant || got[0].Type != feedTypeText || got[0].Text != "3 .txt files." {
+		t.Fatalf("row = (%s/%s,%q), want (assistant/text,\"3 .txt files.\")", got[0].Role, got[0].Type, got[0].Text)
+	}
+	if got[0].TS == "" {
+		t.Error("row TS should be the part's time.end, not empty")
+	}
+}
+
+// permission.asked is a display-only status feed row: it emits one system/status row and
+// does NOT change the activity verdict (which stays whatever session.status last said).
+func TestOpencodeFoldPermissionStatusRow(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+	if got := f.activity(); got != ActivityWorking {
+		t.Fatalf("after busy = %q, want working", got)
+	}
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["rm -rf /tmp/x","ls"]}}`))
+	// Activity is unaffected by the permission ask.
+	if got := f.activity(); got != ActivityWorking {
+		t.Fatalf("after permission.asked = %q, want working (unaffected)", got)
+	}
+	got := f.drainMessages()
+	if len(got) != 1 {
+		t.Fatalf("drained %d rows, want 1:\n%s", len(got), formatOpencodeRows(got))
+	}
+	m := got[0]
+	if m.Role != feedRoleSystem || m.Type != feedTypeStatus {
+		t.Fatalf("row = (%s/%s), want (system/status)", m.Role, m.Type)
+	}
+	if !strings.Contains(m.Text, "awaiting approval: bash") || !strings.Contains(m.Text, "rm -rf /tmp/x") {
+		t.Fatalf("status text = %q, want it to name the permission + patterns", m.Text)
+	}
+}
+
+// noteGap clears the pending-tool set but MUST keep the emitted-part dedup set, so a
+// reseed after a gap still emits no duplicate rows.
+func TestOpencodeFoldNoteGapKeepsDedup(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 5 {
+		t.Fatalf("first drain = %d rows, want 5", len(got))
+	}
+	f.noteGap()
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("post-gap reseed drain = %d rows, want 0 (dedup survives a gap):\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// ---- opencode fold: correctness edge cases (tolerant parsing / no fabricated rows) ----
+
+// Fix 1: a permission.asked with NO id keys its dedup slot on the row's content, so a
+// reseed replay (which also carries no id) emits exactly one status row, not one per replay.
+func TestOpencodeFoldStatusRowDedupNoID(t *testing.T) {
+	f := newOpencodeFold()
+	line := []byte(`{"type":"permission.asked","properties":{"sessionID":"s","permission":"bash","patterns":["ls"]}}`)
+	f.applyLine(line)
+	f.applyLine(line) // reseed replay of the identical, id-less ask
+	got := f.drainMessages()
+	if len(got) != 1 {
+		t.Fatalf("id-less permission.asked replayed twice emitted %d rows, want 1 (content-keyed dedup):\n%s", len(got), formatOpencodeRows(got))
+	}
+	if got[0].Role != feedRoleSystem || got[0].Type != feedTypeStatus {
+		t.Fatalf("row = (%s/%s), want (system/status)", got[0].Role, got[0].Type)
+	}
+}
+
+// Fix 2: a tool part whose state.status is unrecognized is tolerantly ignored — it must not
+// confirm activity, touch the pending set, or emit.
+func TestOpencodeFoldUnknownToolStateIgnored(t *testing.T) {
+	f := newOpencodeFold()
+	line := []byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"tool","tool":"bash","callID":"c1","state":{"status":"bogus","input":{"command":"ls"}}}},"time":1784613621168}`)
+	if f.applyLine(line) {
+		t.Fatal("an unrecognized tool state must not advance state (applyLine=false)")
+	}
+	if got := f.activity(); got != ActivityUnknown {
+		t.Fatalf("activity after unknown tool state = %q, want unknown (no confirm)", got)
+	}
+	if len(f.pending) != 0 {
+		t.Fatalf("unknown tool state mutated the pending set: %v", f.pending)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("unknown tool state emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// Fix 3: a synthetic/ignored snapshot for a partID that was cached as a normal partial must
+// DROP the cached partial so message-completion can never flush the stale text.
+func TestOpencodeFoldSyntheticSnapshotDropsCachedPartial(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000}}}}`))
+	// A normal partial (non-empty, no time.end) → cached, not emitted.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"text","text":"stale partial","time":{"start":1784613627679}}},"time":1784613627679}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("partial (no time.end) drained %d rows, want 0", len(got))
+	}
+	// A later SYNTHETIC snapshot for the SAME partID must drop the cached partial.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"text","text":"stale partial","synthetic":true,"time":{"start":1784613627679}}},"time":1784613627680}`))
+	// The message completes — the dropped partial must NOT be flushed.
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000,"completed":1784613627684}}}}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("a synthetic snapshot must drop the cached partial; got %d rows:\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// Fix 4: permission.asked / question.asked with absent/empty content must not emit a
+// fabricated row, and must report applyLine=false.
+func TestOpencodeFoldEmptyAskNoRow(t *testing.T) {
+	f := newOpencodeFold()
+	if f.applyLine([]byte(`{"type":"permission.asked","properties":{"sessionID":"s"}}`)) {
+		t.Fatal("permission.asked with no permission kind must return false")
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("empty permission.asked emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+	if f.applyLine([]byte(`{"type":"question.asked","properties":{"sessionID":"s"}}`)) {
+		t.Fatal("question.asked with no questions must return false")
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("empty question.asked emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// Fix 5: a text part owned by a message whose role is neither user nor assistant must not be
+// emitted (the feed contract carries only user/assistant/tool/system roles).
+func TestOpencodeFoldUnknownMessageRoleNotEmitted(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"bogus","time":{"created":1784613627000}}}}`))
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"text","text":"should not emit","time":{"start":1784613627679,"end":1784613627681}}},"time":1784613627681}`))
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"bogus","time":{"created":1784613627000,"completed":1784613627684}}}}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("a part owned by a non-user/assistant message must not emit; got %d rows:\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// Fix 6: a text part with an id but NO messageID can never be role-resolved, so it must not
+// be cached (and applyLine reports false).
+func TestOpencodeFoldOwnerlessPartNotCached(t *testing.T) {
+	f := newOpencodeFold()
+	line := []byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","type":"text","text":"orphan","time":{"start":1784613627679,"end":1784613627681}}},"time":1784613627681}`)
+	if f.applyLine(line) {
+		t.Fatal("a part with no messageID must return false (never role-resolvable)")
+	}
+	if len(f.parts) != 0 || len(f.partOrder) != 0 {
+		t.Fatalf("ownerless part was cached: parts=%d partOrder=%d", len(f.parts), len(f.partOrder))
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("ownerless part emitted %d rows, want 0", len(got))
+	}
+}
+
+// Fix 7: replaying already-emitted snapshots on a reseed must not re-cache them — partOrder
+// (and the parts map) must stay bounded rather than growing on every reconnect.
+func TestOpencodeFoldReseedDoesNotGrowCache(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	f.drainMessages()
+	orderAfterFirst := len(f.partOrder)
+	partsAfterFirst := len(f.parts)
+	if orderAfterFirst == 0 {
+		t.Fatal("precondition: the first fold should have appended text/reasoning parts to partOrder")
+	}
+	// Reseed the identical history (a reconnect replay — no reset()).
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("reseed emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+	if len(f.partOrder) != orderAfterFirst {
+		t.Fatalf("reseed grew partOrder from %d to %d (already-emitted parts were re-cached)", orderAfterFirst, len(f.partOrder))
+	}
+	if len(f.parts) != partsAfterFirst {
+		t.Fatalf("reseed grew the parts cache from %d to %d", partsAfterFirst, len(f.parts))
+	}
+}
+
+// Fix 8: an epoch-millis value that would expand to a year outside RFC3339's range yields ""
+// (the ring stamps it), never a non-RFC3339 expanded-year string.
+func TestOpencodeTSOutOfRange(t *testing.T) {
+	if got := opencodeTS(1 << 62); got != "" {
+		t.Fatalf("opencodeTS(1<<62) = %q, want \"\" (year out of RFC3339 range)", got)
+	}
+	if got := opencodeTS(0); got != "" {
+		t.Fatalf("opencodeTS(0) = %q, want \"\"", got)
+	}
+	if got := opencodeTS(-5); got != "" {
+		t.Fatalf("opencodeTS(-5) = %q, want \"\"", got)
+	}
+	// A normal in-range value still converts.
+	if got := opencodeTS(1784613627681); got == "" {
+		t.Fatal("opencodeTS of a normal epoch-ms must convert, got empty")
+	}
+}
+
+// Fix 9: a message.updated that changes nothing meaningful (a repeat, or an id-only frame)
+// must return false — feed-tracking that did not advance is not an event.
+func TestOpencodeFoldNoOpMessageUpdatedReturnsFalse(t *testing.T) {
+	f := newOpencodeFold()
+	// First sighting with a role advances state.
+	if !f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000}}}}`)) {
+		t.Fatal("first message.updated (new role) should advance state")
+	}
+	// Re-emitting the same info (nothing new) must NOT advance state.
+	if f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000}}}}`)) {
+		t.Fatal("a repeated message.updated (nothing new) must return false")
+	}
+	// An id-only frame (no role, no times) is likewise not activity-relevant.
+	if f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m2"}}}`)) {
+		t.Fatal("an id-only message.updated must return false")
+	}
+}
+
 // ---- tolerance: malformed / unknown / partial lines never break the fold ----
 
 func TestFoldsToleratePathologicalLines(t *testing.T) {
@@ -146,6 +508,7 @@ func TestFoldsToleratePathologicalLines(t *testing.T) {
 	}{
 		{"codex", newCodexFold()},
 		{"claude", newClaudeFold()},
+		{"opencode", newOpencodeFold()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bad := [][]byte{
