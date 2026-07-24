@@ -98,12 +98,12 @@ mobile-style clients.
 ## Live activity (the rc hub)
 
 On VZ sheds a resident guest daemon — the **RC activity hub** (`shed-ext-rc serve`) —
-derives a live `activity` dimension for each session and, for codex, a message feed and
-gated input. Two server endpoints expose it to clients (advertised via the `rc-proxy`
+derives a live `activity` dimension for each session and, for codex and opencode, a
+message feed and gated input. Two server endpoints expose it to clients (advertised via the `rc-proxy`
 and `rc-events` feature tokens on `GET /api/info` / `GET /api/overview`):
 
 - **`GET/POST /api/sheds/{name}/rc/*`** reverse-proxies the hub's `/v1` API (session
-  list, SSE `/v1/events`, the codex `/messages` feed, and `POST /input`), ensure-starting
+  list, SSE `/v1/events`, the codex/opencode `/messages` feed, and `POST /input`), ensure-starting
   the hub on demand. The server is the authorization boundary; the hub is loopback-only
   inside the guest.
 - **`GET /api/rc/events`** is a single demand-driven aggregate SSE stream carrying
