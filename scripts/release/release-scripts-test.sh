@@ -81,6 +81,18 @@ RECO="${SCRATCH}/scripts/release/recommend-components.sh"
 (cd "${SCRATCH}/crates" && cargo update --workspace --dry-run -q)
 (cd "${SCRATCH}/desktop/tauri/src-tauri" && cargo update --workspace --dry-run -q)
 
+# Hermetic baseline. The tar copy above imports the REAL component manifests at
+# whatever version the repo currently sits at, so a shipped version can leak into
+# a synthetic case: once v0.8.0 shipped, crates/shed-host-agent/VERSION and
+# cmd/shed-machine-rc/VERSION both read 0.8.0, and the desktop-only `v0.8.0` case
+# below then matched THREE components instead of one (issue #280). Reset all four
+# selectors to a sentinel equal to NONE of the tags this test uses, so every
+# case's residual (unbumped) manifest cannot collide with that case's tag — the
+# test fully owns version state regardless of the repo's current release. (Uses
+# update-version.sh's desktop arm, so it needs the primed cargo index above.)
+BASELINE=0.0.0
+"${UV}" "${BASELINE}" --components server,host-agent,machine-rc,desktop >/dev/null
+
 PASS=0
 step() { echo "--- $*"; }
 ok()   { PASS=$((PASS + 1)); echo "    ok: $*"; }
@@ -258,8 +270,9 @@ ok "stale lock entry caught; bumper repairs it"
 # known shape for the next. C1 has no update-version.sh arm for the new VERSION
 # files (that's C2), so they're written directly here.
 #
-# Entering state: plugin.json=0.8.0, host-agent=0.7.10, machine-rc=0.7.10,
-# desktop surfaces=0.8.0 (lockstep intact).
+# Entering state: plugin.json=0.8.0, host-agent=0.0.0, machine-rc=0.0.0 (the
+# hermetic baseline — never bumped above), desktop surfaces=0.8.0 (lockstep
+# intact).
 # ===========================================================================
 
 HOST_AGENT_VER="${SCRATCH}/crates/shed-host-agent/VERSION"
@@ -364,7 +377,7 @@ run_plan v0.8.0
 [ "${PLAN_RC}" -eq 1 ] || fail "empty-manifest plan exited ${PLAN_RC} (want 1)"
 out="$("${RP}" v0.8.0 2>&1 || true)"
 echo "${out}" | grep -q "crates/shed-host-agent/VERSION is empty" || fail "empty-manifest error doesn't name the file: ${out}"
-printf '0.7.10\n' > "${HOST_AGENT_VER}"   # restore (defensive; last case)
+printf '%s\n' "${BASELINE}" > "${HOST_AGENT_VER}"   # restore to the hermetic baseline (defensive)
 ok "empty crates/shed-host-agent/VERSION rejected, naming the file"
 
 # ---------------------------------------------------------------------------
@@ -410,7 +423,7 @@ run_plan v9.9.9
 out="$("${RP}" v9.9.9 2>&1 || true)"
 echo "${out}" | grep -q "crates/shed-host-agent/VERSION" || fail "zero-padded-manifest error doesn't name the file: ${out}"
 echo "${out}" | grep -q "not semver" || fail "zero-padded-manifest error missing 'not semver': ${out}"
-printf '0.7.10\n' > "${HOST_AGENT_VER}"   # restore
+printf '%s\n' "${BASELINE}" > "${HOST_AGENT_VER}"   # restore to the hermetic baseline
 ok "zero-padded 1.02.3 in crates/shed-host-agent/VERSION rejected, naming the file"
 
 # ---------------------------------------------------------------------------
