@@ -2,6 +2,7 @@ package rc
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -24,9 +25,13 @@ type AgentSpec struct {
 	Kinds []Kind
 	// InnerCommand builds the command the tmux session runs for one of the tool's
 	// kinds. Signature mirrors the exported InnerCommand: display name (already
-	// resolved by the caller), the generic/claude permission mode ("" = omit), and
-	// whether to wrap in `bash -ic` (native machines / non-shed PATH).
-	InnerCommand func(kind Kind, displayName, permissionMode string, interactiveShell bool) string
+	// resolved by the caller), the generic/claude permission mode ("" = omit),
+	// whether to wrap in `bash -ic` (native machines / non-shed PATH), and a trailing
+	// port — opencode's allocated loopback SSE/HTTP server port (0 = none / not
+	// opencode). Every builder accepts port so the func-value signature stays uniform
+	// across the registry; only innerCommandTUI's opencode branch actually consumes it
+	// (claude/shell ignore it).
+	InnerCommand func(kind Kind, displayName, permissionMode string, interactiveShell bool, port int) string
 	// Classify derives a pane's lifecycle state (+ optional url/id) for one of the
 	// tool's kinds. Takes the kind because a tool can back several kinds with
 	// different ready/url regex sets (claude-broker vs claude-rc). The shared
@@ -300,8 +305,9 @@ func AuthHintFor(k Kind) string {
 // innerCommandClaude builds the tmux command for the claude kinds. interactiveShell
 // wraps it in `bash -ic` so a login rc-file loads PATH (nvm/asdf) before claude is
 // exec'd (native machines); sheds bake claude into the system path. See the exported
-// InnerCommand doc for the permission-mode / --remote-control form rationale.
-func innerCommandClaude(kind Kind, displayName, permissionMode string, interactiveShell bool) string {
+// InnerCommand doc for the permission-mode / --remote-control form rationale. port is
+// opencode-only (§ InnerCommand doc) and always ignored here.
+func innerCommandClaude(kind Kind, displayName, permissionMode string, interactiveShell bool, _ int) string {
 	flags, _ := permFlagsFor(kind, permissionMode) // validity pre-checked in Create
 	var cmd string
 	switch kind {
@@ -334,12 +340,26 @@ func innerCommandClaude(kind Kind, displayName, permissionMode string, interacti
 // `bash -ic` so a login rc-file loads PATH before the tool is exec'd (native
 // machines; sheds bake the tools into the system path). The display name is metadata
 // only — these TUIs take no --name.
-func innerCommandTUI(bin string) func(kind Kind, displayName, permissionMode string, interactiveShell bool) string {
-	return func(kind Kind, _, permissionMode string, interactiveShell bool) string {
+//
+// port is opencode's allocated loopback SSE/HTTP server port (0 = none / not
+// opencode; see freeLoopbackPort, ops.go). When kind is KindOpencode and port != 0,
+// `--port <port> --hostname 127.0.0.1` is appended to cmd BEFORE the optional
+// `bash -ic` wrap below — WRAP-ORDER MATTERS: appending after the wrap would place
+// `--port …` as a second argv token handed to bash itself, not inside the quoted
+// string bash execs as opencode's command line, so opencode would never see the flag
+// (and bash would likely reject the stray tokens). Building it into cmd first means
+// it rides inside the `bash -ic '<cmd>'` quoting like every other flag. codex/cursor
+// (and opencode with port == 0) never hit this branch, so a nonzero port passed for a
+// non-opencode kind is silently a no-op — only opencode consumes it.
+func innerCommandTUI(bin string) func(kind Kind, displayName, permissionMode string, interactiveShell bool, port int) string {
+	return func(kind Kind, _, permissionMode string, interactiveShell bool, port int) string {
 		flags, _ := permFlagsFor(kind, permissionMode)
 		cmd := bin
 		if len(flags) > 0 {
 			cmd += " " + strings.Join(flags, " ")
+		}
+		if kind == KindOpencode && port != 0 {
+			cmd += " --port " + strconv.Itoa(port) + " --hostname 127.0.0.1"
 		}
 		if interactiveShell {
 			return "bash -ic " + shellQuote(cmd)
@@ -348,9 +368,9 @@ func innerCommandTUI(bin string) func(kind Kind, displayName, permissionMode str
 	}
 }
 
-// innerCommandShell runs a plain login bash; it ignores permissionMode and the
-// interactive-shell wrap (a shell is already a shell).
-func innerCommandShell(_ Kind, _, _ string, _ bool) string {
+// innerCommandShell runs a plain login bash; it ignores permissionMode, the
+// interactive-shell wrap (a shell is already a shell), and port (opencode-only).
+func innerCommandShell(_ Kind, _, _ string, _ bool, _ int) string {
 	return "bash -l"
 }
 

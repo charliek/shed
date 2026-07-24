@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,17 +16,25 @@ import (
 // The JSONL watchers are the structured-signal source that OVERRIDES the pane
 // stability engine for codex and claude sessions: instead of inferring activity from
 // whether the tmux pane keeps redrawing, they tail the agent's own append-only log
-// (codex rollout / claude transcript) and read the turn/tool structure directly. The
-// hub merges the two per session (see hub_reconcile.go): a fresh, correlated watcher
-// wins; a broken/absent one falls back to stability so activity never goes dark.
+// (codex rollout / claude transcript) and read the turn/tool structure directly.
+// opencode has no append-only log to tail — its sessionWatcher (opencodeWatcher,
+// watch_opencode_transport.go) is a structurally parallel but transport-different
+// sibling that subscribes to the agent's embedded HTTP+SSE server instead of tailing a
+// file (see watchableKind below). The hub merges a session's watcher (JSONL- or
+// SSE-backed) with pane stability per session (see hub_reconcile.go): a fresh,
+// correlated watcher wins; a broken/absent one falls back to stability so activity
+// never goes dark.
 //
 // Layout of the watcher stack:
-//   - lineTailer (watch_tail.go): resilient byte-level tailing.
-//   - activityFold (below): a per-kind fold of the parsed line stream into an
-//     activity verdict + last-message preview (codexFold, claudeFold).
-//   - fileWatcher (below): tailer + fold + a freshness-annotated snapshot.
+//   - lineTailer (watch_tail.go): resilient byte-level tailing (codex/claude only).
+//   - activityFold (below): a per-kind fold of the parsed line/event stream into an
+//     activity verdict + last-message preview (codexFold, claudeFold, opencodeFold).
+//   - fileWatcher (below): tailer + fold + a freshness-annotated snapshot (codex/claude).
+//   - opencodeWatcher (watch_opencode_transport.go): SSE/REST client + fold + a
+//     freshness-annotated snapshot (opencode's sessionWatcher).
 //   - correlation (below + the per-kind files): mapping a tmux session to its file.
-//   - fsNudger (below): the fsnotify layer that wakes reconcile sub-tick on a write.
+//   - fsNudger (below): the fsnotify layer that wakes reconcile sub-tick on a write
+//     (codex/claude only; opencode's SSE stream is its own wakeup source).
 
 // watcherFreshWindow bounds how long a correlated watcher's non-settled, non-working
 // activity is trusted after its last folded event. A settled verdict (needs_input/
@@ -73,8 +82,9 @@ type activityFold interface {
 }
 
 // messageProducer is an activityFold that ALSO produces a normalized message feed
-// (codex only; claude feeds activity only in this phase). The fileWatcher drains it on
-// each refresh; a fold that does not implement it contributes no feed messages.
+// (codex and opencode; claude feeds activity only in this phase). The fileWatcher/
+// opencodeWatcher drains it on each refresh; a fold that does not implement it
+// contributes no feed messages.
 //
 // Ambiguous correlation caveat (accepted): a watcher attached on an AMBIGUOUS window
 // match is follow-only and its ACTIVITY stays untrusted (unknown) until an in-file
@@ -84,6 +94,31 @@ type activityFold interface {
 // same-trust content, and a confirmed-wrong pick is torn down with the watcher.
 type messageProducer interface {
 	drainMessages() []feedMessage
+}
+
+// sessionWatcher is the narrow surface the reconcile loop and the input handler need
+// from a per-session watcher: refresh it, read its current verdict, drain any feed
+// messages it produced, and check whether it has ever folded an event. *fileWatcher
+// (below) satisfies this interface structurally — no other change is required for it
+// to be used through the interface. The seam exists so a second, network/SSE-backed
+// watcher (an opencode session's event stream, added later) can plug into the same
+// reconcile/input-handler call sites: both hub_reconcile.go and hub.go hold the
+// per-session watcher as a sessionWatcher and call only these five methods, so
+// reconcile is transport-agnostic between a tailed JSONL file and a live SSE feed.
+type sessionWatcher interface {
+	// refresh polls for new state and updates the watcher's current verdict. now
+	// stamps the last-event time used by the freshness decision (see snapshot).
+	refresh(now time.Time)
+	// snapshot reports the watcher's activity + message and its authority at now; see
+	// (*fileWatcher).snapshot for the fresh/expiredWorking contract reconcile relies on.
+	snapshot(now time.Time) (activity Activity, message string, fresh, expiredWorking bool)
+	// drainPending returns and clears the feed messages produced since the last drain.
+	drainPending() []feedMessage
+	// hadEvent reports whether the watcher has folded at least one activity-relevant
+	// event since it was created (used to confirm an ambiguous correlation).
+	hadEvent() bool
+	// close releases the watcher's resources and marks it terminally closed.
+	close()
 }
 
 // fileWatcher pairs a tailer with a fold and tracks freshness for the reconcile merge.
@@ -99,6 +134,10 @@ type fileWatcher struct {
 	pending     []feedMessage // feed messages produced since the last drainPending
 	closed      bool          // terminal: refresh no-ops after close (see close)
 }
+
+// var _ sessionWatcher = (*fileWatcher)(nil) is a compile-time check that fileWatcher's
+// method set has not drifted from the interface reconcile/the input handler depend on.
+var _ sessionWatcher = (*fileWatcher)(nil)
 
 func newFileWatcher(path string, catchUp bool, fold activityFold) *fileWatcher {
 	return &fileWatcher{
@@ -232,10 +271,12 @@ func mergedActivity(watcherActivity Activity, watcherMessage string, watcherFres
 	return stability, ""
 }
 
-// watchableKind reports whether a kind has a JSONL watcher (codex rollout / claude
-// transcript). Other kinds derive activity from pane stability alone.
+// watchableKind reports whether a kind has a structured-signal watcher: codex/claude
+// tail a JSONL file (rollout / transcript), opencode subscribes to its embedded
+// HTTP+SSE server (watch_opencode_transport.go). Other kinds derive activity from pane
+// stability alone.
 func watchableKind(k Kind) bool {
-	return k == KindCodex || IsClaudeKind(k)
+	return k == KindCodex || IsClaudeKind(k) || k == KindOpencode
 }
 
 // correlation is the outcome of mapping a tmux session to its agent JSONL file.
@@ -318,6 +359,24 @@ func parseJSONLTime(s string) (time.Time, bool) {
 // ("" when absent). It rides showEnvironment's SHED_RC_ filter.
 func agentSessionEnv(r Runner, tmuxName string) string {
 	return parseEnv(showEnvironment(r, tmuxName))[envAgentSession]
+}
+
+// opencodePortEnv reads the create-time SHED_RC_OPENCODE_PORT for a tmux session
+// (stamped by BuildEnvArgs, meta.go) and range-validates it: a missing key, a value
+// that doesn't parse as an integer, or one outside 1..65535 all report ok=false — the
+// session is unwatchable over the opencode SSE transport (a pre-upgrade session
+// created before this port plumbing shipped simply never had the key stamped, which
+// is exactly this "missing" case; see the design doc's "pre-upgrade sessions" note).
+// Mirrors agentSessionEnv's shape (same showEnvironment/parseEnv path) but returns an
+// (int, bool) instead of a "" sentinel since 0 is not itself an invalid port value in
+// general — the explicit bool avoids overloading a magic int.
+func opencodePortEnv(r Runner, tmuxName string) (int, bool) {
+	raw := parseEnv(showEnvironment(r, tmuxName))[envOpencodePort]
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
 }
 
 // backWriteAgentSession stamps SHED_RC_AGENT_SESSION into the tmux session env so a

@@ -45,8 +45,8 @@ type AgentInfo struct {
 // live message feed for the kind (GET /messages + message.appended); input reports the
 // feed-input posting mode — "gated" means POST /input is accepted only while the
 // session is waiting (see the hub's acceptance re-check), "" means no feed input (the
-// TUI-only post_input path still applies). Both are codex-only in this phase; omitempty
-// keeps the wire shape unchanged for the other kinds.
+// TUI-only post_input path still applies). Both are codex- and opencode-only in this
+// phase; omitempty keeps the wire shape unchanged for the other kinds.
 type KindFeatures struct {
 	PostInput bool   `json:"post_input"`
 	Approvals string `json:"approvals"`
@@ -177,10 +177,11 @@ func kindFeatures() map[Kind]KindFeatures {
 			continue
 		default:
 			kf := KindFeatures{PostInput: AcceptsTypedInput(k), Approvals: "tui"}
-			// The message feed + gated input are codex-only in this phase: codex is the
-			// one kind whose rollout JSONL the watcher folds into a normalized feed and
-			// whose composer anchor gates input acceptance.
-			if k == KindCodex {
+			// The message feed + gated input are codex- and opencode-only in this phase:
+			// codex's rollout JSONL and opencode's HTTP/SSE event stream are the two
+			// watchers the hub folds into a normalized feed, and whose composer anchor
+			// gates input acceptance.
+			if k == KindCodex || k == KindOpencode {
 				kf.Watch = true
 				kf.Input = "gated"
 			}

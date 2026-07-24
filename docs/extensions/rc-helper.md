@@ -138,7 +138,8 @@ version (currently **3**), decoupled from `SHED_RC_V` (metadata schema, still **
   },
   "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"],
   "kind_features": {
-    "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" }
+    "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" },
+    "opencode": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" }
   }
 }
 ```
@@ -148,8 +149,8 @@ version (currently **3**), decoupled from `SHED_RC_V` (metadata schema, still **
 | `rc_version` | Capability/protocol version. Bumped when the capability shape or a feature contract changes; **not** tied to `SHED_RC_V`. |
 | `kinds` | Every kind this binary offers (order matches the pinned wire contract). |
 | `agents` | Per-tool install probe (`command -v` + `--version`, 2 s budget). `version` omitted when not installed. |
-| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`, `serve` (the on-demand rc activity hub), `activity` (the live activity dimension), `messages` (the codex message feed + gated input endpoints). A token is appended in the same change that ships its feature. |
-| `kind_features` | Per-kind UI hints. `post_input` = a typed line can be delivered to the pane; `approvals` = where approvals happen (v1 agents are TUI-only → `tui`); `watch` = the hub produces a live message feed for the kind (`GET …/messages` + the `message.appended` event); `input` = feed-input posting mode (`gated` = `POST …/input` accepted only while the session is waiting, absent = no feed input). `watch`/`input` are codex-only in this phase. `claude-broker` and `shell` are omitted. |
+| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`, `serve` (the on-demand rc activity hub), `activity` (the live activity dimension), `messages` (the codex/opencode message feed + gated input endpoints). A token is appended in the same change that ships its feature. |
+| `kind_features` | Per-kind UI hints. `post_input` = a typed line can be delivered to the pane; `approvals` = where approvals happen (v1 agents are TUI-only → `tui`); `watch` = the hub produces a live message feed for the kind (`GET …/messages` + the `message.appended` event); `input` = feed-input posting mode (`gated` = `POST …/input` accepted only while the session is waiting, absent = no feed input). `watch`/`input` are codex- and opencode-only in this phase. `claude-broker` and `shell` are omitted. |
 
 The `list` envelope embeds this block as `capabilities`. It is a pointer with
 `omitempty`, so an **old** binary's bare `{"rc_sessions":[…]}` output still decodes — a
@@ -206,16 +207,16 @@ absent when no hub is running or the kind is unsupported:
 | `last_message` | Sanitized preview of the most recent message — ANSI/control-stripped, whitespace-collapsed, truncated to ≤200 runes. |
 
 These fields are **derived and served by the RC activity hub**, documented in full
-below — including the codex message feed those previews summarize.
+below — including the codex/opencode message feed those previews summarize.
 
 ## The RC activity hub (`serve`)
 
 `shed-ext-rc serve` runs the **RC activity hub**: a small, resident, per-shed daemon
 that tails each rc session and exposes a loopback HTTP API. It answers the question the
 lifecycle `state` cannot — *what is a usable session doing right now?* — by deriving a
-live `activity` dimension (and, for codex, a normalized message feed and gated input).
-Clients never reach it directly; the server's rc proxy and aggregate SSE stream are the
-only paths in (see [Server surfaces](#server-surfaces)).
+live `activity` dimension (and, for codex and opencode, a normalized message feed and
+gated input). Clients never reach it directly; the server's rc proxy and aggregate SSE
+stream are the only paths in (see [Server surfaces](#server-surfaces)).
 
 The hub drives the **same** tmux/pane machinery the one-shot subcommands use, so its
 session list and classification are byte-identical to `list`; it only *overlays* the
@@ -328,8 +329,14 @@ that log:
   `idle`, or → `needs_input` **only** when the kind declares a prompt anchor the stable
   pane matches (an anchorless kind's stable pane is always `idle`).
 - **codex** tails the rollout JSONL; **claude** tails the transcript JSONL (claude feeds
-  *activity* only in this phase — messages are deferred). A correlated watcher's verdict
-  **overrides** stability while it is *fresh*.
+  *activity* only in this phase — messages are deferred). **opencode** has no JSONL to
+  tail — the bare `opencode` TUI runs an embedded HTTP+SSE server on a per-session
+  loopback port (recorded at `create` time), and the hub subscribes to its `/event`
+  stream (plus a REST seed) as a second client, folding the same shape of
+  activity-verdict + message feed as codex's JSONL fold. A correlated watcher's verdict
+  **overrides** stability while it is *fresh*; for opencode, freshness also depends on
+  the SSE connection's transport health (a disconnected stream is not trusted the way a
+  merely-quiet file is — see [Message feed](#message-feed-codex-opencode)).
 
 **Freshness / grace.** A settled watcher verdict (`needs_input`/`idle`) is trusted
 indefinitely; a transitional verdict is fresh for 30 s since the last in-file event; a
@@ -344,11 +351,19 @@ activity.
 whitespace-collapsed, ≤200 runes) extracted by the watcher; stability has no message
 signal, so a stability-only session carries none.
 
-### Message feed (codex)
+### Message feed (codex, opencode)
 
-The codex rollout watcher folds the JSONL turn stream into normalized conversation
-messages, drained each tick into a per-session **ring buffer** that `GET /messages`
-pages. claude sessions have a ring that simply never fills (messages deferred).
+The codex rollout watcher folds the JSONL turn stream, and the opencode watcher folds
+its HTTP/SSE `/event` stream, into normalized conversation messages, drained each tick
+into a per-session **ring buffer** that `GET /messages` pages. claude sessions have a
+ring that simply never fills (messages deferred).
+
+opencode's fold additionally turns a pending `permission.asked`/`question.asked` event
+into a display-only `status` feed row (role `system`) — e.g. `awaiting approval: bash —
+<patterns>` — **without** changing the `activity` dimension (it stays
+`working`/`needs_input`; the wire-reserved `needs_approval` value is still not
+produced — see [Activity dimension](#activity-dimension)). There is no retraction event;
+the row is simply superseded by whatever the feed emits next.
 
 Message shape: `{seq, ts, role, type, text, tool{name, detail}}` where `role ∈
 {user, assistant, tool, system}` and `type ∈ {text, tool_use, tool_result, reasoning,
@@ -387,9 +402,10 @@ that session reports no `activity`.
 
 ### Input (`POST /input`)
 
-Gated feed input is **codex-only** in this phase (`kind_features.input == "gated"`; other
-kinds keep TUI-only `post_input`). Delivery reuses the shared prompt path (validation +
-bracketed paste), never a duplicate tmux path.
+Gated feed input is **codex- and opencode-only** in this phase (`kind_features.input ==
+"gated"`; other kinds keep TUI-only `post_input`). opencode reuses the *existing* tmux
+prompt-delivery path — there is no opencode-side REST submission. Delivery reuses the
+shared prompt path (validation + bracketed paste), never a duplicate tmux path.
 
 **Gating.** Under a per-slug mutex, immediately before sending the hub **re-captures the
 pane and re-derives state**, and accepts only when the session is genuinely waiting: a
@@ -420,6 +436,28 @@ window (±60 s)**, pinned by **inode**:
 - Watchers stop when the tmux session disappears; a file truncation / inode swap resets
   and re-reads; new dated subdirs are handled (fsnotify is non-recursive). A session
   whose file never appears stops re-scanning after a bounded retry budget.
+
+### Correlation (opencode: session → SSE)
+
+opencode has no JSONL file to correlate against — it creates its conversation session
+only on the **first prompt** (not at TUI start), so a create-time window match would
+routinely expire before anything exists to match. Instead, the opencode watcher
+correlates asynchronously, entirely from its own `/event` stream:
+
+- It subscribes to the session's per-port `/event` stream first, then seeds via REST —
+  so no event is lost in the gap between subscribe and seed.
+- A trusted pin comes **only** from a port-local SSE event on the watcher's own stream
+  (never from `GET /session`, which reads the shared opencode DB and can return other
+  sessions/servers' history): the first **root** session (no parent) whose canonical
+  directory matches the rc session's workdir. Once pinned, the id is back-written to
+  `SHED_RC_AGENT_SESSION` (same as the JSONL path) so a hub restart re-correlates
+  exactly.
+- A fresh, prompt-less opencode TUI has no session yet and stays watchable indefinitely
+  — correlation does not consume a retry budget waiting for the first prompt.
+- On reconnect (SSE drop, hub restart) the watcher re-subscribes, re-seeds
+  (`/session/{id}/message`, `/session/status`, `/permission`, `/question`), and replays
+  buffered live events; feed emission is deduped so a reseed never double-emits a
+  message.
 
 ### Server surfaces
 

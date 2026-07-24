@@ -460,7 +460,8 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "not_accepting", "session was recreated")
 		return
 	}
-	// Feed input is codex-only in this phase (kind_features.input == "gated").
+	// Feed input is codex- and opencode-only in this phase (kind_features.input ==
+	// "gated").
 	if !inputGatedKind(fresh.Kind) {
 		writeError(w, http.StatusConflict, "not_accepting", "this kind does not accept feed input")
 		return
@@ -476,7 +477,7 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 	// replaced since the pre-lock lookup; identity was just re-verified above).
 	h.trackMu.Lock()
 	var (
-		watcher   *fileWatcher
+		watcher   sessionWatcher
 		stability Activity
 	)
 	if cur, ok := h.tracked[slug]; ok {
@@ -536,7 +537,7 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //     the kind's prompt anchor is visible on the FRESH pane. Requiring the fresh
 //     anchor here is what closes the lookup→lock race — a pane that flipped back to
 //     churning no longer shows the composer and is rejected.
-func (h *Hub) inputAccepted(watcher *fileWatcher, stability Activity, kind Kind, pane string) bool {
+func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kind, pane string) bool {
 	var (
 		watcherAct                   Activity
 		watcherFresh, expiredWorking bool
@@ -709,8 +710,8 @@ func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
 	return n.nudge
 }
 
-// shutdown closes all SSE subscribers + JSONL watchers and gracefully stops the HTTP
-// server.
+// shutdown closes all SSE subscribers + session watchers (codex/claude JSONL tails,
+// opencode SSE clients) and gracefully stops the HTTP server.
 func (h *Hub) shutdown(srv *http.Server) error {
 	h.closeAllSubscribers()
 	h.closeAllWatchers()
@@ -720,7 +721,8 @@ func (h *Hub) shutdown(srv *http.Server) error {
 	return nil
 }
 
-// closeAllWatchers releases every tracked session's JSONL watcher (hub shutdown).
+// closeAllWatchers releases every tracked session's watcher — a JSONL tail (codex/
+// claude) or an opencode SSE client (hub shutdown).
 func (h *Hub) closeAllWatchers() {
 	h.trackMu.Lock()
 	defer h.trackMu.Unlock()

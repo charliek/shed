@@ -2,6 +2,7 @@ package rc
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -68,30 +69,43 @@ func TestShellQuote(t *testing.T) {
 
 func TestInnerCommand(t *testing.T) {
 	cases := []struct {
+		caseName    string
 		kind        Kind
 		name        string
 		permMode    string
 		interactive bool
+		port        int
 		want        string
 	}{
 		// No permission mode -> original, backward-compatible forms.
-		{KindClaudeBroker, "my-shed/abc", "", false, "claude remote-control --name 'my-shed/abc' --spawn same-dir"},
-		{KindClaudeRC, "my-shed/abc", "", false, "claude --name 'my-shed/abc' /rc"},
-		{KindShell, "my-shed/abc", "", false, "bash -l"},
-		{KindClaudeRC, "Friday Bug Fix", "", false, "claude --name 'Friday Bug Fix' /rc"},
-		{KindClaudeRC, "x", "", true, `bash -ic 'claude --name '\''x'\'' /rc'`},
-		{KindShell, "x", "", true, "bash -l"}, // shell ignores interactive wrap
+		{"broker no-mode", KindClaudeBroker, "my-shed/abc", "", false, 0, "claude remote-control --name 'my-shed/abc' --spawn same-dir"},
+		{"claude-rc no-mode", KindClaudeRC, "my-shed/abc", "", false, 0, "claude --name 'my-shed/abc' /rc"},
+		{"shell no-mode", KindShell, "my-shed/abc", "", false, 0, "bash -l"},
+		{"claude-rc name with spaces", KindClaudeRC, "Friday Bug Fix", "", false, 0, "claude --name 'Friday Bug Fix' /rc"},
+		{"claude-rc interactive wrap", KindClaudeRC, "x", "", true, 0, `bash -ic 'claude --name '\''x'\'' /rc'`},
+		{"shell ignores interactive wrap", KindShell, "x", "", true, 0, "bash -l"},
 		// With a permission mode -> claude-rc switches to the --remote-control form.
-		{KindClaudeRC, "my-shed/abc", "auto", false, "claude --remote-control --name 'my-shed/abc' --permission-mode auto"},
-		{KindClaudeRC, "x", "bypassPermissions", false, "claude --remote-control --name 'x' --permission-mode bypassPermissions"},
-		{KindClaudeBroker, "b", "auto", false, "claude remote-control --name 'b' --permission-mode auto --spawn same-dir"},
-		{KindClaudeRC, "x", "auto", true, `bash -ic 'claude --remote-control --name '\''x'\'' --permission-mode auto'`},
-		{KindShell, "x", "bypassPermissions", false, "bash -l"}, // shell ignores mode
+		{"claude-rc auto mode", KindClaudeRC, "my-shed/abc", "auto", false, 0, "claude --remote-control --name 'my-shed/abc' --permission-mode auto"},
+		{"claude-rc bypassPermissions mode", KindClaudeRC, "x", "bypassPermissions", false, 0, "claude --remote-control --name 'x' --permission-mode bypassPermissions"},
+		{"broker auto mode", KindClaudeBroker, "b", "auto", false, 0, "claude remote-control --name 'b' --permission-mode auto --spawn same-dir"},
+		{"claude-rc auto mode interactive wrap", KindClaudeRC, "x", "auto", true, 0, `bash -ic 'claude --remote-control --name '\''x'\'' --permission-mode auto'`},
+		{"shell ignores mode", KindShell, "x", "bypassPermissions", false, 0, "bash -l"},
+		// opencode: a nonzero port appends --port/--hostname; zero omits it entirely.
+		{"opencode with port", KindOpencode, "x", "", false, 4096, "opencode --port 4096 --hostname 127.0.0.1"},
+		{"opencode zero port omits flags", KindOpencode, "x", "", false, 0, "opencode"},
+		// interactiveShell: --port must land INSIDE the bash -ic quotes (wrap-correctness).
+		{"opencode interactive wrap port inside quotes", KindOpencode, "x", "", true, 4096, `bash -ic 'opencode --port 4096 --hostname 127.0.0.1'`},
+		// codex/cursor ignore a nonzero port even though the signature accepts one —
+		// only opencode's builder branch consumes it.
+		{"codex ignores port", KindCodex, "x", "", false, 4096, "codex"},
+		{"cursor ignores port", KindCursor, "x", "", false, 4096, "cursor-agent"},
 	}
 	for _, c := range cases {
-		if got := InnerCommand(c.kind, c.name, c.permMode, c.interactive); got != c.want {
-			t.Errorf("InnerCommand(%s,%q,%q,%v) = %q, want %q", c.kind, c.name, c.permMode, c.interactive, got, c.want)
-		}
+		t.Run(c.caseName, func(t *testing.T) {
+			if got := InnerCommand(c.kind, c.name, c.permMode, c.interactive, c.port); got != c.want {
+				t.Errorf("InnerCommand(%s,%q,%q,%v,%d) = %q, want %q", c.kind, c.name, c.permMode, c.interactive, c.port, got, c.want)
+			}
+		})
 	}
 }
 
@@ -304,6 +318,57 @@ func TestBuildEnvArgsRejectsControlChars(t *testing.T) {
 	_, err := BuildEnvArgs(Metadata{ID: "x", DisplayName: "a\nb", Kind: KindShell, Workdir: "/x", CreatedBy: "t/1", CreatedAt: "2026-06-19T18:53:00Z"})
 	if err == nil {
 		t.Fatal("expected control-char rejection")
+	}
+}
+
+func TestBuildEnvArgsOpencodePort(t *testing.T) {
+	base := Metadata{
+		ID: "id-1", DisplayName: "x", Kind: KindOpencode,
+		Workdir: "/home/shed/proj", CreatedBy: "shed-ext-rc/0.5.0",
+		CreatedAt: "2026-06-19T18:53:00Z",
+	}
+	withPort := base
+	withPort.Port = 4096
+	nonOC := base
+	nonOC.Kind = KindShell
+	nonOC.Port = 4096
+
+	cases := []struct {
+		name         string
+		meta         Metadata
+		wantPortEnv  string // "" means no SHED_RC_OPENCODE_PORT= key at all
+		wantPassword bool   // want OPENCODE_SERVER_PASSWORD= present
+	}{
+		// Port allocated: both SHED_RC_OPENCODE_PORT and the password override appear.
+		{"port allocated", withPort, "SHED_RC_OPENCODE_PORT=4096", true},
+		// Port == 0 (allocation failed/non-fatal): no SHED_RC_OPENCODE_PORT, but the
+		// password override still appears — opencode's embedded server always runs
+		// regardless of whether a port was allocated.
+		{"port zero", base, "", true},
+		// Non-opencode kind: neither key appears, even with a nonzero Port.
+		{"non-opencode kind", nonOC, "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			args, err := BuildEnvArgs(c.meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.wantPortEnv != "" {
+				if !slices.Contains(args, c.wantPortEnv) {
+					t.Errorf("args = %v, want %s", args, c.wantPortEnv)
+				}
+			} else {
+				for _, a := range args {
+					if strings.HasPrefix(a, "SHED_RC_OPENCODE_PORT=") {
+						t.Errorf("args = %v, want no SHED_RC_OPENCODE_PORT", args)
+					}
+				}
+			}
+			if got := slices.Contains(args, "OPENCODE_SERVER_PASSWORD="); got != c.wantPassword {
+				t.Errorf("OPENCODE_SERVER_PASSWORD= present = %v, want %v (args=%v)", got, c.wantPassword, args)
+			}
+		})
 	}
 }
 

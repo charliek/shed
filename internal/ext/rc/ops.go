@@ -121,6 +121,18 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 	}
 
 	name := TmuxName(slug)
+	// opencode-only: allocate a per-session loopback port BEFORE Metadata is built, so
+	// BuildEnvArgs below can stamp it into the session env for the hub's opencode
+	// watcher to read back later (opencodePortEnv, watch.go), and so it's available to
+	// pass into InnerCommand. A failed allocation is non-fatal — port stays 0, the
+	// session is created and usable exactly as before, just not watchable over SSE
+	// (opencodePortEnv reads it back as absent/invalid and the watcher never attaches).
+	port := 0
+	if opts.Kind == KindOpencode {
+		if p, perr := freeLoopbackPort(); perr == nil {
+			port = p
+		}
+	}
 	meta := Metadata{
 		ID:          uuid.NewString(),
 		DisplayName: displayName,
@@ -129,6 +141,7 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		CreatedBy:   createdBy,
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		Target:      opts.Target,
+		Port:        port,
 	}
 	envArgs, err := BuildEnvArgs(meta)
 	if err != nil {
@@ -142,7 +155,7 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		_ = spec.Preseed(workdir, env)
 	}
 
-	inner := InnerCommand(opts.Kind, displayName, opts.PermissionMode, opts.InteractiveShell)
+	inner := InnerCommand(opts.Kind, displayName, opts.PermissionMode, opts.InteractiveShell, port)
 	res := createSession(r, name, workdir, envArgs, inner)
 	if res.Code != 0 {
 		if isDuplicateSession(res.Stderr) {

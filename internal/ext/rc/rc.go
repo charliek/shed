@@ -124,6 +124,16 @@ const (
 	// exactly instead of re-running the cwd+window heuristic. It rides the SHED_RC_
 	// prefix so parseEnv/showEnvironment already surface it.
 	envAgentSession = "SHED_RC_AGENT_SESSION"
+	// envOpencodePort is the create-time, opencode-only key recording the per-session
+	// loopback port opencode's embedded HTTP/SSE server listens on (allocated by
+	// freeLoopbackPort, netutil.go, and passed through InnerCommand as `--port`). It
+	// IS part of the create-time BuildEnvArgs set (stamped once, alongside envKind
+	// etc.) — the hub's opencode watcher reads it back via opencodePortEnv (watch.go)
+	// to know which loopback port to connect its SSE/REST client to. Additive (a
+	// pre-upgrade session simply lacks it — see the design doc's "pre-upgrade
+	// sessions" note) and rides the SHED_RC_ prefix so parseEnv/showEnvironment
+	// already surface it like every other key here.
+	envOpencodePort = "SHED_RC_OPENCODE_PORT"
 	envPrefix       = "SHED_RC_"
 )
 
@@ -313,13 +323,18 @@ func validatePermissionMode(kind Kind, mode string) error {
 // `session_*` URL (so the pane classifier treats it identically). With no mode,
 // claude-rc keeps the original `/rc` form for backward compatibility.
 //
+// port is opencode's allocated loopback SSE/HTTP server port (0 = none); only
+// KindOpencode consumes it (innerCommandTUI appends `--port <port> --hostname
+// 127.0.0.1`, wrap-correctly ahead of any `bash -ic` wrap). Every other kind ignores
+// it. See freeLoopbackPort (netutil.go) and Create (ops.go) for where it's allocated.
+//
 // An unregistered kind falls back to `bash -l`.
-func InnerCommand(kind Kind, displayName, permissionMode string, interactiveShell bool) string {
+func InnerCommand(kind Kind, displayName, permissionMode string, interactiveShell bool, port int) string {
 	spec, ok := specForKind(kind)
 	if !ok {
 		return "bash -l"
 	}
-	return spec.InnerCommand(kind, displayName, permissionMode, interactiveShell)
+	return spec.InnerCommand(kind, displayName, permissionMode, interactiveShell, port)
 }
 
 var (

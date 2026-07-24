@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -137,6 +140,382 @@ func TestClaudeFoldNoMidTurnFlap(t *testing.T) {
 	}
 }
 
+// ---- opencode fold: the sanitized live /event capture folds to the expected arc ----
+
+// opencodeFeedRow is one expected drained feed row (only the fields the tests assert).
+type opencodeFeedRow struct {
+	role, typ  string
+	textPrefix string // Text must have this prefix ("" = don't check)
+	toolName   string // Tool.Name must equal this ("" = don't check / not a tool row)
+	detailHas  string // Tool.Detail must contain this substring ("" = don't check)
+}
+
+func TestOpencodeFoldFixtureArc(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+
+	// Before any confirming (activity-relevant) event the verdict is unknown.
+	if got := f.activity(); got != ActivityUnknown {
+		t.Fatalf("initial activity = %q, want unknown", got)
+	}
+
+	sawWorking := false
+	for _, ln := range lines {
+		f.applyLine(ln)
+		if f.activity() == ActivityWorking {
+			sawWorking = true
+		}
+	}
+	if !sawWorking {
+		t.Error("expected a working verdict during the turn")
+	}
+	// The arc ends at session.idle → needs_input, settled, with the final answer.
+	if got := f.activity(); got != ActivityNeedsInput {
+		t.Fatalf("final activity = %q, want needs_input", got)
+	}
+	if !f.settled() {
+		t.Error("final verdict should be settled")
+	}
+	if got := f.lastMessage(); got != "3 .txt files." {
+		t.Fatalf("last_message = %q, want %q", got, "3 .txt files.")
+	}
+
+	// The feed is the normalized turn: user prompt → reasoning → tool_use → tool_result
+	// → assistant answer, in that order.
+	want := []opencodeFeedRow{
+		{role: feedRoleUser, typ: feedTypeText, textPrefix: "Use the bash tool"},
+		{role: feedRoleAssistant, typ: feedTypeReasoning, textPrefix: "The user wants"},
+		{role: feedRoleTool, typ: feedTypeToolUse, toolName: "bash", detailHas: "ls"},
+		{role: feedRoleTool, typ: feedTypeToolResult, toolName: "bash", detailHas: "a.txt"},
+		{role: feedRoleAssistant, typ: feedTypeText, textPrefix: "3 .txt files."},
+	}
+	got := f.drainMessages()
+	assertOpencodeRows(t, got, want)
+
+	// Every row carried a source time, so every TS is non-empty and chronological
+	// (RFC3339 sorts lexicographically in time order; equal-second rows are allowed).
+	prev := ""
+	for i, m := range got {
+		if m.TS == "" {
+			t.Errorf("row %d (%s/%s) has an empty TS, want a source-derived time", i, m.Role, m.Type)
+		}
+		if m.TS < prev {
+			t.Errorf("row %d TS %q is before the previous row's %q (not chronological)", i, m.TS, prev)
+		}
+		prev = m.TS
+	}
+}
+
+func assertOpencodeRows(t *testing.T, got []feedMessage, want []opencodeFeedRow) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("drained %d rows, want %d:\n got=%s", len(got), len(want), formatOpencodeRows(got))
+	}
+	for i, w := range want {
+		m := got[i]
+		if m.Role != w.role || m.Type != w.typ {
+			t.Errorf("row %d = (%s/%s), want (%s/%s)", i, m.Role, m.Type, w.role, w.typ)
+		}
+		if w.textPrefix != "" && !strings.HasPrefix(m.Text, w.textPrefix) {
+			t.Errorf("row %d text = %q, want prefix %q", i, m.Text, w.textPrefix)
+		}
+		if w.toolName != "" {
+			if m.Tool == nil || m.Tool.Name != w.toolName {
+				t.Errorf("row %d tool = %+v, want name %q", i, m.Tool, w.toolName)
+			}
+		}
+		if w.detailHas != "" {
+			if m.Tool == nil || !strings.Contains(m.Tool.Detail, w.detailHas) {
+				t.Errorf("row %d tool detail = %+v, want substring %q", i, m.Tool, w.detailHas)
+			}
+		}
+	}
+}
+
+func formatOpencodeRows(rows []feedMessage) string {
+	var b strings.Builder
+	for _, m := range rows {
+		fmt.Fprintf(&b, "  %s/%s text=%q tool=%+v\n", m.Role, m.Type, m.Text, m.Tool)
+	}
+	return b.String()
+}
+
+// A reconnect re-seeds the same history WITHOUT resetting the fold; the partID/callID
+// dedup must make the second fold of the identical arc emit ZERO new rows.
+func TestOpencodeFoldReseedIdempotent(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 5 {
+		t.Fatalf("first drain = %d rows, want 5", len(got))
+	}
+	// Feed the SAME fixture again (a reconnect reseed — NO reset()).
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("reseed drain = %d rows, want 0 (dedup by partID/callID):\n%s", len(got), formatOpencodeRows(got))
+	}
+	// Activity is still the settled end-state after the reseed.
+	if got := f.activity(); got != ActivityNeedsInput {
+		t.Fatalf("post-reseed activity = %q, want needs_input", got)
+	}
+}
+
+// An assistant text part that gets two non-empty snapshots (partial then full, only the
+// full carrying part.time.end) emits exactly ONE row with the COMPLETE text.
+func TestOpencodeFoldMultiSnapshot(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"msgX","role":"assistant","time":{"created":1784613627000}}}}`))
+	// Partial snapshot: non-empty but no time.end → cached, not emitted.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"prtX","messageID":"msgX","type":"text","text":"3 .txt","time":{"start":1784613627679}}},"time":1784613627679}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("partial (no time.end) drained %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+	// Full snapshot with time.end → emit the complete text once.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"prtX","messageID":"msgX","type":"text","text":"3 .txt files.","time":{"start":1784613627679,"end":1784613627681}}},"time":1784613627681}`))
+	got := f.drainMessages()
+	if len(got) != 1 {
+		t.Fatalf("full snapshot drained %d rows, want 1:\n%s", len(got), formatOpencodeRows(got))
+	}
+	if got[0].Role != feedRoleAssistant || got[0].Type != feedTypeText || got[0].Text != "3 .txt files." {
+		t.Fatalf("row = (%s/%s,%q), want (assistant/text,\"3 .txt files.\")", got[0].Role, got[0].Type, got[0].Text)
+	}
+	if got[0].TS == "" {
+		t.Error("row TS should be the part's time.end, not empty")
+	}
+}
+
+// permission.asked is a display-only status feed row: it emits one system/status row and
+// does NOT change the activity verdict (which stays whatever session.status last said).
+func TestOpencodeFoldPermissionStatusRow(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+	if got := f.activity(); got != ActivityWorking {
+		t.Fatalf("after busy = %q, want working", got)
+	}
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["rm -rf /tmp/x","ls"]}}`))
+	// Activity is unaffected by the permission ask.
+	if got := f.activity(); got != ActivityWorking {
+		t.Fatalf("after permission.asked = %q, want working (unaffected)", got)
+	}
+	got := f.drainMessages()
+	if len(got) != 1 {
+		t.Fatalf("drained %d rows, want 1:\n%s", len(got), formatOpencodeRows(got))
+	}
+	m := got[0]
+	if m.Role != feedRoleSystem || m.Type != feedTypeStatus {
+		t.Fatalf("row = (%s/%s), want (system/status)", m.Role, m.Type)
+	}
+	if !strings.Contains(m.Text, "awaiting approval: bash") || !strings.Contains(m.Text, "rm -rf /tmp/x") {
+		t.Fatalf("status text = %q, want it to name the permission + patterns", m.Text)
+	}
+}
+
+// noteGap clears the pending-tool set but MUST keep the emitted-part dedup set, so a
+// reseed after a gap still emits no duplicate rows.
+func TestOpencodeFoldNoteGapKeepsDedup(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 5 {
+		t.Fatalf("first drain = %d rows, want 5", len(got))
+	}
+	f.noteGap()
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("post-gap reseed drain = %d rows, want 0 (dedup survives a gap):\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// ---- opencode fold: correctness edge cases (tolerant parsing / no fabricated rows) ----
+
+// Fix 1: a permission.asked with NO id keys its dedup slot on the row's content, so a
+// reseed replay (which also carries no id) emits exactly one status row, not one per replay.
+func TestOpencodeFoldStatusRowDedupNoID(t *testing.T) {
+	f := newOpencodeFold()
+	line := []byte(`{"type":"permission.asked","properties":{"sessionID":"s","permission":"bash","patterns":["ls"]}}`)
+	f.applyLine(line)
+	f.applyLine(line) // reseed replay of the identical, id-less ask
+	got := f.drainMessages()
+	if len(got) != 1 {
+		t.Fatalf("id-less permission.asked replayed twice emitted %d rows, want 1 (content-keyed dedup):\n%s", len(got), formatOpencodeRows(got))
+	}
+	if got[0].Role != feedRoleSystem || got[0].Type != feedTypeStatus {
+		t.Fatalf("row = (%s/%s), want (system/status)", got[0].Role, got[0].Type)
+	}
+}
+
+// Fix 2: a tool part whose state.status is unrecognized is tolerantly ignored — it must not
+// confirm activity, touch the pending set, or emit.
+func TestOpencodeFoldUnknownToolStateIgnored(t *testing.T) {
+	f := newOpencodeFold()
+	line := []byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"tool","tool":"bash","callID":"c1","state":{"status":"bogus","input":{"command":"ls"}}}},"time":1784613621168}`)
+	if f.applyLine(line) {
+		t.Fatal("an unrecognized tool state must not advance state (applyLine=false)")
+	}
+	if got := f.activity(); got != ActivityUnknown {
+		t.Fatalf("activity after unknown tool state = %q, want unknown (no confirm)", got)
+	}
+	if len(f.pending) != 0 {
+		t.Fatalf("unknown tool state mutated the pending set: %v", f.pending)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("unknown tool state emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// Fix 3: a synthetic/ignored snapshot for a partID that was cached as a normal partial must
+// DROP the cached partial so message-completion can never flush the stale text.
+func TestOpencodeFoldSyntheticSnapshotDropsCachedPartial(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000}}}}`))
+	// A normal partial (non-empty, no time.end) → cached, not emitted.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"text","text":"stale partial","time":{"start":1784613627679}}},"time":1784613627679}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("partial (no time.end) drained %d rows, want 0", len(got))
+	}
+	// A later SYNTHETIC snapshot for the SAME partID must drop the cached partial.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"text","text":"stale partial","synthetic":true,"time":{"start":1784613627679}}},"time":1784613627680}`))
+	// The message completes — the dropped partial must NOT be flushed.
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000,"completed":1784613627684}}}}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("a synthetic snapshot must drop the cached partial; got %d rows:\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// Fix 4: permission.asked / question.asked with absent/empty content must not emit a
+// fabricated row, and must report applyLine=false.
+func TestOpencodeFoldEmptyAskNoRow(t *testing.T) {
+	cases := []struct {
+		name string
+		line []byte
+	}{
+		{"permission.asked with no permission kind", []byte(`{"type":"permission.asked","properties":{"sessionID":"s"}}`)},
+		{"question.asked with no questions", []byte(`{"type":"question.asked","properties":{"sessionID":"s"}}`)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newOpencodeFold()
+			if f.applyLine(c.line) {
+				t.Fatalf("%s must return false", c.name)
+			}
+			if got := f.drainMessages(); len(got) != 0 {
+				t.Fatalf("%s emitted %d rows, want 0:\n%s", c.name, len(got), formatOpencodeRows(got))
+			}
+		})
+	}
+}
+
+// Fix 5: a text part owned by a message whose role is neither user nor assistant must not be
+// emitted (the feed contract carries only user/assistant/tool/system roles).
+func TestOpencodeFoldUnknownMessageRoleNotEmitted(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"bogus","time":{"created":1784613627000}}}}`))
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"text","text":"should not emit","time":{"start":1784613627679,"end":1784613627681}}},"time":1784613627681}`))
+	f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"bogus","time":{"created":1784613627000,"completed":1784613627684}}}}`))
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("a part owned by a non-user/assistant message must not emit; got %d rows:\n%s", len(got), formatOpencodeRows(got))
+	}
+}
+
+// Fix 6: a text part with an id but NO messageID can never be role-resolved, so it must not
+// be cached (and applyLine reports false).
+func TestOpencodeFoldOwnerlessPartNotCached(t *testing.T) {
+	f := newOpencodeFold()
+	line := []byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","type":"text","text":"orphan","time":{"start":1784613627679,"end":1784613627681}}},"time":1784613627681}`)
+	if f.applyLine(line) {
+		t.Fatal("a part with no messageID must return false (never role-resolvable)")
+	}
+	if len(f.parts) != 0 || len(f.partOrder) != 0 {
+		t.Fatalf("ownerless part was cached: parts=%d partOrder=%d", len(f.parts), len(f.partOrder))
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("ownerless part emitted %d rows, want 0", len(got))
+	}
+}
+
+// Fix 7: replaying already-emitted snapshots on a reseed must not re-cache them — partOrder
+// (and the parts map) must stay bounded rather than growing on every reconnect.
+func TestOpencodeFoldReseedDoesNotGrowCache(t *testing.T) {
+	lines := readJSONL(t, "testdata/jsonl/opencode_turn.jsonl")
+	f := newOpencodeFold()
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	f.drainMessages()
+	orderAfterFirst := len(f.partOrder)
+	partsAfterFirst := len(f.parts)
+	if orderAfterFirst == 0 {
+		t.Fatal("precondition: the first fold should have appended text/reasoning parts to partOrder")
+	}
+	// Reseed the identical history (a reconnect replay — no reset()).
+	for _, ln := range lines {
+		f.applyLine(ln)
+	}
+	if got := f.drainMessages(); len(got) != 0 {
+		t.Fatalf("reseed emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+	}
+	if len(f.partOrder) != orderAfterFirst {
+		t.Fatalf("reseed grew partOrder from %d to %d (already-emitted parts were re-cached)", orderAfterFirst, len(f.partOrder))
+	}
+	if len(f.parts) != partsAfterFirst {
+		t.Fatalf("reseed grew the parts cache from %d to %d", partsAfterFirst, len(f.parts))
+	}
+}
+
+// Fix 8: an epoch-millis value that would expand to a year outside RFC3339's range yields ""
+// (the ring stamps it), never a non-RFC3339 expanded-year string.
+func TestOpencodeTSOutOfRange(t *testing.T) {
+	cases := []struct {
+		name      string
+		ms        int64
+		wantEmpty bool
+	}{
+		{"year out of RFC3339 range", 1 << 62, true},
+		{"zero", 0, true},
+		{"negative", -5, true},
+		// A normal in-range value still converts.
+		{"normal in-range value", 1784613627681, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := opencodeTS(c.ms)
+			if c.wantEmpty && got != "" {
+				t.Fatalf("opencodeTS(%d) = %q, want \"\"", c.ms, got)
+			}
+			if !c.wantEmpty && got == "" {
+				t.Fatalf("opencodeTS(%d) must convert, got empty", c.ms)
+			}
+		})
+	}
+}
+
+// Fix 9: a message.updated that changes nothing meaningful (a repeat, or an id-only frame)
+// must return false — feed-tracking that did not advance is not an event.
+func TestOpencodeFoldNoOpMessageUpdatedReturnsFalse(t *testing.T) {
+	f := newOpencodeFold()
+	// First sighting with a role advances state.
+	if !f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000}}}}`)) {
+		t.Fatal("first message.updated (new role) should advance state")
+	}
+	// Re-emitting the same info (nothing new) must NOT advance state.
+	if f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m1","role":"assistant","time":{"created":1784613627000}}}}`)) {
+		t.Fatal("a repeated message.updated (nothing new) must return false")
+	}
+	// An id-only frame (no role, no times) is likewise not activity-relevant.
+	if f.applyLine([]byte(`{"type":"message.updated","properties":{"sessionID":"s","info":{"id":"m2"}}}`)) {
+		t.Fatal("an id-only message.updated must return false")
+	}
+}
+
 // ---- tolerance: malformed / unknown / partial lines never break the fold ----
 
 func TestFoldsToleratePathologicalLines(t *testing.T) {
@@ -146,6 +525,7 @@ func TestFoldsToleratePathologicalLines(t *testing.T) {
 	}{
 		{"codex", newCodexFold()},
 		{"claude", newClaudeFold()},
+		{"opencode", newOpencodeFold()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bad := [][]byte{
@@ -574,6 +954,33 @@ func TestBackWriteAgentSessionRoundTrip(t *testing.T) {
 	backWriteAgentSession(r, "rc-x", "bad\nvalue")
 	if got := agentSessionEnv(r, "rc-x"); got != "sess-123" {
 		t.Fatalf("control-char id should be rejected, env = %q", got)
+	}
+}
+
+func TestOpencodePortEnv(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string // "" means the key is never set
+		wantOK  bool
+		wantVal int
+	}{
+		{"round-trip", "4096", true, 4096},
+		{"missing", "", false, 0},
+		{"non-numeric", "abc", false, 0},
+		{"zero-out-of-range", "0", false, 0},
+		{"above-max-out-of-range", "70000", false, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &envRecRunner{env: map[string]string{}}
+			if c.raw != "" {
+				r.env[envOpencodePort] = c.raw
+			}
+			gotVal, gotOK := opencodePortEnv(r, "rc-x")
+			if gotOK != c.wantOK || gotVal != c.wantVal {
+				t.Errorf("opencodePortEnv() = (%d, %v), want (%d, %v)", gotVal, gotOK, c.wantVal, c.wantOK)
+			}
+		})
 	}
 }
 
@@ -1013,5 +1420,162 @@ func TestReconcileCodexWatcherOverridesStability(t *testing.T) {
 	h.trackMu.Unlock()
 	if sessions[0].Activity != ActivityNeedsInput || sessions[0].LastMessage != "2+2 equals 4." {
 		t.Fatalf("overlay = %+v", sessions[0])
+	}
+}
+
+// ---- opencode watcher wire-in (C5) ----
+
+// watchableKind must admit opencode (so ensureWatcher's first guard lets it through to
+// the SSE/REST arm) while non-agentic kinds stay stability-only.
+func TestWatchableKindOpencode(t *testing.T) {
+	if !watchableKind(KindOpencode) {
+		t.Fatal("watchableKind(KindOpencode) = false, want true")
+	}
+	if watchableKind(KindShell) {
+		t.Fatal("watchableKind(KindShell) = true, want false (stability only)")
+	}
+}
+
+// A pre-upgrade opencode session (created before the port plumbing shipped, so no
+// SHED_RC_OPENCODE_PORT is stamped) is unwatchable over the SSE transport: ensureWatcher
+// returns no watcher and pane-stability drives its activity.
+func TestReconcileOpencodeNoPortStabilityOnly(t *testing.T) {
+	tm := newHubTmux()
+	env := strings.Join([]string{
+		envV + "=2",
+		envID + "=id-oc-legacy",
+		envKind + "=" + string(KindOpencode),
+		envWorkdir + "=/home/shed",
+		// deliberately NO SHED_RC_OPENCODE_PORT
+	}, "\n") + "\n"
+	tm.set("rc-ocleg1", "opencode\nAsk anything...", env)
+
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(tm, clk)
+
+	h.reconcile()
+
+	h.trackMu.Lock()
+	tr := h.tracked["ocleg1"]
+	h.trackMu.Unlock()
+	if tr == nil {
+		t.Fatal("opencode session not tracked")
+	}
+	if tr.watcher != nil {
+		t.Fatal("a session with no recorded port must get NO watcher (stability only)")
+	}
+	// Pane-stability drives: a ready, just-appeared session reports working on tick 1.
+	if tr.activity != ActivityWorking {
+		t.Fatalf("activity = %q, want working (pane-stability)", tr.activity)
+	}
+}
+
+// End-to-end: a correlated opencode SSE watcher overrides pane stability, populates the
+// message ring, and its discovered session id is back-written into the tmux env. Mirrors
+// TestReconcileCodexWatcherOverridesStability but drives the fake opencode HTTP+SSE server
+// (from watch_opencode_transport_test.go) over the hub's real reconcile loop.
+func TestReconcileOpencodeWatcherOverridesStability(t *testing.T) {
+	f := newFakeOpencode(t)
+	// A fresh session: no candidate list; status reports busy during the turn; the SSE
+	// fixture arc drives the pin (session.created dir-match), the feed, and the activity arc.
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	frames := fixtureFrames(t)
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		for _, fr := range frames {
+			writeSSE(w, flush, fr)
+		}
+		<-ctx.Done() // hold the connection open (no reconnect churn)
+	}
+
+	tm := newHubTmux()
+	// A ready opencode session whose workdir matches the fixture directory (so the SSE
+	// transport pins on the fixture's session.created) and whose recorded port targets the
+	// fake server. The pane classifies ready ("Ask anything...") and — because the hub
+	// clock never advances below — pane-stability can only ever report working (it never
+	// reaches the quiet period), so a needs_input verdict MUST come from the SSE watcher.
+	env := strings.Join([]string{
+		envV + "=2",
+		envID + "=id-oc",
+		envKind + "=" + string(KindOpencode),
+		envWorkdir + "=" + ocFixtureDir,
+		envOpencodePort + "=" + strconv.Itoa(f.port(t)),
+	}, "\n") + "\n"
+	tm.set("rc-oc0001", "opencode\nAsk anything...", env)
+
+	clk := opencodeClock() // fixed instant; never advanced
+	h := newTestHub(tm, clk)
+	// The SSE watcher runs a background goroutine — close every tracked watcher on teardown
+	// (before the fake server's own cleanup, LIFO) so the goroutine exits, no leak.
+	t.Cleanup(func() {
+		h.trackMu.Lock()
+		defer h.trackMu.Unlock()
+		for _, tr := range h.tracked {
+			if tr.watcher != nil {
+				tr.watcher.close()
+			}
+		}
+	})
+
+	// Poll the reconcile loop (real sleeps, frozen clock) until the async SSE watcher has
+	// folded the whole arc: activity settles to needs_input AND the ring holds the 5 rows.
+	var tr *trackedSession
+	var msgs []feedMessage
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h.reconcile()
+		h.trackMu.Lock()
+		tr = h.tracked["oc0001"]
+		h.trackMu.Unlock()
+		if tr != nil {
+			msgs, _ = tr.ring.since(0, 10)
+			if tr.activity == ActivityNeedsInput && len(msgs) >= 5 {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if tr == nil {
+		t.Fatal("opencode session was never tracked")
+	}
+
+	h.trackMu.Lock()
+	activity := tr.activity
+	lastStability := tr.lastStability
+	lastMessage := tr.lastMessage
+	watcher := tr.watcher
+	h.trackMu.Unlock()
+
+	if activity != ActivityNeedsInput {
+		t.Fatalf("activity = %q, want needs_input (SSE watcher override)", activity)
+	}
+	if _, ok := watcher.(*opencodeWatcher); !ok {
+		t.Fatalf("watcher = %T, want *opencodeWatcher", watcher)
+	}
+	// The override is real: pane-stability, with the clock frozen, held working the whole
+	// time — the needs_input verdict came from the watcher, not the anchor/quiet fallback.
+	if lastStability != ActivityWorking {
+		t.Fatalf("lastStability = %q, want working (frozen clock never reaches quiet)", lastStability)
+	}
+	if lastMessage != "3 .txt files." {
+		t.Fatalf("last_message = %q, want %q", lastMessage, "3 .txt files.")
+	}
+
+	// The ring holds the normalized turn in order: user → reasoning → tool_use →
+	// tool_result → assistant.
+	want := []opencodeFeedRow{
+		{role: feedRoleUser, typ: feedTypeText, textPrefix: "Use the bash tool"},
+		{role: feedRoleAssistant, typ: feedTypeReasoning, textPrefix: "The user wants"},
+		{role: feedRoleTool, typ: feedTypeToolUse, toolName: "bash", detailHas: "ls"},
+		{role: feedRoleTool, typ: feedTypeToolResult, toolName: "bash", detailHas: "a.txt"},
+		{role: feedRoleAssistant, typ: feedTypeText, textPrefix: "3 .txt files."},
+	}
+	assertOpencodeRows(t, msgs, want)
+
+	// The SSE-discovered session id was back-written into the tmux env for exact
+	// re-correlation on a hub restart (drainConfirmedAgentID → backWriteAgentSession).
+	wantEnv := envAgentSession + "=" + ocFixtureSID
+	if !slices.Contains(tm.setEnvCalls(), wantEnv) {
+		t.Fatalf("set-environment calls = %v, want one == %q", tm.setEnvCalls(), wantEnv)
 	}
 }

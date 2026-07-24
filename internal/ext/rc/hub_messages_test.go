@@ -307,6 +307,19 @@ func TestMessageRingSinceBeyondTailTruncated(t *testing.T) {
 	}
 }
 
+// inputGatedKind covers exactly codex and opencode — the two kinds whose watcher
+// produces a message feed + accepts POST /input; every other kind stays TUI-only.
+func TestInputGatedKind(t *testing.T) {
+	for _, k := range allKinds {
+		want := k == KindCodex || k == KindOpencode
+		t.Run(string(k), func(t *testing.T) {
+			if got := inputGatedKind(k); got != want {
+				t.Errorf("inputGatedKind(%q) = %v, want %v", k, got, want)
+			}
+		})
+	}
+}
+
 // A closed watcher's refresh is a terminal no-op: it must not reopen the file from
 // offset 0 (full re-read + leaked handle) or refold a dead incarnation's history.
 func TestFileWatcherClosedRefreshNoop(t *testing.T) {
