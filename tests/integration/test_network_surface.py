@@ -18,6 +18,7 @@ import urllib.request
 
 import pytest
 
+from fixtures.devcontrol import skip_mtls_token_semantics
 from fixtures.server import resolve_server_entry
 
 
@@ -38,6 +39,7 @@ def _status(port: int, path: str) -> int | None:
         return None
 
 
+@skip_mtls_token_semantics
 @pytest.mark.vz
 def test_bus_and_connect_on_single_listener(vz_server_dev):
     """The credential bus and the Connect tunnel are served on the single

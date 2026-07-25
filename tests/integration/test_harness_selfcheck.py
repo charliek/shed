@@ -84,6 +84,7 @@ def test_config_ports_safe_rejects_prod_and_nonpositive():
 # --- Live mechanism tests (real dev-server restart) ------------------------
 
 
+@devcontrol.skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_dev_config_roundtrips_override(vz_server_dev):

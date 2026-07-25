@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import SHED_SERVER_BIN, bootstrap_mint, dev_config
+from fixtures.devcontrol import SHED_SERVER_BIN, bootstrap_mint, dev_config, skip_mtls_reconfigure
 from fixtures.server import resolve_server_entry
 from fixtures.tlsclient import fingerprint as _fingerprint
 from fixtures.tlsclient import https_status as _https_status
@@ -84,6 +84,7 @@ def _sans(pem: str) -> str:
         Path(path).unlink(missing_ok=True)
 
 
+@skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_tls_listener_serves_pinnable_cert(vz_server_dev):
@@ -144,6 +145,7 @@ def test_tls_listener_serves_pinnable_cert(vz_server_dev):
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
 
+@skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_tls_client_pin(vz_server_dev):
@@ -178,6 +180,7 @@ def test_tls_client_pin(vz_server_dev):
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
 
+@skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_tls_pin_rotation(vz_server_dev):
@@ -224,6 +227,7 @@ def test_tls_pin_rotation(vz_server_dev):
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
 
+@skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_tls_bus_over_tls_with_token(vz_server_dev):

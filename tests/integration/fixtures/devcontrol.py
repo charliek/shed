@@ -38,6 +38,37 @@ Temp configs live under `~/.shed/dev/`, never the committed configs.
 FC (remote) config mutation is intentionally out of scope here: per the
 plan, config-mutation integration is VZ-only, with FC covered by Go unit
 tests plus a manual pass.
+
+**Auth-mode awareness.** This module (plus `test_mtls.py`) is what a
+config-mutating test actually calls, so it is also the single source of
+truth for `SHED_DEV_AUTH_MODE` detection (`DEV_AUTH_MODE` below) — the
+exact mechanism `test_mtls.py`'s module docstring documents (env var, never
+an unauthenticated `/api/info` probe, which is unreachable once a server is
+actually in mtls). Two ready-made `pytest.mark.skipif` marks are exported
+for tests elsewhere in the suite that structurally cannot run against an
+mtls dev server, expressing the two distinct reasons a test in this suite
+runs into that wall:
+
+  - `skip_mtls_reconfigure` — the test calls `dev_config()` (or otherwise
+    depends on the dev server running the *committed* base config) to set
+    up a scenario unrelated to bearer tokens (TLS pinning, SSH allowlist
+    mechanics, the `dev_config()` round-trip itself). Under
+    `SHED_DEV_AUTH_MODE=mtls` the running server executes a *generated*
+    config (`~/.shed/dev/server.mtls-generated.yaml`, produced by
+    `scripts/render-dev-mtls-config.sh` at `dev-server-up`/`-restart`
+    time) instead — `dev_config()` refuses to touch it (see the guard at
+    the top of `dev_config()` below) rather than silently clobbering the
+    live mtls server other work may depend on.
+  - `skip_mtls_token_semantics` — the test's actual assertions are about
+    bearer-credential semantics (scoped HTTP tokens, TTL expiry,
+    allowlist-gated minting, the open-mode single-plain-listener shape)
+    that don't exist under mtls at all: the mtls client authenticates with
+    a short-lived certificate, never a bearer token (see
+    `internal/servertls/ca.go`, `internal/config/server.go`).
+
+Both marks are inert (no-ops) when `SHED_DEV_AUTH_MODE` is unset or
+`"token"` (today's default) — see `docs/development/testing.md` and
+`tests/integration/README.md` for the full token-vs-mtls run split.
 """
 
 from __future__ import annotations
@@ -56,6 +87,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
+import pytest
 import yaml
 
 from .server import resolve_server_entry
@@ -75,6 +107,44 @@ KNOWN_HOSTS_PATH = Path.home() / ".shed" / "known_hosts"
 # configs/server.dev-parallel.mac.yaml: offset 18080/12222).
 PROD_HTTP_PORT = 8080
 PROD_SSH_PORT = 2222
+
+# ----------------------------------------------------------------------------
+# Auth-mode detection (single source of truth — see the module docstring's
+# "Auth-mode awareness" section). Matches test_mtls.py's own module-level
+# read of the same env var exactly; both must agree on what "mtls mode" means.
+# ----------------------------------------------------------------------------
+
+DEV_AUTH_MODE = os.environ.get("SHED_DEV_AUTH_MODE", "token")
+
+_MTLS_RECONFIGURE_REASON = (
+    f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r}: this test calls dev_config() (or an "
+    "equivalent dev-server-config-mutating helper) to set up a scenario "
+    "unrelated to bearer tokens. Under SHED_DEV_AUTH_MODE=mtls the running "
+    "dev server executes a GENERATED config "
+    "(~/.shed/dev/server.mtls-generated.yaml, produced by "
+    "scripts/render-dev-mtls-config.sh), not the committed base config "
+    "dev_config() merges onto and restores — reconfiguring would silently "
+    "flip the live mtls server other work may depend on. Run this test only "
+    "with SHED_DEV_AUTH_MODE=token (the default)."
+)
+
+skip_mtls_reconfigure = pytest.mark.skipif(
+    DEV_AUTH_MODE == "mtls", reason=_MTLS_RECONFIGURE_REASON
+)
+
+_MTLS_TOKEN_SEMANTICS_REASON = (
+    f"SHED_DEV_AUTH_MODE={DEV_AUTH_MODE!r}: this test asserts bearer-token/"
+    "token-mode semantics (scoped HTTP tokens, TTL expiry, allowlist-gated "
+    "minting, the open-mode single-plain-listener shape, ...) that do not "
+    "hold under mtls — the mtls client authenticates with a short-lived "
+    "certificate, never a bearer token (see internal/servertls/ca.go, "
+    "internal/config/server.go). Run this test only with "
+    "SHED_DEV_AUTH_MODE=token (the default)."
+)
+
+skip_mtls_token_semantics = pytest.mark.skipif(
+    DEV_AUTH_MODE == "mtls", reason=_MTLS_TOKEN_SEMANTICS_REASON
+)
 
 
 @dataclass
@@ -279,7 +349,23 @@ def dev_config(
     `_assert_config_ports_safe` (the merged config's ports), so it can
     only ever restart a `*-dev` server on offset ports. Pass `server`
     from the `vz_server_dev` fixture's `.name`.
+
+    Raises (does not skip) when `SHED_DEV_AUTH_MODE=mtls`: this is a
+    defense-in-depth rail, not the primary mechanism — callers should
+    prefer skipping up front via `skip_mtls_reconfigure` (see the module
+    docstring) so a test never even attempts the restart under mtls. This
+    guard exists for any caller that doesn't.
     """
+    if DEV_AUTH_MODE == "mtls":
+        raise RuntimeError(
+            f"refusing to reconfigure {server!r}: SHED_DEV_AUTH_MODE=mtls means "
+            f"it is running a GENERATED config "
+            f"(~/.shed/dev/server.mtls-generated.yaml, produced by "
+            f"scripts/render-dev-mtls-config.sh), not the committed base config "
+            f"{DEV_BASE_CONFIG} that dev_config() merges onto and restores; "
+            f"tests that reconfigure the dev server must skip under mtls "
+            f"(see fixtures.devcontrol.skip_mtls_reconfigure)"
+        )
     assert_dev_target(server)
     merged = _merge_config(overrides)
     _assert_config_ports_safe(merged)

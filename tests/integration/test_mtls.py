@@ -64,10 +64,14 @@ from typing import Optional
 import pytest
 import yaml
 
-from fixtures.devcontrol import KNOWN_HOSTS_PATH, REPO_ROOT
+from fixtures.devcontrol import DEV_AUTH_MODE, KNOWN_HOSTS_PATH, REPO_ROOT
 from fixtures.server import resolve_server_entry
 
-SHED_DEV_AUTH_MODE = os.environ.get("SHED_DEV_AUTH_MODE", "token")
+# Single source of truth for SHED_DEV_AUTH_MODE detection lives in
+# fixtures/devcontrol.py (DEV_AUTH_MODE) — imported here so this module and
+# every mtls-aware skip elsewhere in the suite (skip_mtls_reconfigure /
+# skip_mtls_token_semantics) can never disagree about what "mtls mode" means.
+SHED_DEV_AUTH_MODE = DEV_AUTH_MODE
 
 pytestmark = pytest.mark.skipif(
     SHED_DEV_AUTH_MODE != "mtls",

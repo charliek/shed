@@ -21,7 +21,12 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import bootstrap_mint, dev_config, run_preflight
+from fixtures.devcontrol import (
+    bootstrap_mint,
+    dev_config,
+    run_preflight,
+    skip_mtls_token_semantics,
+)
 from fixtures.tlsclient import https_status, server_cert_pem
 
 # Secure mode is TLS-only; pin the explicitly-set https_port (the port-safety
@@ -29,6 +34,7 @@ from fixtures.tlsclient import https_status, server_cert_pem
 HTTPS_PORT = 18443
 
 
+@skip_mtls_token_semantics
 @pytest.mark.vz
 @pytest.mark.slow
 def test_cred_bus_forged_respond_dropped(vz_server_dev):

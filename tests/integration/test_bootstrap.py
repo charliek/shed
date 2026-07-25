@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import bootstrap_mint, dev_config
+from fixtures.devcontrol import bootstrap_mint, dev_config, skip_mtls_token_semantics
 from fixtures.server import resolve_server_entry
 
 KNOWN_HOSTS = Path.home() / ".shed" / "known_hosts"
@@ -55,6 +55,7 @@ def _bootstrap_with_key(ssh_port: int, key_path: Path, scope: str = "control") -
     return subprocess.run(args, capture_output=True, text=True, timeout=20)
 
 
+@skip_mtls_token_semantics
 @pytest.mark.vz
 @pytest.mark.slow
 def test_bootstrap_mint_is_allowlist_gated(vz_server_dev):

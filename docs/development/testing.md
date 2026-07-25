@@ -260,6 +260,45 @@ ever read the already-running dev server. Gated behind
 SHED_MTLS_FLIP_TEST=1 SHED_DEV_AUTH_MODE=mtls make test-integration-dev
 ```
 
+**The full suite (`make test-integration-dev[-fc]` with no
+`SHED_DEV_AUTH_MODE` override) is a TOKEN-mode regression run.** Nearly
+every module outside `test_mtls.py` assumes the dev server's token-mode
+invariants — bearer tokens exist, a plain-HTTP listener exists where
+expected, `dev_config()`'s config-mutation round-trip works against the
+committed base config — and doesn't read `SHED_DEV_AUTH_MODE` at all.
+Running the suite against a server actually in `mtls` mode therefore mixes
+two incompatible postures on purpose only in the sense that it's meant to
+degrade gracefully: a documented set of tests **skip cleanly** instead of
+failing, via two shared `pytest.mark.skipif` marks exported from
+`tests/integration/fixtures/devcontrol.py`:
+
+- `skip_mtls_reconfigure` — the test mutates the dev server's config via
+  `dev_config()`/`bootstrap_mint()` for a scenario unrelated to bearer
+  tokens (TLS pinning, SSH allowlist mechanics, the `dev_config()`
+  round-trip test itself). Under mtls the server runs a *generated* config
+  (`~/.shed/dev/server.mtls-generated.yaml`) rather than the committed base
+  `dev_config()` expects, so reconfiguring would silently knock the live
+  server out of mtls — `dev_config()` itself raises `RuntimeError` if
+  called under mtls as a defense-in-depth rail, but the mark is what
+  actually keeps the test from calling it in the first place.
+- `skip_mtls_token_semantics` — the test's assertions are inherently about
+  bearer-credential behavior (scoped HTTP tokens, TTL expiry,
+  allowlist-gated minting, the open-mode single-plain-listener shape) that
+  mtls mode has no equivalent of (short-lived client certs instead).
+
+Guarded tests: `test_tls.py` (all four live tests), `test_ssh_auth.py`
+(both), `test_harness_selfcheck.py::test_dev_config_roundtrips_override`,
+`test_token_ttl.py::test_token_ttl_expiry`,
+`test_http_auth.py::test_secure_mode_enforces_scoped_tokens`,
+`test_bootstrap.py::test_bootstrap_mint_is_allowlist_gated`,
+`test_cred_bus.py::test_cred_bus_forged_respond_dropped`, and
+`test_network_surface.py::test_bus_and_connect_on_single_listener`. Running
+`SHED_DEV_AUTH_MODE=mtls make test-integration-dev[-fc]` is thus **not** a
+second full regression pass — it runs `test_mtls.py` plus whatever else in
+the suite is mode-independent, with the tests above skipping by design; the
+two-config choreography above (run once in each mode) is what gets full
+coverage.
+
 #### Validating pre-release: build-tools image changes
 
 The parallel dev server uses `SHED_BUILD_TOOLS_REF` to pick which
