@@ -247,13 +247,15 @@ type ServerInfo struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 	SSHPort int    `json:"ssh_port"`
-	// HTTPPort is the plain-HTTP port (open mode). Omitted in secure mode, which
+	// HTTPPort is the plain-HTTP port (open mode). Omitted in token mode, which
 	// serves no plain HTTP — clients use the HTTPS endpoint there.
 	HTTPPort int    `json:"http_port,omitempty"`
 	Backend  string `json:"backend"`
-	// AuthMode is the server's auth.mode ("secure" or "open"), so `shed server
-	// add` knows whether to bootstrap an HTTP token over SSH. Reported on the
-	// unauthenticated /api/info — the mode is observable from behavior anyway.
+	// AuthMode is the server's auth.mode ("token" or "open"; the deprecated
+	// "secure" spelling is normalized to "token" before this is ever set), so
+	// `shed server add` knows whether to bootstrap an HTTP token over SSH.
+	// Reported on the unauthenticated /api/info — the mode is observable from
+	// behavior anyway.
 	AuthMode string `json:"auth_mode,omitempty"`
 	// DefaultImage is the resolved default_image for the active backend
 	// (after ${shed.version} expansion / version synthesis at load). Exposed
@@ -261,9 +263,9 @@ type ServerInfo struct {
 	// use — useful when the ref is synthesized and never written in config.
 	DefaultImage string `json:"default_image,omitempty"`
 
-	// HTTPSPort is the pinned-TLS listener port in secure mode (auth.mode:
-	// secure), so a client adding a secure server can learn the TLS endpoint.
-	// 0/omitted in open mode (no HTTPS listener).
+	// HTTPSPort is the pinned-TLS listener port in token mode (auth.mode:
+	// token), so a client adding a token-mode server can learn the TLS
+	// endpoint. 0/omitted in open mode (no HTTPS listener).
 	HTTPSPort int `json:"https_port,omitempty"`
 
 	// Features advertises server capability tokens (e.g. "overview",
@@ -735,19 +737,24 @@ const (
 )
 
 // Auth modes for AuthConfig.Mode — the binary secure-by-default switch.
+// "secure" is the pre-rename spelling of AuthModeToken, kept as a deprecated
+// alias that config load normalizes to AuthModeToken (see normalizeAuthMode
+// in server.go) — downstream code only ever observes AuthModeToken.
 const (
-	AuthModeOpen   = "open"   // default: no enforcement (tailnet/LAN posture)
-	AuthModeSecure = "secure" // SSH allowlist + HTTP tokens + TLS, all enforced
+	AuthModeOpen  = "open"  // default: no enforcement (tailnet/LAN posture)
+	AuthModeToken = "token" // SSH allowlist + HTTP tokens + TLS, all enforced
 )
 
 // AuthConfig configures authentication. The headline control is Mode (the
-// binary open|secure switch). The SSH sub-block carries key sources and the
+// binary open|token switch). The SSH sub-block carries key sources and the
 // advanced SSH mode override. HTTP bearer-token enforcement is derived purely
-// from secure mode — there is no HTTP sub-block.
+// from token mode — there is no HTTP sub-block.
 type AuthConfig struct {
-	// Mode is open | secure (default open). secure derives: SSH allowlist
-	// enforce, HTTP bearer-token enforce, and TLS on (the server serves the
-	// TLS listener only); it requires at least one SSH key source.
+	// Mode is open | token (default open; the deprecated "secure" spelling is
+	// normalized to "token" at config load, with one startup deprecation
+	// warning). token derives: SSH allowlist enforce, HTTP bearer-token
+	// enforce, and TLS on (the server serves the TLS listener only); it
+	// requires at least one SSH key source.
 	Mode string `yaml:"mode,omitempty"`
 	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`

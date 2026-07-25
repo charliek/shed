@@ -303,7 +303,7 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	}
 }
 
-// tunnelTokenSource returns a self-refreshing token source for a secure tunnel,
+// tunnelTokenSource returns a self-refreshing token source for a token-mode tunnel,
 // seeded from the client's freshly-minted token+expiry (post ensureRunningShed).
 // It re-mints over SSH but NEVER persists to config: a background daemon may run
 // for days, and writing its stale in-memory config back would clobber unrelated

@@ -234,7 +234,7 @@ func confirmTLSCert(fingerprint, expected string, trustOnFirstUse, interactive, 
 
 // defaultAddHTTPSPort is the TLS port `shed server add` falls back to — and the
 // port `--secure` bootstraps against — when no --https-port is given. It mirrors
-// the server's secure-mode default; kept as a var so tests can point the
+// the server's token-mode default; kept as a var so tests can point the
 // fallback at a test server.
 var defaultAddHTTPSPort = 8443
 
@@ -272,9 +272,9 @@ func bootstrapTLSClient(host string, httpsPort int) (client *APIClient, apiURL, 
 //
 //   - --https-port N  → pinned TLS on N.
 //   - --secure        → pinned TLS on the default secure port.
-//   - (default)       → try plain HTTP; if it is refused (a TLS-only secure
-//     server serves no plain-HTTP listener), auto-retry pinned TLS on the
-//     default secure port before giving up.
+//   - (default)       → try plain HTTP; if it is refused (a TLS-only
+//     token-mode server serves no plain-HTTP listener), auto-retry pinned TLS
+//     on the default secure port before giving up.
 func selectAddTransport(host string) (client *APIClient, apiURL, fingerprint string, info *config.ServerInfo, err error) {
 	switch {
 	case serverAddHTTPSPort > 0:
@@ -295,8 +295,8 @@ func selectAddTransport(host string) (client *APIClient, apiURL, fingerprint str
 		if !isUnreachableErr(perr) {
 			return nil, "", "", nil, fmt.Errorf("failed to get server info over plain HTTP: %w", perr)
 		}
-		// Plain HTTP is unreachable — likely a TLS-only secure server. Auto-retry
-		// pinned TLS on the default secure port before surfacing an error.
+		// Plain HTTP is unreachable — likely a TLS-only token-mode server.
+		// Auto-retry pinned TLS on the default secure port before surfacing an error.
 		if !jsonFlag {
 			fmt.Fprintf(os.Stderr, "Plain HTTP on %s:%d is unreachable; trying secure TLS on :%d...\n", host, serverAddPort, defaultAddHTTPSPort)
 		}
@@ -344,12 +344,12 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to save SSH host key: %w", err)
 	}
 
-	// Secure servers mint a short-TTL control token over the now-pinned SSH
+	// Token-mode servers mint a short-TTL control token over the now-pinned SSH
 	// channel, so there is no manual token to paste. The host key is pinned just
 	// above, so the bootstrap ssh runs under StrictHostKeyChecking=yes.
 	var controlToken string
 	var controlTokenExpiresAt time.Time
-	if info.AuthMode == config.AuthModeSecure {
+	if info.AuthMode == config.AuthModeToken {
 		bundle, err := bootstrapServer(host, info.SSHPort, "control", "cli")
 		if err != nil {
 			return fmt.Errorf("bootstrap control token from %s: %w", host, err)
@@ -376,7 +376,7 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		SSHPort:               info.SSHPort,
 		APIURL:                apiURL,         // empty for the plain-HTTP path
 		TLSCertFingerprint:    tlsFingerprint, // empty for the plain-HTTP path
-		ControlToken:          controlToken,   // bootstrap-minted in secure mode
+		ControlToken:          controlToken,   // bootstrap-minted in token mode
 		ControlTokenExpiresAt: controlTokenExpiresAt,
 	}
 	if err := clientConfig.AddServer(name, entry); err != nil {
@@ -417,7 +417,7 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		printSuccess("Added server %s (%s:%d)", name, host, info.HTTPPort)
 	}
 	if controlToken != "" {
-		fmt.Println("  Bootstrapped a control token over SSH (secure mode)")
+		fmt.Println("  Bootstrapped a control token over SSH (token mode)")
 	}
 	if clientConfig.DefaultServer == name {
 		fmt.Println("  Set as default server")

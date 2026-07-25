@@ -7,7 +7,7 @@ import (
 	"github.com/charliek/shed/internal/authtoken"
 )
 
-// authMiddleware enforces bearer-token auth in secure mode (auth.mode: secure).
+// authMiddleware enforces bearer-token auth in token mode (auth.mode: token).
 // In open mode (the default) it is a pass-through, so existing deployments are
 // unaffected.
 //

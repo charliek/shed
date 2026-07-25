@@ -10,7 +10,7 @@ import (
 )
 
 // TestHandleGetInfo_HTTPSPort verifies GET /api/info reports https_port only
-// when a TLS listener is configured (secure mode), and omits it otherwise so a
+// when a TLS listener is configured (token mode), and omits it otherwise so a
 // client that predates the field (v0.7.1) decodes a zero value without error.
 func TestHandleGetInfo_HTTPSPort(t *testing.T) {
 	tests := []struct {
@@ -19,7 +19,7 @@ func TestHandleGetInfo_HTTPSPort(t *testing.T) {
 		wantField bool
 		wantValue int
 	}{
-		{name: "secure reports https_port", httpsPort: 8443, wantField: true, wantValue: 8443},
+		{name: "token mode reports https_port", httpsPort: 8443, wantField: true, wantValue: 8443},
 		{name: "open omits https_port", httpsPort: 0, wantField: false, wantValue: 0},
 	}
 

@@ -41,11 +41,11 @@ type ServerConfig struct {
 	// default. Set a routable address (a LAN/tailnet IP, "0.0.0.0"/"*" for all
 	// IPv4, or "::" for all interfaces) to reach it off-box. In open mode that
 	// also requires AllowInsecureExposure, since open mode has no transport
-	// security; secure mode (TLS + tokens) needs no acknowledgment.
+	// security; token mode (TLS + tokens) needs no acknowledgment.
 	BindAddress string `yaml:"bind_address,omitempty"`
 	// AllowInsecureExposure acknowledges binding an open-mode (plaintext,
 	// possibly unauthenticated) server to a non-loopback interface. Required to
-	// start such a server; ignored in secure mode. Prefer auth.mode: secure.
+	// start such a server; ignored in token mode. Prefer auth.mode: token.
 	AllowInsecureExposure bool `yaml:"allow_insecure_exposure,omitempty"`
 	// TrustedProxy enables chi's RealIP middleware, which trusts the
 	// client-supplied X-Forwarded-For. Only safe behind a proxy that
@@ -121,25 +121,25 @@ func (c *ServerConfig) SSHAuth() *SSHAuthConfig {
 // auth.token_ttl is unset.
 const DefaultTokenTTL = 24 * time.Hour
 
-// Secure reports whether the server runs in secure mode (auth.mode: secure):
+// TokenMode reports whether the server runs in token mode (auth.mode: token):
 // SSH allowlist enforce + HTTP bearer-token enforce + TLS-only (no plain HTTP
 // listener faces clients). The default (open) preserves the legacy accept-all
 // tailnet/LAN posture.
-func (c *ServerConfig) Secure() bool {
-	return c.Auth != nil && c.Auth.Mode == AuthModeSecure
+func (c *ServerConfig) TokenMode() bool {
+	return c.Auth != nil && c.Auth.Mode == AuthModeToken
 }
 
 // HTTPAuthEnforced reports whether the HTTP API requires a bearer token. HTTP
-// token enforcement is derived purely from secure mode: enforced iff secure.
+// token enforcement is derived purely from token mode: enforced iff token mode.
 func (c *ServerConfig) HTTPAuthEnforced() bool {
-	return c.Secure()
+	return c.TokenMode()
 }
 
 // EffectiveSSHAuth returns the SSH auth config to build the allowlist from. In
-// secure mode the mode is forced to enforce (key sources still come from the
+// token mode the mode is forced to enforce (key sources still come from the
 // configured auth.ssh block); otherwise the configured block is used verbatim.
 func (c *ServerConfig) EffectiveSSHAuth() *SSHAuthConfig {
-	if !c.Secure() {
+	if !c.TokenMode() {
 		return c.SSHAuth()
 	}
 	eff := SSHAuthConfig{}
@@ -164,12 +164,12 @@ func (c *ServerConfig) TokenTTL() time.Duration {
 func (c *ServerConfig) validateAuth() error {
 	if c.Auth != nil {
 		switch c.Auth.Mode {
-		case "", AuthModeOpen, AuthModeSecure:
+		case "", AuthModeOpen, AuthModeToken:
 		default:
-			return fmt.Errorf("invalid auth.mode: %q (must be open or secure)", c.Auth.Mode)
+			return fmt.Errorf("invalid auth.mode: %q (must be open or token)", c.Auth.Mode)
 		}
 	}
-	secure := c.Secure()
+	tokenMode := c.TokenMode()
 	if ssh := c.SSHAuth(); ssh != nil {
 		switch ssh.Mode {
 		case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
@@ -184,38 +184,38 @@ func (c *ServerConfig) validateAuth() error {
 				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
 			}
 		}
-		// tokens ⟺ TLS ⟺ secure: SSH enforce is the secure-mode posture. An
+		// tokens ⟺ TLS ⟺ token mode: SSH enforce is the token-mode posture. An
 		// explicit enforce on an open-mode server is rejected (warn stages an
-		// allowlist on a trusted network); secure forces enforce itself, so an
-		// explicit off/warn under secure contradicts the mode. An unset ssh.Mode
-		// under secure stays valid (EffectiveSSHAuth derives enforce).
-		if ssh.Mode == SSHAuthEnforce && !secure {
-			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: secure (use warn to stage an allowlist on a trusted network)")
+		// allowlist on a trusted network); token mode forces enforce itself, so an
+		// explicit off/warn under token mode contradicts the mode. An unset
+		// ssh.Mode under token mode stays valid (EffectiveSSHAuth derives enforce).
+		if ssh.Mode == SSHAuthEnforce && !tokenMode {
+			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: token (use warn to stage an allowlist on a trusted network)")
 		}
-		if secure && (ssh.Mode == SSHAuthOff || ssh.Mode == SSHAuthWarn) {
-			return fmt.Errorf("auth.mode: secure forces auth.ssh.mode: enforce; remove the explicit auth.ssh.mode: %s", ssh.Mode)
+		if tokenMode && (ssh.Mode == SSHAuthOff || ssh.Mode == SSHAuthWarn) {
+			return fmt.Errorf("auth.mode: token forces auth.ssh.mode: enforce; remove the explicit auth.ssh.mode: %s", ssh.Mode)
 		}
 	}
-	// https_port is a secure-mode-only surface: an open-mode server serves plain
+	// https_port is a token-mode-only surface: an open-mode server serves plain
 	// http only. Checked outside the ssh block so it fires even when auth.ssh is
 	// unset.
-	if c.HTTPSPort > 0 && !secure {
-		return fmt.Errorf("https_port requires auth.mode: secure (an open-mode server serves plain http only)")
+	if c.HTTPSPort > 0 && !tokenMode {
+		return fmt.Errorf("https_port requires auth.mode: token (an open-mode server serves plain http only)")
 	}
 	return nil
 }
 
 // HTTPListenAddr returns the bind address for the plain-HTTP listener, honoring
 // bind_address (default loopback). The plain-HTTP listener is served only in
-// open mode (see PlainHTTPEnabled); secure mode is TLS-only and starts no
+// open mode (see PlainHTTPEnabled); token mode is TLS-only and starts no
 // plain-HTTP listener, so this is not consulted there.
 func (c *ServerConfig) HTTPListenAddr() string {
 	return listenAddr(c.BindAddress, c.HTTPPort)
 }
 
 // PlainHTTPEnabled reports whether the main plain-HTTP listener should be
-// served. False in secure mode (TLS-only; the plain listener is not started).
-func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.Secure() }
+// served. False in token mode (TLS-only; the plain listener is not started).
+func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.TokenMode() }
 
 // HTTPSEnabled reports whether the HTTPS listener is configured.
 func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
@@ -232,17 +232,17 @@ func (c *ServerConfig) HTTPSListenAddr() string {
 // SSHListenAddr returns the bind address for the SSH listener.
 func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.BindAddress, c.SSHPort) }
 
-// PreflightSecure gates secure-mode startup: it refuses to start when
-// auth.mode: secure is set without any SSH key source (github_users /
-// authorized_keys / authorized_keys_file). Secure mode enforces the SSH
+// PreflightAuth gates token-mode startup: it refuses to start when
+// auth.mode: token is set without any SSH key source (github_users /
+// authorized_keys / authorized_keys_file). Token mode enforces the SSH
 // allowlist, so an empty allowlist would lock everyone out. Inert in open mode.
-func (c *ServerConfig) PreflightSecure() error {
-	if !c.Secure() {
+func (c *ServerConfig) PreflightAuth() error {
+	if !c.TokenMode() {
 		return nil
 	}
 	ssh := c.SSHAuth()
 	if ssh == nil || (len(ssh.GitHubUsers) == 0 && len(ssh.AuthorizedKeys) == 0 && ssh.AuthorizedKeysFile == "") {
-		return errors.New("auth.mode: secure requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)")
+		return errors.New("auth.mode: token requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)")
 	}
 	return nil
 }
@@ -294,11 +294,11 @@ func (c *ServerConfig) validateNetworkSurface() error {
 }
 
 // validateHTTPPort range-checks http_port: required (1..65535) in open mode,
-// where it drives the plain-HTTP listener; optional (0 = unset) in secure mode,
+// where it drives the plain-HTTP listener; optional (0 = unset) in token mode,
 // which serves no plain HTTP. Shared by Validate and ValidateNoHostCoupling.
 func (c *ServerConfig) validateHTTPPort() error {
 	minPort := 1
-	if c.Secure() {
+	if c.TokenMode() {
 		minPort = 0
 	}
 	if c.HTTPPort < minPort || c.HTTPPort > 65535 {
@@ -313,16 +313,16 @@ func (c *ServerConfig) validateHTTPPort() error {
 // a hostname or typo is rejected here rather than failing cryptically at
 // net.Listen on startup. Open mode has no transport security, so binding a
 // routable interface also requires an explicit allow_insecure_exposure
-// acknowledgment; secure mode (TLS + tokens) needs none. Shared by Validate and
+// acknowledgment; token mode (TLS + tokens) needs none. Shared by Validate and
 // ValidateNoHostCoupling.
 func (c *ServerConfig) validateBindAddress() error {
 	if b := c.BindAddress; b != "" && b != "*" && b != "localhost" && net.ParseIP(b) == nil {
 		return fmt.Errorf("invalid bind_address %q (want an IP address, \"0.0.0.0\"/\"*\" for all IPv4, \"::\" for all interfaces, \"localhost\", or empty for loopback)", b)
 	}
-	if c.Secure() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
+	if c.TokenMode() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
 		return nil
 	}
-	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: secure", c.BindAddress)
+	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: token", c.BindAddress)
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -1355,25 +1355,25 @@ func rejectRemovedAuthKeys(data []byte) error {
 	}
 	if _, present := raw["public_exposure"]; present {
 		return fmt.Errorf("config key %q was removed; use %q instead (see docs/upgrades/v0.7.0-to-v0.7.1.md)",
-			"public_exposure", "auth.mode: secure")
+			"public_exposure", "auth.mode: token")
 	}
 	auth, ok := raw["auth"].(map[string]any)
 	if !ok {
 		return nil
 	}
 	// The entire auth.http subtree was removed: HTTP token enforcement is now
-	// derived from auth.mode: secure (the auth.http.mode knob is gone), and
+	// derived from auth.mode: token (the auth.http.mode knob is gone), and
 	// tokens are minted over the SSH bootstrap channel (auth.http.tokens is
 	// gone). Reject the block wholesale, with a tokens-specific hint when present.
 	if httpBlock, present := auth["http"]; present {
 		if hb, ok := httpBlock.(map[string]any); ok {
 			if _, hasTokens := hb["tokens"]; hasTokens {
 				return fmt.Errorf("config key %q was removed; tokens are now minted over the SSH bootstrap channel under %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
-					"auth.http.tokens", "auth.mode: secure")
+					"auth.http.tokens", "auth.mode: token")
 			}
 		}
 		return fmt.Errorf("config key %q was removed; HTTP token enforcement is now derived from %q (see docs/upgrades/v0.7.1-to-v0.7.2.md)",
-			"auth.http", "auth.mode: secure")
+			"auth.http", "auth.mode: token")
 	}
 	return nil
 }
@@ -1388,7 +1388,7 @@ func rejectRemovedNetworkKeys(data []byte) error {
 		return nil // malformed YAML — let the typed unmarshal surface the parse error
 	}
 	if _, present := raw["internal_http_port"]; present {
-		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in secure mode), gated by the credentials scope (see docs/upgrades/v0.7.3-to-v0.7.4.md)",
+		return fmt.Errorf("config key %q was removed in v0.7.4; the credential bus and Connect tunnel now ride the single listener (pinned TLS in token mode), gated by the credentials scope (see docs/upgrades/v0.7.3-to-v0.7.4.md)",
 			"internal_http_port")
 	}
 	for _, removed := range []string{"http_bind", "ssh_bind"} {
@@ -1437,18 +1437,18 @@ func rejectRemovedKeys(data []byte) error {
 
 // applyModeAndCommonDefaults fills in the mode-derived and common zero-value
 // defaults shared by both loaders (serve + config-validate), so the two paths
-// can't drift. http_port drives the open-mode plain-HTTP listener; secure mode
+// can't drift. http_port drives the open-mode plain-HTTP listener; token mode
 // serves no plain HTTP, so any value there is dropped (set or constructor
 // default) and /api/info + the written client entry omit a vestigial port.
-// Secure mode also defaults https_port so `auth.mode: secure` needs no extra
+// Token mode also defaults https_port so `auth.mode: token` needs no extra
 // TLS config.
 func applyModeAndCommonDefaults(cfg *ServerConfig) {
-	if cfg.Secure() {
+	if cfg.TokenMode() {
 		cfg.HTTPPort = 0
 	} else if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
 	}
-	if cfg.Secure() && cfg.HTTPSPort == 0 {
+	if cfg.TokenMode() && cfg.HTTPSPort == 0 {
 		cfg.HTTPSPort = 8443
 	}
 	if cfg.SSHPort == 0 {
@@ -1459,6 +1459,46 @@ func applyModeAndCommonDefaults(cfg *ServerConfig) {
 	}
 	if cfg.Terminal == nil {
 		cfg.Terminal = terminal.DefaultConfig()
+	}
+}
+
+// authModeSecureAlias is the deprecated pre-rename spelling of AuthModeToken,
+// accepted indefinitely for backward compatibility and normalized away at
+// config load time (see normalizeAuthMode).
+const authModeSecureAlias = "secure"
+
+// authModeDeprecationWarning is the single startup line emitted when a config
+// still spells the mode "secure" — printed exactly once per config load.
+const authModeDeprecationWarning = `auth.mode: "secure" is deprecated; use "token"`
+
+// normalizeAuthModeValue maps the deprecated "secure" auth.mode spelling to
+// the canonical "token", reporting whether the legacy alias was used. Any
+// other value — "", the canonical "token", or an invalid string — passes
+// through unchanged; validateAuth rejects an invalid value later. Pure
+// (no I/O) so it can be unit-tested directly; normalizeAuthMode wraps it with
+// the actual warning emission.
+func normalizeAuthModeValue(mode string) (normalized string, isLegacyAlias bool) {
+	if mode == authModeSecureAlias {
+		return AuthModeToken, true
+	}
+	return mode, false
+}
+
+// normalizeAuthMode rewrites cfg.Auth.Mode from the deprecated "secure"
+// spelling to the canonical "token", emitting exactly one startup deprecation
+// warning line when the legacy alias was used. Must run before
+// applyModeAndCommonDefaults and validateAuth — both key off cfg.Auth.Mode —
+// so every downstream reader (TokenMode, HTTPAuthEnforced, PreflightAuth, the
+// /api/info handler, ...) only ever observes "" or the canonical "token".
+// Shared by both server-config loaders so they can't drift.
+func normalizeAuthMode(cfg *ServerConfig) {
+	if cfg.Auth == nil {
+		return
+	}
+	mode, deprecated := normalizeAuthModeValue(cfg.Auth.Mode)
+	cfg.Auth.Mode = mode
+	if deprecated {
+		fmt.Fprintln(os.Stderr, authModeDeprecationWarning)
 	}
 }
 
@@ -1503,6 +1543,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	}
 
 	normalizeMounts(cfg, configPath)
+	normalizeAuthMode(cfg)
 
 	applyModeAndCommonDefaults(cfg)
 
@@ -1647,6 +1688,7 @@ func loadServerConfigForCLI(path string) (*ServerConfig, error) {
 	}
 
 	normalizeMounts(cfg, configPath)
+	normalizeAuthMode(cfg)
 
 	applyModeAndCommonDefaults(cfg)
 

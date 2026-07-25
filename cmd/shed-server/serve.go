@@ -96,11 +96,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Secure-mode preflight: refuse to start `auth.mode: secure` without an SSH
+	// Token-mode preflight: refuse to start `auth.mode: token` without an SSH
 	// key source (an empty enforced allowlist would lock everyone out). Runs
 	// before anything binds; inert in open mode.
-	if err := cfg.PreflightSecure(); err != nil {
-		return fmt.Errorf("secure-mode preflight: %w", err)
+	if err := cfg.PreflightAuth(); err != nil {
+		return fmt.Errorf("token-mode preflight: %w", err)
 	}
 
 	log.Printf("Starting shed-server...")
@@ -282,9 +282,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// resolved addresses separately below.
 	if cfg.BindAddress == "" {
 		if cfg.PlainHTTPEnabled() {
-			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: secure.")
+			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: token.")
 		} else {
-			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this secure server off-box.")
+			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this token-mode server off-box.")
 		}
 	}
 
@@ -292,7 +292,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// listeners share this single handler.
 	publicHandler := apiServer.Router()
 
-	// Plain-HTTP listener. In secure mode it is not started — only the pinned-TLS
+	// Plain-HTTP listener. In token mode it is not started — only the pinned-TLS
 	// (https_port) listener faces clients (TLS-only).
 	var httpServer *http.Server
 	if cfg.PlainHTTPEnabled() {
@@ -331,7 +331,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH).
 	errChan := make(chan error, 3)
 
-	// Start HTTP server in goroutine (skipped in secure mode — TLS-only)
+	// Start HTTP server in goroutine (skipped in token mode — TLS-only)
 	if httpServer != nil {
 		go func() {
 			log.Printf("HTTP server listening on %s", httpServer.Addr)
@@ -378,7 +378,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// Shutdown HTTP server (when serving — skipped in secure mode)
+	// Shutdown HTTP server (when serving — skipped in token mode)
 	if httpServer != nil {
 		log.Printf("Shutting down HTTP server...")
 		if err := httpServer.Shutdown(ctx); err != nil {

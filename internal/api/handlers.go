@@ -23,8 +23,8 @@ import (
 // GET /api/info
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	authMode := config.AuthModeOpen
-	if s.cfg.Secure() {
-		authMode = config.AuthModeSecure
+	if s.cfg.TokenMode() {
+		authMode = config.AuthModeToken
 	}
 	info := config.ServerInfo{
 		Name:         s.cfg.Name,

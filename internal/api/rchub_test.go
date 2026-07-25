@@ -175,10 +175,10 @@ func TestRCProxy_AllowlistRouting(t *testing.T) {
 
 // TestRCProxy_StripsCredentialHeaders pins the proxy's inbound-header allowlist:
 // the guest hub must NEVER receive the client's Authorization (the control-scope
-// bearer token in secure mode) or Cookie headers — a guest that saw them could
+// bearer token in token mode) or Cookie headers — a guest that saw them could
 // replay the token against the server API — while allowlisted headers
 // (Content-Type) still pass. Asserted on both the GET and POST proxied paths, in
-// secure mode so a real bearer token is on the inbound request.
+// token mode so a real bearer token is on the inbound request.
 func TestRCProxy_StripsCredentialHeaders(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[string]http.Header{} // method+path → headers the fake hub received
@@ -190,7 +190,7 @@ func TestRCProxy_StripsCredentialHeaders(t *testing.T) {
 		},
 	})
 	be := &rcFakeBackend{dialFn: dialTo(addr)}
-	srv, control, _ := newSecureRCServer(t, be)
+	srv, control, _ := newTokenModeRCServer(t, be)
 
 	do := func(method, path, body string) {
 		t.Helper()
@@ -242,7 +242,7 @@ func TestRCProxy_StripsCredentialHeaders(t *testing.T) {
 func TestRCProxy_Scope(t *testing.T) {
 	addr := startFakeHub(t, hubMuxOpts{})
 	be := &rcFakeBackend{dialFn: dialTo(addr)}
-	srv, control, credentials := newSecureRCServer(t, be)
+	srv, control, credentials := newTokenModeRCServer(t, be)
 
 	call := func(token string) int {
 		r := httptest.NewRequest(http.MethodGet, "/api/sheds/proj/rc/v1/sessions", nil)

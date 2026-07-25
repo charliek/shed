@@ -10,11 +10,11 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// authTestServer builds a server whose HTTP auth enforcement matches secure
-// (secure mode enforces bearer tokens; open mode is pass-through). Its token
+// authTestServer builds a server whose HTTP auth enforcement matches tokenMode
+// (token mode enforces bearer tokens; open mode is pass-through). Its token
 // store holds one control and one credentials token, returned as plaintext for
 // the table to exercise.
-func authTestServer(t *testing.T, secure bool) (s *Server, control, credentials string) {
+func authTestServer(t *testing.T, tokenMode bool) (s *Server, control, credentials string) {
 	t.Helper()
 	store := authtoken.NewStore()
 	control, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
@@ -26,8 +26,8 @@ func authTestServer(t *testing.T, secure bool) (s *Server, control, credentials 
 		t.Fatalf("mint credentials: %v", err)
 	}
 	mode := config.AuthModeOpen
-	if secure {
-		mode = config.AuthModeSecure
+	if tokenMode {
+		mode = config.AuthModeToken
 	}
 	s = &Server{
 		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{Mode: mode}},
@@ -120,7 +120,7 @@ func TestAuthMiddlewareExpiredToken(t *testing.T) {
 	}
 	time.Sleep(time.Millisecond)
 	s := &Server{
-		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeSecure}},
+		cfg:    &config.ServerConfig{Auth: &config.AuthConfig{Mode: config.AuthModeToken}},
 		tokens: store,
 	}
 	if got := doAuth(s, "GET", "/api/sheds", tok); got != 401 {

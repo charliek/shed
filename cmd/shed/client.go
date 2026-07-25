@@ -29,7 +29,7 @@ type APIClient struct {
 	httpClient    *http.Client
 	transport     http.RoundTripper // non-nil when TLS-pinned; shared by every client below
 	createTimeout time.Duration
-	// tokens holds the bearer token and, in secure mode, transparently re-mints
+	// tokens holds the bearer token and, in token mode, transparently re-mints
 	// it (proactively near expiry, reactively on a 401). Static for open servers,
 	// plain-HTTP clients, and legacy fixed tokens. Never nil.
 	tokens *clienttoken.Source

@@ -23,7 +23,7 @@ type Server struct {
 	bridge      *plugin.Bridge
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
-	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in secure mode (auth.mode: secure)
+	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in token mode (auth.mode: token)
 	rcCaps      *rcCapsCache             // per-shed rc capabilities cache (session enrichment + overview)
 	// rcCapsFlight dedupes concurrent capability probes per shed across requests
 	// (singleflight keyed by shed name), so M concurrent overview requests —

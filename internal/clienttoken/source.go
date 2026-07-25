@@ -1,5 +1,5 @@
 // Package clienttoken holds a bearer token that transparently re-mints itself,
-// shared by every shed client that talks to a secure-mode shed-server: the CLI
+// shared by every shed client that talks to a token-mode shed-server: the CLI
 // API client and the tunnel Connect client. A Source pairs the current token
 // with its expiry and an injected refresh callback (the actual SSH mint +
 // optional persist lives in the caller, keeping this package a dependency-free

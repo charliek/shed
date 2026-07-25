@@ -57,8 +57,8 @@ func TestListenAddrHelpers(t *testing.T) {
 
 func TestValidateBindAddress(t *testing.T) {
 	// Open mode requires allow_insecure_exposure to bind a non-loopback
-	// interface; secure mode (TLS + tokens) needs no acknowledgment.
-	secure := &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
+	// interface; token mode (TLS + tokens) needs no acknowledgment.
+	tokenAuth := &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
 	tests := []struct {
 		name    string
 		cfg     ServerConfig
@@ -74,14 +74,14 @@ func TestValidateBindAddress(t *testing.T) {
 		{"open tailnet ip without ack rejected", ServerConfig{BindAddress: "100.64.0.1"}, true},
 		{"open 0.0.0.0 with ack ok", ServerConfig{BindAddress: "0.0.0.0", AllowInsecureExposure: true}, false},
 		{"open tailnet ip with ack ok", ServerConfig{BindAddress: "100.64.0.1", AllowInsecureExposure: true}, false},
-		{"secure 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: secure}, false},
-		{"secure tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: secure}, false},
+		{"token mode 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: tokenAuth}, false},
+		{"token mode tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: tokenAuth}, false},
 		// Format validation runs before the mode/ack gate, so a malformed bind is
 		// rejected in every mode (it would otherwise fail cryptically at net.Listen).
 		{"malformed ip rejected", ServerConfig{BindAddress: "127.0.0.l"}, true},
 		{"hostname rejected", ServerConfig{BindAddress: "box.example"}, true},
 		{"over-long ipv4 rejected", ServerConfig{BindAddress: "0.0.0.0.0"}, true},
-		{"malformed rejected even in secure", ServerConfig{BindAddress: "nope", Auth: secure}, true},
+		{"malformed rejected even in token mode", ServerConfig{BindAddress: "nope", Auth: tokenAuth}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -125,7 +125,8 @@ func TestRejectRemovedAuthKeys(t *testing.T) {
 		yaml string
 		want string // substring the error must contain; "" means expect no error
 	}{
-		{"clean secure config ok", "name: x\nauth:\n  mode: secure\n", ""},
+		{"clean token config ok", "name: x\nauth:\n  mode: token\n", ""},
+		{"clean deprecated secure-alias config ok", "name: x\nauth:\n  mode: secure\n", ""},
 		{"open config ok", "name: x\nauth:\n  mode: open\n", ""},
 		{"no auth block ok", "name: x\n", ""},
 		{"public_exposure rejected", "name: x\npublic_exposure: true\n", "public_exposure"},
@@ -195,14 +196,14 @@ func TestValidateAuth(t *testing.T) {
 		{"empty ssh mode defaults ok", &AuthConfig{SSH: &SSHAuthConfig{}}, ""},
 		{"ssh off ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthOff}}, ""},
 		{"ssh warn ok", &AuthConfig{SSH: &SSHAuthConfig{Mode: SSHAuthWarn}}, ""},
-		{"secure + ssh enforce ok", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
+		{"token + ssh enforce ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
 		{"invalid ssh mode rejected", &AuthConfig{SSH: &SSHAuthConfig{Mode: "enfore"}}, "auth.ssh.mode"},
-		{"negative max_auth_tries rejected", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: -1}}, "max_auth_tries"},
-		{"zero max_auth_tries ok", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: 0}}, ""},
-		{"valid github user ok", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
-		{"malformed github user rejected", &AuthConfig{Mode: AuthModeSecure, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
+		{"negative max_auth_tries rejected", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: -1}}, "max_auth_tries"},
+		{"zero max_auth_tries ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, MaxAuthTries: 0}}, ""},
+		{"valid github user ok", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"charliek"}}}, ""},
+		{"malformed github user rejected", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
 		{"invalid auth.mode rejected", &AuthConfig{Mode: "secur"}, "auth.mode"},
-		{"secure auth.mode ok", &AuthConfig{Mode: AuthModeSecure}, ""},
+		{"token auth.mode ok", &AuthConfig{Mode: AuthModeToken}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

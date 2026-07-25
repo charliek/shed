@@ -20,7 +20,7 @@ func infoHandler() http.Handler {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(config.ServerInfo{
-			Name: "test-server", HTTPPort: 8080, SSHPort: 2222, Backend: "vz", AuthMode: "secure",
+			Name: "test-server", HTTPPort: 8080, SSHPort: 2222, Backend: "vz", AuthMode: config.AuthModeToken,
 		})
 	})
 }
