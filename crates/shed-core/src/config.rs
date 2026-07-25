@@ -3,8 +3,9 @@
 //! `ShedConfig` (`Sources/ShedKit/Models/ShedConfig.swift`): a deliberately tiny
 //! indentation-aware reader scoped to the machine-generated shape
 //! (`servers: {NAME: {host, http_port, ssh_port, control_token, api_url,
-//! tls_cert_fingerprint}}` + `default_server`), so neither client takes on a YAML
-//! dependency. The GTK client (M2) reads secure/token-gated Linux hosts through
+//! tls_cert_fingerprint, auth_mode, client_cert_file, client_key_file,
+//! client_cert_expires_at}}` + `default_server`), so neither client takes on a
+//! YAML dependency. The GTK client (M2) reads secure/token-gated Linux hosts through
 //! this, so it carries **all** per-server fields — not just host/ports.
 //!
 //! A cross-language parity test (`fixtures/config_sample.yaml`) pins this parser
@@ -13,7 +14,12 @@
 //! now; see `docs/enhancements.md`).
 
 /// One server entry from `~/.shed/config.yaml`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Default` is derived for construction convenience in tests and callers that
+/// build a partial entry (`..Default::default()`); it is NOT the parser's default
+/// entry — [`ShedConfig::parse`] applies the real per-field fallbacks (host =
+/// server name, http_port 8080, ssh_port 22).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShedServerEntry {
     pub name: String,
     pub host: String,
@@ -25,6 +31,27 @@ pub struct ShedServerEntry {
     pub api_url: String,
     /// Pinned TLS cert fingerprint (`sha256:<hex>`, lowercased); empty for plain HTTP.
     pub tls_cert_fingerprint: String,
+    /// The credential shape the server issued at the last bootstrap: `"token"` or
+    /// `"mtls"` (Go `config.ServerEntry.AuthMode`).
+    ///
+    /// **ABSENT MEANS TOKEN.** Every entry written before client-certificate
+    /// support has no `auth_mode` key and every one of those is a token/open
+    /// server, so an empty value must never be read as "unknown, go find out". It
+    /// is a CACHE of what the server last said, not a setting — a bootstrap that
+    /// comes back in the other mode rewrites it, which is what lets an operator
+    /// flip a server's `auth.mode` without re-adding every client. Kept as the raw
+    /// string (rather than an enum) because this parser's job is to reproduce the
+    /// file; interpretation is [`crate::token::AuthMode::from_wire`]'s.
+    pub auth_mode: String,
+    /// Path to this entry's client certificate (mtls only). A PATH, not inline
+    /// PEM: the key beside it must live in a 0600 file of its own, not inside a
+    /// config users hand-edit, copy between machines, and paste into issues.
+    pub client_cert_file: String,
+    /// Path to the private key matching [`Self::client_cert_file`].
+    pub client_key_file: String,
+    /// RFC3339 expiry of the certificate, cached so the proactive re-enrollment
+    /// check costs no file read. The certificate itself remains the authority.
+    pub client_cert_expires_at: String,
 }
 
 /// The resolved control-plane endpoint + TLS pin for a server entry.
@@ -35,6 +62,56 @@ pub struct ResolvedEndpoint {
 }
 
 impl ShedServerEntry {
+    /// The credential shape this entry last saw the server issue (absent ⇒
+    /// [`crate::token::AuthMode::Token`]).
+    pub fn auth_mode(&self) -> crate::token::AuthMode {
+        crate::token::AuthMode::from_wire(Some(&self.auth_mode))
+    }
+
+    /// Is this entry's control plane HTTPS — which, for a shed-server, means the
+    /// server enforces auth (token or mtls)? Open mode serves plain HTTP and has
+    /// no HTTPS listener at all, so this is the one durable signal in a stored
+    /// entry that separates "wants a credential" from "wants nothing".
+    ///
+    /// Either marker alone is enough (Go parity, `ServerEntry.UsesTLS`): an entry
+    /// is user-editable, and a half-filled one still points at a listener that
+    /// will demand a credential.
+    pub fn uses_tls(&self) -> bool {
+        !self.tls_cert_fingerprint.is_empty() || self.api_url.to_lowercase().starts_with("https://")
+    }
+
+    /// Does this entry hold NOTHING it could present to a server that demands a
+    /// credential, while having enough information (host + ssh port) to obtain one
+    /// over the `_bootstrap` SSH channel?
+    ///
+    /// The Go rule verbatim (`ServerEntry.NeedsEnrollment`, fix `4553cc8`), because
+    /// "no credential recorded" is ambiguous in a stored entry and the two readings
+    /// need opposite handling:
+    ///
+    ///   * an OPEN server legitimately has none, and must never pay an SSH
+    ///     round-trip to discover that — it is plain HTTP, so `uses_tls` is false;
+    ///   * a SECURE server's entry that LOST its credential fields must enroll.
+    ///     That is routine during an upgrade, not a corner case: a pre-mtls client
+    ///     that loads and re-saves `config.yaml` silently drops every key its own
+    ///     struct does not know (`auth_mode`, `client_cert_file`,
+    ///     `client_key_file`, `client_cert_expires_at`), leaving exactly this
+    ///     shape. Without enrollment such an entry fails FOREVER: the client holds
+    ///     no credential to be rejected, so it never reaches its reactive re-mint.
+    ///
+    /// A legacy static token (a `control_token` with no expiry) is NOT this case —
+    /// it has something to present and is deliberately never re-minted.
+    pub fn needs_enrollment(&self) -> bool {
+        if !self.uses_tls() || self.host.is_empty() || self.ssh_port == 0 {
+            return false;
+        }
+        match self.auth_mode() {
+            crate::token::AuthMode::Mtls => {
+                self.client_cert_file.is_empty() || self.client_key_file.is_empty()
+            }
+            crate::token::AuthMode::Token => self.control_token.is_empty(),
+        }
+    }
+
     /// Resolve the control-plane endpoint the client should dial: the https
     /// `api_url` (with its pinned cert) when it's a valid http(s) URL with a
     /// host, else plain `http://host:http_port`. Mirrors Swift's
@@ -117,6 +194,16 @@ impl ShedConfig {
                     tls_cert_fingerprint: scalar("tls_cert_fingerprint")
                         .unwrap_or("")
                         .to_lowercase(),
+                    // Lower-cased like the pin: the writer always emits the
+                    // canonical literal, and a hand-edited `MTLS` should mean what
+                    // it obviously means rather than silently falling back to
+                    // token mode.
+                    auth_mode: scalar("auth_mode").unwrap_or("").to_lowercase(),
+                    client_cert_file: scalar("client_cert_file").unwrap_or("").to_string(),
+                    client_key_file: scalar("client_key_file").unwrap_or("").to_string(),
+                    client_cert_expires_at: scalar("client_cert_expires_at")
+                        .unwrap_or("")
+                        .to_string(),
                 });
             }
         }
@@ -322,9 +409,9 @@ default_server: ghost
             host: "localhost".into(),
             http_port: 8080,
             ssh_port: 2222,
-            control_token: String::new(),
             api_url: "https://localhost:8443".into(),
             tls_cert_fingerprint: "sha256:abc".into(),
+            ..Default::default()
         };
         let r = e.resolved_endpoint();
         assert_eq!(r.base_url, "https://localhost:8443");
@@ -338,9 +425,7 @@ default_server: ghost
             host: "mini2".into(),
             http_port: 8080,
             ssh_port: 2222,
-            control_token: String::new(),
-            api_url: String::new(),
-            tls_cert_fingerprint: String::new(),
+            ..Default::default()
         };
         let r = e.resolved_endpoint();
         assert_eq!(r.base_url, "http://mini2:8080");
@@ -363,9 +448,9 @@ default_server: ghost
                 host: "h".into(),
                 http_port: 8080,
                 ssh_port: 2222,
-                control_token: String::new(),
                 api_url: bad.into(),
                 tls_cert_fingerprint: "sha256:x".into(),
+                ..Default::default()
             };
             assert_eq!(
                 e.resolved_endpoint().base_url,
@@ -414,5 +499,127 @@ default_server: ghost
         assert_eq!(minimal.http_port, 8080);
         assert_eq!(minimal.ssh_port, 22);
         assert_eq!(minimal.resolved_endpoint().base_url, "http://minimal:8080");
+    }
+
+    /// The mtls half of the same fixture (plan 001 D6). Swift does not model
+    /// these keys yet and ignores them, which is why adding them to the shared
+    /// fixture leaves `ConfigParityTests` passing unchanged.
+    #[test]
+    fn parity_fixture_carries_the_mtls_entry_fields() {
+        use crate::token::AuthMode;
+        let config = ShedConfig::parse(include_str!("../../fixtures/config_sample.yaml"));
+
+        let secure = by_name(&config, "secure");
+        assert_eq!(secure.auth_mode, "mtls");
+        assert_eq!(secure.auth_mode(), AuthMode::Mtls);
+        assert_eq!(
+            secure.client_cert_file,
+            "/Users/dev/.shed/creds/secure/client.crt"
+        );
+        assert_eq!(
+            secure.client_key_file,
+            "/Users/dev/.shed/creds/secure/client.key"
+        );
+        assert_eq!(secure.client_cert_expires_at, "2026-07-26T12:00:00Z");
+        assert!(secure.uses_tls());
+        // It holds both credential files, so nothing to enroll.
+        assert!(!secure.needs_enrollment());
+
+        // ABSENT auth_mode is token, not "unknown" — the legacy-entry rule.
+        let mini2 = by_name(&config, "mini2");
+        assert_eq!(mini2.auth_mode, "");
+        assert_eq!(mini2.auth_mode(), AuthMode::Token);
+        assert!(!mini2.uses_tls()); // plain http entry → open server, never enrolls
+        assert!(!mini2.needs_enrollment());
+    }
+
+    /// The "no usable credential ⇒ enroll" discrimination (Go `4553cc8` parity).
+    #[test]
+    fn needs_enrollment_discriminates_open_from_stripped_secure_entries() {
+        let base = ShedServerEntry {
+            name: "s".into(),
+            host: "h".into(),
+            http_port: 8080,
+            ssh_port: 2222,
+            control_token: String::new(),
+            api_url: "https://h:8443".into(),
+            tls_cert_fingerprint: "sha256:aa".into(),
+            auth_mode: String::new(),
+            client_cert_file: String::new(),
+            client_key_file: String::new(),
+            client_cert_expires_at: String::new(),
+        };
+
+        // (a) an https entry stripped of every credential field by an older
+        // client — the reproduced-live case — enrolls.
+        assert!(base.needs_enrollment());
+
+        // (b) the same entry with an mtls mode but no files still enrolls...
+        let mtls_stripped = ShedServerEntry {
+            auth_mode: "mtls".into(),
+            ..base.clone()
+        };
+        assert!(mtls_stripped.needs_enrollment());
+
+        // ...and does not once both files are present.
+        let mtls_ready = ShedServerEntry {
+            client_cert_file: "/creds/c.crt".into(),
+            client_key_file: "/creds/c.key".into(),
+            ..mtls_stripped.clone()
+        };
+        assert!(!mtls_ready.needs_enrollment());
+        // A half-written pair is as unusable as none.
+        assert!(ShedServerEntry {
+            client_key_file: String::new(),
+            ..mtls_ready.clone()
+        }
+        .needs_enrollment());
+
+        // (c) a token entry that still holds its token does not enroll.
+        assert!(!ShedServerEntry {
+            control_token: "shed_control_x".into(),
+            ..base.clone()
+        }
+        .needs_enrollment());
+
+        // (d) an OPEN server (plain http, no pin) never enrolls, credential or
+        // not — it must not pay an SSH round-trip to discover it needs nothing.
+        assert!(!ShedServerEntry {
+            api_url: String::new(),
+            tls_cert_fingerprint: String::new(),
+            ..base.clone()
+        }
+        .needs_enrollment());
+
+        // (e) no way to reach SSH → nothing to enroll WITH.
+        assert!(!ShedServerEntry {
+            ssh_port: 0,
+            ..base.clone()
+        }
+        .needs_enrollment());
+        assert!(!ShedServerEntry {
+            host: String::new(),
+            ..base.clone()
+        }
+        .needs_enrollment());
+    }
+
+    #[test]
+    fn auth_mode_is_lowercased_and_unknown_values_read_as_token() {
+        use crate::token::AuthMode;
+        let yaml = "\
+servers:
+    a:
+        host: a
+        auth_mode: MTLS
+    b:
+        host: b
+        auth_mode: something-new
+";
+        let config = ShedConfig::parse(yaml);
+        assert_eq!(by_name(&config, "a").auth_mode(), AuthMode::Mtls);
+        // Forward-compat: an unrecognized mode is the shape whose fields are
+        // actually populated (Go `sdk.Bundle.Mode` parity), never mtls.
+        assert_eq!(by_name(&config, "b").auth_mode(), AuthMode::Token);
     }
 }

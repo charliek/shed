@@ -117,6 +117,7 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 		// already have failed, so reaching here means a misrouted plaintext
 		// listener or a test harness — either way, not authenticated.
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate required")
 			return
 		}
@@ -124,10 +125,12 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 
 		now := time.Now()
 		if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is expired or not yet valid")
 			return
 		}
 		if !s.certSubjectAuthorized(leaf.Subject.CommonName) {
+			closeIdentityBoundConnection(w, r)
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "client certificate is not authorized")
 			return
 		}
@@ -137,6 +140,49 @@ func (s *Server) certAuthMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// closeIdentityBoundConnection marks the response so the server tears the
+// connection down after writing it. Called from the mtls branch's 401s — and
+// only from those.
+//
+// In mtls mode the caller's identity is a property of the CONNECTION: the
+// certificate is presented once, at the handshake, and TLS never re-asks. When
+// certAuthMiddleware's per-request re-validation refuses that certificate —
+// expired, or no longer allowlisted — the connection's identity is dead for
+// every request that will ever arrive on it. Keeping it alive is actively
+// harmful: a correct client answers a 401 by re-minting and retrying, and the
+// retry goes out over the SAME pooled connection, still presenting the OLD
+// certificate, and 401s again. That is a stuck loop the client cannot see its
+// way out of (a TLS session is not re-negotiated per request, and neither Go's
+// http.Client nor reqwest exposes "drop the connection this response arrived
+// on"). Closing hands every client a clean slate for free: the next request
+// dials, re-handshakes, and presents whatever credential it holds now.
+//
+// Scope failures (403) deliberately do NOT close. There the identity is valid
+// and current; it simply may not reach this route. A new connection would
+// present the same certificate and be refused identically, so closing would cost
+// a handshake and fix nothing.
+//
+// Token mode does not close either: a bearer token is carried per request, so a
+// rejected one is replaced by putting a different header on the next request over
+// the same healthy connection.
+//
+// HTTP/1.x only. "Connection" is a hop-by-hop header with no HTTP/2 meaning (h2
+// signals with GOAWAY / RST_STREAM instead) and Go's h2 server refuses to emit
+// it, so on a non-1.x request this is a no-op and recovery falls back to the
+// pre-existing "next connection" behavior. Every shipped shed client negotiates
+// HTTP/1.1 against the HTTPS listener.
+func closeIdentityBoundConnection(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor != 1 {
+		return
+	}
+	// net/http honors a handler-set "Connection: close": (*chunkWriter).writeHeader
+	// reads exactly this header value and sets closeAfterReply from it, which is
+	// what makes the server close the connection once the response is written.
+	// No r.Close fiddling is needed (and would not help — that field is an input
+	// parsed from the REQUEST, not consulted after the handler returns).
+	w.Header().Set("Connection", "close")
 }
 
 // authorizeScope is the single scope table both enforced modes consult. It

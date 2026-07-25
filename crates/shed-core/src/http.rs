@@ -6,12 +6,18 @@
 //!
 //! Parity with Swift's `ShedServerClient`: an 8s GET timeout, an explicit
 //! User-Agent, an https-only redirect policy, leaf-cert pinning (fail-closed on
-//! a non-https URL), a control-token bearer with a 401 → invalidate + retry-once
-//! (provider-backed only; the invalidate is the stale-401-guarded
-//! `invalidate_if_current` on the token actually SENT, and the retry is
-//! skipped when the re-mint returns the same rejected token — plan 001 §3.4),
-//! and `ShedError` matching `ShedClientError`. Lifecycle + SSE create land in
-//! M4.
+//! a non-https URL), a credential with an auth-failure → invalidate + retry-once
+//! (provider-backed only; the retry is skipped when the re-mint returns the same
+//! rejected credential — plan 001 §3.4), and `ShedError` matching
+//! `ShedClientError`. Lifecycle + SSE create land in M4.
+//!
+//! Every request shape — JSON, lifecycle, and BOTH SSE streams — goes through
+//! one re-auth path, [`Client::send_authed`]: classify the outcome
+//! ([`crate::authfail`]: an HTTP 401 or a peer TLS alert naming a certificate
+//! problem), invalidate the credential, re-mint once, retry once. There is no
+//! second policy for streams, and none of it branches on the mode the client
+//! believes it is in — which is what makes a server-side token↔mtls flip
+//! recover in either direction with no operator action (plan 001 D5).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,17 +88,82 @@ pub trait RcEventSink: Send + Sync {
     fn on_event(&self, ev: RcEvent);
 }
 
-/// A read client for one shed-server host. `Clone` is cheap (reqwest::Client and
+/// One completed send, plus the transport it went out on.
+///
+/// Holding the transport is load-bearing for the STREAMING callers: a
+/// `reqwest::Response`'s body is fed by a connection its client owns, so a stream
+/// must outlive the `Arc` that dialed it — including across a
+/// [`Client::recycle_transport`] that replaces the shared one mid-stream.
+struct Sent {
+    resp: reqwest::Response,
+    transport: Arc<reqwest::Client>,
+}
+
+/// One attempt: build the request against `http`, apply `bearer`, send. The
+/// response is returned WHATEVER its status — classification is the caller's
+/// (a 401 has to be told apart from a 404, and only the caller knows which
+/// statuses are success for its route).
+async fn send_once(
+    http: &reqwest::Client,
+    build: &impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    bearer: Option<&str>,
+) -> Result<reqwest::Response, ShedError> {
+    let mut req = build(http);
+    if let Some(tok) = bearer {
+        req = req.bearer_auth(tok);
+    }
+    req.send()
+        .await
+        .map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))
+}
+
+/// A read client for one shed-server host. `Clone` is cheap (the transport and
 /// the token provider are Arc-backed) so a create task can own its own handle
 /// sharing the same token cache.
-#[derive(Clone)]
 pub struct Client {
     base_url: String,
     server_name: String,
     /// Static open-mode config token; used only when there is no `token_provider`.
     token: String,
     token_provider: Option<Arc<ControlTokenProvider>>,
-    http: reqwest::Client,
+    /// The transport. Built once, and replaced only by
+    /// [`Client::recycle_transport`] — never by a credential change.
+    ///
+    /// `Arc`-wrapped on top of reqwest's own internal `Arc` for one reason: it
+    /// gives the transport contract an ASSERTABLE identity. The rotation test
+    /// compares `Arc::as_ptr` across a credential swap, so "we did not rebuild
+    /// the client" is proven rather than asserted in a comment; the pooled-
+    /// revocation test compares it the other way, so the pool purge is proven
+    /// too.
+    ///
+    /// The extra `RwLock` exists for ONE operation — [`Client::recycle_transport`],
+    /// the connection-pool purge a refused CERTIFICATE forces. Every read path
+    /// clones the inner `Arc` once per request and works on that, so a recycle can
+    /// never yank a transport out from under an in-flight request or stream.
+    http: std::sync::RwLock<Arc<reqwest::Client>>,
+    /// The two inputs [`build_http_client`] needs, retained so the transport can
+    /// be rebuilt identically (same pin, same resolver) when its pool has to go.
+    pin: Option<String>,
+    resolver: Arc<crate::tls::ClientCertResolver>,
+}
+
+impl Clone for Client {
+    /// Clones share the token cache and the resolver, and each takes the CURRENT
+    /// transport. A later recycle in one handle is not seen by the other — which
+    /// is the same "each handle keeps the pool it is using" property clones had
+    /// before, and is safe because a stale pool is self-correcting: the first
+    /// rejection on it recycles that handle too.
+    fn clone(&self) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            server_name: self.server_name.clone(),
+            token: self.token.clone(),
+            token_provider: self.token_provider.clone(),
+            http: std::sync::RwLock::new(self.transport()),
+            pin: self.pin.clone(),
+            resolver: self.resolver.clone(),
+        }
+    }
 }
 
 impl Client {
@@ -148,60 +219,193 @@ impl Client {
                 "TLS pin configured for a non-https URL {base_url}; refusing to send unpinned plaintext"
             )));
         }
-        let http = build_http_client(pin.as_deref())?;
+        // The adaptive transport (plan 001 D5): the client-certificate resolver is
+        // installed ALWAYS — the provider's when there is one, an empty one
+        // otherwise — so a credential that arrives (or changes shape) later needs
+        // no new client. An empty resolver behaves exactly like the previous
+        // `.with_no_client_auth()` build.
+        let resolver = token_provider
+            .as_ref()
+            .map(|p| p.cert_resolver())
+            .unwrap_or_default();
+        let http = std::sync::RwLock::new(Arc::new(build_http_client(
+            pin.as_deref(),
+            resolver.clone(),
+        )?));
         Ok(Self {
             base_url,
             server_name,
             token,
             token_provider,
             http,
+            pin,
+            resolver,
         })
+    }
+
+    /// The transport to use for one request or stream. Cloning the `Arc` up front
+    /// means the caller keeps ITS transport for the whole exchange even if a
+    /// concurrent rejection recycles the shared one.
+    fn transport(&self) -> Arc<reqwest::Client> {
+        self.http.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the connection pool: build a fresh `reqwest::Client` (same pin,
+    /// same certificate resolver), install it as this handle's transport, and
+    /// return it for the retry to use.
+    ///
+    /// # The pooled-identity problem, and why this is the fix
+    ///
+    /// In mtls mode the credential is presented at the HANDSHAKE, so it is a
+    /// property of the CONNECTION, not of the request. When a server refuses that
+    /// identity — an expired certificate, or one whose SSH key left the allowlist,
+    /// caught by shed-server's per-request re-validation — re-minting is only half
+    /// a recovery. The retry is checked out of the pool onto the SAME connection,
+    /// which still presents the OLD certificate, and is refused again; worse, that
+    /// connection stays in the pool and is re-used by every LATER request, so each
+    /// one costs a rejection plus a mint (and a mint can be a real SSH round trip,
+    /// or a Touch ID prompt) forever. The pool has to lose it.
+    ///
+    /// Go does this with `Transport.CloseIdleConnections()` after a refresh.
+    /// reqwest 0.12 has no equivalent at any layer, which is why this is a rebuild
+    /// rather than a purge:
+    ///
+    ///   * there is no `close_idle_connections` on `reqwest::Client` (checked
+    ///     against 0.12.28) and no access to the underlying hyper pool;
+    ///   * varying a header does NOT re-key the pool (pooling is keyed on
+    ///     scheme/host/port + proxy), so a "connection epoch" header buys nothing;
+    ///   * a custom connector cannot invalidate connections that are already IN
+    ///     the pool — the pool sits above it;
+    ///   * `pool_max_idle_per_host(0)` would prevent the problem, but by paying a
+    ///     full TLS handshake on every request forever — including for the entire
+    ///     token-mode fleet, which has no pooled-identity problem at all — to fix
+    ///     a path taken only on a rare failure;
+    ///   * a THROWAWAY client for just the retry fixes the one request and leaves
+    ///     the poisoned connection in the main pool, i.e. the mint-per-request
+    ///     steady state above. (Verified, not assumed: the pooled connection is
+    ///     genuinely re-used — see
+    ///     `mtls_tests::a_revoked_identity_recovers_on_a_pooled_keepalive_connection`,
+    ///     which asserts the handshake count.)
+    ///
+    /// Dropping the old client drops its pool; connections still in use are
+    /// unaffected, because every caller holds the `Arc` it started with (see
+    /// [`Sent`], which keeps a streaming response's transport alive).
+    ///
+    /// # Scope: only when a certificate is involved
+    ///
+    /// [`Self::send_authed`] calls this only when the credential on either side of
+    /// the re-mint is an mtls one — either the refused connection presented a
+    /// certificate, or the freshly minted credential is one that can only be
+    /// presented at a handshake (so the pooled, certificate-less connections are
+    /// equally useless). A token-mode 401 recycles nothing: a bearer travels per
+    /// request, so the pool is not part of the credential and throwing away good
+    /// connections would be pure cost.
+    ///
+    /// # Relationship to the immutable-transport contract
+    ///
+    /// The contract (plan 001 D5) is that a credential CHANGE — a rotation, a
+    /// token↔mtls flip — needs no transport rebuild and no swap owned by any layer
+    /// above. That still holds exactly: rotations and flips write through the
+    /// shared resolver, the `Client` object, its provider and its resolver are
+    /// never replaced, and no caller observes anything. What is scoped out of the
+    /// contract here is the one case it never covered: a pool holding connections
+    /// authenticated as an identity the server has REFUSED. Those connections are
+    /// not reusable state, they are stale credentials.
+    ///
+    /// Belt-and-braces with the server-side half: shed-server answers an
+    /// identity-rejection 401 with `Connection: close`
+    /// (`internal/api/auth.go:closeIdentityBoundConnection`), which fixes this for
+    /// every client, in every language. This path is what makes the Rust client
+    /// correct against a server that does not.
+    fn recycle_transport(&self) -> Result<Arc<reqwest::Client>, ShedError> {
+        let fresh = Arc::new(build_http_client(
+            self.pin.as_deref(),
+            self.resolver.clone(),
+        )?);
+        *self.http.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+        Ok(fresh)
+    }
+
+    /// The transport's identity — the address of the `reqwest::Client` currently
+    /// backing this handle. Only for tests asserting the transport contract: it
+    /// must not change for a credential rotation or a mode flip, and it changes
+    /// exactly once when a refused certificate forces a pool purge
+    /// ([`Self::recycle_transport`]).
+    #[cfg(test)]
+    pub(crate) fn transport_id(&self) -> usize {
+        Arc::as_ptr(&self.transport()) as usize
     }
 
     /// The bearer token to send, or `None`. Provider-backed clients send the
     /// minted token, or NOTHING on a mint failure (never the static token — no
     /// secure-by-default downgrade); provider-less clients send the static token.
+    ///
+    /// Test-only since the request path was unified on
+    /// [`Self::send_authed`], which pins the whole CREDENTIAL (the header is only
+    /// half of one in mtls mode) rather than just its bearer half. Tests keep it
+    /// as the shortest way to ask "what would the next request send?".
+    #[cfg(test)]
     pub(crate) async fn bearer(&self) -> Option<String> {
-        if let Some(p) = &self.token_provider {
-            p.token().await.ok().filter(|t| !t.is_empty())
-        } else if !self.token.is_empty() {
-            Some(self.token.clone())
-        } else {
-            None
+        self.credential()
+            .await
+            .and_then(|c| c.bearer_token().map(str::to_string))
+    }
+
+    /// The provider's current credential, resolving (minting) it if needed.
+    ///
+    /// This is where an mtls credential is obtained too: nothing about the call
+    /// site changes, because the certificate leaves through the resolver rather
+    /// than through this return value. A provider-less client has no credential to
+    /// resolve — its static token is applied by [`Self::bearer`] instead.
+    async fn credential(&self) -> Option<crate::token::Credential> {
+        match &self.token_provider {
+            Some(p) => p.credential().await.ok(),
+            None if !self.token.is_empty() => Some(crate::token::Credential {
+                mode: Some(crate::token::AuthMode::Token),
+                token: self.token.clone(),
+                ..Default::default()
+            }),
+            None => None,
         }
     }
 
-    /// [`Self::bearer`] BOUNDED by `bound`, mirroring the connect-phase guard
-    /// [`Self::rc_events`] already applies: a foreign [`crate::TokenMinter`]
-    /// impl can hang indefinitely (the provider holds its mutex across a mint),
-    /// so an unbounded bearer resolution in a JSON/lifecycle request or a create
+    /// [`Self::credential`] BOUNDED by `bound`, mirroring the connect-phase guard
+    /// [`Self::rc_events`] already applies: a foreign [`crate::TokenMinter`] impl
+    /// can hang indefinitely (the provider holds its mutex across a mint), so an
+    /// unbounded credential resolution in a JSON/lifecycle request or a create
     /// would wedge the whole call. On timeout surface a Transport error rather
-    /// than block forever. Used by [`Self::request`] for both the initial and
-    /// the 401-retry bearer resolution.
-    async fn bounded_bearer(&self, bound: Duration) -> Result<Option<String>, ShedError> {
-        tokio::time::timeout(bound, self.bearer())
+    /// than block forever. Used by [`Self::request`] for both the initial and the
+    /// retry resolution.
+    async fn bounded_credential(
+        &self,
+        bound: Duration,
+    ) -> Result<Option<crate::token::Credential>, ShedError> {
+        tokio::time::timeout(bound, self.credential())
             .await
-            .map_err(|_| ShedError::Transport("bearer resolution timeout".into()))
+            .map_err(|_| ShedError::Transport("credential resolution timeout".into()))
     }
 
-    /// 401 aftermath, shared by [`Self::request`], [`Self::create_stream`],
-    /// and [`Self::rc_events`]: drop the provider's cache for the token
-    /// actually SENT (`invalidate_if_current` — the stale-401 guard: a 401
-    /// racing a rotation must not erase the newer token; plan 001 §3.4),
-    /// BOUNDED by `bound`: invalidate only contends on the provider mutex,
-    /// but that mutex is held across a mint by design, so a concurrent
-    /// wedged mint could otherwise pin the await forever. Returns `false`
-    /// when the bound elapsed — the caller then surfaces the original 401
-    /// without retrying (the cache keeps the stale token one extra cycle and
-    /// the next 401 retries the invalidate). No-op `true` for provider-less
-    /// clients or when no token was sent. Retry policy stays with each
-    /// caller (request retries once; the streams don't — their watchers own
-    /// re-auth).
-    async fn invalidate_sent(&self, sent: Option<&str>, bound: Duration) -> bool {
-        let (Some(p), Some(tok)) = (&self.token_provider, sent) else {
+    /// Reactive invalidation of the credential a request actually used, BOUNDED
+    /// by `bound`: invalidating only contends on the provider mutex, but that
+    /// mutex is held across a mint by design, so a concurrent wedged mint could
+    /// otherwise pin the await forever. `false` means the bound elapsed and the
+    /// caller must not retry (it surfaces the original failure; the cache keeps
+    /// the stale credential one extra cycle and the next failure retries the
+    /// invalidate). No-op `true` for provider-less clients.
+    ///
+    /// What "if current" means differs by state and is the provider's call — the
+    /// stale-401 guard in token state, unconditional in mtls state where a
+    /// certificate cannot be attributed to a request (see
+    /// [`crate::token::ControlTokenProvider::invalidate_if_current_credential`]).
+    async fn invalidate_used(
+        &self,
+        used: Option<&crate::token::Credential>,
+        bound: Duration,
+    ) -> bool {
+        let (Some(p), Some(cred)) = (&self.token_provider, used) else {
             return true;
         };
-        tokio::time::timeout(bound, p.invalidate_if_current(tok))
+        tokio::time::timeout(bound, p.invalidate_if_current_credential(cred))
             .await
             .is_ok()
     }
@@ -221,15 +425,11 @@ impl Client {
         segments: &[&str],
         query: &[(&str, String)],
     ) -> Result<reqwest::Url, ShedError> {
-        let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| {
-            ShedError::Config(format!("invalid base URL {}: {e}", self.base_url))
-        })?;
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|e| ShedError::Config(format!("invalid base URL {}: {e}", self.base_url)))?;
         {
             let mut parts = url.path_segments_mut().map_err(|_| {
-                ShedError::Config(format!(
-                    "base URL {} cannot carry a path",
-                    self.base_url
-                ))
+                ShedError::Config(format!("base URL {} cannot carry a path", self.base_url))
             })?;
             parts.pop_if_empty(); // tolerate a trailing slash on base_url
             for seg in segments {
@@ -247,59 +447,134 @@ impl Client {
         Ok(url)
     }
 
-    /// One attempt with `bearer` (resolved by the CALLER — [`Self::request`]
-    /// resolves it per attempt so the 401 path knows exactly which token was
-    /// sent and can `invalidate_if_current` it; plan 001 §3.4).
-    async fn send_once(
+    /// Send once, and on a provider-backed AUTH-SHAPED failure re-mint the
+    /// credential and retry once, ON A FRESH CONNECTION (at-most-once, mirrors
+    /// the SDK/CLI).
+    ///
+    /// This is the ONE re-auth path in this client. The unary JSON/lifecycle
+    /// requests ([`Self::request`]) and both SSE streams
+    /// ([`Self::create_stream`], [`Self::rc_events`]) route through it, so a
+    /// rejected credential recovers identically whether it was refused with a 401
+    /// or with a TLS alert, and whether the response was going to be a JSON body
+    /// or an event stream. (The streams previously classified nothing and only
+    /// invalidated a BEARER token, which is always `None` in mtls state — a
+    /// revoked certificate left them failing forever.)
+    ///
+    /// "Auth-shaped" is [`crate::authfail::is_auth_failure`]: an HTTP 401, or a
+    /// peer TLS alert naming a certificate problem. Both shapes are handled the
+    /// same way and REGARDLESS of the mode this client believes it is in — that
+    /// symmetry is what makes a server-side token↔mtls flip recover with no
+    /// operator action, in either direction (plan 001 D5).
+    ///
+    /// The retry is SKIPPED — surfacing the original outcome — when:
+    ///   * the invalidate timed out (a wedged mint holds the provider mutex;
+    ///     the follow-up resolution would block on the same mutex);
+    ///   * the re-resolved credential is missing or unusable — a provider-backed
+    ///     request never retries UNAUTHENTICATED: the re-mint failed, and
+    ///     dropping the credential is a guaranteed second rejection;
+    ///   * the re-resolved credential has the same identity as the rejected one
+    ///     (same bearer token, or same certificate serial) — a guaranteed second
+    ///     rejection. The successful same-credential re-mint also re-CACHED the
+    ///     rejected value, so it is invalidated again before returning — the
+    ///     must-mint flag stays armed and no later call serves it.
+    ///
+    /// Ahead of all that, the ambiguous "connection was not ready" shape
+    /// ([`crate::authfail::is_connection_lost_message`]) gets ONE plain re-send:
+    /// the request was never dispatched, so re-sending is safe for any method, and
+    /// a fresh connection turns the ambiguity into either success or a
+    /// classifiable alert. It deliberately does NOT re-mint — that shape is also
+    /// what a server restart produces, and a needless mint can cost a real SSH
+    /// round-trip (and, on desktop, a Touch ID prompt).
+    ///
+    /// `used` is the credential this attempt goes out with, captured by the
+    /// caller. Note that the capture is authoritative only for the HEADER: in
+    /// mtls state the certificate is read live from the resolver at handshake
+    /// time, which is why invalidation there is attribution-free (see
+    /// [`Self::invalidate_used`]).
+    ///
+    /// `build` is invoked per attempt against the transport the attempt uses, so
+    /// the retry can be issued on [`Self::fresh_transport`] — that is what makes
+    /// the retry a NEW connection carrying the NEW certificate rather than a
+    /// pooled one still presenting the rejected identity.
+    async fn send_authed(
         &self,
-        method: reqwest::Method,
-        url: &reqwest::Url,
-        timeout: Duration,
-        body: Option<&serde_json::Value>,
-        bearer: Option<&str>,
-    ) -> Result<Vec<u8>, ShedError> {
-        let mut req = self.http.request(method, url.clone()).timeout(timeout);
-        if let Some(b) = body {
-            req = req.json(b);
+        bound: Duration,
+        used: Option<crate::token::Credential>,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Sent, ShedError> {
+        let bearer = used
+            .as_ref()
+            .and_then(|c| c.bearer_token().map(str::to_string));
+        let transport = self.transport();
+        let mut outcome = send_once(&transport, &build, bearer.as_deref()).await;
+        if matches!(&outcome, Err(ShedError::Transport(msg)) if crate::authfail::is_connection_lost_message(msg))
+        {
+            outcome = send_once(&transport, &build, bearer.as_deref()).await;
         }
-        if let Some(tok) = bearer {
-            req = req.bearer_auth(tok);
+
+        let auth_shaped = match &outcome {
+            Ok(resp) => crate::authfail::is_auth_failure(Some(resp.status().as_u16()), None),
+            Err(e) => crate::authfail::is_auth_failure(None, Some(e)),
+        };
+        let sent = |resp| Sent {
+            resp,
+            transport: transport.clone(),
+        };
+        if !auth_shaped || self.token_provider.is_none() {
+            return outcome.map(sent);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ShedError::Transport(e.to_string()))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(ShedError::BadStatus(status));
+        if !self.invalidate_used(used.as_ref(), bound).await {
+            return outcome.map(sent); // wedged provider — no retry
         }
-        Ok(resp
-            .bytes()
-            .await
-            .map_err(|e| ShedError::Transport(e.to_string()))?
-            .to_vec())
+        let fresh = self.bounded_credential(bound).await?;
+        let Some(fresh) = fresh.filter(crate::token::Credential::usable) else {
+            return outcome.map(sent); // never retry unauthenticated
+        };
+        if used.as_ref().map(|c| c.identity()) == Some(fresh.identity()) {
+            // Re-arm the must-mint flag the same-credential re-mint just cleared,
+            // so the rejected credential is never served again.
+            let _ = self.invalidate_used(used.as_ref(), bound).await;
+            return outcome.map(sent);
+        }
+        // Is the credential bound to the CONNECTION on either side of the
+        // re-mint? Then the pool is carrying stale credentials — the connection
+        // we were refused on presented the old certificate, and every other
+        // pooled connection was dialed under the same (or no) identity. Purge it;
+        // see [`Self::recycle_transport`]. A token→token re-mint keeps the pool.
+        let connection_bound = matches!(
+            used.as_ref().and_then(|c| c.mode),
+            Some(crate::token::AuthMode::Mtls)
+        ) || matches!(fresh.mode, Some(crate::token::AuthMode::Mtls));
+        // Drop the refused response BEFORE retrying, so a 401 whose body is still
+        // unread cannot hold its connection open behind the retry.
+        drop(outcome);
+        let retry_transport = if connection_bound {
+            self.recycle_transport()?
+        } else {
+            transport
+        };
+        let resp = send_once(&retry_transport, &build, fresh.bearer_token()).await?;
+        Ok(Sent {
+            resp,
+            transport: retry_transport,
+        })
     }
 
-    /// Send once, and on a provider-backed 401 invalidate the token actually
-    /// SENT ([`Self::invalidate_sent`], bounded by this request's own
-    /// `timeout`) then retry once with a re-resolved bearer (at-most-once,
-    /// mirrors the SDK/CLI). The retry is SKIPPED — surfacing the original
-    /// 401 — when:
-    ///   * the invalidate timed out (a wedged mint holds the provider mutex;
-    ///     the follow-up bearer resolution would block on the same mutex);
-    ///   * the re-resolved bearer is `None` — a provider-backed request never
-    ///     retries UNAUTHENTICATED: the re-mint failed, and dropping the
-    ///     Authorization header is a guaranteed second 401;
-    ///   * the re-resolved bearer equals the rejected one — a same-token
-    ///     retry is a guaranteed second 401 (Dart's `_mustMint` semantics
-    ///     make the provider force-mint here, so equality means the minter
-    ///     re-returned the rejected token). The successful same-token re-mint
-    ///     also re-CACHED the rejected token, so it is invalidated again
-    ///     before returning — the must-mint flag stays armed and no later
-    ///     call serves it.
-    ///
-    /// Static/no-token clients don't retry. `body`, when present, is a JSON
-    /// request body (re-sent on the retry).
+    /// [`Self::send_authed`] with the credential resolved here, bounded by the
+    /// same `bound` (a foreign [`crate::TokenMinter`] impl can hang, and the
+    /// provider holds its mutex across a mint).
+    async fn send_resolved(
+        &self,
+        bound: Duration,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<Sent, ShedError> {
+        let used = self.bounded_credential(bound).await?;
+        self.send_authed(bound, used, build).await
+    }
+
+    /// A JSON/lifecycle request: [`Self::send_resolved`] plus the status check and
+    /// body read. `body`, when present, is a JSON request body (re-sent on the
+    /// retry). Static/no-credential clients don't retry.
     async fn request(
         &self,
         method: reqwest::Method,
@@ -307,33 +582,27 @@ impl Client {
         timeout: Duration,
         body: Option<&serde_json::Value>,
     ) -> Result<Vec<u8>, ShedError> {
-        // Bound the bearer resolution under this request's own `timeout` (GET 8s
-        // / WRITE 15s) so a wedged minter can't hang the call outside any bound
-        // — the same guard rc_events applies to its connect phase.
-        let sent = self.bounded_bearer(timeout).await?;
-        match self
-            .send_once(method.clone(), url, timeout, body, sent.as_deref())
-            .await
-        {
-            Err(ShedError::BadStatus(401)) if self.token_provider.is_some() => {
-                if !self.invalidate_sent(sent.as_deref(), timeout).await {
-                    return Err(ShedError::BadStatus(401)); // wedged provider — no retry
+        // The whole call — credential resolution included — is bounded by this
+        // request's own `timeout` (GET 8s / WRITE 15s).
+        let sent = self
+            .send_resolved(timeout, |http| {
+                let mut req = http.request(method.clone(), url.clone()).timeout(timeout);
+                if let Some(b) = body {
+                    req = req.json(b);
                 }
-                let retry = self.bounded_bearer(timeout).await?;
-                if retry.is_none() {
-                    return Err(ShedError::BadStatus(401)); // never retry unauthenticated
-                }
-                if retry == sent {
-                    // Re-arm the must-mint flag the same-token re-mint just
-                    // cleared, so the rejected token is never served again.
-                    let _ = self.invalidate_sent(sent.as_deref(), timeout).await;
-                    return Err(ShedError::BadStatus(401));
-                }
-                self.send_once(method, url, timeout, body, retry.as_deref())
-                    .await
-            }
-            other => other,
+                req
+            })
+            .await?;
+        let status = sent.resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(ShedError::BadStatus(status));
         }
+        Ok(sent
+            .resp
+            .bytes()
+            .await
+            .map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))?
+            .to_vec())
     }
 
     /// GET the segment-built URL ([`Self::build_url`]) and decode JSON.
@@ -426,7 +695,8 @@ impl Client {
     /// (`handlers.go:765-786`): 404 unknown shed, 409 shed stopped, 503 tmux
     /// unavailable.
     pub async fn list_sessions(&self, shed: &str) -> Result<SessionsResponse, ShedError> {
-        self.get_json(&["api", "sheds", shed, "sessions"], &[]).await
+        self.get_json(&["api", "sheds", shed, "sessions"], &[])
+            .await
     }
 
     /// `DELETE /api/sheds/{shed}/sessions/{session}` — kill one tmux session
@@ -466,7 +736,9 @@ impl Client {
             query.push(("limit", limit.to_string()));
         }
         self.get_json(
-            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "messages"],
+            &[
+                "api", "sheds", shed, "rc", "v1", "sessions", slug, "messages",
+            ],
             &query,
         )
         .await
@@ -512,13 +784,18 @@ impl Client {
     /// after flushing any final unterminated record to the sink. The idle
     /// duration also bounds the whole connect phase (bearer mint + send).
     ///
-    /// ONE connection — no in-method reconnect and no 401 retry: the reconnect
-    /// loop (shed-app's `RcEventsWatcher`) owns backoff AND re-auth. On a 401
-    /// this invalidates the token it SENT (`invalidate_if_current` — the
-    /// stale-401 guard, plan §3.4) and returns `BadStatus(401)`, so the
-    /// watcher's next connect re-mints; an in-method retry would double up
-    /// on the watcher's backoff and hide the auth failure from its Down
-    /// signal.
+    /// ONE connection, and no in-method RECONNECT: the reconnect loop (shed-app's
+    /// `RcEventsWatcher`) owns backoff, and a stream that dies mid-flight is its
+    /// problem, not this method's.
+    ///
+    /// The CONNECT, though, runs the standard re-auth path
+    /// ([`Self::send_authed`]): a refused credential is invalidated, re-minted
+    /// once, and the connect retried once. Leaving that to the watcher was a bug
+    /// rather than a division of labour — the old code invalidated a BEARER token,
+    /// which is `None` in mtls state, so a revoked or expired certificate meant
+    /// every reconnect presented the same dead identity forever. An unrecoverable
+    /// failure still surfaces (`BadStatus(401)` after the retry is refused too),
+    /// so the watcher's Down/backoff signal is unchanged.
     ///
     /// Liveness (plan 001 §3.3, panel-critical pin): the
     /// [`RC_EVENTS_IDLE_TIMEOUT`] idle timer wraps the BYTE-chunk future
@@ -559,36 +836,21 @@ impl Client {
     ) -> Result<(), ShedError> {
         let url = self.build_url(&["api", "rc", "events"], &[])?;
         // Connection-open timeout: the same duration bounds the WHOLE connect
-        // phase — bearer resolution (a foreign `TokenMinter` impl can hang
-        // indefinitely) plus the request send — so no pre-stream await sits
-        // outside the bound (a server that accepts but never responds is as
-        // dead as a silent stream).
-        let connect = async {
-            let bearer = self.bearer().await;
-            let mut rb = self
-                .http
-                .get(url)
-                .header(reqwest::header::ACCEPT, "text/event-stream");
-            if let Some(tok) = &bearer {
-                rb = rb.bearer_auth(tok);
-            }
-            (bearer, rb.send().await)
-        };
-        let (sent_bearer, resp) = match tokio::time::timeout(idle, connect).await {
+        // phase — credential resolution (a foreign `TokenMinter` impl can hang
+        // indefinitely), the request send, and the one re-auth attempt — so no
+        // pre-stream await sits outside the bound (a server that accepts but
+        // never responds is as dead as a silent stream).
+        let connect = self.send_resolved(idle, |http| {
+            http.get(url.clone())
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+        });
+        let sent = match tokio::time::timeout(idle, connect).await {
             Err(_) => {
                 return Err(ShedError::Transport("rc-events connect timeout".into()));
             }
-            Ok((bearer, r)) => (bearer, r.map_err(|e| ShedError::Transport(e.to_string()))?),
+            Ok(r) => r?,
         };
-        let status = resp.status().as_u16();
-        if status == 401 {
-            // Stale token: invalidate the token we SENT ([`Self::invalidate_sent`],
-            // the stale-401 guard, bounded by `idle` — see the helper's docs)
-            // so the NEXT connect re-mints, then surface the 401 — the
-            // watcher owns re-auth (no in-method retry). On a timed-out
-            // invalidate we fall through and surface the 401 anyway.
-            let _ = self.invalidate_sent(sent_bearer.as_deref(), idle).await;
-        }
+        let status = sent.resp.status().as_u16();
         // Exactly 200, not any-2xx: SSE lives in a 200 response body — a
         // 204/206 minted by an intermediary carries no event stream, and
         // treating it as success would end as a silent empty-stream Ok,
@@ -596,7 +858,10 @@ impl Client {
         if status != 200 {
             return Err(ShedError::BadStatus(status));
         }
-        let mut stream = resp.bytes_stream();
+        // Keep the retry's throwaway transport alive for the life of the stream
+        // (see [`Sent`]); `bytes_stream` consumes the response.
+        let _transport = sent.transport;
+        let mut stream = sent.resp.bytes_stream();
         let mut parser = SseParser::new().with_max_event_bytes(max_event_bytes);
         loop {
             // The idle timer wraps the BYTE-chunk future (see rc_events docs):
@@ -607,7 +872,8 @@ impl Client {
                 }
                 Ok(None) => break, // clean EOF
                 Ok(Some(chunk)) => {
-                    let chunk = chunk.map_err(|e| ShedError::Transport(e.to_string()))?;
+                    let chunk =
+                        chunk.map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))?;
                     let events = parser
                         .try_feed(&chunk)
                         .map_err(|e| ShedError::Transport(format!("rc-events stream: {e}")))?;
@@ -670,42 +936,29 @@ impl Client {
         sink: &dyn CreateSink,
     ) -> Result<(), ShedError> {
         let url = self.build_url(&["api", "sheds"], &[])?;
-        // Bound the WHOLE connect phase — bearer resolution (a foreign
-        // TokenMinter can hang) plus the request send — under CREATE_IDLE_TIMEOUT,
-        // mirroring rc_events, so no pre-stream await sits outside the bound.
-        let connect = async {
-            let bearer = self.bearer().await;
-            let mut rb = self
-                .http
-                .post(url)
+        // Bound the WHOLE connect phase — credential resolution (a foreign
+        // TokenMinter can hang), the request send, and the one re-auth attempt —
+        // under CREATE_IDLE_TIMEOUT, mirroring rc_events, so no pre-stream await
+        // sits outside the bound.
+        let connect = self.send_resolved(CREATE_IDLE_TIMEOUT, |http| {
+            http.post(url.clone())
                 .header(reqwest::header::ACCEPT, "text/event-stream")
-                .json(req);
-            if let Some(tok) = &bearer {
-                rb = rb.bearer_auth(tok);
-            }
-            (bearer, rb.send().await)
-        };
-        let (bearer, resp) = match tokio::time::timeout(CREATE_IDLE_TIMEOUT, connect).await {
+                .json(req)
+        });
+        let sent = match tokio::time::timeout(CREATE_IDLE_TIMEOUT, connect).await {
             Err(_) => {
                 return Err(ShedError::Create("create stream idle timeout".into()));
             }
-            Ok((bearer, r)) => (bearer, r.map_err(|e| ShedError::Transport(e.to_string()))?),
+            Ok(r) => r?,
         };
-        let status = resp.status().as_u16();
-        if status == 401 {
-            // Invalidate the token we SENT ([`Self::invalidate_sent`], the
-            // stale-401 guard, bounded by the create idle timeout — see the
-            // helper's docs) so the next attempt re-mints; create stays
-            // one-shot (no retry), so a timed-out invalidate just falls
-            // through to the BadStatus below.
-            let _ = self
-                .invalidate_sent(bearer.as_deref(), CREATE_IDLE_TIMEOUT)
-                .await;
-        }
+        let status = sent.resp.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(ShedError::BadStatus(status));
         }
-        let mut stream = resp.bytes_stream();
+        // Keep the retry's throwaway transport alive for the life of the stream
+        // (see [`Sent`]); `bytes_stream` consumes the response.
+        let _transport = sent.transport;
+        let mut stream = sent.resp.bytes_stream();
         let mut parser = SseParser::new();
         let mut saw_complete = false;
         loop {
@@ -713,7 +966,8 @@ impl Client {
                 Err(_) => return Err(ShedError::Create("create stream idle timeout".into())),
                 Ok(None) => break,
                 Ok(Some(chunk)) => {
-                    let chunk = chunk.map_err(|e| ShedError::Transport(e.to_string()))?;
+                    let chunk =
+                        chunk.map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))?;
                     for ev in parser.feed(&chunk) {
                         self.handle_create_event(&ev, sink, &mut saw_complete)?;
                     }
@@ -757,7 +1011,10 @@ impl Client {
     }
 }
 
-fn build_http_client(pin: Option<&str>) -> Result<reqwest::Client, ShedError> {
+fn build_http_client(
+    pin: Option<&str>,
+    resolver: Arc<crate::tls::ClientCertResolver>,
+) -> Result<reqwest::Client, ShedError> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         // Fail closed on a plaintext redirect, mirroring the Swift pinned session.
@@ -769,11 +1026,13 @@ fn build_http_client(pin: Option<&str>) -> Result<reqwest::Client, ShedError> {
             }
         }));
     if let Some(pin) = pin {
-        builder = builder.use_preconfigured_tls(crate::tls::pinned_client_config(pin)?);
+        builder = builder.use_preconfigured_tls(crate::tls::pinned_client_config_with_client_auth(
+            pin, resolver,
+        )?);
     }
     builder
         .build()
-        .map_err(|e| ShedError::Transport(e.to_string()))
+        .map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))
 }
 
 /// A progress event's `{"message": ...}`, or the raw data as a fallback.
@@ -1228,12 +1487,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_sent_is_bounded_when_the_provider_mutex_is_wedged() {
-        // C6 adversarial review #5b: invalidate_if_current contends on the
-        // provider mutex, which is held ACROSS a mint by design — a wedged
-        // concurrent mint must not pin the 401 path forever. Wedge the mutex
-        // with a never-resolving mint, then assert invalidate_sent returns
-        // false within its bound instead of hanging.
+    async fn invalidate_used_is_bounded_when_the_provider_mutex_is_wedged() {
+        // C6 adversarial review #5b: the invalidate contends on the provider
+        // mutex, which is held ACROSS a mint by design — a wedged concurrent
+        // mint must not pin the auth-failure path forever. Wedge the mutex with
+        // a never-resolving mint, then assert invalidate_used returns false
+        // within its bound instead of hanging.
         struct WedgeMinter {
             entered: std::sync::atomic::AtomicBool,
         }
@@ -1267,12 +1526,17 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "wedge never started");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        let rejected = crate::token::Credential {
+            mode: Some(crate::token::AuthMode::Token),
+            token: "tok-x".into(),
+            ..Default::default()
+        };
         let invalidated = tokio::time::timeout(
             Duration::from_secs(5),
-            c.invalidate_sent(Some("tok-x"), Duration::from_millis(100)),
+            c.invalidate_used(Some(&rejected), Duration::from_millis(100)),
         )
         .await
-        .expect("invalidate_sent must return within its bound, not hang");
+        .expect("invalidate_used must return within its bound, not hang");
         assert!(
             !invalidated,
             "a wedged provider must report a timed-out invalidate"
@@ -1485,16 +1749,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_401_invalidates_provider_without_retry() {
-        // Create is one-shot (no 401 retry), but must still invalidate a stale
-        // cached token so the next attempt remints.
+    async fn create_401_remints_and_retries_once() {
+        // Create runs the same classify → invalidate → one re-mint → retry path
+        // as every other request (it used to be one-shot, invalidating only a
+        // bearer token — `None` in mtls state, so a refused certificate left
+        // create permanently failing). The JSON body is re-sent on the retry.
         let server = MockServer::start_async().await;
-        server
+        let stale = server
             .mock_async(|w, t| {
                 w.method(POST)
                     .path("/api/sheds")
                     .header("authorization", "Bearer tok-1");
                 t.status(401);
+            })
+            .await;
+        let fresh = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds")
+                    .header("authorization", "Bearer tok-2")
+                    .json_body(serde_json::json!({"name": "x"}));
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body("event: progress\ndata: {\"message\":\"building\"}\n\nevent: complete\ndata: {\"name\":\"x\",\"status\":\"running\"}\n\n");
             })
             .await;
         let minter = Arc::new(SeqMinter {
@@ -1518,22 +1795,13 @@ mod tests {
             ..Default::default()
         };
         c.create_shed(&req, sink.as_ref()).await;
-        assert!(
-            sink.snapshot()
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("401") || e.contains("BadStatus") || e.contains("create")),
-            "create should surface the 401: {:?}",
-            sink.snapshot().error
-        );
-        // Still only one mint so far (no create retry); invalidate forces remint next.
-        assert_eq!(minter.calls.load(Ordering::SeqCst), 1);
-        let _ = c.bearer().await;
-        assert_eq!(
-            minter.calls.load(Ordering::SeqCst),
-            2,
-            "401 on create must invalidate so the next bearer remints"
-        );
+        let snap = sink.snapshot();
+        assert_eq!(snap.error, None, "create should have recovered");
+        assert_eq!(snap.messages, vec!["building"]);
+        assert_eq!(snap.shed.expect("a complete shed").name, "x");
+        assert_eq!(stale.hits_async().await, 1, "exactly one rejected attempt");
+        assert_eq!(fresh.hits_async().await, 1, "exactly one retry");
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 2, "one re-mint");
     }
 
     // ---- overview (fetchOverview cases ported from mobile's
@@ -1909,7 +2177,10 @@ mod tests {
             c.delete_session("proj", ".").await,
             Err(ShedError::Config(_))
         ));
-        assert!(matches!(c.list_sessions("").await, Err(ShedError::Config(_))));
+        assert!(matches!(
+            c.list_sessions("").await,
+            Err(ShedError::Config(_))
+        ));
         assert!(matches!(
             c.rc_messages("proj", "..", 0, None).await,
             Err(ShedError::Config(_))
@@ -2110,16 +2381,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rc_events_401_invalidates_provider_with_no_second_request() {
-        // 401 → invalidate + Err(BadStatus(401)), and NO in-method retry (the
-        // C5 watcher owns reconnect/re-auth): exactly one request hits the
-        // server, and the next bearer() re-mints.
+    async fn rc_events_401_remints_and_retries_once() {
+        // The rc-events connect runs the SAME classify → invalidate → one
+        // re-mint → retry path as a unary request (it used to surface the 401
+        // after invalidating only a bearer token — which is `None` in mtls
+        // state, so a refused certificate could never recover there).
         let server = MockServer::start_async().await;
-        let m = server
+        let stale = server
             .mock_async(|w, t| {
                 w.method(GET)
                     .path("/api/rc/events")
                     .header("authorization", "Bearer tok-1");
+                t.status(401);
+            })
+            .await;
+        let fresh = server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/rc/events")
+                    .header("authorization", "Bearer tok-2");
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(": ok\n\nevent: activity.changed\ndata: {\"shed\":\"proj\",\"slug\":\"cdx777\",\"activity\":\"working\",\"state\":\"ready\"}\n\n");
+            })
+            .await;
+        let minter = Arc::new(SeqMinter {
+            calls: AtomicUsize::new(0),
+        });
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+        let sink = RecordingRcSink::default();
+        c.rc_events(&sink).await.unwrap();
+        assert_eq!(sink.events().len(), 1, "the retried stream delivered");
+        assert_eq!(stale.hits_async().await, 1, "exactly one rejected attempt");
+        assert_eq!(fresh.hits_async().await, 1, "exactly one retry");
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 2, "one re-mint");
+    }
+
+    #[tokio::test]
+    async fn rc_events_401_that_survives_the_remint_is_surfaced_once() {
+        // At-most-once: when the retry is refused too, rc_events surfaces the
+        // status rather than looping. The watcher owns the reconnect.
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/rc/events");
                 t.status(401);
             })
             .await;
@@ -2137,16 +2449,9 @@ mod tests {
         let sink = RecordingRcSink::default();
         let err = c.rc_events(&sink).await.unwrap_err();
         assert!(matches!(err, ShedError::BadStatus(401)), "got {err:?}");
-        assert_eq!(m.hits_async().await, 1, "401 must not retry in-method");
+        assert_eq!(m.hits_async().await, 2, "one attempt + one retry, no more");
         assert!(sink.events().is_empty());
-        // Invalidated: one mint so far, the next bearer() re-mints.
-        assert_eq!(minter.calls.load(Ordering::SeqCst), 1);
-        let _ = c.bearer().await;
-        assert_eq!(
-            minter.calls.load(Ordering::SeqCst),
-            2,
-            "401 must invalidate so the watcher's next connect re-mints"
-        );
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2264,8 +2569,16 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            ShedError::Transport(msg) => assert!(msg.contains("connect"), "got: {msg}"),
-            other => panic!("expected Transport connect timeout, got {other:?}"),
+            // Either message is a correct answer, and both are the SAME bound:
+            // credential resolution is now bounded inside the connect phase
+            // (`send_resolved`), so the inner timer usually wins the race with
+            // the outer one. What this pins is that a never-resolving mint ends
+            // the call instead of hanging it.
+            ShedError::Transport(msg) => assert!(
+                msg.contains("credential resolution timeout") || msg.contains("connect"),
+                "got: {msg}"
+            ),
+            other => panic!("expected a Transport timeout, got {other:?}"),
         }
     }
 
@@ -2301,8 +2614,10 @@ mod tests {
         .expect("request must return within the bound, not hang")
         .unwrap_err();
         match err {
-            ShedError::Transport(msg) => assert!(msg.contains("bearer"), "got: {msg}"),
-            other => panic!("expected Transport bearer timeout, got {other:?}"),
+            // "credential" since the resolution generalized past bearer tokens
+            // (plan 001 D5); the bound and the behavior are unchanged.
+            ShedError::Transport(msg) => assert!(msg.contains("credential"), "got: {msg}"),
+            other => panic!("expected Transport credential timeout, got {other:?}"),
         }
     }
 
@@ -2323,5 +2638,662 @@ mod tests {
         let err = client(&server).rc_events(&sink).await.unwrap_err();
         assert!(matches!(err, ShedError::BadStatus(204)), "got {err:?}");
         assert!(sink.events().is_empty());
+    }
+}
+
+/// The adaptive transport end to end (plan 001 D5), against real in-process TLS
+/// listeners rather than a mock: a client that enrolls, rotates, and follows a
+/// server-side mode flip — all on ONE `reqwest::Client` that is never rebuilt.
+#[cfg(test)]
+mod mtls_tests {
+    use super::*;
+    use crate::testtls::*;
+    use crate::token::{
+        AuthMode, ControlTokenProvider, CredentialObserver, CredentialRequest, MintedCredential,
+        MintedToken, TokenMinter,
+    };
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// What the mock server hands back on the next mint — flipped mid-test to
+    /// model an operator changing `auth.mode`.
+    #[derive(Clone)]
+    enum Issue {
+        Certificate,
+        /// A certificate signed by the right CA but already EXPIRED — the shape
+        /// the server refuses inside the handshake, with a TLS alert rather than
+        /// an HTTP status.
+        ExpiredCertificate,
+        Token(String),
+    }
+
+    /// A minter that behaves like the real `_bootstrap` exchange: it receives the
+    /// CSR, signs it with the server's CA (or issues a bearer token instead),
+    /// serializes the SAME JSON bundle shape the Go server emits, and decodes it
+    /// back through [`crate::token::parse_credential_bundle`] — so these tests
+    /// exercise the wire decoder, not a hand-built credential.
+    struct CaMinter {
+        ca: Arc<TestCa>,
+        issue: Mutex<Issue>,
+        calls: AtomicUsize,
+        csrs: Mutex<Vec<String>>,
+        delay_ms: u64,
+        /// Issue a certificate for an UNRELATED key, modelling a server (or a
+        /// man in the middle) returning a certificate this process cannot use.
+        foreign_key: bool,
+    }
+
+    impl CaMinter {
+        fn new(ca: Arc<TestCa>) -> Arc<Self> {
+            Arc::new(Self {
+                ca,
+                issue: Mutex::new(Issue::Certificate),
+                calls: AtomicUsize::new(0),
+                csrs: Mutex::new(Vec::new()),
+                delay_ms: 0,
+                foreign_key: false,
+            })
+        }
+        fn slow(ca: Arc<TestCa>) -> Arc<Self> {
+            Arc::new(Self {
+                delay_ms: 40,
+                ..Self::bare(ca)
+            })
+        }
+        fn foreign(ca: Arc<TestCa>) -> Arc<Self> {
+            Arc::new(Self {
+                foreign_key: true,
+                ..Self::bare(ca)
+            })
+        }
+        fn bare(ca: Arc<TestCa>) -> Self {
+            Self {
+                ca,
+                issue: Mutex::new(Issue::Certificate),
+                calls: AtomicUsize::new(0),
+                csrs: Mutex::new(Vec::new()),
+                delay_ms: 0,
+                foreign_key: false,
+            }
+        }
+        fn set_issue(&self, issue: Issue) {
+            *self.issue.lock().unwrap() = issue;
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn csrs(&self) -> Vec<String> {
+            self.csrs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenMinter for CaMinter {
+        async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+            unreachable!("an mtls-capable minter is driven through mint_credential")
+        }
+
+        fn supports_mtls(&self) -> bool {
+            true
+        }
+
+        async fn mint_credential(
+            &self,
+            _server: &str,
+            req: &CredentialRequest,
+        ) -> Result<MintedCredential, ShedError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(csr) = req.csr_base64() {
+                self.csrs.lock().unwrap().push(csr.to_string());
+            }
+            if self.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            }
+            let issue = self.issue.lock().unwrap().clone();
+            let expired = matches!(issue, Issue::ExpiredCertificate);
+            let bundle = match issue {
+                Issue::Certificate | Issue::ExpiredCertificate => {
+                    let csr = req
+                        .csr_base64()
+                        .ok_or_else(|| ShedError::Transport("no CSR offered".into()))?;
+                    let der = BASE64.decode(csr.as_bytes()).unwrap();
+                    let (pem, serial) = if self.foreign_key {
+                        let other = self.ca.client_cert(
+                            &format!("SHA256:client-{n}"),
+                            "control",
+                            valid_window(),
+                        );
+                        (other.cert_pem, "beef".to_string())
+                    } else {
+                        let window = if expired {
+                            expired_window()
+                        } else {
+                            valid_window()
+                        };
+                        self.ca.sign_csr(
+                            &der,
+                            &format!("SHA256:client-{n}"),
+                            "control",
+                            n as u64,
+                            window,
+                        )
+                    };
+                    serde_json::json!({
+                        "auth_mode": "mtls",
+                        "https_port": 8443,
+                        "tls_cert_fingerprint": "sha256:aa",
+                        "client_cert": pem,
+                        "scope": "control",
+                        "cert_serial": serial,
+                        "expires_at": "2036-01-01T00:00:00Z",
+                    })
+                }
+                Issue::Token(t) => serde_json::json!({
+                    "auth_mode": "token",
+                    "http_port": 8080,
+                    "https_port": 8443,
+                    "tls_cert_fingerprint": "sha256:aa",
+                    "token": t,
+                    "scope": "control",
+                    "token_id": "id-1",
+                    "expires_at": "2036-01-01T00:00:00Z",
+                }),
+            };
+            crate::token::parse_credential_bundle(&bundle.to_string(), None)
+                .map_err(|e| ShedError::Transport(e.to_string()))
+        }
+    }
+
+    /// Records every `mode_changed` event, in order.
+    #[derive(Default)]
+    struct ModeLog(Mutex<Vec<AuthMode>>);
+    impl ModeLog {
+        fn modes(&self) -> Vec<AuthMode> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+    impl CredentialObserver for ModeLog {
+        fn on_mode_changed(&self, _server: &str, mode: AuthMode) {
+            self.0.lock().unwrap().push(mode);
+        }
+    }
+
+    fn client_for(srv: &TlsServer, provider: Arc<ControlTokenProvider>) -> Client {
+        Client::with_provider(
+            srv.base_url(),
+            "mtls-test".into(),
+            Some(srv.pin.clone()),
+            provider,
+        )
+        .unwrap()
+    }
+
+    async fn get(c: &Client) -> Result<Vec<u8>, ShedError> {
+        let url = c.build_url(&["api", "info"], &[]).unwrap();
+        c.request(reqwest::Method::GET, &url, GET_TIMEOUT, None)
+            .await
+    }
+
+    /// [`get`] for tests that assert on the EXACT rejection error. Production
+    /// re-sends the ambiguous "connection was not ready" shape once
+    /// (`authfail.rs`, finding 6) and hands a second occurrence back to the
+    /// caller; under parallel test load that can happen twice in a row, which
+    /// would report a false regression in the alert being pinned.
+    async fn get_stable(c: &Client) -> Result<Vec<u8>, ShedError> {
+        let mut outcome = get(c).await;
+        for _ in 0..3 {
+            match &outcome {
+                Err(ShedError::Transport(m)) if crate::authfail::is_connection_lost_message(m) => {
+                    outcome = get(c).await;
+                }
+                _ => break,
+            }
+        }
+        outcome
+    }
+
+    // (a) The whole enrollment path against a REAL RequireAndVerifyClientCert
+    // listener: keypair + CSR generated here, certificate signed by the server's
+    // CA, presented at the handshake, request authorized.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_authenticates_with_an_enrolled_certificate() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, false).await;
+        let minter = CaMinter::new(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+
+        let body = get(&c).await.unwrap();
+        assert_eq!(body, b"{\"ok\":true}");
+        // The server saw OUR certificate — issued for the CSR this process sent.
+        assert_eq!(srv.client_cns(), vec!["SHA256:client-1".to_string()]);
+        // The CSR really was carried out (and is a decodable P-256 CSR).
+        let csrs = minter.csrs();
+        assert_eq!(csrs.len(), 1);
+        assert_eq!(BASE64.decode(csrs[0].as_bytes()).unwrap()[0], 0x30);
+        // The provider reports the adopted shape, and no bearer is ever sent.
+        let cred = provider.credential().await.unwrap();
+        assert_eq!(cred.mode, Some(AuthMode::Mtls));
+        assert_eq!(cred.bearer_token(), None);
+        assert!(provider.cert_resolver().current().is_some());
+    }
+
+    // (b) ROTATION: serial A → serial B across a forced reconnect, on the SAME
+    // reqwest::Client instance (plan 001 D5's rotation acceptance test).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotation_presents_the_new_certificate_without_rebuilding_the_transport() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        // close_after_each: the server drops the connection after each response,
+        // so request #2 must re-handshake — the "forced reconnect" the AC names.
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, true).await;
+        let minter = CaMinter::new(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+
+        let transport_before = c.transport_id();
+        get(&c).await.unwrap();
+        let cert_a = provider.cert_resolver().current().unwrap();
+
+        // Rotate: the credential is refused / near expiry → one re-mint.
+        //
+        // This is the test that caught TLS 1.3 session RESUMPTION silently
+        // re-presenting the OLD identity — see the resumption note in
+        // `tls::pinned_client_config_with_client_auth`. Without that fix the
+        // server below sees `client-1` twice.
+        provider.invalidate().await;
+        get(&c).await.unwrap();
+        let cert_b = provider.cert_resolver().current().unwrap();
+
+        assert_eq!(
+            c.transport_id(),
+            transport_before,
+            "rotation must not rebuild the reqwest::Client"
+        );
+        assert!(
+            !Arc::ptr_eq(&cert_a, &cert_b),
+            "the resolver must hold a NEW certified key"
+        );
+        assert_eq!(minter.calls(), 2);
+        assert_eq!(minter.csrs().len(), 2, "each renewal generates a fresh CSR");
+        assert_ne!(minter.csrs()[0], minter.csrs()[1], "fresh keypair per mint");
+        // Two handshakes, serial A then serial B — the server saw the rotation.
+        assert_eq!(srv.handshake_count(), 2);
+        assert_eq!(
+            srv.client_cns(),
+            vec!["SHA256:client-1".to_string(), "SHA256:client-2".to_string()]
+        );
+    }
+
+    // (c) MODE FLIP, both directions, on one transport: mtls → token → mtls, each
+    // flip driven only by the server's answer and recovered by a single silent
+    // re-mint (plan 001 D5's migration story).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_mode_flip_never_rebuilds_the_client() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_flip_server(&ca, ServerAuthMode::Mtls, true).await;
+        let minter = CaMinter::new(ca.clone());
+        let log = Arc::new(ModeLog::default());
+        let provider = Arc::new(
+            ControlTokenProvider::new("s".into(), minter.clone())
+                .with_observer(log.clone() as Arc<dyn CredentialObserver>),
+        );
+        let c = client_for(&srv, provider.clone());
+        let resolver = provider.cert_resolver();
+
+        // Phase 1 — mtls: the certificate authorizes the request.
+        get(&c).await.unwrap();
+        assert_eq!(log.modes(), vec![AuthMode::Mtls]);
+        assert!(provider.cert_resolver().current().is_some());
+
+        // Phase 2 — the operator flips the server to token mode. The next request
+        // still presents the (now meaningless) certificate, gets a 401, and the
+        // client re-mints, adopts the token, and retries — all silently.
+        srv.set_mode(ServerAuthMode::Token("tok-flip".into()));
+        minter.set_issue(Issue::Token("tok-flip".into()));
+        get(&c).await.unwrap();
+        assert_eq!(log.modes(), vec![AuthMode::Mtls, AuthMode::Token]);
+        assert_eq!(
+            provider.credential().await.unwrap().bearer_token(),
+            Some("tok-flip")
+        );
+        assert!(
+            provider.cert_resolver().current().is_none(),
+            "the stale certificate must be withdrawn from the transport"
+        );
+
+        // Phase 3 — and back again.
+        srv.set_mode(ServerAuthMode::Mtls);
+        minter.set_issue(Issue::Certificate);
+        get(&c).await.unwrap();
+        assert_eq!(
+            log.modes(),
+            vec![AuthMode::Mtls, AuthMode::Token, AuthMode::Mtls]
+        );
+        assert!(provider.cert_resolver().current().is_some());
+
+        // The flip is invisible ABOVE this client, which is what D5 asks for: the
+        // same `Client`, the same provider, the same resolver handle carried the
+        // whole mtls → token → mtls journey, and nothing had to be reconstructed
+        // by a caller. The connection POOL is a different matter — each flip has a
+        // certificate on one side of it, and a pool cannot carry one (see
+        // `Client::recycle_transport`), so it is purged rather than reused.
+        assert!(
+            Arc::ptr_eq(&provider.cert_resolver(), &resolver),
+            "the flip must be a write through the SAME resolver, not a new one"
+        );
+        assert_eq!(minter.calls(), 3, "one mint per flip, no retry storms");
+    }
+
+    // (b2) The POOLED path, which is the one that actually bites: a keep-alive
+    // server that revokes an identity mid-connection. The 401 arrives on a
+    // connection whose handshake already happened, so re-minting alone does not
+    // help — the retry has to leave that connection behind.
+    //
+    // The handshake count is the assertion that keeps this test honest: exactly
+    // TWO means the rejected request really was served from the pool (one dial for
+    // the original connection, one for the retry). Three would mean the pool had
+    // already dropped the connection and the pooled path was never exercised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_identity_recovers_on_a_pooled_keepalive_connection() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_flip_server(
+            &ca,
+            ServerAuthMode::MtlsAllow(vec!["SHA256:client-1".into()]),
+            false, // keep-alive: the server never hands us a free reconnect
+        )
+        .await;
+        let minter = CaMinter::new(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+        let transport = c.transport_id();
+
+        get(&c).await.unwrap();
+        assert_eq!(srv.handshake_count(), 1);
+
+        // The SSH key leaves the allowlist: the certificate this connection
+        // presented is refused from now on, and only the NEXT one is accepted.
+        srv.set_mode(ServerAuthMode::MtlsAllow(vec!["SHA256:client-2".into()]));
+
+        get(&c)
+            .await
+            .expect("the retry must recover on a fresh connection");
+
+        assert_eq!(minter.calls(), 2, "exactly one re-mint");
+        assert_eq!(
+            srv.client_cns(),
+            vec!["SHA256:client-1".to_string(), "SHA256:client-2".to_string()]
+        );
+        assert_eq!(
+            srv.handshake_count(),
+            2,
+            "one dial for the pooled connection, one for the retry"
+        );
+        assert_ne!(
+            c.transport_id(),
+            transport,
+            "the pool that held the refused connection must be gone, not reused"
+        );
+
+        // And the recovery is DURABLE — the property a throwaway retry client
+        // would not have given: the next request rides the new pool with no
+        // rejection, no mint and no extra dial. (Before the pool purge, the
+        // refused connection stayed checked in and poisoned every later request,
+        // costing a mint each time.)
+        get(&c).await.unwrap();
+        assert_eq!(minter.calls(), 2, "no further mint");
+        assert_eq!(srv.handshake_count(), 2, "no needless third dial");
+        assert_eq!(srv.client_cns().len(), 2);
+    }
+
+    // (d) Single-flight: concurrent resolutions of a missing credential mint once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_enrollments_mint_exactly_once() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, false).await;
+        let minter = CaMinter::slow(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+
+        let (a, b, d) = tokio::join!(get(&c), get(&c), get(&c));
+        a.unwrap();
+        b.unwrap();
+        d.unwrap();
+        assert_eq!(minter.calls(), 1, "concurrent enrollments must coalesce");
+        assert_eq!(minter.csrs().len(), 1, "only one keypair is generated");
+    }
+
+    // (f) "No usable credential ⇒ enroll" (Go `4553cc8` parity): a provider that
+    // holds NOTHING mints BEFORE the first request — the request must not be sent
+    // unauthenticated and rejected first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_holding_nothing_enrolls_before_the_first_request() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, false).await;
+        let minter = CaMinter::new(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        assert!(provider.cert_resolver().current().is_none());
+
+        let c = client_for(&srv, provider.clone());
+        get(&c).await.unwrap();
+
+        assert_eq!(minter.calls(), 1);
+        assert_eq!(
+            srv.handshake_count(),
+            1,
+            "exactly one handshake: no rejected unauthenticated attempt first"
+        );
+    }
+
+    // ---- The SSE streams take the SAME re-auth path (FIX 2) ----
+    //
+    // Both streams used to bypass the classifier entirely: `rc_events` and
+    // `create_stream` flattened a TLS error and returned, and their 401 handling
+    // invalidated a BEARER token — which is `None` in mtls state. A revoked or
+    // expired certificate therefore left every stream permanently failing, with
+    // the provider still holding the refused credential. Each test below drives
+    // one stream through one rejection and asserts it recovers EXACTLY once.
+
+    #[derive(Default)]
+    struct RcSink(Mutex<Vec<crate::rc_events::RcEvent>>);
+    impl RcEventSink for RcSink {
+        fn on_event(&self, ev: crate::rc_events::RcEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
+    }
+
+    #[derive(Default)]
+    struct CreateLog {
+        progress: Mutex<Vec<String>>,
+        shed: Mutex<Option<String>>,
+        error: Mutex<Option<String>>,
+    }
+    impl CreateSink for CreateLog {
+        fn on_progress(&self, message: String) {
+            self.progress.lock().unwrap().push(message);
+        }
+        fn on_complete(&self, shed: crate::models::Shed) {
+            *self.shed.lock().unwrap() = Some(shed.name);
+        }
+        fn on_error(&self, message: String) {
+            *self.error.lock().unwrap() = Some(message);
+        }
+    }
+
+    /// A listener that refuses the FIRST certificate at the TLS layer: the mint
+    /// hands out an expired certificate, so the rejection arrives as a
+    /// `CertificateExpired` alert with no HTTP response at all — the shape the
+    /// streams used to flatten and give up on.
+    async fn tls_alert_setup() -> (TlsServer, Arc<CaMinter>, Arc<ControlTokenProvider>) {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, false).await;
+        let minter = CaMinter::new(ca.clone());
+        minter.set_issue(Issue::ExpiredCertificate);
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        // Enroll NOW, while the mint is the expired one, so the credential the
+        // stream goes out with is already the doomed one. From here the minter
+        // issues valid certificates, so the re-mint can recover.
+        provider.credential().await.unwrap();
+        minter.set_issue(Issue::Certificate);
+        (srv, minter, provider)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rc_events_recovers_from_a_tls_alert_rejection_exactly_once() {
+        let (srv, minter, provider) = tls_alert_setup().await;
+        let c = client_for(&srv, provider.clone());
+        // The re-mint issues a VALID certificate, so the retry authenticates.
+        let sink = RcSink::default();
+        c.rc_events(&sink).await.expect("the stream must recover");
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            1,
+            "the retried stream delivered"
+        );
+        assert_eq!(minter.calls(), 2, "exactly one re-mint");
+        assert_eq!(
+            provider.credential().await.unwrap().cert_serial,
+            "2",
+            "the refused certificate must not still be cached"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_recovers_from_a_tls_alert_rejection_exactly_once() {
+        let (srv, minter, provider) = tls_alert_setup().await;
+        let c = client_for(&srv, provider.clone());
+        let sink = CreateLog::default();
+        let req = crate::models::CreateShedRequest {
+            name: "folio".into(),
+            ..Default::default()
+        };
+        c.create_shed(&req, &sink).await;
+        assert_eq!(*sink.error.lock().unwrap(), None, "create must recover");
+        assert_eq!(sink.shed.lock().unwrap().as_deref(), Some("folio"));
+        assert_eq!(*sink.progress.lock().unwrap(), vec!["building".to_string()]);
+        assert_eq!(minter.calls(), 2, "exactly one re-mint");
+    }
+
+    /// A keep-alive listener that authorizes only the LATEST identity, so the
+    /// first stream connect is refused with an HTTP 401 on a pooled connection.
+    async fn revoked_setup() -> (TlsServer, Arc<CaMinter>, Arc<ControlTokenProvider>, Client) {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_flip_server(
+            &ca,
+            ServerAuthMode::MtlsAllow(vec!["SHA256:client-1".into()]),
+            false,
+        )
+        .await;
+        let minter = CaMinter::new(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+        // One ordinary request to enroll as client-1 AND pool the connection.
+        get(&c).await.unwrap();
+        srv.set_mode(ServerAuthMode::MtlsAllow(vec!["SHA256:client-2".into()]));
+        (srv, minter, provider, c)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rc_events_recovers_from_a_401_rejection_exactly_once() {
+        let (_srv, minter, _provider, c) = revoked_setup().await;
+        let sink = RcSink::default();
+        c.rc_events(&sink).await.expect("the stream must recover");
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert_eq!(minter.calls(), 2, "exactly one re-mint");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_recovers_from_a_401_rejection_exactly_once() {
+        let (_srv, minter, _provider, c) = revoked_setup().await;
+        let sink = CreateLog::default();
+        let req = crate::models::CreateShedRequest {
+            name: "folio".into(),
+            ..Default::default()
+        };
+        c.create_shed(&req, &sink).await;
+        assert_eq!(*sink.error.lock().unwrap(), None, "create must recover");
+        assert_eq!(sink.shed.lock().unwrap().as_deref(), Some("folio"));
+        assert_eq!(minter.calls(), 2, "exactly one re-mint");
+    }
+
+    // ---- The capture/transmit race (FIX 3) ----
+    //
+    // `send_authed` pins the credential it puts in the HEADER, but reqwest gives
+    // no per-request TLS control: the resolver is read live during the handshake,
+    // so a mint that lands between the capture and the dial means the request goes
+    // out as credential N+1 while having recorded N. (A pooled connection is the
+    // same problem in a different order — it presents whatever was current when it
+    // was dialed.)
+    //
+    // Reproduced deterministically, with no timing at all: `send_authed` takes the
+    // captured credential as an argument, so the test hands it a STALE one while
+    // the provider holds a newer one — exactly the state the race produces.
+    // Attributing the failure to the capture would dismiss it as "stale, we
+    // already rotated past that", invalidate nothing, and re-send the credential
+    // the server just refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_capture_still_invalidates_and_recovers() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_flip_server(
+            &ca,
+            ServerAuthMode::MtlsAllow(vec!["SHA256:client-3".into()]),
+            false,
+        )
+        .await;
+        let minter = CaMinter::new(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+
+        // Credential N (client-1) is captured...
+        let captured = provider.credential().await.unwrap();
+        assert_eq!(captured.cert_serial, "1");
+        // ...and a concurrent mint moves the provider (and the resolver the
+        // handshake reads) to N+1 (client-2) before this request is dialed.
+        provider.invalidate().await;
+        let current = provider.credential().await.unwrap();
+        assert_eq!(current.cert_serial, "2");
+
+        // The server accepts neither: only client-3, the NEXT mint, is authorized.
+        let url = c.build_url(&["api", "info"], &[]).unwrap();
+        let sent = c
+            .send_authed(GET_TIMEOUT, Some(captured), |http| {
+                http.get(url.clone()).timeout(GET_TIMEOUT)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sent.resp.status().as_u16(),
+            200,
+            "the rejection of the credential actually transmitted must be acted on"
+        );
+        assert_eq!(minter.calls(), 3, "one re-mint on top of the two above");
+        assert_eq!(
+            provider.credential().await.unwrap().cert_serial,
+            "3",
+            "the refused credential must not still be cached"
+        );
+    }
+
+    // Fail-closed: a certificate that does not match the key we generated is
+    // never adopted, never presented, and surfaces as an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_certificate_for_a_foreign_key_is_refused() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, false).await;
+        let minter = CaMinter::foreign(ca.clone());
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+
+        let err = get_stable(&c).await.unwrap_err();
+        // No credential resolved → the request goes out unauthenticated and the
+        // listener refuses it at the handshake; nothing usable was ever installed.
+        assert!(provider.cert_resolver().current().is_none());
+        assert!(
+            matches!(&err, ShedError::Transport(m) if m.contains("CertificateRequired")),
+            "got {err:?}"
+        );
+        assert!(provider.credential().await.is_err());
     }
 }

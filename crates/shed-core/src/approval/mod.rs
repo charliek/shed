@@ -20,5 +20,6 @@ pub use policy::PolicyEngine;
 // Frame/vocabulary types are flat; the codec free-functions (`decode` + the
 // encoders) stay namespaced under `approval::protocol::` for symmetry.
 pub use protocol::{
-    AuditEventFrame, HelloAck, HostAgentInbound, TokenResponse, HOST_AGENT_PROTOCOL_VERSION,
+    AuditEventFrame, CredentialResponse, HelloAck, HostAgentInbound, TokenResponse,
+    CAP_CREDENTIAL_GET, HOST_AGENT_PROTOCOL_VERSION,
 };

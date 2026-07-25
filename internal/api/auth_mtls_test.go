@@ -840,6 +840,170 @@ func TestMTLSExpiryOnPooledConnection(t *testing.T) {
 	}
 }
 
+// TestMTLSRejectionSetsConnectionCloseHeader asserts the header itself, which
+// the live test above cannot see (net/http parses Connection out of the response
+// into Response.Close). Recorder-level, so it also pins WHICH rejections close:
+// the three identity failures do, the scope failure and the success do not.
+func TestMTLSRejectionSetsConnectionCloseHeader(t *testing.T) {
+	fp := testFingerprint("allowed")
+	s, _ := mtlsTestServer(t, fp)
+	h := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for _, tc := range []struct {
+		name      string
+		certs     []*x509.Certificate
+		wantCode  int
+		wantClose bool
+	}{
+		{"no certificate", nil, http.StatusUnauthorized, true},
+		{"expired", []*x509.Certificate{testClientCert(fp, authtoken.ScopeControl, -time.Hour)}, http.StatusUnauthorized, true},
+		{"not allowlisted", []*x509.Certificate{testClientCert(testFingerprint("stranger"), authtoken.ScopeControl, time.Hour)}, http.StatusUnauthorized, true},
+		{"out of scope", []*x509.Certificate{testClientCert(fp, authtoken.ScopeCredentials, time.Hour)}, http.StatusForbidden, false},
+		{"authorized", []*x509.Certificate{testClientCert(fp, authtoken.ScopeControl, time.Hour)}, http.StatusOK, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/sheds", nil)
+			if len(tc.certs) > 0 {
+				withClientCert(req, tc.certs...)
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != tc.wantCode {
+				t.Fatalf("got %d, want %d", rr.Code, tc.wantCode)
+			}
+			gotClose := strings.EqualFold(rr.Header().Get("Connection"), "close")
+			if gotClose != tc.wantClose {
+				t.Errorf("Connection: close = %v (header %q), want %v",
+					gotClose, rr.Header().Get("Connection"), tc.wantClose)
+			}
+		})
+	}
+}
+
+// reusedDo is reusedGet plus the response headers: the connection-teardown test
+// has to read what the server said about the connection, not just its status.
+// The body is drained and closed (as a keep-alive client must) so the connection
+// is returned to the pool whenever the server allowed that.
+func reusedDo(t *testing.T, c *http.Client, url string) (resp *http.Response, reused bool, err error) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	var gotReused atomic.Bool
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { gotReused.Store(info.Reused) },
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	resp, err = c.Do(req)
+	if err != nil {
+		return nil, gotReused.Load(), err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp, gotReused.Load(), nil
+}
+
+// TestMTLSRejectionClosesTheConnection is the other half of the per-request
+// re-validation story. Re-validating catches the revoked identity (the two tests
+// above); CLOSING is what lets the client act on it.
+//
+// The identity is bound to the connection — presented once at the handshake and
+// never re-asked — so a client that answers the 401 by re-minting and retrying
+// sends the fresh credential over a pooled connection that still presents the
+// OLD certificate, and collects a second 401. Neither Go's http.Client nor
+// reqwest can say "not that connection", so the server has to say it: an
+// identity-rejection 401 carries Connection: close, and the client's very next
+// request re-handshakes with whatever it holds now.
+//
+// A 403 must NOT close: that identity is live and current, it is simply out of
+// scope for the route, and a fresh handshake would present exactly the same
+// certificate.
+func TestMTLSRejectionClosesTheConnection(t *testing.T) {
+	fp := testFingerprint("allowed")
+
+	t.Run("de-authorized identity closes", func(t *testing.T) {
+		h := newMTLSHarness(t, map[string]bool{fp: true}, nil)
+		cert := issueClientCert(t, h.ca, fp, authtoken.ScopeControl, time.Hour)
+		c := h.client(&cert, 0)
+		url := h.srv.URL + "/api/sheds"
+
+		// A live identity, so the connection is established and pooled.
+		if status, _, err := reusedGet(t, c, url); err != nil || status != http.StatusOK {
+			t.Fatalf("first request: status %d, err %v; want 200", status, err)
+		}
+
+		// The key leaves the allowlist; the next request rides the pooled
+		// connection and is refused by the per-request re-validation.
+		h.setAuthorized(func(string) bool { return false })
+		resp, reused, err := reusedDo(t, c, url)
+		if err != nil {
+			t.Fatalf("second request errored instead of returning 401: %v", err)
+		}
+		if !reused {
+			t.Fatal("second request opened a NEW connection — the test cannot prove anything about pooled ones")
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("second request: got %d, want 401", resp.StatusCode)
+		}
+		// Response.Close IS the parsed Connection: close — net/http consumes the
+		// hop-by-hop header while reading the response, so this is where it
+		// surfaces client-side. The verbatim header is asserted on the wire by
+		// TestMTLSRejectionSetsConnectionCloseHeader.
+		if !resp.Close {
+			t.Error("401 response did not tell the client to close the connection")
+		}
+
+		// The connection really is gone: re-authorize and observe that the next
+		// request has to dial. (Without the teardown it would be served from the
+		// pool — the same connection, the same dead identity, another 401.)
+		h.setAuthorized(func(string) bool { return true })
+		status, reused, err := reusedGet(t, c, url)
+		if err != nil {
+			t.Fatalf("third request: %v", err)
+		}
+		if reused {
+			t.Error("the rejected connection was returned to the pool — Connection: close was not honored")
+		}
+		if status != http.StatusOK {
+			t.Errorf("third request: got %d, want 200", status)
+		}
+	})
+
+	t.Run("scope rejection keeps the connection", func(t *testing.T) {
+		h := newMTLSHarness(t, map[string]bool{fp: true}, nil)
+		// A live, allowlisted identity — carrying the credentials scope, which
+		// may not reach a control-only route.
+		cert := issueClientCert(t, h.ca, fp, authtoken.ScopeCredentials, time.Hour)
+		c := h.client(&cert, 0)
+		url := h.srv.URL + "/api/sheds"
+
+		resp, _, err := reusedDo(t, c, url)
+		if err != nil {
+			t.Fatalf("first request: %v", err)
+		}
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("first request: got %d, want 403", resp.StatusCode)
+		}
+		if resp.Close || strings.EqualFold(resp.Header.Get("Connection"), "close") {
+			t.Error("a 403 must not close the connection: the identity is valid, only the route is out of scope")
+		}
+
+		status, reused, err := reusedGet(t, c, url)
+		if err != nil {
+			t.Fatalf("second request: %v", err)
+		}
+		if !reused {
+			t.Error("the connection was torn down by a scope rejection")
+		}
+		if status != http.StatusForbidden {
+			t.Errorf("second request: got %d, want 403", status)
+		}
+	})
+}
+
 // TestMTLSEstablishedStreamSurvivesExpiry pins the documented parity limitation:
 // authorization is checked at request dispatch, so an SSE stream that was
 // authorized when it opened keeps streaming after its certificate expires. It

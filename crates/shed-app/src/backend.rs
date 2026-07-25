@@ -198,7 +198,10 @@ impl Backend {
             .clients
             .iter()
             .map(|(name, c)| async move { (name.clone(), call(c).await) });
-        futures::future::join_all(fetches).await.into_iter().collect()
+        futures::future::join_all(fetches)
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Fetch sheds from every configured host concurrently (host-stamped by
@@ -399,7 +402,11 @@ impl Backend {
     /// host/shed) — what `rc.list` fans out over. Pairs each running shed with the
     /// resolved ssh endpoint of its host, so `RcService::list` can probe them all
     /// without touching `Backend`. Mirrors the Swift `rcList` target selection.
-    pub async fn rc_targets(&self, host: Option<&str>, shed: Option<&str>) -> Vec<(Shed, RcTarget)> {
+    pub async fn rc_targets(
+        &self,
+        host: Option<&str>,
+        shed: Option<&str>,
+    ) -> Vec<(Shed, RcTarget)> {
         self.list_sheds()
             .await
             .into_iter()
@@ -510,9 +517,7 @@ mod tests {
             host: "127.0.0.1".into(),
             http_port: 8080,
             ssh_port: 2222,
-            control_token: String::new(),
-            api_url: String::new(),
-            tls_cert_fingerprint: String::new(),
+            ..Default::default()
         }
     }
 
@@ -807,9 +812,7 @@ mod tests {
                 host: "10.0.0.9".into(),
                 http_port: 8080,
                 ssh_port: 2200,
-                control_token: String::new(),
-                api_url: String::new(),
-                tls_cert_fingerprint: String::new(),
+                ..Default::default()
             }],
             default_server: Some("prod".into()),
         };
