@@ -36,8 +36,9 @@ func captureStderr(t *testing.T, fn func()) string {
 
 func TestTokenModeAndEnforcement(t *testing.T) {
 	// AuthEnforced is the combined open-vs-(token|mtls) predicate; mtls shares
-	// every enforced-mode invariant except HTTP bearer-token enforcement (it
-	// authenticates the client via certificate instead — see HTTPAuthEnforced).
+	// every enforced-mode invariant, including HTTP enforcement — it just
+	// demands a different credential there (a client certificate rather than a
+	// bearer token). Only open mode leaves the HTTP API unauthenticated.
 	tests := []struct {
 		name            string
 		auth            *AuthConfig
@@ -50,7 +51,7 @@ func TestTokenModeAndEnforcement(t *testing.T) {
 		{"open default", &AuthConfig{}, false, false, false, false},
 		{"explicit open", &AuthConfig{Mode: AuthModeOpen}, false, false, false, false},
 		{"token", &AuthConfig{Mode: AuthModeToken}, true, false, true, true},
-		{"mtls", &AuthConfig{Mode: AuthModeMTLS}, false, true, true, false},
+		{"mtls", &AuthConfig{Mode: AuthModeMTLS}, false, true, true, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

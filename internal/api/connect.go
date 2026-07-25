@@ -44,6 +44,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Hijack the HTTP connection.
+	//
+	// Auth note: this is the last point at which any middleware runs on this
+	// connection. Past the hijack the bytes flow through BidirectionalCopy with
+	// no request boundary left, so an established tunnel outlives the expiry or
+	// revocation of the credential that opened it (token or client certificate
+	// alike) until one side closes it. That parity limitation is documented in
+	// full on authMiddleware in auth.go — see the "Known parity limitation"
+	// paragraph there before changing anything here.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		vmConn.Close()

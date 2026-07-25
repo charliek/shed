@@ -131,9 +131,10 @@ func (c *ServerConfig) TokenMode() bool {
 
 // MTLSMode reports whether the server runs in mtls mode (auth.mode: mtls):
 // the client credential is a short-lived certificate issued over the SSH
-// bootstrap channel rather than a bearer token. It shares every other
-// token-mode network/SSH invariant — see AuthEnforced, the combined predicate
-// most call sites outside HTTP bearer-token enforcement should use.
+// bootstrap channel rather than a bearer token, verified at the TLS handshake
+// and re-validated on every HTTP request. It shares every other token-mode
+// network/SSH invariant — see AuthEnforced, the combined predicate most call
+// sites should use when they only care that auth is on.
 func (c *ServerConfig) MTLSMode() bool {
 	return c.Auth != nil && c.Auth.Mode == AuthModeMTLS
 }
@@ -147,12 +148,19 @@ func (c *ServerConfig) AuthEnforced() bool {
 	return c.TokenMode() || c.MTLSMode()
 }
 
-// HTTPAuthEnforced reports whether the HTTP API requires a bearer token. This
-// stays token-only (not the combined AuthEnforced): mtls mode has no bearer
-// tokens at all, so its HTTP requests are authenticated a different way. S6
-// adds the mtls certificate-auth branch here.
+// HTTPAuthEnforced reports whether the HTTP API requires an authenticated
+// caller at all. It is the gate on the auth middleware, not a statement about
+// WHICH credential: token mode requires a scoped bearer token, mtls mode
+// requires a scoped client certificate, and only open mode passes traffic
+// through unauthenticated. The middleware branches on TokenMode/MTLSMode after
+// this gate says "enforce something".
+//
+// It is deliberately identical to AuthEnforced today. The two are kept apart
+// because they answer different questions — "does HTTP require a credential"
+// versus "is the network/SSH posture hardened" — and a future mode could
+// answer them differently.
 func (c *ServerConfig) HTTPAuthEnforced() bool {
-	return c.TokenMode()
+	return c.AuthEnforced()
 }
 
 // AuthModeValue returns the effective auth.mode string, defaulting to
@@ -207,8 +215,9 @@ func (c *ServerConfig) validateAuth() error {
 		}
 	}
 	// enforced covers both non-open modes: mtls inherits every token-mode
-	// SSH/network invariant below (it differs only in HTTP bearer-token
-	// enforcement, which lives in HTTPAuthEnforced and is out of scope here).
+	// SSH/network invariant below (it differs only in which HTTP credential the
+	// auth middleware demands — a client certificate rather than a bearer
+	// token — which is out of scope here).
 	enforced := c.AuthEnforced()
 	if ssh := c.SSHAuth(); ssh != nil {
 		switch ssh.Mode {

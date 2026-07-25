@@ -61,6 +61,49 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
+// buildHTTPSTLSConfig assembles the tls.Config the HTTPS listener runs with.
+// It is the ONE place the client-authentication posture is decided, extracted
+// from runServe so a test can assert on the real production assembly rather
+// than on a hand-built lookalike — if this function stops requiring client
+// certificates in mtls mode, TestBuildHTTPSTLSConfig fails.
+//
+// clientCA is non-nil only in mtls mode (runServe loads it there and nowhere
+// else, and aborts startup if the load fails); authorized is the live
+// SSH-allowlist predicate. In token and open mode the result is a plain
+// server-auth-only config: no ClientAuth, no ClientCAs.
+//
+// Both conditions are required deliberately, and the belt-and-braces costs
+// nothing: an mtls server that somehow reached here with no CA would produce a
+// listener that asks for no certificate — but it would not be open, because the
+// API middleware gates on cfg.MTLSMode() alone and refuses every request that
+// arrives without one.
+//
+// mtls adds three things: trust only the internal CA, require a client
+// certificate that verifies against it, and refuse the handshake outright when
+// the identity that certificate names has left the SSH allowlist.
+//
+// The allowlist check is the FIRST of two, not the only one. A TLS peer's
+// identity is established at the handshake and then held for the life of the
+// connection, so on a pooled keep-alive connection neither expiry nor
+// de-authorization would ever be noticed again — the API middleware re-derives
+// both from the presented certificate on every request, and is the
+// authoritative gate. Checking here as well means a de-authorized client is
+// turned away at the door rather than allowed to open connections and collect
+// 401s. It is installed as VerifyConnection specifically because crypto/tls
+// skips VerifyPeerCertificate on RESUMED sessions (see servertls/clientauth.go).
+func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientCA *servertls.CA, authorized func(string) bool) *tls.Config {
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if cfg.MTLSMode() && clientCA != nil {
+		tlsCfg.ClientCAs = clientCA.Pool()
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsCfg.VerifyConnection = servertls.AllowlistConnectionVerifier(authorized)
+	}
+	return tlsCfg
+}
+
 // defaultHostKeyPath returns the default path for the SSH host key.
 // Uses /etc/shed/host_key when running as root (Linux servers), otherwise
 // falls back to ~/.shed/host_key (macOS development without sudo).
@@ -117,15 +160,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("auth preflight: %w", err)
 	}
 
-	// TEMPORARY — removed by the commit that wires ClientAuth on the HTTPS
-	// listener and the certificate-auth middleware. Certificate ENROLLMENT
-	// works from this commit on, but nothing verifies a presented certificate
-	// yet, so a server started in mtls mode would answer unauthenticated HTTPS
-	// requests. Refuse to start rather than leave a fail-open intermediate
-	// state reachable by anyone building from this commit.
-	if cfg.MTLSMode() {
-		return fmt.Errorf("auth.mode: mtls is not enforceable in this build " +
-			"(client-certificate verification is not wired yet); use auth.mode: token")
+	// mtls authenticates clients at the TLS handshake, so the HTTPS listener IS
+	// the enforcement point — there is no other listener a client could reach.
+	// Config load defaults https_port in every enforced mode, so this is
+	// unreachable through a validated config; it exists so a hand-built config
+	// (a test, a tool) can never produce an mtls server with nothing enforcing.
+	if cfg.MTLSMode() && !cfg.HTTPSEnabled() {
+		return fmt.Errorf("auth.mode: mtls requires https_port (client certificates are verified at the TLS handshake)")
 	}
 
 	log.Printf("Starting shed-server...")
@@ -294,11 +335,42 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	hostKey := sshServer.GetHostPublicKey()
 
+	// Client CA (mtls mode only): the internal root that signs the short-lived
+	// client certificates issued over the SSH bootstrap channel, and the trust
+	// anchor the HTTPS listener verifies presented client certificates against.
+	// Loaded — never silently regenerated — from the state dir.
+	var clientCA *servertls.CA
+	if cfg.MTLSMode() {
+		caCertPath, caKeyPath := caCertPaths(filepath.Dir(hostKeyPath))
+		ca, err := servertls.LoadOrGenerateCA(caCertPath, caKeyPath)
+		if err != nil {
+			return fmt.Errorf("client CA: %w", err)
+		}
+		clientCA = &ca
+		notAfter := ca.NotAfter()
+		log.Printf("Client CA fingerprint: %s (expires %s)", ca.Fingerprint(), notAfter.UTC().Format(time.RFC3339))
+		// The CA is issued for a decade and is never rotated automatically —
+		// rotating it invalidates every client certificate fleet-wide, so the
+		// operator has to schedule it. Start saying so with a season's notice.
+		if remaining := time.Until(notAfter); remaining < caExpiryWarnWindow {
+			log.Printf("WARNING: client CA expires in %d days (%s) — rotate it (delete %s and %s, then re-enroll every client) before issuance stops.",
+				int(remaining.Hours()/24), notAfter.UTC().Format(time.RFC3339), caCertPath, caKeyPath)
+		}
+	}
+
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetTokenStore(tokenStore)           // shared with the SSH bootstrap handler (1c)
+	if clientCA != nil {
+		// mtls: the middleware re-validates every request's client certificate
+		// against the LIVE allowlist, so removing an SSH key de-authorizes its
+		// certificates on the next request — the same "revocation lands
+		// immediately" property the token store gets from RevokeBySubject.
+		apiServer.SetClientCertAuthorizer(sshAllowlist.IsAuthorizedFingerprint)
+		apiServer.SetClientCAInfo(clientCA.Fingerprint(), clientCA.NotAfter())
+	}
 
 	// Warn when bind_address is unset: as of v0.7.4 that defaults to loopback
 	// (was all-interfaces), so a server that relied on the old default is now
@@ -337,33 +409,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		tlsFingerprint = servertls.Fingerprint(der)
 		log.Printf("TLS cert fingerprint: %s", tlsFingerprint)
 		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
-		httpsServer.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-	}
-
-	// Client CA (mtls mode only): the internal root that signs the short-lived
-	// client certificates issued over the SSH bootstrap channel. Loaded — never
-	// silently regenerated — from the state dir. The HTTPS listener's ClientCAs
-	// and the certificate-auth middleware are wired separately.
-	var clientCA *servertls.CA
-	if cfg.MTLSMode() {
-		caCertPath, caKeyPath := caCertPaths(filepath.Dir(hostKeyPath))
-		ca, err := servertls.LoadOrGenerateCA(caCertPath, caKeyPath)
-		if err != nil {
-			return fmt.Errorf("client CA: %w", err)
-		}
-		clientCA = &ca
-		notAfter := ca.NotAfter()
-		log.Printf("Client CA fingerprint: %s (expires %s)", ca.Fingerprint(), notAfter.UTC().Format(time.RFC3339))
-		// The CA is issued for a decade and is never rotated automatically —
-		// rotating it invalidates every client certificate fleet-wide, so the
-		// operator has to schedule it. Start saying so with a season's notice.
-		if remaining := time.Until(notAfter); remaining < caExpiryWarnWindow {
-			log.Printf("WARNING: client CA expires in %d days (%s) — rotate it (delete %s and %s, then re-enroll every client) before issuance stops.",
-				int(remaining.Hours()/24), notAfter.UTC().Format(time.RFC3339), caCertPath, caKeyPath)
-		}
+		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, sshAllowlist.IsAuthorizedFingerprint)
 	}
 
 	// Wire the SSH bootstrap handler: it issues an HTTP credential over the

@@ -3,6 +3,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/backend"
@@ -24,7 +25,19 @@ type Server struct {
 	egressAudit *egress.AuditLog         // nil when egress is disabled
 	egressStore *config.UserProfileStore // nil when egress is disabled
 	tokens      *authtoken.Store         // nil until SetTokenStore; consulted only in token mode (auth.mode: token)
-	rcCaps      *rcCapsCache             // per-shed rc capabilities cache (session enrichment + overview)
+	// certAuthorized answers "is this SSH key fingerprint still allowlisted?"
+	// for the mtls middleware, which re-checks a presented client certificate's
+	// Subject CN on every request. It is a plain predicate rather than the
+	// sshd.KeyAllowlist itself so this package never imports internal/sshd (and
+	// so tests can drive revocation with a closure). nil until
+	// SetClientCertAuthorizer; nil authorizes nothing.
+	certAuthorized func(fingerprint string) bool
+	// caFingerprint / caNotAfter describe the internal client CA, reported on
+	// /api/info in mtls mode so an operator can confirm which CA this server
+	// trusts and when it must be rotated. Zero values in every other mode.
+	caFingerprint string
+	caNotAfter    time.Time
+	rcCaps        *rcCapsCache // per-shed rc capabilities cache (session enrichment + overview)
 	// rcCapsFlight dedupes concurrent capability probes per shed across requests
 	// (singleflight keyed by shed name), so M concurrent overview requests —
 	// ?fresh=1 or a shared cache miss — share one guest exec per shed instead of
@@ -61,6 +74,24 @@ func (s *Server) SetEgressUserStore(st *config.UserProfileStore) { s.egressStore
 // validates against it. Constructed once in shed-server.
 func (s *Server) SetTokenStore(t *authtoken.Store) { s.tokens = t }
 
+// SetClientCertAuthorizer attaches the live SSH-allowlist predicate the mtls
+// middleware re-checks a client certificate's Subject CN against on every
+// request. In shed-server this is sshd.KeyAllowlist.IsAuthorizedFingerprint;
+// passing a function rather than the allowlist keeps internal/api free of an
+// internal/sshd import. It MUST read live state — a snapshot would make
+// certificates unrevokable. Called once at startup in mtls mode; leaving it nil
+// makes the mtls path authorize nothing.
+func (s *Server) SetClientCertAuthorizer(fn func(fingerprint string) bool) { s.certAuthorized = fn }
+
+// SetClientCAInfo records the internal client CA's fingerprint and expiry for
+// /api/info reporting in mtls mode. Two scalars rather than the CA itself: the
+// API server has no use for issuance, and copying the values keeps
+// internal/servertls out of this package's imports.
+func (s *Server) SetClientCAInfo(fingerprint string, notAfter time.Time) {
+	s.caFingerprint = fingerprint
+	s.caNotAfter = notAfter
+}
+
 // NewServer creates a new API server.
 func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, plugins *plugin.Registry, bridge *plugin.Bridge) *Server {
 	s := &Server{
@@ -92,19 +123,22 @@ func (s *Server) useCommonMiddleware(r chi.Router) {
 }
 
 // Router returns the chi router for the HTTP API — served over pinned TLS in
-// secure mode, plain HTTP in open mode. It registers the full route surface on
-// a single listener: the control plane (info, lifecycle, images, system,
-// snapshots, sessions, egress) plus the credential bus (/api/plugins/*) and the
-// Connect tunnel (/api/sheds/*/connect/*). In secure mode the bus requires a
-// credentials-scoped token, the Connect tunnel accepts control or credentials,
-// and everything else requires control (see authMiddleware).
+// an enforced mode (token or mtls), plain HTTP in open mode. It registers the
+// full route surface on a single listener: the control plane (info, lifecycle,
+// images, system, snapshots, sessions, egress) plus the credential bus
+// (/api/plugins/*) and the Connect tunnel (/api/sheds/*/connect/*). In either
+// enforced mode the bus requires a credentials-scoped credential, the Connect
+// tunnel accepts control or credentials, and everything else requires control
+// — identically whether that credential is a bearer token or a client
+// certificate (see authMiddleware).
 func (s *Server) Router() chi.Router {
 	r := chi.NewRouter()
 	s.useCommonMiddleware(r)
 
 	r.Route("/api", func(r chi.Router) {
-		// Server info (also the unauthenticated bootstrap endpoints
-		// used by `shed server add`).
+		// Server info (in open and token mode also the unauthenticated
+		// bootstrap endpoints used by `shed server add`; mtls has no
+		// exemptions — see authMiddleware).
 		r.Get("/info", s.handleGetInfo)
 		r.Get("/ssh-host-key", s.handleGetSSHHostKey)
 

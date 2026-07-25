@@ -269,6 +269,22 @@ type ServerInfo struct {
 	// endpoint. 0/omitted in open mode (no HTTPS listener).
 	HTTPSPort int `json:"https_port,omitempty"`
 
+	// CAFingerprint is the "sha256:<hex>" pin of the internal CA that signs
+	// client certificates, reported only in mtls mode. It is operator
+	// visibility, not a trust anchor: a client never needs it (it authenticates
+	// the SERVER by the tls_cert_fingerprint pin and proves itself with the cert
+	// the SSH bootstrap handed it), but an operator comparing two servers, or
+	// confirming a CA rotation landed, does. Omitted in open/token mode.
+	CAFingerprint string `json:"ca_fingerprint,omitempty"`
+	// CANotAfter is the client CA's expiry (RFC 3339), reported only in mtls
+	// mode. Rotating the CA invalidates every issued client certificate
+	// fleet-wide and must be scheduled, so the deadline is worth surfacing
+	// somewhere a human or a monitor can read it. Omitted in open/token mode.
+	//
+	// A string rather than time.Time so the field can be omitted when unset —
+	// encoding/json's omitempty does not apply to struct values.
+	CANotAfter string `json:"ca_not_after,omitempty"`
+
 	// Features advertises server capability tokens (e.g. "overview",
 	// "rc-enrich") for endpoint discovery, so a client learns which endpoints
 	// and behaviors this server supports without probing each one. The same set

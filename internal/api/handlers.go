@@ -33,6 +33,15 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     serverFeatures(),
 	}
+	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
+	// required a valid client certificate (that mode has no bootstrap
+	// exemptions), so this is reported to authenticated callers only.
+	if s.cfg.MTLSMode() {
+		info.CAFingerprint = s.caFingerprint
+		if !s.caNotAfter.IsZero() {
+			info.CANotAfter = s.caNotAfter.UTC().Format(time.RFC3339)
+		}
+	}
 
 	writeJSON(w, http.StatusOK, info)
 }

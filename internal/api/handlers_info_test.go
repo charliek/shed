@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/charliek/shed/internal/authtoken"
 	"github.com/charliek/shed/internal/config"
 )
 
@@ -85,6 +87,13 @@ func TestHandleGetInfo_AuthMode(t *testing.T) {
 			}, "", nil, nil)
 
 			r := httptest.NewRequest(http.MethodGet, "/api/info", nil)
+			// mtls has no bootstrap exemptions: /api/info requires a valid
+			// client certificate like every other route, so the request has to
+			// carry one to reach the handler at all.
+			if tt.auth != nil && tt.auth.Mode == config.AuthModeMTLS {
+				srv.SetClientCertAuthorizer(func(string) bool { return true })
+				withClientCert(r, testClientCert(testFingerprint("info"), authtoken.ScopeControl, time.Hour))
+			}
 			w := httptest.NewRecorder()
 			srv.Router().ServeHTTP(w, r)
 

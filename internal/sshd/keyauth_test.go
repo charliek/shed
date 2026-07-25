@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -340,5 +341,81 @@ func TestRevokeHookPrefersInMemoryOverStaleDiskCache(t *testing.T) {
 	}
 	if !a.IsAuthorized(k2) {
 		t.Error("k2 must be retained via the in-memory snapshot")
+	}
+}
+
+// TestIsAuthorizedFingerprint pins the contract the mtls HTTP path depends on:
+// the accessor answers for exactly the canonical gossh.FingerprintSHA256 string
+// (which is what the bootstrap burns into an issued certificate's Subject CN),
+// it agrees with IsAuthorized key-for-key, and it fails closed on anything else.
+func TestIsAuthorizedFingerprint(t *testing.T) {
+	listed, listedLine := genKey(t)
+	unlisted, _ := genKey(t)
+
+	a, err := NewKeyAllowlist(&config.SSHAuthConfig{
+		Mode:           config.SSHAuthEnforce,
+		AuthorizedKeys: []string{listedLine},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listedFP := gossh.FingerprintSHA256(listed)
+	if !a.IsAuthorizedFingerprint(listedFP) {
+		t.Errorf("listed fingerprint %s should be authorized", listedFP)
+	}
+	if a.IsAuthorizedFingerprint(gossh.FingerprintSHA256(unlisted)) {
+		t.Error("unlisted fingerprint must not be authorized")
+	}
+	// Fail closed on the empty string and on near-miss spellings — an mtls
+	// certificate CN is attacker-visible, and only the exact canonical form
+	// may match.
+	for _, bogus := range []string{
+		"",
+		listedFP + "=",                          // padded
+		strings.TrimPrefix(listedFP, "SHA256:"), // prefix stripped
+		strings.ToLower(listedFP),               // case-folded
+		"MD5:" + strings.TrimPrefix(listedFP, "SHA256:"), // wrong hash label
+	} {
+		if a.IsAuthorizedFingerprint(bogus) {
+			t.Errorf("non-canonical fingerprint %q must not be authorized", bogus)
+		}
+	}
+
+	// The two views agree, and both track a rebuild: dropping the key from the
+	// source de-authorizes it for the HTTP path on the very next call, which is
+	// how mtls certificate revocation lands without a CRL.
+	if a.IsAuthorized(listed) != a.IsAuthorizedFingerprint(listedFP) {
+		t.Error("IsAuthorized and IsAuthorizedFingerprint disagree")
+	}
+	_, otherLine := genKey(t)
+	a.inline = []string{otherLine}
+	if err := a.rebuild(); err != nil {
+		t.Fatal(err)
+	}
+	if a.IsAuthorizedFingerprint(listedFP) {
+		t.Error("removed key's fingerprint is still authorized after rebuild")
+	}
+	if a.IsAuthorized(listed) {
+		t.Error("IsAuthorized and IsAuthorizedFingerprint disagree after rebuild")
+	}
+}
+
+// TestIsAuthorizedFingerprintOffModeAuthorizesNothing: in off mode the SSH
+// allowlist is accept-all and its key set is empty. The fingerprint accessor
+// reports membership only, so it authorizes nobody — callers that use it as an
+// authorization oracle (the mtls middleware) fail closed rather than inheriting
+// SSH's accept-all posture.
+func TestIsAuthorizedFingerprintOffModeAuthorizesNothing(t *testing.T) {
+	key, line := genKey(t)
+	a, err := NewKeyAllowlist(&config.SSHAuthConfig{
+		Mode:           config.SSHAuthOff,
+		AuthorizedKeys: []string{line},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.IsAuthorizedFingerprint(gossh.FingerprintSHA256(key)) {
+		t.Error("off mode must not authorize any fingerprint")
 	}
 }
