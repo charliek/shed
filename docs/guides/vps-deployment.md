@@ -7,7 +7,7 @@ credentials token over TLS**.
 
 The default shed posture is local-only (open, bound to loopback). This guide is
 the opposite end: a hardened, internet-facing server. One switch —
-[`auth.mode: secure`](../reference/security.md#secure-mode) — derives the whole
+[`auth.mode: token`](../reference/security.md#token-mode) — derives the whole
 hardening bundle (SSH allowlist enforced + HTTP tokens enforced + TLS-only, with
 no plain-HTTP listener) and **refuses to start** if any piece is missing; one
 `bind_address` faces it at the network. There are no tokens to mint or paste:
@@ -15,13 +15,13 @@ clients get them automatically over SSH.
 
 ## 1. Server config
 
-Write `/etc/shed/server.yaml`. `secure` requires an SSH key source, and — since
-v0.7.4 every posture defaults to loopback — a `bind_address` so the VPS is
+Write `/etc/shed/server.yaml`. `token` mode requires an SSH key source, and —
+since v0.7.4 every posture defaults to loopback — a `bind_address` so the VPS is
 reachable from off-box:
 
 ```yaml
 auth:
-  mode: secure                   # derives the full bundle; refuses to start without a key source
+  mode: token                    # derives the full bundle; refuses to start without a key source
   ssh:
     github_users: [charliek]     # only these GitHub keys may SSH in (and mint tokens)
 tls_names:
@@ -29,24 +29,24 @@ tls_names:
 bind_address: 0.0.0.0            # face the network (loopback is the default) — or a specific public IP
 ```
 
-`secure` mode forces `auth.ssh.mode: enforce`, enforces HTTP bearer tokens, turns
+`token` mode forces `auth.ssh.mode: enforce`, enforces HTTP bearer tokens, turns
 on pinned TLS (`https_port` defaults to `8443`), and serves **no plain-HTTP
 listener** (TLS-only) — so the only API is HTTPS on `8443`, with the credential
 bus gated by the `credentials` scope and the Connect tunnel accepting `control`
-or `credentials`. (`shed server add` against a secure server therefore needs
+or `credentials`. (`shed server add` against a token-mode server therefore needs
 `--https-port`, as below.)
 
 !!! warning "`bind_address` is required for a remote server"
-    Since v0.7.4 `bind_address` **defaults to loopback (`127.0.0.1`) in secure
+    Since v0.7.4 `bind_address` **defaults to loopback (`127.0.0.1`) in token
     mode too**, so without the `bind_address: 0.0.0.0` line above the VPS binds
-    loopback only and is unreachable from your laptop. Secure mode needs no
+    loopback only and is unreachable from your laptop. Token mode needs no
     `allow_insecure_exposure` ack — TLS + tokens make the network bind safe.
 
 Start (or restart) the server. If a required piece is missing it exits
 immediately, naming the gap:
 
 ```text
-auth.mode: secure requires at least one SSH key source (github_users, authorized_keys, or authorized_keys_file)
+auth.mode: token requires at least one SSH key source (github_users, authorized_keys, or authorized_keys_file)
 ```
 
 ## 2. Add the server from your client

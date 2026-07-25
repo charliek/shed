@@ -139,9 +139,9 @@ above is then ignored). Servers are discovered from shed's own CLI config
 A server's broker URL is its pinned `api_url` (`https://…`) when present, else
 `http://<host>:<http_port>`.
 
-The agent **self-mints its `credentials` token only for secure servers** — those
+The agent **self-mints its `credentials` token only for token-mode servers** — those
 reached over an `https` `api_url` (which `shed server add` writes for a
-secure-mode server; tokens ⟺ TLS ⟺ secure). For an **open-mode** server (plain
+token-mode server; tokens ⟺ TLS ⟺ token). For an **open-mode** server (plain
 `http`) no token is needed: the agent connects to the credential bus
 unauthenticated and does not attempt a mint. (The presence of an `ssh_port`
 alone is *not* the signal — every shed server has an SSH endpoint.)

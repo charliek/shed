@@ -17,7 +17,7 @@ ssh_port: 2222
 # explicitly exposed. Set a routable address ("0.0.0.0"/"*" = all IPv4,
 # "::" = all interfaces, or a specific LAN/tailnet IP) to reach it off-box.
 # In OPEN mode (no TLS) a non-loopback bind also requires
-# allow_insecure_exposure: true; secure mode (auth.mode: secure) needs no ack.
+# allow_insecure_exposure: true; token mode (auth.mode: token) needs no ack.
 bind_address: 127.0.0.1
 
 # Backend configuration

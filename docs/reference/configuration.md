@@ -44,7 +44,7 @@ sheds:
 | `servers.<name>.ssh_port` | int | SSH server port |
 | `servers.<name>.api_url` | string | HTTPS control-plane URL (e.g. `https://host:8443`); overrides scheme+host+port. Set by `shed server add --https-port`. |
 | `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`). |
-| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop. Auto-written and refreshed by `shed server add` in secure mode. |
+| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop. Auto-written and refreshed by `shed server add` in token mode. |
 | `servers.<name>.control_token_expires_at` | timestamp | Expiry of `control_token`; the CLI refreshes near this and on a 401. Auto-managed. |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
@@ -78,10 +78,10 @@ log_level: info
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | `shed-server` | Server identifier |
-| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in secure mode** (secure serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
+| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in token mode** (token mode serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
 | `ssh_port` | int | `2222` | SSH server port |
-| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in both modes** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; secure mode needs no acknowledgment. |
-| `allow_insecure_exposure` | bool | `false` | Acknowledge binding a **non-loopback** `bind_address` in **open** mode (no transport security). Required there, ignored in secure mode and for loopback binds. |
+| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in both modes** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; token mode needs no acknowledgment. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge binding a **non-loopback** `bind_address` in **open** mode (no transport security). Required there, ignored in token mode and for loopback binds. |
 | `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
@@ -99,25 +99,25 @@ log_level: info
 
 `auth.mode` is the headline switch. The default `open` posture is unchanged —
 ideal on a tailnet or trusted LAN (plain HTTP, no tokens, no TLS); the SSH
-allowlist (`auth.ssh`) is the one independently-tunable layer there. `secure` is
+allowlist (`auth.ssh`) is the one independently-tunable layer there. `token` is
 the internet-facing posture: it derives the full bundle (SSH enforce + HTTP
 tokens + TLS-only) and refuses to start without an SSH key source. Two invariants
-hold: **tokens ⟺ TLS ⟺ secure** and **https ⟺ secure**. See [Security](security.md)
+hold: **tokens ⟺ TLS ⟺ token** and **https ⟺ token**. See [Security](security.md)
 and the [Security Configuration guide](../guides/security-configuration.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `secure` derives SSH-allowlist enforce + HTTP-token enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fails to start without a key source**. |
+| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `token` derives SSH-allowlist enforce + HTTP-token enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fails to start without a key source**. `secure` is accepted as a deprecated alias for `token`, normalized at load with a one-time stderr warning. |
 | `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token. Clients refresh transparently near expiry / on a 401. |
 
 The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
-**rejected at startup** — set `auth.mode: secure` and let `shed server add` mint
+**rejected at startup** — set `auth.mode: token` and let `shed server add` mint
 tokens over SSH. As of v0.7.2 the whole `auth.http` block is gone (HTTP
-enforcement derives from `auth.mode: secure`), and `https_port` /
-`auth.ssh.mode: enforce` are valid only in secure mode — see
+enforcement derives from `auth.mode: token`), and `https_port` /
+`auth.ssh.mode: enforce` are valid only in token mode — see
 [Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
 `http_bind`/`ssh_bind`/`internal_http_port` are removed in favour of a single
-`bind_address` (loopback by default), and `http_port` is optional in secure mode
+`bind_address` (loopback by default), and `http_port` is optional in token mode
 — see [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
 
 ### SSH authentication
@@ -137,26 +137,26 @@ With `mode: enforce`, the server refuses to start if no keys resolve (empty inli
 
 ```yaml
 auth:
-  mode: secure               # open (default) | secure — secure forces ssh enforce
+  mode: token                # open (default) | token — token forces ssh enforce
   ssh:
-    github_users: [charliek]  # a key source is required in secure mode
+    github_users: [charliek]  # a key source is required in token mode
 ```
 
 ### TLS and network surface
 
 TLS and network-surface fields. HTTP token enforcement is **not** an independent
-field — it is derived from `auth.mode: secure` (there is no `auth.http` block).
-`secure` turns on TLS for you, and `https_port` is valid only in secure mode. See
+field — it is derived from `auth.mode: token` (there is no `auth.http` block).
+`token` turns on TLS for you, and `https_port` is valid only in token mode. See
 [Security](security.md) and the
 [Security Configuration guide](../guides/security-configuration.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `https_port` | int | `8443` in secure | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: secure`** (rejected in open mode); defaults to `8443` there. In secure mode this is the *only* listener — no plain HTTP is served. |
+| `https_port` | int | `8443` in token mode | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: token`** (rejected in open mode); defaults to `8443` there. In token mode this is the *only* listener — no plain HTTP is served. |
 | `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
 | `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in both modes). Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`. |
-| `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in secure mode. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in token mode. |
 | `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
 
 ### Mounts

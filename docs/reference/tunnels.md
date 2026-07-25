@@ -135,9 +135,9 @@ running after the launching terminal is closed.
   file is truncated on each start and is not rotated (it only records errors, so
   it stays small in normal use).
 
-## Secure mode
+## Token mode
 
-On a server running `auth.mode: secure`, the tunnel authenticates to the Connect
+On a server running `auth.mode: token`, the tunnel authenticates to the Connect
 API with a bearer token over pinned TLS (the Connect route accepts a `control` or
 `credentials` scope; the CLI uses its control token). Two behaviors matter:
 

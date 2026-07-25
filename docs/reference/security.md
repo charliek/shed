@@ -4,8 +4,13 @@ shed-server has two postures, selected by a single switch:
 
 ```yaml
 auth:
-  mode: open      # open (default) | secure
+  mode: open      # open (default) | token
 ```
+
+!!! note "`secure` is a deprecated alias"
+    The mode value `secure` is still accepted and normalized to `token` at load
+    time, with a one-time stderr deprecation warning. New configs should write
+    `token`.
 
 - **`open`** (the default) serves plain HTTP only — no HTTP token, no TLS — and
   binds loopback by default, so out of the box it is **local-development-only**.
@@ -14,22 +19,22 @@ auth:
   routable `bind_address` *and* `allow_insecure_exposure: true`. The SSH allowlist
   is the one independently-tunable layer here (`auth.ssh.mode: off|warn`, where
   `warn` stages an allowlist before you commit to enforcing it).
-- **`secure`** is for an internet-facing deployment. It derives the whole
+- **`token`** is for an internet-facing deployment. It derives the whole
   hardening bundle (SSH allowlist enforced + HTTP tokens enforced + TLS-only,
   with no plain-HTTP listener) and **refuses to start** without an SSH key
   source, so a server is never half-hardened on a public address. Two invariants
-  hold: **tokens ⟺ TLS ⟺ secure** and **https ⟺ secure**.
+  hold: **tokens ⟺ TLS ⟺ token** and **https ⟺ token**.
 
 | `auth.mode` | SSH allowlist | HTTP tokens | Plain-HTTP listener | TLS |
 |-------------|---------------|-------------|---------------------|-----|
-| `open` | as configured (`auth.ssh`: `off`/`warn`) | off | served (bound to `bind_address`) | none (`https_port` requires `secure`) |
-| `secure` | **forced `enforce`** (needs a key source) | **enforced** | **none — TLS-only** | **on** (`https_port` defaults to 8443) |
+| `open` | as configured (`auth.ssh`: `off`/`warn`) | off | served (bound to `bind_address`) | none (`https_port` requires `token`) |
+| `token` | **forced `enforce`** (needs a key source) | **enforced** | **none — TLS-only** | **on** (`https_port` defaults to 8443) |
 
 Every listener (plain HTTP, HTTPS, SSH) binds the single `bind_address`, which
 **defaults to loopback (`127.0.0.1`) in both modes** — shed is local-first.
 Facing the network is opt-in: set `bind_address` to a routable address, and in
 **open** mode also set `allow_insecure_exposure: true` (open has no transport
-security). Secure mode needs no acknowledgment to bind the network.
+security). Token mode needs no acknowledgment to bind the network.
 
 All server settings live in the server config (`/etc/shed/server.yaml` on
 Linux, `~/.config/shed/server.yaml` on macOS). Client settings live per server
@@ -38,7 +43,7 @@ entry in `~/.shed/config.yaml`.
 ## SSH key allowlist
 
 By default any public key is accepted (the username still selects the shed).
-`auth.ssh` restricts which keys may connect; `auth.mode: secure` forces
+`auth.ssh` restricts which keys may connect; `auth.mode: token` forces
 `enforce`.
 
 ```yaml
@@ -57,7 +62,7 @@ auth:
 |------|----------|
 | `off` | Accept every key (the `open`-mode default). |
 | `warn` | Log would-deny attempts but still accept — useful while building the list. |
-| `enforce` | Reject keys not in the allowlist (forced in `secure` mode). |
+| `enforce` | Reject keys not in the allowlist (forced in `token` mode). |
 
 GitHub-seeded keys are fetched at startup and on `github_refresh`, cached to
 `{state_dir}/github_keys/<user>`, and kept as last-known-good if GitHub is
@@ -102,7 +107,7 @@ the scope, and an expiry.
 | `control` | The control plane (lifecycle, images, sessions, snapshots), the Connect tunnel for `shed forward`, and the egress audit stream. |
 | `credentials` | The credential bus (`/api/plugins/*`) — live SSH signatures and cloud credentials — plus the Connect tunnel and the egress audit stream (used by the host-agent's reverse proxy / egress subscriber). |
 
-(The pre-v0.7.1 `admin` scope is removed.) Under `secure` mode every request needs
+(The pre-v0.7.1 `admin` scope is removed.) Under `token` mode every request needs
 a matching `Authorization: Bearer` token of the required scope. The bus requires
 `credentials`, so a leaked `control` token cannot reach the live-secret bus; the
 Connect tunnel and the egress audit stream accept **either** scope (the CLI uses
@@ -117,7 +122,7 @@ Minted tokens are short-lived — `auth.token_ttl`, default **24h**:
 
 ```yaml
 auth:
-  mode: secure
+  mode: token
   token_ttl: 24h
 ```
 
@@ -167,11 +172,11 @@ There is no client `credentials_token`: the host-agent mints its own.
 shed uses **pinned self-signed TLS** — no CA, no domain, no ACME. The server
 generates a self-signed certificate on first start (the same lifecycle as the
 SSH host key) and clients pin it by the SHA-256 fingerprint of its DER encoding,
-exactly the trust model SSH host keys use. `auth.mode: secure` turns this on by
+exactly the trust model SSH host keys use. `auth.mode: token` turns this on by
 default (`https_port` defaults to `8443`).
 
 ```yaml
-https_port: 8443                 # the pinned-TLS listener (secure mode serves HTTPS only)
+https_port: 8443                 # the pinned-TLS listener (token mode serves HTTPS only)
 tls_names:                       # extra SANs so hostname verification passes
   - shed.example.com
   - 203.0.113.10
@@ -199,10 +204,10 @@ Rotating an existing pin in a non-interactive session requires
 
 There is **one HTTP listener per mode** (SSH always listens separately on
 `ssh_port`): a single plain-HTTP listener in open mode, or a single pinned-TLS
-(`https_port`) listener in `secure` mode — in secure mode there is **no
+(`https_port`) listener in `token` mode — in token mode there is **no
 plain-HTTP listener at all**. The credential bus (`/api/plugins/*`)
 and the Connect tunnel (`/api/sheds/*/connect/*`) ride that same listener; in
-secure mode the bus is gated by the `credentials` scope (so a leaked `control`
+token mode the bus is gated by the `credentials` scope (so a leaked `control`
 token can't reach it) while the Connect tunnel accepts control or credentials,
 and both travel over TLS. A co-located host-agent reaches the bus over
 `https://127.0.0.1:8443` with the pinned cert. There is no separate
@@ -211,19 +216,19 @@ internal/loopback listener. These knobs shape what is reachable where:
 | Field | Effect |
 |-------|--------|
 | `bind_address` | Interface every listener (plain HTTP, HTTPS, SSH) binds to. **Defaults to loopback (`127.0.0.1`) in both modes.** Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. |
-| `allow_insecure_exposure` | Required to bind a **non-loopback** `bind_address` in **open** mode (no transport security). Ignored in secure mode and for loopback binds. |
-| `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `secure` mode**; defaults to `8443` there. |
+| `allow_insecure_exposure` | Required to bind a **non-loopback** `bind_address` in **open** mode (no transport security). Ignored in token mode and for loopback binds. |
+| `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `token` mode**; defaults to `8443` there. |
 | `trusted_proxy` | Trust `X-Forwarded-For` (only safe behind a proxy that overwrites it). Default false uses the real TCP peer, so a source IP can't be forged to evade per-IP controls. |
 
 ## Connection flow — what's encrypted where
 
-| Hop | open mode | secure mode |
+| Hop | open mode | token mode |
 |-----|-----------|-------------|
 | Control-plane / bus HTTP | plain `http://` (the network is the trust boundary) | pinned `https://` only — a client that holds a pin but is given a non-`https` URL **fails closed** rather than sending plaintext |
 | SSH (shed sessions + the `_bootstrap` token mint) | encrypted; host key pinned in `known_hosts` | same |
 | Token mint | n/a (no tokens) | over the pinned-host-key SSH `_bootstrap` channel |
 
-In secure mode **nothing plaintext faces the network**: there is no plain-HTTP
+In token mode **nothing plaintext faces the network**: there is no plain-HTTP
 listener at all (see [Network surface](#network-surface)), and the only
 trust-on-first-use moment is `shed server add` fetching the cert to show you its
 fingerprint for confirmation (or pass `--tls-fingerprint` / `--fingerprint` to
@@ -253,33 +258,33 @@ UUIDv7) is delivered **only** to that listener over its SSE stream. A
   same credential holder can ever receive the re-delivery; stale pending is
   swept after a retention TTL.
 
-This ownership tracking is enforced whenever HTTP auth is on (i.e. `secure`
+This ownership tracking is enforced whenever HTTP auth is on (i.e. `token`
 mode); with auth off (the `open` default) the bus behaves exactly as before, and
 without re-delivery.
 
-## Secure mode
+## Token mode
 
-`auth.mode: secure` is the internet-facing posture. It derives the full bundle
+`auth.mode: token` is the internet-facing posture. It derives the full bundle
 and **refuses to start** if a piece is missing, naming the first gap — so you
 can't half-deploy to a public address.
 
 ```yaml
 auth:
-  mode: secure
+  mode: token
   ssh:
     github_users: [charliek]   # an SSH key source is required
 ```
 
-What `secure` derives:
+What `token` derives:
 
 | Derived | Why |
 |---------|-----|
 | `auth.ssh.mode: enforce` | Only allowlisted keys may SSH in — and that allowlist is what mints/revokes HTTP tokens. **Requires** a key source (`github_users`, `authorized_keys`, or `authorized_keys_file`), else startup fails. |
 | HTTP auth enforced | Every HTTP request needs a bearer token; the credential bus is gated by the `credentials` scope. |
 | `https_port: 8443` | The network-facing API is pinned TLS. |
-| no plain-HTTP listener | Secure mode serves **no** plain-HTTP listener at all (not even on loopback) — only the pinned-TLS listener faces clients. On-box tooling (a co-located host-agent) reaches the control plane and credential bus over `https://127.0.0.1:8443` with the pinned cert; there is no plaintext channel. |
+| no plain-HTTP listener | Token mode serves **no** plain-HTTP listener at all (not even on loopback) — only the pinned-TLS listener faces clients. On-box tooling (a co-located host-agent) reaches the control plane and credential bus over `https://127.0.0.1:8443` with the pinned cert; there is no plaintext channel. |
 
-The whole flow is hands-off: enable `secure`, list your `github_users`, and a
+The whole flow is hands-off: enable `token`, list your `github_users`, and a
 client runs one `shed server add` to pin TLS and mint its token. See the
 [Public VPS Deployment](../guides/vps-deployment.md) guide for a complete
 walkthrough.
@@ -291,7 +296,7 @@ exits) so an old config can't silently weaken a deployment:
 
 | Removed | Replacement |
 |---------|-------------|
-| `public_exposure: true` | `auth.mode: secure` (derives the same bundle). |
+| `public_exposure: true` | `auth.mode: token` (derives the same bundle). |
 | `auth.http.tokens` (static list) + `shed-server token new` | Tokens minted over the `_bootstrap` SSH channel by `shed server add`. |
 | `admin` scope | `control` + `credentials` only. |
 | client `credentials_token` | The host-agent mints its own `credentials` token. |
@@ -301,17 +306,17 @@ See [Upgrading v0.7.0 → v0.7.1](../upgrades/v0.7.0-to-v0.7.1.md) for the migra
 ### Removed/changed in v0.7.2
 
 v0.7.2 collapses the intermediate states beneath `auth.mode` so that
-`tokens ⟺ TLS ⟺ secure` and `https ⟺ secure` always hold. These are **rejected
+`tokens ⟺ TLS ⟺ token` and `https ⟺ token` always hold. These are **rejected
 at startup**:
 
 | Removed / invalid | Replacement |
 |-------------------|-------------|
-| `auth.http.mode` (the whole `auth.http` block) | HTTP enforcement derives from `auth.mode: secure`. |
-| `https_port` under `auth.mode: open` | Use `secure` (defaults `https_port` to 8443), or drop it. |
-| `auth.ssh.mode: enforce` under `open` | Use `secure`, or `warn` to stage. |
-| `auth.ssh.mode: off`/`warn` under `secure` | Remove it — secure forces `enforce`. |
+| `auth.http.mode` (the whole `auth.http` block) | HTTP enforcement derives from `auth.mode: token`. |
+| `https_port` under `auth.mode: open` | Use `token` (defaults `https_port` to 8443), or drop it. |
+| `auth.ssh.mode: enforce` under `open` | Use `token`, or `warn` to stage. |
+| `auth.ssh.mode: off`/`warn` under `token` | Remove it — token forces `enforce`. |
 
-Plus a behavior change: **secure mode no longer serves a loopback plain-HTTP
+Plus a behavior change: **token mode no longer serves a loopback plain-HTTP
 listener** (TLS-only). See [Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md).
 
 ### Removed/changed in v0.7.4
@@ -321,13 +326,13 @@ are **rejected at startup**:
 
 | Removed / renamed | Replacement |
 |-------------------|-------------|
-| `internal_http_port` | Removed — the credential bus (credentials scope) and Connect tunnel (control or credentials) ride the single listener in secure mode; a co-located host-agent reaches them over `https://127.0.0.1:8443`. |
+| `internal_http_port` | Removed — the credential bus (credentials scope) and Connect tunnel (control or credentials) ride the single listener in token mode; a co-located host-agent reaches them over `https://127.0.0.1:8443`. |
 | `http_bind` / `ssh_bind` | A single `bind_address` governs every listener (HTTP, HTTPS, SSH). |
 
 Plus a behavior change: **`bind_address` defaults to loopback (`127.0.0.1`) in
 both modes** (previously unset = all interfaces), and `http_port` is optional in
-secure mode. A non-loopback bind in open mode now requires
-`allow_insecure_exposure: true`; secure mode binds the network without an ack.
+token mode. A non-loopback bind in open mode now requires
+`allow_insecure_exposure: true`; token mode binds the network without an ack.
 See [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
 
 ## Deferred

@@ -73,7 +73,7 @@ pulled registry-direct from `ghcr.io`. See
 
 Shed is local-development-first: out of the box `bind_address` defaults to
 loopback (`127.0.0.1`), so the server is reachable only on the machine it runs
-on. Facing the network is opt-in, and **secure mode** (pinned TLS + minted
+on. Facing the network is opt-in, and **token mode** (pinned TLS + minted
 bearer tokens + an SSH key allowlist) is the preferred posture for anything
 networked — it works locally too. Open mode (plain HTTP, no tokens) stays
 available for a trusted private network (e.g. Tailscale), but exposing it

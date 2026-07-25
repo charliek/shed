@@ -7,7 +7,7 @@ The `shed-server` exposes a REST API for managing sheds.
 !!! note "Authentication"
     In `auth.mode: open` (the default) the API has no authentication — security
     relies on a trusted network (Tailscale, firewall rules). In `auth.mode:
-    secure` every request needs an `Authorization: Bearer <token>` header of the
+    token` every request needs an `Authorization: Bearer <token>` header of the
     required scope, except the bootstrap endpoints `GET /api/info` and
     `GET /api/ssh-host-key`. The credential bus (`/api/plugins/*`) requires the
     `credentials` scope; the Connect tunnel
@@ -20,7 +20,7 @@ The `shed-server` exposes a REST API for managing sheds.
 
 ## Authentication
 
-In `secure` mode the HTTP API is token-gated, but tokens are **not** issued over
+In `token` mode the HTTP API is token-gated, but tokens are **not** issued over
 HTTP. A client mints one over a reserved **`_bootstrap` SSH channel**:
 
 1. Connect to the SSH port as user `_bootstrap` over the pinned host key.
@@ -103,13 +103,13 @@ Returns server metadata and capabilities.
   "ssh_port": 2222,
   "http_port": 8080,
   "backend": "vz",
-  "auth_mode": "secure"
+  "auth_mode": "token"
 }
 ```
 
 The `backend` field reflects the resolved backend for this server (`vz` or `firecracker`). When the server is configured with `default_backend: detect`, this field shows the auto-detected value.
 
-`auth_mode` is `open` or `secure`. This endpoint is reachable without a token (it is bootstrap-exempt) so `shed server add` can read the mode and ports before the client holds one — in `secure` mode it then mints a token over SSH.
+`auth_mode` is `open` or `token`. This endpoint is reachable without a token (it is bootstrap-exempt) so `shed server add` can read the mode and ports before the client holds one — in `token` mode it then mints a token over SSH.
 
 ### GET /api/ssh-host-key
 
@@ -926,7 +926,7 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 | 502 | `CONNECT_FAILED` | Could not connect to the port (service not running) |
 | 503 | `SHED_NOT_RUNNING` | Shed is not running |
 
-**Security:** In `open` mode the Connect API relies on network-level trust (Tailscale, firewall) like the rest of the API; in `secure` mode it requires a bearer token of the `control` **or** `credentials` scope over pinned TLS. It connects to the VM's loopback interface and does not support arbitrary destinations.
+**Security:** In `open` mode the Connect API relies on network-level trust (Tailscale, firewall) like the rest of the API; in `token` mode it requires a bearer token of the `control` **or** `credentials` scope over pinned TLS. It connects to the VM's loopback interface and does not support arbitrary destinations.
 
 **Consumers:**
 
