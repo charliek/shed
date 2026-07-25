@@ -57,8 +57,10 @@ func TestListenAddrHelpers(t *testing.T) {
 
 func TestValidateBindAddress(t *testing.T) {
 	// Open mode requires allow_insecure_exposure to bind a non-loopback
-	// interface; token mode (TLS + tokens) needs no acknowledgment.
+	// interface; an enforced mode (token or mtls; TLS + client auth) needs no
+	// acknowledgment.
 	tokenAuth := &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
+	mtlsAuth := &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{GitHubUsers: []string{"charliek"}}}
 	tests := []struct {
 		name    string
 		cfg     ServerConfig
@@ -76,6 +78,8 @@ func TestValidateBindAddress(t *testing.T) {
 		{"open tailnet ip with ack ok", ServerConfig{BindAddress: "100.64.0.1", AllowInsecureExposure: true}, false},
 		{"token mode 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: tokenAuth}, false},
 		{"token mode tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: tokenAuth}, false},
+		{"mtls mode 0.0.0.0 ok without ack", ServerConfig{BindAddress: "0.0.0.0", Auth: mtlsAuth}, false},
+		{"mtls mode tailnet ip ok without ack", ServerConfig{BindAddress: "100.64.0.1", Auth: mtlsAuth}, false},
 		// Format validation runs before the mode/ack gate, so a malformed bind is
 		// rejected in every mode (it would otherwise fail cryptically at net.Listen).
 		{"malformed ip rejected", ServerConfig{BindAddress: "127.0.0.l"}, true},
@@ -204,6 +208,9 @@ func TestValidateAuth(t *testing.T) {
 		{"malformed github user rejected", &AuthConfig{Mode: AuthModeToken, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce, GitHubUsers: []string{"bad user!"}}}, "github_users"},
 		{"invalid auth.mode rejected", &AuthConfig{Mode: "secur"}, "auth.mode"},
 		{"token auth.mode ok", &AuthConfig{Mode: AuthModeToken}, ""},
+		{"mtls + ssh enforce ok", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: SSHAuthEnforce}}, ""},
+		{"mtls auth.mode ok", &AuthConfig{Mode: AuthModeMTLS}, ""},
+		{"mtls + invalid ssh mode rejected", &AuthConfig{Mode: AuthModeMTLS, SSH: &SSHAuthConfig{Mode: "enfore"}}, "auth.ssh.mode"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

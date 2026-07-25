@@ -129,17 +129,54 @@ func (c *ServerConfig) TokenMode() bool {
 	return c.Auth != nil && c.Auth.Mode == AuthModeToken
 }
 
-// HTTPAuthEnforced reports whether the HTTP API requires a bearer token. HTTP
-// token enforcement is derived purely from token mode: enforced iff token mode.
+// MTLSMode reports whether the server runs in mtls mode (auth.mode: mtls):
+// the client credential is a short-lived certificate issued over the SSH
+// bootstrap channel rather than a bearer token. It shares every other
+// token-mode network/SSH invariant — see AuthEnforced, the combined predicate
+// most call sites outside HTTP bearer-token enforcement should use.
+func (c *ServerConfig) MTLSMode() bool {
+	return c.Auth != nil && c.Auth.Mode == AuthModeMTLS
+}
+
+// AuthEnforced reports whether the server enforces a non-open auth posture —
+// token or mtls. SSH allowlist enforce, TLS-only serving (no plain HTTP),
+// the https_port default, and non-loopback bind without an explicit
+// acknowledgment all key off this combined predicate: both modes share the
+// same network/SSH shape and differ only in how the client authenticates.
+func (c *ServerConfig) AuthEnforced() bool {
+	return c.TokenMode() || c.MTLSMode()
+}
+
+// HTTPAuthEnforced reports whether the HTTP API requires a bearer token. This
+// stays token-only (not the combined AuthEnforced): mtls mode has no bearer
+// tokens at all, so its HTTP requests are authenticated a different way. S6
+// adds the mtls certificate-auth branch here.
 func (c *ServerConfig) HTTPAuthEnforced() bool {
 	return c.TokenMode()
 }
 
+// AuthModeValue returns the effective auth.mode string, defaulting to
+// AuthModeOpen when auth is unset. Config load guarantees this is one of
+// open, token, or mtls by the time the server starts (normalizeAuthMode
+// resolves the deprecated "secure" alias and validateAuth rejects anything
+// else), so callers — e.g. the /api/info handler — can report it directly.
+func (c *ServerConfig) AuthModeValue() string {
+	if c.Auth == nil || c.Auth.Mode == "" {
+		return AuthModeOpen
+	}
+	// Defensive: loaders normalize the deprecated "secure" alias before
+	// validation, but hand-built configs (tests, tooling) may not have gone
+	// through a loader — report the effective mode either way.
+	mode, _ := normalizeAuthModeValue(c.Auth.Mode)
+	return mode
+}
+
 // EffectiveSSHAuth returns the SSH auth config to build the allowlist from. In
-// token mode the mode is forced to enforce (key sources still come from the
-// configured auth.ssh block); otherwise the configured block is used verbatim.
+// an enforced mode (token or mtls) the mode is forced to enforce (key sources
+// still come from the configured auth.ssh block); otherwise the configured
+// block is used verbatim.
 func (c *ServerConfig) EffectiveSSHAuth() *SSHAuthConfig {
-	if !c.TokenMode() {
+	if !c.AuthEnforced() {
 		return c.SSHAuth()
 	}
 	eff := SSHAuthConfig{}
@@ -164,12 +201,15 @@ func (c *ServerConfig) TokenTTL() time.Duration {
 func (c *ServerConfig) validateAuth() error {
 	if c.Auth != nil {
 		switch c.Auth.Mode {
-		case "", AuthModeOpen, AuthModeToken:
+		case "", AuthModeOpen, AuthModeToken, AuthModeMTLS:
 		default:
-			return fmt.Errorf("invalid auth.mode: %q (must be open or token)", c.Auth.Mode)
+			return fmt.Errorf("invalid auth.mode: %q (must be open, token, or mtls)", c.Auth.Mode)
 		}
 	}
-	tokenMode := c.TokenMode()
+	// enforced covers both non-open modes: mtls inherits every token-mode
+	// SSH/network invariant below (it differs only in HTTP bearer-token
+	// enforcement, which lives in HTTPAuthEnforced and is out of scope here).
+	enforced := c.AuthEnforced()
 	if ssh := c.SSHAuth(); ssh != nil {
 		switch ssh.Mode {
 		case "", SSHAuthOff, SSHAuthWarn, SSHAuthEnforce:
@@ -184,23 +224,24 @@ func (c *ServerConfig) validateAuth() error {
 				return fmt.Errorf("invalid auth.ssh.github_users entry: %q", u)
 			}
 		}
-		// tokens ⟺ TLS ⟺ token mode: SSH enforce is the token-mode posture. An
-		// explicit enforce on an open-mode server is rejected (warn stages an
-		// allowlist on a trusted network); token mode forces enforce itself, so an
-		// explicit off/warn under token mode contradicts the mode. An unset
-		// ssh.Mode under token mode stays valid (EffectiveSSHAuth derives enforce).
-		if ssh.Mode == SSHAuthEnforce && !tokenMode {
-			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: token (use warn to stage an allowlist on a trusted network)")
+		// tokens/certs ⟺ TLS ⟺ an enforced mode: SSH enforce is the token/mtls
+		// posture. An explicit enforce on an open-mode server is rejected (warn
+		// stages an allowlist on a trusted network); an enforced mode forces
+		// enforce itself, so an explicit off/warn there contradicts the mode. An
+		// unset ssh.Mode under an enforced mode stays valid (EffectiveSSHAuth
+		// derives enforce).
+		if ssh.Mode == SSHAuthEnforce && !enforced {
+			return fmt.Errorf("auth.ssh.mode: enforce requires auth.mode: token or mtls (use warn to stage an allowlist on a trusted network)")
 		}
-		if tokenMode && (ssh.Mode == SSHAuthOff || ssh.Mode == SSHAuthWarn) {
-			return fmt.Errorf("auth.mode: token forces auth.ssh.mode: enforce; remove the explicit auth.ssh.mode: %s", ssh.Mode)
+		if enforced && (ssh.Mode == SSHAuthOff || ssh.Mode == SSHAuthWarn) {
+			return fmt.Errorf("auth.mode: %s forces auth.ssh.mode: enforce; remove the explicit auth.ssh.mode: %s", c.Auth.Mode, ssh.Mode)
 		}
 	}
-	// https_port is a token-mode-only surface: an open-mode server serves plain
-	// http only. Checked outside the ssh block so it fires even when auth.ssh is
-	// unset.
-	if c.HTTPSPort > 0 && !tokenMode {
-		return fmt.Errorf("https_port requires auth.mode: token (an open-mode server serves plain http only)")
+	// https_port is an enforced-mode-only surface: an open-mode server serves
+	// plain http only. Checked outside the ssh block so it fires even when
+	// auth.ssh is unset.
+	if c.HTTPSPort > 0 && !enforced {
+		return fmt.Errorf("https_port requires auth.mode: token or mtls (an open-mode server serves plain http only)")
 	}
 	return nil
 }
@@ -214,8 +255,9 @@ func (c *ServerConfig) HTTPListenAddr() string {
 }
 
 // PlainHTTPEnabled reports whether the main plain-HTTP listener should be
-// served. False in token mode (TLS-only; the plain listener is not started).
-func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.TokenMode() }
+// served. False in an enforced mode (token or mtls; TLS-only — the plain
+// listener is not started).
+func (c *ServerConfig) PlainHTTPEnabled() bool { return !c.AuthEnforced() }
 
 // HTTPSEnabled reports whether the HTTPS listener is configured.
 func (c *ServerConfig) HTTPSEnabled() bool { return c.HTTPSPort > 0 }
@@ -232,17 +274,19 @@ func (c *ServerConfig) HTTPSListenAddr() string {
 // SSHListenAddr returns the bind address for the SSH listener.
 func (c *ServerConfig) SSHListenAddr() string { return listenAddr(c.BindAddress, c.SSHPort) }
 
-// PreflightAuth gates token-mode startup: it refuses to start when
-// auth.mode: token is set without any SSH key source (github_users /
-// authorized_keys / authorized_keys_file). Token mode enforces the SSH
-// allowlist, so an empty allowlist would lock everyone out. Inert in open mode.
+// PreflightAuth gates enforced-mode startup: it refuses to start when
+// auth.mode: token or mtls is set without any SSH key source (github_users /
+// authorized_keys / authorized_keys_file). Both modes enforce the SSH
+// allowlist, so an empty allowlist would lock everyone out; mtls additionally
+// needs a key source to identify which client gets a certificate issued over
+// the bootstrap channel. Inert in open mode.
 func (c *ServerConfig) PreflightAuth() error {
-	if !c.TokenMode() {
+	if !c.AuthEnforced() {
 		return nil
 	}
 	ssh := c.SSHAuth()
 	if ssh == nil || (len(ssh.GitHubUsers) == 0 && len(ssh.AuthorizedKeys) == 0 && ssh.AuthorizedKeysFile == "") {
-		return errors.New("auth.mode: token requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)")
+		return fmt.Errorf("auth.mode: %s requires at least one SSH key source (auth.ssh.github_users, authorized_keys, or authorized_keys_file)", c.Auth.Mode)
 	}
 	return nil
 }
@@ -294,11 +338,12 @@ func (c *ServerConfig) validateNetworkSurface() error {
 }
 
 // validateHTTPPort range-checks http_port: required (1..65535) in open mode,
-// where it drives the plain-HTTP listener; optional (0 = unset) in token mode,
-// which serves no plain HTTP. Shared by Validate and ValidateNoHostCoupling.
+// where it drives the plain-HTTP listener; optional (0 = unset) in an enforced
+// mode (token or mtls), which serves no plain HTTP. Shared by Validate and
+// ValidateNoHostCoupling.
 func (c *ServerConfig) validateHTTPPort() error {
 	minPort := 1
-	if c.TokenMode() {
+	if c.AuthEnforced() {
 		minPort = 0
 	}
 	if c.HTTPPort < minPort || c.HTTPPort > 65535 {
@@ -313,16 +358,16 @@ func (c *ServerConfig) validateHTTPPort() error {
 // a hostname or typo is rejected here rather than failing cryptically at
 // net.Listen on startup. Open mode has no transport security, so binding a
 // routable interface also requires an explicit allow_insecure_exposure
-// acknowledgment; token mode (TLS + tokens) needs none. Shared by Validate and
-// ValidateNoHostCoupling.
+// acknowledgment; an enforced mode (token or mtls; TLS + client auth) needs
+// none. Shared by Validate and ValidateNoHostCoupling.
 func (c *ServerConfig) validateBindAddress() error {
 	if b := c.BindAddress; b != "" && b != "*" && b != "localhost" && net.ParseIP(b) == nil {
 		return fmt.Errorf("invalid bind_address %q (want an IP address, \"0.0.0.0\"/\"*\" for all IPv4, \"::\" for all interfaces, \"localhost\", or empty for loopback)", b)
 	}
-	if c.TokenMode() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
+	if c.AuthEnforced() || isLoopbackBind(c.BindAddress) || c.AllowInsecureExposure {
 		return nil
 	}
-	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: token", c.BindAddress)
+	return fmt.Errorf("bind_address %q exposes an open-mode (plaintext, no-TLS) server beyond loopback; set allow_insecure_exposure: true to confirm, or use auth.mode: token or mtls", c.BindAddress)
 }
 
 // ExtensionsConfig configures which extensions the agent should enable.
@@ -1437,18 +1482,18 @@ func rejectRemovedKeys(data []byte) error {
 
 // applyModeAndCommonDefaults fills in the mode-derived and common zero-value
 // defaults shared by both loaders (serve + config-validate), so the two paths
-// can't drift. http_port drives the open-mode plain-HTTP listener; token mode
-// serves no plain HTTP, so any value there is dropped (set or constructor
-// default) and /api/info + the written client entry omit a vestigial port.
-// Token mode also defaults https_port so `auth.mode: token` needs no extra
-// TLS config.
+// can't drift. http_port drives the open-mode plain-HTTP listener; an enforced
+// mode (token or mtls) serves no plain HTTP, so any value there is dropped (set
+// or constructor default) and /api/info + the written client entry omit a
+// vestigial port. An enforced mode also defaults https_port so `auth.mode:
+// token` / `auth.mode: mtls` need no extra TLS config.
 func applyModeAndCommonDefaults(cfg *ServerConfig) {
-	if cfg.TokenMode() {
+	if cfg.AuthEnforced() {
 		cfg.HTTPPort = 0
 	} else if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 8080
 	}
-	if cfg.TokenMode() && cfg.HTTPSPort == 0 {
+	if cfg.AuthEnforced() && cfg.HTTPSPort == 0 {
 		cfg.HTTPSPort = 8443
 	}
 	if cfg.SSHPort == 0 {
@@ -1488,8 +1533,9 @@ func normalizeAuthModeValue(mode string) (normalized string, isLegacyAlias bool)
 // spelling to the canonical "token", emitting exactly one startup deprecation
 // warning line when the legacy alias was used. Must run before
 // applyModeAndCommonDefaults and validateAuth — both key off cfg.Auth.Mode —
-// so every downstream reader (TokenMode, HTTPAuthEnforced, PreflightAuth, the
-// /api/info handler, ...) only ever observes "" or the canonical "token".
+// so every downstream reader (TokenMode, MTLSMode, AuthEnforced,
+// HTTPAuthEnforced, PreflightAuth, the /api/info handler, ...) only ever
+// observes "", "open", "token", or "mtls" — never the legacy alias.
 // Shared by both server-config loaders so they can't drift.
 func normalizeAuthMode(cfg *ServerConfig) {
 	if cfg.Auth == nil {

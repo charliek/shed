@@ -9,7 +9,9 @@ import (
 
 // authMiddleware enforces bearer-token auth in token mode (auth.mode: token).
 // In open mode (the default) it is a pass-through, so existing deployments are
-// unaffected.
+// unaffected. mtls mode has no bearer tokens (it authenticates the client via
+// certificate instead), so this middleware is not yet mtls-aware — S6 adds
+// that branch.
 //
 // Exemptions: the bootstrap endpoints GET /api/info and GET /api/ssh-host-key
 // are always reachable without a token, so `shed server add` can fetch server
@@ -77,10 +79,12 @@ func (s *Server) validateToken(tok string) (authtoken.PublicRecord, bool) {
 }
 
 // busOwnershipEnforced reports whether credential-bus /respond ownership is
-// validated against the registry's pending set. It is gated on HTTP auth being
-// on, so the default token-less fleet keeps today's bus behavior.
+// validated against the registry's pending set. It is gated on auth being
+// enforced at all (token or mtls — the gate is about "is this server
+// authenticated", not about which credential form carries it), so the default
+// open-mode fleet keeps today's bus behavior.
 func (s *Server) busOwnershipEnforced() bool {
-	return s.cfg.HTTPAuthEnforced()
+	return s.cfg.AuthEnforced()
 }
 
 // isBootstrapExempt reports whether r targets an endpoint reachable without a

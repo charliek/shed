@@ -96,11 +96,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Token-mode preflight: refuse to start `auth.mode: token` without an SSH
-	// key source (an empty enforced allowlist would lock everyone out). Runs
-	// before anything binds; inert in open mode.
+	// Enforced-mode preflight: refuse to start `auth.mode: token` or `mtls`
+	// without an SSH key source (an empty enforced allowlist would lock
+	// everyone out). Runs before anything binds; inert in open mode.
 	if err := cfg.PreflightAuth(); err != nil {
-		return fmt.Errorf("token-mode preflight: %w", err)
+		return fmt.Errorf("auth preflight: %w", err)
 	}
 
 	log.Printf("Starting shed-server...")
@@ -111,10 +111,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize plugin system (before backends, since backends use the bridge)
 	pluginRegistry := plugin.NewRegistry()
-	// Track pending requests only when HTTP auth is enforced — the /respond
-	// ownership gate is consulted only then, so an unauthenticated server does
-	// no bookkeeping.
-	if cfg.HTTPAuthEnforced() {
+	// Track pending requests only when auth is enforced (token or mtls) — the
+	// /respond ownership gate is consulted only then, so an unauthenticated
+	// open-mode server does no bookkeeping.
+	if cfg.AuthEnforced() {
 		pluginRegistry.EnableOwnershipTracking()
 	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
@@ -284,7 +284,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if cfg.PlainHTTPEnabled() {
 			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: token.")
 		} else {
-			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this token-mode server off-box.")
+			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this token/mtls-mode server off-box.")
 		}
 	}
 
@@ -292,8 +292,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// listeners share this single handler.
 	publicHandler := apiServer.Router()
 
-	// Plain-HTTP listener. In token mode it is not started — only the pinned-TLS
-	// (https_port) listener faces clients (TLS-only).
+	// Plain-HTTP listener. In an enforced mode (token or mtls) it is not
+	// started — only the pinned-TLS (https_port) listener faces clients.
 	var httpServer *http.Server
 	if cfg.PlainHTTPEnabled() {
 		httpServer = newHTTPServer(cfg.HTTPListenAddr(), publicHandler)

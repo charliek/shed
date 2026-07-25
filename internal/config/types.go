@@ -251,9 +251,10 @@ type ServerInfo struct {
 	// serves no plain HTTP — clients use the HTTPS endpoint there.
 	HTTPPort int    `json:"http_port,omitempty"`
 	Backend  string `json:"backend"`
-	// AuthMode is the server's auth.mode ("token" or "open"; the deprecated
-	// "secure" spelling is normalized to "token" before this is ever set), so
-	// `shed server add` knows whether to bootstrap an HTTP token over SSH.
+	// AuthMode is the server's auth.mode ("open", "token", or "mtls"; the
+	// deprecated "secure" spelling is normalized to "token" before this is ever
+	// set), so `shed server add` knows whether to bootstrap an HTTP token (or,
+	// in mtls mode, a client certificate) over SSH.
 	// Reported on the unauthenticated /api/info — the mode is observable from
 	// behavior anyway.
 	AuthMode string `json:"auth_mode,omitempty"`
@@ -736,25 +737,32 @@ const (
 	SSHAuthEnforce = "enforce" // reject keys not in the allowlist
 )
 
-// Auth modes for AuthConfig.Mode — the binary secure-by-default switch.
+// Auth modes for AuthConfig.Mode — the secure-by-default switch.
 // "secure" is the pre-rename spelling of AuthModeToken, kept as a deprecated
 // alias that config load normalizes to AuthModeToken (see normalizeAuthMode
 // in server.go) — downstream code only ever observes AuthModeToken.
 const (
 	AuthModeOpen  = "open"  // default: no enforcement (tailnet/LAN posture)
 	AuthModeToken = "token" // SSH allowlist + HTTP tokens + TLS, all enforced
+	// AuthModeMTLS: the client credential is a short-lived certificate issued
+	// over the SSH bootstrap channel; no bearer tokens exist in this mode.
+	// Shares every other token-mode invariant (SSH allowlist enforce, TLS-only,
+	// https_port default) — see AuthEnforced in server.go.
+	AuthModeMTLS = "mtls"
 )
 
 // AuthConfig configures authentication. The headline control is Mode (the
-// binary open|token switch). The SSH sub-block carries key sources and the
+// open|token|mtls switch). The SSH sub-block carries key sources and the
 // advanced SSH mode override. HTTP bearer-token enforcement is derived purely
 // from token mode — there is no HTTP sub-block.
 type AuthConfig struct {
-	// Mode is open | token (default open; the deprecated "secure" spelling is
-	// normalized to "token" at config load, with one startup deprecation
-	// warning). token derives: SSH allowlist enforce, HTTP bearer-token
-	// enforce, and TLS on (the server serves the TLS listener only); it
-	// requires at least one SSH key source.
+	// Mode is open | token | mtls (default open; the deprecated "secure"
+	// spelling is normalized to "token" at config load, with one startup
+	// deprecation warning). token derives: SSH allowlist enforce, HTTP
+	// bearer-token enforce, and TLS on (the server serves the TLS listener
+	// only). mtls derives the same SSH-allowlist-enforce and TLS-only posture,
+	// but the client credential is a short-lived certificate rather than a
+	// bearer token. Both require at least one SSH key source.
 	Mode string `yaml:"mode,omitempty"`
 	// TokenTTL is the lifetime of a bootstrap-minted HTTP token (default 24h).
 	TokenTTL Duration `yaml:"token_ttl,omitempty"`

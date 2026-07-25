@@ -59,3 +59,46 @@ func TestHandleGetInfo_HTTPSPort(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleGetInfo_AuthMode verifies GET /api/info reports auth_mode
+// directly from the effective config, including the new mtls value — the
+// handler must not special-case a fixed open/token pair (that hardcoding is
+// exactly the bug this test guards against).
+func TestHandleGetInfo_AuthMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		auth     *config.AuthConfig
+		wantMode string
+	}{
+		{name: "nil auth reports open", auth: nil, wantMode: config.AuthModeOpen},
+		{name: "open reports open", auth: &config.AuthConfig{Mode: config.AuthModeOpen}, wantMode: config.AuthModeOpen},
+		{name: "token reports token", auth: &config.AuthConfig{Mode: config.AuthModeToken}, wantMode: config.AuthModeToken},
+		{name: "mtls reports mtls", auth: &config.AuthConfig{Mode: config.AuthModeMTLS}, wantMode: config.AuthModeMTLS},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := NewServer(nil, &config.ServerConfig{
+				Name:     "test-server",
+				HTTPPort: 8080,
+				Auth:     tt.auth,
+			}, "", nil, nil)
+
+			r := httptest.NewRequest(http.MethodGet, "/api/info", nil)
+			w := httptest.NewRecorder()
+			srv.Router().ServeHTTP(w, r)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+
+			var info config.ServerInfo
+			if err := json.Unmarshal(w.Body.Bytes(), &info); err != nil {
+				t.Fatalf("decode ServerInfo: %v", err)
+			}
+			if info.AuthMode != tt.wantMode {
+				t.Fatalf("AuthMode=%q, want %q", info.AuthMode, tt.wantMode)
+			}
+		})
+	}
+}
