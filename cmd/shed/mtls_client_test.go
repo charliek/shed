@@ -13,8 +13,10 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -562,6 +564,192 @@ func TestModeFlipMTLSToToken(t *testing.T) {
 	if _, err := os.Stat(keyPath); !os.IsNotExist(err) {
 		t.Errorf("the obsolete private key is still on disk at %s (err=%v)", keyPath, err)
 	}
+}
+
+// TestCredentialLessEntryEnrolls is the upgrade-path recovery: an entry that
+// holds NO credential of any kind against a server that demands one.
+//
+// That state is routine rather than exotic. A pre-mtls client — the brew-
+// installed binary a user still has around mid-upgrade — loads config.yaml into
+// its own ServerEntry struct and re-saves it, silently dropping every key it
+// predates (auth_mode, client_cert_file, client_key_file,
+// client_cert_expires_at). What is left is an https entry with a TLS pin and
+// nothing to present.
+//
+// Before the credential-less enrollment path existed, such an entry failed
+// PERMANENTLY: it was read as an open server (static, not refreshable), so the
+// reactive re-mint was gated off — and it had no credential to be rejected in
+// the first place. Every invocation died at the same `remote error: tls:
+// certificate required`.
+//
+// Both server modes are covered, because the client does not (and must not)
+// guess which one it is talking to: the bootstrap answers in whatever mode the
+// server is actually in, and the entry adopts it.
+func TestCredentialLessEntryEnrolls(t *testing.T) {
+	t.Run("mtls server: enrolls, adopts mtls, restores the entry", func(t *testing.T) {
+		cfgPath := testClientConfig(t)
+		m := newMTLSServer(t)
+
+		// Exactly what an older client leaves behind: endpoint + pin, no
+		// credential fields at all.
+		clientConfig.Servers["srv"] = config.ServerEntry{
+			Host: "127.0.0.1", SSHPort: 2222,
+			APIURL:             m.srv.URL,
+			TLSCertFingerprint: m.pin,
+		}
+
+		issued := m.credential(t, "cli-key", farFromExpiry)
+		mints := stubBootstrap(func() sdk.Credential { return issued })
+
+		e := clientConfig.Servers["srv"]
+		c := NewAPIClientFromEntry(&e, DefaultTimeout)
+		if got := mints.Load(); got != 1 {
+			t.Fatalf("mints = %d at construction, want 1 — an entry holding nothing must enroll "+
+				"before the first request, not wait for a rejection it cannot provoke", got)
+		}
+		if _, err := c.GetInfo(); err != nil {
+			t.Fatalf("GetInfo after enrollment: %v", err)
+		}
+		if got := mints.Load(); got != 1 {
+			t.Errorf("mints = %d, want 1 (one silent enrollment)", got)
+		}
+		// The recovery is proactive: the FIRST request already carried the new
+		// certificate, so the server saw one request and no refused attempt.
+		if got := m.requests.Load(); got != 1 {
+			t.Errorf("server saw %d requests, want 1", got)
+		}
+		if got := m.lastSerial.Load().(string); got != issued.Bundle.CertSerial {
+			t.Errorf("the request presented serial %q, want the enrolled %q", got, issued.Bundle.CertSerial)
+		}
+
+		// The regression assertion: the fields the older client stripped are back,
+		// in memory AND on disk, so the next invocation needs no SSH at all.
+		for _, cfg := range loadedAndInMemory(t, cfgPath) {
+			got := cfg.Servers["srv"]
+			if got.AuthMode != config.AuthModeMTLS {
+				t.Errorf("auth_mode = %q, want mtls", got.AuthMode)
+			}
+			if got.ClientCertFile == "" || got.ClientKeyFile == "" {
+				t.Errorf("the entry was not repointed at the issued credential: %+v", got)
+			}
+			if !got.ClientCertExpiresAt.Equal(issued.Bundle.ExpiresAt) {
+				t.Errorf("client_cert_expires_at = %v, want %v", got.ClientCertExpiresAt, issued.Bundle.ExpiresAt)
+			}
+		}
+		stored := clientConfig.Servers["srv"]
+		if _, err := tls.LoadX509KeyPair(stored.ClientCertFile, stored.ClientKeyFile); err != nil {
+			t.Errorf("the persisted credential does not load: %v", err)
+		}
+
+		// And the restored entry stands on its own: a fresh client built from it
+		// authenticates with no further bootstrap.
+		next := clientConfig.Servers["srv"]
+		if _, err := NewAPIClientFromEntry(&next, DefaultTimeout).GetInfo(); err != nil {
+			t.Fatalf("the restored entry did not work on its own: %v", err)
+		}
+		if got := mints.Load(); got != 1 {
+			t.Errorf("mints = %d after re-using the restored entry, want 1 (no re-enrollment)", got)
+		}
+	})
+
+	t.Run("token server: enrolls, adopts token, restores the entry", func(t *testing.T) {
+		cfgPath := testClientConfig(t)
+
+		var hits int32
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			if r.Header.Get("Authorization") != "Bearer shed_ctl_fresh" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"name":"srv","ssh_port":2222,"auth_mode":"token"}`)
+		}))
+		defer srv.Close()
+		pin := servertls.Fingerprint(srv.Certificate().Raw)
+
+		clientConfig.Servers["srv"] = config.ServerEntry{
+			Host: "127.0.0.1", SSHPort: 2222,
+			APIURL:             srv.URL,
+			TLSCertFingerprint: pin,
+		}
+
+		newExpiry := time.Now().Add(24 * time.Hour)
+		mints := stubBootstrap(func() sdk.Credential {
+			return sdk.Credential{Bundle: sdk.Bundle{
+				AuthMode: sdk.AuthModeToken, HTTPSPort: 443, TLSCertFingerprint: pin,
+				Token: "shed_ctl_fresh", Scope: "control", ExpiresAt: newExpiry,
+			}}
+		})
+
+		e := clientConfig.Servers["srv"]
+		c := NewAPIClientFromEntry(&e, DefaultTimeout)
+		if _, err := c.GetInfo(); err != nil {
+			t.Fatalf("GetInfo after enrollment: %v", err)
+		}
+		if got := mints.Load(); got != 1 {
+			t.Errorf("mints = %d, want 1", got)
+		}
+		if got := atomic.LoadInt32(&hits); got != 1 {
+			t.Errorf("server saw %d requests, want 1 (the enrollment landed before the first one)", got)
+		}
+
+		for _, cfg := range loadedAndInMemory(t, cfgPath) {
+			got := cfg.Servers["srv"]
+			if got.AuthMode != config.AuthModeToken {
+				t.Errorf("auth_mode = %q, want token", got.AuthMode)
+			}
+			if got.ControlToken != "shed_ctl_fresh" {
+				t.Errorf("control_token = %q, want the enrolled one", got.ControlToken)
+			}
+			if !got.ControlTokenExpiresAt.Equal(newExpiry) {
+				t.Errorf("control_token_expires_at = %v, want %v", got.ControlTokenExpiresAt, newExpiry)
+			}
+		}
+	})
+
+	// The other half of the discrimination: an OPEN server also has no
+	// credential, and must keep costing zero SSH round-trips. Reading "no
+	// credential" as "enroll" unconditionally would put a bootstrap in front of
+	// every command against every open server.
+	t.Run("open server: no credential, no bootstrap", func(t *testing.T) {
+		testClientConfig(t)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"name":"srv","ssh_port":2222,"auth_mode":"open"}`)
+		}))
+		defer srv.Close()
+
+		host, port := hostPortOf(t, srv.URL)
+		clientConfig.Servers["srv"] = config.ServerEntry{Host: host, HTTPPort: port, SSHPort: 2222}
+
+		mints := stubBootstrap(func() sdk.Credential { return sdk.Credential{} })
+
+		e := clientConfig.Servers["srv"]
+		c := NewAPIClientFromEntry(&e, DefaultTimeout)
+		if _, err := c.GetInfo(); err != nil {
+			t.Fatalf("GetInfo against an open server: %v", err)
+		}
+		if got := mints.Load(); got != 0 {
+			t.Errorf("mints = %d against an open server, want 0", got)
+		}
+	})
+}
+
+// hostPortOf splits a test server's URL into the host and numeric port a legacy
+// (plain-HTTP) config entry stores.
+func hostPortOf(t *testing.T, rawURL string) (string, int) {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse port of %s: %v", rawURL, err)
+	}
+	return u.Hostname(), port
 }
 
 // loadedAndInMemory returns the in-memory config and the one re-read from disk,

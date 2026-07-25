@@ -88,6 +88,51 @@ type ServerEntry struct {
 // IsMTLS reports whether this entry last bootstrapped a client certificate.
 func (e *ServerEntry) IsMTLS() bool { return e.AuthMode == AuthModeMTLS }
 
+// UsesTLS reports whether this entry's control plane is HTTPS — which, for a
+// shed-server, means the server enforces auth (token or mtls). Open mode serves
+// plain HTTP and has no HTTPS listener at all, so this is the one durable
+// signal in a stored entry that separates "this server wants a credential" from
+// "this server wants nothing".
+//
+// Either marker alone is enough: `shed server add` writes both an https api_url
+// and a tls_cert_fingerprint for a secure server, but an entry is user-editable
+// and a half-filled one still points at a listener that will demand a
+// credential.
+func (e *ServerEntry) UsesTLS() bool {
+	return e.TLSCertFingerprint != "" ||
+		strings.HasPrefix(strings.ToLower(e.APIURL), "https://")
+}
+
+// NeedsEnrollment reports whether this entry holds NO credential it could
+// present to a server that demands one, and has enough information (host + ssh
+// port) to obtain one over the SSH `_bootstrap` channel.
+//
+// It exists because "no credential recorded" is ambiguous in a stored entry and
+// the two readings need opposite handling:
+//
+//   - an OPEN server legitimately has no credential, and must never pay an SSH
+//     round-trip to discover that. It is plain HTTP, so UsesTLS is false.
+//   - a SECURE server's entry that lost its credential fields must enroll. That
+//     is a routine condition during an upgrade, not a corner case: a pre-mtls
+//     client that loads and re-saves config.yaml silently drops every key its
+//     ServerEntry struct does not know (auth_mode, client_cert_file,
+//     client_key_file, client_cert_expires_at), leaving exactly this shape —
+//     an https entry with nothing to present. Without enrollment such an entry
+//     fails forever, because the client has no credential to be rejected and so
+//     never reaches its reactive re-mint.
+//
+// A legacy static token (a control_token with no expiry) is NOT this case: it
+// has something to present and is deliberately never re-minted.
+func (e *ServerEntry) NeedsEnrollment() bool {
+	if !e.UsesTLS() || e.Host == "" || e.SSHPort == 0 {
+		return false
+	}
+	if e.IsMTLS() {
+		return e.ClientCertFile == "" || e.ClientKeyFile == ""
+	}
+	return e.ControlToken == ""
+}
+
 // BaseURL returns the control-plane base URL for the entry: APIURL when set
 // (it carries scheme+host+port), else the legacy plain http://Host:HTTPPort.
 //

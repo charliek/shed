@@ -66,6 +66,85 @@ func TestServerEntryBaseURL(t *testing.T) {
 	}
 }
 
+// TestServerEntryNeedsEnrollment covers the discrimination the client's
+// credential-less recovery rests on: "no credential recorded" means "open
+// server, present nothing" for a plain-HTTP entry and "enroll over SSH" for a
+// TLS one.
+//
+// The entry that motivates it is the third case — a secure entry whose
+// credential fields were dropped by a pre-mtls client re-saving config.yaml.
+// Read as an open server it fails on every invocation, forever.
+func TestServerEntryNeedsEnrollment(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry ServerEntry
+		want  bool
+	}{
+		{
+			name:  "open server (plain http, no credential) never enrolls",
+			entry: ServerEntry{Host: "h", HTTPPort: 8080, SSHPort: 2222},
+			want:  false,
+		},
+		{
+			name: "token entry with a live token does not enroll",
+			entry: ServerEntry{Host: "h", SSHPort: 2222, APIURL: "https://h:8443",
+				TLSCertFingerprint: "sha256:aa", ControlToken: "shed_ctl_x"},
+			want: false,
+		},
+		{
+			name: "secure entry stripped of every credential field enrolls",
+			entry: ServerEntry{Host: "h", SSHPort: 2222, APIURL: "https://h:8443",
+				TLSCertFingerprint: "sha256:aa"},
+			want: true,
+		},
+		{
+			name:  "a TLS pin alone is enough to mean secure",
+			entry: ServerEntry{Host: "h", SSHPort: 2222, TLSCertFingerprint: "sha256:aa"},
+			want:  true,
+		},
+		{
+			name:  "an https api_url alone is enough to mean secure",
+			entry: ServerEntry{Host: "h", SSHPort: 2222, APIURL: "https://h:8443"},
+			want:  true,
+		},
+		{
+			name: "legacy static token (no expiry) is a credential, not an enrollment",
+			entry: ServerEntry{Host: "h", SSHPort: 2222, APIURL: "https://h:8443",
+				ControlToken: "static-forever"},
+			want: false,
+		},
+		{
+			name: "mtls entry that lost its certificate paths enrolls",
+			entry: ServerEntry{Host: "h", SSHPort: 2222, APIURL: "https://h:8443",
+				AuthMode: AuthModeMTLS},
+			want: true,
+		},
+		{
+			name: "mtls entry pointing at its certificate does not enroll",
+			entry: ServerEntry{Host: "h", SSHPort: 2222, APIURL: "https://h:8443",
+				AuthMode: AuthModeMTLS, ClientCertFile: "/c.pem", ClientKeyFile: "/c.key"},
+			want: false,
+		},
+		{
+			name:  "no ssh port: nothing to bootstrap over",
+			entry: ServerEntry{Host: "h", APIURL: "https://h:8443"},
+			want:  false,
+		},
+		{
+			name:  "no host: nothing to bootstrap over",
+			entry: ServerEntry{SSHPort: 2222, APIURL: "https://h:8443"},
+			want:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.entry.NeedsEnrollment(); got != tt.want {
+				t.Errorf("NeedsEnrollment() = %v, want %v (entry %+v)", got, tt.want, tt.entry)
+			}
+		})
+	}
+}
+
 // TestKnownHostsAddRemove: the add/remove pair is what lets `shed server add`
 // pin a host key for the bootstrap and then take back exactly that line if the
 // add fails.

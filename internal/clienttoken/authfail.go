@@ -57,12 +57,12 @@ import (
 //   - Our client and our server are both Go with MinVersion TLS 1.2 and no
 //     maximum, so they always negotiate TLS 1.3, where the no-certificate case
 //     is the unambiguous alert 116 that IS on this list.
-//   - "We hold no certificate at all" never needs an alert to be discovered:
-//     cmd/shed's entryCredential marks an mtls entry with no loadable
-//     certificate as already expired, so the proactive window enrolls before
-//     the first dial. The alert path only has to catch rejection of a
-//     certificate we DO hold — expired, revoked, foreign CA, de-authorized —
-//     and every one of those produces a specific alert in BOTH TLS versions.
+//   - "We hold no credential at all" never needs an alert to be discovered:
+//     a Source that can mint but holds nothing usable enrolls in EnsureFresh,
+//     before the first dial (see Credential.Usable). The alert path only has to
+//     catch rejection of a certificate we DO hold — expired, revoked, foreign
+//     CA, de-authorized — and every one of those produces a specific alert in
+//     BOTH TLS versions.
 var authAlertDescriptions = []string{
 	"certificate required",          // 116 — TLS 1.3, no cert presented to a RequireAndVerify listener
 	"bad certificate",               // 42  — a malformed or unacceptable certificate

@@ -192,10 +192,21 @@ func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duratio
 // The mtls branch is checked first and gated on the recorded auth_mode, so an
 // entry that still has stale certificate files from before a flip back to token
 // mode does not present them. A certificate that fails to load is NOT an error:
-// it degrades to "refreshable with no current credential", the client presents
-// nothing, the server refuses it, and the reactive path re-enrolls. Failing
-// hard would leave the user with an unusable entry and no way back short of
-// deleting files by hand.
+// it degrades to "refreshable with no usable credential", which EnsureFresh
+// mints for before the first request goes out. Failing hard would leave the user
+// with an unusable entry and no way back short of deleting files by hand.
+//
+// The same reasoning covers an entry with NO credential recorded at all. That is
+// not necessarily an open server — it is also what a secure server's entry looks
+// like after a pre-mtls client loaded and re-saved config.yaml, silently
+// dropping every key its ServerEntry struct predates (auth_mode,
+// client_cert_file, client_key_file, client_cert_expires_at). Both binaries
+// being present is normal during an upgrade, so this shape is expected, and
+// ServerEntry.NeedsEnrollment is what tells the two apart: an https entry with
+// nothing to present enrolls, a plain-HTTP (open) one stays static and pays no
+// SSH round-trip. Read as "open" the secure case fails forever — the client
+// holds no credential to be rejected, so the reactive re-mint has nothing to
+// fire on, and every invocation dies at the same TLS `certificate required`.
 func entryCredential(entry *config.ServerEntry, name string) (cred clienttoken.Credential, refreshable bool) {
 	if entry.IsMTLS() {
 		cert, err := loadClientCert(entry, name)
@@ -205,13 +216,15 @@ func entryCredential(entry *config.ServerEntry, name string) (cred clienttoken.C
 		if cert != nil {
 			return clienttoken.MTLSCredential(cert, entry.ClientCertExpiresAt), true
 		}
-		// No usable certificate: an expired-zero credential, which needsRefresh
-		// treats as "never proactively re-mint". Force enrollment instead by
-		// marking it already expired.
-		return clienttoken.Credential{Mode: clienttoken.ModeMTLS, ExpiresAt: time.Unix(1, 0)}, true
+		// No usable certificate — refreshable, holding nothing. EnsureFresh
+		// enrolls on that (Credential.Usable), so no fake expiry is needed.
+		return clienttoken.Credential{Mode: clienttoken.ModeMTLS}, true
 	}
 	if entry.ControlTokenExpiresAt.IsZero() {
-		return clienttoken.Credential{}, false
+		// Either an open server / legacy static token (static, as always), or a
+		// secure entry stripped of its credential (enroll — holding nothing, so
+		// EnsureFresh mints before the first request).
+		return clienttoken.Credential{}, entry.NeedsEnrollment()
 	}
 	return clienttoken.TokenCredential(entry.ControlToken, entry.ControlTokenExpiresAt), true
 }

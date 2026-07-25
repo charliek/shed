@@ -107,6 +107,84 @@ func TestEnsureFreshZeroExpiryDoesNotMint(t *testing.T) {
 	}
 }
 
+// TestCredentialUsable pins the predicate EnsureFresh uses to decide "we hold
+// nothing — mint before the first request". It is deliberately about the
+// PAYLOAD, not the mode: a recorded mode with its material missing is exactly
+// as unpresentable as no credential at all.
+func TestCredentialUsable(t *testing.T) {
+	tests := []struct {
+		name string
+		cred Credential
+		want bool
+	}{
+		{"a bearer token is usable", TokenCredential("tok", time.Now()), true},
+		{"a certificate is usable", MTLSCredential(certFor("c1"), time.Now()), true},
+		{"the zero credential holds nothing", Credential{}, false},
+		{"mtls with no certificate holds nothing", Credential{Mode: ModeMTLS}, false},
+		{"token mode with an empty token holds nothing", Credential{Mode: ModeToken}, false},
+		{"a certificate recorded under token mode is not presentable", Credential{Mode: ModeToken, Cert: certFor("c1")}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cred.Usable(); got != tt.want {
+				t.Errorf("Usable = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEnsureFreshWithNoCredentialMints is the state-machine gap that made a
+// credential-less config entry fail forever: a Source that CAN mint but holds
+// nothing has no expiry to be near, so an expiry-only proactive check never
+// fires — and, holding nothing, it also has no credential for a server to
+// reject, so the reactive path has nothing to trigger on either. It must mint
+// up front.
+func TestEnsureFreshWithNoCredentialMints(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial Credential
+	}{
+		{"no credential at all (entry stripped by an older client)", Credential{}},
+		{"mtls mode with no certificate (credential files gone)", Credential{Mode: ModeMTLS}},
+		{"mtls mode with no certificate and a far-future expiry", Credential{Mode: ModeMTLS, ExpiresAt: time.Now().Add(24 * time.Hour)}},
+		{"token mode with an empty token", Credential{Mode: ModeToken, ExpiresAt: time.Now().Add(24 * time.Hour)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var count int32
+			s := New(tt.initial, countingRefresh(&count, 24*time.Hour))
+			s.EnsureFresh()
+			if got := atomic.LoadInt32(&count); got != 1 {
+				t.Fatalf("mint count = %d, want 1 (the source held nothing to present)", got)
+			}
+			if s.Token() != "tok1" {
+				t.Errorf("token = %q, want tok1", s.Token())
+			}
+			// And exactly once: the minted credential is usable and far from
+			// expiry, so a second call must be a no-op rather than an SSH
+			// round-trip per client construction.
+			s.EnsureFresh()
+			if got := atomic.LoadInt32(&count); got != 1 {
+				t.Errorf("mint count = %d after a successful mint, want 1", got)
+			}
+		})
+	}
+}
+
+// TestEnsureFreshWithNoCredentialStaysStatic: an open server holds nothing
+// either, and must NOT pay a mint for it. The gate is the refresh callback (a
+// static Source has none), not the credential.
+func TestEnsureFreshWithNoCredentialStaysStatic(t *testing.T) {
+	s := Static("")
+	if s.Refreshable() {
+		t.Fatal("an empty Static source must not be refreshable")
+	}
+	s.EnsureFresh() // must not panic, must not mint
+	if cred, _ := s.Current(); cred.Usable() {
+		t.Errorf("an open-server source acquired a credential: %+v", cred)
+	}
+}
+
 func TestRefreshMintsAndUpdatesExpiry(t *testing.T) {
 	var count int32
 	exp := time.Now().Add(24 * time.Hour)

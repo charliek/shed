@@ -110,6 +110,22 @@ func (c Credential) ClientCertificate() *tls.Certificate {
 	return c.Cert
 }
 
+// Usable reports whether this credential has anything to present to a server: a
+// bearer token in token state, a certificate in mtls state.
+//
+// The zero Credential is NOT usable, and neither is a mode whose payload is
+// missing (an mtls credential with no certificate — the shape a stored entry
+// degrades to when its certificate files are gone). Both mean the same thing to
+// a request: it will be sent unauthenticated, and a server that demands a
+// credential will refuse it.
+//
+// It is what EnsureFresh keys the "mint before the first request" decision on,
+// because expiry alone cannot express it: a credential we never had has no
+// expiry to be near.
+func (c Credential) Usable() bool {
+	return c.BearerToken() != "" || c.ClientCertificate() != nil
+}
+
 // Source is a concurrency-safe holder for the current Credential, with an
 // optional refresh callback. The zero value is not usable; construct with New
 // or Static.
@@ -259,17 +275,30 @@ func needsRefresh(expiresAt, now time.Time) bool {
 	return !now.Before(expiresAt.Add(-refreshWindow))
 }
 
-// EnsureFresh proactively re-mints when the current credential is within the
-// refresh window of its expiry, so the next request never races expiry. It is
-// best-effort: a mint error leaves the existing credential in place (the
+// EnsureFresh proactively mints before the next request, in the two situations
+// where letting the request go out as-is is known to fail:
+//
+//   - the current credential is within refreshWindow of its expiry (or past it),
+//     so the request would race expiry;
+//   - the Source holds NOTHING usable at all (Credential.Usable is false) while
+//     being able to mint. That is not a hypothetical: it is the state a stored
+//     config entry degrades to when an older client rewrote it and dropped the
+//     credential fields it did not understand, or when the credential files it
+//     points at are gone. Expiry cannot express that case — a credential that was
+//     never held has no expiry to be near — so it is checked separately, and
+//     checking it here is what makes the recovery PROACTIVE rather than dependent
+//     on a rejection that some request paths (streaming, long-timeout) have no
+//     retry to act on.
+//
+// It is best-effort: a mint error leaves the existing credential in place (the
 // reactive Refresh path surfaces errors to a real request). No-op for a static
-// Source.
+// Source — an open server holds nothing usable either, and has nothing to mint.
 func (s *Source) EnsureFresh() {
 	if s.refresh == nil {
 		return
 	}
 	cred, gen := s.Current()
-	if needsRefresh(cred.ExpiresAt, time.Now()) {
+	if !cred.Usable() || needsRefresh(cred.ExpiresAt, time.Now()) {
 		_, _ = s.Refresh(gen)
 	}
 }
