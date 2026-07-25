@@ -128,9 +128,9 @@ func TestConnectClientDialRefreshesOn401(t *testing.T) {
 	defer srv.Close()
 
 	pin := servertls.Fingerprint(srv.Certificate().Raw)
-	src := clienttoken.New("shed_control_old", time.Now().Add(24*time.Hour), func() (string, time.Time, error) {
+	src := clienttoken.New(clienttoken.TokenCredential("shed_control_old", time.Now().Add(24*time.Hour)), func() (clienttoken.Credential, error) {
 		atomic.AddInt32(&mints, 1)
-		return newTok, time.Now().Add(24 * time.Hour), nil
+		return clienttoken.TokenCredential(newTok, time.Now().Add(24*time.Hour)), nil
 	})
 	client := NewConnectClient(ConnectTarget{Addr: addrOf(srv), TLSPin: pin}, src)
 
@@ -155,9 +155,9 @@ func TestConnectClientConcurrentDialsCoalesceRefresh(t *testing.T) {
 	defer srv.Close()
 
 	pin := servertls.Fingerprint(srv.Certificate().Raw)
-	src := clienttoken.New("shed_control_old", time.Now().Add(24*time.Hour), func() (string, time.Time, error) {
+	src := clienttoken.New(clienttoken.TokenCredential("shed_control_old", time.Now().Add(24*time.Hour)), func() (clienttoken.Credential, error) {
 		atomic.AddInt32(&mints, 1)
-		return newTok, time.Now().Add(24 * time.Hour), nil
+		return clienttoken.TokenCredential(newTok, time.Now().Add(24*time.Hour)), nil
 	})
 	client := NewConnectClient(ConnectTarget{Addr: addrOf(srv), TLSPin: pin}, src)
 
@@ -210,8 +210,8 @@ func TestConnectClientPlainNeverSendsTokenOnRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	src := clienttoken.New("old", time.Now().Add(24*time.Hour), func() (string, time.Time, error) {
-		return "new", time.Now().Add(24 * time.Hour), nil
+	src := clienttoken.New(clienttoken.TokenCredential("old", time.Now().Add(24*time.Hour)), func() (clienttoken.Credential, error) {
+		return clienttoken.TokenCredential("new", time.Now().Add(24*time.Hour)), nil
 	})
 	client := NewConnectClient(ConnectTarget{Addr: addrOf(srv)}, src) // plain + refreshable
 	_, _ = client.Dial(context.Background(), "myshed", 8080)          // fails after retry; that's fine

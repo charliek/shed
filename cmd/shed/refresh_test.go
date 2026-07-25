@@ -16,11 +16,11 @@ import (
 // (recording whether it fired), with far-future expiries so only the reactive
 // path is exercised.
 func refreshingSource(tok, newTok string, fired *bool) *clienttoken.Source {
-	return clienttoken.New(tok, time.Now().Add(24*time.Hour), func() (string, time.Time, error) {
+	return clienttoken.New(clienttoken.TokenCredential(tok, time.Now().Add(24*time.Hour)), func() (clienttoken.Credential, error) {
 		if fired != nil {
 			*fired = true
 		}
-		return newTok, time.Now().Add(24 * time.Hour), nil
+		return clienttoken.TokenCredential(newTok, time.Now().Add(24*time.Hour)), nil
 	})
 }
 
@@ -37,8 +37,7 @@ func TestDoRequest401RefreshAndRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newAPIClient(srv.URL, "stale", "", DefaultTimeout)
-	c.tokens = refreshingSource("stale", "new", &refreshed)
+	c := newAPIClientWithSource(srv.URL, "", refreshingSource("stale", "new", &refreshed), DefaultTimeout)
 
 	var out struct {
 		OK bool `json:"ok"`
@@ -65,11 +64,11 @@ func TestDoRequest401RetryAtMostOnce(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newAPIClient(srv.URL, "stale", "", DefaultTimeout)
-	c.tokens = clienttoken.New("stale", time.Now().Add(24*time.Hour), func() (string, time.Time, error) {
+	src := clienttoken.New(clienttoken.TokenCredential("stale", time.Now().Add(24*time.Hour)), func() (clienttoken.Credential, error) {
 		refreshes++
-		return "new", time.Now().Add(24 * time.Hour), nil
+		return clienttoken.TokenCredential("new", time.Now().Add(24*time.Hour)), nil
 	})
+	c := newAPIClientWithSource(srv.URL, "", src, DefaultTimeout)
 
 	if err := c.doRequest("GET", "/x", nil, nil); err == nil {
 		t.Error("expected an error when the 401 persists after refresh")
@@ -116,8 +115,7 @@ func TestDeleteShedWithProgress401RefreshAndRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newAPIClient(srv.URL, "stale", "", DefaultTimeout)
-	c.tokens = refreshingSource("stale", "new", &refreshed)
+	c := newAPIClientWithSource(srv.URL, "", refreshingSource("stale", "new", &refreshed), DefaultTimeout)
 
 	if err := c.DeleteShedWithProgress("myshed", nil); err != nil {
 		t.Fatalf("DeleteShedWithProgress: %v", err)
@@ -148,8 +146,8 @@ func TestServerNameForEntry(t *testing.T) {
 }
 
 func TestProactiveRefreshOnNearExpiry(t *testing.T) {
-	origCfg, origBF := clientConfig, bootstrapFn
-	defer func() { clientConfig, bootstrapFn = origCfg, origBF }()
+	origCfg, origBF := clientConfig, bootstrapCredentialFn
+	defer func() { clientConfig, bootstrapCredentialFn = origCfg, origBF }()
 
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	cfg, err := config.LoadClientConfigFromPath(cfgPath) // empty, but with its path set so Save works
@@ -164,8 +162,8 @@ func TestProactiveRefreshOnNearExpiry(t *testing.T) {
 	}
 
 	newExpiry := time.Now().Add(24 * time.Hour)
-	bootstrapFn = func(string, int, string, string) (sdk.Bundle, error) {
-		return sdk.Bundle{Token: "fresh", ExpiresAt: newExpiry, Scope: "control"}, nil
+	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
+		return sdk.Credential{Bundle: sdk.Bundle{Token: "fresh", ExpiresAt: newExpiry, Scope: "control"}}, nil
 	}
 
 	entry := clientConfig.Servers["s"]
@@ -187,12 +185,12 @@ func TestProactiveRefreshOnNearExpiry(t *testing.T) {
 }
 
 func TestNoRefreshForStaticToken(t *testing.T) {
-	origCfg, origBF := clientConfig, bootstrapFn
-	defer func() { clientConfig, bootstrapFn = origCfg, origBF }()
+	origCfg, origBF := clientConfig, bootstrapCredentialFn
+	defer func() { clientConfig, bootstrapCredentialFn = origCfg, origBF }()
 	called := false
-	bootstrapFn = func(string, int, string, string) (sdk.Bundle, error) {
+	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
 		called = true
-		return sdk.Bundle{Token: "x"}, nil
+		return sdk.Credential{Bundle: sdk.Bundle{Token: "x"}}, nil
 	}
 	clientConfig = &config.ClientConfig{Servers: map[string]config.ServerEntry{}}
 
@@ -234,8 +232,8 @@ func TestServerNameForEntryAmbiguous(t *testing.T) {
 // forEachServer directly (rather than snapshotting in the test) is deliberate:
 // it covers the launcher's own map reads, which a hand-rolled snapshot misses.
 func TestConcurrentRefreshNoRace(t *testing.T) {
-	origCfg, origBF := clientConfig, bootstrapFn
-	defer func() { clientConfig, bootstrapFn = origCfg, origBF }()
+	origCfg, origBF := clientConfig, bootstrapCredentialFn
+	defer func() { clientConfig, bootstrapCredentialFn = origCfg, origBF }()
 
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	cfg, err := config.LoadClientConfigFromPath(cfgPath)
@@ -251,8 +249,8 @@ func TestConcurrentRefreshNoRace(t *testing.T) {
 		}
 	}
 	newExpiry := time.Now().Add(24 * time.Hour)
-	bootstrapFn = func(host string, _ int, _, _ string) (sdk.Bundle, error) {
-		return sdk.Bundle{Token: "fresh-" + host, ExpiresAt: newExpiry, Scope: "control"}, nil
+	bootstrapCredentialFn = func(host string, _ int, _, _ string) (sdk.Credential, error) {
+		return sdk.Credential{Bundle: sdk.Bundle{Token: "fresh-" + host, ExpiresAt: newExpiry, Scope: "control"}}, nil
 	}
 
 	_ = forEachServer(clientConfig.Servers, func(_ string, entry config.ServerEntry) (struct{}, error) {

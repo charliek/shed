@@ -288,7 +288,7 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	// A self-refreshing token source so a long-lived tunnel survives the control
 	// token's TTL. Built here for foreground and (re-)built by the detached worker
 	// when it re-runs; the parent -d process starts no tunnels itself.
-	tokenSrc := tunnelTokenSource(client, entry, target)
+	tokenSrc := tunnelCredentialSource(client, entry, target)
 
 	switch {
 	case tunnelBackground && !tunnelDaemon:
@@ -303,18 +303,19 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	}
 }
 
-// tunnelTokenSource returns a self-refreshing token source for a token-mode tunnel,
-// seeded from the client's freshly-minted token+expiry (post ensureRunningShed).
-// It re-mints over SSH but NEVER persists to config: a background daemon may run
-// for days, and writing its stale in-memory config back would clobber unrelated
-// foreground edits (e.g. a `shed server add`). Returns nil for the plain/legacy
-// path (no token, no refresh).
-func tunnelTokenSource(client *APIClient, entry *config.ServerEntry, target tunnels.ConnectTarget) *clienttoken.Source {
+// tunnelCredentialSource returns a self-refreshing credential source for a secure
+// tunnel, seeded from the credential the client just obtained (post
+// ensureRunningShed) — a bearer token or a client certificate, whichever the
+// server issued. It re-mints over SSH but NEVER persists to config: a background
+// daemon may run for days, and writing its stale in-memory config back would
+// clobber unrelated foreground edits (e.g. a `shed server add`). Returns nil for
+// the plain/legacy path (no credential, no refresh).
+func tunnelCredentialSource(client *APIClient, entry *config.ServerEntry, target tunnels.ConnectTarget) *clienttoken.Source {
 	if target.TLSPin == "" {
 		return nil
 	}
-	return clienttoken.New(client.currentToken(), client.TokenSource().ExpiresAt(),
-		controlTokenRefresh(entry.Host, entry.SSHPort, "")) // "" persistName ⇒ mint-only
+	cred, _ := client.CredentialSource().Current()
+	return clienttoken.New(cred, controlCredentialRefresh(entry.Host, entry.SSHPort, "")) // "" persistName ⇒ mint-only
 }
 
 func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, source *clienttoken.Source, ports []tunnels.PortMapping, profile string) error {

@@ -349,13 +349,20 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 	// above, so the bootstrap ssh runs under StrictHostKeyChecking=yes.
 	var controlToken string
 	var controlTokenExpiresAt time.Time
+	var entryAuthMode string
 	if info.AuthMode == config.AuthModeToken {
-		bundle, err := bootstrapServer(host, info.SSHPort, "control", "cli")
+		res, err := bootstrapCredentialFn(host, info.SSHPort, "control", "cli")
 		if err != nil {
 			return fmt.Errorf("bootstrap control token from %s: %w", host, err)
 		}
-		controlToken = bundle.Token
-		controlTokenExpiresAt = bundle.ExpiresAt
+		// A token-mode server ignores the CSR the bootstrap submits and answers
+		// with a bearer token, so this is the same exchange as before. The mtls
+		// first-contact flow (an mtls server serves no plain HTTP and refuses the
+		// handshake to an unenrolled client, so /api/info above is unreachable)
+		// is a separate change.
+		controlToken = res.Bundle.Token
+		controlTokenExpiresAt = res.Bundle.ExpiresAt
+		entryAuthMode = config.AuthModeToken
 	}
 
 	// Determine server name
@@ -378,6 +385,7 @@ func runServerAdd(cmd *cobra.Command, args []string) error {
 		TLSCertFingerprint:    tlsFingerprint, // empty for the plain-HTTP path
 		ControlToken:          controlToken,   // bootstrap-minted in token mode
 		ControlTokenExpiresAt: controlTokenExpiresAt,
+		AuthMode:              entryAuthMode, // "" for an open server (absent means token)
 	}
 	if err := clientConfig.AddServer(name, entry); err != nil {
 		return err
@@ -552,6 +560,15 @@ func runServerRemove(cmd *cobra.Command, args []string) error {
 
 	if err := clientConfig.Save(); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	// Delete any client certificate + private key held for this server. Done
+	// AFTER the save, so a removal failure leaves an orphan file rather than a
+	// config entry pointing at a deleted credential. It is a warning, not an
+	// error: the server is already gone from the config and the command must not
+	// fail on cleanup of material that is now inert.
+	if err := config.RemoveServerCredentials(name); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
 
 	if jsonFlag {

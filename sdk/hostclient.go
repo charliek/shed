@@ -63,6 +63,17 @@ type HostClient struct {
 	// the client; Invalidate is called after a 401.
 	tokenProvider TokenProvider
 	tlsPin        string // "sha256:<hex>" pin applied in NewHostClient, or ""
+	// clientCerts, when set, supplies the client certificate for an mtls-mode
+	// server. It is installed as tls.Config.GetClientCertificate, so it is
+	// consulted per handshake — a rotated certificate is picked up without
+	// rebuilding the client or its transport.
+	clientCerts ClientCertProvider
+	// certAuth records that clientCerts was actually WIRED into the transport
+	// (which needs a pin — see applyTLSPin). It is what setAuth gates the
+	// Authorization header on, so the two credentials are mutually exclusive in
+	// fact and not merely in intent: a provider that was configured but never
+	// installed leaves the token path exactly as it was.
+	certAuth bool
 
 	mu     sync.Mutex
 	states map[string]SubStatus
@@ -79,6 +90,23 @@ type TokenProvider interface {
 	// client calls it after a 401 — the server rejected the cached token.
 	Invalidate()
 }
+
+// ClientCertProvider supplies the client certificate presented to an mtls-mode
+// shed-server. Implementations must be safe for concurrent use: it is called
+// from the TLS stack on every handshake, on whichever goroutine is dialing.
+//
+// Returning nil means "no certificate": the provider is installed
+// unconditionally alongside the pin, so a token-mode client simply has nothing
+// to present and a later mode flip needs no new transport.
+type ClientCertProvider interface {
+	ClientCertificate() *tls.Certificate
+}
+
+// ClientCertFunc adapts a plain function to ClientCertProvider.
+type ClientCertFunc func() *tls.Certificate
+
+// ClientCertificate implements ClientCertProvider.
+func (f ClientCertFunc) ClientCertificate() *tls.Certificate { return f() }
 
 // HostClientOption configures a HostClient.
 type HostClientOption func(*HostClient)
@@ -110,6 +138,9 @@ func WithLogger(logger *slog.Logger) HostClientOption {
 // static WithToken. The host-agent passes one backed by its SSH credential
 // minter so the bus token is re-minted near expiry / on a 401 without rebuilding
 // the client.
+//
+// A wired WithClientCertificates outranks it: no Authorization header is sent
+// while the certificate is the credential.
 func WithTokenProvider(tp TokenProvider) HostClientOption {
 	return func(c *HostClient) {
 		c.tokenProvider = tp
@@ -118,6 +149,9 @@ func WithTokenProvider(tp TokenProvider) HostClientOption {
 
 // WithToken sets the bearer token sent on requests (the host-agent's
 // credentials-scoped token). Sent when non-empty.
+//
+// A wired WithClientCertificates outranks it: no Authorization header is sent
+// while the certificate is the credential.
 func WithToken(token string) HostClientOption {
 	return func(c *HostClient) {
 		c.token = token
@@ -141,6 +175,24 @@ func WithToken(token string) HostClientOption {
 func WithTLSPin(fingerprint string) HostClientOption {
 	return func(c *HostClient) {
 		c.tlsPin = fingerprint
+	}
+}
+
+// WithClientCertificates installs a client-certificate provider for an
+// mtls-mode shed-server, consulted per TLS handshake. Pass it alongside
+// WithTLSPin: mtls is only ever served over the pinned HTTPS listener, and the
+// provider is only wired when a pin is set.
+//
+// It TAKES PRECEDENCE over WithToken/WithTokenProvider: once the provider is
+// wired, no Authorization header is sent at all. That is deliberate, and it
+// mirrors the in-tree CLI's mode gating. An mtls-mode server never reads the
+// header, so a client that sent both would be shipping a live bearer token to
+// an endpoint that ignores it — a credential on the wire with no upside. A
+// token option remains useful only as the thing the client falls back to when
+// no pin is configured and the provider therefore never gets installed.
+func WithClientCertificates(p ClientCertProvider) HostClientOption {
+	return func(c *HostClient) {
+		c.clientCerts = p
 	}
 }
 
@@ -189,6 +241,29 @@ func (c *HostClient) applyTLSPin() {
 	}
 	tlsCfg.InsecureSkipVerify = true
 	tlsCfg.VerifyPeerCertificate = pinVerifier(c.tlsPin)
+	// Install the client-certificate callback UNCONDITIONALLY when a provider is
+	// configured, even if it currently has nothing to present. The callback is
+	// what makes rotation — and a token↔mtls mode flip — invisible to the
+	// transport: the TLS stack asks per handshake, so the credential can change
+	// underneath a live *http.Transport without rebuilding it. See
+	// internal/servertls.PinnedClientConfig, the in-tree twin of this.
+	if c.clientCerts != nil {
+		provider := c.clientCerts
+		// From here on the certificate IS the credential: setAuth stops sending a
+		// bearer token, so the two never travel together.
+		c.certAuth = true
+		tlsCfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			if cert := provider.ClientCertificate(); cert != nil {
+				return cert, nil
+			}
+			// An EMPTY certificate, not an error: the handshake must proceed and
+			// let the server decide. Returning an error aborts the connection
+			// client-side, which would turn "this server wants a cert I don't
+			// have yet" into an opaque dial failure instead of the server's own
+			// certificate_required alert that the re-enrollment path keys on.
+			return &tls.Certificate{}, nil
+		}
+	}
 	base.TLSClientConfig = tlsCfg
 	c.httpClient = &http.Client{
 		Transport:     base,
@@ -201,7 +276,15 @@ func (c *HostClient) applyTLSPin() {
 // setAuth adds the bearer token header. With a tokenProvider it uses the current
 // (possibly just-refreshed) token; otherwise the static token. Both no-op when
 // empty (an open-mode, un-gated server).
+//
+// It adds NOTHING once a client-certificate provider is wired: the credential
+// travels in the handshake, an mtls-mode server never reads this header, and
+// sending a bearer token alongside a certificate would put a second live
+// credential on the wire for no benefit. See WithClientCertificates.
 func (c *HostClient) setAuth(req *http.Request) {
+	if c.certAuth {
+		return
+	}
 	tok := c.token
 	if c.tokenProvider != nil {
 		t, err := c.tokenProvider.Token()

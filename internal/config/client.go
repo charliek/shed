@@ -57,7 +57,34 @@ type ServerEntry struct {
 	// "sha256:<hex>", captured at `shed server add`. When set, the client
 	// verifies the presented cert against it (no CA needed).
 	TLSCertFingerprint string `yaml:"tls_cert_fingerprint,omitempty"`
+	// AuthMode records the credential shape the server issued at the last
+	// bootstrap: AuthModeToken (a bearer token) or AuthModeMTLS (a client
+	// certificate).
+	//
+	// ABSENT MEANS TOKEN. Every entry written before client-certificate support
+	// existed has no auth_mode key, and those are all token/open servers — so an
+	// empty value must never be read as "unknown, go find out". It is a CACHE of
+	// what the server last said, not a setting: a bootstrap that comes back in
+	// the other mode rewrites it (see the mode-flip path in cmd/shed/client.go),
+	// which is what lets an operator switch a server's auth.mode without every
+	// client needing to be re-added.
+	AuthMode string `yaml:"auth_mode,omitempty"`
+	// ClientCertFile / ClientKeyFile locate this entry's client certificate and
+	// its private key under the creds dir (see ServerCredsDir). Paths rather
+	// than inline PEM: the key must live in a 0600 file of its own, not inside a
+	// config the user hand-edits, copies between machines, and pastes into
+	// issues.
+	ClientCertFile string `yaml:"client_cert_file,omitempty"`
+	ClientKeyFile  string `yaml:"client_key_file,omitempty"`
+	// ClientCertExpiresAt is when ClientCertFile's certificate expires, so the
+	// client can re-enroll before a request races expiry — the mtls counterpart
+	// of ControlTokenExpiresAt. Cached here so the proactive check costs no file
+	// read; the certificate itself remains the authority.
+	ClientCertExpiresAt time.Time `yaml:"client_cert_expires_at,omitempty"`
 }
+
+// IsMTLS reports whether this entry last bootstrapped a client certificate.
+func (e *ServerEntry) IsMTLS() bool { return e.AuthMode == AuthModeMTLS }
 
 // BaseURL returns the control-plane base URL for the entry: APIURL when set
 // (it carries scheme+host+port), else the legacy plain http://Host:HTTPPort.

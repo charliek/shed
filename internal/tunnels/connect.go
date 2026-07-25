@@ -32,9 +32,10 @@ type ConnectTarget struct {
 // ConnectClient dials shed VMs via the shed-server Connect API.
 type ConnectClient struct {
 	target ConnectTarget
-	// source, when non-nil, supplies the bearer token and transparently re-mints
-	// it (proactively before expiry, reactively on a 401) so a long-lived tunnel
-	// survives the token TTL. nil ⇒ the static target.Token (legacy/plain path).
+	// source, when non-nil, supplies the credential — a bearer token or a client
+	// certificate — and transparently re-mints it (proactively before expiry,
+	// reactively on an auth failure) so a long-lived tunnel survives the
+	// credential TTL. nil ⇒ the static target.Token (legacy/plain path).
 	source *clienttoken.Source
 }
 
@@ -45,46 +46,71 @@ func NewConnectClient(target ConnectTarget, source *clienttoken.Source) *Connect
 	return &ConnectClient{target: target, source: source}
 }
 
-// authToken returns the bearer token to send: the live token from the refreshing
-// source when present, else the static target.Token. It never returns a token for
-// an unpinned (plain-TCP) target — a bearer token must only travel over the
-// pinned-TLS connection, never plaintext — so a misconfigured source can't leak
-// one over the legacy path.
-func (c *ConnectClient) authToken() string {
+// authToken returns the bearer token to send for one attempt: the bearer half
+// of the credential that attempt CAPTURED, else the static target.Token. It
+// returns "" in mtls state (Credential.BearerToken is mode-gated) — the
+// credential is in the handshake there, and the server does not read the header.
+//
+// It never returns a token for an unpinned (plain-TCP) target either — a bearer
+// token must only travel over the pinned-TLS connection, never plaintext — so a
+// misconfigured source can't leak one over the legacy path.
+//
+// It takes the captured credential rather than re-reading the Source, so the
+// header and the handshake below carry the SAME generation — the one the
+// caller recorded and will hand back to Refresh. See clienttoken.WithPinned.
+func (c *ConnectClient) authToken(cred clienttoken.Credential) string {
 	if c.target.TLSPin == "" {
 		return ""
 	}
 	if c.source != nil {
-		return c.source.Token()
+		return cred.BearerToken()
 	}
 	return c.target.Token
 }
 
+// clientCertificate returns the client certificate to present at the TLS
+// handshake, or nil. It is passed to servertls as a ClientCertSource so the
+// certificate is fetched PER HANDSHAKE — a tunnel that outlives a cert rotation
+// dials the next connection with the new one, with nothing to rebuild.
+//
+// ctx is the handshake's context: an attempt pins its captured credential onto
+// it, so the certificate presented is the one that attempt recorded rather than
+// whatever the Source holds by the time the handshake runs.
+//
+// Like authToken it is inert on an unpinned target: mtls is only ever served on
+// the pinned TLS listener, and a certificate must not be offered to a peer whose
+// identity has not been verified.
+func (c *ConnectClient) clientCertificate(ctx context.Context) *tls.Certificate {
+	if c.target.TLSPin == "" || c.source == nil {
+		return nil
+	}
+	return c.source.CertificateFor(ctx)
+}
+
 // Dial opens a TCP tunnel to a shed VM port via the Connect API. It performs an
 // HTTP upgrade handshake and returns the underlying connection (over pinned TLS
-// when the target is pinned). When the client has a refreshing source, it
-// re-mints the token proactively before dialing and, on a 401, once reactively
-// before re-dialing — so a tunnel outlives the control-token TTL.
+// when the target is pinned).
+//
+// When the client has a refreshing source it re-mints proactively before
+// dialing and, once, reactively before re-dialing — so a tunnel outlives the
+// credential TTL. The reactive trigger is an AUTH-SHAPED FAILURE, which on this
+// path is either a 401 from the Connect route or a TLS-level rejection of the
+// client certificate; the latter surfaces as a dial error with no HTTP status
+// at all, so the retry cannot be keyed on the status alone.
 func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) (net.Conn, error) {
-	if c.source != nil {
-		c.source.EnsureFresh() // proactive: re-mint if within the expiry window
+	cred, sentGen := c.capture()
+	conn, status, err := c.attemptDial(ctx, shedName, port, cred)
+	// A credential can expire mid-tunnel: re-mint once and re-dial from scratch
+	// (the raw upgrade connection can't be reused for a retry).
+	if clienttoken.IsAuthFailure(status, err) && c.source != nil && c.source.Refreshable() {
+		fresh, rerr := c.source.Refresh(sentGen)
+		if rerr != nil {
+			return nil, fmt.Errorf("connect API rejected the tunnel credential and the re-mint failed: %w", rerr)
+		}
+		conn, status, err = c.attemptDial(ctx, shedName, port, fresh)
 	}
-	sent := c.authToken()
-	conn, status, err := c.attemptDial(ctx, shedName, port, sent)
 	if err != nil {
 		return nil, err
-	}
-	// A control token can expire mid-tunnel: on a 401, re-mint once and re-dial
-	// from scratch (the raw upgrade connection can't be reused for a retry).
-	if status == http.StatusUnauthorized && c.source != nil && c.source.Refreshable() {
-		if _, rerr := c.source.Refresh(sent); rerr != nil {
-			return nil, fmt.Errorf("connect API returned 401 and token re-mint failed: %w", rerr)
-		}
-		// Re-read through authToken so the retry re-applies the plaintext guard
-		// (never a bearer over an unpinned connection) rather than the raw token.
-		if conn, status, err = c.attemptDial(ctx, shedName, port, c.authToken()); err != nil {
-			return nil, err
-		}
 	}
 	if status != http.StatusSwitchingProtocols {
 		return nil, fmt.Errorf("connect API returned HTTP %d (expected 101)", status)
@@ -92,15 +118,38 @@ func (c *ConnectClient) Dial(ctx context.Context, shedName string, port uint16) 
 	return conn, nil
 }
 
-// attemptDial performs a single dial + Connect upgrade with the given bearer
-// token. On a 101 it returns the established connection and status 101; on any
+// capture reads the credential this attempt will transmit and the generation it
+// belongs to, in ONE atomic read, after a proactive freshness check. Both the
+// bearer header and the TLS certificate are then derived from that single
+// value, so the generation reported to Refresh after a rejection is provably
+// the generation that was sent — see clienttoken.WithPinned for why re-reading
+// the Source at each use site instead is a race.
+//
+// A client with no source (the legacy static/plain path) captures the zero
+// credential; authToken falls back to target.Token and no certificate is ever
+// offered.
+func (c *ConnectClient) capture() (clienttoken.Credential, uint64) {
+	if c.source == nil {
+		return clienttoken.Credential{}, 0
+	}
+	c.source.EnsureFresh() // proactive: re-mint if within the expiry window
+	return c.source.Current()
+}
+
+// attemptDial performs a single dial + Connect upgrade with cred as its pinned
+// credential — the bearer header and the handshake certificate both come from
+// it. On a 101 it returns the established connection and status 101; on any
 // other HTTP status it closes the connection and returns (nil, status, nil); a
 // transport/handshake/cancellation error returns (nil, 0, err).
-func (c *ConnectClient) attemptDial(ctx context.Context, shedName string, port uint16, token string) (net.Conn, int, error) {
-	conn, err := c.dial(ctx)
+func (c *ConnectClient) attemptDial(ctx context.Context, shedName string, port uint16, cred clienttoken.Credential) (net.Conn, int, error) {
+	// The dial carries the pinned credential so this attempt's handshake presents
+	// the certificate it captured; cancellation is unaffected (the pinned context
+	// derives from ctx), so the watcher below still uses the caller's ctx.
+	conn, err := c.dial(clienttoken.WithPinned(ctx, cred))
 	if err != nil {
 		return nil, 0, err
 	}
+	token := c.authToken(cred)
 
 	// The upgrade write + http.ReadResponse below don't honor ctx on their own,
 	// so a server that accepts the connection but never sends 101 would block
@@ -171,21 +220,71 @@ func (c *ConnectClient) attemptDial(ctx context.Context, shedName string, port u
 //
 // The caller bounds the probe with ctx's deadline (there is no internal
 // timeout), so a stalled server can't wedge startup.
+//
+// Like Dial, the probe recovers REACTIVELY from an auth-shaped failure: it
+// re-mints once and probes again. Without that it was the one credential path
+// with only a proactive refresh, so a certificate the server had already
+// stopped accepting — de-authorized, revoked, or rejected after a mode flip —
+// failed startup with a "re-run the command" message describing work the client
+// was perfectly able to do itself.
 func (c *ConnectClient) Probe(ctx context.Context, shedName string) error {
-	if c.source != nil {
-		c.source.EnsureFresh() // probe with a fresh token so a near-expiry one doesn't fail startup
+	cred, sentGen := c.capture()
+	res := c.attemptProbe(ctx, shedName, cred)
+	if clienttoken.IsAuthFailure(res.status, res.reqErr) && c.source != nil && c.source.Refreshable() {
+		fresh, rerr := c.source.Refresh(sentGen)
+		if rerr != nil {
+			return fmt.Errorf("connect probe: shed-server rejected the tunnel credential and the re-mint failed: %w", rerr)
+		}
+		res = c.attemptProbe(ctx, shedName, fresh)
 	}
+	if res.reqErr != nil {
+		// An mtls server's refusal arrives as a TLS alert, not a status — name it
+		// as the credential problem it is rather than a generic transport error,
+		// so the operator is not sent hunting for a network fault.
+		if clienttoken.IsAuthFailure(0, res.reqErr) {
+			return fmt.Errorf("connect probe: shed-server rejected the tunnel client certificate: %w", res.reqErr)
+		}
+		return fmt.Errorf("connect probe to %s: %w", c.target.Addr, res.reqErr)
+	}
+	return res.verdict
+}
+
+// probeResult is one probe attempt's outcome, split so Probe can classify an
+// auth-shaped failure (which needs the raw status and the raw transport error)
+// separately from the message it finally reports.
+type probeResult struct {
+	// status is the HTTP status, or 0 when the request produced no response.
+	status int
+	// reqErr is the RAW transport error, unwrapped, so IsAuthFailure sees the
+	// TLS alert exactly as crypto/tls produced it. nil on a completed response.
+	reqErr error
+	// verdict is this attempt's answer: nil means authenticated and the Connect
+	// route is reachable. Meaningful only when reqErr is nil.
+	verdict error
+}
+
+// attemptProbe issues one probe with cred as its pinned credential.
+//
+// It builds its own transport per attempt, which is how the retry gets a fresh
+// TLS handshake: a pooled connection still carries the handshake identity the
+// server just rejected, so reusing one would replay the rejected certificate.
+// (The control plane achieves the same thing with CloseIdleConnections on its
+// long-lived shared transport; the probe is one-shot, so a fresh transport is
+// simpler and equivalent.)
+func (c *ConnectClient) attemptProbe(ctx context.Context, shedName string, cred clienttoken.Credential) probeResult {
 	scheme := "http"
 	if c.target.TLSPin != "" {
 		scheme = "https"
 	}
-	transport := servertls.PinnedTransport(c.target.TLSPin) // nil ⇒ DefaultTransport (plain HTTP)
+	// nil ⇒ DefaultTransport (plain HTTP). The client-cert source is always
+	// passed, so the probe authenticates identically to a real dial.
+	transport := servertls.PinnedTransport(c.target.TLSPin, c.clientCertificate)
 	reqURL := fmt.Sprintf("%s://%s/api/sheds/%s/connect/0", scheme, c.target.Addr, url.PathEscape(shedName))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(clienttoken.WithPinned(ctx, cred), http.MethodGet, reqURL, nil)
 	if err != nil {
-		return fmt.Errorf("build connect probe request: %w", err)
+		return probeResult{verdict: fmt.Errorf("build connect probe request: %w", err)}
 	}
-	if tok := c.authToken(); tok != "" {
+	if tok := c.authToken(cred); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
@@ -198,7 +297,7 @@ func (c *ConnectClient) Probe(ctx context.Context, shedName string) error {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("connect probe to %s: %w", c.target.Addr, err)
+		return probeResult{reqErr: err}
 	}
 	defer resp.Body.Close()
 
@@ -210,15 +309,19 @@ func (c *ConnectClient) Probe(ctx context.Context, shedName string) error {
 		// doesn't false-pass as "authenticated" (see internal/api/connect.go).
 		var apiErr config.APIError
 		if json.NewDecoder(resp.Body).Decode(&apiErr) == nil && apiErr.Error.Code == "INVALID_PORT" {
-			return nil // authenticated, Connect route reachable
+			return probeResult{status: resp.StatusCode} // authenticated, Connect route reachable
 		}
-		return fmt.Errorf("connect probe: unexpected 400 from %s — not the shed Connect API (INVALID_PORT); check the endpoint", c.target.Addr)
+		return probeResult{status: resp.StatusCode, verdict: fmt.Errorf(
+			"connect probe: unexpected 400 from %s — not the shed Connect API (INVALID_PORT); check the endpoint", c.target.Addr)}
 	case http.StatusUnauthorized:
-		return fmt.Errorf("connect probe: shed-server rejected the tunnel token (401); it may be missing or expired")
+		return probeResult{status: resp.StatusCode, verdict: fmt.Errorf(
+			"connect probe: shed-server rejected the tunnel token (401); it may be missing or expired")}
 	case http.StatusForbidden:
-		return fmt.Errorf("connect probe: tunnel token scope not accepted on the Connect route (403); the shed-server may be too old to accept a control token — upgrade it")
+		return probeResult{status: resp.StatusCode, verdict: fmt.Errorf(
+			"connect probe: tunnel token scope not accepted on the Connect route (403); the shed-server may be too old to accept a control token — upgrade it")}
 	default:
-		return fmt.Errorf("connect probe: unexpected HTTP %d from the Connect route", resp.StatusCode)
+		return probeResult{status: resp.StatusCode, verdict: fmt.Errorf(
+			"connect probe: unexpected HTTP %d from the Connect route", resp.StatusCode)}
 	}
 }
 
@@ -236,7 +339,7 @@ func (c *ConnectClient) dial(ctx context.Context) (net.Conn, error) {
 	if c.target.TLSPin == "" {
 		return conn, nil // plain TCP — unchanged
 	}
-	tlsConn := tls.Client(conn, servertls.PinnedClientConfig(c.target.TLSPin))
+	tlsConn := tls.Client(conn, servertls.PinnedClientConfig(c.target.TLSPin, c.clientCertificate))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("tls handshake with %s: %w", c.target.Addr, err)
