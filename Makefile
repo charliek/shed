@@ -175,16 +175,19 @@ dev-server-up: build
 	  nohup bin/shed-server serve --config "$$RUN_CONFIG" \
 	    > "$(DEV_LOG_PATH)" 2>&1 & \
 	  echo $$! > "$(DEV_PID_PATH)"
-	@# Readiness probe — same shape used everywhere in this Makefile.
+	@# Readiness probe. Reads the server's OWN readiness line rather than
+	@# probing with the CLI: a CLI probe needs an enrolled client entry, which
+	@# under auth.mode: mtls does not exist until `shed server add` has run —
+	@# so a CLI probe reports a perfectly healthy mtls server as "not
+	@# reachable". The log line is mode-independent and needs no credential.
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if shed -s $(SHED_VZ_DEV_SERVER) list >/dev/null 2>&1; then \
+	  if grep -q "Shed server is ready" "$(DEV_LOG_PATH)" 2>/dev/null; then \
 	    echo "Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) ready after $${i}s."; \
 	    break; \
 	  fi; \
 	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) not reachable after 15 s."; \
+	    echo "WARNING: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) did not report ready after 15 s."; \
 	    echo "  - Tail the log:  make dev-server-logs   (or 'tail $(DEV_LOG_PATH)')"; \
-	    echo "  - CLI entry:     verify ~/.shed/config.yaml has '$(SHED_VZ_DEV_SERVER)' on port 18080"; \
 	    echo "  - Brew server:   should be unaffected; 'shed -s $(SHED_VZ_SERVER) list' still works"; \
 	  fi; \
 	  sleep 1; \
@@ -314,7 +317,15 @@ test-integration-dev: build
 	@# inherited) so `tests/integration/test_mtls.py` sees the exact value
 	@# the dev server was last started/restarted with, regardless of how
 	@# this target was invoked (env var vs. `make ... SHED_DEV_AUTH_MODE=`).
-	SHED_VZ_SERVER=$(SHED_VZ_DEV_SERVER) \
+	@# PATH puts THIS tree's freshly built bin/ first, so the suite drives the
+	@# branch's `shed` rather than the brew-installed release. Without it the
+	@# fixtures resolve `shed` via shutil.which() to /opt/homebrew/bin/shed and
+	@# silently test the OLD client against the dev server — wrong for any
+	@# client-side change, and fatal under auth.mode: mtls, where a pre-mtls
+	@# client cannot complete the TLS handshake at all and every VZ test skips
+	@# with a misleading "dev server is not reachable".
+	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_VZ_SERVER=$(SHED_VZ_DEV_SERVER) \
 	  SHED_VZ_LOG_PATH=$(DEV_LOG_PATH) \
 	  SHED_VZ_DEV_SERVER=$(SHED_VZ_DEV_SERVER) \
 	  SHED_VZ_DEV_LOG_PATH=$(DEV_LOG_PATH) \
@@ -577,7 +588,10 @@ test-integration-dev-fc:
 	@# SHED_DEV_AUTH_MODE is forwarded explicitly for the same reason as in
 	@# test-integration-dev: tests/integration/test_mtls.py needs to see the
 	@# exact value the remote dev server was last (re)started with.
-	SHED_FC_HOST=$(FC_REMOTE_HOST) \
+	@# Same PATH reasoning as test-integration-dev: drive the branch's `shed`,
+	@# not the brew-installed release.
+	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_FC_HOST=$(FC_REMOTE_HOST) \
 	  SHED_FC_SERVER=$(SHED_FC_DEV_SERVER) \
 	  SHED_FC_LOG_PATH=$(FC_DEV_LOG_PATH) \
 	  SHED_FC_DEV_SERVER=$(SHED_FC_DEV_SERVER) \
