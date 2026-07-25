@@ -19,7 +19,7 @@ func TestNeedsRefresh(t *testing.T) {
 		{"zero expiry (static token / open server) never refreshes", time.Time{}, false},
 		{"far-future expiry does not refresh", now.Add(24 * time.Hour), false},
 		{"within the refresh window refreshes", now.Add(time.Hour), true},
-		{"exactly at the window edge refreshes", now.Add(refreshWindow), true},
+		{"exactly at the window edge refreshes", now.Add(RefreshWindow), true},
 		{"expired refreshes", now.Add(-time.Minute), true},
 	}
 	for _, tt := range tests {

@@ -36,15 +36,53 @@ type watcherGroup struct {
 	done   chan struct{}
 }
 
-// shouldMint reports whether the agent should self-mint a credentials token for
-// t (attaching a token provider) rather than send its configured, usually-empty
-// static token. Minting is warranted only for a SECURE server, whose authoritative
-// local signal is an https api_url (tokens ⟺ TLS ⟺ secure; `shed server add` always
-// writes an https api_url for a secure server). It also needs a usable SSH endpoint
-// to mint over and a configured minter. Note: SSHPort>0 alone is NOT the signal —
-// every shed server has an SSH endpoint, including open-mode ones.
+// shouldMint reports whether the agent should self-mint a credential for t
+// (attaching its own credential source) rather than send its configured,
+// usually-empty static token. Minting is warranted only for a SECURE server,
+// whose authoritative local signal is an https api_url (`shed server add` always
+// writes an https api_url for a secure server). It also needs a usable SSH
+// endpoint to mint over and a configured minter. Note: SSHPort>0 alone is NOT
+// the signal — every shed server has an SSH endpoint, including open-mode ones.
+//
+// The recorded auth_mode is deliberately NOT part of this decision. Both secure
+// modes are reached over https and both mint over the same channel; the mint
+// itself is CSR-first and mode-agnostic, so the server's answer — not a cached
+// local string — is what decides whether the credential is a token or a
+// certificate. Keying the decision on auth_mode would make a stale entry able to
+// disable brokering entirely, which is precisely the failure a flip must not
+// cause.
 func shouldMint(deps SharedDeps, t ServerTarget) bool {
 	return deps.Minter != nil && t.SSHHost != "" && t.SSHPort > 0 && t.IsSecure()
+}
+
+// busClientOptions builds the SDK options for one server's credential-bus
+// client. Split out of startWatcherGroup so the wiring can be asserted directly
+// — the difference between "the certificate provider is attached" and "it is
+// not" is invisible in a HostClient and entirely visible on the wire.
+//
+// A nil credSrc means the server is not minted for (open mode): it falls back to
+// the configured static token, which is usually empty.
+func busClientOptions(t ServerTarget, credSrc *credentialSource, log *slog.Logger) []sdk.HostClientOption {
+	opts := []sdk.HostClientOption{
+		sdk.WithServerURL(t.URL),
+		sdk.WithTLSPin(t.TLSFingerprint),
+	}
+	// WithLogger REPLACES the SDK's default rather than layering on it, so passing
+	// a nil logger would leave the client with nothing to log through — and the
+	// paths that log are the ones that only run when something has already gone
+	// wrong. Omit the option instead.
+	if log != nil {
+		opts = append(opts, sdk.WithLogger(log))
+	}
+	if credSrc == nil {
+		return append(opts, sdk.WithToken(t.Token))
+	}
+	// BOTH halves of the same credential. The certificate callback is installed
+	// unconditionally alongside the pin, so the TLS stack asks per handshake; the
+	// bearer header is built per request. Whichever shape the server currently
+	// issues is the one that travels, and neither the transport nor its
+	// connection pool is rebuilt when that changes.
+	return append(opts, sdk.WithTokenProvider(credSrc), sdk.WithClientCertificates(credSrc))
 }
 
 // startWatcherGroup builds a per-server HostClient and runs the SSH/AWS/Docker
@@ -56,26 +94,26 @@ func startWatcherGroup(parent context.Context, t ServerTarget, deps SharedDeps) 
 	log := deps.Logger.With("server", t.Name, "url", t.URL)
 
 	// A SECURE server (reached over an https api_url) authenticates with a
-	// self-minted, auto-refreshing credentials token: the mint happens lazily on
-	// the first request (off this lock), re-mints near expiry / on a 401, and a
-	// host-key pin mismatch fails closed. An OPEN-mode server (plain http) needs no
-	// token and uses its (usually empty) configured static token. We must NOT mint
-	// against an open server: shed-server's _bootstrap handler refuses unless SSH
-	// enforce is on, so the mint fails and would log a WARN on every bus reconnect.
-	// shouldMint encodes that decision.
-	opts := []sdk.HostClientOption{
-		sdk.WithServerURL(t.URL),
-		sdk.WithLogger(log),
-		sdk.WithTLSPin(t.TLSFingerprint),
-	}
+	// self-minted, auto-refreshing credentials-scoped credential: the mint happens
+	// lazily on the first request (off this lock), re-mints near expiry / on a
+	// refusal, and a host-key pin mismatch fails closed. An OPEN-mode server
+	// (plain http) needs no credential and uses its (usually empty) configured
+	// static token. We must NOT mint against an open server: shed-server's
+	// _bootstrap handler refuses unless SSH enforce is on, so the mint fails and
+	// would log a WARN on every bus reconnect. shouldMint encodes that decision.
+	//
+	// The credential source is wired as BOTH the token provider and the
+	// client-certificate provider. That pair is the adaptive transport: the
+	// certificate callback is installed unconditionally alongside the pin, so the
+	// TLS stack asks per handshake and the bearer header is emitted per request,
+	// and whichever of the two the server currently issues is the one that
+	// travels. Nothing is rebuilt when the server's mode flips — the connection
+	// pool, the transport, and this client all survive it.
 	var credSrc *credentialSource
 	if shouldMint(deps, t) {
-		credSrc = newCredentialSource(ctx, deps.Minter, t, scopeCredentials)
-		opts = append(opts, sdk.WithTokenProvider(credSrc))
-	} else {
-		opts = append(opts, sdk.WithToken(t.Token))
+		credSrc = newCredentialSource(ctx, deps.Minter, t, scopeCredentials, hostAgentCredStore(scopeCredentials), log)
 	}
-	client := sdk.NewHostClient(opts...)
+	client := sdk.NewHostClient(busClientOptions(t, credSrc, log)...)
 
 	var wg sync.WaitGroup
 	run := func(fn func(context.Context)) {
@@ -86,8 +124,9 @@ func startWatcherGroup(parent context.Context, t ServerTarget, deps SharedDeps) 
 		}()
 	}
 
-	// Proactively re-mint the credentials token (jittered) so an idle server's
-	// token stays fresh and a reconnect never pays the mint latency inline.
+	// Proactively re-mint the credentials-scoped credential (jittered) so an idle
+	// server's credential stays fresh and a reconnect never pays the mint latency
+	// inline.
 	if credSrc != nil {
 		run(credSrc.refreshLoop)
 	}
@@ -102,13 +141,19 @@ func startWatcherGroup(parent context.Context, t ServerTarget, deps SharedDeps) 
 	// Egress-audit fanout: stream this server's egress decisions into the audit
 	// log + desktop feed (read-only; reconnects on its own, backing off hard when
 	// egress is disabled). The stream route is CONTROL-scoped, so a secure server
-	// gets its own self-minted control token (the bus token is credentials-scoped);
-	// an open server sends none.
-	var egressTokens tokenSource
+	// gets its own self-minted CONTROL credential (the bus credential is
+	// credentials-scoped, and one certificate carries exactly one scope, so in
+	// mtls mode these are two genuinely different certificates rather than the
+	// same credential used twice); an open server sends none.
+	//
+	// It is NOT persisted. The control scope is the agent's secondary credential,
+	// re-minted cheaply on demand, and keeping a second private key on disk to
+	// save one SSH round-trip after a restart is the wrong side of that trade.
+	var egressCreds egressCredentialSource
 	if shouldMint(deps, t) {
-		egressTokens = newCredentialSource(ctx, deps.Minter, t, scopeControl)
+		egressCreds = newCredentialSource(ctx, deps.Minter, t, scopeControl, nil, log)
 	}
-	run(NewEgressSubscriber(t, egressTokens, deps.Audit, log).Run)
+	run(NewEgressSubscriber(t, egressCreds, deps.Audit, log).Run)
 
 	done := make(chan struct{})
 	go func() {

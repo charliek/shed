@@ -142,7 +142,8 @@ def mask_hello_ack(obj: dict) -> dict:
     as `mask_live_status`).
 
     Diffed (stable): `v`, `type`, `accepted`, `reason`, `agent.approval_method`,
-    `namespaces`, `gate_namespaces`, `request_timeout_ms` — and, on a **superseded**
+    `namespaces`, `gate_namespaces`, `agent_capabilities`, `request_timeout_ms` — and,
+    on a **superseded**
     (`accepted:false`) ack, `agent.version` too: that ack carries the ZERO-value agent
     `{"version":"","approval_method":""}` (Go `desktop_server.go:355` sends a bare
     `helloAckMsg{}`; the Rust `hello_ack` builder emits an empty agent whenever
@@ -358,3 +359,32 @@ def mask_status_text(text: str, socket_dir: str, config_path: str) -> str:
         else:
             masked.append(line)
     return "\n".join(masked)
+
+
+def mask_credential_response(obj: dict) -> dict:
+    """Mask the volatile fields of a desktop `credential.response` frame (surface A),
+    leaving everything else to be diffed.
+
+    Masked (volatile): `id` (a fresh UUID — v7 in Go, v4 in Rust) and `ts` (RFC3339
+    send time, shape-asserted BEFORE masking).
+
+    Diffed (stable — NOT masked): `v`, `type`, `in_reply_to`, `server`, `auth_mode`,
+    `token`, `client_cert`, `cert_serial`, and `expires_at`. Same "determinism over
+    blanking" rationale as `mask_token_response`: both daemons run the SAME PATH-shim
+    `ssh` returning a fixed bundle, so the credential fields ARE deterministic, and
+    diffing them is what pins that both impls map the bundle onto the wire identically
+    — including which fields they OMIT, which is the load-bearing half in a message
+    whose whole job is to say "here is a token" or "here is a certificate", never both.
+
+    Returns a new object; the input is not mutated.
+    """
+    assert obj.get("type") == "credential.response", f"not a credential.response: {obj!r}"
+    out = dict(obj)
+
+    _id = out.get("id")
+    assert isinstance(_id, str) and _id, f"credential.response.id missing/empty: {_id!r}"
+    out["id"] = "<id>"
+
+    assert_rfc3339(out.get("ts"), "credential.response.ts")
+    out["ts"] = "<ts>"
+    return out

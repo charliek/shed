@@ -77,7 +77,11 @@ test-host-agent-diff:
 	}
 	cd tests/host-agent-diff && uv sync && uv run pytest -v
 	go test ./cmd/shed-host-agent/... -run Golden
-	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent golden
+	# Both Rust crates: the daemon bin owns tests/golden.rs, while the in-crate
+	# golden runners (load_discovered_servers, ssh_payload_shapes, the config/
+	# aws/docker/egress vectors) moved into shed-broker with the crate split. A
+	# filter scoped to the bin alone silently ran ZERO of them.
+	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
 
 # Parallel dev shed-server lifecycle (Mac VZ).
 #

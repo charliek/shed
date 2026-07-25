@@ -70,6 +70,15 @@ pub struct Params {
     pub known_hosts_path: String,
     pub scope: String,
     pub client_kind: String,
+    /// A standard-base64 PKCS#10 CertificationRequest DER, sent as the `csr=<value>`
+    /// request argument so an mtls-mode server can issue a client certificate. Empty
+    /// means "no CSR" — the legacy, token-only shape (mirror Go `Params.CSRBase64`).
+    ///
+    /// Callers do not build this themselves: [`crate::minter::CredentialMinter`]
+    /// generates the keypair and fills it in. It is a field (rather than an internal
+    /// detail) only so [`validate`] covers it on the same path as every other argv
+    /// element.
+    pub csr: String,
 }
 
 /// The ssh stdout JSON (mirrors Go `sdk.Bundle`, `sdk/bundle.go:16`). Every field is
@@ -81,6 +90,12 @@ pub struct Params {
 /// decode error, matching Go's `json.Unmarshal` into `time.Time` failing).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Bundle {
+    /// The credential shape this bundle carries (`"token"` / `"mtls"`). **ABSENT MEANS
+    /// TOKEN** — a server built before client-certificate support omits the key entirely,
+    /// so `""` must decode as the bearer-token shape. [`Bundle::is_mtls`] is the single
+    /// place that rule is decided (mirror Go `sdk.Bundle.Mode`).
+    #[serde(default)]
+    pub auth_mode: String,
     #[serde(default)]
     pub http_port: u32,
     #[serde(default)]
@@ -89,15 +104,38 @@ pub struct Bundle {
     pub tls_cert_fingerprint: String,
     #[serde(default)]
     pub token: String,
+    /// The PEM leaf the server's internal CA issued for the submitted CSR. Set in mtls
+    /// mode only (mirror Go `sdk.Bundle.ClientCert`).
+    #[serde(default)]
+    pub client_cert: String,
     #[serde(default)]
     pub scope: String,
     #[serde(default)]
     pub token_id: String,
+    /// The issued certificate's serial in lower-case hex. Opaque to the client — it
+    /// exists for logs and rotation proofs (mirror Go `sdk.Bundle.CertSerial`).
+    #[serde(default)]
+    pub cert_serial: String,
     /// Parsed to unix seconds; `None` when absent, empty, or Go's zero time
     /// (`0001-01-01T00:00:00Z`) — the states for which Go omits `token.response`'s
     /// `expires_at`. A present-but-malformed value fails the decode.
     #[serde(default, deserialize_with = "de_expires_at")]
     pub expires_at: Option<i64>,
+}
+
+/// The `auth_mode` literal for a client-certificate bundle (mirror `sdk.AuthModeMTLS`).
+const AUTH_MODE_MTLS: &str = "mtls";
+
+impl Bundle {
+    /// Whether this bundle carries a client certificate rather than a bearer token.
+    ///
+    /// Absent, empty, and any UNRECOGNIZED future value all decode as token — matching
+    /// Go's `sdk.Bundle.Mode`: an unknown mode is not something this client can act on,
+    /// and treating it as mtls (the branch that expects a certificate) would fail more
+    /// confusingly than treating it as the shape whose fields are actually populated.
+    pub fn is_mtls(&self) -> bool {
+        self.auth_mode == AUTH_MODE_MTLS
+    }
 }
 
 /// Outcome sentinels for a bootstrap exchange (mirror Go's `Err*` vars). Only
@@ -205,8 +243,20 @@ pub fn ssh_args(p: &Params) -> Vec<String> {
     if !p.client_kind.is_empty() {
         args.push(p.client_kind.clone());
     }
+    // The server parses everything after the scope order-independently, so the CSR is
+    // appended LAST and a kind-less request (`control csr=…`) is equally valid. A
+    // pre-mtls server only ever inspected position 1, so the extra argument is silently
+    // ignored there — which is what makes always sending it safe against every server
+    // generation. Byte-identical to Go `sshArgs` (`bootstrap.go:155`).
+    if !p.csr.is_empty() {
+        args.push(format!("{CSR_ARG_PREFIX}{}", p.csr));
+    }
     args
 }
+
+/// Names the CSR request argument. MUST match the server's `csrArgKey`
+/// (`internal/sshd/bootstrap.go`) and Go's client-side `csrArgPrefix`.
+const CSR_ARG_PREFIX: &str = "csr=";
 
 /// Reject inputs that could break argv construction or inject ssh options before they
 /// reach exec (mirror Go `validate`): a host that is empty, starts with `-` (option
@@ -247,6 +297,32 @@ pub fn validate(p: &Params) -> Result<(), BootstrapError> {
             p.client_kind
         )));
     }
+    validate_csr_arg(&p.csr)
+}
+
+/// Enforce that the CSR argument is a single argv token of standard-base64 characters
+/// (mirror Go `validateCSRArg`). Empty (no CSR) is valid.
+///
+/// The CSR rides in ONE argv element (`csr=<base64>`) that the server splits on the
+/// FIRST `=` and then base64-decodes. Whitespace would split it into two request
+/// arguments (the second of which the server would read as a client kind), and a NUL
+/// would truncate the element at exec. Neither can occur in standard base64, so anything
+/// outside that alphabet means the value was not produced by `ClientKeyPair` and must not
+/// reach exec.
+///
+/// It scans the ALPHABET rather than attempting a decode: base64 decoders commonly skip
+/// `\r`/`\n`, so a successful decode would prove nothing about the element staying one
+/// token. The value itself is never echoed — it is long, and a corrupted one is no more
+/// legible printed in full.
+fn validate_csr_arg(csr: &str) -> Result<(), BootstrapError> {
+    for (i, c) in csr.bytes().enumerate() {
+        let ok = c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=';
+        if !ok {
+            return Err(BootstrapError::Validate(format!(
+                "invalid csr argument: byte {i} is not standard base64"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -274,10 +350,14 @@ fn classify(exit: i32, host_key_changed: bool, stderr_text: &str) -> BootstrapEr
     BootstrapError::SshFailed(format!("ssh exited {exit}"))
 }
 
-/// Validate ssh stdout: a single JSON object, no trailing garbage, a non-empty token,
-/// a usable API port, an https port paired with a fingerprint, and (when the server
-/// echoes one) a matching scope. Mirrors Go `decodeBundle`, IN THE SAME ORDER. The raw
-/// stdout is NEVER included in an error — it carries the token.
+/// Validate ssh stdout: a single JSON object, no trailing garbage, the credential its
+/// declared mode requires, and (when the server echoes one) a matching scope. Mirrors Go
+/// `decodeBundle`, IN THE SAME ORDER. The raw stdout is NEVER included in an error — it
+/// carries the credential.
+///
+/// Mode dispatch is the subtle part: a bundle with NO `auth_mode` key is a pre-mtls
+/// server's token bundle and must validate exactly as it always did — see
+/// [`Bundle::is_mtls`], which owns that rule.
 pub fn decode_bundle(out: &[u8], want_scope: &str) -> Result<Bundle, BootstrapError> {
     let mut de = serde_json::Deserializer::from_slice(out);
     let b = Bundle::deserialize(&mut de)
@@ -287,6 +367,23 @@ pub fn decode_bundle(out: &[u8], want_scope: &str) -> Result<Bundle, BootstrapEr
     de.end().map_err(|_| {
         BootstrapError::Decode("unexpected trailing data after bootstrap bundle".into())
     })?;
+    if b.is_mtls() {
+        validate_mtls_bundle(&b)?;
+    } else {
+        validate_token_bundle(&b)?;
+    }
+    if !b.scope.is_empty() && b.scope != want_scope {
+        return Err(BootstrapError::Decode(format!(
+            "scope mismatch: requested {want_scope:?}, got {:?}",
+            b.scope
+        )));
+    }
+    Ok(b)
+}
+
+/// The pre-mtls validation ladder, unchanged: what a legacy bundle (no `auth_mode`) and
+/// an explicit token bundle both go through (mirror Go `validateTokenBundle`).
+fn validate_token_bundle(b: &Bundle) -> Result<(), BootstrapError> {
     if b.token.trim().is_empty() {
         return Err(BootstrapError::Decode(
             "bootstrap returned an empty token".into(),
@@ -302,13 +399,38 @@ pub fn decode_bundle(out: &[u8], want_scope: &str) -> Result<Bundle, BootstrapEr
             "bootstrap bundle advertises HTTPS without a TLS fingerprint to pin".into(),
         ));
     }
-    if !b.scope.is_empty() && b.scope != want_scope {
-        return Err(BootstrapError::Decode(format!(
-            "scope mismatch: requested {want_scope:?}, got {:?}",
-            b.scope
-        )));
+    Ok(())
+}
+
+/// What an mtls bundle must carry (mirror Go `validateMTLSBundle`). The requirements are
+/// strictly TIGHTER than the token shape's: the certificate is the entire credential, and
+/// mtls exists only on the TLS listener, so an https port and a pin are not optional the
+/// way they are for a token (which a legacy server may still serve over plain HTTP).
+fn validate_mtls_bundle(b: &Bundle) -> Result<(), BootstrapError> {
+    if b.client_cert.trim().is_empty() {
+        return Err(BootstrapError::Decode(
+            "mtls bundle carries no client certificate".into(),
+        ));
     }
-    Ok(b)
+    if b.https_port == 0 {
+        return Err(BootstrapError::Decode(
+            "mtls bundle has no HTTPS port (mtls is only served over TLS)".into(),
+        ));
+    }
+    if b.tls_cert_fingerprint.trim().is_empty() {
+        return Err(BootstrapError::Decode(
+            "mtls bundle advertises HTTPS without a TLS fingerprint to pin".into(),
+        ));
+    }
+    // A bearer token alongside a certificate would be a server that does not know its own
+    // mode; the mtls middleware never reads the Authorization header, so carrying one
+    // could only mislead.
+    if !b.token.trim().is_empty() {
+        return Err(BootstrapError::Decode(
+            "mtls bundle unexpectedly carries a bearer token".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the ssh binary: `$PATH` search, falling back to the standard macOS path so a
@@ -569,6 +691,7 @@ mod tests {
             known_hosts_path: "/home/x/.shed/known_hosts".into(),
             scope: "credentials".into(),
             client_kind: "host-agent".into(),
+            csr: String::new(),
         }
     }
 
@@ -634,6 +757,55 @@ mod tests {
         assert_eq!(got.last().unwrap(), "credentials"); // scope is the final element
     }
 
+    /// The `csr=` element is ONE argv token appended AFTER scope and the optional kind,
+    /// and a kind-less request keeps it directly after the scope (the server parses the
+    /// post-scope arguments position-independently). Byte-compat with Go `sshArgs`.
+    #[test]
+    fn ssh_args_appends_csr_last() {
+        let mut p = params();
+        p.csr = "QUJD+/aa==".into();
+        let got = ssh_args(&p);
+        assert_eq!(
+            &got[got.len() - 3..],
+            &[
+                "credentials".to_string(),
+                "host-agent".to_string(),
+                "csr=QUJD+/aa==".to_string()
+            ]
+        );
+
+        // No kind → `<scope> csr=…`, still a single trailing token.
+        p.client_kind = String::new();
+        let got = ssh_args(&p);
+        assert_eq!(
+            &got[got.len() - 2..],
+            &["credentials".to_string(), "csr=QUJD+/aa==".to_string()]
+        );
+
+        // Empty CSR → the legacy, token-only argv (no trailing element at all).
+        p.csr = String::new();
+        p.client_kind = "host-agent".into();
+        assert_eq!(ssh_args(&p), ssh_args(&params()));
+    }
+
+    /// A real generated CSR survives argv composition as one token the server can split
+    /// on the FIRST `=` — the end-to-end shape check across the shed-core producer and
+    /// this consumer.
+    #[test]
+    fn ssh_args_carries_a_real_generated_csr() {
+        let kp = shed_core::csr::ClientKeyPair::generate().unwrap();
+        let mut p = params();
+        p.csr = kp.csr_base64();
+        validate(&p).expect("a generated CSR passes validation");
+        let arg = ssh_args(&p).pop().unwrap();
+        let (key, value) = arg.split_once('=').unwrap();
+        assert_eq!(key, "csr");
+        // Splitting on the FIRST `=` keeps base64 padding in the VALUE (the classic
+        // Split-vs-SplitN bug the server-side parser guards against).
+        assert_eq!(value, kp.csr_base64());
+        assert!(!arg.contains(char::is_whitespace));
+    }
+
     #[test]
     fn validate_rejects() {
         let base = params();
@@ -656,6 +828,43 @@ mod tests {
         assert!(bad(&|p| p.scope = "a b".into()), "scope whitespace");
         assert!(bad(&|p| p.client_kind = "a b".into()), "kind whitespace");
         assert!(validate(&base).is_ok());
+    }
+
+    /// The `csr=` value gets the same argv-safety gate as every other element: a single
+    /// token of standard base64. Whitespace would split it into TWO request arguments
+    /// (the second read as a client kind) and a NUL would truncate the element at exec —
+    /// neither can occur in the alphabet, so the scan is the gate (mirror Go
+    /// `validateCSRArg`).
+    #[test]
+    fn validate_rejects_unsafe_csr_arguments() {
+        let bad = |csr: &str| {
+            let mut p = params();
+            p.csr = csr.into();
+            validate(&p).is_err()
+        };
+        assert!(bad("QUJD REVG"), "space");
+        assert!(bad("QUJD\tREVG"), "tab");
+        assert!(bad("QUJD\nREVG"), "newline");
+        assert!(bad("QUJD\rREVG"), "carriage return");
+        assert!(bad("QUJD\0REVG"), "NUL");
+        assert!(bad("QUJD-REVG_"), "url-safe alphabet");
+        assert!(bad("-oProxyCommand=x"), "option injection");
+
+        // Standard base64 (with padding) and the empty value both pass.
+        let mut ok = params();
+        ok.csr = "QUJDREVG+/12==".into();
+        assert!(validate(&ok).is_ok());
+        ok.csr = String::new();
+        assert!(validate(&ok).is_ok());
+
+        // The rejection names the offending byte offset and never echoes the value.
+        let mut p = params();
+        p.csr = "AAAA BBBB".into();
+        let err = validate(&p).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("csr argument"), "{msg}");
+        assert!(msg.contains("byte 4"), "{msg}");
+        assert!(!msg.contains("AAAA"), "value must not be echoed: {msg}");
     }
 
     #[test]
@@ -735,6 +944,79 @@ mod tests {
             "control"
         )
         .is_err()); // scope mismatch
+    }
+
+    /// The mtls leg of the D4 matrix: a certificate bundle decodes, and every shape that
+    /// could not authenticate is refused.
+    #[test]
+    fn decode_bundle_mtls_matrix() {
+        const CERT: &str = "-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n";
+        let mtls = |extra: &str| {
+            format!(
+                r#"{{"auth_mode":"mtls","https_port":8443,"tls_cert_fingerprint":"sha256:abc",
+                     "client_cert":"{CERT}","scope":"control","cert_serial":"0a1b",
+                     "expires_at":"2030-01-01T00:00:00Z"{extra}}}"#
+            )
+        };
+
+        // Happy path: the certificate + serial land on the bundle, the token stays empty.
+        let b = decode_bundle(mtls("").as_bytes(), "control").unwrap();
+        assert!(b.is_mtls());
+        assert_eq!(b.cert_serial, "0a1b");
+        assert_eq!(b.token, "");
+        assert!(b.client_cert.contains("BEGIN CERTIFICATE"));
+        assert_eq!(b.expires_at, Some(1_893_456_000));
+
+        // A bearer token ALONGSIDE the certificate is a server that does not know its
+        // own mode — refused rather than silently half-adopted.
+        assert!(decode_bundle(mtls(r#","token":"tok""#).as_bytes(), "control").is_err());
+
+        // Missing certificate / no https port / no fingerprint each fail closed.
+        assert!(decode_bundle(
+            br#"{"auth_mode":"mtls","https_port":8443,"tls_cert_fingerprint":"sha256:abc","scope":"control"}"#,
+            "control"
+        )
+        .is_err());
+        assert!(decode_bundle(
+            br#"{"auth_mode":"mtls","http_port":8080,"tls_cert_fingerprint":"sha256:abc","client_cert":"x"}"#,
+            "control"
+        )
+        .is_err());
+        assert!(decode_bundle(
+            br#"{"auth_mode":"mtls","https_port":8443,"client_cert":"x"}"#,
+            "control"
+        )
+        .is_err());
+
+        // The scope check is mode-independent.
+        assert!(decode_bundle(mtls("").as_bytes(), "credentials").is_err());
+    }
+
+    /// Absent `auth_mode` means TOKEN: a pre-mtls server's bundle keeps validating (and
+    /// decoding) exactly as it always did, and an UNRECOGNIZED future mode falls through
+    /// to the same branch rather than being treated as a certificate bundle.
+    #[test]
+    fn decode_bundle_absent_auth_mode_is_token() {
+        // Legacy bundle: no auth_mode key at all.
+        let b = decode_bundle(bundle_json("tok", true, "control").as_bytes(), "control").unwrap();
+        assert_eq!(b.auth_mode, "");
+        assert!(!b.is_mtls());
+        assert_eq!(b.token, "tok");
+        assert_eq!(b.client_cert, "");
+
+        // Explicit "token" behaves identically.
+        let explicit = br#"{"auth_mode":"token","http_port":8080,"token":"tok"}"#;
+        let b = decode_bundle(explicit, "control").unwrap();
+        assert!(!b.is_mtls());
+        assert_eq!(b.token, "tok");
+
+        // An unknown future mode is validated as a token bundle (the shape whose fields
+        // are actually populated), not as mtls.
+        let future = br#"{"auth_mode":"quantum","http_port":8080,"token":"tok"}"#;
+        assert!(!decode_bundle(future, "control").unwrap().is_mtls());
+        // ...so a bundle claiming that mode with no token is still rejected.
+        let future_empty = br#"{"auth_mode":"quantum","http_port":8080,"client_cert":"x"}"#;
+        assert!(decode_bundle(future_empty, "control").is_err());
     }
 
     #[test]

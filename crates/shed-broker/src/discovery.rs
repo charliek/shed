@@ -31,6 +31,23 @@ pub struct ServerTarget {
     pub tls_fingerprint: String,
     pub ssh_host: String,
     pub ssh_port: u16,
+    /// The credential shape the server last issued, as recorded in the shed CLI config
+    /// (`"token"`, `"mtls"`, or `""` for an entry written before the field existed).
+    /// Mirror `config.go:ServerTarget.AuthMode`.
+    ///
+    /// It is knowledge, NOT policy. Every enrollment is CSR-first
+    /// ([`crate::minter::CredentialMinter`] always sends a `csr=` argument) and the
+    /// server's answer decides the mode, so a stale value can never lock the agent into
+    /// the wrong one. What it buys is the two places where acting on stale knowledge is
+    /// harmless but acting on none is not: whether a persisted certificate is worth
+    /// loading at startup, and whether the desktop's `token.get` can be answered with an
+    /// explicit "this server issues certificates" error instead of a mint that returns
+    /// no token.
+    ///
+    /// The EMPTY string is preserved verbatim rather than defaulted to `"token"`, so
+    /// "never recorded" and "recorded as token" stay distinguishable — the Go mirror
+    /// keeps the same distinction and the shared golden fixture pins it.
+    pub auth_mode: String,
 }
 
 impl ServerTarget {
@@ -40,6 +57,15 @@ impl ServerTarget {
     /// Consumed by the always-on [`crate::supervisor::should_mint`] in BOTH feature configs.
     pub fn is_secure(&self) -> bool {
         self.url.to_lowercase().starts_with("https://")
+    }
+
+    /// Whether the server was last seen issuing client certificates (mirror
+    /// `config.go:ServerTarget.IsMTLS` — `strings.EqualFold`, so the comparison is
+    /// case-insensitive on both sides).
+    ///
+    /// Deliberately NOT the signal that decides whether to enroll: see [`Self::auth_mode`].
+    pub fn is_mtls(&self) -> bool {
+        self.auth_mode.eq_ignore_ascii_case("mtls")
     }
 }
 
@@ -96,6 +122,9 @@ pub fn load_discovered_servers(path: &str) -> Result<Vec<ServerTarget>, String> 
                 ssh_host: host.to_string(),
                 // ssh_port omitted → 0 (NOT 22): a server without it can't self-mint.
                 ssh_port: scalar("ssh_port").and_then(|s| s.parse().ok()).unwrap_or(0),
+                // Absent → "" (NOT "token"): the Go mirror keeps "never recorded" and
+                // "recorded as token" distinguishable, and the golden fixture pins it.
+                auth_mode: scalar("auth_mode").unwrap_or("").to_string(),
             });
         }
     }
@@ -126,6 +155,10 @@ impl HostAgentConfig {
                 tls_fingerprint: String::new(),
                 ssh_host: String::new(),
                 ssh_port: 0,
+                // Single-server mode has no CLI config entry to learn a mode from; the
+                // unnamed target is plain-http/open in practice, and an enrollment would
+                // discover the mode from the bundle anyway.
+                auth_mode: String::new(),
             }];
         };
         let mut out = Vec::with_capacity(discovered.len());
@@ -215,15 +248,87 @@ mod tests {
                         "tls_fingerprint": t.tls_fingerprint,
                         "ssh_host": t.ssh_host,
                         "ssh_port": t.ssh_port,
+                        "auth_mode": t.auth_mode,
                     })
                 })
                 .collect();
+            // `auth_mode` is REQUIRED on every expected entry, not tolerated as absent:
+            // a fixture that stopped carrying it would otherwise silently stop pinning
+            // the "" vs "token" divergence this field exists to preserve, and the Go
+            // runner (which unmarshals into a struct) would not notice either.
+            for (i, want) in v["expected"].as_array().unwrap().iter().enumerate() {
+                assert!(
+                    want.get("auth_mode")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some(),
+                    "golden vector {name:?} entry {i} has no auth_mode key — the fixture \
+                     must pin it (absent-in-config means \"\", never \"token\")"
+                );
+            }
             assert_eq!(
                 serde_json::Value::from(got_json),
                 v["expected"],
                 "golden vector {name:?}"
             );
         }
+    }
+
+    /// `auth_mode` round-trips verbatim, and an entry that omits it yields the EMPTY
+    /// string rather than a defaulted `"token"` (the Go mirror's rule). `is_mtls` is
+    /// case-insensitive, matching Go's `strings.EqualFold`.
+    #[test]
+    fn load_carries_auth_mode_verbatim() {
+        let (_d, cfg) = write_config(
+            "\
+servers:
+  legacy:
+    api_url: https://legacy.example:8443
+    host: legacy.example
+    ssh_port: 2222
+  mtls:
+    api_url: https://mtls.example:8443
+    host: mtls.example
+    ssh_port: 2222
+    auth_mode: mtls
+  shouty:
+    api_url: https://shouty.example:8443
+    host: shouty.example
+    ssh_port: 2222
+    auth_mode: MTLS
+  tok:
+    api_url: https://tok.example:8443
+    host: tok.example
+    ssh_port: 2222
+    auth_mode: token
+",
+        );
+        let got = load_discovered_servers(&cfg).unwrap();
+        let by = |n: &str| got.iter().find(|t| t.name == n).unwrap().clone();
+
+        // Absent → "" (NOT "token"), and "" is not mtls.
+        assert_eq!(by("legacy").auth_mode, "");
+        assert!(!by("legacy").is_mtls());
+
+        assert_eq!(by("mtls").auth_mode, "mtls");
+        assert!(by("mtls").is_mtls());
+
+        // Case-insensitive predicate, but the stored value is verbatim.
+        assert_eq!(by("shouty").auth_mode, "MTLS");
+        assert!(by("shouty").is_mtls());
+
+        assert_eq!(by("tok").auth_mode, "token");
+        assert!(!by("tok").is_mtls());
+    }
+
+    /// The single-server (no `discovery:` block) target carries no learned mode — it has
+    /// no CLI config entry to read one from.
+    #[test]
+    fn single_server_target_has_no_auth_mode() {
+        let cfg = HostAgentConfig::parse("server: http://localhost:8080\n");
+        let got = cfg.resolve_targets_from(Vec::new());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].auth_mode, "");
+        assert!(!got[0].is_mtls());
     }
 
     #[test]
@@ -279,6 +384,7 @@ servers:
             tls_fingerprint: String::new(),
             ssh_host: String::new(),
             ssh_port: 0,
+            auth_mode: String::new(),
         };
         let discovered = vec![
             mk("mini2", "http://mini2:8080"),

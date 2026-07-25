@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	sdk "github.com/charliek/shed/sdk"
 	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
 	"golang.org/x/crypto/ssh"
@@ -109,29 +110,29 @@ func TestCredentialMinterMint(t *testing.T) {
 		khPath, target := writePinnedKnownHosts(t, host, port)
 		m := NewCredentialMinter(khPath)
 		exp := time.Now().Add(time.Hour)
-		m.bootstrapRun = func(_ context.Context, p sdkbootstrap.Params) (sdk.Bundle, error) {
+		m.bootstrapRun = func(_ context.Context, p sdkbootstrap.Params) (sdk.Credential, error) {
 			if p.Host != host || p.Port != port || p.KnownHostsPath != khPath ||
 				p.Scope != scopeCredentials || p.ClientKind != "host-agent" {
 				t.Errorf("unexpected bootstrap params: %+v", p)
 			}
-			return sdk.Bundle{Token: "tok", ExpiresAt: exp}, nil
+			return tokenCredential("tok", exp), nil
 		}
-		tok, gotExp, err := m.Mint(context.Background(), target, scopeCredentials)
+		got, err := m.Mint(context.Background(), target, scopeCredentials)
 		if err != nil {
 			t.Fatalf("Mint: %v", err)
 		}
-		if tok != "tok" || !gotExp.Equal(exp) {
-			t.Errorf("Mint = %q, %v; want tok, %v", tok, gotExp, exp)
+		if got.Bundle.Token != "tok" || !got.Bundle.ExpiresAt.Equal(exp) {
+			t.Errorf("Mint = %q, %v; want tok, %v", got.Bundle.Token, got.Bundle.ExpiresAt, exp)
 		}
 	})
 
 	t.Run("a host-key mismatch propagates as terminal", func(t *testing.T) {
 		khPath, target := writePinnedKnownHosts(t, host, port)
 		m := NewCredentialMinter(khPath)
-		m.bootstrapRun = func(context.Context, sdkbootstrap.Params) (sdk.Bundle, error) {
-			return sdk.Bundle{}, fmt.Errorf("ssh: %w", sdkbootstrap.ErrHostKeyMismatch)
+		m.bootstrapRun = func(context.Context, sdkbootstrap.Params) (sdk.Credential, error) {
+			return sdk.Credential{}, fmt.Errorf("ssh: %w", sdkbootstrap.ErrHostKeyMismatch)
 		}
-		if _, _, err := m.Mint(context.Background(), target, scopeControl); !errors.Is(err, sdkbootstrap.ErrHostKeyMismatch) {
+		if _, err := m.Mint(context.Background(), target, scopeControl); !errors.Is(err, sdkbootstrap.ErrHostKeyMismatch) {
 			t.Errorf("err = %v, want it to wrap ErrHostKeyMismatch", err)
 		}
 	})
@@ -140,12 +141,12 @@ func TestCredentialMinterMint(t *testing.T) {
 		khPath, _ := writePinnedKnownHosts(t, host, port)
 		m := NewCredentialMinter(khPath)
 		ran := false
-		m.bootstrapRun = func(context.Context, sdkbootstrap.Params) (sdk.Bundle, error) {
+		m.bootstrapRun = func(context.Context, sdkbootstrap.Params) (sdk.Credential, error) {
 			ran = true
-			return sdk.Bundle{Token: "x"}, nil
+			return tokenCredential("x", time.Time{}), nil
 		}
 		// A different, unpinned server: the pre-check must fail before ssh runs.
-		_, _, err := m.Mint(context.Background(), ServerTarget{Name: "s", SSHHost: "unpinned", SSHPort: 1}, scopeCredentials)
+		_, err := m.Mint(context.Background(), ServerTarget{Name: "s", SSHHost: "unpinned", SSHPort: 1}, scopeCredentials)
 		if err == nil {
 			t.Fatal("expected an error for an unpinned server")
 		}
@@ -166,11 +167,11 @@ func TestCredentialSourceMinterMismatchTerminal(t *testing.T) {
 	khPath, target := writePinnedKnownHosts(t, "mini3", 2222)
 	m := NewCredentialMinter(khPath)
 	var calls int32
-	m.bootstrapRun = func(context.Context, sdkbootstrap.Params) (sdk.Bundle, error) {
+	m.bootstrapRun = func(context.Context, sdkbootstrap.Params) (sdk.Credential, error) {
 		atomic.AddInt32(&calls, 1)
-		return sdk.Bundle{}, fmt.Errorf("ssh: %w", sdkbootstrap.ErrHostKeyMismatch)
+		return sdk.Credential{}, fmt.Errorf("ssh: %w", sdkbootstrap.ErrHostKeyMismatch)
 	}
-	s := newCredentialSource(context.Background(), m, target, scopeCredentials)
+	s := newCredentialSource(context.Background(), m, target, scopeCredentials, nil, nil)
 	if _, err := s.Token(); err == nil {
 		t.Fatal("expected a terminal error on a host-key mismatch")
 	}
@@ -183,9 +184,18 @@ func TestCredentialSourceMinterMismatchTerminal(t *testing.T) {
 }
 
 type mintResult struct {
-	tok string
-	exp time.Time
-	err error
+	cred sdk.Credential
+	err  error
+}
+
+// tokenCredential/mtlsCredential build the two shapes a bootstrap can return, so
+// a test names the SERVER's answer rather than assembling wire structs inline.
+func tokenCredential(tok string, exp time.Time) sdk.Credential {
+	return sdk.Credential{Bundle: sdk.Bundle{AuthMode: sdk.AuthModeToken, Token: tok, ExpiresAt: exp}}
+}
+
+func tokenMint(tok string, exp time.Time) mintResult {
+	return mintResult{cred: tokenCredential(tok, exp)}
 }
 
 // fakeMinter returns canned results in sequence (repeating the last) and counts
@@ -193,10 +203,11 @@ type mintResult struct {
 type fakeMinter struct {
 	mu      sync.Mutex
 	calls   int
+	csrs    []string
 	results []mintResult
 }
 
-func (f *fakeMinter) Mint(context.Context, ServerTarget, string) (string, time.Time, error) {
+func (f *fakeMinter) Mint(context.Context, ServerTarget, string) (sdk.Credential, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	i := f.calls
@@ -205,13 +216,31 @@ func (f *fakeMinter) Mint(context.Context, ServerTarget, string) (string, time.T
 	}
 	f.calls++
 	r := f.results[i]
-	return r.tok, r.exp, r.err
+	return r.cred, r.err
+}
+
+// MintRelayed lets the same fake stand in for the desktop relay path. The CSR is
+// recorded so a test can assert it crossed unmodified; the canned answer is the
+// same sequence Mint serves.
+func (f *fakeMinter) MintRelayed(ctx context.Context, t ServerTarget, scope, csrBase64 string) (sdk.Bundle, error) {
+	f.mu.Lock()
+	f.csrs = append(f.csrs, csrBase64)
+	f.mu.Unlock()
+	cred, err := f.Mint(ctx, t, scope)
+	return cred.Bundle, err
+}
+
+// relayedCSRs returns the CSRs MintRelayed was called with, in order.
+func (f *fakeMinter) relayedCSRs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.csrs...)
 }
 
 func TestCredentialSourceCachesAndReMints(t *testing.T) {
 	far := time.Now().Add(24 * time.Hour)
-	fm := &fakeMinter{results: []mintResult{{tok: "tok1", exp: far}, {tok: "tok2", exp: far}}}
-	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials)
+	fm := &fakeMinter{results: []mintResult{tokenMint("tok1", far), tokenMint("tok2", far)}}
+	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)
 
 	if got, _ := s.Token(); got != "tok1" {
 		t.Fatalf("Token = %q, want tok1", got)
@@ -233,7 +262,7 @@ func TestCredentialSourceCachesAndReMints(t *testing.T) {
 
 func TestCredentialSourcePinMismatchTerminal(t *testing.T) {
 	fm := &fakeMinter{results: []mintResult{{err: fmt.Errorf("bootstrap: %w", sdkbootstrap.ErrHostKeyMismatch)}}}
-	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials)
+	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)
 
 	if _, err := s.Token(); err == nil {
 		t.Fatal("expected a terminal error on a host-key pin mismatch")
@@ -248,15 +277,15 @@ func TestCredentialSourcePinMismatchTerminal(t *testing.T) {
 }
 
 func TestCredentialSourceReMintsNearExpiry(t *testing.T) {
-	near := time.Now().Add(tokenRefreshWindow / 2) // inside the refresh window
+	near := time.Now().Add(clienttoken.RefreshWindow / 2) // inside the refresh window
 	far := time.Now().Add(24 * time.Hour)
-	fm := &fakeMinter{results: []mintResult{{tok: "near", exp: near}, {tok: "fresh", exp: far}}}
-	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials)
+	fm := &fakeMinter{results: []mintResult{tokenMint("near", near), tokenMint("fresh", far)}}
+	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)
 
 	if got, _ := s.Token(); got != "near" {
 		t.Fatalf("Token = %q, want near", got)
 	}
-	// The cached token is within tokenRefreshWindow of expiry → the next Token re-mints.
+	// The cached token is within clienttoken.RefreshWindow of expiry → the next Token re-mints.
 	if got, _ := s.Token(); got != "fresh" {
 		t.Errorf("Token = %q, want fresh (near-expiry re-mint)", got)
 	}
@@ -266,21 +295,28 @@ func TestCredentialSourceReMintsNearExpiry(t *testing.T) {
 }
 
 // minterFunc adapts a function to the minter interface.
-type minterFunc func(context.Context, ServerTarget, string) (string, time.Time, error)
+type minterFunc func(context.Context, ServerTarget, string) (sdk.Credential, error)
 
-func (f minterFunc) Mint(ctx context.Context, t ServerTarget, scope string) (string, time.Time, error) {
+func (f minterFunc) Mint(ctx context.Context, t ServerTarget, scope string) (sdk.Credential, error) {
 	return f(ctx, t, scope)
+}
+
+// MintRelayed lets the same function stand in for the desktop relay path; the
+// CSR is ignored, which is what a token-mode server does with it too.
+func (f minterFunc) MintRelayed(ctx context.Context, t ServerTarget, scope, _ string) (sdk.Bundle, error) {
+	cred, err := f(ctx, t, scope)
+	return cred.Bundle, err
 }
 
 func TestCredentialSourceSingleFlight(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
-	mf := minterFunc(func(context.Context, ServerTarget, string) (string, time.Time, error) {
+	mf := minterFunc(func(context.Context, ServerTarget, string) (sdk.Credential, error) {
 		atomic.AddInt32(&calls, 1)
 		<-release // hold the mint open while concurrent callers pile up
-		return "tok", time.Now().Add(24 * time.Hour), nil
+		return tokenCredential("tok", time.Now().Add(24*time.Hour)), nil
 	})
-	s := newCredentialSource(context.Background(), mf, ServerTarget{Name: "s"}, scopeCredentials)
+	s := newCredentialSource(context.Background(), mf, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)
 
 	const n = 8
 	var wg sync.WaitGroup
@@ -308,8 +344,8 @@ func TestCredentialSourceSingleFlight(t *testing.T) {
 
 func TestCredentialSourceProactiveRefresh(t *testing.T) {
 	far := time.Now().Add(24 * time.Hour)
-	fm := &fakeMinter{results: []mintResult{{tok: "first", exp: far}, {tok: "second", exp: far}}}
-	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials)
+	fm := &fakeMinter{results: []mintResult{tokenMint("first", far), tokenMint("second", far)}}
+	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)
 
 	if tok, _ := s.Token(); tok != "first" {
 		t.Fatalf("Token = %q, want first", tok)

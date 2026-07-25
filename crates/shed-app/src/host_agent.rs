@@ -26,7 +26,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use shed_core::approval::protocol::{self, HostAgentInbound};
-use shed_core::approval::{ApprovalDecision, DecidedBy, HelloAck, TokenResponse};
+use shed_core::approval::{
+    ApprovalDecision, CredentialResponse, DecidedBy, HelloAck, TokenResponse,
+};
 
 use crate::traits::ClockRef;
 
@@ -66,6 +68,14 @@ pub enum HostAgentClientError {
     NotConnected,
     TimedOut,
     Disconnected,
+    /// The connected agent does not advertise a capability this request needs.
+    ///
+    /// It is a distinct variant, and it is checked BEFORE the frame is written,
+    /// because the alternative is indistinguishable from a hang: an agent that
+    /// predates a message drops it silently, so the app would sit through the
+    /// full timeout and then report "timed out" for what is really a version
+    /// mismatch with a one-line fix.
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for HostAgentClientError {
@@ -74,6 +84,12 @@ impl std::fmt::Display for HostAgentClientError {
             HostAgentClientError::NotConnected => "host agent not connected",
             HostAgentClientError::TimedOut => "timed out waiting for host agent reply",
             HostAgentClientError::Disconnected => "host agent connection dropped",
+            HostAgentClientError::Unsupported(cap) => {
+                return write!(
+                f,
+                "the connected shed-host-agent does not support `{cap}`; upgrade shed-host-agent"
+            )
+            }
         };
         f.write_str(s)
     }
@@ -89,6 +105,15 @@ struct State {
     /// correlated `token.response` (matched by `in_reply_to`). `remove` is the
     /// single-resume guard — whoever removes the sender owns its resume.
     pending: HashMap<String, oneshot::Sender<TokenResponse>>,
+    /// The same, for `credential.get`. A separate map rather than one keyed on a
+    /// sum type: the two replies are different frames with different fields, and
+    /// a shared map would have to carry a runtime discriminant whose only job
+    /// would be to turn a mismatch into a panic or a silent drop.
+    pending_credentials: HashMap<String, oneshot::Sender<CredentialResponse>>,
+    /// What the connected agent advertised in its `hello_ack`. Empty while
+    /// disconnected, and empty for an agent old enough not to advertise
+    /// anything — which is the same thing as far as any caller is concerned.
+    capabilities: Vec<String>,
 }
 
 struct Inner {
@@ -117,6 +142,8 @@ impl HostAgentClient {
                 state: Mutex::new(State {
                     writer: None,
                     pending: HashMap::new(),
+                    pending_credentials: HashMap::new(),
+                    capabilities: Vec::new(),
                 }),
                 loop_handle: Mutex::new(None),
             }),
@@ -135,6 +162,8 @@ impl HostAgentClient {
             let mut st = self.inner.state.lock().unwrap();
             st.writer = None;
             st.pending.clear();
+            st.pending_credentials.clear();
+            st.capabilities.clear();
         }
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.inner.running.store(true, Ordering::SeqCst);
@@ -152,7 +181,10 @@ impl HostAgentClient {
         }
         let mut st = self.inner.state.lock().unwrap();
         st.writer = None;
-        st.pending.clear(); // dropping the senders fails awaiting `request_token`
+        // Dropping the senders fails everything awaiting a reply.
+        st.pending.clear();
+        st.pending_credentials.clear();
+        st.capabilities.clear();
     }
 
     pub fn is_connected(&self) -> bool {
@@ -218,6 +250,74 @@ impl HostAgentClient {
             Err(_) => {
                 // Timed out — drop our sender so a late reply is a no-op.
                 self.inner.state.lock().unwrap().pending.remove(&id);
+                Err(HostAgentClientError::TimedOut)
+            }
+        }
+    }
+
+    /// Whether the connected agent advertises `capability` (empty while
+    /// disconnected, and for an agent that advertises nothing).
+    pub fn supports(&self, capability: &str) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .capabilities
+            .iter()
+            .any(|c| c == capability)
+    }
+
+    /// Request a CONTROL credential for `server` in whichever shape that server
+    /// issues, relaying `csr_base64` — a CSR THIS process generated, whose
+    /// private key never leaves it.
+    ///
+    /// The capability is checked first, so an agent too old to know the message
+    /// produces `Unsupported` immediately rather than a timeout: an old agent
+    /// does not reject an unknown frame, it drops it, and "no reply ever" is
+    /// indistinguishable from a hang without this check.
+    ///
+    /// As with `request_token`, a fail-closed reply (its `error` set) comes back
+    /// inside the `CredentialResponse` for the caller to inspect; it is not an
+    /// `Err`.
+    pub async fn request_credential(
+        &self,
+        server: &str,
+        csr_base64: Option<&str>,
+        timeout: Duration,
+    ) -> Result<CredentialResponse, HostAgentClientError> {
+        if !self.supports(protocol::CAP_CREDENTIAL_GET) {
+            return Err(HostAgentClientError::Unsupported(
+                protocol::CAP_CREDENTIAL_GET,
+            ));
+        }
+        let id = new_id();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            let Some(writer) = st.writer.clone() else {
+                return Err(HostAgentClientError::NotConnected);
+            };
+            st.pending_credentials.insert(id.clone(), tx);
+            if writer
+                .send(with_newline(protocol::credential_get(
+                    &id, server, csr_base64,
+                )))
+                .is_err()
+            {
+                st.pending_credentials.remove(&id);
+                return Err(HostAgentClientError::NotConnected);
+            }
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(HostAgentClientError::Disconnected),
+            Err(_) => {
+                self.inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .pending_credentials
+                    .remove(&id);
                 Err(HostAgentClientError::TimedOut)
             }
         }
@@ -319,6 +419,8 @@ async fn run_loop(
             let mut st = inner.state.lock().unwrap();
             st.writer = None;
             st.pending.clear();
+            st.pending_credentials.clear();
+            st.capabilities.clear();
         }
         writer_task.abort();
         let _ = event_tx.send(HostAgentEvent::Disconnected);
@@ -367,9 +469,16 @@ async fn read_frames(
                 let _ = writer_tx.send(with_newline(pong));
             }
             HostAgentInbound::HelloAck(ack) => {
+                inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .capabilities
+                    .clone_from(&ack.agent_capabilities);
                 let _ = event_tx.send(HostAgentEvent::Connected(ack));
             }
             HostAgentInbound::TokenResponse(resp) => resolve_pending(inner, resp),
+            HostAgentInbound::CredentialResponse(resp) => resolve_pending_credential(inner, resp),
             other => {
                 let _ = event_tx.send(HostAgentEvent::Frame(Box::new(other)));
             }
@@ -388,6 +497,20 @@ fn resolve_pending(inner: &Arc<Inner>, resp: TokenResponse) {
         .remove(&resp.in_reply_to);
     if let Some(tx) = tx {
         let _ = tx.send(resp); // oneshot: consumed on send; a dropped rx is fine
+    }
+}
+
+/// Resume the `credential.get` matching `resp.in_reply_to`. Same single-resume
+/// guard as `resolve_pending`.
+fn resolve_pending_credential(inner: &Arc<Inner>, resp: CredentialResponse) {
+    let tx = inner
+        .state
+        .lock()
+        .unwrap()
+        .pending_credentials
+        .remove(&resp.in_reply_to);
+    if let Some(tx) = tx {
+        let _ = tx.send(resp);
     }
 }
 
@@ -526,6 +649,7 @@ async fn read_frame_capped(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use shed_core::approval::CAP_CREDENTIAL_GET;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -545,6 +669,7 @@ mod tests {
 
     struct Records {
         token_gets: Vec<Value>,
+        credential_gets: Vec<Value>,
         responses: Vec<Value>,
         hello_count: usize,
         token_seq: u32,
@@ -557,6 +682,11 @@ mod tests {
         path: PathBuf,
         records: Arc<Mutex<Records>>,
         token_mode: Arc<Mutex<TokenMode>>,
+        /// Whether this double advertises `credential.get`. DEFAULT FALSE, i.e.
+        /// the double is an OLD agent unless a test says otherwise — so every
+        /// pre-existing assertion keeps describing the pairing it was written for,
+        /// and the new capability has to be opted into deliberately.
+        advertise_credential_get: Arc<Mutex<bool>>,
         write_half: Arc<AsyncMutex<Option<OwnedWriteHalf>>>,
         _accept: JoinHandle<()>,
     }
@@ -568,13 +698,20 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
             let records = Arc::new(Mutex::new(Records {
                 token_gets: Vec::new(),
+                credential_gets: Vec::new(),
                 responses: Vec::new(),
                 hello_count: 0,
                 token_seq: 0,
             }));
             let token_mode = Arc::new(Mutex::new(TokenMode::Ok));
+            let advertise_credential_get = Arc::new(Mutex::new(false));
             let write_half = Arc::new(AsyncMutex::new(None));
-            let (r, m, w) = (records.clone(), token_mode.clone(), write_half.clone());
+            let (r, m, w, c) = (
+                records.clone(),
+                token_mode.clone(),
+                write_half.clone(),
+                advertise_credential_get.clone(),
+            );
             let accept = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -582,7 +719,7 @@ mod tests {
                     };
                     let (read_half, wh) = stream.into_split();
                     *w.lock().await = Some(wh);
-                    serve_conn(read_half, r.clone(), m.clone(), w.clone()).await;
+                    serve_conn(read_half, r.clone(), m.clone(), w.clone(), c.clone()).await;
                     *w.lock().await = None;
                 }
             });
@@ -590,6 +727,7 @@ mod tests {
                 path,
                 records,
                 token_mode,
+                advertise_credential_get,
                 write_half,
                 _accept: accept,
             }
@@ -620,6 +758,15 @@ mod tests {
 
         fn set_token_mode(&self, mode: TokenMode) {
             *self.token_mode.lock().unwrap() = mode;
+        }
+
+        /// Make this double a NEW agent (advertises `credential.get`).
+        fn advertise_credential_get(&self) {
+            *self.advertise_credential_get.lock().unwrap() = true;
+        }
+
+        fn credential_gets(&self) -> Vec<Value> {
+            self.records.lock().unwrap().credential_gets.clone()
         }
 
         fn hello_count(&self) -> usize {
@@ -654,6 +801,7 @@ mod tests {
         records: Arc<Mutex<Records>>,
         token_mode: Arc<Mutex<TokenMode>>,
         write_half: Arc<AsyncMutex<Option<OwnedWriteHalf>>>,
+        advertise_credential_get: Arc<Mutex<bool>>,
     ) {
         let mut reader = BufReader::new(read_half);
         let mut line = Vec::new();
@@ -673,12 +821,17 @@ mod tests {
             match msg.get("type").and_then(|t| t.as_str()) {
                 Some("hello") => {
                     records.lock().unwrap().hello_count += 1;
-                    let ack = json!({
+                    let mut ack = json!({
                         "type": "hello_ack", "v": 2,
                         "namespaces": ["ssh-agent", "aws-credentials", "docker-credentials"],
                         "gate_namespaces": ["ssh-agent"],
                         "request_timeout_ms": 25000, "accepted": true,
                     });
+                    // An OLD agent omits the key entirely — it is not `[]`, it is
+                    // absent, and that absence is the whole signal.
+                    if *advertise_credential_get.lock().unwrap() {
+                        ack["agent_capabilities"] = json!([CAP_CREDENTIAL_GET]);
+                    }
                     send_on(&write_half, ack).await;
                 }
                 Some("approval_response") => records.lock().unwrap().responses.push(msg),
@@ -719,6 +872,28 @@ mod tests {
                             .await;
                         }
                     }
+                }
+                Some("credential.get") => {
+                    let (id, server) = {
+                        records.lock().unwrap().credential_gets.push(msg.clone());
+                        (
+                            msg.get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            msg.get("server")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    };
+                    // Answer as an mtls server would: a certificate, no token.
+                    send_on(
+                        &write_half,
+                        json!({"type":"credential.response","in_reply_to":id,"server":server,
+                               "auth_mode":"mtls","client_cert":"PEM","cert_serial":"0a0b"}),
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -1066,5 +1241,72 @@ mod tests {
         assert_eq!(peer_uid(&client), Some(our_uid()));
         assert!(peer_trusted(peer_uid(&client), our_uid()));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The desktop↔host-agent compat matrix, from the APP's side.
+    #[tokio::test]
+    async fn credential_get_compat_matrix() {
+        // --- NEW app, OLD agent: no capability advertised. ---
+        let agent = TestAgent::start();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        assert!(agent.wait_hello(1).await);
+        assert!(
+            !client.supports(CAP_CREDENTIAL_GET),
+            "an agent that advertised nothing must not appear to support anything"
+        );
+        let err = client
+            .request_credential("mini2", Some("QUJD"), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(err, HostAgentClientError::Unsupported(CAP_CREDENTIAL_GET));
+        // The message has to name what to upgrade — that is the entire reason the
+        // capability exists instead of a timeout.
+        assert!(
+            err.to_string().contains("upgrade shed-host-agent"),
+            "unhelpful mismatch error: {err}"
+        );
+        // And nothing was written: an old agent must never receive a frame it
+        // would silently drop.
+        assert!(agent.credential_gets().is_empty());
+        // token.get against the same old agent still works untouched.
+        let resp = client
+            .request_token("mini2", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(resp.token.as_deref(), Some("fake-tok-1"));
+        client.stop();
+
+        // --- NEW app, NEW agent: the CSR crosses and a certificate comes back. ---
+        let agent = TestAgent::start();
+        agent.advertise_credential_get();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        assert!(agent.wait_hello(1).await);
+        assert!(wait_until(|| client.supports(CAP_CREDENTIAL_GET)).await);
+        let resp = client
+            .request_credential("mini2", Some("QUJD"), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(resp.auth_mode.as_deref(), Some("mtls"));
+        assert_eq!(resp.client_cert.as_deref(), Some("PEM"));
+        assert!(resp.token.is_none());
+        let sent = agent.credential_gets();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["csr"], "QUJD", "the CSR must cross verbatim");
+        assert_eq!(sent[0]["server"], "mini2");
+        client.stop();
     }
 }

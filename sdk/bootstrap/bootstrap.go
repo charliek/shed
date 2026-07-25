@@ -278,7 +278,31 @@ func RunCredential(ctx context.Context, p Params) (sdk.Credential, error) {
 	return sdk.Credential{Bundle: bundle, KeyPEM: kp.keyPEM}, nil
 }
 
-// run is the shared body of Run and RunCredential.
+// RunWithCSR submits a CSR the CALLER generated and returns the raw bundle.
+//
+// It is the relay shape, and it exists for exactly one reason: the desktop app
+// holds a credential whose private key must never leave the app process, while
+// the SSH channel that can get that key certified belongs to the host-agent.
+// The app generates the keypair, sends only the CSR across the local socket,
+// and the host-agent runs this — passing the CSR through untouched and handing
+// back the certificate the server issued. No private key exists on the
+// host-agent side of that exchange, which is why RunCredential (which generates
+// its own keypair and would return a certificate the app cannot use) is the
+// wrong entry point for it.
+//
+// An empty p.CSRBase64 makes this identical to Run, and against an mtls server
+// the result is the server's own explicit upgrade error — the honest answer for
+// a caller that had no CSR to relay.
+//
+// The returned Bundle is validated for shape (an mtls bundle must carry a
+// certificate, a token bundle a token) but NOT against a private key: this side
+// does not have one. Verifying that the certificate matches the key is the
+// caller's job, at the end of the relay, where the key is.
+func RunWithCSR(ctx context.Context, p Params) (sdk.Bundle, error) {
+	return run(ctx, p)
+}
+
+// run is the shared body of Run, RunCredential and RunWithCSR.
 func run(ctx context.Context, p Params) (sdk.Bundle, error) {
 	if err := validate(p); err != nil {
 		return sdk.Bundle{}, err

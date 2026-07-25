@@ -2,35 +2,55 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	sdk "github.com/charliek/shed/sdk"
 	sdkbootstrap "github.com/charliek/shed/sdk/bootstrap"
+	"github.com/charliek/shed/sdk/creds"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
-// CredentialMinter bootstraps the host-agent's own credentials-scoped token over
-// a server's SSH _bootstrap channel by invoking the system ssh client (via
-// sdk/bootstrap). The agent authenticates with a key already on the server's
-// allowlist (the same key `shed server add` used) — resolved by ssh from the
-// agent, macOS Keychain, 1Password/Secretive IdentityAgent, hardware keys, or
-// ~/.ssh/config — and the server mints a short-TTL token bound to that key. No
-// private key material is read by the host-agent itself.
+// CredentialMinter bootstraps the host-agent's own credential over a server's
+// SSH _bootstrap channel by invoking the system ssh client (via sdk/bootstrap).
+// The agent authenticates with a key already on the server's allowlist (the same
+// key `shed server add` used) — resolved by ssh from the agent, macOS Keychain,
+// 1Password/Secretive IdentityAgent, hardware keys, or ~/.ssh/config — and the
+// server issues a short-TTL credential bound to that key. No private key
+// material belonging to the SSH identity is read by the host-agent itself.
+//
+// The exchange is CSR-first and mode-agnostic: a fresh P-256 keypair is
+// generated per mint and its CSR submitted alongside the request, so the SERVER
+// decides whether the answer is a bearer token or a client certificate. That is
+// what lets one agent work against a token-mode server, an mtls-mode server, and
+// a server that gets flipped between them while the agent is running — without
+// any local configuration saying which.
 type CredentialMinter struct {
 	knownHostsPath string // where the server's SSH host key is pinned (~/.shed/known_hosts)
 
 	// bootstrapRun runs the SSH bootstrap exchange; a field so tests can inject a
-	// fake without spawning ssh or standing up a server. Defaults to sdkbootstrap.Run.
-	bootstrapRun func(context.Context, sdkbootstrap.Params) (sdk.Bundle, error)
+	// fake without spawning ssh or standing up a server. Defaults to
+	// sdkbootstrap.RunCredential.
+	bootstrapRun func(context.Context, sdkbootstrap.Params) (sdk.Credential, error)
+
+	// relayRun runs a bootstrap with a CSR the CALLER generated, returning the
+	// bundle without a private key (the desktop relay — see MintRelayed).
+	// Defaults to sdkbootstrap.RunWithCSR.
+	relayRun func(context.Context, sdkbootstrap.Params) (sdk.Bundle, error)
 }
 
 // NewCredentialMinter builds a minter from the known_hosts file that pins server
@@ -39,41 +59,75 @@ type CredentialMinter struct {
 func NewCredentialMinter(knownHostsPath string) *CredentialMinter {
 	return &CredentialMinter{
 		knownHostsPath: expandTilde(knownHostsPath),
-		bootstrapRun:   sdkbootstrap.Run,
+		bootstrapRun:   sdkbootstrap.RunCredential,
+		relayRun:       sdkbootstrap.RunWithCSR,
 	}
 }
 
-// Token scopes the host-agent mints over SSH: credentials for its own bus
-// brokering, control for a token.get on the desktop's behalf.
+// Credential scopes the host-agent mints over SSH: credentials for its own bus
+// brokering, control for a credential.get/token.get on the desktop's behalf.
 const (
 	scopeCredentials = "credentials"
 	scopeControl     = "control"
 )
 
-// Mint bootstraps a fresh token of the given scope for t over its SSH endpoint
-// and returns the token with its expiry. ssh verifies the server's host key
-// against the pin already in known_hosts (the same trust `shed server add`
-// established), so this never trusts an unpinned server.
-func (m *CredentialMinter) Mint(ctx context.Context, t ServerTarget, scope string) (string, time.Time, error) {
-	// Pre-check that the server is pinned. This is NOT a safety latch — a missing
-	// pin is already non-terminal/retryable downstream (ssh + sdk/bootstrap
-	// classify it as a verification failure, never as a host-key mismatch). It buys
-	// two things: an actionable "run shed server add" error instead of ssh's opaque
-	// "Host key verification failed", and skipping a doomed ssh spawn.
-	if err := knownHostsPinned(m.knownHostsPath, t.SSHHost, t.SSHPort); err != nil {
-		return "", time.Time{}, err
+// clientKindHostAgent is the advisory client kind stamped on every credential
+// the agent mints — including the ones it relays for the desktop, because the
+// SSH key doing the authenticating is the agent's.
+const clientKindHostAgent = "host-agent"
+
+// Mint bootstraps a fresh credential of the given scope for t over its SSH
+// endpoint. ssh verifies the server's host key against the pin already in
+// known_hosts (the same trust `shed server add` established), so this never
+// trusts an unpinned server.
+func (m *CredentialMinter) Mint(ctx context.Context, t ServerTarget, scope string) (sdk.Credential, error) {
+	if err := m.checkPinned(t); err != nil {
+		return sdk.Credential{}, err
 	}
-	bundle, err := m.bootstrapRun(ctx, sdkbootstrap.Params{
+	cred, err := m.bootstrapRun(ctx, m.params(t, scope, ""))
+	if err != nil {
+		return sdk.Credential{}, fmt.Errorf("bootstrapping %s credential for %q: %w", scope, t.Name, err)
+	}
+	return cred, nil
+}
+
+// MintRelayed bootstraps a credential using a CSR generated by SOMEONE ELSE —
+// the desktop app, whose private key stays in the app process. The returned
+// bundle carries the issued certificate (or, against a token-mode server, a
+// token) and no key: this side never had one.
+//
+// csrBase64 may be empty, which makes the exchange CSR-free; against an mtls
+// server that yields the server's own explicit upgrade error, which is the
+// truthful answer to relay back to an app that sent no CSR.
+func (m *CredentialMinter) MintRelayed(ctx context.Context, t ServerTarget, scope, csrBase64 string) (sdk.Bundle, error) {
+	if err := m.checkPinned(t); err != nil {
+		return sdk.Bundle{}, err
+	}
+	bundle, err := m.relayRun(ctx, m.params(t, scope, csrBase64))
+	if err != nil {
+		return sdk.Bundle{}, fmt.Errorf("bootstrapping %s credential for %q: %w", scope, t.Name, err)
+	}
+	return bundle, nil
+}
+
+func (m *CredentialMinter) params(t ServerTarget, scope, csrBase64 string) sdkbootstrap.Params {
+	return sdkbootstrap.Params{
 		Host:           t.SSHHost,
 		Port:           t.SSHPort,
 		KnownHostsPath: m.knownHostsPath,
 		Scope:          scope,
-		ClientKind:     "host-agent",
-	})
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("bootstrapping %s token for %q: %w", scope, t.Name, err)
+		ClientKind:     clientKindHostAgent,
+		CSRBase64:      csrBase64,
 	}
-	return bundle.Token, bundle.ExpiresAt, nil
+}
+
+// checkPinned pre-checks that the server is pinned. This is NOT a safety latch —
+// a missing pin is already non-terminal/retryable downstream (ssh + sdk/bootstrap
+// classify it as a verification failure, never as a host-key mismatch). It buys
+// two things: an actionable "run shed server add" error instead of ssh's opaque
+// "Host key verification failed", and skipping a doomed ssh spawn.
+func (m *CredentialMinter) checkPinned(t ServerTarget) error {
+	return knownHostsPinned(m.knownHostsPath, t.SSHHost, t.SSHPort)
 }
 
 // knownHostsPinned reports whether the known_hosts file has a usable (non-revoked,
@@ -117,11 +171,9 @@ func knownHostsPinned(knownHostsPath, host string, port int) error {
 }
 
 const (
-	// tokenRefreshWindow is how long before expiry an on-demand Token re-mints.
-	tokenRefreshWindow = 2 * time.Hour
 	// The proactive refresh loop re-mints at ~50% of the time remaining until
 	// expiry, jittered, clamped to [minRefreshDelay, maxRefreshDelay]; it uses
-	// defaultRefreshDelay until a token has been minted.
+	// defaultRefreshDelay until a credential has been minted.
 	defaultRefreshDelay = time.Hour
 	minRefreshDelay     = time.Minute
 	maxRefreshDelay     = 12 * time.Hour
@@ -133,164 +185,247 @@ const (
 // minter is the subset of CredentialMinter that credentialSource needs; an
 // interface so tests can inject a fake without a live SSH server.
 type minter interface {
-	Mint(ctx context.Context, t ServerTarget, scope string) (string, time.Time, error)
+	Mint(ctx context.Context, t ServerTarget, scope string) (sdk.Credential, error)
 }
 
-// inflightMint coordinates concurrent mints: only one runs at a time, joiners
-// wait on done then read token/err. This is the single-flight that both keeps a
-// re-mint from being duplicated and lets the network call run off s.mu (so a
-// proactive refresh doesn't block a Token caller serving the still-valid token).
-type inflightMint struct {
-	done   chan struct{}
-	token  string
-	expiry time.Time
-	err    error
-}
-
-// credentialSource is an sdk.TokenProvider backed by the SSH credential minter:
-// it caches a minted token and re-mints on demand (near expiry, or after a 401
-// via Invalidate) and proactively (refreshLoop). A host-key pin mismatch is
-// TERMINAL — a possible MITM — so the source fails closed and never serves a
-// token for that server again, rather than downgrading to a weaker credential.
-type credentialSource struct {
-	ctx    context.Context
-	mint   minter
-	target ServerTarget
-	scope  string // scopeCredentials | scopeControl
-
-	mu          sync.Mutex
-	token       string
-	expiry      time.Time
-	terminalErr error
-	inflight    *inflightMint
-}
-
-func newCredentialSource(ctx context.Context, m minter, t ServerTarget, scope string) *credentialSource {
-	return &credentialSource{ctx: ctx, mint: m, target: t, scope: scope}
-}
-
-// Token returns the current token, minting or re-minting as needed. Implements
-// sdk.TokenProvider.
-func (s *credentialSource) Token() (string, error) {
-	tok, _, err := s.tokenWithExpiry()
-	return tok, err
-}
-
-// tokenWithExpiry is Token plus the token's expiry — the form the SDK callers
-// need so they know when to ask again. It serves the cached token while fresh.
-// A zero expiry means the server returned none.
-func (s *credentialSource) tokenWithExpiry() (string, time.Time, error) {
-	return s.obtainTokenWithExpiry(false)
-}
-
-// forceTokenWithExpiry drops any completed cached token and mints fresh, while
-// still coalescing callers that overlap a single in-flight mint (they join it).
-// The clear + obtain happen under ONE lock acquisition, so — unlike Invalidate()
-// followed by a separate tokenWithExpiry() — a caller can never return a token
-// left over from another caller's already-completed mint. The control-token path
-// (token.get) uses this: a control token can be silently invalidated out-of-band
-// by the target server restarting (it regenerates its token authority), and the
-// agent has no signal for that, so it must never serve a cached copy.
+// hostAgentCredStore returns the agent's OWN credential store for a scope.
 //
-// One residual race at this layer is accepted (and self-heals): a caller that
-// JOINS a mint already in flight across the exact restart instant receives that
-// mint's now-stale token once; the next caller re-mints clean. (A server can
-// also restart after a fresh mint returns but before the token is used — an
-// inherent property of any bearer token, likewise covered by the caller's 401
-// retry.)
-func (s *credentialSource) forceTokenWithExpiry() (string, time.Time, error) {
-	return s.obtainTokenWithExpiry(true)
+// It is deliberately not ~/.shed/creds: that directory belongs to the shed CLI's
+// control-scope certificate, and one certificate carries exactly one scope. Two
+// processes rotating independently into the same per-server directory would
+// overwrite each other's material in place — the agent would keep replacing the
+// CLI's control certificate with its credentials-scoped one and vice versa, and
+// each would then present a certificate the server refuses for the route it is
+// calling. Separate roots, one implementation (sdk/creds).
+//
+// The scope is a path component so the two scopes a single agent can hold never
+// collide either.
+func hostAgentCredStore(scope string) *creds.Store {
+	return creds.NewStore(filepath.Join(stateDir(), "host-agent", "creds", scope))
 }
 
-// obtainTokenWithExpiry is the shared body of tokenWithExpiry / forceTokenWithExpiry.
-// It fails closed on a terminal error (host-key pin mismatch — a possible MITM),
-// then either serves a fresh cached token or mints via the single-flight
-// obtainLocked. force skips the cache short-circuit and clears any completed
-// token so it is never served (the control path needs that — see
-// forceTokenWithExpiry). Keeping the fail-closed guard and the obtain/wait tail
-// in one place means the security invariant has a single home.
-func (s *credentialSource) obtainTokenWithExpiry(force bool) (string, time.Time, error) {
+// credentialSource is the host-agent's per-server, per-scope credential: an
+// sdk.TokenProvider AND an sdk.ClientCertProvider over one clienttoken.Source.
+//
+// Both interfaces are satisfied by the same object on purpose. A bearer token
+// and a client certificate are not two credentials to choose between but two
+// shapes of the same one, and which shape is held is decided by the server at
+// each mint. Splitting them would mean something local had to predict the mode.
+//
+// A host-key pin mismatch is TERMINAL — a possible MITM — so the source fails
+// closed and never mints for that server again, rather than downgrading to a
+// weaker credential.
+type credentialSource struct {
+	src    *clienttoken.Source
+	target ServerTarget
+	scope  string
+	// store persists the minted certificate so a restart does not have to
+	// re-enroll over SSH. nil disables persistence (the control-scope source the
+	// desktop path uses, which deliberately keeps nothing).
+	store  *creds.Store
+	logger *slog.Logger
+
+	mu       sync.Mutex
+	terminal error
+}
+
+// newCredentialSource builds the credential source for one server + scope,
+// seeded from whatever is already on disk (or from the entry's static token).
+// store may be nil to disable persistence.
+func newCredentialSource(ctx context.Context, m minter, t ServerTarget, scope string, store *creds.Store, logger *slog.Logger) *credentialSource {
+	s := &credentialSource{target: t, scope: scope, store: store, logger: logger}
+	s.src = clienttoken.New(s.seed(), func() (clienttoken.Credential, error) {
+		return s.mint(ctx, m)
+	})
+	return s
+}
+
+// seed is the credential the source starts with, before any mint.
+//
+// A persisted certificate is loaded only when the recorded auth_mode says the
+// server issues them. That is not an optimization: loading one unconditionally
+// would present a stale certificate to a server that has since been flipped back
+// to token mode, and the flip is supposed to be invisible. When in doubt the
+// source starts empty, and EnsureFresh mints before the first request.
+func (s *credentialSource) seed() clienttoken.Credential {
+	if s.store != nil && s.target.IsMTLS() && s.target.Name != "" {
+		cert, err := s.store.LoadServer(s.target.Name)
+		switch {
+		case err == nil:
+			return clienttoken.MTLSCredential(cert, certificateExpiry(cert))
+		case errors.Is(err, fs.ErrNotExist):
+			// Nothing stored yet — a first start, or a server that has only ever
+			// been reached in token mode. Not worth a log line.
+		default:
+			// Unreadable, malformed, or a mismatched pair (the shape a crash
+			// between the two renames of a rotation leaves). All of them mean the
+			// same thing here — enroll fresh — but they are worth saying out loud,
+			// because "silently re-enrolled every start" is otherwise invisible.
+			s.debug("no usable stored certificate; will re-enroll", "error", err)
+		}
+	}
+	if s.target.Token != "" {
+		// A statically configured credentials_token. Zero expiry: nothing local
+		// knows when it stops working, so it is never proactively re-minted —
+		// only replaced once a real mint returns something better.
+		return clienttoken.TokenCredential(s.target.Token, time.Time{})
+	}
+	return clienttoken.Credential{}
+}
+
+// certificateExpiry reads a certificate's NotAfter, which is what the refresh
+// window is measured against. A leaf that cannot be parsed yields a zero time —
+// "never proactively re-mint" — rather than an error: the certificate still
+// works until the server says otherwise, and the reactive path covers that.
+func certificateExpiry(cert *tls.Certificate) time.Time {
+	if cert == nil {
+		return time.Time{}
+	}
+	if cert.Leaf != nil {
+		return cert.Leaf.NotAfter
+	}
+	if len(cert.Certificate) == 0 {
+		return time.Time{}
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return time.Time{}
+	}
+	return leaf.NotAfter
+}
+
+// mint is the refresh callback: one SSH bootstrap, adopt whatever came back.
+func (s *credentialSource) mint(ctx context.Context, m minter) (clienttoken.Credential, error) {
 	s.mu.Lock()
-	if s.terminalErr != nil {
-		err := s.terminalErr
-		s.mu.Unlock()
-		return "", time.Time{}, err
-	}
-	switch {
-	case force:
-		s.token = "" // force a re-mint; never serve a completed cached token
-	case s.token != "" && !s.staleLocked():
-		tok, exp := s.token, s.expiry
-		s.mu.Unlock()
-		return tok, exp, nil
-	}
-	call := s.obtainLocked() // start a mint, or join one already in flight
+	terminal := s.terminal
 	s.mu.Unlock()
-	<-call.done
-	return call.token, call.expiry, call.err
+	if terminal != nil {
+		return clienttoken.Credential{}, terminal
+	}
+
+	res, err := m.Mint(ctx, s.target, s.scope)
+	if err != nil {
+		if errors.Is(err, sdkbootstrap.ErrHostKeyMismatch) {
+			err = fmt.Errorf("refusing to broker %q: SSH host key pin mismatch (possible MITM): %w", s.target.Name, err)
+			s.mu.Lock()
+			s.terminal = err
+			s.mu.Unlock()
+		}
+		return clienttoken.Credential{}, err
+	}
+	return s.adopt(res)
 }
 
-// Invalidate clears the cached token so the next Token re-mints. Called by the
-// SDK after a 401 (the server rejected the cached token).
-func (s *credentialSource) Invalidate() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.token = ""
+// adopt turns a bootstrap result into the live credential and persists the mtls
+// half.
+//
+// The persist is best-effort in both directions and deliberately so: the
+// credential in memory is already valid, so failing the mint because the disk is
+// full would turn a recoverable annoyance into an outage. What it costs is one
+// extra SSH round-trip after a restart.
+func (s *credentialSource) adopt(res sdk.Credential) (clienttoken.Credential, error) {
+	if res.Mode() != sdk.AuthModeMTLS {
+		// Token mode — including a server that just flipped BACK from mtls. The
+		// stored certificate is now inert material for a mode this server no
+		// longer serves, so it is removed rather than left to be loaded (and
+		// presented) by the next start.
+		s.discardStored()
+		return clienttoken.TokenCredential(res.Bundle.Token, res.Bundle.ExpiresAt), nil
+	}
+	cert, err := tls.X509KeyPair([]byte(res.Bundle.ClientCert), res.KeyPEM)
+	if err != nil {
+		return clienttoken.Credential{}, fmt.Errorf("assembling issued client certificate for %q: %w", s.target.Name, err)
+	}
+	s.persist(res)
+	return clienttoken.MTLSCredential(&cert, res.Bundle.ExpiresAt), nil
 }
 
-// refresh proactively re-mints, best-effort (errors surface on the next Token).
-// Driven by refreshLoop so an idle server's token stays fresh.
-func (s *credentialSource) refresh() {
-	s.mu.Lock()
-	if s.terminalErr != nil {
-		s.mu.Unlock()
+// persist stores the issued pair. A nameless target — single-server mode, where the
+// agent watches one URL and no discovery name exists — stores nothing: the store is
+// keyed by server name, and inventing one would be a directory nothing ever reads
+// back. Such an agent re-enrolls on restart, which is the same cost it has always paid.
+func (s *credentialSource) persist(res sdk.Credential) {
+	if s.store == nil || s.target.Name == "" {
 		return
 	}
-	call := s.obtainLocked()
-	s.mu.Unlock()
-	<-call.done
-}
-
-// staleLocked reports whether the cached token is within tokenRefreshWindow of
-// expiry (a zero expiry is a non-expiring token). The caller holds s.mu.
-func (s *credentialSource) staleLocked() bool {
-	return !s.expiry.IsZero() && !time.Now().Before(s.expiry.Add(-tokenRefreshWindow))
-}
-
-// obtainLocked returns the in-flight mint, starting one (off s.mu, in a goroutine)
-// if none is running so N concurrent callers share ONE mint. The caller holds s.mu.
-func (s *credentialSource) obtainLocked() *inflightMint {
-	if s.inflight != nil {
-		return s.inflight
+	if _, _, err := s.store.Write(s.target.Name, []byte(res.Bundle.ClientCert), res.KeyPEM); err != nil {
+		s.warn("could not persist the issued client certificate; will re-enroll after a restart", "error", err)
 	}
-	call := &inflightMint{done: make(chan struct{})}
-	s.inflight = call
-	go s.doMint(call)
-	return call
 }
 
-// doMint performs the mint off s.mu, then stores the result under it. A host-key
-// pin mismatch is recorded as terminal (fail closed) so it is never retried.
-func (s *credentialSource) doMint(call *inflightMint) {
-	tok, exp, err := s.mint.Mint(s.ctx, s.target, s.scope)
-	s.mu.Lock()
-	s.inflight = nil
-	switch {
-	case err == nil:
-		s.token, s.expiry = tok, exp
-		call.token, call.expiry = tok, exp // error paths leave call.token "" (zero)
-	case errors.Is(err, sdkbootstrap.ErrHostKeyMismatch):
-		s.terminalErr = fmt.Errorf("refusing to broker %q: SSH host key pin mismatch (possible MITM): %w", s.target.Name, err)
-		err = s.terminalErr
+func (s *credentialSource) discardStored() {
+	if s.store == nil || s.target.Name == "" {
+		return
 	}
-	call.err = err
-	s.mu.Unlock()
-	close(call.done)
+	if err := s.store.Remove(s.target.Name); err != nil {
+		s.warn("could not remove stale client certificate", "error", err)
+	}
+}
+
+// Token returns the current bearer token, minting first when there is nothing
+// usable or the credential is near expiry. Implements sdk.TokenProvider.
+//
+// In mtls state it returns "" with a nil error, which is exactly right: the
+// credential is real and current, it simply is not a bearer token, and the
+// caller's certificate path carries it instead. An error here means there is no
+// credential of ANY shape.
+func (s *credentialSource) Token() (string, error) {
+	if err := s.src.EnsureFreshErr(); err != nil {
+		return "", err
+	}
+	return s.src.Token(), nil
+}
+
+// ClientCertificate returns the certificate to present at a TLS handshake, or
+// nil in token state. Implements sdk.ClientCertProvider.
+//
+// It never mints: it is called from the TLS stack, on the dialing goroutine, at
+// a point where an SSH round-trip would stall the handshake behind a network
+// operation the handshake's own deadline knows nothing about. The mint happens
+// earlier, in Token, which every request path calls before it dials.
+func (s *credentialSource) ClientCertificate() *tls.Certificate {
+	return s.src.ClientCertificate()
+}
+
+// Invalidate re-mints because the server refused what was presented (a 401, or
+// a TLS alert naming the certificate). Implements sdk.TokenProvider.
+//
+// It is generation-aware and coalesced: a caller whose credential was already
+// replaced by a concurrent re-mint does not trigger a second one. A failed
+// re-mint leaves the existing credential in place — presenting something the
+// server MIGHT still accept beats presenting nothing, and the error surfaces on
+// the next Token.
+func (s *credentialSource) Invalidate() { _ = s.reMint() }
+
+// reMint replaces the current credential unconditionally, coalescing concurrent
+// callers onto one mint and skipping the work entirely for a caller whose
+// credential was already replaced.
+func (s *credentialSource) reMint() error {
+	_, gen := s.src.Current()
+	_, err := s.src.Refresh(gen)
+	return err
+}
+
+// Mode reports the shape of the credential currently held ("token", "mtls", or
+// "" for none) — used by `status` and by the tests that assert a flip landed.
+func (s *credentialSource) Mode() string { return s.src.Mode() }
+
+// refresh proactively re-mints, best-effort (errors surface on the next Token).
+// Driven by refreshLoop so an idle server's credential stays fresh.
+//
+// It re-mints unconditionally rather than only inside the expiry window: the
+// loop's own schedule (~50% of the remaining lifetime) IS the policy, and
+// deferring to the window would collapse it to "re-mint in the last two hours",
+// discarding the spread that keeps a fleet from re-enrolling in lockstep.
+func (s *credentialSource) refresh() {
+	if err := s.reMint(); err != nil {
+		s.debug("proactive credential refresh failed", "error", err)
+	}
 }
 
 // refreshLoop proactively re-mints at ~50% of the time until expiry (jittered),
-// so an idle server's token stays fresh and a fleet re-minting after a server
-// restart is spread out rather than thundering. Stops when ctx is done.
+// so an idle server's credential stays fresh and a fleet re-minting after a
+// server restart is spread out rather than thundering. Stops when ctx is done.
 func (s *credentialSource) refreshLoop(ctx context.Context) {
 	for {
 		select {
@@ -305,13 +440,11 @@ func (s *credentialSource) refreshLoop(ctx context.Context) {
 	}
 }
 
-// nextRefreshDelay is ~50% of the time until the cached token expires, jittered
-// ±25%, clamped to [minRefreshDelay, maxRefreshDelay]; defaultRefreshDelay when
-// no token has been minted yet.
+// nextRefreshDelay is ~50% of the time until the cached credential expires,
+// jittered ±25%, clamped to [minRefreshDelay, maxRefreshDelay];
+// defaultRefreshDelay when nothing has been minted yet.
 func (s *credentialSource) nextRefreshDelay() time.Duration {
-	s.mu.Lock()
-	exp := s.expiry
-	s.mu.Unlock()
+	exp := s.src.ExpiresAt()
 
 	base := defaultRefreshDelay
 	if !exp.IsZero() {
@@ -324,4 +457,16 @@ func (s *credentialSource) nextRefreshDelay() time.Duration {
 	// (2*rand-1) is uniform in [-1,1), so this spreads d by ±jitterFraction of base.
 	d := base + time.Duration((2*rand.Float64()-1)*jitterFraction*float64(base))
 	return min(max(d, minRefreshDelay), maxRefreshDelay)
+}
+
+func (s *credentialSource) warn(msg string, args ...any) {
+	if s.logger != nil {
+		s.logger.Warn(msg, append([]any{"server", s.target.Name, "scope", s.scope}, args...)...)
+	}
+}
+
+func (s *credentialSource) debug(msg string, args ...any) {
+	if s.logger != nil {
+		s.logger.Debug(msg, append([]any{"server", s.target.Name, "scope", s.scope}, args...)...)
+	}
 }

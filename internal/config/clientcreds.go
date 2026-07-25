@@ -1,73 +1,24 @@
 package config
 
-// clientcreds.go owns the on-disk client-certificate store: the material an
-// mtls-mode server issues over the SSH bootstrap channel, kept out of
-// config.yaml.
+// clientcreds.go binds the shed CLI to the shared client-credential store: the
+// material an mtls-mode server issues over the SSH bootstrap channel, kept out
+// of config.yaml.
 //
-// Layout, one directory per configured server:
-//
-//	~/.shed/creds/                 0700
-//	~/.shed/creds/<server>/        0700
-//	~/.shed/creds/<server>/client.pem   0600  (the issued leaf)
-//	~/.shed/creds/<server>/client.key   0600  (the private key)
-//	~/.shed/creds/%lock/<server>        0600  (advisory lock, see credsLockDirName)
-//
-// The certificate is public material and 0644 would be defensible, but it is
-// written 0600 alongside the key: nothing needs to read it but this client, and
-// a uniform rule is one fewer thing to get wrong when the pair is rewritten on
-// every rotation.
+// The store itself — the ~/.shed/creds layout, the 0700/0600 permissions, the
+// atomic per-file write, and the per-server advisory lock that makes a rotation
+// atomic as a PAIR — lives in sdk/creds. It lives THERE rather than here
+// because the CLI is not its only holder: the host-agent keeps a
+// credentials-scope certificate of its own, under its own state dir, and two
+// copies of a lock-and-rename discipline is exactly the kind of duplication
+// that drifts. This file is the CLI's binding of that store to ~/.shed/creds,
+// and nothing else.
 
 import (
-	"crypto"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
-	"errors"
-	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
-	"syscall"
-)
 
-const (
-	// clientCertFileName / clientKeyFileName are the fixed basenames inside a
-	// server's creds dir. Fixed rather than serial-stamped: rotation replaces
-	// the pair in place, so there is never a second generation to name, and no
-	// stale keys accumulate for an attacker to find or an operator to wonder at.
-	clientCertFileName = "client.pem"
-	clientKeyFileName  = "client.key"
-
-	// credsDirPerm / credsFilePerm are the permissions enforced on write.
-	credsDirPerm  os.FileMode = 0700
-	credsFilePerm os.FileMode = 0600
-
-	// credsLockDirName holds one advisory lock file per server, as a SIBLING of
-	// the per-server credential directories rather than a file inside them.
-	//
-	// Sibling placement buys two things. RemoveServerCredentials recursively
-	// deletes a server's directory, and deleting a lock file out from under a
-	// process that holds it would let the next locker create a fresh inode and
-	// lock THAT instead — the classic broken-mutex shape (see the same note on
-	// servertls.lockCA). And the per-server directory stays exactly the two
-	// files it documents, with nothing to explain to an operator who looks.
-	//
-	// The "%" prefix is what makes the name collision-proof. Directory names in
-	// the creds root come from escapeServerName, i.e. url.PathEscape, which
-	// emits "%" only as the start of a two-hex-digit escape — "%l" is not one,
-	// so no server name, however chosen, can ever escape to "%lock".
-	credsLockDirName = "%lock"
-
-	// credsStagingDirName holds credential material that has been written but not
-	// yet adopted — see StageClientCredentials.
-	//
-	// It is a sibling of the per-server directories for the same two reasons as
-	// credsLockDirName: RemoveServerCredentials must not be able to delete it out
-	// from under a staging write, and a per-server directory stays exactly the two
-	// files it documents. The "%" prefix is collision-proof by the same argument
-	// (url.PathEscape only ever emits "%" as the start of a two-hex-digit escape,
-	// and "%s" is not one).
-	credsStagingDirName = "%staging"
+	"github.com/charliek/shed/sdk/creds"
 )
 
 // ErrCredentialPairMismatch reports a stored certificate and private key that
@@ -77,7 +28,17 @@ const (
 // between the two renames of a rotation leaves exactly this, and so does an
 // interrupted restore. Callers treat it as "no credential" and re-enroll — see
 // LoadClientCredentials.
-var ErrCredentialPairMismatch = errors.New("client credentials: the stored certificate does not match the stored private key")
+var ErrCredentialPairMismatch = creds.ErrPairMismatch
+
+// credsLockDirName is the store's per-server lock directory name, re-exported
+// at package scope because the collision-proofness of the "%" prefix (no
+// escaped server name can ever produce it) is asserted by this package's tests.
+const credsLockDirName = creds.LockDirName
+
+// clientCredStore is the CLI's store, rooted at ~/.shed/creds. It is resolved
+// per call rather than cached in a package variable because GetClientConfigDir
+// reads the environment, which the tests reassign between cases.
+func clientCredStore() *creds.Store { return creds.NewStore(GetCredsDir()) }
 
 // GetCredsDir returns the root of the client-credential store (~/.shed/creds).
 func GetCredsDir() string {
@@ -85,104 +46,12 @@ func GetCredsDir() string {
 }
 
 // ServerCredsDir returns the credential directory for a named server entry.
-//
-// The name is escaped because it is user-chosen and otherwise unconstrained: an
-// entry called "../../.ssh" must not be able to steer a 0600 write — or the
-// recursive delete in RemoveServerCredentials — outside the creds root.
-// Escaping (rather than rejecting) keeps the mapping total, so no name that is
-// legal everywhere else in the config becomes unusable here.
-func ServerCredsDir(name string) string {
-	return filepath.Join(GetCredsDir(), escapeServerName(name))
-}
-
-// escapeServerName maps a server name onto exactly one inert path component.
-//
-// url.PathEscape does most of it — it encodes "/" and every other separator —
-// but it deliberately leaves "." alone, because a dot is a perfectly legal path
-// character. That is fine for a name embedded in a longer filename (see
-// GetTunnelLogPath, which always surrounds it with a prefix and suffix) and NOT
-// fine here, where the escaped name is the whole component: a server named ".."
-// would resolve ~/.shed/creds/.. to ~/.shed, and RemoveServerCredentials would
-// then recursively delete the user's entire shed configuration — known hosts,
-// tunnels, every other server's credentials.
-//
-// Only the exact components ""/"."/".." carry that meaning; a name like "..foo"
-// is already inert. So those three get a leading "%2E", which keeps the result a
-// single, ordinary directory name, keeps the mapping injective, and leaves every
-// realistic server name untouched.
-func escapeServerName(name string) string {
-	esc := url.PathEscape(name)
-	switch esc {
-	case "", ".", "..":
-		return "%2E" + esc
-	}
-	return esc
-}
+func ServerCredsDir(name string) string { return clientCredStore().ServerDir(name) }
 
 // ClientCredentialPaths returns the certificate and key paths for a named
 // server, without touching the filesystem.
 func ClientCredentialPaths(name string) (certPath, keyPath string) {
-	dir := ServerCredsDir(name)
-	return filepath.Join(dir, clientCertFileName), filepath.Join(dir, clientKeyFileName)
-}
-
-// ensureCredsRoot creates ~/.shed/creds and tightens it to 0700.
-//
-// The chmod is not redundant with the MkdirAll: MkdirAll is a no-op on a
-// directory that already exists, so a root left group- or world-readable by an
-// older build, a careless restore, or a permissive umask would keep those
-// permissions forever — and every private key in the store sits under it. The
-// same reasoning already applies one level down, to the per-server directory.
-func ensureCredsRoot() error {
-	root := GetCredsDir()
-	if err := os.MkdirAll(root, credsDirPerm); err != nil {
-		return fmt.Errorf("create credentials dir %s: %w", root, err)
-	}
-	if err := os.Chmod(root, credsDirPerm); err != nil {
-		return fmt.Errorf("tighten credentials dir %s: %w", root, err)
-	}
-	return nil
-}
-
-// lockServerCreds takes the exclusive advisory lock guarding one server's
-// credential pair and returns the release function.
-//
-// It is held across the WHOLE write (both renames) and across the whole load,
-// which is what makes a rotation atomic as a PAIR rather than merely per file.
-// Each file is already written atomically, but two independent renames are two
-// independent commits: without this lock a reader can observe the new
-// certificate beside the old key, and two processes refreshing at once can
-// interleave into cert-A-with-key-B — a credential that belongs to nobody and
-// fails the handshake at some later, unrelated moment.
-//
-// A lock file is never removed once created (see credsLockDirName), and an
-// empty name means "no identifiable server", which takes no lock at all: a
-// nameless entry is never written by the persist path either, so there is
-// nothing to serialize against.
-func lockServerCreds(name string) (func(), error) {
-	if name == "" {
-		return func() {}, nil
-	}
-	if err := ensureCredsRoot(); err != nil {
-		return nil, err
-	}
-	lockDir := filepath.Join(GetCredsDir(), credsLockDirName)
-	if err := os.MkdirAll(lockDir, credsDirPerm); err != nil {
-		return nil, fmt.Errorf("create credentials lock dir %s: %w", lockDir, err)
-	}
-	lockPath := filepath.Join(lockDir, escapeServerName(name))
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, credsFilePerm)
-	if err != nil {
-		return nil, fmt.Errorf("open credentials lock %s: %w", lockPath, err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("lock credentials %s: %w", lockPath, err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
+	return clientCredStore().Paths(name)
 }
 
 // LoadClientCredentials reads a server's stored certificate + key under that
@@ -191,345 +60,52 @@ func lockServerCreds(name string) (func(), error) {
 // It returns (nil, err) for EVERY unusable state — absent files, unreadable
 // files, malformed PEM, and a certificate that does not match the key — because
 // all of them mean the same thing to the caller: there is no credential to
-// present, so re-enroll. In particular a mismatched pair is
-// ErrCredentialPairMismatch rather than a hard failure: it is what a crash
-// between the two renames of a rotation leaves behind, and the recovery for it
-// is a fresh enrollment, not an operator with a text editor.
+// present, so re-enroll.
 //
 // name identifies the lock, not the paths: the paths come from the config entry
 // (which the user may have edited) while the lock is keyed on the entry's name,
 // matching what WriteClientCredentials holds. An empty name skips the lock.
 func LoadClientCredentials(name, certPath, keyPath string) (*tls.Certificate, error) {
-	if certPath == "" || keyPath == "" {
-		return nil, errors.New("client credentials: no client certificate on file")
-	}
-	unlock, err := lockServerCreds(name)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-
-	certPEM, err := os.ReadFile(certPath)
-	if err != nil {
-		return nil, fmt.Errorf("read client certificate: %w", err)
-	}
-	keyPEM, err := os.ReadFile(keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("read client key: %w", err)
-	}
-	if err := verifyPairMatches(certPEM, keyPEM); err != nil {
-		return nil, err
-	}
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("assemble client credentials: %w", err)
-	}
-	return &cert, nil
-}
-
-// verifyPairMatches reports whether certPEM certifies the public half of
-// keyPEM.
-//
-// tls.X509KeyPair performs the same comparison internally, but only reports it
-// as an opaque error string. Doing it here first is what lets the mismatch be
-// classified — as the recoverable ErrCredentialPairMismatch — instead of being
-// indistinguishable from a genuinely malformed file.
-func verifyPairMatches(certPEM, keyPEM []byte) error {
-	block, _ := pem.Decode(certPEM)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return fmt.Errorf("%w: the certificate file is not a PEM CERTIFICATE block", ErrCredentialPairMismatch)
-	}
-	leaf, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrCredentialPairMismatch, err)
-	}
-	keyPub, err := publicKeyOfPEM(keyPEM)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrCredentialPairMismatch, err)
-	}
-	// crypto.PublicKey is an empty interface, but every standard-library public
-	// key type carries this Equal method — the idiomatic way to compare two keys
-	// without switching on their concrete types.
-	pub, ok := leaf.PublicKey.(interface{ Equal(crypto.PublicKey) bool })
-	if !ok || !pub.Equal(keyPub) {
-		return ErrCredentialPairMismatch
-	}
-	return nil
-}
-
-// publicKeyOfPEM extracts the public half of a PEM-encoded private key. The
-// client's own enrollment always writes SEC 1 EC, but the other two standard
-// encodings are accepted so a hand-restored or externally-provisioned key is
-// compared rather than rejected as unparseable.
-func publicKeyOfPEM(keyPEM []byte) (crypto.PublicKey, error) {
-	block, _ := pem.Decode(keyPEM)
-	if block == nil {
-		return nil, errors.New("the key file is not PEM")
-	}
-	if k, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
-		return k.Public(), nil
-	}
-	if k, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
-		if signer, ok := k.(crypto.Signer); ok {
-			return signer.Public(), nil
-		}
-	}
-	if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
-		return k.Public(), nil
-	}
-	return nil, errors.New("unrecognized private key encoding")
+	return clientCredStore().Load(name, certPath, keyPath)
 }
 
 // WriteClientCredentials persists a freshly issued client certificate and its
 // private key for the named server, returning the paths written.
-//
-// The key is written FIRST and the certificate second. Both orders can be
-// interrupted, and both leave a mismatched pair that the next load rejects —
-// but a key with no certificate is inert, whereas a certificate with no key is
-// the shape of a credential whose private half has gone missing. (Same
-// reasoning as servertls.persistCA, deliberately.)
-//
-// Each file is written atomically (temp file in the same directory, fsynced,
-// renamed) so a concurrent reader never observes a half-written PEM. Atomicity
-// per FILE is not enough on its own, though — two renames are two commits — so
-// the whole write runs under the server's exclusive credential lock, which is
-// what stops two processes rotating at once from interleaving into a cert from
-// one and a key from the other. LoadClientCredentials takes the same lock, and
-// additionally verifies the pair, which covers the one case no lock can: a
-// crash BETWEEN the two renames.
 func WriteClientCredentials(name string, certPEM, keyPEM []byte) (certPath, keyPath string, err error) {
-	if name == "" {
-		return "", "", errors.New("client credentials: server name required")
-	}
-	if len(certPEM) == 0 || len(keyPEM) == 0 {
-		return "", "", errors.New("client credentials: empty certificate or key")
-	}
-	if err := ensureCredsRoot(); err != nil {
-		return "", "", err
-	}
-	unlock, err := lockServerCreds(name)
-	if err != nil {
-		return "", "", err
-	}
-	defer unlock()
-
-	dir := ServerCredsDir(name)
-	if err := os.MkdirAll(dir, credsDirPerm); err != nil {
-		return "", "", fmt.Errorf("create credentials dir %s: %w", dir, err)
-	}
-	// MkdirAll is a no-op on an existing directory, including one created with
-	// looser permissions by an older build or a careless restore. Tighten it.
-	if err := os.Chmod(dir, credsDirPerm); err != nil {
-		return "", "", fmt.Errorf("tighten credentials dir %s: %w", dir, err)
-	}
-
-	certPath, keyPath = ClientCredentialPaths(name)
-	if err := atomicWriteFile(keyPath, keyPEM, credsFilePerm); err != nil {
-		return "", "", fmt.Errorf("write client key %s: %w", keyPath, err)
-	}
-	if err := atomicWriteFile(certPath, certPEM, credsFilePerm); err != nil {
-		// Roll the key back so the next start sees "no credentials" (and
-		// re-enrolls) rather than a key that certifies nothing.
-		_ = os.Remove(keyPath)
-		return "", "", fmt.Errorf("write client certificate %s: %w", certPath, err)
-	}
-	return certPath, keyPath, nil
+	return clientCredStore().Write(name, certPEM, keyPEM)
 }
 
 // CredsStagingRoot returns the directory holding not-yet-adopted credential
 // material (~/.shed/creds/%staging). Exported so a test can make a staging write
 // fail without reaching into this package's internals.
-func CredsStagingRoot() string {
-	return filepath.Join(GetCredsDir(), credsStagingDirName)
-}
+func CredsStagingRoot() string { return clientCredStore().StagingRoot() }
 
 // StagedClientCredentials is a client certificate + key written to disk but not
-// yet adopted by the server it belongs to.
-//
-// It exists so that persisting an enrollment can be a TRANSACTION rather than a
-// sequence of independent mutations. `shed server add` and `shed server update
-// --refetch` both have to update two things — config.yaml and the credential
-// store — and the invariant that matters to the next command is that the config
-// on disk always names credential material that exists and matches the auth mode
-// recorded beside it. Staging is what lets the caller order the two writes so
-// that the DESTRUCTIVE half (overwriting or deleting material the config still
-// points at) only ever runs after the config save it belongs to has succeeded.
-//
-// The staged pair lives in its own directory under CredsStagingRoot, on the same
-// filesystem as its destination, so Commit is a pair of renames rather than a
-// copy that can half-fail.
-type StagedClientCredentials struct {
-	name              string
-	dir               string
-	stagedCert        string
-	stagedKey         string
-	certPath, keyPath string
-}
+// yet adopted by the server it belongs to — the transaction handle that lets
+// `shed server add` order the config save before the destructive half of the
+// credential update. See sdk/creds.Staged.
+type StagedClientCredentials = creds.Staged
 
 // StageClientCredentials writes an issued certificate + key into the staging
 // area for the named server, WITHOUT touching whatever that server currently
-// has. This is where a full disk, a bad permission, or an unwritable creds root
-// surfaces — before the caller commits to anything.
-//
-// Call Commit to adopt the pair, or Discard to throw it away. Neither is
-// automatic: a staged pair that is never committed and never discarded is the
-// one residue this API can leave, and it is inert (a certificate for a server
-// the config does not reference).
+// has. Call Commit to adopt the pair, or Discard to throw it away.
 func StageClientCredentials(name string, certPEM, keyPEM []byte) (*StagedClientCredentials, error) {
-	if name == "" {
-		return nil, errors.New("client credentials: server name required")
-	}
-	if len(certPEM) == 0 || len(keyPEM) == 0 {
-		return nil, errors.New("client credentials: empty certificate or key")
-	}
-	if err := ensureCredsRoot(); err != nil {
-		return nil, err
-	}
-	root := CredsStagingRoot()
-	if err := os.MkdirAll(root, credsDirPerm); err != nil {
-		return nil, fmt.Errorf("create credentials staging dir %s: %w", root, err)
-	}
-	if err := os.Chmod(root, credsDirPerm); err != nil {
-		return nil, fmt.Errorf("tighten credentials staging dir %s: %w", root, err)
-	}
-	dir, err := os.MkdirTemp(root, escapeServerName(name)+".")
-	if err != nil {
-		return nil, fmt.Errorf("create credentials staging dir in %s: %w", root, err)
-	}
-	if err := os.Chmod(dir, credsDirPerm); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("tighten credentials staging dir %s: %w", dir, err)
-	}
-
-	s := &StagedClientCredentials{name: name, dir: dir}
-	s.stagedCert = filepath.Join(dir, clientCertFileName)
-	s.stagedKey = filepath.Join(dir, clientKeyFileName)
-	s.certPath, s.keyPath = ClientCredentialPaths(name)
-
-	if err := atomicWriteFile(s.stagedKey, keyPEM, credsFilePerm); err != nil {
-		s.Discard()
-		return nil, fmt.Errorf("stage client key: %w", err)
-	}
-	if err := atomicWriteFile(s.stagedCert, certPEM, credsFilePerm); err != nil {
-		s.Discard()
-		return nil, fmt.Errorf("stage client certificate: %w", err)
-	}
-	return s, nil
-}
-
-// Paths returns where this pair will live once committed — the ordinary
-// per-server credential paths. They are what the config entry must record: the
-// staging location is an implementation detail that no config ever names.
-func (s *StagedClientCredentials) Paths() (certPath, keyPath string) {
-	return s.certPath, s.keyPath
-}
-
-// Commit moves the staged pair into the server's credential directory, under
-// that server's exclusive lock (so a concurrent load never sees one file from
-// this pair and one from the pair it replaces).
-//
-// The key is renamed first, for the same reason WriteClientCredentials writes it
-// first: an interruption between the two renames leaves a key with no matching
-// certificate, which LoadClientCredentials reports as the recoverable
-// ErrCredentialPairMismatch and the caller answers with a fresh enrollment.
-func (s *StagedClientCredentials) Commit() error {
-	unlock, err := lockServerCreds(s.name)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	dir := ServerCredsDir(s.name)
-	if err := os.MkdirAll(dir, credsDirPerm); err != nil {
-		return fmt.Errorf("create credentials dir %s: %w", dir, err)
-	}
-	if err := os.Chmod(dir, credsDirPerm); err != nil {
-		return fmt.Errorf("tighten credentials dir %s: %w", dir, err)
-	}
-	if err := os.Rename(s.stagedKey, s.keyPath); err != nil {
-		return fmt.Errorf("commit client key %s: %w", s.keyPath, err)
-	}
-	if err := os.Rename(s.stagedCert, s.certPath); err != nil {
-		return fmt.Errorf("commit client certificate %s: %w", s.certPath, err)
-	}
-	// Persist the renames. Best effort: some filesystems reject fsync on a
-	// directory handle, and the renames have already succeeded.
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	s.Discard()
-	return nil
-}
-
-// Discard removes the staged material. It is safe to call twice, and safe to
-// call after Commit (which uses it to clean up the empty staging directory).
-func (s *StagedClientCredentials) Discard() {
-	if s == nil || s.dir == "" {
-		return
-	}
-	_ = os.RemoveAll(s.dir)
-	s.dir = ""
+	return clientCredStore().Stage(name, certPEM, keyPEM)
 }
 
 // RemoveServerCredentials deletes a server's credential directory. It is called
 // by `shed server rm`: leaving a private key behind for a server the user has
 // explicitly forgotten is exactly the kind of quiet residue that turns up years
 // later. A missing directory is not an error.
-func RemoveServerCredentials(name string) error {
-	if name == "" {
-		return nil
-	}
-	dir := ServerCredsDir(name)
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("remove credentials dir %s: %w", dir, err)
-	}
-	return nil
-}
+func RemoveServerCredentials(name string) error { return clientCredStore().Remove(name) }
 
 // atomicWriteFile writes data to path via a temp file in the same directory,
 // fsynced and renamed. The temp file is created with the final permissions
-// before any bytes are written, so the key is never briefly world-readable.
+// before any bytes are written, so a key is never briefly world-readable.
 //
-// It is the package's single atomic writer — the egress user-profile store
-// (egress_userstore.go) shares it rather than keeping a second, weaker copy.
+// It is this package's single atomic writer — the client config saver
+// (client.go) and the egress user-profile store (egress_userstore.go) share the
+// credential store's implementation rather than keeping a second, weaker copy.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp*")
-	if err != nil {
-		return fmt.Errorf("create temp file in %s: %w", dir, err)
-	}
-	tmp := f.Name()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = f.Close()
-			_ = os.Remove(tmp)
-		}
-	}()
-
-	if err := f.Chmod(perm); err != nil {
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("fsync temp file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("rename temp file into place: %w", err)
-	}
-	committed = true
-
-	// Persist the rename itself. Best effort: some filesystems reject fsync on a
-	// directory handle, and the rename has already succeeded.
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	return nil
+	return creds.AtomicWriteFile(path, data, perm)
 }

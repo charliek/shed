@@ -42,7 +42,7 @@ const (
 	ModeMTLS  = "mtls"
 )
 
-// refreshWindow is how long before expiry a credential is proactively re-minted
+// RefreshWindow is how long before expiry a credential is proactively re-minted
 // by EnsureFresh, so a request never races the expiry. It is a fixed threshold,
 // not derived from the TTL: a token_ttl at or below it makes EnsureFresh
 // re-mint eagerly (up to once per call) — still correct, and reactive Refresh
@@ -50,7 +50,7 @@ const (
 // so in normal operation a credential is re-minted at most once, within its
 // final 2h. The same window governs client certificates, whose TTL is the same
 // auth.token_ttl knob.
-const refreshWindow = 2 * time.Hour
+const RefreshWindow = 2 * time.Hour
 
 // ErrStatic is returned by Refresh when the Source has no refresh callback (a
 // static token, an open server, or a plain-HTTP client). Callers use it — or,
@@ -267,18 +267,18 @@ func (s *Source) Refreshable() bool {
 
 // needsRefresh reports whether a credential with the given expiry should be
 // proactively re-minted: expiry is set (non-zero) and now is within
-// refreshWindow of it (or past it). A zero expiry never refreshes.
+// RefreshWindow of it (or past it). A zero expiry never refreshes.
 func needsRefresh(expiresAt, now time.Time) bool {
 	if expiresAt.IsZero() {
 		return false
 	}
-	return !now.Before(expiresAt.Add(-refreshWindow))
+	return !now.Before(expiresAt.Add(-RefreshWindow))
 }
 
 // EnsureFresh proactively mints before the next request, in the two situations
 // where letting the request go out as-is is known to fail:
 //
-//   - the current credential is within refreshWindow of its expiry (or past it),
+//   - the current credential is within RefreshWindow of its expiry (or past it),
 //     so the request would race expiry;
 //   - the Source holds NOTHING usable at all (Credential.Usable is false) while
 //     being able to mint. That is not a hypothetical: it is the state a stored
@@ -293,14 +293,30 @@ func needsRefresh(expiresAt, now time.Time) bool {
 // It is best-effort: a mint error leaves the existing credential in place (the
 // reactive Refresh path surfaces errors to a real request). No-op for a static
 // Source — an open server holds nothing usable either, and has nothing to mint.
-func (s *Source) EnsureFresh() {
+func (s *Source) EnsureFresh() { _ = s.EnsureFreshErr() }
+
+// EnsureFreshErr is EnsureFresh with the mint error returned instead of
+// dropped.
+//
+// The CLI genuinely does not want the error: it mints ahead of a command that
+// will surface any real problem itself, and a warning there would be noise. A
+// long-lived daemon does want it — the host-agent's bus asks its credential
+// source for something to present and has to be able to say WHY there is
+// nothing, rather than silently sending an unauthenticated request and
+// reporting the resulting 401 as the problem.
+//
+// nil means "there is a usable, non-expiring-soon credential now" — either
+// because there already was one, or because this call minted it.
+func (s *Source) EnsureFreshErr() error {
 	if s.refresh == nil {
-		return
+		return nil
 	}
 	cred, gen := s.Current()
-	if !cred.Usable() || needsRefresh(cred.ExpiresAt, time.Now()) {
-		_, _ = s.Refresh(gen)
+	if cred.Usable() && !needsRefresh(cred.ExpiresAt, time.Now()) {
+		return nil
 	}
+	_, err := s.Refresh(gen)
+	return err
 }
 
 // Refresh re-mints the credential and returns the new one. It is:

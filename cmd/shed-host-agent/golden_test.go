@@ -99,6 +99,7 @@ type goldenTarget struct {
 	TLSFingerprint string `json:"tls_fingerprint"`
 	SSHHost        string `json:"ssh_host"`
 	SSHPort        int    `json:"ssh_port"`
+	AuthMode       string `json:"auth_mode"`
 }
 
 func TestGoldenLoadDiscoveredServers(t *testing.T) {

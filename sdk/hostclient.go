@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/charliek/shed/sdk/authfail"
 )
 
 const (
@@ -69,10 +71,8 @@ type HostClient struct {
 	// rebuilding the client or its transport.
 	clientCerts ClientCertProvider
 	// certAuth records that clientCerts was actually WIRED into the transport
-	// (which needs a pin — see applyTLSPin). It is what setAuth gates the
-	// Authorization header on, so the two credentials are mutually exclusive in
-	// fact and not merely in intent: a provider that was configured but never
-	// installed leaves the token path exactly as it was.
+	// (which needs a pin — see applyTLSPin). A provider that was configured but
+	// never installed leaves the token path exactly as it was.
 	certAuth bool
 
 	mu     sync.Mutex
@@ -183,13 +183,17 @@ func WithTLSPin(fingerprint string) HostClientOption {
 // WithTLSPin: mtls is only ever served over the pinned HTTPS listener, and the
 // provider is only wired when a pin is set.
 //
-// It TAKES PRECEDENCE over WithToken/WithTokenProvider: once the provider is
-// wired, no Authorization header is sent at all. That is deliberate, and it
-// mirrors the in-tree CLI's mode gating. An mtls-mode server never reads the
+// It TAKES PRECEDENCE over WithToken/WithTokenProvider whenever it actually has
+// a certificate: for those requests no Authorization header is sent at all,
+// mirroring the in-tree CLI's mode gating. An mtls-mode server never reads the
 // header, so a client that sent both would be shipping a live bearer token to
-// an endpoint that ignores it — a credential on the wire with no upside. A
-// token option remains useful only as the thing the client falls back to when
-// no pin is configured and the provider therefore never gets installed.
+// an endpoint that ignores it — a credential on the wire with no upside.
+//
+// While the provider holds NOTHING the token options apply normally. That is
+// what makes one client work against a server in either mode, and keep working
+// across a flip: the provider and the token source are two faces of the same
+// credential, only one of which is populated at a time, and the transport is
+// never rebuilt when which one changes.
 func WithClientCertificates(p ClientCertProvider) HostClientOption {
 	return func(c *HostClient) {
 		c.clientCerts = p
@@ -273,16 +277,51 @@ func (c *HostClient) applyTLSPin() {
 	}
 }
 
+// invalidateOnAuthFailure asks the credential provider to re-mint when the
+// server refused what we presented, and reports whether it did.
+//
+// The two shapes of refusal — an HTTP 401 and a peer TLS alert naming a
+// certificate problem — are classified together (sdk/authfail) because they are
+// the same event seen from the two modes, and because a client cannot know in
+// advance which mode the server is in. A caller uses the bool to decide whether
+// a single retry is worth attempting; false means "nothing changed, retrying
+// would just repeat the failure".
+func (c *HostClient) invalidateOnAuthFailure(status int, err error) bool {
+	if c.tokenProvider == nil || !authfail.IsAuthFailure(status, err) {
+		return false
+	}
+	c.tokenProvider.Invalidate()
+	return true
+}
+
+// presentingCertificate reports whether the wired client-certificate provider
+// currently HAS a certificate to present.
+//
+// It is a per-request question, not a per-client one, and that is the whole
+// point. The provider is installed unconditionally alongside the pin so that a
+// server flipping between token and mtls needs no new transport — which means
+// "a provider is wired" says nothing about which mode we are actually in.
+// Only "the provider is holding a certificate right now" does.
+func (c *HostClient) presentingCertificate() bool {
+	return c.certAuth && c.clientCerts != nil && c.clientCerts.ClientCertificate() != nil
+}
+
 // setAuth adds the bearer token header. With a tokenProvider it uses the current
 // (possibly just-refreshed) token; otherwise the static token. Both no-op when
 // empty (an open-mode, un-gated server).
 //
-// It adds NOTHING once a client-certificate provider is wired: the credential
-// travels in the handshake, an mtls-mode server never reads this header, and
-// sending a bearer token alongside a certificate would put a second live
-// credential on the wire for no benefit. See WithClientCertificates.
+// It adds NOTHING while a certificate is actually being presented: the
+// credential travels in the handshake, an mtls-mode server never reads this
+// header, and sending a bearer token alongside a certificate would put a second
+// live credential on the wire for no benefit.
+//
+// The gate is on the certificate being HELD, not on the provider being wired.
+// An adaptive client wires the provider always and lets the server decide the
+// mode (see WithClientCertificates); gating on the wiring would mean a
+// token-mode server never receives the token that authenticates the request,
+// which is not "mutually exclusive credentials" but simply a broken client.
 func (c *HostClient) setAuth(req *http.Request) {
-	if c.certAuth {
+	if c.presentingCertificate() {
 		return
 	}
 	tok := c.token
@@ -423,6 +462,12 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// A rejected CLIENT CERTIFICATE arrives here, not as a status: the server
+		// refuses it in (TLS 1.2) or just after (TLS 1.3) the handshake, so there
+		// is no response to read a 401 off. Invalidating on that error is what
+		// makes the backoff-reconnect re-enroll instead of replaying the
+		// credential the server just refused, forever.
+		c.invalidateOnAuthFailure(0, err)
 		return fmt.Errorf("connecting: %w", err)
 	}
 	defer resp.Body.Close()
@@ -432,10 +477,11 @@ func (c *HostClient) streamMessages(ctx context.Context, namespace string, ch ch
 		if resp.StatusCode == http.StatusConflict {
 			return fmt.Errorf("%w: %s", errSubscribeConflict, strings.TrimSpace(string(body)))
 		}
-		if resp.StatusCode == http.StatusUnauthorized && c.tokenProvider != nil {
-			// Token rejected — re-mint so the backoff-reconnect authenticates fresh.
-			c.tokenProvider.Invalidate()
-		}
+		// Credential rejected — re-mint so the backoff-reconnect authenticates
+		// fresh. In token mode that is the classic expired-token 401; in mtls it
+		// is the per-request re-validation of a certificate that has expired or
+		// whose identity has been de-allowlisted since the handshake.
+		c.invalidateOnAuthFailure(resp.StatusCode, nil)
 		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -505,14 +551,19 @@ func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelop
 	}
 
 	resp, err := send()
+	// A credential can be refused mid-session — a token that expired, or a
+	// certificate that expired / was revoked / lost its allowlist entry. Re-mint
+	// once via the provider and retry a single time (mirrors the CLI client).
+	// The certificate case has no response at all to carry a 401, so the
+	// transport error is classified too.
+	if err != nil && c.invalidateOnAuthFailure(0, err) {
+		resp, err = send()
+	}
 	if err != nil {
 		return fmt.Errorf("sending response: %w", err)
 	}
-	// A credentials token can expire mid-session: on 401 re-mint once via the
-	// provider and retry the response a single time (mirrors the CLI client).
-	if resp.StatusCode == http.StatusUnauthorized && c.tokenProvider != nil {
+	if resp.StatusCode == http.StatusUnauthorized && c.invalidateOnAuthFailure(resp.StatusCode, nil) {
 		_ = resp.Body.Close()
-		c.tokenProvider.Invalidate()
 		resp, err = send()
 		if err != nil {
 			return fmt.Errorf("sending response: %w", err)

@@ -41,6 +41,35 @@ pub fn socket_dir() -> PathBuf {
     user_home_dir().join(".local").join("share").join("shed")
 }
 
+/// `state_dir` returns the directory holding the agent's own PERSISTENT state — today
+/// just its client-credential store ([`crate::credstore`]).
+///
+/// It is resolved SEPARATELY from [`socket_dir`], and differs from it on Linux on
+/// purpose. `socket_dir` prefers `$XDG_RUNTIME_DIR`, which is the correct home for a
+/// socket (per-boot, tmpfs, cleaned on logout) and exactly the wrong home for a private
+/// key: the agent would silently re-enroll over SSH on every reboot, and "it worked
+/// yesterday" would depend on whether the tmpfs had been cleared. State goes to the
+/// durable per-user data dir instead.
+///
+/// Order: the `SHED_HOST_AGENT_STATE_DIR` override, else macOS
+/// `~/Library/Application Support/shed`, else `$XDG_DATA_HOME/shed`, else
+/// `~/.local/share/shed`. Mirror of the Go daemon's `sockets.go:stateDir`.
+pub fn state_dir() -> PathBuf {
+    if let Some(d) = env_nonempty("SHED_HOST_AGENT_STATE_DIR") {
+        return PathBuf::from(d);
+    }
+    if cfg!(target_os = "macos") {
+        return user_home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join("shed");
+    }
+    if let Some(d) = env_nonempty("XDG_DATA_HOME") {
+        return PathBuf::from(d).join("shed");
+    }
+    user_home_dir().join(".local").join("share").join("shed")
+}
+
 /// `desktop_socket_path` is the stateful approval channel: a single consumer
 /// (normally the shed-desktop app) receiving the audit/event stream and deciding
 /// shed-desktop-policy approvals.
@@ -261,6 +290,41 @@ mod tests {
             PathBuf::from("/custom/shed/dir/host-agent-status.sock")
         );
         std::env::remove_var("SHED_HOST_AGENT_SOCKET_DIR");
+    }
+
+    #[test]
+    fn state_dir_honors_env_override() {
+        let _guard = crate::env_lock();
+        std::env::set_var("SHED_HOST_AGENT_STATE_DIR", "/custom/shed/state");
+        assert_eq!(state_dir(), PathBuf::from("/custom/shed/state"));
+        std::env::remove_var("SHED_HOST_AGENT_STATE_DIR");
+    }
+
+    /// The load-bearing divergence from [`socket_dir`]: `$XDG_RUNTIME_DIR` is a tmpfs and
+    /// must never hold a persisted private key, so it steers the socket dir and NOT the
+    /// state dir.
+    #[test]
+    fn state_dir_never_follows_xdg_runtime_dir() {
+        let _guard = crate::env_lock();
+        std::env::remove_var("SHED_HOST_AGENT_STATE_DIR");
+        std::env::remove_var("SHED_HOST_AGENT_SOCKET_DIR");
+        std::env::remove_var("XDG_DATA_HOME");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+
+        let state = state_dir();
+        assert!(
+            !state.starts_with("/run/user/1000"),
+            "state dir must not live on the runtime tmpfs: {}",
+            state.display()
+        );
+        if cfg!(target_os = "macos") {
+            assert!(state.ends_with("Library/Application Support/shed"));
+        } else {
+            assert!(state.ends_with(".local/share/shed"));
+            // ...whereas the SOCKET dir does follow it.
+            assert_eq!(socket_dir(), PathBuf::from("/run/user/1000/shed"));
+        }
+        std::env::remove_var("XDG_RUNTIME_DIR");
     }
 
     // An AF_UNIX bind path caps at ~104 bytes (macOS) / ~108 (Linux); pytest's

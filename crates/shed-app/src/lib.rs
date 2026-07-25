@@ -27,11 +27,11 @@ pub use broker_bridge::{
     detect_mode, load_or_synthesize, probe_sockets, probe_sockets_at, resolve_mode, BrokerConfig,
     BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
 };
-#[cfg(feature = "rc")]
-pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
 pub use host_agent::{HelloClientInfo, HostAgentClient, HostAgentClientError, HostAgentEvent};
+#[cfg(feature = "rc")]
+pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
 pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
 pub use token_minter::HostAgentTokenMinter;
 pub use traits::{

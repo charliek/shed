@@ -47,7 +47,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use shed_core::sse::SseParser;
-use shed_core::tls::pinned_client_config;
+use shed_core::tls::{
+    pinned_client_config, pinned_client_config_with_client_auth, ClientCertResolver,
+};
 
 use crate::approval::ApprovalGate;
 use crate::audit::{AuditEntry, AuditSink};
@@ -428,12 +430,16 @@ impl BusClient {
     /// set, supplies a refreshing token and is the only path that 401-retries.
     /// `pin` (`sha256:<hex>`) installs the leaf-cert pin verifier on an https URL;
     /// a pin on a non-https URL is refused (fail-closed, mirroring
-    /// `hostclient.go:applyTLSPin`).
+    /// `hostclient.go:applyTLSPin`). `client_certs`, when set, installs the credential
+    /// source's client-certificate resolver so an `auth.mode: mtls` server is
+    /// authenticated by the CERTIFICATE rather than a bearer header — see
+    /// [`build_http_client`] for why it is optional rather than always-on.
     pub fn new(
         server_url: impl Into<String>,
         static_token: String,
         token_provider: Option<Arc<dyn TokenProvider>>,
         pin: Option<String>,
+        client_certs: Option<Arc<ClientCertResolver>>,
         log: Arc<dyn BusLog>,
     ) -> Result<Self, BusError> {
         let server_url = server_url.into().trim_end_matches('/').to_string();
@@ -443,7 +449,7 @@ impl BusClient {
                 "TLS pin configured for a non-https URL {server_url}; refusing to send unpinned plaintext"
             )));
         }
-        let http = build_http_client(pin.as_deref())?;
+        let http = build_http_client(pin.as_deref(), client_certs)?;
         Ok(Self {
             server_url,
             http,
@@ -822,7 +828,22 @@ async fn read_error_body(mut resp: reqwest::Response, shutdown: &watch::Receiver
 /// pinned session + shed-core's `build_http_client`); with a `pin` it installs the
 /// leaf-cert verifier. No global timeout — the SSE subscribe holds a long-lived
 /// connection, and shutdown/`ctx` cancellation bound it instead.
-fn build_http_client(pin: Option<&str>) -> Result<reqwest::Client, BusError> {
+/// A `client_certs` resolver, when the caller has a credential source that can produce a
+/// client identity, installs the ADAPTIVE-TRANSPORT seam (plan 001 D5): the resolver hands
+/// back the source's current certificate in mtls state and `None` in token state, both
+/// read at HANDSHAKE time. The client is therefore built exactly once — a rotation, and
+/// even a server-side token↔mtls flip, is a write into shared state rather than a rebuilt
+/// `reqwest::Client` and a churned connection pool.
+///
+/// A caller with no source at all (an open server, or a static configured token) passes
+/// `None` and gets the historical no-client-auth config. That is not just a shortcut: the
+/// client-auth path also DISABLES TLS session resumption (see `shed_core::tls`, where the
+/// reason is recorded), and there is no point paying that extra round trip on a transport
+/// that could never present a certificate.
+fn build_http_client(
+    pin: Option<&str>,
+    client_certs: Option<Arc<ClientCertResolver>>,
+) -> Result<reqwest::Client, BusError> {
     let mut builder =
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.url().scheme() == "https" {
@@ -832,7 +853,11 @@ fn build_http_client(pin: Option<&str>) -> Result<reqwest::Client, BusError> {
             }
         }));
     if let Some(pin) = pin {
-        let cfg = pinned_client_config(pin).map_err(|e| BusError::Config(e.to_string()))?;
+        let cfg = match client_certs {
+            Some(resolver) => pinned_client_config_with_client_auth(pin, resolver),
+            None => pinned_client_config(pin),
+        }
+        .map_err(|e| BusError::Config(e.to_string()))?;
         builder = builder.use_preconfigured_tls(cfg);
     }
     builder
@@ -970,6 +995,10 @@ pub fn spawn_server_group(
     // (https + ssh endpoint + minter) authenticates with a self-minted, auto-refreshing
     // credentials-scope token bridged onto the bus `TokenProvider`; an OPEN server
     // sends its (usually empty) static token.
+    // The bus credential source doubles as this group's client-IDENTITY source: in mtls
+    // mode it holds the certificate, and `cert_resolver()` is the handle the transport
+    // reads at handshake time. An open/static-token server has neither, so both stay None
+    // and the transport is byte-identical to what it was before mtls existed.
     let secure = crate::supervisor::should_mint(deps, target);
     let mut refresh_source: Option<Arc<crate::minter::CredentialSource>> = None;
     let provider: Arc<dyn TokenProvider> = if secure {
@@ -990,11 +1019,13 @@ pub fn spawn_server_group(
         Arc::new(StaticTokenProvider::new(target.token.clone())) as Arc<dyn TokenProvider>
     };
 
+    let bus_certs = refresh_source.as_ref().map(|s| s.cert_resolver());
     let client = match BusClient::new(
         target.url.clone(),
         String::new(),
         Some(provider),
         pin,
+        bus_certs,
         log.clone(),
     ) {
         Ok(c) => c,
@@ -1074,6 +1105,10 @@ pub fn spawn_server_group(
     // A SECURE server gets its OWN control-scope source (the bus token is credentials-scope;
     // the egress route is control-scoped) — NOT refresh-looped (bus-only). An OPEN server
     // passes `None` and sends the static config token.
+    // In mtls mode that own source is also the egress transport's own IDENTITY: one
+    // certificate carries one scope, so the control-scoped stream must present the
+    // control-scoped certificate, not the bus's credentials-scoped one.
+    let mut egress_certs: Option<Arc<ClientCertResolver>> = None;
     let egress_tokens: Option<Arc<dyn crate::egress::EgressTokenSource>> = if secure {
         let minter = deps
             .minter
@@ -1084,6 +1119,7 @@ pub fn spawn_server_group(
             target.clone(),
             crate::minter::SCOPE_CONTROL,
         );
+        egress_certs = Some(control.cert_resolver());
         Some(Arc::new(control) as Arc<dyn crate::egress::EgressTokenSource>)
     } else {
         None
@@ -1093,7 +1129,10 @@ pub fn spawn_server_group(
         target.url.clone(),
         target.token.clone(),
         &target.tls_fingerprint,
-        egress_tokens,
+        crate::egress::EgressCredentials {
+            tokens: egress_tokens,
+            client_certs: egress_certs,
+        },
         deps.audit.clone(),
         log.clone(),
     );
@@ -2231,6 +2270,7 @@ mod tests {
             String::new(),
             None,
             None,
+            None,
             silent_log(),
         )
         .unwrap()
@@ -2526,6 +2566,7 @@ mod tests {
             String::new(),
             None,
             Some("sha256:aa".into()),
+            None,
             silent_log(),
         );
         assert!(matches!(r, Err(BusError::Config(_))));
@@ -2538,6 +2579,7 @@ mod tests {
             String::new(),
             None,
             Some("sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into()),
+            None,
             silent_log(),
         );
         assert!(
@@ -2555,9 +2597,105 @@ mod tests {
             String::new(),
             None,
             Some(String::new()),
+            None,
             silent_log(),
         );
         assert!(r.is_ok());
+    }
+
+    /// The client-auth seam is installed when — and only when — a credential source
+    /// supplies a resolver, and the resulting rustls config presents whatever that
+    /// resolver currently holds. Disabling session resumption on that path is asserted
+    /// too: a resumed TLS 1.3 handshake sends NO Certificate message, so the server would
+    /// carry a rotated-away identity forward (`shed_core::tls` records the finding).
+    #[test]
+    fn client_auth_is_installed_only_with_a_resolver() {
+        use shed_core::tls::{
+            pinned_client_config, pinned_client_config_with_client_auth, ClientCertResolver,
+        };
+        const PIN: &str = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+        // No resolver → no client certificate can ever be presented.
+        let plain = pinned_client_config(PIN).unwrap();
+        assert!(plain.client_auth_cert_resolver.resolve(&[], &[]).is_none());
+
+        // With a resolver → the config reads THROUGH it, live, at handshake time.
+        let resolver = Arc::new(ClientCertResolver::new());
+        let cfg = pinned_client_config_with_client_auth(PIN, resolver.clone()).unwrap();
+        assert!(
+            cfg.client_auth_cert_resolver.resolve(&[], &[]).is_none(),
+            "token state presents nothing"
+        );
+
+        // Arming the source's resolver changes what the ALREADY-BUILT config presents —
+        // no rebuild, which is the entire adaptive-transport claim.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "SHA256:agent");
+        let leaf = params.self_signed(&key).unwrap();
+        let certified = shed_core::tls::certified_key_from_pem(
+            &shed_core::csr::pem_encode(shed_core::csr::PEM_LABEL_CERTIFICATE, leaf.der()),
+            &key.serialize_der(),
+        )
+        .unwrap();
+        resolver.set(Some(Arc::new(certified)));
+        assert!(
+            cfg.client_auth_cert_resolver.resolve(&[], &[]).is_some(),
+            "mtls state presents the current certificate"
+        );
+        // Resumption is off on the client-auth path (rustls exposes no predicate for it,
+        // so the store's Debug rendering is the observable): a resumed TLS 1.3 handshake
+        // sends no Certificate message, and the server would carry a rotated-away identity
+        // forward — `shed_core::tls` records the finding.
+        assert!(
+            format!("{:?}", cfg.resumption).contains("NoClientSessionStorage"),
+            "resumption must stay off on the client-auth path: {:?}",
+            cfg.resumption
+        );
+
+        // Both shapes build a usable BusClient over https.
+        for certs in [None, Some(resolver)] {
+            let r = BusClient::new(
+                "https://mini2:8443".to_string(),
+                String::new(),
+                None,
+                Some(PIN.into()),
+                certs,
+                silent_log(),
+            );
+            assert!(r.is_ok());
+        }
+    }
+
+    /// In mtls state the credential source resolves to an EMPTY bearer, so the bus sends
+    /// no `Authorization` header at all — the certificate is the credential (plan 001 D2:
+    /// the middleware ignores the header, so sending one is pure downside).
+    #[tokio::test]
+    async fn no_bearer_header_is_sent_in_mtls_state() {
+        struct MtlsProvider;
+        #[async_trait::async_trait]
+        impl TokenProvider for MtlsProvider {
+            async fn token(&self) -> Result<String, BusError> {
+                Ok(String::new()) // what CredentialSource::token yields in mtls state
+            }
+            fn invalidate(&self) {}
+        }
+        let client = BusClient::new(
+            "https://x:8443".to_string(),
+            "a-static-token-that-must-not-leak".to_string(),
+            Some(Arc::new(MtlsProvider)),
+            None,
+            None,
+            silent_log(),
+        )
+        .unwrap();
+        assert_eq!(
+            client.bearer().await,
+            None,
+            "an mtls credential must not send a bearer, nor fall back to the static token"
+        );
     }
 
     // ---- Backoff logic (pure) ----
@@ -2668,6 +2806,7 @@ mod tests {
             String::new(),
             Some(tp.clone()),
             None,
+            None,
             silent_log(),
         )
         .unwrap();
@@ -2691,6 +2830,7 @@ mod tests {
             server.base_url(),
             String::new(),
             Some(tp.clone()),
+            None,
             None,
             silent_log(),
         )
@@ -2862,6 +3002,7 @@ mod tests {
             String::new(),
             Some(tp.clone()),
             None,
+            None,
             silent_log(),
         )
         .unwrap()
@@ -2890,9 +3031,16 @@ mod tests {
             })
             .await;
         let log = Arc::new(CountingLog::default());
-        let client = BusClient::new(server.base_url(), String::new(), None, None, log.clone())
-            .unwrap()
-            .with_test_backoff(Duration::from_millis(5), Duration::from_millis(10));
+        let client = BusClient::new(
+            server.base_url(),
+            String::new(),
+            None,
+            None,
+            None,
+            log.clone(),
+        )
+        .unwrap()
+        .with_test_backoff(Duration::from_millis(5), Duration::from_millis(10));
         let (tx, rx) = shutdown_pair();
         let sub = client.subscribe("ssh-agent", rx);
         // Poll (bounded) until the quiet DEBUG tier has engaged — ≥1 DEBUG retry
@@ -3480,6 +3628,7 @@ mod tests {
             String::new(),
             Some(Arc::new(StaticTokenProvider::new(""))),
             None,
+            None,
             silent_log(),
         )
         .unwrap();
@@ -3489,6 +3638,7 @@ mod tests {
             "http://x".to_string(),
             String::new(),
             Some(Arc::new(StaticTokenProvider::new("shed_creds_abc"))),
+            None,
             None,
             silent_log(),
         )

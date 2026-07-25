@@ -74,14 +74,21 @@ func TestClientCertificatesSuppressTheBearerToken(t *testing.T) {
 		}
 	})
 
-	// The fix: once the certificate provider is wired, no header at all.
-	certs := ClientCertFunc(func() *tls.Certificate { return nil })
-	t.Run("a static token is suppressed by a client-cert provider", func(t *testing.T) {
+	// Suppression is keyed on the provider actually HOLDING a certificate, not on
+	// it being wired. An adaptive client wires the provider unconditionally so a
+	// server flipping between token and mtls needs no new transport; gating on
+	// the wiring would mean such a client never authenticates against a
+	// token-mode server at all.
+	held := selfSignedClientCert(t)
+	certs := ClientCertFunc(func() *tls.Certificate { return held })
+	empty := ClientCertFunc(func() *tls.Certificate { return nil })
+
+	t.Run("a static token is suppressed while a certificate is held", func(t *testing.T) {
 		if got := probe(t, WithToken("shed_creds_abc"), WithClientCertificates(certs)); got != "" {
 			t.Errorf("Authorization = %q, want none: the certificate is the credential", got)
 		}
 	})
-	t.Run("a token provider is suppressed by a client-cert provider", func(t *testing.T) {
+	t.Run("a token provider is suppressed while a certificate is held", func(t *testing.T) {
 		if got := probe(t, WithTokenProvider(staticTokenProvider{"shed_creds_xyz"}), WithClientCertificates(certs)); got != "" {
 			t.Errorf("Authorization = %q, want none: the certificate is the credential", got)
 		}
@@ -90,6 +97,50 @@ func TestClientCertificatesSuppressTheBearerToken(t *testing.T) {
 	t.Run("option order does not matter", func(t *testing.T) {
 		if got := probe(t, WithClientCertificates(certs), WithToken("shed_creds_abc")); got != "" {
 			t.Errorf("Authorization = %q, want none", got)
+		}
+	})
+
+	// The token half of the same knob: an empty provider is a client in TOKEN
+	// state, and its token must travel. This is the assertion that makes one
+	// HostClient usable against a server in either mode.
+	t.Run("a static token is sent while the provider holds nothing", func(t *testing.T) {
+		if got := probe(t, WithToken("shed_creds_abc"), WithClientCertificates(empty)); got != "Bearer shed_creds_abc" {
+			t.Errorf("Authorization = %q, want the token: an empty provider is token state, not mtls", got)
+		}
+	})
+	t.Run("a token provider is sent while the cert provider holds nothing", func(t *testing.T) {
+		if got := probe(t, WithTokenProvider(staticTokenProvider{"shed_creds_xyz"}), WithClientCertificates(empty)); got != "Bearer shed_creds_xyz" {
+			t.Errorf("Authorization = %q, want the provider's token", got)
+		}
+	})
+
+	// A live flip, on ONE client: the same instance stops sending the token the
+	// moment the provider starts holding a certificate, and resumes when it stops
+	// — with no rebuild of the client or its transport.
+	t.Run("a mode flip changes the header on a live client", func(t *testing.T) {
+		var current atomic.Pointer[tls.Certificate]
+		flipping := ClientCertFunc(func() *tls.Certificate { return current.Load() })
+		c := NewHostClient(
+			WithServerURL(srv.URL), WithTLSPin(pin),
+			WithToken("shed_creds_abc"), WithClientCertificates(flipping),
+		)
+		send := func() string {
+			sawAuth.Store("")
+			if err := c.Respond(context.Background(), "ns", &Envelope{}); err != nil {
+				t.Fatalf("Respond: %v", err)
+			}
+			return sawAuth.Load().(string)
+		}
+		if got := send(); got != "Bearer shed_creds_abc" {
+			t.Fatalf("token state: Authorization = %q, want the token", got)
+		}
+		current.Store(held)
+		if got := send(); got != "" {
+			t.Fatalf("mtls state: Authorization = %q, want none", got)
+		}
+		current.Store(nil)
+		if got := send(); got != "Bearer shed_creds_abc" {
+			t.Fatalf("back to token state: Authorization = %q, want the token", got)
 		}
 	})
 }

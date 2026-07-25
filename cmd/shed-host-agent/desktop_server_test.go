@@ -401,7 +401,7 @@ func TestDesktopDecisionDetailAudited(t *testing.T) {
 func TestDesktopTokenGet(t *testing.T) {
 	cfg := writeShedConfig(t, "\nservers:\n  prod:\n    api_url: https://prod.example:8443\n    host: prod.example\n    ssh_port: 2222\n")
 	far := time.Now().Add(24 * time.Hour)
-	fm := &fakeMinter{results: []mintResult{{tok: "ctl-xyz", exp: far}}}
+	fm := &fakeMinter{results: []mintResult{tokenMint("ctl-xyz", far)}}
 
 	sock := shortSocketPath(t)
 	audit := NewAuditLogger(LogConfig{Enabled: false}, testLogger())

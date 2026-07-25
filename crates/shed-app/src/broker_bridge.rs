@@ -33,7 +33,9 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use shed_core::approval::protocol::{AuditEventFrame, HostAgentInbound};
-use shed_core::approval::{ApprovalDecision, ApprovalRequest, DecidedBy, HelloAck};
+use shed_core::approval::{
+    ApprovalDecision, ApprovalRequest, DecidedBy, HelloAck, CAP_CREDENTIAL_GET,
+};
 use shed_core::http::ShedError;
 use shed_core::token::{MintedToken, TokenMinter};
 
@@ -150,9 +152,9 @@ impl BrokerConfig {
 pub fn load_or_synthesize(config_path: &str) -> Result<BrokerConfig, BrokerError> {
     match HostAgentConfig::load(config_path) {
         Ok(cfg) => Ok(BrokerConfig::Loaded(cfg)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Ok(BrokerConfig::Synthesized(synthesize_default(DEFAULT_DISCOVERY_SOURCE)))
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BrokerConfig::Synthesized(
+            synthesize_default(DEFAULT_DISCOVERY_SOURCE),
+        )),
         Err(e) => Err(BrokerError::Config(e.to_string())),
     }
 }
@@ -506,7 +508,9 @@ impl AuditFanout for ActivityFanout {
         let frame = audit_entry_to_event_frame(entry);
         let _ = self
             .event_tx
-            .send(HostAgentEvent::Frame(Box::new(HostAgentInbound::Event(frame))));
+            .send(HostAgentEvent::Frame(Box::new(HostAgentInbound::Event(
+                frame,
+            ))));
     }
 }
 
@@ -745,11 +749,12 @@ impl EmbeddedHostAgent {
         // error mapping is unchanged (`BrokerError::SshBackend`); a join failure (the
         // resolve thread panicked) is likewise a fail-closed `SshBackend`.
         let ssh_mode = cfg.ssh_mode().to_string();
-        let (ssh_backend, ssh_warnings) =
-            tokio::task::spawn_blocking(move || ssh_backend::resolve_ssh_backend_from_env(&ssh_mode))
-                .await
-                .map_err(|e| BrokerError::SshBackend(format!("ssh backend resolve task failed: {e}")))?
-                .map_err(BrokerError::SshBackend)?;
+        let (ssh_backend, ssh_warnings) = tokio::task::spawn_blocking(move || {
+            ssh_backend::resolve_ssh_backend_from_env(&ssh_mode)
+        })
+        .await
+        .map_err(|e| BrokerError::SshBackend(format!("ssh backend resolve task failed: {e}")))?
+        .map_err(BrokerError::SshBackend)?;
         for w in &ssh_warnings {
             bus_log.warn(w);
         }
@@ -863,6 +868,11 @@ impl EmbeddedHostAgent {
                 NS_EGRESS.to_string(),
             ],
             gate_namespaces: cfg.gate_namespaces(),
+            // The EMBEDDED broker is the same build as the app, so there is no
+            // version skew to describe here — but the synthesized ack must still
+            // advertise what the app can rely on, or capability-gated paths would
+            // work in external mode and silently refuse in embedded mode.
+            agent_capabilities: vec![CAP_CREDENTIAL_GET.to_string()],
             request_timeout_ms: cfg.approval_timeout().as_millis() as i64,
             accepted: true,
         };
@@ -968,7 +978,13 @@ mod tests {
     // ---- the approval round-trip (AppGate ↔ Responder ↔ oneshot) ---------------------
 
     /// Build just the approval-channel seams (no bus) for the round-trip + timeout tests.
-    fn channel_only(timeout: Duration) -> (Arc<BridgeInner>, ResponderRef, mpsc::UnboundedReceiver<HostAgentEvent>) {
+    fn channel_only(
+        timeout: Duration,
+    ) -> (
+        Arc<BridgeInner>,
+        ResponderRef,
+        mpsc::UnboundedReceiver<HostAgentEvent>,
+    ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (respond_tx, respond_rx) = mpsc::channel(RESPOND_QUEUE_CAP);
         let inner = Arc::new(BridgeInner {
@@ -991,8 +1007,10 @@ mod tests {
         let gate = AppGate { inner };
 
         // The gate fires; a fake Coordinator side reads the request and responds approve.
-        let gate_fut =
-            tokio::spawn(async move { gate.approve("ssh-agent", "sign", "mini2", "web", "SSH sign request").await });
+        let gate_fut = tokio::spawn(async move {
+            gate.approve("ssh-agent", "sign", "mini2", "web", "SSH sign request")
+                .await
+        });
 
         let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -1044,8 +1062,10 @@ mod tests {
         let gate = AppGate {
             inner: inner.clone(),
         };
-        let gate_fut =
-            tokio::spawn(async move { gate.approve("ssh-agent", "sign", "", "web", "SSH sign request").await });
+        let gate_fut = tokio::spawn(async move {
+            gate.approve("ssh-agent", "sign", "", "web", "SSH sign request")
+                .await
+        });
 
         let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -1071,7 +1091,13 @@ mod tests {
         // The pending was dropped on timeout, so a late user decision is a no-op (no
         // pending oneshot to resolve, no panic) — the corpse-safety the dismiss provides.
         assert!(inner.pending.lock().unwrap().is_empty());
-        responder.respond(&req.id, ApprovalDecision::Approve, DecidedBy::User, None, None);
+        responder.respond(
+            &req.id,
+            ApprovalDecision::Approve,
+            DecidedBy::User,
+            None,
+            None,
+        );
         // Give the consumer a tick; nothing should blow up and pending stays empty.
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(inner.pending.lock().unwrap().is_empty());
@@ -1110,11 +1136,8 @@ mod tests {
         assert_eq!(f.ts.as_deref(), Some("2026-07-15T00:00:00Z"));
 
         // The app maps it into a stored entry (host-agent source), stamping its own id.
-        let stored = shed_core::approval::AuditEntry::from_event_frame(
-            f,
-            "gen-id".into(),
-            "gen-ts".into(),
-        );
+        let stored =
+            shed_core::approval::AuditEntry::from_event_frame(f, "gen-id".into(), "gen-ts".into());
         assert_eq!(stored.id, "gen-id"); // no request_id → fallback
         assert_eq!(stored.ts, "2026-07-15T00:00:00Z");
         assert_eq!(stored.approval.as_deref(), Some("shed-desktop"));
@@ -1224,6 +1247,8 @@ mod tests {
             tls_fingerprint: String::new(),
             ssh_host: String::new(),
             ssh_port: 0,
+            // No recorded credential shape: an open http target never enrolled.
+            auth_mode: String::new(),
         };
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let group = bus::spawn_server_group(shutdown_rx, &target, &deps);
@@ -1323,7 +1348,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(ev, HostAgentEvent::Connected(_)), "first spawn Connected");
+        assert!(
+            matches!(ev, HostAgentEvent::Connected(_)),
+            "first spawn Connected"
+        );
         let sup_after_first = agent.supervisor.lock().unwrap().clone();
         assert!(sup_after_first.is_some(), "first spawn built a supervisor");
 
@@ -1451,7 +1479,10 @@ mod tests {
             other => panic!("expected Synthesized, got {other:?}"),
         };
         // discovery-mode select-all over ~/.shed/config.yaml.
-        assert!(cfg.discovery.is_some(), "synthesized default is discovery-mode");
+        assert!(
+            cfg.discovery.is_some(),
+            "synthesized default is discovery-mode"
+        );
         // ssh policy routes to the app gate; gate_namespaces is EXACTLY [ssh-agent]
         // (aws/docker default deny-all, not shed-desktop → not gated).
         assert_eq!(cfg.effective_policy(NS_SSH_AGENT), "shed-desktop");
@@ -1553,14 +1584,18 @@ mod tests {
             EffectiveMode::External
         );
         // The evidence is retained regardless of the pref.
-        assert_eq!(resolve_mode(ModePref::External, desktop_live).probe, desktop_live);
+        assert_eq!(
+            resolve_mode(ModePref::External, desktop_live).probe,
+            desktop_live
+        );
     }
 
     /// Serialize the env-mutating socket-dir probe tests (Rust runs tests in-process +
     /// parallel; `set_var`/`remove_var` on `SHED_HOST_AGENT_SOCKET_DIR` would race).
     fn socket_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]
@@ -1587,7 +1622,10 @@ mod tests {
         assert!(p.desktop_socket_live && p.status_socket_live);
         assert_eq!(detect_mode(p), DetectedMode::External);
         // A pref override still pins.
-        assert_eq!(resolve_mode(ModePref::Embedded, p).mode, EffectiveMode::Embedded);
+        assert_eq!(
+            resolve_mode(ModePref::Embedded, p).mode,
+            EffectiveMode::Embedded
+        );
 
         drop(status);
         drop(desktop);
@@ -1607,7 +1645,10 @@ mod tests {
         let desktop = dir.path().join("host-agent.sock");
 
         // Neither bound → Embedded.
-        assert_eq!(detect_mode(probe_sockets_at(&desktop)), DetectedMode::Embedded);
+        assert_eq!(
+            detect_mode(probe_sockets_at(&desktop)),
+            DetectedMode::Embedded
+        );
 
         // Only the sibling status socket live → HeadlessCoexist.
         let status = UnixListener::bind(dir.path().join(STATUS_SOCKET_FILE)).unwrap();

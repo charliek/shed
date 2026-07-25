@@ -56,6 +56,12 @@ notify = "8"
 # unifies one reqwest/rustls build across the workspace.
 reqwest = { workspace = true }
 futures-util = { workspace = true }
+# Named directly (rather than reached through shed-core) for the two client-identity types
+# the credential source owns: `rustls::sign::CertifiedKey` (the assembled leaf+key it arms)
+# and, via shed-core, the `ClientCertResolver` it writes through on every rotation. Same
+# version + ring provider as the workspace pin, so cargo unifies ONE rustls build across
+# reqwest/shed-core/this crate — no new node in the graph.
+rustls = { workspace = true }
 # The ssh-agent `sign` backend (surface B, always-on — the bus is not gated).
 # ed25519-dalek does RFC-8032 *deterministic* ed25519 signing, byte-identical to
 # Go's `x/crypto/ssh` ed25519 signer (same key + data → same 64-byte blob), so the
@@ -152,3 +158,10 @@ tempfile = "3"
 # Hermetic mock shed-server for the bus unit tests (subscribe/respond/409/401),
 # mirroring shed-core's http.rs test rig.
 httpmock = { workspace = true }
+# Throwaway client certificates for the credential-store + credential-source tests
+# (credstore.rs, minter.rs): the persisted-credential paths have to be exercised against
+# REAL certificates, not hand-built byte strings, and the notAfter reader in particular
+# is only meaningful against genuine DER. Test-only — rcgen is already in the workspace
+# lock via shed-core's `csr` module, so this compiles nothing new, and resolver v2 keeps
+# it out of the shipped build.
+rcgen = { workspace = true }
