@@ -15,7 +15,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -181,9 +180,9 @@ func generate(certPath, keyPath string, dnsNames []string, ips []net.IP) (tls.Ce
 	if err != nil {
 		return tls.Certificate{}, nil, fmt.Errorf("generate key: %w", err)
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	serial, err := randomSerial()
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("generate serial: %w", err)
+		return tls.Certificate{}, nil, err
 	}
 	now := time.Now()
 	tmpl := &x509.Certificate{
@@ -214,17 +213,30 @@ func persist(certPath, keyPath string, der []byte, priv *ecdsa.PrivateKey) error
 			return fmt.Errorf("create cert dir: %w", err)
 		}
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+	if err := os.WriteFile(certPath, encodeCertPEM(der), 0644); err != nil {
 		return fmt.Errorf("write cert: %w", err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(priv)
+	keyPEM, err := encodeECKeyPEM(priv)
 	if err != nil {
-		return fmt.Errorf("marshal key: %w", err)
+		return err
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
 		return fmt.Errorf("write key: %w", err)
 	}
 	return nil
+}
+
+// encodeCertPEM wraps a DER certificate in a PEM CERTIFICATE block. Shared by
+// both the server leaf (above) and the internal CA (ca.go).
+func encodeCertPEM(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// encodeECKeyPEM marshals an EC private key to a SEC 1 PEM block.
+func encodeECKeyPEM(key *ecdsa.PrivateKey) ([]byte, error) {
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal EC private key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
 }
