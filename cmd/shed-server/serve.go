@@ -43,6 +43,11 @@ const (
 	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
 	// from the in-memory store (expired tokens are also dropped on validate).
 	tokenSweepInterval = 10 * time.Minute
+
+	// caExpiryWarnWindow is how much remaining client-CA lifetime triggers a
+	// startup warning. Rotation is a manual, fleet-wide re-enrollment, so the
+	// notice has to arrive long before issuance actually stops.
+	caExpiryWarnWindow = 90 * 24 * time.Hour
 )
 
 // newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
@@ -82,6 +87,15 @@ func tlsCertPaths(cfg *config.ServerConfig, stateDir string) (certPath, keyPath 
 	return certPath, keyPath
 }
 
+// caCertPaths returns the client-CA cert + key file paths, alongside the TLS
+// listener's own material in stateDir. It mirrors tlsCertPaths but takes no
+// config override: the CA is server-internal (it exists only to sign the client
+// certs this server then trusts), so there is no tls_cert_file-style knob for
+// pointing it elsewhere.
+func caCertPaths(stateDir string) (certPath, keyPath string) {
+	return filepath.Join(stateDir, "ca_cert.pem"), filepath.Join(stateDir, "ca_key.pem")
+}
+
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Run the shed server",
@@ -101,6 +115,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// everyone out). Runs before anything binds; inert in open mode.
 	if err := cfg.PreflightAuth(); err != nil {
 		return fmt.Errorf("auth preflight: %w", err)
+	}
+
+	// TEMPORARY — removed by the commit that wires ClientAuth on the HTTPS
+	// listener and the certificate-auth middleware. Certificate ENROLLMENT
+	// works from this commit on, but nothing verifies a presented certificate
+	// yet, so a server started in mtls mode would answer unauthenticated HTTPS
+	// requests. Refuse to start rather than leave a fail-open intermediate
+	// state reachable by anyone building from this commit.
+	if cfg.MTLSMode() {
+		return fmt.Errorf("auth.mode: mtls is not enforceable in this build " +
+			"(client-certificate verification is not wired yet); use auth.mode: token")
 	}
 
 	log.Printf("Starting shed-server...")
@@ -318,14 +343,46 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Wire the SSH bootstrap handler: it mints HTTP tokens into the shared
-	// store and returns them (with the TLS pin + ports) over the authenticated
-	// SSH channel, so `shed server add` needs no manual token/pin step.
-	sshServer.SetBootstrap(tokenStore, sshd.BootstrapInfo{
+	// Client CA (mtls mode only): the internal root that signs the short-lived
+	// client certificates issued over the SSH bootstrap channel. Loaded — never
+	// silently regenerated — from the state dir. The HTTPS listener's ClientCAs
+	// and the certificate-auth middleware are wired separately.
+	var clientCA *servertls.CA
+	if cfg.MTLSMode() {
+		caCertPath, caKeyPath := caCertPaths(filepath.Dir(hostKeyPath))
+		ca, err := servertls.LoadOrGenerateCA(caCertPath, caKeyPath)
+		if err != nil {
+			return fmt.Errorf("client CA: %w", err)
+		}
+		clientCA = &ca
+		notAfter := ca.NotAfter()
+		log.Printf("Client CA fingerprint: %s (expires %s)", ca.Fingerprint(), notAfter.UTC().Format(time.RFC3339))
+		// The CA is issued for a decade and is never rotated automatically —
+		// rotating it invalidates every client certificate fleet-wide, so the
+		// operator has to schedule it. Start saying so with a season's notice.
+		if remaining := time.Until(notAfter); remaining < caExpiryWarnWindow {
+			log.Printf("WARNING: client CA expires in %d days (%s) — rotate it (delete %s and %s, then re-enroll every client) before issuance stops.",
+				int(remaining.Hours()/24), notAfter.UTC().Format(time.RFC3339), caCertPath, caKeyPath)
+		}
+	}
+
+	// Wire the SSH bootstrap handler: it issues an HTTP credential over the
+	// authenticated SSH channel and returns it (with the TLS pin + ports), so
+	// `shed server add` needs no manual token/pin step. In token mode that is a
+	// bearer token minted into the shared store; in mtls mode it is a client
+	// certificate signed by clientCA, and the token store is deliberately NOT
+	// handed over — that path must never mint a bearer token.
+	bootstrapTokens := tokenStore
+	if cfg.MTLSMode() {
+		bootstrapTokens = nil
+	}
+	sshServer.SetBootstrap(bootstrapTokens, sshd.BootstrapInfo{
 		HTTPPort:       cfg.HTTPPort,
 		HTTPSPort:      cfg.HTTPSPort,
 		TLSFingerprint: tlsFingerprint,
 		TokenTTL:       cfg.TokenTTL(),
+		AuthMode:       cfg.AuthModeValue(),
+		CA:             clientCA,
 	})
 
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH).
