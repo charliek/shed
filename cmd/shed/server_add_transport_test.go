@@ -12,7 +12,10 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// infoHandler serves a minimal /api/info, the only endpoint selectAddTransport hits.
+// infoHandler serves a minimal /api/info, the only endpoint selectAddTransport
+// hits. It reports auth.mode: open, because that is the only mode whose
+// /api/info an unenrolled client can read on this path — a token/mtls server
+// hands its credential out over SSH, and addOverHTTP refuses to add one.
 func infoHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/info" {
@@ -20,7 +23,7 @@ func infoHandler() http.Handler {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(config.ServerInfo{
-			Name: "test-server", HTTPPort: 8080, SSHPort: 2222, Backend: "vz", AuthMode: config.AuthModeToken,
+			Name: "test-server", HTTPPort: 8080, SSHPort: 2222, Backend: "vz", AuthMode: config.AuthModeOpen,
 		})
 	})
 }
@@ -57,16 +60,28 @@ func withCleanAddFlags(t *testing.T) {
 	oHTTPS, oSecure, oPort, oTOFU, oFP, oDefault, oJSON :=
 		serverAddHTTPSPort, serverAddSecure, serverAddPort, serverAddTrustTOFU,
 		serverAddTLSFingerprint, defaultAddHTTPSPort, jsonFlag
+	oSSHPort, oName, oHostFP, oURefetch, oUTOFU, oUFP :=
+		serverAddSSHPort, serverAddName, serverAddFingerprint,
+		serverUpdateRefetch, serverUpdateTrustTOFU, serverUpdateTLSFingerprint
 	serverAddHTTPSPort = 0
 	serverAddSecure = false
 	serverAddPort = 8080
 	serverAddTrustTOFU = false
 	serverAddTLSFingerprint = ""
 	jsonFlag = false
+	serverAddSSHPort = defaultAddSSHPort
+	serverAddName = ""
+	serverAddFingerprint = ""
+	serverUpdateRefetch = false
+	serverUpdateTrustTOFU = false
+	serverUpdateTLSFingerprint = ""
 	t.Cleanup(func() {
 		serverAddHTTPSPort, serverAddSecure, serverAddPort, serverAddTrustTOFU,
 			serverAddTLSFingerprint, defaultAddHTTPSPort, jsonFlag =
 			oHTTPS, oSecure, oPort, oTOFU, oFP, oDefault, oJSON
+		serverAddSSHPort, serverAddName, serverAddFingerprint,
+			serverUpdateRefetch, serverUpdateTrustTOFU, serverUpdateTLSFingerprint =
+			oSSHPort, oName, oHostFP, oURefetch, oUTOFU, oUFP
 	})
 }
 

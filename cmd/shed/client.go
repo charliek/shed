@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,8 +124,12 @@ func (c *APIClient) newHTTPClient(timeout time.Duration) *http.Client {
 
 // NewAPIClient creates a plain-HTTP API client for the given host and port
 // (the bootstrap path, before any TLS pin is known).
+//
+// host:port is joined with net.JoinHostPort, not printf: an IPv6 literal has to
+// be bracketed or the result is not a parseable URL, and this constructor is on
+// the open-mode add path where the host comes straight from the command line.
 func NewAPIClient(host string, port int, createTimeout time.Duration) *APIClient {
-	return newAPIClient(fmt.Sprintf("http://%s:%d", host, port), "", "", createTimeout)
+	return newAPIClient("http://"+net.JoinHostPort(host, strconv.Itoa(port)), "", "", createTimeout)
 }
 
 // newAPIClient is the shared constructor for a client with a STATIC credential:

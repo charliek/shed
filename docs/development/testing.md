@@ -133,7 +133,7 @@ The mechanism for closing this gap is a **parallel dev shed-server** that runs a
 # One-time setup per developer:
 #   Add a ~/.shed/config.yaml entry for the dev server (snippet at the
 #   end of this section), OR run `shed server add localhost --port 18080
-#   --name my-server-dev` after the first `make dev-server-up`.
+#   --ssh-port 12222 --name my-server-dev` after the first `make dev-server-up`.
 
 # Per dev cycle:
 make dev-server-up              # launches dev shed-server on 18080/12222
@@ -155,7 +155,7 @@ The dev server:
 
 ```sh
 # One-time setup per developer:
-#   shed server add mini3 --port 18080 --name mini3-dev  # after first dev-server-up-fc
+#   shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev  # after first dev-server-up-fc
 #   (or manually add the entry to ~/.shed/config.yaml)
 
 # Per dev cycle:

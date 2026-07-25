@@ -57,6 +57,17 @@ const (
 	// emits "%" only as the start of a two-hex-digit escape — "%l" is not one,
 	// so no server name, however chosen, can ever escape to "%lock".
 	credsLockDirName = "%lock"
+
+	// credsStagingDirName holds credential material that has been written but not
+	// yet adopted — see StageClientCredentials.
+	//
+	// It is a sibling of the per-server directories for the same two reasons as
+	// credsLockDirName: RemoveServerCredentials must not be able to delete it out
+	// from under a staging write, and a per-server directory stays exactly the two
+	// files it documents. The "%" prefix is collision-proof by the same argument
+	// (url.PathEscape only ever emits "%" as the start of a two-hex-digit escape,
+	// and "%s" is not one).
+	credsStagingDirName = "%staging"
 )
 
 // ErrCredentialPairMismatch reports a stored certificate and private key that
@@ -323,6 +334,142 @@ func WriteClientCredentials(name string, certPEM, keyPEM []byte) (certPath, keyP
 		return "", "", fmt.Errorf("write client certificate %s: %w", certPath, err)
 	}
 	return certPath, keyPath, nil
+}
+
+// CredsStagingRoot returns the directory holding not-yet-adopted credential
+// material (~/.shed/creds/%staging). Exported so a test can make a staging write
+// fail without reaching into this package's internals.
+func CredsStagingRoot() string {
+	return filepath.Join(GetCredsDir(), credsStagingDirName)
+}
+
+// StagedClientCredentials is a client certificate + key written to disk but not
+// yet adopted by the server it belongs to.
+//
+// It exists so that persisting an enrollment can be a TRANSACTION rather than a
+// sequence of independent mutations. `shed server add` and `shed server update
+// --refetch` both have to update two things — config.yaml and the credential
+// store — and the invariant that matters to the next command is that the config
+// on disk always names credential material that exists and matches the auth mode
+// recorded beside it. Staging is what lets the caller order the two writes so
+// that the DESTRUCTIVE half (overwriting or deleting material the config still
+// points at) only ever runs after the config save it belongs to has succeeded.
+//
+// The staged pair lives in its own directory under CredsStagingRoot, on the same
+// filesystem as its destination, so Commit is a pair of renames rather than a
+// copy that can half-fail.
+type StagedClientCredentials struct {
+	name              string
+	dir               string
+	stagedCert        string
+	stagedKey         string
+	certPath, keyPath string
+}
+
+// StageClientCredentials writes an issued certificate + key into the staging
+// area for the named server, WITHOUT touching whatever that server currently
+// has. This is where a full disk, a bad permission, or an unwritable creds root
+// surfaces — before the caller commits to anything.
+//
+// Call Commit to adopt the pair, or Discard to throw it away. Neither is
+// automatic: a staged pair that is never committed and never discarded is the
+// one residue this API can leave, and it is inert (a certificate for a server
+// the config does not reference).
+func StageClientCredentials(name string, certPEM, keyPEM []byte) (*StagedClientCredentials, error) {
+	if name == "" {
+		return nil, errors.New("client credentials: server name required")
+	}
+	if len(certPEM) == 0 || len(keyPEM) == 0 {
+		return nil, errors.New("client credentials: empty certificate or key")
+	}
+	if err := ensureCredsRoot(); err != nil {
+		return nil, err
+	}
+	root := CredsStagingRoot()
+	if err := os.MkdirAll(root, credsDirPerm); err != nil {
+		return nil, fmt.Errorf("create credentials staging dir %s: %w", root, err)
+	}
+	if err := os.Chmod(root, credsDirPerm); err != nil {
+		return nil, fmt.Errorf("tighten credentials staging dir %s: %w", root, err)
+	}
+	dir, err := os.MkdirTemp(root, escapeServerName(name)+".")
+	if err != nil {
+		return nil, fmt.Errorf("create credentials staging dir in %s: %w", root, err)
+	}
+	if err := os.Chmod(dir, credsDirPerm); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("tighten credentials staging dir %s: %w", dir, err)
+	}
+
+	s := &StagedClientCredentials{name: name, dir: dir}
+	s.stagedCert = filepath.Join(dir, clientCertFileName)
+	s.stagedKey = filepath.Join(dir, clientKeyFileName)
+	s.certPath, s.keyPath = ClientCredentialPaths(name)
+
+	if err := atomicWriteFile(s.stagedKey, keyPEM, credsFilePerm); err != nil {
+		s.Discard()
+		return nil, fmt.Errorf("stage client key: %w", err)
+	}
+	if err := atomicWriteFile(s.stagedCert, certPEM, credsFilePerm); err != nil {
+		s.Discard()
+		return nil, fmt.Errorf("stage client certificate: %w", err)
+	}
+	return s, nil
+}
+
+// Paths returns where this pair will live once committed — the ordinary
+// per-server credential paths. They are what the config entry must record: the
+// staging location is an implementation detail that no config ever names.
+func (s *StagedClientCredentials) Paths() (certPath, keyPath string) {
+	return s.certPath, s.keyPath
+}
+
+// Commit moves the staged pair into the server's credential directory, under
+// that server's exclusive lock (so a concurrent load never sees one file from
+// this pair and one from the pair it replaces).
+//
+// The key is renamed first, for the same reason WriteClientCredentials writes it
+// first: an interruption between the two renames leaves a key with no matching
+// certificate, which LoadClientCredentials reports as the recoverable
+// ErrCredentialPairMismatch and the caller answers with a fresh enrollment.
+func (s *StagedClientCredentials) Commit() error {
+	unlock, err := lockServerCreds(s.name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	dir := ServerCredsDir(s.name)
+	if err := os.MkdirAll(dir, credsDirPerm); err != nil {
+		return fmt.Errorf("create credentials dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, credsDirPerm); err != nil {
+		return fmt.Errorf("tighten credentials dir %s: %w", dir, err)
+	}
+	if err := os.Rename(s.stagedKey, s.keyPath); err != nil {
+		return fmt.Errorf("commit client key %s: %w", s.keyPath, err)
+	}
+	if err := os.Rename(s.stagedCert, s.certPath); err != nil {
+		return fmt.Errorf("commit client certificate %s: %w", s.certPath, err)
+	}
+	// Persist the renames. Best effort: some filesystems reject fsync on a
+	// directory handle, and the renames have already succeeded.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	s.Discard()
+	return nil
+}
+
+// Discard removes the staged material. It is safe to call twice, and safe to
+// call after Commit (which uses it to clean up the empty staging directory).
+func (s *StagedClientCredentials) Discard() {
+	if s == nil || s.dir == "" {
+		return
+	}
+	_ = os.RemoveAll(s.dir)
+	s.dir = ""
 }
 
 // RemoveServerCredentials deletes a server's credential directory. It is called

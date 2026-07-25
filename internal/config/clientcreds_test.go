@@ -127,6 +127,105 @@ func TestWriteClientCredentialsRotatesInPlace(t *testing.T) {
 	}
 }
 
+// TestStageClientCredentials covers the two-phase write `shed server add` and
+// `--refetch` use: staging must be able to fail without disturbing what the
+// server already has, and committing must land the pair exactly where
+// WriteClientCredentials would have put it.
+func TestStageClientCredentials(t *testing.T) {
+	t.Run("staging touches nothing until it is committed", func(t *testing.T) {
+		withHomeShed(t)
+		certPath, keyPath, err := WriteClientCredentials("s", []byte("CERT-OLD"), []byte("KEY-OLD"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		staged, err := StageClientCredentials("s", []byte("CERT-NEW"), []byte("KEY-NEW"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotCert, gotKey := staged.Paths()
+		if gotCert != certPath || gotKey != keyPath {
+			t.Errorf("Paths() = %s/%s, want the final %s/%s", gotCert, gotKey, certPath, keyPath)
+		}
+		assertFile(t, certPath, "CERT-OLD")
+		assertFile(t, keyPath, "KEY-OLD")
+
+		if err := staged.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		assertFile(t, certPath, "CERT-NEW")
+		assertFile(t, keyPath, "KEY-NEW")
+		for _, p := range []string{certPath, keyPath} {
+			fi, err := os.Stat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.Mode().Perm() != 0600 {
+				t.Errorf("%s mode = %v, want 0600", p, fi.Mode().Perm())
+			}
+		}
+		// The staging area is emptied on commit, so nothing accumulates there.
+		entries, err := os.ReadDir(CredsStagingRoot())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("staging root holds %d entries after a commit, want 0", len(entries))
+		}
+	})
+
+	t.Run("discard leaves the previous pair alone", func(t *testing.T) {
+		withHomeShed(t)
+		certPath, keyPath, err := WriteClientCredentials("s", []byte("CERT-OLD"), []byte("KEY-OLD"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		staged, err := StageClientCredentials("s", []byte("CERT-NEW"), []byte("KEY-NEW"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		staged.Discard()
+		staged.Discard() // idempotent
+		assertFile(t, certPath, "CERT-OLD")
+		assertFile(t, keyPath, "KEY-OLD")
+	})
+
+	t.Run("a staging failure leaves the previous pair alone", func(t *testing.T) {
+		withHomeShed(t)
+		certPath, keyPath, err := WriteClientCredentials("s", []byte("CERT-OLD"), []byte("KEY-OLD"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A regular file where the staging root has to be: every staging write
+		// fails on the mkdir, which is the failure this API exists to survive.
+		if err := os.WriteFile(CredsStagingRoot(), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := StageClientCredentials("s", []byte("CERT-NEW"), []byte("KEY-NEW")); err == nil {
+			t.Fatal("expected staging to fail")
+		}
+		assertFile(t, certPath, "CERT-OLD")
+		assertFile(t, keyPath, "KEY-OLD")
+	})
+
+	t.Run("rejects empty input", func(t *testing.T) {
+		withHomeShed(t)
+		for _, tc := range []struct {
+			name      string
+			server    string
+			cert, key []byte
+		}{
+			{"no name", "", []byte("C"), []byte("K")},
+			{"no cert", "s", nil, []byte("K")},
+			{"no key", "s", []byte("C"), nil},
+		} {
+			if _, err := StageClientCredentials(tc.server, tc.cert, tc.key); err == nil {
+				t.Errorf("%s: expected an error", tc.name)
+			}
+		}
+	})
+}
+
 func TestWriteClientCredentialsRejectsEmptyInput(t *testing.T) {
 	withHomeShed(t)
 	for _, tc := range []struct {

@@ -301,7 +301,7 @@ test-integration-dev: build
 # Setup (one-time per dev workstation):
 #   1. Add a ~/.shed/config.yaml entry for $(SHED_FC_DEV_SERVER)
 #      (snippet in CLAUDE.md / tests/integration/README.md), OR run
-#      `shed server add $(FC_REMOTE_HOST) --port 18080 --name $(SHED_FC_DEV_SERVER)`
+#      `shed server add $(FC_REMOTE_HOST) --port 18080 --ssh-port 12222 --name $(SHED_FC_DEV_SERVER)`
 #      after the first `make dev-server-up-fc`.
 #
 # Assumed infrastructure (same as today's deb install):

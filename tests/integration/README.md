@@ -208,7 +208,7 @@ servers:
     ssh_port: 12222
 EOF
 # Or run after the first `make dev-server-up`:
-shed server add localhost --port 18080 --name my-server-dev
+shed server add localhost --port 18080 --ssh-port 12222 --name my-server-dev
 
 # Per dev cycle:
 make dev-server-up              # launches dev server (nohup, PID file)
@@ -281,7 +281,7 @@ servers:
     ssh_port: 12222
 EOF
 # Or run after the first `make dev-server-up-fc`:
-shed server add mini3 --port 18080 --name mini3-dev
+shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev
 
 # Per dev cycle:
 make dev-server-up-fc              # launches dev shed-server on mini3:18080

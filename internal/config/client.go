@@ -2,9 +2,11 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,11 +90,16 @@ func (e *ServerEntry) IsMTLS() bool { return e.AuthMode == AuthModeMTLS }
 
 // BaseURL returns the control-plane base URL for the entry: APIURL when set
 // (it carries scheme+host+port), else the legacy plain http://Host:HTTPPort.
+//
+// The host:port is joined with net.JoinHostPort, not printf: Host may be an
+// IPv6 literal ("::1"), and "http://::1:8080" is not a URL any client can parse.
+// The bracketed form is what every http.Client, url.Parse, and SSH-first
+// open-mode add downstream of this needs.
 func (e *ServerEntry) BaseURL() string {
 	if e.APIURL != "" {
 		return strings.TrimRight(e.APIURL, "/")
 	}
-	return fmt.Sprintf("http://%s:%d", e.Host, e.HTTPPort)
+	return "http://" + net.JoinHostPort(e.Host, strconv.Itoa(e.HTTPPort))
 }
 
 // ShedCache caches the location of a shed.
@@ -313,6 +320,20 @@ func (c *ClientConfig) RemoveShedCache(name string) {
 	delete(c.Sheds, name)
 }
 
+// KnownHostLine renders the exact ~/.shed/known_hosts line for an endpoint, in
+// OpenSSH's syntax: a bare hostname on port 22, the bracketed "[host]:port"
+// form otherwise.
+//
+// It is exported because it is also the IDENTITY of a line: RemoveKnownHost
+// matches on it, and `shed server add` keeps it around so a failed add can undo
+// exactly the line it wrote and nothing else.
+func KnownHostLine(host string, port int, hostKey string) string {
+	if port == 22 {
+		return host + " " + strings.TrimSpace(hostKey)
+	}
+	return fmt.Sprintf("[%s]:%d %s", host, port, strings.TrimSpace(hostKey))
+}
+
 // AddKnownHost adds an SSH host key to the known_hosts file.
 func AddKnownHost(host string, port int, hostKey string) error {
 	knownHostsPath := GetKnownHostsPath()
@@ -323,14 +344,6 @@ func AddKnownHost(host string, port int, hostKey string) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Format the entry
-	var entry string
-	if port == 22 {
-		entry = fmt.Sprintf("%s %s\n", host, hostKey)
-	} else {
-		entry = fmt.Sprintf("[%s]:%d %s\n", host, port, hostKey)
-	}
-
 	// Append to file
 	f, err := os.OpenFile(knownHostsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
@@ -338,10 +351,61 @@ func AddKnownHost(host string, port int, hostKey string) error {
 	}
 	defer f.Close()
 
-	if _, err := f.WriteString(entry); err != nil {
+	if _, err := f.WriteString(KnownHostLine(host, port, hostKey) + "\n"); err != nil {
 		return fmt.Errorf("failed to write to known_hosts: %w", err)
 	}
 
+	return nil
+}
+
+// RemoveKnownHost deletes ONE line from ~/.shed/known_hosts: the exact line
+// AddKnownHost would have written for this endpoint and key.
+//
+// It exists so a `shed server add` that pins a host key and then fails — an
+// unauthorized SSH key, a verification that does not answer, a duplicate name —
+// can leave the file exactly as it found it. Pinning a key for a server that was
+// never added is quiet residue: it silently pre-trusts that endpoint for the
+// next attempt, which is precisely the decision the operator was in the middle
+// of making.
+//
+// The match is on the whole rendered line, so an entry the user (or an earlier
+// successful add) put there is never touched — not even for the same host with a
+// different key, and not a "@cert-authority"/"@revoked" marked line, whose
+// leading token makes it a different line. Only the LAST occurrence is removed:
+// the line this call is undoing is the one most recently appended.
+//
+// A missing file, or a file with no such line, is not an error — the caller is
+// undoing something it may never have done.
+func RemoveKnownHost(host string, port int, hostKey string) error {
+	path := GetKnownHostsPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read known_hosts %s: %w", path, err)
+	}
+
+	want := KnownHostLine(host, port, hostKey)
+	lines := strings.Split(string(data), "\n")
+	drop := -1
+	for i, ln := range lines {
+		if strings.TrimSpace(ln) == want {
+			drop = i
+		}
+	}
+	if drop < 0 {
+		return nil
+	}
+	lines = append(lines[:drop], lines[drop+1:]...)
+
+	out := strings.Join(lines, "\n")
+	if out != "" && !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	if err := atomicWriteFile(path, []byte(out), 0600); err != nil {
+		return fmt.Errorf("failed to rewrite known_hosts %s: %w", path, err)
+	}
 	return nil
 }
 
