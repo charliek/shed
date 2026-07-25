@@ -30,9 +30,16 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+import yaml
 
-from fixtures.devcontrol import SHED_SERVER_BIN, bootstrap_mint, dev_config, skip_mtls_reconfigure
-from fixtures.server import resolve_server_entry
+from fixtures.devcontrol import (
+    DEV_BASE_CONFIG,
+    SHED_SERVER_BIN,
+    bootstrap_mint,
+    dev_config,
+    skip_mtls_reconfigure,
+    skip_needs_open_mode_dev_server,
+)
 from fixtures.tlsclient import fingerprint as _fingerprint
 from fixtures.tlsclient import https_status as _https_status
 from fixtures.tlsclient import server_cert_pem as _server_cert_pem
@@ -49,6 +56,22 @@ SHED_BIN = SHED_SERVER_BIN.parent / "shed"
 # overrides carry a secure auth block with the local key allowlisted — the same
 # allowlisting the other secure-mode tests use.
 _LOCAL_PUBKEY = (Path.home() / ".ssh" / "id_ed25519.pub").read_text().strip()
+
+
+def _base_http_port() -> int:
+    """The committed dev-parallel base config's own `http_port` field.
+
+    The CLIENT ENTRY no longer carries this at all once the dev server runs
+    an enforced mode (SSH-first `shed server add` records only
+    `https_port`/`api_url` for those — see `fixtures/devcontrol.py`'s module
+    docstring), and the committed base config is itself `auth.mode: token`
+    today, so there is no "open" entry to read a real `http_port` off of
+    either. The YAML file still names the port an open-mode server *would*
+    bind (18080, offset from prod's 8080) — used below only to prove curl
+    gets nothing there once the dev server is in TLS-only secure mode.
+    """
+    with DEV_BASE_CONFIG.open("r", encoding="utf-8") as f:
+        return int((yaml.safe_load(f) or {}).get("http_port") or 8080)
 
 
 def _tls_overrides() -> dict:
@@ -84,13 +107,13 @@ def _sans(pem: str) -> str:
         Path(path).unlink(missing_ok=True)
 
 
+@skip_needs_open_mode_dev_server
 @skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_tls_listener_serves_pinnable_cert(vz_server_dev):
     server = vz_server_dev.name
-    entry = resolve_server_entry(server)
-    http_port = int(entry["http_port"])
+    http_port = _base_http_port()
 
     shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
     DEV_TLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -145,6 +168,7 @@ def test_tls_listener_serves_pinnable_cert(vz_server_dev):
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
 
+@skip_needs_open_mode_dev_server
 @skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
@@ -180,6 +204,7 @@ def test_tls_client_pin(vz_server_dev):
         shutil.rmtree(DEV_TLS_DIR, ignore_errors=True)
 
 
+@skip_needs_open_mode_dev_server
 @skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow

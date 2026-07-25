@@ -25,7 +25,11 @@ import subprocess
 
 import pytest
 
-from fixtures.devcontrol import dev_config, skip_mtls_reconfigure
+from fixtures.devcontrol import (
+    dev_config,
+    skip_mtls_reconfigure,
+    skip_needs_open_mode_dev_server,
+)
 from fixtures.server import resolve_server_entry
 
 # Secure mode is TLS-only; the enforce test pins this explicitly-set https_port
@@ -66,6 +70,7 @@ def _ssh_auth_stderr(port: int, key_path: str, user: str = "probe-shed") -> str:
         return err.decode() if isinstance(err, bytes) else err
 
 
+@skip_needs_open_mode_dev_server
 @skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow

@@ -8,9 +8,10 @@
 //! names/tags/order and the `omitempty` set match it byte-for-byte so a golden
 //! fixture can pin the bytes.
 //!
-//!   app -> agent (server INBOUND):  hello, approval_response, pong, token.get
+//!   app -> agent (server INBOUND):  hello, approval_response, pong, token.get,
+//!                                   credential.get
 //!   agent -> app (server OUTBOUND): hello_ack, approval_request, event, ping,
-//!                                   token.response
+//!                                   token.response, credential.response
 //!
 //! Pure: `id`/`ts` are caller-supplied (the stateful server owns UUID + clock), so
 //! this module never touches time or randomness — same convention as the client
@@ -20,7 +21,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use shed_core::approval::protocol::HOST_AGENT_PROTOCOL_VERSION;
+use shed_core::approval::protocol::{CAP_CREDENTIAL_GET, HOST_AGENT_PROTOCOL_VERSION};
+
+/// What this build advertises in its `hello_ack`. Ordered, not sorted at send
+/// time: it is a wire value pinned by golden fixtures in both implementations.
+/// Mirrors Go `desktop_protocol.go:agentCapabilities`.
+pub fn agent_capabilities() -> Vec<&'static str> {
+    vec![CAP_CREDENTIAL_GET]
+}
 
 /// Peek a frame's `type` discriminator without fully decoding it. A private mirror
 /// of the client codec's `TypeTag` (that one is not `pub`), kept here so
@@ -84,6 +92,22 @@ pub struct TokenGetMsg {
     pub server: String,
 }
 
+/// The app's mode-agnostic credential request (Go `credentialGetMsg`).
+///
+/// `csr` is a standard-base64 PKCS#10 DER the APP generated; only it crosses the
+/// socket, and the private key it will pair with never leaves the app process.
+/// It is optional — an app that has no use for certificates may ask without one,
+/// and an mtls server then answers with its own explicit upgrade error.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CredentialGetMsg {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub server: String,
+    #[serde(default)]
+    pub csr: String,
+}
+
 /// A frame from the app (or a fake), decoded by `type`. Mirrors `HostAgentInbound`
 /// on the client side.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +116,7 @@ pub enum DesktopInbound {
     ApprovalResponse(ApprovalResponseMsg),
     Pong,
     TokenGet(TokenGetMsg),
+    CredentialGet(CredentialGetMsg),
     Unknown { r#type: String },
 }
 
@@ -106,6 +131,7 @@ pub fn decode_desktop(line: &[u8]) -> Result<DesktopInbound, serde_json::Error> 
         "approval_response" => DesktopInbound::ApprovalResponse(serde_json::from_slice(line)?),
         "pong" => DesktopInbound::Pong,
         "token.get" => DesktopInbound::TokenGet(serde_json::from_slice(line)?),
+        "credential.get" => DesktopInbound::CredentialGet(serde_json::from_slice(line)?),
         other => DesktopInbound::Unknown {
             r#type: other.to_string(),
         },
@@ -158,6 +184,7 @@ pub fn hello_ack(
     agent_version: &str,
     namespaces: &[&str],
     gate_namespaces: &[String],
+    agent_caps: &[&str],
     request_timeout_ms: i64,
     accepted: bool,
     reason: Option<&str>,
@@ -178,6 +205,11 @@ pub fn hello_ack(
         // None -> `null`, Some -> array (mirrors Go's nil-slice-as-null).
         namespaces: Option<Vec<&'a str>>,
         gate_namespaces: Option<Vec<&'a str>>,
+        // OMITTED when empty, unlike the two above: Go tags this `omitempty`
+        // because "the key is absent" is the load-bearing signal an old agent
+        // sends, and `null` would be a third state nobody reads.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_capabilities: Option<Vec<&'a str>>,
         request_timeout_ms: i64,
         accepted: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +239,11 @@ pub fn hello_ack(
             approval_method: "",
         }
     };
+    let agent_capabilities = if agent_caps.is_empty() {
+        None
+    } else {
+        Some(agent_caps.to_vec())
+    };
     serde_json::to_string(&Frame {
         v: HOST_AGENT_PROTOCOL_VERSION,
         ty: "hello_ack",
@@ -215,6 +252,7 @@ pub fn hello_ack(
         agent,
         namespaces,
         gate_namespaces,
+        agent_capabilities,
         request_timeout_ms,
         accepted,
         reason,
@@ -386,6 +424,63 @@ pub fn token_response(
     .unwrap_or_default()
 }
 
+/// Build a `credential.response` (Go `credentialResponseMsg`). `server` is
+/// always present; every credential field is omitempty. Fail-closed: on error
+/// the caller passes `None` for all of them, so a partial credential can never
+/// ship and an errored reply can never be mistaken for an empty success.
+// One argument per Go field — a flat wire builder, not a params-struct case.
+#[allow(clippy::too_many_arguments)]
+pub fn credential_response(
+    id: &str,
+    ts: &str,
+    in_reply_to: &str,
+    server: &str,
+    auth_mode: Option<&str>,
+    token: Option<&str>,
+    client_cert: Option<&str>,
+    cert_serial: Option<&str>,
+    expires_at: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    #[derive(Serialize)]
+    struct Frame<'a> {
+        v: u32,
+        #[serde(rename = "type")]
+        ty: &'a str,
+        id: &'a str,
+        ts: &'a str,
+        in_reply_to: &'a str,
+        server: &'a str,
+        #[serde(skip_serializing_if = "is_empty_str")]
+        auth_mode: &'a str,
+        #[serde(skip_serializing_if = "is_empty_str")]
+        token: &'a str,
+        #[serde(skip_serializing_if = "is_empty_str")]
+        client_cert: &'a str,
+        #[serde(skip_serializing_if = "is_empty_str")]
+        cert_serial: &'a str,
+        #[serde(skip_serializing_if = "is_empty_str")]
+        expires_at: &'a str,
+        #[serde(skip_serializing_if = "is_empty_str")]
+        error: &'a str,
+    }
+    serde_json::to_string(&Frame {
+        v: HOST_AGENT_PROTOCOL_VERSION,
+        ty: "credential.response",
+        id,
+        ts,
+        in_reply_to,
+        server,
+        auth_mode: auth_mode.unwrap_or(""),
+        token: token.unwrap_or(""),
+        client_cert: client_cert.unwrap_or(""),
+        cert_serial: cert_serial.unwrap_or(""),
+        expires_at: expires_at.unwrap_or(""),
+        error: error.unwrap_or(""),
+    })
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,13 +499,14 @@ mod tests {
                 "egress",
             ],
             &["ssh-agent".to_string()],
+            &agent_capabilities(),
             25000,
             true,
             None,
         );
         assert_eq!(
             s,
-            r#"{"v":2,"type":"hello_ack","id":"i","ts":"t","agent":{"version":"v1","approval_method":"shed-desktop"},"namespaces":["ssh-agent","aws-credentials","docker-credentials","egress"],"gate_namespaces":["ssh-agent"],"request_timeout_ms":25000,"accepted":true}"#
+            r#"{"v":2,"type":"hello_ack","id":"i","ts":"t","agent":{"version":"v1","approval_method":"shed-desktop"},"namespaces":["ssh-agent","aws-credentials","docker-credentials","egress"],"gate_namespaces":["ssh-agent"],"agent_capabilities":["credential.get"],"request_timeout_ms":25000,"accepted":true}"#
         );
     }
 
@@ -420,7 +516,7 @@ mod tests {
         // empty approval_method — matching Go's `helloAckMsg{...}` with an unset
         // Agent field (desktop_server.go:355). Empty namespaces/gate -> `null`
         // (Go's nil-slice marshal); reason present.
-        let s = hello_ack("i", "t", "", &[], &[], 0, false, Some("superseded"));
+        let s = hello_ack("i", "t", "", &[], &[], &[], 0, false, Some("superseded"));
         assert_eq!(
             s,
             r#"{"v":2,"type":"hello_ack","id":"i","ts":"t","agent":{"version":"","approval_method":""},"namespaces":null,"gate_namespaces":null,"request_timeout_ms":0,"accepted":false,"reason":"superseded"}"#
@@ -588,5 +684,90 @@ mod tests {
             other => panic!("expected unknown, got {other:?}"),
         }
         assert!(decode_desktop(b"{not json").is_err());
+    }
+
+    #[test]
+    fn credential_response_pins_go_field_order_and_omitempty() {
+        // Token mode: auth_mode + token + expiry; no certificate fields.
+        assert_eq!(
+            credential_response(
+                "i",
+                "t",
+                "q1",
+                "mini2",
+                Some("token"),
+                Some("tok"),
+                None,
+                None,
+                Some("2026-01-01T00:00:00Z"),
+                None
+            ),
+            r#"{"v":2,"type":"credential.response","id":"i","ts":"t","in_reply_to":"q1","server":"mini2","auth_mode":"token","token":"tok","expires_at":"2026-01-01T00:00:00Z"}"#
+        );
+        // mtls: the certificate and its serial, and NO bearer token.
+        assert_eq!(
+            credential_response(
+                "i",
+                "t",
+                "q2",
+                "mini2",
+                Some("mtls"),
+                None,
+                Some("PEM"),
+                Some("0a0b"),
+                Some("2026-01-01T00:00:00Z"),
+                None
+            ),
+            r#"{"v":2,"type":"credential.response","id":"i","ts":"t","in_reply_to":"q2","server":"mini2","auth_mode":"mtls","client_cert":"PEM","cert_serial":"0a0b","expires_at":"2026-01-01T00:00:00Z"}"#
+        );
+        // Fail-closed: error only, server still present.
+        assert_eq!(
+            credential_response(
+                "i",
+                "t",
+                "q3",
+                "mini2",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("unknown server")
+            ),
+            r#"{"v":2,"type":"credential.response","id":"i","ts":"t","in_reply_to":"q3","server":"mini2","error":"unknown server"}"#
+        );
+    }
+
+    #[test]
+    fn hello_ack_omits_capabilities_when_there_are_none() {
+        // The OLD-agent shape. Absent, not `null` and not `[]`: absence is the
+        // signal a new app turns into "upgrade shed-host-agent".
+        let s = hello_ack("i", "t", "v1", &[], &[], &[], 0, true, None);
+        assert!(
+            !s.contains("agent_capabilities"),
+            "an ack with no capabilities must omit the key: {s}"
+        );
+    }
+
+    #[test]
+    fn decode_desktop_credential_get_with_and_without_a_csr() {
+        match decode_desktop(
+            br#"{"type":"credential.get","id":"q1","server":"mini2","csr":"QUJD"}"#,
+        )
+        .unwrap()
+        {
+            DesktopInbound::CredentialGet(c) => {
+                assert_eq!(c.id, "q1");
+                assert_eq!(c.server, "mini2");
+                assert_eq!(c.csr, "QUJD");
+            }
+            other => panic!("expected credential.get, got {other:?}"),
+        }
+        // An omitted csr zero-fills (Go json.Unmarshal semantics) rather than
+        // failing: asking without one is legal, and the answer is the server's.
+        match decode_desktop(br#"{"type":"credential.get","id":"q2","server":"mini2"}"#).unwrap() {
+            DesktopInbound::CredentialGet(c) => assert_eq!(c.csr, ""),
+            other => panic!("expected credential.get, got {other:?}"),
+        }
     }
 }

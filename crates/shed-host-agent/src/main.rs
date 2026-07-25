@@ -38,12 +38,12 @@ use std::sync::Arc;
 // Bring the broker-core module names into scope so the daemon wiring below reads
 // against them (`config::HostAgentConfig`, `bus::FileBusLog`, `supervisor::…`, …) —
 // the same bare paths the pre-extraction single-crate daemon used.
+use shed_broker::config::HostAgentConfig;
+use shed_broker::status::{build_live_status, now_rfc3339, LiveStatus};
 use shed_broker::{
     approval, audit, aws_backend, bus, config, docker_backend, minter, sockets, ssh_backend,
     supervisor, watcher,
 };
-use shed_broker::config::HostAgentConfig;
-use shed_broker::status::{build_live_status, now_rfc3339, LiveStatus};
 
 use crate::socket_bind::bind_unix_socket;
 use crate::status_server::{run_status, serve_status_socket};
@@ -307,10 +307,15 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             minter.clone(),
             control_source,
         ));
+        // The SAME provider answers both messages: `token.get` (frozen, bearer
+        // tokens only) and `credential.get` (mode-agnostic, relays the app's CSR).
+        // One provider because they resolve the same server the same way and
+        // differ only in what they ask the server for.
         let server = desktop::DesktopServer::new(
             version.clone(),
             cfg.gate_namespaces(),
             cfg.approval_timeout(),
+            Some(control_minter.clone()),
             Some(control_minter),
         );
         let path = sockets::desktop_socket_path();

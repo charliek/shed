@@ -16,7 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.devcontrol import bootstrap_mint, dev_config, skip_mtls_token_semantics
+from fixtures.devcontrol import (
+    bootstrap_mint,
+    dev_config,
+    skip_mtls_token_semantics,
+    skip_needs_open_mode_dev_server,
+)
 from fixtures.tlsclient import https_status as _status
 from fixtures.tlsclient import server_cert_pem
 
@@ -25,6 +30,7 @@ from fixtures.tlsclient import server_cert_pem
 HTTPS_PORT = 18443
 
 
+@skip_needs_open_mode_dev_server
 @skip_mtls_token_semantics
 @pytest.mark.vz
 @pytest.mark.slow

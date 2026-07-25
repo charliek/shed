@@ -83,7 +83,8 @@ fn parse_param(pair: &str) -> Result<(String, Value), String> {
     let (key, raw) = pair
         .split_once('=')
         .ok_or_else(|| format!("--param expects k=v, got '{pair}'"))?;
-    let value = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+    let value =
+        serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
     Ok((key.to_string(), value))
 }
 
@@ -180,9 +181,13 @@ fn parse_command(args: &[String]) -> Result<Plan, String> {
 
 /// `--socket` flag > `$SHED_TAURI_SOCKET` > `default_socket_path()`.
 fn resolve_socket(flag: Option<String>) -> PathBuf {
-    flag.or_else(|| std::env::var("SHED_TAURI_SOCKET").ok().filter(|v| !v.is_empty()))
-        .map(PathBuf::from)
-        .unwrap_or_else(default_socket_path)
+    flag.or_else(|| {
+        std::env::var("SHED_TAURI_SOCKET")
+            .ok()
+            .filter(|v| !v.is_empty())
+    })
+    .map(PathBuf::from)
+    .unwrap_or_else(default_socket_path)
 }
 
 /// `$XDG_RUNTIME_DIR/shed-tauri.sock`, falling back to
@@ -190,7 +195,10 @@ fn resolve_socket(flag: Option<String>) -> PathBuf {
 /// matching the Tauri app's `env::default_socket_path` (flat, no nested subdir; a
 /// duplicate, not a dependency, to keep shedctl dependency-light).
 fn default_socket_path() -> PathBuf {
-    socket_path_from(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), current_uid())
+    socket_path_from(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        current_uid(),
+    )
 }
 
 /// Pure socket-path resolution (no env reads), so the flat `shed-tauri.sock`
@@ -232,7 +240,12 @@ fn write_png(result: &Value, out: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to decode png base64: {e}"))?;
     std::fs::write(out, &bytes).map_err(|e| format!("failed to write {}: {e}", out.display()))?;
     let dim = |k| result.get(k).and_then(Value::as_u64).unwrap_or(0);
-    println!("wrote {} ({}x{})", out.display(), dim("width"), dim("height"));
+    println!(
+        "wrote {} ({}x{})",
+        out.display(),
+        dim("width"),
+        dim("height")
+    );
     Ok(())
 }
 
@@ -343,7 +356,8 @@ mod tests {
 
     #[test]
     fn parse_reply_maps_error_envelope() {
-        let line = r#"{"id":"1","ok":false,"error":{"code":"bad_request","message":"missing 'name'"}}"#;
+        let line =
+            r#"{"id":"1","ok":false,"error":{"code":"bad_request","message":"missing 'name'"}}"#;
         let (code, message) = parse_reply(line).unwrap_err();
         assert_eq!(code, "bad_request");
         assert_eq!(message, "missing 'name'");
@@ -353,7 +367,10 @@ mod tests {
     fn parse_param_parses_json_scalars_else_string() {
         assert_eq!(parse_param("n=3").unwrap(), ("n".to_string(), json!(3)));
         assert_eq!(parse_param("s=hi").unwrap(), ("s".to_string(), json!("hi")));
-        assert_eq!(parse_param("b=true").unwrap(), ("b".to_string(), json!(true)));
+        assert_eq!(
+            parse_param("b=true").unwrap(),
+            ("b".to_string(), json!(true))
+        );
     }
 
     #[test]
@@ -375,8 +392,14 @@ mod tests {
 
     #[test]
     fn parse_command_screenshot_out_sets_write_target() {
-        let plan =
-            parse_command(&svec(&["screenshot", "--out", "/tmp/x.png", "--scale", "2"])).unwrap();
+        let plan = parse_command(&svec(&[
+            "screenshot",
+            "--out",
+            "/tmp/x.png",
+            "--scale",
+            "2",
+        ]))
+        .unwrap();
         assert_eq!(plan.op, "app.screenshot");
         assert_eq!(plan.params["scale"], 2);
         assert_eq!(plan.write_png_to, Some(PathBuf::from("/tmp/x.png")));
