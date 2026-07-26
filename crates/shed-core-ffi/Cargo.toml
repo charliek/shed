@@ -20,3 +20,9 @@ uniffi = { workspace = true, features = ["cli", "tokio"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Reads the shared §7 P9 credential fixtures (the size caps + the oversize
+# vectors this crate's arm mapper must refuse). Test-only — resolver v2 keeps it
+# out of the shipped staticlib.
+serde_json = { workspace = true }

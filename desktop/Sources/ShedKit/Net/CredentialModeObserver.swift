@@ -43,9 +43,17 @@ public final class CredentialModeObserver: ShedRustCore.CredentialObserver, @unc
     private let lock = NSLock()
     private var mode: ShedAuthMode?
     private let sink: Sink?
+    /// The app-lifetime learned-mode store (`AuthModeRegistry`), when this
+    /// observer was built with one. It is what makes the learned mode outlive
+    /// the client this observer belongs to — a config-watcher rebuild drops the
+    /// observer, not what the session proved. Written through
+    /// `recordObserved`, NEVER `record`: this callback arrives on the core's
+    /// dispatcher and may be older than a synchronous minter write.
+    private let registry: AuthModeRegistry?
 
-    public init(sink: Sink? = nil) {
+    public init(sink: Sink? = nil, registry: AuthModeRegistry? = nil) {
         self.sink = sink
+        self.registry = registry
     }
 
     /// The mode learned this session, or nil if nothing has been adopted yet.
@@ -60,9 +68,11 @@ public final class CredentialModeObserver: ShedRustCore.CredentialObserver, @unc
         // did not change the shape still leaves the learned mode current. The
         // token value on this event is deliberately ignored: this client's
         // storage is not the token's home.
+        let learned = ShedAuthMode(event.mode)
         lock.lock()
-        mode = ShedAuthMode(event.mode)
+        mode = learned
         lock.unlock()
+        registry?.recordObserved(server: event.server, mode: learned)
     }
 
     public func modeChanged(server: String, mode: ShedRustCore.AuthMode) {
@@ -70,6 +80,7 @@ public final class CredentialModeObserver: ShedRustCore.CredentialObserver, @unc
         lock.lock()
         self.mode = learned
         lock.unlock()
+        registry?.recordObserved(server: server, mode: learned)
         sink?(server, learned)
     }
 }

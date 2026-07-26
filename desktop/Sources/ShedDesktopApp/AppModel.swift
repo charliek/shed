@@ -23,6 +23,15 @@ final class AppModel: NSObject, UiBridge {
     let state = AppState()
 
     private var clients: [String: ShedServerClient] = [:]
+    /// The credential shape each server issues, learned this session and held
+    /// for the app's LIFETIME — deliberately not inside a client (plan 002 §7
+    /// P1). `reconnect()` rebuilds every client from config, and config is the
+    /// CLI's cache: it still says `token` after a server flips to certificates.
+    /// A store that died with the clients would let a config-watcher rebuild
+    /// throw away what the session had already proved, and the next mint would
+    /// send a `token.get` to an mtls-only server. In memory only — nothing is
+    /// ever written back to `~/.shed/config.yaml`.
+    private let authModes = AuthModeRegistry()
     private var defaultServerName: String?
     private var creates: [String: CreateProgress] = [:]
     // The task driving each in-flight create's SSE stream, retained so
@@ -432,6 +441,9 @@ final class AppModel: NSObject, UiBridge {
                 // tokenless), so e2e stays hermetic.
                 hostAgent: mockBase == nil ? hostAgent : nil,
                 authMode: authMode,
+                // The app-lifetime learned-mode store, handed to every rebuild:
+                // the client is reconstructed, what the session proved is not.
+                authModes: authModes,
                 onCredentialModeChanged: { _, mode in
                     diag?.log(.info, "auth", "credential mode changed", [
                         ("server", serverName), ("mode", mode.rawValue),

@@ -139,6 +139,10 @@ final class FakeHostAgent: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var connFD: Int32 = -1
     private var captured: [String] = []
+    /// The same lines, split by the connection they arrived on (index 0 = the
+    /// first connection this fake accepted). Lets a test say "the frame landed
+    /// on the connection that was validated, not on its replacement".
+    private var capturedByConnection: [[String]] = []
     private var running = true
 
     init(
@@ -237,6 +241,24 @@ final class FakeHostAgent: @unchecked Sendable {
         frames().compactMap { $0["type"] as? String }
     }
 
+    /// How many connections this fake has accepted so far.
+    func connectionCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return capturedByConnection.count
+    }
+
+    /// The frame `type`s received on connection `index` (0-based), or `[]` for a
+    /// connection that was never accepted.
+    func frameTypes(connection index: Int) -> [String] {
+        lock.lock()
+        let lines = index < capturedByConnection.count ? capturedByConnection[index] : []
+        lock.unlock()
+        return lines.compactMap {
+            ((try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any])?["type"]
+                as? String
+        }
+    }
+
     private func isRunning() -> Bool { lock.lock(); defer { lock.unlock() }; return running }
 
     private func acceptLoop() {
@@ -249,6 +271,8 @@ final class FakeHostAgent: @unchecked Sendable {
             guard conn >= 0 else { return }
             lock.lock()
             connFD = conn
+            capturedByConnection.append([])
+            let index = capturedByConnection.count - 1
             let delay = helloAckDelayMs
             let advertise = advertisesCredentialGet
             lock.unlock()
@@ -262,7 +286,7 @@ final class FakeHostAgent: @unchecked Sendable {
             if advertise { ack["agent_capabilities"] = [HostAgentCapability.credentialGet] }
             _ = writeAll(fd: conn, data: lineData(ack))
 
-            serve(conn: conn)
+            serve(conn: conn, index: index)
             lock.lock()
             if connFD == conn { connFD = -1 }
             lock.unlock()
@@ -270,10 +294,14 @@ final class FakeHostAgent: @unchecked Sendable {
         }
     }
 
-    private func serve(conn: Int32) {
+    private func serve(conn: Int32, index: Int) {
         var reader = LineFrameReader(fd: conn)
         while let line = try? reader.readLine() {
-            lock.lock(); captured.append(String(decoding: line, as: UTF8.self)); lock.unlock()
+            lock.lock()
+            let text = String(decoding: line, as: UTF8.self)
+            captured.append(text)
+            if index < capturedByConnection.count { capturedByConnection[index].append(text) }
+            lock.unlock()
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
                 continue
             }

@@ -52,7 +52,11 @@ public struct ShedServerClient: Sendable {
     // the token/pin paths stay Swift until M3/M4.
     private let rustAdapter: RustShedCoreAdapter?
 
-    public init(baseURL: URL, serverName: String, token: String = "", tlsCertFingerprint: String = "", tokenProvider: ControlTokenProvider? = nil, session: URLSession? = nil, useRustCore: Bool = false, hostAgent: HostAgentClient? = nil, authMode: ShedAuthMode = .token, onCredentialModeChanged: CredentialModeObserver.Sink? = nil) {
+    /// `authModes` is the app-lifetime learned-mode store (§7 P1). Pass the
+    /// SAME instance on every rebuild — that is what keeps a mode this session
+    /// proved from being discarded when the config watcher rebuilds clients.
+    /// Omitted → this client gets a private store (its previous behavior).
+    public init(baseURL: URL, serverName: String, token: String = "", tlsCertFingerprint: String = "", tokenProvider: ControlTokenProvider? = nil, session: URLSession? = nil, useRustCore: Bool = false, hostAgent: HostAgentClient? = nil, authMode: ShedAuthMode = .token, authModes: AuthModeRegistry? = nil, onCredentialModeChanged: CredentialModeObserver.Sink? = nil) {
         self.baseURL = baseURL
         self.serverName = serverName
         self.token = token
@@ -93,7 +97,7 @@ public struct ShedServerClient: Sendable {
                 adapter = try RustShedCoreAdapter(
                     baseURL: baseURL.absoluteString, serverName: serverName,
                     token: token, pin: tlsCertFingerprint.isEmpty ? nil : tlsCertFingerprint,
-                    hostAgent: hostAgent, authMode: authMode,
+                    hostAgent: hostAgent, authMode: authMode, authModes: authModes,
                     onModeChanged: onCredentialModeChanged)
             } catch {
                 configError = .transport(

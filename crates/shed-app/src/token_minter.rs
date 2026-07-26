@@ -33,24 +33,15 @@ use crate::host_agent::{
 };
 use crate::timefmt;
 
-/// Size caps on the credential exchange, in both directions.
+/// Size caps on the credential exchange, in both directions — re-exported from
+/// [`shed_core::token::limits`], which owns them.
 ///
-/// A control credential is a small, bounded thing — a token, a leaf
-/// certificate, a hex serial — so a field arriving orders of magnitude larger is
-/// a bug or an attempt to make this process carry something it should not.
-/// Refusing costs one re-mint; accepting costs whatever the oversized value was
-/// for. The numbers are the Swift client's (`HostAgentCredentialLimits`) because
-/// the two read the SAME frames — a cap that differed by language would be a
-/// cross-client divergence, which is exactly what the §7 P9 fixtures gate.
-pub mod limits {
-    pub const MAX_TOKEN_BYTES: usize = 4 * 1024;
-    pub const MAX_CLIENT_CERT_BYTES: usize = 64 * 1024;
-    pub const MAX_CERT_SERIAL_BYTES: usize = 128;
-    pub const MAX_ERROR_BYTES: usize = 4 * 1024;
-    /// A P-256 PKCS#10 CSR is ~600 bytes base64; 16 KiB leaves room for larger
-    /// key types without leaving room for a payload.
-    pub const MAX_CSR_BYTES: usize = 16 * 1024;
-}
+/// They live in the core because the OTHER Rust credential mapper
+/// (`shed-core-ffi`'s `credential_from_answer`, which serves any foreign
+/// UniFFI minter) must enforce the same numbers and cannot depend on this
+/// crate. Swift's `HostAgentCredentialLimits` is the third site and is pinned
+/// to the same numbers by the shared §7 P9 fixtures' `limits` block.
+pub use shed_core::token::limits;
 
 /// How long an mtls-expecting mint waits for the agent's `hello_ack` before
 /// giving up on learning its capability. Bounded and short: the ack is the

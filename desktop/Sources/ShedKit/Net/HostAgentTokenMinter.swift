@@ -31,6 +31,11 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
     /// capability. Bounded and short: the ack is the agent's first frame, and a
     /// refusal here is retried by the very next request.
     private let capabilityWait: Duration
+    /// Reports every shape this minter maps, SYNCHRONOUSLY, to the app-lifetime
+    /// learned-mode store. It is the highest-priority writer there (the core's
+    /// observer fires later and defers to it), and it is what lets a rebuilt
+    /// client start out knowing what an earlier one proved.
+    private let onMintedMode: (@Sendable (ShedAuthMode) -> Void)?
     private let lock = NSLock()
     /// The shape THIS minter last saw the server issue, recorded synchronously
     /// as the response is mapped. The observer learns the same thing, but only
@@ -43,11 +48,13 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
     init(
         hostAgent: HostAgentClient,
         expectsMtls: @escaping @Sendable () -> Bool = { false },
-        capabilityWait: Duration = .seconds(2)
+        capabilityWait: Duration = .seconds(2),
+        onMintedMode: (@Sendable (ShedAuthMode) -> Void)? = nil
     ) {
         self.hostAgent = hostAgent
         self.expectsMtls = expectsMtls
         self.capabilityWait = capabilityWait
+        self.onMintedMode = onMintedMode
     }
 
     /// Config + observer + this minter's own last mint. Any of the three saying
@@ -63,6 +70,9 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
 
     private func recordMintedMode(_ mode: ShedAuthMode) {
         lock.lock(); lastMintedMode = mode; lock.unlock()
+        // Same write, one level up: the local copy serves THIS minter, the
+        // store serves every client the app builds after this one.
+        onMintedMode?(mode)
     }
 
     func mint(server: String) async throws -> ShedRustCore.MintedToken {

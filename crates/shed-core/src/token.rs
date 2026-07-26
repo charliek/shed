@@ -72,6 +72,38 @@ use crate::http::ShedError;
 use crate::models::dart_trim;
 use crate::tls::{certified_key_from_pem, ClientCertResolver};
 
+/// Size caps on the credential exchange, in both directions — the SINGLE
+/// source of truth for every Rust consumer.
+///
+/// A control credential is a small, bounded thing — a token, a leaf
+/// certificate, a hex serial — so a field arriving orders of magnitude larger
+/// is a bug or an attempt to make this process carry something it should not.
+/// Refusing costs one re-mint; accepting costs whatever the oversized value was
+/// for.
+///
+/// These live in `shed-core` (rather than in one of the layers above it)
+/// because every credential mapper the clients ship must enforce the SAME
+/// numbers, and they sit in different crates: `shed-app`'s
+/// `token_minter::credential_from_parts` (UDS + embedded broker) and
+/// `shed-core-ffi`'s `credential_from_answer` (any foreign UniFFI minter, e.g.
+/// Swift's). Both re-export or reference these constants — a cap that differed
+/// by crate would be a cross-client divergence.
+///
+/// The THIRD mapper is Swift's `HostAgentCredentialLimits`
+/// (`desktop/Sources/ShedKit/Approval/HostAgentProtocol.swift`), which cannot
+/// import Rust constants; it is pinned to the same numbers by the shared
+/// `tests/host-agent-diff/fixtures/desktop-credential/credential_response.json`
+/// `limits` block, which every language asserts against.
+pub mod limits {
+    pub const MAX_TOKEN_BYTES: usize = 4 * 1024;
+    pub const MAX_CLIENT_CERT_BYTES: usize = 64 * 1024;
+    pub const MAX_CERT_SERIAL_BYTES: usize = 128;
+    pub const MAX_ERROR_BYTES: usize = 4 * 1024;
+    /// A P-256 PKCS#10 CSR is ~600 bytes base64; 16 KiB leaves room for larger
+    /// key types without leaving room for a payload.
+    pub const MAX_CSR_BYTES: usize = 16 * 1024;
+}
+
 /// A minted control token plus its optional expiry (unix seconds). `None` expiry
 /// → only an explicit `invalidate*()` forces a refresh (mirrors `MintedToken`).
 /// Swift parses the host agent's ISO-8601 expiry to epoch before handing it over;

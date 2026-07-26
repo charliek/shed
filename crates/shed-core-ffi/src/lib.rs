@@ -433,7 +433,31 @@ impl core_token::TokenMinter for ForeignMinterBridge {
 /// point of a tagged result — so what is left to enforce is that the arm's
 /// payload can actually authenticate. An empty token or an empty certificate is
 /// an error, never a usable credential (F6: the FSM must send nothing rather
-/// than a valid-looking downgrade).
+/// than a valid-looking downgrade), and every populated field is within its
+/// [`core_token::limits`] cap.
+///
+/// # What this boundary CAN and CANNOT check (read before calling it a parity site)
+///
+/// The tagged enum erases the wire frame, so several of the shared §7 P9
+/// `credential_response.json` vectors are STRUCTURALLY UNREACHABLE here and
+/// have no counterpart below — they are refused earlier, by whichever mapper
+/// owns the frame (Swift's `validatedCredential(for:)`, shed-app's
+/// `map_credential_response`):
+///
+///   * the raw `auth_mode` string — unknown/uppercase/padded modes, the legacy
+///     `secure` spelling, an absent mode: the ARM is the mode, so there is no
+///     string left to misinterpret;
+///   * `server` mismatch — the reply is not carried across this boundary, only
+///     the answer for the server the core asked about;
+///   * an unparseable `expires_at` — expiry crosses as parsed unix seconds,
+///     and `None` here means "the minter reported none";
+///   * ambiguity (a token arm carrying certificate fields, or the reverse) —
+///     the arms are exclusive by construction.
+///
+/// What DOES survive the erasure is field CONTENT, so that is what is enforced:
+/// emptiness and the size caps. Both are checked independently of any caller,
+/// because a second UniFFI minter (or a regression in Swift's pre-validation)
+/// must not be able to hand the core a 4097-byte token this side would adopt.
 fn credential_from_answer(
     answer: MintedCredential,
     server: &str,
@@ -444,6 +468,9 @@ fn credential_from_answer(
                 return Err(CoreError::Config(format!(
                     "host agent returned no token for {server}"
                 )));
+            }
+            if token.token.len() > core_token::limits::MAX_TOKEN_BYTES {
+                return Err(oversized("token", server));
             }
             Ok(core_token::MintedCredential::Token(
                 core_token::MintedToken {
@@ -458,6 +485,12 @@ fn credential_from_answer(
                     "host agent reported mtls but returned no certificate for {server}"
                 )));
             }
+            if certificate.cert_pem.len() > core_token::limits::MAX_CLIENT_CERT_BYTES {
+                return Err(oversized("certificate", server));
+            }
+            if certificate.serial.len() > core_token::limits::MAX_CERT_SERIAL_BYTES {
+                return Err(oversized("certificate serial", server));
+            }
             Ok(core_token::MintedCredential::Certificate(
                 core_token::MintedCertificate {
                     cert_pem: certificate.cert_pem,
@@ -468,10 +501,26 @@ fn credential_from_answer(
         }
         MintedCredential::Failed { message } => Err(CoreError::Config(if message.is_empty() {
             format!("the control-credential mint for {server} failed (no reason given)")
+        } else if message.len() > core_token::limits::MAX_ERROR_BYTES {
+            // Same shape as shed-app's: the refusal names the oversize rather
+            // than echoing (or truncating) a megabyte of attacker-chosen text
+            // into every log line and error surface downstream.
+            format!(
+                "host agent returned an oversized error message for {server} ({} bytes); refusing",
+                message.len()
+            )
         } else {
             message
         })),
     }
+}
+
+/// The refusal wording for an over-cap field, byte-for-byte shed-app's, so the
+/// shared §7 P9 vectors get the same sentence whichever mapper refused.
+fn oversized(field: &str, server: &str) -> CoreError {
+    CoreError::Config(format!(
+        "host agent returned an oversized {field} for {server}; refusing"
+    ))
 }
 
 /// What the provider adopted, delivered to [`CredentialObserver`].
@@ -962,6 +1011,132 @@ mod tests {
             matches!(&err, CoreError::Config(msg) if msg.contains("mini2")),
             "got {err:?}"
         );
+    }
+
+    // ---- the shared size caps, enforced independently at THIS boundary ----
+
+    fn credential_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../tests/host-agent-diff/fixtures/desktop-credential/credential_response.json",
+        );
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("fixture is valid JSON")
+    }
+
+    /// The caps are shared DATA, not a per-crate constant: this boundary, the
+    /// shed-app mapper, and Swift's `HostAgentCredentialLimits` all answer to
+    /// the fixture's `limits` block. A cap that drifted in one of the three
+    /// would mean one client adopting a credential another refuses.
+    #[test]
+    fn the_shared_fixture_limits_are_the_constants_this_boundary_enforces() {
+        let fx = credential_fixture();
+        let limits = &fx["limits"];
+        let cap = |k: &str| limits[k].as_u64().expect("cap") as usize;
+        assert_eq!(cap("token_bytes"), core_token::limits::MAX_TOKEN_BYTES);
+        assert_eq!(
+            cap("client_cert_bytes"),
+            core_token::limits::MAX_CLIENT_CERT_BYTES
+        );
+        assert_eq!(
+            cap("cert_serial_bytes"),
+            core_token::limits::MAX_CERT_SERIAL_BYTES
+        );
+        assert_eq!(cap("error_bytes"), core_token::limits::MAX_ERROR_BYTES);
+        assert_eq!(cap("csr_bytes"), core_token::limits::MAX_CSR_BYTES);
+    }
+
+    /// Every §7 P9 oversize vector, driven through the FFI arm mapper as the
+    /// ARM a foreign minter would hand us. Swift refuses these before it ever
+    /// constructs an arm, which is exactly why this test exists: another
+    /// UniFFI minter — or a regression in Swift's pre-validation — must not be
+    /// able to smuggle a 4097-byte token past this side.
+    #[tokio::test]
+    async fn oversized_fixture_vectors_are_refused_at_the_ffi_boundary() {
+        let fx = credential_fixture();
+        let limits = fx["limits"].clone();
+        let mut checked = 0;
+        for v in fx["vectors"].as_array().expect("vectors") {
+            let Some(field) = v["oversize_field"].as_str() else {
+                continue;
+            };
+            let name = v["name"].as_str().unwrap();
+            let cap = limits[format!("{field}_bytes")].as_u64().unwrap() as usize;
+            let big = v["oversize_char"].as_str().unwrap().repeat(cap + 1);
+            let frame = &v["frame"];
+            let answer = match field {
+                "token" => MintedCredential::Token {
+                    token: MintedToken {
+                        token: big,
+                        expires_at_unix: None,
+                    },
+                },
+                "client_cert" => MintedCredential::Certificate {
+                    certificate: MintedCertificate {
+                        cert_pem: big,
+                        serial: frame["cert_serial"].as_str().unwrap_or_default().into(),
+                        expires_at_unix: None,
+                    },
+                },
+                "cert_serial" => MintedCredential::Certificate {
+                    certificate: MintedCertificate {
+                        cert_pem: frame["client_cert"]
+                            .as_str()
+                            .expect("a cert to pair")
+                            .into(),
+                        serial: big,
+                        expires_at_unix: None,
+                    },
+                },
+                "error" => MintedCredential::Failed { message: big },
+                other => panic!("{name}: unhandled oversize field {other}"),
+            };
+            let m = FakeForeignMinter::new(true, answer);
+            let err = mint_through(&m, &core_token::CredentialRequest::with_csr("Q1NS"))
+                .await
+                .unwrap_err();
+            let needle = v["expected"]["message_contains"].as_str().unwrap();
+            assert!(
+                matches!(&err, CoreError::Config(msg) if msg.contains(needle)),
+                "{name}: refusal {err:?} lacks {needle:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the fixture's four oversize vectors");
+    }
+
+    /// The cap is a ceiling, not a fence: a field EXACTLY at it is adopted, so
+    /// the guard can't quietly refuse legitimate credentials.
+    #[tokio::test]
+    async fn a_field_exactly_at_its_cap_is_adopted() {
+        let at_cap = "a".repeat(core_token::limits::MAX_TOKEN_BYTES);
+        let m = FakeForeignMinter::new(false, FakeForeignMinter::token_answer(&at_cap));
+        match mint_through(&m, &core_token::CredentialRequest::default())
+            .await
+            .unwrap()
+        {
+            core_token::MintedCredential::Token(t) => assert_eq!(t.token.len(), at_cap.len()),
+            other => panic!("expected a token, got {other:?}"),
+        }
+
+        let serial = "0".repeat(core_token::limits::MAX_CERT_SERIAL_BYTES);
+        let m = FakeForeignMinter::new(
+            true,
+            MintedCredential::Certificate {
+                certificate: MintedCertificate {
+                    cert_pem: "-----BEGIN CERTIFICATE-----\nZZ\n-----END CERTIFICATE-----\n".into(),
+                    serial: serial.clone(),
+                    expires_at_unix: None,
+                },
+            },
+        );
+        match mint_through(&m, &core_token::CredentialRequest::with_csr("Q1NS"))
+            .await
+            .unwrap()
+        {
+            core_token::MintedCredential::Certificate(c) => assert_eq!(c.serial, serial),
+            other => panic!("expected a certificate, got {other:?}"),
+        }
     }
 
     #[tokio::test]

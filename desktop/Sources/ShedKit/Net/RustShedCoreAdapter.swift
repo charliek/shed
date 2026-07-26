@@ -23,39 +23,63 @@ final class RustShedCoreAdapter: @unchecked Sendable {
     /// (plan 002 §7 P1 — nothing is persisted). Retained here as well as by the
     /// core's dispatcher so the client can read it back for UI/diagnostics.
     private let observer: CredentialModeObserver
+    /// The APP-lifetime learned-mode store. The observer above belongs to this
+    /// adapter and dies with it; this one outlives every rebuild, which is what
+    /// keeps a learned `mtls` from being thrown away by a config reload.
+    private let authModes: AuthModeRegistry
+    private let serverName: String
 
     init(
         baseURL: String, serverName: String, token: String, pin: String?,
         hostAgent: HostAgentClient?, authMode: ShedAuthMode = .token,
+        authModes: AuthModeRegistry? = nil,
         onModeChanged: CredentialModeObserver.Sink? = nil
     ) throws {
-        let observer = CredentialModeObserver(sink: onModeChanged)
+        // A caller with no store gets a private one, so an adapter built
+        // outside the app (tests, one-off clients) behaves exactly as before.
+        let modes = authModes ?? AuthModeRegistry()
+        // SEED, not record: config is the CLI's cache of what the server last
+        // issued, and it must not walk back what this session already proved.
+        modes.seed(server: serverName, mode: authMode)
+        self.authModes = modes
+        self.serverName = serverName
+        let observer = CredentialModeObserver(sink: onModeChanged, registry: modes)
         self.observer = observer
         // A secure server's control credential is obtained through the host
         // agent; the Rust FSM caches/refreshes around it. Open servers have no
         // host agent → the static `token` (if any) is used instead.
         //
-        // `expectsMtls` is the config entry's cached mode OR'd with what the
-        // observer has learned this session: after a mode flip the config still
-        // says `token` (the CLI hasn't rewritten it), and a reconnect must not
-        // lose what the session already proved. The observer is the SLOWER of
-        // the two learned sources — it fires after the core adopts — so the
-        // minter keeps its own synchronous copy on top of this (see
-        // `HostAgentTokenMinter.lastMintedMode`). The observer holds no
+        // `expectsMtls` reads the store, which is the union of all three
+        // writers — the config seed above, the minter's synchronous record, and
+        // the core's observer. After a mode flip the config still says `token`
+        // (the CLI hasn't rewritten it), and neither a reconnect NOR a client
+        // rebuild may lose what the session already proved. The store holds no
         // reference back, so this closure creates no cycle.
         let minter: (any ShedRustCore.TokenMinter)? = hostAgent.map {
-            HostAgentTokenMinter(
-                hostAgent: $0,
-                expectsMtls: { authMode == .mtls || observer.learnedMode == .mtls })
+            Self.makeMinter(hostAgent: $0, serverName: serverName, authModes: modes)
         }
         self.core = try ShedRustCore.ShedCore(
             baseUrl: baseURL, serverName: serverName, token: token, pin: pin, minter: minter,
             observer: observer)
     }
 
-    /// The credential shape the core has adopted for this server this session,
-    /// or nil before the first successful mint.
-    var learnedAuthMode: ShedAuthMode? { observer.learnedMode }
+    /// The control-credential minter the adapter installs. A named factory so a
+    /// test can build the SAME wiring the app does — the learned-mode store is
+    /// the minter's only view of what the session has proved, and "a rebuilt
+    /// client still expects mtls" is a claim about exactly this construction.
+    static func makeMinter(
+        hostAgent: HostAgentClient, serverName: String, authModes: AuthModeRegistry
+    ) -> HostAgentTokenMinter {
+        HostAgentTokenMinter(
+            hostAgent: hostAgent,
+            expectsMtls: { authModes.expectsMtls(serverName) },
+            onMintedMode: { authModes.record(server: serverName, mode: $0) })
+    }
+
+    /// The credential shape learned for this server this session, or nil before
+    /// the first successful mint. Read from the app-lifetime store, so it
+    /// survives a client rebuild the way the minter's view of it does.
+    var learnedAuthMode: ShedAuthMode? { authModes.learnedMode(for: serverName) }
 
     func info() async throws -> ServerInfo { Self.map(try await core.info()) }
     func listSheds() async throws -> [Shed] { try await core.listSheds().map(Self.map) }

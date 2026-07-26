@@ -116,3 +116,73 @@ final class HostAgentClientTokenTests: XCTestCase {
         XCTAssertFalse(client.isConnected)
     }
 }
+
+/// A one-shot, thread-safe latch (the write hook runs off the test's actor).
+private final class Latch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    /// `true` the first time only.
+    func fire() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if fired { return false }
+        fired = true
+        return true
+    }
+    var didFire: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return fired
+    }
+}
+
+/// The send-time capability check and the frame write are ONE atomic step.
+/// Rust holds its state lock across the same span (`shed-app`'s
+/// `host_agent.rs`); Swift used to unlock in between, which left a window where
+/// the validated connection could be replaced and the `credential.get` land on
+/// the NEW, not-yet-acked one — dropped by an old agent, or answered by a new
+/// one with an extra mint whose reply has no waiter.
+final class HostAgentClientAtomicSendTests: XCTestCase {
+    func testValidatedCredentialGetIsNeverWrittenOnAReplacedConnection() async throws {
+        let path = tempSocketPath()
+        let fake = FakeHostAgent(path: path, advertisesCredentialGet: true)
+        try fake.start()
+        defer { fake.stop() }
+
+        let client = HostAgentClient(socketPath: path)
+        let latch = Latch()
+        // Hooked at the instant between "the capability check passed" and the
+        // write: tear the validated connection down and give the client every
+        // chance to replace it (its reconnect backoff is 0.5 s). It cannot —
+        // swapping the fd needs the very lock this request is holding — so the
+        // frame can only ever reach the connection that was validated.
+        client.beforeWriteHookForTests = { [weak fake] in
+            guard let fake, latch.fire() else { return }
+            fake.dropConnection()
+            let deadline = Date().addingTimeInterval(1.2)
+            while Date() < deadline, fake.connectionCount() == 1 {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+
+        let drain = startDraining(client)
+        defer { drain.cancel(); client.stop() }
+        try await waitConnected(client)
+        try await waitCapability(client, .supported)
+        let snapshot = client.credentialCapabilitySnapshot
+
+        // The request itself is allowed to fail — the connection it validated
+        // was torn down under it. What must never happen is the frame showing
+        // up on the replacement.
+        _ = try? await client.requestCredential(
+            server: "prod", csrBase64: "Q1NS", capability: snapshot, timeout: .seconds(2))
+
+        XCTAssertTrue(latch.didFire, "the write hook never ran — the test proved nothing")
+        // Let the reconnect land so there IS a later connection to inspect.
+        try await Task.sleep(for: .milliseconds(900))
+        XCTAssertGreaterThan(fake.connectionCount(), 1, "the client should have reconnected")
+        for index in 1..<fake.connectionCount() {
+            XCTAssertFalse(
+                fake.frameTypes(connection: index).contains("credential.get"),
+                "a credential.get validated against connection 0 landed on connection \(index)")
+        }
+    }
+}

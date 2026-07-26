@@ -136,6 +136,14 @@ public struct TokenResponse: Sendable, Decodable {
 /// process carry something it should not. Refusing costs one re-mint; accepting
 /// costs whatever the oversized value was for. Mirrored on both directions of
 /// the socket: what we accept, and the CSR we are willing to send.
+///
+/// The numbers are OWNED by `shed_core::token::limits` (Rust), where both Rust
+/// credential mappers — shed-app's `credential_from_parts` and shed-core-ffi's
+/// `credential_from_answer` — read them. Swift cannot import them, so this
+/// third copy is pinned to the same values by the shared §7 P9 fixture's
+/// `limits` block, which each language asserts against
+/// (`HostAgentCredentialFixtureTests`). Change one, and the fixture assertion
+/// fails in every language until all three agree.
 public enum HostAgentCredentialLimits {
     public static let maxTokenBytes = 4 * 1024
     public static let maxClientCertBytes = 64 * 1024

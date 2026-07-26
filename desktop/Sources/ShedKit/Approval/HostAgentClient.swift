@@ -98,6 +98,16 @@ public final class HostAgentClient: @unchecked Sendable {
     /// resolves (reply/disconnect/stop) so a resolved request leaves no lingering
     /// timer. Guarded by `lock`.
     private var pendingTimeouts: [String: Task<Void, Never>] = [:]
+    /// TEST SEAM — nil in production, set before `start()` by one test.
+    ///
+    /// Invoked on the requesting thread immediately BEFORE a correlated
+    /// request's frame is written, with `lock` HELD. That is the invariant it
+    /// exists to prove: whatever the closure does while it runs, the connection
+    /// the request just validated cannot be closed and replaced before the
+    /// write, because every path that swaps `currentFD` needs this same lock.
+    /// Keep it adjacent to the write — a version of this file that wrote after
+    /// unlocking would have its bug window exactly here.
+    var beforeWriteHookForTests: (@Sendable () -> Void)?
 
     public init(socketPath: String) {
         self.socketPath = socketPath
@@ -233,17 +243,20 @@ public final class HostAgentClient: @unchecked Sendable {
 
     /// Send one correlated request and await its reply. Shared by `token.get`
     /// and `credential.get` so the registration/timeout/disconnect handling has
-    /// exactly one implementation. `precondition` runs UNDER the lock, after the
-    /// connected check and before registration, so what it validates cannot
-    /// change between the check and the write.
+    /// exactly one implementation.
+    ///
+    /// The connected check, `precondition`, the registration AND the write all
+    /// happen under ONE lock acquisition (the Rust client holds its state lock
+    /// across the same span — `shed-app/src/host_agent.rs`). Unlocking between
+    /// the check and the write would leave a window in which the validated
+    /// connection can drop and be replaced: the frame would then land on a NEW,
+    /// not-yet-acked connection whose agent may not support it — an old agent
+    /// drops it, a new one performs an extra mint whose reply has no waiter.
     private func request(
         id: String, data: Data, timeout: Duration,
         precondition: (() -> HostAgentClientError?)? = nil
     ) async throws -> HostAgentReply {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HostAgentReply, Error>) in
-            // Take the lock, fail fast if disconnected, else register before
-            // writing so a fast reply can't race ahead of registration. (writeLine
-            // re-takes the lock, so write after unlock — NSLock isn't reentrant.)
             lock.lock()
             guard currentFD >= 0 else {
                 lock.unlock()
@@ -255,6 +268,8 @@ public final class HostAgentClient: @unchecked Sendable {
                 cont.resume(throwing: failure)
                 return
             }
+            // Register before writing so a fast reply can't race ahead of
+            // registration (the reader needs this same lock to resolve it).
             pending[id] = cont
             // Arm the timeout only AFTER registering, so it can always find the
             // continuation (a tiny timeout can't fire before registration). It's a
@@ -265,8 +280,17 @@ public final class HostAgentClient: @unchecked Sendable {
                 guard !Task.isCancelled else { return }
                 self?.failPending(id: id, error: HostAgentClientError.timedOut)
             }
+            beforeWriteHookForTests?()
+            guard writeLineLocked(data) else {
+                // The write failed on the very fd we validated. Unregister and
+                // fail now rather than leaving the caller to its timeout.
+                pending.removeValue(forKey: id)
+                pendingTimeouts.removeValue(forKey: id)?.cancel()
+                lock.unlock()
+                cont.resume(throwing: HostAgentClientError.notConnected)
+                return
+            }
             lock.unlock()
-            writeLine(data)
         }
     }
 
@@ -378,13 +402,24 @@ public final class HostAgentClient: @unchecked Sendable {
     }
 
     private func writeLine(_ data: Data) {
-        var frame = data
-        frame.append(0x0a)
         // Hold the lock across the whole write so the fd can't be closed +
         // reused mid-write (the frames are tiny control messages).
         lock.lock(); defer { lock.unlock() }
-        guard currentFD >= 0 else { return }
-        _ = writeAll(fd: currentFD, data: frame)
+        _ = writeLineLocked(data)
+    }
+
+    /// `writeLine`'s body, for callers that already hold `lock` (NSLock is not
+    /// reentrant). Exists so a correlated request can validate the connection,
+    /// register its waiter and write WITHOUT ever dropping the lock — see
+    /// `request(id:data:timeout:precondition:)`.
+    ///
+    /// Returns whether the frame reached the socket; `false` for "not
+    /// connected" as well as a failed write.
+    private func writeLineLocked(_ data: Data) -> Bool {
+        var frame = data
+        frame.append(0x0a)
+        guard currentFD >= 0 else { return false }
+        return writeAll(fd: currentFD, data: frame)
     }
 
     private func connectOnce() -> Int32? {
@@ -397,6 +432,12 @@ public final class HostAgentClient: @unchecked Sendable {
             }
         }
         if rc != 0 { Darwin.close(fd); return nil }
+        // Writing to a socket the agent has closed must return EPIPE, not raise
+        // SIGPIPE. The app ignores the signal process-wide (`ShedBackend`), but
+        // this fd is rolled by hand and outlives that assumption in any host
+        // that doesn't (a test runner, an embedder) — so say it on the socket.
+        var on: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         return fd
     }
 }
