@@ -251,12 +251,15 @@ type ServerInfo struct {
 	// serves no plain HTTP — clients use the HTTPS endpoint there.
 	HTTPPort int    `json:"http_port,omitempty"`
 	Backend  string `json:"backend"`
-	// AuthMode is the server's auth.mode ("open", "token", or "mtls"; the
-	// deprecated "secure" spelling is normalized to "token" before this is ever
-	// set), so `shed server add` knows whether to bootstrap an HTTP token (or,
-	// in mtls mode, a client certificate) over SSH.
-	// Reported on the unauthenticated /api/info — the mode is observable from
-	// behavior anyway.
+	// AuthMode is the server's auth.mode, so `shed server add` knows whether
+	// to bootstrap an HTTP token (or, in mtls mode, a client certificate)
+	// over SSH. WIRE CONTRACT: on /api/info token mode travels as the legacy
+	// "secure" spelling — released clients gate their bootstrap on that exact
+	// string (LegacyWireAuthMode) — and the decode boundary normalizes it back
+	// to "token" (NormalizeAuthMode, applied in the CLI's GetInfo), so
+	// in-process consumers only ever see "open", "token", or "mtls".
+	// Reported on the unauthenticated /api/info in open/token mode — the mode
+	// is observable from behavior anyway.
 	AuthMode string `json:"auth_mode,omitempty"`
 	// DefaultImage is the resolved default_image for the active backend
 	// (after ${shed.version} expansion / version synthesis at load). Exposed

@@ -1538,6 +1538,37 @@ func normalizeAuthModeValue(mode string) (normalized string, isLegacyAlias bool)
 	return mode, false
 }
 
+// NormalizeAuthMode maps the deprecated "secure" auth.mode spelling to the
+// canonical "token"; every other value passes through unchanged. This is the
+// client-boundary half of the wire-compat contract (see LegacyWireAuthMode):
+// any code that decodes an auth mode string off the wire — /api/info from a
+// released pre-rename server (which reports "secure"), or from a current
+// server in token mode (which deliberately still reports "secure") — must
+// normalize before comparing against the AuthMode* constants.
+func NormalizeAuthMode(mode string) string {
+	normalized, _ := normalizeAuthModeValue(mode)
+	return normalized
+}
+
+// LegacyWireAuthMode maps the canonical "token" spelling back to the legacy
+// "secure" for wire surfaces that released pre-rename clients consume.
+//
+// The one such surface is /api/info's auth_mode field: an old client decides
+// whether to bootstrap a credential at all by checking the exact string
+// "secure" (cmd/shed/server.go:352 at v0.8.0). Reporting "token" there makes
+// the old client skip the bootstrap and save an entry with no credential,
+// which then 401s on every command — so token mode keeps the legacy spelling
+// on that wire indefinitely, and clients normalize on decode
+// (NormalizeAuthMode). "open" and "mtls" pass through: "open" predates the
+// rename unchanged, and mtls-mode /api/info is client-certificate-gated, so
+// no pre-rename client can ever read it.
+func LegacyWireAuthMode(mode string) string {
+	if mode == AuthModeToken {
+		return authModeSecureAlias
+	}
+	return mode
+}
+
 // normalizeAuthMode rewrites cfg.Auth.Mode from the deprecated "secure"
 // spelling to the canonical "token", emitting exactly one startup deprecation
 // warning line when the legacy alias was used. Must run before

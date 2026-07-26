@@ -304,6 +304,42 @@ func TestNormalizeAuthModeValue(t *testing.T) {
 	}
 }
 
+// TestWireAuthModeRoundTrip pins the /api/info wire-compat contract: token
+// mode travels as the legacy "secure" spelling (released clients gate their
+// credential bootstrap on that exact string), every mode round-trips
+// LegacyWireAuthMode→NormalizeAuthMode back to its canonical form, and
+// NormalizeAuthMode also accepts what a released pre-rename server reports.
+func TestWireAuthModeRoundTrip(t *testing.T) {
+	wire := map[string]string{
+		AuthModeOpen:  AuthModeOpen,
+		AuthModeToken: "secure", // the load-bearing leg: old clients need this exact string
+		AuthModeMTLS:  AuthModeMTLS,
+	}
+	for canonical, wantWire := range wire {
+		if got := LegacyWireAuthMode(canonical); got != wantWire {
+			t.Errorf("LegacyWireAuthMode(%q) = %q, want %q", canonical, got, wantWire)
+		}
+		if got := NormalizeAuthMode(LegacyWireAuthMode(canonical)); got != canonical {
+			t.Errorf("round-trip of %q = %q, want it back unchanged", canonical, got)
+		}
+	}
+	// A released server reports "secure"; the client boundary must map it to
+	// the canonical constant, or the HTTP-fallback guard in `shed server add`
+	// writes a credential-less entry for it.
+	if got := NormalizeAuthMode("secure"); got != AuthModeToken {
+		t.Errorf("NormalizeAuthMode(secure) = %q, want %q", got, AuthModeToken)
+	}
+	// Unknown/empty values pass through — a future mode must not be eaten.
+	for _, passthrough := range []string{"", "bogus"} {
+		if got := NormalizeAuthMode(passthrough); got != passthrough {
+			t.Errorf("NormalizeAuthMode(%q) = %q, want passthrough", passthrough, got)
+		}
+		if got := LegacyWireAuthMode(passthrough); got != passthrough {
+			t.Errorf("LegacyWireAuthMode(%q) = %q, want passthrough", passthrough, got)
+		}
+	}
+}
+
 // TestNormalizeAuthModeWarning verifies the deprecation warning is emitted
 // exactly once when the legacy "secure" spelling is normalized, and not at
 // all for the canonical "token" (or an unset/open mode).

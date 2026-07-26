@@ -62,10 +62,13 @@ func TestHandleGetInfo_HTTPSPort(t *testing.T) {
 	}
 }
 
-// TestHandleGetInfo_AuthMode verifies GET /api/info reports auth_mode
-// directly from the effective config, including the new mtls value — the
-// handler must not special-case a fixed open/token pair (that hardcoding is
-// exactly the bug this test guards against).
+// TestHandleGetInfo_AuthMode verifies GET /api/info reports auth_mode from
+// the effective config in its WIRE spelling: token mode reports the legacy
+// "secure", because released clients gate their credential bootstrap on that
+// exact string (config.LegacyWireAuthMode) — reporting "token" would make an
+// old client save an entry with no credential. Open and mtls report their
+// canonical names (no pre-rename client can ever read mtls-mode /api/info —
+// it is certificate-gated).
 func TestHandleGetInfo_AuthMode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -74,7 +77,8 @@ func TestHandleGetInfo_AuthMode(t *testing.T) {
 	}{
 		{name: "nil auth reports open", auth: nil, wantMode: config.AuthModeOpen},
 		{name: "open reports open", auth: &config.AuthConfig{Mode: config.AuthModeOpen}, wantMode: config.AuthModeOpen},
-		{name: "token reports token", auth: &config.AuthConfig{Mode: config.AuthModeToken}, wantMode: config.AuthModeToken},
+		{name: "token reports legacy secure on the wire", auth: &config.AuthConfig{Mode: config.AuthModeToken}, wantMode: "secure"},
+		{name: "legacy secure config also reports secure on the wire", auth: &config.AuthConfig{Mode: "secure"}, wantMode: "secure"},
 		{name: "mtls reports mtls", auth: &config.AuthConfig{Mode: config.AuthModeMTLS}, wantMode: config.AuthModeMTLS},
 	}
 

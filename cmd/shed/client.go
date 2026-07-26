@@ -644,6 +644,10 @@ func (c *APIClient) GetInfo() (*config.ServerInfo, error) {
 	if err := c.doRequest(http.MethodGet, "/api/info", nil, &info); err != nil {
 		return nil, err
 	}
+	// Both released servers and current token-mode servers report the legacy
+	// "secure" spelling on this wire (config.LegacyWireAuthMode); normalize
+	// here so every consumer compares against the canonical constants.
+	info.AuthMode = config.NormalizeAuthMode(info.AuthMode)
 	return &info, nil
 }
 

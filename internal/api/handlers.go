@@ -23,12 +23,16 @@ import (
 // GET /api/info
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	info := config.ServerInfo{
-		Name:         s.cfg.Name,
-		Version:      version.Info(),
-		SSHPort:      s.cfg.SSHPort,
-		HTTPPort:     s.cfg.HTTPPort,
-		Backend:      s.cfg.DefaultBackend,
-		AuthMode:     s.cfg.AuthModeValue(),
+		Name:     s.cfg.Name,
+		Version:  version.Info(),
+		SSHPort:  s.cfg.SSHPort,
+		HTTPPort: s.cfg.HTTPPort,
+		Backend:  s.cfg.DefaultBackend,
+		// Token mode reports the legacy "secure" spelling: released clients
+		// gate their credential bootstrap on that exact string, and reporting
+		// "token" would make them save an entry with no credential (see
+		// config.LegacyWireAuthMode). Current clients normalize on decode.
+		AuthMode:     config.LegacyWireAuthMode(s.cfg.AuthModeValue()),
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     serverFeatures(),
