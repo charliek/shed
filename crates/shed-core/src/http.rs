@@ -3069,20 +3069,22 @@ mod mtls_tests {
         // would not have given: the next request rides the new pool with no
         // rejection, no mint and no extra dial. (Before the pool purge, the
         // refused connection stayed checked in and poisoned every later request,
-        // costing a mint each time.) Measured as a DELTA off the dial count the
-        // recovery happened to leave behind, for the reason in the doc comment.
-        let dials = srv.handshake_count();
+        // costing a mint each time.) Stated as the identity invariant rather than
+        // as a dial count, for the reason in the doc comment: a throwaway-retry
+        // implementation fails BOTH of these — the later request rides the
+        // poisoned connection, so the server sees `client-1` a second time and
+        // the client pays another mint.
         get(&c).await.unwrap();
         assert_eq!(minter.calls(), 2, "no further mint");
+        let cns = srv.client_cns();
         assert_eq!(
-            srv.handshake_count(),
-            dials,
-            "the third request rides the recycled pool — no needless extra dial"
+            cns.iter().filter(|cn| *cn == "SHA256:client-1").count(),
+            1,
+            "the refused identity is never presented again: {cns:?}"
         );
-        assert_eq!(
-            srv.client_cns().last().map(String::as_str),
-            Some("SHA256:client-2"),
-            "the refused identity is never presented again"
+        assert!(
+            cns[1..].iter().all(|cn| cn == "SHA256:client-2"),
+            "later requests ride the recycled pool as the NEW identity: {cns:?}"
         );
     }
 
