@@ -10,6 +10,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"fmt"
+	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -169,6 +172,42 @@ func TestClientCertificatesWithoutAPinDoNotSuppressTheToken(t *testing.T) {
 	}
 	if got := sawAuth.Load().(string); got != "Bearer shed_creds_abc" {
 		t.Errorf("Authorization = %q, want the token: no pin means no certificate was ever wired", got)
+	}
+}
+
+// survivingTokenProvider models the rejected-credential-with-failed-re-mint
+// state: Token returns the SURVIVING token alongside the mint error.
+type survivingTokenProvider struct{}
+
+func (survivingTokenProvider) Token() (string, error) {
+	return "surviving", fmt.Errorf("ssh mint down")
+}
+func (survivingTokenProvider) Invalidate() {}
+
+// TestSurvivingTokenIsStillSentWhenRefreshFails pins whole-branch review
+// finding 2 at the wire: when the provider errors but still holds a token,
+// the request carries it — stripping the wire of a credential the server
+// might still accept guaranteed rejection even after a transient revocation
+// was rolled back.
+func TestSurvivingTokenIsStillSentWhenRefreshFails(t *testing.T) {
+	var sawAuth atomic.Value
+	sawAuth.Store("")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := NewHostClient(
+		WithServerURL(srv.URL),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		WithTokenProvider(survivingTokenProvider{}),
+	)
+	if err := c.Respond(context.Background(), "ns", &Envelope{}); err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+	if got := sawAuth.Load().(string); got != "Bearer surviving" {
+		t.Errorf("Authorization = %q, want the surviving token on the wire", got)
 	}
 }
 

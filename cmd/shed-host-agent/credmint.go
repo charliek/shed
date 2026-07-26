@@ -367,13 +367,33 @@ func (s *credentialSource) discardStored() {
 //
 // In mtls state it returns "" with a nil error, which is exactly right: the
 // credential is real and current, it simply is not a bearer token, and the
-// caller's certificate path carries it instead. An error here means there is no
-// credential of ANY shape.
+// caller's certificate path carries it instead.
+//
+// Both values are meaningful together (whole-branch review finding 2): when
+// the freshness machinery fails — a rejected credential whose replacement
+// mint failed — the SURVIVING token is still returned alongside the error, so
+// the caller keeps presenting something the server might still accept (a
+// rejection can be transient) while logging why it could not be replaced.
+// Stripping the wire of the surviving credential guaranteed rejection even
+// once the server would have accepted it again, and was asymmetric with mtls
+// state, where the still-armed certificate keeps being presented.
 func (s *credentialSource) Token() (string, error) {
-	if err := s.src.EnsureFreshErr(); err != nil {
+	err := s.src.EnsureFreshErr()
+	// EXCEPT after a latched host-key mismatch: that is a possible MITM, and
+	// it is the one state where "present what the server might still accept"
+	// inverts — everything is withdrawn, nothing is presented.
+	if s.terminalErr() != nil {
 		return "", err
 	}
-	return s.src.Token(), nil
+	return s.src.Token(), err
+}
+
+// terminalErr returns the latched fail-closed error (a host-key pin mismatch
+// during mint), or nil.
+func (s *credentialSource) terminalErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminal
 }
 
 // ClientCertificate returns the certificate to present at a TLS handshake, or
@@ -383,7 +403,13 @@ func (s *credentialSource) Token() (string, error) {
 // a point where an SSH round-trip would stall the handshake behind a network
 // operation the handshake's own deadline knows nothing about. The mint happens
 // earlier, in Token, which every request path calls before it dials.
+//
+// After a latched host-key mismatch (possible MITM) it presents NOTHING —
+// same fail-closed withdrawal as Token.
 func (s *credentialSource) ClientCertificate() *tls.Certificate {
+	if s.terminalErr() != nil {
+		return nil
+	}
 	return s.src.ClientCertificate()
 }
 

@@ -335,9 +335,16 @@ func (c *HostClient) setAuth(req *http.Request) {
 	if c.tokenProvider != nil {
 		t, err := c.tokenProvider.Token()
 		if err != nil {
-			if c.presentingCertificate() {
+			// The provider returns the SURVIVING credential alongside the
+			// error (a failed re-mint keeps the prior credential presentable
+			// — the server might still accept it), so the log line names what
+			// actually goes on the wire.
+			switch {
+			case c.presentingCertificate():
 				c.logger.Warn("credential refresh failed; presenting the existing certificate", "error", err)
-			} else {
+			case t != "":
+				c.logger.Warn("credential refresh failed; presenting the existing token", "error", err)
+			default:
 				c.logger.Warn("token provider returned no token; sending unauthenticated", "error", err)
 			}
 		}

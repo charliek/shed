@@ -437,6 +437,14 @@ impl Held {
 struct SourceState {
     cred: Option<Held>,
     expiry: Option<i64>,
+    /// The server REFUSED the held credential (a 401 or a TLS certificate
+    /// alert) and no replacement has been minted yet. While set, `obtain`
+    /// skips its cache short-circuit — every call attempts a mint — but the
+    /// credential itself STAYS held and armed on the transport: a rejection
+    /// can be transient (a mid-rotation allowlist refresh), and presenting
+    /// something the server might still accept beats presenting nothing
+    /// (mirror Go `clienttoken.Source.Reject`). Cleared by a successful mint.
+    rejected: bool,
     /// Latched host-key-mismatch error — once set, the source fails closed forever.
     terminal_err: Option<String>,
     /// The in-flight mint's join handle, if one is running (single-flight).
@@ -545,6 +553,7 @@ pub fn new_credential_source_with_store(
     let mut state = SourceState {
         cred: None,
         expiry: None,
+        rejected: false,
         terminal_err: None,
         inflight: None,
     };
@@ -639,20 +648,44 @@ impl CredentialSource {
         }
     }
 
-    /// Clear the cached credential so the next obtain re-mints. Called after a 401 (the
-    /// egress consumer's `EgressTokenSource::invalidate`, mirror Go
-    /// `credentialSource.Invalidate`).
+    /// Mark the held credential server-refused so the next obtain re-mints. Called after
+    /// a 401 or a classified TLS certificate alert (the bus `TokenProvider` and egress
+    /// `EgressTokenSource` bridges; mirror Go `credentialSource.Invalidate` → `Reject`).
     ///
-    /// The certificate is withdrawn from the transport at the same time: a credential the
-    /// server just refused must not keep being presented on the next handshake. Existing
-    /// pooled connections are unaffected — they already authenticated — which is exactly
-    /// the semantics an invalidation wants.
+    /// Deliberately NON-destructive (whole-branch review finding 3): the credential stays
+    /// held and the certificate stays armed on the transport's resolver. A rejection can
+    /// be transient — a mid-rotation allowlist refresh — and if the replacement mint then
+    /// FAILS (SSH down), a client that had withdrawn its certificate would send the next
+    /// handshake with no identity at all, guaranteeing rejection even once the server
+    /// would have accepted the old certificate again. Go keeps presenting the surviving
+    /// credential in exactly this state; the `rejected` flag is what forces the re-mint
+    /// attempt without discarding what we hold.
     pub fn invalidate(&self) {
-        {
-            let mut st = self.state.lock().unwrap();
-            st.cred = None;
+        self.state.lock().unwrap().rejected = true;
+    }
+
+    /// The bearer still held after a failed re-mint, or `None` (no credential,
+    /// a certificate — which travels in the handshake, not a header — or the
+    /// terminal fail-closed state). Lets a caller keep presenting what the
+    /// server might still accept while the mint error surfaces (Go parity:
+    /// `credentialSource.Token` returns the surviving token WITH the error).
+    pub fn surviving_bearer(&self) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        if st.terminal_err.is_some() {
+            return None; // fail closed — never present after a host-key pin mismatch
         }
-        self.cert_resolver.set(None);
+        st.cred
+            .as_ref()
+            .and_then(Held::bearer)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Whether a certificate identity is currently held (and therefore armed on
+    /// the transport's resolver) — used by callers to pick the right log line
+    /// when a re-mint fails.
+    pub fn holds_certificate(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.terminal_err.is_none() && matches!(st.cred, Some(Held::Certificate { .. }))
     }
 
     /// Proactively re-mint, best-effort (errors surface on the next obtain). Driven by
@@ -675,7 +708,11 @@ impl CredentialSource {
             if force {
                 st.cred = None; // force a re-mint; never serve a completed cached credential
             } else if let Some(c) = &st.cred {
-                if c.usable() && !stale(st.expiry) {
+                // A rejected credential is disqualified from the cache
+                // short-circuit even when locally unexpired: the server
+                // refused it, so serving it as "fresh" would skip the re-mint
+                // forever (mirror Go EnsureFreshErr's !rejected condition).
+                if c.usable() && !stale(st.expiry) && !st.rejected {
                     return Ok((c.bearer(), st.expiry));
                 }
             }
@@ -751,6 +788,7 @@ impl CredentialSource {
                     self.cert_resolver.set(held.certified());
                     st.expiry = expiry;
                     st.cred = Some(held);
+                    st.rejected = false; // a fresh credential has no rejection history
                     Ok((bearer, expiry))
                 }
                 Err(MintFailure::Unusable(msg)) => Err(msg),
@@ -763,6 +801,14 @@ impl CredentialSource {
                         e.message()
                     );
                     st.terminal_err = Some(msg.clone());
+                    // Withdraw EVERYTHING (fail closed): a possible MITM is
+                    // the one state where "keep presenting what the server
+                    // might still accept" inverts — the held credential and
+                    // the armed transport identity are both dropped, so no
+                    // handshake or header ever presents them again.
+                    st.cred = None;
+                    st.expiry = None;
+                    self.cert_resolver.set(None);
                     Err(msg)
                 }
                 Err(MintFailure::Minter(e)) => Err(e.message().to_string()),
@@ -1144,6 +1190,135 @@ mod tests {
         assert_eq!(fm.calls.load(Ordering::SeqCst), 2);
     }
 
+    /// Whole-branch review finding 3, token half: a rejection whose
+    /// replacement mint FAILS keeps the surviving token presentable
+    /// (`surviving_bearer`) while `token()` surfaces the mint error, and the
+    /// next successful mint recovers. Counted in real MINT attempts.
+    #[tokio::test]
+    async fn invalidate_keeps_token_presentable_when_remint_fails() {
+        let fm = FakeMinter::new(vec![
+            Ok(minted("tok1")),
+            Err(false), // invalidate's forced re-mint fails
+            Ok(minted("tok2")),
+        ]);
+        let s = new_credential_source(fm.clone(), target("s", "", 0), SCOPE_CONTROL);
+        assert_eq!(s.token().await.unwrap(), "tok1");
+        s.invalidate();
+        let err = s.token().await.unwrap_err();
+        assert!(err.contains("transient"), "mint error must surface: {err}");
+        assert_eq!(
+            s.surviving_bearer().as_deref(),
+            Some("tok1"),
+            "the rejected-but-surviving token stays presentable"
+        );
+        // Recovery: the next call mints, clearing the rejection.
+        assert_eq!(s.token().await.unwrap(), "tok2");
+        assert_eq!(s.token().await.unwrap(), "tok2"); // cached again
+        assert_eq!(
+            fm.calls.load(Ordering::SeqCst),
+            3,
+            "initial + failed re-mint + recovery; steady state is cached"
+        );
+    }
+
+    /// Whole-branch review finding 3, certificate half: invalidate must NOT
+    /// withdraw the armed certificate — a failed replacement mint would leave
+    /// every handshake identity-less, guaranteeing rejection even once a
+    /// transient revocation is rolled back (Go keeps presenting; so do we).
+    #[tokio::test]
+    async fn invalidate_keeps_certificate_armed_when_remint_fails() {
+        let ca = TestCa::new();
+        let fm = FakeMinter::new(vec![
+            Ok(minted_cert(&ca, 0x01, Some(now_unix() + 86_400))),
+            Err(false), // every re-mint fails from here on
+        ]);
+        let s = new_credential_source_with_store(
+            fm.clone(),
+            target("s", "", 0),
+            SCOPE_CREDENTIALS,
+            None,
+        );
+        assert_eq!(s.token().await.unwrap(), ""); // mtls state: bearer is empty
+        assert!(s.cert_resolver().current().is_some(), "certificate armed");
+
+        s.invalidate();
+        assert!(
+            s.cert_resolver().current().is_some(),
+            "invalidate must not strip the transport of the surviving identity"
+        );
+        assert!(s.holds_certificate());
+        assert_eq!(s.surviving_bearer(), None, "a certificate is not a bearer");
+
+        let err = s.token().await.unwrap_err();
+        assert!(err.contains("transient"), "mint error surfaces: {err}");
+        assert!(
+            s.cert_resolver().current().is_some(),
+            "the certificate survives the failed re-mint too"
+        );
+        assert_eq!(
+            fm.calls.load(Ordering::SeqCst),
+            2,
+            "initial + exactly one forced re-mint attempt for this token() call"
+        );
+    }
+
+    /// The rejected state forces one real mint attempt per obtain — bounded,
+    /// no cache short-circuit, no runaway loop within a single call.
+    #[tokio::test]
+    async fn rejected_state_attempts_one_mint_per_obtain() {
+        let fm = FakeMinter::new(vec![Ok(minted("tok1")), Err(false)]);
+        let s = new_credential_source(fm.clone(), target("s", "", 0), SCOPE_CONTROL);
+        assert_eq!(s.token().await.unwrap(), "tok1");
+        s.invalidate();
+        for i in 0..3 {
+            let _ = s.token().await;
+            assert_eq!(
+                fm.calls.load(Ordering::SeqCst),
+                2 + i,
+                "one mint attempt per obtain while rejected"
+            );
+        }
+    }
+
+    /// The surviving-credential contract INVERTS on a latched host-key
+    /// mismatch: a possible MITM withdraws the held credential AND the armed
+    /// transport identity — nothing is presented again. (The empty-state
+    /// terminal test cannot catch this; production commonly already holds a
+    /// credential when the replacement mint goes terminal.)
+    #[tokio::test]
+    async fn terminal_mismatch_withdraws_the_held_credential() {
+        let ca = TestCa::new();
+        // Near-expiry certificate so the second token() forces the re-mint
+        // that hits the terminal mismatch.
+        let fm = FakeMinter::new(vec![
+            Ok(minted_cert(&ca, 0x0a, Some(now_unix() + 60))),
+            Err(true),
+        ]);
+        let s = new_credential_source_with_store(
+            fm.clone(),
+            target("s", "", 0),
+            SCOPE_CREDENTIALS,
+            None,
+        );
+        assert_eq!(s.token().await.unwrap(), "");
+        assert!(
+            s.cert_resolver().current().is_some(),
+            "armed before terminal"
+        );
+
+        let err = s.token().await.unwrap_err();
+        assert!(
+            err.contains("possible MITM"),
+            "terminal error surfaces: {err}"
+        );
+        assert!(
+            s.cert_resolver().current().is_none(),
+            "the armed identity is withdrawn on terminal"
+        );
+        assert!(!s.holds_certificate());
+        assert_eq!(s.surviving_bearer(), None);
+    }
+
     #[tokio::test]
     async fn source_pin_mismatch_is_terminal_no_retry() {
         let fm = FakeMinter::new(vec![Err(true)]);
@@ -1473,7 +1648,7 @@ mod tests {
     /// Invalidation (a 401) drops the certificate from the transport too — a credential
     /// the server just refused must not keep being presented.
     #[tokio::test]
-    async fn invalidate_withdraws_the_certificate_and_re_mints() {
+    async fn invalidate_keeps_the_certificate_and_re_mints() {
         let ca = TestCa::new();
         let fm = FakeMinter::new(vec![
             Ok(minted_cert(&ca, 0x0a, Some(now_unix() + 86_400))),
@@ -1490,7 +1665,14 @@ mod tests {
         assert!(s.cert_resolver().current().is_some());
 
         s.invalidate();
-        assert!(s.cert_resolver().current().is_none(), "withdrawn on 401");
+        // NOT withdrawn (whole-branch review finding 3): the rejection can be
+        // transient, and stripping the identity would guarantee rejection if
+        // the replacement mint then failed. The rejected flag forces the next
+        // obtain to mint regardless.
+        assert!(
+            s.cert_resolver().current().is_some(),
+            "the surviving certificate stays armed across invalidate"
+        );
 
         s.token().await.unwrap();
         assert_eq!(s.credential_serial().as_deref(), Some("b"), "re-minted");

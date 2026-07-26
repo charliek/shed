@@ -164,6 +164,11 @@ impl std::fmt::Display for EgressStreamError {
 pub trait EgressTokenSource: Send + Sync {
     async fn token(&self) -> Result<String, String>;
     fn invalidate(&self);
+    /// The bearer still held after `token()` failed (see the bus
+    /// `TokenProvider::surviving_token` — same Go-parity contract).
+    fn surviving_token(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Bridge the caching, invalidatable control-token source onto [`EgressTokenSource`].
@@ -182,6 +187,9 @@ impl EgressTokenSource for Arc<crate::minter::CredentialSource> {
         // Deref past the Arc to the inherent method (the trait is impl'd on `Arc<_>`, so a
         // bare `self.invalidate()` would recurse into THIS method).
         (**self).invalidate()
+    }
+    fn surviving_token(&self) -> Option<String> {
+        (**self).surviving_bearer()
     }
 }
 
@@ -347,11 +355,14 @@ impl EgressSubscriber {
             Some(src) => match src.token().await {
                 Ok(t) => t,
                 Err(e) => {
+                    // A failed re-mint keeps the surviving bearer on the wire
+                    // (Go parity; in mtls state the armed certificate carries
+                    // the identity instead and "" stays correct).
                     self.log.debug(&format!(
                         "egress: control-token mint failed server={} error={e}",
                         self.server
                     ));
-                    String::new()
+                    src.surviving_token().unwrap_or_default()
                 }
             },
         };

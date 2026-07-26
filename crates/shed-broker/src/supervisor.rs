@@ -59,6 +59,12 @@ impl TokenProvider for Arc<CredentialSource> {
         // bare `self.invalidate()` would recurse into THIS method).
         (**self).invalidate()
     }
+    fn surviving_token(&self) -> Option<String> {
+        (**self).surviving_bearer()
+    }
+    fn presenting_certificate(&self) -> bool {
+        (**self).holds_certificate()
+    }
 }
 
 /// The server-agnostic components every per-server watcher group shares — built once in

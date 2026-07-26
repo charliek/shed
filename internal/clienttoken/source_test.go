@@ -354,13 +354,16 @@ func TestRejectStaleGenerationDoesNotDisqualify(t *testing.T) {
 }
 
 // TestRejectLosingTheMintRaceDoesNotPoisonTheFreshCredential exercises the
-// gen-guard in Reject's marking branch: the mint fails, but by the time the
-// marking runs a concurrent successful re-mint has advanced the generation
-// (simulated white-box from inside the failing mint — the callback runs
-// without mu held, exactly like a real concurrent mint landing). The FRESH
-// credential must not inherit the rejection mark. Without the locked
-// `gen == prevGen` guard this test fails: EnsureFreshErr would re-mint and
-// surface an error against a perfectly good credential.
+// gen-guard in Reject's marking branch. The production interleaving it stands
+// in for is two SEQUENTIAL singleflight batches: caller A's Reject(gen0) mint
+// fails and its batch completes; caller B's Refresh(gen0) then starts a NEW
+// batch that mints successfully (gen→1) — all before A, which is off the
+// lock between its batch returning and its marking, acquires mu. The
+// white-box mutation inside the failing callback (which runs without mu
+// held) reproduces that timing deterministically. The FRESH credential must
+// not inherit A's stale rejection. Without the locked `gen == prevGen` guard
+// this test fails: EnsureFreshErr would re-mint and surface an error against
+// a perfectly good credential.
 func TestRejectLosingTheMintRaceDoesNotPoisonTheFreshCredential(t *testing.T) {
 	var s *Source
 	var mints int32

@@ -260,6 +260,77 @@ func TestCredentialSourceCachesAndReMints(t *testing.T) {
 	}
 }
 
+// TestCredentialSourceSurvivingTokenAfterFailedReMint pins whole-branch
+// review finding 2, counting real MINT attempts (not Invalidate calls): a
+// rejection whose replacement mint FAILS returns the surviving token
+// alongside the error — the server might still accept it, and presenting it
+// beats presenting nothing — and the next successful mint recovers.
+func TestCredentialSourceSurvivingTokenAfterFailedReMint(t *testing.T) {
+	far := time.Now().Add(24 * time.Hour)
+	fm := &fakeMinter{results: []mintResult{
+		tokenMint("tok1", far),
+		{err: fmt.Errorf("ssh down")}, // Invalidate's re-mint
+		{err: fmt.Errorf("ssh down")}, // the next Token's forced re-attempt
+		tokenMint("tok2", far),        // recovery
+	}}
+	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)
+
+	if got, err := s.Token(); got != "tok1" || err != nil {
+		t.Fatalf("Token = %q, %v; want tok1, nil", got, err)
+	}
+	s.Invalidate() // server rejected tok1; the replacement mint fails
+	got, err := s.Token()
+	if err == nil {
+		t.Error("want the mint error surfaced while the mint keeps failing")
+	}
+	if got != "tok1" {
+		t.Errorf("Token = %q, want the SURVIVING tok1 presented alongside the error", got)
+	}
+	got, err = s.Token() // the minter healed
+	if err != nil || got != "tok2" {
+		t.Errorf("Token = %q, %v; want tok2, nil (recovery clears the rejection)", got, err)
+	}
+	if fm.calls != 4 {
+		t.Errorf("mint attempts = %d, want exactly 4 (initial, Invalidate, forced re-attempt, recovery)", fm.calls)
+	}
+	// Steady state after recovery: cached, no further mints.
+	if _, err := s.Token(); err != nil {
+		t.Errorf("post-recovery Token: %v", err)
+	}
+	if fm.calls != 4 {
+		t.Errorf("mint attempts = %d after recovery, want still 4 (cache restored)", fm.calls)
+	}
+}
+
+// TestCredentialSourceTerminalWithdrawsHeldCredential: the surviving-credential
+// contract INVERTS on a latched host-key mismatch. A possible MITM is the one
+// state where presenting anything is wrong — the held token and the armed
+// certificate are both withdrawn, not just the re-mint suppressed. (Production
+// commonly already holds a credential when the replacement mint goes terminal,
+// which the empty-state terminal test cannot catch.)
+func TestCredentialSourceTerminalWithdrawsHeldCredential(t *testing.T) {
+	near := time.Now().Add(clienttoken.RefreshWindow / 2) // forces the next Token to re-mint
+	fm := &fakeMinter{results: []mintResult{
+		tokenMint("tok1", near),
+		{err: fmt.Errorf("bootstrap: %w", sdkbootstrap.ErrHostKeyMismatch)},
+	}}
+	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)
+
+	if got, err := s.Token(); got != "tok1" || err != nil {
+		t.Fatalf("Token = %q, %v; want tok1, nil", got, err)
+	}
+	got, err := s.Token() // near expiry → re-mint → host-key mismatch → terminal
+	if err == nil {
+		t.Fatal("want the terminal error surfaced")
+	}
+	if got != "" {
+		t.Errorf("Token = %q, want empty — a possible MITM withdraws the held credential", got)
+	}
+	if s.ClientCertificate() != nil {
+		t.Error("ClientCertificate must present nothing in the terminal state")
+	}
+}
+
 func TestCredentialSourcePinMismatchTerminal(t *testing.T) {
 	fm := &fakeMinter{results: []mintResult{{err: fmt.Errorf("bootstrap: %w", sdkbootstrap.ErrHostKeyMismatch)}}}
 	s := newCredentialSource(context.Background(), fm, ServerTarget{Name: "s"}, scopeCredentials, nil, nil)

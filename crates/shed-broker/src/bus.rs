@@ -253,6 +253,18 @@ pub trait TokenProvider: Send + Sync {
     /// Mark the current token stale so the next `token()` re-mints. Called after a
     /// 401.
     fn invalidate(&self);
+    /// The bearer still held after `token()` failed — a failed re-mint keeps the
+    /// prior credential presentable (Go parity: the server might still accept
+    /// it, and presenting something beats presenting nothing). Default `None`
+    /// (static providers never fail).
+    fn surviving_token(&self) -> Option<String> {
+        None
+    }
+    /// Whether a certificate identity is armed on the transport — used only to
+    /// pick the right log line when `token()` fails. Default `false`.
+    fn presenting_certificate(&self) -> bool {
+        false
+    }
 }
 
 /// A fixed-token provider (the open-mode / static-token analog of Go's
@@ -806,11 +818,27 @@ impl BusClient {
         if let Some(p) = &self.token_provider {
             match p.token().await {
                 Ok(t) => (!t.is_empty()).then_some(t),
+                // A failed re-mint does not strip the wire of a credential the
+                // server might still accept: present the surviving token (or,
+                // in mtls state, the still-armed certificate) and log WHY the
+                // replacement could not be minted (Go setAuth parity).
                 Err(e) => {
-                    self.log.warn(&format!(
-                        "token provider returned no token; sending unauthenticated: {e}"
-                    ));
-                    None
+                    if let Some(t) = p.surviving_token() {
+                        self.log.warn(&format!(
+                            "credential refresh failed; presenting the existing token: {e}"
+                        ));
+                        Some(t)
+                    } else if p.presenting_certificate() {
+                        self.log.warn(&format!(
+                            "credential refresh failed; presenting the existing certificate: {e}"
+                        ));
+                        None
+                    } else {
+                        self.log.warn(&format!(
+                            "token provider returned no token; sending unauthenticated: {e}"
+                        ));
+                        None
+                    }
                 }
             }
         } else if !self.static_token.is_empty() {
