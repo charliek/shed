@@ -285,7 +285,8 @@ impl Client {
     ///     steady state above. (Verified, not assumed: the pooled connection is
     ///     genuinely re-used — see
     ///     `mtls_tests::a_revoked_identity_recovers_on_a_pooled_keepalive_connection`,
-    ///     which asserts the handshake count.)
+    ///     which asserts the refused identity handshook exactly once, i.e. its
+    ///     rejection really did arrive on a POOLED connection.)
     ///
     /// Dropping the old client drops its pool; connections still in use are
     /// unaffected, because every caller holds the `Arc` it started with (see
@@ -2991,10 +2992,24 @@ mod mtls_tests {
     // connection whose handshake already happened, so re-minting alone does not
     // help — the retry has to leave that connection behind.
     //
-    // The handshake count is the assertion that keeps this test honest: exactly
-    // TWO means the rejected request really was served from the pool (one dial for
-    // the original connection, one for the retry). Three would mean the pool had
-    // already dropped the connection and the pooled path was never exercised.
+    // What keeps this test honest is the IDENTITY SEQUENCE the server saw, and in
+    // particular that the refused identity handshook exactly ONCE: one dial means
+    // the rejected request really was served from the pool (had the pool already
+    // dropped the connection, the refused certificate would have been presented on
+    // a second, fresh dial and the pooled path would never have been exercised),
+    // and it also means the retry did not re-present it.
+    //
+    // It deliberately does NOT assert a total dial count. The test server counts a
+    // handshake — and records the CN — the moment `accept` returns, BEFORE it has
+    // read a request, so the tally is a count of DIALS, not of authorized
+    // requests. hyper's pool may establish a connection that the request it was
+    // dialed for does not end up using (its checkout/connect race is resolved by
+    // whichever finishes first, and the loser's connection can still complete its
+    // handshake), which is platform- and timing-dependent: an exact-length
+    // assertion passes on macOS and fails on Linux with a benign extra
+    // `client-2` dial. A request-less extra dial costs a handshake and nothing
+    // else — `minter.calls()` below pins the expensive part (a mint is an SSH
+    // round trip and, on desktop, a Touch ID prompt) at exactly one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_revoked_identity_recovers_on_a_pooled_keepalive_connection() {
         let ca = Arc::new(TestCa::new("shed-ca"));
@@ -3021,14 +3036,28 @@ mod mtls_tests {
             .expect("the retry must recover on a fresh connection");
 
         assert_eq!(minter.calls(), 2, "exactly one re-mint");
-        assert_eq!(
-            srv.client_cns(),
-            vec!["SHA256:client-1".to_string(), "SHA256:client-2".to_string()]
+
+        let cns = srv.client_cns();
+        assert!(
+            cns.len() >= 2,
+            "the retry must have been a NEW handshake, not a re-send on the \
+             pooled connection: {cns:?}"
         );
         assert_eq!(
-            srv.handshake_count(),
-            2,
-            "one dial for the pooled connection, one for the retry"
+            cns.first().map(String::as_str),
+            Some("SHA256:client-1"),
+            "the refused identity is the first thing the server saw: {cns:?}"
+        );
+        assert_eq!(
+            cns.iter().filter(|cn| *cn == "SHA256:client-1").count(),
+            1,
+            "the refused identity handshook exactly ONCE — the 401 arrived on the \
+             POOLED connection (not on a fresh dial), and the retry never \
+             re-presented it: {cns:?}"
+        );
+        assert!(
+            cns[1..].iter().all(|cn| cn == "SHA256:client-2"),
+            "every handshake after the re-mint carries the NEW identity: {cns:?}"
         );
         assert_ne!(
             c.transport_id(),
@@ -3040,11 +3069,21 @@ mod mtls_tests {
         // would not have given: the next request rides the new pool with no
         // rejection, no mint and no extra dial. (Before the pool purge, the
         // refused connection stayed checked in and poisoned every later request,
-        // costing a mint each time.)
+        // costing a mint each time.) Measured as a DELTA off the dial count the
+        // recovery happened to leave behind, for the reason in the doc comment.
+        let dials = srv.handshake_count();
         get(&c).await.unwrap();
         assert_eq!(minter.calls(), 2, "no further mint");
-        assert_eq!(srv.handshake_count(), 2, "no needless third dial");
-        assert_eq!(srv.client_cns().len(), 2);
+        assert_eq!(
+            srv.handshake_count(),
+            dials,
+            "the third request rides the recycled pool — no needless extra dial"
+        );
+        assert_eq!(
+            srv.client_cns().last().map(String::as_str),
+            Some("SHA256:client-2"),
+            "the refused identity is never presented again"
+        );
     }
 
     // (d) Single-flight: concurrent resolutions of a missing credential mint once.
