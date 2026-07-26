@@ -1270,6 +1270,40 @@ impl ControlTokenProvider {
         self.mint_locked(&mut st, now).await
     }
 
+    /// The credential still HELD right now, without minting anything — the
+    /// "surviving credential" a caller presents when [`Self::credential`] failed
+    /// (Go parity: `clienttoken.Source.Current`, which `sdk` `setAuth` and
+    /// `cmd/shed`'s `pinCredential` read after a failed mint, `66abaa9`).
+    ///
+    /// A failed mint says nothing about what is already held: `mint_locked`
+    /// deliberately leaves the cache alone, so a client whose refresh/enrollment
+    /// just failed can still present what it has — the server may well accept it,
+    /// and presenting something beats presenting nothing. `None` means there is
+    /// genuinely nothing to send, which is what makes the mint error the
+    /// request's error rather than a downstream 401 with no explanation (see
+    /// `http::Client::credential`).
+    ///
+    /// Two properties are deliberate:
+    ///
+    ///   * it never mints and never blocks on one — it takes the same state lock,
+    ///     so a call racing an in-flight mint waits for that mint and then sees
+    ///     its result, which is the answer the caller wants anyway;
+    ///   * a REJECTED credential does not survive here. Go's `Source.Reject`
+    ///     keeps the refused credential presentable and only marks it; this
+    ///     provider's `reject_cached` drops it (Dart parity — "never return the
+    ///     rejected token", pinned by
+    ///     `must_mint_failure_errs_even_with_an_unexpired_cached_token`). So on
+    ///     this side "surviving" means held-and-not-refused: the stale/expired
+    ///     cache a failed refresh left behind, or a credential a concurrent
+    ///     caller minted in the meantime.
+    ///
+    /// Unusable shapes ([`Credential::usable`]) are filtered out: a credential
+    /// with no payload is indistinguishable from having none.
+    pub async fn surviving_credential(&self) -> Option<Credential> {
+        let st = self.state.lock().await;
+        st.cached.clone().filter(Credential::usable)
+    }
+
     /// Drop the cached token UNCONDITIONALLY so the next `token()` force-mints.
     /// Kept for back-compat; prefer [`Self::invalidate_if_current`] when the
     /// rejected token is known — this variant can erase a NEWER token when a

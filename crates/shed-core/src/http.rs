@@ -99,6 +99,72 @@ struct Sent {
     transport: Arc<reqwest::Client>,
 }
 
+/// What a credential resolution produced: what to present, and — when a mint
+/// failed — why there is nothing better to present.
+///
+/// The pairing is what lets a failed mint be neither discarded nor fatal. The
+/// error travels WITH the request instead of replacing it, because whether it
+/// matters is the server's answer to give: an `auth.mode: open` server (which
+/// shed-app also wires a minter to, and for which minting necessarily fails —
+/// there is no credential to issue) answers the unauthenticated request
+/// perfectly well, while an enforcing server refuses it and the carried error
+/// is precisely the explanation the refusal lacks. See [`Client::credential`]
+/// and [`Client::send_authed`].
+#[derive(Default)]
+struct Resolution {
+    /// The credential to present: freshly minted, cached, or the SURVIVOR of a
+    /// failed mint. `None` means the request goes out unauthenticated.
+    cred: Option<crate::token::Credential>,
+    /// The mint failure behind a missing or merely surviving credential.
+    mint_error: Option<ShedError>,
+}
+
+impl Resolution {
+    /// A resolution with nothing to explain: this credential is what to present.
+    fn presenting(cred: crate::token::Credential) -> Self {
+        Self {
+            cred: Some(cred),
+            mint_error: None,
+        }
+    }
+}
+
+/// The error a REFUSED request reports when a mint failure is what left it
+/// unable to authenticate.
+///
+/// The mint error leads (it is the actionable half — "upgrade
+/// shed-host-agent", "the SSH bootstrap is unreachable"), with the refusal
+/// itself as context so the reader can still see WHAT the server said: an HTTP
+/// status, or the flattened TLS alert of a handshake-level refusal. The mint
+/// error's variant is preserved so a consumer mapping [`ShedError`] onto its own
+/// error surface (the FFI, the Swift/Tauri clients) keeps the same category.
+fn refused_because(outcome: &Result<reqwest::Response, ShedError>, mint: ShedError) -> ShedError {
+    let refusal = match outcome {
+        Ok(resp) => format!("HTTP {}", resp.status().as_u16()),
+        Err(e) => e.to_string(),
+    };
+    let describe = |m: String| format!("the server refused this request ({refusal}): {m}");
+    match mint {
+        ShedError::Config(m) => ShedError::Config(describe(m)),
+        ShedError::Transport(m) => ShedError::Transport(describe(m)),
+        other => ShedError::Transport(describe(other.to_string())),
+    }
+}
+
+/// Report a refusal the retry machinery decided not to act on: the mint error
+/// that explains it when there is one ([`refused_because`]), the refusal itself
+/// otherwise.
+fn refuse(
+    outcome: Result<reqwest::Response, ShedError>,
+    mint_error: Option<ShedError>,
+    sent: impl FnOnce(reqwest::Response) -> Sent,
+) -> Result<Sent, ShedError> {
+    match mint_error {
+        Some(e) => Err(refused_because(&outcome, e)),
+        None => outcome.map(sent),
+    }
+}
+
 /// One attempt: build the request against `http`, apply `bearer`, send. The
 /// response is returned WHATEVER its status — classification is the caller's
 /// (a 401 has to be told apart from a 404, and only the caller knows which
@@ -338,8 +404,11 @@ impl Client {
     }
 
     /// The bearer token to send, or `None`. Provider-backed clients send the
-    /// minted token, or NOTHING on a mint failure (never the static token — no
+    /// minted token, or the surviving one when the mint failed with something
+    /// still held, or NOTHING when neither exists (never the static token — no
     /// secure-by-default downgrade); provider-less clients send the static token.
+    /// The mint error that explains that last state rides along with the request
+    /// ([`Resolution`]) rather than showing up here.
     ///
     /// Test-only since the request path was unified on
     /// [`Self::send_authed`], which pins the whole CREDENTIAL (the header is only
@@ -349,6 +418,7 @@ impl Client {
     pub(crate) async fn bearer(&self) -> Option<String> {
         self.credential()
             .await
+            .cred
             .and_then(|c| c.bearer_token().map(str::to_string))
     }
 
@@ -358,15 +428,60 @@ impl Client {
     /// site changes, because the certificate leaves through the resolver rather
     /// than through this return value. A provider-less client has no credential to
     /// resolve — its static token is applied by [`Self::bearer`] instead.
-    async fn credential(&self) -> Option<crate::token::Credential> {
+    ///
+    /// # A failed mint is CARRIED, not discarded and not raised
+    ///
+    /// Three outcomes, and the difference between the last two is the point:
+    ///
+    ///   * a credential to present, freshly minted or cached;
+    ///   * the mint FAILED but the provider still holds something usable
+    ///     ([`crate::token::ControlTokenProvider::surviving_credential`]) —
+    ///     present the survivor and let the request proceed (Go parity,
+    ///     `66abaa9`: "presenting something the server might still accept beats
+    ///     presenting nothing"). The error rides along so a refusal can name it;
+    ///   * the mint failed and NOTHING usable is held — the request still goes
+    ///     out, unauthenticated, with the error riding along.
+    ///
+    /// That last case used to `.ok()`-discard the error, which is why an mtls
+    /// server answered by a host-agent too old to mint a certificate reported a
+    /// bare 401 instead of "upgrade shed-host-agent". Raising it here instead
+    /// would be the opposite bug: shed-app installs the shared minter on EVERY
+    /// server (`shed-app/src/backend.rs`), including `auth.mode: open` ones,
+    /// where the mint fails because there is no credential to issue and the
+    /// unauthenticated request is exactly right. So the error is carried and
+    /// only becomes the caller's error if the server actually refuses the
+    /// attempt — see [`Self::send_authed`], which is where the two cases
+    /// separate, and [`refused_because`], which shapes the message.
+    ///
+    /// # Accepted: a survivor the server still accepts hides its mint error
+    ///
+    /// While the server keeps accepting the surviving credential the mint error
+    /// stays invisible, and each request pays one failed mint attempt (bounded:
+    /// one per request, cooled down by the provider). That is the same trade the
+    /// Go side accepts, and it is not degraded service — the requests work. The
+    /// moment the server refuses the survivor the error surfaces automatically
+    /// through the refusal path below.
+    async fn credential(&self) -> Resolution {
         match &self.token_provider {
-            Some(p) => p.credential().await.ok(),
-            None if !self.token.is_empty() => Some(crate::token::Credential {
+            Some(p) => match p.credential().await {
+                Ok(cred) => Resolution::presenting(cred),
+                Err(e) => match p.surviving_credential().await {
+                    Some(surviving) => Resolution {
+                        cred: Some(surviving),
+                        mint_error: Some(e),
+                    },
+                    None => Resolution {
+                        cred: None,
+                        mint_error: Some(e),
+                    },
+                },
+            },
+            None if !self.token.is_empty() => Resolution::presenting(crate::token::Credential {
                 mode: Some(crate::token::AuthMode::Token),
                 token: self.token.clone(),
                 ..Default::default()
             }),
-            None => None,
+            None => Resolution::default(),
         }
     }
 
@@ -377,10 +492,10 @@ impl Client {
     /// would wedge the whole call. On timeout surface a Transport error rather
     /// than block forever. Used by [`Self::request`] for both the initial and the
     /// retry resolution.
-    async fn bounded_credential(
-        &self,
-        bound: Duration,
-    ) -> Result<Option<crate::token::Credential>, ShedError> {
+    ///
+    /// The timeout is the ONLY error it can produce: a mint failure is carried
+    /// inside the [`Resolution`], not raised (see [`Self::credential`]).
+    async fn bounded_credential(&self, bound: Duration) -> Result<Resolution, ShedError> {
         tokio::time::timeout(bound, self.credential())
             .await
             .map_err(|_| ShedError::Transport("credential resolution timeout".into()))
@@ -467,7 +582,15 @@ impl Client {
     /// symmetry is what makes a server-side token↔mtls flip recover with no
     /// operator action, in either direction (plan 001 D5).
     ///
-    /// The retry is SKIPPED — surfacing the original outcome — when:
+    /// The retry is SKIPPED — surfacing the refusal — when:
+    ///   * the attempt had NOTHING to present because the mint failed
+    ///     ([`Resolution::mint_error`] with no credential). The refusal IS that
+    ///     mint failure, observed one round trip later, so it is reported as
+    ///     such ([`refused_because`]) and the mint is NOT re-attempted: it
+    ///     failed moments ago, and a provider inside its failure cooldown would
+    ///     answer the redacted marker, replacing the actionable message with
+    ///     "control token mint failed". Exactly one mint attempt per request in
+    ///     that state;
     ///   * the invalidate timed out (a wedged mint holds the provider mutex;
     ///     the follow-up resolution would block on the same mutex);
     ///   * the re-resolved credential is missing or unusable — a provider-backed
@@ -479,6 +602,13 @@ impl Client {
     ///     rejected value, so it is invalidated again before returning — the
     ///     must-mint flag stays armed and no later call serves it.
     ///
+    /// In every one of those skips the reported error is the mint failure when
+    /// there is one — the freshest one, i.e. the re-mint's over the one carried
+    /// in — and the plain refusal otherwise. "The host-agent cannot mint a
+    /// replacement" is the actionable half of "the server refused what we had",
+    /// and Go says the same: `cmd/shed`'s `reauthenticated` returns a failed
+    /// re-mint rather than the 401 that triggered it.
+    ///
     /// Ahead of all that, the ambiguous "connection was not ready" shape
     /// ([`crate::authfail::is_connection_lost_message`]) gets ONE plain re-send:
     /// the request was never dispatched, so re-sending is safe for any method, and
@@ -487,11 +617,25 @@ impl Client {
     /// what a server restart produces, and a needless mint can cost a real SSH
     /// round-trip (and, on desktop, a Touch ID prompt).
     ///
-    /// `used` is the credential this attempt goes out with, captured by the
-    /// caller. Note that the capture is authoritative only for the HEADER: in
-    /// mtls state the certificate is read live from the resolver at handshake
-    /// time, which is why invalidation there is attribution-free (see
+    /// `resolved` is what this attempt goes out with — the captured credential
+    /// (if any) plus the mint error that explains its absence or staleness. Note
+    /// that the capture is authoritative only for the HEADER: in mtls state the
+    /// certificate is read live from the resolver at handshake time, which is
+    /// why invalidation there is attribution-free (see
     /// [`Self::invalidate_used`]).
+    ///
+    /// # Pool purge on an mtls invalidation, re-mint or not
+    ///
+    /// When the credential this attempt USED was a certificate, the pool is
+    /// purged ([`Self::recycle_transport`]) as soon as the invalidation lands —
+    /// not only when a replacement is successfully minted. Those idle pooled
+    /// connections were all dialed under the identity the server just refused,
+    /// so they are stale credentials whether or not a replacement exists; a
+    /// failed re-mint used to leave every one of them checked in, ready to
+    /// re-present the refused certificate on the next request. (shed-server's
+    /// `Connection: close` on an identity-bound 401 only closes the ONE
+    /// connection the refusal came back on, and a TLS-alert refusal has no
+    /// response to carry a header at all.)
     ///
     /// `build` is invoked per attempt against the transport the attempt uses, so
     /// the retry can be issued on [`Self::fresh_transport`] — that is what makes
@@ -500,9 +644,13 @@ impl Client {
     async fn send_authed(
         &self,
         bound: Duration,
-        used: Option<crate::token::Credential>,
+        resolved: Resolution,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Sent, ShedError> {
+        let Resolution {
+            cred: used,
+            mint_error,
+        } = resolved;
         let bearer = used
             .as_ref()
             .and_then(|c| c.bearer_token().map(str::to_string));
@@ -524,35 +672,53 @@ impl Client {
         if !auth_shaped || self.token_provider.is_none() {
             return outcome.map(sent);
         }
+        // Nothing was presented because the mint failed: report THAT, and do not
+        // re-mint what just failed (see the skip list above).
+        let mint_error = match (used.as_ref(), mint_error) {
+            (None, Some(e)) => return Err(refused_because(&outcome, e)),
+            (_, carried) => carried,
+        };
         if !self.invalidate_used(used.as_ref(), bound).await {
-            return outcome.map(sent); // wedged provider — no retry
+            // Wedged provider — no retry.
+            return refuse(outcome, mint_error, sent);
         }
-        let fresh = self.bounded_credential(bound).await?;
+        // The refused identity was connection-bound, so every idle pooled
+        // connection is carrying it. Purge them on the INVALIDATION, before the
+        // re-mint that may not succeed (see the pool-purge note above). A
+        // token-state refusal recycles nothing: a bearer travels per request.
+        let purged = match used.as_ref().and_then(|c| c.mode) {
+            Some(crate::token::AuthMode::Mtls) => Some(self.recycle_transport()?),
+            _ => None,
+        };
+        let Resolution {
+            cred: fresh,
+            mint_error: remint_error,
+        } = self.bounded_credential(bound).await?;
         let Some(fresh) = fresh.filter(crate::token::Credential::usable) else {
-            return outcome.map(sent); // never retry unauthenticated
+            // Never retry unauthenticated; the freshest explanation wins.
+            return refuse(outcome, remint_error.or(mint_error), sent);
         };
         if used.as_ref().map(|c| c.identity()) == Some(fresh.identity()) {
             // Re-arm the must-mint flag the same-credential re-mint just cleared,
-            // so the rejected credential is never served again.
+            // so the rejected credential is never served again. (A survivor can
+            // land here too — same identity, and the mint that would have
+            // replaced it failed — which is why the re-mint error is reported.)
             let _ = self.invalidate_used(used.as_ref(), bound).await;
-            return outcome.map(sent);
+            return refuse(outcome, remint_error, sent);
         }
-        // Is the credential bound to the CONNECTION on either side of the
-        // re-mint? Then the pool is carrying stale credentials — the connection
-        // we were refused on presented the old certificate, and every other
-        // pooled connection was dialed under the same (or no) identity. Purge it;
-        // see [`Self::recycle_transport`]. A token→token re-mint keeps the pool.
-        let connection_bound = matches!(
-            used.as_ref().and_then(|c| c.mode),
-            Some(crate::token::AuthMode::Mtls)
-        ) || matches!(fresh.mode, Some(crate::token::AuthMode::Mtls));
         // Drop the refused response BEFORE retrying, so a 401 whose body is still
         // unread cannot hold its connection open behind the retry.
         drop(outcome);
-        let retry_transport = if connection_bound {
-            self.recycle_transport()?
-        } else {
-            transport
+        // The retry rides the pool purged above; a token→mtls flip purges here
+        // instead, because the certificate can only be presented at a handshake
+        // and every pooled connection is certificate-less. A token→token re-mint
+        // keeps the pool — a bearer is not part of the connection.
+        let retry_transport = match purged {
+            Some(fresh_pool) => fresh_pool,
+            None if matches!(fresh.mode, Some(crate::token::AuthMode::Mtls)) => {
+                self.recycle_transport()?
+            }
+            None => transport,
         };
         let resp = send_once(&retry_transport, &build, fresh.bearer_token()).await?;
         Ok(Sent {
@@ -564,13 +730,21 @@ impl Client {
     /// [`Self::send_authed`] with the credential resolved here, bounded by the
     /// same `bound` (a foreign [`crate::TokenMinter`] impl can hang, and the
     /// provider holds its mutex across a mint).
+    ///
+    /// A mint failure does not abort the call here — it rides along in the
+    /// [`Resolution`] and becomes the error only if the server refuses the
+    /// attempt ([`Self::send_authed`]). Every path reaches the wire through this
+    /// function (unary JSON/lifecycle via [`Self::request`], and both SSE
+    /// streams, [`Self::create_stream`] and [`Self::rc_events`]), so all three
+    /// get that behavior identically: open servers keep working, and a refusal
+    /// carries the actionable message instead of a bare 401.
     async fn send_resolved(
         &self,
         bound: Duration,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<Sent, ShedError> {
-        let used = self.bounded_credential(bound).await?;
-        self.send_authed(bound, used, build).await
+        let resolved = self.bounded_credential(bound).await?;
+        self.send_authed(bound, resolved, build).await
     }
 
     /// A JSON/lifecycle request: [`Self::send_resolved`] plus the status check and
@@ -1374,10 +1548,14 @@ mod tests {
     #[tokio::test]
     async fn retry_never_proceeds_unauthenticated_when_the_remint_fails() {
         // C6 adversarial review #2a: after the 401 → invalidate, the forced
-        // re-mint FAILS, so bearer() resolves None. The retry must be skipped
-        // — a provider-backed request never drops its Authorization header
-        // (an unauthenticated retry against a secure server is a guaranteed
-        // second 401 and ships the request with no proof of identity).
+        // re-mint FAILS, so nothing presentable is left. The retry must be
+        // skipped — a provider-backed request never drops its Authorization
+        // header (an unauthenticated retry against a secure server is a
+        // guaranteed second 401 and ships the request with no proof of
+        // identity) — and the failure the user sees is the MINT error, not the
+        // 401 that triggered it: "the replacement could not be minted" is the
+        // actionable half, and Go says the same (`cmd/shed`'s `reauthenticated`
+        // returns a failed re-mint unwrapped).
         struct FlipMinter {
             calls: AtomicUsize,
         }
@@ -1430,10 +1608,266 @@ mod tests {
         )
         .unwrap();
         let err = c.info().await.unwrap_err();
-        assert!(matches!(err, ShedError::BadStatus(401)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mint down") && msg.contains("HTTP 401"),
+            "the mint error leads, with the refusal as context: {err:?}"
+        );
         assert_eq!(authed.hits_async().await, 1, "exactly one authed attempt");
         assert_eq!(unauth.hits_async().await, 0, "no unauthenticated retry");
         assert_eq!(minter.calls.load(Ordering::SeqCst), 2); // initial + failed re-mint
+    }
+
+    // ---- A failed mint is CARRIED, and explains a refusal ----
+    //
+    // Plan 002 C2(i): the resolution used to be `.ok()`-discarded, so a provider
+    // that could not mint sent the request UNAUTHENTICATED and reported whatever
+    // the server said back — a generic 401 or TLS alert. The one message worth
+    // reading ("this server issues certificates; upgrade shed-host-agent", "the
+    // SSH bootstrap is unreachable") was thrown away at the call site. Go has
+    // said the actionable thing all along (`cmd/shed`'s `reauthenticated`
+    // returns the failed re-mint unwrapped; `sdk`'s `setAuth` names what goes on
+    // the wire); these pin the Rust half.
+    //
+    // The error is carried rather than raised because the SAME state is normal
+    // on an `auth.mode: open` server — shed-app installs the shared minter on
+    // every server, and there is no credential for an open one to issue — so the
+    // unauthenticated request must still go out and succeed. The pair below is
+    // the whole contract: open server → works; enforcing server → the refusal
+    // reports the mint failure.
+
+    /// A minter that always fails with a fixed, recognisable message, counting
+    /// attempts. The message stands in for the real one an mtls server's
+    /// too-old host-agent produces.
+    struct CountingFailMinter {
+        calls: AtomicUsize,
+    }
+    const UPGRADE_MSG: &str = "this server issues client certificates; upgrade shed-host-agent";
+    impl CountingFailMinter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl TokenMinter for CountingFailMinter {
+        async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ShedError::Transport(UPGRADE_MSG.into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_server_still_answers_when_the_mint_fails() {
+        // The regression guard for the carry-don't-raise rule: an open server
+        // (whose minter necessarily fails — nothing to issue) must keep working
+        // exactly as before. The mock ONLY matches a request with no
+        // Authorization header, so a token sneaking out would 404 instead.
+        let server = MockServer::start_async().await;
+        let unauth = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info").matches(|req| {
+                    !req.headers.as_ref().is_some_and(|h| {
+                        h.iter()
+                            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    })
+                });
+                t.status(200)
+                    .body(include_str!("../../fixtures/server_info.json"));
+            })
+            .await;
+        let minter = CountingFailMinter::new();
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(c.info().await.unwrap().name, "mini2");
+        assert_eq!(unauth.hits_async().await, 1, "the request went out");
+        assert_eq!(minter.calls(), 1, "one mint attempt, its failure ignored");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reports_the_mint_error_instead_of_the_bare_401() {
+        // Same client state, enforcing server: the request goes out with nothing
+        // to present, is refused, and the error names WHY nothing could be
+        // presented — with the refusal itself as context. This is the message
+        // the `.ok()` swallow used to lose.
+        let server = MockServer::start_async().await;
+        let refused = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(401);
+            })
+            .await;
+        let minter = CountingFailMinter::new();
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+
+        let err = c.info().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(UPGRADE_MSG) && msg.contains("HTTP 401"),
+            "the mint error must lead, the 401 as context: {err:?}"
+        );
+        assert_eq!(refused.hits_async().await, 1, "one attempt, no retry");
+        // Exactly ONE mint: the refusal of a request that had nothing to present
+        // is the mint failure observed a round trip later — re-minting it here
+        // would both cost a round trip and (inside the provider's failure
+        // cooldown) replace the actionable text with the redacted marker.
+        assert_eq!(minter.calls(), 1, "one mint attempt per request");
+    }
+
+    #[tokio::test]
+    async fn a_surviving_credential_is_presented_when_the_mint_fails() {
+        // The other half of the contract: the mint failed but the provider still
+        // HOLDS something usable (here a seeded token the clock has moved past,
+        // which is why the resolution minted at all). The survivor goes on the
+        // wire — the server may well still accept it — and the mint error must
+        // not fail a request that had a credential to send.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET)
+                    .path("/api/info")
+                    .header("authorization", "Bearer surviving-tok");
+                t.status(200)
+                    .body(include_str!("../../fixtures/server_info.json"));
+            })
+            .await;
+        let minter = CountingFailMinter::new();
+        let provider = Arc::new(
+            ControlTokenProvider::new("mini2".into(), minter.clone())
+                .with_seed(MintedToken {
+                    token: "surviving-tok".into(),
+                    expires_at_unix: Some(1_000),
+                })
+                .with_now(|| 5_000),
+        );
+        let c = Client::with_provider(server.base_url(), "mini2".into(), None, provider.clone())
+            .unwrap();
+
+        assert_eq!(c.info().await.unwrap().name, "mini2");
+        assert_eq!(minter.calls(), 1, "the mint was attempted and failed");
+        assert_eq!(
+            provider.surviving_credential().await.map(|c| c.token),
+            Some("surviving-tok".to_string()),
+            "the failed mint leaves the held credential in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_streaming_paths_report_the_mint_error_when_refused() {
+        // create (SSE) and rc-events resolve through the same helper, so both
+        // halves of the contract reach them: the stream is attempted, and the
+        // refusal reports the mint failure rather than a bare 401.
+        let server = MockServer::start_async().await;
+        let create = server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds");
+                t.status(401);
+            })
+            .await;
+        let events = server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/rc/events");
+                t.status(401);
+            })
+            .await;
+        let minter = CountingFailMinter::new();
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+
+        let sink = Arc::new(RecordingSink::default());
+        let req = CreateShedRequest {
+            name: "folio".into(),
+            ..Default::default()
+        };
+        c.create_shed(&req, sink.as_ref()).await;
+        let snap = sink.snapshot();
+        assert!(
+            snap.error
+                .as_deref()
+                .is_some_and(|m| m.contains(UPGRADE_MSG) && m.contains("HTTP 401")),
+            "create must report the mint error, got {:?}",
+            snap.error
+        );
+        assert!(snap.shed.is_none());
+
+        let rc_sink = RecordingRcSink::default();
+        let err = c.rc_events(&rc_sink).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(UPGRADE_MSG) && msg.contains("HTTP 401"),
+            "rc-events must report the mint error, got {err:?}"
+        );
+        assert!(rc_sink.events().is_empty());
+
+        assert_eq!(create.hits_async().await, 1, "one attempt, no retry");
+        assert_eq!(events.hits_async().await, 1, "one attempt, no retry");
+        // One mint attempt per stream call — never a failed mint immediately
+        // re-attempted by the retry machinery.
+        assert_eq!(minter.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_open_server_streams_when_the_mint_fails() {
+        // The open-server half for the streaming paths: the create stream still
+        // opens and completes with no credential at all.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path("/api/sheds").matches(|req| {
+                    !req.headers.as_ref().is_some_and(|h| {
+                        h.iter()
+                            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    })
+                });
+                t.status(200)
+                    .header("content-type", "text/event-stream")
+                    .body("event: complete\ndata: {\"name\":\"folio\",\"status\":\"running\"}\n\n");
+            })
+            .await;
+        let minter = CountingFailMinter::new();
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(minter.clone()),
+        )
+        .unwrap();
+
+        let sink = Arc::new(RecordingSink::default());
+        let req = CreateShedRequest {
+            name: "folio".into(),
+            ..Default::default()
+        };
+        c.create_shed(&req, sink.as_ref()).await;
+        let snap = sink.snapshot();
+        assert_eq!(snap.error, None, "the open server's stream must succeed");
+        assert_eq!(snap.shed.map(|s| s.name).as_deref(), Some("folio"));
+        assert_eq!(minter.calls(), 1);
     }
 
     #[tokio::test]
@@ -2807,6 +3241,51 @@ mod mtls_tests {
         }
     }
 
+    /// A [`CaMinter`] that can be switched to FAIL — the "the host-agent can no
+    /// longer mint" state (it was upgraded away, SSH is down) reached AFTER a
+    /// certificate has already been enrolled and armed.
+    struct FailAfterEnroll {
+        inner: Arc<CaMinter>,
+        fail: std::sync::atomic::AtomicBool,
+        failed: AtomicUsize,
+    }
+    const MTLS_MINT_DOWN: &str = "the SSH bootstrap is unreachable";
+    impl FailAfterEnroll {
+        fn new(inner: Arc<CaMinter>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                fail: std::sync::atomic::AtomicBool::new(false),
+                failed: AtomicUsize::new(0),
+            })
+        }
+        fn set_fail(&self) {
+            self.fail.store(true, Ordering::SeqCst);
+        }
+        fn failed_calls(&self) -> usize {
+            self.failed.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl TokenMinter for FailAfterEnroll {
+        async fn mint(&self, server: &str) -> Result<MintedToken, ShedError> {
+            self.inner.mint(server).await
+        }
+        fn supports_mtls(&self) -> bool {
+            true
+        }
+        async fn mint_credential(
+            &self,
+            server: &str,
+            req: &CredentialRequest,
+        ) -> Result<MintedCredential, ShedError> {
+            if self.fail.load(Ordering::SeqCst) {
+                self.failed.fetch_add(1, Ordering::SeqCst);
+                return Err(ShedError::Transport(MTLS_MINT_DOWN.into()));
+            }
+            self.inner.mint_credential(server, req).await
+        }
+    }
+
     /// Records every `mode_changed` event, in order.
     #[derive(Default)]
     struct ModeLog(Mutex<Vec<AuthMode>>);
@@ -3310,7 +3789,7 @@ mod mtls_tests {
         // The server accepts neither: only client-3, the NEXT mint, is authorized.
         let url = c.build_url(&["api", "info"], &[]).unwrap();
         let sent = c
-            .send_authed(GET_TIMEOUT, Some(captured), |http| {
+            .send_authed(GET_TIMEOUT, Resolution::presenting(captured), |http| {
                 http.get(url.clone()).timeout(GET_TIMEOUT)
             })
             .await
@@ -3329,6 +3808,110 @@ mod mtls_tests {
         );
     }
 
+    // ---- mtls half of the C2(i) contract ----
+    //
+    // The token half (`http::tests::a_surviving_credential_is_presented_when_the
+    // _mint_fails`) proves the survivor goes out in a header; this proves the
+    // same for the credential that travels in the HANDSHAKE. The armed
+    // certificate outlives a failed re-mint (the provider's cache and the
+    // resolver are both untouched by a mint failure), so the request proceeds
+    // presenting it rather than failing with the mint error — Go's
+    // "presenting something the server might still accept beats presenting
+    // nothing" (`66abaa9`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_armed_certificate_is_still_presented_when_the_re_mint_fails() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        // close_after_each: request #2 must re-handshake, so what it presents is
+        // observable rather than inherited from a pooled connection.
+        let srv = spawn_mtls_server(&ca, TlsVersion::Any, true).await;
+        let minter = FailAfterEnroll::new(CaMinter::new(ca.clone()));
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        let ticking = clock.clone();
+        let provider = Arc::new(
+            ControlTokenProvider::new("s".into(), minter.clone())
+                .with_now(move || ticking.load(Ordering::SeqCst)),
+        );
+        let c = client_for(&srv, provider.clone());
+        get(&c).await.unwrap(); // enrolled as client-1, certificate armed
+
+        // The clock moves past the certificate's expiry, so the next resolution
+        // MUST mint — and the host-agent can no longer mint one.
+        clock.store(4_000_000_000, Ordering::SeqCst);
+        minter.set_fail();
+
+        get(&c)
+            .await
+            .expect("the surviving certificate must still be presented");
+        assert_eq!(minter.failed_calls(), 1, "the re-mint was attempted, once");
+        assert_eq!(
+            srv.client_cns(),
+            vec!["SHA256:client-1".to_string(), "SHA256:client-1".to_string()],
+            "the second handshake presented the surviving certificate"
+        );
+        assert!(
+            provider.cert_resolver().current().is_some(),
+            "a failed mint must not withdraw the armed identity"
+        );
+        // And the resolution HANDS BACK that identity rather than a bare `None`:
+        // the request captures it, so a rejection of the surviving certificate is
+        // attributed and invalidated like any other. (Before C2(i) this resolved
+        // to `None` — the certificate went out via the resolver with the request
+        // believing it carried nothing.) The mint error rides along with it.
+        let resolved = c.credential().await;
+        let presented = resolved.cred.expect("something to present");
+        assert_eq!(presented.mode, Some(AuthMode::Mtls));
+        assert_eq!(presented.cert_serial, "1");
+        assert!(
+            resolved.mint_error.is_some(),
+            "the failed mint is carried alongside the survivor"
+        );
+        assert_eq!(minter.failed_calls(), 2, "one attempt per resolution");
+    }
+
+    // The pool purge is driven by the INVALIDATION, not by a successful re-mint.
+    //
+    // A refused certificate leaves every idle pooled connection carrying it (they
+    // were all dialed under that identity). Recycling only after a successful
+    // re-mint meant a failed one left those connections checked in, ready to
+    // re-present the refused certificate on the next request — and the server's
+    // `Connection: close` closes only the connection the 401 came back on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_identity_purges_the_pool_even_when_the_re_mint_fails() {
+        let ca = Arc::new(TestCa::new("shed-ca"));
+        let srv = spawn_flip_server(
+            &ca,
+            ServerAuthMode::MtlsAllow(vec!["SHA256:client-1".into()]),
+            false, // keep-alive: the refused connection stays pooled
+        )
+        .await;
+        let minter = FailAfterEnroll::new(CaMinter::new(ca.clone()));
+        let provider = Arc::new(ControlTokenProvider::new("s".into(), minter.clone()));
+        let c = client_for(&srv, provider.clone());
+
+        get(&c).await.unwrap(); // enrolled as client-1, connection pooled
+        let poisoned_pool = c.transport_id();
+
+        // The identity is revoked AND the host-agent can no longer mint.
+        srv.set_mode(ServerAuthMode::MtlsAllow(vec!["SHA256:client-2".into()]));
+        minter.set_fail();
+
+        let err = get_stable(&c).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(MTLS_MINT_DOWN),
+            "the failed re-mint is what the caller hears about: {err:?}"
+        );
+        assert_ne!(
+            c.transport_id(),
+            poisoned_pool,
+            "the pool holding the refused identity must be gone, re-mint or not"
+        );
+        assert!(
+            provider.cert_resolver().current().is_none(),
+            "the refused certificate is withdrawn"
+        );
+    }
+
     // Fail-closed: a certificate that does not match the key we generated is
     // never adopted, never presented, and surfaces as an error.
     #[tokio::test(flavor = "multi_thread")]
@@ -3340,12 +3923,21 @@ mod mtls_tests {
         let c = client_for(&srv, provider.clone());
 
         let err = get_stable(&c).await.unwrap_err();
-        // No credential resolved → the request goes out unauthenticated and the
-        // listener refuses it at the handshake; nothing usable was ever installed.
+        // Nothing usable was ever installed, so the request goes out with no
+        // certificate and the listener refuses it inside the handshake — and the
+        // error the caller sees names WHY there was nothing to present, with the
+        // TLS refusal as context. (It used to report only the listener's generic
+        // `CertificateRequired` alert: the C2(i) swallow.)
         assert!(provider.cert_resolver().current().is_none());
+        let msg = err.to_string();
         assert!(
-            matches!(&err, ShedError::Transport(m) if m.contains("CertificateRequired")),
-            "got {err:?}"
+            msg.contains("minted client certificate unusable"),
+            "the adoption failure must lead: {err:?}"
+        );
+        assert_eq!(
+            srv.handshake_count(),
+            0,
+            "no handshake COMPLETED — the listener requires a certificate"
         );
         assert!(provider.credential().await.is_err());
     }
