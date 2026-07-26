@@ -418,6 +418,91 @@ func TestRespondRefreshesOn401(t *testing.T) {
 	}
 }
 
+// roundTripFunc adapts a closure into an http.RoundTripper so a test can
+// script transport-level outcomes (a TLS alert has no *http.Response at all,
+// which no httptest server can express).
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestRespondTLSAuthFailureThen401RemintsOnce pins the one-re-mint/two-sends
+// bound across BOTH classifier legs: a first send that dies with a TLS
+// certificate alert (re-mint, retry), whose retry then 401s. The 401 must
+// surface as the error — a second re-mint and third send would present the
+// same freshly-minted-and-refused identity again.
+func TestRespondTLSAuthFailureThen401RemintsOnce(t *testing.T) {
+	var sends int32
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch atomic.AddInt32(&sends, 1) {
+		case 1:
+			// The shape authfail's fallback path classifies: a peer TLS alert
+			// naming a certificate problem, surviving only as text.
+			return nil, fmt.Errorf("remote error: tls: certificate required")
+		default:
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     make(http.Header),
+				Request:    r,
+			}, nil
+		}
+	})
+
+	tp := &fakeTokenProvider{tokens: []string{"a", "b", "c"}}
+	client := NewHostClient(
+		WithServerURL("https://irrelevant.invalid"),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		WithTokenProvider(tp),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+
+	err := client.Respond(context.Background(), "ns", NewEnvelope("ns", MessageTypeResponse, nil))
+	if err == nil {
+		t.Error("expected the retry's 401 to surface as an error")
+	}
+	if tp.invalidated != 1 {
+		t.Errorf("Invalidate called %d times, want exactly 1 (one re-mint total)", tp.invalidated)
+	}
+	if got := atomic.LoadInt32(&sends); got != 2 {
+		t.Errorf("sends = %d, want 2 (TLS failure + one retry, never a third)", got)
+	}
+}
+
+// TestRespondTLSAuthFailureRecovers is the happy half: the TLS-classified
+// failure re-mints once and the retry succeeds.
+func TestRespondTLSAuthFailureRecovers(t *testing.T) {
+	var sends int32
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if atomic.AddInt32(&sends, 1) == 1 {
+			return nil, fmt.Errorf("remote error: tls: certificate required")
+		}
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+			Request:    r,
+		}, nil
+	})
+
+	tp := &fakeTokenProvider{tokens: []string{"stale", "fresh"}}
+	client := NewHostClient(
+		WithServerURL("https://irrelevant.invalid"),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		WithTokenProvider(tp),
+		WithHTTPClient(&http.Client{Transport: transport}),
+	)
+
+	if err := client.Respond(context.Background(), "ns", NewEnvelope("ns", MessageTypeResponse, nil)); err != nil {
+		t.Fatalf("Respond after re-mint: %v", err)
+	}
+	if tp.invalidated != 1 {
+		t.Errorf("Invalidate called %d times, want 1", tp.invalidated)
+	}
+	if got := atomic.LoadInt32(&sends); got != 2 {
+		t.Errorf("sends = %d, want 2", got)
+	}
+}
+
 func TestRespondRetriesAtMostOnceOn401(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

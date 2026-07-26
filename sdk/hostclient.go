@@ -555,14 +555,19 @@ func (c *HostClient) Respond(ctx context.Context, namespace string, env *Envelop
 	// certificate that expired / was revoked / lost its allowlist entry. Re-mint
 	// once via the provider and retry a single time (mirrors the CLI client).
 	// The certificate case has no response at all to carry a 401, so the
-	// transport error is classified too.
+	// transport error is classified too. The bound is one re-mint / two sends
+	// TOTAL: a TLS-level re-mint whose retry then 401s must surface that 401,
+	// not spend a second re-mint on a third send — the fresh credential was
+	// just refused, and a second mint would present the same identity again.
+	reminted := false
 	if err != nil && c.invalidateOnAuthFailure(0, err) {
+		reminted = true
 		resp, err = send()
 	}
 	if err != nil {
 		return fmt.Errorf("sending response: %w", err)
 	}
-	if resp.StatusCode == http.StatusUnauthorized && c.invalidateOnAuthFailure(resp.StatusCode, nil) {
+	if resp.StatusCode == http.StatusUnauthorized && !reminted && c.invalidateOnAuthFailure(resp.StatusCode, nil) {
 		_ = resp.Body.Close()
 		resp, err = send()
 		if err != nil {
