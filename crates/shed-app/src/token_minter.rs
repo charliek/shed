@@ -85,10 +85,9 @@ impl TokenMinter for HostAgentTokenMinter {
 /// Map a `credential.response` into a `MintedCredential`, or an `Err` for a
 /// fail-closed reply. Pure, for the same reason `map_response` is.
 ///
-/// The mode comes from the reply's own `auth_mode` rather than from which field
-/// happens to be populated: "the server said mtls but sent no certificate" is a
-/// protocol violation worth reporting, and inferring the mode from the fields
-/// would silently turn it into "token mode with an empty token".
+/// Only the UDS-specific guards live here (an `error` field, a reply naming
+/// another server); the credential SHAPE rules are
+/// [`credential_from_parts`]'s — see there for why they are shared.
 fn map_credential_response(
     resp: CredentialResponse,
     server: &str,
@@ -102,41 +101,110 @@ fn map_credential_response(
             resp.server
         )));
     }
-    let expires_at_unix = resp
-        .expires_at
-        .as_deref()
-        .and_then(timefmt::parse_unix)
-        .map(|s| s.max(0) as u64);
-    match AuthMode::from_wire(resp.auth_mode.as_deref()) {
+    credential_from_parts(
+        CredentialParts {
+            auth_mode: resp.auth_mode,
+            token: resp.token.unwrap_or_default(),
+            client_cert: resp.client_cert.unwrap_or_default(),
+            cert_serial: resp.cert_serial.unwrap_or_default(),
+            expires_at_unix: expiry_unix(resp.expires_at.as_deref()),
+        },
+        server,
+    )
+}
+
+/// A minted credential's payload, normalized off whichever transport carried it
+/// — the UDS `credential.response` above, or the embedded broker's
+/// `MintedControlCredential` (`broker_bridge.rs`). Absent fields arrive as
+/// empty strings; `expires_at` is already parsed by [`expiry_unix`].
+pub(crate) struct CredentialParts {
+    pub auth_mode: Option<String>,
+    pub token: String,
+    pub client_cert: String,
+    pub cert_serial: String,
+    pub expires_at_unix: Option<u64>,
+}
+
+/// The credential-shape rules, in ONE place for BOTH minters: the external
+/// (UDS) one above and the embedded-broker one. The two paths feed the SAME
+/// provider FSM, so a divergence would mean the app behaved differently in
+/// embedded mode than in external mode against the same server — sharing the
+/// body is what makes "identical rules" mechanical rather than a convention.
+///
+/// The mode comes from the credential's own `auth_mode` rather than from which
+/// field happens to be populated: "the server said mtls but sent no
+/// certificate" is a protocol violation worth reporting, and inferring the mode
+/// from the fields would silently turn it into "token mode with an empty
+/// token". An empty payload for the claimed mode is an error, never a usable
+/// credential.
+pub(crate) fn credential_from_parts(
+    parts: CredentialParts,
+    server: &str,
+) -> Result<MintedCredential, ShedError> {
+    // STRICT mode parse, deliberately not `AuthMode::from_wire`: that decoder's
+    // unknown-means-token lenience is for BUNDLES (where an old client meeting
+    // a future server should degrade to the populated shape), but this is a
+    // minter's ANSWER — adopting a credential whose mode this build cannot
+    // interpret as if it were a bearer token would fail open. Absent/empty and
+    // the legacy "secure" spelling stay token (the compat contract); anything
+    // else is refused by name.
+    let mode = match parts.auth_mode.as_deref().map(str::trim) {
+        None | Some("") | Some("token") | Some("secure") => AuthMode::Token,
+        Some("mtls") => AuthMode::Mtls,
+        Some(other) => {
+            return Err(ShedError::Config(format!(
+                "host agent reported unknown auth_mode {other:?} for {server}; \
+                 refusing to adopt the credential (upgrade this client?)"
+            )));
+        }
+    };
+    match mode {
         AuthMode::Token => {
-            let token = resp.token.filter(|t| !t.is_empty()).ok_or_else(|| {
-                ShedError::Config(format!("host agent returned no token for {server}"))
-            })?;
-            Ok(MintedCredential::Token(MintedToken {
-                token,
-                expires_at_unix,
-            }))
+            minted_token(parts.token, parts.expires_at_unix, server).map(MintedCredential::Token)
         }
         AuthMode::Mtls => {
-            let cert_pem = resp.client_cert.filter(|c| !c.is_empty()).ok_or_else(|| {
-                ShedError::Config(format!(
+            if parts.client_cert.is_empty() {
+                return Err(ShedError::Config(format!(
                     "host agent reported mtls but returned no certificate for {server}"
-                ))
-            })?;
+                )));
+            }
             Ok(MintedCredential::Certificate(MintedCertificate {
-                cert_pem,
-                serial: resp.cert_serial.unwrap_or_default(),
-                expires_at_unix,
+                cert_pem: parts.client_cert,
+                serial: parts.cert_serial,
+                expires_at_unix: parts.expires_at_unix,
             }))
         }
     }
 }
 
+/// The empty-token guard, shared by every token-shaped mint (both minters, both
+/// messages): a blank token is NEVER a valid mint, so the FSM must send nothing
+/// rather than a valid-looking downgrade (F6).
+pub(crate) fn minted_token(
+    token: String,
+    expires_at_unix: Option<u64>,
+    server: &str,
+) -> Result<MintedToken, ShedError> {
+    if token.is_empty() {
+        return Err(ShedError::Config(format!(
+            "host agent returned no token for {server}"
+        )));
+    }
+    Ok(MintedToken {
+        token,
+        expires_at_unix,
+    })
+}
+
+/// A wire expiry string as unix seconds. An absent/unparseable expiry -> `None`
+/// -> the provider caches and only re-mints on `invalidate()` (matches Swift +
+/// `token.rs`); shed-app owns timestamp parsing, so this is the one conversion.
+pub(crate) fn expiry_unix(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(timefmt::parse_unix).map(|s| s.max(0) as u64)
+}
+
 /// Map a `token.response` into a `MintedToken`, or an `Err` for a fail-closed
 /// reply. Pure, so the fail-closed mapping is unit-tested without a live agent.
-/// Expiry is a wire string parsed to unix seconds here (shed-app owns timestamp
-/// parsing); an absent/unparseable expiry -> `None` -> the provider caches and
-/// only re-mints on `invalidate()` (matches Swift + `token.rs`).
 fn map_response(resp: TokenResponse, server: &str) -> Result<MintedToken, ShedError> {
     if let Some(err) = resp.error.as_deref().filter(|e| !e.is_empty()) {
         return Err(ShedError::Config(err.to_string()));
@@ -148,19 +216,11 @@ fn map_response(resp: TokenResponse, server: &str) -> Result<MintedToken, ShedEr
             resp.server
         )));
     }
-    let token = resp
-        .token
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| ShedError::Config(format!("host agent returned no token for {server}")))?;
-    let expires_at_unix = resp
-        .expires_at
-        .as_deref()
-        .and_then(timefmt::parse_unix)
-        .map(|s| s.max(0) as u64);
-    Ok(MintedToken {
-        token,
-        expires_at_unix,
-    })
+    minted_token(
+        resp.token.unwrap_or_default(),
+        expiry_unix(resp.expires_at.as_deref()),
+        server,
+    )
 }
 
 #[cfg(test)]

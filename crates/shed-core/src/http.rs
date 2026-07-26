@@ -2811,8 +2811,22 @@ mod mtls_tests {
     #[derive(Default)]
     struct ModeLog(Mutex<Vec<AuthMode>>);
     impl ModeLog {
-        fn modes(&self) -> Vec<AuthMode> {
-            self.0.lock().unwrap().clone()
+        /// Assert the delivered sequence, waiting for it (bounded) first.
+        ///
+        /// Observer callbacks are delivered off the provider's dispatcher thread
+        /// (token.rs `CredentialEvents`), so they are asynchronous with respect to
+        /// the request that triggered the mint — reading immediately after
+        /// `get()` would race delivery. The wait is the consumer-side shape too:
+        /// a UI learns the flip a beat after the request it rode on.
+        async fn wait_for(&self, expected: &[AuthMode]) {
+            for _ in 0..400 {
+                if self.0.lock().unwrap().len() >= expected.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let got = self.0.lock().unwrap().clone();
+            assert_eq!(got, expected, "mode_changed sequence");
         }
     }
     impl CredentialObserver for ModeLog {
@@ -2945,7 +2959,7 @@ mod mtls_tests {
 
         // Phase 1 — mtls: the certificate authorizes the request.
         get(&c).await.unwrap();
-        assert_eq!(log.modes(), vec![AuthMode::Mtls]);
+        log.wait_for(&[AuthMode::Mtls]).await;
         assert!(provider.cert_resolver().current().is_some());
 
         // Phase 2 — the operator flips the server to token mode. The next request
@@ -2954,7 +2968,7 @@ mod mtls_tests {
         srv.set_mode(ServerAuthMode::Token("tok-flip".into()));
         minter.set_issue(Issue::Token("tok-flip".into()));
         get(&c).await.unwrap();
-        assert_eq!(log.modes(), vec![AuthMode::Mtls, AuthMode::Token]);
+        log.wait_for(&[AuthMode::Mtls, AuthMode::Token]).await;
         assert_eq!(
             provider.credential().await.unwrap().bearer_token(),
             Some("tok-flip")
@@ -2968,10 +2982,8 @@ mod mtls_tests {
         srv.set_mode(ServerAuthMode::Mtls);
         minter.set_issue(Issue::Certificate);
         get(&c).await.unwrap();
-        assert_eq!(
-            log.modes(),
-            vec![AuthMode::Mtls, AuthMode::Token, AuthMode::Mtls]
-        );
+        log.wait_for(&[AuthMode::Mtls, AuthMode::Token, AuthMode::Mtls])
+            .await;
         assert!(provider.cert_resolver().current().is_some());
 
         // The flip is invisible ABOVE this client, which is what D5 asks for: the

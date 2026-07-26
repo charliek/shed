@@ -13,7 +13,10 @@
 //!     handler (bounded-`mpsc` handoff → the bridge's async side completes the matching
 //!     `oneshot`, so nothing awaits under the actor lock);
 //!   * a [`TokenMinter`] adapter over the broker's `ControlTokenProvider` for the
-//!     Backend's secure-server token vend.
+//!     Backend's secure-server credential vend — mtls-capable (plan 002 §7 P2): it
+//!     relays the shed-core provider's CSR into the broker's control-credential mint,
+//!     so an embedded-broker app enrolls against an mtls server exactly as an
+//!     external-agent one does.
 //!
 //! **Deadlock-free** (the §3.2 analysis): the Coordinator is two-phase (never awaits the
 //! gate inline) and `Responder` is synchronous, so `AppGate`-awaits-oneshot /
@@ -37,7 +40,7 @@ use shed_core::approval::{
     ApprovalDecision, ApprovalRequest, DecidedBy, HelloAck, CAP_CREDENTIAL_GET,
 };
 use shed_core::http::ShedError;
-use shed_core::token::{MintedToken, TokenMinter};
+use shed_core::token::{CredentialRequest, MintedCredential, MintedToken, TokenMinter};
 
 use shed_broker::approval::{select_builtin_gate, ApprovalGate, ApprovalOutcome};
 use shed_broker::audit::{AuditEntry as BrokerAuditEntry, AuditFanout, AuditSink, JsonlAuditSink};
@@ -45,7 +48,9 @@ use shed_broker::config::{
     DiscoveryConfig, HostAgentConfig, DEFAULT_DISCOVERY_SOURCE, NS_AWS_CREDENTIALS,
     NS_DOCKER_CREDENTIALS, NS_EGRESS, NS_SSH_AGENT,
 };
-use shed_broker::controltoken::{ControlTokenMinter, ControlTokenProvider};
+use shed_broker::controltoken::{
+    ControlCredentialMinter, ControlTokenMinter, ControlTokenProvider, MintedControlCredential,
+};
 use shed_broker::status::ServerHealth;
 use shed_broker::supervisor::{SharedDeps, Supervisor};
 use shed_broker::{
@@ -55,6 +60,9 @@ use shed_broker::{
 
 use crate::host_agent::HostAgentEvent;
 use crate::timefmt;
+// The credential-shape rules are the UDS minter's, shared verbatim — see
+// `map_embedded_credential`.
+use crate::token_minter::{credential_from_parts, expiry_unix, minted_token, CredentialParts};
 use crate::traits::{system_clock, ClockRef, Responder, ResponderRef};
 
 /// The known_hosts pin the control-token minter bootstraps over (parity with the
@@ -539,57 +547,128 @@ fn audit_entry_to_event_frame(e: &BrokerAuditEntry) -> AuditEventFrame {
 }
 
 // ---------------------------------------------------------------------------
-// Token minter adapter (§3.2)
+// Credential minter adapter (§3.2; mtls per plan 002 §7 P2)
 // ---------------------------------------------------------------------------
 
-/// Adapts the broker's [`ControlTokenMinter`] (`mint_control(server) ->
-/// MintedControlToken`) onto shed-core's [`TokenMinter`] (`mint(server) ->
-/// MintedToken`), so the Backend's secure-server vend calls the in-process provider
-/// directly instead of the UDS `token.get`. Fail-closed: a mint error surfaces as
-/// `Err`, so the FSM sends NO token (parity with [`crate::HostAgentTokenMinter`]). Bus-
-/// independent + synchronously constructible, so it exists BEFORE the Backend (§3.2).
+/// Adapts the broker's control-credential seams onto shed-core's [`TokenMinter`], so
+/// the Backend's secure-server vend calls the in-process provider directly instead of
+/// going out over the UDS. Fail-closed: a mint error surfaces as `Err`, so the FSM sends
+/// NO credential (parity with [`crate::HostAgentTokenMinter`]). Bus-independent +
+/// synchronously constructible, so it exists BEFORE the Backend (§3.2).
+///
+/// Both halves of the contract are implemented (plan 002 §7 P2):
+///   * [`ControlCredentialMinter::mint_control_credential`] — the CSR-bearing mint, the
+///     one production actually uses (see [`Self::supports_mtls`]);
+///   * [`ControlTokenMinter::mint_control`] — the legacy token-only mint, kept because
+///     the trait requires it and because it is the seam the token-shaped unit tests
+///     drive directly.
 ///
 /// Internal: it only ever escapes as the `Arc<dyn TokenMinter>` from
 /// [`EmbeddedHostAgent::token_minter`], so the concrete type stays crate-private.
 struct EmbeddedTokenMinter {
-    provider: Arc<dyn ControlTokenMinter>,
+    tokens: Arc<dyn ControlTokenMinter>,
+    credentials: Arc<dyn ControlCredentialMinter>,
 }
 
 impl EmbeddedTokenMinter {
-    fn new(provider: Arc<dyn ControlTokenMinter>) -> Self {
-        Self { provider }
+    /// Both halves come from the SAME `ControlTokenProvider` in production — two
+    /// `dyn` views of one object — but they are taken separately so a test can drive
+    /// either path against a stand-in.
+    fn new(
+        tokens: Arc<dyn ControlTokenMinter>,
+        credentials: Arc<dyn ControlCredentialMinter>,
+    ) -> Self {
+        Self {
+            tokens,
+            credentials,
+        }
     }
 }
 
 #[async_trait]
 impl TokenMinter for EmbeddedTokenMinter {
+    /// Capability, and here it is a STATIC one — the deliberate difference from
+    /// [`crate::HostAgentTokenMinter`], which has to ask the socket what the agent on
+    /// the other end can do.
+    ///
+    /// There is no other end: the broker is this build, linked into this process, and
+    /// the credential path is compiled in right here. Version skew — the thing the UDS
+    /// capability handshake exists to absorb — cannot occur, so advertising anything
+    /// but `true` would make the provider withhold a CSR from a minter that can always
+    /// relay one, and an mtls server would answer the resulting CSR-less bootstrap with
+    /// its "upgrade the app" refusal.
+    fn supports_mtls(&self) -> bool {
+        true
+    }
+
+    /// Relay the PROVIDER's CSR into the broker's control-credential mint and hand back
+    /// whatever the server issued.
+    ///
+    /// The key containment rule (plan 001 D6 / 002 §7 P3) is the whole reason this is a
+    /// relay and not a mint: `shed_core`'s `ControlTokenProvider` generated the keypair,
+    /// kept the private half, and derived `req`'s CSR from it. Nothing here generates a
+    /// second keypair — a certificate issued for a key THIS layer held would be one the
+    /// provider could never present, which is precisely the failure the CSR-relay shape
+    /// exists to prevent. The broker's own `mint_control_credential` carries the same
+    /// rule on its side; this method's only job is to pass the CSR through verbatim.
+    ///
+    /// A `req` with no CSR (which the provider only produces for a minter that did not
+    /// advertise mtls, so not this one) degrades to the empty string — the legacy
+    /// token-only bootstrap the broker already defines for that argument.
+    async fn mint_credential(
+        &self,
+        server: &str,
+        req: &CredentialRequest,
+    ) -> Result<MintedCredential, ShedError> {
+        let minted = self
+            .credentials
+            .mint_control_credential(server, req.csr_base64().unwrap_or_default())
+            .await
+            .map_err(ShedError::Config)?;
+        map_embedded_credential(minted, server)
+    }
+
     async fn mint(&self, server: &str) -> Result<MintedToken, ShedError> {
         let minted = self
-            .provider
+            .tokens
             .mint_control(server)
             .await
             .map_err(ShedError::Config)?;
-        // Fail-closed on an empty token: a blank token is NEVER a valid mint, so the FSM
-        // must send no token rather than a downgrade (replicates `HostAgentTokenMinter`'s
-        // `map_response` empty-token guard, token_minter.rs:65-68). Without this, an
-        // `Ok(MintedControlToken { token: "" })` would map to a valid-looking blank token.
-        if minted.token.is_empty() {
-            return Err(ShedError::Config(format!(
-                "host agent returned no token for {server}"
-            )));
-        }
-        // An absent/unparseable expiry → None → the provider caches until invalidate()
-        // (matches `HostAgentTokenMinter`'s expiry handling).
-        let expires_at_unix = minted
-            .expires_at
-            .as_deref()
-            .and_then(timefmt::parse_unix)
-            .map(|s| s.max(0) as u64);
-        Ok(MintedToken {
-            token: minted.token,
-            expires_at_unix,
-        })
+        // Same guards as the UDS minter's `map_response`, because they are the same
+        // functions: fail-closed on an empty token (an `Ok(MintedControlToken { token:
+        // "" })` must never become a valid-looking blank token), and an
+        // absent/unparseable expiry → None → the provider caches until invalidate().
+        minted_token(
+            minted.token,
+            expiry_unix(minted.expires_at.as_deref()),
+            server,
+        )
     }
+}
+
+/// Map a broker [`MintedControlCredential`] onto shed-core's [`MintedCredential`], or a
+/// fail-closed `Err`. Pure, so every shape is unit-tested without a live SSH mint.
+///
+/// The in-process sibling of the UDS reply mapper (`token_minter.rs`), and identical in
+/// its rules BY CONSTRUCTION: this only normalizes the broker's struct into
+/// [`CredentialParts`] and hands it to the shared [`credential_from_parts`], which is
+/// where the mode/fail-closed rules live. Nothing here may add a rule of its own — the
+/// two paths feed the SAME provider FSM, so a divergence would mean the app behaved
+/// differently in embedded mode than in external mode against the same server.
+fn map_embedded_credential(
+    minted: MintedControlCredential,
+    server: &str,
+) -> Result<MintedCredential, ShedError> {
+    credential_from_parts(
+        CredentialParts {
+            auth_mode: Some(minted.auth_mode),
+            token: minted.token,
+            client_cert: minted.client_cert,
+            cert_serial: minted.cert_serial,
+            expires_at_unix: expiry_unix(minted.expires_at.as_deref()),
+        },
+        server,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -647,14 +726,18 @@ impl EmbeddedHostAgent {
         // daemon's single `minter` (`main.rs`).
         let minter: Arc<dyn broker_minter::Minter> =
             Arc::new(broker_minter::CredentialMinter::new(KNOWN_HOSTS_PATH));
-        // token.get resolves servers from the shed CLI config (the discovery-source
-        // override is a per-server concern the supervisor owns), matching the daemon.
-        let control_provider: Arc<dyn ControlTokenMinter> = Arc::new(ControlTokenProvider::new(
+        // The control mints resolve servers from the shed CLI config (the discovery-source
+        // override is a per-server concern the supervisor owns), matching the daemon. ONE
+        // provider backs both seams — it implements both traits, and the adapter takes two
+        // `dyn` views of it rather than two objects.
+        let control_provider = Arc::new(ControlTokenProvider::new(
             minter.clone(),
             DEFAULT_DISCOVERY_SOURCE,
         ));
-        let token_minter: Arc<dyn TokenMinter> =
-            Arc::new(EmbeddedTokenMinter::new(control_provider));
+        let token_minter: Arc<dyn TokenMinter> = Arc::new(EmbeddedTokenMinter::new(
+            control_provider.clone() as Arc<dyn ControlTokenMinter>,
+            control_provider as Arc<dyn ControlCredentialMinter>,
+        ));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let gate_namespaces = cfg.gate_namespaces();
@@ -1381,6 +1464,26 @@ mod tests {
 
     // ---- token minter adapter --------------------------------------------------------
 
+    /// A credential seam that must never be reached — paired with the token-only stubs
+    /// below, which drive `mint()` directly.
+    struct NoCredentials;
+    #[async_trait]
+    impl ControlCredentialMinter for NoCredentials {
+        async fn mint_control_credential(
+            &self,
+            _server: &str,
+            _csr_base64: &str,
+        ) -> Result<MintedControlCredential, String> {
+            unreachable!("this test drives the token seam")
+        }
+    }
+
+    /// Pairs a token-only stub with [`NoCredentials`] (the shape every pre-mtls test
+    /// here wants).
+    fn token_only(tokens: Arc<dyn ControlTokenMinter>) -> EmbeddedTokenMinter {
+        EmbeddedTokenMinter::new(tokens, Arc::new(NoCredentials))
+    }
+
     #[tokio::test]
     async fn token_minter_maps_ok_and_parses_expiry() {
         use shed_broker::controltoken::MintedControlToken;
@@ -1395,7 +1498,7 @@ mod tests {
                 })
             }
         }
-        let m = EmbeddedTokenMinter::new(Arc::new(Ok1));
+        let m = token_only(Arc::new(Ok1));
         let out = m.mint("prod").await.unwrap();
         assert_eq!(out.token, "ctl-1");
         let unix = out.expires_at_unix.expect("expiry parsed");
@@ -1412,7 +1515,7 @@ mod tests {
                 Err("host key mismatch".into())
             }
         }
-        let m = EmbeddedTokenMinter::new(Arc::new(Err1));
+        let m = token_only(Arc::new(Err1));
         let e = m.mint("prod").await.unwrap_err();
         assert!(matches!(e, ShedError::Config(msg) if msg.contains("host key mismatch")));
     }
@@ -1430,7 +1533,7 @@ mod tests {
                 })
             }
         }
-        let m = EmbeddedTokenMinter::new(Arc::new(Ok2));
+        let m = token_only(Arc::new(Ok2));
         let out = m.mint("prod").await.unwrap();
         assert_eq!(out.token, "ctl");
         assert_eq!(out.expires_at_unix, None);
@@ -1452,12 +1555,226 @@ mod tests {
                 })
             }
         }
-        let m = EmbeddedTokenMinter::new(Arc::new(EmptyTok));
+        let m = token_only(Arc::new(EmptyTok));
         let e = m.mint("prod").await.unwrap_err();
         assert!(
             matches!(e, ShedError::Config(msg) if msg.contains("no token")),
             "empty token must be a fail-closed Config error"
         );
+    }
+
+    // ---- credential (mtls) minter adapter (plan 002 §7 P2) ---------------------------
+
+    /// An in-process stand-in for the broker's `ControlCredentialMinter`: records every
+    /// CSR it is handed and answers with a certificate whose PEM NAMES that CSR, so a
+    /// test can prove the exact bytes relayed out came back bound to the same request.
+    #[derive(Default)]
+    struct RecordingCredentials {
+        csrs: Mutex<Vec<String>>,
+        /// `None` → answer with a certificate issued for the CSR just received;
+        /// `Some(cred)` → answer with exactly `cred` ([`Self::answering`]).
+        answer: Mutex<Option<MintedControlCredential>>,
+    }
+
+    impl RecordingCredentials {
+        /// A stand-in scripted to answer every mint with `cred`.
+        fn answering(cred: MintedControlCredential) -> Arc<Self> {
+            let this = Arc::new(Self::default());
+            *this.answer.lock().unwrap() = Some(cred);
+            this
+        }
+
+        fn csrs(&self) -> Vec<String> {
+            self.csrs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ControlCredentialMinter for RecordingCredentials {
+        async fn mint_control_credential(
+            &self,
+            server: &str,
+            csr_base64: &str,
+        ) -> Result<MintedControlCredential, String> {
+            assert_eq!(server, "prod");
+            self.csrs.lock().unwrap().push(csr_base64.to_string());
+            if let Some(scripted) = self.answer.lock().unwrap().clone() {
+                return Ok(scripted);
+            }
+            Ok(MintedControlCredential {
+                auth_mode: "mtls".into(),
+                token: String::new(),
+                client_cert: format!(
+                    "-----BEGIN CERTIFICATE-----\nfor:{csr_base64}\n-----END CERTIFICATE-----\n"
+                ),
+                cert_serial: "0a1b".into(),
+                expires_at: Some("2026-07-03T00:00:00Z".into()),
+            })
+        }
+    }
+
+    // The relay, stated as an equality: the CSR the PROVIDER composed is the CSR the
+    // broker seam received, and the certificate that comes back is the one issued for
+    // it. Nothing in this adapter generates a keypair — if it did, the certificate
+    // below would be bound to a key the provider does not hold and could never present
+    // (plan 001 D6 / 002 §7 P3).
+    #[tokio::test]
+    async fn credential_minter_relays_the_csr_verbatim_and_returns_the_certificate() {
+        let creds = Arc::new(RecordingCredentials::default());
+        let m = EmbeddedTokenMinter::new(Arc::new(NoTokens), creds.clone());
+
+        // The embedded broker is this build — no socket, no version skew, so the
+        // capability is unconditional and the provider always sends a CSR.
+        assert!(m.supports_mtls());
+
+        const CSR: &str = "Q1NSLURFUi1CWVRFUw==";
+        let out = m
+            .mint_credential("prod", &CredentialRequest::with_csr(CSR))
+            .await
+            .unwrap();
+
+        assert_eq!(creds.csrs(), vec![CSR.to_string()], "relayed VERBATIM");
+        match out {
+            MintedCredential::Certificate(c) => {
+                assert!(
+                    c.cert_pem.contains("for:Q1NSLURFUi1CWVRFUw=="),
+                    "the certificate must be the one issued for OUR csr: {}",
+                    c.cert_pem
+                );
+                assert_eq!(c.serial, "0a1b");
+                let unix = c.expires_at_unix.expect("expiry parsed");
+                assert_eq!(timefmt::format_iso8601(unix as i64), "2026-07-03T00:00:00Z");
+            }
+            other => panic!("expected a certificate, got {other:?}"),
+        }
+    }
+
+    // The same relay driven by the REAL shed-core provider, which is what production
+    // wires up: the keypair and CSR are generated inside `ControlTokenProvider`, and
+    // every mint composes a fresh one. The adapter is a pass-through in both directions.
+    #[tokio::test]
+    async fn the_provider_generates_the_keypair_and_the_adapter_only_carries_its_csr() {
+        let creds = Arc::new(RecordingCredentials::default());
+        let m: Arc<dyn TokenMinter> =
+            Arc::new(EmbeddedTokenMinter::new(Arc::new(NoTokens), creds.clone()));
+        let p = shed_core::token::ControlTokenProvider::new("prod".into(), m);
+
+        // The stand-in's PEM is not a real certificate, so adoption fails — what this
+        // asserts is the CSR that went OUT, and that a second mint composes a new one.
+        assert!(p.credential().await.is_err());
+        assert!(p.credential().await.is_err());
+
+        let csrs = creds.csrs();
+        assert_eq!(csrs.len(), 2);
+        assert_ne!(csrs[0], csrs[1], "a fresh keypair (and CSR) per mint");
+        for csr in &csrs {
+            // Shape-check without pulling a base64 decoder into shed-app: standard
+            // (padded) base64, and a leading 'M' — which encodes first-byte 0x30, the
+            // DER SEQUENCE tag every CertificationRequest opens with. A placeholder or
+            // a re-encoded something-else would not satisfy both.
+            assert!(csr.len() % 4 == 0 && csr.len() > 100, "csr {csr:?}");
+            assert!(
+                csr.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+                "std base64 alphabet: {csr:?}"
+            );
+            assert!(csr.starts_with('M'), "a DER SEQUENCE: {csr:?}");
+        }
+    }
+
+    // A token-mode server answered over the SAME CSR-bearing request: the mode comes
+    // from the credential's `auth_mode`, and the provider adopts a bearer token. This is
+    // the mode-flip leg — the embedded path needs no reconfiguration to serve either.
+    #[tokio::test]
+    async fn credential_minter_maps_a_token_mode_answer() {
+        let creds = RecordingCredentials::answering(MintedControlCredential {
+            auth_mode: "token".into(),
+            token: "ctl-1".into(),
+            client_cert: String::new(),
+            cert_serial: String::new(),
+            expires_at: None,
+        });
+        let m = EmbeddedTokenMinter::new(Arc::new(NoTokens), creds);
+        let out = m
+            .mint_credential("prod", &CredentialRequest::with_csr("QUJD"))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            MintedCredential::Token(MintedToken {
+                token: "ctl-1".into(),
+                expires_at_unix: None,
+            })
+        );
+    }
+
+    // Fail-closed on every answer that cannot authenticate — the embedded twin of
+    // `token_minter.rs`'s UDS-reply guards, so the two modes behave identically.
+    #[tokio::test]
+    async fn credential_minter_fails_closed_on_unusable_answers() {
+        // (a) an mtls answer with no certificate
+        let creds = RecordingCredentials::answering(MintedControlCredential {
+            auth_mode: "mtls".into(),
+            token: String::new(),
+            client_cert: String::new(),
+            cert_serial: "0a".into(),
+            expires_at: None,
+        });
+        let e = EmbeddedTokenMinter::new(Arc::new(NoTokens), creds)
+            .mint_credential("prod", &CredentialRequest::with_csr("QUJD"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, ShedError::Config(m) if m.contains("no certificate")),
+            "mtls with no certificate must fail closed"
+        );
+
+        // (b) a token answer with a blank token (a protocol-legal Ok that is not a
+        // credential) — and note the mode is read from `auth_mode`, so this is NOT
+        // silently reinterpreted as some other shape.
+        let creds = RecordingCredentials::answering(MintedControlCredential {
+            auth_mode: "token".into(),
+            token: String::new(),
+            client_cert: "-----BEGIN CERTIFICATE-----".into(),
+            cert_serial: String::new(),
+            expires_at: None,
+        });
+        let e = EmbeddedTokenMinter::new(Arc::new(NoTokens), creds)
+            .mint_credential("prod", &CredentialRequest::with_csr("QUJD"))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ShedError::Config(m) if m.contains("no token")));
+
+        // (c) an outright broker error (unknown server, host-key mismatch, …)
+        struct Failing;
+        #[async_trait]
+        impl ControlCredentialMinter for Failing {
+            async fn mint_control_credential(
+                &self,
+                _server: &str,
+                _csr_base64: &str,
+            ) -> Result<MintedControlCredential, String> {
+                Err("unknown server \"prod\"".into())
+            }
+        }
+        let e = EmbeddedTokenMinter::new(Arc::new(NoTokens), Arc::new(Failing))
+            .mint_credential("prod", &CredentialRequest::with_csr("QUJD"))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ShedError::Config(m) if m.contains("unknown server")));
+    }
+
+    /// The token seam for the credential-path tests: reaching it would mean the adapter
+    /// took the legacy route for a CSR-bearing mint.
+    struct NoTokens;
+    #[async_trait]
+    impl ControlTokenMinter for NoTokens {
+        async fn mint_control(
+            &self,
+            _server: &str,
+        ) -> Result<shed_broker::controltoken::MintedControlToken, String> {
+            unreachable!("the credential path must never fall back to token.get")
+        }
     }
 
     // ---- (iv) load_or_synthesize -----------------------------------------------------

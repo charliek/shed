@@ -46,6 +46,12 @@
 //! mint moves the provider (and, via [`CredentialObserver`], the app's stored
 //! entry) to the other state, in either direction.
 //!
+//! Every successful mint emits [`CredentialAdopted`], and a mint that changed the
+//! SHAPE additionally emits the derived `mode_changed` (plan 002 §7 P1). Both are
+//! delivered off the provider — enqueued under its lock, run on its own dispatcher
+//! thread — so a foreign handler can neither block a mint nor re-enter the
+//! provider unsafely.
+//!
 //! The transport above NEVER branches on the state it expects to be in and is
 //! never rebuilt: the bearer header is populated from
 //! [`Credential::bearer_token`] (empty in mtls state) and the client certificate
@@ -179,6 +185,21 @@ impl CredentialRequest {
     pub fn csr_base64(&self) -> Option<&str> {
         self.csr_base64.as_deref()
     }
+
+    /// Build a request carrying `csr_base64`.
+    ///
+    /// Production never calls this — the provider constructs the request from the
+    /// keypair it just generated, which is what keeps the private half here. It
+    /// exists for the foreign minters' own tests (the embedded broker adapter, the
+    /// mobile bridge): asserting "the CSR I was handed is the one I relayed" is the
+    /// property that proves a bridge generated no second keypair, and it should not
+    /// require standing up a whole provider to state. The CSR is public material,
+    /// so a constructor for it widens nothing.
+    pub fn with_csr(csr_base64: impl Into<String>) -> Self {
+        Self {
+            csr_base64: Some(csr_base64.into()),
+        }
+    }
 }
 
 /// The mint primitive: request a fresh CONTROL credential for `server`.
@@ -219,18 +240,160 @@ pub trait TokenMinter: Send + Sync {
     }
 }
 
-/// Notified when the provider adopts a credential of a DIFFERENT shape than the
-/// one it held — the `mode_changed` event of plan 001 D5.
+/// What the provider adopted, emitted after EVERY successful mint — plan 002 §7
+/// P1's `credential_adopted`, the persistence primitive every client bridge hangs
+/// its stored-entry write on.
 ///
-/// The app layer owns persistence (writing `auth_mode` into its stored entry);
-/// the provider owns correctness. A client that misses the event pays one
-/// re-learn on next launch and nothing more — no behavior here depends on the
-/// write succeeding.
+/// # What it carries, and what it deliberately does not
+///
+/// The mint outcome minus everything a consumer has no business holding:
+///   * `server` + `mode` + `expires_at_unix` — enough to persist a learned
+///     `auth_mode` and to render "renews at …" in a UI;
+///   * `token` — populated in [`AuthMode::Token`] ONLY, because the token IS the
+///     credential there and the consumer's store is the sanctioned home for it
+///     (mobile's `ServerRecord` seed);
+///   * in [`AuthMode::Mtls`], NOTHING that could authenticate: no certificate, no
+///     serial, and above all no private key. The key never leaves the provider
+///     (plan 001 D6 / 002 §7 P3), and a certificate without it is useless, so
+///     shipping either across a foreign boundary would buy a consumer nothing
+///     while widening the surface an audit has to reason about.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialAdopted {
+    /// The server name this provider was constructed for.
+    pub server: String,
+    /// The shape just adopted.
+    pub mode: AuthMode,
+    /// Unix seconds; `None` for a credential the minter reported no expiry for.
+    pub expires_at_unix: Option<u64>,
+    /// The bearer token — `Some` in [`AuthMode::Token`], ALWAYS `None` in
+    /// [`AuthMode::Mtls`].
+    pub token: Option<String>,
+}
+
+/// Redacted Debug, for the same reason [`MintedToken`]'s is: the event travels to
+/// app-layer code that logs liberally, and in token mode it holds a live bearer.
+impl std::fmt::Debug for CredentialAdopted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialAdopted")
+            .field("server", &self.server)
+            .field("mode", &self.mode)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Notified about the provider's credential adoptions — plan 002 §7 P1.
+///
+/// The app layer owns persistence (writing `auth_mode`, and on mobile the token,
+/// into its stored entry); the provider owns correctness. A client that misses an
+/// event pays one re-learn on next launch and nothing more — no behavior here
+/// depends on the write succeeding.
+///
+/// # Delivery contract (read before implementing)
+///
+/// Both callbacks run on the provider's own dispatcher THREAD, in emission order,
+/// with NO provider lock held and nothing of the provider's on the stack:
+///   * a handler may block for as long as it likes — it delays only later events,
+///     never a mint (the mint path enqueues and returns);
+///   * a handler may call back into the provider it was registered on without
+///     deadlocking (it is not re-entrancy — the mint that produced the event has
+///     already released the lock and returned to its caller);
+///   * the callbacks are consequently ASYNCHRONOUS with respect to the
+///     `credential()` call that produced them: a test (or a UI) that must see an
+///     event waits for it rather than reading immediately after the mint returns.
 pub trait CredentialObserver: Send + Sync {
-    /// `mode` is the shape just adopted. Called with the provider's internal lock
-    /// HELD, so an implementation must not call back into the provider (do the
-    /// persistence write on a spawned task if it can block).
-    fn on_mode_changed(&self, server: &str, mode: AuthMode);
+    /// A mint succeeded and the provider adopted `event`'s credential. Fires on
+    /// EVERY successful mint — including a plain rotation that changed nothing but
+    /// the credential's value.
+    fn on_credential_adopted(&self, event: &CredentialAdopted) {
+        let _ = event;
+    }
+
+    /// The DERIVED transition event (plan 001 D5's `mode_changed`): the provider
+    /// adopted a credential of a different shape than the one it last ANNOUNCED,
+    /// in either direction. Emitted from the same queue as
+    /// [`Self::on_credential_adopted`] and always immediately after it, so a
+    /// consumer that handles both sees the adoption first.
+    ///
+    /// "Last announced" rather than "last cached" is what makes it a transition
+    /// event: an invalidation (a 401, a refused certificate) drops the cached
+    /// credential, and the re-mint that follows almost always lands on the SAME
+    /// shape — a rotation, which this event must stay silent for.
+    fn on_mode_changed(&self, server: &str, mode: AuthMode) {
+        let _ = (server, mode);
+    }
+}
+
+/// One queued observer notification: the adoption, plus whether this adoption was
+/// also a mode TRANSITION.
+///
+/// The transition is decided by the provider (which knows the shape it last
+/// announced, and knows a seeded credential was never announced at all because its
+/// consumer supplied it) rather than by the dispatcher, which could only infer it
+/// from the event stream and would report a spurious flip for the first mint after
+/// a seed of the same shape.
+struct Emission {
+    event: CredentialAdopted,
+    mode_changed: bool,
+}
+
+/// The non-blocking delivery seam (plan 002 §7 P1): the provider ENQUEUES under
+/// its state lock, a dedicated thread DELIVERS with no lock held.
+///
+/// # Why a thread and not a task
+///
+/// [`CredentialObserver`]'s callbacks are synchronous and foreign — a Swift
+/// closure over UniFFI, a Dart `StreamSink`, a UI store's mutex. Any of them may
+/// block. Delivering them from a `tokio::spawn`ed task would put that block on a
+/// runtime worker, and on a current-thread runtime (which is what a test, and any
+/// embedder that builds one, gets) it would stall the entire executor — including
+/// the mint path this design exists to protect. A thread is the only delivery
+/// vehicle whose worst case is "this observer falls behind".
+///
+/// The thread is started only when an observer is registered ([`with_observer`]),
+/// so a provider without one pays nothing, and it exits when the provider is
+/// dropped (the channel closes and the `for` loop ends — after the callback
+/// currently in flight returns). That last clause is the observer CONTRACT: a
+/// handler may block briefly, but it must return. A handler that never returns
+/// pins this thread, the observer, and any queued emissions (token values
+/// included) for the life of the process — the design trades that bounded,
+/// foreign-bug-only leak for the guarantee that no handler can ever stall the
+/// mint path or the async runtime. If the thread cannot be spawned at all — a
+/// process out of thread handles — the provider keeps working and simply emits
+/// no events, which is the same degradation a consumer already tolerates when
+/// it misses one.
+///
+/// [`with_observer`]: ControlTokenProvider::with_observer
+struct CredentialEvents {
+    tx: std::sync::mpsc::Sender<Emission>,
+}
+
+impl CredentialEvents {
+    fn start(observer: Arc<dyn CredentialObserver>) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Emission>();
+        std::thread::Builder::new()
+            // Linux caps thread names at 15 bytes; keep it inside that so the name
+            // survives into `ps`/Instruments where it is actually useful.
+            .name("shed-credevent".into())
+            .spawn(move || {
+                for em in rx {
+                    observer.on_credential_adopted(&em.event);
+                    if em.mode_changed {
+                        observer.on_mode_changed(&em.event.server, em.event.mode);
+                    }
+                }
+            })
+            .ok()
+            .map(|_detached| Self { tx })
+    }
+
+    /// Enqueue one notification. Never blocks and never fails loudly: a receiver
+    /// that has gone away (only possible if the dispatcher thread panicked inside
+    /// a foreign handler) must not turn into a mint failure.
+    fn emit(&self, em: Emission) {
+        let _ = self.tx.send(em);
+    }
 }
 
 /// The credential a request should present — the public snapshot of the
@@ -847,6 +1010,16 @@ struct State {
     /// Unix second before which no mint attempt is made (set by a mint
     /// failure; `control_token_provider.dart:52,147`).
     cooldown_until: u64,
+    /// The shape most recently ANNOUNCED through `mode_changed`, kept separate
+    /// from `cached` so the derived event describes a real transition.
+    ///
+    /// It must survive an invalidation: `reject_cached` drops the credential, so
+    /// deriving the transition from `cached` alone would report a "flip" for every
+    /// post-401 re-mint that landed on the same shape — a rotation dressed up as a
+    /// mode change, which is exactly the event a consumer acts on by rewriting its
+    /// stored entry. Seeded credentials pre-set it ([`ControlTokenProvider::with_seed`]):
+    /// the consumer that supplied the seed already knows that shape.
+    last_announced_mode: Option<AuthMode>,
     /// Presence of a recorded mint failure (`_lastError`,
     /// `control_token_provider.dart:53,148`), surfaced when a later call must
     /// error without attempting a mint (cooldown). Always the fixed
@@ -913,9 +1086,10 @@ pub struct ControlTokenProvider {
     /// and rewritten on every mint — the seam that makes rotation and mode flips
     /// invisible to the `reqwest::Client` (plan 001 D5).
     cert_resolver: Arc<ClientCertResolver>,
-    /// Notified when an adopted credential's SHAPE changes, so the app layer can
-    /// persist the learned `auth_mode`.
-    observer: Option<Arc<dyn CredentialObserver>>,
+    /// The observer delivery seam ([`CredentialEvents`]) — `None` until an
+    /// observer is registered, so an unobserved provider allocates no channel and
+    /// starts no thread.
+    events: Option<CredentialEvents>,
     state: Mutex<State>,
 }
 
@@ -929,7 +1103,7 @@ impl ControlTokenProvider {
             jitter: Duration::ZERO,
             mint_cooldown: Duration::ZERO,
             cert_resolver: Arc::new(ClientCertResolver::new()),
-            observer: None,
+            events: None,
             state: Mutex::new(State::default()),
         }
     }
@@ -943,9 +1117,15 @@ impl ControlTokenProvider {
         self.cert_resolver.clone()
     }
 
-    /// Observe adopted-mode changes (plan 001 D5's `mode_changed` event).
+    /// Observe this provider's adoptions — `credential_adopted` (every successful
+    /// mint) and the derived `mode_changed` (plan 002 §7 P1 / 001 D5).
+    ///
+    /// Starts the dispatcher thread that owns `observer` and delivers to it; see
+    /// [`CredentialObserver`]'s delivery contract for what a handler may and may
+    /// not assume. Calling this twice replaces the observer — the previous
+    /// dispatcher's channel drops and its thread ends.
     pub fn with_observer(mut self, observer: Arc<dyn CredentialObserver>) -> Self {
-        self.observer = Some(observer);
+        self.events = CredentialEvents::start(observer);
         self
     }
 
@@ -995,12 +1175,16 @@ impl ControlTokenProvider {
     /// is never cached (plan 001 §3.4).
     pub fn with_seed(mut self, seed: MintedToken) -> Self {
         if !seed.token.trim().is_empty() {
-            self.state.get_mut().cached = Some(Credential {
+            let st = self.state.get_mut();
+            st.cached = Some(Credential {
                 mode: Some(AuthMode::Token),
                 token: seed.token,
                 expires_at_unix: seed.expires_at_unix,
                 ..Credential::default()
             });
+            // The consumer that persisted this seed already knows the shape, so a
+            // first mint that stays in token mode is a rotation, not a transition.
+            st.last_announced_mode = Some(AuthMode::Token);
         }
         self
     }
@@ -1203,18 +1387,15 @@ impl ControlTokenProvider {
             .and_then(|minted| self.adopt(minted, keypair.as_ref()));
         match outcome {
             Ok((cred, keypair, certified)) => {
-                let prior_mode = st.cached.as_ref().and_then(|c| c.mode);
+                let prior_mode = st.last_announced_mode;
                 st.cached = Some(cred.clone());
                 st.keypair = keypair;
                 st.last_error = None;
+                st.last_announced_mode = cred.mode;
                 // Present (mtls) or withdraw (token) the certificate BEFORE
                 // returning: the caller's very next request may handshake.
                 self.cert_resolver.set(certified);
-                if prior_mode != cred.mode {
-                    if let (Some(obs), Some(mode)) = (&self.observer, cred.mode) {
-                        obs.on_mode_changed(&self.server, mode);
-                    }
-                }
+                self.emit_adopted(&cred, prior_mode);
                 Ok(cred)
             }
             Err(e) => {
@@ -1225,6 +1406,38 @@ impl ControlTokenProvider {
                 Err(e)
             }
         }
+    }
+
+    /// Queue the `credential_adopted` notification for a credential just adopted,
+    /// plus the derived `mode_changed` when `prior_mode` — the shape last
+    /// ANNOUNCED, not the one last cached — differed.
+    ///
+    /// Called from [`Self::mint_locked`], i.e. with the state lock HELD — but only
+    /// the ENQUEUE happens here (a channel send, O(1), no foreign code). Every
+    /// handler runs on the dispatcher thread with no lock held, which is what makes
+    /// a blocking or re-entrant observer harmless (plan 002 §7 P1).
+    ///
+    /// Emitting under the lock rather than after it is deliberate: the lock is what
+    /// serializes adoptions, so enqueueing inside it is what guarantees the queue's
+    /// order IS the adoption order. Post-lock emission would let two mints reorder.
+    fn emit_adopted(&self, cred: &Credential, prior_mode: Option<AuthMode>) {
+        let (Some(events), Some(mode)) = (&self.events, cred.mode) else {
+            return; // no observer, or (unreachable) an adopted credential with no mode
+        };
+        events.emit(Emission {
+            event: CredentialAdopted {
+                server: self.server.clone(),
+                mode,
+                expires_at_unix: cred.expires_at_unix,
+                // Token mode only — see [`CredentialAdopted`]'s doc for why the
+                // mtls event carries no credential material at all.
+                token: match mode {
+                    AuthMode::Token => Some(cred.token.clone()),
+                    AuthMode::Mtls => None,
+                },
+            },
+            mode_changed: prior_mode != Some(mode),
+        });
     }
 
     /// Validate a freshly minted credential and turn it into the triple the state
@@ -2319,7 +2532,7 @@ mod credential_tests {
     use super::*;
     use crate::testtls::{valid_window, TestCa};
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn cert_bundle(cert_pem: &str, serial: &str) -> String {
         json!({
@@ -2629,52 +2842,11 @@ mod credential_tests {
 
     #[tokio::test]
     async fn token_accessor_errors_in_mtls_state_instead_of_sending_nothing() {
-        let ca = TestCa::new("shed-ca");
-        let kp = crate::csr::ClientKeyPair::generate().unwrap();
-        let (pem, serial) = ca.sign_csr(kp.csr_der(), "SHA256:abc", "control", 7, valid_window());
-        let minter =
-            ScriptMinter::new(vec![Ok(MintedCredential::Certificate(MintedCertificate {
-                cert_pem: pem,
-                serial,
-                expires_at_unix: Some(FAR_FUTURE),
-            }))]);
-        // The provider generates its OWN keypair, so a certificate minted for the
-        // key above cannot be adopted — drive the state through a matching mint
-        // instead by letting the provider's own CSR be signed.
-        struct CaSigner(TestCa, AtomicUsize);
-        #[async_trait::async_trait]
-        impl TokenMinter for CaSigner {
-            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
-                unreachable!()
-            }
-            fn supports_mtls(&self) -> bool {
-                true
-            }
-            async fn mint_credential(
-                &self,
-                _server: &str,
-                req: &CredentialRequest,
-            ) -> Result<MintedCredential, ShedError> {
-                use base64::Engine as _;
-                let n = self.1.fetch_add(1, Ordering::SeqCst) + 1;
-                let der = base64::engine::general_purpose::STANDARD
-                    .decode(req.csr_base64().unwrap().as_bytes())
-                    .unwrap();
-                let (pem, serial) =
-                    self.0
-                        .sign_csr(&der, "SHA256:abc", "control", n as u64, valid_window());
-                Ok(MintedCredential::Certificate(MintedCertificate {
-                    cert_pem: pem,
-                    serial,
-                    expires_at_unix: Some(FAR_FUTURE),
-                }))
-            }
-        }
-        drop(minter);
-        let p = ControlTokenProvider::new(
-            "s".into(),
-            Arc::new(CaSigner(TestCa::new("shed-ca"), AtomicUsize::new(0))),
-        );
+        // The provider generates its OWN keypair, so a certificate minted for any
+        // other key could not be adopted — drive the state through a matching mint
+        // instead, by letting the provider's own CSR be signed (`FlipMinter` in
+        // certificate mode does exactly that).
+        let p = ControlTokenProvider::new("s".into(), FlipMinter::new(true));
         let cred = p.credential().await.unwrap();
         assert_eq!(cred.mode, Some(AuthMode::Mtls));
         assert!(p.cert_resolver().current().is_some());
@@ -2842,6 +3014,401 @@ mod credential_tests {
         let st = p.state.lock().await;
         assert!(st.cached.is_none());
         assert!(p.cert_resolver.current().is_none());
+    }
+
+    // ---- credential_adopted + the derived mode_changed (plan 002 §7 P1) ----
+
+    /// Poll `done` for up to ~2s, then return regardless — every assertion about
+    /// a delivered event goes through this, because delivery is asynchronous BY
+    /// CONTRACT (the dispatcher thread). Returning on timeout rather than
+    /// panicking leaves the caller's own `assert_eq!` to report what was missing.
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// One entry per callback, in a SINGLE interleaved log — so the
+    /// adoption-before-mode_changed ordering contract is assertable, not just
+    /// each stream independently.
+    #[derive(Clone, Debug)]
+    enum Fired {
+        Adopted(CredentialAdopted),
+        Mode(String, AuthMode),
+    }
+
+    /// Records every delivered notification, in order.
+    #[derive(Default)]
+    struct EventLog {
+        fired: std::sync::Mutex<Vec<Fired>>,
+    }
+
+    impl EventLog {
+        fn adopted_snapshot(&self) -> Vec<CredentialAdopted> {
+            self.fired
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|f| match f {
+                    Fired::Adopted(e) => Some(e.clone()),
+                    Fired::Mode(..) => None,
+                })
+                .collect()
+        }
+
+        async fn wait_adopted(&self, n: usize) -> Vec<CredentialAdopted> {
+            wait_until(|| self.adopted_snapshot().len() >= n).await;
+            let got = self.adopted_snapshot();
+            assert_eq!(got.len(), n, "expected {n} adoption events, got {got:?}");
+            got
+        }
+
+        async fn wait_modes(&self, expected: &[AuthMode]) {
+            let count = || {
+                self.fired
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| matches!(f, Fired::Mode(..)))
+                    .count()
+            };
+            wait_until(|| count() >= expected.len()).await;
+            let fired = self.fired.lock().unwrap().clone();
+            let modes: Vec<AuthMode> = fired
+                .iter()
+                .filter_map(|f| match f {
+                    Fired::Mode(_, m) => Some(*m),
+                    Fired::Adopted(_) => None,
+                })
+                .collect();
+            assert_eq!(modes, expected, "mode_changed sequence");
+            // The ordering contract: every mode_changed is preceded, somewhere
+            // earlier in the interleaved log, by the adoption that caused it —
+            // and never fires as the very first event.
+            for (i, f) in fired.iter().enumerate() {
+                if matches!(f, Fired::Mode(..)) {
+                    assert!(
+                        fired[..i].iter().any(|p| matches!(p, Fired::Adopted(_))),
+                        "mode_changed fired before any credential_adopted: {fired:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    impl CredentialObserver for EventLog {
+        fn on_credential_adopted(&self, event: &CredentialAdopted) {
+            self.fired
+                .lock()
+                .unwrap()
+                .push(Fired::Adopted(event.clone()));
+        }
+        fn on_mode_changed(&self, server: &str, mode: AuthMode) {
+            self.fired
+                .lock()
+                .unwrap()
+                .push(Fired::Mode(server.to_string(), mode));
+        }
+    }
+
+    /// Answers with whichever shape the test currently selects, signing the
+    /// PROVIDER's own CSR in certificate mode so the adoption actually succeeds.
+    struct FlipMinter {
+        ca: TestCa,
+        issue_cert: AtomicBool,
+        n: AtomicUsize,
+    }
+
+    impl FlipMinter {
+        fn new(issue_cert: bool) -> Arc<Self> {
+            Arc::new(Self {
+                ca: TestCa::new("shed-ca"),
+                issue_cert: AtomicBool::new(issue_cert),
+                n: AtomicUsize::new(0),
+            })
+        }
+        fn set_issue_cert(&self, v: bool) {
+            self.issue_cert.store(v, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenMinter for FlipMinter {
+        async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
+            unreachable!("an mtls-capable minter is always asked through mint_credential")
+        }
+        fn supports_mtls(&self) -> bool {
+            true
+        }
+        async fn mint_credential(
+            &self,
+            _server: &str,
+            req: &CredentialRequest,
+        ) -> Result<MintedCredential, ShedError> {
+            use base64::Engine as _;
+            let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
+            if !self.issue_cert.load(Ordering::SeqCst) {
+                return Ok(MintedCredential::Token(MintedToken {
+                    token: format!("tok-{n}"),
+                    expires_at_unix: Some(FAR_FUTURE),
+                }));
+            }
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(req.csr_base64().expect("a CSR for an mtls-capable minter"))
+                .unwrap();
+            // A distinctive serial so a leak assertion on it cannot pass by
+            // coincidence against a short number that occurs in a timestamp.
+            let (pem, serial) = self.ca.sign_csr(
+                &der,
+                "SHA256:abc",
+                "control",
+                0x00c0_ffee_0000 + n as u64,
+                valid_window(),
+            );
+            Ok(MintedCredential::Certificate(MintedCertificate {
+                cert_pem: pem,
+                serial,
+                expires_at_unix: Some(FAR_FUTURE),
+            }))
+        }
+    }
+
+    // Every successful mint emits an adoption — including the ROTATIONS that
+    // change nothing but the credential's value. That is what makes the event
+    // usable as a persistence primitive (a consumer that only heard about shape
+    // changes would never learn a refreshed token or a new expiry).
+    #[tokio::test]
+    async fn credential_adopted_fires_on_every_successful_mint() {
+        let log = Arc::new(EventLog::default());
+        let minter = FlipMinter::new(false);
+        let p = ControlTokenProvider::new("mini2".into(), minter)
+            .with_observer(log.clone() as Arc<dyn CredentialObserver>);
+
+        for _ in 0..3 {
+            p.credential().await.unwrap();
+            p.invalidate().await; // force the next resolution to mint again
+        }
+
+        let adopted = log.wait_adopted(3).await;
+        for (i, ev) in adopted.iter().enumerate() {
+            assert_eq!(ev.server, "mini2");
+            assert_eq!(ev.mode, AuthMode::Token);
+            assert_eq!(ev.expires_at_unix, Some(FAR_FUTURE));
+            assert_eq!(ev.token.as_deref(), Some(format!("tok-{}", i + 1).as_str()));
+        }
+        // ...while the DERIVED transition event fired only once: three mints, one
+        // shape.
+        log.wait_modes(&[AuthMode::Token]).await;
+    }
+
+    // The payload split (plan 002 §7 P1 / §7 P3): an mtls adoption carries no
+    // credential material at all — no token, and nothing else that could be
+    // presented to a server either.
+    #[tokio::test]
+    async fn an_mtls_adoption_event_carries_no_credential_material() {
+        let log = Arc::new(EventLog::default());
+        let minter = FlipMinter::new(true);
+        let p = ControlTokenProvider::new("mini2".into(), minter)
+            .with_observer(log.clone() as Arc<dyn CredentialObserver>);
+
+        let cred = p.credential().await.unwrap();
+        assert_eq!(cred.mode, Some(AuthMode::Mtls));
+        assert!(
+            !cred.cert_pem.is_empty(),
+            "the PROVIDER holds the certificate"
+        );
+
+        let ev = log.wait_adopted(1).await.remove(0);
+        assert_eq!(ev.server, "mini2");
+        assert_eq!(ev.mode, AuthMode::Mtls);
+        assert_eq!(ev.expires_at_unix, Some(FAR_FUTURE));
+        assert_eq!(ev.token, None, "an mtls event never carries a bearer token");
+        // The whole rendered event: no certificate, no key, no serial — the
+        // structural audit plan 002 §7 P3 asks for, run against the REAL event.
+        let rendered = format!("{ev:?}");
+        for forbidden in [
+            "BEGIN CERTIFICATE",
+            "PRIVATE KEY",
+            &cred.cert_pem[..40],
+            &cred.cert_serial,
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "adoption event leaked {forbidden:?}: {rendered}"
+            );
+        }
+        // ...and the token-mode Debug still redacts the bearer it does carry.
+        let rendered = format!(
+            "{:?}",
+            CredentialAdopted {
+                server: "mini2".into(),
+                mode: AuthMode::Token,
+                expires_at_unix: None,
+                token: Some("sk-live-do-not-log-me".into()),
+            }
+        );
+        assert!(!rendered.contains("sk-live"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    // `mode_changed` survives as a DERIVED event: it still fires on a transition,
+    // in BOTH directions, and stays silent for a mint that kept the shape.
+    #[tokio::test]
+    async fn mode_changed_is_derived_and_still_fires_on_flips_both_directions() {
+        let log = Arc::new(EventLog::default());
+        let minter = FlipMinter::new(false);
+        let p = ControlTokenProvider::new("mini2".into(), minter.clone())
+            .with_observer(log.clone() as Arc<dyn CredentialObserver>);
+
+        // token → token (a rotation: adoption, no transition)
+        p.credential().await.unwrap();
+        p.invalidate().await;
+        p.credential().await.unwrap();
+
+        // token → mtls
+        minter.set_issue_cert(true);
+        p.invalidate().await;
+        assert_eq!(p.credential().await.unwrap().mode, Some(AuthMode::Mtls));
+
+        // ...and back again.
+        minter.set_issue_cert(false);
+        p.invalidate().await;
+        assert_eq!(p.credential().await.unwrap().mode, Some(AuthMode::Token));
+
+        log.wait_adopted(4).await;
+        log.wait_modes(&[AuthMode::Token, AuthMode::Mtls, AuthMode::Token])
+            .await;
+        // The event names the server the app has to migrate.
+        assert!(log.fired.lock().unwrap().iter().all(|f| match f {
+            Fired::Mode(s, _) => s == "mini2",
+            Fired::Adopted(e) => e.server == "mini2",
+        }));
+    }
+
+    // A foreign handler that blocks — a Swift closure taking a UI lock, a Dart
+    // sink whose isolate is busy — must not slow the mint path down, let alone
+    // stall it. It cannot, because the mint only ENQUEUES: everything foreign runs
+    // on the dispatcher thread.
+    //
+    // Note the runtime: this is the DEFAULT current-thread test runtime, which is
+    // exactly the configuration a `tokio::spawn`ed dispatcher would fail — a
+    // handler blocking a worker there would stall the executor the mint below runs
+    // on. Passing here is the evidence for the thread-not-task decision.
+    #[tokio::test]
+    async fn a_blocking_observer_neither_delays_nor_stalls_the_mint_path() {
+        struct BlockingObserver {
+            entered: AtomicUsize,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            delivered: std::sync::Mutex<Vec<String>>,
+        }
+        impl CredentialObserver for BlockingObserver {
+            fn on_credential_adopted(&self, event: &CredentialAdopted) {
+                if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Park inside the handler until the test lets go.
+                    let _ = self.release.lock().unwrap().recv();
+                }
+                self.delivered
+                    .lock()
+                    .unwrap()
+                    .push(event.token.clone().unwrap_or_default());
+            }
+        }
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let obs = Arc::new(BlockingObserver {
+            entered: AtomicUsize::new(0),
+            release: std::sync::Mutex::new(release_rx),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let minter = FlipMinter::new(false);
+        let p = ControlTokenProvider::new("mini2".into(), minter)
+            .with_observer(obs.clone() as Arc<dyn CredentialObserver>);
+
+        // Three mints while the first handler is wedged. Each is bounded: a mint
+        // path that waited on the observer would blow the timeout.
+        for i in 0..3 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                p.credential().await.unwrap();
+                p.invalidate().await;
+            })
+            .await
+            .unwrap_or_else(|_| panic!("mint {i} waited on the blocked observer"));
+        }
+        // The handler really is still parked (so the mints above genuinely ran
+        // past it, rather than the events happening to be delivered quickly).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(obs.entered.load(Ordering::SeqCst), 1);
+        assert!(obs.delivered.lock().unwrap().is_empty());
+
+        // Released, the queued events drain in order — nothing was dropped.
+        release_tx.send(()).unwrap();
+        wait_until(|| obs.delivered.lock().unwrap().len() >= 3).await;
+        assert_eq!(
+            *obs.delivered.lock().unwrap(),
+            vec!["tok-1".to_string(), "tok-2".into(), "tok-3".into()]
+        );
+    }
+
+    // The post-lock proof: a handler may call straight back INTO the provider that
+    // notified it. Under the previous under-the-lock delivery this deadlocks (the
+    // provider's `Mutex` is not reentrant); it succeeds now because the mint that
+    // produced the event released the lock — and returned to its caller — before
+    // anything foreign ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_observer_may_call_back_into_the_provider_that_notified_it() {
+        struct ReenteringObserver {
+            provider: std::sync::OnceLock<std::sync::Weak<ControlTokenProvider>>,
+            handle: tokio::runtime::Handle,
+            once: AtomicBool,
+            reentered: std::sync::Mutex<Vec<String>>,
+        }
+        impl CredentialObserver for ReenteringObserver {
+            fn on_credential_adopted(&self, _event: &CredentialAdopted) {
+                if self.once.swap(true, Ordering::SeqCst) {
+                    return; // one re-entry is the proof; more would just recurse
+                }
+                let p = self
+                    .provider
+                    .get()
+                    .expect("provider wired before the first mint")
+                    .upgrade()
+                    .expect("provider alive");
+                // A bounded re-entrant call: on the broken (under-lock) design this
+                // reports the deadlock instead of hanging the suite forever.
+                let got = self.handle.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), p.credential()).await
+                });
+                self.reentered.lock().unwrap().push(match got {
+                    Ok(Ok(c)) => c.token,
+                    Ok(Err(e)) => format!("mint error: {e}"),
+                    Err(_) => "DEADLOCK".into(),
+                });
+            }
+        }
+
+        let obs = Arc::new(ReenteringObserver {
+            provider: std::sync::OnceLock::new(),
+            handle: tokio::runtime::Handle::current(),
+            once: AtomicBool::new(false),
+            reentered: std::sync::Mutex::new(Vec::new()),
+        });
+        let minter = FlipMinter::new(false);
+        let p = Arc::new(
+            ControlTokenProvider::new("mini2".into(), minter)
+                .with_observer(obs.clone() as Arc<dyn CredentialObserver>),
+        );
+        obs.provider.set(Arc::downgrade(&p)).ok().unwrap();
+
+        assert_eq!(p.credential().await.unwrap().token, "tok-1");
+        wait_until(|| !obs.reentered.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            *obs.reentered.lock().unwrap(),
+            vec!["tok-1".to_string()],
+            "the re-entrant credential() must return the cached credential, not deadlock"
+        );
     }
 
     // ---- Debug redaction ----
