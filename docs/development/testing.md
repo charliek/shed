@@ -120,7 +120,8 @@ The suite picks up FC tests automatically once the remote server emits PhaseTime
 | `SHED_FC_DEV_SERVER` | `$(SHED_FC_HOST)-dev` | `~/.shed/config.yaml` entry name for the parallel dev FC server. |
 | `SHED_FC_LOG_PATH` | _unset_ (uses journald) | Remote file path for `fc_server` fixture to read logs from. `test-integration-dev-fc` sets this to the dev server's log file so the existing tests find PhaseTimer lines (the dev server runs via `sudo nohup`, not systemd). |
 | `RELEASE_BUILD_TOOLS_REF` | latest `git tag` matching `v*` | shed-build-tools image ref injected into the dev binary so it uses release-shaped upper-template behavior. Pin to an older release if your source has drifted: `RELEASE_BUILD_TOOLS_REF=ghcr.io/charliek/shed-build-tools:v0.5.7`. |
-| `SHED_DEV_AUTH_MODE` | `token` | `auth.mode` the parallel dev server (Mac or FC) is (re)started with — `token` (byte-identical to today's dev config) or `mtls` (renders a throwaway variant via `scripts/render-dev-mtls-config.sh`, never editing the committed base). Honored by `dev-server-up`/`-restart` and the `-fc` variants; forwarded by `test-integration-dev[-fc]` so `tests/integration/test_mtls.py` can tell which mode is running. See "Validating the mtls auth mode" below. |
+| `SHED_DEV_STATE_DIR` | _unset_ | **Per-machine, optional.** Relocates the Mac dev server's blob-heavy state (`images_dir`, `instance_dir`, `snapshots_dir`, `uppers_dir`) under this directory — for a boot volume that cannot host a multi-GB dev image store. Unset means the committed default (`~/Library/Application Support/shed-dev/vz`), so no other developer is affected; set it in your shell profile (e.g. `export SHED_DEV_STATE_DIR=/Volumes/ext/shed-dev/vz`). `socket_dir` is deliberately NOT relocated (unix socket path length limits). `dev-server-up` refuses to start if the path is unmounted or unwritable, rather than silently building a second empty store on the mount point. |
+| `SHED_DEV_AUTH_MODE` | `token` | `auth.mode` the parallel dev server (Mac or FC) is (re)started with — `token` (byte-identical to today's dev config) or `mtls` (renders a throwaway variant via `scripts/render-dev-config.sh`, never editing the committed base). Honored by `dev-server-up`/`-restart` and the `-fc` variants; forwarded by `test-integration-dev[-fc]` so `tests/integration/test_mtls.py` can tell which mode is running. See "Validating the mtls auth mode" below. |
 | `SHED_MTLS_FLIP_TEST` | _unset_ | Opt-in for `test_mtls.py::test_mode_flip_migrates_live`, which restarts the real Mac dev server twice to prove the live auth-mode migration in both directions. Unset skips it. |
 
 #### Validating server-side changes — parallel dev server
@@ -208,7 +209,7 @@ SHED_DEV_AUTH_MODE ?= token   # default: byte-identical to today's dev config
 Honored by `dev-server-up` / `dev-server-restart` (and the `-fc` variants):
 `token` runs the committed `configs/server.dev-parallel.*.yaml` unmodified —
 no generation step at all; `mtls` first renders a throwaway variant
-(`scripts/render-dev-mtls-config.sh`, never editing the committed base) with
+(`scripts/render-dev-config.sh`, never editing the committed base) with
 `auth.mode: mtls`. The mac config already carries the `https_port` +
 `auth.ssh` key source mtls needs (only the mode line flips); the FC config
 defaults to open mode with no `auth:` block at all, so the mtls render also

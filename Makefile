@@ -119,17 +119,62 @@ DEV_LOG_PATH := $(HOME)/.shed/dev/server.log
 DEV_PID_PATH := $(HOME)/.shed/dev/server.pid
 DEV_CONFIG   := $(CURDIR)/configs/server.dev-parallel.mac.yaml
 
-# auth.mode for the dev server: "token" (default) or "mtls". "token" runs the
-# committed $(DEV_CONFIG) byte-identical to today — no generation step at all.
-# "mtls" renders a throwaway copy (scripts/render-dev-mtls-config.sh) with
-# auth.mode: mtls, written to $(DEV_MTLS_CONFIG); the committed base config is
-# never edited. Honored by dev-server-up / dev-server-restart (and the -fc
-# variants below). Forwarded to `make test-integration-dev[-fc]` so
-# tests/integration/test_mtls.py can detect which mode the running dev server
-# is actually in (it skips cleanly unless this is "mtls" — see that module's
-# docstring for the detection mechanism).
+# auth.mode for the dev server: "token" (default) or "mtls". "token" needs no
+# override at all; "mtls" renders a throwaway copy with auth.mode: mtls (see
+# DEV_GENERATED_CONFIG below). Honored by dev-server-up / dev-server-restart
+# (and the -fc variants below). Forwarded to `make test-integration-dev[-fc]`
+# so tests/integration/test_mtls.py can detect which mode the running dev
+# server is actually in (it skips cleanly unless this is "mtls" — see that
+# module's docstring for the detection mechanism).
 SHED_DEV_AUTH_MODE ?= token
-DEV_MTLS_CONFIG := $(HOME)/.shed/dev/server.mtls-generated.yaml
+
+# OPTIONAL, per-machine: relocate the dev server's blob-heavy state (images,
+# instances, snapshots, uppers) off the boot volume. Unset by default, which
+# is the committed config's `~/Library/Application Support/shed-dev/vz` — so
+# every other developer's behavior is unchanged and nothing about this is
+# machine-specific in the repo.
+#
+# Set it in your shell profile when this machine's boot volume can't host a
+# multi-GB dev image store, e.g.:
+#   export SHED_DEV_STATE_DIR=/Volumes/miniext/shed-dev/vz
+#
+# socket_dir is deliberately NOT relocated (unix socket path length limits) —
+# see scripts/render-dev-config.sh. The volume must be mounted; dev-server-up
+# refuses to start otherwise rather than silently building a second, empty
+# image store on the mount point.
+SHED_DEV_STATE_DIR ?=
+
+# The rendered config, written whenever ANY override above is active. With no
+# overrides the targets run the committed $(DEV_CONFIG) directly — byte
+# identical to having no generation step at all.
+DEV_GENERATED_CONFIG := $(HOME)/.shed/dev/server.generated.yaml
+DEV_RENDER_ARGS := $(if $(filter mtls,$(SHED_DEV_AUTH_MODE)),--mtls,) \
+                   $(if $(SHED_DEV_STATE_DIR),--state-dir $(SHED_DEV_STATE_DIR),)
+
+# Refuse to start when SHED_DEV_STATE_DIR points somewhere unwritable — an
+# external volume that isn't mounted, typically. Without this the server
+# happily creates an empty store on the bare mount point, then reports "image
+# not found" for every create, which reads like a product bug rather than
+# "plug the drive in". No-op when the variable is unset.
+define check-dev-state-dir
+@if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
+  parent="$$(dirname "$(SHED_DEV_STATE_DIR)")"; \
+  while [ ! -d "$$parent" ] && [ "$$parent" != "/" ]; do parent="$$(dirname "$$parent")"; done; \
+  case "$(SHED_DEV_STATE_DIR)" in \
+    /Volumes/*) vol="/$$(echo "$(SHED_DEV_STATE_DIR)" | cut -d/ -f2-3)"; \
+      if ! mount | grep -q " on $$vol "; then \
+        echo "ERROR: SHED_DEV_STATE_DIR=$(SHED_DEV_STATE_DIR) but $$vol is not mounted."; \
+        echo "       Mount the volume, or unset SHED_DEV_STATE_DIR to use the"; \
+        echo "       default under ~/Library/Application Support/shed-dev/vz."; \
+        exit 1; \
+      fi ;; \
+  esac; \
+  if ! mkdir -p "$(SHED_DEV_STATE_DIR)" 2>/dev/null || [ ! -w "$(SHED_DEV_STATE_DIR)" ]; then \
+    echo "ERROR: SHED_DEV_STATE_DIR=$(SHED_DEV_STATE_DIR) is not writable."; \
+    exit 1; \
+  fi; \
+fi
+endef
 
 # shed-build-tools image ref to inject when the dev binary runs.
 # Dev binaries embed Version="vX.Y.Z-N-gHASH-dirty", which
@@ -158,11 +203,17 @@ dev-server-up: build
 	  echo "       or 'make dev-server-down' to stop it first."; \
 	  exit 1; \
 	fi
-	@# Select the config: SHED_DEV_AUTH_MODE=token (default) runs the committed
-	@# $(DEV_CONFIG) untouched; =mtls renders a throwaway mtls variant first
-	@# (never edits the committed base). Combined into the SAME shell
-	@# invocation as the nohup launch below (Make starts a fresh subshell per
-	@# recipe line; RUN_CONFIG must survive into the launch line).
+	@case "$(SHED_DEV_AUTH_MODE)" in \
+	  token|mtls) ;; \
+	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
+	esac
+	$(call check-dev-state-dir)
+	@# Select the config: with NO overrides (the default) the committed
+	@# $(DEV_CONFIG) runs untouched — no generation step at all. Any override
+	@# (SHED_DEV_AUTH_MODE=mtls and/or SHED_DEV_STATE_DIR) renders a throwaway
+	@# variant first; the committed base is never edited. Combined into the
+	@# SAME shell invocation as the nohup launch below (Make starts a fresh
+	@# subshell per recipe line; RUN_CONFIG must survive into the launch line).
 	@#
 	@# Inline env so we don't pollute the caller's launchctl domain
 	@# (and so the brew server's launchctl env is left alone). Note
@@ -170,11 +221,12 @@ dev-server-up: build
 	@# Makefile-level variable that holds its value is named
 	@# RELEASE_BUILD_TOOLS_REF (because it points at the *release*
 	@# tooling image).
-	@case "$(SHED_DEV_AUTH_MODE)" in \
-	  token) RUN_CONFIG="$(DEV_CONFIG)" ;; \
-	  mtls) ./scripts/render-dev-mtls-config.sh "$(DEV_CONFIG)" "$(DEV_MTLS_CONFIG)" && RUN_CONFIG="$(DEV_MTLS_CONFIG)" ;; \
-	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
-	esac; \
+	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
+	  ./scripts/render-dev-config.sh "$(DEV_CONFIG)" "$(DEV_GENERATED_CONFIG)" $(DEV_RENDER_ARGS) \
+	    && RUN_CONFIG="$(DEV_GENERATED_CONFIG)"; \
+	else \
+	  RUN_CONFIG="$(DEV_CONFIG)"; \
+	fi; \
 	SHED_BUILD_TOOLS_REF="$(RELEASE_BUILD_TOOLS_REF)" \
 	  nohup bin/shed-server serve --config "$$RUN_CONFIG" \
 	    > "$(DEV_LOG_PATH)" 2>&1 & \
@@ -199,10 +251,13 @@ dev-server-up: build
 	@echo ""
 	@echo "Dev shed-server up: pid $$(cat $(DEV_PID_PATH))"
 	@echo "  Auth mode: $(SHED_DEV_AUTH_MODE)"
-	@if [ "$(SHED_DEV_AUTH_MODE)" = "mtls" ]; then \
-	  echo "  Config:  $(DEV_MTLS_CONFIG) (generated from $(DEV_CONFIG))"; \
+	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
+	  echo "  Config:  $(DEV_GENERATED_CONFIG) (generated from $(DEV_CONFIG))"; \
 	else \
 	  echo "  Config:  $(DEV_CONFIG)"; \
+	fi
+	@if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
+	  echo "  State:   $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR)"; \
 	fi
 	@echo "  Log:     $(DEV_LOG_PATH)"
 	@echo "  CLI:     shed -s $(SHED_VZ_DEV_SERVER) list"
@@ -265,6 +320,9 @@ dev-server-status:
 	  fi; \
 	  echo "Log:        $(DEV_LOG_PATH)"; \
 	  echo "Config:     $(DEV_CONFIG)"; \
+	  if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
+	    echo "State dir:  $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR now in effect)"; \
+	  fi; \
 	  echo "Auth mode:  $(SHED_DEV_AUTH_MODE) (the SHED_DEV_AUTH_MODE value now in effect;"; \
 	  echo "            not introspected from the running process — rerun with the"; \
 	  echo "            same value used at 'dev-server-up'/'-restart' time)"; \
@@ -453,7 +511,7 @@ dev-server-up-fc: build-fc-remote-server
 	@# dev-server-up target; see the SHED_DEV_AUTH_MODE comment there.
 	@case "$(SHED_DEV_AUTH_MODE)" in \
 	  token) LOCAL_CFG="configs/server.dev-parallel.linux-fc.yaml" ;; \
-	  mtls) ./scripts/render-dev-mtls-config.sh configs/server.dev-parallel.linux-fc.yaml "$(FC_DEV_LOCAL_MTLS_CONFIG)" && LOCAL_CFG="$(FC_DEV_LOCAL_MTLS_CONFIG)" ;; \
+	  mtls) ./scripts/render-dev-config.sh configs/server.dev-parallel.linux-fc.yaml "$(FC_DEV_LOCAL_MTLS_CONFIG)" --mtls && LOCAL_CFG="$(FC_DEV_LOCAL_MTLS_CONFIG)" ;; \
 	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
 	esac; \
 	echo "Uploading $$LOCAL_CFG (SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE))..."; \
