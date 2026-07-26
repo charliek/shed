@@ -591,7 +591,15 @@ impl BusClient {
             .http
             .get(&url)
             .header(reqwest::header::ACCEPT, "text/event-stream");
-        if let Some(tok) = self.bearer().await {
+        // The bearer fetch can itself be a full SSH mint (after an
+        // invalidation), so it races shutdown like every other network await —
+        // a SIGTERM during a re-mint must not hold teardown for the mint
+        // timeout.
+        let bearer = tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
+            t = self.bearer() => t,
+        };
+        if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
 
@@ -600,7 +608,24 @@ impl BusClient {
             _ = wait_shutdown(shutdown.clone()) => return StreamEnd::Shutdown,
             r = req.send() => match r {
                 Ok(r) => r,
-                Err(e) => return StreamEnd::Transport(format!("connecting: {e}")),
+                // A connect failure can BE the credential rejection: an
+                // mtls-mode server refuses a bad certificate at (TLS 1.2) or
+                // just after (TLS 1.3) the handshake, so there is no response
+                // to carry a 401 — and reqwest's Display drops the TLS alert
+                // entirely (it sits 2–3 levels down source()), so the error
+                // must be FLATTENED before it can be classified or logged.
+                // An auth-shaped failure takes the Unauthorized arm so the
+                // reconnect loop re-mints instead of replaying the refused
+                // credential forever (Go: streamMessages'
+                // invalidateOnAuthFailure(0, err)).
+                Err(e) => {
+                    let reason = format!("connecting: {}", shed_core::authfail::flatten(&e));
+                    return if shed_core::authfail::is_auth_shaped_message(&reason) {
+                        StreamEnd::Unauthorized(reason)
+                    } else {
+                        StreamEnd::Transport(reason)
+                    };
+                }
             }
         };
 
@@ -685,10 +710,40 @@ impl BusClient {
         let body = serde_json::to_vec(env)
             .map_err(|e| BusError::Transport(format!("marshaling response: {e}")))?;
 
-        let mut resp = self.send_respond(&url, &body, shutdown).await?;
-        // A credentials token can expire mid-session: on a provider-backed 401,
-        // invalidate + retry once (at-most-once, mirroring hostclient.go:Respond).
-        if resp.status().as_u16() == 401 {
+        let mut sent = self.send_respond(&url, &body, shutdown).await;
+        // Rust-only pool race (shed-core finding 29): a pooled connection the
+        // server closed between checkout and write surfaces as "connection was
+        // not ready" with no TLS alert anywhere in the chain. Nothing was
+        // written, so ONE plain re-send is safe — the fresh connection either
+        // works or produces the deterministic alert classified below.
+        if matches!(&sent, Err(BusError::Transport(m))
+            if shed_core::authfail::is_connection_lost_message(m))
+        {
+            sent = self.send_respond(&url, &body, shutdown).await;
+        }
+        // A credential can be refused mid-session in TWO shapes, and both must
+        // invalidate + retry (one re-mint / two sends total, mirroring the Go
+        // hostclient.go:Respond bound): a TLS-alert transport failure — the
+        // mtls rejection has no HTTP status at all — and a provider-backed
+        // 401 (token mode, or mtls per-request re-validation). A fresh
+        // credential the server just refused does not earn a second mint.
+        let mut reminted = false;
+        let mut resp = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                let auth_shaped = matches!(&e, BusError::Transport(m)
+                    if shed_core::authfail::is_auth_shaped_message(m));
+                match (&self.token_provider, auth_shaped) {
+                    (Some(p), true) => {
+                        p.invalidate();
+                        reminted = true;
+                        self.send_respond(&url, &body, shutdown).await?
+                    }
+                    _ => return Err(e),
+                }
+            }
+        };
+        if resp.status().as_u16() == 401 && !reminted {
             if let Some(p) = &self.token_provider {
                 p.invalidate();
                 resp = self.send_respond(&url, &body, shutdown).await?;
@@ -715,7 +770,17 @@ impl BusClient {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_vec());
-        if let Some(tok) = self.bearer().await {
+        // The bearer fetch can itself be a full SSH mint — this is exactly the
+        // call that re-mints after respond()'s invalidate — so it races
+        // shutdown too: a TLS rejection followed by SIGTERM must not hold
+        // teardown for the mint timeout.
+        let bearer = tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => {
+                return Err(BusError::Transport("sending response: shutting down".into()))
+            }
+            t = self.bearer() => t,
+        };
+        if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
         // Race the POST against shutdown: a server that accepts the connection and
@@ -725,7 +790,11 @@ impl BusClient {
                 Err(BusError::Transport("sending response: shutting down".into()))
             }
             r = req.send() => {
-                r.map_err(|e| BusError::Transport(format!("sending response: {e}")))
+                // Flattened, not `{e}`: reqwest's Display drops the TLS alert
+                // that respond()'s classifier (and any human reading the log)
+                // needs — it sits down the source() chain.
+                r.map_err(|e| BusError::Transport(format!(
+                    "sending response: {}", shed_core::authfail::flatten(&e))))
             }
         }
     }
@@ -2847,6 +2916,89 @@ mod tests {
             "at-most-once retry → exactly one invalidate"
         );
         m.assert_hits_async(2).await; // initial + one retry
+    }
+
+    /// Blocker-2 regression (whole-branch review): a TLS certificate alert on
+    /// the respond POST — the shape an mtls-mode server produces, with no HTTP
+    /// status at all — must be classified as an auth failure: one invalidate,
+    /// one retry, and when the retry is also refused the error surfaces with
+    /// the alert in it. Never a second mint or a third send.
+    #[tokio::test]
+    async fn respond_tls_auth_failure_invalidates_once_and_bounds_sends() {
+        let srv =
+            crate::testalert::AlertServer::spawn(crate::testalert::CERTIFICATE_REQUIRED).await;
+        let tp = SeqTokenProvider::new();
+        let client = BusClient::new(
+            srv.base_url(),
+            String::new(),
+            Some(tp.clone()),
+            None,
+            None,
+            silent_log(),
+        )
+        .unwrap();
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        let err = client
+            .respond("ns", &env, &never_shutdown())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, BusError::Transport(m) if m.contains("received fatal alert")),
+            "the flattened alert must survive into the surfaced error: {err:?}"
+        );
+        assert_eq!(
+            tp.invalidated(),
+            1,
+            "exactly one invalidate for the TLS-shaped rejection"
+        );
+        assert_eq!(srv.accepts(), 2, "initial send + one retry, never a third");
+    }
+
+    /// Without a provider there is nothing to re-mint: the classified failure
+    /// surfaces immediately, no retry.
+    #[tokio::test]
+    async fn respond_tls_auth_failure_without_provider_does_not_retry() {
+        let srv =
+            crate::testalert::AlertServer::spawn(crate::testalert::CERTIFICATE_REQUIRED).await;
+        let env = Envelope::new_response("r", "ns", serde_json::Value::Null);
+        let err = open_client(&srv.base_url())
+            .respond("ns", &env, &never_shutdown())
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, BusError::Transport(_)), "err = {err:?}");
+        assert_eq!(srv.accepts(), 1, "no provider → no retry");
+    }
+
+    /// Blocker-2 regression, subscribe side: a TLS certificate alert at connect
+    /// takes the Unauthorized arm of the reconnect loop, so the provider is
+    /// invalidated and the backoff-reconnect re-mints — instead of replaying
+    /// the refused credential forever as a plain Transport error.
+    #[tokio::test]
+    async fn subscribe_tls_auth_connect_failure_invalidates() {
+        let srv =
+            crate::testalert::AlertServer::spawn(crate::testalert::CERTIFICATE_REQUIRED).await;
+        let tp = SeqTokenProvider::new();
+        let client = BusClient::new(
+            srv.base_url(),
+            String::new(),
+            Some(tp.clone()),
+            None,
+            None,
+            silent_log(),
+        )
+        .unwrap()
+        .with_test_backoff(Duration::from_millis(5), Duration::from_millis(20));
+        let (tx, rx) = shutdown_pair();
+        let _sub = client.subscribe("ssh-agent", rx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tp.invalidated() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = tx.send(true);
+        assert!(
+            tp.invalidated() >= 1,
+            "the classified connect failure must invalidate the token"
+        );
     }
 
     /// Bug 1 regression: a server that accepts the POST but never replies must not

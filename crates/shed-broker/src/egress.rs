@@ -375,7 +375,13 @@ impl EgressSubscriber {
         let mut req = http
             .get(&url)
             .header(reqwest::header::ACCEPT, "text/event-stream");
-        if let Some(tok) = self.bearer().await {
+        // The bearer fetch can itself be a full SSH mint (after an
+        // invalidation), so it races shutdown like every other network await.
+        let bearer = tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => return Ok(()),
+            t = self.bearer() => t,
+        };
+        if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
 
@@ -384,7 +390,22 @@ impl EgressSubscriber {
             _ = wait_shutdown(shutdown.clone()) => return Ok(()),
             r = req.send() => match r {
                 Ok(r) => r,
-                Err(e) => return Err(EgressStreamError::Other(format!("connecting: {e}"))),
+                // A refused CLIENT CERTIFICATE lands here rather than as a
+                // status: the server rejects it in (TLS 1.2) or just after
+                // (TLS 1.3) the handshake, so there is no response to carry a
+                // 401 (Go: egress stream's invalidateOnAuthFailure(0, err)).
+                // Flatten first — reqwest's Display drops the alert — then
+                // invalidate so the backoff-reconnect re-mints instead of
+                // presenting the refused credential forever.
+                Err(e) => {
+                    let reason = format!("connecting: {}", shed_core::authfail::flatten(&e));
+                    if shed_core::authfail::is_auth_shaped_message(&reason) {
+                        if let Some(src) = &self.tokens {
+                            src.invalidate();
+                        }
+                    }
+                    return Err(EgressStreamError::Other(reason));
+                }
             }
         };
 
@@ -595,6 +616,59 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         let _ = Box::leak(Box::new(tx));
         rx
+    }
+
+    /// Blocker-2 regression (whole-branch review): a TLS certificate alert at
+    /// connect — an mtls server refusing the credential at the handshake, so
+    /// no response exists to carry a 401 — must invalidate the token source so
+    /// the backoff-reconnect re-mints, and the flattened alert must survive
+    /// into the surfaced error (reqwest's Display drops it).
+    #[tokio::test]
+    async fn stream_tls_auth_connect_failure_invalidates() {
+        let srv =
+            crate::testalert::AlertServer::spawn(crate::testalert::CERTIFICATE_REQUIRED).await;
+        let tokens = FakeTokenSource::ok("tok");
+        let sub = subscriber(
+            &srv.base_url(),
+            "",
+            Some(tokens.clone()),
+            CollectingAudit::new(),
+        );
+        let err = sub.stream(&never_shutdown()).await.unwrap_err();
+        assert!(
+            matches!(&err, EgressStreamError::Other(m) if m.contains("received fatal alert")),
+            "the flattened alert must survive into the error: {err}"
+        );
+        assert_eq!(
+            tokens.invalidated(),
+            1,
+            "the classified connect failure must invalidate the source"
+        );
+    }
+
+    /// A NON-auth connect failure (nothing listening) must NOT invalidate — a
+    /// server restart is not a credential problem, and re-minting on it would
+    /// churn SSH for nothing.
+    #[tokio::test]
+    async fn stream_plain_connect_failure_does_not_invalidate() {
+        // Bind-then-drop for a port with nothing listening.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let tokens = FakeTokenSource::ok("tok");
+        let sub = subscriber(
+            &format!("http://{addr}"),
+            "",
+            Some(tokens.clone()),
+            CollectingAudit::new(),
+        );
+        let err = sub.stream(&never_shutdown()).await.unwrap_err();
+        assert!(matches!(&err, EgressStreamError::Other(_)), "err = {err}");
+        assert_eq!(
+            tokens.invalidated(),
+            0,
+            "connection-refused must not trigger a re-mint"
+        );
     }
 
     // ---- egress_audit_entry (mirror TestEgressAuditEntry[_NoResolvedIP] + goldens) ---

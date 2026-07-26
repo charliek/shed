@@ -55,6 +55,8 @@ mod egress;
 pub mod minter;
 pub mod sockets;
 pub mod ssh_backend;
+#[cfg(test)]
+mod testalert;
 // The agent-forward SSH backend — internal; `ssh_backend` resolves into it.
 mod ssh_backend_agent;
 pub mod status;

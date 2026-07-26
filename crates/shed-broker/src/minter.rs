@@ -791,7 +791,14 @@ impl CredentialSource {
             if *cancel.borrow() {
                 return;
             }
-            let _ = self.obtain_refresh().await;
+            // Race the wait against cancel: a shutdown arriving mid-mint must
+            // not hold the group join for the mint timeout. Safe to abandon —
+            // the mint itself runs in its own spawned task (obtain_locked) and
+            // finishes for any other joiner; only this loop's WAIT is dropped.
+            tokio::select! {
+                _ = cancel.wait_for(|c| *c) => return,
+                _ = self.obtain_refresh() => {}
+            }
         }
     }
 
