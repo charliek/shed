@@ -10,16 +10,10 @@ import XCTest
 /// keep these assertions in lockstep with the Rust test.
 final class ConfigParityTests: XCTestCase {
     private func loadSharedFixture() throws -> ShedConfig {
-        // Navigate from this test file to the shared fixture at the monorepo
-        // root (the same #filePath trick RCTests uses for its golden fixture).
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()  // ShedKitTests
-            .deletingLastPathComponent()  // Tests
-            .deletingLastPathComponent()  // desktop/ (Swift package root)
-            .deletingLastPathComponent()  // monorepo root
-        let fixture = root.appendingPathComponent("crates/fixtures/config_sample.yaml")
-        let text = try String(contentsOf: fixture, encoding: .utf8)
-        return ShedConfig.parse(text)
+        // The fixture lives at the monorepo root, shared with the Rust test —
+        // located via RepoFixtures (TestSupport.swift), not copied in.
+        let url = RepoFixtures.url("crates/fixtures/config_sample.yaml")
+        return ShedConfig.parse(try String(contentsOf: url, encoding: .utf8))
     }
 
     func testSharedFixtureParsesIdenticallyToRust() throws {
@@ -53,5 +47,24 @@ final class ConfigParityTests: XCTestCase {
         XCTAssertEqual(minimal.httpPort, 8080)
         XCTAssertEqual(minimal.sshPort, 22)
         XCTAssertEqual(minimal.resolvedEndpoint().baseURL.absoluteString, "http://minimal:8080")
+    }
+
+    /// `auth_mode` parity (plan 002 C2): the Rust test asserts the same two
+    /// entries — `secure: mtls` and `mini2`'s ABSENT key, which must read as
+    /// token rather than "unknown, go find out". The desktop reads this key; it
+    /// never writes it (§7 P1).
+    func testAuthModeMatchesRust() throws {
+        let config = try loadSharedFixture()
+
+        let secure = try XCTUnwrap(config.servers.first { $0.name == "secure" })
+        XCTAssertEqual(secure.authModeValue, "mtls")
+        XCTAssertEqual(secure.authMode, .mtls)
+
+        let mini2 = try XCTUnwrap(config.servers.first { $0.name == "mini2" })
+        XCTAssertEqual(mini2.authModeValue, "")
+        XCTAssertEqual(mini2.authMode, .token)
+
+        let minimal = try XCTUnwrap(config.servers.first { $0.name == "minimal" })
+        XCTAssertEqual(minimal.authMode, .token)
     }
 }

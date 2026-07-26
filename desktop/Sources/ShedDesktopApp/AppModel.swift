@@ -412,19 +412,37 @@ final class AppModel: NSObject, UiBridge {
             let provider: ControlTokenProvider? = mockBase == nil
                 ? hostAgent.map { ControlTokenProvider.hostAgent($0, server: entry.name) }
                 : nil
+            // The hermetic mock is an open plain-http server; forcing .token
+            // keeps a test config carrying auth_mode from tripping the legacy
+            // path's mtls refusal (§7 P6) against a server that wants nothing.
+            let authMode: ShedAuthMode = mockBase == nil ? entry.authMode : .token
+            // Learned-mode sink: in-memory only (§7 P1). The diagnostic log is
+            // the surface — it's where "why is this host unreachable?" is
+            // answered, and a silent token→mtls flip belongs in that trail. The
+            // sink runs on the Rust dispatcher thread and must return promptly;
+            // DiagnosticLog hands off to its own queue.
+            let diag = self.diag
+            let serverName = entry.name
             clients[entry.name] = ShedServerClient(
                 baseURL: baseURL, serverName: entry.name,
                 token: entry.controlToken, tlsCertFingerprint: pin,
                 tokenProvider: provider, useRustCore: ShedBackend.shared.rustCore,
-                // The Rust path's control-token minter uses the same host agent as
-                // the Swift provider — dropped in test mode (mock is tokenless), so
-                // e2e stays hermetic.
-                hostAgent: mockBase == nil ? hostAgent : nil)
+                // The Rust path's control-credential minter uses the same host
+                // agent as the Swift provider — dropped in test mode (mock is
+                // tokenless), so e2e stays hermetic.
+                hostAgent: mockBase == nil ? hostAgent : nil,
+                authMode: authMode,
+                onCredentialModeChanged: { _, mode in
+                    diag?.log(.info, "auth", "credential mode changed", [
+                        ("server", serverName), ("mode", mode.rawValue),
+                    ])
+                })
             diag?.log(.info, "config", "resolved server", [
                 ("server", entry.name),
                 ("endpoint", baseURL.absoluteString),
                 ("pinned", String(!pin.isEmpty)),
                 ("tokenProvider", String(provider != nil)),
+                ("authMode", authMode.rawValue),
             ])
         }
         self.clients = clients

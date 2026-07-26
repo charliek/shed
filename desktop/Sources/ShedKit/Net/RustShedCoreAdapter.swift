@@ -19,20 +19,43 @@ import ShedRustCore
 /// A read client backed by the Rust `shed-core`, returning Swift `Models`.
 final class RustShedCoreAdapter: @unchecked Sendable {
     private let core: ShedRustCore.ShedCore
+    /// In-memory record of the credential shape the core adopted for this server
+    /// (plan 002 §7 P1 — nothing is persisted). Retained here as well as by the
+    /// core's dispatcher so the client can read it back for UI/diagnostics.
+    private let observer: CredentialModeObserver
 
-    init(baseURL: String, serverName: String, token: String, pin: String?, hostAgent: HostAgentClient?)
-        throws
-    {
-        // A secure server's control token is minted by the host agent; the Rust
-        // FSM caches/refreshes around it. Open servers have no host agent → the
-        // static `token` (if any) is used instead.
-        let minter: (any ShedRustCore.TokenMinter)? = hostAgent.map { HostAgentTokenMinter(hostAgent: $0) }
-        // observer: C2 passes a CredentialObserver here to learn the server's
-        // auth mode in memory (the desktop persists nothing — §7 P1).
+    init(
+        baseURL: String, serverName: String, token: String, pin: String?,
+        hostAgent: HostAgentClient?, authMode: ShedAuthMode = .token,
+        onModeChanged: CredentialModeObserver.Sink? = nil
+    ) throws {
+        let observer = CredentialModeObserver(sink: onModeChanged)
+        self.observer = observer
+        // A secure server's control credential is obtained through the host
+        // agent; the Rust FSM caches/refreshes around it. Open servers have no
+        // host agent → the static `token` (if any) is used instead.
+        //
+        // `expectsMtls` is the config entry's cached mode OR'd with what the
+        // observer has learned this session: after a mode flip the config still
+        // says `token` (the CLI hasn't rewritten it), and a reconnect must not
+        // lose what the session already proved. The observer is the SLOWER of
+        // the two learned sources — it fires after the core adopts — so the
+        // minter keeps its own synchronous copy on top of this (see
+        // `HostAgentTokenMinter.lastMintedMode`). The observer holds no
+        // reference back, so this closure creates no cycle.
+        let minter: (any ShedRustCore.TokenMinter)? = hostAgent.map {
+            HostAgentTokenMinter(
+                hostAgent: $0,
+                expectsMtls: { authMode == .mtls || observer.learnedMode == .mtls })
+        }
         self.core = try ShedRustCore.ShedCore(
             baseUrl: baseURL, serverName: serverName, token: token, pin: pin, minter: minter,
-            observer: nil)
+            observer: observer)
     }
+
+    /// The credential shape the core has adopted for this server this session,
+    /// or nil before the first successful mint.
+    var learnedAuthMode: ShedAuthMode? { observer.learnedMode }
 
     func info() async throws -> ServerInfo { Self.map(try await core.info()) }
     func listSheds() async throws -> [Shed] { try await core.listSheds().map(Self.map) }
