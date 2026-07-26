@@ -703,21 +703,32 @@ func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, wantBl
 	if wantBlobProgress {
 		url += "?progress=blob"
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq = c.setAuth(httpReq)
-
+	// Streaming: no client-level timeout, context deadline only — so this
+	// bypasses doRequest and wires its own send through the shared retry
+	// policy (mirrors DeleteShedWithProgress). The credential is re-read per
+	// send so the retry carries the re-minted one; the body is a fresh reader
+	// each time because the first send consumed it.
 	client := c.newHTTPClient(0)
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+	send := func(cred clienttoken.Credential) (*http.Response, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
-		return nil, fmt.Errorf("failed to connect to server: %w", err)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq = pinCredential(httpReq, cred)
+		return client.Do(httpReq)
+	}
+	wrapSendErr := func(err error) error {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+		}
+		return connectFailure(err)
+	}
+
+	resp, err := c.sendWithReauth(send, wrapSendErr)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -910,9 +921,11 @@ func (c *APIClient) DeleteShedWithProgress(name string, onProgress func(backend.
 
 	// The streaming client (no client-level timeout, context deadline only)
 	// bypasses doRequest, so replicate its send + reactive re-auth here.
-	// Rebuilding per send is fine — a DELETE has no body. Delete, unlike create,
-	// has no GetInfo pre-flight to refresh a stale bootstrap credential, so this
-	// is the only place a mid-session expiry gets re-minted.
+	// Rebuilding per send is fine — a DELETE has no body. (An earlier version of
+	// this comment claimed create was covered by its GetInfo pre-flight: it is
+	// not. /api/info is bootstrap-EXEMPT in token mode, so it answers 200 with a
+	// stale credential and can never trigger a re-mint. Create wires its own
+	// send through sendWithReauth for exactly that reason.)
 	client := c.newHTTPClient(0)
 	send := func(cred clienttoken.Credential) (*http.Response, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/sheds/"+name, nil)
@@ -1076,20 +1089,29 @@ func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, withL
 	if wantBlobProgress {
 		url += "?progress=blob"
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq = c.setAuth(httpReq)
-
-	resp, err := c.newHTTPClient(0).Do(httpReq)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("pull timed out after 30m")
+	// Same shape as CreateShedWithProgress: a streaming send routed through the
+	// shared re-auth policy rather than a bare client.Do.
+	pullClient := c.newHTTPClient(0)
+	send := func(cred clienttoken.Credential) (*http.Response, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
-		return nil, fmt.Errorf("failed to connect to server: %w", err)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq = pinCredential(httpReq, cred)
+		return pullClient.Do(httpReq)
+	}
+	wrapSendErr := func(err error) error {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("pull timed out after 30m")
+		}
+		return connectFailure(err)
+	}
+
+	resp, err := c.sendWithReauth(send, wrapSendErr)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 

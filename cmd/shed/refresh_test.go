@@ -258,3 +258,99 @@ func TestConcurrentRefreshNoRace(t *testing.T) {
 		return struct{}{}, nil
 	})
 }
+
+// TestStreamingPaths401RefreshAndRetry pins the reactive re-auth on the two SSE
+// paths that used to bypass it — `shed create` and `shed image pull`.
+//
+// This was a live bug, not a hypothetical: restarting the dev server (whose
+// token store is in-memory) invalidated every minted token, and the next
+// `shed create` died with "UNAUTHORIZED: missing or invalid bearer token" while
+// `shed list` self-healed. The code carried a comment claiming create was
+// covered by its GetInfo pre-flight — but /api/info is bootstrap-EXEMPT in
+// token mode, so it answers 200 with a stale credential and can never trigger a
+// re-mint. Both streams now route through sendWithReauth like the delete path.
+func TestStreamingPaths401RefreshAndRetry(t *testing.T) {
+	// One handler for both cases: 401 until the re-minted token arrives, then a
+	// minimal well-formed SSE stream ending in the terminal event each caller
+	// expects.
+	newSSEServer := func(t *testing.T, completeEvent string) (*httptest.Server, *int) {
+		t.Helper()
+		hits := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			if r.Header.Get("Authorization") != "Bearer new" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(completeEvent))
+		}))
+		t.Cleanup(srv.Close)
+		return srv, &hits
+	}
+
+	t.Run("create re-mints and retries once", func(t *testing.T) {
+		srv, hits := newSSEServer(t, "event: complete\ndata: {\"name\":\"myshed\"}\n\n")
+		refreshed := false
+		c := newAPIClientWithSource(srv.URL, "", refreshingSource("stale", "new", &refreshed), DefaultTimeout)
+
+		shed, err := c.CreateShedWithProgress(&config.CreateShedRequest{Name: "myshed"}, false, nil)
+		if err != nil {
+			t.Fatalf("CreateShedWithProgress: %v", err)
+		}
+		if shed == nil || shed.Name != "myshed" {
+			t.Errorf("shed = %+v, want name myshed", shed)
+		}
+		if !refreshed {
+			t.Error("the 401 did not trigger a re-mint")
+		}
+		if *hits != 2 {
+			t.Errorf("server hits = %d, want 2 (401 then the retry)", *hits)
+		}
+	})
+
+	t.Run("image pull re-mints and retries once", func(t *testing.T) {
+		srv, hits := newSSEServer(t, "event: complete\ndata: {\"docker_ref\":\"ghcr.io/x/y:v1\"}\n\n")
+		refreshed := false
+		c := newAPIClientWithSource(srv.URL, "", refreshingSource("stale", "new", &refreshed), DefaultTimeout)
+
+		if _, err := c.PullImageWithProgress("ghcr.io/x/y:v1", "", "", false, false, nil); err != nil {
+			t.Fatalf("PullImageWithProgress: %v", err)
+		}
+		if !refreshed {
+			t.Error("the 401 did not trigger a re-mint")
+		}
+		if *hits != 2 {
+			t.Errorf("server hits = %d, want 2 (401 then the retry)", *hits)
+		}
+	})
+
+	// The bound the whole retry policy rests on: a persistent 401 must not
+	// re-mint forever.
+	t.Run("a persistent 401 re-mints exactly once", func(t *testing.T) {
+		hits := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer srv.Close()
+		mints := 0
+		src := clienttoken.New(clienttoken.TokenCredential("stale", time.Now().Add(24*time.Hour)),
+			func() (clienttoken.Credential, error) {
+				mints++
+				return clienttoken.TokenCredential("also-stale", time.Now().Add(24*time.Hour)), nil
+			})
+		c := newAPIClientWithSource(srv.URL, "", src, DefaultTimeout)
+
+		if _, err := c.CreateShedWithProgress(&config.CreateShedRequest{Name: "myshed"}, false, nil); err == nil {
+			t.Error("expected the persistent 401 to surface as an error")
+		}
+		if mints != 1 {
+			t.Errorf("mints = %d, want exactly 1", mints)
+		}
+		if hits != 2 {
+			t.Errorf("server hits = %d, want 2 (initial + one retry)", hits)
+		}
+	})
+}
