@@ -393,17 +393,22 @@ func (s *credentialSource) ClientCertificate() *tls.Certificate {
 // It is generation-aware and coalesced: a caller whose credential was already
 // replaced by a concurrent re-mint does not trigger a second one. A failed
 // re-mint leaves the existing credential in place — presenting something the
-// server MIGHT still accept beats presenting nothing, and the error surfaces on
-// the next Token.
-func (s *credentialSource) Invalidate() { _ = s.reMint() }
-
-// reMint replaces the current credential unconditionally, coalescing concurrent
-// callers onto one mint and skipping the work entirely for a caller whose
-// credential was already replaced.
-func (s *credentialSource) reMint() error {
+// server MIGHT still accept beats presenting nothing — but goes through
+// Source.Reject, which remembers the rejection: the next Token re-attempts
+// the mint and surfaces its error instead of vouching for the credential the
+// server just refused (previously the Refresh error was dropped and
+// EnsureFreshErr kept reporting the rejected-but-locally-unexpired credential
+// as fine, so the retry silently re-sent it).
+//
+// The failure is also logged here: in mtls state the request path presents
+// the certificate from the handshake, so this WARN is where the root cause
+// (say, SSH being down while the server rejects the cert) becomes visible in
+// the daemon log rather than only the server's rejection.
+func (s *credentialSource) Invalidate() {
 	_, gen := s.src.Current()
-	_, err := s.src.Refresh(gen)
-	return err
+	if _, err := s.src.Reject(gen); err != nil {
+		s.warn("re-mint after the server rejected the credential failed; will retry", "error", err)
+	}
 }
 
 // Mode reports the shape of the credential currently held ("token", "mtls", or
@@ -418,7 +423,12 @@ func (s *credentialSource) Mode() string { return s.src.Mode() }
 // deferring to the window would collapse it to "re-mint in the last two hours",
 // discarding the spread that keeps a fleet from re-enrolling in lockstep.
 func (s *credentialSource) refresh() {
-	if err := s.reMint(); err != nil {
+	// Plain Refresh, NOT Reject: a proactive mint failing says nothing about
+	// the current credential's standing with the server — it may still be
+	// accepted happily, and marking it rejected would make every request
+	// re-attempt the mint against a transiently-down SSH endpoint.
+	_, gen := s.src.Current()
+	if _, err := s.src.Refresh(gen); err != nil {
 		s.debug("proactive credential refresh failed", "error", err)
 	}
 }

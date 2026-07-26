@@ -320,17 +320,34 @@ func (c *HostClient) presentingCertificate() bool {
 // mode (see WithClientCertificates); gating on the wiring would mean a
 // token-mode server never receives the token that authenticates the request,
 // which is not "mutually exclusive credentials" but simply a broken client.
+//
+// The provider's Token() runs BEFORE the certificate gate, not behind it:
+// Token is where the freshness machinery lives (proactive renewal, and the
+// forced re-mint after a server rejection whose replacement mint failed), and
+// it is mode-agnostic — in mtls state it returns "" with the machinery run.
+// Gating it on "not presenting a certificate" would mean a cert-holding
+// client never renews on the request path and never surfaces WHY its
+// rejected certificate cannot be replaced. The gate is also re-read after
+// Token() rather than before it, because Token() itself can change the
+// answer — a token→mtls flip mints a certificate right here.
 func (c *HostClient) setAuth(req *http.Request) {
-	if c.presentingCertificate() {
-		return
-	}
 	tok := c.token
 	if c.tokenProvider != nil {
 		t, err := c.tokenProvider.Token()
 		if err != nil {
-			c.logger.Warn("token provider returned no token; sending unauthenticated", "error", err)
+			if c.presentingCertificate() {
+				c.logger.Warn("credential refresh failed; presenting the existing certificate", "error", err)
+			} else {
+				c.logger.Warn("token provider returned no token; sending unauthenticated", "error", err)
+			}
 		}
 		tok = t
+	}
+	// Add NOTHING while a certificate is actually being presented: the
+	// credential travels in the handshake, and a bearer token alongside it
+	// would put a second live credential on the wire for no benefit.
+	if c.presentingCertificate() {
+		return
 	}
 	if tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)

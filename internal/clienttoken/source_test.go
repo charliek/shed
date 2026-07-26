@@ -242,6 +242,153 @@ func TestRefreshError(t *testing.T) {
 	}
 }
 
+// TestRejectFailedMintDisqualifiesTheCredential pins the reactive-rejection
+// contract (whole-branch review blocker 4): after the server refuses a
+// credential and the replacement mint FAILS, EnsureFreshErr must stop
+// vouching for the rejected-but-locally-unexpired credential — it re-attempts
+// the mint and surfaces the mint error, instead of letting a retry silently
+// re-send what the server just refused.
+func TestRejectFailedMintDisqualifiesTheCredential(t *testing.T) {
+	sentinel := errors.New("ssh mint down")
+	var mints int32
+	s := New(TokenCredential("rejected", time.Now().Add(24*time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&mints, 1)
+		return Credential{}, sentinel
+	})
+
+	// Sanity: far-from-expiry credential passes EnsureFreshErr before the
+	// rejection — the disqualification below is Reject's doing, not expiry's.
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Fatalf("EnsureFreshErr before rejection: %v", err)
+	}
+
+	if _, err := s.Reject(gen(s)); !errors.Is(err, sentinel) {
+		t.Fatalf("Reject err = %v, want the mint error", err)
+	}
+	// The credential itself survives — presenting something the server might
+	// still accept beats presenting nothing.
+	if s.Token() != "rejected" {
+		t.Errorf("token = %q, want the surviving rejected credential", s.Token())
+	}
+	// But EnsureFreshErr no longer vouches for it: it re-attempts the mint
+	// and surfaces the error.
+	if err := s.EnsureFreshErr(); !errors.Is(err, sentinel) {
+		t.Errorf("EnsureFreshErr after rejection = %v, want the mint error surfaced", err)
+	}
+	if got := atomic.LoadInt32(&mints); got != 2 {
+		t.Errorf("mint attempts = %d, want 2 (Reject + the re-attempt)", got)
+	}
+}
+
+// TestRejectRecoversOnNextSuccessfulMint: the rejection mark clears when a
+// mint succeeds, restoring the EnsureFreshErr fast path.
+func TestRejectRecoversOnNextSuccessfulMint(t *testing.T) {
+	var mints int32
+	fail := int32(1)
+	s := New(TokenCredential("rejected", time.Now().Add(24*time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&mints, 1)
+		if atomic.LoadInt32(&fail) == 1 {
+			return Credential{}, errors.New("ssh mint down")
+		}
+		return TokenCredential("fresh", time.Now().Add(24*time.Hour)), nil
+	})
+
+	if _, err := s.Reject(gen(s)); err == nil {
+		t.Fatal("Reject should fail while the minter is down")
+	}
+	atomic.StoreInt32(&fail, 0) // SSH is back
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Fatalf("EnsureFreshErr with the minter back: %v", err)
+	}
+	if s.Token() != "fresh" {
+		t.Errorf("token = %q, want fresh", s.Token())
+	}
+	// The mark is cleared: no further mint on the next check.
+	before := atomic.LoadInt32(&mints)
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Fatalf("EnsureFreshErr after recovery: %v", err)
+	}
+	if got := atomic.LoadInt32(&mints); got != before {
+		t.Errorf("mint attempts advanced %d→%d after recovery, want no further mints", before, got)
+	}
+}
+
+// TestRefreshFailureDoesNotDisqualify: a PROACTIVE refresh failing says
+// nothing about the credential it would have replaced — the server may still
+// accept it happily, so EnsureFreshErr keeps its fast path.
+func TestRefreshFailureDoesNotDisqualify(t *testing.T) {
+	calls := int32(0)
+	s := New(TokenCredential("current", time.Now().Add(24*time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&calls, 1)
+		return Credential{}, errors.New("transient")
+	})
+	if _, err := s.Refresh(gen(s)); err == nil {
+		t.Fatal("Refresh should surface the mint error")
+	}
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Errorf("EnsureFreshErr after a failed PROACTIVE refresh = %v, want nil (credential not rejected)", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("mint attempts = %d, want 1 (no forced re-mint)", got)
+	}
+}
+
+// TestRejectStaleGenerationDoesNotDisqualify: a caller whose rejection lost
+// the race against a concurrent successful re-mint must not poison the NEW
+// credential's standing.
+func TestRejectStaleGenerationDoesNotDisqualify(t *testing.T) {
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), func() (Credential, error) {
+		return TokenCredential("new", time.Now().Add(24*time.Hour)), nil
+	})
+	gen0 := gen(s)
+	if _, err := s.Refresh(gen0); err != nil { // concurrent re-mint already advanced
+		t.Fatal(err)
+	}
+	// The stale rejection names gen0; the current credential is gen1.
+	if _, err := s.Reject(gen0); err != nil {
+		t.Fatalf("stale Reject should observe the advanced credential, got %v", err)
+	}
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Errorf("EnsureFreshErr = %v, want nil (new credential not marked rejected)", err)
+	}
+}
+
+// TestRejectLosingTheMintRaceDoesNotPoisonTheFreshCredential exercises the
+// gen-guard in Reject's marking branch: the mint fails, but by the time the
+// marking runs a concurrent successful re-mint has advanced the generation
+// (simulated white-box from inside the failing mint — the callback runs
+// without mu held, exactly like a real concurrent mint landing). The FRESH
+// credential must not inherit the rejection mark. Without the locked
+// `gen == prevGen` guard this test fails: EnsureFreshErr would re-mint and
+// surface an error against a perfectly good credential.
+func TestRejectLosingTheMintRaceDoesNotPoisonTheFreshCredential(t *testing.T) {
+	var s *Source
+	var mints int32
+	s = New(TokenCredential("rejected", time.Now().Add(time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&mints, 1)
+		// A concurrent mint lands while this one is failing.
+		s.mu.Lock()
+		s.cred = TokenCredential("fresh", time.Now().Add(24*time.Hour))
+		s.gen++
+		s.credRejected = false
+		s.mu.Unlock()
+		return Credential{}, errors.New("this mint failed")
+	})
+
+	if _, err := s.Reject(gen(s)); err == nil {
+		t.Fatal("Reject should surface its own mint failure")
+	}
+	if s.Token() != "fresh" {
+		t.Fatalf("token = %q, want the concurrently-minted fresh one", s.Token())
+	}
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Errorf("EnsureFreshErr = %v, want nil (the fresh credential must not carry the stale rejection)", err)
+	}
+	if got := atomic.LoadInt32(&mints); got != 1 {
+		t.Errorf("mint attempts = %d, want 1 (no forced re-mint of the fresh credential)", got)
+	}
+}
+
 // TestRefreshConcurrentCoalesces fires many goroutines that all 401 with the same
 // prev token; singleflight + the generation check must yield exactly one mint.
 // Run with -race for the concurrency guarantee.

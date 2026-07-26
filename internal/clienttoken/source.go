@@ -142,6 +142,14 @@ type Source struct {
 	// batch (see Refresh).
 	refresh func() (Credential, error)
 	sf      singleflight.Group
+	// credRejected records that the server REFUSED the credential of the
+	// current generation while the replacement mint failed (Reject). While
+	// set, EnsureFreshErr stops treating the credential as fresh: every call
+	// re-attempts the mint and surfaces the mint error instead of vouching
+	// for something the server already turned away. Cleared when a mint
+	// advances the generation. Only meaningful for the generation it was set
+	// against — both writes hold mu and check gen.
+	credRejected bool
 }
 
 // New returns a refreshing Source seeded with initial. A nil refresh yields a
@@ -311,8 +319,14 @@ func (s *Source) EnsureFreshErr() error {
 	if s.refresh == nil {
 		return nil
 	}
-	cred, gen := s.Current()
-	if cred.Usable() && !needsRefresh(cred.ExpiresAt, time.Now()) {
+	s.mu.Lock()
+	cred, gen, rejected := s.cred, s.gen, s.credRejected
+	s.mu.Unlock()
+	// A rejected credential is disqualified from the fast path even when its
+	// local expiry looks fine: the server refused it and the replacement mint
+	// failed (Reject), so vouching for it here would hand the caller the very
+	// credential the server just turned away — and swallow the reason why.
+	if cred.Usable() && !needsRefresh(cred.ExpiresAt, time.Now()) && !rejected {
 		return nil
 	}
 	_, err := s.Refresh(gen)
@@ -359,6 +373,7 @@ func (s *Source) Refresh(prevGen uint64) (Credential, error) {
 		s.mu.Lock()
 		s.cred = fresh
 		s.gen++
+		s.credRejected = false // a fresh credential has no rejection history
 		s.mu.Unlock()
 		return fresh, nil
 	})
@@ -366,4 +381,28 @@ func (s *Source) Refresh(prevGen uint64) (Credential, error) {
 		return Credential{}, err
 	}
 	return v.(Credential), nil
+}
+
+// Reject is Refresh for the reactive path: the server REFUSED the credential
+// belonging to prevGen (a 401, or a TLS alert naming the certificate). The
+// difference is what a FAILED mint leaves behind. Refresh keeps quiet — a
+// proactive refresh failing says nothing about the credential it would have
+// replaced, which the server may still be accepting happily. Reject remembers
+// the rejection: the credential itself stays in place to be presented (a
+// rejection can be transient — a mid-rotation allowlist refresh — and
+// presenting something the server might still accept beats presenting
+// nothing), but EnsureFreshErr stops vouching for it, so every subsequent
+// request re-attempts the mint and surfaces the mint error instead of
+// silently re-sending what the server already refused. Recovery is the next
+// mint that succeeds — it advances the generation and clears the mark.
+func (s *Source) Reject(prevGen uint64) (Credential, error) {
+	cred, err := s.Refresh(prevGen)
+	if err != nil {
+		s.mu.Lock()
+		if s.gen == prevGen {
+			s.credRejected = true
+		}
+		s.mu.Unlock()
+	}
+	return cred, err
 }

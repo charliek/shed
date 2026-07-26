@@ -172,6 +172,52 @@ func TestClientCertificatesWithoutAPinDoNotSuppressTheToken(t *testing.T) {
 	}
 }
 
+// countingTokenProvider records how many times Token() was consulted while
+// yielding an empty token (the mtls-state shape: the freshness machinery runs
+// and the credential travels as a certificate, not a header).
+type countingTokenProvider struct{ calls int32 }
+
+func (c *countingTokenProvider) Token() (string, error) {
+	atomic.AddInt32(&c.calls, 1)
+	return "", nil
+}
+func (c *countingTokenProvider) Invalidate() {}
+
+// TestTokenProviderRunsWhilePresentingACertificate: Token() is where the
+// provider's freshness machinery lives (proactive renewal; the forced re-mint
+// after a rejection whose replacement mint failed), so setAuth must consult
+// it on every request EVEN IN certificate state — while still sending no
+// Authorization header. Gating Token() behind "not presenting a certificate"
+// (the old shape) meant a cert-holding daemon never renewed on the request
+// path and never surfaced why a rejected certificate could not be replaced.
+func TestTokenProviderRunsWhilePresentingACertificate(t *testing.T) {
+	cert := selfSignedClientCert(t)
+
+	var sawAuth atomic.Value
+	sawAuth.Store("")
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	tp := &countingTokenProvider{}
+	c := NewHostClient(
+		WithServerURL(srv.URL), WithTLSPin(pinOf(srv)),
+		WithTokenProvider(tp),
+		WithClientCertificates(ClientCertFunc(func() *tls.Certificate { return cert })),
+	)
+	if err := c.Respond(context.Background(), "ns", &Envelope{}); err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+	if got := atomic.LoadInt32(&tp.calls); got == 0 {
+		t.Error("Token() was never consulted while presenting a certificate — the freshness machinery did not run")
+	}
+	if got := sawAuth.Load().(string); got != "" {
+		t.Errorf("Authorization = %q, want none while presenting a certificate", got)
+	}
+}
+
 // TestClientCertificateIsPresentedToAnMTLSServer: the other half of the
 // exchange — suppressing the header is only correct if the certificate actually
 // authenticates. Asserted from the server's side.
