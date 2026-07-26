@@ -428,6 +428,14 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         An unknown mode is rejected (`bad_request`)."""
         return self.call("broker.set_mode", {"mode": mode})
 
+    def hosts_auth(self) -> list[dict]:
+        """Per-server credential mode (plan 002 C3): `[{name, auth_mode, learned}]`,
+        name-sorted. `auth_mode` is `token`|`mtls`; `learned` is False while the value
+        is only the config entry's cached claim and True once a mint in THIS session
+        produced that shape. Nothing here is persisted — the app never writes
+        config.yaml."""
+        return self.call("hosts.auth")["hosts"]
+
     def current_pane(self) -> str | None:
         """The pane the React shell currently renders (reported via ui_report)."""
         return self.call("ui.current_pane").get("pane")

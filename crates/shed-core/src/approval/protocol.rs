@@ -264,7 +264,12 @@ pub fn credential_get(id: &str, server: &str, csr_base64: Option<&str>) -> Strin
     let mut obj = json!({
         "v": HOST_AGENT_PROTOCOL_VERSION, "type": "credential.get", "id": id, "server": server,
     });
-    if let Some(csr) = csr_base64 {
+    // An EMPTY csr is omitted, not sent as `""`: the agents' `omitempty` /
+    // `#[serde(default)]` decode both to "no CSR", so emitting the key would put
+    // a third spelling of the same statement on the wire — and the whole point
+    // of the absent key is that an mtls server's refusal stays legible. Pinned
+    // by the shared `credential_get.json` vectors (plan 002 §7 P9).
+    if let Some(csr) = csr_base64.filter(|c| !c.is_empty()) {
         obj["csr"] = json!(csr);
     }
     obj.to_string()

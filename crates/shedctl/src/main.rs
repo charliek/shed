@@ -136,6 +136,14 @@ fn parse_command(args: &[String]) -> Result<Plan, String> {
             Some("dump") => Ok(Plan::call("dashboard.dump", json!({}))),
             _ => Err("usage: shedctl dashboard dump".to_string()),
         },
+        // The app's credential-mode surface (plan 002 C3). shedctl itself has no
+        // server-credential story — it drives the app's socket and never builds a
+        // shed-core client — so this is a pass-through read, exactly like the ops
+        // above.
+        "hosts" => match rest.first().map(String::as_str) {
+            Some("auth") => Ok(Plan::call("hosts.auth", json!({}))),
+            _ => Err("usage: shedctl hosts auth".to_string()),
+        },
         "screenshot" => {
             let out = take_opt(&mut rest, "--out")?.map(PathBuf::from);
             let scale = match take_opt(&mut rest, "--scale")? {
@@ -259,6 +267,8 @@ COMMANDS:
   identify                              identify the running client
   sheds list                           list sheds across configured hosts
   dashboard dump                       dump the dashboard's rendered sheds
+  hosts auth                           per-server credential mode (token|mtls) + whether
+                                       it was learned this session or read from config
   screenshot [--out FILE] [--scale N]  render the window (PNG → FILE, else JSON)
   shed <start|stop|reset|delete> NAME [--host H]
                                        run a shed lifecycle action
@@ -409,6 +419,15 @@ mod tests {
     fn parse_command_unknown_is_usage_error() {
         assert!(parse_command(&svec(&["bogus"])).is_err());
         assert!(parse_command(&svec(&["shed", "frobnicate", "x"])).is_err());
+        assert!(parse_command(&svec(&["hosts"])).is_err());
+        assert!(parse_command(&svec(&["hosts", "frobnicate"])).is_err());
+    }
+
+    #[test]
+    fn parse_command_maps_hosts_auth() {
+        let plan = parse_command(&svec(&["hosts", "auth"])).unwrap();
+        assert_eq!(plan.op, "hosts.auth");
+        assert_eq!(plan.params, json!({}));
     }
 
     #[test]

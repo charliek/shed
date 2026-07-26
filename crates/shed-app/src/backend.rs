@@ -18,7 +18,9 @@ use shed_core::create::{CreateProgress, CreateStore};
 use shed_core::http::{Client, ShedError};
 use shed_core::models::{CreateShedRequest, EgressProfileInfo, Shed, ShedStatus, SystemDiskUsage};
 use shed_core::terminal::{self, TerminalCommand};
-use shed_core::token::TokenMinter;
+use shed_core::token::{ControlTokenProvider, CredentialObserver, TokenMinter};
+
+use crate::auth_modes::AuthModeRegistry;
 
 pub struct Backend {
     /// (server_name, client) — shed-core stamps each shed's `host` with the name.
@@ -87,6 +89,32 @@ impl Backend {
         minter: Option<&Arc<dyn TokenMinter>>,
         unreachable_hosts: &HashSet<String>,
     ) -> Self {
+        Self::from_env_parts_with_credentials(
+            test_mode,
+            mock_base_url,
+            config_path,
+            minter,
+            None,
+            unreachable_hosts,
+        )
+    }
+
+    /// As [`from_env_parts_with_minter`](Self::from_env_parts_with_minter), but
+    /// also SEEDS `modes` from the config's `auth_mode` entries and attaches it
+    /// as the [`CredentialObserver`] of every provider it builds (plan 002 §7 P1
+    /// / P5).
+    ///
+    /// The registry is passed in rather than returned because the minter — which
+    /// reads it to decide whether to expect a certificate — is constructed
+    /// BEFORE the Backend (the embedded broker's launch order).
+    pub fn from_env_parts_with_credentials(
+        test_mode: bool,
+        mock_base_url: Option<&str>,
+        config_path: &Path,
+        minter: Option<&Arc<dyn TokenMinter>>,
+        modes: Option<&Arc<AuthModeRegistry>>,
+        unreachable_hosts: &HashSet<String>,
+    ) -> Self {
         if test_mode && mock_base_url.is_none() {
             return Self {
                 clients: Vec::new(),
@@ -96,7 +124,10 @@ impl Backend {
             };
         }
         let config = ShedConfig::load(&config_path.to_string_lossy());
-        Self::from_config_with_minter(&config, mock_base_url, minter, unreachable_hosts)
+        if let Some(modes) = modes {
+            modes.seed_from_config(&config);
+        }
+        Self::from_config_with_credentials(&config, mock_base_url, minter, modes, unreachable_hosts)
     }
 
     /// Build clients from an already-parsed config. When `mock_base_url` is set
@@ -122,6 +153,19 @@ impl Backend {
         minter: Option<&Arc<dyn TokenMinter>>,
         unreachable_hosts: &HashSet<String>,
     ) -> Self {
+        Self::from_config_with_credentials(config, mock_base_url, minter, None, unreachable_hosts)
+    }
+
+    /// As [`from_config_with_minter`](Self::from_config_with_minter), but
+    /// attaches `modes` as each provider's [`CredentialObserver`] so the mode
+    /// the core ADOPTS is learned (in memory — this client persists nothing).
+    pub fn from_config_with_credentials(
+        config: &ShedConfig,
+        mock_base_url: Option<&str>,
+        minter: Option<&Arc<dyn TokenMinter>>,
+        modes: Option<&Arc<AuthModeRegistry>>,
+        unreachable_hosts: &HashSet<String>,
+    ) -> Self {
         let clients = config
             .servers
             .iter()
@@ -138,17 +182,32 @@ impl Backend {
                     None => {
                         // A pin on a non-https URL fails closed in Client::new → that
                         // server is skipped rather than sent plaintext. Secure servers
-                        // mint/refresh their control token via the host agent; on a
-                        // mint failure the client sends no token — never the static
+                        // mint/refresh their control credential via the host agent; on
+                        // a mint failure the client sends nothing — never the static
                         // config token (F6).
                         let r = s.resolved_endpoint();
-                        Client::new(
-                            r.base_url,
-                            s.name.clone(),
-                            s.control_token.clone(),
-                            (!r.pin.is_empty()).then_some(r.pin),
-                            minter.map(Arc::clone),
-                        )
+                        let pin = (!r.pin.is_empty()).then_some(r.pin);
+                        match (minter, modes) {
+                            // The observer can only be attached to a provider we
+                            // build ourselves, so this arm exists purely to reach
+                            // `with_observer`; it is otherwise `Client::new`.
+                            (Some(m), Some(obs)) => {
+                                let provider = Arc::new(
+                                    ControlTokenProvider::new(s.name.clone(), Arc::clone(m))
+                                        .with_observer(
+                                            Arc::clone(obs) as Arc<dyn CredentialObserver>
+                                        ),
+                                );
+                                Client::with_provider(r.base_url, s.name.clone(), pin, provider)
+                            }
+                            _ => Client::new(
+                                r.base_url,
+                                s.name.clone(),
+                                s.control_token.clone(),
+                                pin,
+                                minter.map(Arc::clone),
+                            ),
+                        }
                     }
                 }
                 .ok()?;

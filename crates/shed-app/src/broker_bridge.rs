@@ -665,7 +665,7 @@ fn map_embedded_credential(
             token: minted.token,
             client_cert: minted.client_cert,
             cert_serial: minted.cert_serial,
-            expires_at_unix: expiry_unix(minted.expires_at.as_deref()),
+            expires_at: minted.expires_at,
         },
         server,
     )
@@ -1735,7 +1735,7 @@ mod tests {
         let creds = RecordingCredentials::answering(MintedControlCredential {
             auth_mode: "token".into(),
             token: String::new(),
-            client_cert: "-----BEGIN CERTIFICATE-----".into(),
+            client_cert: String::new(),
             cert_serial: String::new(),
             expires_at: None,
         });
@@ -1744,6 +1744,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, ShedError::Config(m) if m.contains("no token")));
+
+        // (b2) a token answer that ALSO carries a certificate: the shapes are
+        // mutually exclusive, so this is a protocol violation rather than a
+        // "token mode with a blank token" — the embedded path gets the same rule
+        // 6 the UDS path does, because it is literally the same function.
+        let creds = RecordingCredentials::answering(MintedControlCredential {
+            auth_mode: "token".into(),
+            token: String::new(),
+            client_cert: "-----BEGIN CERTIFICATE-----".into(),
+            cert_serial: String::new(),
+            expires_at: None,
+        });
+        let e = EmbeddedTokenMinter::new(Arc::new(NoTokens), creds)
+            .mint_credential("prod", &CredentialRequest::with_csr("QUJD"))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ShedError::Config(m) if m.contains("ambiguous credential")));
+
+        // (b3) a populated-but-unparseable expiry refuses rather than silently
+        // becoming "no expiry" (which would disable the proactive refresh).
+        let creds = RecordingCredentials::answering(MintedControlCredential {
+            auth_mode: "token".into(),
+            token: "ctl-1".into(),
+            client_cert: String::new(),
+            cert_serial: String::new(),
+            expires_at: Some("next tuesday".into()),
+        });
+        let e = EmbeddedTokenMinter::new(Arc::new(NoTokens), creds)
+            .mint_credential("prod", &CredentialRequest::with_csr("QUJD"))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ShedError::Config(m) if m.contains("unparseable expiry")));
 
         // (c) an outright broker error (unknown server, host-key mismatch, …)
         struct Failing;

@@ -481,9 +481,24 @@ pub fn credential_response(
     .unwrap_or_default()
 }
 
+/// Read one of the plan 002 §7 P9 desktop-credential vectors — the SAME files
+/// the Go agent runner (`cmd/shed-host-agent/golden_test.go`), the Rust client
+/// (`crates/shed-app`), and the Swift client read. Lives outside the tests
+/// module so `desktop.rs`'s live-server golden shares it.
+#[cfg(test)]
+pub(crate) fn desktop_fixture(name: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/host-agent-diff/fixtures/desktop-credential")
+        .join(name);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    serde_json::from_str(&raw).expect("fixture is valid JSON")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn hello_ack_accepted_pins_go_field_order() {
@@ -768,6 +783,86 @@ mod tests {
         match decode_desktop(br#"{"type":"credential.get","id":"q2","server":"mini2"}"#).unwrap() {
             DesktopInbound::CredentialGet(c) => assert_eq!(c.csr, ""),
             other => panic!("expected credential.get, got {other:?}"),
+        }
+    }
+
+    // --- plan 002 §7 P9: the shared desktop-credential wire vectors ---------
+    //
+    // The SAME files the Go agent runner (cmd/shed-host-agent/golden_test.go),
+    // the Rust client (crates/shed-app), and the Swift client
+    // (desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift) read.
+    // This crate is only ever the AGENT, so it asserts the two directions an
+    // agent owns: the frames it EMITS and the frame it DECODES. Which of those
+    // frames a client may adopt is the clients' half of the same fixture.
+
+    /// The capability derivation every client performs on an ack, using THIS
+    /// crate's production constant — plus the assertion that the ack this build
+    /// emits is a `supported` one. Renaming `CAP_CREDENTIAL_GET` or dropping it
+    /// from `agent_capabilities()` fails here, in lockstep with the Go runner.
+    #[test]
+    fn golden_desktop_hello_ack_capability() {
+        let fx = desktop_fixture("hello_ack.json");
+        assert_eq!(fx["protocol_version"], 1, "fixture version skew");
+        let vectors = fx["vectors"].as_array().expect("vectors");
+        assert!(!vectors.is_empty());
+        let supports = |caps: Option<&Vec<Value>>| {
+            caps.is_some_and(|c| c.iter().any(|v| v == CAP_CREDENTIAL_GET))
+        };
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let caps = v["frame"]["agent_capabilities"].as_array();
+            let want = match v["expected_capability"].as_str().unwrap() {
+                "supported" => true,
+                "unsupported" => false,
+                other => panic!("{name}: unexpected fixture capability {other:?}"),
+            };
+            assert_eq!(supports(caps), want, "{name}");
+        }
+        // This build's own ack, through the production builder.
+        let emitted: Value = serde_json::from_str(&hello_ack(
+            "i",
+            "t",
+            "v1",
+            &["ssh-agent"],
+            &["ssh-agent".to_string()],
+            &agent_capabilities(),
+            25000,
+            true,
+            None,
+        ))
+        .unwrap();
+        assert!(
+            supports(emitted["agent_capabilities"].as_array()),
+            "this agent's hello_ack does not advertise {CAP_CREDENTIAL_GET}"
+        );
+    }
+
+    /// The agent's DECODE of the app's request. The load-bearing case is the
+    /// CSR-less one: `csr` absent must read as "no CSR" — the condition an mtls
+    /// server answers with its own explicit upgrade error — never as a
+    /// zero-length CSR the agent would relay as if it were one.
+    #[test]
+    fn golden_desktop_credential_get() {
+        let fx = desktop_fixture("credential_get.json");
+        assert_eq!(fx["protocol_version"], 1, "fixture version skew");
+        let vectors = fx["vectors"].as_array().expect("vectors");
+        assert!(!vectors.is_empty());
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let line = serde_json::to_vec(&v["expected_frame"]).unwrap();
+            let msg = match decode_desktop(&line).unwrap() {
+                DesktopInbound::CredentialGet(c) => c,
+                other => panic!("{name}: expected credential.get, got {other:?}"),
+            };
+            assert_eq!(
+                msg.server,
+                v["request"]["server"].as_str().unwrap(),
+                "{name}"
+            );
+            // The wire is authoritative: a null/empty request csr is omitted by
+            // the sender, so the agent sees the empty string either way.
+            let want_csr = v["expected_frame"]["csr"].as_str().unwrap_or("");
+            assert_eq!(msg.csr, want_csr, "{name}: csr");
         }
     }
 }

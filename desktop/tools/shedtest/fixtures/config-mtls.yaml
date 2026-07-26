@@ -1,0 +1,19 @@
+# Seed shed config for the plan 002 C3 credential-mode cells: one entry the CLI
+# has cached as an mtls server, one legacy entry with no `auth_mode` at all.
+#
+# In test mode every host is redirected to SHED_TAURI_MOCK_BASE_URL (plain http,
+# tokenless), so no certificate is ever presented here — what these cells assert
+# is that the CONFIG's claim reaches the app's `hosts.auth` surface in all three
+# broker modes, and that it is reported as un-LEARNED until a mint proves it.
+servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+        auth_mode: mtls
+    legacy:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {}

@@ -583,6 +583,17 @@ func driveCredentialGet(t *testing.T, m relayMinter, shedConfig string, req cred
 	return resp
 }
 
+// driveCredentialGetFrame is driveCredentialGet's raw-wire sibling: it returns
+// the reply as the generic object it arrived as, so a caller can assert on the
+// KEY SET (what `omitempty` dropped) and not merely on the fields a typed
+// decode happens to model. The golden vectors need exactly that.
+func driveCredentialGetFrame(t *testing.T, m relayMinter, shedConfig string, req credentialGetMsg) map[string]any {
+	t.Helper()
+	var frame map[string]any
+	driveDesktopRequest(t, m, shedConfig, req, "credential.response", &frame)
+	return frame
+}
+
 func driveTokenGet(t *testing.T, m relayMinter, shedConfig string, req tokenGetMsg) tokenResponseMsg {
 	t.Helper()
 	var resp tokenResponseMsg

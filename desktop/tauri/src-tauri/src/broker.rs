@@ -26,8 +26,9 @@ use tokio::sync::mpsc;
 
 use shed_app::traits::{ClockRef, Responder, ResponderRef};
 use shed_app::{
-    load_or_synthesize, resolve_mode, BrokerConfig, EffectiveMode, EmbeddedHostAgent,
-    HelloClientInfo, HostAgentClient, HostAgentEvent, HostAgentTokenMinter, ModePref, ModeProbe,
+    load_or_synthesize, resolve_mode, AuthModeRegistry, BrokerConfig, EffectiveMode,
+    EmbeddedHostAgent, HelloClientInfo, HostAgentClient, HostAgentEvent, HostAgentTokenMinter,
+    ModePref, ModeProbe,
 };
 use shed_core::approval::{ApprovalDecision, DecidedBy};
 use shed_core::token::TokenMinter;
@@ -213,10 +214,11 @@ pub fn build(
     probe: ModeProbe,
     prefs: SharedPrefs,
     clock: ClockRef,
+    modes: Arc<AuthModeRegistry>,
 ) -> Spine {
     let mode = resolve_mode(pref, probe).mode;
     match mode {
-        EffectiveMode::External => build_external(env, pref, probe, prefs, clock),
+        EffectiveMode::External => build_external(env, pref, probe, prefs, clock, modes),
         EffectiveMode::Embedded => build_embedded(env, pref, probe, prefs, true),
         EffectiveMode::HeadlessCoexist => build_embedded(env, pref, probe, prefs, false),
     }
@@ -228,14 +230,22 @@ fn build_external(
     probe: ModeProbe,
     prefs: SharedPrefs,
     clock: ClockRef,
+    modes: Arc<AuthModeRegistry>,
 ) -> Spine {
     let host = HostAgentClient::new(env.host_agent_socket.clone(), clock);
     // Minting is for real (non-mock) servers only — the hermetic mock is tokenless
     // (parity with the pre-3a.2 wiring).
-    let minter: Option<Arc<dyn TokenMinter>> = env
-        .mock_base_url
-        .is_none()
-        .then(|| Arc::new(HostAgentTokenMinter::new(host.clone())) as Arc<dyn TokenMinter>);
+    //
+    // `with_modes` is what makes mtls work in EXTERNAL mode (plan 002 §7 P5):
+    // the minter has to know which servers issue certificates so a mint that
+    // begins before the agent's `hello_ack` lands neither downgrades to
+    // `token.get` nor invents an "upgrade shed-host-agent" error. The embedded
+    // modes need no such gate — their broker is this build (see
+    // `EmbeddedTokenMinter::supports_mtls`) — so the registry reaches them only
+    // as the Backend's observer.
+    let minter: Option<Arc<dyn TokenMinter>> = env.mock_base_url.is_none().then(|| {
+        Arc::new(HostAgentTokenMinter::new(host.clone()).with_modes(modes)) as Arc<dyn TokenMinter>
+    });
     let event_rx = host.start(hello_info());
     let responder: ResponderRef = Arc::new(host);
     Spine {

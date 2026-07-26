@@ -1465,4 +1465,99 @@ mod tests {
         assert!(resp.get("token").is_none());
         assert!(resp.get("client_cert").is_none());
     }
+
+    // --- plan 002 §7 P9: the shared credential.response vectors, LIVE --------
+    //
+    // The frames THIS build emits, asserted end to end: a real socket, a real
+    // handshake, a real `credential.get`, and a minter answering with the
+    // vector's credential. That is the point — a fixture -> struct -> JSON
+    // round-trip would stay green while `handle_credential_get` dropped or
+    // misrouted `auth_mode`, which is precisely the failure whose blast radius
+    // is "every client refuses the response". Go asserts the same vectors
+    // against its own handler (`cmd/shed-host-agent/golden_test.go`), so the two
+    // agents cannot drift apart — or be wrong together.
+
+    /// A minter that answers with one canned credential (or one error), so a
+    /// fixture vector can be replayed through the production handler.
+    struct FixtureCredentialMinter {
+        answer: Result<shed_broker::controltoken::MintedControlCredential, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlCredentialMinter for FixtureCredentialMinter {
+        async fn mint_control_credential(
+            &self,
+            _server: &str,
+            _csr_base64: &str,
+        ) -> Result<shed_broker::controltoken::MintedControlCredential, String> {
+            self.answer.clone().map_err(|e| e.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_desktop_credential_response_over_the_live_socket() {
+        let fx = crate::desktop_protocol::desktop_fixture("credential_response.json");
+        assert_eq!(fx["protocol_version"], 1, "fixture version skew");
+        let mut emitted = 0;
+        for v in fx["vectors"].as_array().expect("vectors") {
+            if v["agent_emits"] != json!(true) {
+                continue;
+            }
+            emitted += 1;
+            let name = v["name"].as_str().unwrap();
+            let f = &v["frame"];
+            let field = |k: &str| f[k].as_str().unwrap_or("").to_string();
+
+            // The minter's answer, reconstructed from the vector. `auth_mode` is
+            // already normalized to the token/mtls literal by
+            // `ControlTokenProvider::mint_control_credential`, so feeding the
+            // literal the fixture shows is feeding the handler its real input.
+            let err = field("error");
+            let answer = if err.is_empty() {
+                Ok(shed_broker::controltoken::MintedControlCredential {
+                    auth_mode: field("auth_mode"),
+                    token: field("token"),
+                    client_cert: field("client_cert"),
+                    cert_serial: field("cert_serial"),
+                    expires_at: f["expires_at"].as_str().map(String::from),
+                })
+            } else {
+                Err(err)
+            };
+
+            let h = Harness::start_with(
+                Some(Arc::new(StubControlMinter)),
+                Some(Arc::new(FixtureCredentialMinter { answer })),
+                vec![],
+                Duration::from_secs(25),
+            );
+            let mut app = TestApp::connect(&h.path).await;
+            app.handshake(0).await;
+            // The request id is the vector's in_reply_to, so the echoed field is
+            // asserted for real rather than normalized away.
+            app.send(json!({
+                "type": "credential.get",
+                "id": f["in_reply_to"],
+                "server": f["server"],
+                "csr": "QUJD",
+            }))
+            .await;
+            let got = app.recv().await;
+
+            // `id` and `ts` are generated per reply — presence, not value.
+            let mut want = f.clone();
+            for k in ["id", "ts"] {
+                assert!(
+                    got[k].as_str().is_some_and(|s| !s.is_empty()),
+                    "{name}: reply is missing a generated {k}"
+                );
+                want[k] = got[k].clone();
+            }
+            assert_eq!(got, want, "{name}: live credential.response frame");
+        }
+        assert!(
+            emitted > 0,
+            "credential_response.json marks no vector agent_emits"
+        );
+    }
 }
