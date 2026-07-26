@@ -18,6 +18,96 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+**Ships:** server, host-agent, desktop
+
+### Added
+
+- **`auth.mode: mtls` — internet-exposable posture with key-bound client
+  certificates.** A third auth mode alongside `open` and `token`: the client
+  credential is a short-lived certificate bound to a private key that never
+  leaves the client's device, issued over the same already-authenticated
+  `_bootstrap` SSH channel that mints bearer tokens in `token` mode. The
+  server's HTTPS listener runs `RequireAndVerifyClientCert` against a small
+  internal CA — an unauthenticated peer can never send an HTTP byte or reach
+  the router (live-verified: `curl -k` with no client cert gets no HTTP
+  status at all). mtls is now the **recommended posture for anything
+  internet-facing**; `token` is retained, unchanged, and not deprecated,
+  because `curl`/scripts/CI/third-party callers can't present a client
+  certificate. mtls inherits every `token`-mode invariant (SSH enforce, key
+  source at preflight, TLS-only, `https_port` default 8443, non-loopback
+  bind needing no acknowledgment) and re-validates the certificate's
+  expiry/allowlist-membership/scope on **every request**, not just at the
+  TLS handshake, giving it the same revocation-lands-on-the-next-request
+  property tokens have always had. Revocation is coarser than token mode's
+  per-token `RevokeBySubject`: it means removing the SSH key, which also
+  cuts shell/SFTP access — a deliberate, documented tradeoff. An
+  already-established SSE stream or `shed forward` tunnel survives
+  revocation/expiry until it closes, identical to token-mode parity.
+- **`shed server add` is SSH-first for every mode.** The old HTTP TOFU probe
+  of `/api/info` survives only as the `open`-mode fallback; every other mode
+  goes SSH-first (`--ssh-port`, default `2222`), confirms the host key, runs
+  `_bootstrap`, and provisions whatever credential shape the returned bundle
+  carries (bearer token or client certificate). **Behavior change:** adding
+  against a `token`/`mtls` server now requires an allowlisted SSH key at add
+  time, not just lazily on first API call.
+- **Adaptive credential transport, both directions, zero manual steps.**
+  Every secure-mode HTTP client (Go and the shared Rust core) is built once
+  with both a dynamic client-cert resolver and bearer-header injection
+  always installed; a mode flip on the server (`token` ⟷ `mtls`) or ordinary
+  renewal is a pure credential-state change inside the provider — the
+  underlying `http.Transport`/`reqwest::Client` is never rebuilt. An
+  existing client entry silently re-bootstraps on its next command and
+  migrates to whatever mode the server now reports, live-verified in both
+  directions with zero manual steps.
+- **Host-agent (both Go and Rust) hold their own credentials-scope
+  certificate** on both the credential bus and egress transports when
+  talking to an mtls server, mirroring the CLI's control-scope credential.
+  The desktop↔host-agent UDS protocol gains a new mode-agnostic
+  `credential.get` message plus a `hello_ack` capability advertisement, with
+  explicit "upgrade shed-host-agent" / "upgrade the app" errors on either
+  side of a version mismatch — desktop users upgrading to mTLS should
+  upgrade `shed-host-agent` before or alongside the app (separate release
+  selectors; see the upgrade guide below).
+- **Desktop mtls support across all three client shapes.** The Swift macOS
+  app (Rust-core path; the legacy `URLSession` path fails fast with an
+  explicit error instead of attempting mTLS) and the Tauri Linux app's three
+  broker modes (external agent, embedded broker, headless-coexist) all mint
+  and drive an mtls server, relaying only the CSR — never the private
+  key — across the host-agent UDS boundary. The app persists no credential;
+  a cold launch re-mints in memory.
+- **Docs.** [Security](https://charliek.github.io/shed/reference/security/#mtls-mode),
+  [Security Configuration](https://charliek.github.io/shed/guides/security-configuration/),
+  [Configuration](https://charliek.github.io/shed/reference/configuration/),
+  [API reference](https://charliek.github.io/shed/reference/api/), and
+  [Public VPS Deployment](https://charliek.github.io/shed/guides/vps-deployment/)
+  all cover the mtls posture end-to-end, including the precise (not
+  overclaimed) exposure guarantee, per-request re-validation, revocation
+  coarseness, and the accepted limitations. A new [Upgrading to
+  mTLS](https://charliek.github.io/shed/upgrades/token-to-mtls/) guide covers
+  the client-then-server rollout order, the SSH-first `shed server add`
+  behavior change, the desktop component-upgrade ordering, and the
+  fleet-wide-but-self-healing CA rotation story.
+
+### Fixed
+
+- **`GET /api/info`'s `auth_mode` field keeps reporting the legacy `"secure"`
+  spelling for token mode on the wire**, so already-released clients (which
+  gate their bootstrap decision on that exact string) keep working unchanged
+  against an upgraded server; current clients normalize `"secure"` back to
+  `"token"` on decode. `open` and `mtls` are unaffected (`open` predates the
+  rename; an mtls-mode `/api/info` is certificate-gated, so no pre-rename
+  client can ever observe it).
+- Several pre-existing bugs surfaced by this work, unrelated to mtls itself:
+  `shed server rm ..` resolved (via `url.PathEscape` not escaping `..`) to
+  `~/.shed` itself, risking deleting the entire client config directory;
+  IPv6 server URLs were built by string concatenation instead of
+  `net.JoinHostPort`; and `sdk.WithClientCertificates` unconditionally
+  suppressed the bearer header the moment a certificate provider was wired,
+  even while the provider held nothing — breaking token-mode authentication
+  for any SDK consumer with a certificate provider configured.
+
 ## v0.8.0 — 2026-07-18
 
 **Ships:** server, host-agent, machine-rc, desktop

@@ -1,10 +1,10 @@
 # Security
 
-shed-server has two postures, selected by a single switch:
+shed-server has three postures, selected by a single switch:
 
 ```yaml
 auth:
-  mode: open      # open (default) | token
+  mode: open      # open (default) | token | mtls
 ```
 
 !!! note "`secure` is a deprecated alias"
@@ -24,17 +24,23 @@ auth:
   with no plain-HTTP listener) and **refuses to start** without an SSH key
   source, so a server is never half-hardened on a public address. Two invariants
   hold: **tokens ⟺ TLS ⟺ token** and **https ⟺ token**.
+- **`mtls`** replaces the bearer token with a client certificate bound to a
+  private key that never leaves the client's device. It inherits every `token`
+  invariant (SSH enforce, key source at preflight, TLS-only, `https_port`
+  default) and is the **recommended posture for anything internet-facing** — see
+  [mTLS mode](#mtls-mode) below.
 
-| `auth.mode` | SSH allowlist | HTTP tokens | Plain-HTTP listener | TLS |
+| `auth.mode` | SSH allowlist | HTTP credential | Plain-HTTP listener | TLS |
 |-------------|---------------|-------------|---------------------|-----|
-| `open` | as configured (`auth.ssh`: `off`/`warn`) | off | served (bound to `bind_address`) | none (`https_port` requires `token`) |
-| `token` | **forced `enforce`** (needs a key source) | **enforced** | **none — TLS-only** | **on** (`https_port` defaults to 8443) |
+| `open` | as configured (`auth.ssh`: `off`/`warn`) | none | served (bound to `bind_address`) | none (`https_port` requires `token`/`mtls`) |
+| `token` | **forced `enforce`** (needs a key source) | bearer token, minted over SSH | **none — TLS-only** | **on** (`https_port` defaults to 8443) |
+| `mtls` | **forced `enforce`** (needs a key source) | client certificate, issued over SSH | **none — TLS-only** | **on, `RequireAndVerifyClientCert`** (`https_port` defaults to 8443) |
 
 Every listener (plain HTTP, HTTPS, SSH) binds the single `bind_address`, which
-**defaults to loopback (`127.0.0.1`) in both modes** — shed is local-first.
+**defaults to loopback (`127.0.0.1`) in every mode** — shed is local-first.
 Facing the network is opt-in: set `bind_address` to a routable address, and in
 **open** mode also set `allow_insecure_exposure: true` (open has no transport
-security). Token mode needs no acknowledgment to bind the network.
+security). Token and mtls modes need no acknowledgment to bind the network.
 
 All server settings live in the server config (`/etc/shed/server.yaml` on
 Linux, `~/.config/shed/server.yaml` on macOS). Client settings live per server
@@ -75,6 +81,9 @@ GitHub keys, which you already rotate — and, as below, the same allowlist is
 what mints and revokes HTTP tokens.
 
 ## HTTP tokens are minted over SSH
+
+This section describes **token** mode. In **mtls** mode there are no bearer
+tokens at all — skip ahead to [mTLS mode](#mtls-mode).
 
 There is no `shed-server token new` and no static `auth.http.tokens` list.
 Instead, a client that already holds an allowlisted SSH key mints a token over a
@@ -169,14 +178,20 @@ There is no client `credentials_token`: the host-agent mints its own.
 
 ## Native pinned TLS
 
-shed uses **pinned self-signed TLS** — no CA, no domain, no ACME. The server
-generates a self-signed certificate on first start (the same lifecycle as the
-SSH host key) and clients pin it by the SHA-256 fingerprint of its DER encoding,
-exactly the trust model SSH host keys use. `auth.mode: token` turns this on by
+shed uses **pinned self-signed TLS** for the *server's* identity — no public
+CA, no domain, no ACME. The server generates a self-signed certificate on
+first start (the same lifecycle as the SSH host key) and clients pin it by
+the SHA-256 fingerprint of its DER encoding, exactly the trust model SSH host
+keys use. `auth.mode: token` and `auth.mode: mtls` both turn this on by
 default (`https_port` defaults to `8443`).
 
+This is a **separate mechanism from the small internal CA** mtls mode uses to
+sign *client* certificates (see [mTLS mode](#mtls-mode)) — the server's own
+leaf and how clients pin it are unchanged by mtls; only the client-credential
+side changes from a bearer token to a certificate.
+
 ```yaml
-https_port: 8443                 # the pinned-TLS listener (token mode serves HTTPS only)
+https_port: 8443                 # the pinned-TLS listener (token/mtls mode serves HTTPS only)
 tls_names:                       # extra SANs so hostname verification passes
   - shed.example.com
   - 203.0.113.10
@@ -204,37 +219,38 @@ Rotating an existing pin in a non-interactive session requires
 
 There is **one HTTP listener per mode** (SSH always listens separately on
 `ssh_port`): a single plain-HTTP listener in open mode, or a single pinned-TLS
-(`https_port`) listener in `token` mode — in token mode there is **no
-plain-HTTP listener at all**. The credential bus (`/api/plugins/*`)
+(`https_port`) listener in `token`/`mtls` mode — in either enforced mode there
+is **no plain-HTTP listener at all**. The credential bus (`/api/plugins/*`)
 and the Connect tunnel (`/api/sheds/*/connect/*`) ride that same listener; in
-token mode the bus is gated by the `credentials` scope (so a leaked `control`
-token can't reach it) while the Connect tunnel accepts control or credentials,
-and both travel over TLS. A co-located host-agent reaches the bus over
-`https://127.0.0.1:8443` with the pinned cert. There is no separate
-internal/loopback listener. These knobs shape what is reachable where:
+an enforced mode the bus is gated by the `credentials` scope (so a leaked
+`control` credential can't reach it) while the Connect tunnel accepts control
+or credentials, and both travel over TLS. A co-located host-agent reaches the
+bus over `https://127.0.0.1:8443` with the pinned cert (in mtls mode, its own
+credentials-scope client certificate). There is no separate internal/loopback
+listener. These knobs shape what is reachable where:
 
 | Field | Effect |
 |-------|--------|
-| `bind_address` | Interface every listener (plain HTTP, HTTPS, SSH) binds to. **Defaults to loopback (`127.0.0.1`) in both modes.** Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. |
-| `allow_insecure_exposure` | Required to bind a **non-loopback** `bind_address` in **open** mode (no transport security). Ignored in token mode and for loopback binds. |
-| `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `token` mode**; defaults to `8443` there. |
+| `bind_address` | Interface every listener (plain HTTP, HTTPS, SSH) binds to. **Defaults to loopback (`127.0.0.1`) in every mode.** Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. |
+| `allow_insecure_exposure` | Required to bind a **non-loopback** `bind_address` in **open** mode (no transport security). Ignored in token/mtls mode and for loopback binds. |
+| `https_port` | The HTTPS listener (bound to `bind_address`) serving the control plane, credential bus, and Connect tunnel over pinned TLS. **Requires `token` or `mtls` mode**; defaults to `8443` there. |
 | `trusted_proxy` | Trust `X-Forwarded-For` (only safe behind a proxy that overwrites it). Default false uses the real TCP peer, so a source IP can't be forged to evade per-IP controls. |
 
 ## Connection flow — what's encrypted where
 
-| Hop | open mode | token mode |
-|-----|-----------|-------------|
-| Control-plane / bus HTTP | plain `http://` (the network is the trust boundary) | pinned `https://` only — a client that holds a pin but is given a non-`https` URL **fails closed** rather than sending plaintext |
-| SSH (shed sessions + the `_bootstrap` token mint) | encrypted; host key pinned in `known_hosts` | same |
-| Token mint | n/a (no tokens) | over the pinned-host-key SSH `_bootstrap` channel |
+| Hop | open mode | token mode | mtls mode |
+|-----|-----------|-------------|-----------|
+| Control-plane / bus HTTP | plain `http://` (the network is the trust boundary) | pinned `https://` only — a client that holds a pin but is given a non-`https` URL **fails closed** rather than sending plaintext | pinned `https://`, client presents a certificate at the handshake; a peer with no cert never completes the handshake |
+| SSH (shed sessions + the `_bootstrap` issuance channel) | encrypted; host key pinned in `known_hosts` | same | same |
+| Credential mint/issuance | n/a (no credential) | bearer token, over the pinned-host-key SSH `_bootstrap` channel | client certificate, over the same `_bootstrap` channel (CSR in, signed cert out) |
 
-In token mode **nothing plaintext faces the network**: there is no plain-HTTP
-listener at all (see [Network surface](#network-surface)), and the only
-trust-on-first-use moment is `shed server add` fetching the cert to show you its
-fingerprint for confirmation (or pass `--tls-fingerprint` / `--fingerprint` to
-verify out-of-band). After that, every byte travels over pinned TLS or
-pinned-host-key SSH — the flow never depends on an unverified or plaintext
-response.
+In token and mtls modes **nothing plaintext faces the network**: there is no
+plain-HTTP listener at all (see [Network surface](#network-surface)), and the
+only trust-on-first-use moment is `shed server add` fetching the SSH host key
+and TLS/CA fingerprints to show you for confirmation (or pass
+`--tls-fingerprint` / `--fingerprint` to verify out-of-band). After that, every
+byte travels over pinned TLS or pinned-host-key SSH — the flow never depends on
+an unverified or plaintext response.
 
 ## Credential bus
 
@@ -335,10 +351,129 @@ token mode. A non-loopback bind in open mode now requires
 `allow_insecure_exposure: true`; token mode binds the network without an ack.
 See [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
 
+## mTLS mode
+
+`auth.mode: mtls` is the **recommended posture for anything internet-facing**
+(and the intended eventual default). It inherits every `token`-mode invariant
+— SSH allowlist forced to `enforce`, an SSH key source required at preflight,
+TLS-only serving, `https_port` defaulting to `8443`, no acknowledgment needed
+to bind the network — and replaces the bearer token with a **client
+certificate bound to a private key that never leaves the client's device**,
+issued over the same already-authenticated `_bootstrap` SSH channel that mints
+tokens in `token` mode.
+
+```yaml
+auth:
+  mode: mtls
+  ssh:
+    github_users: [charliek]   # an SSH key source is required, same as token mode
+```
+
+### What it guarantees — precisely
+
+The server's HTTPS listener runs `RequireAndVerifyClientCert` against a small
+internal CA (`ca_cert.pem` / `ca_key.pem`, generated on first mtls startup and
+persisted next to the SSH host key / TLS cert). The precise claim, stated
+carefully rather than oversold:
+
+- **An unauthenticated peer can never send an HTTP byte or reach the
+  router.** The TLS handshake itself enforces the certificate — Go's
+  `net/http` never invokes a handler until `RequireAndVerifyClientCert`
+  passes, so there is no code path from "no cert" to a parsed request.
+- **The listener and the TLS `CertificateRequest` remain observable to a
+  scanner.** A port scan still finds the port open, and `openssl s_client`
+  still completes a TCP connection and sees the server ask for a client
+  certificate. Nothing about mtls mode makes the port *invisible* — the
+  guarantee is about what happens *after* the handshake starts, not whether
+  the port exists. Docs and error messages avoid the word "invisible" for
+  exactly this reason.
+
+Live-verified behavior (see the branch's validation transcripts): `curl -k`
+with no client certificate against an mtls server gets `http_code=000` and
+curl exit 56 — **no HTTP status is ever obtained**. `openssl s_client` shows
+the server send `Acceptable client certificate CA names` (the
+`CertificateRequest`) and then terminate with `tlsv13 alert certificate
+required` — the connection dies at the TLS layer, before any HTTP parsing.
+With the enrolled certificate, the same request returns `200`.
+
+### The certificate IS the credential
+
+There are no bearer tokens in mtls mode: nothing mints them, the
+`Authorization` header is ignored (it cannot augment or substitute for a
+certificate's scope), and the token store is not wired. The certificate's
+subject carries the principal, composed entirely server-side from
+authenticated knowledge — a client cannot request an identity it doesn't
+hold:
+
+- **CN** = the SSH key fingerprint (`SHA256:...`), the same subject string
+  tokens use today.
+- **OU** = scope (`control` or `credentials`), one scope per certificate.
+- **O** = client kind (`cli`, `host-agent`, `desktop`, `mobile`).
+- TTL = `auth.token_ttl` (default 24h), extended-key-usage
+  `ClientAuth` only.
+
+Enrollment rides the `_bootstrap` channel exactly like a token mint, with a
+CSR appended to the request line: the client generates a P-256 keypair
+locally, sends the CSR, and the server signs it — ignoring every requested
+subject field, SAN, or extension in the CSR itself.
+
+### Per-request re-validation
+
+A TLS handshake happens once per connection, but a pooled keep-alive
+connection can carry many requests — so the mtls auth middleware
+**re-validates on every request**, not just at the handshake: certificate
+`NotBefore`/`NotAfter` against the current time, the CN against the *live*
+SSH allowlist, and the OU against the route's required scope. This gives mtls
+the same "revocation/expiry lands on the next request" property token mode
+has always had, rather than a weaker "only checked once per TCP connection"
+guarantee.
+
+### Revocation
+
+Revoking a client certificate means **removing its SSH key from the
+allowlist** — there is no separate `RevokeBySubject` for certificates (that
+mechanism still exists for tokens). The next request on any connection
+presenting that certificate is rejected by the per-request re-validation
+above; a new connection is rejected at the handshake itself.
+
+This is a **deliberate, coarser tradeoff than token mode**: removing a key in
+mtls mode also cuts off shell/SFTP access (the SSH allowlist is now the one
+lever for both), where token mode can revoke an HTTP credential independently
+via `RevokeBySubject`. Documented and accepted — an mtls deployment that wants
+per-purpose revocation without cutting SSH access should stay on `token` mode.
+
+### Accepted limitations
+
+- **Already-established streams survive revocation until they close.** An SSE
+  subscription or a `shed forward` tunnel opened before a certificate is
+  revoked or expires keeps running until it ends — identical to token mode's
+  behavior (tokens are also only checked at request time, not mid-stream).
+  Revocation and expiry bind on the *next* request/dial, not on
+  already-hijacked byte-copy loops.
+- **`curl` and ad-hoc scripts cannot reach an mtls server.** There is no way
+  to hand a script a bearer header and have it work — it needs a client
+  certificate and the private key that signed its CSR. **This is exactly why
+  `token` mode is retained and not deprecated**: anything that needs
+  programmatic HTTP access without the shed client fleet (CI runners,
+  third-party integrations, `curl` debugging) stays on `token`.
+- **CA rotation is manual.** Deleting `ca_cert.pem` + `ca_key.pem` and
+  restarting the server invalidates every previously-issued client
+  certificate at once — a fleet-wide re-enrollment. Every well-behaved client
+  recovers automatically (one silent SSH round-trip on its next command, via
+  the same adaptive-transport mechanism that handles ordinary renewal and
+  mode flips), so the operator-facing cost is "every client pays one extra
+  SSH round-trip," not an outage requiring per-client intervention. There is
+  no `shed server ca rotate` / `ca status` command yet — a full CLI story is
+  future work. The server logs the CA fingerprint and expiry at startup (like
+  the TLS cert fingerprint) and **warns when the CA is within 90 days of
+  expiry**; `/api/info` also carries `ca_fingerprint` + `ca_not_after` in mtls
+  mode (see [API › GET /api/info](api.md#get-apiinfo)).
+
+See [Upgrading to mTLS](../upgrades/token-to-mtls.md) for the client-then-server
+rollout order and the desktop component-upgrade ordering.
+
 ## Deferred
 
-Two hardening layers are intentionally out of scope for v0.7.1 and tracked
-separately: an **enrollment secret** (a transport-layer HMAC over the bootstrap
-handshake, to gate token issuance even tighter than the SSH allowlist) and
-**mutual TLS** / a **broker handoff** for the credential bus. The current
-issuance trust anchor is the SSH allowlist plus the pinned TLS/host keys.
+An **enrollment secret** (a transport-layer HMAC over the bootstrap handshake,
+to gate issuance even tighter than the SSH allowlist) remains out of scope.
+Mutual TLS itself is no longer deferred — see [mTLS mode](#mtls-mode) above.
