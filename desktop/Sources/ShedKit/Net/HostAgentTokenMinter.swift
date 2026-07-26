@@ -37,4 +37,22 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
             .map { UInt64(max(0, $0.timeIntervalSince1970)) }
         return ShedRustCore.MintedToken(token: token, expiresAtUnix: expiresAtUnix)
     }
+
+    // MARK: - mtls (plan 002) — C2 implements these for real.
+    //
+    // The Rust core now asks every minter whether it can carry a CSR, and mints
+    // through `mintCredential`. C2 answers `supportsMtls()` from the tri-state
+    // `hello_ack` capability gate (§7 P5) and relays the CSR over
+    // `credential.get`. Until then the app stays exactly on today's token path:
+    // no CSR is ever generated (the core skips the keypair when this says
+    // false), and `mintCredential` is the legacy mint wrapped in the token arm —
+    // which is what the Rust-side default did before this trait grew.
+
+    func supportsMtls() -> Bool { false }
+
+    func mintCredential(server: String, csrBase64: String?) async throws
+        -> ShedRustCore.MintedCredential
+    {
+        .token(token: try await mint(server: server))
+    }
 }

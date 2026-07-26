@@ -39,7 +39,7 @@ final class RustCoreFFISmokeTests: XCTestCase {
     func testShedCoreSurfacesTypedError() async throws {
         let core = try ShedCore(
             baseUrl: "http://127.0.0.1:1", serverName: "unreachable",
-            token: "", pin: nil, minter: nil)
+            token: "", pin: nil, minter: nil, observer: nil)
         do {
             _ = try await core.info()
             XCTFail("expected a ShedError against a closed port")

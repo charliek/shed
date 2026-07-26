@@ -27,8 +27,11 @@ final class RustShedCoreAdapter: @unchecked Sendable {
         // FSM caches/refreshes around it. Open servers have no host agent → the
         // static `token` (if any) is used instead.
         let minter: (any ShedRustCore.TokenMinter)? = hostAgent.map { HostAgentTokenMinter(hostAgent: $0) }
+        // observer: C2 passes a CredentialObserver here to learn the server's
+        // auth mode in memory (the desktop persists nothing — §7 P1).
         self.core = try ShedRustCore.ShedCore(
-            baseUrl: baseURL, serverName: serverName, token: token, pin: pin, minter: minter)
+            baseUrl: baseURL, serverName: serverName, token: token, pin: pin, minter: minter,
+            observer: nil)
     }
 
     func info() async throws -> ServerInfo { Self.map(try await core.info()) }
