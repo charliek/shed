@@ -17,12 +17,15 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/internal/tunnels"
 	"github.com/charliek/shed/sdk"
 )
 
@@ -130,6 +133,23 @@ func newMTLSServer(t *testing.T) *mtlsServer {
 	m.srv = srv
 	m.pin = servertls.Fingerprint(srv.Certificate().Raw)
 	return m
+}
+
+// newMTLSCredentialIssuer provides the real CA/CSR issuance half of
+// newMTLSServer without opening a listener. Persistence-only tests do not need
+// an HTTP exchange, and keeping them listener-free makes their failure signal
+// independent of the host's networking policy.
+func newMTLSCredentialIssuer(t *testing.T) *mtlsServer {
+	t.Helper()
+	dir := t.TempDir()
+	ca, err := servertls.LoadOrGenerateCA(filepath.Join(dir, "ca.pem"), filepath.Join(dir, "ca.key"))
+	if err != nil {
+		t.Fatalf("generate CA: %v", err)
+	}
+	return &mtlsServer{
+		ca:  ca,
+		pin: servertls.Fingerprint([]byte("test-server-certificate")),
+	}
 }
 
 // issue runs the REAL enrollment path — generate a P-256 key, build a CSR, have
@@ -735,6 +755,150 @@ func TestCredentialLessEntryEnrolls(t *testing.T) {
 			t.Errorf("mints = %d against an open server, want 0", got)
 		}
 	})
+}
+
+// TestNamedEntryEnrollsWithDuplicateEndpointAlias is the regression for #295:
+// endpoint matching is intentionally ambiguous when two aliases point at the
+// same server, but the alias selected by the command is not. The issued private
+// key must be stored under that selected alias and no other.
+func TestNamedEntryEnrollsWithDuplicateEndpointAlias(t *testing.T) {
+	cfgPath := testClientConfig(t)
+	m := newMTLSCredentialIssuer(t)
+
+	entry := config.ServerEntry{
+		Host: "127.0.0.1", SSHPort: 2222,
+		APIURL:             "https://localhost:18443",
+		TLSCertFingerprint: m.pin,
+	}
+	clientConfig.Servers["my-server-dev"] = entry
+	clientConfig.Servers["dev-mtls"] = entry
+
+	issued := m.credential(t, "cli-key", farFromExpiry)
+	mints := stubBootstrap(func() sdk.Credential { return issued })
+
+	_ = NewAPIClientFromNamedEntry("dev-mtls", &entry, DefaultTimeout)
+	if got := mints.Load(); got != 1 {
+		t.Fatalf("mints = %d, want 1", got)
+	}
+
+	for _, cfg := range loadedAndInMemory(t, cfgPath) {
+		got := cfg.Servers["dev-mtls"]
+		if got.AuthMode != config.AuthModeMTLS || got.ClientCertFile == "" || got.ClientKeyFile == "" {
+			t.Errorf("selected alias was not updated with the issued credential: %+v", got)
+		}
+		other := cfg.Servers["my-server-dev"]
+		if other.AuthMode != "" || other.ClientCertFile != "" || other.ClientKeyFile != "" {
+			t.Errorf("unselected alias was modified: %+v", other)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(config.ServerCredsDir("dev-mtls"), "client.pem")); err != nil {
+		t.Errorf("selected alias certificate was not persisted: %v", err)
+	}
+	if _, err := os.Stat(config.ServerCredsDir("my-server-dev")); !os.IsNotExist(err) {
+		t.Errorf("credential directory for the unselected alias exists (err=%v)", err)
+	}
+}
+
+// TestCredentialLessEntryWithoutConfigMatchMintsWithoutPersisting covers the
+// genuinely unresolvable fallback: a one-off entry can enroll for this process,
+// but there is no safe config row to update. Under -v that mint-only result must
+// be visible rather than silently causing re-enrollment on every invocation.
+func TestCredentialLessEntryWithoutConfigMatchMintsWithoutPersisting(t *testing.T) {
+	testClientConfig(t)
+	m := newMTLSCredentialIssuer(t)
+
+	entry := config.ServerEntry{
+		Host: "127.0.0.1", SSHPort: 2222,
+		APIURL:             "https://localhost:18443",
+		TLSCertFingerprint: m.pin,
+	}
+	issued := m.credential(t, "cli-key", farFromExpiry)
+	mints := stubBootstrap(func() sdk.Credential { return issued })
+
+	origVerbose := verboseLevel
+	verboseLevel = 1
+	t.Cleanup(func() { verboseLevel = origVerbose })
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
+
+	_ = NewAPIClientFromEntry(&entry, DefaultTimeout)
+	_ = w.Close()
+	os.Stderr = origStderr
+	warning, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+
+	if got := mints.Load(); got != 1 {
+		t.Fatalf("mints = %d, want 1", got)
+	}
+	if !strings.Contains(string(warning), "was not persisted: no configured server matches this entry") {
+		t.Errorf("verbose warning = %q, want an observable no-match persistence skip", warning)
+	}
+	if len(clientConfig.Servers) != 0 {
+		t.Errorf("one-off enrollment unexpectedly changed config: %+v", clientConfig.Servers)
+	}
+	credsRoot := filepath.Dir(config.ServerCredsDir("unused"))
+	if _, err := os.Stat(credsRoot); !os.IsNotExist(err) {
+		t.Errorf("one-off enrollment created a credential store at %s (err=%v)", credsRoot, err)
+	}
+}
+
+// TestTunnelCredentialSourceRefreshIsMintOnly pins the long-lived daemon
+// contract: it can refresh an mtls certificate in memory, but must not write its
+// stale entry copy or create credential files.
+func TestTunnelCredentialSourceRefreshIsMintOnly(t *testing.T) {
+	testClientConfig(t)
+	m := newMTLSCredentialIssuer(t)
+
+	initial := m.credential(t, "cli-key", farFromExpiry)
+	cert, err := tls.X509KeyPair([]byte(initial.Bundle.ClientCert), initial.KeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := config.ServerEntry{
+		Host: "127.0.0.1", SSHPort: 2222,
+		APIURL:             "https://localhost:18443",
+		TLSCertFingerprint: m.pin,
+	}
+	clientConfig.Servers["dev-mtls"] = entry
+	client := newAPIClientWithSource(
+		entry.BaseURL(),
+		entry.TLSCertFingerprint,
+		clienttoken.New(clienttoken.MTLSCredential(&cert, initial.Bundle.ExpiresAt), nil),
+		DefaultTimeout,
+	)
+
+	issued := m.credential(t, "cli-key", farFromExpiry)
+	mints := stubBootstrap(func() sdk.Credential { return issued })
+	source := tunnelCredentialSource(client, &entry, tunnels.ConnectTarget{TLSPin: m.pin})
+	if source == nil {
+		t.Fatal("secure tunnel should have a credential source")
+	}
+	_, generation := source.Current()
+	fresh, err := source.Refresh(generation)
+	if err != nil {
+		t.Fatalf("tunnel credential refresh: %v", err)
+	}
+	if got := mints.Load(); got != 1 {
+		t.Fatalf("mints = %d, want 1", got)
+	}
+	if fresh.ClientCertificate() == nil {
+		t.Fatal("tunnel did not adopt the freshly minted certificate in memory")
+	}
+	if got := clientConfig.Servers["dev-mtls"]; got.AuthMode != "" || got.ClientCertFile != "" || got.ClientKeyFile != "" {
+		t.Errorf("tunnel refresh rewrote its config entry: %+v", got)
+	}
+	if _, err := os.Stat(config.ServerCredsDir("dev-mtls")); !os.IsNotExist(err) {
+		t.Errorf("tunnel refresh created a credential directory (err=%v)", err)
+	}
 }
 
 // hostPortOf splits a test server's URL into the host and numeric port a legacy

@@ -32,7 +32,7 @@ func forEachServer[T any](servers map[string]config.ServerEntry, fn func(name st
 	sort.Strings(names)
 
 	// Snapshot every entry from the shared map BEFORE spawning any goroutine.
-	// fn may mutate the source map — NewAPIClientFromEntry persists a refreshed
+	// fn may mutate the source map — NewAPIClientFromNamedEntry persists a refreshed
 	// control token back into clientConfig.Servers — so reading servers[name] in
 	// the spawn loop would race those writes (a fatal concurrent map read+write).
 	results := make([]ServerResult[T], len(names))

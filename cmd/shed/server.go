@@ -363,7 +363,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 		result := make([]serverJSON, 0, len(names))
 		for _, name := range names {
 			entry := clientConfig.Servers[name]
-			client := NewAPIClientFromEntry(&entry, DefaultTimeout)
+			client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
 			status := "offline"
 			if client.Ping() {
 				status = "online"
@@ -400,7 +400,7 @@ func runServerList(cmd *cobra.Command, args []string) error {
 
 		// Reachability is probed over the entry's real endpoint (BaseURL +
 		// pinned cert), so STATUS is correct for secure servers too.
-		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
 		status := "offline"
 		if client.Ping() {
 			status = "online"

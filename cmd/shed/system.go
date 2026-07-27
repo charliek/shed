@@ -104,7 +104,7 @@ func runSystemDFSingle() error {
 		return err
 	}
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(name, entry, DefaultTimeout)
 	du, err := client.GetSystemDF()
 	if err != nil {
 		return fmt.Errorf("failed to get disk usage from %s: %w", name, err)
@@ -133,7 +133,7 @@ func runSystemDFAll() error {
 	}
 
 	results := forEachServer(clientConfig.Servers, func(name string, entry config.ServerEntry) (*config.DiskUsage, error) {
-		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
 		du, err := client.GetSystemDF()
 		if err != nil {
 			return nil, err
@@ -425,7 +425,7 @@ func runSystemPruneSingle() error {
 		return err
 	}
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(name, entry, DefaultTimeout)
 
 	// Always do a dry-run first. --dry-run and the real run return the same
 	// shape; the difference is that the real run shows post-mutation Freed.
@@ -502,7 +502,7 @@ func runSystemPruneAll() error {
 
 	// Phase 1: dry-run fan-out across all servers.
 	dryResults := forEachServer(clientConfig.Servers, func(name string, entry config.ServerEntry) (*config.PruneReport, error) {
-		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
 		report, err := client.SystemPrune(pruneFlagsToOptions(true))
 		if err != nil {
 			return nil, err
@@ -556,7 +556,7 @@ func runSystemPruneAll() error {
 
 	// Phase 2: execute fan-out.
 	execResults := forEachServer(clientConfig.Servers, func(name string, entry config.ServerEntry) (*config.PruneReport, error) {
-		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(name, &entry, DefaultTimeout)
 		report, err := client.SystemPrune(pruneFlagsToOptions(false))
 		if err != nil {
 			return nil, err

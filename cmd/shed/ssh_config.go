@@ -153,7 +153,7 @@ func getAllShedsInfo() ([]shedInfo, error) {
 	// Query all servers for their sheds
 	for serverName, entry := range clientConfig.Servers {
 		entryCopy := entry
-		client := NewAPIClientFromEntry(&entryCopy, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(serverName, &entryCopy, DefaultTimeout)
 		resp, err := client.ListSheds()
 		if err != nil {
 			if verboseLevel > 0 {

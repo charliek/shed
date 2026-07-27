@@ -214,7 +214,7 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Ensure the shed is running
-	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
+	client := NewAPIClientFromNamedEntry(serverName, entry, clientConfig.GetCreateTimeout())
 	if _, err := ensureRunningShed(client, shedName); err != nil {
 		return err
 	}

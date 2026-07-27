@@ -208,7 +208,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		timeout = clientConfig.GetCreateTimeout()
 	}
 
-	client := NewAPIClientFromEntry(entry, timeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, timeout)
 
 	info, err := client.GetInfo()
 	if err != nil {
@@ -348,7 +348,7 @@ func runList(cmd *cobra.Command, args []string) error {
 	if listAll {
 		// Query all servers
 		for name, e := range clientConfig.Servers {
-			client := NewAPIClientFromEntry(&e, DefaultTimeout)
+			client := NewAPIClientFromNamedEntry(name, &e, DefaultTimeout)
 			resp, err := client.ListSheds()
 			if err != nil {
 				if verboseLevel > 0 {
@@ -363,7 +363,7 @@ func runList(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		client := NewAPIClientFromEntry(entry, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 		resp, err := client.ListSheds()
 		if err != nil {
 			return fmt.Errorf("failed to list sheds: %w", err)
@@ -705,7 +705,7 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// timeout (not the 30s quick-op default) so a slow teardown isn't cut off,
 	// and stream phases through the shared renderer (plain lines under --json /
 	// non-TTY / old server).
-	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
+	client := NewAPIClientFromNamedEntry(serverName, entry, clientConfig.GetCreateTimeout())
 	onProgress, finish, _ := progressSink(jsonFlag)
 	delErr := client.DeleteShedWithProgress(name, onProgress)
 	finish()
@@ -753,7 +753,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		timeout = clientConfig.GetCreateTimeout()
 	}
 
-	client := NewAPIClientFromEntry(entry, timeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, timeout)
 	shed, err := client.StartShed(name)
 	if err != nil {
 		return fmt.Errorf("failed to start shed: %w", err)
@@ -796,7 +796,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	// Stop any associated tunnels first
 	stopTunnelsForShed(name)
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	shed, err := client.StopShed(name)
 	if err != nil {
 		return fmt.Errorf("failed to stop shed: %w", err)
@@ -849,7 +849,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		entry, err := clientConfig.GetServer(cachedServer)
 		if err == nil {
 			// Verify the shed still exists
-			client := NewAPIClientFromEntry(entry, DefaultTimeout)
+			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
 				return cachedServer, entry, nil
 			}
@@ -864,7 +864,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		if err != nil {
 			return "", nil, err
 		}
-		client := NewAPIClientFromEntry(entry, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(serverFlag, entry, DefaultTimeout)
 		if _, err := client.GetShed(name); err != nil {
 			printError(fmt.Sprintf("shed %q not found on %s", name, serverFlag),
 				"shed list --all       # Find which server has it",
@@ -878,7 +878,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 	if clientConfig.DefaultServer != "" {
 		entry, _ := clientConfig.GetServer(clientConfig.DefaultServer)
 		if entry != nil {
-			client := NewAPIClientFromEntry(entry, DefaultTimeout)
+			client := NewAPIClientFromNamedEntry(clientConfig.DefaultServer, entry, DefaultTimeout)
 			if _, err := client.GetShed(name); err == nil {
 				clientConfig.CacheShed(name, clientConfig.DefaultServer, "")
 				return clientConfig.DefaultServer, entry, nil
@@ -891,7 +891,7 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 		if serverName == clientConfig.DefaultServer {
 			continue // Already checked
 		}
-		client := NewAPIClientFromEntry(&entry, DefaultTimeout)
+		client := NewAPIClientFromNamedEntry(serverName, &entry, DefaultTimeout)
 		if _, err := client.GetShed(name); err == nil {
 			// Update cache
 			clientConfig.CacheShed(name, serverName, "")

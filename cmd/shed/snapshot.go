@@ -88,7 +88,7 @@ func runSnapshotCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	timeout := clientConfig.GetCreateTimeout()
-	client := NewAPIClientFromEntry(entry, timeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, timeout)
 
 	if verboseLevel > 0 {
 		fmt.Printf("Creating snapshot %s of %s on %s...\n", snapName, shedName, serverName)
@@ -133,7 +133,7 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	resp, err := client.ListSnapshots()
 	if err != nil {
 		return fmt.Errorf("failed to list snapshots: %w", err)
@@ -176,7 +176,7 @@ func runSnapshotInfo(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 
 	snap, err := client.GetSnapshot(name)
 	if err != nil {
@@ -234,7 +234,7 @@ func runSnapshotDelete(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 
 	if !snapshotDeleteForce {
 		prompt := fmt.Sprintf("Delete snapshot %q on %s? [y/N] ", name, serverName)

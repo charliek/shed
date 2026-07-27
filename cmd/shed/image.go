@@ -570,12 +570,12 @@ func finishImageBuild(digest string) {
 }
 
 func runImageList(_ *cobra.Command, _ []string) error {
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	resp, err := client.ListImages()
 	if err != nil {
 		return fmt.Errorf("failed to list images: %w", err)
@@ -627,12 +627,12 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("--force is required when using --json")
 	}
 
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 
 	// Fetch image info for confirmation prompt and success output
 	var targetImage *config.ImageInfo
@@ -695,11 +695,11 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 }
 
 func runImageInspect(_ *cobra.Command, args []string) error {
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	resp, err := client.InspectImage(args[0])
 	if err != nil {
 		return fmt.Errorf("failed to inspect image: %w", err)
@@ -742,11 +742,11 @@ func runImageInspect(_ *cobra.Command, args []string) error {
 }
 
 func runImageTag(_ *cobra.Command, args []string) error {
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	if err := client.TagImage(args[0], args[1]); err != nil {
 		return fmt.Errorf("failed to tag image: %w", err)
 	}
@@ -767,11 +767,11 @@ func runImagePull(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid tag %q: %w", tag, err)
 	}
 
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 
 	// On an interactive terminal, draw a live block of per-blob bars; pipe,
 	// --json, redirected, or an old server fall back to the plain line stream.
@@ -812,11 +812,11 @@ func runImagePush(_ *cobra.Command, args []string) error {
 		return nil
 	}
 
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	resp, err := client.PushImage(source, dest)
 	if err != nil {
 		return fmt.Errorf("failed to push image: %w", err)
@@ -844,12 +844,12 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("--force is required when combining --json with an execute pass (add --dry-run to preview)")
 	}
 
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 
 	// First do a dry run to see candidates
 	dryResp, err := client.PruneImages(true)

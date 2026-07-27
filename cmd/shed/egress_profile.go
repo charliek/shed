@@ -80,11 +80,11 @@ func init() {
 }
 
 func egressProfileClient() (*APIClient, error) {
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return nil, err
 	}
-	return NewAPIClientFromEntry(entry, DefaultTimeout), nil
+	return NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout), nil
 }
 
 func runEgressProfileLs(cmd *cobra.Command, args []string) error {

@@ -158,32 +158,73 @@ func newAPIClientWithSource(baseURL, tlsFingerprint string, src *clienttoken.Sou
 	return c
 }
 
-// NewAPIClientFromEntry creates an API client from a server entry, honoring its
-// api_url/TLS pin and whichever credential it last bootstrapped. When the entry
-// carries a bootstrap-minted credential (a control token with an expiry, or a
-// client certificate), the client transparently re-mints it over SSH —
-// proactively before expiry and reactively on an auth-shaped failure —
-// persisting it back to the config entry it came from.
+// NewAPIClientFromEntry creates an API client from an entry whose config name is
+// not available to the caller. It preserves the historical single-match
+// behavior by inferring the name from the endpoint. When there is no unique
+// match, refresh still works for this client's lifetime but is not persisted.
+//
+// Callers that already resolved a server name must use
+// NewAPIClientFromNamedEntry instead. Endpoint matching cannot distinguish two
+// aliases for the same server, while the selected/map-key name can.
 func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
-	// Resolve which config entry this is first: it names both the credential
-	// lock the load takes and the entry a refreshed credential is persisted to.
-	// "" means no unambiguous match (a one-off entry, or duplicate aliases to
-	// the same endpoint) — the refresh still works for this client's lifetime,
-	// it just isn't saved.
-	name := serverNameForEntry(entry)
-	initial, refreshable := entryCredential(entry, name)
+	name, matches := matchingServerName(entry)
+	reason := ""
+	switch {
+	case matches == 0:
+		reason = "no configured server matches this entry"
+	case matches > 1:
+		reason = "multiple configured server aliases match this endpoint"
+	}
+	return newAPIClientFromEntry(entry, name, reason, createTimeout)
+}
+
+// NewAPIClientFromNamedEntry creates an API client for the named config entry.
+// name is authoritative: it is the alias selected by --server/default
+// resolution or the map key being iterated, so duplicate endpoint aliases still
+// persist refreshed credentials to the entry the command is actually using.
+//
+// The endpoint identity is checked against the current config before name is
+// trusted. A stale or incorrect caller must never write a credential to the
+// wrong alias; on mismatch the client remains usable in memory and a successful
+// mint reports the persistence skip under -v.
+func NewAPIClientFromNamedEntry(name string, entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
+	persistName, reason := verifiedServerName(name, entry)
+	return newAPIClientFromEntry(entry, persistName, reason, createTimeout)
+}
+
+func newAPIClientFromEntry(entry *config.ServerEntry, persistName, unpersistedReason string, createTimeout time.Duration) *APIClient {
+	initial, refreshable := entryCredential(entry, persistName)
 	if !refreshable {
 		// Static/legacy token or open server — no refresh wiring, exactly as
 		// before client certificates existed.
 		return newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
 	}
-	src := clienttoken.New(initial, controlCredentialRefresh(entry.Host, entry.SSHPort, name))
+	refresh := controlCredentialRefresh(entry.Host, entry.SSHPort, persistName)
+	if unpersistedReason != "" {
+		refresh = observableMintOnlyRefresh(entry.Host, unpersistedReason, refresh)
+	}
+	src := clienttoken.New(initial, refresh)
 	c := newAPIClientWithSource(entry.BaseURL(), entry.TLSCertFingerprint, src, createTimeout)
 	// Proactively re-mint a near-expiry credential so a request never races
 	// expiry. A mint failure here is non-fatal (EnsureFresh keeps the stale
 	// credential); the reactive retry surfaces any error on the next request.
 	src.EnsureFresh()
 	return c
+}
+
+// observableMintOnlyRefresh makes an accidental persistence skip visible while
+// preserving the best-effort contract: the freshly minted credential is still
+// returned and the command still succeeds. The tunnel daemon deliberately uses
+// controlCredentialRefresh(..., "") directly, without this wrapper, because
+// its mint-only policy is intentional rather than a name-resolution failure.
+func observableMintOnlyRefresh(host, reason string, refresh func() (clienttoken.Credential, error)) func() (clienttoken.Credential, error) {
+	return func() (clienttoken.Credential, error) {
+		cred, err := refresh()
+		if err == nil && verboseLevel > 0 {
+			fmt.Fprintf(os.Stderr, "warning: refreshed credential for %s was not persisted: %s\n", host, reason)
+		}
+		return cred, err
+	}
 }
 
 // entryCredential reads a server entry's stored credential into the Source's
@@ -245,7 +286,7 @@ func loadClientCert(entry *config.ServerEntry, name string) (*tls.Certificate, e
 // controlCredentialRefresh returns a refresh callback that mints a control
 // credential over the SSH bootstrap channel and, when persistName != "",
 // best-effort persists it to that config entry. It is shared by
-// NewAPIClientFromEntry (persisting) and the tunnel daemon (persistName "" —
+// the entry-based API clients (persisting) and the tunnel daemon (persistName "" —
 // mint-only, so a long-lived daemon never rewrites the user's config from its
 // own stale in-memory copy).
 //
@@ -292,7 +333,7 @@ func adoptMTLSCredential(res sdk.Credential, persistName string) (clienttoken.Cr
 }
 
 // configMu serializes refresh-path access to the shared clientConfig global —
-// the serverNameForEntry lookup and the token persist (map write + Save). The
+// the server-name lookup and credential persist (map write + Save). The
 // `--all` fan-out (forEachServer) constructs clients, and thus refreshes,
 // concurrently across goroutines; without this, two near-expiry refreshes would
 // race on the Servers map (a fatal "concurrent map writes") and clobber each
@@ -395,27 +436,58 @@ func saveServerEntry(name, what string, mutate func(*config.ServerEntry)) error 
 // serverNameForEntry returns the config name whose stored entry UNIQUELY matches
 // e by its stable identity (host + ssh port + api_url), or "" when there is no
 // match (a one-off entry) or more than one (duplicate aliases to the same
-// endpoint). Returning "" on ambiguity is deliberate: a refreshed token is only
-// persisted when the target entry is unambiguous, so it can never be written to
-// the wrong alias. Used so a refreshed token can be written back without
-// threading the name through every call site.
+// endpoint). It is the compatibility fallback for NewAPIClientFromEntry;
+// callers that possess the authoritative alias use NewAPIClientFromNamedEntry.
 //
 // ControlToken is deliberately NOT part of the key: the refresh path rewrites
 // it, so matching on it would make an entry stop matching its own config row
 // after the first re-mint.
 func serverNameForEntry(e *config.ServerEntry) string {
+	name, _ := matchingServerName(e)
+	return name
+}
+
+// matchingServerName is serverNameForEntry plus the match count needed to make
+// a skipped persistence observable without changing the compatibility helper's
+// signature.
+func matchingServerName(e *config.ServerEntry) (string, int) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	match := ""
+	matches := 0
 	for n, se := range clientConfig.Servers {
-		if se.Host == e.Host && se.SSHPort == e.SSHPort && se.APIURL == e.APIURL {
-			if match != "" {
-				return "" // ambiguous — refuse to persist to the wrong alias
-			}
+		if sameServerEndpoint(se, *e) {
+			matches++
 			match = n
 		}
 	}
-	return match
+	if matches != 1 {
+		return "", matches
+	}
+	return match, matches
+}
+
+// verifiedServerName accepts a caller-resolved alias only while its current
+// config row still names the same endpoint. This is the guard against a stale
+// entry/name pair persisting a private key under an unrelated alias.
+func verifiedServerName(name string, e *config.ServerEntry) (string, string) {
+	if name == "" {
+		return "", "the caller did not provide a server name"
+	}
+	configMu.Lock()
+	defer configMu.Unlock()
+	stored, ok := clientConfig.Servers[name]
+	if !ok {
+		return "", fmt.Sprintf("configured server %q no longer exists", name)
+	}
+	if !sameServerEndpoint(stored, *e) {
+		return "", fmt.Sprintf("configured server %q no longer matches this endpoint", name)
+	}
+	return name, ""
+}
+
+func sameServerEndpoint(a, b config.ServerEntry) bool {
+	return a.Host == b.Host && a.SSHPort == b.SSHPort && a.APIURL == b.APIURL
 }
 
 // sendRequest builds and sends a single JSON request with cred as its pinned

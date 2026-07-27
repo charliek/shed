@@ -168,7 +168,7 @@ func sshToShed(name string, command []string) error {
 	}
 
 	// Ensure the shed is running (auto-start if stopped)
-	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
+	client := NewAPIClientFromNamedEntry(serverName, entry, clientConfig.GetCreateTimeout())
 	if _, err := ensureRunningShed(client, name); err != nil {
 		return err
 	}
