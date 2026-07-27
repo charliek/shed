@@ -99,6 +99,29 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// Render a log field value the way Go's `slog` TextHandler does: bare when it is safe,
+/// quoted-and-escaped otherwise. Go's `needsQuoting` quotes an empty value, or one
+/// containing a space, `=`, `"`, `\`, or any non-printable rune.
+///
+/// This is not cosmetic. The stock macOS socket path contains a space
+/// (`~/Library/Application Support/shed/…`), so Go quotes it and an unquoted Rust field
+/// would be both divergent and ambiguous to a text-log parser in the COMMON case. And
+/// escaping is what stops a config scalar containing a newline from forging a second log
+/// line — see the `desktop.timeout_ms` warning.
+fn slog_value(s: &str) -> String {
+    let needs_quoting = s.is_empty()
+        || s.chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '=' || c == '"' || c == '\\');
+    if needs_quoting {
+        // Rust's Debug for &str is strconv.Quote-shaped: wraps in `"` and escapes
+        // control characters, quotes and backslashes. Close enough for parity here,
+        // and identical for the cases that matter (paths, integers, injected newlines).
+        format!("{s:?}")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Resolve `approval_timeout`'s raw string to a `Duration`, defaulting an
 /// absent/invalid/non-positive value to 25s (fail-safe). Always called by `parse`.
 fn parse_approval_timeout(raw: &str) -> Duration {
@@ -336,6 +359,30 @@ pub struct HostAgentConfig {
     ssh_session_ttl_raw: String,
     pub logging_enabled: bool,
     pub logging_path: String,
+    /// Log lines for deprecated keys that are still set and are IGNORED, collected at
+    /// parse time for the caller to emit (same shape as `resolve_ssh_backend`'s
+    /// warnings). Mirrors Go's `warnDeprecatedDesktopKeys`, which logs one line per
+    /// `desktop.*` key that is present; the daemons are maintained wire-identical, and
+    /// a silent Rust daemon meant an operator migrating off the Go one lost the signal
+    /// that their config knob does nothing. Emitted by `main.rs` right after load.
+    ///
+    /// Two known divergences from Go, both accepted deliberately:
+    ///
+    /// 1. Go warns inside `LoadConfig` BEFORE `Validate`, so a config that is BOTH
+    ///    invalid and sets deprecated keys logs the warnings and then the validation
+    ///    error. Here the warnings ride on the parsed value, which `load` drops when
+    ///    `validate` fails — so that path logs only the error. Both daemons still exit
+    ///    1 on that config (the error text already differs between them: Go prefixes
+    ///    `invalid config:`), so the only loss is the migration hint on a startup that
+    ///    was failing anyway; it reappears once the unrelated error is fixed. Reshaping
+    ///    `load`'s signature to carry warnings off the error path is not worth that.
+    /// 2. Go type-checks these keys (`*bool`/`*string`/`*int`), so `enabled: "false"` or
+    ///    `enabled: [false]` makes Go reject the whole config; the Rust reader never
+    ///    decoded the `desktop:` block at all, so it loads and (for a scalar) warns.
+    ///    That accept/reject split PREDATES this warning and is not introduced by it —
+    ///    making Rust hard-error to match would be a behaviour change well outside a
+    ///    diagnostics fix, and would break configs that load on the shipped daemon today.
+    pub deprecated_warnings: Vec<String>,
     // Read only by `approval_timeout()`, which the desktop/embedder approval path calls.
     approval_timeout: Duration,
     /// The RAW `approval_timeout` string exactly as written in the config (`""`
@@ -515,6 +562,53 @@ impl HostAgentConfig {
                 Some(dc)
             }
         };
+        // Deprecated `desktop.*` keys are IGNORED but must not be ignored SILENTLY —
+        // Go's `warnDeprecatedDesktopKeys` logs one line per key that is set, and the
+        // two daemons are maintained as behavioural twins. Presence is what matters,
+        // not the value: Go decodes into `*bool`/`*string`/`*int`, so an explicit
+        // `enabled: false` or `timeout_ms: 0` is still "set" and still warns. A bare
+        // `desktop:` (YAML null) or `desktop: {}` sets no key, so it stays quiet, and
+        // an explicit null sub-key decodes to nil in Go — hence `Scalar` only.
+        let desktop = root.as_map().and_then(|m| m.get("desktop"));
+        let desktop_key = |key: &str| -> Option<&String> {
+            match desktop
+                .and_then(yaml_lite::Node::as_map)
+                .and_then(|m| m.get(key))
+            {
+                Some(yaml_lite::Node::Scalar(s)) => Some(s),
+                _ => None,
+            }
+        };
+        let mut deprecated_warnings = Vec::new();
+        if desktop_key("enabled").is_some() {
+            deprecated_warnings.push(
+                "config: `desktop.enabled` is deprecated and ignored — the approval channel is always on"
+                    .to_string(),
+            );
+        }
+        if desktop_key("socket_path").is_some() {
+            deprecated_warnings.push(format!(
+                "config: `desktop.socket_path` is deprecated and ignored — the socket path is fixed path={}",
+                slog_value(&crate::sockets::desktop_socket_path().to_string_lossy())
+            ));
+        }
+        if let Some(v) = desktop_key("timeout_ms") {
+            // Echo the PARSED integer, never the raw scalar. Go decodes into `*int`, so
+            // the only values it ever logs are valid integers (`01` prints as `1`), and
+            // anything else fails `yaml.Unmarshal` before the warning is reached. Two
+            // reasons this matters beyond cosmetics: raw text drifts from Go's rendering,
+            // and a scalar containing a newline would otherwise forge a whole log line
+            // (`timeout_ms: "0\nERROR forged"`). Unparseable values are a config Go
+            // rejects outright, so quote/escape rather than invent a number.
+            let rendered = match v.trim().parse::<i64>() {
+                Ok(n) => n.to_string(),
+                Err(_) => slog_value(v),
+            };
+            deprecated_warnings.push(format!(
+                "config: `desktop.timeout_ms` is deprecated and ignored — use the top-level `approval_timeout` timeout_ms={rendered}"
+            ));
+        }
+
         Ok(HostAgentConfig {
             ssh_policy: policy("ssh"),
             aws_policy: policy("aws"),
@@ -527,6 +621,7 @@ impl HostAgentConfig {
             ssh_session_ttl_raw: ssh_scalar_or_default("session_ttl", "4h"),
             logging_enabled,
             logging_path,
+            deprecated_warnings,
             approval_timeout: parse_approval_timeout(&approval_timeout_raw),
             approval_timeout_raw,
             server,
@@ -2900,8 +2995,13 @@ aws:
     /// that still sets the deprecated `desktop.*` keys with EXPLICIT ZERO/false values
     /// LOADS OK (exit 0) — the Rust reader ignores the block entirely, and validate
     /// touches only policies/aws/approval_timeout. (P: H3) this is unit-owned: "still
-    /// loads" has no live exit-code cell. (P: H4) warnings are op-log-only and not
-    /// ported. Driven through the real `load` (parse → validate) on a temp file.
+    /// loads" has no live exit-code cell. Driven through the real `load` (parse →
+    /// validate) on a temp file.
+    ///
+    /// The warnings WERE originally left unported ("(P: H4) op-log-only") because they
+    /// are not wire-visible and so were out of scope for the wire-identity port. That
+    /// left the brew-shipped Rust daemon silently ignoring a knob the Go one warned
+    /// about (shed#296), so they are ported now and asserted below.
     #[test]
     fn deprecated_desktop_keys_load_ok() {
         let dir = tempfile::tempdir().unwrap();
@@ -2916,6 +3016,82 @@ aws:
             HostAgentConfig::load(path.to_str().unwrap()).expect("deprecated desktop keys load ok");
         // The budget still comes from approval_timeout (defaulted 25s), not timeout_ms.
         assert_eq!(cfg.approval_timeout(), Duration::from_secs(25));
+        // Presence, not truthiness: `enabled: false` and `timeout_ms: 0` still warn,
+        // because Go decodes into pointers and warns on a set key (config.go:201-207).
+        let w = &cfg.deprecated_warnings;
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert_eq!(
+            w[0],
+            "config: `desktop.enabled` is deprecated and ignored — the approval channel is always on"
+        );
+        assert!(
+            w[1].starts_with(
+                "config: `desktop.socket_path` is deprecated and ignored — the socket path is fixed path="
+            ),
+            "{:?}",
+            w[1]
+        );
+        assert_eq!(
+            w[2],
+            "config: `desktop.timeout_ms` is deprecated and ignored — use the top-level `approval_timeout` timeout_ms=0"
+        );
+    }
+
+    /// `timeout_ms` is echoed as the PARSED integer, never the raw scalar: Go decodes
+    /// into `*int` so `01` prints as `1`, and — the reason this is not cosmetic — a
+    /// scalar carrying a newline must not be able to forge a second log line.
+    #[test]
+    fn deprecated_timeout_ms_is_rendered_not_echoed() {
+        let cfg = HostAgentConfig::parse("desktop:\n  timeout_ms: 01\n");
+        assert!(
+            cfg.deprecated_warnings[0].ends_with("timeout_ms=1"),
+            "{:?}",
+            cfg.deprecated_warnings[0]
+        );
+
+        // A value Go would reject outright: quote+escape rather than invent a number,
+        // and above all never emit a bare newline into the log stream.
+        let cfg = HostAgentConfig::parse("desktop:\n  timeout_ms: \"0\\nERROR forged-line\"\n");
+        let w = &cfg.deprecated_warnings[0];
+        assert!(!w.contains('\n'), "warning must stay one line: {w:?}");
+        assert!(w.ends_with(r#"timeout_ms="0\nERROR forged-line""#), "{w:?}");
+    }
+
+    /// A field value containing a space is quoted, matching Go's slog `needsQuoting`.
+    /// The stock macOS socket path (`~/Library/Application Support/…`) hits this, so it
+    /// is the common case, not an exotic one.
+    #[test]
+    fn slog_value_quotes_like_go() {
+        assert_eq!(
+            slog_value("/tmp/plain/host-agent.sock"),
+            "/tmp/plain/host-agent.sock"
+        );
+        assert_eq!(
+            slog_value("/Users/x/Library/Application Support/shed/host-agent.sock"),
+            "\"/Users/x/Library/Application Support/shed/host-agent.sock\""
+        );
+        assert_eq!(slog_value(""), "\"\"");
+        assert_eq!(slog_value("a\nb"), r#""a\nb""#);
+        assert_eq!(slog_value("k=v"), "\"k=v\"");
+    }
+
+    /// No `desktop:` block, a bare `desktop:` (YAML null), and `desktop: {}` all set
+    /// no key, so none of them warn — Go's pointers stay nil in each case. Guards the
+    /// obvious over-fire: warning at every startup for a config nobody wrote.
+    #[test]
+    fn absent_or_empty_desktop_block_is_quiet() {
+        for yaml in [
+            "server: http://localhost:8080\n",
+            "server: http://localhost:8080\ndesktop:\n",
+            "server: http://localhost:8080\ndesktop: {}\n",
+        ] {
+            let cfg = HostAgentConfig::parse(yaml);
+            assert!(
+                cfg.deprecated_warnings.is_empty(),
+                "{yaml:?} → {:?}",
+                cfg.deprecated_warnings
+            );
+        }
     }
 
     /// Validate runs in Go's EXACT order (`config.go:487-505`): ssh → aws → docker

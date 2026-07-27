@@ -224,6 +224,11 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             return 1;
         }
     };
+    // Deprecated-key warnings first, matching Go: `warnDeprecatedDesktopKeys` runs
+    // inside `LoadConfig`, so its lines precede every other config-derived line.
+    for warning in &cfg.deprecated_warnings {
+        log.warn(warning);
+    }
     let resolved_config_path = resolve_config_path(config_path);
     log.info(&format!(
         "approval policies ssh={} aws={} docker={}",
