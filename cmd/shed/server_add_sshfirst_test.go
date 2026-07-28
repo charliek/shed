@@ -1049,7 +1049,7 @@ func breakConfigSave(t *testing.T) {
 	}
 	broken.DefaultServer = clientConfig.DefaultServer
 	clientConfig = broken
-	if err := clientConfig.Update(func(*config.ClientConfig) error { return nil }); err == nil {
+	if err := clientConfig.Update(func(*config.ClientConfig) {}); err == nil {
 		t.Fatal("test setup: the config save was supposed to fail")
 	}
 }

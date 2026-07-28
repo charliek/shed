@@ -242,9 +242,8 @@ func testClientConfig(t *testing.T) string {
 // and the persist correctly refuses to resurrect it.
 func putServerEntry(t *testing.T, name string, entry config.ServerEntry) {
 	t.Helper()
-	if err := clientConfig.Update(func(c *config.ClientConfig) error {
+	if err := clientConfig.Update(func(c *config.ClientConfig) {
 		c.Servers[name] = entry
-		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}

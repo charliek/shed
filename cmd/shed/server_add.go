@@ -31,6 +31,7 @@ package main
 //     credentialTxn).
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -477,6 +478,14 @@ type credentialTxn struct {
 	// material the currently-saved config entry still points at. It is the only
 	// input to the ordering decision.
 	replacing bool
+	// certPEM is the certificate this transaction staged, kept so the commit can
+	// prove — under the server's credential lock — that what ended up on disk is
+	// still THIS enrollment's material and not a concurrent one's.
+	certPEM []byte
+	// prevCert / prevKey are the material the entry had before this transaction,
+	// read before anything was overwritten, so a failed save on the replacing
+	// path can put it back.
+	prevCert, prevKey []byte
 }
 
 // stageCredentials writes the entry's new credential material somewhere
@@ -503,35 +512,124 @@ func stageCredentials(entry *config.ServerEntry, name string, res sdk.Credential
 		return nil, fmt.Errorf("could not store the issued client certificate: %w", err)
 	}
 	txn.staged = staged
+	txn.certPEM = []byte(res.Bundle.ClientCert)
+	if prev != nil {
+		// Best effort, and read BEFORE the commit overwrites anything: it is
+		// only used to undo a commit whose save then failed.
+		txn.prevCert, _ = os.ReadFile(prev.ClientCertFile)
+		txn.prevKey, _ = os.ReadFile(prev.ClientKeyFile)
+	}
 	entry.ClientCertFile, entry.ClientKeyFile = staged.Paths()
 	return txn, nil
 }
 
-// commitAround runs the config save and the credential commit in the order this
-// transaction's material requires, and unwinds cleanly whichever one fails.
+// commitAround runs the credential commit and the config save as one
+// transaction, serialized against any other process enrolling this same server
+// name by the per-server credential lock.
+//
+// The lock is what makes an interleaved pair of same-name enrollments safe.
+// Without it, two `shed server add srv` runs can both commit their material —
+// the second overwriting the first at the same fixed paths — and then both save
+// their config rows, leaving whichever row lands last describing the OTHER
+// enrollment's certificate: an entry whose recorded serial, expiry and auth
+// mode belong to a credential the file no longer holds.
+//
+// LOCK ORDERING: credential lock first, config lock underneath (inside save) —
+// the order pinned in cmd/shed/client.go, and never the reverse anywhere.
+//
+// The mtls path cannot hold ONE lock across both halves, because
+// StagedClientCredentials.Commit takes the same per-server lock itself
+// (sdk/creds) and flock is not re-entrant — taking it here first would deadlock
+// the process against itself. The equivalent guarantee is bought differently:
+// commit, then lock, then PROVE the committed material is still ours, then
+// save. A loser of the file race finds someone else's certificate under the
+// lock and aborts without writing a config row, so no row is ever saved beside
+// another enrollment's material.
 func (t *credentialTxn) commitAround(save func() error) error {
-	if !t.replacing {
-		// The commit destroys nothing the saved config references, so it goes
-		// first — and the save that names these paths then runs with the files
-		// already in place.
-		if err := t.commit(); err != nil {
-			t.discard()
+	if t.staged == nil {
+		// Token/open mode: the "commit" is a directory removal, which takes no
+		// lock of its own, so the whole transaction fits under a single hold.
+		// The removal runs AFTER the save in both cases — it is destructive
+		// whenever there is anything to destroy, and ordering it last costs
+		// nothing when there is not.
+		unlock, err := config.LockServerCredentials(t.name)
+		if err != nil {
 			return err
 		}
+		defer unlock()
 		if err := save(); err != nil {
-			t.rollback()
 			return err
 		}
-		return nil
+		return t.commit()
 	}
-	// The commit WOULD destroy material the saved config still points at, so the
-	// save goes first: until it succeeds, the old entry and the old credential
-	// must both stay exactly as they are.
-	if err := save(); err != nil {
+
+	if err := t.commit(); err != nil {
 		t.discard()
 		return err
 	}
-	return t.commit()
+
+	unlock, err := config.LockServerCredentials(t.name)
+	if err != nil {
+		t.rollback()
+		return err
+	}
+	ownsMaterial := t.committedMaterialIsOurs()
+	var saveErr error
+	if ownsMaterial == nil {
+		saveErr = save()
+	}
+	// Released BEFORE unwinding: restorePrevious writes through the credential
+	// store, which takes this very lock.
+	unlock()
+
+	if ownsMaterial != nil {
+		// Another enrollment for this name won the race and its material is
+		// what is on disk. Ours is superseded, not lost data — the caller
+		// re-runs and gets a coherent pair.
+		return ownsMaterial
+	}
+	if saveErr != nil {
+		t.restorePrevious()
+		return saveErr
+	}
+	return nil
+}
+
+// committedMaterialIsOurs reports whether the certificate now at the entry's
+// path is the one this transaction committed. It must be called under the
+// server's credential lock, which is what makes the answer stay true through
+// the config save that follows.
+func (t *credentialTxn) committedMaterialIsOurs() error {
+	certPath, _ := t.staged.Paths()
+	onDisk, err := os.ReadFile(certPath)
+	if err != nil {
+		return fmt.Errorf("the client certificate stored for %q went away before it could be recorded "+
+			"(another process is enrolling the same server name): %w", t.name, err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(onDisk), bytes.TrimSpace(t.certPEM)) {
+		return fmt.Errorf("another process enrolled %q at the same time and its client certificate is the one on disk; "+
+			"this add was abandoned rather than record an entry describing a certificate that is not there", t.name)
+	}
+	return nil
+}
+
+// restorePrevious undoes a commit whose save then failed.
+//
+// On a fresh add there is nothing to restore, so the material this command
+// created is removed (that is exactly the old rollback). On a replace, the
+// previous pair — captured before the commit overwrote it — is written back, so
+// the saved config still names material that exists and matches it. That is the
+// invariant the old save-then-commit ordering bought on the replacing path, now
+// bought by an undo instead, because the commit has to precede the save for the
+// ownership check to mean anything.
+func (t *credentialTxn) restorePrevious() {
+	if len(t.prevCert) > 0 && len(t.prevKey) > 0 {
+		if _, _, err := config.WriteClientCredentials(t.name, t.prevCert, t.prevKey); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not restore the previous client certificate for %q: %v\n", t.name, err)
+		}
+		return
+	}
+	t.rollback()
 }
 
 // commit adopts the staged material — or, in token/open mode, removes the
@@ -856,28 +954,40 @@ func addOverHTTP(host string, sshPort int) error {
 // with no explicit rollback: Update mutates the in-memory config only AFTER the
 // file write succeeds.
 //
-// The duplicate check and the AddedAt stamp both happen HERE, before the
-// update, rather than inside it via ClientConfig.AddServer. Update applies its
-// mutation twice — once to the fresh on-disk snapshot, once to the in-memory
-// one — so a mutation that stamps time.Now() would write two different instants
-// to the two, and a mutation that can return an error would report a FAILED add
-// for a row already durably on disk. What goes into the closure is therefore a
-// plain, idempotent assignment of one fully-formed entry.
+// ClientConfig.AddServer is deliberately not used: it stamps its own
+// time.Now() (Update applies a mutation twice, so that writes two different
+// instants to the file and to this process) and it can fail (an error on the
+// second application would report a FAILED add for a row already durably on
+// disk). The two halves are split instead — the duplicate check becomes a
+// precondition evaluated ON THE FRESH SNAPSHOT under the lock, so two
+// concurrent adds of one name cannot both see "free"; the mutation is a plain
+// assignment of one fully-formed entry, stamped once, here.
 func saveAddedServer(name string, entry config.ServerEntry) error {
-	if _, exists := clientConfig.Servers[name]; exists {
-		return fmt.Errorf("server '%s' already exists", name)
-	}
 	entry.AddedAt = time.Now()
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
-		c.Servers[name] = entry
-		// First server wins the default, per snapshot: if another process has
-		// meanwhile set one on disk, that choice stands and only this process's
-		// (defaultless) view adopts the new entry.
-		if c.DefaultServer == "" {
-			c.DefaultServer = name
+	// The check runs exactly once (that is UpdateChecked's contract), so
+	// capturing its verdict here is safe — unlike capturing from a mutation,
+	// which runs twice.
+	var duplicate error
+	err := updateClientConfigChecked(
+		func(c *config.ClientConfig) error {
+			if _, exists := c.Servers[name]; exists {
+				duplicate = fmt.Errorf("server '%s' already exists", name)
+			}
+			return duplicate
+		},
+		func(c *config.ClientConfig) {
+			c.Servers[name] = entry
+			// First server wins the default, per snapshot: if another process
+			// has meanwhile set one on disk, that choice stands and only this
+			// process's (defaultless) view adopts the new entry.
+			if c.DefaultServer == "" {
+				c.DefaultServer = name
+			}
+		})
+	if err != nil {
+		if duplicate != nil {
+			return duplicate
 		}
-		return nil
-	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -1008,7 +1118,7 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 	if err != nil {
 		return err
 	}
-	if err := txn.commitAround(func() error { return saveUpdatedServer(name, updated) }); err != nil {
+	if err := txn.commitAround(func() error { return saveUpdatedServer(name, *entry, updated) }); err != nil {
 		return err
 	}
 
@@ -1030,11 +1140,30 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 // locked update primitive. No explicit in-memory rollback is needed: Update
 // applies the mutation in memory only after the file write has succeeded, so a
 // failure leaves this process's view exactly as the file's.
-func saveUpdatedServer(name string, updated config.ServerEntry) error {
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
-		c.Servers[name] = updated
-		return nil
-	}); err != nil {
+//
+// was is the entry as it stood when this update was decided, and it is checked
+// against the FRESH on-disk row under the lock — the same guard the credential
+// persist uses, for the same reason. A `--refetch` is an SSH round-trip; a
+// `shed server rm` or a re-add pointing the name somewhere else can land inside
+// it, and writing `updated` regardless would resurrect the removed entry or
+// staple this endpoint's pin and certificate onto a different server.
+func saveUpdatedServer(name string, was, updated config.ServerEntry) error {
+	var gone error
+	err := updateClientConfigChecked(
+		func(c *config.ClientConfig) error {
+			gone = checkStillNames(c, name, was)
+			return gone
+		},
+		func(c *config.ClientConfig) {
+			if _, ok := c.Servers[name]; !ok {
+				return // in-memory only; see saveServerEntry
+			}
+			c.Servers[name] = updated
+		})
+	if err != nil {
+		if gone != nil {
+			return fmt.Errorf("cannot update server %q: %w", name, gone)
+		}
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -1067,7 +1196,7 @@ func refetchTLSPinOverHTTPS(name string, entry *config.ServerEntry) error {
 	}
 	updated := *entry
 	updated.TLSCertFingerprint = fp
-	if err := saveUpdatedServer(name, updated); err != nil {
+	if err := saveUpdatedServer(name, *entry, updated); err != nil {
 		return err
 	}
 	if jsonFlag {

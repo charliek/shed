@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/sdk"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,7 +38,7 @@ func srvEndpoint() config.ServerEntry {
 // independently-loaded *ClientConfig — the closest thing to a concurrent `shed`
 // invocation without spawning one. The in-memory clientConfig is left stale on
 // purpose.
-func asAnotherProcess(t *testing.T, cfgPath string, mutate func(*config.ClientConfig) error) {
+func asAnotherProcess(t *testing.T, cfgPath string, mutate func(*config.ClientConfig)) {
 	t.Helper()
 	other, err := config.LoadClientConfigFromPath(cfgPath)
 	if err != nil {
@@ -64,9 +67,8 @@ func TestCredentialPersistAbortsWhenTheEntryWentAway(t *testing.T) {
 	cfgPath := testClientConfig(t)
 	putServerEntry(t, "srv", srvEndpoint())
 
-	asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) error {
+	asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) {
 		delete(c.Servers, "srv")
-		return nil
 	})
 
 	err := saveServerEntry("srv", "refreshed token", srvEndpoint(), func(e *config.ServerEntry) {
@@ -92,9 +94,8 @@ func TestCredentialPersistAbortsWhenTheEntryWasRepointed(t *testing.T) {
 	putServerEntry(t, "srv", srvEndpoint())
 
 	repointed := config.ServerEntry{Host: "somewhere-else.example", SSHPort: 2222, APIURL: "https://somewhere-else.example:8443"}
-	asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) error {
+	asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) {
 		c.Servers["srv"] = repointed
-		return nil
 	})
 
 	err := saveServerEntry("srv", "client certificate", srvEndpoint(), func(e *config.ServerEntry) {
@@ -147,9 +148,8 @@ func TestCredentialPersistMergesIntoAConcurrentWrite(t *testing.T) {
 	putServerEntry(t, "srv", srvEndpoint())
 
 	// Another process refreshes its shed cache after this process loaded.
-	asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) error {
+	asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) {
 		c.CacheShed("myshed", "srv", "running")
-		return nil
 	})
 
 	if err := saveServerEntry("srv", "refreshed token", srvEndpoint(), func(e *config.ServerEntry) {
@@ -348,9 +348,8 @@ func TestUpdateClosuresAreDeterministic(t *testing.T) {
 	})
 
 	t.Run("set default", func(t *testing.T) {
-		if err := updateClientConfig(func(c *config.ClientConfig) error {
+		if err := updateClientConfig(func(c *config.ClientConfig) {
 			c.DefaultServer = "added"
-			return nil
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -374,6 +373,175 @@ func assertConfigMatchesDisk(t *testing.T, cfgPath string) {
 	if string(inMemory) != string(stored) {
 		t.Errorf("the mutation was not deterministic — the file and this process diverged.\n--- on disk ---\n%s\n--- in memory ---\n%s", stored, inMemory)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Preconditions must be tested against the config as it is ON DISK, under the
+// lock — not against this process's view of it before the lock is taken.
+//
+// A check performed before the update reads a snapshot another `shed` can
+// invalidate in the interval, which is how two adds of one name both see "free"
+// and how a set-default outlives the removal of its target. UpdateChecked moves
+// the question inside the locked section; these tests are what say so.
+// ---------------------------------------------------------------------------
+
+// TestConcurrentSameNameAddsLeaveExactlyOneWinner. The duplicate check used to
+// run against clientConfig before the lock, so every racer saw an empty config
+// and every racer "succeeded" — the last rename deciding, silently, which
+// server the name actually meant.
+func TestConcurrentSameNameAddsLeaveExactlyOneWinner(t *testing.T) {
+	cfgPath := testClientConfig(t)
+
+	const racers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, racers)
+	for i := range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = saveAddedServer("srv", config.ServerEntry{
+				Host: fmt.Sprintf("h%d.example", i), SSHPort: 2222,
+			})
+		}()
+	}
+	wg.Wait()
+
+	winners := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+		case strings.Contains(err.Error(), "already exists"):
+		default:
+			t.Errorf("racer %d: unexpected error %v", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d of %d concurrent adds of one name succeeded, want exactly 1", winners, racers)
+	}
+
+	stored := onDisk(t, cfgPath).Servers["srv"]
+	if stored.Host == "" || stored.AddedAt.IsZero() {
+		t.Fatalf("the surviving row is not a complete entry: %+v", stored)
+	}
+	if got := clientConfig.Servers["srv"]; got.Host != stored.Host {
+		t.Errorf("in-memory host %q disagrees with the file's %q", got.Host, stored.Host)
+	}
+	assertConfigMatchesDisk(t, cfgPath)
+}
+
+// TestSaveUpdatedServerDoesNotResurrectARemovedEntry: a --refetch is an SSH
+// round-trip, and a `shed server rm` can land inside it. The pre-lock check
+// could not see that; the under-lock one can.
+func TestSaveUpdatedServerDoesNotResurrectARemovedEntry(t *testing.T) {
+	was := srvEndpoint()
+
+	t.Run("removed", func(t *testing.T) {
+		cfgPath := testClientConfig(t)
+		putServerEntry(t, "srv", was)
+		asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) { delete(c.Servers, "srv") })
+
+		updated := was
+		updated.TLSCertFingerprint = "sha256:new"
+		if err := saveUpdatedServer("srv", was, updated); err == nil {
+			t.Fatal("updating a concurrently-removed entry should fail")
+		}
+		if _, ok := onDisk(t, cfgPath).Servers["srv"]; ok {
+			t.Error("the removed entry was resurrected by the update")
+		}
+	})
+
+	t.Run("repointed", func(t *testing.T) {
+		cfgPath := testClientConfig(t)
+		putServerEntry(t, "srv", was)
+		elsewhere := config.ServerEntry{Host: "elsewhere.example", SSHPort: 2222, APIURL: "https://elsewhere.example:8443"}
+		asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) { c.Servers["srv"] = elsewhere })
+
+		updated := was
+		updated.TLSCertFingerprint = "sha256:new"
+		if err := saveUpdatedServer("srv", was, updated); err == nil {
+			t.Fatal("updating a concurrently-repointed entry should fail")
+		}
+		if got := onDisk(t, cfgPath).Servers["srv"]; got.Host != elsewhere.Host || got.TLSCertFingerprint != "" {
+			t.Errorf("the re-added entry was overwritten: %+v", got)
+		}
+	})
+}
+
+// TestSetDefaultRefusesAConcurrentlyRemovedServer: default_server naming a row
+// nobody has makes every later command fail on a default the user never chose.
+func TestSetDefaultRefusesAConcurrentlyRemovedServer(t *testing.T) {
+	cfgPath := testClientConfig(t)
+	putServerEntry(t, "keep", config.ServerEntry{Host: "keep.example", SSHPort: 2222})
+	putServerEntry(t, "doomed", config.ServerEntry{Host: "doomed.example", SSHPort: 2222})
+
+	asAnotherProcess(t, cfgPath, func(c *config.ClientConfig) { delete(c.Servers, "doomed") })
+
+	if err := runServerSetDefault(nil, []string{"doomed"}); err == nil {
+		t.Fatal("setting the default to a concurrently-removed server should fail")
+	}
+	loaded := onDisk(t, cfgPath)
+	if loaded.DefaultServer == "doomed" {
+		t.Error("default_server was left naming a server that no longer exists")
+	}
+	if _, _, err := loaded.GetDefaultServer(); loaded.DefaultServer != "" && err != nil {
+		t.Errorf("default_server %q does not resolve: %v", loaded.DefaultServer, err)
+	}
+}
+
+// TestCommittedMaterialOwnership covers the guard that replaces "hold one lock
+// across the commit and the save" on the mtls path, where holding one lock is
+// impossible: StagedClientCredentials.Commit takes the per-server credential
+// lock itself, and flock is not re-entrant.
+//
+// Instead the transaction commits, THEN locks, then proves the pair under the
+// entry's paths is still the one it committed. A loser of that race abandons
+// its add rather than saving a config row that describes somebody else's
+// certificate.
+func TestCommittedMaterialOwnership(t *testing.T) {
+	newTxn := func(t *testing.T) (*credentialTxn, sdk.Credential) {
+		t.Helper()
+		testClientConfig(t)
+		cred := newMTLSCredentialIssuer(t).credential(t, "cli-key", farFromExpiry)
+		entry := config.ServerEntry{Host: "h.example", SSHPort: 2222}
+		txn, err := stageCredentials(&entry, "srv", cred, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.commit(); err != nil {
+			t.Fatal(err)
+		}
+		return txn, cred
+	}
+
+	t.Run("the material this transaction committed is accepted", func(t *testing.T) {
+		txn, _ := newTxn(t)
+		if err := txn.committedMaterialIsOurs(); err != nil {
+			t.Errorf("own material rejected: %v", err)
+		}
+	})
+
+	t.Run("another enrollment's material is refused", func(t *testing.T) {
+		txn, _ := newTxn(t)
+		other := newMTLSCredentialIssuer(t).credential(t, "cli-key", farFromExpiry)
+		certPath, _ := txn.staged.Paths()
+		if err := os.WriteFile(certPath, []byte(other.Bundle.ClientCert), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.committedMaterialIsOurs(); err == nil {
+			t.Error("a certificate from another enrollment was accepted as ours")
+		}
+	})
+
+	t.Run("material that went away is refused", func(t *testing.T) {
+		txn, _ := newTxn(t)
+		if err := config.RemoveServerCredentials("srv"); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.committedMaterialIsOurs(); err == nil {
+			t.Error("a missing certificate was accepted as ours")
+		}
+	})
 }
 
 // saveServerEntryIfMaterialPresent mirrors persistMTLSCredential's guard so the

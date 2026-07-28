@@ -323,29 +323,52 @@ func lockClientConfig(path string) (func(), error) {
 // add` — or a credential re-mint — just committed. Last writer wins, and what
 // it wins with is everything, including the fields it never touched.
 //
-// So Update does not save the receiver. It:
+// mutate cannot fail, by type. That is the whole reason this signature is not
+// `func(*ClientConfig) error`: the mutation is applied TWICE (see
+// UpdateChecked), with the file write in between, so a mutation that could fail
+// on its second application would report an error for a change already durably
+// committed. Anything that needs to say no is a precondition, and preconditions
+// belong in UpdateChecked's check — which runs once, on the fresh snapshot,
+// before anything is written.
+func (c *ClientConfig) Update(mutate func(*ClientConfig)) error {
+	return c.UpdateChecked(nil, mutate)
+}
+
+// UpdateChecked is Update with a precondition evaluated under the lock, against
+// the config as it is on disk at that instant.
 //
-//  1. takes updateMu (in-process) and then the config file lock (cross-process,
-//     blocking; ORDER: creds lock, if any, is taken by the caller BEFORE this —
-//     see cmd/shed/client.go — and nothing here ever takes a creds lock);
-//  2. loads a FRESH snapshot from the receiver's path (a missing file is the
+// It exists because "validate, then update" is not a safe shape when another
+// process may be writing the same file: a check performed before the lock is
+// taken reads a snapshot that can be stale by the time the write lands — two
+// concurrent `shed server add`s for one name both see "not taken", and both
+// succeed. The check has to happen inside the locked section, against the fresh
+// snapshot, and it has to happen exactly once.
+//
+// The sequence is:
+//
+//  1. take updateMu (in-process) and then the config file lock (cross-process,
+//     blocking; ORDER: the creds lock, when a caller needs both, is taken by
+//     that caller BEFORE this — see cmd/shed/client.go — and nothing here ever
+//     takes a creds lock);
+//  2. load a FRESH snapshot from the receiver's path (a missing file is the
 //     empty config, exactly as LoadClientConfigFromPath treats it);
-//  3. runs mutate on that snapshot and saves it;
-//  4. runs the SAME mutate on the receiver.
+//  3. run check on that snapshot; a non-nil error aborts with NOTHING written
+//     and the receiver untouched;
+//  4. run mutate on the snapshot and save it;
+//  5. run the SAME mutate on the receiver.
 //
-// Step 4 is a re-application rather than a wholesale replacement on purpose:
+// Step 5 is a re-application rather than a wholesale replacement on purpose:
 // concurrent readers of the in-memory config hold live map values, and swapping
 // the maps out from under them would make an unrelated entry momentarily
-// vanish. Mutations are field writes, so applying them to both snapshots is
-// well-defined; a closure that is not a pure function of the config it is
-// handed (one that consumes state on first call, say) is a caller bug.
+// vanish. It also means mutate must be a deterministic function of the config
+// it is handed — one that stamps its own time.Now() leaves the file and the
+// running process holding rows that differ (which is why CacheShedAt exists
+// beside CacheShed, and why AddServer must not be called from here).
 //
-// mutate returning an error on the fresh snapshot aborts everything: nothing is
-// written and the receiver is untouched. A save failure has the same shape —
-// the receiver is only mutated AFTER the file is durable, so a process's view
-// never gets ahead of the file. (The one asymmetry: an error from the second
-// call is returned after the disk write has already committed.)
-func (c *ClientConfig) Update(mutate func(*ClientConfig) error) error {
+// check is evaluated ONLY on the fresh snapshot. The receiver is this process's
+// view of that same file, so re-checking it would either be redundant or, in
+// the one case where the two disagree, would fail after the write committed.
+func (c *ClientConfig) UpdateChecked(check func(*ClientConfig) error, mutate func(*ClientConfig)) error {
 	if mutate == nil {
 		return errors.New("client config: Update requires a mutation")
 	}
@@ -366,13 +389,17 @@ func (c *ClientConfig) Update(mutate func(*ClientConfig) error) error {
 	if err != nil {
 		return err
 	}
-	if err := mutate(fresh); err != nil {
-		return err
+	if check != nil {
+		if err := check(fresh); err != nil {
+			return err
+		}
 	}
+	mutate(fresh)
 	if err := fresh.SaveToPath(c.path); err != nil {
 		return err
 	}
-	return mutate(c)
+	mutate(c)
+	return nil
 }
 
 // Save writes the configuration to disk.

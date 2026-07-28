@@ -31,11 +31,8 @@ func newTestConfig(t *testing.T) *ClientConfig {
 }
 
 // setEntry is the mutation these tests use most: one field write on one entry.
-func setEntry(name string, entry ServerEntry) func(*ClientConfig) error {
-	return func(c *ClientConfig) error {
-		c.Servers[name] = entry
-		return nil
-	}
+func setEntry(name string, entry ServerEntry) func(*ClientConfig) {
+	return func(c *ClientConfig) { c.Servers[name] = entry }
 }
 
 // TestUpdateOnAMissingFileStartsFromTheEmptyConfig: the fresh snapshot is
@@ -234,11 +231,10 @@ func TestUpdateSurvivesAStaleWholeSnapshotWriter(t *testing.T) {
 		}
 
 		// A credential persist commits in between.
-		if err := seed.Update(func(c *ClientConfig) error {
+		if err := seed.Update(func(c *ClientConfig) {
 			e := c.Servers["srv"]
 			e.ControlToken = "freshly-minted"
 			c.Servers["srv"] = e
-			return nil
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -270,18 +266,16 @@ func TestUpdateSurvivesAStaleWholeSnapshotWriter(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := seed.Update(func(c *ClientConfig) error {
+		if err := seed.Update(func(c *ClientConfig) {
 			e := c.Servers["srv"]
 			e.ControlToken = "freshly-minted"
 			c.Servers["srv"] = e
-			return nil
 		}); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := stale.Update(func(c *ClientConfig) error {
+		if err := stale.Update(func(c *ClientConfig) {
 			c.CacheShed("myshed", "srv", "running")
-			return nil
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -311,11 +305,10 @@ func TestUpdateWritesOnlyItsOwnMutation(t *testing.T) {
 	cfg.Sheds["never-asked-for"] = ShedCache{Server: "srv", Status: "running"}
 	cfg.DefaultServer = "not-committed"
 
-	if err := cfg.Update(func(c *ClientConfig) error {
+	if err := cfg.Update(func(c *ClientConfig) {
 		e := c.Servers["srv"]
 		e.ControlToken = "tok"
 		c.Servers["srv"] = e
-		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -337,21 +330,27 @@ func TestUpdateWritesOnlyItsOwnMutation(t *testing.T) {
 	}
 }
 
-// TestUpdateAbortsOnAFailedMutation: a mutation that says no leaves the file
-// and the in-memory config exactly as they were.
-func TestUpdateAbortsOnAFailedMutation(t *testing.T) {
+// TestUpdateAbortsOnAFailedCheck: a precondition that says no leaves the file
+// and the in-memory config exactly as they were, and the mutation never runs.
+func TestUpdateAbortsOnAFailedCheck(t *testing.T) {
 	cfg := newTestConfig(t)
 	if err := cfg.Update(setEntry("srv", ServerEntry{Host: "h"})); err != nil {
 		t.Fatal(err)
 	}
 
 	boom := errors.New("injected")
-	err := cfg.Update(func(c *ClientConfig) error {
-		c.Servers["ghost"] = ServerEntry{Host: "should-not-survive"}
-		return boom
-	})
+	mutations := 0
+	err := cfg.UpdateChecked(
+		func(*ClientConfig) error { return boom },
+		func(c *ClientConfig) {
+			mutations++
+			c.Servers["ghost"] = ServerEntry{Host: "should-not-survive"}
+		})
 	if !errors.Is(err, boom) {
-		t.Fatalf("Update err = %v, want the injected error", err)
+		t.Fatalf("UpdateChecked err = %v, want the injected error", err)
+	}
+	if mutations != 0 {
+		t.Errorf("the mutation ran %d times despite a failed check", mutations)
 	}
 	if _, ok := cfg.Servers["ghost"]; ok {
 		t.Error("the in-memory config was mutated by an aborted Update")
@@ -361,12 +360,66 @@ func TestUpdateAbortsOnAFailedMutation(t *testing.T) {
 	}
 }
 
+// TestUpdateCheckedEvaluatesThePreconditionUnderTheLock is why the check is a
+// parameter rather than something a caller does first.
+//
+// Every racer here holds its own *ClientConfig, loaded when the file was empty,
+// and asks the same "is this name free" question. Asked of their own snapshot
+// the answer is yes for all of them; asked of the fresh snapshot inside the
+// lock it is yes for exactly one.
+func TestUpdateCheckedEvaluatesThePreconditionUnderTheLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	taken := errors.New("already taken")
+
+	const racers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, racers)
+	for i := range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cfg, err := LoadClientConfigFromPath(path)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			errs[i] = cfg.UpdateChecked(
+				func(c *ClientConfig) error {
+					if _, exists := c.Servers["srv"]; exists {
+						return taken
+					}
+					return nil
+				},
+				setEntry("srv", ServerEntry{Host: string(rune('a' + i))}),
+			)
+		}()
+	}
+	wg.Wait()
+
+	winners := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+		case errors.Is(err, taken):
+		default:
+			t.Errorf("racer %d: %v", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d racers claimed the name, want exactly 1", winners)
+	}
+	if got := len(reloadFrom2(t, path).Servers); got != 1 {
+		t.Errorf("on-disk servers = %d, want 1", got)
+	}
+}
+
 // TestUpdateRefusesAPathlessConfig: a config with no path (a hand-built
 // literal) has nothing to lock or merge against, so it must say so rather than
 // write somewhere arbitrary.
 func TestUpdateRefusesAPathlessConfig(t *testing.T) {
 	cfg := &ClientConfig{Servers: map[string]ServerEntry{}, Sheds: map[string]ShedCache{}}
-	if err := cfg.Update(func(*ClientConfig) error { return nil }); err == nil {
+	if err := cfg.Update(func(*ClientConfig) {}); err == nil {
 		t.Fatal("Update on a pathless config should fail")
 	}
 }
@@ -415,9 +468,8 @@ func TestRemoveServerPromotesADeterministicDefault(t *testing.T) {
 func TestUpdateAppliesACacheRowIdentically(t *testing.T) {
 	cfg := newTestConfig(t)
 	at := time.Now()
-	if err := cfg.Update(func(c *ClientConfig) error {
+	if err := cfg.Update(func(c *ClientConfig) {
 		c.CacheShedAt("myshed", "srv", "running", at)
-		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +483,13 @@ func TestUpdateAppliesACacheRowIdentically(t *testing.T) {
 // reloadFrom reads the config file cfg points at, as a second process would.
 func reloadFrom(t *testing.T, cfg *ClientConfig) *ClientConfig {
 	t.Helper()
-	loaded, err := LoadClientConfigFromPath(cfg.path)
+	return reloadFrom2(t, cfg.path)
+}
+
+// reloadFrom2 is reloadFrom for a bare path.
+func reloadFrom2(t *testing.T, path string) *ClientConfig {
+	t.Helper()
+	loaded, err := LoadClientConfigFromPath(path)
 	if err != nil {
 		t.Fatal(err)
 	}

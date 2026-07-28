@@ -185,11 +185,10 @@ func getAllShedsInfo() ([]shedInfo, error) {
 	// closure to the fresh on-disk snapshot and then to the in-memory one, and a
 	// per-call time.Now() would make those two disagree.
 	cachedAt := time.Now()
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
+	if err := updateClientConfig(func(c *config.ClientConfig) {
 		for _, r := range cacheRows {
 			c.CacheShedAt(r.name, r.server, r.status, cachedAt)
 		}
-		return nil
 	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)

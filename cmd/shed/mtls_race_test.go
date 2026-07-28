@@ -226,7 +226,7 @@ func TestPersistTokenCredentialDeletesOnlyAfterASuccessfulSave(t *testing.T) {
 		if err := os.MkdirAll(cfgPath, 0700); err != nil {
 			t.Fatal(err)
 		}
-		if err := clientConfig.Update(func(*config.ClientConfig) error { return nil }); err == nil {
+		if err := clientConfig.Update(func(*config.ClientConfig) {}); err == nil {
 			t.Fatal("test setup: the config update was expected to fail")
 		}
 

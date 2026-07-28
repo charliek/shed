@@ -359,17 +359,34 @@ var configMu sync.Mutex
 // processes, loads a fresh on-disk snapshot, saves it, and only then re-applies
 // the mutation in memory).
 //
-// Every mutation closure must be a pure function of the config it is handed —
-// Update runs it twice, once on the fresh snapshot and once on the in-memory
-// one — so it must not read the clientConfig global or accumulate state.
+// Every mutation closure must be a deterministic function of the config it is
+// handed — Update runs it twice, once on the fresh snapshot and once on the
+// in-memory one — so it must not read the clientConfig global or accumulate
+// state. It also cannot fail: preconditions go through
+// updateClientConfigChecked, whose check runs once, under the lock, against the
+// on-disk snapshot.
 //
 // LOCK ORDERING: a caller that also needs a server's credential lock
 // (config.LockServerCredentials) takes THAT first. Nothing reached from here
 // touches the credential store, so the order can never invert.
-func updateClientConfig(mutate func(*config.ClientConfig) error) error {
+func updateClientConfig(mutate func(*config.ClientConfig)) error {
 	configMu.Lock()
 	defer configMu.Unlock()
 	return clientConfig.Update(mutate)
+}
+
+// updateClientConfigChecked is updateClientConfig with a precondition tested
+// against the FRESH on-disk snapshot inside the lock.
+//
+// Every "does this entry still exist / still mean what I think" question in
+// this package goes here rather than being asked before the call. Asked
+// earlier, it is answered from a snapshot that another `shed` process can
+// invalidate before the write lands — which is how two concurrent adds of one
+// name both succeed, and how a set-default survives the removal of its target.
+func updateClientConfigChecked(check func(*config.ClientConfig) error, mutate func(*config.ClientConfig)) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	return clientConfig.UpdateChecked(check, mutate)
 }
 
 // cacheShedLocation records where a shed lives, through the locked write path.
@@ -381,9 +398,8 @@ func updateClientConfig(mutate func(*config.ClientConfig) error) error {
 // holding rows that differ in updated_at for no reason anyone chose.
 func cacheShedLocation(shedName, serverName, status string) error {
 	now := time.Now()
-	return updateClientConfig(func(c *config.ClientConfig) error {
+	return updateClientConfig(func(c *config.ClientConfig) {
 		c.CacheShedAt(shedName, serverName, status, now)
-		return nil
 	})
 }
 
@@ -535,36 +551,41 @@ func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Cre
 // proceed on a failed save — deleting superseded credential files is only safe
 // once the config that stopped referring to them is durable.
 func saveServerEntry(name, what string, endpoint config.ServerEntry, mutate func(*config.ServerEntry)) error {
-	applied := 0
-	err := updateClientConfig(func(c *config.ClientConfig) error {
-		stored, ok := c.Servers[name]
-		if !ok {
-			return fmt.Errorf("configured server %q no longer exists", name)
-		}
-		if !sameServerEndpoint(stored, endpoint) {
-			return fmt.Errorf("configured server %q no longer names the endpoint this credential was issued for", name)
-		}
-		mutate(&stored)
-		c.Servers[name] = stored
-		applied++
-		return nil
-	})
-	if err == nil {
-		return nil
+	err := updateClientConfigChecked(
+		func(c *config.ClientConfig) error { return checkStillNames(c, name, endpoint) },
+		func(c *config.ClientConfig) {
+			stored, ok := c.Servers[name]
+			if !ok {
+				// Only reachable for this process's in-memory snapshot, which
+				// the check above did not (and must not) cover. Skipping is
+				// right: re-creating the row here would resurrect an entry this
+				// process has already dropped.
+				return
+			}
+			mutate(&stored)
+			c.Servers[name] = stored
+		})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not persist %s for %q: %v\n", what, name, err)
+		return err
 	}
-	// Which application refused decides what this failure MEANS. Update runs
-	// the mutation on the fresh on-disk snapshot first and writes the file
-	// between the two, so a refusal with something already applied is the
-	// in-memory one — the durable half is done, and reporting a failure would
-	// make the caller skip the credential-file deletion that the completed save
-	// has already made safe. Only a refusal before any application is a persist
-	// that did not happen.
-	if applied > 0 {
-		fmt.Fprintf(os.Stderr, "warning: persisted %s for %q, but this process's in-memory config no longer matches: %v\n", what, name, err)
-		return nil
+	return nil
+}
+
+// checkStillNames is the precondition every credential persist and every
+// entry-editing command shares: the named row must still exist AND still be the
+// endpoint the caller resolved. It is written as a check rather than folded
+// into a mutation so it runs exactly once, on the on-disk snapshot, under the
+// lock — the only instant at which the answer is authoritative.
+func checkStillNames(c *config.ClientConfig, name string, endpoint config.ServerEntry) error {
+	stored, ok := c.Servers[name]
+	if !ok {
+		return fmt.Errorf("configured server %q no longer exists", name)
 	}
-	fmt.Fprintf(os.Stderr, "warning: could not persist %s for %q: %v\n", what, name, err)
-	return err
+	if !sameServerEndpoint(stored, endpoint) {
+		return fmt.Errorf("configured server %q no longer names the endpoint this credential was issued for", name)
+	}
+	return nil
 }
 
 // serverNameForEntry returns the config name whose stored entry UNIQUELY matches

@@ -376,11 +376,10 @@ func runList(cmd *cobra.Command, args []string) error {
 	// rather than work interleaved with the calls above, and one timestamp
 	// taken here rather than a fresh time.Now() per application.
 	cachedAt := time.Now()
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
+	if err := updateClientConfig(func(c *config.ClientConfig) {
 		for _, s := range allSheds {
 			c.CacheShedAt(s.shed.Name, s.server, s.shed.Status, cachedAt)
 		}
-		return nil
 	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
@@ -719,9 +718,8 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	// Remove from cache
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
+	if err := updateClientConfig(func(c *config.ClientConfig) {
 		c.RemoveShedCache(name)
-		return nil
 	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)

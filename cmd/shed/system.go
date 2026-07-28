@@ -484,11 +484,10 @@ func runSystemPruneSingle() error {
 	// cache is cosmetic and self-healing (findShedServer re-resolves on a miss),
 	// so the fix would cost more than the symptom.
 	deleted := deletedShedNames(report)
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
+	if err := updateClientConfig(func(c *config.ClientConfig) {
 		for _, n := range deleted {
 			c.RemoveShedCache(n)
 		}
-		return nil
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save client config: %v\n", err)
 	}
@@ -587,11 +586,10 @@ func runSystemPruneAll() error {
 		deleted = append(deleted, deletedShedNames(r.Value)...)
 	}
 	if len(deleted) > 0 {
-		if err := updateClientConfig(func(c *config.ClientConfig) error {
+		if err := updateClientConfig(func(c *config.ClientConfig) {
 			for _, n := range deleted {
 				c.RemoveShedCache(n)
 			}
-			return nil
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save client config: %v\n", err)
 		}

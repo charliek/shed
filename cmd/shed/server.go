@@ -473,22 +473,21 @@ func hostPortFromAPIURL(apiURL string) (string, int, error) {
 func runServerRemove(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	// "Is there such a server" is decided ONCE, here. Inside the update it
-	// could not be: Update applies its mutation to the fresh on-disk snapshot
-	// and then to the in-memory one, so a not-found error raised on the second
-	// application would report a failure for a removal already committed to
-	// disk. The mutation itself is idempotent — removing an absent entry is the
-	// state the caller asked for — so the two applications always agree.
+	// "Is there such a server to remove" is answered from this process's view,
+	// deliberately, and NOT re-checked under the lock. Removal is the one
+	// mutation here that is idempotent in the direction the user is asking for:
+	// if a concurrent `shed server rm` got there first, the requested end state
+	// already holds, and failing would be pedantry. So no precondition — just a
+	// mutation that tolerates an absent row on either snapshot.
 	if _, err := clientConfig.GetServer(name); err != nil {
 		return err
 	}
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
+	if err := updateClientConfig(func(c *config.ClientConfig) {
 		if _, ok := c.Servers[name]; ok {
-			// Ignores only the not-found error, which the guard above rules out
-			// for the in-memory snapshot and the check here rules out for disk.
+			// The only error RemoveServer can return is not-found, which this
+			// branch has just ruled out.
 			_ = c.RemoveServer(name)
 		}
-		return nil
 	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
@@ -517,16 +516,24 @@ func runServerRemove(cmd *cobra.Command, args []string) error {
 func runServerSetDefault(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	// Validated once, outside the update, for the same reason as the removal
-	// above: a mutation that can fail on its second application would report a
-	// failure for a change already on disk. What is left is a plain assignment.
-	if _, err := clientConfig.GetServer(name); err != nil {
-		return err
-	}
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
-		c.DefaultServer = name
-		return nil
-	}); err != nil {
+	// The target must exist in the config as it is ON DISK at the moment of the
+	// write, not merely in this process's view of it: `shed server rm other` +
+	// `shed server set-default other` racing would otherwise leave
+	// default_server naming a row nobody has, and every later command failing
+	// on a default the user never chose.
+	var missing error
+	if err := updateClientConfigChecked(
+		func(c *config.ClientConfig) error {
+			if _, ok := c.Servers[name]; !ok {
+				missing = fmt.Errorf("server '%s' not found", name)
+			}
+			return missing
+		},
+		func(c *config.ClientConfig) { c.DefaultServer = name },
+	); err != nil {
+		if missing != nil {
+			return missing
+		}
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -585,21 +592,29 @@ func runServerUpdate(cmd *cobra.Command, args []string) error {
 	// have rewritten this row's token or certificate paths since; re-pinning
 	// must not roll those back.
 	//
-	// The entry's existence was established by the GetServer at the top of this
-	// function; a row that has vanished from a snapshot since is skipped rather
-	// than raised, because Update applies this twice and an error on the second
-	// application would report a failure for a pin already written. Skipping is
-	// also the right merge: re-creating the row from a lone fingerprint would
-	// resurrect a server the user just removed.
-	if err := updateClientConfig(func(c *config.ClientConfig) error {
-		stored, ok := c.Servers[name]
-		if !ok {
-			return nil
+	// The row must still be there, and still be the same server, in the config
+	// as it is ON DISK — the GetServer above only proves it was there when this
+	// process loaded. Re-creating a row from a lone fingerprint would resurrect
+	// a server the user just removed; writing it onto a re-added one would pin
+	// a certificate the operator never saw.
+	var gone error
+	if err := updateClientConfigChecked(
+		func(c *config.ClientConfig) error {
+			gone = checkStillNames(c, name, *entry)
+			return gone
+		},
+		func(c *config.ClientConfig) {
+			stored, ok := c.Servers[name]
+			if !ok {
+				return // in-memory only; see saveServerEntry
+			}
+			stored.TLSCertFingerprint = newFingerprint
+			c.Servers[name] = stored
+		},
+	); err != nil {
+		if gone != nil {
+			return fmt.Errorf("cannot re-pin server %q: %w", name, gone)
 		}
-		stored.TLSCertFingerprint = newFingerprint
-		c.Servers[name] = stored
-		return nil
-	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
